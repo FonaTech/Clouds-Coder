@@ -155,6 +155,7 @@ RAG_LIBRARY_DIRNAME = "RAG_Library"
 RAG_ADMIN_PORT_OFFSET = 2
 CODE_LIBRARY_DIRNAME = "Code_Library"
 CODE_ADMIN_PORT_OFFSET = 3
+IDE_DEFAULT_PORT = 8084
 WEB_SEARCH_INDEX_DIRNAME = "Web_Search_Index"
 DEFAULT_WEB_SEARCH_ENABLED = True
 USER_MEMORY_DIRNAME = ".clouds_coder"
@@ -1063,6 +1064,36 @@ CODE_PREVIEW_DIFF_CONTEXT_LINES = 4
 CODE_PREVIEW_DIFF_MERGE_GAP = 10
 PREVIEW_DOWNLOAD_MAX_FILES = 500
 PREVIEW_DOWNLOAD_MAX_BYTES = 80_000_000
+FILES_TREE_DEFAULT_MAX_NODES = 420
+FILES_TREE_DEFAULT_MAX_DEPTH = 5
+FILES_TREE_SKIP_DIRS = {
+    ".git", ".hg", ".svn", ".idea", ".vscode", ".vs",
+    ".next", ".nuxt", ".svelte-kit", ".angular", ".expo",
+    ".cache", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+    ".turbo", ".yarn", ".pnpm-store", ".parcel-cache",
+    "__pycache__", ".venv", "venv", "env", ".tox",
+    "node_modules", "bower_components", "vendor",
+    "dist", "build", "target", "coverage", "out", "bin", "obj",
+}
+FILES_TREE_SKIP_REL_DIRS = {
+    ".clouds_coder/long_output",
+}
+IDE_FILE_MAX_BYTES = 12 * 1024 * 1024
+IDE_UPLOAD_MAX_BYTES = 32 * 1024 * 1024
+IDE_UPLOAD_TOTAL_MAX_BYTES = 220 * 1024 * 1024
+IDE_UPLOAD_MAX_ITEMS = 1200
+IDE_COMMAND_TIMEOUT_DEFAULT = 120
+IDE_TREE_DEFAULT_MAX_NODES = 800
+IDE_TREE_MAX_NODES = 5000
+IDE_TREE_SKIP_DIRS = {
+    ".git", ".hg", ".svn",
+    ".next", ".nuxt", ".svelte-kit", ".angular", ".expo",
+    ".cache", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+    ".turbo", ".yarn", ".pnpm-store", ".parcel-cache",
+    "__pycache__", ".venv", "venv", "env", ".tox",
+    "node_modules", "bower_components",
+    "dist", "build", "target", "coverage", "out", "bin", "obj",
+}
 RENDER_FRAME_MAX_B64_CHARS = 2_200_000
 RENDER_FRAME_MAX_POINTS = 12_000
 RENDER_FRAME_MAX_LINES = 2_000
@@ -1817,7 +1848,7 @@ BACKEND_I18N["en"].update(
         "step_completed_evidence": "step completed",
         "plan_step_summary": "📋 Plan step {step}/{total}: {content}",
         "plan_step_label": "Step {step}/{total}",
-        "plan_step_hint": "Moved to {step_label}: {step_text}\nRead the updated plan with: read_file {plan_path}\nNow call TodoWrite only for this step. Each subtask must include parent_step_id='{parent_step_id}'. Create 3-5 items with exactly one in_progress. Do not create subtasks for other plan steps.",
+        "plan_step_hint": "Moved to {step_label}: {step_text}\nRead the updated plan with: read_file {plan_path}\nUse TodoWrite for this step only when it materially improves execution tracking. If you create subtasks, include parent_step_id='{parent_step_id}' and keep exactly one in_progress. Do not create subtasks for other plan steps.",
         "stall_execution_blocked_title": "## Execution Blocked\n",
         "stall_stop_reason": "**Stop reason:** {reason}",
         "stall_error_details": "**Error details:** {detail}",
@@ -1866,7 +1897,7 @@ BACKEND_I18N["en"].update(
         "plan_bubble_full_ref": "Full plan: `{path}`",
         "plan_bubble_reply": 'Reply with a choice (e.g. "Option A", "A", "choose 1"), or provide revisions.',
         "plan_read_instruction": "Plan approved. Read `{path}` with `read_file {path}` for the authoritative step order and live status.\nExecute steps in order, finish the current step before advancing, and load any referenced skill or workflow before starting.",
-        "plan_read_todo_note": "\nTODO PLANNING: At the START of your work, call TodoWrite to list ALL subtasks you plan to complete for {step_label} (status=pending, parent_step_id='{parent_step_id}'). Create 3-5 subtasks for THIS step ONLY — do NOT list subtasks for other plan steps. If subtasks already exist for this step, continue the current in_progress subtask first instead of replacing it. After EACH completed subtask, immediately call TodoWrite again to mark it completed and move the next subtask to in_progress. Do NOT wait until the end of the step to update todos. Do NOT call finish_current_task for a subtask or a single plan step; finish tools are reserved for the overall user task.\n",
+        "plan_read_todo_note": "\nTODO GUIDANCE: Decide semantically whether TodoWrite will improve execution for {step_label}. Use it for genuinely multi-part, uncertain, or validation-heavy work; skip it when the step can be completed cleanly in one coherent pass. If subtasks already exist for this step, continue the current in_progress subtask first instead of replacing it. If you create or update subtasks, include parent_step_id='{parent_step_id}', keep exactly one in_progress, and update status when real work changes. Do NOT call finish_current_task for a subtask or a single plan step; finish tools are reserved for the overall user task.\n",
         "plan_proposal_title": "## 📋 Execution Plans\n",
         "plan_proposal_background": "### Background Analysis\n{context}\n",
         "plan_proposal_option": "### Option {id}: {title}",
@@ -1911,7 +1942,7 @@ BACKEND_I18N["zh-CN"].update(
         "step_completed_evidence": "步骤已完成",
         "plan_step_summary": "📋 计划步骤 {step}/{total}：{content}",
         "plan_step_label": "步骤 {step}/{total}",
-        "plan_step_hint": "已切换到{step_label}：{step_text}\n读取更新后的计划：read_file {plan_path}\n现在调用 TodoWrite，只为当前步骤拆分子任务。每个子任务都必须包含 parent_step_id='{parent_step_id}'。创建 3-5 项，并且只能有 1 项是 in_progress。不要为其他计划步骤创建子任务。",
+        "plan_step_hint": "已切换到{step_label}：{step_text}\n读取更新后的计划：read_file {plan_path}\n仅在 TodoWrite 确实有助于执行跟踪时，才为当前步骤创建/更新子任务。若创建子任务，必须包含 parent_step_id='{parent_step_id}'，并且只能有 1 项是 in_progress。不要为其他计划步骤创建子任务。",
         "stall_execution_blocked_title": "## 执行遇阻\n",
         "stall_stop_reason": "**停止原因：** {reason}",
         "stall_error_details": "**错误详情：** {detail}",
@@ -1960,7 +1991,7 @@ BACKEND_I18N["zh-CN"].update(
         "plan_bubble_full_ref": "完整方案详见：`{path}`",
         "plan_bubble_reply": "请回复选择（如“方案A”“A”“选1”），或输入修改意见。",
         "plan_read_instruction": "计划已批准。请用 `read_file {path}` 读取 `{path}`，它是步骤顺序和实时状态的唯一权威来源。\n按顺序执行，完成当前步骤后再推进下一步；如果步骤引用了 skill 或 workflow，开始前先调用 load_skill。",
-        "plan_read_todo_note": "\nTODO 更新：一开始就调用 TodoWrite，只为当前步骤（{step_label}）设置子任务。\n每个子任务都必须包含 parent_step_id='{parent_step_id}'。\n创建 3-5 个只属于当前步骤的子任务；如果当前步骤已经有子任务，就先继续当前 in_progress 子任务，不要重写路线。\n每完成一个子任务后，都要立刻再次调用 TodoWrite，将它标记为 completed，并把下一个子任务切到 in_progress。\n不要等到整步结束后才统一更新。\n不要为其他计划步骤创建子任务。\n",
+        "plan_read_todo_note": "\nTODO 指引：根据语义自行判断 TodoWrite 是否能提升当前步骤（{step_label}）的执行质量。\n多部分、不确定、需要验证跟踪的工作才创建/更新子任务；能够一口气清晰完成的步骤可以跳过 todo。\n若当前步骤已有子任务，先继续当前 in_progress 子任务，不要重写路线。\n若创建或更新子任务，每项都必须包含 parent_step_id='{parent_step_id}'，且只能有 1 项是 in_progress；只在真实状态变化时更新。\n不要为其他计划步骤创建子任务。\n",
         "plan_proposal_title": "## 📋 执行方案\n",
         "plan_proposal_background": "### 背景分析\n{context}\n",
         "plan_proposal_option": "### 方案 {id}：{title}",
@@ -2005,7 +2036,7 @@ BACKEND_I18N["zh-TW"].update(
         "step_completed_evidence": "步驟已完成",
         "plan_step_summary": "📋 計畫步驟 {step}/{total}：{content}",
         "plan_step_label": "步驟 {step}/{total}",
-        "plan_step_hint": "已切換到{step_label}：{step_text}\n讀取更新後的計畫：read_file {plan_path}\n現在呼叫 TodoWrite，只為目前步驟拆分子任務。每個子任務都必須包含 parent_step_id='{parent_step_id}'。建立 3-5 項，而且只能有 1 項是 in_progress。不要為其他計畫步驟建立子任務。",
+        "plan_step_hint": "已切換到{step_label}：{step_text}\n讀取更新後的計畫：read_file {plan_path}\n只有在 TodoWrite 確實有助於執行追蹤時，才為目前步驟建立/更新子任務。若建立子任務，必須包含 parent_step_id='{parent_step_id}'，而且只能有 1 項是 in_progress。不要為其他計畫步驟建立子任務。",
         "stall_execution_blocked_title": "## 執行受阻\n",
         "stall_stop_reason": "**停止原因：** {reason}",
         "stall_error_details": "**錯誤詳情：** {detail}",
@@ -2054,7 +2085,7 @@ BACKEND_I18N["zh-TW"].update(
         "plan_bubble_full_ref": "完整方案詳見：`{path}`",
         "plan_bubble_reply": "請回覆選擇（如「方案A」「A」「選1」），或輸入修改意見。",
         "plan_read_instruction": "計畫已核准。請用 `read_file {path}` 讀取 `{path}`，它是步驟順序與即時狀態的唯一權威來源。\n請依序執行，完成目前步驟後再推進下一步；如果步驟引用了 skill 或 workflow，開始前先呼叫 load_skill。",
-        "plan_read_todo_note": "\nTODO 更新：一開始就呼叫 TodoWrite，只為目前步驟（{step_label}）設定子任務。\n每個子任務都必須包含 parent_step_id='{parent_step_id}'。\n建立 3-5 個只屬於目前步驟的子任務；若目前步驟已經有子任務，請先延續目前的 in_progress 子任務，不要改寫路線。\n每完成一個子任務後，都要立刻再次呼叫 TodoWrite，把它標記為 completed，並把下一個子任務切到 in_progress。\n不要等到整個步驟結束後才一次更新。\n不要為其他計畫步驟建立子任務。\n",
+        "plan_read_todo_note": "\nTODO 指引：根據語義自行判斷 TodoWrite 是否能提升目前步驟（{step_label}）的執行品質。\n多部分、不確定、需要驗證追蹤的工作才建立/更新子任務；能清楚一次完成的步驟可以略過 todo。\n若目前步驟已有子任務，先延續目前的 in_progress 子任務，不要改寫路線。\n若建立或更新子任務，每項都必須包含 parent_step_id='{parent_step_id}'，且只能有 1 項是 in_progress；只在真實狀態變化時更新。\n不要為其他計畫步驟建立子任務。\n",
         "plan_proposal_title": "## 📋 執行方案\n",
         "plan_proposal_background": "### 背景分析\n{context}\n",
         "plan_proposal_option": "### 方案 {id}：{title}",
@@ -2099,7 +2130,7 @@ BACKEND_I18N["ja"].update(
         "step_completed_evidence": "ステップ完了",
         "plan_step_summary": "📋 計画ステップ {step}/{total}: {content}",
         "plan_step_label": "ステップ {step}/{total}",
-        "plan_step_hint": "{step_label} に移動しました: {step_text}\n更新済みプランを読む: read_file {plan_path}\n今すぐ TodoWrite を呼び出し、このステップだけのサブタスクを設定してください。各サブタスクには parent_step_id='{parent_step_id}' を必ず含め、3-5 件作成し、in_progress は 1 件だけにしてください。他の計画ステップのサブタスクは作成しないでください。",
+        "plan_step_hint": "{step_label} に移動しました: {step_text}\n更新済みプランを読む: read_file {plan_path}\nTodoWrite が実行追跡に役立つ場合だけ、このステップのサブタスクを作成/更新してください。作成する場合は parent_step_id='{parent_step_id}' を必ず含め、in_progress は 1 件だけにしてください。他の計画ステップのサブタスクは作成しないでください。",
         "stall_execution_blocked_title": "## 実行が停止しました\n",
         "stall_stop_reason": "**停止理由:** {reason}",
         "stall_error_details": "**エラー詳細:** {detail}",
@@ -2148,7 +2179,7 @@ BACKEND_I18N["ja"].update(
         "plan_bubble_full_ref": "完全なプラン: `{path}`",
         "plan_bubble_reply": "選択肢（例: 「案A」「A」「1を選ぶ」）を返信するか、修正要望を入力してください。",
         "plan_read_instruction": "計画が承認されました。`read_file {path}` で `{path}` を読み、正式な手順順序と進行状況を確認してください。\n必ず順番に実行し、現在のステップを完了してから次へ進んでください。ステップが skill や workflow を参照している場合は、開始前に load_skill を呼び出してください。",
-        "plan_read_todo_note": "\nTODO 更新: 最初に TodoWrite を呼び出し、現在のステップ（{step_label}）だけのサブタスクを設定してください。\n各サブタスクには parent_step_id='{parent_step_id}' を必ず含めてください。\n現在のステップだけを分解した 3-5 件のサブタスクを作成し、既存のサブタスクがある場合は現在の in_progress サブタスクから先に続行してください。\n各サブタスクを完了した直後に、必ずもう一度 TodoWrite を呼び出して completed に更新し、次のサブタスクを in_progress に切り替えてください。\nステップ全体の最後まで Todo 更新を先送りしないでください。\n他の計画ステップのサブタスクは作成しないでください。\n",
+        "plan_read_todo_note": "\nTODO ガイダンス: {step_label} で TodoWrite が実行品質を高めるかを意味的に判断してください。\n複数部分・不確実・検証追跡が必要な作業では作成/更新し、1 回で明確に完了できるステップでは省略できます。\n既存のサブタスクがある場合は現在の in_progress サブタスクから続行し、ルートを書き換えないでください。\n作成/更新する場合は parent_step_id='{parent_step_id}' を必ず含め、in_progress は 1 件だけにし、実際の状態変化がある時だけ更新してください。\n他の計画ステップのサブタスクは作成しないでください。\n",
         "plan_proposal_title": "## 📋 実行プラン\n",
         "plan_proposal_background": "### 背景分析\n{context}\n",
         "plan_proposal_option": "### 案 {id}: {title}",
@@ -12125,8 +12156,9 @@ _BUILTIN_SKILLS: dict[str, dict] = {
         "description": "Todo/Task creation, updates, and best practices",
         "body": (
             "# Task Management Guide\n"
-            "- For level 1-2 (simple) tasks: skip todo scaffolding, give direct response, UNLESS an approved plan step is active.\n"
-            "- When an approved plan step is active, ALWAYS create/update step-local TodoWrite subtasks even at level 1-2.\n"
+            "- For level 1 tasks: skip todo scaffolding and give the direct response, UNLESS an approved plan step is active.\n"
+            "- For level 2 tasks: decide semantically whether todos will improve execution. Create a compact TodoWrite plan only when the request has enough moving parts, uncertainty, state tracking, or verification burden that todos would reduce mistakes; skip todos when the work can be completed cleanly in one coherent pass. Do not rely on fixed task-type or keyword lists.\n"
+            "- When an approved plan step is active, create/update step-local TodoWrite subtasks only when they materially improve execution tracking; if you do, keep them scoped to the active step.\n"
             "- For level 3+ tasks: call TodoWrite early with 3-7 concise items, one marked in_progress.\n"
             "- Update todos only when plan or status actually changes. Avoid redundant calls.\n"
             "- If TodoWrite fails or repeats unchanged, use TodoWriteRescue with simple string items.\n"
@@ -18234,7 +18266,145 @@ class SessionState:
             800,
         )
 
-    def _reset_blackboard_plan_state_locked(self) -> None:
+    def _previous_task_context_snapshot(self, board: dict | None = None) -> dict:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        completion = self._normalize_completion_state(bb.get("completion", {}))
+        approval = bb.get("approval", {}) if isinstance(bb.get("approval"), dict) else {}
+        artifacts = bb.get("code_artifacts", {}) if isinstance(bb.get("code_artifacts"), dict) else {}
+        artifact_paths = [str(path) for path in artifacts.keys() if str(path).strip()][-12:]
+        plan_rows = [
+            row for row in (bb.get("project_todos", []) if isinstance(bb.get("project_todos"), list) else [])
+            if isinstance(row, dict) and str(row.get("category", "") or "") == "plan_step"
+        ]
+        completed_steps = [
+            trim(str(row.get("content", "") or ""), 120)
+            for row in plan_rows
+            if str(row.get("status", "") or "").strip().lower() == "completed"
+        ][-6:]
+        file_paths: list[str] = []
+        step_files = bb.get("step_files", {}) if isinstance(bb.get("step_files"), dict) else {}
+        for entries in step_files.values():
+            if not isinstance(entries, list):
+                continue
+            for item in entries[-8:]:
+                if not isinstance(item, dict):
+                    continue
+                path = str(item.get("path", "") or "").strip()
+                if path and path not in file_paths:
+                    file_paths.append(path)
+        file_paths = file_paths[-12:]
+        summary = (
+            trim(str(completion.get("summary", "") or ""), 800)
+            or trim(str(approval.get("note", "") or ""), 800)
+        )
+        if not summary:
+            for row in reversed(self.messages[-24:]):
+                if not isinstance(row, dict):
+                    continue
+                if str(row.get("type", "") or "") == "completion_summary":
+                    summary = trim(str(row.get("content", "") or ""), 800)
+                    break
+        out = {
+            "goal": trim(str(bb.get("original_goal", "") or ""), 800),
+            "status": self._normalize_blackboard_status(bb.get("status", "INITIALIZING")),
+            "summary": summary,
+            "artifact_paths": artifact_paths,
+            "file_paths": file_paths,
+            "completed_plan_steps": completed_steps,
+            "captured_at": float(now_ts()),
+        }
+        return {k: v for k, v in out.items() if v not in ("", [], {}, None)}
+
+    def _format_previous_task_context_for_prompt(self, context: dict | None = None, *, max_chars: int = 1000) -> str:
+        ctx = context if isinstance(context, dict) else (
+            self._ensure_blackboard().get("previous_task_context", {})
+            if isinstance(self._ensure_blackboard().get("previous_task_context", {}), dict)
+            else {}
+        )
+        if not ctx:
+            return ""
+        lines: list[str] = []
+        goal = trim(str(ctx.get("goal", "") or ""), 240)
+        if goal:
+            lines.append(f"previous_goal: {goal}")
+        summary = trim(str(ctx.get("summary", "") or ""), 420)
+        if summary:
+            lines.append(f"previous_summary: {summary}")
+        paths = [
+            str(path) for path in (
+                ctx.get("artifact_paths", []) if isinstance(ctx.get("artifact_paths", []), list) else []
+            )
+            if str(path).strip()
+        ]
+        files = [
+            str(path) for path in (
+                ctx.get("file_paths", []) if isinstance(ctx.get("file_paths", []), list) else []
+            )
+            if str(path).strip()
+        ]
+        merged_paths = list(dict.fromkeys(paths + files))[:12]
+        if merged_paths:
+            lines.append("previous_files: " + ", ".join(merged_paths))
+        steps = [
+            trim(str(step), 120)
+            for step in (
+                ctx.get("completed_plan_steps", []) if isinstance(ctx.get("completed_plan_steps", []), list) else []
+            )
+            if str(step).strip()
+        ]
+        if steps:
+            lines.append("completed_steps: " + "; ".join(steps[:5]))
+        return trim("\n".join(lines), max_chars)
+
+    def _blackboard_is_finished_or_aborted(self, board: dict | None = None) -> bool:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        raw_status = str(bb.get("status", "") or "").strip().upper()
+        status = self._normalize_blackboard_status(bb.get("status", "INITIALIZING"))
+        approval = bb.get("approval", {}) if isinstance(bb.get("approval"), dict) else {}
+        completion = self._normalize_completion_state(bb.get("completion", {}))
+        return bool(
+            raw_status in {"COMPLETED", "ABORTED"} or status == "COMPLETED"
+            or bool(approval.get("approved", False))
+            or completion.get("state") in {"finalizing", "completed"}
+        )
+
+    def _has_resumable_work_state(self, board: dict | None = None) -> bool:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        if self._blackboard_is_finished_or_aborted(bb):
+            return False
+        if self._has_resumable_plan_state():
+            return True
+        todos = bb.get("project_todos", []) if isinstance(bb.get("project_todos"), list) else []
+        if any(
+            isinstance(row, dict)
+            and str(row.get("status", "pending") or "pending").strip().lower() != "completed"
+            for row in todos
+        ):
+            return True
+        try:
+            if self.todo.has_open_items():
+                return True
+        except Exception:
+            pass
+        dq = self._normalize_decomposition_queue_state(bb.get("decomposition_queue", {}))
+        if bool(dq.get("active", False)):
+            return True
+        completion = self._normalize_completion_state(bb.get("completion", {}))
+        if completion.get("state") in {"finish_requested", "blocked"}:
+            return True
+        status = self._normalize_blackboard_status(bb.get("status", "INITIALIZING"))
+        if status in {"PAUSED", "BLOCKED", "RESEARCHING", "CODING", "TESTING", "REVIEWING", "PLANNING"}:
+            return True
+        return False
+
+    def _reset_blackboard_plan_state_locked(
+        self,
+        *,
+        new_goal: str = "",
+        previous_context: dict | None = None,
+        clear_progress: bool = False,
+        reset_agent_contexts: bool = False,
+    ) -> None:
         """Clear plan/todo/skills state from a completed run so the next run starts fresh.
 
         Called from submit_user_message when a new user request arrives after a
@@ -18243,19 +18413,81 @@ class SessionState:
         immediately routing to 'finish' again on the very first round.
         """
         bb = self._ensure_blackboard()
+        goal_text = trim(str(new_goal or "").strip(), 4000)
+        previous = dict(previous_context or {}) if isinstance(previous_context, dict) else {}
+        if clear_progress:
+            bb["research_notes"] = []
+            bb["code_artifacts"] = {}
+            bb["execution_logs"] = []
+            bb["review_feedback"] = []
+            bb["conversation_history"] = []
+            bb["step_files"] = {}
+            bb["failure_ledger"] = {
+                "attempted_fixes": [],
+                "compilation_errors": [],
+                "errors": [],
+                "repeated_delegations": [],
+                "stall_events": [],
+                "tool_call_fingerprints": [],
+            }
+            bb["persisted_manager_routes"] = []
         bb["project_todos"] = []
         bb["plan"] = {}
         bb["plan_steps"] = []
         bb["plan_step_cursor"] = 0
         bb["plan_step_total"] = 0
-        bb["status"] = ""
-        bb["approval"] = ""
+        bb["status"] = "INITIALIZING"
+        if goal_text:
+            bb["original_goal"] = goal_text
+            bb["task_epoch"] = float(now_ts())
+            bb["task_profile"] = self._normalize_task_profile(goal_text, {})
+            bb["manager_judgement"] = {
+                "task_type": str(bb["task_profile"].get("task_type", "general")),
+                "complexity": str(bb["task_profile"].get("complexity", "simple")),
+                "scale_preference": str(bb["task_profile"].get("scale_preference", "balanced") or "balanced"),
+                "progress": "initializing",
+                "remaining_rounds": int(bb["task_profile"].get("round_budget", 1) or 1),
+                "task_level": int(bb["task_profile"].get("task_level", 1) or 1),
+                "execution_mode": str(bb["task_profile"].get("execution_mode", self.execution_mode or EXECUTION_MODE_SYNC)),
+                "participants": list(bb["task_profile"].get("participants", [])),
+                "assigned_expert": str(bb["task_profile"].get("assigned_expert", "developer")),
+                "updated_at": float(now_ts()),
+            }
+        bb["approval"] = {
+            "approved": False,
+            "by": "",
+            "note": "",
+            "ts": 0.0,
+        }
+        bb["completion"] = self._new_completion_state()
+        bb["manager_cycles"] = 0
+        bb["manager_summary_attempts"] = 0
+        bb["active_agent"] = ""
+        bb["last_delegate"] = {
+            "target": "",
+            "instruction": "",
+            "reason": "",
+            "source": "",
+            "progress_fp": "",
+            "is_mandatory": False,
+            "ts": 0.0,
+        }
+        bb["last_worker_reply"] = {
+            "role": "",
+            "text": "",
+            "ts": 0.0,
+        }
+        bb["watchdog"] = self._new_watchdog_state()
+        bb["decomposition_queue"] = self._new_decomposition_queue_state()
+        bb.pop("sync_worker_round_done", None)
         bb["plan_findings"] = ""
         bb["plan_proposal"] = ""
         bb["plan_risks"] = ""
         bb["plan_meta"] = {}
         bb["loaded_skills"] = {}
         bb["loaded_skills_goal_sig"] = ""
+        if previous:
+            bb["previous_task_context"] = previous
         self.blackboard = bb
         self.runtime_plan_mode_needed = False
         self.runtime_plan_approved = False
@@ -18268,6 +18500,19 @@ class SessionState:
             self.todo.items = []
         except Exception:
             pass
+        if reset_agent_contexts:
+            self.manager_context = []
+            try:
+                self.contexts = {role: [] for role in AGENT_ROLES}
+            except Exception:
+                pass
+            blocked_roles = set(AGENT_ROLES) | {"manager", "planner"}
+            self.agent_messages = [
+                row for row in self.agent_messages
+                if str(row.get("agent_role", "") or "") not in blocked_roles
+            ]
+            self.manager_routes = []
+            self.agent_bus_messages = []
         # Clean up stale plan.md file from previous run
         try:
             _pf = self._plan_file_path()
@@ -22132,7 +22377,8 @@ class SessionState:
             "test", "pytest", "unittest", "vitest", "jest", "mocha", "playwright", "cypress",
             "lint", "eslint", "ruff", "mypy", "pyright", "tsc", "typecheck", "check",
             "build", "compile", "cargo", "go test", "npm run", "pnpm", "yarn",
-            "py_compile", "self-check", "self_check",
+            "py_compile", "self-check", "self_check", "selftest", "node --check",
+            "curl ", "http://", "https://", "http.server",
         )
         return any(tok in low for tok in tokens)
 
@@ -24407,6 +24653,58 @@ class SessionState:
         if file_buffer_ref:
             return f".__file_buffer__/{file_buffer_ref}.txt"
         low = raw.lower()
+        raw_abs = None
+        try:
+            raw_path = Path(raw)
+            if raw_path.is_absolute():
+                raw_abs = raw_path.resolve()
+        except Exception:
+            raw_abs = None
+        for root_path in (
+            getattr(self, "files_root", None),
+            getattr(self, "root", None),
+        ):
+            try:
+                if not root_path:
+                    continue
+                root_resolved = Path(root_path).resolve()
+                if raw_abs is not None and raw_abs.is_relative_to(root_resolved):
+                    rel = raw_abs.relative_to(root_resolved).as_posix()
+                    if root_path == getattr(self, "root", None) and rel.startswith("files/"):
+                        rel = rel[len("files/"):]
+                    return rel or "."
+                root_txt = str(root_resolved).replace("\\", "/").rstrip("/")
+                if not root_txt:
+                    continue
+                if raw == root_txt:
+                    return "."
+                if raw.startswith(root_txt + "/"):
+                    rel = raw[len(root_txt) + 1:].lstrip("/")
+                    if root_path == getattr(self, "root", None) and rel.startswith("files/"):
+                        rel = rel[len("files/"):]
+                    return rel or "."
+            except Exception:
+                continue
+        if raw.startswith("$SESSION_ROOT/"):
+            return raw[len("$SESSION_ROOT/") :].lstrip("/") or "."
+        if raw == "$SESSION_ROOT":
+            return "."
+        if raw.startswith("${SESSION_ROOT}/"):
+            return raw[len("${SESSION_ROOT}/") :].lstrip("/") or "."
+        if raw == "${SESSION_ROOT}":
+            return "."
+        if raw.startswith("$WORKSPACE_ROOT/files/"):
+            return raw[len("$WORKSPACE_ROOT/files/") :].lstrip("/") or "."
+        if raw.startswith("${WORKSPACE_ROOT}/files/"):
+            return raw[len("${WORKSPACE_ROOT}/files/") :].lstrip("/") or "."
+        if raw.startswith("$WORKSPACE_ROOT/"):
+            return raw[len("$WORKSPACE_ROOT/") :].lstrip("/") or "."
+        if raw == "$WORKSPACE_ROOT":
+            return "."
+        if raw.startswith("${WORKSPACE_ROOT}/"):
+            return raw[len("${WORKSPACE_ROOT}/") :].lstrip("/") or "."
+        if raw == "${WORKSPACE_ROOT}":
+            return "."
         if low in {"/workspace", "/workspace/"}:
             return "."
         if low.startswith("/workspace/"):
@@ -24440,6 +24738,16 @@ class SessionState:
             return ""
         if not txt.startswith("/"):
             return ""
+        try:
+            candidate = Path(txt).resolve()
+            for root_path in (
+                getattr(self, "files_root", None),
+                getattr(self, "root", None),
+            ):
+                if root_path and candidate.is_relative_to(Path(root_path).resolve()):
+                    return ""
+        except Exception:
+            pass
         low = txt.lower()
         if (
             low in {"/workspace", "/workspace/", SKILLS_VIRTUAL_PREFIX, f"{SKILLS_VIRTUAL_PREFIX}/", "/js_lib", "/js_lib/"}
@@ -24512,6 +24820,32 @@ class SessionState:
             f"Error: {action} blocked for runtime-managed file '{PLAN_FILE_RELATIVE_PATH}'. "
             "This file mirrors the approved execution plan and is auto-generated from blackboard state. "
             "Use read_file to inspect it; do not modify it with write_file/edit_file."
+        )
+
+    def _is_plan_infrastructure_path(self, path_text: object) -> bool:
+        raw = str(path_text or "").strip().replace("\\", "/")
+        if not raw:
+            return False
+        if PLAN_FILE_RELATIVE_PATH in raw:
+            return True
+        try:
+            rel = self._normalize_tool_path_text(raw)
+        except Exception:
+            rel = raw.lstrip("/")
+        return str(rel or "").replace("\\", "/").lstrip("/") == PLAN_FILE_RELATIVE_PATH
+
+    def _is_plan_infrastructure_tool_error(self, name: str, args: dict | None, output: object) -> bool:
+        src = args if isinstance(args, dict) else {}
+        tool_name = canonicalize_tool_name(name)
+        if tool_name in {"write_file", "edit_file"} and self._is_plan_infrastructure_path(src.get("path", "")):
+            return True
+        if tool_name == "read_file" and self._is_plan_infrastructure_path(src.get("path", "")):
+            return True
+        low = str(output or "").lower()
+        return ".clouds_coder/plan.md" in low and (
+            "filenotfounderror" in low
+            or "runtime-managed file" in low
+            or "illegal absolute path" in low
         )
 
     def _code_preview_bucket_dir(self, rel_path: str) -> Path:
@@ -26379,12 +26713,14 @@ body{padding:18px}
         bio.seek(0)
         return bio.read()
 
-    def files_tree_payload(self, max_nodes: int = 1200, max_depth: int = 10) -> dict:
+    def files_tree_payload(self, max_nodes: int = FILES_TREE_DEFAULT_MAX_NODES, max_depth: int = FILES_TREE_DEFAULT_MAX_DEPTH) -> dict:
+        started = time.perf_counter()
         root = self.files_root.resolve()
-        max_nodes = max(100, min(8000, int(max_nodes or 1200)))
-        max_depth = max(1, min(24, int(max_depth or 10)))
+        max_nodes = max(100, min(8000, int(max_nodes or FILES_TREE_DEFAULT_MAX_NODES)))
+        max_depth = max(1, min(24, int(max_depth or FILES_TREE_DEFAULT_MAX_DEPTH)))
         node_count = 1
         truncated = False
+        skipped_dirs = 0
 
         def _reserve_node() -> bool:
             nonlocal node_count, truncated
@@ -26394,23 +26730,26 @@ body{padding:18px}
             node_count += 1
             return True
 
+        def _skip_dir(name: str, rel: str) -> bool:
+            lname = str(name or "").strip().lower()
+            rlow = str(rel or "").strip().replace("\\", "/").lower().strip("/")
+            return (
+                lname in FILES_TREE_SKIP_DIRS
+                or rlow in FILES_TREE_SKIP_REL_DIRS
+                or any(rlow.startswith(f"{skip}/") for skip in FILES_TREE_SKIP_REL_DIRS)
+            )
+
         def _dir_children(abs_dir: Path, rel_dir: str, depth: int) -> list[dict]:
+            nonlocal skipped_dirs
             if truncated or depth >= max_depth:
                 return []
             try:
                 entries = list(os.scandir(abs_dir))
             except Exception:
                 return []
-            entries.sort(
-                key=lambda e: (
-                    0 if e.is_dir(follow_symlinks=False) else 1,
-                    str(e.name).lower(),
-                )
-            )
-            out: list[dict] = []
+            dirs: list[os.DirEntry] = []
+            files: list[os.DirEntry] = []
             for entry in entries:
-                if truncated:
-                    break
                 try:
                     if entry.is_symlink():
                         continue
@@ -26421,19 +26760,41 @@ body{padding:18px}
                     if not rel:
                         continue
                     if entry.is_dir(follow_symlinks=False):
-                        if not _reserve_node():
-                            break
-                        out.append(
-                            {
-                                "type": "dir",
-                                "name": name,
-                                "path": rel,
-                                "children": _dir_children(Path(entry.path), rel, depth + 1),
-                            }
-                        )
-                        continue
-                    if not entry.is_file(follow_symlinks=False):
-                        continue
+                        if _skip_dir(name, rel):
+                            skipped_dirs += 1
+                            continue
+                        dirs.append(entry)
+                    elif entry.is_file(follow_symlinks=False):
+                        files.append(entry)
+                except Exception:
+                    continue
+            dirs.sort(key=lambda e: str(e.name).lower())
+            files.sort(key=lambda e: str(e.name).lower())
+            out: list[dict] = []
+            for entry in dirs:
+                if truncated:
+                    break
+                try:
+                    name = str(entry.name)
+                    rel = normalize_rel_preview_path(f"{rel_dir}/{name}" if rel_dir else name)
+                    if not _reserve_node():
+                        break
+                    out.append(
+                        {
+                            "type": "dir",
+                            "name": name,
+                            "path": rel,
+                            "children": _dir_children(Path(entry.path), rel, depth + 1),
+                        }
+                    )
+                except Exception:
+                    continue
+            for entry in files:
+                if truncated:
+                    break
+                try:
+                    name = str(entry.name)
+                    rel = normalize_rel_preview_path(f"{rel_dir}/{name}" if rel_dir else name)
                     if not _reserve_node():
                         break
                     try:
@@ -26471,6 +26832,8 @@ body{padding:18px}
             "max_depth": max_depth,
             "node_count": int(node_count),
             "truncated": bool(truncated),
+            "skipped_dirs": int(skipped_dirs),
+            "scan_ms": int((time.perf_counter() - started) * 1000),
             "tree": tree,
         }
 
@@ -28533,6 +28896,77 @@ body{padding:18px}
             "score": int(score),
             "threshold": int(threshold),
             "reasons": reasons[:6],
+        }
+
+    def _detect_no_tool_deliverable_intent(
+        self,
+        text: str,
+        tool_calls: list | None = None,
+    ) -> dict:
+        """Classify a no-tool assistant reply as a possible final user deliverable.
+
+        This is deliberately task-agnostic. A direct text answer, analysis,
+        outline, draft, checklist, explanation, or generated snippet can be the
+        requested output. Auto-continue should only preempt such replies when the
+        assistant clearly promised additional concrete execution.
+        """
+        if tool_calls:
+            return {"matched": False, "score": 0, "threshold": 0, "reasons": ["tool-calls-present"]}
+        clean = strip_thinking_content(str(text or "")).strip()
+        if not clean:
+            return {"matched": False, "score": 0, "threshold": 0, "reasons": ["empty-content"]}
+        score = 0
+        reasons: list[str] = []
+        endpoint = self._detect_endpoint_intent(clean, None)
+        if bool(endpoint.get("matched", False)):
+            score += 4
+            reasons.append("endpoint-intent")
+        if self._looks_like_substantial_informative_reply(clean):
+            score += 3
+            reasons.append("substantial-informative")
+        if self._looks_like_conclusive_reply(clean):
+            score += 3
+            reasons.append("conclusive")
+        if len(clean) >= 360:
+            score += 2
+            reasons.append("long-form-output")
+        elif len(clean) >= 160:
+            score += 1
+            reasons.append("medium-form-output")
+        section_count = len(re.findall(r"(?m)^\s{0,3}#{1,6}\s+\S+", clean))
+        list_count = len(re.findall(r"(?m)^\s*(?:[-*]|\d+\.|#{1,6})\s*\S+", clean))
+        if section_count >= 1:
+            score += 1
+            reasons.append("structured-sections")
+        if list_count >= 3:
+            score += 1
+            reasons.append("structured-list")
+        if self._looks_like_user_decision_needed(clean):
+            score += 2
+            reasons.append("awaits-user-choice")
+        if self._looks_like_action_promise_without_tool(clean):
+            score -= 5
+            reasons.append("action-promise")
+        elif self._looks_like_incomplete_reply(clean):
+            score -= 4
+            reasons.append("incomplete-marker")
+        if self._is_long_running_engineering_context():
+            score -= 2
+            reasons.append("engineering-context")
+        open_rows = self._completion_scoped_open_todo_rows(self._ensure_blackboard())
+        if open_rows:
+            score -= 3
+            reasons.append("open-completion-todos")
+        if self._manager_has_error_log(self._ensure_blackboard()):
+            score -= 3
+            reasons.append("blocking-error-log")
+        threshold = 4
+        return {
+            "matched": bool(score >= threshold),
+            "score": int(score),
+            "threshold": int(threshold),
+            "reasons": reasons[:8],
+            "endpoint": endpoint,
         }
 
     def _infer_arbiter_status_from_text(self, text: str) -> str:
@@ -30759,6 +31193,13 @@ body{padding:18px}
                 f"File-buffer hint: use read_file path=\"{expected}\" or reference `[file_buffer:{fb_ref}]`. "
                 "If the buffer was compacted away, use the recent tool result summary/search context instead of repeating the same failed read."
             )
+        if self._is_plan_file_rel_path(rel):
+            if self._ensure_plan_file_current(force=True):
+                try:
+                    return self._read_plan_file() or self._runtime_managed_plan_missing_read_hint()
+                except Exception:
+                    pass
+            return self._runtime_managed_plan_missing_read_hint()
         suggestions = self._suggest_workspace_paths(rel, limit=6)
         parent = PurePosixPath(str(rel or "").replace("\\", "/")).parent.as_posix()
         lines = [f"Error: FileNotFoundError: {rel}"]
@@ -30949,6 +31390,8 @@ body{padding:18px}
             rel = self._normalize_tool_path_text(path)
             fp = self._fuzzy_resolve_path(self._session_path(rel))
             rel = self._session_rel(fp)
+            if self._is_plan_file_rel_path(rel) and not fp.exists():
+                self._ensure_plan_file_current(force=True)
             if not fp.exists():
                 return self._render_missing_read_hint(rel)
             if fp.is_dir():
@@ -32012,6 +32455,8 @@ body{padding:18px}
         if not txt:
             return False
         low = txt.lower()
+        if ".clouds_coder/plan.md" in low or "$workspace_root/.clouds_coder/plan.md" in low or "$session_root/.clouds_coder/plan.md" in low:
+            return False
         actor = self._sanitize_agent_role(str((row or {}).get("actor", "") or ""))
         benign_phrases = (
             "no errors", "0 errors", "0 error", "no error", "without errors",
@@ -32047,6 +32492,8 @@ body{padding:18px}
             return False
         has_evidence = self._plan_step_has_blackboard_evidence(plan_step, bb) or self._step_has_accumulated_evidence(plan_step, bb)
         if not has_evidence:
+            return False
+        if self._active_plan_step_quality_block(plan_step, bb):
             return False
         step_text = str(plan_step.get("full_content", "") or plan_step.get("content", "") or "").lower()
         phase = self._plan_step_phase_hint(step_text)
@@ -32084,6 +32531,19 @@ body{padding:18px}
                 or self._collect_accumulated_step_evidence(current, bb)
                 or f"{source}: current plan step accepted before finish"
             )
+            quality_review = self._llm_review_plan_step_quality(
+                current,
+                {"tool_results": [], "text": evidence},
+                bb,
+                candidate_evidence={"source": source, "path": "finish_reconcile"},
+            )
+            self._record_plan_step_quality_review(current, quality_review, board=bb)
+            if not bool(quality_review.get("available", True)):
+                self._inject_semantic_review_unavailable_recheck(current, {"tool_results": [], "text": evidence}, quality_review)
+                break
+            if not bool(quality_review.get("passed", False)):
+                self._inject_semantic_quality_rework_if_needed(current, {"tool_results": [], "text": evidence}, quality_review)
+                break
             if not self._advance_plan_step(evidence=trim(f"finish-reconcile: {evidence}", 200), actor=actor_key):
                 break
             changed = True
@@ -32347,7 +32807,8 @@ body{padding:18px}
         bb["status"] = "COMPLETED"
         self.blackboard = bb
         self._blackboard_touch()
-        self._emit_completion_summary_bubble(final_summary, role=role)
+        if not str(source or "").startswith("single-direct-deliverable"):
+            self._emit_completion_summary_bubble(final_summary, role=role)
         return {"stop": True, "finalized": True, "reason": "ok", "summary": final_summary}
 
     def _resolve_finish_request(
@@ -32515,13 +32976,20 @@ body{padding:18px}
             )
         return True
 
-    def _latest_agent_assistant_text(self, role: str) -> str:
+    def _latest_agent_assistant_text(self, role: str, *, min_ts: float = 0.0) -> str:
         role_key = self._sanitize_agent_role(role)
         if not role_key:
             return ""
         for row in reversed(self._agent_context(role_key)):
             if str(row.get("role", "") or "") != "assistant":
                 continue
+            if float(min_ts or 0.0) > 0.0:
+                try:
+                    msg_ts = float(row.get("ts", 0.0) or 0.0)
+                except Exception:
+                    msg_ts = 0.0
+                if msg_ts > 0.0 and msg_ts + 1e-6 < float(min_ts or 0.0):
+                    continue
             txt = strip_thinking_content(str(row.get("content", "") or "")).strip()
             if txt:
                 return txt
@@ -33444,6 +33912,8 @@ body{padding:18px}
             "execution_logs": [],
             "review_feedback": [],
             "conversation_history": [],
+            "plan_step_quality_reviews": {},
+            "plan_step_quality_review_attempts": {},
             "status": "INITIALIZING",
             "task_epoch": float(now_ts()),
             "focus": {
@@ -33668,12 +34138,72 @@ body{padding:18px}
         board["execution_logs"] = _clean_rows(src.get("execution_logs", []), key="content", actor_key="actor")
         board["review_feedback"] = _clean_rows(src.get("review_feedback", []), key="content", actor_key="actor")
         board["conversation_history"] = _clean_rows(src.get("conversation_history", []), key="content", actor_key="actor")
+        raw_quality_reviews = src.get("plan_step_quality_reviews", {})
+        if isinstance(raw_quality_reviews, dict):
+            clean_quality_reviews: dict[str, dict] = {}
+            for key, row in list(raw_quality_reviews.items())[-80:]:
+                if not isinstance(row, dict):
+                    continue
+                step_id = trim(str(row.get("step_id", key) or "").strip(), 80)
+                if not step_id:
+                    continue
+                status = str(row.get("status", "") or "").strip().lower()
+                if status not in {"passed", "failed"}:
+                    continue
+                clean_quality_reviews[step_id] = {
+                    "step_id": step_id,
+                    "status": status,
+                    "confidence": trim(str(row.get("confidence", "") or "").strip().lower(), 20),
+                    "reason": trim(str(row.get("reason", "") or "").strip(), 800),
+                    "missing": [
+                        trim(str(item or "").strip(), 220)
+                        for item in (row.get("missing", []) if isinstance(row.get("missing", []), list) else [])[:8]
+                        if str(item or "").strip()
+                    ],
+                    "next_actions": [
+                        trim(str(item or "").strip(), 220)
+                        for item in (row.get("next_actions", []) if isinstance(row.get("next_actions", []), list) else [])[:8]
+                        if str(item or "").strip()
+                    ],
+                    "evidence": [
+                        trim(str(item or "").strip(), 220)
+                        for item in (row.get("evidence", []) if isinstance(row.get("evidence", []), list) else [])[:8]
+                        if str(item or "").strip()
+                    ],
+                    "reviewed_at": float(row.get("reviewed_at", 0.0) or 0.0),
+                    "step_index": int(row.get("step_index", -1)) if row.get("step_index") not in (None, "") else -1,
+                    "activated_at": float(row.get("activated_at", 0.0) or 0.0),
+                }
+            board["plan_step_quality_reviews"] = clean_quality_reviews
+        raw_quality_attempts = src.get("plan_step_quality_review_attempts", {})
+        if isinstance(raw_quality_attempts, dict):
+            clean_quality_attempts: dict[str, dict] = {}
+            for key, row in list(raw_quality_attempts.items())[-80:]:
+                if not isinstance(row, dict):
+                    continue
+                step_id = trim(str(row.get("step_id", key) or "").strip(), 80)
+                if not step_id:
+                    continue
+                status = str(row.get("status", "") or "").strip().lower()
+                if status not in {"unavailable"}:
+                    continue
+                clean_quality_attempts[step_id] = {
+                    "step_id": step_id,
+                    "status": status,
+                    "reason": trim(str(row.get("reason", "") or "").strip(), 800),
+                    "reviewed_at": float(row.get("reviewed_at", 0.0) or 0.0),
+                    "raw": trim(str(row.get("raw", "") or "").strip(), 1200),
+                    "attempts": max(1, int(row.get("attempts", 1) or 1)),
+                }
+            board["plan_step_quality_review_attempts"] = clean_quality_attempts
         raw_artifacts = src.get("code_artifacts", {})
         artifacts: dict[str, dict] = {}
         if isinstance(raw_artifacts, dict):
             for p, row in list(raw_artifacts.items())[:320]:
                 rel = normalize_rel_preview_path(str(p or "")) or trim(str(p or "").strip(), 280)
                 if not rel:
+                    continue
+                if self._is_plan_infrastructure_path(rel):
                     continue
                 item = row if isinstance(row, dict) else {}
                 summary = trim(str(item.get("summary", "") or "").strip(), BLACKBOARD_MAX_TEXT)
@@ -34457,15 +34987,36 @@ body{padding:18px}
             "error:", "fatal error", "syntax error", "compile error", "build failed",
             "traceback", "exception", "failed", "panic:", "FAIL:", "AssertionError",
         )
+        last_error_text = ""
+        last_error_ts = 0.0
+        last_success_ts = 0.0
         for entry in reversed(logs[-6:]):
             if not isinstance(entry, dict):
                 continue
+            if self._is_plan_infrastructure_tool_error(
+                str(entry.get("tool", "") or ""),
+                entry.get("args", {}) if isinstance(entry.get("args", {}), dict) else {},
+                entry.get("content", ""),
+            ):
+                continue
+            if ".clouds_coder/plan.md" in str(entry.get("content", "") or "").lower():
+                continue
             if self._execution_log_entry_is_success_evidence(entry):
+                try:
+                    last_success_ts = max(last_success_ts, float(entry.get("ts", 0.0) or 0.0))
+                except Exception:
+                    pass
                 break
             txt = str(entry.get("content", "") or "")
             if self._execution_log_entry_is_blocking_error(entry) or any(kw in txt.lower() for kw in _all_kw):
-                lines.append(f"LAST ERROR OUTPUT:\n{trim(txt, 400)}")
+                last_error_text = txt
+                try:
+                    last_error_ts = float(entry.get("ts", 0.0) or 0.0)
+                except Exception:
+                    last_error_ts = 0.0
                 break
+        if last_error_text and (last_success_ts <= 0.0 or last_error_ts <= 0.0 or last_error_ts + 1e-6 >= last_success_ts):
+            lines.append(f"LAST ERROR OUTPUT:\n{trim(last_error_text, 400)}")
         if not lines:
             return ""
         return trim("\n".join(lines), max_chars)
@@ -34565,11 +35116,16 @@ body{padding:18px}
             bb["updated_at"] = float(now_ts())
             self.blackboard = bb
 
-    def _blackboard_reset_for_goal(self, goal: str):
+    def _blackboard_reset_for_goal(self, goal: str, *, preserve_active_state: bool = False):
         # Preserve plan state when safe, but refresh loaded skills on goal change.
         old_bb = self._ensure_blackboard()
         preserved_skills = old_bb.get("loaded_skills", {})
         preserved_skills_sig = str(old_bb.get("loaded_skills_goal_sig", "") or "")
+        preserved_previous_context = (
+            dict(old_bb.get("previous_task_context", {}))
+            if isinstance(old_bb.get("previous_task_context", {}), dict)
+            else {}
+        )
         new_goal_sig = self._loaded_skills_goal_signature(goal)
         preserved_plan = old_bb.get("plan", {})
         preserved_todos = old_bb.get("project_todos", [])
@@ -34585,6 +35141,8 @@ body{padding:18px}
             self.blackboard["loaded_skills"] = preserved_skills
             self.blackboard["loaded_skills_goal_sig"] = preserved_skills_sig
             self.blackboard["loaded_skills_goal_preview"] = trim(str(goal or ""), 240)
+        if preserved_previous_context:
+            self.blackboard["previous_task_context"] = preserved_previous_context
         # Restore plan state if plan is active (any phase) or todos have pending work
         has_active_plan = (
             isinstance(preserved_plan, dict)
@@ -34593,7 +35151,7 @@ body{padding:18px}
         has_active_todos = isinstance(preserved_todos, list) and any(
             t.get("status") != "completed" for t in preserved_todos if isinstance(t, dict)
         )
-        if has_active_plan or has_active_todos:
+        if preserve_active_state and (has_active_plan or has_active_todos):
             if isinstance(preserved_plan, dict):
                 self.blackboard["plan"] = preserved_plan
             if isinstance(preserved_todos, list) and preserved_todos:
@@ -34603,8 +35161,17 @@ body{padding:18px}
             if preserved_total is not None:
                 self.blackboard["plan_step_total"] = preserved_total
         self.manager_context = []
-        self.agent_messages = [m for m in self.agent_messages if m.get("agent_role") != "manager"]
+        try:
+            self.contexts = {role: [] for role in AGENT_ROLES}
+        except Exception:
+            pass
+        blocked_roles = set(AGENT_ROLES) | {"manager", "planner"}
+        self.agent_messages = [
+            m for m in self.agent_messages
+            if str(m.get("agent_role", "") or "") not in blocked_roles
+        ]
         self.manager_routes = []
+        self.agent_bus_messages = []
         self._blackboard_history("manager", f"new goal accepted: {trim(goal, 300)}")
         self._sync_todos_from_blackboard(reason="goal-reset", board=self.blackboard)
 
@@ -35025,6 +35592,125 @@ body{padding:18px}
         self.blackboard = bb
         self._blackboard_touch()
 
+    def _bootstrap_sync_plan_steps_if_needed(self, board: dict | None = None, *, reason: str = "") -> bool:
+        # Do not synthesize project plan steps for ordinary sync/multi-agent runs.
+        # Runtime-generated generic steps such as "Clarify / Produce / Review"
+        # create a second authority beside the model's own task reasoning and
+        # have repeatedly caused workers to optimize for bookkeeping instead of
+        # the user's concrete deliverable. Approved user/plan-mode plans are
+        # still represented through _build_plan_todos_from_steps().
+        return False
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        profile = self._ensure_blackboard_task_profile(bb)
+        mode = normalize_execution_mode(
+            profile.get("execution_mode", self._effective_execution_mode()),
+            default=self._effective_execution_mode(),
+        )
+        if mode != EXECUTION_MODE_SYNC:
+            return False
+        complexity = normalize_task_complexity(profile.get("complexity", "simple"), default="simple")
+        if not task_complexity_at_least(complexity, "moderate"):
+            return False
+        todos = bb.get("project_todos", []) if isinstance(bb.get("project_todos"), list) else []
+        if any(isinstance(row, dict) and str(row.get("category", "") or "") == "plan_step" for row in todos):
+            return False
+        plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
+        if str(plan.get("phase", "") or "").strip().lower() == "executing" and plan.get("steps"):
+            return False
+        objective = trim(
+            str(profile.get("direct_objective", "") or bb.get("original_goal", "") or "").strip(),
+            300,
+        )
+        task_type = str(profile.get("task_type", "general") or "general").strip().lower()
+        raw = self._generate_project_todos_from_profile(bb)
+        raw_items = [
+            trim(str(item.get("content", "") or "").strip(), 260)
+            for item in raw
+            if isinstance(item, dict) and str(item.get("content", "") or "").strip()
+        ]
+        if len(raw_items) <= 1:
+            if task_type == "research":
+                raw_items = [
+                    f"Gather and organize evidence for: {objective or 'the request'}",
+                    "Synthesize findings into the requested format",
+                    "Review coverage and fill any missing points",
+                ]
+            elif task_type in {"simple_code", "engineering"}:
+                raw_items = [
+                    f"Inspect relevant files and constraints for: {objective or 'the change'}",
+                    "Implement the requested change with concrete file edits",
+                    "Run focused validation and fix any failures",
+                    "Summarize changed files and remaining risks",
+                ]
+            else:
+                raw_items = [
+                    f"Clarify deliverable shape and reusable context for: {objective or 'the request'}",
+                    "Produce the requested deliverable with concrete tool output",
+                    "Review the result against the latest user request and revise if needed",
+                ]
+        now_value = float(now_ts())
+        plan_rows = []
+        for idx, item in enumerate(raw_items[:5]):
+            text = trim(str(item or "").strip(), 320)
+            if not text:
+                continue
+            plan_rows.append(
+                {
+                    "id": f"sync:{idx:03d}",
+                    "content": f"{idx + 1}. {text}",
+                    "full_content": text,
+                    "status": "in_progress" if idx == 0 else "pending",
+                    "category": "plan_step",
+                    "owner": "manager",
+                    "plan_step_index": idx,
+                    "created_at": now_value,
+                    "activated_at": now_value if idx == 0 else None,
+                    "completed_at": None,
+                    "completed_by": "",
+                    "evidence": "",
+                    "source": "sync-bootstrap",
+                }
+            )
+        if not plan_rows:
+            return False
+        other_rows = [
+            row for row in todos
+            if isinstance(row, dict) and str(row.get("category", "") or "") != "plan_step"
+        ]
+        bb["project_todos"] = plan_rows + other_rows
+        bb["plan_step_cursor"] = 0
+        bb["plan_step_total"] = len(plan_rows)
+        bb["plan"] = {
+            "phase": "executing",
+            "source": "sync-bootstrap",
+            "steps": [str(row.get("full_content", "") or row.get("content", "")) for row in plan_rows],
+        }
+        bb["focus"] = self._blackboard_focus_identity(bb)
+        self.blackboard = bb
+        self._blackboard_touch()
+        self._sync_todos_from_blackboard(reason=reason or "sync-bootstrap-plan-steps", board=bb)
+        self._append_manager_context(
+            {
+                "role": "system",
+                "content": (
+                    "[sync-bootstrap] Runtime created internal plan-step todos for this sync task. "
+                    "Delegate the active step only and require workers to update TodoWrite before finishing."
+                ),
+                "ts": now_ts(),
+                "agent_role": "manager",
+            }
+        )
+        self._emit(
+            "status",
+            {
+                "summary": (
+                    "sync task todos bootstrapped "
+                    f"(steps={len(plan_rows)}, reason={trim(str(reason or 'sync-bootstrap'), 80)})"
+                )
+            },
+        )
+        return True
+
     def _has_compile_pass_evidence(self, board: dict | None = None) -> bool:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         logs = bb.get("execution_logs", []) if isinstance(bb.get("execution_logs"), list) else []
@@ -35058,7 +35744,41 @@ body{padding:18px}
             return ""
         return trim(lines[0], max_chars)
 
+    def _tool_result_has_positive_retrieval_signal(self, item: dict) -> bool:
+        if not isinstance(item, dict) or not item.get("ok", False):
+            return False
+        if str(item.get("name", "") or "") not in {"query_code_library", "query_knowledge_library", "agent_web_search"}:
+            return False
+        raw = str(item.get("output", "") or "")
+        low = raw.lower()
+        if not raw.strip():
+            return False
+        negative_markers = (
+            "evidence_status=miss",
+            "results=0",
+            "documents=0",
+            "chunks=0",
+            "暂无足够证据",
+            "no results",
+            "not found",
+            "timed out",
+            "url_error",
+            "network",
+        )
+        if any(marker in low for marker in negative_markers):
+            return False
+        if re.search(r"\bresults\s*=\s*[1-9]\d*\b", low):
+            return True
+        if re.search(r"\bconfidence\s*=\s*(?:0\.[1-9]\d*|[1-9]\d*(?:\.\d+)?)\b", low):
+            return True
+        return len(raw.strip()) >= 120
+
     def _tool_results_have_validation_evidence(self, plan_step: dict, results: list[dict]) -> bool:
+        """Return whether current tool output is useful candidate evidence.
+
+        This is intentionally not an acceptance decision. Plan-step completion is
+        decided by the semantic quality reviewer before advancement.
+        """
         if not isinstance(plan_step, dict):
             return False
         rows = [r for r in (results or []) if isinstance(r, dict) and r.get("ok", False)]
@@ -35073,25 +35793,38 @@ body{padding:18px}
             and bool(self._tool_result_output_excerpt(r, 140))
             for r in rows
         )
-        knowledge_signal = any(
-            str(r.get("name", "")) in ("write_to_blackboard", "read_from_blackboard", "query_code_library", "query_knowledge_library", "agent_web_search")
+        positive_retrieval_signal = any(self._tool_result_has_positive_retrieval_signal(r) for r in rows)
+        blackboard_write_signal = any(
+            str(r.get("name", "")) == "write_to_blackboard"
             for r in rows
         )
+        blackboard_read_signal = any(str(r.get("name", "")) == "read_from_blackboard" for r in rows)
         bash_rows = [r for r in rows if str(r.get("name", "")) == "bash"]
         observed_signal = False
         compile_signal = False
         test_signal = False
         negative_hints = ("error:", "failed", "failure", "traceback", "fatal error", "assertionerror", "exception")
         compile_hints = ("compiled successfully", "build successful", "build succeeded", "syntax ok", "lint passed", "no issues found", "0 errors")
-        test_hints = ("test passed", "tests passed", "all tests passed", "0 failed", "100%", "ok", "success")
+        test_hints = (
+            "test passed", "tests passed", "all tests passed", "0 failed", "100%", "ok", "success",
+            "http 200", "200 ok", "node --check", "syntax ok", "selftest", "playwright", "screenshot",
+            "dom", "canvas", "browser", "页面正常", "验证通过",
+        )
         validation_cmd_tokens = ("pytest", "test", "unittest", "jest", "vitest", "cargo test", "go test", "build", "compile", "lint", "run")
         for row in bash_rows:
             cmd = str(row.get("args", {}).get("command", "") or "").strip().lower()
+            raw_output = str(row.get("output", "") or "")
+            clean_output, _ = filter_runtime_noise_lines(raw_output)
             excerpt = self._tool_result_output_excerpt(row, 180)
-            low = excerpt.lower()
-            if excerpt and not any(neg in low for neg in negative_hints):
-                observed_signal = True
-            if any(tok in cmd for tok in validation_cmd_tokens):
+            low = trim((clean_output or excerpt).lower(), 4000)
+            cmd_is_validation = self._command_looks_like_validation(cmd) or any(tok in cmd for tok in validation_cmd_tokens)
+            output_has_positive = bool(low) and (
+                any(tok in low for tok in compile_hints)
+                or any(tok in low for tok in test_hints)
+                or bool(re.search(r"\b(?:http\s*)?200\b", low))
+                or bool(re.search(r"\bexit\s*[:=]\s*0\b", low))
+            )
+            if (cmd_is_validation or output_has_positive) and low and not any(neg in low for neg in negative_hints):
                 observed_signal = True
             if low and any(tok in low for tok in compile_hints) and not any(neg in low for neg in negative_hints):
                 compile_signal = True
@@ -35106,12 +35839,12 @@ body{padding:18px}
         if wants_test:
             return test_signal or (bool(bash_rows) and observed_signal)
         if phase == "implement":
-            return wrote_files and (compile_signal or test_signal or observed_signal or read_back)
+            return wrote_files and (compile_signal or test_signal or observed_signal)
         if phase in ("research", "design"):
-            return knowledge_signal or read_back or observed_signal or wrote_files
+            return wrote_files or read_back or positive_retrieval_signal or blackboard_write_signal or observed_signal
         if wants_runtime_validation:
-            return observed_signal or read_back or wrote_files
-        return wrote_files or read_back or knowledge_signal or observed_signal
+            return observed_signal or read_back or positive_retrieval_signal or blackboard_write_signal
+        return wrote_files or read_back or positive_retrieval_signal or blackboard_write_signal or blackboard_read_signal or observed_signal
 
     def _plan_step_activation_ts(self, plan_step: dict) -> float:
         if not isinstance(plan_step, dict):
@@ -35142,6 +35875,9 @@ body{padding:18px}
                 txt = trim(str(row.get("content", "") or "").strip(), 1200)
                 if not txt:
                     continue
+                txt_low = txt.lower()
+                if PLAN_FILE_RELATIVE_PATH in txt_low or ".clouds_coder\\plan.md" in txt_low:
+                    continue
                 try:
                     ts = float(row.get("ts", 0.0) or 0.0)
                 except Exception:
@@ -35166,6 +35902,8 @@ body{padding:18px}
         for entry in step_entries:
             if not isinstance(entry, dict):
                 continue
+            if self._is_plan_infrastructure_path(entry.get("path", "")):
+                continue
             try:
                 ts = float(entry.get("ts", 0.0) or 0.0)
             except Exception:
@@ -35179,6 +35917,8 @@ body{padding:18px}
         raw_artifacts = bb.get("code_artifacts", {}) if isinstance(bb.get("code_artifacts"), dict) else {}
         for path, meta in raw_artifacts.items():
             if not isinstance(meta, dict):
+                continue
+            if self._is_plan_infrastructure_path(path):
                 continue
             try:
                 ts = float(meta.get("updated_at", 0.0) or 0.0)
@@ -35216,7 +35956,15 @@ body{padding:18px}
         def _has_observed(rows: list[dict]) -> bool:
             for row in reversed(rows[-6:]):
                 low = str(row.get("content", "") or "").lower()
-                if low and not any(neg in low for neg in negative_hints):
+                if not low or any(neg in low for neg in negative_hints):
+                    continue
+                if (
+                    self._command_looks_like_validation(low)
+                    or any(tok in low for tok in compile_hints)
+                    or any(tok in low for tok in test_hints)
+                    or re.search(r"\b(?:http\s*)?200\b", low)
+                    or re.search(r"\bexit\s*[:=]\s*0\b", low)
+                ):
                     return True
             return False
 
@@ -35244,6 +35992,7 @@ body{padding:18px}
         }
 
     def _plan_step_has_blackboard_evidence(self, plan_step: dict, board: dict | None = None) -> bool:
+        """Return whether blackboard history has candidate evidence for review."""
         if not isinstance(plan_step, dict):
             return False
         sig = self._plan_step_blackboard_signals(plan_step, board)
@@ -35259,19 +36008,22 @@ body{padding:18px}
             return sig["has_test_pass"] or sig["has_exec"] or sig["has_review"]
         if phase == "implement":
             return sig["has_write"] and (
-                sig["has_compile_pass"] or sig["has_test_pass"] or sig["has_exec"] or sig["has_read"] or sig["has_review"]
+                sig["has_compile_pass"] or sig["has_test_pass"] or sig["has_exec"] or sig["has_review"]
             )
         if phase in ("research", "design"):
             return sig["has_research"] or sig["has_read"] or sig["has_exec"] or sig["has_write"]
         if wants_runtime_validation:
-            return sig["has_exec"] or sig["has_read"] or sig["has_write"] or sig["has_review"]
+            return sig["has_exec"] or sig["has_read"] or sig["has_review"]
         return sig["has_write"] or sig["has_read"] or sig["has_research"] or sig["has_exec"] or sig["has_review"]
 
     def _step_has_accumulated_evidence(self, plan_step: dict, bb: dict | None = None) -> bool:
-        """Fix 3: Check if step has accumulated evidence across ALL turns (not just current turn).
-        Uses step_files registry + blackboard signals to detect writes/execution during step lifetime."""
+        """Check whether a step has accumulated candidate evidence across turns."""
         if not isinstance(plan_step, dict):
             return False
+        step_text = str(plan_step.get("full_content", "") or plan_step.get("content", "") or "").lower()
+        phase = self._plan_step_phase_hint(step_text)
+        if phase in {"implement", "test", "review"}:
+            return self._plan_step_has_blackboard_evidence(plan_step, bb)
         sig = self._plan_step_blackboard_signals(plan_step, bb)
         return sig["has_write"] or sig["has_exec"] or sig["has_research"]
 
@@ -35301,6 +36053,524 @@ body{padding:18px}
         if sig.get("recent_research_excerpt"):
             parts.append(f"notes: {sig['recent_research_excerpt']}")
         return trim("; ".join(parts), 200)
+
+    def _plan_step_quality_review_paths(self, plan_step: dict, worker_step: dict, bb: dict) -> list[str]:
+        step_id = trim(str((plan_step or {}).get("id", "") or "").strip(), 80)
+        since_ts = self._plan_step_activation_ts(plan_step)
+        paths: list[str] = []
+
+        def _add(raw: object):
+            rel = normalize_rel_preview_path(str(raw or "").replace("\\", "/").strip()) or trim(
+                str(raw or "").replace("\\", "/").strip(),
+                300,
+            )
+            if not rel or self._is_plan_infrastructure_path(rel):
+                return
+            if rel not in paths:
+                paths.append(rel)
+
+        step_files = bb.get("step_files", {}) if isinstance(bb.get("step_files"), dict) else {}
+        entries = step_files.get(step_id, []) if step_id and isinstance(step_files.get(step_id), list) else []
+        for entry in entries[-20:]:
+            if not isinstance(entry, dict):
+                _add(entry)
+                continue
+            try:
+                ts = float(entry.get("ts", 0.0) or 0.0)
+            except Exception:
+                ts = 0.0
+            if since_ts > 0 and ts > 0 and ts + 1e-6 < since_ts:
+                continue
+            _add(entry.get("path", ""))
+
+        artifacts = bb.get("code_artifacts", {}) if isinstance(bb.get("code_artifacts"), dict) else {}
+        artifact_rows: list[tuple[float, str]] = []
+        for path, meta in artifacts.items():
+            if not isinstance(meta, dict):
+                continue
+            meta_step = str(meta.get("plan_step_id", "") or "").strip()
+            try:
+                ts = float(meta.get("updated_at", 0.0) or 0.0)
+            except Exception:
+                ts = 0.0
+            if step_id and meta_step and meta_step != step_id:
+                continue
+            if not meta_step and since_ts > 0 and ts > 0 and ts + 1e-6 < since_ts:
+                continue
+            artifact_rows.append((ts, str(path or "")))
+        for _ts, path in sorted(artifact_rows, reverse=True)[:8]:
+            _add(path)
+
+        for result in (worker_step or {}).get("tool_results", []) or []:
+            if not isinstance(result, dict) or not result.get("ok", False):
+                continue
+            name = str(result.get("name", "") or "")
+            args = result.get("args", {}) if isinstance(result.get("args"), dict) else {}
+            if name in {"read_file", "write_file", "edit_file"}:
+                _add(args.get("path", "") or args.get("file_path", ""))
+            elif name in {"bash", "worktree_run", "background_run"}:
+                for path in self._bash_file_read_targets(str(args.get("command", "") or ""))[:6]:
+                    _add(path)
+        return paths[:8]
+
+    def _plan_step_quality_file_excerpts(self, paths: list[str], *, max_files: int = 5, max_chars: int = 1600) -> list[dict]:
+        excerpts: list[dict] = []
+        for rel in paths[: max(1, int(max_files or 5))]:
+            try:
+                path = self._session_path(rel)
+            except Exception:
+                continue
+            text = try_read_text(path, max_bytes=120_000)
+            if text is None:
+                continue
+            excerpts.append({
+                "path": rel,
+                "excerpt": trim(text.replace("\r\n", "\n"), max_chars),
+            })
+        return excerpts
+
+    def _plan_step_quality_recent_rows(
+        self,
+        bb: dict,
+        section: str,
+        plan_step: dict,
+        *,
+        limit: int = 6,
+        max_chars: int = 500,
+    ) -> list[dict]:
+        rows = bb.get(section, []) if isinstance(bb.get(section), list) else []
+        if not rows:
+            return []
+        step_id = trim(str((plan_step or {}).get("id", "") or "").strip(), 80)
+        since_ts = self._plan_step_activation_ts(plan_step)
+        matched: list[dict] = []
+        fallback: list[dict] = []
+        for row in rows[-40:]:
+            if not isinstance(row, dict):
+                continue
+            txt = trim(str(row.get("content", "") or "").strip(), max_chars)
+            if not txt:
+                continue
+            clean = {
+                "actor": trim(str(row.get("actor", "") or "").strip(), 40),
+                "content": txt,
+            }
+            try:
+                ts = float(row.get("ts", 0.0) or 0.0)
+            except Exception:
+                ts = 0.0
+            row_step = str(row.get("plan_step_id", "") or "").strip()
+            if step_id and row_step == step_id:
+                matched.append(clean)
+            elif since_ts > 0 and ts > 0 and ts + 1e-6 >= since_ts:
+                matched.append(clean)
+            else:
+                fallback.append(clean)
+        if matched:
+            return matched[-max(1, int(limit or 6)) :]
+        return fallback[-max(1, int(limit or 6)) :]
+
+    def _build_plan_step_quality_review_context(
+        self,
+        plan_step: dict,
+        worker_step: dict,
+        bb: dict,
+        candidate_evidence: dict | None = None,
+    ) -> str:
+        profile = self._ensure_blackboard_task_profile(bb)
+        step_id = trim(str((plan_step or {}).get("id", "") or "").strip(), 80)
+        step_text = trim(
+            str((plan_step or {}).get("full_content", "") or (plan_step or {}).get("content", "") or "").strip(),
+            1800,
+        )
+        rows = self._active_plan_worker_todo_rows(step_id, role="") if step_id else []
+        subtasks = [
+            {
+                "status": trim(str(row.get("status", "") or "").strip(), 30),
+                "owner": trim(str(row.get("owner", "") or "").strip(), 40),
+                "content": trim(str(row.get("content", "") or "").strip(), 180),
+            }
+            for row in rows[:12]
+            if isinstance(row, dict) and str(row.get("content", "") or "").strip()
+        ]
+
+        tool_rows: list[dict] = []
+        for result in (worker_step or {}).get("tool_results", []) or []:
+            if not isinstance(result, dict):
+                continue
+            name = trim(str(result.get("name", "") or "").strip(), 60)
+            args = result.get("args", {}) if isinstance(result.get("args"), dict) else {}
+            row = {
+                "name": name,
+                "ok": bool(result.get("ok", False)),
+                "path": trim(str(args.get("path", "") or args.get("file_path", "") or "").strip(), 240),
+                "command": trim(str(args.get("command", "") or "").strip(), 260),
+                "output_excerpt": self._tool_result_output_excerpt(result, 260),
+            }
+            tool_rows.append(row)
+            if len(tool_rows) >= 12:
+                break
+
+        paths = self._plan_step_quality_review_paths(plan_step, worker_step, bb)
+        context = {
+            "objective": trim(str(bb.get("original_goal", "") or self._latest_user_goal_text() or "").strip(), 2000),
+            "direct_objective": trim(str(profile.get("direct_objective", self.runtime_direct_objective or "") or "").strip(), 900),
+            "plan_step": {
+                "id": step_id,
+                "index": int((plan_step or {}).get("plan_step_index", -1) or -1),
+                "text": step_text,
+                "phase_hint": self._plan_step_phase_hint(step_text.lower()),
+            },
+            "candidate_evidence": candidate_evidence or {},
+            "worker_reply": trim(str((worker_step or {}).get("text", "") or "").strip(), 1200),
+            "tool_results": tool_rows,
+            "subtasks": subtasks,
+            "recent_files": paths,
+            "file_excerpts": self._plan_step_quality_file_excerpts(paths),
+            "recent_execution_logs": self._plan_step_quality_recent_rows(bb, "execution_logs", plan_step),
+            "recent_review_feedback": self._plan_step_quality_recent_rows(bb, "review_feedback", plan_step),
+            "recent_research_notes": self._plan_step_quality_recent_rows(bb, "research_notes", plan_step, limit=4),
+            "recent_errors": self._recent_error_context(max_chars=900),
+        }
+        return trim(json_dumps(context, indent=2), 12000)
+
+    def _llm_review_plan_step_quality(
+        self,
+        plan_step: dict,
+        worker_step: dict,
+        bb: dict,
+        *,
+        candidate_evidence: dict | None = None,
+    ) -> dict:
+        """Use semantic LLM review as the final plan-step quality gate."""
+        context = self._build_plan_step_quality_review_context(
+            plan_step,
+            worker_step,
+            bb,
+            candidate_evidence=candidate_evidence,
+        )
+        step_id = trim(str((plan_step or {}).get("id", "") or "").strip(), 80)
+        fp = hashlib.sha1(context.encode("utf-8", errors="replace")).hexdigest()[:16]
+        cache = getattr(self, "_plan_step_quality_review_cache", {})
+        cached = cache.get(step_id) if isinstance(cache, dict) and step_id else None
+        if isinstance(cached, dict) and cached.get("fingerprint") == fp:
+            try:
+                if float(now_ts()) - float(cached.get("ts", 0.0) or 0.0) < 45.0:
+                    return dict(cached.get("review", {}) or {})
+            except Exception:
+                pass
+
+        system_prompt = (
+            "You are a strict semantic QA reviewer for an autonomous coding workflow. "
+            "Your job is to decide whether the current plan step is actually acceptable "
+            "against the user's intent and the step text. Hard-coded signals such as file "
+            "existence, HTTP 200, successful syntax checks, or a tool returning ok are only "
+            "candidate evidence; never treat them as automatic proof. Read the artifacts, "
+            "logs, worker reply, subtasks, and user objective semantically. Return JSON only."
+        )
+        user_prompt = (
+            "Decide whether this plan step may advance.\n\n"
+            "Acceptance standard:\n"
+            "- Pass only when the evidence shows the step's real intent has been satisfied.\n"
+            "- Reject shallow bookkeeping, stale logs, unrelated files, or validation that does not cover the requested behavior.\n"
+            "- For implementation/frontend/runtime work, require evidence appropriate to what changed, such as relevant code, runtime behavior, UI/control behavior, absence of blocking errors, or targeted tests. Choose what matters semantically.\n"
+            "- If evidence is insufficient, explain the missing proof and concrete next actions.\n\n"
+            "Return JSON only with this shape:\n"
+            "{\"passed\":true|false,\"confidence\":\"high|medium|low\",\"reason\":\"...\","
+            "\"missing\":[\"...\"],\"next_actions\":[\"...\"],\"evidence\":[\"...\"]}\n\n"
+            f"REVIEW CONTEXT:\n{context}"
+        )
+
+        def _string_list(value: object) -> list[str]:
+            if not isinstance(value, list):
+                return []
+            out: list[str] = []
+            for item in value[:8]:
+                txt = trim(str(item or "").strip(), 220)
+                if txt:
+                    out.append(txt)
+            return out
+
+        def _review_from_payload(payload: dict, raw_text: str) -> dict:
+            confidence = str(payload.get("confidence", "") or "").strip().lower()
+            if confidence not in {"high", "medium", "low"}:
+                confidence = "medium" if payload.get("passed", False) else "low"
+            return {
+                "available": True,
+                "passed": bool(payload.get("passed", False)),
+                "confidence": confidence,
+                "reason": trim(str(payload.get("reason", "") or "").strip(), 600),
+                "missing": _string_list(payload.get("missing", [])),
+                "next_actions": _string_list(payload.get("next_actions", [])),
+                "evidence": _string_list(payload.get("evidence", [])),
+                "raw": raw_text,
+            }
+
+        def _repair_review_json(raw_text: str) -> dict:
+            if not str(raw_text or "").strip():
+                return {}
+            repair_prompt = (
+                "The previous semantic QA reviewer did not return parseable JSON. "
+                "Convert its answer into the required JSON shape without adding new facts. "
+                "If the answer is too ambiguous to decide, return passed=false with low confidence "
+                "and explain that the review text was ambiguous.\n\n"
+                "Required JSON shape:\n"
+                "{\"passed\":true|false,\"confidence\":\"high|medium|low\",\"reason\":\"...\","
+                "\"missing\":[\"...\"],\"next_actions\":[\"...\"],\"evidence\":[\"...\"]}\n\n"
+                f"PREVIOUS REVIEW TEXT:\n{trim(raw_text, 2400)}"
+            )
+            rsp = self._chat_with_same_model_retry(
+                [{"role": "user", "content": repair_prompt, "ts": now_ts()}],
+                tools=None,
+                system="Return JSON only. Do not perform a new review; only normalize the previous review text.",
+                max_tokens=600,
+                think=False,
+                stream_thinking=False,
+                context_label="semantic quality review json repair",
+                retries=1,
+            )
+            repaired_raw = trim(
+                str((rsp or {}).get("content", "") or (rsp or {}).get("text", "") or "").strip()
+                or str((rsp or {}).get("thinking", "") or "").strip(),
+                2000,
+            )
+            return extract_json_object_from_text(repaired_raw, {})
+
+        raw = ""
+        try:
+            rsp = self._chat_with_same_model_retry(
+                [{"role": "user", "content": user_prompt, "ts": now_ts()}],
+                tools=None,
+                system=system_prompt,
+                max_tokens=900,
+                think=False,
+                stream_thinking=False,
+                context_label="semantic quality review",
+                retries=max(1, min(2, int(MODEL_OUTPUT_RETRY_TIMES))),
+            )
+            raw = trim(
+                str((rsp or {}).get("content", "") or (rsp or {}).get("text", "") or "").strip()
+                or str((rsp or {}).get("thinking", "") or "").strip(),
+                3000,
+            )
+            payload = extract_json_object_from_text(raw, {})
+            if not payload:
+                payload = _repair_review_json(raw)
+            if not payload:
+                raise ValueError("semantic reviewer returned no JSON")
+            review = _review_from_payload(payload, raw)
+        except Exception as exc:
+            review = {
+                "available": False,
+                "passed": False,
+                "confidence": "low",
+                "reason": f"semantic quality review unavailable: {trim(str(exc), 240)}",
+                "missing": ["semantic quality review did not complete"],
+                "next_actions": ["retry semantic review or ask a reviewer to inspect the current step evidence"],
+                "evidence": [],
+                "raw": raw,
+            }
+
+        try:
+            if not bool(review.get("available", True)):
+                status = "UNAVAILABLE"
+            else:
+                status = "PASS" if review.get("passed") else "FAIL"
+            feedback = (
+                f"semantic_quality_review {status} confidence={review.get('confidence', 'low')}\n"
+                f"reason: {trim(str(review.get('reason', '') or ''), 500)}\n"
+            )
+            if review.get("evidence"):
+                feedback += "evidence: " + "; ".join(review["evidence"][:5]) + "\n"
+            if review.get("missing"):
+                feedback += "missing: " + "; ".join(review["missing"][:5]) + "\n"
+            if review.get("next_actions"):
+                feedback += "next_actions: " + "; ".join(review["next_actions"][:5])
+            self._blackboard_append_section("review_feedback", "semantic_reviewer", trim(feedback, BLACKBOARD_MAX_TEXT))
+        except Exception:
+            pass
+
+        if step_id and bool(review.get("available", True)):
+            if not isinstance(cache, dict):
+                cache = {}
+            cache[step_id] = {"fingerprint": fp, "ts": float(now_ts()), "review": dict(review)}
+            try:
+                setattr(self, "_plan_step_quality_review_cache", cache)
+            except Exception:
+                pass
+        return review
+
+    def _record_plan_step_quality_review(self, plan_step: dict, review: dict, *, board: dict | None = None):
+        if not isinstance(plan_step, dict) or not isinstance(review, dict):
+            return
+        step_id = trim(str(plan_step.get("id", "") or "").strip(), 80)
+        if not step_id:
+            return
+        if not bool(review.get("available", True)):
+            bb = board if isinstance(board, dict) else self._ensure_blackboard()
+            attempts = bb.get("plan_step_quality_review_attempts", {})
+            if not isinstance(attempts, dict):
+                attempts = {}
+            row = dict(attempts.get(step_id, {}) if isinstance(attempts.get(step_id), dict) else {})
+            row.update(
+                {
+                    "step_id": step_id,
+                    "status": "unavailable",
+                    "reason": trim(str(review.get("reason", "") or "").strip(), 800),
+                    "reviewed_at": float(now_ts()),
+                    "raw": trim(str(review.get("raw", "") or ""), 1200),
+                }
+            )
+            row["attempts"] = int(row.get("attempts", 0) or 0) + 1
+            attempts[step_id] = row
+            bb["plan_step_quality_review_attempts"] = attempts
+            self.blackboard = bb
+            self._blackboard_touch()
+            return
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        reviews = bb.get("plan_step_quality_reviews", {})
+        if not isinstance(reviews, dict):
+            reviews = {}
+        reviews[step_id] = {
+            "step_id": step_id,
+            "status": "passed" if bool(review.get("passed", False)) else "failed",
+            "confidence": trim(str(review.get("confidence", "") or "").strip().lower(), 20),
+            "reason": trim(str(review.get("reason", "") or "").strip(), 800),
+            "missing": [
+                trim(str(item or "").strip(), 220)
+                for item in (review.get("missing", []) if isinstance(review.get("missing", []), list) else [])[:8]
+                if str(item or "").strip()
+            ],
+            "next_actions": [
+                trim(str(item or "").strip(), 220)
+                for item in (review.get("next_actions", []) if isinstance(review.get("next_actions", []), list) else [])[:8]
+                if str(item or "").strip()
+            ],
+            "evidence": [
+                trim(str(item or "").strip(), 220)
+                for item in (review.get("evidence", []) if isinstance(review.get("evidence", []), list) else [])[:8]
+                if str(item or "").strip()
+            ],
+            "reviewed_at": float(now_ts()),
+            "step_index": int(plan_step.get("plan_step_index", -1)) if plan_step.get("plan_step_index") not in (None, "") else -1,
+            "activated_at": float(plan_step.get("activated_at", 0.0) or 0.0),
+        }
+        bb["plan_step_quality_reviews"] = reviews
+        attempts = bb.get("plan_step_quality_review_attempts", {})
+        if isinstance(attempts, dict) and step_id in attempts:
+            attempts.pop(step_id, None)
+            bb["plan_step_quality_review_attempts"] = attempts
+        self.blackboard = bb
+        self._blackboard_touch()
+
+    def _active_plan_step_quality_block(self, plan_step: dict, board: dict | None = None) -> dict | None:
+        if not isinstance(plan_step, dict):
+            return None
+        step_id = trim(str(plan_step.get("id", "") or "").strip(), 80)
+        if not step_id:
+            return None
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        reviews = bb.get("plan_step_quality_reviews", {})
+        if not isinstance(reviews, dict):
+            return None
+        row = reviews.get(step_id)
+        if not isinstance(row, dict) or str(row.get("status", "") or "").strip().lower() != "failed":
+            return None
+        reason_low = str(row.get("reason", "") or "").lower()
+        missing_low = " ".join(str(x or "") for x in (row.get("missing", []) if isinstance(row.get("missing", []), list) else [])).lower()
+        if (
+            "semantic quality review unavailable" in reason_low
+            or "semantic reviewer returned no json" in reason_low
+            or "semantic quality review did not complete" in missing_low
+        ):
+            return None
+        try:
+            review_ts = float(row.get("reviewed_at", 0.0) or 0.0)
+        except Exception:
+            review_ts = 0.0
+        try:
+            activated_at = float(plan_step.get("activated_at", 0.0) or plan_step.get("created_at", 0.0) or 0.0)
+        except Exception:
+            activated_at = 0.0
+        if activated_at > 0 and review_ts > 0 and review_ts + 1e-6 < activated_at:
+            return None
+        return row
+
+    def _inject_semantic_quality_rework_if_needed(self, plan_step: dict, worker_step: dict, review: dict):
+        try:
+            step_id = str((plan_step or {}).get("id", "") or "")
+            if not step_id:
+                return
+            _key = f"_semantic_quality_rework_{step_id}"
+            last_ts = float(getattr(self, _key, 0.0) or 0.0)
+            if float(now_ts()) - last_ts < 25.0:
+                return
+            setattr(self, _key, float(now_ts()))
+            step_label = trim(str((plan_step or {}).get("content", "") or ""), 100)
+            reason = trim(str((review or {}).get("reason", "") or ""), 600)
+            missing = [trim(str(x or ""), 180) for x in (review or {}).get("missing", [])[:5] if str(x or "").strip()]
+            actions = [trim(str(x or ""), 180) for x in (review or {}).get("next_actions", [])[:5] if str(x or "").strip()]
+            lines = [
+                "<semantic-quality-review>",
+                f"Plan step \"{step_label}\" is not accepted by semantic review.",
+                f"Reason: {reason or 'insufficient evidence for the requested behavior'}",
+            ]
+            if missing:
+                lines.append("Missing evidence or work:")
+                lines.extend(f"- {item}" for item in missing)
+            if actions:
+                lines.append("Next actions:")
+                lines.extend(f"- {item}" for item in actions)
+            lines.append(
+                "Continue the same user task. Update existing step-local todos if they no longer reflect the real state; "
+                "create new todos only when they materially improve tracking."
+            )
+            lines.append("</semantic-quality-review>")
+            bb = self._ensure_blackboard()
+            target_roles: tuple[str, ...] = ()
+            if self._is_multi_agent_mode():
+                active_role = str(bb.get("active_agent", "") or "developer")
+                if active_role:
+                    target_roles = (active_role,)
+            self._append_plan_guidance_bubble(
+                "\n".join(lines),
+                target_roles=target_roles,
+                summary="semantic quality review failed",
+            )
+        except Exception:
+            pass
+
+    def _inject_semantic_review_unavailable_recheck(self, plan_step: dict, worker_step: dict, review: dict):
+        try:
+            step_id = str((plan_step or {}).get("id", "") or "")
+            if not step_id:
+                return
+            _key = f"_semantic_review_unavailable_{step_id}"
+            last_ts = float(getattr(self, _key, 0.0) or 0.0)
+            if float(now_ts()) - last_ts < 20.0:
+                return
+            setattr(self, _key, float(now_ts()))
+            step_label = trim(str((plan_step or {}).get("content", "") or ""), 120)
+            reason = trim(str((review or {}).get("reason", "") or ""), 500)
+            lines = [
+                "<semantic-review-retry>",
+                f"Semantic review for plan step \"{step_label}\" was unavailable, not failed.",
+                f"Reason: {reason or 'reviewer returned unparsable output'}",
+                "Do not repeat completed work solely because the semantic reviewer failed to return JSON.",
+                "Do not edit `.clouds_coder/plan.md`; it is a read-only runtime mirror.",
+                "Re-check the current step evidence with read_file/bash/blackboard as needed, then ask the manager to retry plan-step advancement via advance_plan_step=true.",
+                "</semantic-review-retry>",
+            ]
+            target_roles: tuple[str, ...] = ()
+            if self._is_multi_agent_mode():
+                target_roles = ("reviewer",)
+            self._append_plan_guidance_bubble(
+                "\n".join(lines),
+                target_roles=target_roles,
+                summary="semantic quality review unavailable",
+            )
+        except Exception:
+            pass
 
     def _has_test_pass_evidence(self, board: dict | None = None) -> bool:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
@@ -35475,6 +36745,31 @@ body{padding:18px}
                 break
         if not current:
             return False
+        quality_block = self._active_plan_step_quality_block(current, bb)
+        if quality_block:
+            self._blackboard_append_memory(
+                "decision",
+                (
+                    "blocked plan step advancement because semantic quality review failed: "
+                    f"{trim(str(quality_block.get('reason', '') or ''), 220)}"
+                ),
+                actor=actor,
+                tier="long",
+                board=bb,
+            )
+            self._inject_semantic_quality_rework_if_needed(
+                current,
+                {"tool_results": [], "text": ""},
+                {
+                    "passed": False,
+                    "confidence": quality_block.get("confidence", "medium"),
+                    "reason": quality_block.get("reason", ""),
+                    "missing": quality_block.get("missing", []),
+                    "next_actions": quality_block.get("next_actions", []),
+                    "evidence": quality_block.get("evidence", []),
+                },
+            )
+            return False
         previous_focus = self._blackboard_focus_identity(bb)
         # Fix 5c: Reset TodoWrite loop counter on step advancement
         try:
@@ -35506,10 +36801,6 @@ body{padding:18px}
         if next_step:
             next_step["status"] = "in_progress"
             next_step["activated_at"] = float(now_ts())
-            try:
-                self._ensure_worker_todos_for_plan_step(next_step, force_refresh=False, owner=self._current_plan_worker_owner())
-            except Exception:
-                pass
             step_idx = int(next_step.get("plan_step_index", 0) or 0) + 1
             total = int(bb.get("plan_step_total", len(todos)) or len(todos))
             self._emit("status", {
@@ -35556,19 +36847,29 @@ body{padding:18px}
             self._update_plan_file_step_status()
         except Exception:
             pass  # Plan file update is best-effort
-        # Clear worker subtasks linked to the completed plan step by parent_step_id.
-        # Keep completed rows and rows that belong to other plan steps.
+        # Close worker subtasks linked to the completed plan step. If the model
+        # skipped detailed todo bookkeeping but the step was accepted by real
+        # evidence, the UI should not keep stale pending/in_progress rows.
         completed_step_id = str(current.get("id", "") or "")
         try:
             _snap = self.todo.snapshot()
-            _clean = [
-                r for r in _snap
-                if str(r.get("parent_step_id", "") or "") != completed_step_id
-                or str(r.get("status", "") or "").lower() == "completed"
-            ]
-            if len(_clean) < len(_snap):
+            _changed = False
+            _closed_at = float(now_ts())
+            for _row in _snap:
+                if not isinstance(_row, dict):
+                    continue
+                if str(_row.get("parent_step_id", "") or "") != completed_step_id:
+                    continue
+                if str(_row.get("status", "") or "").lower() == "completed":
+                    continue
+                _row["status"] = "completed"
+                _row["completed_at"] = _closed_at
+                _row["completed_by"] = actor
+                _row["evidence"] = trim(str(evidence or "closed with accepted plan step"), 200)
+                _changed = True
+            if _changed:
                 with self.todo.lock:
-                    self.todo.items = _clean
+                    self.todo.items = _snap
         except Exception:
             pass
         # Immediately sync todos so UI reflects plan step advancement
@@ -35675,20 +36976,12 @@ body{padding:18px}
             and str(r.get("name", "")) in ("TodoWrite", "TodoWriteRescue")
             for r in results
         )
-        # Advance when:
-        # - Manager requested AND worker produced output, OR
-        # - All subtasks completed AND worker produced output, OR
-        # - Phase heuristics confirm BUT ONLY if no incomplete subtasks exist
-        # - Fix 3: All subtasks completed + accumulated step evidence (covers TodoWrite-only turns)
-        # CRITICAL: When subtasks exist, phase_evidence alone CANNOT bypass subtask completion.
+        # Candidate gate: these are only signals that there is enough material
+        # for semantic review. They must not advance a plan step by themselves.
         _has_subtasks = bool(self._active_plan_worker_todo_rows(
             str(current.get("id", "") or ""), role=""
         ))
-        _has_expected_subtasks = bool(self._extract_plan_step_subtasks(current, limit=5))
-        _phase_gate = phase_evidence and (
-            subtasks_all_done
-            or ((not _has_subtasks) and (not _has_expected_subtasks))
-        )
+        _phase_gate = phase_evidence and (subtasks_all_done or not _has_subtasks)
         accumulated_evidence_path = (
             subtasks_all_done
             and todo_progress_signal
@@ -35699,7 +36992,7 @@ body{padding:18px}
             and verified_tag_current
             and (validation_ok_blackboard or self._step_has_accumulated_evidence(current, bb))
         )
-        has_strong_evidence = (
+        has_review_candidate_evidence = (
             validation_ok and (
                 (
                     worker_produced_output
@@ -35712,27 +37005,44 @@ body{padding:18px}
                 )
             )
         ) or accumulated_evidence_path or explicit_verified_path
-        if has_strong_evidence:
-            # Sync mode exec gate: when all subtasks done for implement/test/deploy phases,
-            # require at least some execution evidence (bash/test/compile ran at any point).
-            # Manager-requested advancement has its own escape hatch after 10 blocks.
-            _exec_gate_needed = (
-                subtasks_all_done
-                and phase in ("implement", "test", "deploy")
+        if has_review_candidate_evidence:
+            candidate_context = {
+                "phase": phase,
+                "manager_requested": manager_requested,
+                "worker_produced_output": worker_produced_output,
+                "subtasks_all_done": subtasks_all_done,
+                "has_subtasks": _has_subtasks,
+                "phase_evidence": phase_evidence,
+                "validation_current": validation_ok_current,
+                "validation_blackboard": validation_ok_blackboard,
+                "accumulated_evidence_path": accumulated_evidence_path,
+                "explicit_verified_path": explicit_verified_path,
+                "blackboard_signals": {
+                    "has_write": bool(bb_sig.get("has_write")),
+                    "has_exec": bool(bb_sig.get("has_exec")),
+                    "has_review": bool(bb_sig.get("has_review")),
+                    "has_compile_pass": bool(bb_sig.get("has_compile_pass")),
+                    "has_test_pass": bool(bb_sig.get("has_test_pass")),
+                    "recent_files": list(bb_sig.get("recent_files", []) or [])[:4],
+                },
+            }
+            quality_review = self._llm_review_plan_step_quality(
+                current,
+                worker_step,
+                bb,
+                candidate_evidence=candidate_context,
             )
-            if _exec_gate_needed:
-                # Require model's explicit <step-verified/> tag in agent_messages since step activation
-                _has_verified = verified_tag_current
-                if not _has_verified:
-                    _sync_n_flag = f"_sync_exec_gate_n_{str(current.get('id', '') or '')}"
-                    _sync_n = int(getattr(self, _sync_n_flag, 0))
-                    if _sync_n < 10:
-                        setattr(self, _sync_n_flag, _sync_n + 1)
-                        # No verified tag yet — push worker to evaluate and emit <step-verified/>
-                        self._inject_sync_mode_verification_hint(current, worker_step)
-                        return
-                    # After 10 blocks, allow advancement to prevent permanent stall
+            self._record_plan_step_quality_review(current, quality_review, board=bb)
+            if not bool(quality_review.get("available", True)):
+                self._inject_semantic_review_unavailable_recheck(current, worker_step, quality_review)
+                return
+            if not bool(quality_review.get("passed", False)):
+                self._inject_semantic_quality_rework_if_needed(current, worker_step, quality_review)
+                return
             evidence = self._collect_step_evidence(current, worker_step)
+            review_reason = trim(str(quality_review.get("reason", "") or ""), 120)
+            if review_reason:
+                evidence = trim(f"{evidence}; semantic_review: {review_reason}", 200)
             # Clear sync exec gate counter on successful advance
             try:
                 _sync_clear = f"_sync_exec_gate_n_{str(current.get('id', '') or '')}"
@@ -35797,9 +37107,6 @@ body{padding:18px}
             and str(r.get("parent_step_id", "") or "") == step_id
         ]
         if not worker_items:
-            expected = self._extract_plan_step_subtasks(plan_step, limit=5)
-            if expected:
-                return False
             # Fallback: no parent_step_id linkage — check ALL worker items
             all_worker = [
                 r for r in snap
@@ -36351,8 +37658,6 @@ body{padding:18px}
         )
         if int(snapshot.get("worker_todo_count", 0) or 0) > 0:
             parts.append(todo_state)
-        elif int(snapshot.get("expected_count", 0) or 0) > 0:
-            parts.append(f"todos=missing/{int(snapshot.get('expected_count', 0) or 0)}")
         focus = trim(str(snapshot.get("current_subtask", "") or ""), 160)
         if focus:
             parts.append(f"focus={focus}")
@@ -36390,8 +37695,6 @@ body{padding:18px}
         step_text = trim(str(snapshot.get("step_text", "") or ""), 220)
         full_text = self._current_plan_step_full_text(bb, max_len=600)
         phase = self._plan_step_phase_hint(full_text)
-        expected_count = int(snapshot.get("expected_count", 0) or 0)
-        worker_todo_count = int(snapshot.get("worker_todo_count", 0) or 0)
         current_subtask = trim(str(snapshot.get("current_subtask", "") or ""), 180)
         next_pending = trim(str(snapshot.get("next_pending_subtask", "") or ""), 180)
         subtasks_done = self._step_subtasks_all_completed(step)
@@ -36422,12 +37725,7 @@ body{padding:18px}
         owner = self._sanitize_agent_role(row.get("target", "")) or self._current_plan_worker_owner(bb)
         if owner not in {"developer", "explorer"}:
             owner = default_owner
-        if expected_count > 0 and worker_todo_count == 0:
-            action_text = (
-                "First call TodoWrite for the current plan step and create the missing worker subtasks "
-                "before any more implementation."
-            )
-        elif current_subtask:
+        if current_subtask:
             action_text = f"Continue ONLY the current in_progress subtask: {current_subtask}."
         elif next_pending:
             action_text = f"Resume the next pending subtask: {next_pending}."
@@ -36949,6 +38247,10 @@ body{padding:18px}
         }
 
     def _append_plan_guidance_bubble(self, content: str, *, target_roles: tuple[str, ...] = (), summary: str = "") -> bool:
+        if str(self.plan_mode_user_preference or "auto").strip().lower() == "off":
+            return False
+        if not isinstance(self._current_plan_step_row(self._ensure_blackboard()), dict):
+            return False
         text = trim(str(content or "").strip(), PLAN_NOTICE_BODY_MAX_CHARS)
         if not text:
             return False
@@ -36996,13 +38298,13 @@ body{padding:18px}
         if missing_subtasks:
             return (
                 "<reminder>"
-                "Current plan-step subtasks were missing or invalid. The runtime will bootstrap them when possible. "
-                "Continue with one concrete action for the active plan step; use TodoWriteRescue only if progress state is still wrong."
+                "No current-step subtasks are active. Continue with one concrete action for the active plan step; "
+                "create TodoWrite rows only if they materially improve execution tracking."
                 "</reminder>"
             )
         return (
             "<reminder>"
-            "Update your todos now: finish the current subtask in TodoWrite before moving on."
+            "Existing todos are active for this step; update TodoWrite only when real status changes."
             "</reminder>"
         )
 
@@ -37019,8 +38321,8 @@ body{padding:18px}
         completed = [r for r in rows if str(r.get("status", "") or "").strip().lower() == "completed"]
         if not rows:
             todo_state = (
-                f"No worker subtasks are available yet for this step. Inspect the current plan/todo state before doing broad work. "
-                f"If the state is genuinely broken, use TodoWrite or TodoWriteRescue to repair only parent_step_id='{step_id}', then continue this step. "
+                "No worker subtasks are active for this step. You may complete the step directly in one coherent pass "
+                f"when that is clearer; create TodoWrite rows scoped to parent_step_id='{step_id}' only if they materially improve tracking. "
             )
             subtasks_exist_ban = ""
         else:
@@ -37044,23 +38346,23 @@ body{padding:18px}
             )
         if for_manager:
             return (
-                f"PLAN/TODO DISCIPLINE: `{PLAN_FILE_RELATIVE_PATH}` is the authoritative execution path. "
+                f"PLAN/TODO DISCIPLINE: `{PLAN_FILE_RELATIVE_PATH}` is a read-only runtime mirror of the authoritative execution path. "
+                "It may be inspected with read_file but must never be edited with write_file/edit_file/bash redirection. "
+                "Plan advancement must happen only through route_to_next_agent with advance_plan_step=true after evidence is reviewed. "
                 f"Delegate ONLY against the current in-progress plan step (Step {step_idx}: {step_text}). "
                 f"{subtasks_exist_ban}"
                 f"{todo_state}"
-                "Treat existing worker subtasks as live execution state, not optional notes. "
-                "In every delegation, explicitly tell the owner to finish the current in_progress subtask first. "
-                "After EACH completed subtask, require a manual TodoWrite or TodoWriteRescue update before the owner starts the next subtask. "
-                "Do not let the owner silently batch multiple subtasks without updating todos. "
+                "Treat existing worker subtasks as live execution state, but do not require new subtasks when none exist. "
+                "When subtasks exist, tell the owner to finish the current in_progress subtask first and update TodoWrite/TodoWriteRescue after real status changes. "
                 "Do not route to finish_current_task while the approved plan still has unfinished steps."
             )
         return (
-            f"PLAN/TODO DISCIPLINE: `{PLAN_FILE_RELATIVE_PATH}` is authoritative. "
+            f"PLAN/TODO DISCIPLINE: `{PLAN_FILE_RELATIVE_PATH}` is a read-only runtime mirror of the approved plan. "
+            "Read it for status; never write/edit it directly. "
             f"Work ONLY on the current in-progress plan step (Step {step_idx}: {step_text}). "
             f"{subtasks_exist_ban}"
             f"{todo_state}"
-            "After EACH completed subtask, immediately call TodoWrite or TodoWriteRescue to mark it completed and set the next subtask to in_progress before continuing. "
-            "Do not wait until the end of the step to update todos. "
+            "When subtasks exist, update TodoWrite or TodoWriteRescue after real status changes; when none exist, do not create bookkeeping-only todos. "
             "Do not call finish_current_task for a subtask or a single plan step; use it only when the overall user task is truly complete."
         )
 
@@ -37620,23 +38922,26 @@ body{padding:18px}
 
     def _single_mode_validation_gate(self, plan_step: dict, tool_results: list[dict]) -> bool:
         """Gate passes when:
-          1. Phase is research/design (no execution needed)
-          2. Model emitted <step-verified/> since step activation
-          3. Blackboard shows phase-appropriate accumulated evidence (has_write+has_exec for implement)
-          4. Escape hatch: 10 consecutive blocks
-        Research/design phases exempt. Escape hatch prevents permanent stall."""
+          1. The model emitted <step-verified/> since step activation
+          2. Blackboard shows phase-appropriate accumulated evidence
+          3. Escape hatch: 10 consecutive blocks
+        The semantic quality reviewer remains the final acceptance gate."""
         step_id = str(plan_step.get("id", "") or "")
         _flag = f"_smvg_{step_id}"
         if getattr(self, _flag, False):
             return True  # Already validated in a previous round
         step_content = str(plan_step.get("full_content", "") or plan_step.get("content", "") or "").lower()
         phase = self._plan_step_phase_hint(step_content)
-        if phase in ("research", "design"):
-            setattr(self, _flag, True)
-            return True  # No verification needed for non-execution phases
-        # Escape hatch: after 10 consecutive blocks, unblock to prevent permanent stall
         _n_flag = f"_smvg_n_{step_id}"
         _n_blocked = int(getattr(self, _n_flag, 0))
+        if phase in ("research", "design"):
+            if self._plan_step_has_blackboard_evidence(plan_step):
+                setattr(self, _flag, True)
+                return True
+            setattr(self, _n_flag, _n_blocked + 1)
+            self._inject_single_mode_validation_hint(plan_step)
+            return False
+        # Escape hatch: after 10 consecutive blocks, unblock to prevent permanent stall
         if _n_blocked >= 10:
             setattr(self, _flag, True)
             return True
@@ -37844,7 +39149,40 @@ body{padding:18px}
             ):
                 should_advance = True
         if should_advance:
+            candidate_context = {
+                "phase": phase,
+                "mode": "single",
+                "subtasks_done": subtasks_done,
+                "validation_current": validation_ok_current,
+                "validation_blackboard": validation_ok_blackboard,
+                "blackboard_signals": {
+                    "has_write": bool(bb_sig.get("has_write")),
+                    "has_exec": bool(bb_sig.get("has_exec")),
+                    "has_review": bool(bb_sig.get("has_review")),
+                    "has_compile_pass": bool(bb_sig.get("has_compile_pass")),
+                    "has_test_pass": bool(bb_sig.get("has_test_pass")),
+                    "recent_files": list(bb_sig.get("recent_files", []) or [])[:4],
+                },
+            }
+            quality_review = self._llm_review_plan_step_quality(
+                current,
+                {"tool_results": tool_results, "text": self._latest_agent_assistant_text("developer")},
+                bb,
+                candidate_evidence=candidate_context,
+            )
+            self._record_plan_step_quality_review(current, quality_review, board=bb)
+            if not bool(quality_review.get("available", True)):
+                self._inject_semantic_review_unavailable_recheck(current, {"tool_results": tool_results}, quality_review)
+                self._sync_todos_from_blackboard(reason="single-agent-quality-review-unavailable")
+                return False
+            if not bool(quality_review.get("passed", False)):
+                self._inject_semantic_quality_rework_if_needed(current, {"tool_results": tool_results}, quality_review)
+                self._sync_todos_from_blackboard(reason="single-agent-quality-rework")
+                return False
             evidence = self._collect_step_evidence(current, {"tool_results": tool_results})
+            review_reason = trim(str(quality_review.get("reason", "") or ""), 120)
+            if review_reason:
+                evidence = trim(f"{evidence}; semantic_review: {review_reason}", 200)
             advanced = self._advance_plan_step(evidence=evidence, actor="single")
             if advanced:
                 try:
@@ -38189,6 +39527,11 @@ body{padding:18px}
             + (f" | gate={completion.get('gate_reason', '')}" if completion.get("gate_reason") else "")
             + (f" | attempts={int(completion.get('attempt_count', 0) or 0)}" if int(completion.get("attempt_count", 0) or 0) else "")
         )
+        previous_context = self._format_previous_task_context_for_prompt(max_chars=900)
+        if previous_context:
+            lines.append("- previous_task_context:")
+            for prev_line in previous_context.splitlines():
+                lines.append(f"  {prev_line}")
         last_worker_reply = board.get("last_worker_reply", {}) if isinstance(board.get("last_worker_reply"), dict) else {}
         last_role = self._sanitize_agent_role(last_worker_reply.get("role", ""))
         last_text = trim(str(last_worker_reply.get("text", "") or "").strip(), 220)
@@ -39184,6 +40527,7 @@ body{padding:18px}
             "Classify this user request now and decide run topology/budget.\n\n"
             f"User request:\n{trim(str(goal_text or ''), 4000)}\n\n"
             f"Previous blackboard goal:\n{trim(str(self._ensure_blackboard().get('original_goal', '') or ''), 1200) or '(none)'}\n"
+            f"Previous task context:\n{self._format_previous_task_context_for_prompt(max_chars=1000) or '(none)'}\n"
             f"Current blackboard progress: {self._manager_progress_state(self._ensure_blackboard())}\n\n"
             f"Current runtime policy: level={int(self.runtime_task_level or 0)}, "
             f"mode={self._effective_execution_mode()}, "
@@ -39533,7 +40877,8 @@ body{padding:18px}
         todos = bb.get("project_todos", [])
         if not todos or not any(t.get("category") == "plan_step" for t in todos):
             return ""
-        lines = [f"PLAN FILE: {PLAN_FILE_RELATIVE_PATH} (read_file for full plan with live status)",
+        self._ensure_plan_file_current()
+        lines = [f"PLAN FILE: {PLAN_FILE_RELATIVE_PATH} (read_file only; runtime-managed mirror, never edit directly)",
                  "APPROVED PLAN STEPS:"]
         for t in todos:
             if t.get("category") != "plan_step":
@@ -39553,6 +40898,8 @@ body{padding:18px}
             "bash execution succeeded, or all worker TodoWrite subtasks (with parent_step_id) completed.\n"
             "  NEVER set advance_plan_step=true in the SAME delegation that assigns the work. "
             "The step must have been executed FIRST.\n"
+            f"  NEVER instruct any agent to write/edit `{PLAN_FILE_RELATIVE_PATH}`. "
+            "It is regenerated from blackboard state; direct edits are blocked and create recovery noise.\n"
             "COMPLEXITY LOCK: Do NOT change complexity or task_level below the plan-approved levels. "
         )
         lines.append("MANDATORY: Your delegation instruction MUST reference the current plan step. "
@@ -39694,6 +41041,17 @@ body{padding:18px}
                 pass
             # Build an explicit completion hint from blackboard-side evidence.
             bb_evidence_hint = ""
+            review_attempt_hint = ""
+            attempts = bb.get("plan_step_quality_review_attempts", {})
+            cur_step_id = trim(str(cur.get("id", "") or ""), 80)
+            if isinstance(attempts, dict) and cur_step_id:
+                attempt_row = attempts.get(cur_step_id)
+                if isinstance(attempt_row, dict) and str(attempt_row.get("status", "") or "") == "unavailable":
+                    review_attempt_hint = (
+                        "Last semantic review was unavailable/unparseable, not a quality failure. "
+                        "Route to Reviewer to inspect evidence and then retry advance_plan_step=true; "
+                        f"do not edit `{PLAN_FILE_RELATIVE_PATH}`. "
+                    )
             is_research_step = any(kw in step_content_low for kw in ("读取", "分析", "研究", "调研", "检索", "搜索", "查找", "查询", "收集", "采集", "提取", "整理", "数据", "排行", "资金流向", "read", "analyze", "extract", "research", "summarize", "search", "collect", "gather", "retrieve", "总结"))
             is_implement_step = any(kw in step_content_low for kw in ("创建", "写", "生成", "制作", "implement", "create", "write", "generate", "build", "pptx", "ppt"))
             is_test_step = any(kw in step_content_low for kw in ("测试", "验证", "test", "verify", "compile", "run"))
@@ -39723,9 +41081,10 @@ body{padding:18px}
                 f"⚠️ PLAN STEP {step_idx}/{total}: {trim(str(cur.get('content', '') or ''), 200)}. "
                 f"({len(completed)} completed, {len(pending)} remaining) "
                 f"DO NOT finish until all {total} steps are completed. "
-                f"Focus on THIS step. When done, set advance_plan_step=true. "
+                f"Focus on THIS step. When done, set advance_plan_step=true; do not edit `{PLAN_FILE_RELATIVE_PATH}` directly. "
                 f"{worker_hint}"
                 f"{bb_evidence_hint}"
+                f"{review_attempt_hint}"
             )
         # Generic project-todo mode when no plan-step structure is active.
         pending = [t for t in todos if t.get("status") != "completed"]
@@ -39812,7 +41171,8 @@ body{padding:18px}
             f"{'Reviewer=DEBUG MODE (bash/read_file/write_file/edit_file/finish_task — can fix bugs directly). ' if bool(self.reviewer_debug_mode) else 'Reviewer=read+verify (bash/read_file/finish_task, NO write_file/edit_file). '}"
             f"{'NEVER delegate file-writing tasks to Explorer. Reviewer is in debug mode and can fix bugs. ' if bool(self.reviewer_debug_mode) else 'NEVER delegate file-writing tasks to Explorer or Reviewer. '}"
             "TODO & SKILL CHAIN MANAGEMENT: "
-            "When a plan step is active, `.clouds_coder/plan.md` and the worker todo list are the source of truth. "
+            "When a plan step is active, `.clouds_coder/plan.md` is a read-only status mirror and the worker todo list is live execution state. "
+            "Never instruct agents to write/edit `.clouds_coder/plan.md`; use advance_plan_step=true to move the plan. "
             "Do NOT reinterpret the current step or let the owner skip ahead. "
             "Require the owner to manually update TodoWrite or TodoWriteRescue immediately after EACH completed subtask, "
             "before starting the next subtask. Never assume todo progress unless the worker actually called the todo tool. "
@@ -40121,7 +41481,7 @@ body{padding:18px}
                 blocked_route["source"] = "fallback"
                 return blocked_route
         if task_type == "simple_qa":
-            dev_text = self._latest_agent_assistant_text("developer")
+            dev_text = self._latest_agent_assistant_text("developer", min_ts=latest_user_ts)
             if dev_text:
                 done_probe = self._detect_endpoint_intent(dev_text, None)
                 if bool(done_probe.get("matched", False)):
@@ -40142,7 +41502,7 @@ body{padding:18px}
             }
         # General endpoint detection: non-simple_qa developer conclusions may also finish the run.
         if task_type != "simple_qa":
-            dev_text = self._latest_agent_assistant_text("developer")
+            dev_text = self._latest_agent_assistant_text("developer", min_ts=latest_user_ts)
             if dev_text:
                 done_probe = self._detect_endpoint_intent(dev_text, None)
                 if bool(done_probe.get("matched", False)) and not has_error_log:
@@ -40155,7 +41515,7 @@ body{padding:18px}
         # General guard: if the latest agent reply is conclusive and no todos remain, finish immediately.
         if not has_error_log:
             for _role in ("developer", "explorer", "reviewer"):
-                _last = self._latest_agent_assistant_text(_role)
+                _last = self._latest_agent_assistant_text(_role, min_ts=latest_user_ts)
                 if _last and self._looks_like_conclusive_reply(_last) and not self.todo.has_open_items():
                     return {
                         "target": "finish",
@@ -40535,7 +41895,7 @@ body{padding:18px}
         # Conclusive-reply cut-off: if the agent already concluded with no open work or errors, force finish.
         if target in AGENT_ROLES and target != "finish":
             for _check_role in ("developer", "explorer", "reviewer"):
-                _last_text = self._latest_agent_assistant_text(_check_role)
+                _last_text = self._latest_agent_assistant_text(_check_role, min_ts=latest_user_ts)
                 if (
                     _last_text
                     and self._looks_like_conclusive_reply(_last_text)
@@ -40974,7 +42334,7 @@ body{padding:18px}
         }
         return text, data
 
-    def _sanitize_instruction_for_current_plan_step(self, text: str) -> str:
+    def _sanitize_instruction_for_current_plan_step(self, text: str, current_step: dict | None = None) -> str:
         raw, policy = self._split_language_policy_from_text(text, max_len=4000)
         cleaned = str(raw or "")
         if cleaned:
@@ -40985,6 +42345,59 @@ body{padding:18px}
                 "\n",
                 cleaned,
             )
+        current_step = current_step if isinstance(current_step, dict) else self._current_plan_step_row()
+        try:
+            active_step_no = int((current_step or {}).get("plan_step_index", -1)) + 1
+        except Exception:
+            active_step_no = 0
+
+        def _is_negated(line_low: str) -> bool:
+            return any(
+                marker in line_low
+                for marker in (
+                    "do not", "don't", "never", "must never", "cannot", "can't", "forbidden",
+                    "不要", "不得", "不能", "禁止", "不可", "請勿", "请勿", "不应", "不應",
+                )
+            )
+
+        def _is_runtime_plan_mutation(line: str, line_low: str) -> bool:
+            if PLAN_FILE_RELATIVE_PATH not in line_low and ".clouds_coder\\plan.md" not in line_low:
+                return False
+            if _is_negated(line_low):
+                return False
+            mutation_tokens = (
+                "write_file", "edit_file", "write file", "edit file", "bash redirection",
+                "redirection", "tee ", ">", ">>", "directly edit", "manual", "manually",
+                "update", "rewrite", "replace", "mark step", "mark as", "修改", "编辑",
+                "編輯", "写入", "寫入", "重写", "重寫", "手动", "手工", "直接编辑", "直接修改",
+                "标记", "標記", "推进", "推進",
+            )
+            return any(tok in line_low for tok in mutation_tokens) or any(tok in line for tok in (">", ">>"))
+
+        def _is_future_step_instruction(line: str, line_low: str) -> bool:
+            if active_step_no <= 0 or _is_negated(line_low):
+                return False
+            refs: list[int] = []
+            for m in re.finditer(r"(?i)\bstep\s*(\d+)\b", line):
+                try:
+                    refs.append(int(m.group(1)))
+                except Exception:
+                    pass
+            for m in re.finditer(r"(?:步骤|步驟)\s*(\d+)", line):
+                try:
+                    refs.append(int(m.group(1)))
+                except Exception:
+                    pass
+            if not any(ref > active_step_no for ref in refs):
+                return False
+            action_tokens = (
+                "start", "begin", "execute", "implement", "create", "write", "continue",
+                "then", "next", "advance", "move to", "进入", "開始", "开始", "执行",
+                "實施", "实现", "創建", "创建", "写", "寫", "继续", "繼續", "然后",
+                "接着", "下一步", "推进", "推進",
+            )
+            return any(tok in line_low for tok in action_tokens) or any(tok in line for tok in ("进入", "开始", "执行", "创建", "继续", "然后"))
+
         keep_lines: list[str] = []
         seen: set[str] = set()
         for line in str(cleaned).splitlines():
@@ -40992,6 +42405,10 @@ body{padding:18px}
             if not s:
                 continue
             low = s.lower()
+            if _is_runtime_plan_mutation(s, low):
+                continue
+            if _is_future_step_instruction(s, low):
+                continue
             if low in {"objective", "instruction"}:
                 continue
             if low.startswith("direct objective:"):
@@ -40999,6 +42416,10 @@ body{padding:18px}
             if low.startswith("execute only the approved current plan step"):
                 continue
             if low.startswith("current plan step"):
+                continue
+            if re.search(r"(?:当前|current).*?(?:step|步骤)\s*\d+\s*/\s*\d+", low):
+                continue
+            if re.search(r"(?:已切换到步骤|switched to step)\s*\d+\s*/\s*\d+", low):
                 continue
             if low.startswith("do not replace it with a different project"):
                 continue
@@ -41069,7 +42490,8 @@ body{padding:18px}
             total=max(1, total),
         ) + f": {header}"
         instruction = self._sanitize_instruction_for_current_plan_step(
-            str(row.get("instruction", "") or "").strip()
+            str(row.get("instruction", "") or "").strip(),
+            current_step=current,
         )
         preface = (
             f"Execute ONLY the approved current plan step.\n"
@@ -41889,9 +43311,10 @@ body{padding:18px}
         ok = bool(item.get("ok", False))
         if name in {"write_file", "edit_file"}:
             rel_path = str(args.get("path", "") or "").strip()
-            summary = output if output else f"{name} executed"
-            self._blackboard_upsert_artifact(rel_path, summary, role_key)
-            self._blackboard_set_status("CODING")
+            if ok and not self._is_plan_infrastructure_path(rel_path):
+                summary = output if output else f"{name} executed"
+                self._blackboard_upsert_artifact(rel_path, summary, role_key)
+                self._blackboard_set_status("CODING")
         elif name in {"bash", "worktree_run", "background_run"}:
             cmd = trim(str(args.get("command", "") or "").strip(), 180)
             line = f"{name} {cmd}".strip()
@@ -41996,7 +43419,7 @@ body{padding:18px}
                     self._emit("status", {"summary": "finish deferred: sync mode requires reviewer approval"})
                 else:
                     self._blackboard_mark_approved(approval_note, role_key)
-        if not ok and output:
+        if not ok and output and not self._is_plan_infrastructure_tool_error(name, args, output):
             self._blackboard_append_section(
                 "execution_logs",
                 role_key,
@@ -42008,6 +43431,10 @@ body{padding:18px}
             file_paths = [file_path] if file_path else []
             if name in {"bash", "worktree_run", "background_run"}:
                 file_paths = self._bash_file_read_targets(str(args.get("command", "") or ""))
+            file_paths = [
+                p for p in file_paths
+                if not self._is_plan_infrastructure_path(p)
+            ]
             if file_paths:
                 try:
                     bb = self._ensure_blackboard()
@@ -42842,10 +44269,20 @@ body{padding:18px}
                 mirror_to_global=False,
             )
         if not self.manager_context:
+            previous_context = self._format_previous_task_context_for_prompt(max_chars=900)
+            goal_line = f"Current user goal: {goal_text}\n" if goal_text else ""
+            previous_line = (
+                f"Previous task context for continuity only:\n{previous_context}\n"
+                if previous_context
+                else ""
+            )
             init_msg = {
                 "role": "system",
                 "content": (
                     "Manager context initialized. Delegate by reading blackboard and assigning short slices.\n"
+                    f"{goal_line}"
+                    f"{previous_line}"
+                    "Previous task context is background only; do not treat previous completion as current completion.\n"
                     f"{language_note}"
                 ),
                 "ts": now_ts(),
@@ -44948,17 +46385,19 @@ body{padding:18px}
 
     def _is_restart_scenario(self) -> bool:
         """Check if current state is a restart after finished/aborted task."""
-        bb = self._ensure_blackboard()
-        status = str(bb.get("status", "") or "").upper()
-        approval = bb.get("approval", {}) if isinstance(bb.get("approval"), dict) else {}
-        return status in ("COMPLETED", "ABORTED") or bool(approval.get("approved", False))
+        return bool(self._blackboard_is_finished_or_aborted(self._ensure_blackboard()))
 
     def _fuse_restart_intent(self, user_text: str):
         """Fuse user intent with plan/context intent on restart.
         Priority: 1. user intent, 2. plan intent, 3. context intent."""
         bb = self._ensure_blackboard()
         plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
-        original_goal = trim(str(bb.get("original_goal", "") or ""), 500)
+        previous_ctx = bb.get("previous_task_context", {}) if isinstance(bb.get("previous_task_context", {}), dict) else {}
+        previous_brief = self._format_previous_task_context_for_prompt(previous_ctx, max_chars=900)
+        original_goal = trim(
+            str(previous_ctx.get("goal", "") or bb.get("original_goal", "") or ""),
+            500,
+        )
         plan_steps = plan.get("steps", []) if isinstance(plan.get("steps"), list) else []
         # Detect pure continuation
         _CONTINUE_PHRASES = {
@@ -44985,10 +46424,12 @@ body{padding:18px}
                 return
         if is_continuation and original_goal:
             # Continuation without plan — inherit context intent
+            previous_context_line = f"Previous context:\n{previous_brief}\n" if previous_brief else ""
             fused = (
                 f"<intent-fusion type='context-continuation'>\n"
                 f"User said: {trim(user_text, 100)}\n"
                 f"Continue previous work. Original goal: {original_goal}\n"
+                f"{previous_context_line}"
                 f"{self._continuation_failure_briefing()}"
                 f"Resume from current state. Do NOT restart.\n"
                 f"</intent-fusion>"
@@ -44997,11 +46438,11 @@ body{padding:18px}
             self._mark_runtime_goal_reset_handled(reason="continuation-intent-fusion", clear_reclassify=True)
             return
         # New instruction — fuse with context but user intent takes priority
-        if original_goal:
+        if original_goal and trim(str(user_text or ""), 500) != original_goal:
             fused = (
                 f"<intent-fusion type='new-with-context'>\n"
                 f"New user instruction: {trim(user_text, 500)}\n"
-                f"Previous context: {original_goal}\n"
+                f"Previous context: {previous_brief or original_goal}\n"
                 f"User's new instruction takes priority. Use previous context for background only.\n"
                 f"</intent-fusion>"
             )
@@ -45045,6 +46486,14 @@ body{padding:18px}
                 if self.pending_user_inputs:
                     dropped_stale_inputs = len(self.pending_user_inputs)
                 clean_goal_pre = trim(str(content or "").strip(), 4000)
+                bb_before_submit = self._ensure_blackboard()
+                _finished_boundary = bool(self._blackboard_is_finished_or_aborted(bb_before_submit))
+                _resumable_work_state = bool(self._has_resumable_work_state(bb_before_submit))
+                _previous_task_context = (
+                    self._previous_task_context_snapshot(bb_before_submit)
+                    if _finished_boundary
+                    else {}
+                )
                 # Preserve plan state if awaiting user choice or continuing an approved plan.
                 _awaiting_plan_choice = bool(
                     (
@@ -45067,13 +46516,25 @@ body{padding:18px}
                         if isinstance(bb_plan, dict) and isinstance(bb_plan.get("proposal"), dict):
                             self.runtime_plan_proposal = dict(bb_plan.get("proposal", {}))
                     self._restore_runtime_policy_from_blackboard_locked()
-                elif _continue_existing_plan:
+                elif _continue_existing_plan or (_resumable_work_state and not _finished_boundary):
                     self._restore_runtime_policy_from_blackboard_locked()
                 # Reset completed plan/todo/skills blackboard state so the manager
                 # does not see status=COMPLETED on the very first round and immediately finish.
-                # But preserve plan state if user is continuing an existing task.
-                if not (_awaiting_plan_choice or _continue_existing_plan):
-                    self._reset_blackboard_plan_state_locked()
+                # But preserve active work state so follow-up/resume inputs can be
+                # semantically reclassified before todos are discarded.
+                if _finished_boundary and not (_awaiting_plan_choice or _continue_existing_plan):
+                    self._reset_blackboard_plan_state_locked(
+                        new_goal=clean_goal_pre,
+                        previous_context=_previous_task_context,
+                        clear_progress=True,
+                        reset_agent_contexts=True,
+                    )
+                elif not (_awaiting_plan_choice or _continue_existing_plan or _resumable_work_state):
+                    self._reset_blackboard_plan_state_locked(
+                        new_goal=clean_goal_pre,
+                        clear_progress=True,
+                        reset_agent_contexts=True,
+                    )
                 self.run_generation = int(self.run_generation) + 1
                 clean_goal = trim(str(content or "").strip(), 4000)
                 self._refresh_runtime_code_reference(clean_goal or content)
@@ -45100,7 +46561,7 @@ body{padding:18px}
                         self.runtime_reclassify_required = False
                         self._mark_runtime_goal_reset_handled(reason="plan-choice-accepted", clear_reclassify=True)
                 # Restart intent fusion: merge user/plan/context intents
-                if (not _continue_existing_plan) and self._is_restart_scenario():
+                if (not _continue_existing_plan) and _finished_boundary:
                     self._fuse_restart_intent(clean_goal)
                 self.runtime_reclassify_goal = clean_goal
                 # Skip reclassification for plan choice responses — preserve complexity
@@ -45615,26 +47076,36 @@ body{padding:18px}
         board = self._ensure_blackboard()
         profile = self._ensure_blackboard_task_profile(board)
         budget_val = self._blackboard_round_budget(board)
-        # Fix 7: Pure sync no-plan — if complex task and no plan steps exist, prompt manager
-        # to create them before delegating. Guard: only fires when no plan_step items exist,
-        # so plan+sync mode (which already has plan steps) is completely unaffected.
+        # Pure sync no-plan — create internal plan-step todos at the runtime
+        # boundary. The manager only has routing tools, so a visible prompt asking
+        # it to write blackboard plan rows is not actionable.
         _sync_has_plan = any(
             isinstance(t, dict) and t.get("category") == "plan_step"
             for t in board.get("project_todos", [])
         )
         _sync_complexity = normalize_task_complexity(profile.get("complexity", "simple"), default="simple")
         if not _sync_has_plan and task_complexity_at_least(_sync_complexity, "moderate"):
-            self.messages.append({
-                "role": "system",
-                "content": (
-                    "[SYNC-INIT] No plan steps found for this task. Before delegating to workers, "
-                    "use write_to_blackboard to add 3-5 plan_step items to project_todos. "
-                    'Each item: {"category":"plan_step","content":"N. Step title",'
-                    '"status":"pending","owner":"manager"}. '
-                    "This enables proper todo tracking and completion detection."
-                ),
-                "ts": now_ts(),
-            })
+            bootstrapped = self._bootstrap_sync_plan_steps_if_needed(
+                board,
+                reason="sync-worker-start",
+            )
+            if bootstrapped:
+                board = self._ensure_blackboard()
+                profile = self._ensure_blackboard_task_profile(board)
+            else:
+                self._append_manager_context(
+                    {
+                        "role": "system",
+                        "content": (
+                            "[sync-init] No approved plan-step todos are active. "
+                            "Keep orchestration lightweight: route the concrete user request to the assigned worker. "
+                            "The worker may create TodoWrite items only when semantic complexity, uncertainty, "
+                            "or validation burden makes them useful."
+                        ),
+                        "ts": now_ts(),
+                        "agent_role": "manager",
+                    }
+                )
         self._blackboard_set_status("INITIALIZING", "sync collaborative loop started")
         self._emit(
             "status",
@@ -45916,7 +47387,7 @@ body{padding:18px}
                             pass
             # End-of-turn finish guard:
             # conclusive reply + no open todos + no known errors => auto-finish.
-            agent_text = self._latest_agent_assistant_text(role)
+            agent_text = self._latest_agent_assistant_text(role, min_ts=latest_user_ts)
             if (
                 agent_text
                 and self._looks_like_conclusive_reply(agent_text)
@@ -47388,6 +48859,51 @@ body{padding:18px}
         except Exception:
             return ""
 
+    def _is_plan_file_rel_path(self, path: object) -> bool:
+        rel = str(path or "").strip().replace("\\", "/").lstrip("/")
+        return rel == PLAN_FILE_RELATIVE_PATH
+
+    def _runtime_managed_plan_missing_read_hint(self) -> str:
+        return (
+            f"Error: runtime-managed file '{PLAN_FILE_RELATIVE_PATH}' is not available yet. "
+            "Do not create or repair it with write_file/edit_file. "
+            "Continue from the approved plan in blackboard/project_todos if present; otherwise proceed with the user's task directly."
+        )
+
+    def _ensure_plan_file_current(self, *, force: bool = False) -> bool:
+        """Ensure runtime-managed plan.md exists when plan state exists."""
+        try:
+            target = self._plan_file_path()
+            if target.exists() and not force:
+                return True
+            bb = self._ensure_blackboard()
+            plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
+            todos = bb.get("project_todos", []) if isinstance(bb.get("project_todos"), list) else []
+            has_plan_todos = any(isinstance(t, dict) and t.get("category") == "plan_step" for t in todos)
+            if isinstance(plan, dict) and isinstance(plan.get("steps"), list) and plan.get("steps") and not has_plan_todos:
+                plan_todos = self._build_plan_todos_from_steps(plan.get("steps", []), limit=40)
+                if plan_todos:
+                    bb["project_todos"] = plan_todos[:40]
+                    bb["plan_step_cursor"] = int(bb.get("plan_step_cursor", 0) or 0)
+                    bb["plan_step_total"] = len(plan_todos)
+                    self.blackboard = bb
+                    self._blackboard_touch()
+                    has_plan_todos = True
+            if has_plan_todos or (isinstance(plan, dict) and plan.get("steps")):
+                choice_id = str(
+                    self.runtime_plan_choice
+                    or plan.get("chosen", "")
+                    or (self.runtime_plan_proposal or {}).get("recommended", "")
+                    or "A"
+                ).strip()
+                return self._write_plan_file(self._format_plan_file_execution(choice_id))
+            proposal = self.runtime_plan_proposal if isinstance(self.runtime_plan_proposal, dict) else {}
+            if proposal.get("options"):
+                return self._write_plan_file(self._format_plan_file_preselection(proposal))
+        except Exception:
+            return False
+        return False
+
     def _build_plan_todos_from_steps(self, raw_steps: list, *, limit: int = 40) -> list[dict]:
         grouped_steps = self._group_plan_steps(raw_steps if isinstance(raw_steps, list) else [])
         plan_todos: list[dict] = []
@@ -47556,7 +49072,7 @@ body{padding:18px}
             plan_data = bb.get("plan", {})
             choice_id = str(plan_data.get("chosen", "") if isinstance(plan_data, dict) else "")
         if not choice_id:
-            return False
+            choice_id = "A"
         content = self._format_plan_file_execution(choice_id)
         return self._write_plan_file(content)
 
@@ -48309,7 +49825,7 @@ body{padding:18px}
                 goal_text=self.runtime_reclassify_goal or self._latest_user_goal_text(),
                 media_inputs_round=initial_policy_media_inputs,
             )
-            if self._has_resumable_plan_state():
+            if str(self.plan_mode_user_preference or "auto").strip().lower() != "off" and self._has_resumable_plan_state():
                 try:
                     self._restore_runtime_policy_from_blackboard_locked()
                     repair_issue = self._maybe_prompt_plan_resume_repair(
@@ -48794,10 +50310,55 @@ body{padding:18px}
                         )
                         continue
                     clean_decision_probe = strip_thinking_content(decision_probe).strip()
+                    substantial_reply = self._looks_like_substantial_informative_reply(done_probe)
+                    done_like = self._looks_like_conclusive_reply(done_probe)
+                    todo_blocking = self._todo_should_block_auto_continue(done_probe)
+                    action_promise_pending = self._looks_like_action_promise_without_tool(done_probe)
+                    endpoint = self._detect_endpoint_intent(done_probe, tool_calls)
+                    deliverable = self._detect_no_tool_deliverable_intent(done_probe, tool_calls)
+                    if bool(deliverable.get("matched", False)):
+                        arbiter_planning_rounds = 0
+                        no_tool_rounds = 0
+                        fault_counter = 0
+                        last_fault_reason = ""
+                        self._prune_runtime_retry_hints()
+                        note = (
+                            "single-agent no-tool deliverable accepted "
+                            f"(score={int(deliverable.get('score', 0) or 0)}/"
+                            f"{int(deliverable.get('threshold', 0) or 0)}; "
+                            f"reasons={','.join(deliverable.get('reasons', []) or [])})"
+                        )
+                        self._blackboard_mark_approved(note, single_role)
+                        finish_result = self._resolve_finish_request(
+                            single_role,
+                            source="single-direct-deliverable",
+                            summary=trim(done_probe, 1200),
+                        )
+                        if bool(finish_result.get("stop", False)):
+                            self._emit(
+                                "status",
+                                {
+                                    "summary": (
+                                        "single-agent deliverable detected; run stopped "
+                                        f"(score={int(deliverable.get('score', 0) or 0)}/"
+                                        f"{int(deliverable.get('threshold', 0) or 0)})"
+                                    )
+                                },
+                            )
+                            break
+                        force_single_tool_rounds = max(force_single_tool_rounds, 2)
+                        continue
                     arbiter_probe_len = max(len(clean_decision_probe), len(str(thinking_text or "").strip()))
                     arbiter_should_run = bool(self.arbiter_enabled) and (
-                        arbiter_probe_len >= int(ARBITER_TRIGGER_MIN_CONTENT_CHARS)
-                        or self._looks_like_action_promise_without_tool(done_probe)
+                        action_promise_pending
+                        or (
+                            arbiter_probe_len >= int(ARBITER_TRIGGER_MIN_CONTENT_CHARS)
+                            and (
+                                self._looks_like_incomplete_reply(done_probe)
+                                or todo_blocking
+                                or self._is_long_running_engineering_context()
+                            )
+                        )
                     )
                     if arbiter_should_run:
                         arbiter_decision = self._call_arbiter_llm(clean_decision_probe, thinking_text)
@@ -48927,11 +50488,6 @@ body{padding:18px}
                             },
                         )
                         break
-                    substantial_reply = self._looks_like_substantial_informative_reply(done_probe)
-                    done_like = self._looks_like_conclusive_reply(done_probe)
-                    todo_blocking = self._todo_should_block_auto_continue(done_probe)
-                    action_promise_pending = self._looks_like_action_promise_without_tool(done_probe)
-                    endpoint = self._detect_endpoint_intent(done_probe, tool_calls)
                     if bool(endpoint.get("matched", False)):
                         arbiter_planning_rounds = 0
                         no_tool_rounds = 0
@@ -49864,31 +51420,52 @@ body{padding:18px}
             self._emit("error", {"summary": f"agent error: {exc}", "trace": traceback.format_exc()})
         finally:
             if self.todo.has_open_items() and not self.cancel_requested:
-                _last = self._latest_agent_assistant_text(single_role) or ""
+                _last = self._latest_agent_assistant_text(single_role, min_ts=self._latest_user_message_ts()) or ""
                 if self._looks_like_conclusive_reply(_last):
                     self._resolve_finish_request(
                         single_role,
                         source="single-finally-conclusive",
                         summary=f"single-mode conclusive exit by {single_role}",
                     )
-            dropped_pending_inputs = 0
+            # Generate the old run's completion summary while the run is still
+            # marked active. User input arriving during this tail window stays in
+            # pending_user_inputs and is requeued below instead of being lost.
+            try:
+                self._generate_run_completion_summary()
+            except Exception:
+                pass
+            requeued_pending_inputs: list[dict] = []
+            discarded_pending_inputs = 0
             removed_runtime_hints = 0
             with self.lock:
-                if self.pending_user_inputs:
-                    dropped_pending_inputs = len(self.pending_user_inputs)
+                with self.live_input_queue_lock:
+                    pending_rows = [
+                        dict(row) for row in self.pending_user_inputs
+                        if isinstance(row, dict)
+                    ]
+                    self.pending_user_inputs = []
+                for row in pending_rows:
+                    content = trim(str(row.get("content", "") or "").strip(), 6000)
+                    if not content:
+                        discarded_pending_inputs += 1
+                        continue
+                    if int(row.get("applied_count", 0) or 0) > 0:
+                        discarded_pending_inputs += 1
+                        continue
+                    requeued_pending_inputs.append(row)
                 removed_runtime_hints = self._reset_runtime_state_locked(purge_runtime_hints=True)
                 self.running = False
                 self.scheduler_starting = False
                 self.run_last_heartbeat = now_ts()
                 self.updated_at = now_ts()
                 self._persist()
-            if dropped_pending_inputs > 0:
+            if discarded_pending_inputs > 0:
                 self._emit(
                     "status",
                     {
                         "summary": (
-                            "discarded delayed live inputs after run finished "
-                            f"(count={dropped_pending_inputs})"
+                            "discarded already-applied delayed live inputs after run finished "
+                            f"(count={discarded_pending_inputs})"
                         )
                     },
                 )
@@ -49902,11 +51479,6 @@ body{padding:18px}
                         )
                     },
                 )
-            # Generate completion summary bubble before finishing
-            try:
-                self._generate_run_completion_summary()
-            except Exception:
-                pass
             try:
                 _applied_runtime_updates = self._apply_deferred_runtime_updates()
                 for _note in _applied_runtime_updates[:6]:
@@ -49920,6 +51492,30 @@ body{padding:18px}
                     cb(str(self.owner_user_id or ""), self.id)
                 except Exception:
                     pass
+            if requeued_pending_inputs:
+                requeued_count = 0
+                for row in requeued_pending_inputs:
+                    content = trim(str(row.get("content", "") or "").strip(), 6000)
+                    if not content:
+                        continue
+                    try:
+                        self._enqueue_deferred_start_input(
+                            content,
+                            "live input arrived during run finalization",
+                        )
+                        requeued_count += 1
+                    except Exception:
+                        discarded_pending_inputs += 1
+                if requeued_count > 0:
+                    self._emit(
+                        "status",
+                        {
+                            "summary": (
+                                "requeued live inputs after run finished "
+                                f"(count={requeued_count})"
+                            )
+                        },
+                    )
 
     def snapshot(self, include_model_catalog: bool = False, lite: bool = False) -> dict:
         with self.lock:
@@ -52916,7 +54512,7 @@ function _domUpdateWouldInterrupt(el){
   if(!ae||ae===document.body||ae===document.documentElement)return false;
   if(!el.contains(ae))return false;
   if(ae.matches&&ae.matches('input,textarea,select,[contenteditable="true"]'))return true;
-  if(ae.closest&&ae.closest('.popup-menu,.cmd-pager,.chat-tab,.fe-row,.msg-preview-row'))return true;
+  if(ae.closest&&ae.closest('.popup-menu'))return true;
   return false;
 }
 function _flushDeferredHtml(){
@@ -53212,15 +54808,6 @@ function _deltaScheduleRender(flags={}){
 function scheduleRenderChat(reason='snapshot'){
   const next=String(reason||'snapshot');
   const chatEl=E('chat');
-  if(
-    next!=='scroll'&&
-    chatEl&&
-    _chatVirtIsUserScrolling(chatEl)&&
-    !_chatVirtWantsBottom(chatEl,36)
-  ){
-    _chatVirtDebounceWhileScrolling(chatEl,'_virtDeferredRenderTimer',()=>scheduleRenderChat(next),CHAT_SCROLL_SYNC_DEBOUNCE_MS);
-    return;
-  }
   if(chatEl&&next!=='scroll')_chatVirtCancelDebounce(chatEl,'_virtDeferredRenderTimer');
   const priority={scroll:1,measure:2,delta:3,snapshot:4,language:5,select:6};
   const cur=String(S.chatRenderPendingReason||'');
@@ -53454,7 +55041,7 @@ function _deltaStartWatchdog(){
 function renderSkillsEntryLink(){const link=E('downloadBtn');if(!link)return;const host=location.hostname||'127.0.0.1';const enabled=Boolean(S.config?.skills_ui_enabled);const fromConfig=String(S.config?.skills_ui_url||'').trim();const skillsPort=Number(S.config?.skills_port||0);let href='#';if(enabled){if(fromConfig){href=fromConfig}else if(Number.isFinite(skillsPort)&&skillsPort>0){const currentPort=Number(location.port||0);if(!(currentPort&&skillsPort===currentPort)){href=`${location.protocol}//${host}:${skillsPort}`}}}const offline=(href==='#');link.href=href;link.classList.toggle('disabled',offline);link.textContent=offline?t('skills_offline'):t('open_skills')}
 function tailSig(rows,count,mapper){const arr=Array.isArray(rows)?rows:[];if(!arr.length)return'';return arr.slice(Math.max(0,arr.length-count)).map(mapper).join('|')}
 function feedSignature(snap){const feed=Array.isArray(snap?.conversation_feed)?snap.conversation_feed:(Array.isArray(snap?.messages)?snap.messages:[]);const sig=tailSig(feed,8,row=>`${Number(row?.ts||0)}:${String(row?.role||'')}:${String(row?.agent_role||'')}:${String(row?.type||'')}:${String(row?.text||'').length}:${String(row?.thinking||'').length}:${String(row?.text||'').slice(-12)}:${String(row?.thinking||'').slice(-12)}`);const live=String(snap?.live_thinking||'');const runActive=snap?.live_run_notice_active?1:0;const runLabel=String(snap?.live_run_notice_label||'');const runStart=Number(snap?.live_run_notice_started_at||0);const truncText=String(snap?.live_truncation_text||'');const truncKind=String(snap?.live_truncation_kind||'');const truncTool=String(snap?.live_truncation_tool||'');const truncAttempts=Number(snap?.live_truncation_attempts||0);const truncTokens=Number(snap?.live_truncation_tokens||0);const truncActive=snap?.live_truncation_active?1:0;return `${feed.length}|${sig}|lt=${live.length}:${live.slice(-12)}|rn=${runActive}:${runStart}:${runLabel.slice(-12)}|tr=${truncActive}:${truncAttempts}:${truncTokens}:${truncKind.slice(-12)}:${truncTool.slice(-12)}:${truncText.length}`}
-function boardsSignature(snap){const agentCtx=(Array.isArray(snap?.agent_contexts)?snap.agent_contexts:[]).map(r=>`${r.role}:${r.left}:${r.left_percent}:${r.tier}:${r.active?1:0}`).join(',');return [snap?.running?1:0,snap?.agent_phase||'',Number(snap?.agent_round_index||0),Number(snap?.queued_user_inputs_count||0),Number(snap?.truncation_count||0),Number(snap?.live_truncation_attempts||0),Number(snap?.live_truncation_tokens||0),snap?.live_truncation_active?1:0,Number(snap?.context_tokens_estimate||0),Number(snap?.context_left_tokens||0),Number(snap?.context_left_percent||0),agentCtx,Number(snap?.render_bridge?.seq||0),(snap?.todos||[]).length,(snap?.tasks||[]).length,(snap?.activity||[]).length,(snap?.operations||[]).length,(snap?.uploads||[]).length].join('|')}
+function boardsSignature(snap){const agentCtx=(Array.isArray(snap?.agent_contexts)?snap.agent_contexts:[]).map(r=>`${r.role}:${r.left}:${r.left_percent}:${r.tier}:${r.active?1:0}`).join(',');return [snap?.running?1:0,snap?.agent_phase||'',Number(snap?.agent_round_index||0),Number(snap?.queued_user_inputs_count||0),Number(snap?.truncation_count||0),Number(snap?.live_truncation_attempts||0),Number(snap?.live_truncation_tokens||0),snap?.live_truncation_active?1:0,Number(snap?.context_tokens_estimate||0),Number(snap?.context_left_tokens||0),Number(snap?.context_left_percent||0),agentCtx,Number(snap?.render_bridge?.seq||0),String(snap?.plan_mode_preference||'auto'),Number(snap?.user_task_level||0),(snap?.todos||[]).length,(snap?.tasks||[]).length,(snap?.activity||[]).length,(snap?.operations||[]).length,(snap?.uploads||[]).length].join('|')}
 function sessionsSignature(list){const rows=Array.isArray(list)?list:[];const sig=tailSig(rows,6,row=>`${String(row?.id||'')}:${row?.running?1:0}:${Number(row?.message_count||0)}:${Number(row?.updated_at||0)}`);const aid=String(S.activeId||'').trim();let activeSig='-';if(aid){const activeRow=rows.find(row=>String(row?.id||'')===aid);if(activeRow){activeSig=`${aid}:${activeRow?.running?1:0}:${Number(activeRow?.message_count||0)}:${Number(activeRow?.updated_at||0)}`}else{activeSig=`missing:${aid}`}}return `${rows.length}|active=${activeSig}|${sig}`}
 function _statInfinite(n){const v=Number(n);return(Number.isFinite(v)&&v>0)?String(v):'∞'}
 function applyRuntimeConfigStats(cfg){if(!cfg||typeof cfg!=='object')return;S.config=S.config||{};if(cfg.scheduler&&typeof cfg.scheduler==='object')S.config.scheduler=cfg.scheduler;if(cfg.session_creation_limit&&typeof cfg.session_creation_limit==='object')S.config.session_creation_limit=cfg.session_creation_limit;if(Object.prototype.hasOwnProperty.call(cfg,'daily_session_limit'))S.config.daily_session_limit=cfg.daily_session_limit;if(Object.prototype.hasOwnProperty.call(cfg,'download_js_lib_enabled'))S.config.download_js_lib_enabled=!!cfg.download_js_lib_enabled;if(Object.prototype.hasOwnProperty.call(cfg,'request_timeout_default'))S.config.request_timeout_default=cfg.request_timeout_default;if(Object.prototype.hasOwnProperty.call(cfg,'run_timeout'))S.config.run_timeout=cfg.run_timeout;if(Object.prototype.hasOwnProperty.call(cfg,'shell_command_timeout_seconds'))S.config.shell_command_timeout_seconds=cfg.shell_command_timeout_seconds;if(Object.prototype.hasOwnProperty.call(cfg,'user_memory_mode'))S.config.user_memory_mode=String(cfg.user_memory_mode||'weak');if(Object.prototype.hasOwnProperty.call(cfg,'user_memory_setting_locked'))S.config.user_memory_setting_locked=!!cfg.user_memory_setting_locked;if(Object.prototype.hasOwnProperty.call(cfg,'model')&&String(cfg.model||'').trim())S.config.model=cfg.model;renderMemoryModeAction()}
@@ -55790,22 +57377,18 @@ function _chatVirtSetScrollTop(chatEl,target){
   const maxTop=Math.max(0,Number(chatEl.scrollHeight||0)-Number(chatEl.clientHeight||0));
   const next=Math.max(0,Math.min(Number(target)||0,maxTop));
   if(Math.abs(next-Number(chatEl.scrollTop||0))<0.75)return false;
-  const now=Date.now();
-  chatEl._virtProgrammaticScrollUntil=now+140;
-  chatEl._virtSuppressProgrammaticScrollRenderUntil=now+140;
+  chatEl._virtProgrammaticScrollUntil=Date.now()+120;
   chatEl.scrollTop=next;
   return true;
 }
 function _chatVirtIsBottomLocked(chatEl){
-  return !!chatEl&&Number(chatEl._virtBottomLockUntil||0)>Date.now();
+  return false;
 }
 function _chatVirtClearBottomFollow(chatEl,pause=true){
   S.follow.chat=false;
   if(!chatEl)return;
   chatEl._virtBottomLockUntil=0;
-  if(pause&&S.snap?.running){
-    chatEl._virtAutoFollowPaused=true;
-  }
+  chatEl._virtAutoFollowPaused=false;
 }
 function _chatVirtWithAnchorPreserved(chatEl,fn){
   if(!chatEl||typeof fn!=='function'){
@@ -55844,40 +57427,19 @@ function _chatVirtHasRecentManualInput(chatEl){
 function _chatVirtWantsBottom(chatEl,threshold=24){
   if(!chatEl)return false;
   const th=Math.max(0,Number(threshold)||24);
-  if(nearBottom(chatEl,th)||_chatVirtIsBottomLocked(chatEl))return true;
-  if(chatEl._virtAutoFollowPaused)return false;
-  return false;
+  return Boolean(S.follow.chat)||nearBottom(chatEl,th);
 }
-function _chatVirtShouldDeferLiveRender(chatEl){return !!chatEl&&_chatVirtIsUserScrolling(chatEl)&&!_chatVirtWantsBottom(chatEl,36)}
+function _chatVirtShouldDeferLiveRender(chatEl){return false}
 function _chatVirtScrollToBottom(chatEl){
   if(!chatEl)return;
   S.follow.chat=true;
   chatEl._virtAutoFollowPaused=false;
-  chatEl._virtBottomLockUntil=Math.max(Number(chatEl._virtBottomLockUntil||0),Date.now()+420);
-  const apply=()=>{
-    const maxTop=Math.max(0,Number(chatEl.scrollHeight||0)-Number(chatEl.clientHeight||0));
-    return _chatVirtSetScrollTop(chatEl,maxTop);
-  };
-  const changed=apply();
-  if(changed){
-    if(chatEl._virtBottomRenderRaf)cancelAnimationFrame(chatEl._virtBottomRenderRaf);
-    chatEl._virtBottomRenderRaf=requestAnimationFrame(()=>{
-      chatEl._virtBottomRenderRaf=0;
-      if(_chatVirtWantsBottom(chatEl,12))scheduleRenderChat('scroll');
-    });
-  }
-  if(_chatVirtHasRecentManualInput(chatEl)&&!_chatVirtWantsBottom(chatEl,36))return;
+  chatEl._virtBottomLockUntil=0;
+  if(chatEl._virtBottomRenderRaf){cancelAnimationFrame(chatEl._virtBottomRenderRaf);chatEl._virtBottomRenderRaf=0;}
   if(chatEl._virtBottomRaf)cancelAnimationFrame(chatEl._virtBottomRaf);
-  chatEl._virtBottomRaf=requestAnimationFrame(()=>{
-    chatEl._virtBottomRaf=0;
-    if(!_chatVirtWantsBottom(chatEl,36))return;
-    if(apply()&&_chatVirtWantsBottom(chatEl,12))scheduleRenderChat('scroll');
-    if(_chatVirtWantsBottom(chatEl,18)){
-      requestAnimationFrame(()=>{
-        if(_chatVirtWantsBottom(chatEl,36))apply();
-      });
-    }
-  });
+  chatEl._virtBottomRaf=0;
+  const maxTop=Math.max(0,Number(chatEl.scrollHeight||0)-Number(chatEl.clientHeight||0));
+  _chatVirtSetScrollTop(chatEl,maxTop);
 }
 function _chatVirtBindScroll(chatEl){
   if(chatEl._virtBound)return;
@@ -55895,9 +57457,7 @@ function _chatVirtBindScroll(chatEl){
       now+Math.max(CHAT_SCROLL_ACTIVE_MS,Math.round(lock*0.8))
     );
     if(!nearBottom(chatEl,24)){
-      _chatVirtClearBottomFollow(chatEl,true);
-    }else if(S.snap?.running){
-      chatEl._virtAutoFollowPaused=true;
+      _chatVirtClearBottomFollow(chatEl,false);
     }
   };
   const markTouchStart=(lockMs=CHAT_TOUCH_SCROLL_LOCK_MS)=>{
@@ -55951,16 +57511,10 @@ function _chatVirtBindScroll(chatEl){
     chatEl._virtLastWheelTs=now;
     chatEl._virtLastWheelDy=dy;
     if(dy<0){
-      _chatVirtClearBottomFollow(chatEl,true);
+      if(!nearBottom(chatEl,24))_chatVirtClearBottomFollow(chatEl,false);
       return;
     }
-    if(nearBottom(chatEl,32)){
-      S.follow.chat=true;
-      chatEl._virtBottomLockUntil=Math.max(Number(chatEl._virtBottomLockUntil||0),now+520);
-      chatEl._virtAutoFollowPaused=false;
-    }else{
-      _chatVirtClearBottomFollow(chatEl,true);
-    }
+    if(nearBottom(chatEl,32))S.follow.chat=true;
   },{passive:true});
   chatEl.addEventListener('mousedown',()=>{markManual(Math.round(CHAT_SCROLL_LOCK_MS*0.9))},{passive:true});
   chatEl.addEventListener('touchstart',()=>{markTouchStart(CHAT_TOUCH_SCROLL_LOCK_MS)},{passive:true});
@@ -55988,10 +57542,9 @@ function _chatVirtBindScroll(chatEl){
         chatEl._virtAutoFollowPaused=false;
       }
     }else if(!programmatic){
-      _chatVirtClearBottomFollow(chatEl,true);
+      _chatVirtClearBottomFollow(chatEl,false);
     }
-    if(programmatic&&Number(chatEl._virtSuppressProgrammaticScrollRenderUntil||0)>now)return;
-    scheduleScrollRender();
+    if(!programmatic) scheduleScrollRender();
   });
 }
 function renderChat(reason='snapshot'){
@@ -56246,7 +57799,8 @@ function renderTodoBoard(items){
   const planSteps=todos.filter(x=>String(x?.key||'').startsWith('bb:proj:'));
   const workerTodos=todos.filter(x=>!String(x?.key||'').startsWith('bb:proj:'));
   let html='';
-  if(planSteps.length&&workerTodos.length){
+  const planGroupingEnabled=String(S.snap?.plan_mode_preference||'auto').toLowerCase()!=='off';
+  if(planGroupingEnabled&&planSteps.length){
     // Build parent_step_id index: map step key suffix to its subtasks
     const stepIdFromKey=(key)=>{const k=String(key||'');return k.startsWith('bb:proj:')?k.slice(8):''};
     const subtasksByStep={};
@@ -56280,7 +57834,7 @@ function renderTodoBoard(items){
 }
 function renderTaskBoard(items){const tasks=Array.isArray(items)?items:[];if(!tasks.length)return `<div class=\"mono\">${esc(t('no_tasks'))}</div>`;const completed=tasks.filter(row=>normalizeStatus(row?.status,'pending')==='completed').length;const blocked=tasks.filter(row=>normalizeStatus(row?.status,'pending')==='blocked').length;const cards=tasks.map(row=>{const status=normalizeStatus(row?.status,'pending');const id=Number(row?.id||0)||'-';const subject=cleanWorkText(row?.subject,status)||'(empty task)';const owner=String(row?.owner||'').trim();const blockedBy=Array.isArray(row?.blockedBy)&&row.blockedBy.length?`blocked_by=${row.blockedBy.map(x=>`#${x}`).join(', ')}`:'';const blocks=Array.isArray(row?.blocks)&&row.blocks.length?`blocks=${row.blocks.map(x=>`#${x}`).join(', ')}`:'';const timeTxt=formatTs(row?.updated_at||row?.created_at);const meta=[owner?`owner=@${owner}`:t('owner_unassigned'),blockedBy,blocks,timeTxt].filter(Boolean).join(' · ');return `<div class=\"task-item ${statusClass(status)}\"><div class=\"task-head\"><span class=\"mono task-id\">#${esc(id)}</span><span class=\"status-badge ${statusClass(status)}\">${esc(statusLabel(status))}</span></div><div class=\"task-subject\">${esc(subject)}</div><div class=\"task-meta\">${esc(meta)}</div></div>`}).join('');return `<div class=\"board-summary\"><span>${esc(tasks.length-completed)} ${esc(t('open'))}</span><span>${esc(completed)} ${esc(t('completed'))} · ${esc(blocked)} ${esc(t('blocked'))}</span></div><div class=\"task-list\">${cards}</div>`}
 function ensureFileExplorerState(sessionId){const sid=String(sessionId||S.activeId||'').trim();if(!sid)return null;if(!S.fileExplorerBySession)S.fileExplorerBySession={};if(!S.fileExplorerBySession[sid]||typeof S.fileExplorerBySession[sid]!=='object'){S.fileExplorerBySession[sid]={tree:null,root:'',nodeCount:0,truncated:false,maxNodes:0,fetchedAt:0,lastRequestAt:0,lastErrorAt:0,inflight:false,selected:'',expanded:{'':true}}}const st=S.fileExplorerBySession[sid];if(!st.expanded||typeof st.expanded!=='object')st.expanded={'':true};st.expanded['']=true;if(!Number.isFinite(Number(st.lastRequestAt)))st.lastRequestAt=0;if(!Number.isFinite(Number(st.lastErrorAt)))st.lastErrorAt=0;return st}
-function _fePath(sessionId){const sid=encodeURIComponent(String(sessionId||'').trim());return `/api/sessions/${sid}/files-tree`}
+function _fePath(sessionId){const sid=encodeURIComponent(String(sessionId||'').trim());return `/api/sessions/${sid}/files-tree?max_nodes=420&max_depth=5`}
 function _feSize(bytes){const n=Number(bytes||0);if(!Number.isFinite(n)||n<0)return '-';if(n<1024)return `${n}B`;if(n<1024*1024)return `${(n/1024).toFixed(1)}KB`;if(n<1024*1024*1024)return `${(n/(1024*1024)).toFixed(1)}MB`;return `${(n/(1024*1024*1024)).toFixed(1)}GB`}
 function _feTs(ts){const n=Number(ts||0);if(!Number.isFinite(n)||n<=0)return'';try{return new Date(n*1000).toLocaleString()}catch(_){return''}}
 function _feKindLabel(kind){const k=String(kind||'').trim().toLowerCase();if(k==='html')return'HTML';if(k==='markdown')return'MD';if(k==='image')return'IMG';if(k==='video')return'VIDEO';if(k==='audio')return'AUDIO';if(k==='pdf')return'PDF';if(k==='csv')return'CSV';if(k==='excel')return'XLS';if(k==='document')return'DOC';if(k==='presentation')return'PPT';if(k==='code')return'CODE';return''}
@@ -56298,7 +57852,7 @@ function _safeJsonSig(value){try{return JSON.stringify(value??null)}catch(_){ret
 function _opsTailSignature(rows,count,mapper){const arr=Array.isArray(rows)?rows:[];return arr.slice(Math.max(0,arr.length-count)).map(mapper).join('|')}
 function renderRuntimeStatus(){const uiState=S.staticMode?(S.frozen?'static':'live'):'live';const boolWord=v=>t(v?'state_on':'state_off');const activeRole=String(S.snap?.agent_active_role||'').trim();const activeRoleLabel=activeRole?_chatVirtAgentRoleLabel(activeRole):'-';const runtimeItems=[{label:t('rt_session'),value:S.snap?.id||'-',mono:true},{label:t('rt_model'),value:S.snap?.model||'-',mono:true},{label:t('rt_thinking'),value:boolWord(S.snap?.thinking)},{label:t('rt_thinking_stream'),value:boolWord(S.snap?.thinking_stream)},{label:t('rt_mode'),value:S.snap?.execution_mode||S.config?.execution_mode||'sync'},{label:t('rt_active_agent'),value:activeRoleLabel},{label:t('rt_blackboard'),value:S.snap?.blackboard?.status||'-'},{label:t('rt_task'),value:S.snap?.blackboard?.task_profile?.task_type||'-'},{label:t('rt_complexity'),value:S.snap?.blackboard?.task_profile?.complexity||'-'},{label:t('rt_judgement'),value:S.snap?.blackboard?.manager_judgement?.progress||'-'},{label:t('rt_budget'),value:S.snap?.blackboard?.task_profile?.round_budget??'-'},{label:t('rt_remaining'),value:S.snap?.blackboard?.manager_judgement?.remaining_rounds??'-'},{label:t('rt_blackboard_cycles'),value:S.snap?.blackboard?.manager_cycles??'-'},{label:t('rt_round_limit'),value:S.snap?.max_agent_rounds||'-'},{label:t('rt_round'),value:S.snap?.agent_round_index??'-'},{label:t('rt_phase'),value:S.snap?.agent_phase||t('idle')},{label:t('rt_queued_inputs'),value:S.snap?.queued_user_inputs_count??0},{label:t('rt_run_timeout'),value:`${S.snap?.max_run_seconds??'-'}s`},{label:t('rt_ctx_used'),value:S.snap?.context_tokens_estimate??'-'},{label:t('rt_ctx_limit'),value:S.snap?.context_effective_token_limit||S.snap?.context_token_upper_bound||'-'},{label:t('rt_ctx_mode'),value:t(S.snap?.context_token_limit_locked?'rt_manual_lock':'rt_adaptive')},{label:t('rt_ctx_left'),value:formatContextLeft(S.snap)},{label:t('rt_truncation'),value:S.snap?.truncation_count||0},{label:t('rt_trunc_retry'),value:S.snap?.live_truncation_attempts||0},{label:t('rt_trunc_tokens'),value:S.snap?.live_truncation_tokens||0},{label:t('rt_archive'),value:S.snap?.compact_segments_count||0},{label:t('rt_last_compact'),value:S.snap?.last_compact_reason||'-'},{label:t('rt_ollama'),value:S.snap?.ollama_base_url||'-',mono:true,wide:true},{label:t('rt_files'),value:S.snap?.session_files_root||'-',mono:true,wide:true},{label:t('rt_ui_mode'),value:uiState},{label:t('rt_state'),value:S.snap?.running?t('running'):t('idle'),tone:S.snap?.running?'state-running':'state-idle'}];setHtmlIfChanged('status',runtimeItems.map(item=>_runtimePillHtml(item.label,item.value,item)).join('')+agentContextChipsHtml(S.snap),'runtimeStatus')}
 function renderPlanLevelControls(){const _pmBtn=E('planModeBtn');if(_pmBtn){const _pm=S.snap?.plan_mode_preference||'auto';setTextIfChanged(_pmBtn,'Plan: '+_pm.charAt(0).toUpperCase()+_pm.slice(1))}updateLevelBtn(S.snap?.user_task_level||0)}
-function renderTodoTaskPanels(){const todoSig=currentLang()+'|'+_safeJsonSig(S.snap?.todos||[]);if(S.renderSigs.todosSig!==todoSig){S.renderSigs.todosSig=todoSig;setPanelHtml('todos',renderTodoBoard(S.snap?.todos||[]))}const taskSig=currentLang()+'|'+_safeJsonSig(S.snap?.tasks||[]);if(S.renderSigs.tasksSig!==taskSig){S.renderSigs.tasksSig=taskSig;setPanelHtml('tasks',renderTaskBoard(S.snap?.tasks||[]))}}
+function renderTodoTaskPanels(){const todoSig=currentLang()+'|'+String(S.snap?.plan_mode_preference||'auto')+'|'+_safeJsonSig(S.snap?.todos||[]);if(S.renderSigs.todosSig!==todoSig){S.renderSigs.todosSig=todoSig;setPanelHtml('todos',renderTodoBoard(S.snap?.todos||[]))}const taskSig=currentLang()+'|'+_safeJsonSig(S.snap?.tasks||[]);if(S.renderSigs.tasksSig!==taskSig){S.renderSigs.tasksSig=taskSig;setPanelHtml('tasks',renderTaskBoard(S.snap?.tasks||[]))}}
 function renderActivityPanel(){const rows=(S.snap?.activity||[]).slice(-80).sort((a,b)=>Number(a.ts||0)-Number(b.ts||0));const sig=currentLang()+'|'+rows.map(a=>`${Number(a.ts||0)}:${String(a.summary||'')}`).join('|');if(S.renderSigs.activitySig===sig)return;S.renderSigs.activitySig=sig;setPanelHtml('activity',rows.map(a=>`<div class=\"mono\">${new Date(a.ts*1000).toLocaleTimeString()} · ${esc(a.summary)}</div>`).join('')||`<div class=\"mono\">${esc(t('no_activity'))}</div>`)}
 function _commandPanelSig(cmds){return currentLang()+'|'+cmds.map(e=>{const d=(e&&typeof e==='object'&&e.data&&typeof e.data==='object')?e.data:{};const page=_cmdCurrentPage(e);const out=String(_cmdPageText(e,page)||'');return `${_cmdStateKey(e)}:${page}:${_cmdPageCount(e)}:${d.exit_code}:${d.ui_truncated?1:0}:${d.model_truncated?1:0}:${out.length}:${out.slice(-24)}`}).join('|')}
 function renderCommandsPanel(ops){const cmds=(Array.isArray(ops)?ops:[]).filter(x=>x.type==='command').slice(-30).reverse();const sig=_commandPanelSig(cmds);if(S.renderSigs.commandsSig===sig)return;S.renderSigs.commandsSig=sig;setPanelHtml('commands',cmds.map(e=>{const d=(e&&typeof e==='object'&&e.data&&typeof e.data==='object')?e.data:{};const page=_cmdCurrentPage(e);const total=_cmdPageCount(e);const totalAll=Math.max(total,Number(d.ui_output_page_total||0)||total);const flags=[d.ui_truncated?`<span class=\"cmd-flag warn\">${esc(t('cmd_ui_preview_truncated'))}</span>`:'',d.model_truncated?`<span class=\"cmd-flag info\">${esc(t('cmd_model_context_truncated'))}</span>`:'',d.temp_output_path?`<span class=\"cmd-flag info\">${esc(t('cmd_temp_read_file_ready'))}</span>`:'',d.buffer_ref?`<span class=\"cmd-flag\">${esc(t('cmd_buffered_copy'))}</span>`:''].filter(Boolean).join('');const pager=total>1?`<div class=\"cmd-pager\"><button data-cmd-key=\"${esc(_cmdStateKey(e))}\" data-cmd-page=\"-1\" data-cmd-total=\"${esc(total)}\" ${page<=1?'disabled':''}>${esc(t('cmd_prev'))}</button><span class=\"cmd-sub\">${esc(t('cmd_preview'))} ${esc(page)}/${esc(total)}${totalAll>total?` · ${esc(t('cmd_of'))} ${esc(totalAll)}`:''}</span><button data-cmd-key=\"${esc(_cmdStateKey(e))}\" data-cmd-page=\"1\" data-cmd-total=\"${esc(total)}\" ${page>=total?'disabled':''}>${esc(t('cmd_next'))}</button></div>`:'';const extra=[d.temp_output_path?`<div class=\"cmd-sub\">${esc(t('cmd_read_file_path'))}: ${esc(d.temp_output_path)}</div>`:'',d.buffer_ref?`<div class=\"cmd-sub\">${esc(t('cmd_buffer_ref'))}: ${esc(d.buffer_ref)} · ${esc(t('cmd_chars'))}=${esc(d.buffer_chars||0)}</div>`:'',Number(d.output_full_chars||0)>0?`<div class=\"cmd-sub\">${esc(t('cmd_full_output'))}: ${esc(d.output_full_chars)} ${esc(t('cmd_chars'))} · ${esc(d.output_full_lines||0)} ${esc(t('cmd_lines'))} · ${esc(t('cmd_strategy'))}=${esc(d.long_output_strategy||'inline')}</div>`:''].filter(Boolean).join('');const output=String(_cmdPageText(e,page)||'').trim();return `<div class=\"cmd-item\"><div class=\"cmd-main\">${esc(d.name||t('cmd_default_name'))} · ${esc(t('cmd_exit'))}=${esc(d.exit_code??'-')}</div><div class=\"cmd-sub\">${esc(d.command||'')}<br>${esc(d.cwd||'')}</div>${flags?`<div class=\"cmd-flags\">${flags}</div>`:''}${extra}${output?`<div class=\"cmd-output\">${esc(output)}</div>`:''}${pager}</div>`}).join('')||`<div class=\"mono\">${esc(t('no_commands'))}</div>`);const cmdHost=E('commands');if(cmdHost){for(const btn of cmdHost.querySelectorAll('[data-cmd-page]')){btn.onclick=(ev)=>{ev.preventDefault();const key=String(btn.getAttribute('data-cmd-key')||'').trim();const step=Number(btn.getAttribute('data-cmd-page')||0);const total=Math.max(1,Number(btn.getAttribute('data-cmd-total')||1));if(!key||!step)return;if(!S.commandPageState||typeof S.commandPageState!=='object')S.commandPageState={};const cur=Number(S.commandPageState[key]||1);S.commandPageState[key]=Math.max(1,Math.min(total,cur+step));S.renderSigs.commandsSig='';renderBoards()}}}}
@@ -56640,7 +58194,58 @@ function bindEvents(id){
   };
 }
 async function loadModelCatalog(forceRefresh=false){const q=forceRefresh?'?refresh=1':'';if(S.activeId){return await api('/api/sessions/'+S.activeId+'/models'+q)}return await api('/api/models'+q)}
-async function selectSession(id){S.activeId=id;S.frozen=false;S.lastEventSeq=0;S.deltaGapCount=0;S.lastDeltaTs=Date.now();S.diffCenterDisabled=Object.create(null);S.previewCenterDisabled=Object.create(null);S.diffCenteredDone=Object.create(null);S.previewCenteredDone=Object.create(null);applyStaticUiClass();renderSessions();ensurePreviewState(id);bindEvents(id);_deltaStartWatchdog();pullRenderState(id,true);await refreshSnapshot({forceFull:true,allowWhenFrozen:true});renderPreviewTabs();renderPreviewVisibility();renderActivePreview(false);showError('')}
+function _chatVirtResetScrollState(chatEl){
+  S.follow.chat=true;
+  if(!chatEl)return;
+  if(chatEl._virtScrollRenderTimer){clearTimeout(chatEl._virtScrollRenderTimer);chatEl._virtScrollRenderTimer=0;}
+  if(chatEl._virtRaf){cancelAnimationFrame(chatEl._virtRaf);chatEl._virtRaf=0;}
+  if(chatEl._virtBottomRaf){cancelAnimationFrame(chatEl._virtBottomRaf);chatEl._virtBottomRaf=0;}
+  if(chatEl._virtBottomRenderRaf){cancelAnimationFrame(chatEl._virtBottomRenderRaf);chatEl._virtBottomRenderRaf=0;}
+  _chatVirtCancelDebounce(chatEl,'_virtScrollSyncTimer');
+  _chatVirtCancelDebounce(chatEl,'_virtBoardsSyncTimer');
+  _chatVirtCancelDebounce(chatEl,'_virtDeferredRenderTimer');
+  chatEl._virtProgrammaticScrollUntil=0;
+  chatEl._virtUserScrollTs=0;
+  chatEl._virtLastScrollTs=0;
+  chatEl._virtManualUnlockTs=0;
+  chatEl._virtInputUnlockTs=0;
+  chatEl._virtTouchUnlockTs=0;
+  chatEl._virtAutoFollowPaused=false;
+  chatEl._virtBottomLockUntil=0;
+  chatEl._chatHasRendered=false;
+  chatEl._virtRangeKey='';
+  chatEl._virtRenderKey='';
+  chatEl._virtRowsCacheSig='';
+  chatEl._virtRowsCacheRows=null;
+  chatEl._virtRowsStableKeySig='';
+  chatEl._virtRowsStableKeyValue='';
+  chatEl._virtLastRows=null;
+  chatEl._virtLastWinStart=-1;
+  chatEl._virtLastWinEnd=-1;
+}
+async function selectSession(id){
+  S.activeId=id;
+  S.frozen=false;
+  S.lastEventSeq=0;
+  S.deltaGapCount=0;
+  S.lastDeltaTs=Date.now();
+  S.diffCenterDisabled=Object.create(null);
+  S.previewCenterDisabled=Object.create(null);
+  S.diffCenteredDone=Object.create(null);
+  S.previewCenteredDone=Object.create(null);
+  _chatVirtResetScrollState(E('chat'));
+  applyStaticUiClass();
+  renderSessions();
+  ensurePreviewState(id);
+  bindEvents(id);
+  _deltaStartWatchdog();
+  pullRenderState(id,true);
+  await refreshSnapshot({forceFull:true,allowWhenFrozen:true});
+  renderPreviewTabs();
+  renderPreviewVisibility();
+  renderActivePreview(false);
+  showError('');
+}
 async function createSession(opt={}){
   showError('');
   const usePrompt=opt.prompt!==false;
@@ -71492,6 +73097,349 @@ CODE_ADMIN_JS = (
     .replace("No query results.", "No code library results.")
 )
 
+IDE_INDEX_HTML = """<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Clouds Coder IDE</title>
+<link rel="stylesheet" href="/assets/ide.css">
+</head>
+<body>
+<div class="ide-shell">
+  <aside class="activity-bar">
+    <button class="activity-button is-active" data-view="explorer" title="Explorer">EX</button>
+    <button class="activity-button" data-view="tools" title="Tools">TL</button>
+    <button class="activity-button" data-view="agent" title="Agent">AI</button>
+  </aside>
+  <aside class="side-panel">
+    <section class="panel-view is-active" data-panel="explorer">
+      <div class="panel-head">
+        <span>Explorer</span>
+        <div class="panel-actions">
+          <button id="refreshTreeBtn" title="Refresh">R</button>
+          <button id="newFileBtn" title="New file">F</button>
+          <button id="newFolderBtn" title="New folder">D</button>
+        </div>
+      </div>
+      <select id="sessionSelect" class="select"></select>
+      <select id="rootSelect" class="select"></select>
+      <div class="upload-row">
+        <button id="uploadFilesBtn">Files</button>
+        <button id="uploadFolderBtn">Folder</button>
+        <input id="fileInput" type="file" multiple hidden>
+        <input id="folderInput" type="file" multiple webkitdirectory directory hidden>
+      </div>
+      <div id="tree" class="tree"></div>
+    </section>
+    <section class="panel-view" data-panel="tools">
+      <div class="panel-head"><span>Toolchains</span><button id="refreshToolsBtn">R</button></div>
+      <div id="toolchains" class="toolchains"></div>
+      <div class="mount-box">
+        <label>Mount path</label>
+        <input id="mountPathInput" class="input" placeholder="/path/to/project">
+        <button id="mountBtn">Authorize</button>
+        <div id="mounts" class="mounts"></div>
+      </div>
+    </section>
+    <section class="panel-view" data-panel="agent">
+      <div class="panel-head"><span>Agent</span></div>
+      <textarea id="agentPrompt" class="agent-prompt" placeholder="Describe the coding task"></textarea>
+      <button id="sendAgentBtn" class="primary">Run agent task</button>
+      <div id="agentStatus" class="status-line"></div>
+    </section>
+  </aside>
+  <main class="workbench">
+    <header class="topbar">
+      <div class="brand">Clouds Coder IDE</div>
+      <div id="status" class="status-line">loading</div>
+      <button id="createSessionBtn">New session</button>
+    </header>
+    <div id="tabs" class="tabs"></div>
+    <section class="editor-wrap">
+      <div id="emptyState" class="empty-state">Open a file from Explorer</div>
+      <textarea id="editor" spellcheck="false"></textarea>
+    </section>
+    <section class="bottom-panel">
+      <div class="terminal-head">
+        <span>Terminal</span>
+        <input id="cwdInput" class="terminal-cwd" placeholder="cwd">
+      </div>
+      <div class="terminal-run">
+        <input id="commandInput" class="command-input" placeholder="python3 main.py">
+        <button id="runCommandBtn">Run</button>
+      </div>
+      <pre id="terminalOutput" class="terminal-output"></pre>
+    </section>
+  </main>
+</div>
+<script src="/assets/ide.js"></script>
+</body>
+</html>
+"""
+
+IDE_CSS = """
+:root{
+  --bg:#111315;
+  --panel:#181b1f;
+  --panel-2:#1f242a;
+  --line:#30363d;
+  --ink:#e7edf3;
+  --muted:#9aa5b1;
+  --accent:#4aa8ff;
+  --accent-2:#55d6a9;
+  --danger:#ff6b6b;
+}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0;background:var(--bg);color:var(--ink);font-family:Inter,Segoe UI,Arial,sans-serif;font-size:13px;letter-spacing:0}
+button,input,select,textarea{font:inherit}
+button{border:1px solid var(--line);background:var(--panel-2);color:var(--ink);border-radius:4px;padding:6px 9px;cursor:pointer}
+button:hover{border-color:#52606c;background:#252b32}
+button.primary{background:#0f5fa8;border-color:#1674c8}
+.ide-shell{height:100vh;display:grid;grid-template-columns:44px minmax(230px,320px) 1fr;overflow:hidden}
+.activity-bar{background:#0d0f11;border-right:1px solid var(--line);display:flex;flex-direction:column;align-items:center;padding:8px 4px;gap:8px}
+.activity-button{width:32px;height:32px;padding:0;border-radius:6px;font-size:11px;color:var(--muted)}
+.activity-button.is-active{color:#fff;background:#173a59;border-color:#28679a}
+.side-panel{background:var(--panel);border-right:1px solid var(--line);min-width:0;overflow:hidden}
+.panel-view{height:100%;display:none;grid-template-rows:auto auto auto 1fr;gap:8px;padding:10px;min-width:0}
+.panel-view.is-active{display:grid}
+.panel-head{display:flex;align-items:center;justify-content:space-between;gap:8px;text-transform:uppercase;color:#cbd5df;font-size:12px;font-weight:700}
+.panel-actions{display:flex;gap:5px}
+.select,.input{width:100%;min-width:0;background:#101316;color:var(--ink);border:1px solid var(--line);border-radius:4px;padding:7px}
+.upload-row{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.tree{overflow:auto;min-height:0;border-top:1px solid var(--line);padding-top:8px}
+.tree-row{display:grid;grid-template-columns:18px 1fr auto;align-items:center;gap:4px;min-height:24px;padding:1px 4px;border-radius:4px;white-space:nowrap}
+.tree-row:hover{background:#242a31}
+.tree-row.is-active{background:#123454}
+.tree-name{overflow:hidden;text-overflow:ellipsis}
+.tree-meta{color:var(--muted);font-size:11px}
+.tree-twist{width:18px;height:18px;padding:0;border:none;background:transparent;color:var(--muted)}
+.toolchains,.mounts{display:flex;flex-direction:column;gap:7px;overflow:auto}
+.tool-row,.mount-row{border:1px solid var(--line);background:#12161a;border-radius:6px;padding:8px}
+.tool-row strong{color:#d8e4ef}
+.tool-row span,.mount-row span{display:block;color:var(--muted);font-size:12px;margin-top:3px;overflow:hidden;text-overflow:ellipsis}
+.mount-box{display:grid;gap:7px;align-content:start}
+.workbench{min-width:0;display:grid;grid-template-rows:42px 34px minmax(0,1fr) minmax(120px,25vh);height:100vh}
+.topbar{display:flex;align-items:center;gap:10px;padding:0 12px;background:#15181c;border-bottom:1px solid var(--line)}
+.brand{font-weight:700;white-space:nowrap}
+.status-line{color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:1}
+.tabs{display:flex;align-items:end;overflow-x:auto;background:#171a1f;border-bottom:1px solid var(--line)}
+.tab{display:flex;align-items:center;gap:8px;max-width:260px;min-width:120px;height:33px;padding:0 9px;border-right:1px solid var(--line);background:#1b2026;color:#b9c4cf}
+.tab.is-active{background:#222832;color:#fff}
+.tab span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tab button{border:none;background:transparent;padding:0;color:var(--muted)}
+.editor-wrap{position:relative;min-height:0;background:#101316}
+#editor{display:none;width:100%;height:100%;resize:none;border:0;outline:0;background:#101316;color:#dce6f0;padding:14px;font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;tab-size:2}
+#editor.is-visible{display:block}
+.empty-state{position:absolute;inset:0;display:grid;place-items:center;color:#6f7b86}
+.empty-state.is-hidden{display:none}
+.bottom-panel{min-height:0;display:grid;grid-template-rows:32px 36px 1fr;background:#14171b;border-top:1px solid var(--line)}
+.terminal-head,.terminal-run{display:flex;align-items:center;gap:8px;padding:5px 9px;border-bottom:1px solid var(--line)}
+.terminal-cwd{width:220px;background:#0e1114;color:var(--ink);border:1px solid var(--line);border-radius:4px;padding:5px}
+.command-input{flex:1;min-width:0;background:#0e1114;color:var(--ink);border:1px solid var(--line);border-radius:4px;padding:6px}
+.terminal-output{margin:0;padding:10px;overflow:auto;white-space:pre-wrap;color:#d7dee6;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.agent-prompt{width:100%;min-height:170px;resize:vertical;background:#101316;color:var(--ink);border:1px solid var(--line);border-radius:6px;padding:8px}
+@media (max-width:860px){
+  .ide-shell{grid-template-columns:40px minmax(190px,42vw) 1fr}
+  .workbench{grid-template-rows:42px 34px minmax(0,1fr) 180px}
+  .terminal-cwd{width:120px}
+}
+"""
+
+IDE_JS = """
+const E=id=>document.getElementById(id);
+const S={config:null,sessions:[],roots:[],activeSession:'',activeRoot:'session',treeCache:new Map(),openFiles:new Map(),activeFile:null,dirty:false};
+async function api(path,opts={}){
+  const headers=Object.assign({'Content-Type':'application/json'},opts.headers||{});
+  const res=await fetch(path,Object.assign({headers},opts));
+  const text=await res.text();
+  let data={};
+  try{data=text?JSON.parse(text):{}}catch{data={error:text||res.statusText}}
+  if(!res.ok)throw new Error(data.error||res.statusText);
+  return data;
+}
+function setStatus(text,bad=false){const el=E('status');el.textContent=text||'';el.style.color=bad?'var(--danger)':'var(--muted)'}
+function rootQuery(){return 'root_id='+encodeURIComponent(S.activeRoot||'session')}
+function pathQuery(path){return '&path='+encodeURIComponent(path||'')}
+function activeDir(){if(S.activeFile){const p=S.activeFile.path||'';const i=p.lastIndexOf('/');return i>0?p.slice(0,i):''}return E('cwdInput').value.trim()}
+function fileIcon(row){return row.type==='dir'?(row.skipped?'x':'▸'):'·'}
+function escapeText(v){return String(v||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
+async function refreshConfig(){
+  S.config=await api('/api/ide/config');
+  S.sessions=Array.isArray(S.config.sessions)?S.config.sessions:[];
+  S.activeSession=S.activeSession||S.config.active_session_id||'';
+  renderSessions();
+  renderTools();
+  if(!S.activeSession)await createSession();
+  await loadRoots();
+}
+function renderSessions(){
+  const sel=E('sessionSelect');sel.innerHTML='';
+  for(const row of S.sessions){
+    const opt=document.createElement('option');opt.value=row.id;opt.textContent=row.title||row.id;if(row.id===S.activeSession)opt.selected=true;sel.appendChild(opt);
+  }
+}
+async function createSession(){
+  const title='IDE Workspace '+new Date().toLocaleTimeString();
+  const out=await api('/api/ide/sessions',{method:'POST',body:JSON.stringify({title})});
+  S.activeSession=out.id;await refreshConfig();
+}
+async function loadRoots(){
+  if(!S.activeSession)return;
+  const out=await api('/api/ide/sessions/'+encodeURIComponent(S.activeSession)+'/workspace/roots');
+  S.roots=Array.isArray(out.roots)?out.roots:[];
+  renderRoots();
+  if(!S.roots.some(r=>r.id===S.activeRoot))S.activeRoot=(S.roots[0]&&S.roots[0].id)||'session';
+  E('rootSelect').value=S.activeRoot;
+  await loadTree('');
+}
+function renderRoots(){
+  const sel=E('rootSelect');sel.innerHTML='';
+  for(const root of S.roots){
+    const opt=document.createElement('option');opt.value=root.id;opt.textContent=(root.kind==='mount'?'M ':'S ')+(root.label||root.id);sel.appendChild(opt);
+  }
+}
+function renderTools(){
+  const tools=E('toolchains');tools.innerHTML='';
+  for(const t of (S.config.toolchains||[])){
+    const row=document.createElement('div');row.className='tool-row';
+    row.innerHTML='<strong>'+escapeText(t.name)+' '+(t.available?'available':'missing')+'</strong><span>'+escapeText(t.available?Object.keys(t.found||{}).join(', '):t.install_hint)+'</span>';
+    tools.appendChild(row);
+  }
+  const mounts=E('mounts');mounts.innerHTML='';
+  for(const m of (S.config.mounts||[])){
+    const row=document.createElement('div');row.className='mount-row';
+    row.innerHTML='<strong>'+escapeText(m.label||m.id)+'</strong><span>'+escapeText(m.path||'')+'</span><button data-mid="'+escapeText(m.id)+'">Remove</button>';
+    row.querySelector('button').onclick=()=>removeMount(m.id).catch(err=>setStatus(err.message,true));
+    mounts.appendChild(row);
+  }
+}
+async function loadTree(path){
+  if(!S.activeSession)return;
+  const out=await api('/api/ide/sessions/'+encodeURIComponent(S.activeSession)+'/workspace/tree?'+rootQuery()+pathQuery(path||''));
+  S.treeCache.set((path||''),out.tree.children||[]);
+  renderTree();
+  setStatus('tree '+(out.scan_ms||0)+'ms');
+}
+function renderTree(){
+  const host=E('tree');host.innerHTML='';
+  const draw=(path,depth)=>{
+    const rows=S.treeCache.get(path||'')||[];
+    for(const row of rows){
+      const div=document.createElement('div');div.className='tree-row'+(S.activeFile&&S.activeFile.path===row.path?' is-active':'');
+      div.style.paddingLeft=(4+depth*14)+'px';
+      div.innerHTML='<button class="tree-twist">'+escapeText(fileIcon(row))+'</button><span class="tree-name">'+escapeText(row.name)+'</span><span class="tree-meta">'+(row.type==='file'?Math.ceil((row.size||0)/1024)+'k':'')+'</span>';
+      div.onclick=async(ev)=>{
+        ev.stopPropagation();
+        if(row.type==='dir'){
+          if(row.skipped)return setStatus('directory skipped by performance guard');
+          if(S.treeCache.has(row.path))S.treeCache.delete(row.path);else await loadTree(row.path);
+          renderTree();
+        }else{
+          await openFile(row.path);
+        }
+      };
+      host.appendChild(div);
+      if(row.type==='dir'&&S.treeCache.has(row.path))draw(row.path,depth+1);
+    }
+  };
+  draw('',0);
+}
+function renderTabs(){
+  const tabs=E('tabs');tabs.innerHTML='';
+  for(const [key,file] of S.openFiles){
+    const tab=document.createElement('div');tab.className='tab'+(S.activeFile&&key===S.activeFile.key?' is-active':'');
+    tab.innerHTML='<span>'+escapeText(file.name||file.path)+'</span><button>x</button>';
+    tab.onclick=()=>activateFile(key);
+    tab.querySelector('button').onclick=(ev)=>{ev.stopPropagation();closeFile(key)};
+    tabs.appendChild(tab);
+  }
+}
+function activateFile(key){
+  const file=S.openFiles.get(key);if(!file)return;
+  S.activeFile=file;S.dirty=false;E('editor').value=file.content||'';E('editor').classList.add('is-visible');E('emptyState').classList.add('is-hidden');E('cwdInput').value=file.dir||'';renderTabs();renderTree();
+}
+function closeFile(key){
+  S.openFiles.delete(key);
+  if(S.activeFile&&S.activeFile.key===key){S.activeFile=null;E('editor').value='';E('editor').classList.remove('is-visible');E('emptyState').classList.remove('is-hidden')}
+  renderTabs();
+}
+async function openFile(path){
+  const key=S.activeRoot+'::'+path;
+  if(S.openFiles.has(key))return activateFile(key);
+  const out=await api('/api/ide/sessions/'+encodeURIComponent(S.activeSession)+'/workspace/file?'+rootQuery()+pathQuery(path));
+  if(out.encoding==='base64')throw new Error('binary file cannot be edited here');
+  const i=path.lastIndexOf('/');
+  const file={key,path,name:path.split('/').pop(),dir:i>0?path.slice(0,i):'',content:out.content||'',root_id:S.activeRoot};
+  S.openFiles.set(key,file);activateFile(key);setStatus('opened '+path);
+}
+async function saveActive(){
+  if(!S.activeFile)return;
+  const content=E('editor').value;
+  await api('/api/ide/sessions/'+encodeURIComponent(S.activeSession)+'/workspace/file',{method:'PUT',body:JSON.stringify({root_id:S.activeRoot,path:S.activeFile.path,content})});
+  S.activeFile.content=content;S.dirty=false;setStatus('saved '+S.activeFile.path);await loadTree(activeDir());
+}
+async function newFile(){
+  const rel=prompt('File path',activeDir()?activeDir()+'/untitled.txt':'untitled.txt');if(!rel)return;
+  await api('/api/ide/sessions/'+encodeURIComponent(S.activeSession)+'/workspace/file',{method:'PUT',body:JSON.stringify({root_id:S.activeRoot,path:rel,content:''})});
+  await loadTree(activeDir());await openFile(rel);
+}
+async function newFolder(){
+  const rel=prompt('Folder path',activeDir()?activeDir()+'/new-folder':'new-folder');if(!rel)return;
+  await api('/api/ide/sessions/'+encodeURIComponent(S.activeSession)+'/workspace/mkdir',{method:'POST',body:JSON.stringify({root_id:S.activeRoot,path:rel})});
+  await loadTree(activeDir());
+}
+function readFileAsB64(file){return new Promise((resolve,reject)=>{const r=new FileReader();r.onload=()=>resolve(String(r.result||'').split(',',2)[1]||'');r.onerror=()=>reject(r.error||new Error('read failed'));r.readAsDataURL(file)})}
+async function uploadFiles(files){
+  const list=Array.from(files||[]);if(!list.length)return;
+  const items=[];let n=0;
+  for(const f of list){items.push({path:f.webkitRelativePath||f.name,content_b64:await readFileAsB64(f)});n++;setStatus('uploading '+n+'/'+list.length)}
+  await api('/api/ide/sessions/'+encodeURIComponent(S.activeSession)+'/workspace/upload',{method:'POST',body:JSON.stringify({root_id:S.activeRoot,dest:activeDir(),items})});
+  await loadTree(activeDir());setStatus('uploaded '+list.length+' file(s)');
+}
+async function runCommand(){
+  const command=E('commandInput').value.trim();if(!command)return;
+  E('terminalOutput').textContent+='\\n$ '+command+'\\n';
+  const out=await api('/api/ide/sessions/'+encodeURIComponent(S.activeSession)+'/terminal/run',{method:'POST',body:JSON.stringify({root_id:S.activeRoot,cwd:E('cwdInput').value.trim(),command})});
+  E('terminalOutput').textContent+=(out.stdout||'')+(out.stderr?'\\n'+out.stderr:'')+'\\n[exit '+out.returncode+']\\n';
+  E('terminalOutput').scrollTop=E('terminalOutput').scrollHeight;
+}
+async function sendAgent(){
+  const message=E('agentPrompt').value.trim();if(!message)return;
+  const out=await api('/api/ide/sessions/'+encodeURIComponent(S.activeSession)+'/agent-task',{method:'POST',body:JSON.stringify({root_id:S.activeRoot,active_path:S.activeFile?S.activeFile.path:'',message})});
+  E('agentStatus').textContent=out.queued?'queued':'started';
+}
+async function addMount(){
+  const path=E('mountPathInput').value.trim();if(!path)return;
+  await api('/api/ide/mounts',{method:'POST',body:JSON.stringify({path})});
+  await refreshConfig();await loadRoots();setStatus('mount authorized');
+}
+async function removeMount(id){
+  await api('/api/ide/mounts',{method:'DELETE',body:JSON.stringify({mount_id:id})});
+  await refreshConfig();await loadRoots();
+}
+function bind(){
+  document.querySelectorAll('.activity-button').forEach(btn=>btn.onclick=()=>{document.querySelectorAll('.activity-button').forEach(x=>x.classList.remove('is-active'));btn.classList.add('is-active');document.querySelectorAll('.panel-view').forEach(x=>x.classList.toggle('is-active',x.dataset.panel===btn.dataset.view))});
+  E('createSessionBtn').onclick=()=>createSession().catch(err=>setStatus(err.message,true));
+  E('sessionSelect').onchange=async()=>{S.activeSession=E('sessionSelect').value;S.treeCache.clear();S.openFiles.clear();S.activeFile=null;renderTabs();await loadRoots()};
+  E('rootSelect').onchange=async()=>{S.activeRoot=E('rootSelect').value;S.treeCache.clear();await loadTree('')};
+  E('refreshTreeBtn').onclick=()=>{S.treeCache.clear();loadTree('').catch(err=>setStatus(err.message,true))};
+  E('newFileBtn').onclick=()=>newFile().catch(err=>setStatus(err.message,true));
+  E('newFolderBtn').onclick=()=>newFolder().catch(err=>setStatus(err.message,true));
+  E('uploadFilesBtn').onclick=()=>E('fileInput').click();
+  E('uploadFolderBtn').onclick=()=>E('folderInput').click();
+  E('fileInput').onchange=()=>uploadFiles(E('fileInput').files).catch(err=>setStatus(err.message,true));
+  E('folderInput').onchange=()=>uploadFiles(E('folderInput').files).catch(err=>setStatus(err.message,true));
+  E('runCommandBtn').onclick=()=>runCommand().catch(err=>setStatus(err.message,true));
+  E('sendAgentBtn').onclick=()=>sendAgent().catch(err=>setStatus(err.message,true));
+  E('mountBtn').onclick=()=>addMount().catch(err=>setStatus(err.message,true));
+  E('refreshToolsBtn').onclick=()=>refreshConfig().catch(err=>setStatus(err.message,true));
+  E('editor').addEventListener('input',()=>{S.dirty=true;if(S.activeFile){S.activeFile.content=E('editor').value}});
+  window.addEventListener('keydown',ev=>{if((ev.ctrlKey||ev.metaKey)&&ev.key.toLowerCase()==='s'){ev.preventDefault();saveActive().catch(err=>setStatus(err.message,true))}});
+}
+window.addEventListener('DOMContentLoaded',async()=>{bind();try{await refreshConfig();setStatus('ready')}catch(err){setStatus(err.message,true)}});
+"""
+
 # ============================================================================
 # Architecture / 架构 / アーキテクチャ
 # Layer 7: Application orchestration, runtime services, and UI integration.
@@ -71682,6 +73630,9 @@ class AppContext:
         self.web_ui_validation: dict = {"ok": False, "reason": "external_web_ui_disabled"}
         self.web_ui_assets_override: dict[str, str] = {}
         self.show_upload_list = False
+        self.ide_mounts_cache: dict[str, list[dict]] = {}
+        self.ide_port = IDE_DEFAULT_PORT
+        self.ide_enabled = False
         self.rag_include_filename_entities = bool(rag_include_filename_entities)
         self.rag_parser = RAGContentParser(include_filename_entities=self.rag_include_filename_entities)
         self.rag_root = self.workspace / RAG_LIBRARY_DIRNAME
@@ -71986,6 +73937,602 @@ class AppContext:
 
     def web_ui_code_admin_js(self) -> str:
         return CODE_ADMIN_JS
+
+    def web_ui_ide_index_html(self) -> str:
+        return IDE_INDEX_HTML
+
+    def web_ui_ide_style_css(self) -> str:
+        return IDE_CSS
+
+    def web_ui_ide_js(self) -> str:
+        return IDE_JS
+
+    def _ide_mounts_path(self, user_id: str) -> Path:
+        return self.user_root(user_id) / "ide_mounts.json"
+
+    def _ide_mount_id(self, path: Path) -> str:
+        digest = hashlib.sha256(str(path.resolve()).encode("utf-8", errors="ignore")).hexdigest()[:16]
+        return f"mount:{digest}"
+
+    def _ide_load_mounts(self, user_id: str) -> list[dict]:
+        uid = str(user_id or "")
+        with self._lock:
+            cached = self.ide_mounts_cache.get(uid)
+        if cached is not None:
+            return [dict(x) for x in cached if isinstance(x, dict)]
+        path = self._ide_mounts_path(uid)
+        raw = self.crypto.read_json(path, {})
+        rows = raw.get("mounts", []) if isinstance(raw, dict) else []
+        cleaned: list[dict] = []
+        seen: set[str] = set()
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict):
+                continue
+            root_raw = str(row.get("path", "") or "").strip()
+            if not root_raw:
+                continue
+            try:
+                root = Path(root_raw).expanduser().resolve()
+            except Exception:
+                continue
+            mid = str(row.get("id", "") or "").strip() or self._ide_mount_id(root)
+            if mid in seen:
+                continue
+            seen.add(mid)
+            cleaned.append(
+                {
+                    "id": mid,
+                    "label": str(row.get("label", "") or root.name or str(root)),
+                    "path": str(root),
+                    "exists": bool(root.exists() and root.is_dir()),
+                    "authorized_at": float(row.get("authorized_at", 0.0) or 0.0),
+                }
+            )
+        with self._lock:
+            self.ide_mounts_cache[uid] = [dict(x) for x in cleaned]
+        return cleaned
+
+    def _ide_save_mounts(self, user_id: str, mounts: list[dict]) -> None:
+        uid = str(user_id or "")
+        rows = [dict(x) for x in mounts if isinstance(x, dict)]
+        self.crypto.write_json(
+            self._ide_mounts_path(uid),
+            {"mounts": rows, "updated_at": now_ts()},
+        )
+        with self._lock:
+            self.ide_mounts_cache[uid] = [dict(x) for x in rows]
+
+    def _ide_reject_unsafe_mount(self, root: Path) -> None:
+        resolved = root.expanduser().resolve()
+        if not resolved.exists() or not resolved.is_dir():
+            raise ValueError("mount path must be an existing directory")
+        anchor = Path(resolved.anchor).resolve() if resolved.anchor else resolved
+        if resolved == anchor:
+            raise ValueError("mounting a filesystem root is not allowed")
+        text = str(resolved).replace("\\", "/").lower()
+        parts = [str(x).lower() for x in resolved.parts]
+        if os.name == "nt":
+            forbidden = {"windows", "program files", "program files (x86)"}
+            if len(parts) >= 2 and parts[1] in forbidden:
+                raise ValueError("mounting system directories is not allowed")
+            return
+        forbidden_roots = [
+            Path("/System"),
+            Path("/Library"),
+            Path("/usr"),
+            Path("/bin"),
+            Path("/sbin"),
+            Path("/private"),
+            Path("/etc"),
+            Path("/var"),
+        ]
+        for forbidden in forbidden_roots:
+            try:
+                f_resolved = forbidden.resolve()
+                if resolved == f_resolved or resolved.is_relative_to(f_resolved):
+                    raise ValueError("mounting system directories is not allowed")
+            except ValueError:
+                raise
+            except Exception:
+                continue
+        if text in {"/", ""}:
+            raise ValueError("mounting a filesystem root is not allowed")
+
+    def ide_authorize_mount(self, user_id: str, path_text: str) -> dict:
+        root = Path(str(path_text or "")).expanduser().resolve()
+        self._ide_reject_unsafe_mount(root)
+        mount_id = self._ide_mount_id(root)
+        mounts = self._ide_load_mounts(user_id)
+        now_value = now_ts()
+        row = {
+            "id": mount_id,
+            "label": root.name or str(root),
+            "path": str(root),
+            "exists": True,
+            "authorized_at": now_value,
+        }
+        replaced = False
+        for idx, item in enumerate(mounts):
+            if str(item.get("id", "")) == mount_id or str(item.get("path", "")) == str(root):
+                previous = dict(item)
+                previous.update(row)
+                mounts[idx] = previous
+                replaced = True
+                break
+        if not replaced:
+            mounts.append(row)
+        self._ide_save_mounts(user_id, mounts)
+        return {"ok": True, "mount": row, "mounts": self._ide_load_mounts(user_id)}
+
+    def ide_remove_mount(self, user_id: str, mount_id: str) -> dict:
+        mid = str(mount_id or "").strip()
+        if not mid:
+            raise ValueError("mount_id required")
+        mounts = [x for x in self._ide_load_mounts(user_id) if str(x.get("id", "")) != mid]
+        self._ide_save_mounts(user_id, mounts)
+        return {"ok": True, "mounts": mounts}
+
+    def ide_session_payload(self, user_id: str, client_ip: str = "") -> dict:
+        mgr = self.manager_for_user(user_id)
+        sessions = mgr.list(limit=80, offset=0)
+        if isinstance(sessions, dict):
+            rows = list(sessions.get("sessions", []))
+        else:
+            rows = list(sessions)
+        latest_id = ""
+        if rows:
+            latest = max(rows, key=lambda x: float((x or {}).get("updated_at", 0.0) or 0.0))
+            latest_id = str(latest.get("id", "") or "")
+        quota = self.session_creation_quota_status(user_id, client_ip=client_ip)
+        return {
+            "sessions": rows,
+            "active_session_id": latest_id,
+            "session_creation_limit": quota,
+        }
+
+    def ide_config(self, user_id: str, client_ip: str = "") -> dict:
+        sessions = self.ide_session_payload(user_id, client_ip=client_ip)
+        return {
+            "ok": True,
+            "app": "clouds-coder-ide",
+            "version": APP_VERSION,
+            "workspace": str(self.workspace),
+            "user_id": str(user_id or ""),
+            "agent_port": int(getattr(self, "agent_port", 0) or 0),
+            "ide_port": int(getattr(self, "ide_port", IDE_DEFAULT_PORT) or IDE_DEFAULT_PORT),
+            "js_lib_root": str(self.js_lib_root),
+            "toolchains": self.ide_toolchains(),
+            "mounts": self._ide_load_mounts(user_id),
+            "sessions": sessions.get("sessions", []),
+            "active_session_id": str(sessions.get("active_session_id", "") or ""),
+            "session_creation_limit": sessions.get("session_creation_limit", {}),
+        }
+
+    def ide_create_session(self, user_id: str, title: str | None = None, client_ip: str = "") -> dict:
+        sess, quota = self.create_session_for_user(user_id, title or "IDE Workspace", client_ip=client_ip)
+        return {
+            "ok": True,
+            "id": sess.id,
+            "title": sess.title,
+            "ui_language": sess.ui_language,
+            "session_creation_limit": quota,
+            "roots": self.ide_workspace_roots(user_id, sess.id),
+        }
+
+    def _ide_session(self, user_id: str, session_id: str) -> SessionState:
+        sess = self.manager_for_user(user_id).get(str(session_id or "").strip())
+        if not sess:
+            raise KeyError("session not found")
+        return sess
+
+    def ide_workspace_roots(self, user_id: str, session_id: str) -> list[dict]:
+        sess = self._ide_session(user_id, session_id)
+        roots = [
+            {
+                "id": "session",
+                "kind": "session",
+                "label": str(getattr(sess, "title", "") or sess.id),
+                "path": str(sess.files_root.resolve()),
+                "readonly": False,
+            }
+        ]
+        for mount in self._ide_load_mounts(user_id):
+            root = Path(str(mount.get("path", "") or "")).expanduser()
+            roots.append(
+                {
+                    "id": str(mount.get("id", "") or self._ide_mount_id(root)),
+                    "kind": "mount",
+                    "label": str(mount.get("label", "") or root.name or str(root)),
+                    "path": str(root.resolve()),
+                    "readonly": False,
+                    "exists": bool(root.exists() and root.is_dir()),
+                }
+            )
+        return roots
+
+    def ide_resolve_workspace(self, user_id: str, session_id: str, root_id: str, rel: str = "") -> tuple[Path, Path, dict]:
+        rid = str(root_id or "session").strip() or "session"
+        if rid == "session":
+            sess = self._ide_session(user_id, session_id)
+            root = sess.files_root.resolve()
+            meta = {
+                "id": "session",
+                "kind": "session",
+                "label": str(getattr(sess, "title", "") or sess.id),
+                "path": str(root),
+                "readonly": False,
+            }
+        else:
+            meta = {}
+            for mount in self._ide_load_mounts(user_id):
+                if str(mount.get("id", "") or "") == rid:
+                    meta = dict(mount)
+                    break
+            if not meta:
+                raise KeyError("workspace root not authorized")
+            root = Path(str(meta.get("path", "") or "")).expanduser().resolve()
+            if not root.exists() or not root.is_dir():
+                raise FileNotFoundError("workspace root is unavailable")
+            meta.update({"id": rid, "kind": "mount", "path": str(root), "readonly": False})
+        rel_norm = normalize_rel_preview_path(rel)
+        target = safe_path(rel_norm or ".", root)
+        return root, target, meta
+
+    def _ide_file_stat(self, root: Path, fp: Path) -> dict:
+        try:
+            st = fp.stat()
+            rel = fp.resolve().relative_to(root.resolve()).as_posix()
+        except Exception:
+            st = None
+            rel = ""
+        return {
+            "path": rel,
+            "name": fp.name,
+            "type": "dir" if fp.is_dir() else "file",
+            "size": int(getattr(st, "st_size", 0) or 0),
+            "mtime": float(getattr(st, "st_mtime", 0.0) or 0.0),
+            "mime": guess_mime_from_name(fp.name, "application/octet-stream") if fp.is_file() else "",
+            "preview_kind": preview_kind_for_path(rel) if fp.is_file() else "",
+        }
+
+    def ide_tree_payload(
+        self,
+        user_id: str,
+        session_id: str,
+        *,
+        root_id: str = "session",
+        rel: str = "",
+        max_nodes: int = IDE_TREE_DEFAULT_MAX_NODES,
+    ) -> dict:
+        started = time.perf_counter()
+        root, target, meta = self.ide_resolve_workspace(user_id, session_id, root_id, rel)
+        if not target.exists() or not target.is_dir():
+            raise FileNotFoundError("directory not found")
+        max_nodes = max(40, min(IDE_TREE_MAX_NODES, int(max_nodes or IDE_TREE_DEFAULT_MAX_NODES)))
+        rel_norm = normalize_rel_preview_path(rel)
+        node_count = 0
+        truncated = False
+        skipped_dirs = 0
+
+        def _entry_rel(name: str) -> str:
+            return normalize_rel_preview_path(f"{rel_norm}/{name}" if rel_norm else name)
+
+        try:
+            entries = list(os.scandir(target))
+        except Exception as exc:
+            raise ValueError(str(exc)) from exc
+        dirs: list[os.DirEntry] = []
+        files: list[os.DirEntry] = []
+        for entry in entries:
+            try:
+                if entry.is_symlink():
+                    continue
+                name = str(entry.name or "")
+                if not name:
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    dirs.append(entry)
+                elif entry.is_file(follow_symlinks=False):
+                    files.append(entry)
+            except Exception:
+                continue
+        dirs.sort(key=lambda e: str(e.name).lower())
+        files.sort(key=lambda e: str(e.name).lower())
+        children: list[dict] = []
+        for entry in dirs:
+            if node_count >= max_nodes:
+                truncated = True
+                break
+            name = str(entry.name)
+            rel_child = _entry_rel(name)
+            skipped = name.lower() in IDE_TREE_SKIP_DIRS
+            if skipped:
+                skipped_dirs += 1
+            children.append(
+                {
+                    "type": "dir",
+                    "name": name,
+                    "path": rel_child,
+                    "has_children": not skipped,
+                    "skipped": bool(skipped),
+                    "children": [],
+                }
+            )
+            node_count += 1
+        for entry in files:
+            if node_count >= max_nodes:
+                truncated = True
+                break
+            try:
+                st = entry.stat(follow_symlinks=False)
+                size = int(st.st_size)
+                mtime = float(st.st_mtime)
+            except Exception:
+                size = 0
+                mtime = 0.0
+            name = str(entry.name)
+            rel_child = _entry_rel(name)
+            children.append(
+                {
+                    "type": "file",
+                    "name": name,
+                    "path": rel_child,
+                    "size": size,
+                    "mtime": mtime,
+                    "mime": guess_mime_from_name(name, "application/octet-stream"),
+                    "preview_kind": preview_kind_for_path(rel_child),
+                }
+            )
+            node_count += 1
+        return {
+            "ok": True,
+            "session_id": session_id,
+            "root": meta,
+            "path": rel_norm,
+            "node_count": node_count,
+            "truncated": bool(truncated),
+            "skipped_dirs": int(skipped_dirs),
+            "scan_ms": int((time.perf_counter() - started) * 1000),
+            "tree": {
+                "type": "dir",
+                "name": target.name or str(root),
+                "path": rel_norm,
+                "children": children,
+            },
+        }
+
+    def ide_read_file(self, user_id: str, session_id: str, *, root_id: str = "session", rel: str = "") -> dict:
+        root, target, meta = self.ide_resolve_workspace(user_id, session_id, root_id, rel)
+        if not target.exists() or not target.is_file():
+            raise FileNotFoundError("file not found")
+        size = int(target.stat().st_size)
+        if size > IDE_FILE_MAX_BYTES:
+            raise ValueError(f"file is too large for editor ({size} bytes)")
+        data = target.read_bytes()
+        is_binary = b"\x00" in data[:4096]
+        payload = {
+            "ok": True,
+            "root": meta,
+            "file": self._ide_file_stat(root, target),
+            "readonly": False,
+            "encoding": "base64" if is_binary else "text",
+        }
+        if is_binary:
+            payload["content_b64"] = base64.b64encode(data).decode("ascii")
+        else:
+            text = ""
+            used_encoding = "utf-8"
+            for enc in ("utf-8", "utf-8-sig", "gb18030"):
+                try:
+                    text = data.decode(enc)
+                    used_encoding = enc
+                    break
+                except Exception:
+                    continue
+            else:
+                text = data.decode("latin-1", errors="replace")
+                used_encoding = "latin-1"
+            payload["content"] = text
+            payload["text_encoding"] = used_encoding
+        return payload
+
+    def ide_write_file(self, user_id: str, session_id: str, payload: dict) -> dict:
+        root_id = str(payload.get("root_id", payload.get("root", "session")) or "session")
+        rel = str(payload.get("path", payload.get("rel", "")) or "")
+        if not normalize_rel_preview_path(rel):
+            raise ValueError("path required")
+        root, target, meta = self.ide_resolve_workspace(user_id, session_id, root_id, rel)
+        if target.exists() and target.is_dir():
+            raise IsADirectoryError("target is a directory")
+        if "content_b64" in payload:
+            data = base64.b64decode(str(payload.get("content_b64", "") or ""), validate=True)
+        else:
+            data = str(payload.get("content", "")).encode(str(payload.get("encoding", "utf-8") or "utf-8"))
+        if len(data) > IDE_FILE_MAX_BYTES:
+            raise ValueError(f"file is too large for editor ({len(data)} bytes)")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        return {"ok": True, "root": meta, "file": self._ide_file_stat(root, target)}
+
+    def ide_mkdir(self, user_id: str, session_id: str, payload: dict) -> dict:
+        root_id = str(payload.get("root_id", payload.get("root", "session")) or "session")
+        rel = str(payload.get("path", payload.get("rel", "")) or "")
+        if not normalize_rel_preview_path(rel):
+            raise ValueError("path required")
+        root, target, meta = self.ide_resolve_workspace(user_id, session_id, root_id, rel)
+        target.mkdir(parents=True, exist_ok=bool(payload.get("exist_ok", True)))
+        return {"ok": True, "root": meta, "file": self._ide_file_stat(root, target)}
+
+    def ide_rename(self, user_id: str, session_id: str, payload: dict) -> dict:
+        root_id = str(payload.get("root_id", payload.get("root", "session")) or "session")
+        old_rel = str(payload.get("old_path", payload.get("from", "")) or "")
+        new_rel = str(payload.get("new_path", payload.get("to", "")) or "")
+        if not normalize_rel_preview_path(old_rel) or not normalize_rel_preview_path(new_rel):
+            raise ValueError("old_path and new_path required")
+        root, old_target, meta = self.ide_resolve_workspace(user_id, session_id, root_id, old_rel)
+        _, new_target, _ = self.ide_resolve_workspace(user_id, session_id, root_id, new_rel)
+        if not old_target.exists():
+            raise FileNotFoundError("source not found")
+        if new_target.exists() and not bool(payload.get("overwrite", False)):
+            raise FileExistsError("target already exists")
+        new_target.parent.mkdir(parents=True, exist_ok=True)
+        old_target.replace(new_target)
+        return {"ok": True, "root": meta, "file": self._ide_file_stat(root, new_target)}
+
+    def ide_delete(self, user_id: str, session_id: str, payload: dict) -> dict:
+        root_id = str(payload.get("root_id", payload.get("root", "session")) or "session")
+        rel = str(payload.get("path", payload.get("rel", "")) or "")
+        if not normalize_rel_preview_path(rel):
+            raise ValueError("path required")
+        _, target, meta = self.ide_resolve_workspace(user_id, session_id, root_id, rel)
+        if not target.exists():
+            raise FileNotFoundError("target not found")
+        if target.is_dir():
+            if not bool(payload.get("recursive", True)):
+                target.rmdir()
+            else:
+                shutil.rmtree(target)
+        else:
+            target.unlink()
+        return {"ok": True, "root": meta, "path": normalize_rel_preview_path(rel)}
+
+    def ide_upload(self, user_id: str, session_id: str, payload: dict) -> dict:
+        root_id = str(payload.get("root_id", payload.get("root", "session")) or "session")
+        dest = normalize_rel_preview_path(str(payload.get("dest", payload.get("dir", "")) or ""))
+        items = payload.get("items", [])
+        if not isinstance(items, list):
+            raise ValueError("items must be a list")
+        if len(items) > IDE_UPLOAD_MAX_ITEMS:
+            raise ValueError(f"too many upload items (max {IDE_UPLOAD_MAX_ITEMS})")
+        root, dest_dir, meta = self.ide_resolve_workspace(user_id, session_id, root_id, dest or ".")
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        written: list[dict] = []
+        total = 0
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            rel_item = normalize_rel_preview_path(str(item.get("path", item.get("filename", "")) or ""))
+            if not rel_item:
+                continue
+            raw = base64.b64decode(str(item.get("content_b64", "") or ""), validate=True)
+            if len(raw) > IDE_UPLOAD_MAX_BYTES:
+                raise ValueError(f"upload item too large: {rel_item}")
+            total += len(raw)
+            if total > IDE_UPLOAD_TOTAL_MAX_BYTES:
+                raise ValueError("upload batch is too large")
+            target = safe_path(normalize_rel_preview_path(f"{dest}/{rel_item}" if dest else rel_item), root)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(raw)
+            written.append(self._ide_file_stat(root, target))
+        return {
+            "ok": True,
+            "root": meta,
+            "written": written,
+            "count": len(written),
+            "bytes": total,
+        }
+
+    def ide_toolchains(self) -> list[dict]:
+        specs = [
+            ("python3", ["python3", "python"], "Install Python from https://www.python.org/downloads/ or your OS package manager."),
+            ("node", ["node"], "Install Node.js LTS from https://nodejs.org/ or use your package manager."),
+            ("npm", ["npm"], "Install Node.js LTS; npm is included with standard Node.js installers."),
+            ("go", ["go"], "Install Go from https://go.dev/dl/."),
+            ("rust", ["rustc", "cargo"], "Install Rust with rustup from https://rustup.rs/."),
+            ("java", ["java", "javac"], "Install a JDK such as Temurin, Microsoft Build of OpenJDK, or Oracle JDK."),
+            ("c_cpp", ["clang", "gcc", "make"], "Install Xcode Command Line Tools, build-essential, MSYS2, or Visual Studio Build Tools."),
+            ("git", ["git"], "Install Git from https://git-scm.com/downloads."),
+        ]
+        rows: list[dict] = []
+        for name, commands, hint in specs:
+            found: dict[str, str] = {}
+            for command in commands:
+                path = shutil.which(command)
+                if path:
+                    found[command] = path
+            rows.append(
+                {
+                    "name": name,
+                    "available": bool(found),
+                    "required_commands": commands,
+                    "found": found,
+                    "install_hint": "" if found else hint,
+                }
+            )
+        return rows
+
+    def ide_run_command(self, user_id: str, session_id: str, payload: dict) -> dict:
+        command = str(payload.get("command", "") or "").strip()
+        if not command:
+            raise ValueError("command required")
+        root_id = str(payload.get("root_id", payload.get("root", "session")) or "session")
+        cwd_rel = str(payload.get("cwd", payload.get("path", "")) or "")
+        root, cwd, meta = self.ide_resolve_workspace(user_id, session_id, root_id, cwd_rel or ".")
+        if cwd.exists() and cwd.is_file():
+            cwd = cwd.parent
+        if not cwd.exists() or not cwd.is_dir():
+            raise FileNotFoundError("cwd not found")
+        requested_timeout = int(payload.get("timeout", IDE_COMMAND_TIMEOUT_DEFAULT) or IDE_COMMAND_TIMEOUT_DEFAULT)
+        timeout = max(1, min(MAX_SHELL_COMMAND_TIMEOUT_SECONDS, requested_timeout))
+        started = now_ts()
+        try:
+            proc = subprocess.run(
+                command,
+                cwd=str(cwd),
+                shell=True,
+                text=True,
+                capture_output=True,
+                timeout=timeout,
+            )
+            return {
+                "ok": proc.returncode == 0,
+                "root": meta,
+                "cwd": cwd.relative_to(root).as_posix() if cwd.is_relative_to(root) else str(cwd),
+                "command": command,
+                "returncode": int(proc.returncode),
+                "stdout": trim(proc.stdout, 120_000),
+                "stderr": trim(proc.stderr, 120_000),
+                "duration_ms": int((now_ts() - started) * 1000),
+                "timeout": timeout,
+            }
+        except subprocess.TimeoutExpired as exc:
+            return {
+                "ok": False,
+                "root": meta,
+                "cwd": cwd.relative_to(root).as_posix() if cwd.is_relative_to(root) else str(cwd),
+                "command": command,
+                "returncode": None,
+                "stdout": trim(getattr(exc, "stdout", "") or "", 80_000),
+                "stderr": trim(getattr(exc, "stderr", "") or "", 80_000),
+                "duration_ms": int((now_ts() - started) * 1000),
+                "timeout": timeout,
+                "timed_out": True,
+            }
+
+    def ide_agent_task(self, user_id: str, session_id: str, payload: dict, client_ip: str = "") -> dict:
+        sid = str(session_id or "").strip()
+        if not sid:
+            created = self.ide_create_session(user_id, "IDE Workspace", client_ip=client_ip)
+            sid = str(created.get("id", "") or "")
+        message = str(payload.get("message", payload.get("content", "")) or "").strip()
+        if not message:
+            raise ValueError("message required")
+        root_id = str(payload.get("root_id", payload.get("root", "session")) or "session")
+        active_path = normalize_rel_preview_path(str(payload.get("active_path", "") or ""))
+        root, _, meta = self.ide_resolve_workspace(user_id, sid, root_id, ".")
+        context_lines = [
+            "IDE programming request.",
+            f"Workspace root: {meta.get('label', root.name)} ({meta.get('kind', 'workspace')})",
+            f"Writable path: {root}",
+        ]
+        if active_path:
+            context_lines.append(f"Active file: {active_path}")
+        context_lines.append("")
+        context_lines.append(message)
+        out = self.submit_user_message(user_id, sid, "\n".join(context_lines))
+        result = dict(out if isinstance(out, dict) else {"ok": True, "result": out})
+        result["session_id"] = sid
+        return result
 
     def rag_js_lib_asset_path(self, filename: str) -> Path | None:
         return _resolve_js_lib_asset_path(self.js_lib_root, str(filename or "").strip())
@@ -75465,13 +78012,13 @@ class Handler(BaseHTTPRequestHandler):
             if not sess:
                 return self._send_json({"error": "session not found"}, status=404)
             try:
-                max_nodes = int((query.get("max_nodes", ["1200"]) or ["1200"])[0] or 1200)
+                max_nodes = int((query.get("max_nodes", [str(FILES_TREE_DEFAULT_MAX_NODES)]) or [str(FILES_TREE_DEFAULT_MAX_NODES)])[0] or FILES_TREE_DEFAULT_MAX_NODES)
             except Exception:
-                max_nodes = 1200
+                max_nodes = FILES_TREE_DEFAULT_MAX_NODES
             try:
-                max_depth = int((query.get("max_depth", ["10"]) or ["10"])[0] or 10)
+                max_depth = int((query.get("max_depth", [str(FILES_TREE_DEFAULT_MAX_DEPTH)]) or [str(FILES_TREE_DEFAULT_MAX_DEPTH)])[0] or FILES_TREE_DEFAULT_MAX_DEPTH)
             except Exception:
-                max_depth = 10
+                max_depth = FILES_TREE_DEFAULT_MAX_DEPTH
             try:
                 payload = sess.files_tree_payload(max_nodes=max_nodes, max_depth=max_depth)
             except Exception as exc:
@@ -76563,6 +79110,270 @@ class CodeAdminHandler(BaseHTTPRequestHandler):
                 return self._send_json({"error": str(exc)}, status=400)
         return self._send_json({"error": "not found"}, status=404)
 
+
+class IdeHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = f"StandaloneWebIDE/{APP_VERSION}"
+
+    def log_message(self, fmt: str, *args):
+        return
+
+    def handle(self):
+        try:
+            super().handle()
+        except Exception as exc:
+            if swallow_benign_socket_error(exc, "ide-handler.handle"):
+                return
+            raise
+
+    @property
+    def app(self) -> AppContext:
+        return self.server.app  # type: ignore[attr-defined]
+
+    def _client_ip(self) -> str:
+        xff = self.headers.get("X-Forwarded-For", "").strip()
+        if xff:
+            return xff.split(",")[0].strip()
+        return self.client_address[0] if self.client_address else "0.0.0.0"
+
+    def _user_id(self) -> str:
+        return user_id_from_ip(self._client_ip())
+
+    def _read_json(self) -> dict:
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        if length <= 0:
+            return {}
+        body = self.rfile.read(length).decode("utf-8")
+        return json.loads(body) if body else {}
+
+    def _send_json(self, obj: object, status: int = 200):
+        body = json_dumps(obj).encode("utf-8")
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as exc:
+            if swallow_benign_socket_error(exc, "ide-handler.send_json"):
+                return
+            raise
+
+    def _send_text(self, text: str, content_type: str = "text/plain; charset=utf-8", status: int = 200):
+        body = text.encode("utf-8")
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Expires", "0")
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as exc:
+            if swallow_benign_socket_error(exc, "ide-handler.send_text"):
+                return
+            raise
+
+    def _send_inline_bytes(self, data: bytes, content_type: str, status: int = 200):
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Content-Disposition", "inline")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+        except Exception as exc:
+            if swallow_benign_socket_error(exc, "ide-handler.send_inline_bytes"):
+                return
+            raise
+
+    def _send_exception(self, exc: Exception):
+        if isinstance(exc, KeyError):
+            return self._send_json({"error": str(exc).strip("'") or "not found"}, status=404)
+        if isinstance(exc, FileNotFoundError):
+            return self._send_json({"error": str(exc) or "not found"}, status=404)
+        if isinstance(exc, FileExistsError):
+            return self._send_json({"error": str(exc) or "already exists"}, status=409)
+        if isinstance(exc, (ValueError, IsADirectoryError, NotADirectoryError)):
+            return self._send_json({"error": str(exc)}, status=400)
+        return self._send_json({"error": str(exc)}, status=500)
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        path = unquote(parsed.path)
+        query = parse_qs(parsed.query or "")
+        if path == "/":
+            return self._send_text(self.app.web_ui_ide_index_html(), "text/html; charset=utf-8")
+        if path == "/assets/ide.css":
+            return self._send_text(self.app.web_ui_ide_style_css(), "text/css; charset=utf-8")
+        if path == "/assets/ide.js":
+            return self._send_text(self.app.web_ui_ide_js(), "application/javascript; charset=utf-8")
+        if path.startswith("/assets/js_lib/"):
+            asset_ref = path[len("/assets/js_lib/"):]
+            fp = self.app.rag_js_lib_asset_path(asset_ref)
+            if not fp:
+                return self._send_json({"error": "asset not found"}, status=404)
+            try:
+                data = fp.read_bytes()
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=500)
+            content_type = guess_mime_from_name(fp.name, "application/javascript")
+            if fp.suffix.lower() in {".js", ".mjs", ".cjs"}:
+                content_type = "application/javascript; charset=utf-8"
+            return self._send_inline_bytes(data, content_type)
+        if path == "/api/health":
+            return self._send_json({"ok": True, "app": "clouds-coder-ide", "version": APP_VERSION})
+        if path == "/api/ide/config":
+            try:
+                return self._send_json(self.app.ide_config(self._user_id(), client_ip=self._client_ip()))
+            except Exception as exc:
+                return self._send_exception(exc)
+        if path == "/api/ide/sessions":
+            try:
+                return self._send_json(self.app.ide_session_payload(self._user_id(), client_ip=self._client_ip()))
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/roots$", path)
+        if m:
+            try:
+                roots = self.app.ide_workspace_roots(self._user_id(), m.group(1))
+                return self._send_json({"ok": True, "session_id": m.group(1), "roots": roots})
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/tree$", path)
+        if m:
+            try:
+                max_nodes = int((query.get("max_nodes", [str(IDE_TREE_DEFAULT_MAX_NODES)]) or [str(IDE_TREE_DEFAULT_MAX_NODES)])[0] or IDE_TREE_DEFAULT_MAX_NODES)
+            except Exception:
+                max_nodes = IDE_TREE_DEFAULT_MAX_NODES
+            root_id = str((query.get("root_id", query.get("root", ["session"])) or ["session"])[0] or "session")
+            rel = str((query.get("path", query.get("rel", [""])) or [""])[0] or "")
+            try:
+                return self._send_json(
+                    self.app.ide_tree_payload(
+                        self._user_id(),
+                        m.group(1),
+                        root_id=root_id,
+                        rel=rel,
+                        max_nodes=max_nodes,
+                    )
+                )
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/file$", path)
+        if m:
+            root_id = str((query.get("root_id", query.get("root", ["session"])) or ["session"])[0] or "session")
+            rel = str((query.get("path", query.get("rel", [""])) or [""])[0] or "")
+            try:
+                return self._send_json(self.app.ide_read_file(self._user_id(), m.group(1), root_id=root_id, rel=rel))
+            except Exception as exc:
+                return self._send_exception(exc)
+        return self._send_json({"error": "not found"}, status=404)
+
+    def do_POST(self):
+        path = unquote(urlparse(self.path).path)
+        if path == "/api/ide/sessions":
+            payload = self._read_json()
+            try:
+                return self._send_json(
+                    self.app.ide_create_session(
+                        self._user_id(),
+                        str(payload.get("title", "") or "").strip() or None,
+                        client_ip=self._client_ip(),
+                    ),
+                    status=201,
+                )
+            except SessionCreationLimitExceeded as exc:
+                return self._send_json(
+                    {
+                        "error": str(exc),
+                        "session_creation_limit": dict(getattr(exc, "status", {}) or {}),
+                    },
+                    status=429,
+                )
+            except Exception as exc:
+                return self._send_exception(exc)
+        if path == "/api/ide/mounts":
+            payload = self._read_json()
+            try:
+                return self._send_json(
+                    self.app.ide_authorize_mount(self._user_id(), str(payload.get("path", "") or "")),
+                    status=201,
+                )
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/mkdir$", path)
+        if m:
+            try:
+                return self._send_json(self.app.ide_mkdir(self._user_id(), m.group(1), self._read_json()), status=201)
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/upload$", path)
+        if m:
+            try:
+                return self._send_json(self.app.ide_upload(self._user_id(), m.group(1), self._read_json()), status=201)
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/sessions/([^/]+)/terminal/run$", path)
+        if m:
+            try:
+                return self._send_json(self.app.ide_run_command(self._user_id(), m.group(1), self._read_json()))
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/sessions/([^/]+)/agent-task$", path)
+        if m:
+            try:
+                return self._send_json(
+                    self.app.ide_agent_task(
+                        self._user_id(),
+                        m.group(1),
+                        self._read_json(),
+                        client_ip=self._client_ip(),
+                    )
+                )
+            except Exception as exc:
+                return self._send_exception(exc)
+        return self._send_json({"error": "not found"}, status=404)
+
+    def do_PUT(self):
+        path = unquote(urlparse(self.path).path)
+        m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/file$", path)
+        if not m:
+            return self._send_json({"error": "not found"}, status=404)
+        try:
+            return self._send_json(self.app.ide_write_file(self._user_id(), m.group(1), self._read_json()))
+        except Exception as exc:
+            return self._send_exception(exc)
+
+    def do_PATCH(self):
+        path = unquote(urlparse(self.path).path)
+        m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/rename$", path)
+        if not m:
+            return self._send_json({"error": "not found"}, status=404)
+        try:
+            return self._send_json(self.app.ide_rename(self._user_id(), m.group(1), self._read_json()))
+        except Exception as exc:
+            return self._send_exception(exc)
+
+    def do_DELETE(self):
+        path = unquote(urlparse(self.path).path)
+        if path == "/api/ide/mounts":
+            try:
+                payload = self._read_json()
+                return self._send_json(self.app.ide_remove_mount(self._user_id(), str(payload.get("mount_id", "") or "")))
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/file$", path)
+        if m:
+            try:
+                return self._send_json(self.app.ide_delete(self._user_id(), m.group(1), self._read_json()))
+            except Exception as exc:
+                return self._send_exception(exc)
+        return self._send_json({"error": "not found"}, status=404)
+
 # ============================================================================
 # Architecture / 架构 / アーキテクチャ
 # Layer 9: Process entrypoint and server bootstrap.
@@ -76696,6 +79507,13 @@ def main():
         help=f"Code library admin web port (default: agent port + {CODE_ADMIN_PORT_OFFSET})",
     )
     parser.add_argument(
+        "--ide_port",
+        "--IDE_port",
+        default=IDE_DEFAULT_PORT,
+        type=int,
+        help=f"Programming IDE web port (default: {IDE_DEFAULT_PORT})",
+    )
+    parser.add_argument(
         "--skills_root",
         default="",
         help="Override skills root directory. Supports relative paths and both 'skills'/'Skills' naming.",
@@ -76720,6 +79538,22 @@ def main():
         dest="no_code_admin",
         action="store_true",
         help="Disable Code Library admin web UI server startup",
+    )
+    parser.add_argument(
+        "--enable_ide",
+        "--enable-ide",
+        "--enable_IDE",
+        dest="enable_ide",
+        action="store_true",
+        help="Enable Programming IDE web UI server startup (disabled by default)",
+    )
+    parser.add_argument(
+        "--no_ide",
+        "--no-ide",
+        "--no_IDE",
+        dest="no_ide",
+        action="store_true",
+        help="Disable Programming IDE web UI server startup (default)",
     )
     parser.add_argument(
         "--web_ui_config",
@@ -77528,6 +80362,7 @@ def main():
     skills_port = int(args.skills_port) if args.skills_port is not None else int(args.port) + 1
     rag_admin_port = int(args.rag_admin_port) if args.rag_admin_port is not None else int(args.port) + RAG_ADMIN_PORT_OFFSET
     code_admin_port = int(args.code_admin_port) if args.code_admin_port is not None else int(args.port) + CODE_ADMIN_PORT_OFFSET
+    ide_port = int(getattr(args, "ide_port", IDE_DEFAULT_PORT) or IDE_DEFAULT_PORT)
     setattr(app, "agent_port", int(args.port))
     setattr(app, "skills_port", int(skills_port))
     setattr(app, "skills_ui_enabled", False)
@@ -77535,6 +80370,8 @@ def main():
     setattr(app, "rag_admin_enabled", False)
     setattr(app, "code_admin_port", int(code_admin_port))
     setattr(app, "code_admin_enabled", False)
+    setattr(app, "ide_port", int(ide_port))
+    setattr(app, "ide_enabled", False)
     server = AgentHTTPServer((args.host, args.port), Handler, app)
     skills_server = None
     skills_thread = None
@@ -77602,6 +80439,30 @@ def main():
             setattr(app, "code_admin_enabled", True)
         except Exception as exc:
             print(f"[web-agent] code admin failed to start on {args.host}:{code_admin_port}: {exc}")
+    ide_server = None
+    ide_thread = None
+    if args.no_ide:
+        print("[web-agent] programming IDE disabled by --no_ide")
+    elif not bool(getattr(args, "enable_ide", False)):
+        print("[web-agent] programming IDE disabled by default; use --enable_ide to start it")
+    elif int(ide_port) in {int(args.port), int(skills_port), int(rag_admin_port), int(code_admin_port)}:
+        print("[web-agent] programming IDE disabled: ide_port conflicts with existing server port")
+    else:
+        try:
+            ide_server = AgentHTTPServer((args.host, ide_port), IdeHandler, app)
+
+            def _ide_serve_loop():
+                try:
+                    ide_server.serve_forever()
+                except OSError as exc:
+                    if not swallow_benign_socket_error(exc, "ide-server.serve_forever"):
+                        raise
+
+            ide_thread = threading.Thread(target=_ide_serve_loop, daemon=True)
+            ide_thread.start()
+            setattr(app, "ide_enabled", True)
+        except Exception as exc:
+            print(f"[web-agent] programming IDE failed to start on {args.host}:{ide_port}: {exc}")
     print(f"[web-agent] workspace={WORKDIR}")
     print(f"[web-agent] repo_root={REPO_ROOT}")
     print(f"[web-agent] codes_root={app.codes_root}")
@@ -77732,6 +80593,10 @@ def main():
         "[web-agent] code_admin="
         + ("enabled" if bool(getattr(app, "code_admin_enabled", False)) else "disabled")
     )
+    print(
+        "[web-agent] programming_ide="
+        + ("enabled" if bool(getattr(app, "ide_enabled", False)) else "disabled")
+    )
     if str(args.host).strip() in {"0.0.0.0", "::"}:
         lan_ip = detect_local_lan_ip()
         print("[web-agent] bind=all interfaces")
@@ -77746,6 +80611,9 @@ def main():
         if code_admin_server:
             print(f"[code-admin] open local: http://127.0.0.1:{code_admin_port}")
             print(f"[code-admin] open lan:   http://{lan_ip}:{code_admin_port}")
+        if ide_server:
+            print(f"[ide] open local: http://127.0.0.1:{ide_port}")
+            print(f"[ide] open lan:   http://{lan_ip}:{ide_port}")
     else:
         print(f"[web-agent] open http://{args.host}:{args.port}")
         if skills_server:
@@ -77754,6 +80622,8 @@ def main():
             print(f"[rag-admin] open http://{args.host}:{rag_admin_port}")
         if code_admin_server:
             print(f"[code-admin] open http://{args.host}:{code_admin_port}")
+        if ide_server:
+            print(f"[ide] open http://{args.host}:{ide_port}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -77805,6 +80675,15 @@ def main():
                 pass
             try:
                 code_admin_server.server_close()
+            except Exception:
+                pass
+        if ide_server:
+            try:
+                ide_server.shutdown()
+            except Exception:
+                pass
+            try:
+                ide_server.server_close()
             except Exception:
                 pass
         app.shutdown_services()
