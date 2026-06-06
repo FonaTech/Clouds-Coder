@@ -1063,6 +1063,20 @@ CODE_PREVIEW_DIFF_CONTEXT_LINES = 4
 CODE_PREVIEW_DIFF_MERGE_GAP = 10
 PREVIEW_DOWNLOAD_MAX_FILES = 500
 PREVIEW_DOWNLOAD_MAX_BYTES = 80_000_000
+FILES_TREE_DEFAULT_MAX_NODES = 420
+FILES_TREE_DEFAULT_MAX_DEPTH = 5
+FILES_TREE_SKIP_DIRS = {
+    ".git", ".hg", ".svn", ".idea", ".vscode", ".vs",
+    ".next", ".nuxt", ".svelte-kit", ".angular", ".expo",
+    ".cache", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+    ".turbo", ".yarn", ".pnpm-store", ".parcel-cache",
+    "__pycache__", ".venv", "venv", "env", ".tox",
+    "node_modules", "bower_components", "vendor",
+    "dist", "build", "target", "coverage", "out", "bin", "obj",
+}
+FILES_TREE_SKIP_REL_DIRS = {
+    ".clouds_coder/long_output",
+}
 RENDER_FRAME_MAX_B64_CHARS = 2_200_000
 RENDER_FRAME_MAX_POINTS = 12_000
 RENDER_FRAME_MAX_LINES = 2_000
@@ -12125,8 +12139,9 @@ _BUILTIN_SKILLS: dict[str, dict] = {
         "description": "Todo/Task creation, updates, and best practices",
         "body": (
             "# Task Management Guide\n"
-            "- For level 1-2 (simple) tasks: skip todo scaffolding, give direct response, UNLESS an approved plan step is active.\n"
-            "- When an approved plan step is active, ALWAYS create/update step-local TodoWrite subtasks even at level 1-2.\n"
+            "- For level 1 tasks: skip todo scaffolding and give the direct response, UNLESS an approved plan step is active.\n"
+            "- For level 2 tasks: skip todos only for genuinely simple Q&A or single-action work; create a compact TodoWrite plan for complex, multi-file, debugging, implementation, or validation-heavy requests.\n"
+            "- When an approved plan step is active, ALWAYS create/update step-local TodoWrite subtasks even at level 1-2 unless Plan mode is explicitly Off.\n"
             "- For level 3+ tasks: call TodoWrite early with 3-7 concise items, one marked in_progress.\n"
             "- Update todos only when plan or status actually changes. Avoid redundant calls.\n"
             "- If TodoWrite fails or repeats unchanged, use TodoWriteRescue with simple string items.\n"
@@ -26379,12 +26394,14 @@ body{padding:18px}
         bio.seek(0)
         return bio.read()
 
-    def files_tree_payload(self, max_nodes: int = 1200, max_depth: int = 10) -> dict:
+    def files_tree_payload(self, max_nodes: int = FILES_TREE_DEFAULT_MAX_NODES, max_depth: int = FILES_TREE_DEFAULT_MAX_DEPTH) -> dict:
+        started = time.perf_counter()
         root = self.files_root.resolve()
-        max_nodes = max(100, min(8000, int(max_nodes or 1200)))
-        max_depth = max(1, min(24, int(max_depth or 10)))
+        max_nodes = max(100, min(8000, int(max_nodes or FILES_TREE_DEFAULT_MAX_NODES)))
+        max_depth = max(1, min(24, int(max_depth or FILES_TREE_DEFAULT_MAX_DEPTH)))
         node_count = 1
         truncated = False
+        skipped_dirs = 0
 
         def _reserve_node() -> bool:
             nonlocal node_count, truncated
@@ -26394,23 +26411,26 @@ body{padding:18px}
             node_count += 1
             return True
 
+        def _skip_dir(name: str, rel: str) -> bool:
+            lname = str(name or "").strip().lower()
+            rlow = str(rel or "").strip().replace("\\", "/").lower().strip("/")
+            return (
+                lname in FILES_TREE_SKIP_DIRS
+                or rlow in FILES_TREE_SKIP_REL_DIRS
+                or any(rlow.startswith(f"{skip}/") for skip in FILES_TREE_SKIP_REL_DIRS)
+            )
+
         def _dir_children(abs_dir: Path, rel_dir: str, depth: int) -> list[dict]:
+            nonlocal skipped_dirs
             if truncated or depth >= max_depth:
                 return []
             try:
                 entries = list(os.scandir(abs_dir))
             except Exception:
                 return []
-            entries.sort(
-                key=lambda e: (
-                    0 if e.is_dir(follow_symlinks=False) else 1,
-                    str(e.name).lower(),
-                )
-            )
-            out: list[dict] = []
+            dirs: list[os.DirEntry] = []
+            files: list[os.DirEntry] = []
             for entry in entries:
-                if truncated:
-                    break
                 try:
                     if entry.is_symlink():
                         continue
@@ -26421,19 +26441,41 @@ body{padding:18px}
                     if not rel:
                         continue
                     if entry.is_dir(follow_symlinks=False):
-                        if not _reserve_node():
-                            break
-                        out.append(
-                            {
-                                "type": "dir",
-                                "name": name,
-                                "path": rel,
-                                "children": _dir_children(Path(entry.path), rel, depth + 1),
-                            }
-                        )
-                        continue
-                    if not entry.is_file(follow_symlinks=False):
-                        continue
+                        if _skip_dir(name, rel):
+                            skipped_dirs += 1
+                            continue
+                        dirs.append(entry)
+                    elif entry.is_file(follow_symlinks=False):
+                        files.append(entry)
+                except Exception:
+                    continue
+            dirs.sort(key=lambda e: str(e.name).lower())
+            files.sort(key=lambda e: str(e.name).lower())
+            out: list[dict] = []
+            for entry in dirs:
+                if truncated:
+                    break
+                try:
+                    name = str(entry.name)
+                    rel = normalize_rel_preview_path(f"{rel_dir}/{name}" if rel_dir else name)
+                    if not _reserve_node():
+                        break
+                    out.append(
+                        {
+                            "type": "dir",
+                            "name": name,
+                            "path": rel,
+                            "children": _dir_children(Path(entry.path), rel, depth + 1),
+                        }
+                    )
+                except Exception:
+                    continue
+            for entry in files:
+                if truncated:
+                    break
+                try:
+                    name = str(entry.name)
+                    rel = normalize_rel_preview_path(f"{rel_dir}/{name}" if rel_dir else name)
                     if not _reserve_node():
                         break
                     try:
@@ -26471,6 +26513,8 @@ body{padding:18px}
             "max_depth": max_depth,
             "node_count": int(node_count),
             "truncated": bool(truncated),
+            "skipped_dirs": int(skipped_dirs),
+            "scan_ms": int((time.perf_counter() - started) * 1000),
             "tree": tree,
         }
 
@@ -36949,6 +36993,10 @@ body{padding:18px}
         }
 
     def _append_plan_guidance_bubble(self, content: str, *, target_roles: tuple[str, ...] = (), summary: str = "") -> bool:
+        if str(self.plan_mode_user_preference or "auto").strip().lower() == "off":
+            return False
+        if not isinstance(self._current_plan_step_row(self._ensure_blackboard()), dict):
+            return False
         text = trim(str(content or "").strip(), PLAN_NOTICE_BODY_MAX_CHARS)
         if not text:
             return False
@@ -48309,7 +48357,7 @@ body{padding:18px}
                 goal_text=self.runtime_reclassify_goal or self._latest_user_goal_text(),
                 media_inputs_round=initial_policy_media_inputs,
             )
-            if self._has_resumable_plan_state():
+            if str(self.plan_mode_user_preference or "auto").strip().lower() != "off" and self._has_resumable_plan_state():
                 try:
                     self._restore_runtime_policy_from_blackboard_locked()
                     repair_issue = self._maybe_prompt_plan_resume_repair(
@@ -52916,7 +52964,7 @@ function _domUpdateWouldInterrupt(el){
   if(!ae||ae===document.body||ae===document.documentElement)return false;
   if(!el.contains(ae))return false;
   if(ae.matches&&ae.matches('input,textarea,select,[contenteditable="true"]'))return true;
-  if(ae.closest&&ae.closest('.popup-menu,.cmd-pager,.chat-tab,.fe-row,.msg-preview-row'))return true;
+  if(ae.closest&&ae.closest('.popup-menu'))return true;
   return false;
 }
 function _flushDeferredHtml(){
@@ -56246,7 +56294,8 @@ function renderTodoBoard(items){
   const planSteps=todos.filter(x=>String(x?.key||'').startsWith('bb:proj:'));
   const workerTodos=todos.filter(x=>!String(x?.key||'').startsWith('bb:proj:'));
   let html='';
-  if(planSteps.length&&workerTodos.length){
+  const planGroupingEnabled=String(S.snap?.plan_mode_preference||'auto').toLowerCase()!=='off';
+  if(planGroupingEnabled&&planSteps.length){
     // Build parent_step_id index: map step key suffix to its subtasks
     const stepIdFromKey=(key)=>{const k=String(key||'');return k.startsWith('bb:proj:')?k.slice(8):''};
     const subtasksByStep={};
@@ -56280,7 +56329,7 @@ function renderTodoBoard(items){
 }
 function renderTaskBoard(items){const tasks=Array.isArray(items)?items:[];if(!tasks.length)return `<div class=\"mono\">${esc(t('no_tasks'))}</div>`;const completed=tasks.filter(row=>normalizeStatus(row?.status,'pending')==='completed').length;const blocked=tasks.filter(row=>normalizeStatus(row?.status,'pending')==='blocked').length;const cards=tasks.map(row=>{const status=normalizeStatus(row?.status,'pending');const id=Number(row?.id||0)||'-';const subject=cleanWorkText(row?.subject,status)||'(empty task)';const owner=String(row?.owner||'').trim();const blockedBy=Array.isArray(row?.blockedBy)&&row.blockedBy.length?`blocked_by=${row.blockedBy.map(x=>`#${x}`).join(', ')}`:'';const blocks=Array.isArray(row?.blocks)&&row.blocks.length?`blocks=${row.blocks.map(x=>`#${x}`).join(', ')}`:'';const timeTxt=formatTs(row?.updated_at||row?.created_at);const meta=[owner?`owner=@${owner}`:t('owner_unassigned'),blockedBy,blocks,timeTxt].filter(Boolean).join(' · ');return `<div class=\"task-item ${statusClass(status)}\"><div class=\"task-head\"><span class=\"mono task-id\">#${esc(id)}</span><span class=\"status-badge ${statusClass(status)}\">${esc(statusLabel(status))}</span></div><div class=\"task-subject\">${esc(subject)}</div><div class=\"task-meta\">${esc(meta)}</div></div>`}).join('');return `<div class=\"board-summary\"><span>${esc(tasks.length-completed)} ${esc(t('open'))}</span><span>${esc(completed)} ${esc(t('completed'))} · ${esc(blocked)} ${esc(t('blocked'))}</span></div><div class=\"task-list\">${cards}</div>`}
 function ensureFileExplorerState(sessionId){const sid=String(sessionId||S.activeId||'').trim();if(!sid)return null;if(!S.fileExplorerBySession)S.fileExplorerBySession={};if(!S.fileExplorerBySession[sid]||typeof S.fileExplorerBySession[sid]!=='object'){S.fileExplorerBySession[sid]={tree:null,root:'',nodeCount:0,truncated:false,maxNodes:0,fetchedAt:0,lastRequestAt:0,lastErrorAt:0,inflight:false,selected:'',expanded:{'':true}}}const st=S.fileExplorerBySession[sid];if(!st.expanded||typeof st.expanded!=='object')st.expanded={'':true};st.expanded['']=true;if(!Number.isFinite(Number(st.lastRequestAt)))st.lastRequestAt=0;if(!Number.isFinite(Number(st.lastErrorAt)))st.lastErrorAt=0;return st}
-function _fePath(sessionId){const sid=encodeURIComponent(String(sessionId||'').trim());return `/api/sessions/${sid}/files-tree`}
+function _fePath(sessionId){const sid=encodeURIComponent(String(sessionId||'').trim());return `/api/sessions/${sid}/files-tree?max_nodes=420&max_depth=5`}
 function _feSize(bytes){const n=Number(bytes||0);if(!Number.isFinite(n)||n<0)return '-';if(n<1024)return `${n}B`;if(n<1024*1024)return `${(n/1024).toFixed(1)}KB`;if(n<1024*1024*1024)return `${(n/(1024*1024)).toFixed(1)}MB`;return `${(n/(1024*1024*1024)).toFixed(1)}GB`}
 function _feTs(ts){const n=Number(ts||0);if(!Number.isFinite(n)||n<=0)return'';try{return new Date(n*1000).toLocaleString()}catch(_){return''}}
 function _feKindLabel(kind){const k=String(kind||'').trim().toLowerCase();if(k==='html')return'HTML';if(k==='markdown')return'MD';if(k==='image')return'IMG';if(k==='video')return'VIDEO';if(k==='audio')return'AUDIO';if(k==='pdf')return'PDF';if(k==='csv')return'CSV';if(k==='excel')return'XLS';if(k==='document')return'DOC';if(k==='presentation')return'PPT';if(k==='code')return'CODE';return''}
@@ -75465,13 +75514,13 @@ class Handler(BaseHTTPRequestHandler):
             if not sess:
                 return self._send_json({"error": "session not found"}, status=404)
             try:
-                max_nodes = int((query.get("max_nodes", ["1200"]) or ["1200"])[0] or 1200)
+                max_nodes = int((query.get("max_nodes", [str(FILES_TREE_DEFAULT_MAX_NODES)]) or [str(FILES_TREE_DEFAULT_MAX_NODES)])[0] or FILES_TREE_DEFAULT_MAX_NODES)
             except Exception:
-                max_nodes = 1200
+                max_nodes = FILES_TREE_DEFAULT_MAX_NODES
             try:
-                max_depth = int((query.get("max_depth", ["10"]) or ["10"])[0] or 10)
+                max_depth = int((query.get("max_depth", [str(FILES_TREE_DEFAULT_MAX_DEPTH)]) or [str(FILES_TREE_DEFAULT_MAX_DEPTH)])[0] or FILES_TREE_DEFAULT_MAX_DEPTH)
             except Exception:
-                max_depth = 10
+                max_depth = FILES_TREE_DEFAULT_MAX_DEPTH
             try:
                 payload = sess.files_tree_payload(max_nodes=max_nodes, max_depth=max_depth)
             except Exception as exc:

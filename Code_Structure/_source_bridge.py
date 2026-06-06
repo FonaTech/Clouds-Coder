@@ -8,7 +8,7 @@ import sys
 import threading
 from pathlib import Path
 
-_SPLIT_SOURCE_PATH = Path('/Users/Fona/Downloads/Clouds_Coder/Clouds_Coder.py').resolve()
+_SPLIT_SOURCE_PATH = Path('/Users/Fona/Downloads/Clouds_Upload/Clouds_Coder.py').resolve()
 _SPLIT_SOURCE_MODULE_NAME = "_clouds_coder_split_source_" + str(abs(hash(str(_SPLIT_SOURCE_PATH))))
 _SPLIT_SOURCE_LOCK = threading.RLock()
 _SPLIT_SOURCE_MODULE = None
