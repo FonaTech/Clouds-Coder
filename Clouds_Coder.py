@@ -29059,6 +29059,30 @@ body{padding:18px}
         if any(
             x in low
             for x in [
+                "user_input_required",
+                "user input required",
+                "user_required",
+                "needs_user_input",
+                "needs user input",
+                "need user input",
+                "waiting_for_user",
+                "waiting for user",
+                "requires user",
+                "ask user",
+                "需要用户输入",
+                "需要用戶輸入",
+                "需要用户确认",
+                "需要用戶確認",
+                "等待用户",
+                "等待用戶",
+                "ユーザー入力が必要",
+                "ユーザー確認が必要",
+            ]
+        ):
+            return "USER_INPUT_REQUIRED"
+        if any(
+            x in low
+            for x in [
                 "task_completed",
                 "task completed",
                 "已完成",
@@ -29147,12 +29171,18 @@ body{padding:18px}
             "TOOL_REQUIRED": "ACTION_REQUIRED",
             "NEEDS_TOOL": "ACTION_REQUIRED",
             "EXECUTE_TOOL": "ACTION_REQUIRED",
+            "USER_INPUT": "USER_INPUT_REQUIRED",
+            "USER_REQUIRED": "USER_INPUT_REQUIRED",
+            "USER_CONFIRMATION_REQUIRED": "USER_INPUT_REQUIRED",
+            "NEEDS_USER_INPUT": "USER_INPUT_REQUIRED",
+            "WAITING_FOR_USER": "USER_INPUT_REQUIRED",
+            "ASK_USER": "USER_INPUT_REQUIRED",
             "EMPTY": "EMPTY_RAMBLING",
             "RAMBLING": "EMPTY_RAMBLING",
             "IDLE": "EMPTY_RAMBLING",
         }
         status = aliases.get(key, key)
-        if status in {"TASK_COMPLETED", "ACTION_REQUIRED", "VALID_PLANNING", "EMPTY_RAMBLING"}:
+        if status in {"TASK_COMPLETED", "ACTION_REQUIRED", "VALID_PLANNING", "USER_INPUT_REQUIRED", "EMPTY_RAMBLING"}:
             return status
         inferred = self._infer_arbiter_status_from_text(fallback_text)
         return inferred or ""
@@ -29187,6 +29217,14 @@ body{padding:18px}
             completed = len([t for t in plan_steps if t.get("status") == "completed"])
             total = len(plan_steps)
             snapshot["plan_progress"] = f"{completed}/{total} steps completed"
+            snapshot["approved_plan_unfinished"] = bool(completed < total)
+            active_step = self._get_active_plan_step(bb)
+            if isinstance(active_step, dict) and active_step:
+                snapshot["active_plan_step"] = {
+                    "id": trim(str(active_step.get("id", "") or ""), 40),
+                    "content": trim(str(active_step.get("content", "") or ""), 240),
+                    "status": trim(str(active_step.get("status", "") or ""), 40),
+                }
             if completed < total:
                 snapshot["plan_warning"] = (
                     f"IMPORTANT: Only {completed}/{total} plan steps are completed. "
@@ -29209,13 +29247,15 @@ body{padding:18px}
         client.timeout = max(0.2, float(self.arbiter_timeout_seconds or ARBITER_DEFAULT_TIMEOUT_SECONDS))
         return client
 
-    def _call_arbiter_llm(self, assistant_text: str, thinking_text: str = "") -> dict:
+    def _call_arbiter_llm(self, assistant_text: str, thinking_text: str = "", *, force: bool = False) -> dict:
         clean = strip_thinking_content(str(assistant_text or "")).strip()
         thinking_clean = str(thinking_text or "").strip()
         if not self.arbiter_enabled:
             return {"status": "DISABLED", "reasoning": "arbiter disabled", "raw": ""}
         probe_len = max(len(clean), len(thinking_clean))
         if (
+            not force
+            and
             probe_len < int(ARBITER_TRIGGER_MIN_CONTENT_CHARS)
             and not self._looks_like_action_promise_without_tool(f"{clean}\n{thinking_clean}")
         ):
@@ -29224,7 +29264,7 @@ body{padding:18px}
         arbiter_system = (
             "You are a task-state arbiter. "
             "Classify worker output into exactly one status: "
-            "TASK_COMPLETED, ACTION_REQUIRED, VALID_PLANNING, or EMPTY_RAMBLING. "
+            "TASK_COMPLETED, ACTION_REQUIRED, VALID_PLANNING, USER_INPUT_REQUIRED, or EMPTY_RAMBLING. "
             "Return strict JSON only."
         )
         arbiter_user = (
@@ -29232,11 +29272,14 @@ body{padding:18px}
             "Status definitions:\n"
             "- TASK_COMPLETED: worker already completed user's target and gave final deliverable/summary.\n"
             "- ACTION_REQUIRED: worker has decided or promised to create/write/modify/run/verify something, or thinking contains a concrete next tool action, but no tool call was emitted.\n"
+            "- ACTION_REQUIRED also applies when an approved plan is unfinished and the worker only asks for routine confirmation, routine plan advancement, Todo updates, evidence collection, or verification instead of using a tool.\n"
             "- VALID_PLANNING: worker output is useful high-level analysis or design that still needs more reasoning before a concrete tool action.\n"
+            "- USER_INPUT_REQUIRED: worker is genuinely blocked by missing external information, a subjective user choice, credentials, permissions, or a requirement decision that cannot be inferred from the current goal/plan.\n"
+            "- Do not use USER_INPUT_REQUIRED for routine approved-plan advancement or ordinary self-management; those are ACTION_REQUIRED.\n"
             "- EMPTY_RAMBLING: worker is stalling, repeating, or hallucinating with no actionable progress.\n"
             "Prefer ACTION_REQUIRED over VALID_PLANNING when the next step is already a concrete artifact/action.\n"
             "Output JSON only:\n"
-            "{\"status\":\"TASK_COMPLETED|ACTION_REQUIRED|VALID_PLANNING|EMPTY_RAMBLING\",\"reasoning\":\"<=40 words\"}\n\n"
+            "{\"status\":\"TASK_COMPLETED|ACTION_REQUIRED|VALID_PLANNING|USER_INPUT_REQUIRED|EMPTY_RAMBLING\",\"reasoning\":\"<=40 words\"}\n\n"
             f"Snapshot:\n{json_dumps(snapshot, indent=2)}"
         )
         box: dict[str, object] = {}
@@ -38434,6 +38477,9 @@ body{padding:18px}
         content = re.sub(r"\s+", " ", content.strip().lower())
         if not content:
             return ""
+        parent_step_id = trim(str(row.get("parent_step_id", "") or "").strip(), 40)
+        if parent_step_id and self._is_plan_step_acceptance_subtask(content):
+            return f"acceptance:{parent_step_id}"
         match = re.match(r"^(\d+\.\d+)\b", content)
         if match:
             return f"substep:{match.group(1)}"
@@ -39132,6 +39178,14 @@ body{padding:18px}
         if self._is_generic_plan_step_acceptance_subtask(raw):
             return False
         low = raw.lower()
+        evidence_value_markers = (
+            "exit_code", "exit code", "rc=", "exit=", "pass", "passed", "ok",
+            "size=", "bytes", "kb", "mb", "http 200", "status 200",
+            "version=", "semantic_version", "文件大小", "字节", "退出码",
+            "通过", "已通过", "成功", "证据", "證據", "証拠",
+        )
+        if any(marker in low for marker in evidence_value_markers):
+            return True
         action_low = re.split(
             r"(?:证据|證據|証拠|根拠|evidence)\s*[:：]",
             raw,
@@ -39756,9 +39810,10 @@ body{padding:18px}
             )
             work_texts = [str(row.get("content", "") or "") for row in work_rows]
             if not self._plan_step_acceptance_subtask_is_specific(existing_acceptance, plan_step, work_texts):
-                acceptance_row["content"] = expected_acceptance
                 if str(acceptance_row.get("status", "pending") or "pending").lower() == "completed":
-                    acceptance_row["status"] = "pending"
+                    acceptance_row["content"] = existing_acceptance or expected_acceptance
+                else:
+                    acceptance_row["content"] = expected_acceptance
             else:
                 acceptance_row["content"] = existing_acceptance or expected_acceptance
         else:
@@ -42275,6 +42330,24 @@ body{padding:18px}
                 for t in (todos if isinstance(todos, list) else [])
             )
         return False
+
+    def _approved_plan_has_unfinished_steps(self, board: dict | None = None) -> bool:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
+        plan_phase = str(plan.get("phase", "") or "").strip().lower()
+        if not (bool(self.runtime_plan_approved) or plan_phase == "executing"):
+            return False
+        todos = bb.get("project_todos", []) if isinstance(bb.get("project_todos"), list) else []
+        plan_steps = [
+            t for t in todos
+            if isinstance(t, dict) and str(t.get("category", "") or "") == "plan_step"
+        ]
+        if not plan_steps:
+            return False
+        return any(
+            str(t.get("status", "") or "").strip().lower() in {"pending", "in_progress", ""}
+            for t in plan_steps
+        )
 
     def _user_explicit_complexity_value(self, text: str) -> str:
         return infer_user_complexity_value(text)
@@ -46298,6 +46371,50 @@ body{padding:18px}
             },
         )
 
+    def _inject_plan_no_tool_recovery_hint(self, assistant_text: str = ""):
+        bb = self._ensure_blackboard()
+        step = self._get_active_plan_step(bb)
+        step_id = trim(str((step or {}).get("id", "") or ""), 20)
+        step_label = trim(str((step or {}).get("content", "") or "current plan step"), 220)
+        rows = self._active_plan_worker_todo_rows(step_id, role="") if step_id else []
+        current = next(
+            (r for r in rows if str(r.get("status", "") or "").strip().lower() == "in_progress"),
+            None,
+        )
+        pending = next(
+            (r for r in rows if str(r.get("status", "") or "").strip().lower() == "pending"),
+            None,
+        )
+        current_text = trim(str((current or pending or {}).get("content", "") or ""), 260)
+        latest = trim(strip_thinking_content(str(assistant_text or "")).strip(), 420)
+        self._prune_runtime_retry_hints()
+        self.messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "<plan-no-tool-recovery>"
+                    "Approved plan execution is still active, so the previous assistant text cannot pause for user confirmation or stop as a final answer. "
+                    f"Stay on the active plan step: {step_label}. "
+                    f"{('Current subtask: ' + current_text + '. ') if current_text else ''}"
+                    "Next turn must use exactly one concrete tool call. "
+                    "If the current subtask or final acceptance check is complete, update the same TodoWrite/TodoWriteRescue row to completed with evidence. "
+                    "If evidence is missing, run one focused read/bash/check tool to collect it. "
+                    "Do not ask the user to confirm routine plan advancement and do not summarize instead of updating the live plan state. "
+                    f"{('Previous text: ' + latest) if latest else ''}"
+                    "</plan-no-tool-recovery>"
+                ),
+                "ts": now_ts(),
+            }
+        )
+        self._emit(
+            "status",
+            {
+                "summary": (
+                    "plan no-tool recovery injected; approved plan is still active"
+                )
+            },
+        )
+
     def _inject_action_promise_recovery_hint(self, assistant_text: str):
         goal = trim(str(self._latest_user_goal_text() or ""), 500)
         latest = trim(strip_thinking_content(str(assistant_text or "")).strip(), 500)
@@ -48546,20 +48663,39 @@ body{padding:18px}
         clean_text = strip_thinking_content(str(text or "")).strip()
         def _lang_payload(seed: str) -> str:
             return self._apply_agent_language_policy(seed, max_len=2000)
-        if self._current_delegate_is_mandatory_for(role_key):
-            self._emit(
-                "status",
-                {
-                    "summary": (
-                        f"mandatory delegate still unmet for {self._agent_display_name(role_key)}; "
-                        "keep pushing concrete tool execution"
-                    )
-                },
+        plan_work_pending = self._approved_plan_has_unfinished_steps()
+        if bool(self.arbiter_enabled) and (
+            bool(plan_work_pending)
+            or len(clean_text) >= int(ARBITER_TRIGGER_MIN_CONTENT_CHARS)
+        ):
+            decision = self._call_arbiter_llm(
+                clean_text,
+                "",
+                force=bool(plan_work_pending),
             )
-            return False, role_key
-        if bool(self.arbiter_enabled) and len(clean_text) >= int(ARBITER_TRIGGER_MIN_CONTENT_CHARS):
-            decision = self._call_arbiter_llm(clean_text, "")
             status = str(decision.get("status", "") or "").strip().upper()
+            if status == "USER_INPUT_REQUIRED":
+                self._emit(
+                    "status",
+                    {
+                        "summary": (
+                            f"{self._agent_display_name(role_key)} arbiter requires user input; "
+                            "pausing run"
+                        )
+                    },
+                )
+                return True, role_key
+            if status == "TASK_COMPLETED" and bool(plan_work_pending):
+                status = "ACTION_REQUIRED"
+                decision = dict(decision)
+                decision["status"] = "ACTION_REQUIRED"
+                decision["reasoning"] = trim(
+                    (
+                        str(decision.get("reasoning", "") or "")
+                        + " Approved plan still has unfinished steps."
+                    ).strip(),
+                    280,
+                )
             if status == "TASK_COMPLETED":
                 if role_key in {"reviewer", "developer"}:
                     finish_result = self._resolve_finish_request(
@@ -48579,6 +48715,21 @@ body{padding:18px}
                         )
                         return True, role_key
                     return False, role_key
+            elif status == "ACTION_REQUIRED":
+                if bool(plan_work_pending):
+                    self._inject_plan_no_tool_recovery_hint(clean_text)
+                else:
+                    self._inject_arbiter_action_required_hint(decision, clean_text)
+                self._emit(
+                    "status",
+                    {
+                        "summary": (
+                            f"{self._agent_display_name(role_key)} arbiter requires concrete action; "
+                            "continuing execution"
+                        )
+                    },
+                )
+                return False, role_key
             elif status == "VALID_PLANNING":
                 self._inject_arbiter_continue_hint(decision)
                 self._emit(
@@ -48591,6 +48742,17 @@ body{padding:18px}
                     },
                 )
                 return False, role_key
+        if self._current_delegate_is_mandatory_for(role_key):
+            self._emit(
+                "status",
+                {
+                    "summary": (
+                        f"mandatory delegate still unmet for {self._agent_display_name(role_key)}; "
+                        "keep pushing concrete tool execution"
+                    )
+                },
+            )
+            return False, role_key
         if mode == EXECUTION_MODE_SEQUENTIAL:
             if role_key == "explorer":
                 payload = _lang_payload(
@@ -52154,8 +52316,21 @@ body{padding:18px}
                             },
                         )
                         break
+                    plan_work_pending = self._approved_plan_has_unfinished_steps()
                     decision_needed = self._looks_like_user_decision_needed(decision_probe)
-                    if decision_needed:
+                    plan_routine_advance_text = bool(
+                        plan_work_pending
+                        and (
+                            "advance_plan_step" in done_probe
+                            or "route_to_next_agent" in done_probe
+                            or "推进" in done_probe
+                            or "推進" in done_probe
+                            or "下一轮" in done_probe
+                            or "下一輪" in done_probe
+                            or "next step" in done_probe.lower()
+                        )
+                    )
+                    if decision_needed and (not plan_work_pending) and not plan_routine_advance_text:
                         arbiter_planning_rounds = 0
                         self._emit("status", {"summary": "waiting for user input: assistant asked for a decision"})
                         break
@@ -52192,7 +52367,19 @@ body{padding:18px}
                     action_promise_pending = self._looks_like_action_promise_without_tool(done_probe)
                     endpoint = self._detect_endpoint_intent(done_probe, tool_calls)
                     deliverable = self._detect_no_tool_deliverable_intent(done_probe, tool_calls)
-                    if bool(deliverable.get("matched", False)):
+                    fallback_plan_no_tool_recovery_needed = bool(
+                        plan_work_pending
+                        and (
+                            plan_routine_advance_text
+                            or action_promise_pending
+                            or done_like
+                            or self._looks_like_incomplete_reply(done_probe)
+                            or bool(endpoint.get("matched", False))
+                            or bool(deliverable.get("matched", False))
+                        )
+                    )
+                    plan_no_tool_recovery_needed = False
+                    if bool(deliverable.get("matched", False)) and not plan_work_pending:
                         arbiter_planning_rounds = 0
                         no_tool_rounds = 0
                         fault_counter = 0
@@ -52226,6 +52413,8 @@ body{padding:18px}
                         continue
                     arbiter_probe_len = max(len(clean_decision_probe), len(str(thinking_text or "").strip()))
                     arbiter_should_run = bool(self.arbiter_enabled) and (
+                        plan_work_pending
+                        or
                         action_promise_pending
                         or (
                             arbiter_probe_len >= int(ARBITER_TRIGGER_MIN_CONTENT_CHARS)
@@ -52236,39 +52425,86 @@ body{padding:18px}
                             )
                         )
                     )
+                    arbiter_decision: dict = {}
+                    arbiter_status = ""
+                    arbiter_unavailable = False
                     if arbiter_should_run:
-                        arbiter_decision = self._call_arbiter_llm(clean_decision_probe, thinking_text)
+                        arbiter_decision = self._call_arbiter_llm(
+                            clean_decision_probe,
+                            thinking_text,
+                            force=bool(plan_work_pending),
+                        )
                         arbiter_status = str(arbiter_decision.get("status", "") or "").strip().upper()
-                        if arbiter_status == "TASK_COMPLETED":
+                        arbiter_unavailable = arbiter_status in {
+                            "",
+                            "UNKNOWN",
+                            "DISABLED",
+                            "SKIP_SHORT",
+                            "ARBITER_TIMEOUT",
+                            "ARBITER_ERROR",
+                        }
+                        if arbiter_status == "USER_INPUT_REQUIRED":
                             arbiter_planning_rounds = 0
                             no_tool_rounds = 0
                             fault_counter = 0
                             last_fault_reason = ""
-                            finish_result = self._resolve_finish_request(
-                                single_role,
-                                source="single-arbiter-task-completed",
-                                summary=str(arbiter_decision.get("reasoning", "") or ""),
+                            self._prune_runtime_retry_hints()
+                            self._emit(
+                                "status",
+                                {
+                                    "summary": (
+                                        "arbiter decision=USER_INPUT_REQUIRED; "
+                                        "waiting for user input"
+                                    )
+                                },
                             )
-                            if bool(finish_result.get("stop", False)):
-                                self._emit(
-                                    "status",
-                                    {
-                                        "summary": (
-                                            "arbiter decision=TASK_COMPLETED; "
-                                            "run stopped cleanly"
-                                        )
-                                    },
+                            break
+                        if arbiter_status == "TASK_COMPLETED":
+                            if plan_work_pending:
+                                arbiter_status = "ACTION_REQUIRED"
+                                arbiter_decision = dict(arbiter_decision)
+                                arbiter_decision["status"] = "ACTION_REQUIRED"
+                                arbiter_decision["reasoning"] = trim(
+                                    (
+                                        str(arbiter_decision.get("reasoning", "") or "")
+                                        + " Approved plan still has unfinished steps."
+                                    ).strip(),
+                                    280,
                                 )
-                                break
-                            force_single_tool_rounds = max(force_single_tool_rounds, 2)
-                            continue
+                            else:
+                                arbiter_planning_rounds = 0
+                                no_tool_rounds = 0
+                                fault_counter = 0
+                                last_fault_reason = ""
+                                finish_result = self._resolve_finish_request(
+                                    single_role,
+                                    source="single-arbiter-task-completed",
+                                    summary=str(arbiter_decision.get("reasoning", "") or ""),
+                                )
+                                if bool(finish_result.get("stop", False)):
+                                    self._emit(
+                                        "status",
+                                        {
+                                            "summary": (
+                                                "arbiter decision=TASK_COMPLETED; "
+                                                "run stopped cleanly"
+                                            )
+                                        },
+                                    )
+                                    break
+                                force_single_tool_rounds = max(force_single_tool_rounds, 2)
+                                continue
                         if arbiter_status == "ACTION_REQUIRED":
                             arbiter_planning_rounds = 0
                             no_tool_rounds = 0
                             fault_counter = 0
                             last_fault_reason = ""
                             force_single_tool_rounds = max(force_single_tool_rounds, 2)
-                            self._inject_arbiter_action_required_hint(arbiter_decision, done_probe)
+                            if plan_work_pending:
+                                plan_no_tool_recovery_needed = True
+                                self._inject_plan_no_tool_recovery_hint(done_probe)
+                            else:
+                                self._inject_arbiter_action_required_hint(arbiter_decision, done_probe)
                             if auto_continue_budget > 0:
                                 auto_continue_budget -= 1
                                 self._emit(
@@ -52334,6 +52570,8 @@ body{padding:18px}
                             arbiter_status = "EMPTY_RAMBLING"
                         if arbiter_status == "EMPTY_RAMBLING":
                             arbiter_planning_rounds = 0
+                            if plan_work_pending:
+                                plan_no_tool_recovery_needed = True
                             self._emit(
                                 "status",
                                 {
@@ -52345,6 +52583,23 @@ body{padding:18px}
                             )
                     else:
                         arbiter_planning_rounds = 0
+                        arbiter_unavailable = bool(plan_work_pending)
+                    if plan_work_pending and arbiter_unavailable:
+                        plan_no_tool_recovery_needed = bool(fallback_plan_no_tool_recovery_needed)
+                        if decision_needed and not plan_routine_advance_text and not plan_no_tool_recovery_needed:
+                            arbiter_planning_rounds = 0
+                            no_tool_rounds = 0
+                            self._prune_runtime_retry_hints()
+                            self._emit(
+                                "status",
+                                {
+                                    "summary": (
+                                        "waiting for user input: semantic arbiter unavailable and "
+                                        "assistant appears to ask for a real decision"
+                                    )
+                                },
+                            )
+                            break
                     long_plan_reply = bool(
                         len(clean_decision_probe) >= 100
                         or self._looks_nontrivial_request(clean_decision_probe)
@@ -52364,7 +52619,7 @@ body{padding:18px}
                             },
                         )
                         break
-                    if bool(endpoint.get("matched", False)):
+                    if bool(endpoint.get("matched", False)) and not plan_work_pending:
                         arbiter_planning_rounds = 0
                         no_tool_rounds = 0
                         fault_counter = 0
@@ -52389,7 +52644,7 @@ body{padding:18px}
                             break
                         force_single_tool_rounds = max(force_single_tool_rounds, 2)
                         continue
-                    if done_like or (substantial_reply and (not bool(self.arbiter_enabled))):
+                    if (done_like or (substantial_reply and (not bool(self.arbiter_enabled)))) and not plan_work_pending:
                         arbiter_planning_rounds = 0
                         no_tool_rounds = 0
                         fault_counter = 0
@@ -52414,7 +52669,7 @@ body{padding:18px}
                             break
                         force_single_tool_rounds = max(force_single_tool_rounds, 2)
                         continue
-                    if self._should_soft_pause_no_action(done_probe, tool_calls):
+                    if self._should_soft_pause_no_action(done_probe, tool_calls) and not plan_work_pending:
                         arbiter_planning_rounds = 0
                         no_tool_rounds = 0
                         self._prune_runtime_retry_hints()
@@ -52430,7 +52685,12 @@ body{padding:18px}
                         break
                     no_tool_rounds += 1
                     diagnosis = self._diagnose_no_tool_idle(decision_probe, no_tool_rounds)
-                    pending_like = bool(diagnosis.get("work_pending", False)) or todo_blocking or action_promise_pending
+                    pending_like = (
+                        bool(diagnosis.get("work_pending", False))
+                        or todo_blocking
+                        or action_promise_pending
+                        or plan_no_tool_recovery_needed
+                    )
                     if no_tool_rounds >= 2 and pending_like:
                         fault_counter += 1
                         last_fault_reason = f"no-tool-idle(streak={no_tool_rounds})"
@@ -52452,7 +52712,11 @@ body{padding:18px}
                     if (not done_like) and no_tool_rounds >= 1 and pending_like:
                         if auto_continue_budget > 0:
                             auto_continue_budget -= 1
-                            if action_promise_pending:
+                            if plan_no_tool_recovery_needed:
+                                force_single_tool_rounds = max(force_single_tool_rounds, 2)
+                                self._inject_plan_no_tool_recovery_hint(done_probe)
+                                summary = "approved-plan no-tool recovery engaged"
+                            elif action_promise_pending:
                                 force_single_tool_rounds = max(force_single_tool_rounds, 2)
                                 self._inject_action_promise_recovery_hint(done_probe)
                                 summary = "no-tool action promise recovered"
@@ -52476,13 +52740,29 @@ body{padding:18px}
                     if auto_continue_budget > 8 and not self._is_long_running_engineering_context():
                         auto_continue_budget = min(auto_continue_budget, 8)
                     can_continue = auto_continue_budget > 0 and (
-                        todo_blocking or action_promise_pending or self._looks_like_incomplete_reply(text)
+                        plan_no_tool_recovery_needed
+                        or todo_blocking
+                        or action_promise_pending
+                        or self._looks_like_incomplete_reply(text)
                     )
                     if can_continue:
                         if self.cancel_requested:
                             self._emit("status", {"summary": "run interrupted"})
                             break
                         auto_continue_budget -= 1
+                        if plan_no_tool_recovery_needed:
+                            force_single_tool_rounds = max(force_single_tool_rounds, 2)
+                            self._inject_plan_no_tool_recovery_hint(done_probe)
+                            self._emit(
+                                "status",
+                                {
+                                    "summary": (
+                                        "approved plan still active; auto-continue after no-tool text "
+                                        f"(streak={no_tool_rounds}, remaining={auto_continue_budget})"
+                                    )
+                                },
+                            )
+                            continue
                         if no_tool_rounds % 6 == 0:
                             self._prune_runtime_retry_hints()
                             self.messages.append(
