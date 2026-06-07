@@ -7841,12 +7841,19 @@ class TodoManager:
         worker_in_progress_seen_by_owner: set[str] = set()
         status_alias = {
             "todo": "pending",
+            "[_]": "pending",
+            "[]": "pending",
+            "[ ]": "pending",
             "doing": "in_progress",
             "inprogress": "in_progress",
             "in-progress": "in_progress",
+            "[>]": "in_progress",
+            ">": "in_progress",
             "done": "completed",
             "finish": "completed",
             "finished": "completed",
+            "[x]": "completed",
+            "x": "completed",
         }
         for idx, item in enumerate(expanded_items):
             raw = item if isinstance(item, dict) else {"content": str(item or "").strip(), "status": "pending"}
@@ -34246,10 +34253,15 @@ body{padding:18px}
                 for row in raw_rows[-12:]:
                     if not isinstance(row, dict):
                         continue
-                    content = trim(normalize_work_text(row.get("content", "") or "") or str(row.get("content", "") or "").strip(), 360)
+                    raw_content = str(row.get("content", "") or "").strip()
+                    parsed_status, parsed_content = split_todo_status_text(raw_content)
+                    content = trim(normalize_work_text(parsed_content or raw_content) or (parsed_content or raw_content), 360)
                     if not content:
                         continue
-                    status = self._normalize_todo_status_value(row.get("status", ""), "pending")
+                    raw_status = str(row.get("status", "") or "").strip().lower().replace("-", "_").replace(" ", "_")
+                    status = self._normalize_todo_status_value(row.get("status", ""), parsed_status or "pending")
+                    if parsed_status and raw_status in {"", "todo", "pending"}:
+                        status = parsed_status
                     if status == "blocked":
                         status = "pending"
                     clean_rows.append({
@@ -37797,10 +37809,15 @@ body{padding:18px}
             owner = self._sanitize_agent_role(row.get("owner", "")) or "developer"
             if role_key and owner != role_key:
                 continue
-            content = trim(normalize_work_text(row.get("content", "") or "") or str(row.get("content", "") or "").strip(), 360)
+            raw_content = str(row.get("content", "") or "").strip()
+            parsed_status, parsed_content = split_todo_status_text(raw_content)
+            content = trim(normalize_work_text(parsed_content or raw_content) or (parsed_content or raw_content), 360)
             if not content:
                 continue
-            status = self._normalize_todo_status_value(row.get("status", ""), "pending")
+            raw_status = str(row.get("status", "") or "").strip().lower().replace("-", "_").replace(" ", "_")
+            status = self._normalize_todo_status_value(row.get("status", ""), parsed_status or "pending")
+            if parsed_status and raw_status in {"", "todo", "pending"}:
+                status = parsed_status
             if status == "blocked":
                 status = "pending"
             rows.append({
@@ -37841,10 +37858,15 @@ body{padding:18px}
                 continue
             if step_filter and parent != step_filter:
                 continue
-            content = trim(normalize_work_text(raw.get("content", "") or "") or str(raw.get("content", "") or "").strip(), 360)
+            raw_content = str(raw.get("content", "") or "").strip()
+            parsed_status, parsed_content = split_todo_status_text(raw_content)
+            content = trim(normalize_work_text(parsed_content or raw_content) or (parsed_content or raw_content), 360)
             if not content:
                 continue
-            status = self._normalize_todo_status_value(raw.get("status", ""), "pending")
+            raw_status = str(raw.get("status", "") or "").strip().lower().replace("-", "_").replace(" ", "_")
+            status = self._normalize_todo_status_value(raw.get("status", ""), parsed_status or "pending")
+            if parsed_status and raw_status in {"", "todo", "pending"}:
+                status = parsed_status
             if status == "blocked":
                 status = "pending"
             item = {
@@ -37884,6 +37906,54 @@ body{padding:18px}
             bb["updated_at"] = float(now_ts())
             self.blackboard = bb
         return changed
+
+    def _reconcile_plan_worker_todos_with_blackboard(
+        self,
+        step_id: str,
+        *,
+        board: dict | None = None,
+    ) -> bool:
+        step_key = trim(str(step_id or "").strip(), 20)
+        if not step_key:
+            return False
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        mirror_rows = self._plan_worker_todo_rows_from_blackboard(step_key, role="", board=bb)
+        if not mirror_rows:
+            return False
+        worker_owners = {"developer", "explorer", "reviewer"}
+        memory_rows = [
+            dict(row) for row in self.todo.snapshot()
+            if isinstance(row, dict)
+            and str(row.get("owner", "") or "").strip().lower() in worker_owners
+            and trim(str(row.get("parent_step_id", "") or "").strip(), 20) == step_key
+        ]
+        before = [
+            (
+                self._plan_worker_todo_identity(row),
+                str(row.get("status", "") or "").strip().lower(),
+                str(row.get("owner", "") or "").strip().lower(),
+                trim(str(row.get("parent_step_id", "") or "").strip(), 20),
+            )
+            for row in memory_rows
+        ]
+        role_key = self._current_plan_worker_owner(bb)
+        self._merge_plan_worker_todo_items(mirror_rows + memory_rows, role=role_key)
+        after_rows = [
+            dict(row) for row in self.todo.snapshot()
+            if isinstance(row, dict)
+            and str(row.get("owner", "") or "").strip().lower() in worker_owners
+            and trim(str(row.get("parent_step_id", "") or "").strip(), 20) == step_key
+        ]
+        after = [
+            (
+                self._plan_worker_todo_identity(row),
+                str(row.get("status", "") or "").strip().lower(),
+                str(row.get("owner", "") or "").strip().lower(),
+                trim(str(row.get("parent_step_id", "") or "").strip(), 20),
+            )
+            for row in after_rows
+        ]
+        return before != after
 
     def _active_plan_step_has_worker_todos(self, role: str = "") -> bool:
         step = self._get_active_plan_step()
@@ -38163,18 +38233,77 @@ body{padding:18px}
         raw = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
         aliases = {
             "todo": "pending",
+            "[_]": "pending",
+            "[]": "pending",
+            "[ ]": "pending",
             "doing": "in_progress",
             "working": "in_progress",
             "inprogress": "in_progress",
             "in_progress": "in_progress",
+            "[>]": "in_progress",
+            ">": "in_progress",
             "done": "completed",
             "finish": "completed",
             "finished": "completed",
+            "[x]": "completed",
+            "x": "completed",
         }
         status = aliases.get(raw, raw or default)
         if status in {"pending", "in_progress", "completed", "blocked"}:
             return status
         return default
+
+    def _normalize_plan_worker_todo_input(
+        self,
+        item: object,
+        *,
+        step_id: str,
+        role_key: str,
+        default_status: str = "pending",
+    ) -> dict:
+        worker_owners = {"developer", "explorer", "reviewer"}
+        step_key = trim(str(step_id or "").strip(), 20)
+        owner_hint = self._sanitize_agent_role(role_key) or self._current_plan_worker_owner()
+        if isinstance(item, str):
+            raw: dict = {"content": item}
+        elif isinstance(item, dict):
+            raw = dict(item)
+        else:
+            raw = {"content": str(item or "").strip()}
+        key = trim(str(raw.get("key", "") or "").strip(), 120)
+        if key.startswith("bb:"):
+            return raw
+        raw_content = str(raw.get("content", raw.get("text", raw.get("title", ""))) or "").strip()
+        parsed_status, parsed_content = split_todo_status_text(raw_content)
+        content = normalize_work_text(parsed_content or raw_content) or (parsed_content or raw_content)
+        content = trim(str(content or "").strip(), 500)
+        if not content:
+            return {}
+        raw_status = str(raw.get("status", raw.get("state", "")) or "").strip()
+        raw_status_key = raw_status.lower().replace("-", "_").replace(" ", "_")
+        status = self._normalize_todo_status_value(raw_status, parsed_status or default_status)
+        if parsed_status and raw_status_key in {"", "todo", "pending"}:
+            status = parsed_status
+        if status == "blocked":
+            status = "pending"
+        owner = self._sanitize_agent_role(raw.get("owner", "")) or owner_hint
+        if owner not in worker_owners:
+            owner = owner_hint
+        parent_step_id = trim(str(raw.get("parent_step_id", "") or step_key), 20) or step_key
+        row: dict = {
+            "content": content,
+            "status": status,
+            "owner": owner,
+        }
+        if parent_step_id:
+            row["parent_step_id"] = parent_step_id
+        active_form = str(raw.get("activeForm", raw.get("active_form", "")) or "").strip()
+        if active_form:
+            row["activeForm"] = active_form
+        for meta_key in ("created_at", "updated_at", "completed_at", "completed_by", "evidence"):
+            if meta_key in raw and raw.get(meta_key) not in (None, ""):
+                row[meta_key] = raw.get(meta_key)
+        return row
 
     def _plan_worker_todo_sort_key(self, row: dict | None) -> tuple:
         import re
@@ -38350,12 +38479,19 @@ body{padding:18px}
 
         status_alias = {
             "todo": "pending",
+            "[_]": "pending",
+            "[]": "pending",
+            "[ ]": "pending",
             "doing": "in_progress",
             "inprogress": "in_progress",
             "in-progress": "in_progress",
+            "[>]": "in_progress",
+            ">": "in_progress",
             "done": "completed",
             "finish": "completed",
             "finished": "completed",
+            "[x]": "completed",
+            "x": "completed",
         }
         passthrough_rows: list[dict] = []
         merged_rows: list[dict] = []
@@ -38463,19 +38599,20 @@ body{padding:18px}
 
         incoming_normalized: list[dict] = []
         for idx, item in enumerate(items):
-            if isinstance(item, str):
-                raw = {"content": item, "status": "pending"}
-            elif isinstance(item, dict):
-                raw = dict(item)
-            else:
+            if not isinstance(item, (str, dict)):
                 raise ValueError(f"item {idx}: invalid type")
+            raw = self._normalize_plan_worker_todo_input(
+                item,
+                step_id=step_id,
+                role_key=role_key,
+                default_status="pending",
+            )
+            if not raw:
+                continue
             key = trim(str(raw.get("key", "") or "").strip(), 120)
             if key.startswith("bb:"):
                 incoming_normalized.append(raw)
                 continue
-            owner = str(raw.get("owner", "") or "").strip().lower()
-            if owner not in worker_owners:
-                raw["owner"] = role_key
             parent_step_id = trim(str(raw.get("parent_step_id", "") or ""), 20)
             if not parent_step_id:
                 raw["parent_step_id"] = step_id
@@ -40667,6 +40804,10 @@ body{padding:18px}
         plan_data = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
         if has_plan_steps and str(plan_data.get("phase", "") or "").strip() == "executing":
             try:
+                active_step = self._get_active_plan_step(bb)
+                active_step_id = trim(str((active_step or {}).get("id", "") or ""), 20)
+                if active_step_id:
+                    self._reconcile_plan_worker_todos_with_blackboard(active_step_id, board=bb)
                 self._sync_plan_worker_todos_to_blackboard(board=bb)
                 self._update_plan_file_step_status()
             except Exception:
@@ -45778,7 +45919,9 @@ body{padding:18px}
         _status_alias = {
             "todo": "pending", "doing": "in_progress", "inprogress": "in_progress",
             "in-progress": "in_progress", "done": "completed", "finish": "completed",
-            "finished": "completed",
+            "finished": "completed", "[_]": "pending", "[]": "pending",
+            "[ ]": "pending", "[>]": "in_progress", ">": "in_progress",
+            "[x]": "completed", "x": "completed",
         }
         for idx, item in enumerate(limited):
             if isinstance(item, dict):
