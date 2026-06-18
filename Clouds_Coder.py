@@ -6093,6 +6093,156 @@ def is_openai_compat_provider(provider: str) -> bool:
 def is_openai_like_provider(provider: str) -> bool:
     return normalize_openai_compat_provider_name(provider) in OPENAI_LIKE_PROVIDER_NAMES
 
+# ── Effort / reasoning-budget model ────────────────────────────────────
+# A single provider-neutral "effort" axis that maps onto each provider's
+# native reasoning controls:
+#   - Anthropic (Claude)  -> extended thinking: {"type":"enabled","budget_tokens":N}
+#   - OpenAI / DeepSeek    -> {"reasoning_effort": "low|medium|high"}
+#   - GLM (智谱/coding)     -> {"thinking": {"type":"enabled|disabled"}}
+#   - Ollama (local)       -> native options {"think": true}
+# Effort is provider-neutral; the resolver below converts it to whatever the
+# active provider+model actually understands, and unknown fields are stripped
+# on a 400 fallback so non-reasoning models never break.
+EFFORT_OFF = "off"
+EFFORT_LOW = "low"
+EFFORT_MEDIUM = "medium"
+EFFORT_HIGH = "high"
+EFFORT_MAX = "max"
+EFFORT_LEVELS = (EFFORT_OFF, EFFORT_LOW, EFFORT_MEDIUM, EFFORT_HIGH, EFFORT_MAX)
+EFFORT_ORDER = {name: idx for idx, name in enumerate(EFFORT_LEVELS)}
+EFFORT_DEFAULT = EFFORT_MEDIUM
+
+# Anthropic extended-thinking token budgets per effort level.
+EFFORT_ANTHROPIC_BUDGET = {
+    EFFORT_LOW: 4_096,
+    EFFORT_MEDIUM: 10_000,
+    EFFORT_HIGH: 21_000,
+    EFFORT_MAX: 32_000,
+}
+# OpenAI/DeepSeek reasoning_effort enum mapping (their API only has 3 tiers).
+EFFORT_OPENAI_REASONING = {
+    EFFORT_LOW: "low",
+    EFFORT_MEDIUM: "medium",
+    EFFORT_HIGH: "high",
+    EFFORT_MAX: "high",
+}
+
+# Task level (L1-L5) -> default effort. L3-L5 are forced to MAX per spec:
+# moderate/complex/expert tiers always run reasoning at full strength.
+TASK_LEVEL_EFFORT = {
+    1: EFFORT_LOW,
+    2: EFFORT_LOW,
+    3: EFFORT_MAX,
+    4: EFFORT_MAX,
+    5: EFFORT_MAX,
+}
+# Per-role effort floor: managers and reviewers reason at least at HIGH even on
+# lighter tiers, because routing/critique quality dominates outcome quality.
+ROLE_EFFORT_FLOOR = {
+    "manager": EFFORT_HIGH,
+    "reviewer": EFFORT_HIGH,
+}
+
+
+def clamp_effort(effort: str, *, ceiling: str = EFFORT_MAX, floor: str = EFFORT_OFF) -> str:
+    """Clamp an effort label into [floor, ceiling] on the EFFORT_ORDER axis."""
+    e = str(effort or EFFORT_DEFAULT).strip().lower()
+    if e not in EFFORT_ORDER:
+        e = EFFORT_DEFAULT
+    lo = EFFORT_ORDER.get(str(floor or EFFORT_OFF).strip().lower(), 0)
+    hi = EFFORT_ORDER.get(str(ceiling or EFFORT_MAX).strip().lower(), EFFORT_ORDER[EFFORT_MAX])
+    if hi < lo:
+        hi = lo
+    return EFFORT_LEVELS[min(max(EFFORT_ORDER[e], lo), hi)]
+
+
+def model_reasoning_style(provider: str, model: str) -> str:
+    """Return which reasoning dialect a (provider, model) pair speaks.
+
+    One of: "anthropic" | "openai" | "deepseek" | "glm" | "ollama" | "none".
+    Conservative: only models known to support reasoning return a non-"none"
+    style, so unknown models are never sent reasoning fields.
+    """
+    prov = normalize_openai_compat_provider_name(provider) if provider else ""
+    raw_prov = str(provider or "").strip().lower()
+    m = str(model or "").strip().lower()
+    if raw_prov == "anthropic":
+        # Extended thinking on Claude 3.7+ / 4.x families.
+        if any(tok in m for tok in ("claude-3-7", "claude-3.7", "claude-sonnet-4",
+                                    "claude-opus-4", "claude-haiku-4", "claude-4",
+                                    "-thinking", "claude-sonnet-5", "claude-opus-5")):
+            return "anthropic"
+        return "none"
+    if raw_prov == "ollama":
+        # Local reasoning models (qwen3, deepseek-r1, etc.) accept native think flag.
+        if any(tok in m for tok in ("r1", "qwen3", "deepseek", "thinking", "reasoner", "magistral")):
+            return "ollama"
+        return "none"
+    if prov in OPENAI_COMPAT_PROVIDER_NAMES or raw_prov == "custom_http":
+        if prov == "glm" or m.startswith("glm-") or "glm" in m:
+            # GLM 4.5/4.6/5.x + coding endpoints use {"thinking": {...}}.
+            return "glm"
+        if "deepseek" in m or m in ("deepseek-reasoner",):
+            return "deepseek"
+        # OpenAI o-series / gpt-5 reasoning, and openrouter slugs that wrap them.
+        if (m.startswith("o1") or m.startswith("o3") or m.startswith("o4")
+                or "gpt-5" in m or "/o1" in m or "/o3" in m or "/o4" in m
+                or "reasoning" in m):
+            return "openai"
+        return "none"
+    return "none"
+
+
+def resolve_reasoning_payload(
+    provider: str,
+    model: str,
+    effort: str,
+    *,
+    max_tokens: int = 2000,
+) -> dict:
+    """Map (provider, model, effort) -> concrete request mutations.
+
+    Returns a dict that MAY contain:
+      - "payload": dict of fields to merge into the request body
+      - "max_tokens": int override (Anthropic needs budget < max_tokens)
+      - "temperature": float override (Anthropic thinking requires temp=1)
+      - "think": bool (Ollama native flag)
+      - "strip_keys": list[str] of payload keys to drop on a 400 retry
+    Empty/`off` effort or non-reasoning models return an empty mutation dict.
+    """
+    eff = str(effort or EFFORT_OFF).strip().lower()
+    if eff not in EFFORT_ORDER or eff == EFFORT_OFF:
+        return {}
+    style = model_reasoning_style(provider, model)
+    if style == "none":
+        return {}
+    if style == "anthropic":
+        budget = EFFORT_ANTHROPIC_BUDGET.get(eff, EFFORT_ANTHROPIC_BUDGET[EFFORT_MEDIUM])
+        # Anthropic requires max_tokens > budget_tokens; keep healthy headroom.
+        out_max = max(int(max_tokens or 0), budget + 4_096)
+        return {
+            "payload": {"thinking": {"type": "enabled", "budget_tokens": budget}},
+            "max_tokens": out_max,
+            "temperature": 1.0,  # required when extended thinking is enabled
+            "strip_keys": ["thinking"],
+        }
+    if style in ("openai", "deepseek"):
+        # DeepSeek-reasoner ignores reasoning_effort but reasons by default; still
+        # send it for o-series/gpt-5 and newer deepseek that honor the field.
+        return {
+            "payload": {"reasoning_effort": EFFORT_OPENAI_REASONING.get(eff, "medium")},
+            "strip_keys": ["reasoning_effort"],
+        }
+    if style == "glm":
+        thinking_type = "disabled" if eff in (EFFORT_OFF,) else "enabled"
+        return {
+            "payload": {"thinking": {"type": thinking_type}},
+            "strip_keys": ["thinking"],
+        }
+    if style == "ollama":
+        return {"think": True}
+    return {}
+
 def openai_compat_probe_headers(provider: str, api_key: str = "") -> dict[str, str]:
     normalized = normalize_openai_compat_provider_name(provider)
     headers = {
@@ -6363,11 +6513,14 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
         headers: dict | None = None,
         payload_template: str = "",
         thinking_stream: bool = False,
+        response_stream: bool = False,
         temperature: float = 0.2,
         request_timeout: int = DEFAULT_REQUEST_TIMEOUT,
         capabilities: dict | None = None,
         media_endpoints: dict | None = None,
         source: str = "config",
+        effort: str = "",
+        max_effort: str = "",
     ):
         out.append(
             {
@@ -6381,6 +6534,7 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
                 "headers": headers or {},
                 "payload_template": payload_template or "",
                 "thinking_stream": bool(thinking_stream),
+                "response_stream": bool(response_stream),
                 "temperature": float(temperature or 0.2),
                 "request_timeout": normalize_timeout_seconds(
                     request_timeout,
@@ -6390,6 +6544,8 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
                 ),
                 "capabilities": capabilities or default_multimodal_capabilities(),
                 "media_endpoints": media_endpoints or {},
+                "effort": str(effort or "").strip().lower(),
+                "max_effort": str(max_effort or "").strip().lower(),
                 "source": source,
             }
         )
@@ -6403,8 +6559,14 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
         maximum=MAX_TIMEOUT_SECONDS,
         fallback=DEFAULT_REQUEST_TIMEOUT,
     )
+    # Global effort default + ceiling (per-profile fields override these).
+    effort_default = str(config.get("effort", "") or "").strip().lower()
+    max_effort_default = str(config.get("max_effort", "") or "").strip().lower()
     thinking_stream_default = bool(
         config.get("thinking_stream", config.get("stream_thinking", False))
+    )
+    response_stream_default = bool(
+        config.get("response_stream", config.get("stream_response", False))
     )
     explicit_default_profile_id = sanitize_profile_id(
         str(
@@ -6560,10 +6722,18 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
                     ),
                 )
             ),
+            response_stream=bool(
+                raw_profile.get(
+                    "response_stream",
+                    raw_profile.get("stream_response", response_stream_default),
+                )
+            ),
             temperature=float(raw_profile.get("temperature", temp) or temp),
             request_timeout=raw_profile.get("request_timeout", timeout),
             capabilities=capabilities,
             media_endpoints=media_endpoints,
+            effort=str(raw_profile.get("effort", effort_default) or effort_default),
+            max_effort=str(raw_profile.get("max_effort", max_effort_default) or max_effort_default),
             source=str(raw_profile.get("source", "profiles") or "profiles"),
         )
         if bool(raw_profile.get("default")) or bool(raw_profile.get("active")) or bool(raw_profile.get("selected")):
@@ -6585,6 +6755,7 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             model=ollama_model,
             base_url=extract_base_url(ollama_url),
             thinking_stream=bool(config.get("ollama_thinking_stream", thinking_stream_default)),
+            response_stream=bool(config.get("ollama_response_stream", response_stream_default)),
             temperature=temp,
             request_timeout=timeout,
             capabilities=build_profile_capabilities("ollama", "ollama", ollama_model),
@@ -6605,6 +6776,7 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             endpoint=complete_chat_endpoint(openai_url),
             api_key=openai_key,
             thinking_stream=bool(config.get("openai_thinking_stream", thinking_stream_default)),
+            response_stream=bool(config.get("openai_response_stream", response_stream_default)),
             temperature=temp,
             request_timeout=timeout,
             capabilities=build_profile_capabilities("openai", normalize_profile_provider("openai"), openai_model or "gpt-4o-mini"),
@@ -6625,6 +6797,7 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             endpoint=complete_chat_endpoint(sf_url),
             api_key=sf_key,
             thinking_stream=bool(config.get("siliconflow_thinking_stream", thinking_stream_default)),
+            response_stream=bool(config.get("siliconflow_response_stream", response_stream_default)),
             temperature=temp,
             request_timeout=timeout,
             capabilities=build_profile_capabilities("siliconflow", normalize_profile_provider("siliconflow"), sf_model or "Qwen/Qwen3-Next-80B-A3B-Instruct"),
@@ -6647,6 +6820,7 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             endpoint=complete_chat_endpoint(vllm_url or _vllm_default),
             api_key=vllm_key,
             thinking_stream=bool(config.get("vllm_thinking_stream", thinking_stream_default)),
+            response_stream=bool(config.get("vllm_response_stream", response_stream_default)),
             temperature=temp,
             request_timeout=timeout,
             capabilities=build_profile_capabilities("vllm", normalize_profile_provider("vllm"), vllm_model or "auto"),
@@ -6667,6 +6841,7 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             base_url=extract_base_url(lms_url or _lms_default),
             endpoint=complete_chat_endpoint(lms_url or _lms_default),
             thinking_stream=bool(config.get("lmstudio_thinking_stream", thinking_stream_default)),
+            response_stream=bool(config.get("lmstudio_response_stream", response_stream_default)),
             temperature=temp,
             request_timeout=timeout,
             capabilities=build_profile_capabilities("lmstudio", normalize_profile_provider("lmstudio"), lms_model or "auto"),
@@ -6689,6 +6864,7 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             endpoint=_anth_base.rstrip("/") + "/v1/messages",
             api_key=anth_key,
             thinking_stream=bool(config.get("anthropic_thinking_stream", thinking_stream_default)),
+            response_stream=bool(config.get("anthropic_response_stream", response_stream_default)),
             temperature=temp,
             request_timeout=timeout,
             capabilities=build_profile_capabilities("anthropic", "anthropic", anth_model or "claude-sonnet-4-20250514"),
@@ -6711,10 +6887,13 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             endpoint=complete_chat_endpoint(glm_url or _glm_default),
             api_key=glm_key,
             thinking_stream=bool(config.get("glm_thinking_stream", thinking_stream_default)),
+            response_stream=bool(config.get("glm_response_stream", response_stream_default)),
             temperature=temp,
             request_timeout=timeout,
             capabilities=build_profile_capabilities("glm", normalize_profile_provider("glm"), glm_model or "glm-4-flash"),
             media_endpoints=build_profile_media_endpoints("glm"),
+            effort=str(config.get("glm_effort", effort_default) or effort_default),
+            max_effort=str(config.get("glm_max_effort", max_effort_default) or max_effort_default),
         )
 
     # ── KIMI (Moonshot / 月之暗面) ─────────────────────────────────
@@ -6733,6 +6912,7 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             endpoint=complete_chat_endpoint(kimi_url or _kimi_default),
             api_key=kimi_key,
             thinking_stream=bool(config.get("kimi_thinking_stream", thinking_stream_default)),
+            response_stream=bool(config.get("kimi_response_stream", response_stream_default)),
             temperature=temp,
             request_timeout=timeout,
             capabilities=build_profile_capabilities("kimi", normalize_profile_provider("kimi"), kimi_model or "moonshot-v1-8k"),
@@ -6755,6 +6935,7 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             endpoint=complete_chat_endpoint(or_url or _or_default),
             api_key=or_key,
             thinking_stream=bool(config.get("openrouter_thinking_stream", thinking_stream_default)),
+            response_stream=bool(config.get("openrouter_response_stream", response_stream_default)),
             temperature=temp,
             request_timeout=timeout,
             capabilities=build_profile_capabilities("openrouter", normalize_profile_provider("openrouter"), or_model or "meta-llama/llama-3.1-8b-instruct"),
@@ -6778,6 +6959,7 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             headers=custom_headers,
             payload_template=custom_payload,
             thinking_stream=bool(config.get("custom_thinking_stream", thinking_stream_default)),
+            response_stream=bool(config.get("custom_response_stream", response_stream_default)),
             temperature=temp,
             request_timeout=timeout,
             capabilities=build_profile_capabilities("custom", normalize_profile_provider("custom_http"), str(config.get("custom_model", "") or config.get("openai_model", "") or "custom-model")),
@@ -6793,6 +6975,7 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             model=default_ollama_model,
             base_url=default_ollama_url,
             thinking_stream=thinking_stream_default,
+            response_stream=response_stream_default,
             temperature=0.2,
             request_timeout=DEFAULT_REQUEST_TIMEOUT,
             capabilities=build_profile_capabilities("ollama", "ollama", default_ollama_model),
@@ -6861,6 +7044,8 @@ def looks_like_llm_config(config: dict) -> bool:
         "glm_url",
         "glm_model",
         "glm_key",
+        "glm_effort",
+        "glm_max_effort",
         "kimi_url",
         "kimi_model",
         "kimi_key",
@@ -14086,6 +14271,7 @@ class OllamaClient:
         headers: dict | None = None,
         payload_template: str = "",
         thinking_stream: bool = False,
+        response_stream: bool = False,
     ):
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -14101,6 +14287,7 @@ class OllamaClient:
         self.headers = headers or {}
         self.payload_template = payload_template
         self.thinking_stream = bool(thinking_stream)
+        self.response_stream = bool(response_stream)
         self.capabilities = default_multimodal_capabilities()
         self.media_endpoints: dict[str, str] = {}
         self.embed_model: str = ""  # embedding model name, e.g. "nomic-embed-text"
@@ -14290,6 +14477,7 @@ class OllamaClient:
         )
         self.payload_template = str(profile.get("payload_template", self.payload_template) or self.payload_template)
         self.thinking_stream = bool(profile.get("thinking_stream", self.thinking_stream))
+        self.response_stream = bool(profile.get("response_stream", self.response_stream))
         declared_caps = parse_capability_overrides(profile.get("capabilities", {}))
         self.capabilities = merge_multimodal_capabilities(
             infer_model_multimodal_capabilities(self.provider, self.model),
@@ -14435,6 +14623,7 @@ class OllamaClient:
                 retryable = bool(http_retryable or conn_retryable)
                 exc.retryable = retryable
                 exc.transient = bool(transient or conn_retryable)
+                exc.stream_emitted = False
                 if not retryable or attempt >= retry_budget:
                     raise
                 delay = self._http_retry_delay(exc, attempt)
@@ -14458,6 +14647,110 @@ class OllamaClient:
         if last_exc is not None:
             raise last_exc
         raise OllamaError("model HTTP request failed", url=url)
+
+    def _iter_response_lines_url(self, url: str, payload: dict, headers: dict | None = None, *, cancel_check=None):
+        req_headers = {"Content-Type": "application/json"}
+        if headers:
+            req_headers.update(headers)
+        req = Request(
+            url,
+            data=json_dumps(payload).encode("utf-8"),
+            headers=req_headers,
+            method="POST",
+        )
+        try:
+            with urlopen(req, timeout=self.timeout) as resp:
+                while True:
+                    if cancel_check is not None:
+                        try:
+                            if cancel_check():
+                                raise OllamaError("interrupted by user", status=499, url=url)
+                        except OllamaError:
+                            raise
+                        except Exception:
+                            pass
+                    line = resp.readline()
+                    if not line:
+                        break
+                    yield line.decode("utf-8", errors="replace")
+        except HTTPError as exc:
+            text = exc.read().decode("utf-8", errors="replace")
+            hdrs = self._headers_to_dict(getattr(exc, "headers", None))
+            raise OllamaError(
+                f"HTTP {exc.code}: {text}",
+                status=exc.code,
+                headers=hdrs,
+                body=text,
+                url=url,
+                retry_after=self._parse_retry_after_seconds(hdrs, text),
+            ) from exc
+        except (URLError, TimeoutError, socket.timeout, ConnectionResetError, ConnectionAbortedError) as exc:
+            raise OllamaError(f"Connection error: {exc}", url=url) from exc
+
+    def _iter_response_lines_url_with_retries(
+        self,
+        url: str,
+        payload: dict,
+        headers: dict | None = None,
+        *,
+        max_attempts: int | None = None,
+        cancel_check=None,
+        on_retry=None,
+    ):
+        retry_budget = LLM_HTTP_RETRY_MAX_ATTEMPTS if max_attempts is None else max(0, int(max_attempts or 0))
+        key = self._http_retry_key(url)
+        label = self._provider_retry_label()
+        for attempt in range(0, retry_budget + 1):
+            cooldown = self._cooldown_remaining(key)
+            if cooldown > 0:
+                if on_retry:
+                    try:
+                        on_retry(
+                            {
+                                "provider": label,
+                                "url": url,
+                                "attempt": attempt,
+                                "retry_budget": retry_budget,
+                                "delay": round(cooldown, 2),
+                                "reason": "endpoint cooldown",
+                                "status": 0,
+                            }
+                        )
+                    except Exception:
+                        pass
+                self._wait_with_cancel(cooldown, cancel_check=cancel_check)
+            emitted = False
+            try:
+                for line in self._iter_response_lines_url(url, payload, headers=headers, cancel_check=cancel_check):
+                    emitted = True
+                    yield line
+                return
+            except OllamaError as exc:
+                http_retryable, transient = self._is_retryable_http_error(exc, url)
+                conn_retryable = self._is_retryable_connection_error(exc)
+                retryable = bool((http_retryable or conn_retryable) and not emitted)
+                exc.retryable = retryable
+                exc.transient = bool(transient or conn_retryable)
+                if not retryable or attempt >= retry_budget:
+                    raise
+                delay = self._http_retry_delay(exc, attempt)
+                self._set_endpoint_cooldown(key, delay, exc)
+                if on_retry:
+                    try:
+                        on_retry(
+                            {
+                                "provider": label,
+                                "url": url,
+                                "attempt": attempt + 1,
+                                "retry_budget": retry_budget,
+                                "delay": round(delay, 2),
+                                "reason": trim(str(exc), 240),
+                                "status": int(getattr(exc, "status", 0) or 0),
+                            }
+                        )
+                    except Exception:
+                        pass
+                self._wait_with_cancel(delay, cancel_check=cancel_check)
 
     def _post_raw_url(self, url: str, payload: dict, headers: dict | None = None) -> tuple[bytes, str]:
         req_headers = {"Content-Type": "application/json"}
@@ -14692,6 +14985,128 @@ class OllamaClient:
         thinking = trim("\n\n".join(x for x in thinking_parts if str(x).strip()).strip(), 24_000)
         tool_calls = self._normalize_tool_calls(msg.get("tool_calls", []))
         return main, tool_calls, thinking
+
+    def _emit_content_delta(self, callback, piece: object):
+        text = str(piece or "")
+        if not text or not callback:
+            return
+        try:
+            callback(text)
+        except Exception:
+            pass
+
+    def _merge_openai_tool_delta(self, tool_buffers: dict[int, dict], delta_calls: object):
+        if not isinstance(delta_calls, list):
+            return
+        for fallback_idx, raw_call in enumerate(delta_calls):
+            if not isinstance(raw_call, dict):
+                continue
+            try:
+                idx = int(raw_call.get("index", fallback_idx) or 0)
+            except Exception:
+                idx = fallback_idx
+            buf = tool_buffers.setdefault(
+                idx,
+                {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+            )
+            if raw_call.get("id"):
+                buf["id"] = str(raw_call.get("id") or "")
+            if raw_call.get("type"):
+                buf["type"] = str(raw_call.get("type") or "function")
+            fn = raw_call.get("function", {})
+            if isinstance(fn, dict):
+                bfn = buf.setdefault("function", {"name": "", "arguments": ""})
+                if fn.get("name"):
+                    bfn["name"] = str(bfn.get("name", "") or "") + str(fn.get("name") or "")
+                if fn.get("arguments") is not None:
+                    bfn["arguments"] = str(bfn.get("arguments", "") or "") + str(fn.get("arguments") or "")
+
+    def _openai_stream_result_from_lines(self, lines, *, on_content_delta=None) -> dict:
+        content_parts: list[str] = []
+        thinking_parts: list[str] = []
+        tool_buffers: dict[int, dict] = {}
+        final_chunks: list[dict] = []
+        usage: dict = {}
+        sse_data_parts: list[str] = []
+
+        def _handle_payload(raw_text: str):
+            text = str(raw_text or "").strip()
+            if not text or text == "[DONE]":
+                return
+            part = parse_json_object(text, {})
+            if not isinstance(part, dict) or not part:
+                return
+            final_chunks.append(part)
+            if isinstance(part.get("usage"), dict):
+                usage.update(part.get("usage") or {})
+            choices = part.get("choices", [])
+            if not isinstance(choices, list):
+                choices = []
+            for choice in choices:
+                if not isinstance(choice, dict):
+                    continue
+                delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+                if not delta and isinstance(choice.get("message"), dict):
+                    delta = choice.get("message") or {}
+                content_piece = delta.get("content")
+                if isinstance(content_piece, list):
+                    joined = []
+                    for item in content_piece:
+                        if not isinstance(item, dict):
+                            if item:
+                                joined.append(str(item))
+                            continue
+                        ptype = str(item.get("type", "") or "").strip().lower()
+                        txt = item.get("text") or item.get("content") or ""
+                        if ptype in {"reasoning", "thinking", "thought"}:
+                            if txt:
+                                thinking_parts.append(str(txt))
+                        elif txt:
+                            joined.append(str(txt))
+                    content_piece = "\n".join(joined)
+                if content_piece:
+                    piece = str(content_piece)
+                    content_parts.append(piece)
+                    self._emit_content_delta(on_content_delta, piece)
+                for key in ("reasoning_content", "reasoning", "thinking", "thought"):
+                    extra = delta.get(key)
+                    if extra:
+                        thinking_parts.append(str(extra))
+                self._merge_openai_tool_delta(tool_buffers, delta.get("tool_calls"))
+
+        for raw_line in lines:
+            line = str(raw_line or "").rstrip("\r\n")
+            if not line:
+                if sse_data_parts:
+                    _handle_payload("\n".join(sse_data_parts))
+                    sse_data_parts = []
+                continue
+            if line.startswith(":"):
+                continue
+            if line.startswith("data:"):
+                payload = line[5:].lstrip()
+                if payload:
+                    _handle_payload(payload)
+                else:
+                    sse_data_parts.append(payload)
+                continue
+            _handle_payload(line)
+        if sse_data_parts:
+            _handle_payload("\n".join(sse_data_parts))
+
+        content, thinking_inline = split_thinking_content("".join(content_parts))
+        if thinking_inline:
+            thinking_parts.append(thinking_inline)
+        tool_calls = self._normalize_tool_calls([tool_buffers[k] for k in sorted(tool_buffers.keys())])
+        raw: dict = {"streamed": True, "chunks": len(final_chunks)}
+        if usage:
+            raw["usage"] = usage
+        return {
+            "content": content,
+            "thinking": trim("\n\n".join(x for x in thinking_parts if str(x).strip()).strip(), 24_000),
+            "tool_calls": tool_calls,
+            "raw": raw,
+        }
 
     def _render_headers(self) -> dict:
         out = {}
@@ -15070,17 +15485,53 @@ class OllamaClient:
         cancel_check=None,
         on_http_retry=None,
         http_retry_attempts: int | None = None,
+        response_stream: bool = False,
+        on_content_delta=None,
+        reasoning: dict | None = None,
     ) -> dict:
         endpoint = self.endpoint.strip() or complete_chat_endpoint(self.base_url)
         payload = {
             "model": self.model,
             "messages": req_messages,
-            "stream": False,
+            "stream": bool(response_stream),
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
         if tools:
             payload["tools"] = tools
+        reasoning = reasoning or {}
+        reasoning_fields = reasoning.get("payload") if isinstance(reasoning, dict) else None
+        reasoning_strip = list(reasoning.get("strip_keys", []) or []) if isinstance(reasoning, dict) else []
+        if isinstance(reasoning_fields, dict):
+            payload.update(reasoning_fields)
+        if response_stream:
+            try:
+                lines = self._iter_response_lines_url_with_retries(
+                    endpoint,
+                    payload,
+                    headers=self._render_headers(),
+                    max_attempts=http_retry_attempts,
+                    cancel_check=cancel_check,
+                    on_retry=on_http_retry,
+                )
+                return self._openai_stream_result_from_lines(lines, on_content_delta=on_content_delta)
+            except OllamaError as exc:
+                # If the endpoint rejects the reasoning field, drop it and retry once.
+                if reasoning_strip and int(getattr(exc, "status", 0) or 0) == 400:
+                    stripped = {k: v for k, v in payload.items() if k not in reasoning_strip}
+                    lines = self._iter_response_lines_url_with_retries(
+                        endpoint,
+                        stripped,
+                        headers=self._render_headers(),
+                        max_attempts=http_retry_attempts,
+                        cancel_check=cancel_check,
+                        on_retry=on_http_retry,
+                    )
+                    return self._openai_stream_result_from_lines(lines, on_content_delta=on_content_delta)
+                raise
+            except Exception as exc:
+                raise OllamaError(f"stream response failed: {exc}", url=endpoint) from exc
+        payload["stream"] = False
         try:
             raw = self._post_json_url_with_retries(
                 endpoint,
@@ -15091,18 +15542,32 @@ class OllamaClient:
                 on_retry=on_http_retry,
             )
         except OllamaError as exc:
+            err_text = str(exc).lower()
+            status_400 = int(getattr(exc, "status", 0) or 0) == 400
             # Some providers (e.g. certain Chinese cloud APIs) reject role=tool.
             # Retry once with tool messages collapsed into user messages.
-            err_text = str(exc).lower()
-            if int(getattr(exc, "status", 0) or 0) == 400 and (
+            if status_400 and (
                 "messages.role" in err_text or ("tool" in err_text and "role" in err_text)
             ):
                 fallback_msgs = self._collapse_tool_role_messages(req_messages)
                 fallback_payload = {**payload, "messages": fallback_msgs, "tools": None}
                 fallback_payload.pop("tools", None)
+                fallback_payload["stream"] = False
                 raw = self._post_json_url_with_retries(
                     endpoint,
                     fallback_payload,
+                    headers=self._render_headers(),
+                    max_attempts=http_retry_attempts,
+                    cancel_check=cancel_check,
+                    on_retry=on_http_retry,
+                )
+            elif status_400 and reasoning_strip and any(k in payload for k in reasoning_strip):
+                # Endpoint does not understand the reasoning field; drop and retry.
+                stripped = {k: v for k, v in payload.items() if k not in reasoning_strip}
+                stripped["stream"] = False
+                raw = self._post_json_url_with_retries(
+                    endpoint,
+                    stripped,
                     headers=self._render_headers(),
                     max_attempts=http_retry_attempts,
                     cancel_check=cancel_check,
@@ -15124,10 +15589,16 @@ class OllamaClient:
         cancel_check=None,
         on_http_retry=None,
         http_retry_attempts: int | None = None,
+        response_stream: bool = False,
+        on_content_delta=None,
+        reasoning: dict | None = None,
     ) -> dict:
         endpoint = (self.endpoint or "").strip()
         if not endpoint:
             raise OllamaError("Custom provider endpoint is empty")
+        reasoning = reasoning or {}
+        reasoning_fields = reasoning.get("payload") if isinstance(reasoning, dict) else None
+        reasoning_fields = reasoning_fields if isinstance(reasoning_fields, dict) else {}
         payload = {}
         tpl = (self.payload_template or "").strip()
         if tpl:
@@ -15138,6 +15609,7 @@ class OllamaClient:
                 .replace("${max_tokens}", str(max_tokens))
                 .replace("${api_key}", self.api_key)
                 .replace("${think}", "true" if think else "false")
+                .replace("${reasoning_json}", json_dumps(reasoning_fields))
             )
             payload = parse_json_object(rendered, {})
         if not payload:
@@ -15146,10 +15618,28 @@ class OllamaClient:
                 "messages": req_messages,
                 "temperature": temperature,
                 "max_tokens": max_tokens,
-                "stream": False,
+                "stream": bool(response_stream),
             }
             if tools:
                 payload["tools"] = tools
+            if reasoning_fields:
+                payload.update(reasoning_fields)
+        if response_stream and bool(payload.get("stream", False)):
+            try:
+                lines = self._iter_response_lines_url_with_retries(
+                    endpoint,
+                    payload,
+                    headers=self._render_headers(),
+                    max_attempts=http_retry_attempts,
+                    cancel_check=cancel_check,
+                    on_retry=on_http_retry,
+                )
+                return self._openai_stream_result_from_lines(lines, on_content_delta=on_content_delta)
+            except OllamaError:
+                raise
+            except Exception as exc:
+                raise OllamaError(f"stream response failed: {exc}", url=endpoint) from exc
+        payload["stream"] = False
         raw = self._post_json_url_with_retries(
             endpoint,
             payload,
@@ -15182,6 +15672,10 @@ class OllamaClient:
         max_tokens: int = 2000,
         temperature: float = 0.2,
         think: bool = False,
+        response_stream: bool = False,
+        on_content_delta=None,
+        cancel_check=None,
+        reasoning: dict | None = None,
     ) -> dict:
         endpoint = (self.endpoint or "").strip()
         if not endpoint:
@@ -15242,6 +15736,13 @@ class OllamaClient:
             "temperature": temperature,
             "messages": messages,
         }
+        reasoning = reasoning or {}
+        reasoning_fields = reasoning.get("payload") if isinstance(reasoning, dict) else None
+        if isinstance(reasoning_fields, dict):
+            payload.update(reasoning_fields)
+            # Anthropic forbids temperature != 1 when extended thinking is on.
+            if "thinking" in reasoning_fields:
+                payload["temperature"] = 1.0
         if system_parts:
             payload["system"] = "\n\n".join(system_parts)
         if tools:
@@ -15251,6 +15752,15 @@ class OllamaClient:
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
         }
+        if response_stream:
+            payload["stream"] = True
+            try:
+                lines = self._iter_response_lines_url(endpoint, payload, headers=headers, cancel_check=cancel_check)
+                return self._anthropic_stream_result_from_lines(lines, on_content_delta=on_content_delta)
+            except OllamaError:
+                raise
+            except Exception as exc:
+                raise OllamaError(f"anthropic stream response failed: {exc}", url=endpoint) from exc
         raw = self._post_json_url(endpoint, payload, headers=headers)
         # If the provider returned OpenAI-format (has 'choices'), it's an OpenAI-compat endpoint
         # that doesn't understand Anthropic tool schemas. Retry with OpenAI-format tools.
@@ -15290,6 +15800,121 @@ class OllamaClient:
                 })
         return "\n".join(text_parts), tool_calls, "\n".join(thinking_parts)
 
+    def _anthropic_stream_result_from_lines(self, lines, *, on_content_delta=None) -> dict:
+        text_parts: list[str] = []
+        thinking_parts: list[str] = []
+        tool_buffers: dict[int, dict] = {}
+        block_index_to_type: dict[int, str] = {}
+        usage: dict = {}
+        event_name = ""
+        sse_data_parts: list[str] = []
+        chunk_count = 0
+
+        def _handle_payload(raw_text: str):
+            nonlocal chunk_count, event_name
+            text = str(raw_text or "").strip()
+            if not text:
+                return
+            part = parse_json_object(text, {})
+            if not isinstance(part, dict) or not part:
+                return
+            chunk_count += 1
+            if isinstance(part.get("usage"), dict):
+                usage.update(part.get("usage") or {})
+            ptype = str(part.get("type", event_name) or "").strip()
+            if ptype == "content_block_start":
+                idx = int(part.get("index", 0) or 0)
+                block = part.get("content_block", {})
+                if isinstance(block, dict):
+                    btype = str(block.get("type", "") or "").strip()
+                    block_index_to_type[idx] = btype
+                    if btype == "tool_use":
+                        tool_buffers[idx] = {
+                            "id": str(block.get("id") or make_id("tool")),
+                            "type": "function",
+                            "function": {
+                                "name": str(block.get("name", "") or ""),
+                                "arguments": "",
+                            },
+                        }
+                    elif btype == "text" and block.get("text"):
+                        piece = str(block.get("text") or "")
+                        text_parts.append(piece)
+                        self._emit_content_delta(on_content_delta, piece)
+                    elif btype == "thinking" and block.get("thinking"):
+                        thinking_parts.append(str(block.get("thinking") or ""))
+                return
+            if ptype == "content_block_delta":
+                idx = int(part.get("index", 0) or 0)
+                delta = part.get("delta", {})
+                if not isinstance(delta, dict):
+                    return
+                dtype = str(delta.get("type", "") or block_index_to_type.get(idx, "") or "").strip()
+                if dtype in {"text_delta", "text"}:
+                    piece = str(delta.get("text", "") or "")
+                    if piece:
+                        text_parts.append(piece)
+                        self._emit_content_delta(on_content_delta, piece)
+                elif dtype in {"thinking_delta", "thinking"}:
+                    piece = str(delta.get("thinking", "") or "")
+                    if piece:
+                        thinking_parts.append(piece)
+                elif dtype in {"input_json_delta", "tool_use"}:
+                    piece = str(delta.get("partial_json", "") or delta.get("input", "") or "")
+                    if piece:
+                        buf = tool_buffers.setdefault(
+                            idx,
+                            {
+                                "id": make_id("tool"),
+                                "type": "function",
+                                "function": {"name": "", "arguments": ""},
+                            },
+                        )
+                        fn = buf.setdefault("function", {"name": "", "arguments": ""})
+                        fn["arguments"] = str(fn.get("arguments", "") or "") + piece
+                return
+            if ptype == "message_delta":
+                delta = part.get("delta", {})
+                if isinstance(delta, dict) and isinstance(delta.get("usage"), dict):
+                    usage.update(delta.get("usage") or {})
+
+        for raw_line in lines:
+            line = str(raw_line or "").rstrip("\r\n")
+            if not line:
+                if sse_data_parts:
+                    _handle_payload("\n".join(sse_data_parts))
+                    sse_data_parts = []
+                event_name = ""
+                continue
+            if line.startswith(":"):
+                continue
+            if line.startswith("event:"):
+                event_name = line[6:].strip()
+                continue
+            if line.startswith("data:"):
+                payload = line[5:].lstrip()
+                if payload:
+                    _handle_payload(payload)
+                else:
+                    sse_data_parts.append(payload)
+                continue
+            _handle_payload(line)
+        if sse_data_parts:
+            _handle_payload("\n".join(sse_data_parts))
+
+        content, thinking_inline = split_thinking_content("".join(text_parts))
+        if thinking_inline:
+            thinking_parts.append(thinking_inline)
+        raw: dict = {"streamed": True, "chunks": chunk_count}
+        if usage:
+            raw["usage"] = usage
+        return {
+            "content": content,
+            "thinking": trim("\n\n".join(x for x in thinking_parts if str(x).strip()).strip(), 24_000),
+            "tool_calls": self._normalize_tool_calls([tool_buffers[k] for k in sorted(tool_buffers.keys())]),
+            "raw": raw,
+        }
+
     def _convert_tools_to_anthropic(self, openai_tools: list[dict]) -> list[dict]:
         """Convert OpenAI-format tool definitions to Anthropic format."""
         out: list[dict] = []
@@ -15315,6 +15940,7 @@ class OllamaClient:
         temperature: float = 0.2,
         think: bool = False,
         on_thinking_chunk=None,
+        on_content_delta=None,
     ) -> dict:
         effective_max = max_tokens
         if tools:
@@ -15325,6 +15951,8 @@ class OllamaClient:
             "stream": True,
             "options": {"temperature": temperature, "num_predict": effective_max},
         }
+        if think:
+            payload["think"] = True
         if tools:
             payload["tools"] = tools
         req = Request(
@@ -15356,6 +15984,7 @@ class OllamaClient:
                     piece_main, piece_thinking = split_thinking_content(raw_piece)
                     if piece_main:
                         full_content.append(piece_main)
+                        self._emit_content_delta(on_content_delta, piece_main)
                     if piece_thinking:
                         full_thinking.append(piece_thinking)
                         if on_thinking_chunk:
@@ -15414,16 +16043,31 @@ class OllamaClient:
         think: bool = False,
         stream_thinking: bool = False,
         on_thinking_chunk=None,
+        response_stream: bool = False,
+        on_content_delta=None,
         media_inputs: list[dict] | None = None,
         probe_mode: bool = False,
         cancel_check=None,
         on_http_retry=None,
+        effort: str = "",
     ) -> dict:
         provider = (self.provider or "ollama").lower()
+        # Resolve provider-neutral effort into native reasoning mutations once.
+        # probe_mode never reasons (it is a cheap capability ping).
+        reasoning = {} if probe_mode else resolve_reasoning_payload(
+            self.provider, self.model, effort, max_tokens=max_tokens,
+        )
+        if reasoning.get("max_tokens"):
+            max_tokens = int(reasoning["max_tokens"])
+        if reasoning.get("temperature") is not None:
+            temperature = float(reasoning["temperature"])
+        if reasoning.get("think"):
+            think = True
         req_messages = self._prepare_request_messages(messages, provider, media_inputs=media_inputs)
         if probe_mode:
             tools = None
             stream_thinking = False
+            response_stream = False
         http_retry_attempts = 0 if probe_mode else None
         if system:
             req_messages = [{"role": "system", "content": system}] + req_messages
@@ -15451,10 +16095,21 @@ class OllamaClient:
                 cancel_check=cancel_check,
                 on_http_retry=on_http_retry,
                 http_retry_attempts=http_retry_attempts,
+                response_stream=bool(response_stream),
+                on_content_delta=on_content_delta,
+                reasoning=reasoning,
             )
         if provider == "anthropic":
             return self._chat_anthropic(
-                req_messages, tools=tools, max_tokens=max_tokens, temperature=temperature, think=False
+                req_messages,
+                tools=tools,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                think=False,
+                response_stream=bool(response_stream),
+                on_content_delta=on_content_delta,
+                cancel_check=cancel_check,
+                reasoning=reasoning,
             )
         if provider == "custom_http":
             return self._chat_custom_http(
@@ -15466,29 +16121,41 @@ class OllamaClient:
                 cancel_check=cancel_check,
                 on_http_retry=on_http_retry,
                 http_retry_attempts=http_retry_attempts,
+                response_stream=bool(response_stream),
+                on_content_delta=on_content_delta,
+                reasoning=reasoning,
             )
-        if stream_thinking:
+        if stream_thinking or response_stream:
             try:
                 return self._chat_ollama_stream_native(
                     req_messages,
                     tools=tools,
                     max_tokens=max_tokens,
                     temperature=temperature,
-                    think=False,
+                    think=bool(think),
                     on_thinking_chunk=on_thinking_chunk,
+                    on_content_delta=on_content_delta if response_stream else None,
                 )
             except OllamaError:
-                pass
+                if response_stream:
+                    raise
         openai_payload = {
             "model": self.model,
             "messages": req_messages,
-            "stream": False,
+            "stream": bool(response_stream),
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
         if tools:
             openai_payload["tools"] = tools
         try:
+            if response_stream:
+                lines = self._iter_response_lines_url(
+                    f"{self.base_url}/v1/chat/completions",
+                    openai_payload,
+                    cancel_check=cancel_check,
+                )
+                return self._openai_stream_result_from_lines(lines, on_content_delta=on_content_delta)
             raw = self._post_json("/v1/chat/completions", openai_payload)
             content, tool_calls, thinking_content = self._extract_openai_message(raw)
             return {"content": content, "thinking": thinking_content, "tool_calls": tool_calls, "raw": raw}
@@ -15508,6 +16175,8 @@ class OllamaClient:
             "stream": False,
             "options": {"temperature": temperature, "num_predict": effective_max_native},
         }
+        if think:
+            native_payload["think"] = True
         if tools:
             native_payload["tools"] = tools
         raw = self._post_json("/api/chat", native_payload)
@@ -16250,6 +16919,12 @@ class SessionState:
         self.last_auto_title_ts = 0.0
         self.live_thinking_text = ""
         self.live_thinking_last_emit = 0.0
+        self.live_response_text = ""
+        self.live_response_role = ""
+        self.live_response_label = ""
+        self.live_response_visible = False
+        self.live_response_last_emit = 0.0
+        self.live_response_stream_id = ""
         self.live_truncation_text = ""
         self.live_truncation_kind = ""
         self.live_truncation_tool = ""
@@ -16958,6 +17633,8 @@ class SessionState:
             "temperature": 0.2,
             "request_timeout": DEFAULT_REQUEST_TIMEOUT,
             "selection": f"ollama::{self.ollama.model}",
+            "thinking_stream": bool(getattr(self.ollama, "thinking_stream", False)),
+            "response_stream": bool(getattr(self.ollama, "response_stream", False)),
             "capabilities": infer_model_multimodal_capabilities("ollama", self.ollama.model),
             "media_endpoints": {},
             "source": "fallback",
@@ -16987,6 +17664,8 @@ class SessionState:
                 "temperature": 0.2,
                 "request_timeout": DEFAULT_REQUEST_TIMEOUT,
                 "selection": f"ollama::{self.ollama.model}",
+                "thinking_stream": bool(getattr(self.ollama, "thinking_stream", False)),
+                "response_stream": bool(getattr(self.ollama, "response_stream", False)),
                 "capabilities": infer_model_multimodal_capabilities("ollama", self.ollama.model),
                 "media_endpoints": {},
                 "source": "fallback",
@@ -17107,6 +17786,7 @@ class SessionState:
                     "source": profile.get("source", ""),
                     "thinking_hint": bool(profile.get("thinking_hint", False)),
                     "thinking_stream": bool(profile.get("thinking_stream", False)),
+                    "response_stream": bool(profile.get("response_stream", False)),
                     "capabilities": caps,
                     "capabilities_probed": bool(cache_entry),
                     "capabilities_probed_at": float(cache_entry.get("updated_at", 0.0) or 0.0)
@@ -17149,6 +17829,7 @@ class SessionState:
                         "source": "ollama-tags",
                         "thinking_hint": bool(profile.get("thinking_hint", self.thinking)),
                         "thinking_stream": bool(profile.get("thinking_stream", self.ollama.thinking_stream)),
+                        "response_stream": bool(profile.get("response_stream", self.ollama.response_stream)),
                         "capabilities": tag_caps,
                         "capabilities_probed": bool(tag_cache_entry),
                         "capabilities_probed_at": float(tag_cache_entry.get("updated_at", 0.0) or 0.0)
@@ -17176,6 +17857,7 @@ class SessionState:
                     "source": active.get("source", "active-profile"),
                     "thinking_hint": bool(active.get("thinking_hint", False)),
                     "thinking_stream": bool(active.get("thinking_stream", False)),
+                    "response_stream": bool(active.get("response_stream", False)),
                     "capabilities": self._capabilities_from_profile(active if isinstance(active, dict) else {}),
                     "capabilities_probed": bool(active_cache_entry),
                     "capabilities_probed_at": float(active_cache_entry.get("updated_at", 0.0) or 0.0)
@@ -17194,6 +17876,7 @@ class SessionState:
             "models": [x["selection"] for x in opts],
             "options": opts,
             "thinking": self.thinking,
+            "response_stream": bool(active.get("response_stream", self.ollama.response_stream)),
             "thinking_mode": "auto",
             "active_capabilities": active_caps,
             "active_capabilities_probed": bool(active_cache),
@@ -18153,6 +18836,12 @@ class SessionState:
         self.stall_escalation_round = 0
         self.live_thinking_text = ""
         self.live_thinking_last_emit = 0.0
+        self.live_response_text = ""
+        self.live_response_role = ""
+        self.live_response_label = ""
+        self.live_response_visible = False
+        self.live_response_last_emit = 0.0
+        self.live_response_stream_id = ""
         self.live_truncation_text = ""
         self.live_truncation_kind = ""
         self.live_truncation_tool = ""
@@ -20722,8 +21411,8 @@ class SessionState:
         """Compress plan mode context based on tier.
         Tier 0: keep everything
         Tier 1: trim plan findings to last 3
-        Tier 2: drop plan findings, keep only plan steps + user choice
-        Tier 3: minimal — only plan steps and chosen option title
+        Tier 2: drop findings, keep plan steps + execution charter + continuity
+        Tier 3: minimal — keep plan steps + compact charter + recent continuity
         """
         bb = self._ensure_blackboard()
         plan = bb.get("plan")
@@ -20731,6 +21420,9 @@ class SessionState:
             return
         if tier <= 0:
             return
+        charter = self._ensure_plan_charter(bb)
+        plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
+        step_results = self._normalize_plan_step_results(plan.get("step_results", {}))
         if tier == 1:
             # Keep last 3 findings
             findings = plan.get("findings", [])
@@ -20754,13 +21446,47 @@ class SessionState:
                         o.pop("pros", None)
                         o.pop("cons", None)
                         o.pop("risk", None)
+            plan["charter"] = charter
+            plan["step_results"] = step_results
         elif tier >= 3:
             # Minimal: keep execution snapshot fields that drive plan.md/todos.
+            # original_goal + execution_brief carry the reasoning thread (思路);
+            # give them a larger budget than secondary fields so the framework
+            # survives even heavy compaction and execution does not fragment.
+            charter_caps = {
+                "original_goal": 1400,
+                "execution_brief": 1400,
+                "summary": 1100,
+            }
             compact_plan = {
                 "phase": plan.get("phase", ""),
                 "chosen": plan.get("chosen", ""),
                 "steps": plan.get("steps", []),
+                "charter": {
+                    key: trim(str(value or ""), charter_caps.get(key, 900))
+                    for key, value in charter.items()
+                    if key in {
+                        "original_goal",
+                        "title",
+                        "summary",
+                        "execution_brief",
+                        "deliverables",
+                        "quality_bar",
+                        "global_constraints",
+                    }
+                    and str(value or "").strip()
+                },
             }
+            if step_results:
+                ordered_results = sorted(
+                    step_results.values(),
+                    key=lambda row: (int(row.get("index", 0) or 0), float(row.get("completed_at", 0.0) or 0.0)),
+                )
+                compact_plan["step_results"] = {
+                    str(row.get("step_id", "") or idx): row
+                    for idx, row in enumerate(ordered_results[-8:])
+                    if isinstance(row, dict)
+                }
             for key in ("title", "summary", "risk"):
                 value = plan.get(key)
                 if value:
@@ -29729,6 +30455,77 @@ body{padding:18px}
             self.live_thinking_text = ""
             self.live_thinking_last_emit = 0.0
 
+    def _clear_live_response(self):
+        stream_id = ""
+        with self.lock:
+            stream_id = str(self.live_response_stream_id or "")
+            self.live_response_text = ""
+            self.live_response_role = ""
+            self.live_response_label = ""
+            self.live_response_visible = False
+            self.live_response_last_emit = 0.0
+            self.live_response_stream_id = ""
+            self.updated_at = now_ts()
+        if stream_id:
+            self._emit(
+                "response_delta",
+                {
+                    "summary": "response streaming cleared",
+                    "active": False,
+                    "stream_id": stream_id,
+                },
+            )
+
+    def _begin_live_response(self, *, context_label: str = "", visible: bool = True) -> tuple[str, str]:
+        role = self._sanitize_agent_bubble_role(self.active_agent_role) or self._sanitize_agent_bubble_role(
+            str(context_label or "").split(" ", 1)[0]
+        )
+        if not role:
+            role = "single" if self._effective_execution_mode() == EXECUTION_MODE_SINGLE else ""
+        stream_id = make_id("resp")
+        with self.lock:
+            self.live_response_text = ""
+            self.live_response_role = role
+            self.live_response_label = trim(str(context_label or "model response"), 120)
+            self.live_response_visible = bool(visible)
+            self.live_response_last_emit = 0.0
+            self.live_response_stream_id = stream_id
+            self.updated_at = now_ts()
+        return stream_id, role
+
+    def _append_live_response_delta(self, chunk: str, *, context_label: str = "", visible: bool = True):
+        piece = str(chunk or "")
+        if not piece:
+            return
+        now_tick = now_ts()
+        with self.lock:
+            if self.cancel_requested or (not self.running):
+                return
+            if not self.live_response_stream_id:
+                self._begin_live_response(context_label=context_label, visible=visible)
+            self.live_response_visible = bool(visible)
+            if context_label:
+                self.live_response_label = trim(str(context_label), 120)
+            self.live_response_text = (self.live_response_text + piece)[-48_000:]
+            self.updated_at = now_tick
+            should_emit = (now_tick - self.live_response_last_emit) >= 0.12
+            if should_emit:
+                self.live_response_last_emit = now_tick
+                payload = {
+                    "summary": "response streaming",
+                    "active": True,
+                    "visible": bool(self.live_response_visible),
+                    "stream_id": self.live_response_stream_id,
+                    "agent_role": self.live_response_role,
+                    "label": self.live_response_label,
+                    "size": len(self.live_response_text),
+                    "text": self.live_response_text[-4000:] if self.live_response_visible else "",
+                }
+            else:
+                payload = None
+        if payload:
+            self._emit("response_delta", payload)
+
     def _append_live_thinking(self, chunk: str):
         piece = str(chunk or "").strip()
         if not piece:
@@ -30377,6 +31174,49 @@ body{padding:18px}
                 {"state": "stop", "label": label, "elapsed": round(end_elapsed, 1)},
             )
 
+    def _profile_effort_bounds(self) -> tuple[str, str]:
+        """Return (default_effort, ceiling) configured on the active profile.
+
+        Falls back to ("", max) so task level fully drives effort unless the
+        user explicitly pins/caps it in their LLM config profile via the
+        optional `effort` / `max_effort` fields.
+        """
+        try:
+            prof = dict(self.model_profiles.get(self.active_profile_id, {}))
+        except Exception:
+            prof = {}
+        if not isinstance(prof, dict):
+            prof = {}
+        default = str(prof.get("effort", "") or "").strip().lower()
+        ceiling = str(prof.get("max_effort", "") or "").strip().lower()
+        if ceiling not in EFFORT_ORDER:
+            ceiling = EFFORT_MAX
+        if default not in EFFORT_ORDER:
+            default = ""
+        return default, ceiling
+
+    def _resolve_effort_for_call(self, *, role_hint: str = "", explicit: str = "") -> str:
+        """Decide the reasoning effort for a model call.
+
+        Precedence: explicit arg > profile pin > task-level default. The result
+        is raised to any per-role floor (manager/reviewer reason >= HIGH) and
+        then clamped down to the profile's max_effort ceiling. L3-L5 default to
+        MAX via TASK_LEVEL_EFFORT.
+        """
+        default_pin, ceiling = self._profile_effort_bounds()
+        if str(explicit or "").strip().lower() in EFFORT_ORDER:
+            effort = str(explicit).strip().lower()
+        elif default_pin in EFFORT_ORDER:
+            effort = default_pin
+        else:
+            level = int(getattr(self, "runtime_task_level", 0) or 0)
+            effort = TASK_LEVEL_EFFORT.get(level, EFFORT_DEFAULT)
+        role = str(role_hint or "").strip().lower()
+        floor = ROLE_EFFORT_FLOOR.get(role, EFFORT_OFF)
+        if EFFORT_ORDER.get(floor, 0) > EFFORT_ORDER.get(effort, 0):
+            effort = floor
+        return clamp_effort(effort, ceiling=ceiling)
+
     def _chat_with_same_model_retry(
         self,
         messages: list[dict],
@@ -30391,6 +31231,7 @@ body{padding:18px}
         context_label: str = "agent",
         retries: int = MODEL_OUTPUT_RETRY_TIMES,
         media_inputs: list[dict] | None = None,
+        effort: str = "",
     ) -> dict:
         retry_budget = max(0, int(retries or 0))
         pin = str(pinned_selection or self._active_runtime_selection()).strip() or self._active_runtime_selection()
@@ -30412,6 +31253,18 @@ body{padding:18px}
                 if _role in label_low:
                     context_role_hint = _role
                     break
+        resolved_effort = self._resolve_effort_for_call(role_hint=context_role_hint, explicit=effort)
+        response_stream_enabled = bool(getattr(self.ollama, "response_stream", False))
+        visible_response_stream = bool(
+            response_stream_enabled
+            and (
+                label_low == "agent turn"
+                or (
+                    label_low.endswith(" turn")
+                    and not any(x in label_low for x in ("manager", "planner"))
+                )
+            )
+        )
 
         def _emit_http_retry(meta: dict):
             try:
@@ -30447,6 +31300,12 @@ body{padding:18px}
 
         for attempt in range(1, retry_budget + 2):
             try:
+                if visible_response_stream:
+                    self._clear_live_response()
+                    self._begin_live_response(
+                        context_label=context_label,
+                        visible=visible_response_stream,
+                    )
                 response = self._call_interruptible(
                     lambda: self.ollama.chat(
                         messages,
@@ -30456,12 +31315,25 @@ body{padding:18px}
                         think=False,
                         stream_thinking=bool(stream_thinking),
                         on_thinking_chunk=on_thinking_chunk,
+                        response_stream=response_stream_enabled,
+                        on_content_delta=(
+                            lambda chunk: self._append_live_response_delta(
+                                chunk,
+                                context_label=context_label,
+                                visible=visible_response_stream,
+                            )
+                        )
+                        if visible_response_stream
+                        else None,
                         media_inputs=media_inputs,
                         cancel_check=lambda: bool(self.cancel_requested),
                         on_http_retry=_emit_http_retry,
+                        effort=resolved_effort,
                     ),
                     progress_label=f"{context_label} model call",
                 )
+                if visible_response_stream:
+                    self._clear_live_response()
                 self._record_model_usage(
                     response,
                     estimated_prompt_tokens=estimated_prompt_tokens,
@@ -30469,9 +31341,13 @@ body{padding:18px}
                 )
                 return response
             except OllamaError as exc:
+                if visible_response_stream:
+                    self._clear_live_response()
                 last_exc = exc
                 if self.cancel_requested or "interrupted by user" in str(exc).lower():
                     raise
+                if bool(getattr(exc, "stream_emitted", False)):
+                    break
                 if self._context_window_error_hint(exc):
                     if self._shrink_context_upper_bound_from_actual_pressure(
                         estimated_prompt_tokens=estimated_prompt_tokens,
@@ -30537,12 +31413,24 @@ body{padding:18px}
                                 think=False,
                                 stream_thinking=bool(stream_thinking),
                                 on_thinking_chunk=on_thinking_chunk,
+                                response_stream=response_stream_enabled,
+                                on_content_delta=(
+                                    lambda chunk: self._append_live_response_delta(
+                                        chunk,
+                                        context_label=f"{context_label}:no-media",
+                                        visible=visible_response_stream,
+                                    )
+                                )
+                                if visible_response_stream
+                                else None,
                                 media_inputs=None,
                                 cancel_check=lambda: bool(self.cancel_requested),
                                 on_http_retry=_emit_http_retry,
                             ),
                             progress_label=f"{context_label} model call (no-media fallback)",
                         )
+                        if visible_response_stream:
+                            self._clear_live_response()
                         self._record_model_usage(
                             response,
                             estimated_prompt_tokens=fallback_estimated_prompt_tokens,
@@ -30550,6 +31438,8 @@ body{padding:18px}
                         )
                         return response
                     except OllamaError:
+                        if visible_response_stream:
+                            self._clear_live_response()
                         pass  # fallback also failed, continue normal retry
                 wake_note = ""
                 status = int(getattr(exc, "status", 0) or 0)
@@ -34437,6 +35327,19 @@ body{padding:18px}
             plan_clean = dict(raw_plan)
             if isinstance(plan_clean.get("steps"), list):
                 plan_clean["steps"] = self._group_plan_steps(plan_clean.get("steps", []))
+            plan_clean["charter"] = self._normalize_plan_charter(plan_clean.get("charter", {}))
+            if not plan_clean["charter"]:
+                plan_clean["charter"] = self._build_plan_charter(
+                    str(plan_clean.get("chosen", "") or ""),
+                    {
+                        "id": str(plan_clean.get("chosen", "") or ""),
+                        "title": str(plan_clean.get("title", "") or ""),
+                        "summary": str(plan_clean.get("summary", "") or ""),
+                    },
+                    board=board,
+                    grouped_steps=plan_clean.get("steps", []),
+                )
+            plan_clean["step_results"] = self._normalize_plan_step_results(plan_clean.get("step_results", {}))
             board["plan"] = plan_clean
         # Preserve failure_ledger, checkpoints, persisted_manager_routes
         raw_fl = src.get("failure_ledger")
@@ -35980,6 +36883,49 @@ body{padding:18px}
             return True
         return len(raw.strip()) >= 120
 
+    def _plan_text_file_content_subject(self, text: object) -> bool:
+        low = str(text or "").lower()
+        return any(
+            tok in low
+            for tok in (
+                "文件", "目录", "路径", "文档", "正文", "大纲", "章节", "字数", "标题", "段落",
+                "内容", "清单", "列表", "表格", "报告", "稿", "设定", "角色", "markdown",
+                ".md", ".txt", ".csv", ".json", ".yaml", ".yml", ".toml", ".ini",
+                "file", "directory", "path", "document", "chapter", "outline", "content",
+                "word count", "title", "section", "report", "ファイル", "ディレクトリ",
+            )
+        )
+
+    def _plan_text_runtime_subject(self, text: object) -> bool:
+        low = str(text or "").lower()
+        return any(
+            tok in low
+            for tok in (
+                "代码", "前端", "后端", "组件", "接口", "服务", "程序", "模块", "函数", "类",
+                "依赖", "编译", "构建", "测试", "浏览器", "控制台", "webgl", "shader",
+                "api", "ui", "web", "app", "service", "script", "package", "dependency",
+                "npm", "node", "python", "pytest", "ruff", "unit", "integration", "server",
+                ".py", ".js", ".ts", ".tsx", ".jsx", ".css", ".html", ".go", ".rs", ".java",
+                ".cpp", ".c", ".h", ".hpp", ".f90", ".glsl",
+            )
+        )
+
+    def _plan_text_explicit_runtime_check(self, text: object) -> bool:
+        low = str(text or "").lower()
+        return any(
+            tok in low
+            for tok in (
+                "测试", "測試", "构建", "编译", "运行测试", "运行构建", "启动服务", "浏览器检查",
+                "控制台", "http", "200", "pytest", "test", "build", "compile", "playwright",
+                "browser", "server", "curl", "node --check", "npm run", "ruff",
+            )
+        )
+
+    def _plan_text_prefers_file_content_evidence(self, text: object) -> bool:
+        return self._plan_text_file_content_subject(text) and not (
+            self._plan_text_runtime_subject(text) or self._plan_text_explicit_runtime_check(text)
+        )
+
     def _tool_results_have_validation_evidence(self, plan_step: dict, results: list[dict]) -> bool:
         """Return whether current tool output is useful candidate evidence.
 
@@ -36043,9 +36989,14 @@ body{padding:18px}
         wants_runtime_validation = wants_test or phase == "implement" or any(
             tok in step_text for tok in ("verify", "validation", "check", "lint", "build", "compile", "运行", "校验", "檢查")
         )
+        if self._plan_text_prefers_file_content_evidence(step_text):
+            wants_test = False
+            wants_runtime_validation = False
         if wants_test:
             return test_signal or (bool(bash_rows) and observed_signal)
         if phase == "implement":
+            if self._plan_text_prefers_file_content_evidence(step_text):
+                return wrote_files or read_back or blackboard_write_signal or observed_signal
             return wrote_files and (compile_signal or test_signal or observed_signal)
         if phase in ("research", "design"):
             return wrote_files or read_back or positive_retrieval_signal or blackboard_write_signal or observed_signal
@@ -36224,9 +37175,14 @@ body{padding:18px}
         wants_runtime_validation = wants_test or phase == "implement" or any(
             tok in step_text for tok in ("verify", "validation", "check", "lint", "build", "compile", "运行", "校验", "檢查")
         )
+        if self._plan_text_prefers_file_content_evidence(step_text):
+            wants_test = False
+            wants_runtime_validation = False
         if wants_test:
             return sig["has_test_pass"] or sig["has_exec"] or sig["has_review"]
         if phase == "implement":
+            if self._plan_text_prefers_file_content_evidence(step_text):
+                return sig["has_write"] or sig["has_read"] or sig["has_exec"] or sig["has_review"]
             return sig["has_write"] and (
                 sig["has_compile_pass"] or sig["has_test_pass"] or sig["has_exec"] or sig["has_review"]
             )
@@ -36302,22 +37258,19 @@ body{padding:18px}
             for row in results
         )
 
-        wants_runtime = any(
-            tok in text
-            for tok in (
-                "运行", "执行", "测试", "构建", "编译", "浏览器", "控制台", "页面", "http", "200",
-                "selftest", "assert", "bash", "node", "pytest", "test", "build", "compile", "browser",
-                "console", "playwright", "screenshot", "run", "curl", "server", "服务", "驗證", "測試",
-                "実行", "テスト", "ブラウザ", "コンソール",
-            )
-        )
         wants_file_inspection = any(
             tok in text
             for tok in (
                 "读取", "检查", "文件", "目录", "路径", "选择器", "read", "inspect", "file",
                 "directory", "path", "selector", "檢查", "讀取", "確認", "ファイル", "ディレクトリ",
             )
+        ) or self._plan_text_file_content_subject(text)
+        wants_runtime = self._plan_text_explicit_runtime_check(text) or (
+            any(tok in text for tok in ("运行", "执行", "run", "実行"))
+            and self._plan_text_runtime_subject(text)
         )
+        if wants_file_inspection and self._plan_text_prefers_file_content_evidence(text):
+            wants_runtime = False
         wants_research = any(
             tok in text
             for tok in (
@@ -37127,6 +38080,12 @@ body{padding:18px}
         current["completed_at"] = float(now_ts())
         current["completed_by"] = actor
         current["evidence"] = trim(str(evidence or "").strip(), 200) or self._ui_text("step_completed_evidence")
+        try:
+            self._record_plan_step_result(current, evidence=evidence, actor=actor, board=bb)
+            bb = self._ensure_blackboard()
+            todos = bb.get("project_todos", todos)
+        except Exception:
+            pass
         # Clear single-mode validation gate flags for the completed step
         try:
             _completed_id = str(current.get("id", "") or "")
@@ -37428,13 +38387,7 @@ body{padding:18px}
         step_id = str(plan_step.get("id", "") or "")
         if not step_id:
             return False
-        snap = self.todo.snapshot()
-        worker_owners = {"developer", "explorer", "reviewer"}
-        worker_items = [
-            r for r in snap
-            if str(r.get("owner", "") or "").lower() in worker_owners
-            and str(r.get("parent_step_id", "") or "") == step_id
-        ]
+        worker_items = self._active_plan_worker_todo_rows(step_id, role="")
         if not worker_items:
             expected = self._extract_plan_step_subtasks(plan_step, limit=6)
             if expected:
@@ -37814,6 +38767,107 @@ body{padding:18px}
                 return cand
         return "developer"
 
+    def _get_plan_step_by_id(self, step_id: str, board: dict | None = None) -> dict | None:
+        step_key = trim(str(step_id or "").strip(), 40)
+        if not step_key:
+            return None
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        todos = bb.get("project_todos", []) if isinstance(bb.get("project_todos", []), list) else []
+        for todo in todos:
+            if (
+                isinstance(todo, dict)
+                and str(todo.get("category", "") or "") == "plan_step"
+                and trim(str(todo.get("id", "") or "").strip(), 40) == step_key
+            ):
+                return todo
+        return None
+
+    def _plan_todo_compare_forms(self, text: object) -> set[str]:
+        import re
+
+        raw = normalize_embedded_newlines(normalize_work_text(str(text or "")) or str(text or "")).strip()
+        if not raw:
+            return set()
+        first = next((ln.strip() for ln in raw.splitlines() if ln.strip()), raw)
+        _status, parsed = split_todo_status_text(first)
+        base = parsed or first
+        forms: set[str] = set()
+
+        def _clean(value: str) -> str:
+            val = normalize_work_text(value) or value
+            val = re.sub(r"\s+", " ", val.strip().lower())
+            val = re.sub(r"^(?:[-*•]\s*)?(?:\[[x >_]\]\s*)+", "", val).strip()
+            val = re.sub(r"^#+\s*", "", val).strip()
+            return val
+
+        current = _clean(base)
+        while current and current not in forms:
+            forms.add(current)
+            stripped = re.sub(
+                r"^(?:(?:step|步骤|步驟|阶段|階段)\s*)?\d+\s*[：:]\s*",
+                "",
+                current,
+                flags=re.IGNORECASE,
+            ).strip()
+            stripped = re.sub(r"^(?:step|步骤|步驟|阶段|階段)\s*\d+[\.\)．、]\s*", "", stripped, flags=re.IGNORECASE).strip()
+            stripped = re.sub(r"^\d+[\.\)．、]\s+", "", stripped).strip()
+            stripped = _clean(stripped)
+            if stripped == current:
+                break
+            current = stripped
+        return {form for form in forms if len(form) >= 2}
+
+    def _plan_worker_row_duplicates_parent_step(self, row: dict | None, plan_step: dict | None) -> bool:
+        if not isinstance(row, dict) or not isinstance(plan_step, dict):
+            return False
+        content = normalize_embedded_newlines(str(row.get("content", "") or "")).strip()
+        if not content or self._is_plan_step_acceptance_subtask(content):
+            return False
+        marker = self._plan_line_marker(content)
+        if isinstance(marker, dict) and marker.get("kind") == "sub":
+            return False
+        step_texts = [
+            str(plan_step.get("content", "") or ""),
+            str(plan_step.get("full_content", "") or ""),
+        ]
+        step_forms: set[str] = set()
+        for text in step_texts:
+            if not text:
+                continue
+            step_forms.update(self._plan_todo_compare_forms(text))
+            first = next((ln.strip() for ln in normalize_embedded_newlines(text).splitlines() if ln.strip()), "")
+            if first:
+                step_forms.update(self._plan_todo_compare_forms(first))
+        row_forms = self._plan_todo_compare_forms(content)
+        if not row_forms or not step_forms:
+            return False
+        if row_forms.intersection(step_forms):
+            return True
+        if isinstance(marker, dict) and marker.get("kind") == "major":
+            try:
+                row_major = int(marker.get("major", 0) or 0)
+                step_index = int(plan_step.get("plan_step_index", -1) or -1) + 1
+            except Exception:
+                row_major = 0
+                step_index = -1
+            marker_title_forms = self._plan_todo_compare_forms(str(marker.get("title", "") or ""))
+            if row_major > 0 and row_major == step_index and marker_title_forms.intersection(step_forms):
+                return True
+        return False
+
+    def _filter_parent_step_duplicate_worker_rows(
+        self,
+        rows: list[dict],
+        plan_step: dict | None,
+    ) -> list[dict]:
+        if not isinstance(rows, list) or not isinstance(plan_step, dict):
+            return list(rows or [])
+        return [
+            dict(row)
+            for row in rows
+            if isinstance(row, dict) and not self._plan_worker_row_duplicates_parent_step(row, plan_step)
+        ]
+
     def _active_plan_worker_todo_rows(self, step_id: str, role: str = "") -> list[dict]:
         step_key = str(step_id or "").strip()
         if not step_key:
@@ -37831,6 +38885,8 @@ body{padding:18px}
             all_rows.append(dict(row))
         if not all_rows:
             return self._plan_worker_todo_rows_from_blackboard(step_key, role=role_key)
+        plan_step = self._get_plan_step_by_id(step_key)
+        all_rows = self._filter_parent_step_duplicate_worker_rows(all_rows, plan_step)
         rows = [r for r in all_rows if str(r.get("owner", "") or "").strip().lower() == role_key] if role_key else list(all_rows)
         if role_key and not rows:
             rows = list(all_rows)
@@ -37874,6 +38930,8 @@ body{padding:18px}
                 "completed_by": trim(str(row.get("completed_by", "") or ""), 40),
                 "evidence": trim(str(row.get("evidence", "") or ""), 300),
             })
+        plan_step = self._get_plan_step_by_id(step_key, bb)
+        rows = self._filter_parent_step_duplicate_worker_rows(rows, plan_step)
         if role_key and not rows:
             return self._plan_worker_todo_rows_from_blackboard(step_key, role="", board=bb)
         rows.sort(key=self._plan_worker_todo_sort_key)
@@ -37892,6 +38950,7 @@ body{padding:18px}
         step_filter = trim(str(step_id or "").strip(), 40)
         src_rows = rows if isinstance(rows, list) else self.todo.snapshot()
         grouped: dict[str, list[dict]] = {}
+        plan_step_cache: dict[str, dict | None] = {}
         for raw in src_rows:
             if not isinstance(raw, dict):
                 continue
@@ -37912,6 +38971,13 @@ body{padding:18px}
                 status = parsed_status
             if status == "blocked":
                 status = "pending"
+            if parent not in plan_step_cache:
+                plan_step_cache[parent] = self._get_plan_step_by_id(parent, bb)
+            if self._plan_worker_row_duplicates_parent_step(
+                {"content": content, "parent_step_id": parent, "owner": owner},
+                plan_step_cache.get(parent),
+            ):
+                continue
             item = {
                 "content": content,
                 "status": status,
@@ -37936,6 +39002,9 @@ body{padding:18px}
         changed = False
         for parent in sorted(x for x in target_steps if x):
             clean_rows = grouped.get(parent, [])
+            if parent not in plan_step_cache:
+                plan_step_cache[parent] = self._get_plan_step_by_id(parent, bb)
+            clean_rows = self._filter_parent_step_duplicate_worker_rows(clean_rows, plan_step_cache.get(parent))
             clean_rows.sort(key=self._plan_worker_todo_sort_key)
             if clean_rows:
                 if mirror.get(parent) != clean_rows:
@@ -37961,15 +39030,21 @@ body{padding:18px}
             return False
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         mirror_rows = self._plan_worker_todo_rows_from_blackboard(step_key, role="", board=bb)
-        if not mirror_rows:
-            return False
         worker_owners = {"developer", "explorer", "reviewer"}
+        plan_step = self._get_plan_step_by_id(step_key, bb)
         memory_rows = [
             dict(row) for row in self.todo.snapshot()
             if isinstance(row, dict)
             and str(row.get("owner", "") or "").strip().lower() in worker_owners
             and trim(str(row.get("parent_step_id", "") or "").strip(), 20) == step_key
         ]
+        memory_rows = self._filter_parent_step_duplicate_worker_rows(memory_rows, plan_step)
+        if not mirror_rows:
+            mirror = bb.get("plan_worker_todos", {}) if isinstance(bb.get("plan_worker_todos"), dict) else {}
+            raw_mirror = mirror.get(step_key, []) if isinstance(mirror.get(step_key), list) else []
+            if raw_mirror or memory_rows:
+                return self._sync_plan_worker_todos_to_blackboard(step_key, rows=memory_rows, board=bb)
+            return False
         before = [
             (
                 self._plan_worker_todo_identity(row),
@@ -37987,6 +39062,7 @@ body{padding:18px}
             and str(row.get("owner", "") or "").strip().lower() in worker_owners
             and trim(str(row.get("parent_step_id", "") or "").strip(), 20) == step_key
         ]
+        after_rows = self._filter_parent_step_duplicate_worker_rows(after_rows, plan_step)
         after = [
             (
                 self._plan_worker_todo_identity(row),
@@ -38662,6 +39738,8 @@ body{padding:18px}
             parent_step_id = trim(str(raw.get("parent_step_id", "") or ""), 20)
             if not parent_step_id:
                 raw["parent_step_id"] = step_id
+            if self._plan_worker_row_duplicates_parent_step(raw, active_step):
+                continue
             incoming_normalized.append(raw)
 
         passthrough_rows = [row for row in incoming_normalized if str(row.get("key", "") or "").startswith("bb:")]
@@ -38716,6 +39794,7 @@ body{padding:18px}
                 ordered_identities.append(identity)
 
         merged_target_rows = [merged_by_identity[i] for i in ordered_identities if i in merged_by_identity]
+        merged_target_rows = self._filter_parent_step_duplicate_worker_rows(merged_target_rows, active_step)
 
         # Fix 4: Content-based deduplication to prevent duplicate subtasks from accumulating
         _seen_content: set[str] = set()
@@ -39000,6 +40079,11 @@ body{padding:18px}
             acceptance_hint += (
                 "Do not delegate reviewer-style validation before the current work subtask is completed; continue executable work first. "
             )
+        continuity = self._plan_continuity_context_block(max_chars=4200, include_steps=False)
+        continuity_note = (
+            f"{continuity}\n"
+            if continuity else ""
+        )
         if not rows:
             todo_state = (
                 "No worker subtasks are active for this step. First create 3-6 step-local TodoWrite rows; the final row must be a semantic acceptance check with evidence shape. "
@@ -39031,6 +40115,8 @@ body{padding:18px}
                 "It may be inspected with read_file but must never be edited with write_file/edit_file/bash redirection. "
                 "Plan advancement must happen only through route_to_next_agent with advance_plan_step=true after evidence is reviewed. "
                 f"Delegate ONLY against the current in-progress plan step (Step {step_idx}: {step_text}). "
+                "The delegation must preserve the approved plan charter, prior step outputs, and final deliverable logic. "
+                f"{continuity_note}"
                 f"{subtasks_exist_ban}"
                 f"{todo_state}"
                 f"{acceptance_hint}"
@@ -39042,6 +40128,8 @@ body{padding:18px}
             f"PLAN/TODO DISCIPLINE: `{PLAN_FILE_RELATIVE_PATH}` is a read-only runtime mirror of the approved plan. "
             "Read it for status; never write/edit it directly. "
             f"Work ONLY on the current in-progress plan step (Step {step_idx}: {step_text}). "
+            "Keep this step aligned with the approved plan charter, prior step outputs, and final deliverable logic. "
+            f"{continuity_note}"
             f"{subtasks_exist_ban}"
             f"{todo_state}"
             f"{acceptance_hint}"
@@ -42527,6 +43615,9 @@ body{padding:18px}
         self._ensure_plan_file_current()
         lines = [f"PLAN FILE: {PLAN_FILE_RELATIVE_PATH} (read_file only; runtime-managed mirror, never edit directly)",
                  "APPROVED PLAN STEPS:"]
+        continuity = self._plan_continuity_context_block(max_chars=4800, include_steps=False)
+        if continuity:
+            lines.append(continuity)
         for t in todos:
             if t.get("category") != "plan_step":
                 continue
@@ -42536,7 +43627,10 @@ body{padding:18px}
             phase_hint = self._plan_step_phase_hint(str(t.get("full_content", "") or t.get("content", "") or ""))
             phase_tag = f" [{phase_hint}]" if phase_hint else ""
             lines.append(f"  {mark} Step {idx}: {trim(str(t.get('content', '') or ''), 160)}{phase_tag}")
-        lines.append("Execute steps IN ORDER. Do NOT skip ahead. Mark current step done before advancing. ")
+        lines.append(
+            "Execute steps IN ORDER. Do NOT skip ahead. Mark current step done before advancing. "
+            "Every delegation must preserve the plan charter, prior step outputs, and final deliverable logic."
+        )
         lines.append(
             "STEP COMPLETION RULE: Set advance_plan_step=true ONLY when:\n"
             "  1. The worker has ALREADY executed tools and produced verifiable output "
@@ -42549,7 +43643,7 @@ body{padding:18px}
             "It is regenerated from blackboard state; direct edits are blocked and create recovery noise.\n"
             "COMPLEXITY LOCK: Do NOT change complexity or task_level below the plan-approved levels. "
         )
-        lines.append("MANDATORY: Your delegation instruction MUST reference the current plan step. "
+        lines.append("MANDATORY: Your delegation instruction MUST reference the current plan step AND the relevant plan-charter objective. "
                      "Do NOT reinterpret or replace plan steps with your own objectives. ")
         # Add loaded skills enforcement
         bb_skills = bb.get("loaded_skills", {})
@@ -44733,16 +45827,22 @@ body{padding:18px}
                     board=bb_focus,
                 )
         if bool(executor_mode):
+            # Even in a stateless hot-swap, anchor the agent to the plan arc so
+            # "ignore old plans" never means "lose the framework". The roadmap +
+            # charter keep the isolated step connected to the overall goal.
+            charter_anchor = self._plan_continuity_context_block(max_chars=3200, include_steps=False)
+            seed_body = (
+                "Executor mode is enabled by watchdog. You are stateless for this step: "
+                "ignore old conversational chatter, execute only the delegated step, call concrete tools, "
+                "and write verifiable evidence to blackboard. "
+                "Stay consistent with the plan charter and roadmap below — the step is part of a larger plan, "
+                "not an isolated task."
+            )
+            if charter_anchor:
+                seed_body = seed_body + "\n\n" + charter_anchor
             executor_seed = {
                 "role": "system",
-                "content": self._apply_agent_language_policy(
-                    (
-                        "Executor mode is enabled by watchdog. You are stateless for this step: "
-                        "ignore old conversational plans, execute only the delegated step, call concrete tools, "
-                        "and write verifiable evidence to blackboard."
-                    ),
-                    max_len=800,
-                ),
+                "content": self._apply_agent_language_policy(seed_body, max_len=4000),
                 "ts": now_ts(),
                 "agent_role": role_key,
             }
@@ -50137,6 +51237,10 @@ body{padding:18px}
             "pros": pros,
             "cons": cons,
             "risk": risk,
+            "execution_brief": trim(str(raw.get("execution_brief", "") or "").strip(), 1200),
+            "deliverables": trim(str(raw.get("deliverables", "") or "").strip(), 900),
+            "quality_bar": trim(str(raw.get("quality_bar", "") or "").strip(), 900),
+            "global_constraints": trim(str(raw.get("global_constraints", "") or "").strip(), 900),
         }
 
     def _normalize_plan_proposal_payload(self, raw: object) -> dict:
@@ -50282,6 +51386,10 @@ body{padding:18px}
                     "pros": "Deterministic fallback that keeps plan-mode available even when model synthesis formatting is unstable.",
                     "cons": "Less tailored than a fully synthesized multi-option proposal.",
                     "risk": "medium",
+                    "execution_brief": trim(context, 900),
+                    "deliverables": trim(goal or "Requested final artifact plus delivery summary.", 600),
+                    "quality_bar": "Each step must preserve the original objective and record observable evidence before advancement.",
+                    "global_constraints": "Execute in order while carrying prior outputs into later steps.",
                 }
             ],
             "recommended": "A",
@@ -50332,6 +51440,8 @@ body{padding:18px}
             f"You MUST call the submit_plan_proposal tool exactly once with:\n"
             f"- context: brief background analysis\n"
             f"- options: array of 1-{PLAN_MODE_MAX_OPTIONS} options, each with id (A/B/C), title, summary, steps, pros, cons, risk\n"
+            f"- Each option should also include execution_brief, deliverables, quality_bar, and global_constraints when useful. "
+            f"These fields preserve the plan's reasoning and final-objective logic during step-by-step execution.\n"
             f"- recommended: id of the recommended option\n"
             f"Do NOT answer with prose-only markdown. A response without submit_plan_proposal tool call is invalid.\n\n"
             f"STEP QUALITY REQUIREMENTS:\n"
@@ -50570,6 +51680,10 @@ body{padding:18px}
                             "pros": {"type": "string"},
                             "cons": {"type": "string"},
                             "risk": {"type": "string", "enum": ["low", "medium", "high"]},
+                            "execution_brief": {"type": "string"},
+                            "deliverables": {"type": "string"},
+                            "quality_bar": {"type": "string"},
+                            "global_constraints": {"type": "string"},
                         },
                         "required": ["id", "title", "summary", "steps"],
                     },
@@ -50578,6 +51692,320 @@ body{padding:18px}
             },
             ["context", "options", "recommended"],
         )]
+
+    def _normalize_plan_charter(self, raw: object) -> dict:
+        src = raw if isinstance(raw, dict) else {}
+        out: dict = {}
+        fields = {
+            "original_goal": 2400,
+            "chosen": 40,
+            "title": 600,
+            "summary": 1800,
+            "context": 1800,
+            "execution_brief": 1800,
+            "deliverables": 1200,
+            "quality_bar": 1200,
+            "global_constraints": 1200,
+        }
+        for key, max_chars in fields.items():
+            value = trim(normalize_embedded_newlines(str(src.get(key, "") or "")).strip(), max_chars)
+            if value:
+                out[key] = value
+        try:
+            out["created_at"] = float(src.get("created_at", 0.0) or 0.0)
+        except Exception:
+            pass
+        try:
+            out["updated_at"] = float(src.get("updated_at", 0.0) or 0.0)
+        except Exception:
+            pass
+        return out
+
+    def _build_plan_charter(
+        self,
+        choice_id: str = "",
+        chosen: dict | None = None,
+        *,
+        board: dict | None = None,
+        grouped_steps: list | None = None,
+    ) -> dict:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
+        proposal = self.runtime_plan_proposal if isinstance(self.runtime_plan_proposal, dict) else {}
+        selected = chosen if isinstance(chosen, dict) else {}
+        chosen_key = trim(str(choice_id or plan.get("chosen", "") or selected.get("id", "") or ""), 40)
+        title = trim(str(selected.get("title", "") or plan.get("title", "") or chosen_key), 600)
+        summary = trim(str(selected.get("summary", "") or plan.get("summary", "") or ""), 1800)
+        context = trim(str(selected.get("context", "") or proposal.get("context", "") or plan.get("context", "") or ""), 1800)
+        goal = trim(
+            str(
+                bb.get("original_goal", "")
+                or self.runtime_reclassify_goal
+                or self._latest_user_goal_text()
+                or ""
+            ).strip(),
+            2400,
+        )
+        step_rows = grouped_steps if isinstance(grouped_steps, list) else plan.get("steps", [])
+        step_preview = [
+            trim(str(step or "").splitlines()[0], 180)
+            for step in (step_rows if isinstance(step_rows, list) else [])
+            if str(step or "").strip()
+        ][:8]
+        deliverables = trim(str(selected.get("deliverables", "") or ""), 1200)
+        if not deliverables:
+            deliverables = trim(
+                str(selected.get("summary", "") or plan.get("summary", "") or title or goal),
+                900,
+            )
+        quality_bar = trim(str(selected.get("quality_bar", "") or ""), 1200)
+        if not quality_bar:
+            quality_bar = (
+                "Keep every step aligned with the original goal, selected plan summary, "
+                "prior step outputs, and the final deliverable. Verify each step with concrete evidence."
+            )
+        global_constraints = trim(str(selected.get("global_constraints", "") or ""), 1200)
+        if not global_constraints and step_preview:
+            global_constraints = "Execute in order while preserving the cross-step logic: " + "; ".join(step_preview)
+        execution_brief = trim(str(selected.get("execution_brief", "") or ""), 1800)
+        if not execution_brief:
+            execution_brief = trim(
+                " | ".join(
+                    part for part in (
+                        f"Goal: {goal}" if goal else "",
+                        f"Chosen plan: {title}" if title else "",
+                        f"Plan summary: {summary}" if summary else "",
+                    )
+                    if part
+                ),
+                1800,
+            )
+        now_value = float(now_ts())
+        return self._normalize_plan_charter({
+            "original_goal": goal,
+            "chosen": chosen_key,
+            "title": title,
+            "summary": summary,
+            "context": context,
+            "execution_brief": execution_brief,
+            "deliverables": deliverables,
+            "quality_bar": quality_bar,
+            "global_constraints": global_constraints,
+            "created_at": now_value,
+            "updated_at": now_value,
+        })
+
+    def _normalize_plan_step_results(self, raw: object) -> dict[str, dict]:
+        src = raw if isinstance(raw, dict) else {}
+        out: dict[str, dict] = {}
+        for key, value in list(src.items())[-80:]:
+            if not isinstance(value, dict):
+                continue
+            step_id = trim(str(value.get("step_id", "") or key or "").strip(), 40)
+            if not step_id:
+                continue
+            files = value.get("files", []) if isinstance(value.get("files", []), list) else []
+            out[step_id] = {
+                "step_id": step_id,
+                "index": int(value.get("index", -1) or -1),
+                "title": trim(str(value.get("title", "") or "").strip(), 240),
+                "summary": trim(normalize_embedded_newlines(str(value.get("summary", "") or "")).strip(), 900),
+                "evidence": trim(normalize_embedded_newlines(str(value.get("evidence", "") or "")).strip(), 600),
+                "actor": trim(str(value.get("actor", "") or "").strip(), 40),
+                "files": [trim(str(path or "").strip(), 240) for path in files[:8] if str(path or "").strip()],
+                "completed_at": float(value.get("completed_at", 0.0) or 0.0),
+            }
+        return out
+
+    def _ensure_plan_charter(self, board: dict | None = None) -> dict:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
+        if not plan:
+            return {}
+        charter = self._normalize_plan_charter(plan.get("charter", {}))
+        if not charter:
+            charter = self._build_plan_charter(str(plan.get("chosen", "") or ""), board=bb)
+            if charter:
+                plan = dict(plan)
+                plan["charter"] = charter
+                bb["plan"] = plan
+                self.blackboard = bb
+        else:
+            changed = False
+            if "original_goal" not in charter and str(bb.get("original_goal", "") or "").strip():
+                charter["original_goal"] = trim(str(bb.get("original_goal", "") or "").strip(), 2400)
+                changed = True
+            if "summary" not in charter and str(plan.get("summary", "") or "").strip():
+                charter["summary"] = trim(str(plan.get("summary", "") or "").strip(), 1800)
+                changed = True
+            if changed:
+                plan = dict(plan)
+                plan["charter"] = charter
+                bb["plan"] = plan
+                self.blackboard = bb
+        return charter
+
+    def _record_plan_step_result(
+        self,
+        plan_step: dict,
+        *,
+        evidence: str = "",
+        actor: str = "",
+        board: dict | None = None,
+    ) -> dict:
+        if not isinstance(plan_step, dict):
+            return {}
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        plan = dict(bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {})
+        step_id = trim(str(plan_step.get("id", "") or ""), 40)
+        if not step_id:
+            return {}
+        title = trim(str(plan_step.get("content", "") or ""), 240)
+        full_text = trim(normalize_embedded_newlines(plan_step.get("full_content", "") or title), 700)
+        evidence_text = trim(str(evidence or "").strip(), 600)
+        try:
+            sig = self._plan_step_blackboard_signals(plan_step, bb)
+            files = list(sig.get("recent_files", []) or [])[:8]
+        except Exception:
+            files = []
+        if not evidence_text:
+            try:
+                evidence_text = trim(self._collect_blackboard_step_evidence(plan_step, bb), 600)
+            except Exception:
+                evidence_text = ""
+        summary = trim(
+            (
+                f"{title}. "
+                f"{('Evidence: ' + evidence_text) if evidence_text else 'Completed with accepted step evidence.'}"
+            ),
+            900,
+        )
+        result = {
+            "step_id": step_id,
+            "index": int(plan_step.get("plan_step_index", -1) or -1),
+            "title": title,
+            "summary": summary,
+            "evidence": evidence_text,
+            "actor": trim(str(actor or "").strip(), 40),
+            "files": files,
+            "completed_at": float(plan_step.get("completed_at", 0.0) or now_ts()),
+        }
+        results = self._normalize_plan_step_results(plan.get("step_results", {}))
+        results[step_id] = result
+        plan["step_results"] = results
+        if "charter" not in plan:
+            plan["charter"] = self._build_plan_charter(str(plan.get("chosen", "") or ""), board=bb)
+        bb["plan"] = plan
+        self.blackboard = bb
+        if full_text:
+            self._blackboard_append_memory(
+                "step_result",
+                trim(f"{full_text}\n{summary}", 1000),
+                actor=actor or "manager",
+                tier="long",
+            )
+        return result
+
+    def _plan_roadmap_lines(self, bb: dict, *, max_steps: int = 40, content_chars: int = 110) -> list[str]:
+        """Render the full ordered step list with you-are-here markers.
+
+        This is the anti-fragmentation anchor: even mid-execution the agent sees
+        the whole arc (done ✓ / current ▶ / pending ○) so it reasons about how the
+        active step connects to the plan, instead of treating it in isolation.
+        Built from project_todos (authoritative per-step status), falling back to
+        plan["steps"] text when todos are unavailable.
+        """
+        lines: list[str] = []
+        todos = bb.get("project_todos", []) if isinstance(bb.get("project_todos"), list) else []
+        plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
+        step_rows = [
+            t for t in todos
+            if isinstance(t, dict) and t.get("category") == "plan_step"
+        ]
+        if step_rows:
+            step_rows.sort(key=lambda t: int(t.get("plan_step_index", 0) or 0))
+            total = len(step_rows)
+            for t in step_rows[:max_steps]:
+                idx = int(t.get("plan_step_index", 0) or 0) + 1
+                status = str(t.get("status", "") or "").strip().lower()
+                mark = "[✓]" if status == "done" else ("[▶]" if status == "in_progress" else "[ ]")
+                here = "  ← current" if status == "in_progress" else ""
+                text = trim(normalize_embedded_newlines(str(t.get("content", "") or "")).replace("\n", " "), content_chars)
+                lines.append(f"  {mark} {idx}/{total}. {text}{here}")
+            return lines
+        steps = plan.get("steps", []) if isinstance(plan.get("steps", []), list) else []
+        if steps:
+            cursor = int(bb.get("plan_step_cursor", 0) or 0)
+            total = len(steps)
+            for i, step in enumerate(steps[:max_steps]):
+                mark = "[✓]" if i < cursor else ("[▶]" if i == cursor else "[ ]")
+                here = "  ← current" if i == cursor else ""
+                text = trim(normalize_embedded_newlines(str(step)).replace("\n", " "), content_chars)
+                lines.append(f"  {mark} {i+1}/{total}. {text}{here}")
+        return lines
+
+    def _plan_continuity_context_block(self, *, max_chars: int = 3000, include_steps: bool = False) -> str:
+        bb = self._ensure_blackboard()
+        plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
+        if not plan:
+            return ""
+        charter = self._ensure_plan_charter(bb)
+        if not charter:
+            return ""
+        lines = ["APPROVED PLAN CHARTER:"]
+        field_labels = (
+            ("original_goal", "Original goal"),
+            ("title", "Chosen plan"),
+            ("summary", "Plan summary"),
+            ("execution_brief", "Execution logic"),
+            ("deliverables", "Final deliverable"),
+            ("quality_bar", "Quality bar"),
+            ("global_constraints", "Global constraints"),
+        )
+        for key, label in field_labels:
+            # Keep the framework/思路 intact: original_goal + execution_brief carry
+            # the reasoning thread and get a larger budget than secondary fields.
+            cap = 1400 if key in ("original_goal", "execution_brief", "summary") else 900
+            value = trim(str(charter.get(key, "") or ""), cap)
+            if value:
+                lines.append(f"- {label}: {value}")
+        # ALWAYS render the full roadmap so execution never loses the plan arc.
+        roadmap = self._plan_roadmap_lines(bb)
+        if roadmap:
+            lines.append("PLAN ROADMAP ([✓] done · [▶] current · [ ] pending):")
+            lines.extend(roadmap)
+        current = self._current_plan_step_row(bb)
+        if isinstance(current, dict):
+            idx = int(current.get("plan_step_index", 0) or 0) + 1
+            total = int(bb.get("plan_step_total", 0) or 0)
+            full = trim(
+                normalize_embedded_newlines(current.get("full_content", "") or current.get("content", "") or ""),
+                1100,
+            )
+            lines.append(f"- Current step purpose ({idx}/{max(1, total)}): {full}")
+        results = self._normalize_plan_step_results(plan.get("step_results", {}))
+        if results:
+            lines.append("CROSS-STEP CONTINUITY (what prior steps produced):")
+            ordered = sorted(results.values(), key=lambda row: (int(row.get("index", 0) or 0), float(row.get("completed_at", 0.0) or 0.0)))
+            for row in ordered[-8:]:
+                files = row.get("files", []) if isinstance(row.get("files", []), list) else []
+                file_note = f" files={', '.join(files[:3])}" if files else ""
+                lines.append(
+                    f"- Step {int(row.get('index', -1) or -1) + 1}: "
+                    f"{trim(str(row.get('summary', '') or row.get('title', '') or ''), 460)}{file_note}"
+                )
+        if include_steps:
+            steps = plan.get("steps", []) if isinstance(plan.get("steps", []), list) else []
+            if steps:
+                lines.append("FULL STEP LOGIC:")
+                for idx, step in enumerate(steps[:12], start=1):
+                    lines.append(f"- {idx}. {trim(normalize_embedded_newlines(step), 300)}")
+        lines.append(
+            "Continuity rule: act ONLY on the current step's scope, but stay consistent with the charter, "
+            "the roadmap above, prior step outputs, and the final deliverable. Do not redo done steps or "
+            "pre-empt pending ones; carry forward decisions and naming from earlier steps."
+        )
+        return trim("\n".join(lines), max(900, int(max_chars or 3000)))
 
     # ── Plan MD File helpers ──────────────────────────────────────────
 
@@ -51017,6 +52445,19 @@ body{padding:18px}
         lines.append(self._ui_text("active_plan_updated", updated=_dt_cls.now().isoformat(timespec="seconds")))
         if summary:
             lines.append(self._ui_text("active_plan_summary", summary=summary))
+        continuity_block = self._plan_continuity_context_block(max_chars=3600, include_steps=False)
+        if continuity_block:
+            lines.append("## Execution Charter")
+            for raw_line in continuity_block.splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                if line.endswith(":") and not line.startswith("-"):
+                    lines.append(f"### {line[:-1]}")
+                elif line.startswith("- "):
+                    lines.append(line)
+                else:
+                    lines.append(f"> {line}")
         lines.append(self._ui_text("active_plan_steps"))
         import re as _re_exec
         _mid_re_exec = _re_exec.compile(r"(?<=\S)\s+(\d+\.\d+\s)")
@@ -51642,6 +53083,12 @@ body{padding:18px}
         grouped_steps = self._group_plan_steps(chosen.get("steps", []))
         chosen_title = trim(str(chosen.get("title", "") or choice_id).strip(), 800)
         chosen_summary = trim(str(chosen.get("summary", "") or "").strip(), PLAN_STEP_FULL_CONTENT_MAX_CHARS)
+        charter = self._build_plan_charter(
+            choice_id,
+            chosen,
+            board=bb,
+            grouped_steps=grouped_steps,
+        )
         # Preserve current complexity unless the user explicitly changes it elsewhere.
         _current_complexity = normalize_task_complexity(
             self.runtime_task_complexity
@@ -51672,8 +53119,13 @@ body{padding:18px}
             "chosen": choice_id,
             "title": chosen_title,
             "summary": chosen_summary,
+            "context": trim(str((self.runtime_plan_proposal or {}).get("context", "") or ""), 1800),
             "risk": _plan_risk,
             "steps": grouped_steps,
+            "charter": charter,
+            "step_results": self._normalize_plan_step_results(
+                (bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}).get("step_results", {})
+            ),
         }
         self.blackboard = bb
         self._blackboard_history("manager", f"plan approved: option {choice_id} — {chosen_title}")
@@ -54030,7 +55482,13 @@ body{padding:18px}
                 "ollama_base_url": self.ollama.base_url,
                 "thinking": self.thinking,
                 "thinking_stream": bool(self.ollama.thinking_stream),
+                "response_stream": bool(self.ollama.response_stream),
                 "live_thinking": str(self.live_thinking_text or "") if self.running else "",
+                "live_response_text": str(self.live_response_text or "") if (self.running and self.live_response_visible) else "",
+                "live_response_role": str(self.live_response_role or "") if self.running else "",
+                "live_response_label": str(self.live_response_label or "") if self.running else "",
+                "live_response_stream_id": str(self.live_response_stream_id or "") if self.running else "",
+                "live_response_active": bool(self.live_response_stream_id and self.live_response_visible and self.running),
                 "live_truncation_text": str(self.live_truncation_text or "") if self.running else "",
                 "live_truncation_kind": str(self.live_truncation_kind or "") if self.running else "",
                 "live_truncation_tool": str(self.live_truncation_tool or "") if self.running else "",
@@ -54565,6 +56023,8 @@ class SessionManager:
                 "temperature": 0.2,
                 "request_timeout": DEFAULT_REQUEST_TIMEOUT,
                 "selection": f"ollama::{self.model}",
+                "thinking_stream": False,
+                "response_stream": False,
                 "capabilities": infer_model_multimodal_capabilities("ollama", self.model),
                 "media_endpoints": {},
                 "source": "fallback",
@@ -55267,6 +56727,7 @@ class SessionManager:
             headers=profile.get("headers", {}) if isinstance(profile.get("headers"), dict) else {},
             payload_template=str(profile.get("payload_template", "") or ""),
             thinking_stream=bool(profile.get("thinking_stream", False)),
+            response_stream=bool(profile.get("response_stream", False)),
         )
         client.apply_profile(profile)
         caps = client.probe_multimodal_capabilities(force=True if force_probe else False)
@@ -55332,6 +56793,7 @@ class SessionManager:
                     "source": profile.get("source", ""),
                     "thinking_hint": bool(profile.get("thinking_hint", False)),
                     "thinking_stream": bool(profile.get("thinking_stream", False)),
+                    "response_stream": bool(profile.get("response_stream", False)),
                     "capabilities": caps,
                 }
             )
@@ -55369,6 +56831,7 @@ class SessionManager:
                         "source": "ollama-tags",
                         "thinking_hint": bool(profile.get("thinking_hint", self.thinking)),
                         "thinking_stream": bool(profile.get("thinking_stream", False)),
+                        "response_stream": bool(profile.get("response_stream", False)),
                         "capabilities": tag_caps,
                     }
                 )
@@ -55394,6 +56857,7 @@ class SessionManager:
                     "source": active.get("source", "active-profile"),
                     "thinking_hint": bool(active.get("thinking_hint", False)),
                     "thinking_stream": bool(active.get("thinking_stream", False)),
+                    "response_stream": bool(active.get("response_stream", False)),
                     "capabilities": active_caps,
                 },
             )
@@ -55410,6 +56874,7 @@ class SessionManager:
             "options": opts,
             "selected": selected,
             "thinking": self.thinking,
+            "response_stream": bool(active.get("response_stream", False)),
             "thinking_mode": "auto",
             "active_capabilities": active_caps,
         }
@@ -55980,7 +57445,7 @@ linear-gradient(180deg,#f8fbff 0%,#f2f6fb 100%)}
 .msg-agent-badge.reviewer{background:#fff3d4;border-color:#efd692;color:#8a6213}
 .msg-agent-badge.manager{background:#efe4ff;border-color:#d2b6ff;color:#6e36b8}
 .msg-agent-badge.planner{background:#fde8e4;border-color:#f5b8ad;color:#c0392b}
-.msg.msg-kind-manager_delegate,.msg.msg-kind-agent_bus,.msg.msg-kind-plain_text.agent-explorer,.msg.msg-kind-plain_text.agent-developer,.msg.msg-kind-plain_text.agent-reviewer,.msg.msg-kind-plain_text.agent-manager,.msg.msg-kind-plain_text.agent-planner,.msg.msg-kind-assistant_thinking.agent-explorer,.msg.msg-kind-assistant_thinking.agent-developer,.msg.msg-kind-assistant_thinking.agent-reviewer,.msg.msg-kind-assistant_thinking.agent-manager,.msg.msg-kind-assistant_thinking.agent-planner,.msg.msg-kind-live_thinking.agent-explorer,.msg.msg-kind-live_thinking.agent-developer,.msg.msg-kind-live_thinking.agent-reviewer,.msg.msg-kind-live_thinking.agent-manager,.msg.msg-kind-live_thinking.agent-planner{padding:0;background:transparent!important;border:0!important;box-shadow:none;max-width:min(92%,920px)}
+.msg.msg-kind-manager_delegate,.msg.msg-kind-agent_bus,.msg.msg-kind-plain_text.agent-explorer,.msg.msg-kind-plain_text.agent-developer,.msg.msg-kind-plain_text.agent-reviewer,.msg.msg-kind-plain_text.agent-manager,.msg.msg-kind-plain_text.agent-planner,.msg.msg-kind-assistant_thinking.agent-explorer,.msg.msg-kind-assistant_thinking.agent-developer,.msg.msg-kind-assistant_thinking.agent-reviewer,.msg.msg-kind-assistant_thinking.agent-manager,.msg.msg-kind-assistant_thinking.agent-planner,.msg.msg-kind-live_thinking.agent-explorer,.msg.msg-kind-live_thinking.agent-developer,.msg.msg-kind-live_thinking.agent-reviewer,.msg.msg-kind-live_thinking.agent-manager,.msg.msg-kind-live_thinking.agent-planner,.msg.msg-kind-live_response.agent-explorer,.msg.msg-kind-live_response.agent-developer,.msg.msg-kind-live_response.agent-reviewer,.msg.msg-kind-live_response.agent-manager,.msg.msg-kind-live_response.agent-planner,.msg.msg-kind-live_response.agent-single{padding:0;background:transparent!important;border:0!important;box-shadow:none;max-width:min(92%,920px)}
 .msg-agent-shell{position:relative;border:1px solid #d9e4f1;border-radius:12px;padding:10px 11px;background:linear-gradient(180deg,#ffffff 0%,#f6f9ff 100%);box-shadow:0 8px 18px rgba(15,23,42,.07);overflow:hidden}
 .msg.agent-explorer .msg-agent-shell{background:linear-gradient(180deg,#fff9fc 0%,#ffeff6 100%);border-color:#ffd2e4}
 .msg.agent-developer .msg-agent-shell{background:linear-gradient(180deg,#fbfffc 0%,#edf9f1 100%);border-color:#c9e6d1}
@@ -56357,10 +57822,10 @@ S.staticMode=STATIC_UI;
 async function setTaskLevel(level){if(!S.activeId)return;const lvl=parseInt(level,10);try{await api('/api/sessions/'+S.activeId+'/config/task-level',{method:'POST',body:JSON.stringify({level:lvl})});updateLevelBtn(lvl);scheduleSnapshot({forceFull:false,delayMs:80,allowWhenFrozen:true})}catch(err){showError(err.message||String(err))}}
 function updateLevelBtn(level){const btn=E('levelBtn');if(!btn)return;if(!level||level===0){setTextIfChanged(btn,t('btn_level')+': '+t('level_auto'))}else{const labels={1:'L1',2:'L2',3:'L3',4:'L4',5:'L5'};setTextIfChanged(btn,t('btn_level')+': '+(labels[level]||t('level_auto')))}}
 const LLM_PROVIDER_FIELDS={ollama:[{key:'ollama_url',label:'Ollama URL',type:'url',placeholder:'http://127.0.0.1:11434',hint:'Ollama API endpoint'}],vllm:[{key:'vllm_url',label:'vLLM URL',type:'url',placeholder:'http://localhost:8000/v1',hint:'vLLM OpenAI-compat endpoint'},{key:'vllm_model',label:'Model',type:'text',placeholder:'(auto-detect)',hint:'Leave empty to auto-detect'},{key:'vllm_key',label:'API Key (optional)',type:'password',placeholder:'',hint:'Usually not required for local'}],lmstudio:[{key:'lmstudio_url',label:'LM Studio URL',type:'url',placeholder:'http://localhost:1234/v1',hint:'LM Studio server endpoint'},{key:'lmstudio_model',label:'Model',type:'text',placeholder:'(auto-detect)',hint:'Leave empty to auto-detect'}],openai_compat:[{key:'openai_url',label:'API Base URL',type:'url',placeholder:'https://api.openai.com/v1',hint:'OpenAI-compatible endpoint'},{key:'openai_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'Your API key'},{key:'openai_model',label:'Model',type:'text',placeholder:'gpt-4o-mini',hint:'e.g. gpt-4o, claude-sonnet-4-20250514'}],anthropic:[{key:'anthropic_url',label:'API URL',type:'url',placeholder:'https://api.anthropic.com',hint:'Anthropic API endpoint'},{key:'anthropic_key',label:'API Key',type:'password',placeholder:'sk-ant-...',hint:'Anthropic API key'},{key:'anthropic_model',label:'Model',type:'text',placeholder:'claude-sonnet-4-20250514',hint:'e.g. claude-sonnet-4-20250514, claude-opus-4-20250514'}],glm:[{key:'glm_url',label:'API URL',type:'url',placeholder:'https://open.bigmodel.cn/api/paas/v4',hint:'GLM API endpoint'},{key:'glm_key',label:'API Key',type:'password',placeholder:'',hint:'GLM API Key'},{key:'glm_model',label:'Model',type:'text',placeholder:'glm-4-flash',hint:'e.g. glm-4-flash, glm-4-plus, glm-4v'}],kimi:[{key:'kimi_url',label:'API URL',type:'url',placeholder:'https://api.moonshot.cn/v1',hint:'KIMI/Moonshot API endpoint'},{key:'kimi_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'Moonshot API Key'},{key:'kimi_model',label:'Model',type:'text',placeholder:'moonshot-v1-8k',hint:'e.g. moonshot-v1-8k, moonshot-v1-32k, moonshot-v1-128k'}],openrouter:[{key:'openrouter_url',label:'API URL',type:'url',placeholder:'https://openrouter.ai/api/v1',hint:'OpenRouter endpoint'},{key:'openrouter_key',label:'API Key',type:'password',placeholder:'sk-or-...',hint:'OpenRouter API Key'},{key:'openrouter_model',label:'Model',type:'text',placeholder:'meta-llama/llama-3.1-8b-instruct',hint:'Full model slug from openrouter.ai/models'}],siliconflow:[{key:'siliconflow_url',label:'API URL',type:'url',placeholder:'https://api.siliconflow.cn/v1',hint:'SiliconFlow API endpoint'},{key:'siliconflow_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'SiliconFlow API key'},{key:'siliconflow_model',label:'Model',type:'text',placeholder:'Qwen/Qwen3-Next-80B-A3B-Instruct',hint:'Model identifier'}],custom_http:[{key:'custom_url',label:'API Endpoint URL',type:'url',placeholder:'https://your-api.com/v1/chat/completions',hint:'Full API endpoint URL'},{key:'custom_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'API key (optional)'},{key:'custom_model',label:'Model',type:'text',placeholder:'model-name',hint:'Model identifier'},{key:'custom_headers',label:'Custom Headers (JSON)',type:'textarea',placeholder:'{"Authorization":"Bearer token","X-Custom":"value"}',hint:'JSON object of additional HTTP headers'},{key:'custom_payload',label:'Payload Template (JSON)',type:'textarea',placeholder:'{"custom_param":"value","stream":true}',hint:'Extra fields merged into the request body'},{key:'temperature',label:'Temperature',type:'number',placeholder:'0.2',hint:'0.0-2.0, lower=deterministic'},{key:'request_timeout',label:'Request Timeout (seconds)',type:'number',placeholder:'3600',hint:'Max seconds per LLM request'}]};
-function renderLlmFields(provider){const container=E('llmFieldsContainer');if(!container)return;let html='';const openaiCompatProviders=new Set(['openai_compat','siliconflow','vllm','lmstudio','glm','kimi','openrouter','custom_http']);if(provider==='ollama'){const fields=LLM_PROVIDER_FIELDS.ollama;for(const f of fields){html+='<div class=\"llm-field\"><label>'+esc(f.label)+'</label><input type=\"'+f.type+'\" id=\"llmF_'+f.key+'\" placeholder=\"'+esc(f.placeholder||'')+'\" value=\"\"><div class=\"llm-hint\">'+esc(f.hint||'')+'</div></div>'}html+='<div class=\"llm-field\"><label>'+esc(t('llm_model'))+'</label><div style=\"display:flex;gap:8px;align-items:center\"><select id=\"llmF_ollama_model\" style=\"flex:1\"><option value=\"\">-- '+esc(t('llm_scan_first'))+' --</option></select><button type=\"button\" id=\"ollamaScanBtn\" class=\"llm-modal-btn-secondary\" style=\"flex:none;padding:6px 12px\">'+esc(t('llm_scan'))+'</button></div><div class=\"llm-hint\" id=\"ollamaScanHint\">'+esc(t('llm_scan_hint'))+'</div></div>'}else{const fields=LLM_PROVIDER_FIELDS[provider]||[];for(const f of fields){if(f.type==='textarea'){html+='<div class=\"llm-field\"><label>'+esc(f.label)+'</label><textarea id=\"llmF_'+f.key+'\" placeholder=\"'+esc(f.placeholder||'')+'\" rows=\"3\" style=\"width:100%;padding:8px 10px;border:1px solid var(--line,#d9e1ec);border-radius:8px;font-size:.84rem;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;resize:vertical;box-sizing:border-box\"></textarea><div class=\"llm-hint\">'+esc(f.hint||'')+'</div></div>'}else{html+='<div class=\"llm-field\"><label>'+esc(f.label)+'</label><input type=\"'+(f.type==='number'?'text':f.type)+'\" id=\"llmF_'+f.key+'\" placeholder=\"'+esc(f.placeholder||'')+'\" value=\"\"><div class=\"llm-hint\">'+esc(f.hint||'')+'</div></div>'}}if(openaiCompatProviders.has(provider)){html+='<div class=\"llm-field\"><div style=\"display:flex;gap:8px;align-items:center\"><button type=\"button\" id=\"localScanBtn\" class=\"llm-modal-btn-secondary\" style=\"flex:none;padding:6px 12px\">'+esc(t('llm_scan'))+'</button></div><div class=\"llm-hint\" id=\"localScanHint\">'+esc(t('llm_scan_hint'))+'</div></div>'}}html+='<div class=\"llm-field\"><label>'+esc(t('llm_thinking_stream'))+'</label><select id=\"llmF_thinking_stream\"><option value=\"true\">'+esc(t('llm_enabled'))+'</option><option value=\"false\">'+esc(t('llm_disabled'))+'</option></select></div>';container.innerHTML=html;if(provider!=='custom_http'){const defaults=LLM_PROVIDER_FIELDS[provider]||[];for(const f of defaults){if(f.type!=='url')continue;const el=E('llmF_'+f.key);if(el&&!String(el.value||'').trim())el.value=String(f.placeholder||'')}}if(provider==='ollama'){const scanBtn=E('ollamaScanBtn');if(scanBtn)scanBtn.onclick=()=>scanOllamaModels()}if(openaiCompatProviders.has(provider)){const scanBtn=E('localScanBtn');if(scanBtn)scanBtn.onclick=()=>scanOpenAICompatModels(provider)}}
+function renderLlmFields(provider){const container=E('llmFieldsContainer');if(!container)return;let html='';const openaiCompatProviders=new Set(['openai_compat','siliconflow','vllm','lmstudio','glm','kimi','openrouter','custom_http']);if(provider==='ollama'){const fields=LLM_PROVIDER_FIELDS.ollama;for(const f of fields){html+='<div class=\"llm-field\"><label>'+esc(f.label)+'</label><input type=\"'+f.type+'\" id=\"llmF_'+f.key+'\" placeholder=\"'+esc(f.placeholder||'')+'\" value=\"\"><div class=\"llm-hint\">'+esc(f.hint||'')+'</div></div>'}html+='<div class=\"llm-field\"><label>'+esc(t('llm_model'))+'</label><div style=\"display:flex;gap:8px;align-items:center\"><select id=\"llmF_ollama_model\" style=\"flex:1\"><option value=\"\">-- '+esc(t('llm_scan_first'))+' --</option></select><button type=\"button\" id=\"ollamaScanBtn\" class=\"llm-modal-btn-secondary\" style=\"flex:none;padding:6px 12px\">'+esc(t('llm_scan'))+'</button></div><div class=\"llm-hint\" id=\"ollamaScanHint\">'+esc(t('llm_scan_hint'))+'</div></div>'}else{const fields=LLM_PROVIDER_FIELDS[provider]||[];for(const f of fields){if(f.type==='textarea'){html+='<div class=\"llm-field\"><label>'+esc(f.label)+'</label><textarea id=\"llmF_'+f.key+'\" placeholder=\"'+esc(f.placeholder||'')+'\" rows=\"3\" style=\"width:100%;padding:8px 10px;border:1px solid var(--line,#d9e1ec);border-radius:8px;font-size:.84rem;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;resize:vertical;box-sizing:border-box\"></textarea><div class=\"llm-hint\">'+esc(f.hint||'')+'</div></div>'}else{html+='<div class=\"llm-field\"><label>'+esc(f.label)+'</label><input type=\"'+(f.type==='number'?'text':f.type)+'\" id=\"llmF_'+f.key+'\" placeholder=\"'+esc(f.placeholder||'')+'\" value=\"\"><div class=\"llm-hint\">'+esc(f.hint||'')+'</div></div>'}}if(openaiCompatProviders.has(provider)){html+='<div class=\"llm-field\"><div style=\"display:flex;gap:8px;align-items:center\"><button type=\"button\" id=\"localScanBtn\" class=\"llm-modal-btn-secondary\" style=\"flex:none;padding:6px 12px\">'+esc(t('llm_scan'))+'</button></div><div class=\"llm-hint\" id=\"localScanHint\">'+esc(t('llm_scan_hint'))+'</div></div>'}}html+='<div class=\"llm-field\"><label>'+esc(t('llm_thinking_stream'))+'</label><select id=\"llmF_thinking_stream\"><option value=\"true\">'+esc(t('llm_enabled'))+'</option><option value=\"false\" selected>'+esc(t('llm_disabled'))+'</option></select></div>';html+='<div class=\"llm-field\"><label>'+esc(t('llm_response_stream'))+'</label><select id=\"llmF_response_stream\"><option value=\"true\">'+esc(t('llm_enabled'))+'</option><option value=\"false\" selected>'+esc(t('llm_disabled'))+'</option></select><div class=\"llm-hint\">'+esc(t('llm_response_stream_hint'))+'</div></div>';container.innerHTML=html;if(provider!=='custom_http'){const defaults=LLM_PROVIDER_FIELDS[provider]||[];for(const f of defaults){if(f.type!=='url')continue;const el=E('llmF_'+f.key);if(el&&!String(el.value||'').trim())el.value=String(f.placeholder||'')}}if(provider==='ollama'){const scanBtn=E('ollamaScanBtn');if(scanBtn)scanBtn.onclick=()=>scanOllamaModels()}if(openaiCompatProviders.has(provider)){const scanBtn=E('localScanBtn');if(scanBtn)scanBtn.onclick=()=>scanOpenAICompatModels(provider)}}
 async function scanOllamaModels(){const urlEl=E('llmF_ollama_url');const sel=E('llmF_ollama_model');const hint=E('ollamaScanHint');const baseUrl=(urlEl?.value||'').trim()||'http://127.0.0.1:11434';if(hint)hint.textContent=t('llm_scanning');try{const res=await fetch('/api/ollama/models?base_url='+encodeURIComponent(baseUrl));const data=await res.json();if(!data.ok||!data.models?.length){if(hint)hint.textContent=t('llm_scan_empty')+(data.error?' ('+data.error+')':'');return}if(sel){sel.innerHTML='';for(const m of data.models){const op=document.createElement('option');op.value=m;op.textContent=m;sel.appendChild(op)}}if(hint)hint.textContent=t('llm_scan_found').replace('{n}',String(data.models.length))}catch(err){if(hint)hint.textContent=t('llm_scan_error')+': '+(err.message||String(err))}}
 async function scanOpenAICompatModels(provider){const scanMap={openai_compat:{urlKey:'openai_url',modelKey:'openai_model',keyKey:'openai_key',defaultUrl:'https://api.openai.com/v1'},siliconflow:{urlKey:'siliconflow_url',modelKey:'siliconflow_model',keyKey:'siliconflow_key',defaultUrl:'https://api.siliconflow.cn/v1'},vllm:{urlKey:'vllm_url',modelKey:'vllm_model',keyKey:'vllm_key',defaultUrl:'http://localhost:8000/v1'},lmstudio:{urlKey:'lmstudio_url',modelKey:'lmstudio_model',keyKey:'lmstudio_key',defaultUrl:'http://localhost:1234/v1'},glm:{urlKey:'glm_url',modelKey:'glm_model',keyKey:'glm_key',defaultUrl:'https://open.bigmodel.cn/api/paas/v4'},kimi:{urlKey:'kimi_url',modelKey:'kimi_model',keyKey:'kimi_key',defaultUrl:'https://api.moonshot.cn/v1'},openrouter:{urlKey:'openrouter_url',modelKey:'openrouter_model',keyKey:'openrouter_key',defaultUrl:'https://openrouter.ai/api/v1'},custom_http:{urlKey:'custom_url',modelKey:'custom_model',keyKey:'custom_key',defaultUrl:''}};const normalizedProvider=String(provider||'openai_compat').trim()||'openai_compat';const meta=scanMap[normalizedProvider]||scanMap.openai_compat;const urlEl=E('llmF_'+meta.urlKey);const modelEl=E('llmF_'+meta.modelKey);const hint=E('localScanHint');const baseUrl=(urlEl?.value||'').trim()||meta.defaultUrl||'';const apiKey=(E('llmF_'+meta.keyKey)?.value||'').trim();if(hint)hint.textContent=t('llm_scanning');try{let url='/api/openai_compat/models?provider='+encodeURIComponent(normalizedProvider)+'&base_url='+encodeURIComponent(baseUrl);if(apiKey)url+='&api_key='+encodeURIComponent(apiKey);const res=await fetch(url);const data=await res.json();const models=Array.isArray(data.models)?data.models.filter(Boolean):[];if(!data.ok){if(hint)hint.textContent=t('llm_scan_error')+(data.error?' ('+data.error+')':'');return}if(models.length){if(modelEl&&!String(modelEl.value||'').trim())modelEl.value=models[0];if(hint)hint.textContent=t('llm_scan_found').replace('{n}',String(models.length))+': '+models.slice(0,3).join(', ');return}if(data.reachable){if(hint)hint.textContent=t('llm_scan_reachable_manual')+(data.error?' ('+data.error+')':'');return}if(hint)hint.textContent=t('llm_scan_empty')+(data.error?' ('+data.error+')':'')}catch(err){if(hint)hint.textContent=t('llm_scan_error')+': '+(err.message||String(err))}}
-function collectLlmConfig(){const provider=E('llmProvider')?.value||'ollama';const config={provider:provider};if(provider==='ollama'){config.ollama_url=(E('llmF_ollama_url')?.value||'').trim()||'http://127.0.0.1:11434';config.ollama_model=E('llmF_ollama_model')?.value||''}else if(provider==='custom_http'){const fields=LLM_PROVIDER_FIELDS.custom_http;for(const f of fields){const el=E('llmF_'+f.key);if(!el)continue;if(f.type==='textarea'){config[f.key]=el.value.trim()}else if(f.key==='temperature'){const v=parseFloat(el.value);if(!isNaN(v))config[f.key]=v}else if(f.key==='request_timeout'){const v=parseInt(el.value,10);if(!isNaN(v)&&v>0)config[f.key]=v}else{config[f.key]=el.value.trim()}}}else{const fields=LLM_PROVIDER_FIELDS[provider]||[];for(const f of fields){const el=E('llmF_'+f.key);if(el){const raw=el.value.trim();config[f.key]=(provider!=='custom_http'&&f.type==='url')?(raw||String(f.placeholder||'').trim()):raw}}}config.thinking_stream=E('llmF_thinking_stream')?.value==='true';return config}
+function collectLlmConfig(){const provider=E('llmProvider')?.value||'ollama';const config={provider:provider};if(provider==='ollama'){config.ollama_url=(E('llmF_ollama_url')?.value||'').trim()||'http://127.0.0.1:11434';config.ollama_model=E('llmF_ollama_model')?.value||''}else if(provider==='custom_http'){const fields=LLM_PROVIDER_FIELDS.custom_http;for(const f of fields){const el=E('llmF_'+f.key);if(!el)continue;if(f.type==='textarea'){config[f.key]=el.value.trim()}else if(f.key==='temperature'){const v=parseFloat(el.value);if(!isNaN(v))config[f.key]=v}else if(f.key==='request_timeout'){const v=parseInt(el.value,10);if(!isNaN(v)&&v>0)config[f.key]=v}else{config[f.key]=el.value.trim()}}}else{const fields=LLM_PROVIDER_FIELDS[provider]||[];for(const f of fields){const el=E('llmF_'+f.key);if(el){const raw=el.value.trim();config[f.key]=(provider!=='custom_http'&&f.type==='url')?(raw||String(f.placeholder||'').trim()):raw}}}config.thinking_stream=E('llmF_thinking_stream')?.value==='true';config.response_stream=E('llmF_response_stream')?.value==='true';return config}
 async function submitLlmConfig(){if(!S.activeId){showError(t('select_session_first'));return}const config=collectLlmConfig();try{const payload={filename:'LLM.config.json',mime:'application/json',content_b64:btoa(unescape(encodeURIComponent(JSON.stringify(config,null,2))))};const out=await api('/api/sessions/'+S.activeId+'/uploads',{method:'POST',body:JSON.stringify(payload)});const note=String(out?.note||out?.model_catalog?.note||'').trim();if(!out?.model_catalog){showError(t('config_uploaded_no_profiles'))}else if(note){showError(note)}else{showError('')}const cat=out?.model_catalog||await loadModelCatalog();if(!applyModelCatalog(cat)){renderModelControls()}await refreshSnapshot({forceFull:true,allowWhenFrozen:true});E('llmConfigModal').style.display='none'}catch(err){showError(err.message||String(err))}}
 function openLlmConfigModal(){const modal=E('llmConfigModal');if(!modal)return;modal.style.display='flex';const prov=E('llmProvider');if(prov){renderLlmFields(prov.value)}}
 const COMPACT_AUTO_REFRESH_COUNT=3;
@@ -56400,7 +57865,7 @@ const I18N={
 
 
     llm_fill_config:'Fill LLM Config',llm_provider:'Provider',llm_confirm:'Confirm',llm_import_config:'Import config',
-    llm_thinking_stream:'Thinking Stream',llm_enabled:'Enabled',llm_disabled:'Disabled',
+    llm_thinking_stream:'Thinking Stream',llm_response_stream:'Response Stream',llm_response_stream_hint:'Stream assistant response text through live events. Default is disabled.',llm_enabled:'Enabled',llm_disabled:'Disabled',
     llm_model:'Model',llm_scan:'Scan',llm_scan_hint:'Click Scan to probe the endpoint and detect models',llm_scan_first:'Scan models first',
     llm_scanning:'Scanning...',llm_scan_found:'Found {n} model(s)',llm_scan_empty:'No models found',llm_scan_error:'Scan failed',llm_scan_reachable_manual:'Endpoint reachable, fill model manually',
     todo_plan_steps:'Plan Steps',todo_subtasks:'Subtasks'
@@ -56438,7 +57903,7 @@ const I18N={
 
 
     llm_fill_config:'填写 LLM 配置',llm_provider:'供应商',llm_confirm:'确认',llm_import_config:'导入配置',
-    llm_thinking_stream:'思维流',llm_enabled:'启用',llm_disabled:'禁用',
+    llm_thinking_stream:'思维流',llm_response_stream:'正文流',llm_response_stream_hint:'通过实时事件流式显示助手正文，默认禁用。',llm_enabled:'启用',llm_disabled:'禁用',
     llm_model:'模型',llm_scan:'扫描',llm_scan_hint:'点击扫描探测当前接口并识别模型',llm_scan_first:'请先扫描模型',
     llm_scanning:'扫描中...',llm_scan_found:'发现 {n} 个模型',llm_scan_empty:'未发现模型',llm_scan_error:'扫描失败',llm_scan_reachable_manual:'接口可达，请手动填写模型名',
     todo_plan_steps:'计划步骤',todo_subtasks:'子任务'
@@ -56476,7 +57941,7 @@ const I18N={
 
 
     llm_fill_config:'填寫 LLM 設定',llm_provider:'供應商',llm_confirm:'確認',llm_import_config:'匯入設定',
-    llm_thinking_stream:'思維流',llm_enabled:'啟用',llm_disabled:'停用',
+    llm_thinking_stream:'思維流',llm_response_stream:'正文串流',llm_response_stream_hint:'透過即時事件串流顯示助手正文，預設停用。',llm_enabled:'啟用',llm_disabled:'停用',
     llm_model:'模型',llm_scan:'掃描',llm_scan_hint:'點擊掃描探測目前介面並辨識模型',llm_scan_first:'請先掃描模型',
     llm_scanning:'掃描中...',llm_scan_found:'發現 {n} 個模型',llm_scan_empty:'未發現模型',llm_scan_error:'掃描失敗',llm_scan_reachable_manual:'介面可達，請手動填寫模型名稱',
     todo_plan_steps:'計劃步驟',todo_subtasks:'子任務'
@@ -56514,7 +57979,7 @@ const I18N={
 
 
     llm_fill_config:'LLM設定入力',llm_provider:'プロバイダー',llm_confirm:'確認',llm_import_config:'設定をインポート',
-    llm_thinking_stream:'シンキングストリーム',llm_enabled:'有効',llm_disabled:'無効',
+    llm_thinking_stream:'シンキングストリーム',llm_response_stream:'レスポンスストリーム',llm_response_stream_hint:'アシスタント本文をライブイベントでストリーミング表示します。既定は無効です。',llm_enabled:'有効',llm_disabled:'無効',
     llm_model:'モデル',llm_scan:'スキャン',llm_scan_hint:'スキャンしてエンドポイント到達性とモデルを確認',llm_scan_first:'先にモデルをスキャン',
     llm_scanning:'スキャン中...',llm_scan_found:'{n}個のモデルを検出',llm_scan_empty:'モデルが見つかりません',llm_scan_error:'スキャン失敗',llm_scan_reachable_manual:'エンドポイント到達可、モデル名は手動入力してください',
     todo_plan_steps:'計画ステップ',todo_subtasks:'サブタスク'
@@ -56542,7 +58007,7 @@ Object.assign(I18N['en'],{
       event_scheduler_queued_title:'Queued Task',event_scheduler_queued_note:'This message is saved and waiting for an execution slot.',event_scheduler_queue_position:'queue position',event_scheduler_reason:'reason',event_scheduler_queued_hint:'queued',
   event_auto_continue:'Auto Continue',event_arbiter_continue:'Arbiter Continue',event_continuation_briefing:'Continuation Briefing',event_reminder:'Reminder',event_todo_rescue:'Todo Rescue',event_tool_retry:'Tool Retry',event_segmented_retry:'Segmented Retry',event_forced_converge:'Forced Converge',event_no_tool_recovery:'No-Tool Recovery',event_context_recall:'Context Recall',event_failure_recovery:'Failure Recovery',event_truncate_rescue:'Truncation Rescue',event_thinking_recovery:'Thinking Recovery',event_fault_prefill:'Fault Prefill',event_edit_recovery:'Edit Recovery',
   state_on:'on',state_off:'off',
-  rt_session:'session',rt_model:'model',rt_thinking:'thinking',rt_thinking_stream:'thinking_stream',rt_mode:'mode',rt_active_agent:'active_agent',rt_blackboard:'bb',rt_task:'task',rt_complexity:'complexity',rt_judgement:'judgement',rt_budget:'budget',rt_remaining:'remaining',rt_blackboard_cycles:'bb_cycles',rt_round_limit:'round_limit',rt_round:'round',rt_phase:'phase',rt_queued_inputs:'queued_inputs',rt_run_timeout:'run_timeout',rt_ctx_used:'ctx_used',rt_ctx_limit:'ctx_limit',rt_ctx_mode:'ctx_mode',rt_manual_lock:'manual-lock',rt_adaptive:'adaptive',rt_ctx_left:'ctx_left',rt_ctx_left_for:'{label} left',rt_ctx_live_title:'Remaining context budget by active call',rt_truncation:'truncation',rt_trunc_retry:'trunc_retry',rt_trunc_tokens:'trunc_tokens~',rt_archive:'archive',rt_last_compact:'last_compact',rt_ollama:'ollama',rt_files:'files',rt_ui_mode:'ui_mode',rt_state:'state',
+  rt_session:'session',rt_model:'model',rt_thinking:'thinking',rt_thinking_stream:'thinking_stream',rt_response_stream:'response_stream',rt_mode:'mode',rt_active_agent:'active_agent',rt_blackboard:'bb',rt_task:'task',rt_complexity:'complexity',rt_judgement:'judgement',rt_budget:'budget',rt_remaining:'remaining',rt_blackboard_cycles:'bb_cycles',rt_round_limit:'round_limit',rt_round:'round',rt_phase:'phase',rt_queued_inputs:'queued_inputs',rt_run_timeout:'run_timeout',rt_ctx_used:'ctx_used',rt_ctx_limit:'ctx_limit',rt_ctx_mode:'ctx_mode',rt_manual_lock:'manual-lock',rt_adaptive:'adaptive',rt_ctx_left:'ctx_left',rt_ctx_left_for:'{label} left',rt_ctx_live_title:'Remaining context budget by active call',rt_truncation:'truncation',rt_trunc_retry:'trunc_retry',rt_trunc_tokens:'trunc_tokens~',rt_archive:'archive',rt_last_compact:'last_compact',rt_ollama:'ollama',rt_files:'files',rt_ui_mode:'ui_mode',rt_state:'state',
   preview_download:'Download',preview_source:'Source',preview_rendered:'Preview',
   fe_nodes:'nodes={n}',fe_loading:'loading...',fe_tree_truncated:'tree truncated at {n} nodes',fe_items:'{n} item(s)',
   cmd_ui_preview_truncated:'UI preview truncated',cmd_model_context_truncated:'Model context truncated',cmd_temp_read_file_ready:'Temp read_file ready',cmd_buffered_copy:'Buffered copy',cmd_prev:'Prev',cmd_next:'Next',cmd_preview:'preview',cmd_of:'of',cmd_read_file_path:'read_file path',cmd_buffer_ref:'buffer_ref',cmd_chars:'chars',cmd_lines:'lines',cmd_strategy:'strategy',cmd_full_output:'full_output',cmd_exit:'exit',cmd_default_name:'command'
@@ -56570,7 +58035,7 @@ Object.assign(I18N['zh-CN'],{
       event_scheduler_queued_title:'任务已排队',event_scheduler_queued_note:'这条消息已保存，正在等待后台执行名额。',event_scheduler_queue_position:'队列位置',event_scheduler_reason:'原因',event_scheduler_queued_hint:'已排队',
   event_auto_continue:'自动继续',event_arbiter_continue:'裁决继续',event_continuation_briefing:'续跑简报',event_reminder:'提醒',event_todo_rescue:'待办救援',event_tool_retry:'工具重试',event_segmented_retry:'分段重试',event_forced_converge:'强制收敛',event_no_tool_recovery:'无工具恢复',event_context_recall:'上下文召回',event_failure_recovery:'故障恢复',event_truncate_rescue:'截断救援',event_thinking_recovery:'思考恢复',event_fault_prefill:'故障预填',event_edit_recovery:'编辑恢复',
   state_on:'开',state_off:'关',
-  rt_session:'会话',rt_model:'模型',rt_thinking:'思考',rt_thinking_stream:'思考流',rt_mode:'模式',rt_active_agent:'活跃代理',rt_blackboard:'黑板',rt_task:'任务',rt_complexity:'复杂度',rt_judgement:'裁决',rt_budget:'预算',rt_remaining:'剩余',rt_blackboard_cycles:'黑板轮次',rt_round_limit:'轮次上限',rt_round:'轮次',rt_phase:'阶段',rt_queued_inputs:'排队输入',rt_run_timeout:'运行超时',rt_ctx_used:'上下文已用',rt_ctx_limit:'上下文上限',rt_ctx_mode:'上下文模式',rt_manual_lock:'手动锁定',rt_adaptive:'自适应',rt_ctx_left:'上下文剩余',rt_ctx_left_for:'{label}剩余',rt_ctx_live_title:'按真实调用显示上下文剩余',rt_truncation:'截断数',rt_trunc_retry:'截断重试',rt_trunc_tokens:'截断Token~',rt_archive:'归档',rt_last_compact:'最近压缩',rt_ollama:'Ollama',rt_files:'文件根目录',rt_ui_mode:'界面模式',rt_state:'状态',
+  rt_session:'会话',rt_model:'模型',rt_thinking:'思考',rt_thinking_stream:'思考流',rt_response_stream:'正文流',rt_mode:'模式',rt_active_agent:'活跃代理',rt_blackboard:'黑板',rt_task:'任务',rt_complexity:'复杂度',rt_judgement:'裁决',rt_budget:'预算',rt_remaining:'剩余',rt_blackboard_cycles:'黑板轮次',rt_round_limit:'轮次上限',rt_round:'轮次',rt_phase:'阶段',rt_queued_inputs:'排队输入',rt_run_timeout:'运行超时',rt_ctx_used:'上下文已用',rt_ctx_limit:'上下文上限',rt_ctx_mode:'上下文模式',rt_manual_lock:'手动锁定',rt_adaptive:'自适应',rt_ctx_left:'上下文剩余',rt_ctx_left_for:'{label}剩余',rt_ctx_live_title:'按真实调用显示上下文剩余',rt_truncation:'截断数',rt_trunc_retry:'截断重试',rt_trunc_tokens:'截断Token~',rt_archive:'归档',rt_last_compact:'最近压缩',rt_ollama:'Ollama',rt_files:'文件根目录',rt_ui_mode:'界面模式',rt_state:'状态',
   preview_download:'下载',preview_source:'源码',preview_rendered:'预览',
   fe_nodes:'节点={n}',fe_loading:'加载中...',fe_tree_truncated:'目录树在 {n} 个节点处被截断',fe_items:'{n} 项',
   cmd_ui_preview_truncated:'UI 预览截断',cmd_model_context_truncated:'模型上下文截断',cmd_temp_read_file_ready:'临时 read_file 已就绪',cmd_buffered_copy:'缓冲副本',cmd_prev:'上一页',cmd_next:'下一页',cmd_preview:'预览',cmd_of:'共',cmd_read_file_path:'read_file 路径',cmd_buffer_ref:'缓冲引用',cmd_chars:'字符',cmd_lines:'行',cmd_strategy:'策略',cmd_full_output:'完整输出',cmd_exit:'退出码',cmd_default_name:'命令'
@@ -56601,7 +58066,7 @@ Object.assign(I18N['zh-TW'],{
       event_scheduler_queued_title:'任務已排隊',event_scheduler_queued_note:'這則訊息已保存，正在等待背景執行名額。',event_scheduler_queue_position:'佇列位置',event_scheduler_reason:'原因',event_scheduler_queued_hint:'已排隊',
   event_auto_continue:'自動繼續',event_arbiter_continue:'裁決繼續',event_continuation_briefing:'續跑簡報',event_reminder:'提醒',event_todo_rescue:'待辦救援',event_tool_retry:'工具重試',event_segmented_retry:'分段重試',event_forced_converge:'強制收斂',event_no_tool_recovery:'無工具恢復',event_context_recall:'上下文召回',event_failure_recovery:'故障恢復',event_truncate_rescue:'截斷救援',event_thinking_recovery:'思考恢復',event_fault_prefill:'故障預填',event_edit_recovery:'編輯恢復',
   state_on:'開',state_off:'關',
-  rt_session:'會話',rt_model:'模型',rt_thinking:'思考',rt_thinking_stream:'思考流',rt_mode:'模式',rt_active_agent:'活躍代理',rt_blackboard:'黑板',rt_task:'任務',rt_complexity:'複雜度',rt_judgement:'裁決',rt_budget:'預算',rt_remaining:'剩餘',rt_blackboard_cycles:'黑板輪次',rt_round_limit:'輪次上限',rt_round:'輪次',rt_phase:'階段',rt_queued_inputs:'排隊輸入',rt_run_timeout:'執行逾時',rt_ctx_used:'上下文已用',rt_ctx_limit:'上下文上限',rt_ctx_mode:'上下文模式',rt_manual_lock:'手動鎖定',rt_adaptive:'自適應',rt_ctx_left:'上下文剩餘',rt_ctx_left_for:'{label}剩餘',rt_ctx_live_title:'依真實呼叫顯示上下文剩餘',rt_truncation:'截斷數',rt_trunc_retry:'截斷重試',rt_trunc_tokens:'截斷Token~',rt_archive:'封存',rt_last_compact:'最近壓縮',rt_ollama:'Ollama',rt_files:'檔案根目錄',rt_ui_mode:'介面模式',rt_state:'狀態',
+  rt_session:'會話',rt_model:'模型',rt_thinking:'思考',rt_thinking_stream:'思考流',rt_response_stream:'正文串流',rt_mode:'模式',rt_active_agent:'活躍代理',rt_blackboard:'黑板',rt_task:'任務',rt_complexity:'複雜度',rt_judgement:'裁決',rt_budget:'預算',rt_remaining:'剩餘',rt_blackboard_cycles:'黑板輪次',rt_round_limit:'輪次上限',rt_round:'輪次',rt_phase:'階段',rt_queued_inputs:'排隊輸入',rt_run_timeout:'執行逾時',rt_ctx_used:'上下文已用',rt_ctx_limit:'上下文上限',rt_ctx_mode:'上下文模式',rt_manual_lock:'手動鎖定',rt_adaptive:'自適應',rt_ctx_left:'上下文剩餘',rt_ctx_left_for:'{label}剩餘',rt_ctx_live_title:'依真實呼叫顯示上下文剩餘',rt_truncation:'截斷數',rt_trunc_retry:'截斷重試',rt_trunc_tokens:'截斷Token~',rt_archive:'封存',rt_last_compact:'最近壓縮',rt_ollama:'Ollama',rt_files:'檔案根目錄',rt_ui_mode:'介面模式',rt_state:'狀態',
   preview_download:'下載',preview_source:'原始碼',preview_rendered:'預覽',
   fe_nodes:'節點={n}',fe_loading:'載入中...',fe_tree_truncated:'目錄樹在 {n} 個節點處被截斷',fe_items:'{n} 項',
   cmd_ui_preview_truncated:'UI 預覽截斷',cmd_model_context_truncated:'模型上下文截斷',cmd_temp_read_file_ready:'暫存 read_file 已就緒',cmd_buffered_copy:'緩衝副本',cmd_prev:'上一頁',cmd_next:'下一頁',cmd_preview:'預覽',cmd_of:'共',cmd_read_file_path:'read_file 路徑',cmd_buffer_ref:'緩衝引用',cmd_chars:'字元',cmd_lines:'行',cmd_strategy:'策略',cmd_full_output:'完整輸出',cmd_exit:'退出碼',cmd_default_name:'命令'
@@ -56630,7 +58095,7 @@ Object.assign(I18N['ja'],{
       event_scheduler_queued_title:'キュー済みタスク',event_scheduler_queued_note:'このメッセージは保存され、実行枠を待っています。',event_scheduler_queue_position:'キュー位置',event_scheduler_reason:'理由',event_scheduler_queued_hint:'キュー済み',
   event_auto_continue:'自動継続',event_arbiter_continue:'判定継続',event_continuation_briefing:'継続ブリーフ',event_reminder:'リマインダー',event_todo_rescue:'Todo 救援',event_tool_retry:'ツール再試行',event_segmented_retry:'分割再試行',event_forced_converge:'強制収束',event_no_tool_recovery:'ツールなし復旧',event_context_recall:'コンテキスト再呼び出し',event_failure_recovery:'障害復旧',event_truncate_rescue:'切り詰め救援',event_thinking_recovery:'思考復旧',event_fault_prefill:'障害プリフィル',event_edit_recovery:'編集復旧',
   state_on:'オン',state_off:'オフ',
-  rt_session:'セッション',rt_model:'モデル',rt_thinking:'思考',rt_thinking_stream:'思考ストリーム',rt_mode:'モード',rt_active_agent:'アクティブAgent',rt_blackboard:'黒板',rt_task:'タスク',rt_complexity:'複雑度',rt_judgement:'判定',rt_budget:'予算',rt_remaining:'残り',rt_blackboard_cycles:'黒板サイクル',rt_round_limit:'ラウンド上限',rt_round:'ラウンド',rt_phase:'フェーズ',rt_queued_inputs:'待機入力',rt_run_timeout:'実行タイムアウト',rt_ctx_used:'コンテキスト使用量',rt_ctx_limit:'コンテキスト上限',rt_ctx_mode:'コンテキストモード',rt_manual_lock:'手動固定',rt_adaptive:'適応',rt_ctx_left:'残りコンテキスト',rt_ctx_left_for:'{label}残り',rt_ctx_live_title:'実際の呼び出し別の残りコンテキスト',rt_truncation:'切り詰め数',rt_trunc_retry:'切り詰め再試行',rt_trunc_tokens:'切り詰めToken~',rt_archive:'アーカイブ',rt_last_compact:'直近 compact',rt_ollama:'Ollama',rt_files:'ファイルルート',rt_ui_mode:'UIモード',rt_state:'状態',
+  rt_session:'セッション',rt_model:'モデル',rt_thinking:'思考',rt_thinking_stream:'思考ストリーム',rt_response_stream:'レスポンスストリーム',rt_mode:'モード',rt_active_agent:'アクティブAgent',rt_blackboard:'黒板',rt_task:'タスク',rt_complexity:'複雑度',rt_judgement:'判定',rt_budget:'予算',rt_remaining:'残り',rt_blackboard_cycles:'黒板サイクル',rt_round_limit:'ラウンド上限',rt_round:'ラウンド',rt_phase:'フェーズ',rt_queued_inputs:'待機入力',rt_run_timeout:'実行タイムアウト',rt_ctx_used:'コンテキスト使用量',rt_ctx_limit:'コンテキスト上限',rt_ctx_mode:'コンテキストモード',rt_manual_lock:'手動固定',rt_adaptive:'適応',rt_ctx_left:'残りコンテキスト',rt_ctx_left_for:'{label}残り',rt_ctx_live_title:'実際の呼び出し別の残りコンテキスト',rt_truncation:'切り詰め数',rt_trunc_retry:'切り詰め再試行',rt_trunc_tokens:'切り詰めToken~',rt_archive:'アーカイブ',rt_last_compact:'直近 compact',rt_ollama:'Ollama',rt_files:'ファイルルート',rt_ui_mode:'UIモード',rt_state:'状態',
   preview_download:'ダウンロード',preview_source:'ソース',preview_rendered:'プレビュー',
   fe_nodes:'ノード={n}',fe_loading:'読み込み中...',fe_tree_truncated:'ツリーは {n} ノードで切り詰められました',fe_items:'{n} 件',
   cmd_ui_preview_truncated:'UI プレビュー切り詰め',cmd_model_context_truncated:'モデルコンテキスト切り詰め',cmd_temp_read_file_ready:'一時 read_file 準備完了',cmd_buffered_copy:'バッファコピー',cmd_prev:'前へ',cmd_next:'次へ',cmd_preview:'プレビュー',cmd_of:'全',cmd_read_file_path:'read_file パス',cmd_buffer_ref:'buffer_ref',cmd_chars:'文字',cmd_lines:'行',cmd_strategy:'戦略',cmd_full_output:'完全出力',cmd_exit:'終了コード',cmd_default_name:'コマンド'
@@ -57040,6 +58505,26 @@ function _deltaApplyRuntimeEvent(evt){
     _deltaScheduleRender({boards:true});
     return{handled:true,needsSnapshot:false};
   }
+  if(typ==='response_delta'){
+    const active=!!data.active;
+    const visible=!!data.visible;
+    S.snap.live_response_active=active&&visible;
+    S.snap.live_response_stream_id=String(data.stream_id||'');
+    S.snap.live_response_role=String(data.agent_role||'');
+    S.snap.live_response_label=String(data.label||'');
+    if(active&&visible){
+      S.snap.live_response_text=String(data.text||'');
+      if(S.snap.live_response_role){
+        const keyRole=_chatVirtAgentRoleKey(S.snap.live_response_role);
+        if(keyRole)S.snap.agent_active_role=keyRole;
+      }
+    }else{
+      S.snap.live_response_text='';
+    }
+    _deltaAppendActivity(typ,{...data,text:''},ts);
+    _deltaScheduleRender({chat:true,boards:true});
+    return{handled:true,needsSnapshot:false};
+  }
   if(typ==='truncation_delta'){
     S.snap.live_truncation_active=!!data.active;
     S.snap.live_truncation_attempts=Number(data.attempts||0);
@@ -57199,7 +58684,7 @@ function _deltaStartWatchdog(){
 }
 function renderSkillsEntryLink(){const link=E('downloadBtn');if(!link)return;const host=location.hostname||'127.0.0.1';const enabled=Boolean(S.config?.skills_ui_enabled);const fromConfig=String(S.config?.skills_ui_url||'').trim();const skillsPort=Number(S.config?.skills_port||0);let href='#';if(enabled){if(fromConfig){href=fromConfig}else if(Number.isFinite(skillsPort)&&skillsPort>0){const currentPort=Number(location.port||0);if(!(currentPort&&skillsPort===currentPort)){href=`${location.protocol}//${host}:${skillsPort}`}}}const offline=(href==='#');link.href=href;link.classList.toggle('disabled',offline);link.textContent=offline?t('skills_offline'):t('open_skills')}
 function tailSig(rows,count,mapper){const arr=Array.isArray(rows)?rows:[];if(!arr.length)return'';return arr.slice(Math.max(0,arr.length-count)).map(mapper).join('|')}
-function feedSignature(snap){const feed=Array.isArray(snap?.conversation_feed)?snap.conversation_feed:(Array.isArray(snap?.messages)?snap.messages:[]);const sig=tailSig(feed,8,row=>`${Number(row?.ts||0)}:${String(row?.role||'')}:${String(row?.agent_role||'')}:${String(row?.type||'')}:${String(row?.text||'').length}:${String(row?.thinking||'').length}:${String(row?.text||'').slice(-12)}:${String(row?.thinking||'').slice(-12)}`);const live=String(snap?.live_thinking||'');const runActive=snap?.live_run_notice_active?1:0;const runLabel=String(snap?.live_run_notice_label||'');const runStart=Number(snap?.live_run_notice_started_at||0);const truncText=String(snap?.live_truncation_text||'');const truncKind=String(snap?.live_truncation_kind||'');const truncTool=String(snap?.live_truncation_tool||'');const truncAttempts=Number(snap?.live_truncation_attempts||0);const truncTokens=Number(snap?.live_truncation_tokens||0);const truncActive=snap?.live_truncation_active?1:0;return `${feed.length}|${sig}|lt=${live.length}:${live.slice(-12)}|rn=${runActive}:${runStart}:${runLabel.slice(-12)}|tr=${truncActive}:${truncAttempts}:${truncTokens}:${truncKind.slice(-12)}:${truncTool.slice(-12)}:${truncText.length}`}
+function feedSignature(snap){const feed=Array.isArray(snap?.conversation_feed)?snap.conversation_feed:(Array.isArray(snap?.messages)?snap.messages:[]);const sig=tailSig(feed,8,row=>`${Number(row?.ts||0)}:${String(row?.role||'')}:${String(row?.agent_role||'')}:${String(row?.type||'')}:${String(row?.text||'').length}:${String(row?.thinking||'').length}:${String(row?.text||'').slice(-12)}:${String(row?.thinking||'').slice(-12)}`);const live=String(snap?.live_thinking||'');const liveResp=String(snap?.live_response_text||'');const liveRespId=String(snap?.live_response_stream_id||'');const liveRespActive=snap?.live_response_active?1:0;const runActive=snap?.live_run_notice_active?1:0;const runLabel=String(snap?.live_run_notice_label||'');const runStart=Number(snap?.live_run_notice_started_at||0);const truncText=String(snap?.live_truncation_text||'');const truncKind=String(snap?.live_truncation_kind||'');const truncTool=String(snap?.live_truncation_tool||'');const truncAttempts=Number(snap?.live_truncation_attempts||0);const truncTokens=Number(snap?.live_truncation_tokens||0);const truncActive=snap?.live_truncation_active?1:0;return `${feed.length}|${sig}|lt=${live.length}:${live.slice(-12)}|lr=${liveRespActive}:${liveRespId}:${liveResp.length}:${liveResp.slice(-12)}|rn=${runActive}:${runStart}:${runLabel.slice(-12)}|tr=${truncActive}:${truncAttempts}:${truncTokens}:${truncKind.slice(-12)}:${truncTool.slice(-12)}:${truncText.length}`}
 function boardsSignature(snap){const agentCtx=(Array.isArray(snap?.agent_contexts)?snap.agent_contexts:[]).map(r=>`${r.role}:${r.left}:${r.left_percent}:${r.tier}:${r.active?1:0}`).join(',');return [snap?.running?1:0,snap?.agent_phase||'',Number(snap?.agent_round_index||0),Number(snap?.queued_user_inputs_count||0),Number(snap?.truncation_count||0),Number(snap?.live_truncation_attempts||0),Number(snap?.live_truncation_tokens||0),snap?.live_truncation_active?1:0,Number(snap?.context_tokens_estimate||0),Number(snap?.context_left_tokens||0),Number(snap?.context_left_percent||0),agentCtx,Number(snap?.render_bridge?.seq||0),String(snap?.plan_mode_preference||'auto'),Number(snap?.user_task_level||0),(snap?.todos||[]).length,(snap?.tasks||[]).length,(snap?.activity||[]).length,(snap?.operations||[]).length,(snap?.uploads||[]).length].join('|')}
 function sessionsSignature(list){const rows=Array.isArray(list)?list:[];const sig=tailSig(rows,6,row=>`${String(row?.id||'')}:${row?.running?1:0}:${Number(row?.message_count||0)}:${Number(row?.updated_at||0)}`);const aid=String(S.activeId||'').trim();let activeSig='-';if(aid){const activeRow=rows.find(row=>String(row?.id||'')===aid);if(activeRow){activeSig=`${aid}:${activeRow?.running?1:0}:${Number(activeRow?.message_count||0)}:${Number(activeRow?.updated_at||0)}`}else{activeSig=`missing:${aid}`}}return `${rows.length}|active=${activeSig}|${sig}`}
 function mergeSessionRows(base,incoming){const map=new Map();for(const row of Array.isArray(base)?base:[]){const id=String(row?.id||'').trim();if(id)map.set(id,{...row})}for(const row of Array.isArray(incoming)?incoming:[]){const id=String(row?.id||'').trim();if(id)map.set(id,{...(map.get(id)||{}),...row})}return Array.from(map.values()).sort((a,b)=>Number(b?.updated_at||0)-Number(a?.updated_at||0))}
@@ -58753,6 +60238,20 @@ function _chatVirtCollectRows(){
       _vk:`live:${activeAgentRole}:${liveThinking.length}:${liveThinking.slice(-24)}`
     });
   }
+  const liveResponse=String(S.snap?.live_response_text||'').trim();
+  if(liveResponse&&S.snap?.live_response_active){
+    const respRole=_chatVirtAgentRoleKey(S.snap?.live_response_role)||activeAgentRole;
+    const streamId=String(S.snap?.live_response_stream_id||'live-response');
+    rows.push({
+      role:'assistant',
+      type:'live_response',
+      ts:Number(S.snap?.updated_at||Date.now()/1000),
+      text:liveResponse,
+      label:String(S.snap?.live_response_label||''),
+      agent_role:respRole||undefined,
+      _vk:`response:${streamId}:${respRole}:${liveResponse.length}:${liveResponse.slice(-24)}`
+    });
+  }
   const liveTrunc=String(S.snap?.live_truncation_text||'').trim();
   if(liveTrunc){
     const active=!!S.snap?.live_truncation_active;
@@ -58960,6 +60459,7 @@ function _chatVirtBuildMessageNode(m){
       else if(m.type==='web_search'&&m.data)kind='web_search';
       else if(parsedWebSearchText)kind='web_search';
   else if(m.type==='live_thinking')kind='live_thinking';
+  else if(m.type==='live_response')kind='live_response';
   else if(m.type==='live_truncation')kind='live_truncation';
   else if(m.type==='live_run_notice')kind='live_run_notice';
   else if(m.type==='plan_approved_handoff'||_chatVirtParsePlanHandoff(rawTextForKind))kind='plan_approved_handoff';
@@ -59334,6 +60834,13 @@ function _chatVirtBuildMessageNode(m){
     const liveThinkingHtml=`<div class=\"msg-thinking\"><div class=\"msg-thinking-label\">${esc(t('thinking_stream'))}</div><pre>${esc(String(m.text||''))}</pre></div>`;
     d.innerHTML=(agentRole&&m.role!=='user')?`<div class=\"msg-agent-shell\">${roleBadge}${liveThinkingHtml}</div>`:`${roleBadge}${liveThinkingHtml}`;
     d.setAttribute('data-math-request',`${String(m._vk||'')}:live-thinking`);
+    return d;
+  }
+  if(m.type==='live_response'){
+    const key=`${String(m._vk||'')}:live-response`;
+    const liveResponseHtml=`<div class=\"msg-md live-response\">${renderMarkdownCached(String(m.text||''),key)}</div>`;
+    d.innerHTML=(agentRole&&m.role!=='user')?`<div class=\"msg-agent-shell\">${roleBadge}${liveResponseHtml}</div>`:`${roleBadge}${liveResponseHtml}`;
+    d.setAttribute('data-math-request',key);
     return d;
   }
   if(m.type==='live_truncation'){
@@ -60012,7 +61519,7 @@ function _cmdPageText(op,page){const d=(op&&typeof op==='object'&&op.data&&typeo
 function _runtimePillHtml(label,value,opts={}){const wide=opts&&opts.wide?' runtime-pill-wide':'';const tone=opts&&opts.tone?` ${opts.tone}`:'';const mono=opts&&opts.mono?' mono':'';return `<span class=\"runtime-pill${wide}${tone}\"><span class=\"runtime-pill-label\">${esc(label)}</span><span class=\"runtime-pill-value${mono}\">${esc(String(value??'-'))}</span></span>`}
 function _safeJsonSig(value){try{return JSON.stringify(value??null)}catch(_){return String(value??'')}}
 function _opsTailSignature(rows,count,mapper){const arr=Array.isArray(rows)?rows:[];return arr.slice(Math.max(0,arr.length-count)).map(mapper).join('|')}
-function renderRuntimeStatus(){const uiState=S.staticMode?(S.frozen?'static':'live'):'live';const boolWord=v=>t(v?'state_on':'state_off');const activeRole=String(S.snap?.agent_active_role||'').trim();const activeRoleLabel=activeRole?_chatVirtAgentRoleLabel(activeRole):'-';const runtimeItems=[{label:t('rt_session'),value:S.snap?.id||'-',mono:true},{label:t('rt_model'),value:S.snap?.model||'-',mono:true},{label:t('rt_thinking'),value:boolWord(S.snap?.thinking)},{label:t('rt_thinking_stream'),value:boolWord(S.snap?.thinking_stream)},{label:t('rt_mode'),value:S.snap?.execution_mode||S.config?.execution_mode||'sync'},{label:t('rt_active_agent'),value:activeRoleLabel},{label:t('rt_blackboard'),value:S.snap?.blackboard?.status||'-'},{label:t('rt_task'),value:S.snap?.blackboard?.task_profile?.task_type||'-'},{label:t('rt_complexity'),value:S.snap?.blackboard?.task_profile?.complexity||'-'},{label:t('rt_judgement'),value:S.snap?.blackboard?.manager_judgement?.progress||'-'},{label:t('rt_budget'),value:S.snap?.blackboard?.task_profile?.round_budget??'-'},{label:t('rt_remaining'),value:S.snap?.blackboard?.manager_judgement?.remaining_rounds??'-'},{label:t('rt_blackboard_cycles'),value:S.snap?.blackboard?.manager_cycles??'-'},{label:t('rt_round_limit'),value:S.snap?.max_agent_rounds||'-'},{label:t('rt_round'),value:S.snap?.agent_round_index??'-'},{label:t('rt_phase'),value:S.snap?.agent_phase||t('idle')},{label:t('rt_queued_inputs'),value:S.snap?.queued_user_inputs_count??0},{label:t('rt_run_timeout'),value:`${S.snap?.max_run_seconds??'-'}s`},{label:t('rt_ctx_used'),value:S.snap?.context_tokens_estimate??'-'},{label:t('rt_ctx_limit'),value:S.snap?.context_effective_token_limit||S.snap?.context_token_upper_bound||'-'},{label:t('rt_ctx_mode'),value:t(S.snap?.context_token_limit_locked?'rt_manual_lock':'rt_adaptive')},{label:t('rt_ctx_left'),value:formatContextLeft(S.snap)},{label:t('rt_truncation'),value:S.snap?.truncation_count||0},{label:t('rt_trunc_retry'),value:S.snap?.live_truncation_attempts||0},{label:t('rt_trunc_tokens'),value:S.snap?.live_truncation_tokens||0},{label:t('rt_archive'),value:S.snap?.compact_segments_count||0},{label:t('rt_last_compact'),value:S.snap?.last_compact_reason||'-'},{label:t('rt_ollama'),value:S.snap?.ollama_base_url||'-',mono:true,wide:true},{label:t('rt_files'),value:S.snap?.session_files_root||'-',mono:true,wide:true},{label:t('rt_ui_mode'),value:uiState},{label:t('rt_state'),value:S.snap?.running?t('running'):t('idle'),tone:S.snap?.running?'state-running':'state-idle'}];setHtmlIfChanged('status',runtimeItems.map(item=>_runtimePillHtml(item.label,item.value,item)).join('')+agentContextChipsHtml(S.snap),'runtimeStatus')}
+function renderRuntimeStatus(){const uiState=S.staticMode?(S.frozen?'static':'live'):'live';const boolWord=v=>t(v?'state_on':'state_off');const activeRole=String(S.snap?.agent_active_role||'').trim();const activeRoleLabel=activeRole?_chatVirtAgentRoleLabel(activeRole):'-';const runtimeItems=[{label:t('rt_session'),value:S.snap?.id||'-',mono:true},{label:t('rt_model'),value:S.snap?.model||'-',mono:true},{label:t('rt_thinking'),value:boolWord(S.snap?.thinking)},{label:t('rt_thinking_stream'),value:boolWord(S.snap?.thinking_stream)},{label:t('rt_response_stream'),value:boolWord(S.snap?.response_stream)},{label:t('rt_mode'),value:S.snap?.execution_mode||S.config?.execution_mode||'sync'},{label:t('rt_active_agent'),value:activeRoleLabel},{label:t('rt_blackboard'),value:S.snap?.blackboard?.status||'-'},{label:t('rt_task'),value:S.snap?.blackboard?.task_profile?.task_type||'-'},{label:t('rt_complexity'),value:S.snap?.blackboard?.task_profile?.complexity||'-'},{label:t('rt_judgement'),value:S.snap?.blackboard?.manager_judgement?.progress||'-'},{label:t('rt_budget'),value:S.snap?.blackboard?.task_profile?.round_budget??'-'},{label:t('rt_remaining'),value:S.snap?.blackboard?.manager_judgement?.remaining_rounds??'-'},{label:t('rt_blackboard_cycles'),value:S.snap?.blackboard?.manager_cycles??'-'},{label:t('rt_round_limit'),value:S.snap?.max_agent_rounds||'-'},{label:t('rt_round'),value:S.snap?.agent_round_index??'-'},{label:t('rt_phase'),value:S.snap?.agent_phase||t('idle')},{label:t('rt_queued_inputs'),value:S.snap?.queued_user_inputs_count??0},{label:t('rt_run_timeout'),value:`${S.snap?.max_run_seconds??'-'}s`},{label:t('rt_ctx_used'),value:S.snap?.context_tokens_estimate??'-'},{label:t('rt_ctx_limit'),value:S.snap?.context_effective_token_limit||S.snap?.context_token_upper_bound||'-'},{label:t('rt_ctx_mode'),value:t(S.snap?.context_token_limit_locked?'rt_manual_lock':'rt_adaptive')},{label:t('rt_ctx_left'),value:formatContextLeft(S.snap)},{label:t('rt_truncation'),value:S.snap?.truncation_count||0},{label:t('rt_trunc_retry'),value:S.snap?.live_truncation_attempts||0},{label:t('rt_trunc_tokens'),value:S.snap?.live_truncation_tokens||0},{label:t('rt_archive'),value:S.snap?.compact_segments_count||0},{label:t('rt_last_compact'),value:S.snap?.last_compact_reason||'-'},{label:t('rt_ollama'),value:S.snap?.ollama_base_url||'-',mono:true,wide:true},{label:t('rt_files'),value:S.snap?.session_files_root||'-',mono:true,wide:true},{label:t('rt_ui_mode'),value:uiState},{label:t('rt_state'),value:S.snap?.running?t('running'):t('idle'),tone:S.snap?.running?'state-running':'state-idle'}];setHtmlIfChanged('status',runtimeItems.map(item=>_runtimePillHtml(item.label,item.value,item)).join('')+agentContextChipsHtml(S.snap),'runtimeStatus')}
 function renderPlanLevelControls(){const _pmBtn=E('planModeBtn');if(_pmBtn){const _pm=S.snap?.plan_mode_preference||'auto';setTextIfChanged(_pmBtn,'Plan: '+_pm.charAt(0).toUpperCase()+_pm.slice(1))}updateLevelBtn(S.snap?.user_task_level||0)}
 function renderTodoTaskPanels(){const todoSig=currentLang()+'|'+String(S.snap?.plan_mode_preference||'auto')+'|'+_safeJsonSig(S.snap?.todos||[]);if(S.renderSigs.todosSig!==todoSig){S.renderSigs.todosSig=todoSig;setPanelHtml('todos',renderTodoBoard(S.snap?.todos||[]))}const taskSig=currentLang()+'|'+_safeJsonSig(S.snap?.tasks||[]);if(S.renderSigs.tasksSig!==taskSig){S.renderSigs.tasksSig=taskSig;setPanelHtml('tasks',renderTaskBoard(S.snap?.tasks||[]))}}
 function renderActivityPanel(){const rows=(S.snap?.activity||[]).slice(-80).sort((a,b)=>Number(a.ts||0)-Number(b.ts||0));const sig=currentLang()+'|'+rows.map(a=>`${Number(a.ts||0)}:${String(a.summary||'')}`).join('|');if(S.renderSigs.activitySig===sig)return;S.renderSigs.activitySig=sig;setPanelHtml('activity',rows.map(a=>`<div class=\"mono\">${new Date(a.ts*1000).toLocaleTimeString()} · ${esc(a.summary)}</div>`).join('')||`<div class=\"mono\">${esc(t('no_activity'))}</div>`)}
@@ -60036,7 +61543,7 @@ function _fileOpsSig(ops){return _opsTailSignature((Array.isArray(ops)?ops:[]).f
 function renderFilesPanelFromBoards(ops){const sid=String(S.activeId||'').trim();if(!sid){renderFileExplorer();return}const st=ensureFileExplorerState(sid);const fileSig=_fileOpsSig(ops);const refreshKey=`${sid}|${fileSig}`;const paintSig=`${sid}|${currentLang()}|${S.snap?.session_files_root||''}|${Number(st?.fetchedAt||0)}|${Number(st?.nodeCount||0)}|${String(st?.selected||'')}|${st?.inflight?1:0}`;if(S.renderSigs.filePaintSig!==paintSig){S.renderSigs.filePaintSig=paintSig;renderFileExplorer()}if(!st?.tree){if(Date.now()<Number(S.fileExplorerDeferUntil||0))return;refreshFileExplorer(false).catch(()=>{});return}if(fileSig&&S.renderSigs.fileRefreshSig!==refreshKey){S.renderSigs.fileRefreshSig=refreshKey;refreshFileExplorer(true).catch(()=>{})}}
 function renderDownloadLinks(){const sessionZip=S.activeId?('/api/sessions/'+S.activeId+'/export.zip'):'#';const sessionMd=S.activeId?('/api/sessions/'+S.activeId+'/export.md'):'#';const sessionPdf=S.activeId?('/api/sessions/'+S.activeId+'/export.pdf'):'#';const sessionPng=S.activeId?('/api/sessions/'+S.activeId+'/export.png'):'#';const sig=[sessionZip,sessionMd,sessionPdf,sessionPng].join('|');if(S.renderSigs.downloadLinksSig===sig)return;S.renderSigs.downloadLinksSig=sig;const dl1=E('downloadSessionBtn');const dlMd=E('exportMdBtn');const dlPdf=E('exportPdfBtn');const dlPng=E('exportPngBtn');if(dl1)dl1.href=sessionZip;if(dlMd)dlMd.href=sessionMd;if(dlPdf)dlPdf.href=sessionPdf;if(dlPng)dlPng.href=sessionPng}
 function renderBoardsOptimized(){const ops=S.snap?.operations||[];renderRuntimeStatus();renderCtxLive(S.snap);renderPlanLevelControls();_renderBridgeSyncFromSnapshot(S.snap||{});renderTodoTaskPanels();renderActivityPanel();renderCommandsPanel(ops);renderDiffsPanel(ops);renderCatalogPanel();renderFilesPanelFromBoards(ops);renderUploadList();renderDownloadLinks();renderSkillsEntryLink()}
-function renderBoards(){renderBoardsOptimized();return;const uiState=S.staticMode?(S.frozen?'static':'live'):'live';const boolWord=v=>t(v?'state_on':'state_off');const activeRole=String(S.snap?.agent_active_role||'').trim();const activeRoleLabel=activeRole?_chatVirtAgentRoleLabel(activeRole):'-';const runtimeItems=[{label:t('rt_session'),value:S.snap?.id||'-',mono:true},{label:t('rt_model'),value:S.snap?.model||'-',mono:true},{label:t('rt_thinking'),value:boolWord(S.snap?.thinking)},{label:t('rt_thinking_stream'),value:boolWord(S.snap?.thinking_stream)},{label:t('rt_mode'),value:S.snap?.execution_mode||S.config?.execution_mode||'sync'},{label:t('rt_active_agent'),value:activeRoleLabel},{label:t('rt_blackboard'),value:S.snap?.blackboard?.status||'-'},{label:t('rt_task'),value:S.snap?.blackboard?.task_profile?.task_type||'-'},{label:t('rt_complexity'),value:S.snap?.blackboard?.task_profile?.complexity||'-'},{label:t('rt_judgement'),value:S.snap?.blackboard?.manager_judgement?.progress||'-'},{label:t('rt_budget'),value:S.snap?.blackboard?.task_profile?.round_budget??'-'},{label:t('rt_remaining'),value:S.snap?.blackboard?.manager_judgement?.remaining_rounds??'-'},{label:t('rt_blackboard_cycles'),value:S.snap?.blackboard?.manager_cycles??'-'},{label:t('rt_round_limit'),value:S.snap?.max_agent_rounds||'-'},{label:t('rt_round'),value:S.snap?.agent_round_index??'-'},{label:t('rt_phase'),value:S.snap?.agent_phase||t('idle')},{label:t('rt_queued_inputs'),value:S.snap?.queued_user_inputs_count??0},{label:t('rt_run_timeout'),value:`${S.snap?.max_run_seconds??'-'}s`},{label:t('rt_ctx_used'),value:S.snap?.context_tokens_estimate??'-'},{label:t('rt_ctx_limit'),value:S.snap?.context_effective_token_limit||S.snap?.context_token_upper_bound||'-'},{label:t('rt_ctx_mode'),value:t(S.snap?.context_token_limit_locked?'rt_manual_lock':'rt_adaptive')},{label:t('rt_ctx_left'),value:formatContextLeft(S.snap)},{label:t('rt_truncation'),value:S.snap?.truncation_count||0},{label:t('rt_trunc_retry'),value:S.snap?.live_truncation_attempts||0},{label:t('rt_trunc_tokens'),value:S.snap?.live_truncation_tokens||0},{label:t('rt_archive'),value:S.snap?.compact_segments_count||0},{label:t('rt_last_compact'),value:S.snap?.last_compact_reason||'-'},{label:t('rt_ollama'),value:S.snap?.ollama_base_url||'-',mono:true,wide:true},{label:t('rt_files'),value:S.snap?.session_files_root||'-',mono:true,wide:true},{label:t('rt_ui_mode'),value:uiState},{label:t('rt_state'),value:S.snap?.running?t('running'):t('idle'),tone:S.snap?.running?'state-running':'state-idle'}];E('status').innerHTML=runtimeItems.map(item=>_runtimePillHtml(item.label,item.value,item)).join('')+agentContextChipsHtml(S.snap);
+function renderBoards(){renderBoardsOptimized();return;const uiState=S.staticMode?(S.frozen?'static':'live'):'live';const boolWord=v=>t(v?'state_on':'state_off');const activeRole=String(S.snap?.agent_active_role||'').trim();const activeRoleLabel=activeRole?_chatVirtAgentRoleLabel(activeRole):'-';const runtimeItems=[{label:t('rt_session'),value:S.snap?.id||'-',mono:true},{label:t('rt_model'),value:S.snap?.model||'-',mono:true},{label:t('rt_thinking'),value:boolWord(S.snap?.thinking)},{label:t('rt_thinking_stream'),value:boolWord(S.snap?.thinking_stream)},{label:t('rt_response_stream'),value:boolWord(S.snap?.response_stream)},{label:t('rt_mode'),value:S.snap?.execution_mode||S.config?.execution_mode||'sync'},{label:t('rt_active_agent'),value:activeRoleLabel},{label:t('rt_blackboard'),value:S.snap?.blackboard?.status||'-'},{label:t('rt_task'),value:S.snap?.blackboard?.task_profile?.task_type||'-'},{label:t('rt_complexity'),value:S.snap?.blackboard?.task_profile?.complexity||'-'},{label:t('rt_judgement'),value:S.snap?.blackboard?.manager_judgement?.progress||'-'},{label:t('rt_budget'),value:S.snap?.blackboard?.task_profile?.round_budget??'-'},{label:t('rt_remaining'),value:S.snap?.blackboard?.manager_judgement?.remaining_rounds??'-'},{label:t('rt_blackboard_cycles'),value:S.snap?.blackboard?.manager_cycles??'-'},{label:t('rt_round_limit'),value:S.snap?.max_agent_rounds||'-'},{label:t('rt_round'),value:S.snap?.agent_round_index??'-'},{label:t('rt_phase'),value:S.snap?.agent_phase||t('idle')},{label:t('rt_queued_inputs'),value:S.snap?.queued_user_inputs_count??0},{label:t('rt_run_timeout'),value:`${S.snap?.max_run_seconds??'-'}s`},{label:t('rt_ctx_used'),value:S.snap?.context_tokens_estimate??'-'},{label:t('rt_ctx_limit'),value:S.snap?.context_effective_token_limit||S.snap?.context_token_upper_bound||'-'},{label:t('rt_ctx_mode'),value:t(S.snap?.context_token_limit_locked?'rt_manual_lock':'rt_adaptive')},{label:t('rt_ctx_left'),value:formatContextLeft(S.snap)},{label:t('rt_truncation'),value:S.snap?.truncation_count||0},{label:t('rt_trunc_retry'),value:S.snap?.live_truncation_attempts||0},{label:t('rt_trunc_tokens'),value:S.snap?.live_truncation_tokens||0},{label:t('rt_archive'),value:S.snap?.compact_segments_count||0},{label:t('rt_last_compact'),value:S.snap?.last_compact_reason||'-'},{label:t('rt_ollama'),value:S.snap?.ollama_base_url||'-',mono:true,wide:true},{label:t('rt_files'),value:S.snap?.session_files_root||'-',mono:true,wide:true},{label:t('rt_ui_mode'),value:uiState},{label:t('rt_state'),value:S.snap?.running?t('running'):t('idle'),tone:S.snap?.running?'state-running':'state-idle'}];E('status').innerHTML=runtimeItems.map(item=>_runtimePillHtml(item.label,item.value,item)).join('')+agentContextChipsHtml(S.snap);
 renderCtxLive(S.snap);
 const _pmBtn=E('planModeBtn');if(_pmBtn){const _pm=S.snap?.plan_mode_preference||'auto';_pmBtn.textContent='Plan: '+_pm.charAt(0).toUpperCase()+_pm.slice(1)}
 const _lvl=S.snap?.user_task_level||0;updateLevelBtn(_lvl)
@@ -60068,9 +61575,9 @@ const dlPdf=E('exportPdfBtn');
 const dlPng=E('exportPngBtn');
 if(S.activeId){dl1.href=sessionZip;if(dlMd)dlMd.href=sessionMd;if(dlPdf)dlPdf.href=sessionPdf;if(dlPng)dlPng.href=sessionPng}else{dl1.href='#';if(dlMd)dlMd.href='#';if(dlPdf)dlPdf.href='#';if(dlPng)dlPng.href='#'}
 renderSkillsEntryLink()}
-function _normalizeModelCatalog(cat){const src=(cat&&typeof cat==='object')?cat:{};const options=Array.isArray(src.options)?src.options.map(it=>{const row=(it&&typeof it==='object')?it:{};const sel=String(row.selection||'').trim();const mdl=String(row.model||'').trim();if(!sel&&!mdl)return null;const profileId=String(row.profile_id||'').trim()||'profile';const selection=sel||`${profileId}::${mdl}`;return{...row,selection,label:String(row.label||selection)}}).filter(Boolean):[];const models=Array.isArray(src.models)?src.models.map(x=>String(x||'').trim()).filter(Boolean):[];const selected=String(src.selected||'').trim();const thinking=('thinking'in src)?!!src.thinking:null;return{options,models,selected,thinking}}
+function _normalizeModelCatalog(cat){const src=(cat&&typeof cat==='object')?cat:{};const options=Array.isArray(src.options)?src.options.map(it=>{const row=(it&&typeof it==='object')?it:{};const sel=String(row.selection||'').trim();const mdl=String(row.model||'').trim();if(!sel&&!mdl)return null;const profileId=String(row.profile_id||'').trim()||'profile';const selection=sel||`${profileId}::${mdl}`;return{...row,selection,label:String(row.label||selection),response_stream:!!row.response_stream}}).filter(Boolean):[];const models=Array.isArray(src.models)?src.models.map(x=>String(x||'').trim()).filter(Boolean):[];const selected=String(src.selected||'').trim();const thinking=('thinking'in src)?!!src.thinking:null;const response_stream=('response_stream'in src)?!!src.response_stream:null;return{options,models,selected,thinking,response_stream}}
 function _modelNameFromSelection(selection){const raw=String(selection||'').trim();if(!raw)return'';if(raw.includes('::')){const parts=raw.split('::',2);return String(parts[1]||parts[0]||'').trim()}return raw}
-function applyModelCatalog(cat){const norm=_normalizeModelCatalog(cat);const hasCat=!!(norm.options.length||norm.models.length||norm.selected);if(!hasCat)return false;S.modelOptions=norm.options;S.models=norm.models;S.config=S.config||{};if(norm.selected){S.config.model=norm.selected}else if(!String(S.config.model||'').trim()){const first=(norm.options[0]?.selection||norm.models[0]||'').trim();if(first)S.config.model=first}if(norm.thinking!==null)S.config.thinking=!!norm.thinking;renderModelControls();return true}
+function applyModelCatalog(cat){const norm=_normalizeModelCatalog(cat);const hasCat=!!(norm.options.length||norm.models.length||norm.selected);if(!hasCat)return false;S.modelOptions=norm.options;S.models=norm.models;S.config=S.config||{};if(norm.selected){S.config.model=norm.selected}else if(!String(S.config.model||'').trim()){const first=(norm.options[0]?.selection||norm.models[0]||'').trim();if(first)S.config.model=first}if(norm.thinking!==null)S.config.thinking=!!norm.thinking;if(norm.response_stream!==null)S.config.response_stream=!!norm.response_stream;renderModelControls();return true}
 function renderModelControls(){const sel=E('modelSelect');if(!sel)return;const active=document.activeElement===sel;const opts=S.modelOptions||[];const parts=[];if(opts.length){for(const it of opts){parts.push(`<option value=\"${esc(it.selection)}\">${esc(it.label||it.selection)}</option>`)}}else{const models=S.models||[];if(!models.length&&S.config?.model){parts.push(`<option value=\"${esc(S.config.model)}\">${esc(S.config.model)}</option>`)}for(const m of models){parts.push(`<option value=\"${esc(m)}\">${esc(m)}</option>`)}}const selected=String(S.config?.model||'').trim();let html=parts.join('');if(selected&&!parts.some(p=>p.includes(`value=\"${esc(selected)}\"`))){html+=`<option value=\"${esc(selected)}\">${esc(selected)}</option>`}setHtmlIfChanged('modelSelect',html,'modelSelect');if(selected&&sel.value!==selected&&!active)sel.value=selected}
 async function refreshSessions(opt={}){
   const useProvidedCfg=Object.prototype.hasOwnProperty.call(opt,'statsConfig');
@@ -60527,12 +62034,12 @@ window.addEventListener('DOMContentLoaded',()=>{bindClick('memoryModeAction',(e)
 APP_TS = """type SessionSummary={id:string;title:string;running:boolean;updated_at:number;message_count:number};
 type Msg={role:string;text:string;type?:string;data?:Record<string,unknown>;thinking?:string;agent_role?:string;[key:string]:unknown};
 type UploadMeta={id:string;filename:string;workspace_path:string;kind:string;size:number;uploaded_at:number;preview?:string};
-type Snapshot={id:string;title:string;running:boolean;message_count?:number;model:string;ollama_base_url:string;thinking:boolean;thinking_stream?:boolean;live_thinking?:string;live_truncation_text?:string;live_truncation_kind?:string;live_truncation_tool?:string;live_truncation_active?:boolean;live_truncation_attempts?:number;live_truncation_tokens?:number;live_run_notice_active?:boolean;live_run_notice_label?:string;live_run_notice_started_at?:number;live_run_notice_elapsed?:number;execution_mode?:string;multi_agent_context_hud_enabled?:boolean;agent_active_role?:string;agent_contexts?:Array<{role:string;label?:string;active?:boolean;used?:number;left?:number;left_percent?:number;effective_limit?:number;tier?:number;message_count?:number;next_call_label?:string}>;max_agent_rounds?:number;max_run_seconds?:number;agent_round_index?:number;agent_phase?:string;agent_active_tool?:string;queued_user_inputs_count?:number;context_token_upper_bound?:number;context_token_limit_config?:number;context_token_limit_locked?:boolean;context_tokens_estimate?:number;context_left_tokens?:number;context_left_percent?:number;context_used_percent?:number;truncation_count?:number;compact_segments_count?:number;last_compact_reason?:string;last_compact_ts?:number;last_compact_segment_id?:string;event_seq?:number;render_bridge?:{seq:number;received?:number;last_ts?:number;last_kind?:string;latest?:Record<string,unknown>};blackboard?:{status?:string;original_goal?:string;manager_cycles?:number;active_agent?:string;approval?:Record<string,unknown>;last_delegate?:Record<string,unknown>};messages:Msg[];uploads?:UploadMeta[];llm_model_catalog?:ModelCatalog|null};
+type Snapshot={id:string;title:string;running:boolean;message_count?:number;model:string;ollama_base_url:string;thinking:boolean;thinking_stream?:boolean;response_stream?:boolean;live_thinking?:string;live_response_text?:string;live_response_role?:string;live_response_label?:string;live_response_stream_id?:string;live_response_active?:boolean;live_truncation_text?:string;live_truncation_kind?:string;live_truncation_tool?:string;live_truncation_active?:boolean;live_truncation_attempts?:number;live_truncation_tokens?:number;live_run_notice_active?:boolean;live_run_notice_label?:string;live_run_notice_started_at?:number;live_run_notice_elapsed?:number;execution_mode?:string;multi_agent_context_hud_enabled?:boolean;agent_active_role?:string;agent_contexts?:Array<{role:string;label?:string;active?:boolean;used?:number;left?:number;left_percent?:number;effective_limit?:number;tier?:number;message_count?:number;next_call_label?:string}>;max_agent_rounds?:number;max_run_seconds?:number;agent_round_index?:number;agent_phase?:string;agent_active_tool?:string;queued_user_inputs_count?:number;context_token_upper_bound?:number;context_token_limit_config?:number;context_token_limit_locked?:boolean;context_tokens_estimate?:number;context_left_tokens?:number;context_left_percent?:number;context_used_percent?:number;truncation_count?:number;compact_segments_count?:number;last_compact_reason?:string;last_compact_ts?:number;last_compact_segment_id?:string;event_seq?:number;render_bridge?:{seq:number;received?:number;last_ts?:number;last_kind?:string;latest?:Record<string,unknown>};blackboard?:{status?:string;original_goal?:string;manager_cycles?:number;active_agent?:string;approval?:Record<string,unknown>;last_delegate?:Record<string,unknown>};messages:Msg[];uploads?:UploadMeta[];llm_model_catalog?:ModelCatalog|null};
 type SkillMeta={name:string;qualified_name?:string;description:string;provider_id?:string;protocol?:string;meta:Record<string,string>};
 type SkillProvider={provider_id:string;protocol:string;protocol_version:string;skill_count:number;description:string};
 type SkillProtocol={protocol:string;version:string;active_providers:number;active_skills:number;description:string};
 type ToolMeta={name:string;description:string;parameters:Record<string,unknown>};
-type ModelOption={selection:string;profile_id:string;provider:string;model:string;label:string;source?:string;thinking_hint?:boolean;thinking_stream?:boolean};
+type ModelOption={selection:string;profile_id:string;provider:string;model:string;label:string;source?:string;thinking_hint?:boolean;thinking_stream?:boolean;response_stream?:boolean};
 type ModelCatalog={provider:string;models:string[];selected:string;thinking:boolean;thinking_mode?:string;note?:string;options?:ModelOption[]};
 async function api<T>(path:string,opt:RequestInit={}):Promise<T>{const r=await fetch(path,{headers:{'Content-Type':'application/json'},...opt});if(!r.ok)throw new Error(await r.text());return await r.json() as T}
 export const loadSessions=()=>api<SessionSummary[]>('/api/sessions');
@@ -79607,6 +81114,9 @@ Use this skill when tasks match this flow pattern and reusable execution is need
                     "model": model,
                     "label": f"{profile.get('label', pid)} | {model}",
                     "source": profile.get("source", ""),
+                    "thinking_hint": bool(profile.get("thinking_hint", False)),
+                    "thinking_stream": bool(profile.get("thinking_stream", False)),
+                    "response_stream": bool(profile.get("response_stream", False)),
                     "capabilities": caps,
                 }
             )
@@ -79623,6 +81133,9 @@ Use this skill when tasks match this flow pattern and reusable execution is need
                     "model": str(selected_profile.get("model", self.model) or self.model),
                     "label": f"{selected_profile.get('label', self.global_active_profile_id)} | {str(selected_profile.get('model', self.model) or self.model)}",
                     "source": selected_profile.get("source", "active-profile"),
+                    "thinking_hint": bool(selected_profile.get("thinking_hint", False)),
+                    "thinking_stream": bool(selected_profile.get("thinking_stream", False)),
+                    "response_stream": bool(selected_profile.get("response_stream", False)),
                     "capabilities": merge_multimodal_capabilities(
                         infer_model_multimodal_capabilities(
                             str(selected_profile.get("provider", "")),
@@ -79645,6 +81158,7 @@ Use this skill when tasks match this flow pattern and reusable execution is need
             "options": opts,
             "selected": selected,
             "thinking": self.thinking,
+            "response_stream": bool(selected_profile.get("response_stream", False)),
             "thinking_mode": "auto",
             "active_capabilities": active_caps,
         }
@@ -79665,6 +81179,8 @@ Use this skill when tasks match this flow pattern and reusable execution is need
                 "label": pid,
                 "model": selected_model or self.model,
                 "base_url": self.base_url,
+                "thinking_stream": False,
+                "response_stream": False,
                 "capabilities": infer_model_multimodal_capabilities("ollama", selected_model or self.model),
                 "media_endpoints": {},
                 "source": "runtime",
@@ -79954,7 +81470,11 @@ class Handler(BaseHTTPRequestHandler):
                     if active_profile
                     else str(mgr.model or "")
                 )
-                model_cat = {"selected": selected_model, "thinking": bool(mgr.thinking)}
+                model_cat = {
+                    "selected": selected_model,
+                    "thinking": bool(mgr.thinking),
+                    "response_stream": bool(active_profile.get("response_stream", False)),
+                }
             else:
                 model_cat = mgr.model_catalog()
             skills_url = ""
@@ -79976,6 +81496,7 @@ class Handler(BaseHTTPRequestHandler):
                     "ollama_base_url": mgr.ollama_base,
                     "model": model_cat.get("selected", mgr.model),
                     "thinking": model_cat.get("thinking", mgr.thinking),
+                    "response_stream": bool(model_cat.get("response_stream", False)),
                     "language": normalize_ui_language(getattr(mgr, "user_language", DEFAULT_UI_LANGUAGE)),
                     "ui_style": normalize_ui_style(getattr(self.app, "ui_style", DEFAULT_UI_STYLE)),
                     "ui_style_label": UI_STYLE_LABELS.get(
