@@ -823,6 +823,11 @@ REVIEWER_DEBUG_TOOL_ALLOWLIST = {
 }
 EXPLORER_STALL_THRESHOLD = 3  # consecutive same-target delegations before forced switch
 DEVELOPER_EDIT_STALL_THRESHOLD = 3  # consecutive edit_file failures on same file before forced strategy change
+# Acceptance-gate anti-stall: after this many consecutive gate failures on the
+# same step we escalate (multi-agent: reviewer-debug to actively fix) and, with
+# any accumulated evidence, relax-and-advance so a step can never loop forever.
+ACCEPTANCE_GATE_STALL_THRESHOLD = 3
+ACCEPTANCE_GATE_HARD_CEILING = 6  # absolute max gate failures before forced advance
 PLAN_MODE_MANAGER_SYNTHESIS_MAX_TOKENS = 8192
 PLAN_MODE_MAX_OPTIONS = 3
 PLAN_FILE_RELATIVE_PATH = ".clouds_coder/plan.md"
@@ -1848,7 +1853,7 @@ BACKEND_I18N["en"].update(
         "step_completed_evidence": "step completed",
         "plan_step_summary": "📋 Plan step {step}/{total}: {content}",
         "plan_step_label": "Step {step}/{total}",
-        "plan_step_hint": "Moved to {step_label}: {step_text}\nRead the updated plan with: read_file {plan_path}\nUse TodoWrite for this step only when it materially improves execution tracking. If you create subtasks, include parent_step_id='{parent_step_id}' and keep exactly one in_progress. Do not create subtasks for other plan steps.",
+        "plan_step_hint": "Moved to {step_label}: {step_text}\nRead the updated plan with: read_file {plan_path}\nNow call TodoWrite only for this step. Each subtask must include parent_step_id='{parent_step_id}'. Create 3-6 items with exactly one in_progress; the final item must be an Acceptance subtask that states the check action and evidence shape. Do not create subtasks for other plan steps.",
         "stall_execution_blocked_title": "## Execution Blocked\n",
         "stall_stop_reason": "**Stop reason:** {reason}",
         "stall_error_details": "**Error details:** {detail}",
@@ -1897,7 +1902,7 @@ BACKEND_I18N["en"].update(
         "plan_bubble_full_ref": "Full plan: `{path}`",
         "plan_bubble_reply": 'Reply with a choice (e.g. "Option A", "A", "choose 1"), or provide revisions.',
         "plan_read_instruction": "Plan approved. Read `{path}` with `read_file {path}` for the authoritative step order and live status.\nExecute steps in order, finish the current step before advancing, and load any referenced skill or workflow before starting.",
-        "plan_read_todo_note": "\nTODO GUIDANCE: Decide semantically whether TodoWrite will improve execution for {step_label}. Use it for genuinely multi-part, uncertain, or validation-heavy work; skip it when the step can be completed cleanly in one coherent pass. If subtasks already exist for this step, continue the current in_progress subtask first instead of replacing it. If you create or update subtasks, include parent_step_id='{parent_step_id}', keep exactly one in_progress, and update status when real work changes. Do NOT call finish_current_task for a subtask or a single plan step; finish tools are reserved for the overall user task.\n",
+        "plan_read_todo_note": "\nTODO PLANNING: At the START of your work, call TodoWrite to list ALL subtasks you plan to complete for {step_label} (status=pending, parent_step_id='{parent_step_id}'). Create 3-6 subtasks for THIS step ONLY; the final subtask must be an Acceptance item that states the check action and evidence shape. Do NOT list subtasks for other plan steps. If subtasks already exist for this step, continue the current in_progress subtask first instead of replacing it. After EACH completed subtask, immediately call TodoWrite again to mark it completed and move the next subtask to in_progress. Do NOT wait until the end of the step to update todos. Do NOT call finish_current_task for a subtask or a single plan step; finish tools are reserved for the overall user task.\n",
         "plan_proposal_title": "## 📋 Execution Plans\n",
         "plan_proposal_background": "### Background Analysis\n{context}\n",
         "plan_proposal_option": "### Option {id}: {title}",
@@ -1942,7 +1947,7 @@ BACKEND_I18N["zh-CN"].update(
         "step_completed_evidence": "步骤已完成",
         "plan_step_summary": "📋 计划步骤 {step}/{total}：{content}",
         "plan_step_label": "步骤 {step}/{total}",
-        "plan_step_hint": "已切换到{step_label}：{step_text}\n读取更新后的计划：read_file {plan_path}\n仅在 TodoWrite 确实有助于执行跟踪时，才为当前步骤创建/更新子任务。若创建子任务，必须包含 parent_step_id='{parent_step_id}'，并且只能有 1 项是 in_progress。不要为其他计划步骤创建子任务。",
+        "plan_step_hint": "已切换到{step_label}：{step_text}\n读取更新后的计划：read_file {plan_path}\n现在调用 TodoWrite，只为当前步骤拆分子任务。每个子任务都必须包含 parent_step_id='{parent_step_id}'。创建 3-6 项，并且只能有 1 项是 in_progress；最后一项必须是“验收”子任务，写明检查动作和证据形态。不要为其他计划步骤创建子任务。",
         "stall_execution_blocked_title": "## 执行遇阻\n",
         "stall_stop_reason": "**停止原因：** {reason}",
         "stall_error_details": "**错误详情：** {detail}",
@@ -1991,7 +1996,7 @@ BACKEND_I18N["zh-CN"].update(
         "plan_bubble_full_ref": "完整方案详见：`{path}`",
         "plan_bubble_reply": "请回复选择（如“方案A”“A”“选1”），或输入修改意见。",
         "plan_read_instruction": "计划已批准。请用 `read_file {path}` 读取 `{path}`，它是步骤顺序和实时状态的唯一权威来源。\n按顺序执行，完成当前步骤后再推进下一步；如果步骤引用了 skill 或 workflow，开始前先调用 load_skill。",
-        "plan_read_todo_note": "\nTODO 指引：根据语义自行判断 TodoWrite 是否能提升当前步骤（{step_label}）的执行质量。\n多部分、不确定、需要验证跟踪的工作才创建/更新子任务；能够一口气清晰完成的步骤可以跳过 todo。\n若当前步骤已有子任务，先继续当前 in_progress 子任务，不要重写路线。\n若创建或更新子任务，每项都必须包含 parent_step_id='{parent_step_id}'，且只能有 1 项是 in_progress；只在真实状态变化时更新。\n不要为其他计划步骤创建子任务。\n",
+        "plan_read_todo_note": "\nTODO 更新：一开始就调用 TodoWrite，只为当前步骤（{step_label}）设置子任务。\n每个子任务都必须包含 parent_step_id='{parent_step_id}'。\n创建 3-6 个只属于当前步骤的子任务；最后一个必须是“验收”子任务，并写明检查动作和证据形态。\n如果当前步骤已经有子任务，就先继续当前 in_progress 子任务，不要重写路线。\n每完成一个子任务后，都要立刻再次调用 TodoWrite，将它标记为 completed，并把下一个子任务切到 in_progress。\n不要等到整步结束后才统一更新。\n不要为其他计划步骤创建子任务。\n",
         "plan_proposal_title": "## 📋 执行方案\n",
         "plan_proposal_background": "### 背景分析\n{context}\n",
         "plan_proposal_option": "### 方案 {id}：{title}",
@@ -2036,7 +2041,7 @@ BACKEND_I18N["zh-TW"].update(
         "step_completed_evidence": "步驟已完成",
         "plan_step_summary": "📋 計畫步驟 {step}/{total}：{content}",
         "plan_step_label": "步驟 {step}/{total}",
-        "plan_step_hint": "已切換到{step_label}：{step_text}\n讀取更新後的計畫：read_file {plan_path}\n只有在 TodoWrite 確實有助於執行追蹤時，才為目前步驟建立/更新子任務。若建立子任務，必須包含 parent_step_id='{parent_step_id}'，而且只能有 1 項是 in_progress。不要為其他計畫步驟建立子任務。",
+        "plan_step_hint": "已切換到{step_label}：{step_text}\n讀取更新後的計畫：read_file {plan_path}\n現在呼叫 TodoWrite，只為目前步驟拆分子任務。每個子任務都必須包含 parent_step_id='{parent_step_id}'。建立 3-6 項，而且只能有 1 項是 in_progress；最後一項必須是「驗收」子任務，寫明檢查動作與證據形態。不要為其他計畫步驟建立子任務。",
         "stall_execution_blocked_title": "## 執行受阻\n",
         "stall_stop_reason": "**停止原因：** {reason}",
         "stall_error_details": "**錯誤詳情：** {detail}",
@@ -2085,7 +2090,7 @@ BACKEND_I18N["zh-TW"].update(
         "plan_bubble_full_ref": "完整方案詳見：`{path}`",
         "plan_bubble_reply": "請回覆選擇（如「方案A」「A」「選1」），或輸入修改意見。",
         "plan_read_instruction": "計畫已核准。請用 `read_file {path}` 讀取 `{path}`，它是步驟順序與即時狀態的唯一權威來源。\n請依序執行，完成目前步驟後再推進下一步；如果步驟引用了 skill 或 workflow，開始前先呼叫 load_skill。",
-        "plan_read_todo_note": "\nTODO 指引：根據語義自行判斷 TodoWrite 是否能提升目前步驟（{step_label}）的執行品質。\n多部分、不確定、需要驗證追蹤的工作才建立/更新子任務；能清楚一次完成的步驟可以略過 todo。\n若目前步驟已有子任務，先延續目前的 in_progress 子任務，不要改寫路線。\n若建立或更新子任務，每項都必須包含 parent_step_id='{parent_step_id}'，且只能有 1 項是 in_progress；只在真實狀態變化時更新。\n不要為其他計畫步驟建立子任務。\n",
+        "plan_read_todo_note": "\nTODO 更新：一開始就呼叫 TodoWrite，只為目前步驟（{step_label}）設定子任務。\n每個子任務都必須包含 parent_step_id='{parent_step_id}'。\n建立 3-6 個只屬於目前步驟的子任務；最後一個必須是「驗收」子任務，並寫明檢查動作與證據形態。\n若目前步驟已經有子任務，請先延續目前的 in_progress 子任務，不要改寫路線。\n每完成一個子任務後，都要立刻再次呼叫 TodoWrite，把它標記為 completed，並把下一個子任務切到 in_progress。\n不要等到整個步驟結束後才一次更新。\n不要為其他計畫步驟建立子任務。\n",
         "plan_proposal_title": "## 📋 執行方案\n",
         "plan_proposal_background": "### 背景分析\n{context}\n",
         "plan_proposal_option": "### 方案 {id}：{title}",
@@ -2130,7 +2135,7 @@ BACKEND_I18N["ja"].update(
         "step_completed_evidence": "ステップ完了",
         "plan_step_summary": "📋 計画ステップ {step}/{total}: {content}",
         "plan_step_label": "ステップ {step}/{total}",
-        "plan_step_hint": "{step_label} に移動しました: {step_text}\n更新済みプランを読む: read_file {plan_path}\nTodoWrite が実行追跡に役立つ場合だけ、このステップのサブタスクを作成/更新してください。作成する場合は parent_step_id='{parent_step_id}' を必ず含め、in_progress は 1 件だけにしてください。他の計画ステップのサブタスクは作成しないでください。",
+        "plan_step_hint": "{step_label} に移動しました: {step_text}\n更新済みプランを読む: read_file {plan_path}\n今すぐ TodoWrite を呼び出し、このステップだけのサブタスクを設定してください。各サブタスクには parent_step_id='{parent_step_id}' を必ず含め、3-6 件作成し、in_progress は 1 件だけにしてください。最後の項目は必ず「受入確認」サブタスクにし、確認内容と証拠の形を明記してください。他の計画ステップのサブタスクは作成しないでください。",
         "stall_execution_blocked_title": "## 実行が停止しました\n",
         "stall_stop_reason": "**停止理由:** {reason}",
         "stall_error_details": "**エラー詳細:** {detail}",
@@ -2179,7 +2184,7 @@ BACKEND_I18N["ja"].update(
         "plan_bubble_full_ref": "完全なプラン: `{path}`",
         "plan_bubble_reply": "選択肢（例: 「案A」「A」「1を選ぶ」）を返信するか、修正要望を入力してください。",
         "plan_read_instruction": "計画が承認されました。`read_file {path}` で `{path}` を読み、正式な手順順序と進行状況を確認してください。\n必ず順番に実行し、現在のステップを完了してから次へ進んでください。ステップが skill や workflow を参照している場合は、開始前に load_skill を呼び出してください。",
-        "plan_read_todo_note": "\nTODO ガイダンス: {step_label} で TodoWrite が実行品質を高めるかを意味的に判断してください。\n複数部分・不確実・検証追跡が必要な作業では作成/更新し、1 回で明確に完了できるステップでは省略できます。\n既存のサブタスクがある場合は現在の in_progress サブタスクから続行し、ルートを書き換えないでください。\n作成/更新する場合は parent_step_id='{parent_step_id}' を必ず含め、in_progress は 1 件だけにし、実際の状態変化がある時だけ更新してください。\n他の計画ステップのサブタスクは作成しないでください。\n",
+        "plan_read_todo_note": "\nTODO 更新: 最初に TodoWrite を呼び出し、現在のステップ（{step_label}）だけのサブタスクを設定してください。\n各サブタスクには parent_step_id='{parent_step_id}' を必ず含めてください。\n現在のステップだけを分解した 3-6 件のサブタスクを作成し、最後の項目は必ず「受入確認」サブタスクにして、確認内容と証拠の形を明記してください。\n既存のサブタスクがある場合は現在の in_progress サブタスクから先に続行してください。\n各サブタスクを完了した直後に、必ずもう一度 TodoWrite を呼び出して completed に更新し、次のサブタスクを in_progress に切り替えてください。\nステップ全体の最後まで Todo 更新を先送りしないでください。\n他の計画ステップのサブタスクは作成しないでください。\n",
         "plan_proposal_title": "## 📋 実行プラン\n",
         "plan_proposal_background": "### 背景分析\n{context}\n",
         "plan_proposal_option": "### 案 {id}: {title}",
@@ -6093,6 +6098,156 @@ def is_openai_compat_provider(provider: str) -> bool:
 def is_openai_like_provider(provider: str) -> bool:
     return normalize_openai_compat_provider_name(provider) in OPENAI_LIKE_PROVIDER_NAMES
 
+# ── Effort / reasoning-budget model ────────────────────────────────────
+# A single provider-neutral "effort" axis that maps onto each provider's
+# native reasoning controls:
+#   - Anthropic (Claude)  -> extended thinking: {"type":"enabled","budget_tokens":N}
+#   - OpenAI / DeepSeek    -> {"reasoning_effort": "low|medium|high"}
+#   - GLM (智谱/coding)     -> {"thinking": {"type":"enabled|disabled"}}
+#   - Ollama (local)       -> native options {"think": true}
+# Effort is provider-neutral; the resolver below converts it to whatever the
+# active provider+model actually understands, and unknown fields are stripped
+# on a 400 fallback so non-reasoning models never break.
+EFFORT_OFF = "off"
+EFFORT_LOW = "low"
+EFFORT_MEDIUM = "medium"
+EFFORT_HIGH = "high"
+EFFORT_MAX = "max"
+EFFORT_LEVELS = (EFFORT_OFF, EFFORT_LOW, EFFORT_MEDIUM, EFFORT_HIGH, EFFORT_MAX)
+EFFORT_ORDER = {name: idx for idx, name in enumerate(EFFORT_LEVELS)}
+EFFORT_DEFAULT = EFFORT_MEDIUM
+
+# Anthropic extended-thinking token budgets per effort level.
+EFFORT_ANTHROPIC_BUDGET = {
+    EFFORT_LOW: 4_096,
+    EFFORT_MEDIUM: 10_000,
+    EFFORT_HIGH: 21_000,
+    EFFORT_MAX: 32_000,
+}
+# OpenAI/DeepSeek reasoning_effort enum mapping (their API only has 3 tiers).
+EFFORT_OPENAI_REASONING = {
+    EFFORT_LOW: "low",
+    EFFORT_MEDIUM: "medium",
+    EFFORT_HIGH: "high",
+    EFFORT_MAX: "high",
+}
+
+# Task level (L1-L5) -> default effort. L3-L5 are forced to MAX per spec:
+# moderate/complex/expert tiers always run reasoning at full strength.
+TASK_LEVEL_EFFORT = {
+    1: EFFORT_LOW,
+    2: EFFORT_LOW,
+    3: EFFORT_MAX,
+    4: EFFORT_MAX,
+    5: EFFORT_MAX,
+}
+# Per-role effort floor: managers and reviewers reason at least at HIGH even on
+# lighter tiers, because routing/critique quality dominates outcome quality.
+ROLE_EFFORT_FLOOR = {
+    "manager": EFFORT_HIGH,
+    "reviewer": EFFORT_HIGH,
+}
+
+
+def clamp_effort(effort: str, *, ceiling: str = EFFORT_MAX, floor: str = EFFORT_OFF) -> str:
+    """Clamp an effort label into [floor, ceiling] on the EFFORT_ORDER axis."""
+    e = str(effort or EFFORT_DEFAULT).strip().lower()
+    if e not in EFFORT_ORDER:
+        e = EFFORT_DEFAULT
+    lo = EFFORT_ORDER.get(str(floor or EFFORT_OFF).strip().lower(), 0)
+    hi = EFFORT_ORDER.get(str(ceiling or EFFORT_MAX).strip().lower(), EFFORT_ORDER[EFFORT_MAX])
+    if hi < lo:
+        hi = lo
+    return EFFORT_LEVELS[min(max(EFFORT_ORDER[e], lo), hi)]
+
+
+def model_reasoning_style(provider: str, model: str) -> str:
+    """Return which reasoning dialect a (provider, model) pair speaks.
+
+    One of: "anthropic" | "openai" | "deepseek" | "glm" | "ollama" | "none".
+    Conservative: only models known to support reasoning return a non-"none"
+    style, so unknown models are never sent reasoning fields.
+    """
+    prov = normalize_openai_compat_provider_name(provider) if provider else ""
+    raw_prov = str(provider or "").strip().lower()
+    m = str(model or "").strip().lower()
+    if raw_prov == "anthropic":
+        # Extended thinking on Claude 3.7+ / 4.x families.
+        if any(tok in m for tok in ("claude-3-7", "claude-3.7", "claude-sonnet-4",
+                                    "claude-opus-4", "claude-haiku-4", "claude-4",
+                                    "-thinking", "claude-sonnet-5", "claude-opus-5")):
+            return "anthropic"
+        return "none"
+    if raw_prov == "ollama":
+        # Local reasoning models (qwen3, deepseek-r1, etc.) accept native think flag.
+        if any(tok in m for tok in ("r1", "qwen3", "deepseek", "thinking", "reasoner", "magistral")):
+            return "ollama"
+        return "none"
+    if prov in OPENAI_COMPAT_PROVIDER_NAMES or raw_prov == "custom_http":
+        if prov == "glm" or m.startswith("glm-") or "glm" in m:
+            # GLM 4.5/4.6/5.x + coding endpoints use {"thinking": {...}}.
+            return "glm"
+        if "deepseek" in m or m in ("deepseek-reasoner",):
+            return "deepseek"
+        # OpenAI o-series / gpt-5 reasoning, and openrouter slugs that wrap them.
+        if (m.startswith("o1") or m.startswith("o3") or m.startswith("o4")
+                or "gpt-5" in m or "/o1" in m or "/o3" in m or "/o4" in m
+                or "reasoning" in m):
+            return "openai"
+        return "none"
+    return "none"
+
+
+def resolve_reasoning_payload(
+    provider: str,
+    model: str,
+    effort: str,
+    *,
+    max_tokens: int = 2000,
+) -> dict:
+    """Map (provider, model, effort) -> concrete request mutations.
+
+    Returns a dict that MAY contain:
+      - "payload": dict of fields to merge into the request body
+      - "max_tokens": int override (Anthropic needs budget < max_tokens)
+      - "temperature": float override (Anthropic thinking requires temp=1)
+      - "think": bool (Ollama native flag)
+      - "strip_keys": list[str] of payload keys to drop on a 400 retry
+    Empty/`off` effort or non-reasoning models return an empty mutation dict.
+    """
+    eff = str(effort or EFFORT_OFF).strip().lower()
+    if eff not in EFFORT_ORDER or eff == EFFORT_OFF:
+        return {}
+    style = model_reasoning_style(provider, model)
+    if style == "none":
+        return {}
+    if style == "anthropic":
+        budget = EFFORT_ANTHROPIC_BUDGET.get(eff, EFFORT_ANTHROPIC_BUDGET[EFFORT_MEDIUM])
+        # Anthropic requires max_tokens > budget_tokens; keep healthy headroom.
+        out_max = max(int(max_tokens or 0), budget + 4_096)
+        return {
+            "payload": {"thinking": {"type": "enabled", "budget_tokens": budget}},
+            "max_tokens": out_max,
+            "temperature": 1.0,  # required when extended thinking is enabled
+            "strip_keys": ["thinking"],
+        }
+    if style in ("openai", "deepseek"):
+        # DeepSeek-reasoner ignores reasoning_effort but reasons by default; still
+        # send it for o-series/gpt-5 and newer deepseek that honor the field.
+        return {
+            "payload": {"reasoning_effort": EFFORT_OPENAI_REASONING.get(eff, "medium")},
+            "strip_keys": ["reasoning_effort"],
+        }
+    if style == "glm":
+        thinking_type = "disabled" if eff in (EFFORT_OFF,) else "enabled"
+        return {
+            "payload": {"thinking": {"type": thinking_type}},
+            "strip_keys": ["thinking"],
+        }
+    if style == "ollama":
+        return {"think": True}
+    return {}
+
 def openai_compat_probe_headers(provider: str, api_key: str = "") -> dict[str, str]:
     normalized = normalize_openai_compat_provider_name(provider)
     headers = {
@@ -6363,11 +6518,14 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
         headers: dict | None = None,
         payload_template: str = "",
         thinking_stream: bool = False,
+        response_stream: bool = False,
         temperature: float = 0.2,
         request_timeout: int = DEFAULT_REQUEST_TIMEOUT,
         capabilities: dict | None = None,
         media_endpoints: dict | None = None,
         source: str = "config",
+        effort: str = "",
+        max_effort: str = "",
     ):
         out.append(
             {
@@ -6381,6 +6539,7 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
                 "headers": headers or {},
                 "payload_template": payload_template or "",
                 "thinking_stream": bool(thinking_stream),
+                "response_stream": bool(response_stream),
                 "temperature": float(temperature or 0.2),
                 "request_timeout": normalize_timeout_seconds(
                     request_timeout,
@@ -6390,6 +6549,8 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
                 ),
                 "capabilities": capabilities or default_multimodal_capabilities(),
                 "media_endpoints": media_endpoints or {},
+                "effort": str(effort or "").strip().lower(),
+                "max_effort": str(max_effort or "").strip().lower(),
                 "source": source,
             }
         )
@@ -6403,8 +6564,14 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
         maximum=MAX_TIMEOUT_SECONDS,
         fallback=DEFAULT_REQUEST_TIMEOUT,
     )
+    # Global effort default + ceiling (per-profile fields override these).
+    effort_default = str(config.get("effort", "") or "").strip().lower()
+    max_effort_default = str(config.get("max_effort", "") or "").strip().lower()
     thinking_stream_default = bool(
         config.get("thinking_stream", config.get("stream_thinking", False))
+    )
+    response_stream_default = bool(
+        config.get("response_stream", config.get("stream_response", False))
     )
     explicit_default_profile_id = sanitize_profile_id(
         str(
@@ -6560,10 +6727,18 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
                     ),
                 )
             ),
+            response_stream=bool(
+                raw_profile.get(
+                    "response_stream",
+                    raw_profile.get("stream_response", response_stream_default),
+                )
+            ),
             temperature=float(raw_profile.get("temperature", temp) or temp),
             request_timeout=raw_profile.get("request_timeout", timeout),
             capabilities=capabilities,
             media_endpoints=media_endpoints,
+            effort=str(raw_profile.get("effort", effort_default) or effort_default),
+            max_effort=str(raw_profile.get("max_effort", max_effort_default) or max_effort_default),
             source=str(raw_profile.get("source", "profiles") or "profiles"),
         )
         if bool(raw_profile.get("default")) or bool(raw_profile.get("active")) or bool(raw_profile.get("selected")):
@@ -6585,6 +6760,7 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             model=ollama_model,
             base_url=extract_base_url(ollama_url),
             thinking_stream=bool(config.get("ollama_thinking_stream", thinking_stream_default)),
+            response_stream=bool(config.get("ollama_response_stream", response_stream_default)),
             temperature=temp,
             request_timeout=timeout,
             capabilities=build_profile_capabilities("ollama", "ollama", ollama_model),
@@ -6605,6 +6781,7 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             endpoint=complete_chat_endpoint(openai_url),
             api_key=openai_key,
             thinking_stream=bool(config.get("openai_thinking_stream", thinking_stream_default)),
+            response_stream=bool(config.get("openai_response_stream", response_stream_default)),
             temperature=temp,
             request_timeout=timeout,
             capabilities=build_profile_capabilities("openai", normalize_profile_provider("openai"), openai_model or "gpt-4o-mini"),
@@ -6625,6 +6802,7 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             endpoint=complete_chat_endpoint(sf_url),
             api_key=sf_key,
             thinking_stream=bool(config.get("siliconflow_thinking_stream", thinking_stream_default)),
+            response_stream=bool(config.get("siliconflow_response_stream", response_stream_default)),
             temperature=temp,
             request_timeout=timeout,
             capabilities=build_profile_capabilities("siliconflow", normalize_profile_provider("siliconflow"), sf_model or "Qwen/Qwen3-Next-80B-A3B-Instruct"),
@@ -6647,6 +6825,7 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             endpoint=complete_chat_endpoint(vllm_url or _vllm_default),
             api_key=vllm_key,
             thinking_stream=bool(config.get("vllm_thinking_stream", thinking_stream_default)),
+            response_stream=bool(config.get("vllm_response_stream", response_stream_default)),
             temperature=temp,
             request_timeout=timeout,
             capabilities=build_profile_capabilities("vllm", normalize_profile_provider("vllm"), vllm_model or "auto"),
@@ -6667,6 +6846,7 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             base_url=extract_base_url(lms_url or _lms_default),
             endpoint=complete_chat_endpoint(lms_url or _lms_default),
             thinking_stream=bool(config.get("lmstudio_thinking_stream", thinking_stream_default)),
+            response_stream=bool(config.get("lmstudio_response_stream", response_stream_default)),
             temperature=temp,
             request_timeout=timeout,
             capabilities=build_profile_capabilities("lmstudio", normalize_profile_provider("lmstudio"), lms_model or "auto"),
@@ -6689,6 +6869,7 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             endpoint=_anth_base.rstrip("/") + "/v1/messages",
             api_key=anth_key,
             thinking_stream=bool(config.get("anthropic_thinking_stream", thinking_stream_default)),
+            response_stream=bool(config.get("anthropic_response_stream", response_stream_default)),
             temperature=temp,
             request_timeout=timeout,
             capabilities=build_profile_capabilities("anthropic", "anthropic", anth_model or "claude-sonnet-4-20250514"),
@@ -6711,10 +6892,13 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             endpoint=complete_chat_endpoint(glm_url or _glm_default),
             api_key=glm_key,
             thinking_stream=bool(config.get("glm_thinking_stream", thinking_stream_default)),
+            response_stream=bool(config.get("glm_response_stream", response_stream_default)),
             temperature=temp,
             request_timeout=timeout,
             capabilities=build_profile_capabilities("glm", normalize_profile_provider("glm"), glm_model or "glm-4-flash"),
             media_endpoints=build_profile_media_endpoints("glm"),
+            effort=str(config.get("glm_effort", effort_default) or effort_default),
+            max_effort=str(config.get("glm_max_effort", max_effort_default) or max_effort_default),
         )
 
     # ── KIMI (Moonshot / 月之暗面) ─────────────────────────────────
@@ -6733,6 +6917,7 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             endpoint=complete_chat_endpoint(kimi_url or _kimi_default),
             api_key=kimi_key,
             thinking_stream=bool(config.get("kimi_thinking_stream", thinking_stream_default)),
+            response_stream=bool(config.get("kimi_response_stream", response_stream_default)),
             temperature=temp,
             request_timeout=timeout,
             capabilities=build_profile_capabilities("kimi", normalize_profile_provider("kimi"), kimi_model or "moonshot-v1-8k"),
@@ -6755,6 +6940,7 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             endpoint=complete_chat_endpoint(or_url or _or_default),
             api_key=or_key,
             thinking_stream=bool(config.get("openrouter_thinking_stream", thinking_stream_default)),
+            response_stream=bool(config.get("openrouter_response_stream", response_stream_default)),
             temperature=temp,
             request_timeout=timeout,
             capabilities=build_profile_capabilities("openrouter", normalize_profile_provider("openrouter"), or_model or "meta-llama/llama-3.1-8b-instruct"),
@@ -6778,6 +6964,7 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             headers=custom_headers,
             payload_template=custom_payload,
             thinking_stream=bool(config.get("custom_thinking_stream", thinking_stream_default)),
+            response_stream=bool(config.get("custom_response_stream", response_stream_default)),
             temperature=temp,
             request_timeout=timeout,
             capabilities=build_profile_capabilities("custom", normalize_profile_provider("custom_http"), str(config.get("custom_model", "") or config.get("openai_model", "") or "custom-model")),
@@ -6793,6 +6980,7 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             model=default_ollama_model,
             base_url=default_ollama_url,
             thinking_stream=thinking_stream_default,
+            response_stream=response_stream_default,
             temperature=0.2,
             request_timeout=DEFAULT_REQUEST_TIMEOUT,
             capabilities=build_profile_capabilities("ollama", "ollama", default_ollama_model),
@@ -6861,6 +7049,8 @@ def looks_like_llm_config(config: dict) -> bool:
         "glm_url",
         "glm_model",
         "glm_key",
+        "glm_effort",
+        "glm_max_effort",
         "kimi_url",
         "kimi_model",
         "kimi_key",
@@ -7841,12 +8031,19 @@ class TodoManager:
         worker_in_progress_seen_by_owner: set[str] = set()
         status_alias = {
             "todo": "pending",
+            "[_]": "pending",
+            "[]": "pending",
+            "[ ]": "pending",
             "doing": "in_progress",
             "inprogress": "in_progress",
             "in-progress": "in_progress",
+            "[>]": "in_progress",
+            ">": "in_progress",
             "done": "completed",
             "finish": "completed",
             "finished": "completed",
+            "[x]": "completed",
+            "x": "completed",
         }
         for idx, item in enumerate(expanded_items):
             raw = item if isinstance(item, dict) else {"content": str(item or "").strip(), "status": "pending"}
@@ -7898,6 +8095,13 @@ class TodoManager:
             parent_step_id = trim(str(raw.get("parent_step_id", "") or ""), 20)
             if parent_step_id:
                 row["parent_step_id"] = parent_step_id
+            for meta_key in ("created_at", "updated_at", "completed_at", "completed_by", "evidence"):
+                if meta_key in raw and raw.get(meta_key) not in (None, ""):
+                    row[meta_key] = raw.get(meta_key)
+            if status == "completed" and not row.get("completed_at"):
+                row["completed_at"] = float(now_ts())
+            if status in {"completed", "in_progress"} and not row.get("updated_at"):
+                row["updated_at"] = float(now_ts())
             validated.append(row)
         if len(validated) > 40:
             raise ValueError("max 40 todos")
@@ -12158,7 +12362,7 @@ _BUILTIN_SKILLS: dict[str, dict] = {
             "# Task Management Guide\n"
             "- For level 1 tasks: skip todo scaffolding and give the direct response, UNLESS an approved plan step is active.\n"
             "- For level 2 tasks: decide semantically whether todos will improve execution. Create a compact TodoWrite plan only when the request has enough moving parts, uncertainty, state tracking, or verification burden that todos would reduce mistakes; skip todos when the work can be completed cleanly in one coherent pass. Do not rely on fixed task-type or keyword lists.\n"
-            "- When an approved plan step is active, create/update step-local TodoWrite subtasks only when they materially improve execution tracking; if you do, keep them scoped to the active step.\n"
+            "- When an approved plan step is active, ALWAYS maintain step-local TodoWrite subtasks scoped to the active parent_step_id. Execute one subtask at a time and update status after each real change.\n"
             "- For level 3+ tasks: call TodoWrite early with 3-7 concise items, one marked in_progress.\n"
             "- Update todos only when plan or status actually changes. Avoid redundant calls.\n"
             "- If TodoWrite fails or repeats unchanged, use TodoWriteRescue with simple string items.\n"
@@ -14072,6 +14276,7 @@ class OllamaClient:
         headers: dict | None = None,
         payload_template: str = "",
         thinking_stream: bool = False,
+        response_stream: bool = False,
     ):
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -14087,6 +14292,7 @@ class OllamaClient:
         self.headers = headers or {}
         self.payload_template = payload_template
         self.thinking_stream = bool(thinking_stream)
+        self.response_stream = bool(response_stream)
         self.capabilities = default_multimodal_capabilities()
         self.media_endpoints: dict[str, str] = {}
         self.embed_model: str = ""  # embedding model name, e.g. "nomic-embed-text"
@@ -14276,6 +14482,7 @@ class OllamaClient:
         )
         self.payload_template = str(profile.get("payload_template", self.payload_template) or self.payload_template)
         self.thinking_stream = bool(profile.get("thinking_stream", self.thinking_stream))
+        self.response_stream = bool(profile.get("response_stream", self.response_stream))
         declared_caps = parse_capability_overrides(profile.get("capabilities", {}))
         self.capabilities = merge_multimodal_capabilities(
             infer_model_multimodal_capabilities(self.provider, self.model),
@@ -14421,6 +14628,7 @@ class OllamaClient:
                 retryable = bool(http_retryable or conn_retryable)
                 exc.retryable = retryable
                 exc.transient = bool(transient or conn_retryable)
+                exc.stream_emitted = False
                 if not retryable or attempt >= retry_budget:
                     raise
                 delay = self._http_retry_delay(exc, attempt)
@@ -14444,6 +14652,110 @@ class OllamaClient:
         if last_exc is not None:
             raise last_exc
         raise OllamaError("model HTTP request failed", url=url)
+
+    def _iter_response_lines_url(self, url: str, payload: dict, headers: dict | None = None, *, cancel_check=None):
+        req_headers = {"Content-Type": "application/json"}
+        if headers:
+            req_headers.update(headers)
+        req = Request(
+            url,
+            data=json_dumps(payload).encode("utf-8"),
+            headers=req_headers,
+            method="POST",
+        )
+        try:
+            with urlopen(req, timeout=self.timeout) as resp:
+                while True:
+                    if cancel_check is not None:
+                        try:
+                            if cancel_check():
+                                raise OllamaError("interrupted by user", status=499, url=url)
+                        except OllamaError:
+                            raise
+                        except Exception:
+                            pass
+                    line = resp.readline()
+                    if not line:
+                        break
+                    yield line.decode("utf-8", errors="replace")
+        except HTTPError as exc:
+            text = exc.read().decode("utf-8", errors="replace")
+            hdrs = self._headers_to_dict(getattr(exc, "headers", None))
+            raise OllamaError(
+                f"HTTP {exc.code}: {text}",
+                status=exc.code,
+                headers=hdrs,
+                body=text,
+                url=url,
+                retry_after=self._parse_retry_after_seconds(hdrs, text),
+            ) from exc
+        except (URLError, TimeoutError, socket.timeout, ConnectionResetError, ConnectionAbortedError) as exc:
+            raise OllamaError(f"Connection error: {exc}", url=url) from exc
+
+    def _iter_response_lines_url_with_retries(
+        self,
+        url: str,
+        payload: dict,
+        headers: dict | None = None,
+        *,
+        max_attempts: int | None = None,
+        cancel_check=None,
+        on_retry=None,
+    ):
+        retry_budget = LLM_HTTP_RETRY_MAX_ATTEMPTS if max_attempts is None else max(0, int(max_attempts or 0))
+        key = self._http_retry_key(url)
+        label = self._provider_retry_label()
+        for attempt in range(0, retry_budget + 1):
+            cooldown = self._cooldown_remaining(key)
+            if cooldown > 0:
+                if on_retry:
+                    try:
+                        on_retry(
+                            {
+                                "provider": label,
+                                "url": url,
+                                "attempt": attempt,
+                                "retry_budget": retry_budget,
+                                "delay": round(cooldown, 2),
+                                "reason": "endpoint cooldown",
+                                "status": 0,
+                            }
+                        )
+                    except Exception:
+                        pass
+                self._wait_with_cancel(cooldown, cancel_check=cancel_check)
+            emitted = False
+            try:
+                for line in self._iter_response_lines_url(url, payload, headers=headers, cancel_check=cancel_check):
+                    emitted = True
+                    yield line
+                return
+            except OllamaError as exc:
+                http_retryable, transient = self._is_retryable_http_error(exc, url)
+                conn_retryable = self._is_retryable_connection_error(exc)
+                retryable = bool((http_retryable or conn_retryable) and not emitted)
+                exc.retryable = retryable
+                exc.transient = bool(transient or conn_retryable)
+                if not retryable or attempt >= retry_budget:
+                    raise
+                delay = self._http_retry_delay(exc, attempt)
+                self._set_endpoint_cooldown(key, delay, exc)
+                if on_retry:
+                    try:
+                        on_retry(
+                            {
+                                "provider": label,
+                                "url": url,
+                                "attempt": attempt + 1,
+                                "retry_budget": retry_budget,
+                                "delay": round(delay, 2),
+                                "reason": trim(str(exc), 240),
+                                "status": int(getattr(exc, "status", 0) or 0),
+                            }
+                        )
+                    except Exception:
+                        pass
+                self._wait_with_cancel(delay, cancel_check=cancel_check)
 
     def _post_raw_url(self, url: str, payload: dict, headers: dict | None = None) -> tuple[bytes, str]:
         req_headers = {"Content-Type": "application/json"}
@@ -14678,6 +14990,128 @@ class OllamaClient:
         thinking = trim("\n\n".join(x for x in thinking_parts if str(x).strip()).strip(), 24_000)
         tool_calls = self._normalize_tool_calls(msg.get("tool_calls", []))
         return main, tool_calls, thinking
+
+    def _emit_content_delta(self, callback, piece: object):
+        text = str(piece or "")
+        if not text or not callback:
+            return
+        try:
+            callback(text)
+        except Exception:
+            pass
+
+    def _merge_openai_tool_delta(self, tool_buffers: dict[int, dict], delta_calls: object):
+        if not isinstance(delta_calls, list):
+            return
+        for fallback_idx, raw_call in enumerate(delta_calls):
+            if not isinstance(raw_call, dict):
+                continue
+            try:
+                idx = int(raw_call.get("index", fallback_idx) or 0)
+            except Exception:
+                idx = fallback_idx
+            buf = tool_buffers.setdefault(
+                idx,
+                {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+            )
+            if raw_call.get("id"):
+                buf["id"] = str(raw_call.get("id") or "")
+            if raw_call.get("type"):
+                buf["type"] = str(raw_call.get("type") or "function")
+            fn = raw_call.get("function", {})
+            if isinstance(fn, dict):
+                bfn = buf.setdefault("function", {"name": "", "arguments": ""})
+                if fn.get("name"):
+                    bfn["name"] = str(bfn.get("name", "") or "") + str(fn.get("name") or "")
+                if fn.get("arguments") is not None:
+                    bfn["arguments"] = str(bfn.get("arguments", "") or "") + str(fn.get("arguments") or "")
+
+    def _openai_stream_result_from_lines(self, lines, *, on_content_delta=None) -> dict:
+        content_parts: list[str] = []
+        thinking_parts: list[str] = []
+        tool_buffers: dict[int, dict] = {}
+        final_chunks: list[dict] = []
+        usage: dict = {}
+        sse_data_parts: list[str] = []
+
+        def _handle_payload(raw_text: str):
+            text = str(raw_text or "").strip()
+            if not text or text == "[DONE]":
+                return
+            part = parse_json_object(text, {})
+            if not isinstance(part, dict) or not part:
+                return
+            final_chunks.append(part)
+            if isinstance(part.get("usage"), dict):
+                usage.update(part.get("usage") or {})
+            choices = part.get("choices", [])
+            if not isinstance(choices, list):
+                choices = []
+            for choice in choices:
+                if not isinstance(choice, dict):
+                    continue
+                delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+                if not delta and isinstance(choice.get("message"), dict):
+                    delta = choice.get("message") or {}
+                content_piece = delta.get("content")
+                if isinstance(content_piece, list):
+                    joined = []
+                    for item in content_piece:
+                        if not isinstance(item, dict):
+                            if item:
+                                joined.append(str(item))
+                            continue
+                        ptype = str(item.get("type", "") or "").strip().lower()
+                        txt = item.get("text") or item.get("content") or ""
+                        if ptype in {"reasoning", "thinking", "thought"}:
+                            if txt:
+                                thinking_parts.append(str(txt))
+                        elif txt:
+                            joined.append(str(txt))
+                    content_piece = "\n".join(joined)
+                if content_piece:
+                    piece = str(content_piece)
+                    content_parts.append(piece)
+                    self._emit_content_delta(on_content_delta, piece)
+                for key in ("reasoning_content", "reasoning", "thinking", "thought"):
+                    extra = delta.get(key)
+                    if extra:
+                        thinking_parts.append(str(extra))
+                self._merge_openai_tool_delta(tool_buffers, delta.get("tool_calls"))
+
+        for raw_line in lines:
+            line = str(raw_line or "").rstrip("\r\n")
+            if not line:
+                if sse_data_parts:
+                    _handle_payload("\n".join(sse_data_parts))
+                    sse_data_parts = []
+                continue
+            if line.startswith(":"):
+                continue
+            if line.startswith("data:"):
+                payload = line[5:].lstrip()
+                if payload:
+                    _handle_payload(payload)
+                else:
+                    sse_data_parts.append(payload)
+                continue
+            _handle_payload(line)
+        if sse_data_parts:
+            _handle_payload("\n".join(sse_data_parts))
+
+        content, thinking_inline = split_thinking_content("".join(content_parts))
+        if thinking_inline:
+            thinking_parts.append(thinking_inline)
+        tool_calls = self._normalize_tool_calls([tool_buffers[k] for k in sorted(tool_buffers.keys())])
+        raw: dict = {"streamed": True, "chunks": len(final_chunks)}
+        if usage:
+            raw["usage"] = usage
+        return {
+            "content": content,
+            "thinking": trim("\n\n".join(x for x in thinking_parts if str(x).strip()).strip(), 24_000),
+            "tool_calls": tool_calls,
+            "raw": raw,
+        }
 
     def _render_headers(self) -> dict:
         out = {}
@@ -15056,17 +15490,53 @@ class OllamaClient:
         cancel_check=None,
         on_http_retry=None,
         http_retry_attempts: int | None = None,
+        response_stream: bool = False,
+        on_content_delta=None,
+        reasoning: dict | None = None,
     ) -> dict:
         endpoint = self.endpoint.strip() or complete_chat_endpoint(self.base_url)
         payload = {
             "model": self.model,
             "messages": req_messages,
-            "stream": False,
+            "stream": bool(response_stream),
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
         if tools:
             payload["tools"] = tools
+        reasoning = reasoning or {}
+        reasoning_fields = reasoning.get("payload") if isinstance(reasoning, dict) else None
+        reasoning_strip = list(reasoning.get("strip_keys", []) or []) if isinstance(reasoning, dict) else []
+        if isinstance(reasoning_fields, dict):
+            payload.update(reasoning_fields)
+        if response_stream:
+            try:
+                lines = self._iter_response_lines_url_with_retries(
+                    endpoint,
+                    payload,
+                    headers=self._render_headers(),
+                    max_attempts=http_retry_attempts,
+                    cancel_check=cancel_check,
+                    on_retry=on_http_retry,
+                )
+                return self._openai_stream_result_from_lines(lines, on_content_delta=on_content_delta)
+            except OllamaError as exc:
+                # If the endpoint rejects the reasoning field, drop it and retry once.
+                if reasoning_strip and int(getattr(exc, "status", 0) or 0) == 400:
+                    stripped = {k: v for k, v in payload.items() if k not in reasoning_strip}
+                    lines = self._iter_response_lines_url_with_retries(
+                        endpoint,
+                        stripped,
+                        headers=self._render_headers(),
+                        max_attempts=http_retry_attempts,
+                        cancel_check=cancel_check,
+                        on_retry=on_http_retry,
+                    )
+                    return self._openai_stream_result_from_lines(lines, on_content_delta=on_content_delta)
+                raise
+            except Exception as exc:
+                raise OllamaError(f"stream response failed: {exc}", url=endpoint) from exc
+        payload["stream"] = False
         try:
             raw = self._post_json_url_with_retries(
                 endpoint,
@@ -15077,18 +15547,32 @@ class OllamaClient:
                 on_retry=on_http_retry,
             )
         except OllamaError as exc:
+            err_text = str(exc).lower()
+            status_400 = int(getattr(exc, "status", 0) or 0) == 400
             # Some providers (e.g. certain Chinese cloud APIs) reject role=tool.
             # Retry once with tool messages collapsed into user messages.
-            err_text = str(exc).lower()
-            if int(getattr(exc, "status", 0) or 0) == 400 and (
+            if status_400 and (
                 "messages.role" in err_text or ("tool" in err_text and "role" in err_text)
             ):
                 fallback_msgs = self._collapse_tool_role_messages(req_messages)
                 fallback_payload = {**payload, "messages": fallback_msgs, "tools": None}
                 fallback_payload.pop("tools", None)
+                fallback_payload["stream"] = False
                 raw = self._post_json_url_with_retries(
                     endpoint,
                     fallback_payload,
+                    headers=self._render_headers(),
+                    max_attempts=http_retry_attempts,
+                    cancel_check=cancel_check,
+                    on_retry=on_http_retry,
+                )
+            elif status_400 and reasoning_strip and any(k in payload for k in reasoning_strip):
+                # Endpoint does not understand the reasoning field; drop and retry.
+                stripped = {k: v for k, v in payload.items() if k not in reasoning_strip}
+                stripped["stream"] = False
+                raw = self._post_json_url_with_retries(
+                    endpoint,
+                    stripped,
                     headers=self._render_headers(),
                     max_attempts=http_retry_attempts,
                     cancel_check=cancel_check,
@@ -15110,10 +15594,16 @@ class OllamaClient:
         cancel_check=None,
         on_http_retry=None,
         http_retry_attempts: int | None = None,
+        response_stream: bool = False,
+        on_content_delta=None,
+        reasoning: dict | None = None,
     ) -> dict:
         endpoint = (self.endpoint or "").strip()
         if not endpoint:
             raise OllamaError("Custom provider endpoint is empty")
+        reasoning = reasoning or {}
+        reasoning_fields = reasoning.get("payload") if isinstance(reasoning, dict) else None
+        reasoning_fields = reasoning_fields if isinstance(reasoning_fields, dict) else {}
         payload = {}
         tpl = (self.payload_template or "").strip()
         if tpl:
@@ -15124,6 +15614,7 @@ class OllamaClient:
                 .replace("${max_tokens}", str(max_tokens))
                 .replace("${api_key}", self.api_key)
                 .replace("${think}", "true" if think else "false")
+                .replace("${reasoning_json}", json_dumps(reasoning_fields))
             )
             payload = parse_json_object(rendered, {})
         if not payload:
@@ -15132,10 +15623,28 @@ class OllamaClient:
                 "messages": req_messages,
                 "temperature": temperature,
                 "max_tokens": max_tokens,
-                "stream": False,
+                "stream": bool(response_stream),
             }
             if tools:
                 payload["tools"] = tools
+            if reasoning_fields:
+                payload.update(reasoning_fields)
+        if response_stream and bool(payload.get("stream", False)):
+            try:
+                lines = self._iter_response_lines_url_with_retries(
+                    endpoint,
+                    payload,
+                    headers=self._render_headers(),
+                    max_attempts=http_retry_attempts,
+                    cancel_check=cancel_check,
+                    on_retry=on_http_retry,
+                )
+                return self._openai_stream_result_from_lines(lines, on_content_delta=on_content_delta)
+            except OllamaError:
+                raise
+            except Exception as exc:
+                raise OllamaError(f"stream response failed: {exc}", url=endpoint) from exc
+        payload["stream"] = False
         raw = self._post_json_url_with_retries(
             endpoint,
             payload,
@@ -15168,6 +15677,10 @@ class OllamaClient:
         max_tokens: int = 2000,
         temperature: float = 0.2,
         think: bool = False,
+        response_stream: bool = False,
+        on_content_delta=None,
+        cancel_check=None,
+        reasoning: dict | None = None,
     ) -> dict:
         endpoint = (self.endpoint or "").strip()
         if not endpoint:
@@ -15228,6 +15741,13 @@ class OllamaClient:
             "temperature": temperature,
             "messages": messages,
         }
+        reasoning = reasoning or {}
+        reasoning_fields = reasoning.get("payload") if isinstance(reasoning, dict) else None
+        if isinstance(reasoning_fields, dict):
+            payload.update(reasoning_fields)
+            # Anthropic forbids temperature != 1 when extended thinking is on.
+            if "thinking" in reasoning_fields:
+                payload["temperature"] = 1.0
         if system_parts:
             payload["system"] = "\n\n".join(system_parts)
         if tools:
@@ -15237,6 +15757,15 @@ class OllamaClient:
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
         }
+        if response_stream:
+            payload["stream"] = True
+            try:
+                lines = self._iter_response_lines_url(endpoint, payload, headers=headers, cancel_check=cancel_check)
+                return self._anthropic_stream_result_from_lines(lines, on_content_delta=on_content_delta)
+            except OllamaError:
+                raise
+            except Exception as exc:
+                raise OllamaError(f"anthropic stream response failed: {exc}", url=endpoint) from exc
         raw = self._post_json_url(endpoint, payload, headers=headers)
         # If the provider returned OpenAI-format (has 'choices'), it's an OpenAI-compat endpoint
         # that doesn't understand Anthropic tool schemas. Retry with OpenAI-format tools.
@@ -15276,6 +15805,121 @@ class OllamaClient:
                 })
         return "\n".join(text_parts), tool_calls, "\n".join(thinking_parts)
 
+    def _anthropic_stream_result_from_lines(self, lines, *, on_content_delta=None) -> dict:
+        text_parts: list[str] = []
+        thinking_parts: list[str] = []
+        tool_buffers: dict[int, dict] = {}
+        block_index_to_type: dict[int, str] = {}
+        usage: dict = {}
+        event_name = ""
+        sse_data_parts: list[str] = []
+        chunk_count = 0
+
+        def _handle_payload(raw_text: str):
+            nonlocal chunk_count, event_name
+            text = str(raw_text or "").strip()
+            if not text:
+                return
+            part = parse_json_object(text, {})
+            if not isinstance(part, dict) or not part:
+                return
+            chunk_count += 1
+            if isinstance(part.get("usage"), dict):
+                usage.update(part.get("usage") or {})
+            ptype = str(part.get("type", event_name) or "").strip()
+            if ptype == "content_block_start":
+                idx = int(part.get("index", 0) or 0)
+                block = part.get("content_block", {})
+                if isinstance(block, dict):
+                    btype = str(block.get("type", "") or "").strip()
+                    block_index_to_type[idx] = btype
+                    if btype == "tool_use":
+                        tool_buffers[idx] = {
+                            "id": str(block.get("id") or make_id("tool")),
+                            "type": "function",
+                            "function": {
+                                "name": str(block.get("name", "") or ""),
+                                "arguments": "",
+                            },
+                        }
+                    elif btype == "text" and block.get("text"):
+                        piece = str(block.get("text") or "")
+                        text_parts.append(piece)
+                        self._emit_content_delta(on_content_delta, piece)
+                    elif btype == "thinking" and block.get("thinking"):
+                        thinking_parts.append(str(block.get("thinking") or ""))
+                return
+            if ptype == "content_block_delta":
+                idx = int(part.get("index", 0) or 0)
+                delta = part.get("delta", {})
+                if not isinstance(delta, dict):
+                    return
+                dtype = str(delta.get("type", "") or block_index_to_type.get(idx, "") or "").strip()
+                if dtype in {"text_delta", "text"}:
+                    piece = str(delta.get("text", "") or "")
+                    if piece:
+                        text_parts.append(piece)
+                        self._emit_content_delta(on_content_delta, piece)
+                elif dtype in {"thinking_delta", "thinking"}:
+                    piece = str(delta.get("thinking", "") or "")
+                    if piece:
+                        thinking_parts.append(piece)
+                elif dtype in {"input_json_delta", "tool_use"}:
+                    piece = str(delta.get("partial_json", "") or delta.get("input", "") or "")
+                    if piece:
+                        buf = tool_buffers.setdefault(
+                            idx,
+                            {
+                                "id": make_id("tool"),
+                                "type": "function",
+                                "function": {"name": "", "arguments": ""},
+                            },
+                        )
+                        fn = buf.setdefault("function", {"name": "", "arguments": ""})
+                        fn["arguments"] = str(fn.get("arguments", "") or "") + piece
+                return
+            if ptype == "message_delta":
+                delta = part.get("delta", {})
+                if isinstance(delta, dict) and isinstance(delta.get("usage"), dict):
+                    usage.update(delta.get("usage") or {})
+
+        for raw_line in lines:
+            line = str(raw_line or "").rstrip("\r\n")
+            if not line:
+                if sse_data_parts:
+                    _handle_payload("\n".join(sse_data_parts))
+                    sse_data_parts = []
+                event_name = ""
+                continue
+            if line.startswith(":"):
+                continue
+            if line.startswith("event:"):
+                event_name = line[6:].strip()
+                continue
+            if line.startswith("data:"):
+                payload = line[5:].lstrip()
+                if payload:
+                    _handle_payload(payload)
+                else:
+                    sse_data_parts.append(payload)
+                continue
+            _handle_payload(line)
+        if sse_data_parts:
+            _handle_payload("\n".join(sse_data_parts))
+
+        content, thinking_inline = split_thinking_content("".join(text_parts))
+        if thinking_inline:
+            thinking_parts.append(thinking_inline)
+        raw: dict = {"streamed": True, "chunks": chunk_count}
+        if usage:
+            raw["usage"] = usage
+        return {
+            "content": content,
+            "thinking": trim("\n\n".join(x for x in thinking_parts if str(x).strip()).strip(), 24_000),
+            "tool_calls": self._normalize_tool_calls([tool_buffers[k] for k in sorted(tool_buffers.keys())]),
+            "raw": raw,
+        }
+
     def _convert_tools_to_anthropic(self, openai_tools: list[dict]) -> list[dict]:
         """Convert OpenAI-format tool definitions to Anthropic format."""
         out: list[dict] = []
@@ -15301,6 +15945,7 @@ class OllamaClient:
         temperature: float = 0.2,
         think: bool = False,
         on_thinking_chunk=None,
+        on_content_delta=None,
     ) -> dict:
         effective_max = max_tokens
         if tools:
@@ -15311,6 +15956,8 @@ class OllamaClient:
             "stream": True,
             "options": {"temperature": temperature, "num_predict": effective_max},
         }
+        if think:
+            payload["think"] = True
         if tools:
             payload["tools"] = tools
         req = Request(
@@ -15342,6 +15989,7 @@ class OllamaClient:
                     piece_main, piece_thinking = split_thinking_content(raw_piece)
                     if piece_main:
                         full_content.append(piece_main)
+                        self._emit_content_delta(on_content_delta, piece_main)
                     if piece_thinking:
                         full_thinking.append(piece_thinking)
                         if on_thinking_chunk:
@@ -15400,16 +16048,31 @@ class OllamaClient:
         think: bool = False,
         stream_thinking: bool = False,
         on_thinking_chunk=None,
+        response_stream: bool = False,
+        on_content_delta=None,
         media_inputs: list[dict] | None = None,
         probe_mode: bool = False,
         cancel_check=None,
         on_http_retry=None,
+        effort: str = "",
     ) -> dict:
         provider = (self.provider or "ollama").lower()
+        # Resolve provider-neutral effort into native reasoning mutations once.
+        # probe_mode never reasons (it is a cheap capability ping).
+        reasoning = {} if probe_mode else resolve_reasoning_payload(
+            self.provider, self.model, effort, max_tokens=max_tokens,
+        )
+        if reasoning.get("max_tokens"):
+            max_tokens = int(reasoning["max_tokens"])
+        if reasoning.get("temperature") is not None:
+            temperature = float(reasoning["temperature"])
+        if reasoning.get("think"):
+            think = True
         req_messages = self._prepare_request_messages(messages, provider, media_inputs=media_inputs)
         if probe_mode:
             tools = None
             stream_thinking = False
+            response_stream = False
         http_retry_attempts = 0 if probe_mode else None
         if system:
             req_messages = [{"role": "system", "content": system}] + req_messages
@@ -15437,10 +16100,21 @@ class OllamaClient:
                 cancel_check=cancel_check,
                 on_http_retry=on_http_retry,
                 http_retry_attempts=http_retry_attempts,
+                response_stream=bool(response_stream),
+                on_content_delta=on_content_delta,
+                reasoning=reasoning,
             )
         if provider == "anthropic":
             return self._chat_anthropic(
-                req_messages, tools=tools, max_tokens=max_tokens, temperature=temperature, think=False
+                req_messages,
+                tools=tools,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                think=False,
+                response_stream=bool(response_stream),
+                on_content_delta=on_content_delta,
+                cancel_check=cancel_check,
+                reasoning=reasoning,
             )
         if provider == "custom_http":
             return self._chat_custom_http(
@@ -15452,29 +16126,41 @@ class OllamaClient:
                 cancel_check=cancel_check,
                 on_http_retry=on_http_retry,
                 http_retry_attempts=http_retry_attempts,
+                response_stream=bool(response_stream),
+                on_content_delta=on_content_delta,
+                reasoning=reasoning,
             )
-        if stream_thinking:
+        if stream_thinking or response_stream:
             try:
                 return self._chat_ollama_stream_native(
                     req_messages,
                     tools=tools,
                     max_tokens=max_tokens,
                     temperature=temperature,
-                    think=False,
+                    think=bool(think),
                     on_thinking_chunk=on_thinking_chunk,
+                    on_content_delta=on_content_delta if response_stream else None,
                 )
             except OllamaError:
-                pass
+                if response_stream:
+                    raise
         openai_payload = {
             "model": self.model,
             "messages": req_messages,
-            "stream": False,
+            "stream": bool(response_stream),
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
         if tools:
             openai_payload["tools"] = tools
         try:
+            if response_stream:
+                lines = self._iter_response_lines_url(
+                    f"{self.base_url}/v1/chat/completions",
+                    openai_payload,
+                    cancel_check=cancel_check,
+                )
+                return self._openai_stream_result_from_lines(lines, on_content_delta=on_content_delta)
             raw = self._post_json("/v1/chat/completions", openai_payload)
             content, tool_calls, thinking_content = self._extract_openai_message(raw)
             return {"content": content, "thinking": thinking_content, "tool_calls": tool_calls, "raw": raw}
@@ -15494,6 +16180,8 @@ class OllamaClient:
             "stream": False,
             "options": {"temperature": temperature, "num_predict": effective_max_native},
         }
+        if think:
+            native_payload["think"] = True
         if tools:
             native_payload["tools"] = tools
         raw = self._post_json("/api/chat", native_payload)
@@ -16236,6 +16924,12 @@ class SessionState:
         self.last_auto_title_ts = 0.0
         self.live_thinking_text = ""
         self.live_thinking_last_emit = 0.0
+        self.live_response_text = ""
+        self.live_response_role = ""
+        self.live_response_label = ""
+        self.live_response_visible = False
+        self.live_response_last_emit = 0.0
+        self.live_response_stream_id = ""
         self.live_truncation_text = ""
         self.live_truncation_kind = ""
         self.live_truncation_tool = ""
@@ -16944,6 +17638,8 @@ class SessionState:
             "temperature": 0.2,
             "request_timeout": DEFAULT_REQUEST_TIMEOUT,
             "selection": f"ollama::{self.ollama.model}",
+            "thinking_stream": bool(getattr(self.ollama, "thinking_stream", False)),
+            "response_stream": bool(getattr(self.ollama, "response_stream", False)),
             "capabilities": infer_model_multimodal_capabilities("ollama", self.ollama.model),
             "media_endpoints": {},
             "source": "fallback",
@@ -16973,6 +17669,8 @@ class SessionState:
                 "temperature": 0.2,
                 "request_timeout": DEFAULT_REQUEST_TIMEOUT,
                 "selection": f"ollama::{self.ollama.model}",
+                "thinking_stream": bool(getattr(self.ollama, "thinking_stream", False)),
+                "response_stream": bool(getattr(self.ollama, "response_stream", False)),
                 "capabilities": infer_model_multimodal_capabilities("ollama", self.ollama.model),
                 "media_endpoints": {},
                 "source": "fallback",
@@ -17093,6 +17791,7 @@ class SessionState:
                     "source": profile.get("source", ""),
                     "thinking_hint": bool(profile.get("thinking_hint", False)),
                     "thinking_stream": bool(profile.get("thinking_stream", False)),
+                    "response_stream": bool(profile.get("response_stream", False)),
                     "capabilities": caps,
                     "capabilities_probed": bool(cache_entry),
                     "capabilities_probed_at": float(cache_entry.get("updated_at", 0.0) or 0.0)
@@ -17135,6 +17834,7 @@ class SessionState:
                         "source": "ollama-tags",
                         "thinking_hint": bool(profile.get("thinking_hint", self.thinking)),
                         "thinking_stream": bool(profile.get("thinking_stream", self.ollama.thinking_stream)),
+                        "response_stream": bool(profile.get("response_stream", self.ollama.response_stream)),
                         "capabilities": tag_caps,
                         "capabilities_probed": bool(tag_cache_entry),
                         "capabilities_probed_at": float(tag_cache_entry.get("updated_at", 0.0) or 0.0)
@@ -17162,6 +17862,7 @@ class SessionState:
                     "source": active.get("source", "active-profile"),
                     "thinking_hint": bool(active.get("thinking_hint", False)),
                     "thinking_stream": bool(active.get("thinking_stream", False)),
+                    "response_stream": bool(active.get("response_stream", False)),
                     "capabilities": self._capabilities_from_profile(active if isinstance(active, dict) else {}),
                     "capabilities_probed": bool(active_cache_entry),
                     "capabilities_probed_at": float(active_cache_entry.get("updated_at", 0.0) or 0.0)
@@ -17180,6 +17881,7 @@ class SessionState:
             "models": [x["selection"] for x in opts],
             "options": opts,
             "thinking": self.thinking,
+            "response_stream": bool(active.get("response_stream", self.ollama.response_stream)),
             "thinking_mode": "auto",
             "active_capabilities": active_caps,
             "active_capabilities_probed": bool(active_cache),
@@ -18139,6 +18841,12 @@ class SessionState:
         self.stall_escalation_round = 0
         self.live_thinking_text = ""
         self.live_thinking_last_emit = 0.0
+        self.live_response_text = ""
+        self.live_response_role = ""
+        self.live_response_label = ""
+        self.live_response_visible = False
+        self.live_response_last_emit = 0.0
+        self.live_response_stream_id = ""
         self.live_truncation_text = ""
         self.live_truncation_kind = ""
         self.live_truncation_tool = ""
@@ -20708,8 +21416,8 @@ class SessionState:
         """Compress plan mode context based on tier.
         Tier 0: keep everything
         Tier 1: trim plan findings to last 3
-        Tier 2: drop plan findings, keep only plan steps + user choice
-        Tier 3: minimal — only plan steps and chosen option title
+        Tier 2: drop findings, keep plan steps + execution charter + continuity
+        Tier 3: minimal — keep plan steps + compact charter + recent continuity
         """
         bb = self._ensure_blackboard()
         plan = bb.get("plan")
@@ -20717,6 +21425,9 @@ class SessionState:
             return
         if tier <= 0:
             return
+        charter = self._ensure_plan_charter(bb)
+        plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
+        step_results = self._normalize_plan_step_results(plan.get("step_results", {}))
         if tier == 1:
             # Keep last 3 findings
             findings = plan.get("findings", [])
@@ -20740,13 +21451,47 @@ class SessionState:
                         o.pop("pros", None)
                         o.pop("cons", None)
                         o.pop("risk", None)
+            plan["charter"] = charter
+            plan["step_results"] = step_results
         elif tier >= 3:
             # Minimal: keep execution snapshot fields that drive plan.md/todos.
+            # original_goal + execution_brief carry the reasoning thread (思路);
+            # give them a larger budget than secondary fields so the framework
+            # survives even heavy compaction and execution does not fragment.
+            charter_caps = {
+                "original_goal": 1400,
+                "execution_brief": 1400,
+                "summary": 1100,
+            }
             compact_plan = {
                 "phase": plan.get("phase", ""),
                 "chosen": plan.get("chosen", ""),
                 "steps": plan.get("steps", []),
+                "charter": {
+                    key: trim(str(value or ""), charter_caps.get(key, 900))
+                    for key, value in charter.items()
+                    if key in {
+                        "original_goal",
+                        "title",
+                        "summary",
+                        "execution_brief",
+                        "deliverables",
+                        "quality_bar",
+                        "global_constraints",
+                    }
+                    and str(value or "").strip()
+                },
             }
+            if step_results:
+                ordered_results = sorted(
+                    step_results.values(),
+                    key=lambda row: (int(row.get("index", 0) or 0), float(row.get("completed_at", 0.0) or 0.0)),
+                )
+                compact_plan["step_results"] = {
+                    str(row.get("step_id", "") or idx): row
+                    for idx, row in enumerate(ordered_results[-8:])
+                    if isinstance(row, dict)
+                }
             for key in ("title", "summary", "risk"):
                 value = plan.get(key)
                 if value:
@@ -24121,17 +24866,53 @@ class SessionState:
                 return mapped
             return fallback
 
-        todo_open: list[str] = []
-        focus = ""
-        for row in self.todo.snapshot():
+        snap = [dict(row) for row in self.todo.snapshot() if isinstance(row, dict)]
+        bb = self._ensure_blackboard()
+        active_step = self._current_plan_step_row(bb)
+        active_step_id = trim(str((active_step or {}).get("id", "") or ""), 20) if isinstance(active_step, dict) else ""
+
+        def _todo_line(row: dict) -> tuple[str, str, str]:
             status = norm_status(row.get("status", ""), "pending")
-            if status not in {"pending", "in_progress"}:
-                continue
             content = normalize_work_text(row.get("content", ""), status) or str(row.get("content", "")).strip()
             content = trim(content or "(empty todo)", 140)
+            return status, content, f"- [{status}] {content}"
+
+        todo_open: list[str] = []
+        focus = ""
+        used_row_ids: set[int] = set()
+        if active_step_id:
+            active_system_rows = [
+                row for row in snap
+                if self._todo_row_kind(row) == "system"
+                and str(row.get("key", "") or "").strip().endswith(active_step_id)
+                and norm_status(row.get("status", ""), "pending") in {"pending", "in_progress"}
+            ]
+            worker_rows = [
+                row for row in self._active_plan_worker_todo_rows(active_step_id, role="")
+                if norm_status(row.get("status", ""), "pending") in {"pending", "in_progress"}
+            ]
+            for row in active_system_rows + worker_rows:
+                status, content, line = _todo_line(row)
+                todo_open.append(line)
+                used_row_ids.add(id(row))
+                if status == "in_progress" and self._todo_row_kind(row) == "plan_worker" and not focus:
+                    focus = content
+            if not focus:
+                for row in worker_rows:
+                    status, content, _line = _todo_line(row)
+                    if status == "pending":
+                        focus = content
+                        break
+        for row in snap:
+            if id(row) in used_row_ids:
+                continue
+            status, content, line = _todo_line(row)
+            if status not in {"pending", "in_progress"}:
+                continue
             if status == "in_progress" and not focus:
                 focus = content
-            todo_open.append(f"- [{status}] {content}")
+            if line not in todo_open:
+                todo_open.append(line)
 
         task_open: list[str] = []
         for row in self.tasks.list_objects():
@@ -24151,7 +24932,6 @@ class SessionState:
         lines.append(f"Open tasks ({len(task_open)}):")
         lines.extend(task_open[:6] if task_open else ["- none"])
         # Checkpoint drift detection
-        bb = self._ensure_blackboard()
         cps = bb.get("checkpoints", [])
         if isinstance(cps, list) and len(cps) >= 2:
             latest_cp = cps[-1] if isinstance(cps[-1], dict) else {}
@@ -24167,13 +24947,37 @@ class SessionState:
         if not isinstance(fl, dict):
             return ""
         lines: list[str] = []
+        focus = self._blackboard_focus_identity(bb)
+        current_step_id = str(focus.get("id", "") or "") if str(focus.get("kind", "") or "") == "plan_step" else ""
+        try:
+            current_epoch = float(focus.get("epoch", 0.0) or 0.0)
+        except Exception:
+            current_epoch = 0.0
+
+        def _current_error_rows(rows: list[dict]) -> list[dict]:
+            if not current_step_id:
+                return rows
+            out: list[dict] = []
+            for err in rows:
+                err_step_id = str(err.get("plan_step_id", "") or "")
+                if err_step_id and err_step_id != current_step_id:
+                    continue
+                try:
+                    err_ts = float(err.get("last_ts", 0.0) or 0.0)
+                except Exception:
+                    err_ts = 0.0
+                if current_epoch > 0 and err_ts > 0 and err_ts + 1e-6 < current_epoch:
+                    continue
+                out.append(err)
+            return out
+
         # Unresolved errors (unified) — grouped by category
         all_errors = fl.get("errors", [])
-        unresolved = [e for e in all_errors if isinstance(e, dict) and int(e.get("count", 0) or 0) > 0]
+        unresolved = _current_error_rows([e for e in all_errors if isinstance(e, dict) and int(e.get("count", 0) or 0) > 0])
         # Fallback: if errors is empty but compilation_errors has data, use that
         if not unresolved:
             comp_errors = fl.get("compilation_errors", [])
-            unresolved = [e for e in comp_errors if isinstance(e, dict) and int(e.get("count", 0) or 0) > 0]
+            unresolved = _current_error_rows([e for e in comp_errors if isinstance(e, dict) and int(e.get("count", 0) or 0) > 0])
             for e in unresolved:
                 if "category" not in e:
                     e["category"] = "compilation"
@@ -24580,6 +25384,16 @@ class SessionState:
             parts.append(f"PLAN_PROGRESS: {completed}/{total_steps} completed, cursor={cursor}")
             if current_step:
                 parts.append(f"CURRENT_STEP: {current_step}")
+                try:
+                    progress_snapshot = self._active_plan_progress_snapshot(bb)
+                    current_subtask = trim(str(progress_snapshot.get("current_subtask", "") or ""), 220)
+                    next_subtask = trim(str(progress_snapshot.get("next_pending_subtask", "") or ""), 220)
+                    if current_subtask:
+                        parts.append(f"CURRENT_SUBTASK: {current_subtask}")
+                    elif next_subtask:
+                        parts.append(f"NEXT_SUBTASK: {next_subtask}")
+                except Exception:
+                    pass
         # 9. Loaded skills
         loaded_skills = bb.get("loaded_skills", {})
         if isinstance(loaded_skills, dict) and loaded_skills:
@@ -28976,6 +29790,30 @@ body{padding:18px}
         if any(
             x in low
             for x in [
+                "user_input_required",
+                "user input required",
+                "user_required",
+                "needs_user_input",
+                "needs user input",
+                "need user input",
+                "waiting_for_user",
+                "waiting for user",
+                "requires user",
+                "ask user",
+                "需要用户输入",
+                "需要用戶輸入",
+                "需要用户确认",
+                "需要用戶確認",
+                "等待用户",
+                "等待用戶",
+                "ユーザー入力が必要",
+                "ユーザー確認が必要",
+            ]
+        ):
+            return "USER_INPUT_REQUIRED"
+        if any(
+            x in low
+            for x in [
                 "task_completed",
                 "task completed",
                 "已完成",
@@ -29064,12 +29902,18 @@ body{padding:18px}
             "TOOL_REQUIRED": "ACTION_REQUIRED",
             "NEEDS_TOOL": "ACTION_REQUIRED",
             "EXECUTE_TOOL": "ACTION_REQUIRED",
+            "USER_INPUT": "USER_INPUT_REQUIRED",
+            "USER_REQUIRED": "USER_INPUT_REQUIRED",
+            "USER_CONFIRMATION_REQUIRED": "USER_INPUT_REQUIRED",
+            "NEEDS_USER_INPUT": "USER_INPUT_REQUIRED",
+            "WAITING_FOR_USER": "USER_INPUT_REQUIRED",
+            "ASK_USER": "USER_INPUT_REQUIRED",
             "EMPTY": "EMPTY_RAMBLING",
             "RAMBLING": "EMPTY_RAMBLING",
             "IDLE": "EMPTY_RAMBLING",
         }
         status = aliases.get(key, key)
-        if status in {"TASK_COMPLETED", "ACTION_REQUIRED", "VALID_PLANNING", "EMPTY_RAMBLING"}:
+        if status in {"TASK_COMPLETED", "ACTION_REQUIRED", "VALID_PLANNING", "USER_INPUT_REQUIRED", "EMPTY_RAMBLING"}:
             return status
         inferred = self._infer_arbiter_status_from_text(fallback_text)
         return inferred or ""
@@ -29104,6 +29948,14 @@ body{padding:18px}
             completed = len([t for t in plan_steps if t.get("status") == "completed"])
             total = len(plan_steps)
             snapshot["plan_progress"] = f"{completed}/{total} steps completed"
+            snapshot["approved_plan_unfinished"] = bool(completed < total)
+            active_step = self._get_active_plan_step(bb)
+            if isinstance(active_step, dict) and active_step:
+                snapshot["active_plan_step"] = {
+                    "id": trim(str(active_step.get("id", "") or ""), 40),
+                    "content": trim(str(active_step.get("content", "") or ""), 240),
+                    "status": trim(str(active_step.get("status", "") or ""), 40),
+                }
             if completed < total:
                 snapshot["plan_warning"] = (
                     f"IMPORTANT: Only {completed}/{total} plan steps are completed. "
@@ -29126,13 +29978,15 @@ body{padding:18px}
         client.timeout = max(0.2, float(self.arbiter_timeout_seconds or ARBITER_DEFAULT_TIMEOUT_SECONDS))
         return client
 
-    def _call_arbiter_llm(self, assistant_text: str, thinking_text: str = "") -> dict:
+    def _call_arbiter_llm(self, assistant_text: str, thinking_text: str = "", *, force: bool = False) -> dict:
         clean = strip_thinking_content(str(assistant_text or "")).strip()
         thinking_clean = str(thinking_text or "").strip()
         if not self.arbiter_enabled:
             return {"status": "DISABLED", "reasoning": "arbiter disabled", "raw": ""}
         probe_len = max(len(clean), len(thinking_clean))
         if (
+            not force
+            and
             probe_len < int(ARBITER_TRIGGER_MIN_CONTENT_CHARS)
             and not self._looks_like_action_promise_without_tool(f"{clean}\n{thinking_clean}")
         ):
@@ -29141,7 +29995,7 @@ body{padding:18px}
         arbiter_system = (
             "You are a task-state arbiter. "
             "Classify worker output into exactly one status: "
-            "TASK_COMPLETED, ACTION_REQUIRED, VALID_PLANNING, or EMPTY_RAMBLING. "
+            "TASK_COMPLETED, ACTION_REQUIRED, VALID_PLANNING, USER_INPUT_REQUIRED, or EMPTY_RAMBLING. "
             "Return strict JSON only."
         )
         arbiter_user = (
@@ -29149,11 +30003,14 @@ body{padding:18px}
             "Status definitions:\n"
             "- TASK_COMPLETED: worker already completed user's target and gave final deliverable/summary.\n"
             "- ACTION_REQUIRED: worker has decided or promised to create/write/modify/run/verify something, or thinking contains a concrete next tool action, but no tool call was emitted.\n"
+            "- ACTION_REQUIRED also applies when an approved plan is unfinished and the worker only asks for routine confirmation, routine plan advancement, Todo updates, evidence collection, or verification instead of using a tool.\n"
             "- VALID_PLANNING: worker output is useful high-level analysis or design that still needs more reasoning before a concrete tool action.\n"
+            "- USER_INPUT_REQUIRED: worker is genuinely blocked by missing external information, a subjective user choice, credentials, permissions, or a requirement decision that cannot be inferred from the current goal/plan.\n"
+            "- Do not use USER_INPUT_REQUIRED for routine approved-plan advancement or ordinary self-management; those are ACTION_REQUIRED.\n"
             "- EMPTY_RAMBLING: worker is stalling, repeating, or hallucinating with no actionable progress.\n"
             "Prefer ACTION_REQUIRED over VALID_PLANNING when the next step is already a concrete artifact/action.\n"
             "Output JSON only:\n"
-            "{\"status\":\"TASK_COMPLETED|ACTION_REQUIRED|VALID_PLANNING|EMPTY_RAMBLING\",\"reasoning\":\"<=40 words\"}\n\n"
+            "{\"status\":\"TASK_COMPLETED|ACTION_REQUIRED|VALID_PLANNING|USER_INPUT_REQUIRED|EMPTY_RAMBLING\",\"reasoning\":\"<=40 words\"}\n\n"
             f"Snapshot:\n{json_dumps(snapshot, indent=2)}"
         )
         box: dict[str, object] = {}
@@ -29517,6 +30374,21 @@ body{padding:18px}
         self.todo_reminder_count = 0
         self.todo_write_issue_count = 0
         self.todo_last_issue = ""
+        removed_plan_fragments: list[str] = []
+        bb = self._ensure_blackboard()
+        if isinstance(bb.get("project_todos"), list):
+            cleaned_todos, changed, removed_plan_fragments = self._sanitize_project_plan_todos(bb.get("project_todos", []))
+            if changed:
+                bb["project_todos"] = cleaned_todos
+                bb["plan_step_total"] = len([
+                    t for t in cleaned_todos
+                    if isinstance(t, dict) and t.get("category") == "plan_step"
+                ])
+                plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
+                if isinstance(plan.get("steps"), list):
+                    plan["steps"] = self._group_plan_steps(plan.get("steps", []))
+                    bb["plan"] = plan
+                self.blackboard = bb
         repair_result: dict = {}
         if self._has_resumable_plan_state():
             try:
@@ -29537,7 +30409,12 @@ body{padding:18px}
                 )
             },
         )
-        return {"ok": True, **result, "repair": repair_result}
+        return {
+            "ok": True,
+            **result,
+            "repair": repair_result,
+            "removed_plan_fragments": removed_plan_fragments[:8],
+        }
 
     def _is_empty_action_turn(self, text: str, thinking_text: str, tool_calls: list | None = None) -> bool:
         if tool_calls:
@@ -29582,6 +30459,77 @@ body{padding:18px}
         with self.lock:
             self.live_thinking_text = ""
             self.live_thinking_last_emit = 0.0
+
+    def _clear_live_response(self):
+        stream_id = ""
+        with self.lock:
+            stream_id = str(self.live_response_stream_id or "")
+            self.live_response_text = ""
+            self.live_response_role = ""
+            self.live_response_label = ""
+            self.live_response_visible = False
+            self.live_response_last_emit = 0.0
+            self.live_response_stream_id = ""
+            self.updated_at = now_ts()
+        if stream_id:
+            self._emit(
+                "response_delta",
+                {
+                    "summary": "response streaming cleared",
+                    "active": False,
+                    "stream_id": stream_id,
+                },
+            )
+
+    def _begin_live_response(self, *, context_label: str = "", visible: bool = True) -> tuple[str, str]:
+        role = self._sanitize_agent_bubble_role(self.active_agent_role) or self._sanitize_agent_bubble_role(
+            str(context_label or "").split(" ", 1)[0]
+        )
+        if not role:
+            role = "single" if self._effective_execution_mode() == EXECUTION_MODE_SINGLE else ""
+        stream_id = make_id("resp")
+        with self.lock:
+            self.live_response_text = ""
+            self.live_response_role = role
+            self.live_response_label = trim(str(context_label or "model response"), 120)
+            self.live_response_visible = bool(visible)
+            self.live_response_last_emit = 0.0
+            self.live_response_stream_id = stream_id
+            self.updated_at = now_ts()
+        return stream_id, role
+
+    def _append_live_response_delta(self, chunk: str, *, context_label: str = "", visible: bool = True):
+        piece = str(chunk or "")
+        if not piece:
+            return
+        now_tick = now_ts()
+        with self.lock:
+            if self.cancel_requested or (not self.running):
+                return
+            if not self.live_response_stream_id:
+                self._begin_live_response(context_label=context_label, visible=visible)
+            self.live_response_visible = bool(visible)
+            if context_label:
+                self.live_response_label = trim(str(context_label), 120)
+            self.live_response_text = (self.live_response_text + piece)[-48_000:]
+            self.updated_at = now_tick
+            should_emit = (now_tick - self.live_response_last_emit) >= 0.12
+            if should_emit:
+                self.live_response_last_emit = now_tick
+                payload = {
+                    "summary": "response streaming",
+                    "active": True,
+                    "visible": bool(self.live_response_visible),
+                    "stream_id": self.live_response_stream_id,
+                    "agent_role": self.live_response_role,
+                    "label": self.live_response_label,
+                    "size": len(self.live_response_text),
+                    "text": self.live_response_text[-4000:] if self.live_response_visible else "",
+                }
+            else:
+                payload = None
+        if payload:
+            self._emit("response_delta", payload)
 
     def _append_live_thinking(self, chunk: str):
         piece = str(chunk or "").strip()
@@ -30231,6 +31179,49 @@ body{padding:18px}
                 {"state": "stop", "label": label, "elapsed": round(end_elapsed, 1)},
             )
 
+    def _profile_effort_bounds(self) -> tuple[str, str]:
+        """Return (default_effort, ceiling) configured on the active profile.
+
+        Falls back to ("", max) so task level fully drives effort unless the
+        user explicitly pins/caps it in their LLM config profile via the
+        optional `effort` / `max_effort` fields.
+        """
+        try:
+            prof = dict(self.model_profiles.get(self.active_profile_id, {}))
+        except Exception:
+            prof = {}
+        if not isinstance(prof, dict):
+            prof = {}
+        default = str(prof.get("effort", "") or "").strip().lower()
+        ceiling = str(prof.get("max_effort", "") or "").strip().lower()
+        if ceiling not in EFFORT_ORDER:
+            ceiling = EFFORT_MAX
+        if default not in EFFORT_ORDER:
+            default = ""
+        return default, ceiling
+
+    def _resolve_effort_for_call(self, *, role_hint: str = "", explicit: str = "") -> str:
+        """Decide the reasoning effort for a model call.
+
+        Precedence: explicit arg > profile pin > task-level default. The result
+        is raised to any per-role floor (manager/reviewer reason >= HIGH) and
+        then clamped down to the profile's max_effort ceiling. L3-L5 default to
+        MAX via TASK_LEVEL_EFFORT.
+        """
+        default_pin, ceiling = self._profile_effort_bounds()
+        if str(explicit or "").strip().lower() in EFFORT_ORDER:
+            effort = str(explicit).strip().lower()
+        elif default_pin in EFFORT_ORDER:
+            effort = default_pin
+        else:
+            level = int(getattr(self, "runtime_task_level", 0) or 0)
+            effort = TASK_LEVEL_EFFORT.get(level, EFFORT_DEFAULT)
+        role = str(role_hint or "").strip().lower()
+        floor = ROLE_EFFORT_FLOOR.get(role, EFFORT_OFF)
+        if EFFORT_ORDER.get(floor, 0) > EFFORT_ORDER.get(effort, 0):
+            effort = floor
+        return clamp_effort(effort, ceiling=ceiling)
+
     def _chat_with_same_model_retry(
         self,
         messages: list[dict],
@@ -30245,6 +31236,7 @@ body{padding:18px}
         context_label: str = "agent",
         retries: int = MODEL_OUTPUT_RETRY_TIMES,
         media_inputs: list[dict] | None = None,
+        effort: str = "",
     ) -> dict:
         retry_budget = max(0, int(retries or 0))
         pin = str(pinned_selection or self._active_runtime_selection()).strip() or self._active_runtime_selection()
@@ -30266,6 +31258,18 @@ body{padding:18px}
                 if _role in label_low:
                     context_role_hint = _role
                     break
+        resolved_effort = self._resolve_effort_for_call(role_hint=context_role_hint, explicit=effort)
+        response_stream_enabled = bool(getattr(self.ollama, "response_stream", False))
+        visible_response_stream = bool(
+            response_stream_enabled
+            and (
+                label_low == "agent turn"
+                or (
+                    label_low.endswith(" turn")
+                    and not any(x in label_low for x in ("manager", "planner"))
+                )
+            )
+        )
 
         def _emit_http_retry(meta: dict):
             try:
@@ -30301,6 +31305,12 @@ body{padding:18px}
 
         for attempt in range(1, retry_budget + 2):
             try:
+                if visible_response_stream:
+                    self._clear_live_response()
+                    self._begin_live_response(
+                        context_label=context_label,
+                        visible=visible_response_stream,
+                    )
                 response = self._call_interruptible(
                     lambda: self.ollama.chat(
                         messages,
@@ -30310,12 +31320,25 @@ body{padding:18px}
                         think=False,
                         stream_thinking=bool(stream_thinking),
                         on_thinking_chunk=on_thinking_chunk,
+                        response_stream=response_stream_enabled,
+                        on_content_delta=(
+                            lambda chunk: self._append_live_response_delta(
+                                chunk,
+                                context_label=context_label,
+                                visible=visible_response_stream,
+                            )
+                        )
+                        if visible_response_stream
+                        else None,
                         media_inputs=media_inputs,
                         cancel_check=lambda: bool(self.cancel_requested),
                         on_http_retry=_emit_http_retry,
+                        effort=resolved_effort,
                     ),
                     progress_label=f"{context_label} model call",
                 )
+                if visible_response_stream:
+                    self._clear_live_response()
                 self._record_model_usage(
                     response,
                     estimated_prompt_tokens=estimated_prompt_tokens,
@@ -30323,9 +31346,13 @@ body{padding:18px}
                 )
                 return response
             except OllamaError as exc:
+                if visible_response_stream:
+                    self._clear_live_response()
                 last_exc = exc
                 if self.cancel_requested or "interrupted by user" in str(exc).lower():
                     raise
+                if bool(getattr(exc, "stream_emitted", False)):
+                    break
                 if self._context_window_error_hint(exc):
                     if self._shrink_context_upper_bound_from_actual_pressure(
                         estimated_prompt_tokens=estimated_prompt_tokens,
@@ -30391,12 +31418,24 @@ body{padding:18px}
                                 think=False,
                                 stream_thinking=bool(stream_thinking),
                                 on_thinking_chunk=on_thinking_chunk,
+                                response_stream=response_stream_enabled,
+                                on_content_delta=(
+                                    lambda chunk: self._append_live_response_delta(
+                                        chunk,
+                                        context_label=f"{context_label}:no-media",
+                                        visible=visible_response_stream,
+                                    )
+                                )
+                                if visible_response_stream
+                                else None,
                                 media_inputs=None,
                                 cancel_check=lambda: bool(self.cancel_requested),
                                 on_http_retry=_emit_http_retry,
                             ),
                             progress_label=f"{context_label} model call (no-media fallback)",
                         )
+                        if visible_response_stream:
+                            self._clear_live_response()
                         self._record_model_usage(
                             response,
                             estimated_prompt_tokens=fallback_estimated_prompt_tokens,
@@ -30404,6 +31443,8 @@ body{padding:18px}
                         )
                         return response
                     except OllamaError:
+                        if visible_response_stream:
+                            self._clear_live_response()
                         pass  # fallback also failed, continue normal retry
                 wake_note = ""
                 status = int(getattr(exc, "status", 0) or 0)
@@ -32387,11 +33428,26 @@ body{padding:18px}
         logs = bb.get("execution_logs", []) if isinstance(bb.get("execution_logs"), list) else []
         if not logs:
             return False
+        focus = self._blackboard_focus_identity(bb)
+        current_step_id = str(focus.get("id", "") or "") if str(focus.get("kind", "") or "") == "plan_step" else ""
+        try:
+            current_epoch = float(focus.get("epoch", 0.0) or 0.0)
+        except Exception:
+            current_epoch = 0.0
         recent = [row for row in logs[-12:] if isinstance(row, dict)]
         last_blocking_idx = -1
         last_success_idx = -1
         last_blocking_ts = 0.0
         for idx, row in enumerate(recent):
+            row_step_id = str(row.get("plan_step_id", "") or "")
+            if current_step_id and row_step_id and row_step_id != current_step_id:
+                continue
+            try:
+                row_ts = float(row.get("ts", 0.0) or 0.0)
+            except Exception:
+                row_ts = 0.0
+            if current_step_id and current_epoch > 0 and row_ts > 0 and row_ts + 1e-6 < current_epoch:
+                continue
             if self._execution_log_entry_is_blocking_error(row):
                 last_blocking_idx = idx
                 try:
@@ -32490,10 +33546,10 @@ body{padding:18px}
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         if not self._step_subtasks_all_completed(plan_step):
             return False
+        if not self._plan_step_acceptance_gate_passed(plan_step, None, bb):
+            return False
         has_evidence = self._plan_step_has_blackboard_evidence(plan_step, bb) or self._step_has_accumulated_evidence(plan_step, bb)
         if not has_evidence:
-            return False
-        if self._active_plan_step_quality_block(plan_step, bb):
             return False
         step_text = str(plan_step.get("full_content", "") or plan_step.get("content", "") or "").lower()
         phase = self._plan_step_phase_hint(step_text)
@@ -32531,19 +33587,6 @@ body{padding:18px}
                 or self._collect_accumulated_step_evidence(current, bb)
                 or f"{source}: current plan step accepted before finish"
             )
-            quality_review = self._llm_review_plan_step_quality(
-                current,
-                {"tool_results": [], "text": evidence},
-                bb,
-                candidate_evidence={"source": source, "path": "finish_reconcile"},
-            )
-            self._record_plan_step_quality_review(current, quality_review, board=bb)
-            if not bool(quality_review.get("available", True)):
-                self._inject_semantic_review_unavailable_recheck(current, {"tool_results": [], "text": evidence}, quality_review)
-                break
-            if not bool(quality_review.get("passed", False)):
-                self._inject_semantic_quality_rework_if_needed(current, {"tool_results": [], "text": evidence}, quality_review)
-                break
             if not self._advance_plan_step(evidence=trim(f"finish-reconcile: {evidence}", 200), actor=actor_key):
                 break
             changed = True
@@ -33912,8 +34955,7 @@ body{padding:18px}
             "execution_logs": [],
             "review_feedback": [],
             "conversation_history": [],
-            "plan_step_quality_reviews": {},
-            "plan_step_quality_review_attempts": {},
+            "plan_worker_todos": {},
             "status": "INITIALIZING",
             "task_epoch": float(now_ts()),
             "focus": {
@@ -34138,64 +35180,43 @@ body{padding:18px}
         board["execution_logs"] = _clean_rows(src.get("execution_logs", []), key="content", actor_key="actor")
         board["review_feedback"] = _clean_rows(src.get("review_feedback", []), key="content", actor_key="actor")
         board["conversation_history"] = _clean_rows(src.get("conversation_history", []), key="content", actor_key="actor")
-        raw_quality_reviews = src.get("plan_step_quality_reviews", {})
-        if isinstance(raw_quality_reviews, dict):
-            clean_quality_reviews: dict[str, dict] = {}
-            for key, row in list(raw_quality_reviews.items())[-80:]:
-                if not isinstance(row, dict):
+        raw_worker_todos = src.get("plan_worker_todos")
+        if isinstance(raw_worker_todos, dict):
+            clean_worker_todos: dict[str, list[dict]] = {}
+            for raw_step_id, raw_rows in list(raw_worker_todos.items())[:80]:
+                step_id = trim(str(raw_step_id or "").strip(), 40)
+                if not step_id or not isinstance(raw_rows, list):
                     continue
-                step_id = trim(str(row.get("step_id", key) or "").strip(), 80)
-                if not step_id:
-                    continue
-                status = str(row.get("status", "") or "").strip().lower()
-                if status not in {"passed", "failed"}:
-                    continue
-                clean_quality_reviews[step_id] = {
-                    "step_id": step_id,
-                    "status": status,
-                    "confidence": trim(str(row.get("confidence", "") or "").strip().lower(), 20),
-                    "reason": trim(str(row.get("reason", "") or "").strip(), 800),
-                    "missing": [
-                        trim(str(item or "").strip(), 220)
-                        for item in (row.get("missing", []) if isinstance(row.get("missing", []), list) else [])[:8]
-                        if str(item or "").strip()
-                    ],
-                    "next_actions": [
-                        trim(str(item or "").strip(), 220)
-                        for item in (row.get("next_actions", []) if isinstance(row.get("next_actions", []), list) else [])[:8]
-                        if str(item or "").strip()
-                    ],
-                    "evidence": [
-                        trim(str(item or "").strip(), 220)
-                        for item in (row.get("evidence", []) if isinstance(row.get("evidence", []), list) else [])[:8]
-                        if str(item or "").strip()
-                    ],
-                    "reviewed_at": float(row.get("reviewed_at", 0.0) or 0.0),
-                    "step_index": int(row.get("step_index", -1)) if row.get("step_index") not in (None, "") else -1,
-                    "activated_at": float(row.get("activated_at", 0.0) or 0.0),
-                }
-            board["plan_step_quality_reviews"] = clean_quality_reviews
-        raw_quality_attempts = src.get("plan_step_quality_review_attempts", {})
-        if isinstance(raw_quality_attempts, dict):
-            clean_quality_attempts: dict[str, dict] = {}
-            for key, row in list(raw_quality_attempts.items())[-80:]:
-                if not isinstance(row, dict):
-                    continue
-                step_id = trim(str(row.get("step_id", key) or "").strip(), 80)
-                if not step_id:
-                    continue
-                status = str(row.get("status", "") or "").strip().lower()
-                if status not in {"unavailable"}:
-                    continue
-                clean_quality_attempts[step_id] = {
-                    "step_id": step_id,
-                    "status": status,
-                    "reason": trim(str(row.get("reason", "") or "").strip(), 800),
-                    "reviewed_at": float(row.get("reviewed_at", 0.0) or 0.0),
-                    "raw": trim(str(row.get("raw", "") or "").strip(), 1200),
-                    "attempts": max(1, int(row.get("attempts", 1) or 1)),
-                }
-            board["plan_step_quality_review_attempts"] = clean_quality_attempts
+                clean_rows: list[dict] = []
+                for row in raw_rows[-12:]:
+                    if not isinstance(row, dict):
+                        continue
+                    raw_content = str(row.get("content", "") or "").strip()
+                    parsed_status, parsed_content = split_todo_status_text(raw_content)
+                    content = trim(normalize_work_text(parsed_content or raw_content) or (parsed_content or raw_content), 360)
+                    if not content:
+                        continue
+                    raw_status = str(row.get("status", "") or "").strip().lower().replace("-", "_").replace(" ", "_")
+                    status = self._normalize_todo_status_value(row.get("status", ""), parsed_status or "pending")
+                    if parsed_status and raw_status in {"", "todo", "pending"}:
+                        status = parsed_status
+                    if status == "blocked":
+                        status = "pending"
+                    clean_rows.append({
+                        "content": content,
+                        "status": status,
+                        "owner": self._sanitize_agent_role(row.get("owner", "")) or "developer",
+                        "parent_step_id": trim(str(row.get("parent_step_id", "") or step_id), 40) or step_id,
+                        "created_at": float(row.get("created_at", 0.0) or 0.0),
+                        "updated_at": float(row.get("updated_at", 0.0) or 0.0),
+                        "completed_at": float(row.get("completed_at", 0.0) or 0.0) if row.get("completed_at") else None,
+                        "completed_by": trim(str(row.get("completed_by", "") or ""), 40),
+                        "evidence": trim(str(row.get("evidence", "") or ""), 300),
+                    })
+                if clean_rows:
+                    clean_worker_todos[step_id] = clean_rows
+            if clean_worker_todos:
+                board["plan_worker_todos"] = clean_worker_todos
         raw_artifacts = src.get("code_artifacts", {})
         artifacts: dict[str, dict] = {}
         if isinstance(raw_artifacts, dict):
@@ -34249,6 +35270,19 @@ body{padding:18px}
                     "completed_by": trim(str(pt.get("completed_by", "") or ""), 40),
                     "evidence": trim(str(pt.get("evidence", "") or ""), 200),
                 })
+            clean_todos, todos_changed, removed_plan_fragments = self._sanitize_project_plan_todos(clean_todos)
+            if todos_changed:
+                hist = board.get("conversation_history", [])
+                if isinstance(hist, list):
+                    hist.append({
+                        "actor": "manager",
+                        "content": (
+                            "normalized plan todos: removed numeric/text fragments "
+                            f"({', '.join(removed_plan_fragments[:4]) or 'renumbered'})"
+                        ),
+                        "ts": float(now_ts()),
+                    })
+                    board["conversation_history"] = hist[-120:]
             board["project_todos"] = clean_todos
         # Preserve plan step cursor/total (used by _advance_plan_step and UI progress)
         raw_cursor = src.get("plan_step_cursor")
@@ -34263,6 +35297,31 @@ body{padding:18px}
                 board["plan_step_total"] = int(raw_total)
             except Exception:
                 pass
+        plan_row_count = len([
+            t for t in (board.get("project_todos", []) if isinstance(board.get("project_todos"), list) else [])
+            if isinstance(t, dict) and t.get("category") == "plan_step"
+        ])
+        if plan_row_count > 0:
+            board["plan_step_total"] = plan_row_count
+            active_row = next(
+                (
+                    t for t in board.get("project_todos", [])
+                    if isinstance(t, dict)
+                    and t.get("category") == "plan_step"
+                    and t.get("status") == "in_progress"
+                ),
+                None,
+            )
+            if isinstance(active_row, dict):
+                board["plan_step_cursor"] = int(active_row.get("plan_step_index", 0) or 0)
+            else:
+                board["plan_step_cursor"] = sum(
+                    1
+                    for t in board.get("project_todos", [])
+                    if isinstance(t, dict)
+                    and t.get("category") == "plan_step"
+                    and t.get("status") == "completed"
+                )
         board["watchdog"] = self._normalize_watchdog_state(src.get("watchdog", {}))
         board["decomposition_queue"] = self._normalize_decomposition_queue_state(
             src.get("decomposition_queue", {})
@@ -34270,7 +35329,23 @@ body{padding:18px}
         # Preserve plan-mode data through normalization
         raw_plan = src.get("plan")
         if isinstance(raw_plan, dict):
-            board["plan"] = raw_plan
+            plan_clean = dict(raw_plan)
+            if isinstance(plan_clean.get("steps"), list):
+                plan_clean["steps"] = self._group_plan_steps(plan_clean.get("steps", []))
+            plan_clean["charter"] = self._normalize_plan_charter(plan_clean.get("charter", {}))
+            if not plan_clean["charter"]:
+                plan_clean["charter"] = self._build_plan_charter(
+                    str(plan_clean.get("chosen", "") or ""),
+                    {
+                        "id": str(plan_clean.get("chosen", "") or ""),
+                        "title": str(plan_clean.get("title", "") or ""),
+                        "summary": str(plan_clean.get("summary", "") or ""),
+                    },
+                    board=board,
+                    grouped_steps=plan_clean.get("steps", []),
+                )
+            plan_clean["step_results"] = self._normalize_plan_step_results(plan_clean.get("step_results", {}))
+            board["plan"] = plan_clean
         # Preserve failure_ledger, checkpoints, persisted_manager_routes
         raw_fl = src.get("failure_ledger")
         board["failure_ledger"] = self._normalize_failure_ledger(raw_fl) if isinstance(raw_fl, dict) else {
@@ -34840,11 +35915,17 @@ body{padding:18px}
         if not isinstance(fl, dict):
             return
         errors = fl.get("errors", [])
+        focus = self._blackboard_focus_identity(bb)
+        now_tick = float(now_ts())
         fp = hashlib.sha1((str(category or "") + str(file or "") + str(error_msg or "")).encode("utf-8")).hexdigest()[:12]
         for entry in errors:
             if entry.get("fingerprint") == fp:
                 entry["count"] = int(entry.get("count", 1) or 1) + 1
                 entry["last_round"] = int(getattr(self, "agent_round_index", 0) or 0)
+                entry["last_ts"] = now_tick
+                entry["focus_id"] = str(focus.get("id", "") or entry.get("focus_id", "") or "")
+                entry["focus_kind"] = str(focus.get("kind", "") or entry.get("focus_kind", "") or "")
+                entry["plan_step_id"] = str(focus.get("id", "") or "") if str(focus.get("kind", "") or "") == "plan_step" else ""
                 fl["errors"] = errors
                 bb["failure_ledger"] = fl
                 self.blackboard = bb
@@ -34858,6 +35939,11 @@ body{padding:18px}
             "count": 1,
             "first_round": int(getattr(self, "agent_round_index", 0) or 0),
             "last_round": int(getattr(self, "agent_round_index", 0) or 0),
+            "first_ts": now_tick,
+            "last_ts": now_tick,
+            "focus_id": str(focus.get("id", "") or ""),
+            "focus_kind": str(focus.get("kind", "") or ""),
+            "plan_step_id": str(focus.get("id", "") or "") if str(focus.get("kind", "") or "") == "plan_step" else "",
         })
         fl["errors"] = errors[-FAILURE_LEDGER_MAX_ERRORS:]
         bb["failure_ledger"] = fl
@@ -34957,10 +36043,30 @@ body{padding:18px}
         """Build context string from all error categories in fl['errors']."""
         bb = self._ensure_blackboard()
         lines: list[str] = []
+        focus = self._blackboard_focus_identity(bb)
+        current_step_id = str(focus.get("id", "") or "") if str(focus.get("kind", "") or "") == "plan_step" else ""
+        try:
+            current_epoch = float(focus.get("epoch", 0.0) or 0.0)
+        except Exception:
+            current_epoch = 0.0
         fl = bb.get("failure_ledger", {})
         if isinstance(fl, dict):
             all_errors = fl.get("errors", [])
             unresolved = [e for e in all_errors if isinstance(e, dict) and int(e.get("count", 0) or 0) > 0]
+            if current_step_id:
+                filtered_unresolved: list[dict] = []
+                for e in unresolved:
+                    err_step_id = str(e.get("plan_step_id", "") or "")
+                    if err_step_id and err_step_id != current_step_id:
+                        continue
+                    try:
+                        err_ts = float(e.get("last_ts", 0.0) or 0.0)
+                    except Exception:
+                        err_ts = 0.0
+                    if current_epoch > 0 and err_ts > 0 and err_ts + 1e-6 < current_epoch:
+                        continue
+                    filtered_unresolved.append(e)
+                unresolved = filtered_unresolved
             if unresolved:
                 # Group by category
                 by_cat: dict[str, list] = {}
@@ -34992,6 +36098,15 @@ body{padding:18px}
         last_success_ts = 0.0
         for entry in reversed(logs[-6:]):
             if not isinstance(entry, dict):
+                continue
+            row_step_id = str(entry.get("plan_step_id", "") or "")
+            if current_step_id and row_step_id and row_step_id != current_step_id:
+                continue
+            try:
+                entry_ts = float(entry.get("ts", 0.0) or 0.0)
+            except Exception:
+                entry_ts = 0.0
+            if current_step_id and current_epoch > 0 and entry_ts > 0 and entry_ts + 1e-6 < current_epoch:
                 continue
             if self._is_plan_infrastructure_tool_error(
                 str(entry.get("tool", "") or ""),
@@ -35773,11 +36888,54 @@ body{padding:18px}
             return True
         return len(raw.strip()) >= 120
 
+    def _plan_text_file_content_subject(self, text: object) -> bool:
+        low = str(text or "").lower()
+        return any(
+            tok in low
+            for tok in (
+                "文件", "目录", "路径", "文档", "正文", "大纲", "章节", "字数", "标题", "段落",
+                "内容", "清单", "列表", "表格", "报告", "稿", "设定", "角色", "markdown",
+                ".md", ".txt", ".csv", ".json", ".yaml", ".yml", ".toml", ".ini",
+                "file", "directory", "path", "document", "chapter", "outline", "content",
+                "word count", "title", "section", "report", "ファイル", "ディレクトリ",
+            )
+        )
+
+    def _plan_text_runtime_subject(self, text: object) -> bool:
+        low = str(text or "").lower()
+        return any(
+            tok in low
+            for tok in (
+                "代码", "前端", "后端", "组件", "接口", "服务", "程序", "模块", "函数", "类",
+                "依赖", "编译", "构建", "测试", "浏览器", "控制台", "webgl", "shader",
+                "api", "ui", "web", "app", "service", "script", "package", "dependency",
+                "npm", "node", "python", "pytest", "ruff", "unit", "integration", "server",
+                ".py", ".js", ".ts", ".tsx", ".jsx", ".css", ".html", ".go", ".rs", ".java",
+                ".cpp", ".c", ".h", ".hpp", ".f90", ".glsl",
+            )
+        )
+
+    def _plan_text_explicit_runtime_check(self, text: object) -> bool:
+        low = str(text or "").lower()
+        return any(
+            tok in low
+            for tok in (
+                "测试", "測試", "构建", "编译", "运行测试", "运行构建", "启动服务", "浏览器检查",
+                "控制台", "http", "200", "pytest", "test", "build", "compile", "playwright",
+                "browser", "server", "curl", "node --check", "npm run", "ruff",
+            )
+        )
+
+    def _plan_text_prefers_file_content_evidence(self, text: object) -> bool:
+        return self._plan_text_file_content_subject(text) and not (
+            self._plan_text_runtime_subject(text) or self._plan_text_explicit_runtime_check(text)
+        )
+
     def _tool_results_have_validation_evidence(self, plan_step: dict, results: list[dict]) -> bool:
         """Return whether current tool output is useful candidate evidence.
 
         This is intentionally not an acceptance decision. Plan-step completion is
-        decided by the semantic quality reviewer before advancement.
+        decided by accumulated evidence, optional semantic audit, and any explicit human block.
         """
         if not isinstance(plan_step, dict):
             return False
@@ -35836,9 +36994,14 @@ body{padding:18px}
         wants_runtime_validation = wants_test or phase == "implement" or any(
             tok in step_text for tok in ("verify", "validation", "check", "lint", "build", "compile", "运行", "校验", "檢查")
         )
+        if self._plan_text_prefers_file_content_evidence(step_text):
+            wants_test = False
+            wants_runtime_validation = False
         if wants_test:
             return test_signal or (bool(bash_rows) and observed_signal)
         if phase == "implement":
+            if self._plan_text_prefers_file_content_evidence(step_text):
+                return wrote_files or read_back or blackboard_write_signal or observed_signal
             return wrote_files and (compile_signal or test_signal or observed_signal)
         if phase in ("research", "design"):
             return wrote_files or read_back or positive_retrieval_signal or blackboard_write_signal or observed_signal
@@ -35860,10 +37023,23 @@ body{padding:18px}
         except Exception:
             return 0.0
 
-    def _plan_step_blackboard_signals(self, plan_step: dict, board: dict | None = None) -> dict:
+    def _plan_step_blackboard_signals(
+        self,
+        plan_step: dict,
+        board: dict | None = None,
+        *,
+        since_ts_override: float | None = None,
+    ) -> dict:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         step_id = trim(str((plan_step or {}).get("id", "") or ""), 20)
         since_ts = self._plan_step_activation_ts(plan_step)
+        if since_ts_override is not None:
+            try:
+                override_ts = float(since_ts_override or 0.0)
+            except Exception:
+                override_ts = 0.0
+            if override_ts > 0:
+                since_ts = max(float(since_ts or 0.0), override_ts)
 
         def _rows_since(rows: object) -> list[dict]:
             out: list[dict] = []
@@ -36004,9 +37180,14 @@ body{padding:18px}
         wants_runtime_validation = wants_test or phase == "implement" or any(
             tok in step_text for tok in ("verify", "validation", "check", "lint", "build", "compile", "运行", "校验", "檢查")
         )
+        if self._plan_text_prefers_file_content_evidence(step_text):
+            wants_test = False
+            wants_runtime_validation = False
         if wants_test:
             return sig["has_test_pass"] or sig["has_exec"] or sig["has_review"]
         if phase == "implement":
+            if self._plan_text_prefers_file_content_evidence(step_text):
+                return sig["has_write"] or sig["has_read"] or sig["has_exec"] or sig["has_review"]
             return sig["has_write"] and (
                 sig["has_compile_pass"] or sig["has_test_pass"] or sig["has_exec"] or sig["has_review"]
             )
@@ -36015,6 +37196,316 @@ body{padding:18px}
         if wants_runtime_validation:
             return sig["has_exec"] or sig["has_read"] or sig["has_review"]
         return sig["has_write"] or sig["has_read"] or sig["has_research"] or sig["has_exec"] or sig["has_review"]
+
+    def _plan_step_acceptance_gate_status(
+        self,
+        plan_step: dict,
+        worker_step: dict | None = None,
+        board: dict | None = None,
+    ) -> dict:
+        """Return the final acceptance-subtask gate status for a plan step."""
+        if not isinstance(plan_step, dict):
+            return {"ok": False, "reason": "missing-plan-step"}
+        step_id = trim(str(plan_step.get("id", "") or ""), 20)
+        if not step_id:
+            return {"ok": False, "reason": "missing-plan-step-id"}
+        rows = self._active_plan_worker_todo_rows(step_id, role="")
+        if not rows:
+            return {"ok": False, "reason": "missing-step-local-subtasks"}
+        acceptance_rows = [
+            row for row in rows
+            if self._is_plan_step_acceptance_subtask(row.get("content", ""))
+        ]
+        if not acceptance_rows:
+            return {"ok": False, "reason": "missing-final-acceptance-subtask"}
+        acceptance = dict(acceptance_rows[-1])
+        if str(acceptance.get("status", "") or "").strip().lower() != "completed":
+            return {
+                "ok": False,
+                "reason": "final-acceptance-subtask-not-completed",
+                "acceptance": acceptance,
+            }
+        text = str(acceptance.get("content", "") or "").strip().lower()
+        if not text:
+            return {"ok": False, "reason": "empty-final-acceptance-subtask", "acceptance": acceptance}
+
+        results = [
+            row for row in ((worker_step or {}).get("tool_results", []) if isinstance(worker_step, dict) else [])
+            if isinstance(row, dict) and row.get("ok", False)
+        ]
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        try:
+            acceptance_started_ts = float(
+                acceptance.get("updated_at", 0.0)
+                or acceptance.get("created_at", 0.0)
+                or acceptance.get("completed_at", 0.0)
+                or 0.0
+            )
+        except Exception:
+            acceptance_started_ts = 0.0
+        sig = self._plan_step_blackboard_signals(
+            plan_step,
+            bb,
+            since_ts_override=acceptance_started_ts,
+        )
+        has_current_read = any(
+            str(row.get("name", "") or "") == "read_file"
+            and not self._is_plan_infrastructure_read_result(row)
+            and bool(self._tool_result_output_excerpt(row, 80))
+            for row in results
+        )
+        has_current_exec = any(str(row.get("name", "") or "") in {"bash", "worktree_run", "background_run"} for row in results)
+        has_current_validation = self._tool_results_have_validation_evidence(plan_step, results)
+        has_current_retrieval = any(self._tool_result_has_positive_retrieval_signal(row) for row in results)
+        has_current_blackboard_acceptance = any(
+            str(row.get("name", "") or "") == "write_to_blackboard"
+            and any(marker in str(row.get("args", {})).lower() for marker in ("验收", "驗收", "acceptance", "受入確認"))
+            for row in results
+        )
+
+        wants_file_inspection = any(
+            tok in text
+            for tok in (
+                "读取", "检查", "文件", "目录", "路径", "选择器", "read", "inspect", "file",
+                "directory", "path", "selector", "檢查", "讀取", "確認", "ファイル", "ディレクトリ",
+            )
+        ) or self._plan_text_file_content_subject(text)
+        wants_runtime = self._plan_text_explicit_runtime_check(text) or (
+            any(tok in text for tok in ("运行", "执行", "run", "実行"))
+            and self._plan_text_runtime_subject(text)
+        )
+        if wants_file_inspection and self._plan_text_prefers_file_content_evidence(text):
+            wants_runtime = False
+        wants_research = any(
+            tok in text
+            for tok in (
+                "检索", "搜索", "研究", "调研", "资料", "来源", "引用", "research", "search",
+                "source", "citation", "evidence chain", "搜集", "收集", "調査", "検索",
+            )
+        )
+        wants_blackboard_record = any(
+            tok in text
+            for tok in ("黑板", "blackboard", "记录", "記錄", "record", "status", "review_feedback")
+        )
+
+        current_match = False
+        blackboard_match = False
+        expected = "generic-observable-check"
+        if wants_runtime:
+            expected = "runtime/test/build/browser execution evidence"
+            current_match = bool(has_current_validation or has_current_exec)
+            blackboard_match = bool(sig.get("has_exec") or sig.get("has_review"))
+        elif wants_file_inspection:
+            expected = "file/path/directory inspection evidence"
+            current_match = bool(has_current_read or has_current_exec)
+            blackboard_match = bool(sig.get("has_read") or sig.get("has_exec") or sig.get("has_review"))
+        elif wants_research:
+            expected = "research/retrieval evidence"
+            current_match = bool(has_current_retrieval or has_current_read)
+            blackboard_match = bool(sig.get("has_research") or sig.get("has_read") or sig.get("has_review"))
+        elif wants_blackboard_record:
+            expected = "blackboard acceptance record"
+            current_match = bool(has_current_blackboard_acceptance or has_current_validation)
+            blackboard_match = bool(sig.get("has_exec") or sig.get("has_review") or sig.get("has_research"))
+        else:
+            current_match = bool(has_current_validation or has_current_read or has_current_exec or has_current_retrieval)
+            blackboard_match = bool(sig.get("has_exec") or sig.get("has_review") or sig.get("has_read") or sig.get("has_research"))
+
+        # During a live worker/single-agent turn, the acceptance action must be
+        # visible in this turn's tool_results. Blackboard fallback is only for
+        # finish/resume reconciliation where current tool_results are no longer
+        # available but the step-scoped evidence has already been recorded.
+        if results:
+            blackboard_match = False
+        if current_match:
+            return {
+                "ok": True,
+                "reason": "current-tool-evidence-matches-final-acceptance",
+                "source": "current_tool_results",
+                "expected": expected,
+                "acceptance": acceptance,
+            }
+        if blackboard_match:
+            return {
+                "ok": True,
+                "reason": "blackboard-evidence-matches-final-acceptance",
+                "source": "blackboard",
+                "expected": expected,
+                "acceptance": acceptance,
+            }
+        return {
+            "ok": False,
+            "reason": "final-acceptance-evidence-missing",
+            "expected": expected,
+            "acceptance": acceptance,
+        }
+
+    def _plan_step_acceptance_gate_passed(
+        self,
+        plan_step: dict,
+        worker_step: dict | None = None,
+        board: dict | None = None,
+    ) -> bool:
+        """Hard gate: the final acceptance subtask must be completed with matching tool evidence."""
+        return bool(self._plan_step_acceptance_gate_status(plan_step, worker_step, board).get("ok", False))
+
+    def _inject_acceptance_gate_rework_hint(
+        self,
+        plan_step: dict,
+        gate: dict | None = None,
+        *,
+        target_roles: tuple[str, ...] = (),
+    ) -> bool:
+        if not isinstance(plan_step, dict):
+            return False
+        step_id = trim(str(plan_step.get("id", "") or ""), 20)
+        if not step_id:
+            return False
+        _flag = f"_acceptance_gate_hint_ts_{step_id}"
+        try:
+            last_ts = float(getattr(self, _flag, 0.0) or 0.0)
+        except Exception:
+            last_ts = 0.0
+        if float(now_ts()) - last_ts < 20.0:
+            return False
+        try:
+            setattr(self, _flag, float(now_ts()))
+        except Exception:
+            pass
+        gate_row = gate if isinstance(gate, dict) else self._plan_step_acceptance_gate_status(plan_step)
+        acceptance = gate_row.get("acceptance", {}) if isinstance(gate_row.get("acceptance"), dict) else {}
+        acceptance_text = trim(str(acceptance.get("content", "") or ""), 300)
+        reason = trim(str(gate_row.get("reason", "") or "final-acceptance-gate-failed"), 160)
+        expected = trim(str(gate_row.get("expected", "") or ""), 180)
+        step_label = trim(str(plan_step.get("content", "") or ""), 160)
+        # Concrete what+how spec (same heuristic the gate uses) so the worker
+        # knows exactly which action produces passing evidence.
+        try:
+            guidance = self._plan_step_acceptance_guidance(plan_step)
+        except Exception:
+            guidance = {}
+        guidance_line = ""
+        if guidance:
+            guidance_line = (
+                f"WHAT to verify: {guidance.get('what', '')} "
+                f"HOW: {guidance.get('how', '')} "
+                f"EXAMPLE ACTION: {guidance.get('example', '')} "
+            )
+        # Show what evidence the step has ALREADY accumulated, so the worker can
+        # see the gap instead of redoing everything.
+        try:
+            already = self._collect_accumulated_step_evidence(plan_step, self._ensure_blackboard())
+        except Exception:
+            already = ""
+        already_line = f"Evidence already on record: {already}. " if already and already != "accumulated-step-evidence" else ""
+        roles = tuple(
+            role for role in (self._sanitize_agent_role(x) for x in target_roles)
+            if role
+        )
+        if not roles and self._is_multi_agent_mode():
+            roles = (self._current_plan_worker_owner(),)
+        content = (
+            "<acceptance-required>\n"
+            f"Stay on the current plan step: {step_label}. "
+            "The final acceptance subtask is a normal step-local TodoWrite task, but the plan step cannot advance until its check action has matching tool or blackboard evidence in THIS turn. "
+            f"Gate reason: {reason}. "
+            f"{('Expected evidence: ' + expected + '. ') if expected else ''}"
+            f"{guidance_line}"
+            f"{already_line}"
+            f"{('Final acceptance subtask: ' + acceptance_text + '. ') if acceptance_text else ''}"
+            "Now CALL THE TOOL described under HOW/EXAMPLE ACTION (do not just describe it), confirm the success signal in its output, "
+            "then update the same acceptance TodoWrite row to completed. If the check FAILS, fix the underlying problem first, then re-run the check. "
+            "Do not skip to another plan step and do not edit .clouds_coder/plan.md directly.\n"
+            "</acceptance-required>"
+        )
+        return self._append_plan_guidance_bubble(
+            content,
+            target_roles=roles,
+            summary="acceptance gate requires evidence",
+        )
+
+    def _acceptance_gate_handle_failure(
+        self,
+        plan_step: dict,
+        gate: dict,
+        bb: dict,
+        *,
+        actor: str = "developer",
+        target_roles: tuple[str, ...] = (),
+    ) -> bool:
+        """Track repeated acceptance-gate failures and escalate to prevent a stuck step.
+
+        Returns True if the step was force-advanced (relaxed), in which case the
+        caller must NOT keep blocking. Escalation ladder:
+          1. < threshold: inject the concrete rework hint (normal path).
+          2. >= threshold: in multi-agent, switch reviewer into debug mode so a
+             second role actively diagnoses+fixes; keep injecting the hint.
+          3. >= threshold WITH any accumulated/blackboard evidence: relax — the
+             gate heuristic is being too strict; advance with a recorded warning.
+          4. >= hard ceiling: force-advance regardless, recording that the gate
+             never matched, so the plan can make progress instead of looping.
+        """
+        step_id = trim(str((plan_step or {}).get("id", "") or ""), 40)
+        if not step_id:
+            self._inject_acceptance_gate_rework_hint(plan_step, gate, target_roles=target_roles)
+            return False
+        attr = f"_acceptance_gate_fail_n_{step_id}"
+        try:
+            count = int(getattr(self, attr, 0) or 0) + 1
+        except Exception:
+            count = 1
+        try:
+            setattr(self, attr, count)
+        except Exception:
+            pass
+
+        has_evidence = bool(
+            self._step_has_accumulated_evidence(plan_step, bb)
+            or self._plan_step_has_blackboard_evidence(plan_step, bb)
+        )
+
+        # Step 2: wake the reviewer to actively debug in multi-agent mode.
+        if count >= ACCEPTANCE_GATE_STALL_THRESHOLD and self._is_multi_agent_mode() and not self.reviewer_debug_mode:
+            self.reviewer_debug_mode = True
+            self._blackboard_append_memory(
+                "decision",
+                f"acceptance gate stalled {count}x on step; enabled reviewer-debug mode to actively diagnose and fix",
+                actor="manager",
+                tier="long",
+                board=bb,
+            )
+            self._emit("status", {"summary": "acceptance gate stalled — reviewer debug mode enabled to fix the blocker"})
+
+        # Step 3/4: relax-and-advance so the plan never loops forever.
+        relax = (count >= ACCEPTANCE_GATE_STALL_THRESHOLD and has_evidence) or (count >= ACCEPTANCE_GATE_HARD_CEILING)
+        if relax:
+            reason = trim(str((gate or {}).get("reason", "") or "gate-never-matched"), 160)
+            note = (
+                f"acceptance gate relaxed after {count} failures on this step "
+                f"({'accumulated evidence present' if has_evidence else 'hard ceiling reached'}; gate reason: {reason}); "
+                "advancing to avoid an infinite stall"
+            )
+            evidence = self._collect_step_evidence(plan_step, {}) or self._collect_blackboard_step_evidence(plan_step, bb)
+            self._blackboard_append_memory("decision", note, actor=str(actor or "manager"), tier="long", board=bb)
+            self._emit("status", {"summary": f"step advanced via gate-relax after {count} stalled acceptance checks"})
+            advanced = self._advance_plan_step(
+                evidence=trim(f"[gate-relaxed] {evidence}", 200),
+                actor=str(actor or "developer"),
+            )
+            if advanced:
+                try:
+                    setattr(self, attr, 0)
+                except Exception:
+                    pass
+                try:
+                    self._inject_current_plan_step_execution_hints()
+                except Exception:
+                    pass
+            return bool(advanced)
+
+        # Default: concrete rework hint.
+        self._inject_acceptance_gate_rework_hint(plan_step, gate, target_roles=target_roles)
+        return False
 
     def _step_has_accumulated_evidence(self, plan_step: dict, bb: dict | None = None) -> bool:
         """Check whether a step has accumulated candidate evidence across turns."""
@@ -36053,6 +37544,209 @@ body{padding:18px}
         if sig.get("recent_research_excerpt"):
             parts.append(f"notes: {sig['recent_research_excerpt']}")
         return trim("; ".join(parts), 200)
+
+    def _extract_plan_step_referenced_paths(self, text: object, *, limit: int = 24) -> list[str]:
+        src = normalize_embedded_newlines(text)
+        if not src:
+            return []
+        candidates: list[str] = []
+        for match in re.finditer(r"`([^`]{1,260})`", src):
+            candidates.append(str(match.group(1) or ""))
+        candidates.extend(
+            re.findall(
+                r"(?<![\w./-])([A-Za-z0-9_.@+~-]+(?:/[A-Za-z0-9_.@+~ -]+)+)(?![\w./-])",
+                src,
+            )
+        )
+        out: list[str] = []
+        deny_prefixes = {
+            "python",
+            "python3",
+            "bash",
+            "pytest",
+            "grep",
+            "find",
+            "cat",
+            "echo",
+            "mkdir",
+            "touch",
+            "ls",
+        }
+        for raw in candidates:
+            item = str(raw or "").strip().strip("'\"")
+            if not item or "://" in item:
+                continue
+            if item.split(None, 1)[0].strip().lower() in deny_prefixes:
+                continue
+            if not ("/" in item or re.search(r"\.[A-Za-z0-9]{1,8}$", item)):
+                continue
+            rel = normalize_rel_preview_path(item.replace("\\", "/"))
+            if not rel or self._is_plan_infrastructure_path(rel):
+                continue
+            if rel not in out:
+                out.append(rel)
+            if len(out) >= max(1, int(limit or 24)):
+                break
+        return out
+
+    @staticmethod
+    def _semantic_path_key(path_text: object) -> str:
+        rel = normalize_rel_preview_path(str(path_text or "").replace("\\", "/")).lower()
+        if not rel:
+            return ""
+        path = PurePosixPath(rel)
+        stem = path.stem
+        suffix = path.suffix.lower()
+        parent = "/".join(path.parts[:-1])
+        compact_parent = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", parent)
+        compact_stem = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", stem)
+        return f"{compact_parent}/{compact_stem}{suffix}"
+
+    @staticmethod
+    def _semantic_path_score(expected: str, actual: str) -> tuple[float, str]:
+        exp = normalize_rel_preview_path(expected).lower()
+        act = normalize_rel_preview_path(actual).lower()
+        if not exp or not act:
+            return 0.0, ""
+        if exp == act:
+            return 1.0, "exact"
+        exp_path = PurePosixPath(exp)
+        act_path = PurePosixPath(act)
+        exp_key = SessionState._semantic_path_key(exp)
+        act_key = SessionState._semantic_path_key(act)
+        if exp_key and exp_key == act_key:
+            return 0.96, "separator-insensitive path match"
+        exp_stem = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", exp_path.stem.lower())
+        act_stem = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", act_path.stem.lower())
+        same_parent = exp_path.parent.as_posix() == act_path.parent.as_posix()
+        same_suffix = exp_path.suffix.lower() == act_path.suffix.lower()
+        if exp_stem and act_stem and same_parent and same_suffix:
+            if exp_stem == act_stem:
+                return 0.94, "separator-insensitive filename match"
+            ratio = difflib.SequenceMatcher(None, exp_stem, act_stem).ratio()
+            if ratio >= 0.76:
+                return 0.72 + (ratio - 0.76) * 0.5, "similar filename in expected directory"
+        exp_parts = set(re.findall(r"[a-z0-9\u4e00-\u9fff]+", exp_path.stem.lower()))
+        act_parts = set(re.findall(r"[a-z0-9\u4e00-\u9fff]+", act_path.stem.lower()))
+        if exp_parts and act_parts:
+            overlap = len(exp_parts & act_parts) / max(1, len(exp_parts | act_parts))
+            if same_parent and same_suffix and overlap >= 0.5:
+                return 0.62 + overlap * 0.2, "token-overlap filename match"
+        return 0.0, ""
+
+    def _workspace_text_files_for_review(self, *, limit: int = 480) -> list[str]:
+        rows: list[str] = []
+        skip_dirs = {
+            ".clouds_coder",
+            ".git",
+            "__pycache__",
+            "node_modules",
+            ".venv",
+            "venv",
+            "dist",
+            "build",
+        }
+        text_suffixes = {
+            ".md",
+            ".txt",
+            ".py",
+            ".js",
+            ".ts",
+            ".tsx",
+            ".jsx",
+            ".json",
+            ".yaml",
+            ".yml",
+            ".html",
+            ".css",
+            ".csv",
+            ".toml",
+        }
+        try:
+            for root, dirs, files in os.walk(self.files_root):
+                dirs[:] = [d for d in dirs if d not in skip_dirs and not d.startswith(".")]
+                for name in files:
+                    if len(rows) >= max(1, int(limit or 480)):
+                        return rows
+                    if name.startswith("."):
+                        continue
+                    fp = Path(root) / name
+                    if fp.suffix.lower() not in text_suffixes:
+                        continue
+                    try:
+                        if fp.stat().st_size > 300_000:
+                            continue
+                        rel = self._session_rel(fp)
+                    except Exception:
+                        continue
+                    if rel and not self._is_plan_infrastructure_path(rel):
+                        rows.append(rel)
+        except Exception:
+            return rows
+        return rows
+
+    def _plan_step_quality_path_inference(
+        self,
+        plan_step: dict,
+        known_paths: list[str],
+        *,
+        max_candidates: int = 10,
+    ) -> dict:
+        step_text = str((plan_step or {}).get("full_content", "") or (plan_step or {}).get("content", "") or "")
+        expected_paths = self._extract_plan_step_referenced_paths(step_text)
+        known = [
+            normalize_rel_preview_path(str(p or ""))
+            for p in (known_paths if isinstance(known_paths, list) else [])
+            if normalize_rel_preview_path(str(p or ""))
+        ]
+        workspace_paths = self._workspace_text_files_for_review()
+        search_paths = list(dict.fromkeys(known + workspace_paths))
+        expected_rows: list[dict] = []
+        semantic_candidates: list[dict] = []
+        candidate_paths: list[str] = []
+        for expected in expected_paths:
+            exists = False
+            try:
+                exists = self._session_path(expected).exists()
+            except Exception:
+                exists = False
+            scored: list[tuple[float, str, str]] = []
+            for actual in search_paths:
+                score, reason = self._semantic_path_score(expected, actual)
+                if score >= 0.62:
+                    scored.append((score, actual, reason))
+            scored.sort(key=lambda row: row[0], reverse=True)
+            candidates = [
+                {"path": actual, "score": round(float(score), 3), "reason": reason}
+                for score, actual, reason in scored[:4]
+                if actual != expected or not exists
+            ]
+            expected_rows.append(
+                {
+                    "path": expected,
+                    "exists": bool(exists),
+                    "similar_existing": candidates,
+                }
+            )
+            for score, actual, reason in scored[:4]:
+                if actual not in candidate_paths:
+                    candidate_paths.append(actual)
+                semantic_candidates.append(
+                    {
+                        "expected": expected,
+                        "actual": actual,
+                        "score": round(float(score), 3),
+                        "reason": reason,
+                        "expected_exists": bool(exists),
+                    }
+                )
+                if len(semantic_candidates) >= max(1, int(max_candidates or 10)):
+                    break
+        return {
+            "expected_artifacts": expected_rows,
+            "semantic_candidate_files": semantic_candidates[: max(1, int(max_candidates or 10))],
+            "candidate_paths": candidate_paths[: max(1, int(max_candidates or 10))],
+        }
 
     def _plan_step_quality_review_paths(self, plan_step: dict, worker_step: dict, bb: dict) -> list[str]:
         step_id = trim(str((plan_step or {}).get("id", "") or "").strip(), 80)
@@ -36111,6 +37805,9 @@ body{padding:18px}
             elif name in {"bash", "worktree_run", "background_run"}:
                 for path in self._bash_file_read_targets(str(args.get("command", "") or ""))[:6]:
                     _add(path)
+        path_inference = self._plan_step_quality_path_inference(plan_step, paths)
+        for path in path_inference.get("candidate_paths", []) if isinstance(path_inference, dict) else []:
+            _add(path)
         return paths[:8]
 
     def _plan_step_quality_file_excerpts(self, paths: list[str], *, max_files: int = 5, max_chars: int = 1600) -> list[dict]:
@@ -36212,6 +37909,13 @@ body{padding:18px}
                 break
 
         paths = self._plan_step_quality_review_paths(plan_step, worker_step, bb)
+        path_inference = self._plan_step_quality_path_inference(plan_step, paths)
+        inferred_paths = [
+            normalize_rel_preview_path(str(inferred_path or ""))
+            for inferred_path in (path_inference.get("candidate_paths", []) if isinstance(path_inference, dict) else [])
+            if normalize_rel_preview_path(str(inferred_path or ""))
+        ]
+        paths = list(dict.fromkeys(inferred_paths + paths))[:8]
         context = {
             "objective": trim(str(bb.get("original_goal", "") or self._latest_user_goal_text() or "").strip(), 2000),
             "direct_objective": trim(str(profile.get("direct_objective", self.runtime_direct_objective or "") or "").strip(), 900),
@@ -36225,6 +37929,15 @@ body{padding:18px}
             "worker_reply": trim(str((worker_step or {}).get("text", "") or "").strip(), 1200),
             "tool_results": tool_rows,
             "subtasks": subtasks,
+            "artifact_path_inference": {
+                "expected_artifacts": path_inference.get("expected_artifacts", []) if isinstance(path_inference, dict) else [],
+                "semantic_candidate_files": path_inference.get("semantic_candidate_files", []) if isinstance(path_inference, dict) else [],
+                "review_instruction": (
+                    "If an expected artifact path is missing but semantic_candidate_files contains near-equivalent files, "
+                    "evaluate whether those files collectively satisfy the step's real deliverable. Treat naming drift as a "
+                    "repairable artifact issue, not automatic failure, unless downstream compatibility or the user explicitly requires the exact path."
+                ),
+            },
             "recent_files": paths,
             "file_excerpts": self._plan_step_quality_file_excerpts(paths),
             "recent_execution_logs": self._plan_step_quality_recent_rows(bb, "execution_logs", plan_step),
@@ -36242,335 +37955,58 @@ body{padding:18px}
         *,
         candidate_evidence: dict | None = None,
     ) -> dict:
-        """Use semantic LLM review as the final plan-step quality gate."""
-        context = self._build_plan_step_quality_review_context(
-            plan_step,
-            worker_step,
-            bb,
-            candidate_evidence=candidate_evidence,
-        )
-        step_id = trim(str((plan_step or {}).get("id", "") or "").strip(), 80)
-        fp = hashlib.sha1(context.encode("utf-8", errors="replace")).hexdigest()[:16]
-        cache = getattr(self, "_plan_step_quality_review_cache", {})
-        cached = cache.get(step_id) if isinstance(cache, dict) and step_id else None
-        if isinstance(cached, dict) and cached.get("fingerprint") == fp:
-            try:
-                if float(now_ts()) - float(cached.get("ts", 0.0) or 0.0) < 45.0:
-                    return dict(cached.get("review", {}) or {})
-            except Exception:
-                pass
-
-        system_prompt = (
-            "You are a strict semantic QA reviewer for an autonomous coding workflow. "
-            "Your job is to decide whether the current plan step is actually acceptable "
-            "against the user's intent and the step text. Hard-coded signals such as file "
-            "existence, HTTP 200, successful syntax checks, or a tool returning ok are only "
-            "candidate evidence; never treat them as automatic proof. Read the artifacts, "
-            "logs, worker reply, subtasks, and user objective semantically. Return JSON only."
-        )
-        user_prompt = (
-            "Decide whether this plan step may advance.\n\n"
-            "Acceptance standard:\n"
-            "- Pass only when the evidence shows the step's real intent has been satisfied.\n"
-            "- Reject shallow bookkeeping, stale logs, unrelated files, or validation that does not cover the requested behavior.\n"
-            "- For implementation/frontend/runtime work, require evidence appropriate to what changed, such as relevant code, runtime behavior, UI/control behavior, absence of blocking errors, or targeted tests. Choose what matters semantically.\n"
-            "- If evidence is insufficient, explain the missing proof and concrete next actions.\n\n"
-            "Return JSON only with this shape:\n"
-            "{\"passed\":true|false,\"confidence\":\"high|medium|low\",\"reason\":\"...\","
-            "\"missing\":[\"...\"],\"next_actions\":[\"...\"],\"evidence\":[\"...\"]}\n\n"
-            f"REVIEW CONTEXT:\n{context}"
-        )
-
-        def _string_list(value: object) -> list[str]:
-            if not isinstance(value, list):
-                return []
-            out: list[str] = []
-            for item in value[:8]:
-                txt = trim(str(item or "").strip(), 220)
-                if txt:
-                    out.append(txt)
-            return out
-
-        def _review_from_payload(payload: dict, raw_text: str) -> dict:
-            confidence = str(payload.get("confidence", "") or "").strip().lower()
-            if confidence not in {"high", "medium", "low"}:
-                confidence = "medium" if payload.get("passed", False) else "low"
-            return {
-                "available": True,
-                "passed": bool(payload.get("passed", False)),
-                "confidence": confidence,
-                "reason": trim(str(payload.get("reason", "") or "").strip(), 600),
-                "missing": _string_list(payload.get("missing", [])),
-                "next_actions": _string_list(payload.get("next_actions", [])),
-                "evidence": _string_list(payload.get("evidence", [])),
-                "raw": raw_text,
-            }
-
-        def _repair_review_json(raw_text: str) -> dict:
-            if not str(raw_text or "").strip():
-                return {}
-            repair_prompt = (
-                "The previous semantic QA reviewer did not return parseable JSON. "
-                "Convert its answer into the required JSON shape without adding new facts. "
-                "If the answer is too ambiguous to decide, return passed=false with low confidence "
-                "and explain that the review text was ambiguous.\n\n"
-                "Required JSON shape:\n"
-                "{\"passed\":true|false,\"confidence\":\"high|medium|low\",\"reason\":\"...\","
-                "\"missing\":[\"...\"],\"next_actions\":[\"...\"],\"evidence\":[\"...\"]}\n\n"
-                f"PREVIOUS REVIEW TEXT:\n{trim(raw_text, 2400)}"
-            )
-            rsp = self._chat_with_same_model_retry(
-                [{"role": "user", "content": repair_prompt, "ts": now_ts()}],
-                tools=None,
-                system="Return JSON only. Do not perform a new review; only normalize the previous review text.",
-                max_tokens=600,
-                think=False,
-                stream_thinking=False,
-                context_label="semantic quality review json repair",
-                retries=1,
-            )
-            repaired_raw = trim(
-                str((rsp or {}).get("content", "") or (rsp or {}).get("text", "") or "").strip()
-                or str((rsp or {}).get("thinking", "") or "").strip(),
-                2000,
-            )
-            return extract_json_object_from_text(repaired_raw, {})
-
-        raw = ""
-        try:
-            rsp = self._chat_with_same_model_retry(
-                [{"role": "user", "content": user_prompt, "ts": now_ts()}],
-                tools=None,
-                system=system_prompt,
-                max_tokens=900,
-                think=False,
-                stream_thinking=False,
-                context_label="semantic quality review",
-                retries=max(1, min(2, int(MODEL_OUTPUT_RETRY_TIMES))),
-            )
-            raw = trim(
-                str((rsp or {}).get("content", "") or (rsp or {}).get("text", "") or "").strip()
-                or str((rsp or {}).get("thinking", "") or "").strip(),
-                3000,
-            )
-            payload = extract_json_object_from_text(raw, {})
-            if not payload:
-                payload = _repair_review_json(raw)
-            if not payload:
-                raise ValueError("semantic reviewer returned no JSON")
-            review = _review_from_payload(payload, raw)
-        except Exception as exc:
-            review = {
-                "available": False,
-                "passed": False,
-                "confidence": "low",
-                "reason": f"semantic quality review unavailable: {trim(str(exc), 240)}",
-                "missing": ["semantic quality review did not complete"],
-                "next_actions": ["retry semantic review or ask a reviewer to inspect the current step evidence"],
-                "evidence": [],
-                "raw": raw,
-            }
-
-        try:
-            if not bool(review.get("available", True)):
-                status = "UNAVAILABLE"
-            else:
-                status = "PASS" if review.get("passed") else "FAIL"
-            feedback = (
-                f"semantic_quality_review {status} confidence={review.get('confidence', 'low')}\n"
-                f"reason: {trim(str(review.get('reason', '') or ''), 500)}\n"
-            )
-            if review.get("evidence"):
-                feedback += "evidence: " + "; ".join(review["evidence"][:5]) + "\n"
-            if review.get("missing"):
-                feedback += "missing: " + "; ".join(review["missing"][:5]) + "\n"
-            if review.get("next_actions"):
-                feedback += "next_actions: " + "; ".join(review["next_actions"][:5])
-            self._blackboard_append_section("review_feedback", "semantic_reviewer", trim(feedback, BLACKBOARD_MAX_TEXT))
-        except Exception:
-            pass
-
-        if step_id and bool(review.get("available", True)):
-            if not isinstance(cache, dict):
-                cache = {}
-            cache[step_id] = {"fingerprint": fp, "ts": float(now_ts()), "review": dict(review)}
-            try:
-                setattr(self, "_plan_step_quality_review_cache", cache)
-            except Exception:
-                pass
-        return review
+        """Compatibility stub: semantic review no longer gates plan advancement."""
+        return {
+            "available": True,
+            "passed": True,
+            "confidence": "disabled",
+            "reason": "plan-step semantic review is disabled; advancement is controlled by subtasks and concrete evidence",
+            "missing": [],
+            "next_actions": [],
+            "evidence": [],
+            "raw": "",
+            "source": "disabled",
+        }
 
     def _record_plan_step_quality_review(self, plan_step: dict, review: dict, *, board: dict | None = None):
-        if not isinstance(plan_step, dict) or not isinstance(review, dict):
-            return
-        step_id = trim(str(plan_step.get("id", "") or "").strip(), 80)
-        if not step_id:
-            return
-        if not bool(review.get("available", True)):
-            bb = board if isinstance(board, dict) else self._ensure_blackboard()
-            attempts = bb.get("plan_step_quality_review_attempts", {})
-            if not isinstance(attempts, dict):
-                attempts = {}
-            row = dict(attempts.get(step_id, {}) if isinstance(attempts.get(step_id), dict) else {})
-            row.update(
-                {
-                    "step_id": step_id,
-                    "status": "unavailable",
-                    "reason": trim(str(review.get("reason", "") or "").strip(), 800),
-                    "reviewed_at": float(now_ts()),
-                    "raw": trim(str(review.get("raw", "") or ""), 1200),
-                }
-            )
-            row["attempts"] = int(row.get("attempts", 0) or 0) + 1
-            attempts[step_id] = row
-            bb["plan_step_quality_review_attempts"] = attempts
-            self.blackboard = bb
-            self._blackboard_touch()
-            return
-        bb = board if isinstance(board, dict) else self._ensure_blackboard()
-        reviews = bb.get("plan_step_quality_reviews", {})
-        if not isinstance(reviews, dict):
-            reviews = {}
-        reviews[step_id] = {
-            "step_id": step_id,
-            "status": "passed" if bool(review.get("passed", False)) else "failed",
-            "confidence": trim(str(review.get("confidence", "") or "").strip().lower(), 20),
-            "reason": trim(str(review.get("reason", "") or "").strip(), 800),
-            "missing": [
-                trim(str(item or "").strip(), 220)
-                for item in (review.get("missing", []) if isinstance(review.get("missing", []), list) else [])[:8]
-                if str(item or "").strip()
-            ],
-            "next_actions": [
-                trim(str(item or "").strip(), 220)
-                for item in (review.get("next_actions", []) if isinstance(review.get("next_actions", []), list) else [])[:8]
-                if str(item or "").strip()
-            ],
-            "evidence": [
-                trim(str(item or "").strip(), 220)
-                for item in (review.get("evidence", []) if isinstance(review.get("evidence", []), list) else [])[:8]
-                if str(item or "").strip()
-            ],
-            "reviewed_at": float(now_ts()),
-            "step_index": int(plan_step.get("plan_step_index", -1)) if plan_step.get("plan_step_index") not in (None, "") else -1,
-            "activated_at": float(plan_step.get("activated_at", 0.0) or 0.0),
-        }
-        bb["plan_step_quality_reviews"] = reviews
-        attempts = bb.get("plan_step_quality_review_attempts", {})
-        if isinstance(attempts, dict) and step_id in attempts:
-            attempts.pop(step_id, None)
-            bb["plan_step_quality_review_attempts"] = attempts
-        self.blackboard = bb
-        self._blackboard_touch()
+        return
 
     def _active_plan_step_quality_block(self, plan_step: dict, board: dict | None = None) -> dict | None:
-        if not isinstance(plan_step, dict):
-            return None
-        step_id = trim(str(plan_step.get("id", "") or "").strip(), 80)
-        if not step_id:
-            return None
-        bb = board if isinstance(board, dict) else self._ensure_blackboard()
-        reviews = bb.get("plan_step_quality_reviews", {})
-        if not isinstance(reviews, dict):
-            return None
-        row = reviews.get(step_id)
-        if not isinstance(row, dict) or str(row.get("status", "") or "").strip().lower() != "failed":
-            return None
-        reason_low = str(row.get("reason", "") or "").lower()
-        missing_low = " ".join(str(x or "") for x in (row.get("missing", []) if isinstance(row.get("missing", []), list) else [])).lower()
-        if (
-            "semantic quality review unavailable" in reason_low
-            or "semantic reviewer returned no json" in reason_low
-            or "semantic quality review did not complete" in missing_low
-        ):
-            return None
-        try:
-            review_ts = float(row.get("reviewed_at", 0.0) or 0.0)
-        except Exception:
-            review_ts = 0.0
-        try:
-            activated_at = float(plan_step.get("activated_at", 0.0) or plan_step.get("created_at", 0.0) or 0.0)
-        except Exception:
-            activated_at = 0.0
-        if activated_at > 0 and review_ts > 0 and review_ts + 1e-6 < activated_at:
-            return None
-        return row
+        return None
+
+    def _semantic_followup_requires_write(self, review: dict | None) -> bool:
+        return False
+
+    def _semantic_followup_target(self, review: dict | None, board: dict | None = None) -> str:
+        return "developer"
+
+    def _semantic_followup_instruction(self, plan_step: dict, review: dict | None, *, unavailable: bool = False) -> str:
+        return ""
+
+    def _record_semantic_followup(
+        self,
+        plan_step: dict,
+        review: dict | None,
+        *,
+        board: dict | None = None,
+        unavailable: bool = False,
+    ) -> dict | None:
+        return None
+
+    def _resolve_semantic_followup(self, plan_step: dict | None, *, board: dict | None = None, reason: str = "resolved"):
+        return
+
+    def _active_semantic_followup_row(self, plan_step: dict | None, board: dict | None = None) -> dict | None:
+        return None
+
+    def _pending_semantic_followup_route(self, board: dict | None = None) -> dict | None:
+        return None
 
     def _inject_semantic_quality_rework_if_needed(self, plan_step: dict, worker_step: dict, review: dict):
-        try:
-            step_id = str((plan_step or {}).get("id", "") or "")
-            if not step_id:
-                return
-            _key = f"_semantic_quality_rework_{step_id}"
-            last_ts = float(getattr(self, _key, 0.0) or 0.0)
-            if float(now_ts()) - last_ts < 25.0:
-                return
-            setattr(self, _key, float(now_ts()))
-            step_label = trim(str((plan_step or {}).get("content", "") or ""), 100)
-            reason = trim(str((review or {}).get("reason", "") or ""), 600)
-            missing = [trim(str(x or ""), 180) for x in (review or {}).get("missing", [])[:5] if str(x or "").strip()]
-            actions = [trim(str(x or ""), 180) for x in (review or {}).get("next_actions", [])[:5] if str(x or "").strip()]
-            lines = [
-                "<semantic-quality-review>",
-                f"Plan step \"{step_label}\" is not accepted by semantic review.",
-                f"Reason: {reason or 'insufficient evidence for the requested behavior'}",
-            ]
-            if missing:
-                lines.append("Missing evidence or work:")
-                lines.extend(f"- {item}" for item in missing)
-            if actions:
-                lines.append("Next actions:")
-                lines.extend(f"- {item}" for item in actions)
-            lines.append(
-                "Continue the same user task. Update existing step-local todos if they no longer reflect the real state; "
-                "create new todos only when they materially improve tracking."
-            )
-            lines.append("</semantic-quality-review>")
-            bb = self._ensure_blackboard()
-            target_roles: tuple[str, ...] = ()
-            if self._is_multi_agent_mode():
-                active_role = str(bb.get("active_agent", "") or "developer")
-                if active_role:
-                    target_roles = (active_role,)
-            self._append_plan_guidance_bubble(
-                "\n".join(lines),
-                target_roles=target_roles,
-                summary="semantic quality review failed",
-            )
-        except Exception:
-            pass
+        return
 
     def _inject_semantic_review_unavailable_recheck(self, plan_step: dict, worker_step: dict, review: dict):
-        try:
-            step_id = str((plan_step or {}).get("id", "") or "")
-            if not step_id:
-                return
-            _key = f"_semantic_review_unavailable_{step_id}"
-            last_ts = float(getattr(self, _key, 0.0) or 0.0)
-            if float(now_ts()) - last_ts < 20.0:
-                return
-            setattr(self, _key, float(now_ts()))
-            step_label = trim(str((plan_step or {}).get("content", "") or ""), 120)
-            reason = trim(str((review or {}).get("reason", "") or ""), 500)
-            lines = [
-                "<semantic-review-retry>",
-                f"Semantic review for plan step \"{step_label}\" was unavailable, not failed.",
-                f"Reason: {reason or 'reviewer returned unparsable output'}",
-                "Do not repeat completed work solely because the semantic reviewer failed to return JSON.",
-                "Do not edit `.clouds_coder/plan.md`; it is a read-only runtime mirror.",
-                "Re-check the current step evidence with read_file/bash/blackboard as needed, then ask the manager to retry plan-step advancement via advance_plan_step=true.",
-                "</semantic-review-retry>",
-            ]
-            target_roles: tuple[str, ...] = ()
-            if self._is_multi_agent_mode():
-                target_roles = ("reviewer",)
-            self._append_plan_guidance_bubble(
-                "\n".join(lines),
-                target_roles=target_roles,
-                summary="semantic quality review unavailable",
-            )
-        except Exception:
-            pass
+        return
 
     def _has_test_pass_evidence(self, board: dict | None = None) -> bool:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
@@ -36745,31 +38181,6 @@ body{padding:18px}
                 break
         if not current:
             return False
-        quality_block = self._active_plan_step_quality_block(current, bb)
-        if quality_block:
-            self._blackboard_append_memory(
-                "decision",
-                (
-                    "blocked plan step advancement because semantic quality review failed: "
-                    f"{trim(str(quality_block.get('reason', '') or ''), 220)}"
-                ),
-                actor=actor,
-                tier="long",
-                board=bb,
-            )
-            self._inject_semantic_quality_rework_if_needed(
-                current,
-                {"tool_results": [], "text": ""},
-                {
-                    "passed": False,
-                    "confidence": quality_block.get("confidence", "medium"),
-                    "reason": quality_block.get("reason", ""),
-                    "missing": quality_block.get("missing", []),
-                    "next_actions": quality_block.get("next_actions", []),
-                    "evidence": quality_block.get("evidence", []),
-                },
-            )
-            return False
         previous_focus = self._blackboard_focus_identity(bb)
         # Fix 5c: Reset TodoWrite loop counter on step advancement
         try:
@@ -36780,6 +38191,12 @@ body{padding:18px}
         current["completed_at"] = float(now_ts())
         current["completed_by"] = actor
         current["evidence"] = trim(str(evidence or "").strip(), 200) or self._ui_text("step_completed_evidence")
+        try:
+            self._record_plan_step_result(current, evidence=evidence, actor=actor, board=bb)
+            bb = self._ensure_blackboard()
+            todos = bb.get("project_todos", todos)
+        except Exception:
+            pass
         # Clear single-mode validation gate flags for the completed step
         try:
             _completed_id = str(current.get("id", "") or "")
@@ -36801,6 +38218,10 @@ body{padding:18px}
         if next_step:
             next_step["status"] = "in_progress"
             next_step["activated_at"] = float(now_ts())
+            try:
+                self._ensure_worker_todos_for_plan_step(next_step, force_refresh=False, owner=self._current_plan_worker_owner())
+            except Exception:
+                pass
             step_idx = int(next_step.get("plan_step_index", 0) or 0) + 1
             total = int(bb.get("plan_step_total", len(todos)) or len(todos))
             self._emit("status", {
@@ -36971,20 +38392,14 @@ body{padding:18px}
             or ((bb_sig["has_exec"] or bb_sig["has_review"]) and validation_ok_blackboard)
         ):
             phase_evidence = True
-        todo_progress_signal = any(
-            isinstance(r, dict) and r.get("ok", False)
-            and str(r.get("name", "")) in ("TodoWrite", "TodoWriteRescue")
-            for r in results
-        )
-        # Candidate gate: these are only signals that there is enough material
-        # for semantic review. They must not advance a plan step by themselves.
+        # Advance when the step-local subtask chain is complete and concrete
+        # evidence exists. The final acceptance subtask is the validation gate;
+        # manager requests or phase heuristics cannot bypass incomplete subtasks.
         _has_subtasks = bool(self._active_plan_worker_todo_rows(
             str(current.get("id", "") or ""), role=""
         ))
-        _phase_gate = phase_evidence and (subtasks_all_done or not _has_subtasks)
         accumulated_evidence_path = (
             subtasks_all_done
-            and todo_progress_signal
             and self._step_has_accumulated_evidence(current, bb)
         )
         explicit_verified_path = (
@@ -36992,57 +38407,34 @@ body{padding:18px}
             and verified_tag_current
             and (validation_ok_blackboard or self._step_has_accumulated_evidence(current, bb))
         )
-        has_review_candidate_evidence = (
-            validation_ok and (
+        acceptance_gate = self._plan_step_acceptance_gate_status(current, worker_step, bb)
+        acceptance_gate_ok = bool(acceptance_gate.get("ok", False))
+        has_strong_evidence = subtasks_all_done and acceptance_gate_ok and (
+            validation_ok
+            or validation_ok_blackboard
+            or phase_evidence
+            or accumulated_evidence_path
+            or explicit_verified_path
+        )
+        if manager_requested and worker_produced_output and not subtasks_all_done and _has_subtasks:
+            self._blackboard_append_memory(
+                "decision",
+                "ignored plan advancement request because step-local subtasks are incomplete",
+                actor="manager",
+                tier="long",
+            )
+        if manager_requested and subtasks_all_done and not acceptance_gate_ok:
+            self._blackboard_append_memory(
+                "decision",
                 (
-                    worker_produced_output
-                    and (manager_requested or subtasks_all_done or _phase_gate)
-                )
-                or (
-                    todo_progress_signal
-                    and subtasks_all_done
-                    and validation_ok_blackboard
-                )
+                    "ignored plan advancement request because final acceptance subtask gate failed: "
+                    f"{trim(str(acceptance_gate.get('reason', '') or ''), 160)}"
+                ),
+                actor="manager",
+                tier="long",
             )
-        ) or accumulated_evidence_path or explicit_verified_path
-        if has_review_candidate_evidence:
-            candidate_context = {
-                "phase": phase,
-                "manager_requested": manager_requested,
-                "worker_produced_output": worker_produced_output,
-                "subtasks_all_done": subtasks_all_done,
-                "has_subtasks": _has_subtasks,
-                "phase_evidence": phase_evidence,
-                "validation_current": validation_ok_current,
-                "validation_blackboard": validation_ok_blackboard,
-                "accumulated_evidence_path": accumulated_evidence_path,
-                "explicit_verified_path": explicit_verified_path,
-                "blackboard_signals": {
-                    "has_write": bool(bb_sig.get("has_write")),
-                    "has_exec": bool(bb_sig.get("has_exec")),
-                    "has_review": bool(bb_sig.get("has_review")),
-                    "has_compile_pass": bool(bb_sig.get("has_compile_pass")),
-                    "has_test_pass": bool(bb_sig.get("has_test_pass")),
-                    "recent_files": list(bb_sig.get("recent_files", []) or [])[:4],
-                },
-            }
-            quality_review = self._llm_review_plan_step_quality(
-                current,
-                worker_step,
-                bb,
-                candidate_evidence=candidate_context,
-            )
-            self._record_plan_step_quality_review(current, quality_review, board=bb)
-            if not bool(quality_review.get("available", True)):
-                self._inject_semantic_review_unavailable_recheck(current, worker_step, quality_review)
-                return
-            if not bool(quality_review.get("passed", False)):
-                self._inject_semantic_quality_rework_if_needed(current, worker_step, quality_review)
-                return
+        if has_strong_evidence:
             evidence = self._collect_step_evidence(current, worker_step)
-            review_reason = trim(str(quality_review.get("reason", "") or ""), 120)
-            if review_reason:
-                evidence = trim(f"{evidence}; semantic_review: {review_reason}", 200)
             # Clear sync exec gate counter on successful advance
             try:
                 _sync_clear = f"_sync_exec_gate_n_{str(current.get('id', '') or '')}"
@@ -37055,6 +38447,17 @@ body{padding:18px}
                 actor=str(route.get("target", "developer") or "developer"),
             )
         else:
+            if subtasks_all_done and not acceptance_gate_ok:
+                target_role = self._sanitize_agent_role(str(route.get("target", "") or ""))
+                # Track repeated failures and escalate/relax so the step can't loop forever.
+                if self._acceptance_gate_handle_failure(
+                    current,
+                    acceptance_gate,
+                    bb,
+                    actor=str(route.get("target", "developer") or "developer"),
+                    target_roles=((target_role,) if target_role else ()),
+                ):
+                    return  # step force-advanced via gate-relax
             self._inject_rework_if_needed(current, worker_step)
 
     def _worker_step_has_evidence(self, step: dict) -> bool:
@@ -37099,22 +38502,15 @@ body{padding:18px}
         step_id = str(plan_step.get("id", "") or "")
         if not step_id:
             return False
-        snap = self.todo.snapshot()
-        worker_owners = {"developer", "explorer", "reviewer"}
-        worker_items = [
-            r for r in snap
-            if str(r.get("owner", "") or "").lower() in worker_owners
-            and str(r.get("parent_step_id", "") or "") == step_id
-        ]
+        worker_items = self._active_plan_worker_todo_rows(step_id, role="")
         if not worker_items:
-            # Fallback: no parent_step_id linkage — check ALL worker items
-            all_worker = [
-                r for r in snap
-                if str(r.get("owner", "") or "").lower() in worker_owners
-            ]
-            if all_worker:
-                return all(str(r.get("status", "")).lower() == "completed" for r in all_worker)
-            return True  # No worker items at all → nothing blocks advancement
+            expected = self._extract_plan_step_subtasks(plan_step, limit=6)
+            if expected:
+                return False
+            # Approved plan steps are executed through step-local worker
+            # subtasks. If none exist yet, the bootstrap/LLM decomposition path
+            # must run before this step can be considered complete.
+            return False
         # Extract major step number from plan step content (e.g., "1. Project init" → "1")
         import re
         step_content = str(plan_step.get("full_content", "") or plan_step.get("content", "") or "")
@@ -37486,6 +38882,107 @@ body{padding:18px}
                 return cand
         return "developer"
 
+    def _get_plan_step_by_id(self, step_id: str, board: dict | None = None) -> dict | None:
+        step_key = trim(str(step_id or "").strip(), 40)
+        if not step_key:
+            return None
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        todos = bb.get("project_todos", []) if isinstance(bb.get("project_todos", []), list) else []
+        for todo in todos:
+            if (
+                isinstance(todo, dict)
+                and str(todo.get("category", "") or "") == "plan_step"
+                and trim(str(todo.get("id", "") or "").strip(), 40) == step_key
+            ):
+                return todo
+        return None
+
+    def _plan_todo_compare_forms(self, text: object) -> set[str]:
+        import re
+
+        raw = normalize_embedded_newlines(normalize_work_text(str(text or "")) or str(text or "")).strip()
+        if not raw:
+            return set()
+        first = next((ln.strip() for ln in raw.splitlines() if ln.strip()), raw)
+        _status, parsed = split_todo_status_text(first)
+        base = parsed or first
+        forms: set[str] = set()
+
+        def _clean(value: str) -> str:
+            val = normalize_work_text(value) or value
+            val = re.sub(r"\s+", " ", val.strip().lower())
+            val = re.sub(r"^(?:[-*•]\s*)?(?:\[[x >_]\]\s*)+", "", val).strip()
+            val = re.sub(r"^#+\s*", "", val).strip()
+            return val
+
+        current = _clean(base)
+        while current and current not in forms:
+            forms.add(current)
+            stripped = re.sub(
+                r"^(?:(?:step|步骤|步驟|阶段|階段)\s*)?\d+\s*[：:]\s*",
+                "",
+                current,
+                flags=re.IGNORECASE,
+            ).strip()
+            stripped = re.sub(r"^(?:step|步骤|步驟|阶段|階段)\s*\d+[\.\)．、]\s*", "", stripped, flags=re.IGNORECASE).strip()
+            stripped = re.sub(r"^\d+[\.\)．、]\s+", "", stripped).strip()
+            stripped = _clean(stripped)
+            if stripped == current:
+                break
+            current = stripped
+        return {form for form in forms if len(form) >= 2}
+
+    def _plan_worker_row_duplicates_parent_step(self, row: dict | None, plan_step: dict | None) -> bool:
+        if not isinstance(row, dict) or not isinstance(plan_step, dict):
+            return False
+        content = normalize_embedded_newlines(str(row.get("content", "") or "")).strip()
+        if not content or self._is_plan_step_acceptance_subtask(content):
+            return False
+        marker = self._plan_line_marker(content)
+        if isinstance(marker, dict) and marker.get("kind") == "sub":
+            return False
+        step_texts = [
+            str(plan_step.get("content", "") or ""),
+            str(plan_step.get("full_content", "") or ""),
+        ]
+        step_forms: set[str] = set()
+        for text in step_texts:
+            if not text:
+                continue
+            step_forms.update(self._plan_todo_compare_forms(text))
+            first = next((ln.strip() for ln in normalize_embedded_newlines(text).splitlines() if ln.strip()), "")
+            if first:
+                step_forms.update(self._plan_todo_compare_forms(first))
+        row_forms = self._plan_todo_compare_forms(content)
+        if not row_forms or not step_forms:
+            return False
+        if row_forms.intersection(step_forms):
+            return True
+        if isinstance(marker, dict) and marker.get("kind") == "major":
+            try:
+                row_major = int(marker.get("major", 0) or 0)
+                step_index = int(plan_step.get("plan_step_index", -1) or -1) + 1
+            except Exception:
+                row_major = 0
+                step_index = -1
+            marker_title_forms = self._plan_todo_compare_forms(str(marker.get("title", "") or ""))
+            if row_major > 0 and row_major == step_index and marker_title_forms.intersection(step_forms):
+                return True
+        return False
+
+    def _filter_parent_step_duplicate_worker_rows(
+        self,
+        rows: list[dict],
+        plan_step: dict | None,
+    ) -> list[dict]:
+        if not isinstance(rows, list) or not isinstance(plan_step, dict):
+            return list(rows or [])
+        return [
+            dict(row)
+            for row in rows
+            if isinstance(row, dict) and not self._plan_worker_row_duplicates_parent_step(row, plan_step)
+        ]
+
     def _active_plan_worker_todo_rows(self, step_id: str, role: str = "") -> list[dict]:
         step_key = str(step_id or "").strip()
         if not step_key:
@@ -37502,19 +38999,195 @@ body{padding:18px}
                 continue
             all_rows.append(dict(row))
         if not all_rows:
-            return []
+            return self._plan_worker_todo_rows_from_blackboard(step_key, role=role_key)
+        plan_step = self._get_plan_step_by_id(step_key)
+        all_rows = self._filter_parent_step_duplicate_worker_rows(all_rows, plan_step)
         rows = [r for r in all_rows if str(r.get("owner", "") or "").strip().lower() == role_key] if role_key else list(all_rows)
         if role_key and not rows:
             rows = list(all_rows)
-        order = {"in_progress": 0, "pending": 1, "completed": 2}
-        rows.sort(
-            key=lambda r: (
-                order.get(str(r.get("status", "pending") or "pending").strip().lower(), 9),
-                str(r.get("owner", "") or "").strip().lower(),
-                str(r.get("content", "") or "").strip().lower(),
-            )
-        )
+        rows.sort(key=self._plan_worker_todo_sort_key)
         return rows
+
+    def _plan_worker_todo_rows_from_blackboard(self, step_id: str, role: str = "", board: dict | None = None) -> list[dict]:
+        step_key = trim(str(step_id or "").strip(), 40)
+        if not step_key:
+            return []
+        bb = board if isinstance(board, dict) else (self.blackboard if isinstance(getattr(self, "blackboard", None), dict) else {})
+        mirror = bb.get("plan_worker_todos", {}) if isinstance(bb.get("plan_worker_todos"), dict) else {}
+        raw_rows = mirror.get(step_key, []) if isinstance(mirror.get(step_key), list) else []
+        role_key = self._sanitize_agent_role(role)
+        rows: list[dict] = []
+        for row in raw_rows:
+            if not isinstance(row, dict):
+                continue
+            owner = self._sanitize_agent_role(row.get("owner", "")) or "developer"
+            if role_key and owner != role_key:
+                continue
+            raw_content = str(row.get("content", "") or "").strip()
+            parsed_status, parsed_content = split_todo_status_text(raw_content)
+            content = trim(normalize_work_text(parsed_content or raw_content) or (parsed_content or raw_content), 360)
+            if not content:
+                continue
+            raw_status = str(row.get("status", "") or "").strip().lower().replace("-", "_").replace(" ", "_")
+            status = self._normalize_todo_status_value(row.get("status", ""), parsed_status or "pending")
+            if parsed_status and raw_status in {"", "todo", "pending"}:
+                status = parsed_status
+            if status == "blocked":
+                status = "pending"
+            rows.append({
+                "content": content,
+                "status": status,
+                "owner": owner,
+                "parent_step_id": step_key,
+                "created_at": float(row.get("created_at", 0.0) or 0.0),
+                "updated_at": float(row.get("updated_at", 0.0) or 0.0),
+                "completed_at": float(row.get("completed_at", 0.0) or 0.0) if row.get("completed_at") else None,
+                "completed_by": trim(str(row.get("completed_by", "") or ""), 40),
+                "evidence": trim(str(row.get("evidence", "") or ""), 300),
+            })
+        plan_step = self._get_plan_step_by_id(step_key, bb)
+        rows = self._filter_parent_step_duplicate_worker_rows(rows, plan_step)
+        if role_key and not rows:
+            return self._plan_worker_todo_rows_from_blackboard(step_key, role="", board=bb)
+        rows.sort(key=self._plan_worker_todo_sort_key)
+        return rows
+
+    def _sync_plan_worker_todos_to_blackboard(
+        self,
+        step_id: str = "",
+        *,
+        rows: list[dict] | None = None,
+        board: dict | None = None,
+    ) -> bool:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        mirror = dict(bb.get("plan_worker_todos", {}) if isinstance(bb.get("plan_worker_todos"), dict) else {})
+        worker_owners = {"developer", "explorer", "reviewer"}
+        step_filter = trim(str(step_id or "").strip(), 40)
+        src_rows = rows if isinstance(rows, list) else self.todo.snapshot()
+        grouped: dict[str, list[dict]] = {}
+        plan_step_cache: dict[str, dict | None] = {}
+        for raw in src_rows:
+            if not isinstance(raw, dict):
+                continue
+            owner = self._sanitize_agent_role(raw.get("owner", "")) or ""
+            parent = trim(str(raw.get("parent_step_id", "") or "").strip(), 40)
+            if owner not in worker_owners or not parent:
+                continue
+            if step_filter and parent != step_filter:
+                continue
+            raw_content = str(raw.get("content", "") or "").strip()
+            parsed_status, parsed_content = split_todo_status_text(raw_content)
+            content = trim(normalize_work_text(parsed_content or raw_content) or (parsed_content or raw_content), 360)
+            if not content:
+                continue
+            raw_status = str(raw.get("status", "") or "").strip().lower().replace("-", "_").replace(" ", "_")
+            status = self._normalize_todo_status_value(raw.get("status", ""), parsed_status or "pending")
+            if parsed_status and raw_status in {"", "todo", "pending"}:
+                status = parsed_status
+            if status == "blocked":
+                status = "pending"
+            if parent not in plan_step_cache:
+                plan_step_cache[parent] = self._get_plan_step_by_id(parent, bb)
+            if self._plan_worker_row_duplicates_parent_step(
+                {"content": content, "parent_step_id": parent, "owner": owner},
+                plan_step_cache.get(parent),
+            ):
+                continue
+            item = {
+                "content": content,
+                "status": status,
+                "owner": owner,
+                "parent_step_id": parent,
+                "created_at": float(raw.get("created_at", 0.0) or 0.0),
+                "updated_at": float(raw.get("updated_at", 0.0) or 0.0),
+                "completed_at": float(raw.get("completed_at", 0.0) or 0.0) if raw.get("completed_at") else None,
+                "completed_by": trim(str(raw.get("completed_by", "") or ""), 40),
+                "evidence": trim(str(raw.get("evidence", "") or ""), 300),
+            }
+            grouped.setdefault(parent, []).append(item)
+        target_steps = {step_filter} if step_filter else set(grouped.keys())
+        if not step_filter:
+            target_steps.update(
+                trim(str(row.get("parent_step_id", "") or "").strip(), 40)
+                for row in src_rows
+                if isinstance(row, dict)
+                and self._sanitize_agent_role(row.get("owner", "")) in worker_owners
+                and str(row.get("parent_step_id", "") or "").strip()
+            )
+        changed = False
+        for parent in sorted(x for x in target_steps if x):
+            clean_rows = grouped.get(parent, [])
+            if parent not in plan_step_cache:
+                plan_step_cache[parent] = self._get_plan_step_by_id(parent, bb)
+            clean_rows = self._filter_parent_step_duplicate_worker_rows(clean_rows, plan_step_cache.get(parent))
+            clean_rows.sort(key=self._plan_worker_todo_sort_key)
+            if clean_rows:
+                if mirror.get(parent) != clean_rows:
+                    mirror[parent] = clean_rows
+                    changed = True
+            elif parent in mirror:
+                mirror.pop(parent, None)
+                changed = True
+        if changed:
+            bb["plan_worker_todos"] = mirror
+            bb["updated_at"] = float(now_ts())
+            self.blackboard = bb
+        return changed
+
+    def _reconcile_plan_worker_todos_with_blackboard(
+        self,
+        step_id: str,
+        *,
+        board: dict | None = None,
+    ) -> bool:
+        step_key = trim(str(step_id or "").strip(), 20)
+        if not step_key:
+            return False
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        mirror_rows = self._plan_worker_todo_rows_from_blackboard(step_key, role="", board=bb)
+        worker_owners = {"developer", "explorer", "reviewer"}
+        plan_step = self._get_plan_step_by_id(step_key, bb)
+        memory_rows = [
+            dict(row) for row in self.todo.snapshot()
+            if isinstance(row, dict)
+            and str(row.get("owner", "") or "").strip().lower() in worker_owners
+            and trim(str(row.get("parent_step_id", "") or "").strip(), 20) == step_key
+        ]
+        memory_rows = self._filter_parent_step_duplicate_worker_rows(memory_rows, plan_step)
+        if not mirror_rows:
+            mirror = bb.get("plan_worker_todos", {}) if isinstance(bb.get("plan_worker_todos"), dict) else {}
+            raw_mirror = mirror.get(step_key, []) if isinstance(mirror.get(step_key), list) else []
+            if raw_mirror or memory_rows:
+                return self._sync_plan_worker_todos_to_blackboard(step_key, rows=memory_rows, board=bb)
+            return False
+        before = [
+            (
+                self._plan_worker_todo_identity(row),
+                str(row.get("status", "") or "").strip().lower(),
+                str(row.get("owner", "") or "").strip().lower(),
+                trim(str(row.get("parent_step_id", "") or "").strip(), 20),
+            )
+            for row in memory_rows
+        ]
+        role_key = self._current_plan_worker_owner(bb)
+        self._merge_plan_worker_todo_items(mirror_rows + memory_rows, role=role_key)
+        after_rows = [
+            dict(row) for row in self.todo.snapshot()
+            if isinstance(row, dict)
+            and str(row.get("owner", "") or "").strip().lower() in worker_owners
+            and trim(str(row.get("parent_step_id", "") or "").strip(), 20) == step_key
+        ]
+        after_rows = self._filter_parent_step_duplicate_worker_rows(after_rows, plan_step)
+        after = [
+            (
+                self._plan_worker_todo_identity(row),
+                str(row.get("status", "") or "").strip().lower(),
+                str(row.get("owner", "") or "").strip().lower(),
+                trim(str(row.get("parent_step_id", "") or "").strip(), 20),
+            )
+            for row in after_rows
+        ]
+        return before != after
 
     def _active_plan_step_has_worker_todos(self, role: str = "") -> bool:
         step = self._get_active_plan_step()
@@ -37589,7 +39262,7 @@ body{padding:18px}
             }
         step_id = trim(str(step.get("id", "") or ""), 20)
         rows = self._active_plan_worker_todo_rows(step_id, role="") if step_id else []
-        expected = self._extract_plan_step_subtasks(step, limit=5)
+        expected = self._extract_plan_step_subtasks(step, limit=6)
         completed_count = 0
         in_progress_count = 0
         pending_count = 0
@@ -37668,7 +39341,7 @@ body{padding:18px}
             evidence = self._collect_blackboard_step_evidence(current_step, bb)
             if evidence:
                 parts.append(f"evidence={trim(evidence, 180)}")
-            if self._step_subtasks_all_completed(current_step) and self._plan_step_has_blackboard_evidence(current_step, bb):
+            if self._step_subtasks_all_completed(current_step) and self._plan_step_acceptance_gate_passed(current_step, None, bb):
                 parts.append("acceptance=ready")
         reply = bb.get("last_worker_reply", {}) if isinstance(bb.get("last_worker_reply"), dict) else {}
         if self._sanitize_agent_role(reply.get("role", "")) == role_key:
@@ -37790,6 +39463,115 @@ body{padding:18px}
             return "owner_worker"
         return "flat"
 
+    def _normalize_todo_status_value(self, value: object, default: str = "pending") -> str:
+        raw = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+        aliases = {
+            "todo": "pending",
+            "[_]": "pending",
+            "[]": "pending",
+            "[ ]": "pending",
+            "doing": "in_progress",
+            "working": "in_progress",
+            "inprogress": "in_progress",
+            "in_progress": "in_progress",
+            "[>]": "in_progress",
+            ">": "in_progress",
+            "done": "completed",
+            "finish": "completed",
+            "finished": "completed",
+            "[x]": "completed",
+            "x": "completed",
+        }
+        status = aliases.get(raw, raw or default)
+        if status in {"pending", "in_progress", "completed", "blocked"}:
+            return status
+        return default
+
+    def _normalize_plan_worker_todo_input(
+        self,
+        item: object,
+        *,
+        step_id: str,
+        role_key: str,
+        default_status: str = "pending",
+    ) -> dict:
+        worker_owners = {"developer", "explorer", "reviewer"}
+        step_key = trim(str(step_id or "").strip(), 20)
+        owner_hint = self._sanitize_agent_role(role_key) or self._current_plan_worker_owner()
+        if isinstance(item, str):
+            raw: dict = {"content": item}
+        elif isinstance(item, dict):
+            raw = dict(item)
+        else:
+            raw = {"content": str(item or "").strip()}
+        key = trim(str(raw.get("key", "") or "").strip(), 120)
+        if key.startswith("bb:"):
+            return raw
+        raw_content = str(raw.get("content", raw.get("text", raw.get("title", ""))) or "").strip()
+        parsed_status, parsed_content = split_todo_status_text(raw_content)
+        content = normalize_work_text(parsed_content or raw_content) or (parsed_content or raw_content)
+        content = trim(str(content or "").strip(), 500)
+        if not content:
+            return {}
+        raw_status = str(raw.get("status", raw.get("state", "")) or "").strip()
+        raw_status_key = raw_status.lower().replace("-", "_").replace(" ", "_")
+        status = self._normalize_todo_status_value(raw_status, parsed_status or default_status)
+        if parsed_status and raw_status_key in {"", "todo", "pending"}:
+            status = parsed_status
+        if status == "blocked":
+            status = "pending"
+        owner = self._sanitize_agent_role(raw.get("owner", "")) or owner_hint
+        if owner not in worker_owners:
+            owner = owner_hint
+        parent_step_id = trim(str(raw.get("parent_step_id", "") or step_key), 20) or step_key
+        row: dict = {
+            "content": content,
+            "status": status,
+            "owner": owner,
+        }
+        if parent_step_id:
+            row["parent_step_id"] = parent_step_id
+        active_form = str(raw.get("activeForm", raw.get("active_form", "")) or "").strip()
+        if active_form:
+            row["activeForm"] = active_form
+        for meta_key in ("created_at", "updated_at", "completed_at", "completed_by", "evidence"):
+            if meta_key in raw and raw.get(meta_key) not in (None, ""):
+                row[meta_key] = raw.get(meta_key)
+        return row
+
+    def _plan_worker_todo_sort_key(self, row: dict | None) -> tuple:
+        import re
+
+        if not isinstance(row, dict):
+            return (9999, 9999, 9, 0.0, "")
+        content = normalize_work_text(str(row.get("content", "") or "")) or str(row.get("content", "") or "")
+        text = content.strip()
+        low = text.lower()
+        match = re.match(r"^(\d+)\.(\d+)\b", low)
+        if match:
+            major = int(match.group(1))
+            minor = int(match.group(2))
+        elif self._is_plan_step_acceptance_subtask(text):
+            major = 9998
+            minor = 9998
+        else:
+            major = 9999
+            minor = 9999
+        status_order = {"completed": 0, "in_progress": 1, "pending": 2, "blocked": 3}
+        status = self._normalize_todo_status_value(row.get("status", ""), "pending")
+        try:
+            created_at = float(row.get("created_at", 0.0) or 0.0)
+        except Exception:
+            created_at = 0.0
+        return (
+            major,
+            minor,
+            status_order.get(status, 9),
+            created_at,
+            str(row.get("owner", "") or "").strip().lower(),
+            low,
+        )
+
     def _todo_route_rows(
         self,
         route_kind: str,
@@ -37824,6 +39606,30 @@ body{padding:18px}
         if route_kind == "pure_single":
             return [row for row in snap if self._todo_row_kind(row) == "flat"]
         return []
+
+    def _filter_plan_fragment_todo_rows(self, rows: list[dict]) -> list[dict]:
+        if not isinstance(rows, list) or len(rows) <= 1:
+            return list(rows or [])
+        out: list[dict] = []
+        expected = 1
+        candidate_count = len(rows)
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            content = normalize_embedded_newlines(row.get("content", "") or "").strip()
+            marker = self._plan_line_marker(content)
+            if self._plan_marker_is_sequence_outlier(
+                marker,
+                expected_number=expected,
+                candidate_count=candidate_count,
+            ):
+                continue
+            out.append(row)
+            if isinstance(marker, dict) and marker.get("kind") == "major":
+                number = int(marker.get("major", expected) or expected)
+                if number >= expected:
+                    expected = number + 1
+        return out
 
     def _todo_runtime_has_worker_rows(self, role: str = "") -> bool:
         route_kind = self._todo_route_kind(role=role)
@@ -37862,6 +39668,9 @@ body{padding:18px}
         content = re.sub(r"\s+", " ", content.strip().lower())
         if not content:
             return ""
+        parent_step_id = trim(str(row.get("parent_step_id", "") or "").strip(), 40)
+        if parent_step_id and self._is_plan_step_acceptance_subtask(content):
+            return f"acceptance:{parent_step_id}"
         match = re.match(r"^(\d+\.\d+)\b", content)
         if match:
             return f"substep:{match.group(1)}"
@@ -37907,12 +39716,19 @@ body{padding:18px}
 
         status_alias = {
             "todo": "pending",
+            "[_]": "pending",
+            "[]": "pending",
+            "[ ]": "pending",
             "doing": "in_progress",
             "inprogress": "in_progress",
             "in-progress": "in_progress",
+            "[>]": "in_progress",
+            ">": "in_progress",
             "done": "completed",
             "finish": "completed",
             "finished": "completed",
+            "[x]": "completed",
+            "x": "completed",
         }
         passthrough_rows: list[dict] = []
         merged_rows: list[dict] = []
@@ -38020,22 +39836,25 @@ body{padding:18px}
 
         incoming_normalized: list[dict] = []
         for idx, item in enumerate(items):
-            if isinstance(item, str):
-                raw = {"content": item, "status": "pending"}
-            elif isinstance(item, dict):
-                raw = dict(item)
-            else:
+            if not isinstance(item, (str, dict)):
                 raise ValueError(f"item {idx}: invalid type")
+            raw = self._normalize_plan_worker_todo_input(
+                item,
+                step_id=step_id,
+                role_key=role_key,
+                default_status="pending",
+            )
+            if not raw:
+                continue
             key = trim(str(raw.get("key", "") or "").strip(), 120)
             if key.startswith("bb:"):
                 incoming_normalized.append(raw)
                 continue
-            owner = str(raw.get("owner", "") or "").strip().lower()
-            if owner not in worker_owners:
-                raw["owner"] = role_key
             parent_step_id = trim(str(raw.get("parent_step_id", "") or ""), 20)
             if not parent_step_id:
                 raw["parent_step_id"] = step_id
+            if self._plan_worker_row_duplicates_parent_step(raw, active_step):
+                continue
             incoming_normalized.append(raw)
 
         passthrough_rows = [row for row in incoming_normalized if str(row.get("key", "") or "").startswith("bb:")]
@@ -38056,9 +39875,28 @@ body{padding:18px}
                         identity = _core_to_identity[check_core]
                         break
             merged = dict(merged_by_identity.get(identity, {}))
+            prev_status = self._normalize_todo_status_value(merged.get("status", ""), "")
+            incoming_status = self._normalize_todo_status_value(row.get("status", ""), "pending")
             if "activeForm" not in row and "active_form" not in row:
                 merged.pop("activeForm", None)
+            prev_content = str(merged.get("content", "") or "")
             merged.update(row)
+            if incoming_status:
+                merged["status"] = incoming_status
+            # Step-local progress is monotonic. A compact/resume or role change
+            # may cause a worker to resend the whole subtask list from 4.1, but
+            # that must not reopen completed work or demote the active subtask.
+            if prev_status == "completed" and incoming_status != "completed":
+                merged["status"] = "completed"
+                for field in ("completed_at", "completed_by", "evidence", "updated_at"):
+                    if field in merged_by_identity.get(identity, {}) and field not in row:
+                        merged[field] = merged_by_identity[identity].get(field)
+                if prev_content and len(prev_content) > len(str(row.get("content", "") or "")):
+                    merged["content"] = prev_content
+            elif prev_status == "in_progress" and incoming_status == "pending":
+                merged["status"] = "in_progress"
+                if prev_content and len(prev_content) > len(str(row.get("content", "") or "")):
+                    merged["content"] = prev_content
             merged["owner"] = str(merged.get("owner", "") or role_key).strip().lower() or role_key
             merged["parent_step_id"] = trim(str(merged.get("parent_step_id", "") or step_id), 20) or step_id
             # Fix 2 support: Timestamp new items for next-step detection
@@ -38071,6 +39909,7 @@ body{padding:18px}
                 ordered_identities.append(identity)
 
         merged_target_rows = [merged_by_identity[i] for i in ordered_identities if i in merged_by_identity]
+        merged_target_rows = self._filter_parent_step_duplicate_worker_rows(merged_target_rows, active_step)
 
         # Fix 4: Content-based deduplication to prevent duplicate subtasks from accumulating
         _seen_content: set[str] = set()
@@ -38097,6 +39936,22 @@ body{padding:18px}
                         and str(row.get("status", "")).lower() != "completed"):
                     row.pop("parent_step_id", None)  # Not for current step
 
+        current_step_rows = [
+            row for row in merged_target_rows
+            if trim(str(row.get("parent_step_id", "") or ""), 20) == step_id
+        ]
+        detached_rows = [
+            row for row in merged_target_rows
+            if trim(str(row.get("parent_step_id", "") or ""), 20) != step_id
+        ]
+        current_step_rows = self._plan_worker_rows_with_acceptance(
+            active_step,
+            current_step_rows,
+            expected=[str(row.get("content", "") or "") for row in current_step_rows],
+            owner=role_key,
+        )
+        merged_target_rows = current_step_rows + detached_rows
+
         # Insert merged_target_rows right after the active plan step's bb: row in preserved,
         # so subtasks appear nested under their parent step rather than at the list bottom.
         _step_key = str(active_step.get("key", "") or "")
@@ -38107,7 +39962,13 @@ body{padding:18px}
                     _insert_idx = _i + 1
                     break
         final_rows = preserved[:_insert_idx] + passthrough_rows + merged_target_rows + preserved[_insert_idx:]
-        return self.todo.update(final_rows)
+        result = self.todo.update(final_rows)
+        try:
+            self._sync_plan_worker_todos_to_blackboard(step_id)
+            self._update_plan_file_step_status()
+        except Exception:
+            pass
+        return result
 
     def _merge_owner_scoped_todo_items(self, items: list[dict], role: str = "") -> str:
         if not isinstance(items, list):
@@ -38298,8 +40159,8 @@ body{padding:18px}
         if missing_subtasks:
             return (
                 "<reminder>"
-                "No current-step subtasks are active. Continue with one concrete action for the active plan step; "
-                "create TodoWrite rows only if they materially improve execution tracking."
+                "No current-step subtasks are active. First call TodoWrite for this plan step only, "
+                "using parent_step_id for every row and exactly one in_progress item."
                 "</reminder>"
             )
         return (
@@ -38319,10 +40180,29 @@ body{padding:18px}
         current = next((r for r in rows if str(r.get("status", "") or "").strip().lower() == "in_progress"), None)
         pending = [r for r in rows if str(r.get("status", "") or "").strip().lower() == "pending"]
         completed = [r for r in rows if str(r.get("status", "") or "").strip().lower() == "completed"]
+        current_text = str((current or {}).get("content", "") or "")
+        current_is_acceptance = self._is_plan_step_acceptance_subtask(current_text)
+        acceptance_terms = self._plan_step_acceptance_terms()
+        acceptance_hint = (
+            f"The final subtask must be a semantic {acceptance_terms['prefix']} item with a concrete check action and evidence shape. "
+        )
+        if current_is_acceptance:
+            acceptance_hint += (
+                "The current subtask is the acceptance gate: execute the check, record evidence, and only mark it completed when it passes. "
+            )
+        else:
+            acceptance_hint += (
+                "Do not delegate reviewer-style validation before the current work subtask is completed; continue executable work first. "
+            )
+        continuity = self._plan_continuity_context_block(max_chars=4200, include_steps=False)
+        continuity_note = (
+            f"{continuity}\n"
+            if continuity else ""
+        )
         if not rows:
             todo_state = (
-                "No worker subtasks are active for this step. You may complete the step directly in one coherent pass "
-                f"when that is clearer; create TodoWrite rows scoped to parent_step_id='{step_id}' only if they materially improve tracking. "
+                "No worker subtasks are active for this step. First create 3-6 step-local TodoWrite rows; the final row must be a semantic acceptance check with evidence shape. "
+                f"scoped to parent_step_id='{step_id}', with exactly one in_progress item. "
             )
             subtasks_exist_ban = ""
         else:
@@ -38350,9 +40230,12 @@ body{padding:18px}
                 "It may be inspected with read_file but must never be edited with write_file/edit_file/bash redirection. "
                 "Plan advancement must happen only through route_to_next_agent with advance_plan_step=true after evidence is reviewed. "
                 f"Delegate ONLY against the current in-progress plan step (Step {step_idx}: {step_text}). "
+                "The delegation must preserve the approved plan charter, prior step outputs, and final deliverable logic. "
+                f"{continuity_note}"
                 f"{subtasks_exist_ban}"
                 f"{todo_state}"
-                "Treat existing worker subtasks as live execution state, but do not require new subtasks when none exist. "
+                f"{acceptance_hint}"
+                "Treat worker subtasks as the live execution state for the current plan step. "
                 "When subtasks exist, tell the owner to finish the current in_progress subtask first and update TodoWrite/TodoWriteRescue after real status changes. "
                 "Do not route to finish_current_task while the approved plan still has unfinished steps."
             )
@@ -38360,9 +40243,12 @@ body{padding:18px}
             f"PLAN/TODO DISCIPLINE: `{PLAN_FILE_RELATIVE_PATH}` is a read-only runtime mirror of the approved plan. "
             "Read it for status; never write/edit it directly. "
             f"Work ONLY on the current in-progress plan step (Step {step_idx}: {step_text}). "
+            "Keep this step aligned with the approved plan charter, prior step outputs, and final deliverable logic. "
+            f"{continuity_note}"
             f"{subtasks_exist_ban}"
             f"{todo_state}"
-            "When subtasks exist, update TodoWrite or TodoWriteRescue after real status changes; when none exist, do not create bookkeeping-only todos. "
+            f"{acceptance_hint}"
+            "After EACH completed subtask, update TodoWrite or TodoWriteRescue before starting the next one. "
             "Do not call finish_current_task for a subtask or a single plan step; use it only when the overall user task is truly complete."
         )
 
@@ -38390,7 +40276,871 @@ body{padding:18px}
         )
         return True
 
-    def _extract_plan_step_subtasks(self, plan_step: dict, limit: int = 5) -> list[str]:
+    def _is_plan_step_acceptance_subtask(self, text: object) -> bool:
+        import re
+
+        raw = normalize_work_text(str(text or "")) or str(text or "")
+        low = re.sub(r"^\s*\d+\.\d+\s+", "", raw.strip().lower())
+        if not low:
+            return False
+        prefixes = (
+            "验收", "驗收", "最终验收", "最終驗收",
+            "acceptance", "final acceptance", "final verification",
+            "verify acceptance", "semantic acceptance",
+            "受入確認", "受け入れ確認", "検収", "最終確認",
+        )
+        if low.startswith(prefixes):
+            return True
+        return (
+            low.startswith(("final check", "final verify"))
+            and ("evidence" in low or "证据" in low or "證據" in low or "証拠" in low)
+        )
+
+    def _plan_step_acceptance_terms(self) -> dict[str, str]:
+        lang = normalize_ui_language(getattr(self, "ui_language", DEFAULT_UI_LANGUAGE))
+        if lang == "en":
+            return {
+                "prefix": "Acceptance",
+                "evidence": "Evidence",
+                "suffix": "Evidence: record the actual check result and key tool/file output.",
+            }
+        if lang == "zh-TW":
+            return {
+                "prefix": "驗收",
+                "evidence": "證據",
+                "suffix": "證據：記錄實際檢查結果與關鍵工具/檔案輸出。",
+            }
+        if lang == "ja":
+            return {
+                "prefix": "受入確認",
+                "evidence": "証拠",
+                "suffix": "証拠：実際の確認結果と主要なツール/ファイル出力を記録する。",
+            }
+        return {
+            "prefix": "验收",
+            "evidence": "证据",
+            "suffix": "证据：记录实际检查结果和关键工具/文件输出。",
+        }
+
+    def _normalize_plan_step_acceptance_subtask_text(self, text: object) -> str:
+        raw = trim(normalize_work_text(str(text or "")) or str(text or "").strip(), 260)
+        if not raw:
+            return ""
+        terms = self._plan_step_acceptance_terms()
+        if not self._is_plan_step_acceptance_subtask(raw):
+            sep = ":" if normalize_ui_language(getattr(self, "ui_language", DEFAULT_UI_LANGUAGE)) == "en" else "："
+            raw = f"{terms['prefix']}{sep}{raw}"
+        evidence_markers = (
+            "证据", "證據", "証拠", "根拠", "evidence", "exit code",
+            "输出", "輸出", "出力", "output", "日志", "日誌", "ログ", "log",
+        )
+        if not any(marker.lower() in raw.lower() for marker in evidence_markers):
+            raw = trim(f"{raw}；{terms['suffix']}", 300)
+        return raw
+
+    def _is_generic_plan_step_acceptance_subtask(self, text: object) -> bool:
+        raw = normalize_work_text(str(text or "")) or str(text or "")
+        low = raw.lower()
+        generic_markers = (
+            "根据本步骤目标运行构建/测试/导入检查",
+            "根据本步骤目标",
+            "对照本步骤目标检查当前产出",
+            "依照本步驟目標執行建置/測試/匯入檢查",
+            "依照本步驟目標",
+            "對照本步驟目標檢查目前產出",
+            "このステップの目的に沿ってビルド/テスト/インポート確認",
+            "このステップの目的に照らして現在の成果",
+            "run the build/test/import check",
+            "check whether the current output fully satisfies this step",
+            "verify result",
+            "check whether output satisfies",
+            "current output",
+            "this step's output",
+            "当前产出是否",
+            "本步骤产出",
+            "目前產出是否",
+            "本步驟產出",
+            "record key output",
+            "记录关键输出",
+            "記錄關鍵輸出",
+            "关键工具/文件输出",
+            "關鍵工具/檔案輸出",
+            "key tool/file output",
+        )
+        return any(marker.lower() in low for marker in generic_markers)
+
+    def _plan_step_acceptance_subtask_is_specific(
+        self,
+        text: object,
+        plan_step: dict,
+        work_subtasks: list[str] | None = None,
+    ) -> bool:
+        raw = normalize_work_text(str(text or "")) or str(text or "")
+        if not raw or not self._is_plan_step_acceptance_subtask(raw):
+            return False
+        if self._is_generic_plan_step_acceptance_subtask(raw):
+            return False
+        low = raw.lower()
+        evidence_value_markers = (
+            "exit_code", "exit code", "rc=", "exit=", "pass", "passed", "ok",
+            "size=", "bytes", "kb", "mb", "http 200", "status 200",
+            "version=", "semantic_version", "文件大小", "字节", "退出码",
+            "通过", "已通过", "成功", "证据", "證據", "証拠",
+        )
+        if any(marker in low for marker in evidence_value_markers):
+            return True
+        action_low = re.split(
+            r"(?:证据|證據|証拠|根拠|evidence)\s*[:：]",
+            raw,
+            maxsplit=1,
+            flags=re.I,
+        )[0].lower()
+        concrete_markers = (
+            "path", "file", "directory", "folder", "console", "browser", "static", "server",
+            "module", "package", "dependency", "schema", "migration", "endpoint", "api",
+            "command", "build", "test", "lint", "typecheck", "compile", "runtime", "service",
+            "python", "javascript", "typescript", "go", "rust", "java", "kotlin", "swift",
+            "c++", "cpp", "c#", "dotnet", "php", "ruby", "html", "css", "sql", "shell",
+            "three.js", "vite", "react", "vue", "svelte", "docker", "kubernetes",
+            "路径", "文件", "目录", "模块", "包", "控制台", "浏览器", "静态服务", "加载", "入口", "依赖",
+            "构建", "测试", "静态检查", "类型检查", "编译", "运行", "服务", "接口", "端点", "数据库", "迁移", "表结构",
+            "路徑", "檔案", "目錄", "模組", "套件", "控制台", "瀏覽器", "靜態服務", "載入", "入口", "依賴",
+            "建置", "測試", "靜態檢查", "型別檢查", "編譯", "執行", "服務", "介面", "端點", "資料庫", "遷移",
+            "パス", "ファイル", "ディレクトリ", "コンソール", "ブラウザ", "読み込み", "依存",
+            "ビルド", "テスト", "型チェック", "コンパイル", "実行", "サービス", "エンドポイント", "データベース",
+        )
+        if any(marker in action_low for marker in concrete_markers):
+            return True
+        targets = self._plan_step_acceptance_targets(plan_step, work_subtasks)
+        for path in targets.get("paths", []) or []:
+            if str(path or "").lower() in low:
+                return True
+        target_aliases = {
+            "project_dir": ("project directory", "project folder", "workspace", "项目目录", "工程目录", "專案目錄", "프로ジェクト", "ディレクトリ"),
+            "source_code": ("source", "code", "module", "源码", "代码", "模組", "程式碼", "ソース", "コード"),
+            "language_code": ("python", "javascript", "typescript", "go", "rust", "java", "kotlin", "swift", "c++", "cpp", "c#", "dotnet", "php", "ruby"),
+            "three_dependency": ("three.js", "threejs", "three.min", "three 依赖", "three 依賴", "three 依存"),
+            "html_css_js_entry": ("html/css/js", "html", "css", "javascript", "入口文件", "入口檔案", "エントリファイル"),
+            "html_entry": ("html", "入口文件", "入口檔案", "エントリファイル"),
+            "html_file": ("html",),
+            "css_entry": ("css", "入口文件", "入口檔案", "エントリファイル"),
+            "css_file": ("css",),
+            "js_entry": ("javascript", ".js", "入口文件", "入口檔案", "エントリファイル"),
+            "js_file": ("javascript", ".js"),
+            "dependency_config": ("dependency", "package", "requirements", "cargo", "go.mod", "pom.xml", "gradle", "package.json", "vite", "npm", "pnpm", "yarn", "依赖", "依賴", "依存"),
+            "build_config": ("build", "compile", "makefile", "cmake", "webpack", "vite", "构建", "建置", "ビルド"),
+            "frontend_behavior": ("frontend", "webui", "web ui", "界面", "介面", "交互", "互動", "browser", "浏览器", "瀏覽器"),
+            "rendering": ("render", "canvas", "fps", "渲染", "描画"),
+            "runtime_service": ("run", "runtime", "service", "server", "port", "运行", "服務", "サーバー"),
+            "api_behavior": ("api", "endpoint", "route", "request", "response", "接口", "端点", "介面", "エンドポイント"),
+            "database_schema": ("database", "schema", "migration", "sql", "sqlite", "postgres", "mysql", "数据库", "資料庫"),
+            "data_files": ("csv", "json", "parquet", "dataset", "data", "数据", "資料"),
+            "asset_files": ("asset", "image", "svg", "png", "jpg", "font", "资源", "素材", "画像"),
+            "config_files": ("config", "settings", ".env", "yaml", "toml", "配置", "設定"),
+            "infra_files": ("docker", "kubernetes", "deployment", "ci", "workflow", "部署", "インフラ"),
+            "test_output": ("test", "pytest", "ruff", "py_compile", "jest", "vitest", "go test", "cargo test", "测试", "測試", "検証"),
+            "lint_typecheck": ("lint", "typecheck", "mypy", "eslint", "tsc", "ruff", "静态检查", "型別檢查"),
+            "document_output": ("document", "markdown", ".md", "文档", "文件", "章", "章节", "outline", "chapter", "小说", "文章"),
+            "referenced_paths": ("path", "file", "路径", "路徑", "パス", "ファイル"),
+        }
+        for key in targets.get("keys", []) or []:
+            aliases = target_aliases.get(str(key or ""), ())
+            if any(alias.lower() in action_low for alias in aliases):
+                return True
+        return False
+
+    def _plan_step_acceptance_targets(self, plan_step: dict, work_subtasks: list[str] | None = None) -> dict:
+        raw_parts = [
+            str((plan_step or {}).get("full_content", "") or (plan_step or {}).get("content", "") or "")
+        ]
+        raw_parts.extend(str(item or "") for item in (work_subtasks or [])[:8])
+        text = normalize_embedded_newlines("\n".join(raw_parts))
+        low = text.lower()
+        document_context = any(
+            token in low
+            for token in (
+                "文档", "文件", "document", "docs/", ".md", "markdown", "说明", "手册",
+                "文件", "ドキュメント", "説明", "マニュアル",
+            )
+        )
+        api_runtime_context = any(
+            token in low
+            for token in (
+                "endpoint", "route", "handler", "controller", "middleware", "server", "service", "curl",
+                "http request", "api request", "call api", "run server", "serve", "websocket",
+                "端点", "路由", "处理器", "控制器", "中间件", "服务", "运行请求", "启动服务", "调用接口",
+                "端點", "路由", "處理器", "控制器", "中介軟體", "服務", "執行請求", "啟動服務", "呼叫介面",
+                "エンドポイント", "ルート", "ハンドラ", "コントローラ", "ミドルウェア", "サーバー", "サービス",
+            )
+        )
+        paths: list[str] = []
+        path_re = re.compile(
+            r"(?:[\w.@()+ -]+/)+[\w.@()+ -]+\.[A-Za-z0-9]{1,8}\b"
+            r"|[\w.@()+-]+\.(?:html|css|js|mjs|ts|tsx|jsx|json|md|py|txt|yaml|yml|toml|rs|go|java|kt|swift|cpp|c|h)\b"
+        )
+        for match in path_re.finditer(text):
+            value = match.group(0).strip(" \t\r\n.,;:，。；：)）]")
+            if " " in value or "\t" in value:
+                value = value.replace("\t", " ").split()[-1].strip()
+            if value.lower() in {"three.js"}:
+                continue
+            if value and value not in paths:
+                paths.append(value)
+            if len(paths) >= 5:
+                break
+
+        keys: list[str] = []
+
+        def add(key: str):
+            if key not in keys:
+                keys.append(key)
+
+        if any(token in low for token in ("项目目录", "工程目录", "专案目录", "專案目錄", "project directory", "project folder", "workspace", "ディレクトリ")):
+            add("project_dir")
+        source_extensions = (
+            ".py", ".go", ".rs", ".java", ".kt", ".kts", ".swift",
+            ".cpp", ".cc", ".cxx", ".c", ".h", ".hpp", ".cs", ".php", ".rb", ".lua", ".r", ".scala", ".dart",
+            ".sh", ".bash", ".zsh", ".ps1", ".sql",
+        )
+        if any(ext in low for ext in source_extensions) or any(
+            token in low
+            for token in (
+                "source code", "module", "function", "class", "源码", "源代码", "代码", "模块", "函数", "类",
+                "原始碼", "程式碼", "模組", "函式", "ソース", "コード", "モジュール", "関数", "クラス",
+            )
+        ):
+            add("source_code")
+        if any(
+            token in low
+            for token in (
+                "python", "typescript", "javascript", "node", "deno", "go ", "golang", "rust", "java", "kotlin",
+                "swift", "c++", "cpp", " c ", "c#", "dotnet", ".net", "php", "ruby", "rails", "lua", "scala",
+                "dart", "flutter", "shell", "bash", "powershell", "sql",
+            )
+        ):
+            add("language_code")
+        if any(token in low for token in ("three.js", "threejs", "three min", "three.min", "three ")):
+            add("three_dependency")
+        has_html = "html" in low or ".html" in low
+        has_css = "css" in low or ".css" in low
+        has_js = any(
+            token in low
+            for token in ("javascript", " js", ".js", "/js", "js/", "js ", "js入口", "js 入口", "脚本", "腳本", "スクリプト")
+        )
+        has_entry = any(token in low for token in ("入口", "entry", "エントリ"))
+        if has_html and has_css and has_js and has_entry:
+            add("html_css_js_entry")
+        else:
+            if has_html:
+                add("html_entry" if has_entry else "html_file")
+            if has_css:
+                add("css_entry" if has_entry else "css_file")
+            if has_js:
+                add("js_entry" if has_entry else "js_file")
+        if any(
+            token in low
+            for token in (
+                "package.json", "requirements.txt", "pyproject.toml", "poetry.lock", "pipfile", "cargo.toml",
+                "cargo.lock", "go.mod", "go.sum", "pom.xml", "build.gradle", "gradle", "gemfile",
+                "composer.json", "pubspec.yaml", "package-lock.json", "pnpm-lock.yaml", "yarn.lock",
+                "vite", "npm", "pnpm", "yarn", "pip", "uv ", "poetry", "cargo", "maven", "依赖", "依賴", "dependency",
+            )
+        ):
+            add("dependency_config")
+        if any(
+            token in low
+            for token in (
+                "makefile", "cmakelists.txt", "cmake", "webpack", "vite", "rollup", "esbuild", "tsconfig",
+                "build", "compile", "构建", "编译", "建置", "編譯", "ビルド", "コンパイル",
+            )
+        ):
+            add("build_config")
+        if any(token in low for token in ("frontend", "webui", "web ui", "界面", "介面", "交互", "互動", "ui", "画面")):
+            add("frontend_behavior")
+        if any(token in low for token in ("3d", "canvas", "render", "渲染", "描画", "fps", "three.js")):
+            add("rendering")
+        if any(
+            token in low
+            for token in (
+                "runtime", "server", "port", "daemon", "cli", "command line", "run server", "serve",
+                "启动", "运行服务", "启动服务", "端口", "命令行", "啟動", "執行服務", "啟動服務", "服務執行",
+                "ポート", "起動", "サーバー", "サービス起動",
+            )
+        ):
+            add("runtime_service")
+        if any(
+            token in low
+            for token in (
+                "api", "endpoint", "route", "request", "response", "http", "graphql", "websocket",
+                "接口", "端点", "请求", "响应", "路由", "介面", "端點", "請求", "回應", "エンドポイント", "リクエスト",
+            )
+        ) and (api_runtime_context or not document_context):
+            add("api_behavior")
+        if any(
+            token in low
+            for token in (
+                "database", "schema", "migration", "sql", "sqlite", "postgres", "postgresql", "mysql", "redis",
+                "mongodb", "table", "index", "数据库", "表结构", "迁移", "資料庫", "遷移", "テーブル", "データベース",
+            )
+        ):
+            add("database_schema")
+        if any(
+            token in low
+            for token in (
+                "csv", "tsv", "jsonl", "parquet", "dataset", "data file", "data set",
+                "数据文件", "数据集", "资料文件", "資料檔案", "資料集", "データファイル", "データセット",
+            )
+        ):
+            add("data_files")
+        if any(token in low for token in ("png", "jpg", "jpeg", "svg", "webp", "gif", "font", "asset", "image", "资源", "素材", "画像")):
+            add("asset_files")
+        if any(token in low for token in (".env", "config", "settings", "yaml", "yml", "toml", "ini", "配置", "設定")):
+            add("config_files")
+        if any(token in low for token in ("dockerfile", "docker-compose", "kubernetes", "k8s", "ci", "github actions", "workflow", "部署", "インフラ")):
+            add("infra_files")
+        if any(
+            token in low
+            for token in (
+                "测试", "測試", "test", "pytest", "unittest", "jest", "vitest", "go test", "cargo test",
+                "ruff", "py_compile", "验证", "驗證", "検証",
+            )
+        ):
+            add("test_output")
+        if any(token in low for token in ("lint", "typecheck", "type check", "mypy", "eslint", "tsc", "clippy", "fmt", "静态检查", "类型检查", "型別檢查")):
+            add("lint_typecheck")
+        if any(token in low for token in ("文档", "文件", "document", "markdown", ".md", "章", "章节", "outline", "chapter", "小说", "文章")):
+            add("document_output")
+        if paths:
+            add("referenced_paths")
+        return {"keys": keys[:8], "paths": paths[:5], "low": low}
+
+    def _localized_plan_step_acceptance_parts(
+        self,
+        target_info: dict,
+        lang: str,
+        fallback_title: str,
+    ) -> tuple[str, str]:
+        keys = list(target_info.get("keys", []) or [])
+        paths = list(target_info.get("paths", []) or [])
+        labels_by_lang = {
+            "en": {
+                "project_dir": "the project directory",
+                "source_code": "the source code/module files",
+                "language_code": "the language-specific code changes",
+                "three_dependency": "the local Three.js dependency",
+                "html_css_js_entry": "the HTML/CSS/JS entry files",
+                "html_entry": "the HTML entry file",
+                "html_file": "the HTML file",
+                "css_entry": "the CSS entry file",
+                "css_file": "the CSS file",
+                "js_entry": "the JavaScript entry file",
+                "js_file": "the JavaScript file",
+                "dependency_config": "dependency/package configuration",
+                "build_config": "build/compile configuration",
+                "frontend_behavior": "the frontend loading and interaction behavior",
+                "rendering": "the rendering/FPS behavior",
+                "runtime_service": "the runtime service or command behavior",
+                "api_behavior": "the API route/request behavior",
+                "database_schema": "the database schema or migration",
+                "data_files": "the data files or dataset output",
+                "asset_files": "the asset files",
+                "config_files": "configuration files/settings",
+                "infra_files": "deployment or infrastructure files",
+                "test_output": "the relevant test or validation output",
+                "lint_typecheck": "static analysis or type-check output",
+                "document_output": "the document/output content",
+                "referenced_paths": "the referenced files",
+            },
+            "zh-TW": {
+                "project_dir": "專案目錄",
+                "source_code": "源碼/模組檔案",
+                "language_code": "特定語言程式碼修改",
+                "three_dependency": "本地 Three.js 依賴",
+                "html_css_js_entry": "HTML/CSS/JS 入口檔案",
+                "html_entry": "HTML 入口檔案",
+                "html_file": "HTML 檔案",
+                "css_entry": "CSS 入口檔案",
+                "css_file": "CSS 檔案",
+                "js_entry": "JavaScript 入口檔案",
+                "js_file": "JavaScript 檔案",
+                "dependency_config": "依賴/package 設定",
+                "build_config": "建置/編譯設定",
+                "frontend_behavior": "前端載入與互動行為",
+                "rendering": "渲染/FPS 行為",
+                "runtime_service": "執行服務或命令行為",
+                "api_behavior": "API 路由/請求行為",
+                "database_schema": "資料庫結構或遷移",
+                "data_files": "資料檔案或資料集產出",
+                "asset_files": "資源檔案",
+                "config_files": "設定檔/設定項",
+                "infra_files": "部署或基礎設施檔案",
+                "test_output": "相關測試或驗證輸出",
+                "lint_typecheck": "靜態分析或型別檢查輸出",
+                "document_output": "文件/產出內容",
+                "referenced_paths": "指定檔案",
+            },
+            "ja": {
+                "project_dir": "プロジェクトディレクトリ",
+                "source_code": "ソースコード/モジュールファイル",
+                "language_code": "言語別のコード変更",
+                "three_dependency": "ローカル Three.js 依存関係",
+                "html_css_js_entry": "HTML/CSS/JS エントリファイル",
+                "html_entry": "HTML エントリファイル",
+                "html_file": "HTML ファイル",
+                "css_entry": "CSS エントリファイル",
+                "css_file": "CSS ファイル",
+                "js_entry": "JavaScript エントリファイル",
+                "js_file": "JavaScript ファイル",
+                "dependency_config": "依存関係/package 設定",
+                "build_config": "ビルド/コンパイル設定",
+                "frontend_behavior": "フロントエンドの読み込みと操作",
+                "rendering": "描画/FPS の挙動",
+                "runtime_service": "実行サービスまたはコマンドの挙動",
+                "api_behavior": "API ルート/リクエストの挙動",
+                "database_schema": "データベーススキーマまたはマイグレーション",
+                "data_files": "データファイルまたはデータセット出力",
+                "asset_files": "アセットファイル",
+                "config_files": "設定ファイル/設定値",
+                "infra_files": "デプロイまたはインフラファイル",
+                "test_output": "関連するテストまたは検証出力",
+                "lint_typecheck": "静的解析または型チェック出力",
+                "document_output": "文書/成果物の内容",
+                "referenced_paths": "指定ファイル",
+            },
+            "zh-CN": {
+                "project_dir": "项目目录",
+                "source_code": "源码/模块文件",
+                "language_code": "特定语言代码修改",
+                "three_dependency": "本地 Three.js 依赖",
+                "html_css_js_entry": "HTML/CSS/JS 入口文件",
+                "html_entry": "HTML 入口文件",
+                "html_file": "HTML 文件",
+                "css_entry": "CSS 入口文件",
+                "css_file": "CSS 文件",
+                "js_entry": "JavaScript 入口文件",
+                "js_file": "JavaScript 文件",
+                "dependency_config": "依赖/package 配置",
+                "build_config": "构建/编译配置",
+                "frontend_behavior": "前端加载与交互行为",
+                "rendering": "渲染/FPS 行为",
+                "runtime_service": "运行服务或命令行为",
+                "api_behavior": "API 路由/请求行为",
+                "database_schema": "数据库结构或迁移",
+                "data_files": "数据文件或数据集产出",
+                "asset_files": "资源文件",
+                "config_files": "配置文件/配置项",
+                "infra_files": "部署或基础设施文件",
+                "test_output": "相关测试或验证输出",
+                "lint_typecheck": "静态分析或类型检查输出",
+                "document_output": "文档/产出内容",
+                "referenced_paths": "指定文件",
+            },
+        }
+        labels = labels_by_lang.get(lang) or labels_by_lang["zh-CN"]
+        target_labels = [labels[key] for key in keys if key in labels]
+        if paths:
+            target_labels.extend(paths[:3])
+        target_labels = list(dict.fromkeys(target_labels))[:5]
+
+        def join_targets(items: list[str]) -> str:
+            if not items:
+                return ""
+            if lang == "en":
+                return items[0] if len(items) == 1 else f"{', '.join(items[:-1])}, and {items[-1]}"
+            if lang == "ja":
+                return items[0] if len(items) == 1 else "、".join(items[:-1]) + "、および" + items[-1]
+            return items[0] if len(items) == 1 else "、".join(items[:-1]) + "以及" + items[-1]
+
+        target_text = join_targets(target_labels)
+        if not target_text:
+            target_text = fallback_title
+        path_or_file_keys = {
+            "project_dir", "three_dependency", "html_css_js_entry", "html_entry", "html_file",
+            "css_entry", "css_file", "js_entry", "js_file", "dependency_config", "referenced_paths",
+            "source_code", "language_code", "build_config", "database_schema", "data_files",
+            "asset_files", "config_files", "infra_files",
+        }
+        has_files = bool(paths or path_or_file_keys.intersection(keys))
+        has_frontend = bool({"frontend_behavior", "rendering", "html_css_js_entry"}.intersection(keys))
+        has_runtime = "runtime_service" in keys
+        has_api = "api_behavior" in keys
+        has_data = bool({"database_schema", "data_files"}.intersection(keys))
+        has_tests = bool({"test_output", "lint_typecheck"}.intersection(keys))
+        has_docs = "document_output" in keys
+        if lang == "en":
+            check = f"inspect {target_text} and confirm they exist, match this step's intent, and are usable"
+            evidence_bits = []
+            if has_files:
+                evidence_bits.append("record paths, file sizes, or directory listing")
+            if has_frontend:
+                evidence_bits.append("record page/static-server load status and console result")
+            if has_runtime:
+                evidence_bits.append("record command or service status and key output")
+            if has_api:
+                evidence_bits.append("record API request status and key response")
+            if has_data:
+                evidence_bits.append("record schema/data preview, row count, or migration status")
+            if has_tests:
+                evidence_bits.append("record command exit code and key output")
+            if has_docs:
+                evidence_bits.append("record output location plus satisfied/missing sections")
+            evidence = "; ".join(evidence_bits or ["record the concrete inspection result and remaining gaps"])
+            return check, evidence
+        if lang == "zh-TW":
+            check = f"檢查{target_text}是否已建立、符合本步驟意圖並可用"
+            evidence_bits = []
+            if has_files:
+                evidence_bits.append("記錄路徑、檔案大小或目錄列表")
+            if has_frontend:
+                evidence_bits.append("記錄頁面/靜態服務載入狀態與控制台結果")
+            if has_runtime:
+                evidence_bits.append("記錄命令或服務狀態與關鍵輸出")
+            if has_api:
+                evidence_bits.append("記錄 API 請求狀態與關鍵回應")
+            if has_data:
+                evidence_bits.append("記錄結構/資料預覽、行數或遷移狀態")
+            if has_tests:
+                evidence_bits.append("記錄命令 exit code 與關鍵輸出")
+            if has_docs:
+                evidence_bits.append("記錄產出位置以及滿足/缺失章節")
+            evidence = "；".join(evidence_bits or ["記錄具體檢查結果與剩餘缺口"])
+            return check, evidence
+        if lang == "ja":
+            check = f"{target_text}が作成済みで、このステップの意図に合い、利用可能か確認する"
+            evidence_bits = []
+            if has_files:
+                evidence_bits.append("パス、ファイルサイズ、またはディレクトリ一覧を記録する")
+            if has_frontend:
+                evidence_bits.append("ページ/静的サーバーの読み込み状態とコンソール結果を記録する")
+            if has_runtime:
+                evidence_bits.append("コマンドまたはサービス状態と主要出力を記録する")
+            if has_api:
+                evidence_bits.append("API リクエストの状態と主要レスポンスを記録する")
+            if has_data:
+                evidence_bits.append("スキーマ/データプレビュー、行数、またはマイグレーション状態を記録する")
+            if has_tests:
+                evidence_bits.append("コマンドの exit code と主要出力を記録する")
+            if has_docs:
+                evidence_bits.append("成果物の場所と満たした/不足している節を記録する")
+            evidence = "；".join(evidence_bits or ["具体的な確認結果と残りの不足を記録する"])
+            return check, evidence
+        check = f"检查{target_text}是否已创建、符合本步骤意图并可用"
+        evidence_bits = []
+        if has_files:
+            evidence_bits.append("记录路径、文件大小或目录列表")
+        if has_frontend:
+            evidence_bits.append("记录页面/静态服务加载状态和控制台结果")
+        if has_runtime:
+            evidence_bits.append("记录命令或服务状态和关键输出")
+        if has_api:
+            evidence_bits.append("记录 API 请求状态和关键响应")
+        if has_data:
+            evidence_bits.append("记录结构/数据预览、行数或迁移状态")
+        if has_tests:
+            evidence_bits.append("记录命令 exit code 和关键输出")
+        if has_docs:
+            evidence_bits.append("记录产出位置以及满足/缺失章节")
+        evidence = "；".join(evidence_bits or ["记录具体检查结果和剩余缺口"])
+        return check, evidence
+
+    def _default_plan_step_acceptance_subtask(self, plan_step: dict, work_subtasks: list[str] | None = None) -> str:
+        text = normalize_embedded_newlines(
+            str((plan_step or {}).get("full_content", "") or (plan_step or {}).get("content", "") or "")
+        )
+        lang = normalize_ui_language(getattr(self, "ui_language", DEFAULT_UI_LANGUAGE))
+        terms = self._plan_step_acceptance_terms()
+        sep = ":" if lang == "en" else "："
+        fallback_title = trim(re.sub(r"^\s*\d+(?:\.\d+)*[.)、]?\s*", "", text.replace("\n", " ")), 80)
+        if not fallback_title:
+            fallback_title = "current step" if lang == "en" else "当前步骤"
+        target_info = self._plan_step_acceptance_targets(plan_step, work_subtasks)
+        check, evidence = self._localized_plan_step_acceptance_parts(target_info, lang, fallback_title)
+        if lang == "en":
+            return f"{terms['prefix']}{sep} {check}; {terms['evidence']}{sep} {evidence}."
+        if lang == "zh-TW":
+            return f"{terms['prefix']}{sep}{check}；{terms['evidence']}{sep}{evidence}。"
+        if lang == "ja":
+            return f"{terms['prefix']}{sep}{check}；{terms['evidence']}{sep}{evidence}。"
+        return f"{terms['prefix']}{sep}{check}；{terms['evidence']}{sep}{evidence}。"
+
+    def _llm_plan_step_acceptance_subtask(self, plan_step: dict, work_subtasks: list[str] | None = None) -> str:
+        if not isinstance(plan_step, dict):
+            return ""
+        step_text = trim(
+            normalize_embedded_newlines(
+                str(plan_step.get("full_content", "") or plan_step.get("content", "") or "")
+            ),
+            1000,
+        )
+        if not step_text:
+            return ""
+        work_text = "\n".join(f"- {trim(str(item or ''), 180)}" for item in (work_subtasks or [])[:6])
+        fp_src = f"{step_text}\n{work_text}"
+        fp = hashlib.sha1(fp_src.encode("utf-8", errors="replace")).hexdigest()[:16]
+        cache = getattr(self, "_plan_step_acceptance_subtask_cache", {})
+        if isinstance(cache, dict) and fp in cache:
+            cached_item = self._normalize_plan_step_acceptance_subtask_text(cache.get(fp, ""))
+            if self._plan_step_acceptance_subtask_is_specific(cached_item, plan_step, work_subtasks):
+                return cached_item
+            try:
+                cache.pop(fp, None)
+            except Exception:
+                pass
+        try:
+            terms = self._plan_step_acceptance_terms()
+            lang = normalize_ui_language(getattr(self, "ui_language", DEFAULT_UI_LANGUAGE))
+            sep = ":" if lang == "en" else "："
+            prefix_example = f"{terms['prefix']}{sep}..."
+            evidence_example = f"{terms['evidence']}{sep}..."
+            prompt = (
+                "/no_think\n"
+                "Create the final acceptance subtask for this active approved plan step.\n"
+                f"It must be one concise TodoWrite item in UI language {lang}. It must start with '{terms['prefix']}{sep}'.\n"
+                "It must include BOTH the concrete check action and the evidence shape to record.\n"
+                "Choose the check semantically from the active step and the work subtasks before acceptance.\n"
+                "Name the concrete artifact, command, behavior, file path/type, dependency, document section, or inspection target that should be checked.\n"
+                "Name the evidence form that proves the check: e.g. paths and sizes, directory listing, command exit code/key output, browser/static-server load status, console result, or satisfied/missing sections.\n"
+                "Do NOT write a generic acceptance item such as 'verify result', 'check whether the output satisfies this step', 'run build/test/import check', or 'record key output'.\n"
+                "Do not include work from other plan steps.\n"
+                f"Return JSON only: {{\"acceptance_subtask\":\"{prefix_example}；{evidence_example}\"}}\n\n"
+                f"ACTIVE PLAN STEP:\n{step_text}\n\n"
+                f"WORK SUBTASKS BEFORE ACCEPTANCE:\n{work_text or '(none)'}"
+            )
+            resp = self.ollama.chat(
+                [{"role": "user", "content": prompt}],
+                system=self._inject_runtime_environment_context(
+                    "/no_think\nYou write one final acceptance TodoWrite subtask. Reply only valid JSON."
+                ),
+                max_tokens=220,
+                temperature=0.2,
+                think=False,
+            )
+            raw = str(resp.get("content", "") or resp.get("text", "") or "").strip()
+            payload = extract_json_object_from_text(raw, {})
+            item = ""
+            if isinstance(payload, dict):
+                item = trim(str(payload.get("acceptance_subtask", "") or ""), 260)
+            item = self._normalize_plan_step_acceptance_subtask_text(item)
+            if item and self._plan_step_acceptance_subtask_is_specific(item, plan_step, work_subtasks):
+                if not isinstance(cache, dict):
+                    cache = {}
+                cache[fp] = item
+                try:
+                    setattr(self, "_plan_step_acceptance_subtask_cache", cache)
+                except Exception:
+                    pass
+                return item
+        except Exception:
+            pass
+        return ""
+
+    def _ensure_plan_step_acceptance_subtask(
+        self,
+        plan_step: dict,
+        subtasks: list[str],
+        *,
+        allow_llm: bool = False,
+        limit: int = 6,
+    ) -> list[str]:
+        clean_items: list[str] = []
+        acceptance_item = ""
+        for item in subtasks or []:
+            text = trim(normalize_work_text(str(item or "")) or str(item or "").strip(), 260)
+            if not text:
+                continue
+            if self._is_plan_step_acceptance_subtask(text):
+                if self._plan_step_acceptance_subtask_is_specific(text, plan_step, clean_items):
+                    acceptance_item = text
+                continue
+            if text not in clean_items:
+                clean_items.append(text)
+        max_items = max(2, min(int(limit or 6), 7))
+        clean_items = clean_items[: max_items - 1]
+        if allow_llm and (not acceptance_item or self._is_generic_plan_step_acceptance_subtask(acceptance_item)):
+            acceptance_item = self._llm_plan_step_acceptance_subtask(plan_step, clean_items)
+        if not acceptance_item:
+            acceptance_item = self._default_plan_step_acceptance_subtask(plan_step, clean_items)
+        acceptance_item = self._normalize_plan_step_acceptance_subtask_text(acceptance_item)
+        if not clean_items:
+            step_text = trim(str((plan_step or {}).get("content", "") or "Complete this plan step"), 180)
+            clean_items.append(f"Complete this plan step with concrete evidence: {step_text}")
+        if acceptance_item:
+            clean_items.append(acceptance_item)
+        return clean_items[:max_items]
+
+    def _plan_worker_rows_with_acceptance(
+        self,
+        plan_step: dict,
+        rows: list[dict],
+        *,
+        expected: list[str] | None = None,
+        owner: str = "",
+    ) -> list[dict]:
+        step_id = trim(str((plan_step or {}).get("id", "") or ""), 20)
+        owner_key = self._sanitize_agent_role(owner) or self._current_plan_worker_owner()
+        work_rows: list[dict] = []
+        acceptance_rows: list[dict] = []
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            cloned = dict(row)
+            cloned["parent_step_id"] = trim(str(cloned.get("parent_step_id", "") or step_id), 20) or step_id
+            if str(cloned.get("owner", "") or "").strip().lower() not in {"developer", "explorer", "reviewer"}:
+                cloned["owner"] = owner_key
+            if self._is_plan_step_acceptance_subtask(cloned.get("content", "")):
+                acceptance_rows.append(cloned)
+            else:
+                work_rows.append(cloned)
+
+        expected_items = self._ensure_plan_step_acceptance_subtask(
+            plan_step,
+            expected or [str(row.get("content", "") or "") for row in work_rows],
+            allow_llm=True,
+            limit=6,
+        )
+        expected_acceptance = next(
+            (item for item in reversed(expected_items) if self._is_plan_step_acceptance_subtask(item)),
+            self._default_plan_step_acceptance_subtask(plan_step, []),
+        )
+
+        acceptance_row: dict
+        if acceptance_rows:
+            priority = {"in_progress": 0, "completed": 1, "pending": 2}
+            acceptance_rows.sort(key=lambda r: priority.get(str(r.get("status", "pending") or "pending").lower(), 9))
+            acceptance_row = dict(acceptance_rows[0])
+            existing_acceptance = self._normalize_plan_step_acceptance_subtask_text(
+                acceptance_row.get("content", "")
+            )
+            work_texts = [str(row.get("content", "") or "") for row in work_rows]
+            if not self._plan_step_acceptance_subtask_is_specific(existing_acceptance, plan_step, work_texts):
+                if str(acceptance_row.get("status", "pending") or "pending").lower() == "completed":
+                    acceptance_row["content"] = existing_acceptance or expected_acceptance
+                else:
+                    acceptance_row["content"] = expected_acceptance
+            else:
+                acceptance_row["content"] = existing_acceptance or expected_acceptance
+        else:
+            acceptance_row = {
+                "content": expected_acceptance,
+                "status": "pending",
+                "owner": owner_key,
+                "parent_step_id": step_id,
+            }
+        acceptance_row["owner"] = self._sanitize_agent_role(acceptance_row.get("owner", "")) or owner_key
+        acceptance_row["parent_step_id"] = trim(str(acceptance_row.get("parent_step_id", "") or step_id), 20) or step_id
+
+        work_open = [row for row in work_rows if str(row.get("status", "pending") or "pending").lower() != "completed"]
+        any_work_active = any(str(row.get("status", "") or "").lower() == "in_progress" for row in work_rows)
+        if work_open:
+            if str(acceptance_row.get("status", "pending") or "pending").lower() == "in_progress":
+                acceptance_row["status"] = "pending"
+            if not any_work_active:
+                for row in work_rows:
+                    if str(row.get("status", "pending") or "pending").lower() == "pending":
+                        row["status"] = "in_progress"
+                        break
+        else:
+            if str(acceptance_row.get("status", "pending") or "pending").lower() != "completed":
+                acceptance_row["status"] = "in_progress"
+
+        return work_rows + [acceptance_row]
+
+    def _plan_subtask_has_accumulated_evidence(
+        self,
+        plan_step: dict,
+        subtask_text: object,
+        *,
+        board: dict | None = None,
+    ) -> bool:
+        if not isinstance(plan_step, dict):
+            return False
+        text = str(subtask_text or "").strip()
+        if not text or self._is_plan_step_acceptance_subtask(text):
+            return False
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        step_id = trim(str(plan_step.get("id", "") or ""), 20)
+        since_ts = self._plan_step_activation_ts(plan_step)
+        expected_paths = self._extract_plan_step_referenced_paths(text, limit=10)
+        if expected_paths:
+            known_paths: list[str] = []
+            step_files = bb.get("step_files", {}) if isinstance(bb.get("step_files"), dict) else {}
+            step_entries = step_files.get(step_id, []) if step_id and isinstance(step_files.get(step_id), list) else []
+            for entry in step_entries:
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    ts = float(entry.get("ts", 0.0) or 0.0)
+                except Exception:
+                    ts = 0.0
+                if since_ts > 0 and ts > 0 and ts + 1e-6 < since_ts:
+                    continue
+                op = str(entry.get("op", "") or "").strip()
+                if op and op not in {"write_file", "edit_file", "read_file"}:
+                    continue
+                path = normalize_rel_preview_path(str(entry.get("path", "") or ""))
+                if path and not self._is_plan_infrastructure_path(path):
+                    known_paths.append(path)
+            artifacts = bb.get("code_artifacts", {}) if isinstance(bb.get("code_artifacts"), dict) else {}
+            for path, meta in artifacts.items():
+                if not isinstance(meta, dict):
+                    continue
+                try:
+                    ts = float(meta.get("updated_at", 0.0) or 0.0)
+                except Exception:
+                    ts = 0.0
+                if since_ts > 0 and ts > 0 and ts + 1e-6 < since_ts:
+                    continue
+                rel = normalize_rel_preview_path(str(path or ""))
+                if rel and not self._is_plan_infrastructure_path(rel):
+                    known_paths.append(rel)
+            known_paths = list(dict.fromkeys(known_paths))
+            all_paths_satisfied = True
+            for expected in expected_paths:
+                rel = normalize_rel_preview_path(expected)
+                if not rel:
+                    continue
+                satisfied = False
+                try:
+                    if self._session_path(rel).exists():
+                        satisfied = True
+                except Exception:
+                    pass
+                if not satisfied:
+                    for actual in known_paths:
+                        if rel == actual:
+                            satisfied = True
+                            break
+                        score, _reason = self._semantic_path_score(rel, actual)
+                        if score >= 0.72:
+                            satisfied = True
+                            break
+                if not satisfied:
+                    all_paths_satisfied = False
+                    break
+            return all_paths_satisfied
+        low = text.lower()
+        validation_terms = (
+            "run", "test", "build", "compile", "verify", "validate", "check",
+            "运行", "测试", "构建", "编译", "验证", "校验", "检查",
+            "執行", "測試", "建置", "編譯", "驗證", "檢查",
+            "実行", "テスト", "ビルド", "コンパイル", "検証", "確認",
+        )
+        if any(term in low for term in validation_terms):
+            return self._plan_step_has_blackboard_evidence(plan_step, bb)
+        return False
+
+    def _initial_plan_worker_row_status_from_evidence(
+        self,
+        plan_step: dict,
+        subtask_text: object,
+        *,
+        board: dict | None = None,
+    ) -> str:
+        if self._plan_subtask_has_accumulated_evidence(plan_step, subtask_text, board=board):
+            return "completed"
+        return "pending"
+
+    def _extract_plan_step_subtasks(self, plan_step: dict, limit: int = 6) -> list[str]:
         import re
 
         if not isinstance(plan_step, dict):
@@ -38428,28 +41178,84 @@ body{padding:18px}
             prose = [line for line in lines[1:] if not shellish_re.match(line)]
             for line in prose[: max(1, limit)]:
                 text = trim(line, 260)
-                if text and text != header and text not in picked:
+                # Treat prose as explicit subtasks only when the plan author
+                # wrote multiple actionable lines. A single paragraph should be
+                # semantically decomposed by the LLM instead of becoming a
+                # vague one-item todo.
+                if len(prose) >= 2 and text and text != header and text not in picked:
                     picked.append(text)
-        if not picked:
-            phase = self._plan_step_phase_hint(raw.lower())
-            phase_defaults = {
-                "research": ["Read relevant context", "Collect required references", "Summarize findings for this step"],
-                "design": ["Define the implementation scope", "Draft the interfaces for this step", "Confirm the design constraints"],
-                "implement": ["Create the required files", "Implement the core logic for this step", "Run a quick verification"],
-                "test": ["Prepare the test inputs", "Run the required checks", "Review the failing and passing results"],
-                "review": ["Inspect the generated changes", "Validate the critical paths", "Summarize review findings"],
-            }
-            picked = phase_defaults.get(phase, ["Break down the current step", "Execute the core work", "Verify the result"])
         out: list[str] = []
-        max_items = max(1, min(int(limit or 5), 7))
+        max_items = max(2, min(int(limit or 6), 7))
         for text in picked:
             clean = normalize_work_text(text) or str(text or "").strip()
             if not clean or clean == header or clean in out:
                 continue
             out.append(clean)
-            if len(out) >= max_items:
+            if len(out) >= max_items - 1:
                 break
-        return out
+        if out:
+            return out[: max_items - 1]
+        return []
+
+    def _llm_plan_step_subtasks(self, plan_step: dict, *, limit: int = 5) -> list[str]:
+        if not isinstance(plan_step, dict):
+            return []
+        step_text = trim(
+            normalize_embedded_newlines(
+                str(plan_step.get("full_content", "") or plan_step.get("content", "") or "")
+            ),
+            1200,
+        )
+        if not step_text:
+            return []
+        max_items = max(3, min(int(limit or 6), 6))
+        try:
+            terms = self._plan_step_acceptance_terms()
+            lang = normalize_ui_language(getattr(self, "ui_language", DEFAULT_UI_LANGUAGE))
+            sep = ":" if lang == "en" else "："
+            prompt = (
+                "/no_think\n"
+                "Create step-local execution subtasks for the active approved plan step.\n"
+                "Use the step semantics, not generic templates. Split only this step into concrete actions a worker can execute in order.\n"
+                "Do not include other plan steps, final delivery, or broad project management.\n"
+                f"Write all subtasks in UI language {lang}. "
+                f"The FINAL subtask is mandatory and must be a semantic acceptance subtask starting with '{terms['prefix']}{sep}'. "
+                "That final subtask must include both the check action and the evidence shape to record.\n"
+                "The final acceptance subtask must name the concrete artifact, command, behavior, file path/type, dependency, document section, or inspection target for this step. "
+                "Do NOT use generic acceptance text such as 'verify result', 'check whether the output satisfies this step', or 'run build/test/import check'.\n"
+                f"Return JSON only: {{\"subtasks\":[\"...\" ]}} with 3-{max_items} concise items.\n\n"
+                f"ACTIVE PLAN STEP:\n{step_text}"
+            )
+            resp = self.ollama.chat(
+                [{"role": "user", "content": prompt}],
+                system=self._inject_runtime_environment_context(
+                    "/no_think\nYou decompose one active plan step into concrete, ordered worker subtasks. Reply only valid JSON."
+                ),
+                max_tokens=360,
+                temperature=0.2,
+                think=False,
+            )
+            raw = str(resp.get("content", "") or resp.get("text", "") or "").strip()
+            payload = extract_json_object_from_text(raw, {})
+            rows = payload.get("subtasks", []) if isinstance(payload, dict) else []
+            out: list[str] = []
+            if isinstance(rows, list):
+                for item in rows:
+                    clean = normalize_work_text(trim(str(item or "").strip(), 220))
+                    if clean and clean not in out:
+                        out.append(clean)
+                    if len(out) >= max_items:
+                        break
+            if len(out) >= 2:
+                return self._ensure_plan_step_acceptance_subtask(
+                    plan_step,
+                    out,
+                    allow_llm=True,
+                    limit=max_items,
+                )
+        except Exception:
+            pass
+        return []
 
     def _ensure_worker_todos_for_plan_step(self, plan_step: dict | None, force_refresh: bool = False, owner: str = "") -> bool:
         if not isinstance(plan_step, dict):
@@ -38457,7 +41263,18 @@ body{padding:18px}
         step_id = trim(str(plan_step.get("id", "") or ""), 20)
         if not step_id:
             return False
-        expected = self._extract_plan_step_subtasks(plan_step, limit=5)
+        expected = self._extract_plan_step_subtasks(plan_step, limit=6)
+        if not expected:
+            expected = self._llm_plan_step_subtasks(plan_step, limit=6)
+        if not expected:
+            step_text = trim(str(plan_step.get("content", "") or "Execute and verify current plan step"), 180)
+            expected = [f"Complete this plan step with concrete evidence: {step_text}"]
+        expected = self._ensure_plan_step_acceptance_subtask(
+            plan_step,
+            expected,
+            allow_llm=True,
+            limit=6,
+        )
         if not expected:
             return False
         owner_key = str(owner or "").strip().lower()
@@ -38470,8 +41287,7 @@ body{padding:18px}
             base = normalize_work_text(str(text or "")) or str(text or "")
             return re.sub(r"\s+", " ", base.strip().lower())
 
-        expected_keys = [_fingerprint(text) for text in expected if _fingerprint(text)]
-        if not expected_keys:
+        if not [_fingerprint(text) for text in expected if _fingerprint(text)]:
             return False
         snap = self.todo.snapshot()
         worker_owners = {"developer", "explorer", "reviewer"}
@@ -38481,36 +41297,47 @@ body{padding:18px}
             and str(row.get("owner", "") or "").strip().lower() in worker_owners
             and str(row.get("parent_step_id", "") or "").strip() == step_id
         ]
-        linked_by_key: dict[str, dict] = {}
-        for row in linked_rows:
-            fp = _fingerprint(str(row.get("content", "") or ""))
-            if fp and fp not in linked_by_key:
-                linked_by_key[fp] = row
-        already_exact = (
-            len(linked_rows) == len(expected_keys)
-            and all(key in linked_by_key for key in expected_keys)
-        )
-        if already_exact and not force_refresh:
-            return False
-        replacement: list[dict] = []
-        for text in expected:
-            fp = _fingerprint(text)
-            prev = linked_by_key.get(fp, {})
-            status = str(prev.get("status", "pending") or "pending").strip().lower()
-            if status not in {"pending", "in_progress", "completed"}:
-                status = "pending"
-            row = {
-                "content": text,
-                "status": status,
-                "owner": str(prev.get("owner", "") or owner_key).strip().lower() or owner_key,
-                "parent_step_id": step_id,
-            }
-            replacement.append(row)
-        if replacement and not any(r.get("status") == "in_progress" for r in replacement) and any(r.get("status") == "pending" for r in replacement):
-            for row in replacement:
-                if row.get("status") == "pending":
-                    row["status"] = "in_progress"
-                    break
+        if linked_rows:
+            replacement = self._plan_worker_rows_with_acceptance(
+                plan_step,
+                linked_rows,
+                expected=expected,
+                owner=owner_key,
+            )
+            def _sig(rows: list[dict]) -> list[tuple[str, str, str, str]]:
+                return [
+                    (
+                        _fingerprint(str(row.get("content", "") or "")),
+                        str(row.get("status", "") or "").strip().lower(),
+                        str(row.get("owner", "") or "").strip().lower(),
+                        str(row.get("parent_step_id", "") or "").strip(),
+                    )
+                    for row in rows
+                    if isinstance(row, dict)
+                ]
+            if _sig(replacement) == _sig(linked_rows) and not force_refresh:
+                return False
+        else:
+            bb = self._ensure_blackboard()
+            replacement = [
+                {
+                    "content": text,
+                    "status": self._initial_plan_worker_row_status_from_evidence(
+                        plan_step,
+                        text,
+                        board=bb,
+                    ),
+                    "owner": owner_key,
+                    "parent_step_id": step_id,
+                }
+                for text in expected
+            ]
+            replacement = self._plan_worker_rows_with_acceptance(
+                plan_step,
+                replacement,
+                expected=expected,
+                owner=owner_key,
+            )
         if not replacement:
             return False
         preserved = [
@@ -38523,6 +41350,11 @@ body{padding:18px}
         ]
         with self.todo.lock:
             self.todo.items = preserved + replacement
+        try:
+            self._sync_plan_worker_todos_to_blackboard(step_id)
+            self._update_plan_file_step_status()
+        except Exception:
+            pass
         return True
 
     def _ensure_worker_todos_available_for_plan_step(
@@ -38537,7 +41369,18 @@ body{padding:18px}
         step_id = trim(str(plan_step.get("id", "") or ""), 20)
         if not step_id:
             return {"ok": False, "available": False, "changed": False, "reason": "missing-parent-step-id"}
-        expected = self._extract_plan_step_subtasks(plan_step, limit=5)
+        expected = self._extract_plan_step_subtasks(plan_step, limit=6)
+        if not expected:
+            expected = self._llm_plan_step_subtasks(plan_step, limit=6)
+        if not expected:
+            step_text = trim(str(plan_step.get("content", "") or "current plan step"), 180)
+            expected = [f"Complete this plan step with concrete evidence: {step_text}"]
+        expected = self._ensure_plan_step_acceptance_subtask(
+            plan_step,
+            expected,
+            allow_llm=True,
+            limit=6,
+        )
         if not expected:
             return {"ok": False, "available": False, "changed": False, "reason": "no-subtask-template"}
         before = self._active_plan_worker_todo_rows(step_id, role="")
@@ -38667,6 +41510,19 @@ body{padding:18px}
                 row["plan_step_index"] = idx
                 changed = True
                 repairs.append("renumbered-plan-step")
+
+        sanitized_rows, sanitized_changed, removed_fragments = self._sanitize_project_plan_todos(plan_rows)
+        sanitized_plan_rows = [
+            r for r in sanitized_rows
+            if isinstance(r, dict) and str(r.get("category", "") or "") == "plan_step"
+        ]
+        if sanitized_changed and sanitized_plan_rows:
+            plan_rows = sanitized_plan_rows
+            changed = True
+            repairs.append(
+                "removed-plan-step-fragments"
+                + (f":{','.join(removed_fragments[:3])}" if removed_fragments else "")
+            )
 
         if "rebuilt-plan-steps" in repairs and persisted_cursor > 0:
             restored_idx = min(max(0, persisted_cursor), len(plan_rows))
@@ -38819,7 +41675,12 @@ body{padding:18px}
         worker_count = 0
         if isinstance(active_step, dict):
             step_id = trim(str(active_step.get("id", "") or ""), 20)
-            expected_count = len(self._extract_plan_step_subtasks(active_step, limit=5))
+            expected = self._extract_plan_step_subtasks(active_step, limit=6)
+            if not expected:
+                existing_rows = self._active_plan_worker_todo_rows(step_id, role="")
+                expected_count = len(existing_rows) if existing_rows else 3
+            else:
+                expected_count = len(expected)
             worker_rows = self._active_plan_worker_todo_rows(step_id, role=role)
             worker_count = len(worker_rows)
             if expected_count > 0 and worker_count == 0:
@@ -38921,49 +41782,16 @@ body{padding:18px}
         return False
 
     def _single_mode_validation_gate(self, plan_step: dict, tool_results: list[dict]) -> bool:
-        """Gate passes when:
-          1. The model emitted <step-verified/> since step activation
-          2. Blackboard shows phase-appropriate accumulated evidence
-          3. Escape hatch: 10 consecutive blocks
-        The semantic quality reviewer remains the final acceptance gate."""
-        step_id = str(plan_step.get("id", "") or "")
-        _flag = f"_smvg_{step_id}"
-        if getattr(self, _flag, False):
-            return True  # Already validated in a previous round
-        step_content = str(plan_step.get("full_content", "") or plan_step.get("content", "") or "").lower()
-        phase = self._plan_step_phase_hint(step_content)
-        _n_flag = f"_smvg_n_{step_id}"
-        _n_blocked = int(getattr(self, _n_flag, 0))
-        if phase in ("research", "design"):
-            if self._plan_step_has_blackboard_evidence(plan_step):
-                setattr(self, _flag, True)
-                return True
-            setattr(self, _n_flag, _n_blocked + 1)
-            self._inject_single_mode_validation_hint(plan_step)
+        """Compatibility helper; final acceptance subtasks now own validation."""
+        if not isinstance(plan_step, dict):
             return False
-        # Escape hatch: after 10 consecutive blocks, unblock to prevent permanent stall
-        if _n_blocked >= 10:
-            setattr(self, _flag, True)
-            return True
-        # Path A: model explicit tag
-        if self._check_step_verified_tag(plan_step):
-            setattr(self, _flag, True)
-            return True
-        # Path B: blackboard shows phase-appropriate accumulated evidence
-        # implement: has_write AND (has_exec OR ...) — wrote files + ran bash
-        # test/review: has_exec OR has_test_pass — ran tests
-        # other: use generic evidence check
-        if self._plan_step_has_blackboard_evidence(plan_step):
-            setattr(self, _flag, True)
-            return True
-        # Gate blocked — increment counter and inject hint
-        setattr(self, _n_flag, _n_blocked + 1)
-        self._inject_single_mode_validation_hint(plan_step)
-        return False
+        return self._plan_step_has_blackboard_evidence(plan_step) or self._tool_results_have_validation_evidence(
+            plan_step,
+            tool_results,
+        )
 
     def _inject_single_mode_validation_hint(self, plan_step: dict):
-        """Inject a hint (rate-limited 20s) instructing the model to emit <step-verified/>
-        after evaluating bash output against the step's acceptance criteria."""
+        """Compatibility hint: ask the model to complete the acceptance subtask."""
         step_id = str(plan_step.get("id", "") or "")
         _ts_flag = f"_smvg_ts_{step_id}"
         _last_ts = float(getattr(self, _ts_flag, 0.0))
@@ -38990,8 +41818,8 @@ body{padding:18px}
             f"Before this step can advance, you must:\n"
             f"1. {action}\n"
             f"2. Review the bash output and confirm it meets the acceptance criteria\n"
-            f"3. If it passes, emit exactly: <step-verified/>\n"
-            f"4. If it fails, fix the issue and retry — do NOT emit <step-verified/> until resolved\n"
+            f"3. Record the evidence in the final acceptance TodoWrite subtask and mark it completed only if it passes\n"
+            f"4. If it fails, fix the issue and retry before completing the acceptance subtask\n"
             f"</verification-required>"
         )
         _recent = self.messages[-5:]
@@ -39000,7 +41828,7 @@ body{padding:18px}
 
     def _inject_sync_mode_verification_hint(self, plan_step: dict, worker_step: dict):
         """Inject a verification hint into agent_messages (rate-limited 30s) for sync mode.
-        Instructs the worker to emit <step-verified/> after evaluating bash output."""
+        Instructs the worker to finish the final acceptance subtask with evidence."""
         step_id = str(plan_step.get("id", "") or "")
         _ts_flag = f"_sync_sv_ts_{step_id}"
         _last_ts = float(getattr(self, _ts_flag, 0.0))
@@ -39026,8 +41854,8 @@ body{padding:18px}
             f"Before this step can advance:\n"
             f"1. {action}\n"
             f"2. Review the output and confirm acceptance criteria are met\n"
-            f"3. If it passes, emit exactly: <step-verified/>\n"
-            f"4. If it fails, fix and retry — do NOT emit <step-verified/> until resolved\n"
+            f"3. Record evidence in the final acceptance TodoWrite subtask and mark it completed only if it passes\n"
+            f"4. If it fails, fix and retry before completing the acceptance subtask\n"
             f"</verification-required>"
         )
         _recent = self.agent_messages[-5:]
@@ -39104,15 +41932,17 @@ body{padding:18px}
         _gate_blocked = False  # True when validation gate fired and blocked — no other path may advance
         # Priority 1: Check if worker subtasks are all completed (most reliable signal)
         subtasks_done = self._step_subtasks_all_completed(current)
+        acceptance_gate = self._plan_step_acceptance_gate_status(current, {"tool_results": tool_results}, bb)
+        acceptance_gate_ok = bool(acceptance_gate.get("ok", False))
         if subtasks_done:
-            # Validation gate: passes when model emitted <step-verified/>, blackboard has
-            # phase-appropriate evidence, or escape hatch (10 blocks). Gate is the authoritative
-            # "step done" check — no additional validation_ok required after gate passes.
-            _gate_ok = self._single_mode_validation_gate(current, tool_results)
-            if _gate_ok:
+            # The final step-local acceptance subtask is the validation gate.
+            # Once all subtasks are completed, advancement only needs concrete
+            # current or accumulated evidence; no external semantic reviewer or
+            # extra structured verification tag.
+            if acceptance_gate_ok and (validation_ok or self._step_has_accumulated_evidence(current, bb)):
                 should_advance = True
             else:
-                _gate_blocked = True  # Gate blocked — disable ALL remaining advancement paths
+                _gate_blocked = True  # Evidence missing — disable weaker advancement paths
         # Priority 2: Phase-based heuristics — BUT gate by subtask completion when subtasks exist
         # CRITICAL: A single write_file must NOT advance when 3+ subtasks remain
         # Skipped when validation gate has blocked advancement (subtasks_done + gate failed)
@@ -39149,40 +41979,7 @@ body{padding:18px}
             ):
                 should_advance = True
         if should_advance:
-            candidate_context = {
-                "phase": phase,
-                "mode": "single",
-                "subtasks_done": subtasks_done,
-                "validation_current": validation_ok_current,
-                "validation_blackboard": validation_ok_blackboard,
-                "blackboard_signals": {
-                    "has_write": bool(bb_sig.get("has_write")),
-                    "has_exec": bool(bb_sig.get("has_exec")),
-                    "has_review": bool(bb_sig.get("has_review")),
-                    "has_compile_pass": bool(bb_sig.get("has_compile_pass")),
-                    "has_test_pass": bool(bb_sig.get("has_test_pass")),
-                    "recent_files": list(bb_sig.get("recent_files", []) or [])[:4],
-                },
-            }
-            quality_review = self._llm_review_plan_step_quality(
-                current,
-                {"tool_results": tool_results, "text": self._latest_agent_assistant_text("developer")},
-                bb,
-                candidate_evidence=candidate_context,
-            )
-            self._record_plan_step_quality_review(current, quality_review, board=bb)
-            if not bool(quality_review.get("available", True)):
-                self._inject_semantic_review_unavailable_recheck(current, {"tool_results": tool_results}, quality_review)
-                self._sync_todos_from_blackboard(reason="single-agent-quality-review-unavailable")
-                return False
-            if not bool(quality_review.get("passed", False)):
-                self._inject_semantic_quality_rework_if_needed(current, {"tool_results": tool_results}, quality_review)
-                self._sync_todos_from_blackboard(reason="single-agent-quality-rework")
-                return False
             evidence = self._collect_step_evidence(current, {"tool_results": tool_results})
-            review_reason = trim(str(quality_review.get("reason", "") or ""), 120)
-            if review_reason:
-                evidence = trim(f"{evidence}; semantic_review: {review_reason}", 200)
             advanced = self._advance_plan_step(evidence=evidence, actor="single")
             if advanced:
                 try:
@@ -39192,6 +41989,21 @@ body{padding:18px}
                 return True
             return False
         else:
+            if subtasks_done and not acceptance_gate_ok:
+                self._blackboard_append_memory(
+                    "decision",
+                    (
+                        "blocked single-agent plan advancement because final acceptance subtask gate failed: "
+                        f"{trim(str(acceptance_gate.get('reason', '') or ''), 160)}"
+                    ),
+                    actor="single",
+                    tier="long",
+                )
+                # Track repeated failures and relax-advance so the step can't loop forever.
+                if self._acceptance_gate_handle_failure(
+                    current, acceptance_gate, bb, actor="single", target_roles=("developer",)
+                ):
+                    return True  # step force-advanced via gate-relax
             self._inject_rework_if_needed(current, {"tool_results": tool_results})
             self._sync_todos_from_blackboard(reason="single-agent-round")
             if todo_progress_signal and not subtasks_done:
@@ -39216,6 +42028,15 @@ body{padding:18px}
     def _todo_project_rows_from_blackboard(self, board: dict | None = None) -> list[dict]:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         todos = bb.get("project_todos", [])
+        if isinstance(todos, list):
+            todos, changed, _removed = self._sanitize_project_plan_todos(todos)
+            if changed:
+                bb["project_todos"] = todos
+                bb["plan_step_total"] = len([
+                    t for t in todos
+                    if isinstance(t, dict) and t.get("category") == "plan_step"
+                ])
+                self.blackboard = bb
         if not todos:
             return self._todo_owner_rows_from_blackboard(bb)
         rows = []
@@ -39245,6 +42066,11 @@ body{padding:18px}
         plan_data = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
         if has_plan_steps and str(plan_data.get("phase", "") or "").strip() == "executing":
             try:
+                active_step = self._get_active_plan_step(bb)
+                active_step_id = trim(str((active_step or {}).get("id", "") or ""), 20)
+                if active_step_id:
+                    self._reconcile_plan_worker_todos_with_blackboard(active_step_id, board=bb)
+                self._sync_plan_worker_todos_to_blackboard(board=bb)
                 self._update_plan_file_step_status()
             except Exception:
                 pass
@@ -39260,8 +42086,16 @@ body{padding:18px}
                 bridged_rows, bridged_flat_rows = self._bridge_flat_todos_to_active_plan_step(flat_rows, board=bb)
                 if bridged_flat_rows:
                     worker_rows = self._todo_route_rows(route_kind, rows=bridged_rows, board=bb)
+            if not worker_rows:
+                active_step = self._get_active_plan_step(bb)
+                active_step_id = trim(str((active_step or {}).get("id", "") or ""), 40)
+                worker_rows = self._plan_worker_todo_rows_from_blackboard(active_step_id, board=bb)
         elif route_kind == "plan_sync":
             worker_rows = self._todo_route_rows(route_kind, rows=existing, board=bb)
+            if not worker_rows:
+                active_step = self._get_active_plan_step(bb)
+                active_step_id = trim(str((active_step or {}).get("id", "") or ""), 40)
+                worker_rows = self._plan_worker_todo_rows_from_blackboard(active_step_id, board=bb)
         elif route_kind == "pure_sync":
             worker_rows = self._todo_route_rows(
                 route_kind,
@@ -39269,6 +42103,8 @@ body{padding:18px}
                 role=self._todo_worker_role_hint(board=bb),
                 board=bb,
             )
+        worker_rows = self._filter_plan_fragment_todo_rows(worker_rows)
+        non_system_rows = self._filter_plan_fragment_todo_rows(non_system_rows)
         # Smart trim: keep all active (in_progress/pending) system rows,
         # but only recent 3 completed system rows to save capacity for worker subtasks
         active_system = [r for r in system_rows if r.get("status") != "completed"]
@@ -40702,6 +43538,24 @@ body{padding:18px}
             )
         return False
 
+    def _approved_plan_has_unfinished_steps(self, board: dict | None = None) -> bool:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
+        plan_phase = str(plan.get("phase", "") or "").strip().lower()
+        if not (bool(self.runtime_plan_approved) or plan_phase == "executing"):
+            return False
+        todos = bb.get("project_todos", []) if isinstance(bb.get("project_todos"), list) else []
+        plan_steps = [
+            t for t in todos
+            if isinstance(t, dict) and str(t.get("category", "") or "") == "plan_step"
+        ]
+        if not plan_steps:
+            return False
+        return any(
+            str(t.get("status", "") or "").strip().lower() in {"pending", "in_progress", ""}
+            for t in plan_steps
+        )
+
     def _user_explicit_complexity_value(self, text: str) -> str:
         return infer_user_complexity_value(text)
 
@@ -40880,6 +43734,9 @@ body{padding:18px}
         self._ensure_plan_file_current()
         lines = [f"PLAN FILE: {PLAN_FILE_RELATIVE_PATH} (read_file only; runtime-managed mirror, never edit directly)",
                  "APPROVED PLAN STEPS:"]
+        continuity = self._plan_continuity_context_block(max_chars=4800, include_steps=False)
+        if continuity:
+            lines.append(continuity)
         for t in todos:
             if t.get("category") != "plan_step":
                 continue
@@ -40889,7 +43746,10 @@ body{padding:18px}
             phase_hint = self._plan_step_phase_hint(str(t.get("full_content", "") or t.get("content", "") or ""))
             phase_tag = f" [{phase_hint}]" if phase_hint else ""
             lines.append(f"  {mark} Step {idx}: {trim(str(t.get('content', '') or ''), 160)}{phase_tag}")
-        lines.append("Execute steps IN ORDER. Do NOT skip ahead. Mark current step done before advancing. ")
+        lines.append(
+            "Execute steps IN ORDER. Do NOT skip ahead. Mark current step done before advancing. "
+            "Every delegation must preserve the plan charter, prior step outputs, and final deliverable logic."
+        )
         lines.append(
             "STEP COMPLETION RULE: Set advance_plan_step=true ONLY when:\n"
             "  1. The worker has ALREADY executed tools and produced verifiable output "
@@ -40902,7 +43762,7 @@ body{padding:18px}
             "It is regenerated from blackboard state; direct edits are blocked and create recovery noise.\n"
             "COMPLEXITY LOCK: Do NOT change complexity or task_level below the plan-approved levels. "
         )
-        lines.append("MANDATORY: Your delegation instruction MUST reference the current plan step. "
+        lines.append("MANDATORY: Your delegation instruction MUST reference the current plan step AND the relevant plan-charter objective. "
                      "Do NOT reinterpret or replace plan steps with your own objectives. ")
         # Add loaded skills enforcement
         bb_skills = bb.get("loaded_skills", {})
@@ -40960,6 +43820,92 @@ body{padding:18px}
             return "implement"
         return ""
 
+    def _plan_step_acceptance_guidance(self, plan_step: dict) -> dict:
+        """Return a concrete what+how acceptance spec for a plan step.
+
+        The acceptance gate (`_plan_step_acceptance_gate_status`) decides PASS by
+        matching tool evidence against an inferred category. Historically that
+        expected category was only revealed AFTER the worker failed the gate,
+        which is why steps could loop forever: the model never knew up front
+        *what* to verify or *how*. This helper exposes the same intent as an
+        actionable spec the worker sees before and during execution.
+
+        Returns: {phase, what, how, example, evidence_kind}
+        """
+        text = str(
+            (plan_step or {}).get("full_content", "")
+            or (plan_step or {}).get("content", "")
+            or ""
+        )
+        low = text.lower()
+        phase = self._plan_step_phase_hint(text)
+        # Mirror the gate's category heuristics so guidance == what the gate checks.
+        wants_runtime = self._plan_text_explicit_runtime_check(low) or (
+            any(tok in low for tok in ("运行", "执行", "run", "実行")) and self._plan_text_runtime_subject(low)
+        )
+        wants_file = any(
+            tok in low for tok in (
+                "读取", "检查", "文件", "目录", "路径", "选择器", "read", "inspect", "file",
+                "directory", "path", "selector", "檢查", "讀取", "確認", "ファイル",
+            )
+        ) or self._plan_text_file_content_subject(low)
+        wants_research = any(
+            tok in low for tok in (
+                "检索", "搜索", "研究", "调研", "资料", "来源", "引用", "research", "search",
+                "source", "citation", "搜集", "收集", "調査", "検索",
+            )
+        )
+        if wants_file and self._plan_text_prefers_file_content_evidence(low):
+            wants_runtime = False
+        if wants_runtime or phase in ("test", "review"):
+            return {
+                "phase": phase or "test",
+                "evidence_kind": "runtime",
+                "what": "Confirm the change actually runs/builds/passes — not just that a file exists.",
+                "how": "Run the project's real check and confirm a success signal (exit 0 / tests passed / HTTP 200 / no errors).",
+                "example": "bash: run the build/test, or `node --check`/`python -m py_compile` for touched files; capture the exit code.",
+            }
+        if phase == "implement" or (not wants_file and not wants_research and not phase):
+            return {
+                "phase": phase or "implement",
+                "evidence_kind": "runtime",
+                "what": "Confirm the implemented code is syntactically valid and does what the step requires.",
+                "how": "Write/edit the file AND run a concrete check (compile/lint/test/run) that proves it works.",
+                "example": "bash: `python -m py_compile <file>` or `node --check <file>` or the project's test command; show passing output.",
+            }
+        if wants_file:
+            return {
+                "phase": phase or "implement",
+                "evidence_kind": "file",
+                "what": "Confirm the produced/edited file's CONTENT matches the step's requirement.",
+                "how": "read_file the target and verify the specific content/selector/section is present in the output.",
+                "example": "read_file: open the file and quote the key lines that satisfy the step.",
+            }
+        if wants_research:
+            return {
+                "phase": phase or "research",
+                "evidence_kind": "research",
+                "what": "Confirm the research produced concrete, cited findings (not an empty/failed search).",
+                "how": "Run the retrieval/search and record the sources + key extracted facts to the blackboard.",
+                "example": "agent_web_search / query_*_library, then write_to_blackboard with the findings and sources.",
+            }
+        return {
+            "phase": phase or "",
+            "evidence_kind": "generic",
+            "what": "Confirm the step's concrete deliverable exists and is correct.",
+            "how": "Take one observable action (read/run/search) that produces evidence the deliverable is done.",
+            "example": "bash or read_file that shows the deliverable in a good state.",
+        }
+
+    def _plan_step_acceptance_guidance_text(self, plan_step: dict, *, header: str = "ACCEPTANCE CRITERIA") -> str:
+        g = self._plan_step_acceptance_guidance(plan_step)
+        return (
+            f"{header} for this step — WHAT to verify: {g['what']} "
+            f"HOW: {g['how']} EXAMPLE: {g['example']} "
+            "Make the FINAL step-local TodoWrite subtask this acceptance check, execute it with a real tool call, "
+            "and only mark it completed once the evidence above is present in this turn."
+        )
+
     def _infer_current_phase_from_blackboard(self) -> str:
         """Infer the current task phase from blackboard state and active plan step."""
         bb = self._ensure_blackboard()
@@ -41005,32 +43951,32 @@ body{padding:18px}
             # Snapshot worker todos so the manager can see what was actually executed.
             worker_hint = ""
             try:
+                cur_step_id = trim(str(cur.get("id", "") or ""), 40)
                 worker_todos = [
                     r for r in self.todo.snapshot()
                     if str(r.get("owner", "") or "").lower() in {"developer", "explorer", "reviewer"}
+                    and str(r.get("parent_step_id", "") or "").strip() == cur_step_id
                     and not str(r.get("key", "") or "").startswith("bb:")
                 ]
+                if not worker_todos:
+                    worker_todos = self._plan_worker_todo_rows_from_blackboard(cur_step_id, board=bb)
                 if worker_todos:
                     completed_w = [r for r in worker_todos if str(r.get("status", "")).lower() == "completed"]
                     pending_w = [r for r in worker_todos if str(r.get("status", "")).lower() not in ("completed",)]
                     if not pending_w and completed_w:
-                        # Verify actual work evidence before suggesting advance
-                        bb_now = self._ensure_blackboard()
-                        has_artifacts = bool(bb_now.get("code_artifacts"))
-                        has_research = bool(bb_now.get("research_notes"))
-                        has_shell_output = bool(bb_now.get("execution_logs"))
-                        has_evidence = has_artifacts or has_research or has_shell_output
-                        if has_evidence:
+                        acceptance_gate = self._plan_step_acceptance_gate_status(cur, None, self._ensure_blackboard())
+                        if bool(acceptance_gate.get("ok", False)):
                             worker_hint = (
                                 f"Worker subtasks: all {len(completed_w)} completed "
                                 f"({', '.join(trim(str(r.get('content','') or ''), 40) for r in completed_w[:3])}). "
-                                "Blackboard has concrete outputs. \u2192 Set advance_plan_step=true NOW. "
+                                "Final acceptance gate has matching evidence. \u2192 Set advance_plan_step=true NOW. "
                             )
                         else:
                             worker_hint = (
                                 f"Worker subtasks: all {len(completed_w)} marked completed "
-                                "but blackboard has NO concrete outputs (no code_artifacts, research_notes, or execution_logs). "
-                                "\u2192 Do NOT advance. Re-delegate to verify actual work was done. "
+                                "but the final acceptance gate is not satisfied "
+                                f"({trim(str(acceptance_gate.get('reason', '') or ''), 80)}). "
+                                "\u2192 Do NOT advance. Re-delegate to execute the acceptance subtask and record evidence. "
                             )
                     elif completed_w or pending_w:
                         worker_hint = (
@@ -41041,17 +43987,6 @@ body{padding:18px}
                 pass
             # Build an explicit completion hint from blackboard-side evidence.
             bb_evidence_hint = ""
-            review_attempt_hint = ""
-            attempts = bb.get("plan_step_quality_review_attempts", {})
-            cur_step_id = trim(str(cur.get("id", "") or ""), 80)
-            if isinstance(attempts, dict) and cur_step_id:
-                attempt_row = attempts.get(cur_step_id)
-                if isinstance(attempt_row, dict) and str(attempt_row.get("status", "") or "") == "unavailable":
-                    review_attempt_hint = (
-                        "Last semantic review was unavailable/unparseable, not a quality failure. "
-                        "Route to Reviewer to inspect evidence and then retry advance_plan_step=true; "
-                        f"do not edit `{PLAN_FILE_RELATIVE_PATH}`. "
-                    )
             is_research_step = any(kw in step_content_low for kw in ("读取", "分析", "研究", "调研", "检索", "搜索", "查找", "查询", "收集", "采集", "提取", "整理", "数据", "排行", "资金流向", "read", "analyze", "extract", "research", "summarize", "search", "collect", "gather", "retrieve", "总结"))
             is_implement_step = any(kw in step_content_low for kw in ("创建", "写", "生成", "制作", "implement", "create", "write", "generate", "build", "pptx", "ppt"))
             is_test_step = any(kw in step_content_low for kw in ("测试", "验证", "test", "verify", "compile", "run"))
@@ -41084,7 +44019,6 @@ body{padding:18px}
                 f"Focus on THIS step. When done, set advance_plan_step=true; do not edit `{PLAN_FILE_RELATIVE_PATH}` directly. "
                 f"{worker_hint}"
                 f"{bb_evidence_hint}"
-                f"{review_attempt_hint}"
             )
         # Generic project-todo mode when no plan-step structure is active.
         pending = [t for t in todos if t.get("status") != "completed"]
@@ -42190,12 +45124,33 @@ body{padding:18px}
             current_subtask = trim(str(snapshot.get("current_subtask", "") or ""), 180)
             if current_subtask:
                 lines.append(f"Current subtask: {current_subtask}.")
+
+        def _is_stale_semantic_followup_text(text: str) -> bool:
+            low = str(text or "").strip().lower()
+            if not low:
+                return False
+            stale_markers = (
+                "pending semantic audit follow-up",
+                "semantic-quality-followup",
+                "semantic quality review unavailable",
+                "semantic review was unavailable",
+                "returned no json",
+                "route this retry as a semantic follow-up",
+                "follow the pending semantic audit",
+                "semantic-review-retry",
+                "待处理语义审核",
+                "语义审核 follow-up",
+            )
+            return any(marker in low for marker in stale_markers)
+
         try:
             memory_signal = self._blackboard_memory_context_markdown(for_role=target_role, max_chars=900)
             memory_lines = []
             for raw_line in str(memory_signal or "").splitlines():
                 line = trim(raw_line.lstrip("#- ").strip(), 180)
                 if not line or line.lower() in {"task memory", "active focus evidence", "stable cross-step memory"}:
+                    continue
+                if _is_stale_semantic_followup_text(line):
                     continue
                 memory_lines.append(line)
                 if len(memory_lines) >= 4:
@@ -42234,6 +45189,8 @@ body{padding:18px}
                 if not isinstance(row, dict):
                     continue
                 content = trim(str(row.get("content", "") or ""), 220)
+                if _is_stale_semantic_followup_text(content):
+                    continue
                 if content:
                     lines.append(f"Recent review signal: {content}")
                     break
@@ -43075,16 +46032,22 @@ body{padding:18px}
                     board=bb_focus,
                 )
         if bool(executor_mode):
+            # Even in a stateless hot-swap, anchor the agent to the plan arc so
+            # "ignore old plans" never means "lose the framework". The roadmap +
+            # charter keep the isolated step connected to the overall goal.
+            charter_anchor = self._plan_continuity_context_block(max_chars=3200, include_steps=False)
+            seed_body = (
+                "Executor mode is enabled by watchdog. You are stateless for this step: "
+                "ignore old conversational chatter, execute only the delegated step, call concrete tools, "
+                "and write verifiable evidence to blackboard. "
+                "Stay consistent with the plan charter and roadmap below — the step is part of a larger plan, "
+                "not an isolated task."
+            )
+            if charter_anchor:
+                seed_body = seed_body + "\n\n" + charter_anchor
             executor_seed = {
                 "role": "system",
-                "content": self._apply_agent_language_policy(
-                    (
-                        "Executor mode is enabled by watchdog. You are stateless for this step: "
-                        "ignore old conversational plans, execute only the delegated step, call concrete tools, "
-                        "and write verifiable evidence to blackboard."
-                    ),
-                    max_len=800,
-                ),
+                "content": self._apply_agent_language_policy(seed_body, max_len=4000),
                 "ts": now_ts(),
                 "agent_role": role_key,
             }
@@ -44334,7 +47297,9 @@ body{padding:18px}
         _status_alias = {
             "todo": "pending", "doing": "in_progress", "inprogress": "in_progress",
             "in-progress": "in_progress", "done": "completed", "finish": "completed",
-            "finished": "completed",
+            "finished": "completed", "[_]": "pending", "[]": "pending",
+            "[ ]": "pending", "[>]": "in_progress", ">": "in_progress",
+            "[x]": "completed", "x": "completed",
         }
         for idx, item in enumerate(limited):
             if isinstance(item, dict):
@@ -44711,6 +47676,50 @@ body{padding:18px}
             },
         )
 
+    def _inject_plan_no_tool_recovery_hint(self, assistant_text: str = ""):
+        bb = self._ensure_blackboard()
+        step = self._get_active_plan_step(bb)
+        step_id = trim(str((step or {}).get("id", "") or ""), 20)
+        step_label = trim(str((step or {}).get("content", "") or "current plan step"), 220)
+        rows = self._active_plan_worker_todo_rows(step_id, role="") if step_id else []
+        current = next(
+            (r for r in rows if str(r.get("status", "") or "").strip().lower() == "in_progress"),
+            None,
+        )
+        pending = next(
+            (r for r in rows if str(r.get("status", "") or "").strip().lower() == "pending"),
+            None,
+        )
+        current_text = trim(str((current or pending or {}).get("content", "") or ""), 260)
+        latest = trim(strip_thinking_content(str(assistant_text or "")).strip(), 420)
+        self._prune_runtime_retry_hints()
+        self.messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "<plan-no-tool-recovery>"
+                    "Approved plan execution is still active, so the previous assistant text cannot pause for user confirmation or stop as a final answer. "
+                    f"Stay on the active plan step: {step_label}. "
+                    f"{('Current subtask: ' + current_text + '. ') if current_text else ''}"
+                    "Next turn must use exactly one concrete tool call. "
+                    "If the current subtask or final acceptance check is complete, update the same TodoWrite/TodoWriteRescue row to completed with evidence. "
+                    "If evidence is missing, run one focused read/bash/check tool to collect it. "
+                    "Do not ask the user to confirm routine plan advancement and do not summarize instead of updating the live plan state. "
+                    f"{('Previous text: ' + latest) if latest else ''}"
+                    "</plan-no-tool-recovery>"
+                ),
+                "ts": now_ts(),
+            }
+        )
+        self._emit(
+            "status",
+            {
+                "summary": (
+                    "plan no-tool recovery injected; approved plan is still active"
+                )
+            },
+        )
+
     def _inject_action_promise_recovery_hint(self, assistant_text: str):
         goal = trim(str(self._latest_user_goal_text() or ""), 500)
         latest = trim(strip_thinking_content(str(assistant_text or "")).strip(), 500)
@@ -44743,33 +47752,35 @@ body{padding:18px}
             if budget_forced
             else ""
         )
-        # If in plan mode, include the current in-progress subtask and the <step-verified/> escape path
+        # If in plan mode, include the current in-progress worker subtask.
         plan_subtask_hint = ""
         try:
             bb = self._ensure_blackboard()
-            todos = bb.get("project_todos", [])
-            active_step = next(
-                (t for t in todos if t.get("category") == "plan_step" and t.get("status") == "in_progress"),
-                None,
-            )
+            active_step = self._current_plan_step_row(bb)
             if active_step:
                 step_id = str(active_step.get("id", "") or "")
                 active_subtask = next(
                     (
-                        t for t in todos
-                        if t.get("category") != "plan_step"
-                        and t.get("status") == "in_progress"
-                        and str(t.get("parent_step_id", "") or "") == step_id
+                        t for t in self._active_plan_worker_todo_rows(step_id, role="")
+                        if str(t.get("status", "") or "").strip().lower() == "in_progress"
                     ),
                     None,
                 )
                 if active_subtask:
                     subtask_text = trim(str(active_subtask.get("content", "") or ""), 120)
+                    if self._is_plan_step_acceptance_subtask(subtask_text):
+                        action_hint = (
+                            "当前子任务是最终验收：请执行验收检查，记录工具/文件/黑板证据，"
+                            "通过后用 TodoWrite 标记 completed；失败则先修复。"
+                        )
+                    else:
+                        action_hint = (
+                            "请只推进这个子任务；完成后立即用 TodoWrite 标记 completed，"
+                            "并切换下一项为 in_progress。"
+                        )
                     plan_subtask_hint = (
                         f"\n当前子任务: {subtask_text}\n"
-                        "如果此子任务需要视觉/浏览器验证而无法通过 bash 完整执行，"
-                        "请创建相关文件，通过代码审查确认实现正确，"
-                        "然后在回复中发出 <step-verified/> 并调用 TodoWrite 将子任务标记为 completed。"
+                        f"{action_hint}"
                     )
         except Exception:
             pass
@@ -46957,20 +49968,39 @@ body{padding:18px}
         clean_text = strip_thinking_content(str(text or "")).strip()
         def _lang_payload(seed: str) -> str:
             return self._apply_agent_language_policy(seed, max_len=2000)
-        if self._current_delegate_is_mandatory_for(role_key):
-            self._emit(
-                "status",
-                {
-                    "summary": (
-                        f"mandatory delegate still unmet for {self._agent_display_name(role_key)}; "
-                        "keep pushing concrete tool execution"
-                    )
-                },
+        plan_work_pending = self._approved_plan_has_unfinished_steps()
+        if bool(self.arbiter_enabled) and (
+            bool(plan_work_pending)
+            or len(clean_text) >= int(ARBITER_TRIGGER_MIN_CONTENT_CHARS)
+        ):
+            decision = self._call_arbiter_llm(
+                clean_text,
+                "",
+                force=bool(plan_work_pending),
             )
-            return False, role_key
-        if bool(self.arbiter_enabled) and len(clean_text) >= int(ARBITER_TRIGGER_MIN_CONTENT_CHARS):
-            decision = self._call_arbiter_llm(clean_text, "")
             status = str(decision.get("status", "") or "").strip().upper()
+            if status == "USER_INPUT_REQUIRED":
+                self._emit(
+                    "status",
+                    {
+                        "summary": (
+                            f"{self._agent_display_name(role_key)} arbiter requires user input; "
+                            "pausing run"
+                        )
+                    },
+                )
+                return True, role_key
+            if status == "TASK_COMPLETED" and bool(plan_work_pending):
+                status = "ACTION_REQUIRED"
+                decision = dict(decision)
+                decision["status"] = "ACTION_REQUIRED"
+                decision["reasoning"] = trim(
+                    (
+                        str(decision.get("reasoning", "") or "")
+                        + " Approved plan still has unfinished steps."
+                    ).strip(),
+                    280,
+                )
             if status == "TASK_COMPLETED":
                 if role_key in {"reviewer", "developer"}:
                     finish_result = self._resolve_finish_request(
@@ -46990,6 +50020,21 @@ body{padding:18px}
                         )
                         return True, role_key
                     return False, role_key
+            elif status == "ACTION_REQUIRED":
+                if bool(plan_work_pending):
+                    self._inject_plan_no_tool_recovery_hint(clean_text)
+                else:
+                    self._inject_arbiter_action_required_hint(decision, clean_text)
+                self._emit(
+                    "status",
+                    {
+                        "summary": (
+                            f"{self._agent_display_name(role_key)} arbiter requires concrete action; "
+                            "continuing execution"
+                        )
+                    },
+                )
+                return False, role_key
             elif status == "VALID_PLANNING":
                 self._inject_arbiter_continue_hint(decision)
                 self._emit(
@@ -47002,6 +50047,17 @@ body{padding:18px}
                     },
                 )
                 return False, role_key
+        if self._current_delegate_is_mandatory_for(role_key):
+            self._emit(
+                "status",
+                {
+                    "summary": (
+                        f"mandatory delegate still unmet for {self._agent_display_name(role_key)}; "
+                        "keep pushing concrete tool execution"
+                    )
+                },
+            )
+            return False, role_key
         if mode == EXECUTION_MODE_SEQUENTIAL:
             if role_key == "explorer":
                 payload = _lang_payload(
@@ -48386,6 +51442,10 @@ body{padding:18px}
             "pros": pros,
             "cons": cons,
             "risk": risk,
+            "execution_brief": trim(str(raw.get("execution_brief", "") or "").strip(), 1200),
+            "deliverables": trim(str(raw.get("deliverables", "") or "").strip(), 900),
+            "quality_bar": trim(str(raw.get("quality_bar", "") or "").strip(), 900),
+            "global_constraints": trim(str(raw.get("global_constraints", "") or "").strip(), 900),
         }
 
     def _normalize_plan_proposal_payload(self, raw: object) -> dict:
@@ -48531,6 +51591,10 @@ body{padding:18px}
                     "pros": "Deterministic fallback that keeps plan-mode available even when model synthesis formatting is unstable.",
                     "cons": "Less tailored than a fully synthesized multi-option proposal.",
                     "risk": "medium",
+                    "execution_brief": trim(context, 900),
+                    "deliverables": trim(goal or "Requested final artifact plus delivery summary.", 600),
+                    "quality_bar": "Each step must preserve the original objective and record observable evidence before advancement.",
+                    "global_constraints": "Execute in order while carrying prior outputs into later steps.",
                 }
             ],
             "recommended": "A",
@@ -48581,6 +51645,8 @@ body{padding:18px}
             f"You MUST call the submit_plan_proposal tool exactly once with:\n"
             f"- context: brief background analysis\n"
             f"- options: array of 1-{PLAN_MODE_MAX_OPTIONS} options, each with id (A/B/C), title, summary, steps, pros, cons, risk\n"
+            f"- Each option should also include execution_brief, deliverables, quality_bar, and global_constraints when useful. "
+            f"These fields preserve the plan's reasoning and final-objective logic during step-by-step execution.\n"
             f"- recommended: id of the recommended option\n"
             f"Do NOT answer with prose-only markdown. A response without submit_plan_proposal tool call is invalid.\n\n"
             f"STEP QUALITY REQUIREMENTS:\n"
@@ -48819,6 +51885,10 @@ body{padding:18px}
                             "pros": {"type": "string"},
                             "cons": {"type": "string"},
                             "risk": {"type": "string", "enum": ["low", "medium", "high"]},
+                            "execution_brief": {"type": "string"},
+                            "deliverables": {"type": "string"},
+                            "quality_bar": {"type": "string"},
+                            "global_constraints": {"type": "string"},
                         },
                         "required": ["id", "title", "summary", "steps"],
                     },
@@ -48827,6 +51897,320 @@ body{padding:18px}
             },
             ["context", "options", "recommended"],
         )]
+
+    def _normalize_plan_charter(self, raw: object) -> dict:
+        src = raw if isinstance(raw, dict) else {}
+        out: dict = {}
+        fields = {
+            "original_goal": 2400,
+            "chosen": 40,
+            "title": 600,
+            "summary": 1800,
+            "context": 1800,
+            "execution_brief": 1800,
+            "deliverables": 1200,
+            "quality_bar": 1200,
+            "global_constraints": 1200,
+        }
+        for key, max_chars in fields.items():
+            value = trim(normalize_embedded_newlines(str(src.get(key, "") or "")).strip(), max_chars)
+            if value:
+                out[key] = value
+        try:
+            out["created_at"] = float(src.get("created_at", 0.0) or 0.0)
+        except Exception:
+            pass
+        try:
+            out["updated_at"] = float(src.get("updated_at", 0.0) or 0.0)
+        except Exception:
+            pass
+        return out
+
+    def _build_plan_charter(
+        self,
+        choice_id: str = "",
+        chosen: dict | None = None,
+        *,
+        board: dict | None = None,
+        grouped_steps: list | None = None,
+    ) -> dict:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
+        proposal = self.runtime_plan_proposal if isinstance(self.runtime_plan_proposal, dict) else {}
+        selected = chosen if isinstance(chosen, dict) else {}
+        chosen_key = trim(str(choice_id or plan.get("chosen", "") or selected.get("id", "") or ""), 40)
+        title = trim(str(selected.get("title", "") or plan.get("title", "") or chosen_key), 600)
+        summary = trim(str(selected.get("summary", "") or plan.get("summary", "") or ""), 1800)
+        context = trim(str(selected.get("context", "") or proposal.get("context", "") or plan.get("context", "") or ""), 1800)
+        goal = trim(
+            str(
+                bb.get("original_goal", "")
+                or self.runtime_reclassify_goal
+                or self._latest_user_goal_text()
+                or ""
+            ).strip(),
+            2400,
+        )
+        step_rows = grouped_steps if isinstance(grouped_steps, list) else plan.get("steps", [])
+        step_preview = [
+            trim(str(step or "").splitlines()[0], 180)
+            for step in (step_rows if isinstance(step_rows, list) else [])
+            if str(step or "").strip()
+        ][:8]
+        deliverables = trim(str(selected.get("deliverables", "") or ""), 1200)
+        if not deliverables:
+            deliverables = trim(
+                str(selected.get("summary", "") or plan.get("summary", "") or title or goal),
+                900,
+            )
+        quality_bar = trim(str(selected.get("quality_bar", "") or ""), 1200)
+        if not quality_bar:
+            quality_bar = (
+                "Keep every step aligned with the original goal, selected plan summary, "
+                "prior step outputs, and the final deliverable. Verify each step with concrete evidence."
+            )
+        global_constraints = trim(str(selected.get("global_constraints", "") or ""), 1200)
+        if not global_constraints and step_preview:
+            global_constraints = "Execute in order while preserving the cross-step logic: " + "; ".join(step_preview)
+        execution_brief = trim(str(selected.get("execution_brief", "") or ""), 1800)
+        if not execution_brief:
+            execution_brief = trim(
+                " | ".join(
+                    part for part in (
+                        f"Goal: {goal}" if goal else "",
+                        f"Chosen plan: {title}" if title else "",
+                        f"Plan summary: {summary}" if summary else "",
+                    )
+                    if part
+                ),
+                1800,
+            )
+        now_value = float(now_ts())
+        return self._normalize_plan_charter({
+            "original_goal": goal,
+            "chosen": chosen_key,
+            "title": title,
+            "summary": summary,
+            "context": context,
+            "execution_brief": execution_brief,
+            "deliverables": deliverables,
+            "quality_bar": quality_bar,
+            "global_constraints": global_constraints,
+            "created_at": now_value,
+            "updated_at": now_value,
+        })
+
+    def _normalize_plan_step_results(self, raw: object) -> dict[str, dict]:
+        src = raw if isinstance(raw, dict) else {}
+        out: dict[str, dict] = {}
+        for key, value in list(src.items())[-80:]:
+            if not isinstance(value, dict):
+                continue
+            step_id = trim(str(value.get("step_id", "") or key or "").strip(), 40)
+            if not step_id:
+                continue
+            files = value.get("files", []) if isinstance(value.get("files", []), list) else []
+            out[step_id] = {
+                "step_id": step_id,
+                "index": int(value.get("index", -1) or -1),
+                "title": trim(str(value.get("title", "") or "").strip(), 240),
+                "summary": trim(normalize_embedded_newlines(str(value.get("summary", "") or "")).strip(), 900),
+                "evidence": trim(normalize_embedded_newlines(str(value.get("evidence", "") or "")).strip(), 600),
+                "actor": trim(str(value.get("actor", "") or "").strip(), 40),
+                "files": [trim(str(path or "").strip(), 240) for path in files[:8] if str(path or "").strip()],
+                "completed_at": float(value.get("completed_at", 0.0) or 0.0),
+            }
+        return out
+
+    def _ensure_plan_charter(self, board: dict | None = None) -> dict:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
+        if not plan:
+            return {}
+        charter = self._normalize_plan_charter(plan.get("charter", {}))
+        if not charter:
+            charter = self._build_plan_charter(str(plan.get("chosen", "") or ""), board=bb)
+            if charter:
+                plan = dict(plan)
+                plan["charter"] = charter
+                bb["plan"] = plan
+                self.blackboard = bb
+        else:
+            changed = False
+            if "original_goal" not in charter and str(bb.get("original_goal", "") or "").strip():
+                charter["original_goal"] = trim(str(bb.get("original_goal", "") or "").strip(), 2400)
+                changed = True
+            if "summary" not in charter and str(plan.get("summary", "") or "").strip():
+                charter["summary"] = trim(str(plan.get("summary", "") or "").strip(), 1800)
+                changed = True
+            if changed:
+                plan = dict(plan)
+                plan["charter"] = charter
+                bb["plan"] = plan
+                self.blackboard = bb
+        return charter
+
+    def _record_plan_step_result(
+        self,
+        plan_step: dict,
+        *,
+        evidence: str = "",
+        actor: str = "",
+        board: dict | None = None,
+    ) -> dict:
+        if not isinstance(plan_step, dict):
+            return {}
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        plan = dict(bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {})
+        step_id = trim(str(plan_step.get("id", "") or ""), 40)
+        if not step_id:
+            return {}
+        title = trim(str(plan_step.get("content", "") or ""), 240)
+        full_text = trim(normalize_embedded_newlines(plan_step.get("full_content", "") or title), 700)
+        evidence_text = trim(str(evidence or "").strip(), 600)
+        try:
+            sig = self._plan_step_blackboard_signals(plan_step, bb)
+            files = list(sig.get("recent_files", []) or [])[:8]
+        except Exception:
+            files = []
+        if not evidence_text:
+            try:
+                evidence_text = trim(self._collect_blackboard_step_evidence(plan_step, bb), 600)
+            except Exception:
+                evidence_text = ""
+        summary = trim(
+            (
+                f"{title}. "
+                f"{('Evidence: ' + evidence_text) if evidence_text else 'Completed with accepted step evidence.'}"
+            ),
+            900,
+        )
+        result = {
+            "step_id": step_id,
+            "index": int(plan_step.get("plan_step_index", -1) or -1),
+            "title": title,
+            "summary": summary,
+            "evidence": evidence_text,
+            "actor": trim(str(actor or "").strip(), 40),
+            "files": files,
+            "completed_at": float(plan_step.get("completed_at", 0.0) or now_ts()),
+        }
+        results = self._normalize_plan_step_results(plan.get("step_results", {}))
+        results[step_id] = result
+        plan["step_results"] = results
+        if "charter" not in plan:
+            plan["charter"] = self._build_plan_charter(str(plan.get("chosen", "") or ""), board=bb)
+        bb["plan"] = plan
+        self.blackboard = bb
+        if full_text:
+            self._blackboard_append_memory(
+                "step_result",
+                trim(f"{full_text}\n{summary}", 1000),
+                actor=actor or "manager",
+                tier="long",
+            )
+        return result
+
+    def _plan_roadmap_lines(self, bb: dict, *, max_steps: int = 40, content_chars: int = 110) -> list[str]:
+        """Render the full ordered step list with you-are-here markers.
+
+        This is the anti-fragmentation anchor: even mid-execution the agent sees
+        the whole arc (done ✓ / current ▶ / pending ○) so it reasons about how the
+        active step connects to the plan, instead of treating it in isolation.
+        Built from project_todos (authoritative per-step status), falling back to
+        plan["steps"] text when todos are unavailable.
+        """
+        lines: list[str] = []
+        todos = bb.get("project_todos", []) if isinstance(bb.get("project_todos"), list) else []
+        plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
+        step_rows = [
+            t for t in todos
+            if isinstance(t, dict) and t.get("category") == "plan_step"
+        ]
+        if step_rows:
+            step_rows.sort(key=lambda t: int(t.get("plan_step_index", 0) or 0))
+            total = len(step_rows)
+            for t in step_rows[:max_steps]:
+                idx = int(t.get("plan_step_index", 0) or 0) + 1
+                status = str(t.get("status", "") or "").strip().lower()
+                mark = "[✓]" if status == "done" else ("[▶]" if status == "in_progress" else "[ ]")
+                here = "  ← current" if status == "in_progress" else ""
+                text = trim(normalize_embedded_newlines(str(t.get("content", "") or "")).replace("\n", " "), content_chars)
+                lines.append(f"  {mark} {idx}/{total}. {text}{here}")
+            return lines
+        steps = plan.get("steps", []) if isinstance(plan.get("steps", []), list) else []
+        if steps:
+            cursor = int(bb.get("plan_step_cursor", 0) or 0)
+            total = len(steps)
+            for i, step in enumerate(steps[:max_steps]):
+                mark = "[✓]" if i < cursor else ("[▶]" if i == cursor else "[ ]")
+                here = "  ← current" if i == cursor else ""
+                text = trim(normalize_embedded_newlines(str(step)).replace("\n", " "), content_chars)
+                lines.append(f"  {mark} {i+1}/{total}. {text}{here}")
+        return lines
+
+    def _plan_continuity_context_block(self, *, max_chars: int = 3000, include_steps: bool = False) -> str:
+        bb = self._ensure_blackboard()
+        plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
+        if not plan:
+            return ""
+        charter = self._ensure_plan_charter(bb)
+        if not charter:
+            return ""
+        lines = ["APPROVED PLAN CHARTER:"]
+        field_labels = (
+            ("original_goal", "Original goal"),
+            ("title", "Chosen plan"),
+            ("summary", "Plan summary"),
+            ("execution_brief", "Execution logic"),
+            ("deliverables", "Final deliverable"),
+            ("quality_bar", "Quality bar"),
+            ("global_constraints", "Global constraints"),
+        )
+        for key, label in field_labels:
+            # Keep the framework/思路 intact: original_goal + execution_brief carry
+            # the reasoning thread and get a larger budget than secondary fields.
+            cap = 1400 if key in ("original_goal", "execution_brief", "summary") else 900
+            value = trim(str(charter.get(key, "") or ""), cap)
+            if value:
+                lines.append(f"- {label}: {value}")
+        # ALWAYS render the full roadmap so execution never loses the plan arc.
+        roadmap = self._plan_roadmap_lines(bb)
+        if roadmap:
+            lines.append("PLAN ROADMAP ([✓] done · [▶] current · [ ] pending):")
+            lines.extend(roadmap)
+        current = self._current_plan_step_row(bb)
+        if isinstance(current, dict):
+            idx = int(current.get("plan_step_index", 0) or 0) + 1
+            total = int(bb.get("plan_step_total", 0) or 0)
+            full = trim(
+                normalize_embedded_newlines(current.get("full_content", "") or current.get("content", "") or ""),
+                1100,
+            )
+            lines.append(f"- Current step purpose ({idx}/{max(1, total)}): {full}")
+        results = self._normalize_plan_step_results(plan.get("step_results", {}))
+        if results:
+            lines.append("CROSS-STEP CONTINUITY (what prior steps produced):")
+            ordered = sorted(results.values(), key=lambda row: (int(row.get("index", 0) or 0), float(row.get("completed_at", 0.0) or 0.0)))
+            for row in ordered[-8:]:
+                files = row.get("files", []) if isinstance(row.get("files", []), list) else []
+                file_note = f" files={', '.join(files[:3])}" if files else ""
+                lines.append(
+                    f"- Step {int(row.get('index', -1) or -1) + 1}: "
+                    f"{trim(str(row.get('summary', '') or row.get('title', '') or ''), 460)}{file_note}"
+                )
+        if include_steps:
+            steps = plan.get("steps", []) if isinstance(plan.get("steps", []), list) else []
+            if steps:
+                lines.append("FULL STEP LOGIC:")
+                for idx, step in enumerate(steps[:12], start=1):
+                    lines.append(f"- {idx}. {trim(normalize_embedded_newlines(step), 300)}")
+        lines.append(
+            "Continuity rule: act ONLY on the current step's scope, but stay consistent with the charter, "
+            "the roadmap above, prior step outputs, and the final deliverable. Do not redo done steps or "
+            "pre-empt pending ones; carry forward decisions and naming from earlier steps."
+        )
+        return trim("\n".join(lines), max(900, int(max_chars or 3000)))
 
     # ── Plan MD File helpers ──────────────────────────────────────────
 
@@ -48930,6 +52314,242 @@ body{padding:18px}
             )
         return plan_todos
 
+    @staticmethod
+    def _plan_line_marker(line: object) -> dict | None:
+        text = normalize_embedded_newlines(line).strip()
+        if not text:
+            return None
+        sub = re.match(r"^(?:[-*•]\s*)?(\d+)\.(\d+)\s+(.+)$", text)
+        if sub:
+            try:
+                major = int(sub.group(1))
+                minor = int(sub.group(2))
+            except Exception:
+                return None
+            if major <= 0 or minor <= 0:
+                return None
+            return {
+                "kind": "sub",
+                "major": major,
+                "minor": minor,
+                "title": sub.group(3).strip(),
+            }
+        major = re.match(
+            r"^(?:[-*•]\s*)?(?:(?:step|步骤|步驟|阶段|階段)\s*)?(\d+)[\.\)．、]\s+(.+)$",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if major:
+            try:
+                number = int(major.group(1))
+            except Exception:
+                return None
+            if number <= 0:
+                return None
+            return {
+                "kind": "major",
+                "major": number,
+                "minor": 0,
+                "title": major.group(2).strip(),
+            }
+        return None
+
+    @staticmethod
+    def _looks_like_plan_data_fragment_title(title: object) -> bool:
+        text = normalize_embedded_newlines(title).strip()
+        if not text:
+            return True
+        first = re.split(r"\s+", text, 1)[0].strip(" \t,，;；:：.。()[]{}")
+        if not first:
+            return True
+        if re.match(r"^[A-Za-zµμ%°]+(?:[/._^·-][A-Za-z0-9µμ%°]+)+$", first):
+            return True
+        if re.match(r"^[~≈=<>+\-*/×÷^%°]", text):
+            return True
+        if len(text) <= 18 and re.search(r"[/=<>≈±×÷^%°]|\d", text):
+            return True
+        return False
+
+    @staticmethod
+    def _plan_marker_is_sequence_outlier(
+        marker: dict | None,
+        *,
+        expected_number: int,
+        candidate_count: int,
+    ) -> bool:
+        if not isinstance(marker, dict) or marker.get("kind") != "major":
+            return False
+        try:
+            number = int(marker.get("major", 0) or 0)
+        except Exception:
+            return True
+        if number <= 0:
+            return True
+        if expected_number > 0 and number == expected_number:
+            return False
+        # A top-level plan number far beyond the number of available candidates
+        # is usually a numeric fact that wrapped onto its own line, not step N.
+        if candidate_count > 0 and number > candidate_count + 2:
+            return True
+        title = str(marker.get("title", "") or "")
+        if expected_number > 0 and number > expected_number + 2:
+            return SessionState._looks_like_plan_data_fragment_title(title)
+        if expected_number > 2 and number < expected_number - 2:
+            return SessionState._looks_like_plan_data_fragment_title(title)
+        return False
+
+    @staticmethod
+    def _split_plan_text_into_entries(text: object) -> list[str]:
+        src = normalize_embedded_newlines(text).strip()
+        if not src:
+            return []
+        lines = [ln.strip() for ln in src.split("\n") if ln.strip()]
+        if len(lines) <= 1:
+            return lines
+        entries: list[str] = []
+        current: list[str] = []
+        expected = 1
+        saw_boundary = False
+        candidate_count = len(lines)
+        for line in lines:
+            marker = SessionState._plan_line_marker(line)
+            is_major = bool(marker and marker.get("kind") == "major")
+            marker_number = int(marker.get("major", 0) or 0) if is_major else 0
+            is_outlier = SessionState._plan_marker_is_sequence_outlier(
+                marker,
+                expected_number=expected,
+                candidate_count=candidate_count,
+            )
+            if is_major and not is_outlier and marker_number == expected:
+                if current:
+                    entries.append("\n".join(current))
+                current = [line]
+                expected = int(marker.get("major", expected) or expected) + 1
+                saw_boundary = True
+                continue
+            if current:
+                current.append(line)
+            else:
+                current = [line]
+        if current:
+            entries.append("\n".join(current))
+        if not saw_boundary:
+            return ["\n".join(lines)]
+        return entries
+
+    @staticmethod
+    def _sanitize_plan_step_entries(entries: list[str]) -> list[str]:
+        raw_entries = [
+            normalize_embedded_newlines(entry).strip()
+            for entry in (entries if isinstance(entries, list) else [])
+            if normalize_embedded_newlines(entry).strip()
+        ]
+        if not raw_entries:
+            return []
+        candidate_count = len(raw_entries)
+        cleaned: list[str] = []
+        expected = 1
+        for entry in raw_entries:
+            first = next((ln.strip() for ln in entry.split("\n") if ln.strip()), "")
+            marker = SessionState._plan_line_marker(first)
+            if SessionState._plan_marker_is_sequence_outlier(
+                marker,
+                expected_number=expected,
+                candidate_count=candidate_count,
+            ):
+                if cleaned:
+                    cleaned[-1] = trim(
+                        cleaned[-1].rstrip() + "\n" + entry,
+                        PLAN_STEP_FULL_CONTENT_MAX_CHARS,
+                    )
+                continue
+            cleaned.append(entry)
+            if isinstance(marker, dict) and marker.get("kind") == "major":
+                marker_number = int(marker.get("major", expected) or expected)
+                if marker_number >= expected:
+                    expected = marker_number + 1
+        return cleaned
+
+    @staticmethod
+    def _sanitize_project_plan_todos(todos: list[dict]) -> tuple[list[dict], bool, list[str]]:
+        if not isinstance(todos, list) or not todos:
+            return list(todos or []), False, []
+        plan_rows: list[dict] = []
+        other_rows: list[dict] = []
+        for row in todos:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("category", "") or "") == "plan_step":
+                plan_rows.append(dict(row))
+            else:
+                other_rows.append(row)
+        if not plan_rows:
+            return list(todos), False, []
+        try:
+            plan_rows.sort(key=lambda r: int(r.get("plan_step_index", 0) or 0))
+        except Exception:
+            pass
+        cleaned: list[dict] = []
+        removed: list[str] = []
+        changed = False
+        expected = 1
+        candidate_count = len(plan_rows)
+        for row in plan_rows:
+            content = normalize_embedded_newlines(row.get("content", "") or "").strip()
+            full = normalize_embedded_newlines(row.get("full_content", "") or "").strip()
+            first = content or next((ln.strip() for ln in full.split("\n") if ln.strip()), "")
+            marker = SessionState._plan_line_marker(first)
+            if SessionState._plan_marker_is_sequence_outlier(
+                marker,
+                expected_number=expected,
+                candidate_count=candidate_count,
+            ):
+                removed.append(trim(first, 120))
+                if cleaned:
+                    append_text = full or content
+                    prev_full = normalize_embedded_newlines(
+                        cleaned[-1].get("full_content", "") or cleaned[-1].get("content", "") or ""
+                    ).strip()
+                    if append_text and append_text not in prev_full:
+                        cleaned[-1]["full_content"] = trim(
+                            (prev_full + "\n" + append_text).strip(),
+                            PLAN_STEP_FULL_CONTENT_MAX_CHARS,
+                        )
+                changed = True
+                continue
+            cleaned.append(row)
+            if isinstance(marker, dict) and marker.get("kind") == "major":
+                expected = int(marker.get("major", expected) or expected) + 1
+        for idx, row in enumerate(cleaned):
+            try:
+                old_idx = int(row.get("plan_step_index", idx) or idx)
+            except Exception:
+                old_idx = idx
+            if old_idx != idx:
+                row["plan_step_index"] = idx
+                changed = True
+            if not str(row.get("id", "") or "").strip():
+                row["id"] = f"pt:{idx:03d}"
+                changed = True
+        active_rows = [r for r in cleaned if str(r.get("status", "") or "") == "in_progress"]
+        if len(active_rows) > 1:
+            keep = min(active_rows, key=lambda r: int(r.get("plan_step_index", 0) or 0))
+            keep_id = str(keep.get("id", "") or "")
+            for row in cleaned:
+                if str(row.get("status", "") or "") == "in_progress" and str(row.get("id", "") or "") != keep_id:
+                    row["status"] = "pending"
+                    row["activated_at"] = None
+            changed = True
+        elif not active_rows and any(str(r.get("status", "") or "") != "completed" for r in cleaned):
+            for row in cleaned:
+                if str(row.get("status", "") or "") != "completed":
+                    row["status"] = "in_progress"
+                    if not row.get("activated_at"):
+                        row["activated_at"] = float(now_ts())
+                    changed = True
+                    break
+        return cleaned + other_rows, changed, removed
+
     def _format_plan_file_preselection(self, proposal: dict) -> str:
         """Full MD content with ALL options for model review (no char limit)."""
         lines = [self._ui_text("plan_file_proposals_title")]
@@ -49030,6 +52650,19 @@ body{padding:18px}
         lines.append(self._ui_text("active_plan_updated", updated=_dt_cls.now().isoformat(timespec="seconds")))
         if summary:
             lines.append(self._ui_text("active_plan_summary", summary=summary))
+        continuity_block = self._plan_continuity_context_block(max_chars=3600, include_steps=False)
+        if continuity_block:
+            lines.append("## Execution Charter")
+            for raw_line in continuity_block.splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                if line.endswith(":") and not line.startswith("-"):
+                    lines.append(f"### {line[:-1]}")
+                elif line.startswith("- "):
+                    lines.append(line)
+                else:
+                    lines.append(f"> {line}")
         lines.append(self._ui_text("active_plan_steps"))
         import re as _re_exec
         _mid_re_exec = _re_exec.compile(r"(?<=\S)\s+(\d+\.\d+\s)")
@@ -49040,6 +52673,7 @@ body{padding:18px}
             full = _mid_re_exec.sub(r"\n\1", full)
             header = full.split("\n")[0] if "\n" in full else full
             sub_lines = [ln for ln in full.split("\n")[1:] if ln.strip()] if "\n" in full else []
+            step_worker_rows = self._active_plan_worker_todo_rows(str(t.get("id", "") or ""), role="")
             status = str(t.get("status", "pending") or "pending")
             if status == "completed":
                 actor = str(t.get("completed_by", "") or "")
@@ -49047,6 +52681,13 @@ body{padding:18px}
                 lines.append(self._ui_text("active_plan_step_done", idx=idx, header=header))
                 for sub in sub_lines:
                     lines.append(f"  - {sub.strip()}")
+                for subtask in step_worker_rows:
+                    st_status = str(subtask.get("status", "pending") or "pending")
+                    marker = {"completed": "x", "in_progress": ">", "pending": " "}.get(st_status, " ")
+                    lines.append(f"  - [{marker}] {trim(str(subtask.get('content', '') or ''), 240)}")
+                    st_evidence = trim(str(subtask.get("evidence", "") or ""), 240)
+                    if st_evidence:
+                        lines.append(f"    > {st_evidence}")
                 meta_parts = []
                 if actor:
                     meta_parts.append(self._ui_text("active_plan_completed_by", actor=actor))
@@ -49058,10 +52699,24 @@ body{padding:18px}
                 lines.append(self._ui_text("active_plan_step_current", idx=idx, header=header))
                 for sub in sub_lines:
                     lines.append(f"  - {sub.strip()}")
+                for subtask in step_worker_rows:
+                    st_status = str(subtask.get("status", "pending") or "pending")
+                    marker = {"completed": "x", "in_progress": ">", "pending": " "}.get(st_status, " ")
+                    lines.append(f"  - [{marker}] {trim(str(subtask.get('content', '') or ''), 240)}")
+                    st_evidence = trim(str(subtask.get("evidence", "") or ""), 240)
+                    if st_evidence:
+                        lines.append(f"    > {st_evidence}")
             else:
                 lines.append(self._ui_text("active_plan_step_pending", idx=idx, header=header))
                 for sub in sub_lines:
                     lines.append(f"  - {sub.strip()}")
+                for subtask in step_worker_rows:
+                    st_status = str(subtask.get("status", "pending") or "pending")
+                    marker = {"completed": "x", "in_progress": ">", "pending": " "}.get(st_status, " ")
+                    lines.append(f"  - [{marker}] {trim(str(subtask.get('content', '') or ''), 240)}")
+                    st_evidence = trim(str(subtask.get("evidence", "") or ""), 240)
+                    if st_evidence:
+                        lines.append(f"    > {st_evidence}")
         return "\n".join(lines) + "\n"
 
     def _update_plan_file_step_status(self) -> bool:
@@ -49162,6 +52817,16 @@ body{padding:18px}
         )
         if step_hint and step_hint not in hint_rows:
             hint_rows.append(step_hint)
+        # Tell the worker up front WHAT to verify and HOW, so the acceptance
+        # subtask is created with the right check from the start (prevents the
+        # "step stuck because the gate wanted evidence the worker never knew
+        # about" loop).
+        try:
+            acceptance_guidance = self._plan_step_acceptance_guidance_text(step)
+        except Exception:
+            acceptance_guidance = ""
+        if acceptance_guidance and acceptance_guidance not in hint_rows:
+            hint_rows.append(acceptance_guidance)
         if not hint_rows:
             return
         target_roles = ("explorer", "developer") if self._is_multi_agent_mode() else ()
@@ -49190,6 +52855,10 @@ body{padding:18px}
         import re
         if not raw_steps or not isinstance(raw_steps, list):
             return list(raw_steps or [])
+        raw_entries: list[str] = []
+        for item in raw_steps:
+            raw_entries.extend(SessionState._split_plan_text_into_entries(item))
+        raw_steps = SessionState._sanitize_plan_step_entries(raw_entries)
         # Patterns
         sub_step_re = re.compile(r"^(\d+)\.(\d+)\s")   # "N.M ..."
         major_step_re = re.compile(r"^(\d+)\.\s")       # "N. ..." (summary line)
@@ -49207,10 +52876,24 @@ body{padding:18px}
                     normalized.append(stripped)
         if not normalized:
             return [str(s) for s in raw_steps if str(s or "").strip()]
+
+        def _valid_sub_step_line(line: str) -> bool:
+            m = sub_step_re.match(line)
+            if not m:
+                return False
+            try:
+                major_num = int(m.group(1))
+            except Exception:
+                return False
+            title = str(line[m.end():] or "").strip()
+            if major_num > len(raw_steps) + 2 and SessionState._looks_like_plan_data_fragment_title(title):
+                return False
+            return True
+
         # Phase 1: Check if any N.N sub-step headers exist
-        has_sub_steps = any(sub_step_re.match(ln) for ln in normalized)
+        has_sub_steps = any(_valid_sub_step_line(ln) for ln in normalized)
         if not has_sub_steps:
-            return normalized
+            return [str(s).strip() for s in raw_steps if str(s or "").strip()]
         # Phase 2: Group by major number (first digit of N.N)
         from collections import OrderedDict
         major_groups: OrderedDict[str, list[str]] = OrderedDict()
@@ -49220,7 +52903,7 @@ body{padding:18px}
         for line in normalized:
             m_sub = sub_step_re.match(line)
             m_major = major_step_re.match(line)
-            if m_sub:
+            if m_sub and _valid_sub_step_line(line):
                 major_num = m_sub.group(1)
                 current_major = major_num
                 if major_num not in major_groups:
@@ -49229,6 +52912,17 @@ body{padding:18px}
             elif m_major:
                 # "N. Summary title" line → store as header for this major group
                 major_num = m_major.group(1)
+                marker = SessionState._plan_line_marker(line)
+                if SessionState._plan_marker_is_sequence_outlier(
+                    marker,
+                    expected_number=len(major_groups) + 1,
+                    candidate_count=len(raw_steps),
+                ):
+                    if current_major and current_major in major_groups:
+                        major_groups[current_major].append(line)
+                    else:
+                        orphan_lines.append(line)
+                    continue
                 current_major = major_num
                 major_headers[major_num] = line
                 if major_num not in major_groups:
@@ -49604,6 +53298,12 @@ body{padding:18px}
         grouped_steps = self._group_plan_steps(chosen.get("steps", []))
         chosen_title = trim(str(chosen.get("title", "") or choice_id).strip(), 800)
         chosen_summary = trim(str(chosen.get("summary", "") or "").strip(), PLAN_STEP_FULL_CONTENT_MAX_CHARS)
+        charter = self._build_plan_charter(
+            choice_id,
+            chosen,
+            board=bb,
+            grouped_steps=grouped_steps,
+        )
         # Preserve current complexity unless the user explicitly changes it elsewhere.
         _current_complexity = normalize_task_complexity(
             self.runtime_task_complexity
@@ -49634,8 +53334,13 @@ body{padding:18px}
             "chosen": choice_id,
             "title": chosen_title,
             "summary": chosen_summary,
+            "context": trim(str((self.runtime_plan_proposal or {}).get("context", "") or ""), 1800),
             "risk": _plan_risk,
             "steps": grouped_steps,
+            "charter": charter,
+            "step_results": self._normalize_plan_step_results(
+                (bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}).get("step_results", {})
+            ),
         }
         self.blackboard = bb
         self._blackboard_history("manager", f"plan approved: option {choice_id} — {chosen_title}")
@@ -50278,8 +53983,21 @@ body{padding:18px}
                             },
                         )
                         break
+                    plan_work_pending = self._approved_plan_has_unfinished_steps()
                     decision_needed = self._looks_like_user_decision_needed(decision_probe)
-                    if decision_needed:
+                    plan_routine_advance_text = bool(
+                        plan_work_pending
+                        and (
+                            "advance_plan_step" in done_probe
+                            or "route_to_next_agent" in done_probe
+                            or "推进" in done_probe
+                            or "推進" in done_probe
+                            or "下一轮" in done_probe
+                            or "下一輪" in done_probe
+                            or "next step" in done_probe.lower()
+                        )
+                    )
+                    if decision_needed and (not plan_work_pending) and not plan_routine_advance_text:
                         arbiter_planning_rounds = 0
                         self._emit("status", {"summary": "waiting for user input: assistant asked for a decision"})
                         break
@@ -50316,7 +54034,19 @@ body{padding:18px}
                     action_promise_pending = self._looks_like_action_promise_without_tool(done_probe)
                     endpoint = self._detect_endpoint_intent(done_probe, tool_calls)
                     deliverable = self._detect_no_tool_deliverable_intent(done_probe, tool_calls)
-                    if bool(deliverable.get("matched", False)):
+                    fallback_plan_no_tool_recovery_needed = bool(
+                        plan_work_pending
+                        and (
+                            plan_routine_advance_text
+                            or action_promise_pending
+                            or done_like
+                            or self._looks_like_incomplete_reply(done_probe)
+                            or bool(endpoint.get("matched", False))
+                            or bool(deliverable.get("matched", False))
+                        )
+                    )
+                    plan_no_tool_recovery_needed = False
+                    if bool(deliverable.get("matched", False)) and not plan_work_pending:
                         arbiter_planning_rounds = 0
                         no_tool_rounds = 0
                         fault_counter = 0
@@ -50350,6 +54080,8 @@ body{padding:18px}
                         continue
                     arbiter_probe_len = max(len(clean_decision_probe), len(str(thinking_text or "").strip()))
                     arbiter_should_run = bool(self.arbiter_enabled) and (
+                        plan_work_pending
+                        or
                         action_promise_pending
                         or (
                             arbiter_probe_len >= int(ARBITER_TRIGGER_MIN_CONTENT_CHARS)
@@ -50360,39 +54092,86 @@ body{padding:18px}
                             )
                         )
                     )
+                    arbiter_decision: dict = {}
+                    arbiter_status = ""
+                    arbiter_unavailable = False
                     if arbiter_should_run:
-                        arbiter_decision = self._call_arbiter_llm(clean_decision_probe, thinking_text)
+                        arbiter_decision = self._call_arbiter_llm(
+                            clean_decision_probe,
+                            thinking_text,
+                            force=bool(plan_work_pending),
+                        )
                         arbiter_status = str(arbiter_decision.get("status", "") or "").strip().upper()
-                        if arbiter_status == "TASK_COMPLETED":
+                        arbiter_unavailable = arbiter_status in {
+                            "",
+                            "UNKNOWN",
+                            "DISABLED",
+                            "SKIP_SHORT",
+                            "ARBITER_TIMEOUT",
+                            "ARBITER_ERROR",
+                        }
+                        if arbiter_status == "USER_INPUT_REQUIRED":
                             arbiter_planning_rounds = 0
                             no_tool_rounds = 0
                             fault_counter = 0
                             last_fault_reason = ""
-                            finish_result = self._resolve_finish_request(
-                                single_role,
-                                source="single-arbiter-task-completed",
-                                summary=str(arbiter_decision.get("reasoning", "") or ""),
+                            self._prune_runtime_retry_hints()
+                            self._emit(
+                                "status",
+                                {
+                                    "summary": (
+                                        "arbiter decision=USER_INPUT_REQUIRED; "
+                                        "waiting for user input"
+                                    )
+                                },
                             )
-                            if bool(finish_result.get("stop", False)):
-                                self._emit(
-                                    "status",
-                                    {
-                                        "summary": (
-                                            "arbiter decision=TASK_COMPLETED; "
-                                            "run stopped cleanly"
-                                        )
-                                    },
+                            break
+                        if arbiter_status == "TASK_COMPLETED":
+                            if plan_work_pending:
+                                arbiter_status = "ACTION_REQUIRED"
+                                arbiter_decision = dict(arbiter_decision)
+                                arbiter_decision["status"] = "ACTION_REQUIRED"
+                                arbiter_decision["reasoning"] = trim(
+                                    (
+                                        str(arbiter_decision.get("reasoning", "") or "")
+                                        + " Approved plan still has unfinished steps."
+                                    ).strip(),
+                                    280,
                                 )
-                                break
-                            force_single_tool_rounds = max(force_single_tool_rounds, 2)
-                            continue
+                            else:
+                                arbiter_planning_rounds = 0
+                                no_tool_rounds = 0
+                                fault_counter = 0
+                                last_fault_reason = ""
+                                finish_result = self._resolve_finish_request(
+                                    single_role,
+                                    source="single-arbiter-task-completed",
+                                    summary=str(arbiter_decision.get("reasoning", "") or ""),
+                                )
+                                if bool(finish_result.get("stop", False)):
+                                    self._emit(
+                                        "status",
+                                        {
+                                            "summary": (
+                                                "arbiter decision=TASK_COMPLETED; "
+                                                "run stopped cleanly"
+                                            )
+                                        },
+                                    )
+                                    break
+                                force_single_tool_rounds = max(force_single_tool_rounds, 2)
+                                continue
                         if arbiter_status == "ACTION_REQUIRED":
                             arbiter_planning_rounds = 0
                             no_tool_rounds = 0
                             fault_counter = 0
                             last_fault_reason = ""
                             force_single_tool_rounds = max(force_single_tool_rounds, 2)
-                            self._inject_arbiter_action_required_hint(arbiter_decision, done_probe)
+                            if plan_work_pending:
+                                plan_no_tool_recovery_needed = True
+                                self._inject_plan_no_tool_recovery_hint(done_probe)
+                            else:
+                                self._inject_arbiter_action_required_hint(arbiter_decision, done_probe)
                             if auto_continue_budget > 0:
                                 auto_continue_budget -= 1
                                 self._emit(
@@ -50458,6 +54237,8 @@ body{padding:18px}
                             arbiter_status = "EMPTY_RAMBLING"
                         if arbiter_status == "EMPTY_RAMBLING":
                             arbiter_planning_rounds = 0
+                            if plan_work_pending:
+                                plan_no_tool_recovery_needed = True
                             self._emit(
                                 "status",
                                 {
@@ -50469,6 +54250,23 @@ body{padding:18px}
                             )
                     else:
                         arbiter_planning_rounds = 0
+                        arbiter_unavailable = bool(plan_work_pending)
+                    if plan_work_pending and arbiter_unavailable:
+                        plan_no_tool_recovery_needed = bool(fallback_plan_no_tool_recovery_needed)
+                        if decision_needed and not plan_routine_advance_text and not plan_no_tool_recovery_needed:
+                            arbiter_planning_rounds = 0
+                            no_tool_rounds = 0
+                            self._prune_runtime_retry_hints()
+                            self._emit(
+                                "status",
+                                {
+                                    "summary": (
+                                        "waiting for user input: semantic arbiter unavailable and "
+                                        "assistant appears to ask for a real decision"
+                                    )
+                                },
+                            )
+                            break
                     long_plan_reply = bool(
                         len(clean_decision_probe) >= 100
                         or self._looks_nontrivial_request(clean_decision_probe)
@@ -50488,7 +54286,7 @@ body{padding:18px}
                             },
                         )
                         break
-                    if bool(endpoint.get("matched", False)):
+                    if bool(endpoint.get("matched", False)) and not plan_work_pending:
                         arbiter_planning_rounds = 0
                         no_tool_rounds = 0
                         fault_counter = 0
@@ -50513,7 +54311,7 @@ body{padding:18px}
                             break
                         force_single_tool_rounds = max(force_single_tool_rounds, 2)
                         continue
-                    if done_like or (substantial_reply and (not bool(self.arbiter_enabled))):
+                    if (done_like or (substantial_reply and (not bool(self.arbiter_enabled)))) and not plan_work_pending:
                         arbiter_planning_rounds = 0
                         no_tool_rounds = 0
                         fault_counter = 0
@@ -50538,7 +54336,7 @@ body{padding:18px}
                             break
                         force_single_tool_rounds = max(force_single_tool_rounds, 2)
                         continue
-                    if self._should_soft_pause_no_action(done_probe, tool_calls):
+                    if self._should_soft_pause_no_action(done_probe, tool_calls) and not plan_work_pending:
                         arbiter_planning_rounds = 0
                         no_tool_rounds = 0
                         self._prune_runtime_retry_hints()
@@ -50554,7 +54352,12 @@ body{padding:18px}
                         break
                     no_tool_rounds += 1
                     diagnosis = self._diagnose_no_tool_idle(decision_probe, no_tool_rounds)
-                    pending_like = bool(diagnosis.get("work_pending", False)) or todo_blocking or action_promise_pending
+                    pending_like = (
+                        bool(diagnosis.get("work_pending", False))
+                        or todo_blocking
+                        or action_promise_pending
+                        or plan_no_tool_recovery_needed
+                    )
                     if no_tool_rounds >= 2 and pending_like:
                         fault_counter += 1
                         last_fault_reason = f"no-tool-idle(streak={no_tool_rounds})"
@@ -50576,7 +54379,11 @@ body{padding:18px}
                     if (not done_like) and no_tool_rounds >= 1 and pending_like:
                         if auto_continue_budget > 0:
                             auto_continue_budget -= 1
-                            if action_promise_pending:
+                            if plan_no_tool_recovery_needed:
+                                force_single_tool_rounds = max(force_single_tool_rounds, 2)
+                                self._inject_plan_no_tool_recovery_hint(done_probe)
+                                summary = "approved-plan no-tool recovery engaged"
+                            elif action_promise_pending:
                                 force_single_tool_rounds = max(force_single_tool_rounds, 2)
                                 self._inject_action_promise_recovery_hint(done_probe)
                                 summary = "no-tool action promise recovered"
@@ -50600,13 +54407,29 @@ body{padding:18px}
                     if auto_continue_budget > 8 and not self._is_long_running_engineering_context():
                         auto_continue_budget = min(auto_continue_budget, 8)
                     can_continue = auto_continue_budget > 0 and (
-                        todo_blocking or action_promise_pending or self._looks_like_incomplete_reply(text)
+                        plan_no_tool_recovery_needed
+                        or todo_blocking
+                        or action_promise_pending
+                        or self._looks_like_incomplete_reply(text)
                     )
                     if can_continue:
                         if self.cancel_requested:
                             self._emit("status", {"summary": "run interrupted"})
                             break
                         auto_continue_budget -= 1
+                        if plan_no_tool_recovery_needed:
+                            force_single_tool_rounds = max(force_single_tool_rounds, 2)
+                            self._inject_plan_no_tool_recovery_hint(done_probe)
+                            self._emit(
+                                "status",
+                                {
+                                    "summary": (
+                                        "approved plan still active; auto-continue after no-tool text "
+                                        f"(streak={no_tool_rounds}, remaining={auto_continue_budget})"
+                                    )
+                                },
+                            )
+                            continue
                         if no_tool_rounds % 6 == 0:
                             self._prune_runtime_retry_hints()
                             self.messages.append(
@@ -51874,7 +55697,13 @@ body{padding:18px}
                 "ollama_base_url": self.ollama.base_url,
                 "thinking": self.thinking,
                 "thinking_stream": bool(self.ollama.thinking_stream),
+                "response_stream": bool(self.ollama.response_stream),
                 "live_thinking": str(self.live_thinking_text or "") if self.running else "",
+                "live_response_text": str(self.live_response_text or "") if (self.running and self.live_response_visible) else "",
+                "live_response_role": str(self.live_response_role or "") if self.running else "",
+                "live_response_label": str(self.live_response_label or "") if self.running else "",
+                "live_response_stream_id": str(self.live_response_stream_id or "") if self.running else "",
+                "live_response_active": bool(self.live_response_stream_id and self.live_response_visible and self.running),
                 "live_truncation_text": str(self.live_truncation_text or "") if self.running else "",
                 "live_truncation_kind": str(self.live_truncation_kind or "") if self.running else "",
                 "live_truncation_tool": str(self.live_truncation_tool or "") if self.running else "",
@@ -52378,17 +56207,12 @@ class SessionManager:
         self.user_intent_profiler = UserIntentProfiler(self.user_memory_store, self.user_interaction_optimizer)
         self.user_model_profiles: dict[str, dict] = {}
         self.user_active_profile_id = ""
+        self.global_llm_config_revision = ""
+        self.global_llm_config_source = ""
+        self.force_global_defaults_on_load = False
         self.user_language = normalize_ui_language(default_language)
-        loaded_from_prefs = self._load_user_prefs()
+        self._load_user_prefs()
         self._load_existing()
-        if not loaded_from_prefs and self.session_index:
-            latest_id = max(
-                self.session_index.keys(),
-                key=lambda sid: float((self.session_index.get(sid) or {}).get("updated_at", 0.0) or 0.0),
-            )
-            latest = self.get(latest_id)
-            if latest:
-                self._sync_from_session(latest, apply_to_all=False)
 
     def _profiles_from_config(self, config: dict) -> tuple[dict[str, dict], str]:
         parsed = parse_llm_config_profiles(config, self.ollama_base, self.model)
@@ -52414,6 +56238,8 @@ class SessionManager:
                 "temperature": 0.2,
                 "request_timeout": DEFAULT_REQUEST_TIMEOUT,
                 "selection": f"ollama::{self.model}",
+                "thinking_stream": False,
+                "response_stream": False,
                 "capabilities": infer_model_multimodal_capabilities("ollama", self.model),
                 "media_endpoints": {},
                 "source": "fallback",
@@ -52496,6 +56322,8 @@ class SessionManager:
             ),
             "web_search_enabled": bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED)),
             "user_memory_mode": normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE)),
+            "global_llm_config_revision": str(getattr(self, "global_llm_config_revision", "") or ""),
+            "global_llm_config_source": str(getattr(self, "global_llm_config_source", "") or ""),
             "updated_at": now_ts(),
         }
         self.crypto.write_json(self.user_prefs_path, data)
@@ -52570,6 +56398,8 @@ class SessionManager:
                 raw_user_memory_mode = extract_user_memory_mode_setting(raw)
                 if raw_user_memory_mode is not None:
                     self.user_memory_mode = normalize_user_memory_mode(raw_user_memory_mode)
+            self.global_llm_config_revision = str(raw.get("global_llm_config_revision", "") or "")
+            self.global_llm_config_source = str(raw.get("global_llm_config_source", "") or "")
             profiles = raw.get("model_profiles", {})
             if isinstance(profiles, dict) and profiles:
                 for k, v in profiles.items():
@@ -52896,7 +56726,9 @@ class SessionManager:
             sess.execution_mode = desired_mode
             sess.updated_at = now_ts()
             sess._persist()
-        if not sess.model_profiles:
+        if bool(getattr(self, "force_global_defaults_on_load", False)):
+            self._apply_user_defaults_to_session(sess, clear_cap_cache=True)
+        elif not sess.model_profiles:
             self._apply_user_defaults_to_session(sess)
         return sess
 
@@ -53110,6 +56942,7 @@ class SessionManager:
             headers=profile.get("headers", {}) if isinstance(profile.get("headers"), dict) else {},
             payload_template=str(profile.get("payload_template", "") or ""),
             thinking_stream=bool(profile.get("thinking_stream", False)),
+            response_stream=bool(profile.get("response_stream", False)),
         )
         client.apply_profile(profile)
         caps = client.probe_multimodal_capabilities(force=True if force_probe else False)
@@ -53175,6 +57008,7 @@ class SessionManager:
                     "source": profile.get("source", ""),
                     "thinking_hint": bool(profile.get("thinking_hint", False)),
                     "thinking_stream": bool(profile.get("thinking_stream", False)),
+                    "response_stream": bool(profile.get("response_stream", False)),
                     "capabilities": caps,
                 }
             )
@@ -53212,6 +57046,7 @@ class SessionManager:
                         "source": "ollama-tags",
                         "thinking_hint": bool(profile.get("thinking_hint", self.thinking)),
                         "thinking_stream": bool(profile.get("thinking_stream", False)),
+                        "response_stream": bool(profile.get("response_stream", False)),
                         "capabilities": tag_caps,
                     }
                 )
@@ -53237,6 +57072,7 @@ class SessionManager:
                     "source": active.get("source", "active-profile"),
                     "thinking_hint": bool(active.get("thinking_hint", False)),
                     "thinking_stream": bool(active.get("thinking_stream", False)),
+                    "response_stream": bool(active.get("response_stream", False)),
                     "capabilities": active_caps,
                 },
             )
@@ -53253,6 +57089,7 @@ class SessionManager:
             "options": opts,
             "selected": selected,
             "thinking": self.thinking,
+            "response_stream": bool(active.get("response_stream", False)),
             "thinking_mode": "auto",
             "active_capabilities": active_caps,
         }
@@ -53823,7 +57660,7 @@ linear-gradient(180deg,#f8fbff 0%,#f2f6fb 100%)}
 .msg-agent-badge.reviewer{background:#fff3d4;border-color:#efd692;color:#8a6213}
 .msg-agent-badge.manager{background:#efe4ff;border-color:#d2b6ff;color:#6e36b8}
 .msg-agent-badge.planner{background:#fde8e4;border-color:#f5b8ad;color:#c0392b}
-.msg.msg-kind-manager_delegate,.msg.msg-kind-agent_bus,.msg.msg-kind-plain_text.agent-explorer,.msg.msg-kind-plain_text.agent-developer,.msg.msg-kind-plain_text.agent-reviewer,.msg.msg-kind-plain_text.agent-manager,.msg.msg-kind-plain_text.agent-planner,.msg.msg-kind-assistant_thinking.agent-explorer,.msg.msg-kind-assistant_thinking.agent-developer,.msg.msg-kind-assistant_thinking.agent-reviewer,.msg.msg-kind-assistant_thinking.agent-manager,.msg.msg-kind-assistant_thinking.agent-planner,.msg.msg-kind-live_thinking.agent-explorer,.msg.msg-kind-live_thinking.agent-developer,.msg.msg-kind-live_thinking.agent-reviewer,.msg.msg-kind-live_thinking.agent-manager,.msg.msg-kind-live_thinking.agent-planner{padding:0;background:transparent!important;border:0!important;box-shadow:none;max-width:min(92%,920px)}
+.msg.msg-kind-manager_delegate,.msg.msg-kind-agent_bus,.msg.msg-kind-plain_text.agent-explorer,.msg.msg-kind-plain_text.agent-developer,.msg.msg-kind-plain_text.agent-reviewer,.msg.msg-kind-plain_text.agent-manager,.msg.msg-kind-plain_text.agent-planner,.msg.msg-kind-assistant_thinking.agent-explorer,.msg.msg-kind-assistant_thinking.agent-developer,.msg.msg-kind-assistant_thinking.agent-reviewer,.msg.msg-kind-assistant_thinking.agent-manager,.msg.msg-kind-assistant_thinking.agent-planner,.msg.msg-kind-live_thinking.agent-explorer,.msg.msg-kind-live_thinking.agent-developer,.msg.msg-kind-live_thinking.agent-reviewer,.msg.msg-kind-live_thinking.agent-manager,.msg.msg-kind-live_thinking.agent-planner,.msg.msg-kind-live_response.agent-explorer,.msg.msg-kind-live_response.agent-developer,.msg.msg-kind-live_response.agent-reviewer,.msg.msg-kind-live_response.agent-manager,.msg.msg-kind-live_response.agent-planner,.msg.msg-kind-live_response.agent-single{padding:0;background:transparent!important;border:0!important;box-shadow:none;max-width:min(92%,920px)}
 .msg-agent-shell{position:relative;border:1px solid #d9e4f1;border-radius:12px;padding:10px 11px;background:linear-gradient(180deg,#ffffff 0%,#f6f9ff 100%);box-shadow:0 8px 18px rgba(15,23,42,.07);overflow:hidden}
 .msg.agent-explorer .msg-agent-shell{background:linear-gradient(180deg,#fff9fc 0%,#ffeff6 100%);border-color:#ffd2e4}
 .msg.agent-developer .msg-agent-shell{background:linear-gradient(180deg,#fbfffc 0%,#edf9f1 100%);border-color:#c9e6d1}
@@ -54146,7 +57983,7 @@ h3{font-size:.96rem;margin:10px 0 6px}
 .llm-modal-btn-secondary:hover{background:var(--line,#d9e1ec)}
 """
 
-APP_JS = """const S={sessions:[],activeId:null,snap:null,es:null,esId:'',skills:[],tools:[],providers:[],protocols:[],config:null,models:[],modelOptions:[],previewBySession:{},fileExplorerBySession:{},commandPageState:{},previewNonce:0,refreshTimer:null,refreshInFlight:false,pendingSnapshot:false,pendingFullSnapshot:false,scheduledFullSnapshot:false,sessionPollTimer:null,renderStateInFlight:false,lastRenderStatePullAt:0,lastFeedSig:'',lastBoardsSig:'',lastSessionsSig:'',lastVisibilityState:document.visibilityState||'visible',staticMode:false,frozen:false,bootRendered:false,panelHtml:{},renderSigs:Object.create(null),deferredHtml:Object.create(null),deferredHtmlTimer:0,openPopup:'',follow:{chat:true,sessionList:false,todos:false,tasks:false,activity:true,commands:true,diffs:true,catalog:true,fileExplorer:false},lastEventSeq:0,lastDeltaTs:0,deltaGapCount:0,deltaWatchdogTimer:null,deltaWatchdogStalls:0,deltaWatchdogSeq:0,deltaRenderRaf:0,deltaRenderChat:false,deltaRenderBoards:false,deltaRenderSessions:false,chatRenderRaf:0,chatRenderPendingReason:'',mathObserver:null,mathRoot:null,mdWorker:null,mdWorkerUrl:'',mdReqSeq:0,mdPending:Object.create(null),diffCenterDisabled:Object.create(null),previewCenterDisabled:Object.create(null),diffCenteredDone:Object.create(null),previewCenteredDone:Object.create(null)};
+APP_JS = """const S={sessions:[],sessionTotal:0,sessionHasMore:false,sessionNextOffset:0,sessionLoadingMore:false,sessionLoadAllTimer:0,activeId:null,snap:null,es:null,esId:'',skills:[],tools:[],providers:[],protocols:[],config:null,models:[],modelOptions:[],previewBySession:{},fileExplorerBySession:{},commandPageState:{},previewNonce:0,refreshTimer:null,refreshInFlight:false,pendingSnapshot:false,pendingFullSnapshot:false,scheduledFullSnapshot:false,sessionPollTimer:null,renderStateInFlight:false,lastRenderStatePullAt:0,lastFeedSig:'',lastBoardsSig:'',lastSessionsSig:'',lastVisibilityState:document.visibilityState||'visible',staticMode:false,frozen:false,bootRendered:false,panelHtml:{},renderSigs:Object.create(null),deferredHtml:Object.create(null),deferredHtmlTimer:0,openPopup:'',follow:{chat:true,sessionList:false,todos:false,tasks:false,activity:true,commands:true,diffs:true,catalog:true,fileExplorer:false},lastEventSeq:0,lastDeltaTs:0,deltaGapCount:0,deltaWatchdogTimer:null,deltaWatchdogStalls:0,deltaWatchdogSeq:0,deltaRenderRaf:0,deltaRenderChat:false,deltaRenderBoards:false,deltaRenderSessions:false,chatRenderRaf:0,chatRenderPendingReason:'',mathObserver:null,mathRoot:null,mdWorker:null,mdWorkerUrl:'',mdReqSeq:0,mdPending:Object.create(null),diffCenterDisabled:Object.create(null),previewCenterDisabled:Object.create(null),diffCenteredDone:Object.create(null),previewCenteredDone:Object.create(null),deferredFullSnapshotTimer:0,deferredFileExplorerTimer:0,modelCatalogTimer:0,modelCatalogInFlight:false,catalogRefreshInFlight:false,fileExplorerDeferUntil:0};
 const MD_CACHE=new Map();
 const MD_CACHE_MAX=280;
 const STATIC_UI=((new URLSearchParams(location.search)).get('static_ui')==='1');
@@ -54154,6 +57991,8 @@ const SNAPSHOT_DELAY_VISIBLE_MS=300;
 const SNAPSHOT_DELAY_HIDDEN_MS=2400;
 const SESSION_POLL_VISIBLE_MS=30000;
 const SESSION_POLL_HIDDEN_MS=60000;
+const SESSION_BOOT_LIMIT=80;
+const SESSION_REFRESH_LIMIT=120;
 const PANEL_SCROLL_ACTIVE_MS=1100;
 const CHAT_SCROLL_ACTIVE_MS=180;
 const CHAT_SCROLL_LOCK_MS=500;
@@ -54198,10 +58037,10 @@ S.staticMode=STATIC_UI;
 async function setTaskLevel(level){if(!S.activeId)return;const lvl=parseInt(level,10);try{await api('/api/sessions/'+S.activeId+'/config/task-level',{method:'POST',body:JSON.stringify({level:lvl})});updateLevelBtn(lvl);scheduleSnapshot({forceFull:false,delayMs:80,allowWhenFrozen:true})}catch(err){showError(err.message||String(err))}}
 function updateLevelBtn(level){const btn=E('levelBtn');if(!btn)return;if(!level||level===0){setTextIfChanged(btn,t('btn_level')+': '+t('level_auto'))}else{const labels={1:'L1',2:'L2',3:'L3',4:'L4',5:'L5'};setTextIfChanged(btn,t('btn_level')+': '+(labels[level]||t('level_auto')))}}
 const LLM_PROVIDER_FIELDS={ollama:[{key:'ollama_url',label:'Ollama URL',type:'url',placeholder:'http://127.0.0.1:11434',hint:'Ollama API endpoint'}],vllm:[{key:'vllm_url',label:'vLLM URL',type:'url',placeholder:'http://localhost:8000/v1',hint:'vLLM OpenAI-compat endpoint'},{key:'vllm_model',label:'Model',type:'text',placeholder:'(auto-detect)',hint:'Leave empty to auto-detect'},{key:'vllm_key',label:'API Key (optional)',type:'password',placeholder:'',hint:'Usually not required for local'}],lmstudio:[{key:'lmstudio_url',label:'LM Studio URL',type:'url',placeholder:'http://localhost:1234/v1',hint:'LM Studio server endpoint'},{key:'lmstudio_model',label:'Model',type:'text',placeholder:'(auto-detect)',hint:'Leave empty to auto-detect'}],openai_compat:[{key:'openai_url',label:'API Base URL',type:'url',placeholder:'https://api.openai.com/v1',hint:'OpenAI-compatible endpoint'},{key:'openai_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'Your API key'},{key:'openai_model',label:'Model',type:'text',placeholder:'gpt-4o-mini',hint:'e.g. gpt-4o, claude-sonnet-4-20250514'}],anthropic:[{key:'anthropic_url',label:'API URL',type:'url',placeholder:'https://api.anthropic.com',hint:'Anthropic API endpoint'},{key:'anthropic_key',label:'API Key',type:'password',placeholder:'sk-ant-...',hint:'Anthropic API key'},{key:'anthropic_model',label:'Model',type:'text',placeholder:'claude-sonnet-4-20250514',hint:'e.g. claude-sonnet-4-20250514, claude-opus-4-20250514'}],glm:[{key:'glm_url',label:'API URL',type:'url',placeholder:'https://open.bigmodel.cn/api/paas/v4',hint:'GLM API endpoint'},{key:'glm_key',label:'API Key',type:'password',placeholder:'',hint:'GLM API Key'},{key:'glm_model',label:'Model',type:'text',placeholder:'glm-4-flash',hint:'e.g. glm-4-flash, glm-4-plus, glm-4v'}],kimi:[{key:'kimi_url',label:'API URL',type:'url',placeholder:'https://api.moonshot.cn/v1',hint:'KIMI/Moonshot API endpoint'},{key:'kimi_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'Moonshot API Key'},{key:'kimi_model',label:'Model',type:'text',placeholder:'moonshot-v1-8k',hint:'e.g. moonshot-v1-8k, moonshot-v1-32k, moonshot-v1-128k'}],openrouter:[{key:'openrouter_url',label:'API URL',type:'url',placeholder:'https://openrouter.ai/api/v1',hint:'OpenRouter endpoint'},{key:'openrouter_key',label:'API Key',type:'password',placeholder:'sk-or-...',hint:'OpenRouter API Key'},{key:'openrouter_model',label:'Model',type:'text',placeholder:'meta-llama/llama-3.1-8b-instruct',hint:'Full model slug from openrouter.ai/models'}],siliconflow:[{key:'siliconflow_url',label:'API URL',type:'url',placeholder:'https://api.siliconflow.cn/v1',hint:'SiliconFlow API endpoint'},{key:'siliconflow_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'SiliconFlow API key'},{key:'siliconflow_model',label:'Model',type:'text',placeholder:'Qwen/Qwen3-Next-80B-A3B-Instruct',hint:'Model identifier'}],custom_http:[{key:'custom_url',label:'API Endpoint URL',type:'url',placeholder:'https://your-api.com/v1/chat/completions',hint:'Full API endpoint URL'},{key:'custom_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'API key (optional)'},{key:'custom_model',label:'Model',type:'text',placeholder:'model-name',hint:'Model identifier'},{key:'custom_headers',label:'Custom Headers (JSON)',type:'textarea',placeholder:'{"Authorization":"Bearer token","X-Custom":"value"}',hint:'JSON object of additional HTTP headers'},{key:'custom_payload',label:'Payload Template (JSON)',type:'textarea',placeholder:'{"custom_param":"value","stream":true}',hint:'Extra fields merged into the request body'},{key:'temperature',label:'Temperature',type:'number',placeholder:'0.2',hint:'0.0-2.0, lower=deterministic'},{key:'request_timeout',label:'Request Timeout (seconds)',type:'number',placeholder:'3600',hint:'Max seconds per LLM request'}]};
-function renderLlmFields(provider){const container=E('llmFieldsContainer');if(!container)return;let html='';const openaiCompatProviders=new Set(['openai_compat','siliconflow','vllm','lmstudio','glm','kimi','openrouter','custom_http']);if(provider==='ollama'){const fields=LLM_PROVIDER_FIELDS.ollama;for(const f of fields){html+='<div class=\"llm-field\"><label>'+esc(f.label)+'</label><input type=\"'+f.type+'\" id=\"llmF_'+f.key+'\" placeholder=\"'+esc(f.placeholder||'')+'\" value=\"\"><div class=\"llm-hint\">'+esc(f.hint||'')+'</div></div>'}html+='<div class=\"llm-field\"><label>'+esc(t('llm_model'))+'</label><div style=\"display:flex;gap:8px;align-items:center\"><select id=\"llmF_ollama_model\" style=\"flex:1\"><option value=\"\">-- '+esc(t('llm_scan_first'))+' --</option></select><button type=\"button\" id=\"ollamaScanBtn\" class=\"llm-modal-btn-secondary\" style=\"flex:none;padding:6px 12px\">'+esc(t('llm_scan'))+'</button></div><div class=\"llm-hint\" id=\"ollamaScanHint\">'+esc(t('llm_scan_hint'))+'</div></div>'}else{const fields=LLM_PROVIDER_FIELDS[provider]||[];for(const f of fields){if(f.type==='textarea'){html+='<div class=\"llm-field\"><label>'+esc(f.label)+'</label><textarea id=\"llmF_'+f.key+'\" placeholder=\"'+esc(f.placeholder||'')+'\" rows=\"3\" style=\"width:100%;padding:8px 10px;border:1px solid var(--line,#d9e1ec);border-radius:8px;font-size:.84rem;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;resize:vertical;box-sizing:border-box\"></textarea><div class=\"llm-hint\">'+esc(f.hint||'')+'</div></div>'}else{html+='<div class=\"llm-field\"><label>'+esc(f.label)+'</label><input type=\"'+(f.type==='number'?'text':f.type)+'\" id=\"llmF_'+f.key+'\" placeholder=\"'+esc(f.placeholder||'')+'\" value=\"\"><div class=\"llm-hint\">'+esc(f.hint||'')+'</div></div>'}}if(openaiCompatProviders.has(provider)){html+='<div class=\"llm-field\"><div style=\"display:flex;gap:8px;align-items:center\"><button type=\"button\" id=\"localScanBtn\" class=\"llm-modal-btn-secondary\" style=\"flex:none;padding:6px 12px\">'+esc(t('llm_scan'))+'</button></div><div class=\"llm-hint\" id=\"localScanHint\">'+esc(t('llm_scan_hint'))+'</div></div>'}}html+='<div class=\"llm-field\"><label>'+esc(t('llm_thinking_stream'))+'</label><select id=\"llmF_thinking_stream\"><option value=\"true\">'+esc(t('llm_enabled'))+'</option><option value=\"false\">'+esc(t('llm_disabled'))+'</option></select></div>';container.innerHTML=html;if(provider!=='custom_http'){const defaults=LLM_PROVIDER_FIELDS[provider]||[];for(const f of defaults){if(f.type!=='url')continue;const el=E('llmF_'+f.key);if(el&&!String(el.value||'').trim())el.value=String(f.placeholder||'')}}if(provider==='ollama'){const scanBtn=E('ollamaScanBtn');if(scanBtn)scanBtn.onclick=()=>scanOllamaModels()}if(openaiCompatProviders.has(provider)){const scanBtn=E('localScanBtn');if(scanBtn)scanBtn.onclick=()=>scanOpenAICompatModels(provider)}}
+function renderLlmFields(provider){const container=E('llmFieldsContainer');if(!container)return;let html='';const openaiCompatProviders=new Set(['openai_compat','siliconflow','vllm','lmstudio','glm','kimi','openrouter','custom_http']);if(provider==='ollama'){const fields=LLM_PROVIDER_FIELDS.ollama;for(const f of fields){html+='<div class=\"llm-field\"><label>'+esc(f.label)+'</label><input type=\"'+f.type+'\" id=\"llmF_'+f.key+'\" placeholder=\"'+esc(f.placeholder||'')+'\" value=\"\"><div class=\"llm-hint\">'+esc(f.hint||'')+'</div></div>'}html+='<div class=\"llm-field\"><label>'+esc(t('llm_model'))+'</label><div style=\"display:flex;gap:8px;align-items:center\"><select id=\"llmF_ollama_model\" style=\"flex:1\"><option value=\"\">-- '+esc(t('llm_scan_first'))+' --</option></select><button type=\"button\" id=\"ollamaScanBtn\" class=\"llm-modal-btn-secondary\" style=\"flex:none;padding:6px 12px\">'+esc(t('llm_scan'))+'</button></div><div class=\"llm-hint\" id=\"ollamaScanHint\">'+esc(t('llm_scan_hint'))+'</div></div>'}else{const fields=LLM_PROVIDER_FIELDS[provider]||[];for(const f of fields){if(f.type==='textarea'){html+='<div class=\"llm-field\"><label>'+esc(f.label)+'</label><textarea id=\"llmF_'+f.key+'\" placeholder=\"'+esc(f.placeholder||'')+'\" rows=\"3\" style=\"width:100%;padding:8px 10px;border:1px solid var(--line,#d9e1ec);border-radius:8px;font-size:.84rem;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;resize:vertical;box-sizing:border-box\"></textarea><div class=\"llm-hint\">'+esc(f.hint||'')+'</div></div>'}else{html+='<div class=\"llm-field\"><label>'+esc(f.label)+'</label><input type=\"'+(f.type==='number'?'text':f.type)+'\" id=\"llmF_'+f.key+'\" placeholder=\"'+esc(f.placeholder||'')+'\" value=\"\"><div class=\"llm-hint\">'+esc(f.hint||'')+'</div></div>'}}if(openaiCompatProviders.has(provider)){html+='<div class=\"llm-field\"><div style=\"display:flex;gap:8px;align-items:center\"><button type=\"button\" id=\"localScanBtn\" class=\"llm-modal-btn-secondary\" style=\"flex:none;padding:6px 12px\">'+esc(t('llm_scan'))+'</button></div><div class=\"llm-hint\" id=\"localScanHint\">'+esc(t('llm_scan_hint'))+'</div></div>'}}html+='<div class=\"llm-field\"><label>'+esc(t('llm_thinking_stream'))+'</label><select id=\"llmF_thinking_stream\"><option value=\"true\">'+esc(t('llm_enabled'))+'</option><option value=\"false\" selected>'+esc(t('llm_disabled'))+'</option></select></div>';html+='<div class=\"llm-field\"><label>'+esc(t('llm_response_stream'))+'</label><select id=\"llmF_response_stream\"><option value=\"true\">'+esc(t('llm_enabled'))+'</option><option value=\"false\" selected>'+esc(t('llm_disabled'))+'</option></select><div class=\"llm-hint\">'+esc(t('llm_response_stream_hint'))+'</div></div>';container.innerHTML=html;if(provider!=='custom_http'){const defaults=LLM_PROVIDER_FIELDS[provider]||[];for(const f of defaults){if(f.type!=='url')continue;const el=E('llmF_'+f.key);if(el&&!String(el.value||'').trim())el.value=String(f.placeholder||'')}}if(provider==='ollama'){const scanBtn=E('ollamaScanBtn');if(scanBtn)scanBtn.onclick=()=>scanOllamaModels()}if(openaiCompatProviders.has(provider)){const scanBtn=E('localScanBtn');if(scanBtn)scanBtn.onclick=()=>scanOpenAICompatModels(provider)}}
 async function scanOllamaModels(){const urlEl=E('llmF_ollama_url');const sel=E('llmF_ollama_model');const hint=E('ollamaScanHint');const baseUrl=(urlEl?.value||'').trim()||'http://127.0.0.1:11434';if(hint)hint.textContent=t('llm_scanning');try{const res=await fetch('/api/ollama/models?base_url='+encodeURIComponent(baseUrl));const data=await res.json();if(!data.ok||!data.models?.length){if(hint)hint.textContent=t('llm_scan_empty')+(data.error?' ('+data.error+')':'');return}if(sel){sel.innerHTML='';for(const m of data.models){const op=document.createElement('option');op.value=m;op.textContent=m;sel.appendChild(op)}}if(hint)hint.textContent=t('llm_scan_found').replace('{n}',String(data.models.length))}catch(err){if(hint)hint.textContent=t('llm_scan_error')+': '+(err.message||String(err))}}
 async function scanOpenAICompatModels(provider){const scanMap={openai_compat:{urlKey:'openai_url',modelKey:'openai_model',keyKey:'openai_key',defaultUrl:'https://api.openai.com/v1'},siliconflow:{urlKey:'siliconflow_url',modelKey:'siliconflow_model',keyKey:'siliconflow_key',defaultUrl:'https://api.siliconflow.cn/v1'},vllm:{urlKey:'vllm_url',modelKey:'vllm_model',keyKey:'vllm_key',defaultUrl:'http://localhost:8000/v1'},lmstudio:{urlKey:'lmstudio_url',modelKey:'lmstudio_model',keyKey:'lmstudio_key',defaultUrl:'http://localhost:1234/v1'},glm:{urlKey:'glm_url',modelKey:'glm_model',keyKey:'glm_key',defaultUrl:'https://open.bigmodel.cn/api/paas/v4'},kimi:{urlKey:'kimi_url',modelKey:'kimi_model',keyKey:'kimi_key',defaultUrl:'https://api.moonshot.cn/v1'},openrouter:{urlKey:'openrouter_url',modelKey:'openrouter_model',keyKey:'openrouter_key',defaultUrl:'https://openrouter.ai/api/v1'},custom_http:{urlKey:'custom_url',modelKey:'custom_model',keyKey:'custom_key',defaultUrl:''}};const normalizedProvider=String(provider||'openai_compat').trim()||'openai_compat';const meta=scanMap[normalizedProvider]||scanMap.openai_compat;const urlEl=E('llmF_'+meta.urlKey);const modelEl=E('llmF_'+meta.modelKey);const hint=E('localScanHint');const baseUrl=(urlEl?.value||'').trim()||meta.defaultUrl||'';const apiKey=(E('llmF_'+meta.keyKey)?.value||'').trim();if(hint)hint.textContent=t('llm_scanning');try{let url='/api/openai_compat/models?provider='+encodeURIComponent(normalizedProvider)+'&base_url='+encodeURIComponent(baseUrl);if(apiKey)url+='&api_key='+encodeURIComponent(apiKey);const res=await fetch(url);const data=await res.json();const models=Array.isArray(data.models)?data.models.filter(Boolean):[];if(!data.ok){if(hint)hint.textContent=t('llm_scan_error')+(data.error?' ('+data.error+')':'');return}if(models.length){if(modelEl&&!String(modelEl.value||'').trim())modelEl.value=models[0];if(hint)hint.textContent=t('llm_scan_found').replace('{n}',String(models.length))+': '+models.slice(0,3).join(', ');return}if(data.reachable){if(hint)hint.textContent=t('llm_scan_reachable_manual')+(data.error?' ('+data.error+')':'');return}if(hint)hint.textContent=t('llm_scan_empty')+(data.error?' ('+data.error+')':'')}catch(err){if(hint)hint.textContent=t('llm_scan_error')+': '+(err.message||String(err))}}
-function collectLlmConfig(){const provider=E('llmProvider')?.value||'ollama';const config={provider:provider};if(provider==='ollama'){config.ollama_url=(E('llmF_ollama_url')?.value||'').trim()||'http://127.0.0.1:11434';config.ollama_model=E('llmF_ollama_model')?.value||''}else if(provider==='custom_http'){const fields=LLM_PROVIDER_FIELDS.custom_http;for(const f of fields){const el=E('llmF_'+f.key);if(!el)continue;if(f.type==='textarea'){config[f.key]=el.value.trim()}else if(f.key==='temperature'){const v=parseFloat(el.value);if(!isNaN(v))config[f.key]=v}else if(f.key==='request_timeout'){const v=parseInt(el.value,10);if(!isNaN(v)&&v>0)config[f.key]=v}else{config[f.key]=el.value.trim()}}}else{const fields=LLM_PROVIDER_FIELDS[provider]||[];for(const f of fields){const el=E('llmF_'+f.key);if(el){const raw=el.value.trim();config[f.key]=(provider!=='custom_http'&&f.type==='url')?(raw||String(f.placeholder||'').trim()):raw}}}config.thinking_stream=E('llmF_thinking_stream')?.value==='true';return config}
+function collectLlmConfig(){const provider=E('llmProvider')?.value||'ollama';const config={provider:provider};if(provider==='ollama'){config.ollama_url=(E('llmF_ollama_url')?.value||'').trim()||'http://127.0.0.1:11434';config.ollama_model=E('llmF_ollama_model')?.value||''}else if(provider==='custom_http'){const fields=LLM_PROVIDER_FIELDS.custom_http;for(const f of fields){const el=E('llmF_'+f.key);if(!el)continue;if(f.type==='textarea'){config[f.key]=el.value.trim()}else if(f.key==='temperature'){const v=parseFloat(el.value);if(!isNaN(v))config[f.key]=v}else if(f.key==='request_timeout'){const v=parseInt(el.value,10);if(!isNaN(v)&&v>0)config[f.key]=v}else{config[f.key]=el.value.trim()}}}else{const fields=LLM_PROVIDER_FIELDS[provider]||[];for(const f of fields){const el=E('llmF_'+f.key);if(el){const raw=el.value.trim();config[f.key]=(provider!=='custom_http'&&f.type==='url')?(raw||String(f.placeholder||'').trim()):raw}}}config.thinking_stream=E('llmF_thinking_stream')?.value==='true';config.response_stream=E('llmF_response_stream')?.value==='true';return config}
 async function submitLlmConfig(){if(!S.activeId){showError(t('select_session_first'));return}const config=collectLlmConfig();try{const payload={filename:'LLM.config.json',mime:'application/json',content_b64:btoa(unescape(encodeURIComponent(JSON.stringify(config,null,2))))};const out=await api('/api/sessions/'+S.activeId+'/uploads',{method:'POST',body:JSON.stringify(payload)});const note=String(out?.note||out?.model_catalog?.note||'').trim();if(!out?.model_catalog){showError(t('config_uploaded_no_profiles'))}else if(note){showError(note)}else{showError('')}const cat=out?.model_catalog||await loadModelCatalog();if(!applyModelCatalog(cat)){renderModelControls()}await refreshSnapshot({forceFull:true,allowWhenFrozen:true});E('llmConfigModal').style.display='none'}catch(err){showError(err.message||String(err))}}
 function openLlmConfigModal(){const modal=E('llmConfigModal');if(!modal)return;modal.style.display='flex';const prov=E('llmProvider');if(prov){renderLlmFields(prov.value)}}
 const COMPACT_AUTO_REFRESH_COUNT=3;
@@ -54241,7 +58080,7 @@ const I18N={
 
 
     llm_fill_config:'Fill LLM Config',llm_provider:'Provider',llm_confirm:'Confirm',llm_import_config:'Import config',
-    llm_thinking_stream:'Thinking Stream',llm_enabled:'Enabled',llm_disabled:'Disabled',
+    llm_thinking_stream:'Thinking Stream',llm_response_stream:'Response Stream',llm_response_stream_hint:'Stream assistant response text through live events. Default is disabled.',llm_enabled:'Enabled',llm_disabled:'Disabled',
     llm_model:'Model',llm_scan:'Scan',llm_scan_hint:'Click Scan to probe the endpoint and detect models',llm_scan_first:'Scan models first',
     llm_scanning:'Scanning...',llm_scan_found:'Found {n} model(s)',llm_scan_empty:'No models found',llm_scan_error:'Scan failed',llm_scan_reachable_manual:'Endpoint reachable, fill model manually',
     todo_plan_steps:'Plan Steps',todo_subtasks:'Subtasks'
@@ -54279,7 +58118,7 @@ const I18N={
 
 
     llm_fill_config:'填写 LLM 配置',llm_provider:'供应商',llm_confirm:'确认',llm_import_config:'导入配置',
-    llm_thinking_stream:'思维流',llm_enabled:'启用',llm_disabled:'禁用',
+    llm_thinking_stream:'思维流',llm_response_stream:'正文流',llm_response_stream_hint:'通过实时事件流式显示助手正文，默认禁用。',llm_enabled:'启用',llm_disabled:'禁用',
     llm_model:'模型',llm_scan:'扫描',llm_scan_hint:'点击扫描探测当前接口并识别模型',llm_scan_first:'请先扫描模型',
     llm_scanning:'扫描中...',llm_scan_found:'发现 {n} 个模型',llm_scan_empty:'未发现模型',llm_scan_error:'扫描失败',llm_scan_reachable_manual:'接口可达，请手动填写模型名',
     todo_plan_steps:'计划步骤',todo_subtasks:'子任务'
@@ -54317,7 +58156,7 @@ const I18N={
 
 
     llm_fill_config:'填寫 LLM 設定',llm_provider:'供應商',llm_confirm:'確認',llm_import_config:'匯入設定',
-    llm_thinking_stream:'思維流',llm_enabled:'啟用',llm_disabled:'停用',
+    llm_thinking_stream:'思維流',llm_response_stream:'正文串流',llm_response_stream_hint:'透過即時事件串流顯示助手正文，預設停用。',llm_enabled:'啟用',llm_disabled:'停用',
     llm_model:'模型',llm_scan:'掃描',llm_scan_hint:'點擊掃描探測目前介面並辨識模型',llm_scan_first:'請先掃描模型',
     llm_scanning:'掃描中...',llm_scan_found:'發現 {n} 個模型',llm_scan_empty:'未發現模型',llm_scan_error:'掃描失敗',llm_scan_reachable_manual:'介面可達，請手動填寫模型名稱',
     todo_plan_steps:'計劃步驟',todo_subtasks:'子任務'
@@ -54355,7 +58194,7 @@ const I18N={
 
 
     llm_fill_config:'LLM設定入力',llm_provider:'プロバイダー',llm_confirm:'確認',llm_import_config:'設定をインポート',
-    llm_thinking_stream:'シンキングストリーム',llm_enabled:'有効',llm_disabled:'無効',
+    llm_thinking_stream:'シンキングストリーム',llm_response_stream:'レスポンスストリーム',llm_response_stream_hint:'アシスタント本文をライブイベントでストリーミング表示します。既定は無効です。',llm_enabled:'有効',llm_disabled:'無効',
     llm_model:'モデル',llm_scan:'スキャン',llm_scan_hint:'スキャンしてエンドポイント到達性とモデルを確認',llm_scan_first:'先にモデルをスキャン',
     llm_scanning:'スキャン中...',llm_scan_found:'{n}個のモデルを検出',llm_scan_empty:'モデルが見つかりません',llm_scan_error:'スキャン失敗',llm_scan_reachable_manual:'エンドポイント到達可、モデル名は手動入力してください',
     todo_plan_steps:'計画ステップ',todo_subtasks:'サブタスク'
@@ -54383,7 +58222,7 @@ Object.assign(I18N['en'],{
       event_scheduler_queued_title:'Queued Task',event_scheduler_queued_note:'This message is saved and waiting for an execution slot.',event_scheduler_queue_position:'queue position',event_scheduler_reason:'reason',event_scheduler_queued_hint:'queued',
   event_auto_continue:'Auto Continue',event_arbiter_continue:'Arbiter Continue',event_continuation_briefing:'Continuation Briefing',event_reminder:'Reminder',event_todo_rescue:'Todo Rescue',event_tool_retry:'Tool Retry',event_segmented_retry:'Segmented Retry',event_forced_converge:'Forced Converge',event_no_tool_recovery:'No-Tool Recovery',event_context_recall:'Context Recall',event_failure_recovery:'Failure Recovery',event_truncate_rescue:'Truncation Rescue',event_thinking_recovery:'Thinking Recovery',event_fault_prefill:'Fault Prefill',event_edit_recovery:'Edit Recovery',
   state_on:'on',state_off:'off',
-  rt_session:'session',rt_model:'model',rt_thinking:'thinking',rt_thinking_stream:'thinking_stream',rt_mode:'mode',rt_active_agent:'active_agent',rt_blackboard:'bb',rt_task:'task',rt_complexity:'complexity',rt_judgement:'judgement',rt_budget:'budget',rt_remaining:'remaining',rt_blackboard_cycles:'bb_cycles',rt_round_limit:'round_limit',rt_round:'round',rt_phase:'phase',rt_queued_inputs:'queued_inputs',rt_run_timeout:'run_timeout',rt_ctx_used:'ctx_used',rt_ctx_limit:'ctx_limit',rt_ctx_mode:'ctx_mode',rt_manual_lock:'manual-lock',rt_adaptive:'adaptive',rt_ctx_left:'ctx_left',rt_ctx_left_for:'{label} left',rt_ctx_live_title:'Remaining context budget by active call',rt_truncation:'truncation',rt_trunc_retry:'trunc_retry',rt_trunc_tokens:'trunc_tokens~',rt_archive:'archive',rt_last_compact:'last_compact',rt_ollama:'ollama',rt_files:'files',rt_ui_mode:'ui_mode',rt_state:'state',
+  rt_session:'session',rt_model:'model',rt_thinking:'thinking',rt_thinking_stream:'thinking_stream',rt_response_stream:'response_stream',rt_mode:'mode',rt_active_agent:'active_agent',rt_blackboard:'bb',rt_task:'task',rt_complexity:'complexity',rt_judgement:'judgement',rt_budget:'budget',rt_remaining:'remaining',rt_blackboard_cycles:'bb_cycles',rt_round_limit:'round_limit',rt_round:'round',rt_phase:'phase',rt_queued_inputs:'queued_inputs',rt_run_timeout:'run_timeout',rt_ctx_used:'ctx_used',rt_ctx_limit:'ctx_limit',rt_ctx_mode:'ctx_mode',rt_manual_lock:'manual-lock',rt_adaptive:'adaptive',rt_ctx_left:'ctx_left',rt_ctx_left_for:'{label} left',rt_ctx_live_title:'Remaining context budget by active call',rt_truncation:'truncation',rt_trunc_retry:'trunc_retry',rt_trunc_tokens:'trunc_tokens~',rt_archive:'archive',rt_last_compact:'last_compact',rt_ollama:'ollama',rt_files:'files',rt_ui_mode:'ui_mode',rt_state:'state',
   preview_download:'Download',preview_source:'Source',preview_rendered:'Preview',
   fe_nodes:'nodes={n}',fe_loading:'loading...',fe_tree_truncated:'tree truncated at {n} nodes',fe_items:'{n} item(s)',
   cmd_ui_preview_truncated:'UI preview truncated',cmd_model_context_truncated:'Model context truncated',cmd_temp_read_file_ready:'Temp read_file ready',cmd_buffered_copy:'Buffered copy',cmd_prev:'Prev',cmd_next:'Next',cmd_preview:'preview',cmd_of:'of',cmd_read_file_path:'read_file path',cmd_buffer_ref:'buffer_ref',cmd_chars:'chars',cmd_lines:'lines',cmd_strategy:'strategy',cmd_full_output:'full_output',cmd_exit:'exit',cmd_default_name:'command'
@@ -54411,7 +58250,7 @@ Object.assign(I18N['zh-CN'],{
       event_scheduler_queued_title:'任务已排队',event_scheduler_queued_note:'这条消息已保存，正在等待后台执行名额。',event_scheduler_queue_position:'队列位置',event_scheduler_reason:'原因',event_scheduler_queued_hint:'已排队',
   event_auto_continue:'自动继续',event_arbiter_continue:'裁决继续',event_continuation_briefing:'续跑简报',event_reminder:'提醒',event_todo_rescue:'待办救援',event_tool_retry:'工具重试',event_segmented_retry:'分段重试',event_forced_converge:'强制收敛',event_no_tool_recovery:'无工具恢复',event_context_recall:'上下文召回',event_failure_recovery:'故障恢复',event_truncate_rescue:'截断救援',event_thinking_recovery:'思考恢复',event_fault_prefill:'故障预填',event_edit_recovery:'编辑恢复',
   state_on:'开',state_off:'关',
-  rt_session:'会话',rt_model:'模型',rt_thinking:'思考',rt_thinking_stream:'思考流',rt_mode:'模式',rt_active_agent:'活跃代理',rt_blackboard:'黑板',rt_task:'任务',rt_complexity:'复杂度',rt_judgement:'裁决',rt_budget:'预算',rt_remaining:'剩余',rt_blackboard_cycles:'黑板轮次',rt_round_limit:'轮次上限',rt_round:'轮次',rt_phase:'阶段',rt_queued_inputs:'排队输入',rt_run_timeout:'运行超时',rt_ctx_used:'上下文已用',rt_ctx_limit:'上下文上限',rt_ctx_mode:'上下文模式',rt_manual_lock:'手动锁定',rt_adaptive:'自适应',rt_ctx_left:'上下文剩余',rt_ctx_left_for:'{label}剩余',rt_ctx_live_title:'按真实调用显示上下文剩余',rt_truncation:'截断数',rt_trunc_retry:'截断重试',rt_trunc_tokens:'截断Token~',rt_archive:'归档',rt_last_compact:'最近压缩',rt_ollama:'Ollama',rt_files:'文件根目录',rt_ui_mode:'界面模式',rt_state:'状态',
+  rt_session:'会话',rt_model:'模型',rt_thinking:'思考',rt_thinking_stream:'思考流',rt_response_stream:'正文流',rt_mode:'模式',rt_active_agent:'活跃代理',rt_blackboard:'黑板',rt_task:'任务',rt_complexity:'复杂度',rt_judgement:'裁决',rt_budget:'预算',rt_remaining:'剩余',rt_blackboard_cycles:'黑板轮次',rt_round_limit:'轮次上限',rt_round:'轮次',rt_phase:'阶段',rt_queued_inputs:'排队输入',rt_run_timeout:'运行超时',rt_ctx_used:'上下文已用',rt_ctx_limit:'上下文上限',rt_ctx_mode:'上下文模式',rt_manual_lock:'手动锁定',rt_adaptive:'自适应',rt_ctx_left:'上下文剩余',rt_ctx_left_for:'{label}剩余',rt_ctx_live_title:'按真实调用显示上下文剩余',rt_truncation:'截断数',rt_trunc_retry:'截断重试',rt_trunc_tokens:'截断Token~',rt_archive:'归档',rt_last_compact:'最近压缩',rt_ollama:'Ollama',rt_files:'文件根目录',rt_ui_mode:'界面模式',rt_state:'状态',
   preview_download:'下载',preview_source:'源码',preview_rendered:'预览',
   fe_nodes:'节点={n}',fe_loading:'加载中...',fe_tree_truncated:'目录树在 {n} 个节点处被截断',fe_items:'{n} 项',
   cmd_ui_preview_truncated:'UI 预览截断',cmd_model_context_truncated:'模型上下文截断',cmd_temp_read_file_ready:'临时 read_file 已就绪',cmd_buffered_copy:'缓冲副本',cmd_prev:'上一页',cmd_next:'下一页',cmd_preview:'预览',cmd_of:'共',cmd_read_file_path:'read_file 路径',cmd_buffer_ref:'缓冲引用',cmd_chars:'字符',cmd_lines:'行',cmd_strategy:'策略',cmd_full_output:'完整输出',cmd_exit:'退出码',cmd_default_name:'命令'
@@ -54442,7 +58281,7 @@ Object.assign(I18N['zh-TW'],{
       event_scheduler_queued_title:'任務已排隊',event_scheduler_queued_note:'這則訊息已保存，正在等待背景執行名額。',event_scheduler_queue_position:'佇列位置',event_scheduler_reason:'原因',event_scheduler_queued_hint:'已排隊',
   event_auto_continue:'自動繼續',event_arbiter_continue:'裁決繼續',event_continuation_briefing:'續跑簡報',event_reminder:'提醒',event_todo_rescue:'待辦救援',event_tool_retry:'工具重試',event_segmented_retry:'分段重試',event_forced_converge:'強制收斂',event_no_tool_recovery:'無工具恢復',event_context_recall:'上下文召回',event_failure_recovery:'故障恢復',event_truncate_rescue:'截斷救援',event_thinking_recovery:'思考恢復',event_fault_prefill:'故障預填',event_edit_recovery:'編輯恢復',
   state_on:'開',state_off:'關',
-  rt_session:'會話',rt_model:'模型',rt_thinking:'思考',rt_thinking_stream:'思考流',rt_mode:'模式',rt_active_agent:'活躍代理',rt_blackboard:'黑板',rt_task:'任務',rt_complexity:'複雜度',rt_judgement:'裁決',rt_budget:'預算',rt_remaining:'剩餘',rt_blackboard_cycles:'黑板輪次',rt_round_limit:'輪次上限',rt_round:'輪次',rt_phase:'階段',rt_queued_inputs:'排隊輸入',rt_run_timeout:'執行逾時',rt_ctx_used:'上下文已用',rt_ctx_limit:'上下文上限',rt_ctx_mode:'上下文模式',rt_manual_lock:'手動鎖定',rt_adaptive:'自適應',rt_ctx_left:'上下文剩餘',rt_ctx_left_for:'{label}剩餘',rt_ctx_live_title:'依真實呼叫顯示上下文剩餘',rt_truncation:'截斷數',rt_trunc_retry:'截斷重試',rt_trunc_tokens:'截斷Token~',rt_archive:'封存',rt_last_compact:'最近壓縮',rt_ollama:'Ollama',rt_files:'檔案根目錄',rt_ui_mode:'介面模式',rt_state:'狀態',
+  rt_session:'會話',rt_model:'模型',rt_thinking:'思考',rt_thinking_stream:'思考流',rt_response_stream:'正文串流',rt_mode:'模式',rt_active_agent:'活躍代理',rt_blackboard:'黑板',rt_task:'任務',rt_complexity:'複雜度',rt_judgement:'裁決',rt_budget:'預算',rt_remaining:'剩餘',rt_blackboard_cycles:'黑板輪次',rt_round_limit:'輪次上限',rt_round:'輪次',rt_phase:'階段',rt_queued_inputs:'排隊輸入',rt_run_timeout:'執行逾時',rt_ctx_used:'上下文已用',rt_ctx_limit:'上下文上限',rt_ctx_mode:'上下文模式',rt_manual_lock:'手動鎖定',rt_adaptive:'自適應',rt_ctx_left:'上下文剩餘',rt_ctx_left_for:'{label}剩餘',rt_ctx_live_title:'依真實呼叫顯示上下文剩餘',rt_truncation:'截斷數',rt_trunc_retry:'截斷重試',rt_trunc_tokens:'截斷Token~',rt_archive:'封存',rt_last_compact:'最近壓縮',rt_ollama:'Ollama',rt_files:'檔案根目錄',rt_ui_mode:'介面模式',rt_state:'狀態',
   preview_download:'下載',preview_source:'原始碼',preview_rendered:'預覽',
   fe_nodes:'節點={n}',fe_loading:'載入中...',fe_tree_truncated:'目錄樹在 {n} 個節點處被截斷',fe_items:'{n} 項',
   cmd_ui_preview_truncated:'UI 預覽截斷',cmd_model_context_truncated:'模型上下文截斷',cmd_temp_read_file_ready:'暫存 read_file 已就緒',cmd_buffered_copy:'緩衝副本',cmd_prev:'上一頁',cmd_next:'下一頁',cmd_preview:'預覽',cmd_of:'共',cmd_read_file_path:'read_file 路徑',cmd_buffer_ref:'緩衝引用',cmd_chars:'字元',cmd_lines:'行',cmd_strategy:'策略',cmd_full_output:'完整輸出',cmd_exit:'退出碼',cmd_default_name:'命令'
@@ -54471,7 +58310,7 @@ Object.assign(I18N['ja'],{
       event_scheduler_queued_title:'キュー済みタスク',event_scheduler_queued_note:'このメッセージは保存され、実行枠を待っています。',event_scheduler_queue_position:'キュー位置',event_scheduler_reason:'理由',event_scheduler_queued_hint:'キュー済み',
   event_auto_continue:'自動継続',event_arbiter_continue:'判定継続',event_continuation_briefing:'継続ブリーフ',event_reminder:'リマインダー',event_todo_rescue:'Todo 救援',event_tool_retry:'ツール再試行',event_segmented_retry:'分割再試行',event_forced_converge:'強制収束',event_no_tool_recovery:'ツールなし復旧',event_context_recall:'コンテキスト再呼び出し',event_failure_recovery:'障害復旧',event_truncate_rescue:'切り詰め救援',event_thinking_recovery:'思考復旧',event_fault_prefill:'障害プリフィル',event_edit_recovery:'編集復旧',
   state_on:'オン',state_off:'オフ',
-  rt_session:'セッション',rt_model:'モデル',rt_thinking:'思考',rt_thinking_stream:'思考ストリーム',rt_mode:'モード',rt_active_agent:'アクティブAgent',rt_blackboard:'黒板',rt_task:'タスク',rt_complexity:'複雑度',rt_judgement:'判定',rt_budget:'予算',rt_remaining:'残り',rt_blackboard_cycles:'黒板サイクル',rt_round_limit:'ラウンド上限',rt_round:'ラウンド',rt_phase:'フェーズ',rt_queued_inputs:'待機入力',rt_run_timeout:'実行タイムアウト',rt_ctx_used:'コンテキスト使用量',rt_ctx_limit:'コンテキスト上限',rt_ctx_mode:'コンテキストモード',rt_manual_lock:'手動固定',rt_adaptive:'適応',rt_ctx_left:'残りコンテキスト',rt_ctx_left_for:'{label}残り',rt_ctx_live_title:'実際の呼び出し別の残りコンテキスト',rt_truncation:'切り詰め数',rt_trunc_retry:'切り詰め再試行',rt_trunc_tokens:'切り詰めToken~',rt_archive:'アーカイブ',rt_last_compact:'直近 compact',rt_ollama:'Ollama',rt_files:'ファイルルート',rt_ui_mode:'UIモード',rt_state:'状態',
+  rt_session:'セッション',rt_model:'モデル',rt_thinking:'思考',rt_thinking_stream:'思考ストリーム',rt_response_stream:'レスポンスストリーム',rt_mode:'モード',rt_active_agent:'アクティブAgent',rt_blackboard:'黒板',rt_task:'タスク',rt_complexity:'複雑度',rt_judgement:'判定',rt_budget:'予算',rt_remaining:'残り',rt_blackboard_cycles:'黒板サイクル',rt_round_limit:'ラウンド上限',rt_round:'ラウンド',rt_phase:'フェーズ',rt_queued_inputs:'待機入力',rt_run_timeout:'実行タイムアウト',rt_ctx_used:'コンテキスト使用量',rt_ctx_limit:'コンテキスト上限',rt_ctx_mode:'コンテキストモード',rt_manual_lock:'手動固定',rt_adaptive:'適応',rt_ctx_left:'残りコンテキスト',rt_ctx_left_for:'{label}残り',rt_ctx_live_title:'実際の呼び出し別の残りコンテキスト',rt_truncation:'切り詰め数',rt_trunc_retry:'切り詰め再試行',rt_trunc_tokens:'切り詰めToken~',rt_archive:'アーカイブ',rt_last_compact:'直近 compact',rt_ollama:'Ollama',rt_files:'ファイルルート',rt_ui_mode:'UIモード',rt_state:'状態',
   preview_download:'ダウンロード',preview_source:'ソース',preview_rendered:'プレビュー',
   fe_nodes:'ノード={n}',fe_loading:'読み込み中...',fe_tree_truncated:'ツリーは {n} ノードで切り詰められました',fe_items:'{n} 件',
   cmd_ui_preview_truncated:'UI プレビュー切り詰め',cmd_model_context_truncated:'モデルコンテキスト切り詰め',cmd_temp_read_file_ready:'一時 read_file 準備完了',cmd_buffered_copy:'バッファコピー',cmd_prev:'前へ',cmd_next:'次へ',cmd_preview:'プレビュー',cmd_of:'全',cmd_read_file_path:'read_file パス',cmd_buffer_ref:'buffer_ref',cmd_chars:'文字',cmd_lines:'行',cmd_strategy:'戦略',cmd_full_output:'完全出力',cmd_exit:'終了コード',cmd_default_name:'コマンド'
@@ -54881,6 +58720,26 @@ function _deltaApplyRuntimeEvent(evt){
     _deltaScheduleRender({boards:true});
     return{handled:true,needsSnapshot:false};
   }
+  if(typ==='response_delta'){
+    const active=!!data.active;
+    const visible=!!data.visible;
+    S.snap.live_response_active=active&&visible;
+    S.snap.live_response_stream_id=String(data.stream_id||'');
+    S.snap.live_response_role=String(data.agent_role||'');
+    S.snap.live_response_label=String(data.label||'');
+    if(active&&visible){
+      S.snap.live_response_text=String(data.text||'');
+      if(S.snap.live_response_role){
+        const keyRole=_chatVirtAgentRoleKey(S.snap.live_response_role);
+        if(keyRole)S.snap.agent_active_role=keyRole;
+      }
+    }else{
+      S.snap.live_response_text='';
+    }
+    _deltaAppendActivity(typ,{...data,text:''},ts);
+    _deltaScheduleRender({chat:true,boards:true});
+    return{handled:true,needsSnapshot:false};
+  }
   if(typ==='truncation_delta'){
     S.snap.live_truncation_active=!!data.active;
     S.snap.live_truncation_attempts=Number(data.attempts||0);
@@ -55040,12 +58899,14 @@ function _deltaStartWatchdog(){
 }
 function renderSkillsEntryLink(){const link=E('downloadBtn');if(!link)return;const host=location.hostname||'127.0.0.1';const enabled=Boolean(S.config?.skills_ui_enabled);const fromConfig=String(S.config?.skills_ui_url||'').trim();const skillsPort=Number(S.config?.skills_port||0);let href='#';if(enabled){if(fromConfig){href=fromConfig}else if(Number.isFinite(skillsPort)&&skillsPort>0){const currentPort=Number(location.port||0);if(!(currentPort&&skillsPort===currentPort)){href=`${location.protocol}//${host}:${skillsPort}`}}}const offline=(href==='#');link.href=href;link.classList.toggle('disabled',offline);link.textContent=offline?t('skills_offline'):t('open_skills')}
 function tailSig(rows,count,mapper){const arr=Array.isArray(rows)?rows:[];if(!arr.length)return'';return arr.slice(Math.max(0,arr.length-count)).map(mapper).join('|')}
-function feedSignature(snap){const feed=Array.isArray(snap?.conversation_feed)?snap.conversation_feed:(Array.isArray(snap?.messages)?snap.messages:[]);const sig=tailSig(feed,8,row=>`${Number(row?.ts||0)}:${String(row?.role||'')}:${String(row?.agent_role||'')}:${String(row?.type||'')}:${String(row?.text||'').length}:${String(row?.thinking||'').length}:${String(row?.text||'').slice(-12)}:${String(row?.thinking||'').slice(-12)}`);const live=String(snap?.live_thinking||'');const runActive=snap?.live_run_notice_active?1:0;const runLabel=String(snap?.live_run_notice_label||'');const runStart=Number(snap?.live_run_notice_started_at||0);const truncText=String(snap?.live_truncation_text||'');const truncKind=String(snap?.live_truncation_kind||'');const truncTool=String(snap?.live_truncation_tool||'');const truncAttempts=Number(snap?.live_truncation_attempts||0);const truncTokens=Number(snap?.live_truncation_tokens||0);const truncActive=snap?.live_truncation_active?1:0;return `${feed.length}|${sig}|lt=${live.length}:${live.slice(-12)}|rn=${runActive}:${runStart}:${runLabel.slice(-12)}|tr=${truncActive}:${truncAttempts}:${truncTokens}:${truncKind.slice(-12)}:${truncTool.slice(-12)}:${truncText.length}`}
+function feedSignature(snap){const feed=Array.isArray(snap?.conversation_feed)?snap.conversation_feed:(Array.isArray(snap?.messages)?snap.messages:[]);const sig=tailSig(feed,8,row=>`${Number(row?.ts||0)}:${String(row?.role||'')}:${String(row?.agent_role||'')}:${String(row?.type||'')}:${String(row?.text||'').length}:${String(row?.thinking||'').length}:${String(row?.text||'').slice(-12)}:${String(row?.thinking||'').slice(-12)}`);const live=String(snap?.live_thinking||'');const liveResp=String(snap?.live_response_text||'');const liveRespId=String(snap?.live_response_stream_id||'');const liveRespActive=snap?.live_response_active?1:0;const runActive=snap?.live_run_notice_active?1:0;const runLabel=String(snap?.live_run_notice_label||'');const runStart=Number(snap?.live_run_notice_started_at||0);const truncText=String(snap?.live_truncation_text||'');const truncKind=String(snap?.live_truncation_kind||'');const truncTool=String(snap?.live_truncation_tool||'');const truncAttempts=Number(snap?.live_truncation_attempts||0);const truncTokens=Number(snap?.live_truncation_tokens||0);const truncActive=snap?.live_truncation_active?1:0;return `${feed.length}|${sig}|lt=${live.length}:${live.slice(-12)}|lr=${liveRespActive}:${liveRespId}:${liveResp.length}:${liveResp.slice(-12)}|rn=${runActive}:${runStart}:${runLabel.slice(-12)}|tr=${truncActive}:${truncAttempts}:${truncTokens}:${truncKind.slice(-12)}:${truncTool.slice(-12)}:${truncText.length}`}
 function boardsSignature(snap){const agentCtx=(Array.isArray(snap?.agent_contexts)?snap.agent_contexts:[]).map(r=>`${r.role}:${r.left}:${r.left_percent}:${r.tier}:${r.active?1:0}`).join(',');return [snap?.running?1:0,snap?.agent_phase||'',Number(snap?.agent_round_index||0),Number(snap?.queued_user_inputs_count||0),Number(snap?.truncation_count||0),Number(snap?.live_truncation_attempts||0),Number(snap?.live_truncation_tokens||0),snap?.live_truncation_active?1:0,Number(snap?.context_tokens_estimate||0),Number(snap?.context_left_tokens||0),Number(snap?.context_left_percent||0),agentCtx,Number(snap?.render_bridge?.seq||0),String(snap?.plan_mode_preference||'auto'),Number(snap?.user_task_level||0),(snap?.todos||[]).length,(snap?.tasks||[]).length,(snap?.activity||[]).length,(snap?.operations||[]).length,(snap?.uploads||[]).length].join('|')}
 function sessionsSignature(list){const rows=Array.isArray(list)?list:[];const sig=tailSig(rows,6,row=>`${String(row?.id||'')}:${row?.running?1:0}:${Number(row?.message_count||0)}:${Number(row?.updated_at||0)}`);const aid=String(S.activeId||'').trim();let activeSig='-';if(aid){const activeRow=rows.find(row=>String(row?.id||'')===aid);if(activeRow){activeSig=`${aid}:${activeRow?.running?1:0}:${Number(activeRow?.message_count||0)}:${Number(activeRow?.updated_at||0)}`}else{activeSig=`missing:${aid}`}}return `${rows.length}|active=${activeSig}|${sig}`}
+function mergeSessionRows(base,incoming){const map=new Map();for(const row of Array.isArray(base)?base:[]){const id=String(row?.id||'').trim();if(id)map.set(id,{...row})}for(const row of Array.isArray(incoming)?incoming:[]){const id=String(row?.id||'').trim();if(id)map.set(id,{...(map.get(id)||{}),...row})}return Array.from(map.values()).sort((a,b)=>Number(b?.updated_at||0)-Number(a?.updated_at||0))}
+function applySessionPage(rowsRaw,opt={}){const payload=(rowsRaw&&typeof rowsRaw==='object'&&!Array.isArray(rowsRaw))?rowsRaw:{};const rows=Array.isArray(rowsRaw)?rowsRaw:(Array.isArray(payload.sessions)?payload.sessions:[]);const append=!!opt.append;const keepExisting=append||Number(S.sessions?.length||0)>rows.length;S.sessions=keepExisting?mergeSessionRows(S.sessions,rows):rows;const total=Number(payload.total);S.sessionTotal=Number.isFinite(total)&&total>=S.sessions.length?total:S.sessions.length;const offset=Number(payload.offset||0);const limit=Number(payload.limit||rows.length||0);const next=Number.isFinite(offset)&&Number.isFinite(limit)?offset+rows.length:S.sessions.length;S.sessionNextOffset=Math.max(Number(S.sessionNextOffset||0),next,S.sessions.length);const payloadHasMore=Object.prototype.hasOwnProperty.call(payload,'has_more')?!!payload.has_more:(S.sessionNextOffset<S.sessionTotal);S.sessionHasMore=!!(payloadHasMore&&S.sessionNextOffset<S.sessionTotal);return{rows,selectedId:'',total:S.sessionTotal,hasMore:S.sessionHasMore}}
 function _statInfinite(n){const v=Number(n);return(Number.isFinite(v)&&v>0)?String(v):'∞'}
 function applyRuntimeConfigStats(cfg){if(!cfg||typeof cfg!=='object')return;S.config=S.config||{};if(cfg.scheduler&&typeof cfg.scheduler==='object')S.config.scheduler=cfg.scheduler;if(cfg.session_creation_limit&&typeof cfg.session_creation_limit==='object')S.config.session_creation_limit=cfg.session_creation_limit;if(Object.prototype.hasOwnProperty.call(cfg,'daily_session_limit'))S.config.daily_session_limit=cfg.daily_session_limit;if(Object.prototype.hasOwnProperty.call(cfg,'download_js_lib_enabled'))S.config.download_js_lib_enabled=!!cfg.download_js_lib_enabled;if(Object.prototype.hasOwnProperty.call(cfg,'request_timeout_default'))S.config.request_timeout_default=cfg.request_timeout_default;if(Object.prototype.hasOwnProperty.call(cfg,'run_timeout'))S.config.run_timeout=cfg.run_timeout;if(Object.prototype.hasOwnProperty.call(cfg,'shell_command_timeout_seconds'))S.config.shell_command_timeout_seconds=cfg.shell_command_timeout_seconds;if(Object.prototype.hasOwnProperty.call(cfg,'user_memory_mode'))S.config.user_memory_mode=String(cfg.user_memory_mode||'weak');if(Object.prototype.hasOwnProperty.call(cfg,'user_memory_setting_locked'))S.config.user_memory_setting_locked=!!cfg.user_memory_setting_locked;if(Object.prototype.hasOwnProperty.call(cfg,'model')&&String(cfg.model||'').trim())S.config.model=cfg.model;renderMemoryModeAction()}
-function renderStats(){const sessions=S.sessions.length;const running=S.sessions.filter(x=>x.running).length;const msgs=S.sessions.reduce((n,x)=>n+x.message_count,0);const model=S.config?.model||'-';const sched=(S.config&&typeof S.config.scheduler==='object')?S.config.scheduler:{};const quota=(S.config&&typeof S.config.session_creation_limit==='object')?S.config.session_creation_limit:{};const runningTotal=Math.max(0,Number(sched?.running_total||0));const maxTasks=Number(sched?.max_user||0);const globalTasks=`${runningTotal}/${_statInfinite(maxTasks)}`;const dailySessions=(quota&&quota.enabled)?`${Math.max(0,Number(quota.used||0))}/${Math.max(0,Number(quota.limit||0))}`:'∞';const compact=[[t('stat_sessions'),sessions],[t('stat_running'),running],[t('stat_messages'),msgs],[t('stat_global_tasks'),globalTasks],[t('stat_daily_sessions'),dailySessions]].map(([k,v])=>`<div class=\"stat compact\"><div class=\"k\">${esc(k)}</div><div class=\"v\">${esc(v)}</div></div>`).join('');const modelHtml=`<div class=\"stat model\"><div class=\"k\">${esc(t('stat_model'))}</div><div class=\"v\">${esc(model)}</div></div>`;setHtmlIfChanged('topStats',`<div class=\"top-stats-primary\">${compact}</div><div class=\"top-stats-model\">${modelHtml}</div>`,'topStats')}
+function renderStats(){const sessions=Math.max(Number(S.sessionTotal||0),S.sessions.length);const running=S.sessions.filter(x=>x.running).length;const msgs=S.sessions.reduce((n,x)=>n+x.message_count,0);const model=S.config?.model||'-';const sched=(S.config&&typeof S.config.scheduler==='object')?S.config.scheduler:{};const quota=(S.config&&typeof S.config.session_creation_limit==='object')?S.config.session_creation_limit:{};const runningTotal=Math.max(0,Number(sched?.running_total||0));const maxTasks=Number(sched?.max_user||0);const globalTasks=`${runningTotal}/${_statInfinite(maxTasks)}`;const dailySessions=(quota&&quota.enabled)?`${Math.max(0,Number(quota.used||0))}/${Math.max(0,Number(quota.limit||0))}`:'∞';const compact=[[t('stat_sessions'),sessions],[t('stat_running'),running],[t('stat_messages'),msgs],[t('stat_global_tasks'),globalTasks],[t('stat_daily_sessions'),dailySessions]].map(([k,v])=>`<div class=\"stat compact\"><div class=\"k\">${esc(k)}</div><div class=\"v\">${esc(v)}</div></div>`).join('');const modelHtml=`<div class=\"stat model\"><div class=\"k\">${esc(t('stat_model'))}</div><div class=\"v\">${esc(model)}</div></div>`;setHtmlIfChanged('topStats',`<div class=\"top-stats-primary\">${compact}</div><div class=\"top-stats-model\">${modelHtml}</div>`,'topStats')}
 function renderSessions(){
   const host=E('sessionList');
   if(!host)return;
@@ -55063,16 +58924,17 @@ function renderSessions(){
   const visible=rows.slice(start,start+count);
   const padTop=start*rowStride;
   const padBottom=Math.max(0,(rows.length-start-count)*rowStride);
+  const loadingMore=S.sessionHasMore?`<div class=\"mono\" style=\"padding:8px 10px;flex:0 0 auto\">${esc(S.sessionLoadingMore?t('fe_loading'):`${rows.length}/${S.sessionTotal||rows.length}`)}</div>`:'';
   const html=`<div style=\"height:${padTop}px;flex:0 0 auto\"></div>`+
     visible.map(s=>`<div class=\"session-item${s.id===S.activeId?' active':''}\" style=\"height:${itemH}px;min-height:${itemH}px;flex:0 0 ${itemH}px\" data-id=\"${esc(s.id)}\"><div><strong>${esc(s.title)}</strong></div><div class=\"mono\">${s.running?t('running'):t('idle')} · ${s.message_count} msgs</div></div>`).join('')+
-    `<div style=\"height:${padBottom}px;flex:0 0 auto\"></div>`;
+    `<div style=\"height:${padBottom}px;flex:0 0 auto\"></div>${loadingMore}`;
   setPanelHtml('sessionList',html);
   for(const el of host.querySelectorAll('.session-item')){el.onclick=()=>selectSession(el.getAttribute('data-id'))}
   if(!host._sessionVirtBound){
     host._sessionVirtBound=true;
     host.addEventListener('scroll',()=>{
       if(host._sessionVirtRaf)return;
-      host._sessionVirtRaf=requestAnimationFrame(()=>{host._sessionVirtRaf=0;renderSessions()});
+      host._sessionVirtRaf=requestAnimationFrame(()=>{host._sessionVirtRaf=0;renderSessions();if(S.sessionHasMore&&(Number(host.scrollTop||0)+Number(host.clientHeight||0)>Number(host.scrollHeight||0)-900)){loadMoreSessions({limit:SESSION_REFRESH_LIMIT}).catch(()=>{})}});
     },{passive:true});
   }
 }
@@ -56591,6 +60453,20 @@ function _chatVirtCollectRows(){
       _vk:`live:${activeAgentRole}:${liveThinking.length}:${liveThinking.slice(-24)}`
     });
   }
+  const liveResponse=String(S.snap?.live_response_text||'').trim();
+  if(liveResponse&&S.snap?.live_response_active){
+    const respRole=_chatVirtAgentRoleKey(S.snap?.live_response_role)||activeAgentRole;
+    const streamId=String(S.snap?.live_response_stream_id||'live-response');
+    rows.push({
+      role:'assistant',
+      type:'live_response',
+      ts:Number(S.snap?.updated_at||Date.now()/1000),
+      text:liveResponse,
+      label:String(S.snap?.live_response_label||''),
+      agent_role:respRole||undefined,
+      _vk:`response:${streamId}:${respRole}:${liveResponse.length}:${liveResponse.slice(-24)}`
+    });
+  }
   const liveTrunc=String(S.snap?.live_truncation_text||'').trim();
   if(liveTrunc){
     const active=!!S.snap?.live_truncation_active;
@@ -56798,6 +60674,7 @@ function _chatVirtBuildMessageNode(m){
       else if(m.type==='web_search'&&m.data)kind='web_search';
       else if(parsedWebSearchText)kind='web_search';
   else if(m.type==='live_thinking')kind='live_thinking';
+  else if(m.type==='live_response')kind='live_response';
   else if(m.type==='live_truncation')kind='live_truncation';
   else if(m.type==='live_run_notice')kind='live_run_notice';
   else if(m.type==='plan_approved_handoff'||_chatVirtParsePlanHandoff(rawTextForKind))kind='plan_approved_handoff';
@@ -57172,6 +61049,13 @@ function _chatVirtBuildMessageNode(m){
     const liveThinkingHtml=`<div class=\"msg-thinking\"><div class=\"msg-thinking-label\">${esc(t('thinking_stream'))}</div><pre>${esc(String(m.text||''))}</pre></div>`;
     d.innerHTML=(agentRole&&m.role!=='user')?`<div class=\"msg-agent-shell\">${roleBadge}${liveThinkingHtml}</div>`:`${roleBadge}${liveThinkingHtml}`;
     d.setAttribute('data-math-request',`${String(m._vk||'')}:live-thinking`);
+    return d;
+  }
+  if(m.type==='live_response'){
+    const key=`${String(m._vk||'')}:live-response`;
+    const liveResponseHtml=`<div class=\"msg-md live-response\">${renderMarkdownCached(String(m.text||''),key)}</div>`;
+    d.innerHTML=(agentRole&&m.role!=='user')?`<div class=\"msg-agent-shell\">${roleBadge}${liveResponseHtml}</div>`:`${roleBadge}${liveResponseHtml}`;
+    d.setAttribute('data-math-request',key);
     return d;
   }
   if(m.type==='live_truncation'){
@@ -57850,7 +61734,7 @@ function _cmdPageText(op,page){const d=(op&&typeof op==='object'&&op.data&&typeo
 function _runtimePillHtml(label,value,opts={}){const wide=opts&&opts.wide?' runtime-pill-wide':'';const tone=opts&&opts.tone?` ${opts.tone}`:'';const mono=opts&&opts.mono?' mono':'';return `<span class=\"runtime-pill${wide}${tone}\"><span class=\"runtime-pill-label\">${esc(label)}</span><span class=\"runtime-pill-value${mono}\">${esc(String(value??'-'))}</span></span>`}
 function _safeJsonSig(value){try{return JSON.stringify(value??null)}catch(_){return String(value??'')}}
 function _opsTailSignature(rows,count,mapper){const arr=Array.isArray(rows)?rows:[];return arr.slice(Math.max(0,arr.length-count)).map(mapper).join('|')}
-function renderRuntimeStatus(){const uiState=S.staticMode?(S.frozen?'static':'live'):'live';const boolWord=v=>t(v?'state_on':'state_off');const activeRole=String(S.snap?.agent_active_role||'').trim();const activeRoleLabel=activeRole?_chatVirtAgentRoleLabel(activeRole):'-';const runtimeItems=[{label:t('rt_session'),value:S.snap?.id||'-',mono:true},{label:t('rt_model'),value:S.snap?.model||'-',mono:true},{label:t('rt_thinking'),value:boolWord(S.snap?.thinking)},{label:t('rt_thinking_stream'),value:boolWord(S.snap?.thinking_stream)},{label:t('rt_mode'),value:S.snap?.execution_mode||S.config?.execution_mode||'sync'},{label:t('rt_active_agent'),value:activeRoleLabel},{label:t('rt_blackboard'),value:S.snap?.blackboard?.status||'-'},{label:t('rt_task'),value:S.snap?.blackboard?.task_profile?.task_type||'-'},{label:t('rt_complexity'),value:S.snap?.blackboard?.task_profile?.complexity||'-'},{label:t('rt_judgement'),value:S.snap?.blackboard?.manager_judgement?.progress||'-'},{label:t('rt_budget'),value:S.snap?.blackboard?.task_profile?.round_budget??'-'},{label:t('rt_remaining'),value:S.snap?.blackboard?.manager_judgement?.remaining_rounds??'-'},{label:t('rt_blackboard_cycles'),value:S.snap?.blackboard?.manager_cycles??'-'},{label:t('rt_round_limit'),value:S.snap?.max_agent_rounds||'-'},{label:t('rt_round'),value:S.snap?.agent_round_index??'-'},{label:t('rt_phase'),value:S.snap?.agent_phase||t('idle')},{label:t('rt_queued_inputs'),value:S.snap?.queued_user_inputs_count??0},{label:t('rt_run_timeout'),value:`${S.snap?.max_run_seconds??'-'}s`},{label:t('rt_ctx_used'),value:S.snap?.context_tokens_estimate??'-'},{label:t('rt_ctx_limit'),value:S.snap?.context_effective_token_limit||S.snap?.context_token_upper_bound||'-'},{label:t('rt_ctx_mode'),value:t(S.snap?.context_token_limit_locked?'rt_manual_lock':'rt_adaptive')},{label:t('rt_ctx_left'),value:formatContextLeft(S.snap)},{label:t('rt_truncation'),value:S.snap?.truncation_count||0},{label:t('rt_trunc_retry'),value:S.snap?.live_truncation_attempts||0},{label:t('rt_trunc_tokens'),value:S.snap?.live_truncation_tokens||0},{label:t('rt_archive'),value:S.snap?.compact_segments_count||0},{label:t('rt_last_compact'),value:S.snap?.last_compact_reason||'-'},{label:t('rt_ollama'),value:S.snap?.ollama_base_url||'-',mono:true,wide:true},{label:t('rt_files'),value:S.snap?.session_files_root||'-',mono:true,wide:true},{label:t('rt_ui_mode'),value:uiState},{label:t('rt_state'),value:S.snap?.running?t('running'):t('idle'),tone:S.snap?.running?'state-running':'state-idle'}];setHtmlIfChanged('status',runtimeItems.map(item=>_runtimePillHtml(item.label,item.value,item)).join('')+agentContextChipsHtml(S.snap),'runtimeStatus')}
+function renderRuntimeStatus(){const uiState=S.staticMode?(S.frozen?'static':'live'):'live';const boolWord=v=>t(v?'state_on':'state_off');const activeRole=String(S.snap?.agent_active_role||'').trim();const activeRoleLabel=activeRole?_chatVirtAgentRoleLabel(activeRole):'-';const runtimeItems=[{label:t('rt_session'),value:S.snap?.id||'-',mono:true},{label:t('rt_model'),value:S.snap?.model||'-',mono:true},{label:t('rt_thinking'),value:boolWord(S.snap?.thinking)},{label:t('rt_thinking_stream'),value:boolWord(S.snap?.thinking_stream)},{label:t('rt_response_stream'),value:boolWord(S.snap?.response_stream)},{label:t('rt_mode'),value:S.snap?.execution_mode||S.config?.execution_mode||'sync'},{label:t('rt_active_agent'),value:activeRoleLabel},{label:t('rt_blackboard'),value:S.snap?.blackboard?.status||'-'},{label:t('rt_task'),value:S.snap?.blackboard?.task_profile?.task_type||'-'},{label:t('rt_complexity'),value:S.snap?.blackboard?.task_profile?.complexity||'-'},{label:t('rt_judgement'),value:S.snap?.blackboard?.manager_judgement?.progress||'-'},{label:t('rt_budget'),value:S.snap?.blackboard?.task_profile?.round_budget??'-'},{label:t('rt_remaining'),value:S.snap?.blackboard?.manager_judgement?.remaining_rounds??'-'},{label:t('rt_blackboard_cycles'),value:S.snap?.blackboard?.manager_cycles??'-'},{label:t('rt_round_limit'),value:S.snap?.max_agent_rounds||'-'},{label:t('rt_round'),value:S.snap?.agent_round_index??'-'},{label:t('rt_phase'),value:S.snap?.agent_phase||t('idle')},{label:t('rt_queued_inputs'),value:S.snap?.queued_user_inputs_count??0},{label:t('rt_run_timeout'),value:`${S.snap?.max_run_seconds??'-'}s`},{label:t('rt_ctx_used'),value:S.snap?.context_tokens_estimate??'-'},{label:t('rt_ctx_limit'),value:S.snap?.context_effective_token_limit||S.snap?.context_token_upper_bound||'-'},{label:t('rt_ctx_mode'),value:t(S.snap?.context_token_limit_locked?'rt_manual_lock':'rt_adaptive')},{label:t('rt_ctx_left'),value:formatContextLeft(S.snap)},{label:t('rt_truncation'),value:S.snap?.truncation_count||0},{label:t('rt_trunc_retry'),value:S.snap?.live_truncation_attempts||0},{label:t('rt_trunc_tokens'),value:S.snap?.live_truncation_tokens||0},{label:t('rt_archive'),value:S.snap?.compact_segments_count||0},{label:t('rt_last_compact'),value:S.snap?.last_compact_reason||'-'},{label:t('rt_ollama'),value:S.snap?.ollama_base_url||'-',mono:true,wide:true},{label:t('rt_files'),value:S.snap?.session_files_root||'-',mono:true,wide:true},{label:t('rt_ui_mode'),value:uiState},{label:t('rt_state'),value:S.snap?.running?t('running'):t('idle'),tone:S.snap?.running?'state-running':'state-idle'}];setHtmlIfChanged('status',runtimeItems.map(item=>_runtimePillHtml(item.label,item.value,item)).join('')+agentContextChipsHtml(S.snap),'runtimeStatus')}
 function renderPlanLevelControls(){const _pmBtn=E('planModeBtn');if(_pmBtn){const _pm=S.snap?.plan_mode_preference||'auto';setTextIfChanged(_pmBtn,'Plan: '+_pm.charAt(0).toUpperCase()+_pm.slice(1))}updateLevelBtn(S.snap?.user_task_level||0)}
 function renderTodoTaskPanels(){const todoSig=currentLang()+'|'+String(S.snap?.plan_mode_preference||'auto')+'|'+_safeJsonSig(S.snap?.todos||[]);if(S.renderSigs.todosSig!==todoSig){S.renderSigs.todosSig=todoSig;setPanelHtml('todos',renderTodoBoard(S.snap?.todos||[]))}const taskSig=currentLang()+'|'+_safeJsonSig(S.snap?.tasks||[]);if(S.renderSigs.tasksSig!==taskSig){S.renderSigs.tasksSig=taskSig;setPanelHtml('tasks',renderTaskBoard(S.snap?.tasks||[]))}}
 function renderActivityPanel(){const rows=(S.snap?.activity||[]).slice(-80).sort((a,b)=>Number(a.ts||0)-Number(b.ts||0));const sig=currentLang()+'|'+rows.map(a=>`${Number(a.ts||0)}:${String(a.summary||'')}`).join('|');if(S.renderSigs.activitySig===sig)return;S.renderSigs.activitySig=sig;setPanelHtml('activity',rows.map(a=>`<div class=\"mono\">${new Date(a.ts*1000).toLocaleTimeString()} · ${esc(a.summary)}</div>`).join('')||`<div class=\"mono\">${esc(t('no_activity'))}</div>`)}
@@ -57871,10 +61755,10 @@ function renderDiffsPanel(ops){
 }
 function renderCatalogPanel(){const sig=currentLang()+'|'+_safeJsonSig({p:S.protocols,pr:S.providers,s:S.skills,t:S.tools});if(S.renderSigs.catalogSig===sig)return;S.renderSigs.catalogSig=sig;const protocols=(S.protocols||[]).map(x=>`<div><span class=\"tag\">protocol</span>${esc(x.protocol)} · providers=${esc(x.active_providers)} · skills=${esc(x.active_skills)}</div>`).join('');const providers=(S.providers||[]).map(x=>`<div><span class=\"tag\">provider</span>${esc(x.provider_id)} · ${esc(x.protocol)} · skills=${esc(x.skill_count)}</div>`).join('');const skills=(S.skills||[]).filter(x=>x.id!=='_warnings').map(x=>`<div><span class=\"tag\">skill</span>${esc(x.qualified_name||x.name)} - ${esc(x.description||'')}</div>`).join('');const tools=(S.tools||[]).slice(0,16).map(x=>`<div><span class=\"tag\">tool</span>${esc(x.name)}</div>`).join('');setPanelHtml('catalog',protocols+providers+skills+tools||`<div class=\"mono\">${esc(t('no_catalog'))}</div>`)}
 function _fileOpsSig(ops){return _opsTailSignature((Array.isArray(ops)?ops:[]).filter(x=>x.type==='file_patch'||x.type==='upload'),12,e=>{const d=e?.data||{};return `${e.type}:${e.id||e.seq||e.ts||''}:${d.session_rel_path||d.path||d.workspace_path||''}:${d.size||''}:${d.parse_status||''}`})}
-function renderFilesPanelFromBoards(ops){const sid=String(S.activeId||'').trim();if(!sid){renderFileExplorer();return}const st=ensureFileExplorerState(sid);const fileSig=_fileOpsSig(ops);const refreshKey=`${sid}|${fileSig}`;const paintSig=`${sid}|${currentLang()}|${S.snap?.session_files_root||''}|${Number(st?.fetchedAt||0)}|${Number(st?.nodeCount||0)}|${String(st?.selected||'')}|${st?.inflight?1:0}`;if(S.renderSigs.filePaintSig!==paintSig){S.renderSigs.filePaintSig=paintSig;renderFileExplorer()}if(!st?.tree){refreshFileExplorer(false).catch(()=>{});return}if(fileSig&&S.renderSigs.fileRefreshSig!==refreshKey){S.renderSigs.fileRefreshSig=refreshKey;refreshFileExplorer(true).catch(()=>{})}}
+function renderFilesPanelFromBoards(ops){const sid=String(S.activeId||'').trim();if(!sid){renderFileExplorer();return}const st=ensureFileExplorerState(sid);const fileSig=_fileOpsSig(ops);const refreshKey=`${sid}|${fileSig}`;const paintSig=`${sid}|${currentLang()}|${S.snap?.session_files_root||''}|${Number(st?.fetchedAt||0)}|${Number(st?.nodeCount||0)}|${String(st?.selected||'')}|${st?.inflight?1:0}`;if(S.renderSigs.filePaintSig!==paintSig){S.renderSigs.filePaintSig=paintSig;renderFileExplorer()}if(!st?.tree){if(Date.now()<Number(S.fileExplorerDeferUntil||0))return;refreshFileExplorer(false).catch(()=>{});return}if(fileSig&&S.renderSigs.fileRefreshSig!==refreshKey){S.renderSigs.fileRefreshSig=refreshKey;refreshFileExplorer(true).catch(()=>{})}}
 function renderDownloadLinks(){const sessionZip=S.activeId?('/api/sessions/'+S.activeId+'/export.zip'):'#';const sessionMd=S.activeId?('/api/sessions/'+S.activeId+'/export.md'):'#';const sessionPdf=S.activeId?('/api/sessions/'+S.activeId+'/export.pdf'):'#';const sessionPng=S.activeId?('/api/sessions/'+S.activeId+'/export.png'):'#';const sig=[sessionZip,sessionMd,sessionPdf,sessionPng].join('|');if(S.renderSigs.downloadLinksSig===sig)return;S.renderSigs.downloadLinksSig=sig;const dl1=E('downloadSessionBtn');const dlMd=E('exportMdBtn');const dlPdf=E('exportPdfBtn');const dlPng=E('exportPngBtn');if(dl1)dl1.href=sessionZip;if(dlMd)dlMd.href=sessionMd;if(dlPdf)dlPdf.href=sessionPdf;if(dlPng)dlPng.href=sessionPng}
 function renderBoardsOptimized(){const ops=S.snap?.operations||[];renderRuntimeStatus();renderCtxLive(S.snap);renderPlanLevelControls();_renderBridgeSyncFromSnapshot(S.snap||{});renderTodoTaskPanels();renderActivityPanel();renderCommandsPanel(ops);renderDiffsPanel(ops);renderCatalogPanel();renderFilesPanelFromBoards(ops);renderUploadList();renderDownloadLinks();renderSkillsEntryLink()}
-function renderBoards(){renderBoardsOptimized();return;const uiState=S.staticMode?(S.frozen?'static':'live'):'live';const boolWord=v=>t(v?'state_on':'state_off');const activeRole=String(S.snap?.agent_active_role||'').trim();const activeRoleLabel=activeRole?_chatVirtAgentRoleLabel(activeRole):'-';const runtimeItems=[{label:t('rt_session'),value:S.snap?.id||'-',mono:true},{label:t('rt_model'),value:S.snap?.model||'-',mono:true},{label:t('rt_thinking'),value:boolWord(S.snap?.thinking)},{label:t('rt_thinking_stream'),value:boolWord(S.snap?.thinking_stream)},{label:t('rt_mode'),value:S.snap?.execution_mode||S.config?.execution_mode||'sync'},{label:t('rt_active_agent'),value:activeRoleLabel},{label:t('rt_blackboard'),value:S.snap?.blackboard?.status||'-'},{label:t('rt_task'),value:S.snap?.blackboard?.task_profile?.task_type||'-'},{label:t('rt_complexity'),value:S.snap?.blackboard?.task_profile?.complexity||'-'},{label:t('rt_judgement'),value:S.snap?.blackboard?.manager_judgement?.progress||'-'},{label:t('rt_budget'),value:S.snap?.blackboard?.task_profile?.round_budget??'-'},{label:t('rt_remaining'),value:S.snap?.blackboard?.manager_judgement?.remaining_rounds??'-'},{label:t('rt_blackboard_cycles'),value:S.snap?.blackboard?.manager_cycles??'-'},{label:t('rt_round_limit'),value:S.snap?.max_agent_rounds||'-'},{label:t('rt_round'),value:S.snap?.agent_round_index??'-'},{label:t('rt_phase'),value:S.snap?.agent_phase||t('idle')},{label:t('rt_queued_inputs'),value:S.snap?.queued_user_inputs_count??0},{label:t('rt_run_timeout'),value:`${S.snap?.max_run_seconds??'-'}s`},{label:t('rt_ctx_used'),value:S.snap?.context_tokens_estimate??'-'},{label:t('rt_ctx_limit'),value:S.snap?.context_effective_token_limit||S.snap?.context_token_upper_bound||'-'},{label:t('rt_ctx_mode'),value:t(S.snap?.context_token_limit_locked?'rt_manual_lock':'rt_adaptive')},{label:t('rt_ctx_left'),value:formatContextLeft(S.snap)},{label:t('rt_truncation'),value:S.snap?.truncation_count||0},{label:t('rt_trunc_retry'),value:S.snap?.live_truncation_attempts||0},{label:t('rt_trunc_tokens'),value:S.snap?.live_truncation_tokens||0},{label:t('rt_archive'),value:S.snap?.compact_segments_count||0},{label:t('rt_last_compact'),value:S.snap?.last_compact_reason||'-'},{label:t('rt_ollama'),value:S.snap?.ollama_base_url||'-',mono:true,wide:true},{label:t('rt_files'),value:S.snap?.session_files_root||'-',mono:true,wide:true},{label:t('rt_ui_mode'),value:uiState},{label:t('rt_state'),value:S.snap?.running?t('running'):t('idle'),tone:S.snap?.running?'state-running':'state-idle'}];E('status').innerHTML=runtimeItems.map(item=>_runtimePillHtml(item.label,item.value,item)).join('')+agentContextChipsHtml(S.snap);
+function renderBoards(){renderBoardsOptimized();return;const uiState=S.staticMode?(S.frozen?'static':'live'):'live';const boolWord=v=>t(v?'state_on':'state_off');const activeRole=String(S.snap?.agent_active_role||'').trim();const activeRoleLabel=activeRole?_chatVirtAgentRoleLabel(activeRole):'-';const runtimeItems=[{label:t('rt_session'),value:S.snap?.id||'-',mono:true},{label:t('rt_model'),value:S.snap?.model||'-',mono:true},{label:t('rt_thinking'),value:boolWord(S.snap?.thinking)},{label:t('rt_thinking_stream'),value:boolWord(S.snap?.thinking_stream)},{label:t('rt_response_stream'),value:boolWord(S.snap?.response_stream)},{label:t('rt_mode'),value:S.snap?.execution_mode||S.config?.execution_mode||'sync'},{label:t('rt_active_agent'),value:activeRoleLabel},{label:t('rt_blackboard'),value:S.snap?.blackboard?.status||'-'},{label:t('rt_task'),value:S.snap?.blackboard?.task_profile?.task_type||'-'},{label:t('rt_complexity'),value:S.snap?.blackboard?.task_profile?.complexity||'-'},{label:t('rt_judgement'),value:S.snap?.blackboard?.manager_judgement?.progress||'-'},{label:t('rt_budget'),value:S.snap?.blackboard?.task_profile?.round_budget??'-'},{label:t('rt_remaining'),value:S.snap?.blackboard?.manager_judgement?.remaining_rounds??'-'},{label:t('rt_blackboard_cycles'),value:S.snap?.blackboard?.manager_cycles??'-'},{label:t('rt_round_limit'),value:S.snap?.max_agent_rounds||'-'},{label:t('rt_round'),value:S.snap?.agent_round_index??'-'},{label:t('rt_phase'),value:S.snap?.agent_phase||t('idle')},{label:t('rt_queued_inputs'),value:S.snap?.queued_user_inputs_count??0},{label:t('rt_run_timeout'),value:`${S.snap?.max_run_seconds??'-'}s`},{label:t('rt_ctx_used'),value:S.snap?.context_tokens_estimate??'-'},{label:t('rt_ctx_limit'),value:S.snap?.context_effective_token_limit||S.snap?.context_token_upper_bound||'-'},{label:t('rt_ctx_mode'),value:t(S.snap?.context_token_limit_locked?'rt_manual_lock':'rt_adaptive')},{label:t('rt_ctx_left'),value:formatContextLeft(S.snap)},{label:t('rt_truncation'),value:S.snap?.truncation_count||0},{label:t('rt_trunc_retry'),value:S.snap?.live_truncation_attempts||0},{label:t('rt_trunc_tokens'),value:S.snap?.live_truncation_tokens||0},{label:t('rt_archive'),value:S.snap?.compact_segments_count||0},{label:t('rt_last_compact'),value:S.snap?.last_compact_reason||'-'},{label:t('rt_ollama'),value:S.snap?.ollama_base_url||'-',mono:true,wide:true},{label:t('rt_files'),value:S.snap?.session_files_root||'-',mono:true,wide:true},{label:t('rt_ui_mode'),value:uiState},{label:t('rt_state'),value:S.snap?.running?t('running'):t('idle'),tone:S.snap?.running?'state-running':'state-idle'}];E('status').innerHTML=runtimeItems.map(item=>_runtimePillHtml(item.label,item.value,item)).join('')+agentContextChipsHtml(S.snap);
 renderCtxLive(S.snap);
 const _pmBtn=E('planModeBtn');if(_pmBtn){const _pm=S.snap?.plan_mode_preference||'auto';_pmBtn.textContent='Plan: '+_pm.charAt(0).toUpperCase()+_pm.slice(1)}
 const _lvl=S.snap?.user_task_level||0;updateLevelBtn(_lvl)
@@ -57906,44 +61790,78 @@ const dlPdf=E('exportPdfBtn');
 const dlPng=E('exportPngBtn');
 if(S.activeId){dl1.href=sessionZip;if(dlMd)dlMd.href=sessionMd;if(dlPdf)dlPdf.href=sessionPdf;if(dlPng)dlPng.href=sessionPng}else{dl1.href='#';if(dlMd)dlMd.href='#';if(dlPdf)dlPdf.href='#';if(dlPng)dlPng.href='#'}
 renderSkillsEntryLink()}
-function _normalizeModelCatalog(cat){const src=(cat&&typeof cat==='object')?cat:{};const options=Array.isArray(src.options)?src.options.map(it=>{const row=(it&&typeof it==='object')?it:{};const sel=String(row.selection||'').trim();const mdl=String(row.model||'').trim();if(!sel&&!mdl)return null;const profileId=String(row.profile_id||'').trim()||'profile';const selection=sel||`${profileId}::${mdl}`;return{...row,selection,label:String(row.label||selection)}}).filter(Boolean):[];const models=Array.isArray(src.models)?src.models.map(x=>String(x||'').trim()).filter(Boolean):[];const selected=String(src.selected||'').trim();const thinking=('thinking'in src)?!!src.thinking:null;return{options,models,selected,thinking}}
+function _normalizeModelCatalog(cat){const src=(cat&&typeof cat==='object')?cat:{};const options=Array.isArray(src.options)?src.options.map(it=>{const row=(it&&typeof it==='object')?it:{};const sel=String(row.selection||'').trim();const mdl=String(row.model||'').trim();if(!sel&&!mdl)return null;const profileId=String(row.profile_id||'').trim()||'profile';const selection=sel||`${profileId}::${mdl}`;return{...row,selection,label:String(row.label||selection),response_stream:!!row.response_stream}}).filter(Boolean):[];const models=Array.isArray(src.models)?src.models.map(x=>String(x||'').trim()).filter(Boolean):[];const selected=String(src.selected||'').trim();const thinking=('thinking'in src)?!!src.thinking:null;const response_stream=('response_stream'in src)?!!src.response_stream:null;return{options,models,selected,thinking,response_stream}}
 function _modelNameFromSelection(selection){const raw=String(selection||'').trim();if(!raw)return'';if(raw.includes('::')){const parts=raw.split('::',2);return String(parts[1]||parts[0]||'').trim()}return raw}
-function applyModelCatalog(cat){const norm=_normalizeModelCatalog(cat);const hasCat=!!(norm.options.length||norm.models.length||norm.selected);if(!hasCat)return false;S.modelOptions=norm.options;S.models=norm.models;S.config=S.config||{};if(norm.selected){S.config.model=norm.selected}else if(!String(S.config.model||'').trim()){const first=(norm.options[0]?.selection||norm.models[0]||'').trim();if(first)S.config.model=first}if(norm.thinking!==null)S.config.thinking=!!norm.thinking;renderModelControls();return true}
+function applyModelCatalog(cat){const norm=_normalizeModelCatalog(cat);const hasCat=!!(norm.options.length||norm.models.length||norm.selected);if(!hasCat)return false;S.modelOptions=norm.options;S.models=norm.models;S.config=S.config||{};if(norm.selected){S.config.model=norm.selected}else if(!String(S.config.model||'').trim()){const first=(norm.options[0]?.selection||norm.models[0]||'').trim();if(first)S.config.model=first}if(norm.thinking!==null)S.config.thinking=!!norm.thinking;if(norm.response_stream!==null)S.config.response_stream=!!norm.response_stream;renderModelControls();return true}
 function renderModelControls(){const sel=E('modelSelect');if(!sel)return;const active=document.activeElement===sel;const opts=S.modelOptions||[];const parts=[];if(opts.length){for(const it of opts){parts.push(`<option value=\"${esc(it.selection)}\">${esc(it.label||it.selection)}</option>`)}}else{const models=S.models||[];if(!models.length&&S.config?.model){parts.push(`<option value=\"${esc(S.config.model)}\">${esc(S.config.model)}</option>`)}for(const m of models){parts.push(`<option value=\"${esc(m)}\">${esc(m)}</option>`)}}const selected=String(S.config?.model||'').trim();let html=parts.join('');if(selected&&!parts.some(p=>p.includes(`value=\"${esc(selected)}\"`))){html+=`<option value=\"${esc(selected)}\">${esc(selected)}</option>`}setHtmlIfChanged('modelSelect',html,'modelSelect');if(selected&&sel.value!==selected&&!active)sel.value=selected}
 async function refreshSessions(opt={}){
   const useProvidedCfg=Object.prototype.hasOwnProperty.call(opt,'statsConfig');
   const useProvidedRows=Object.prototype.hasOwnProperty.call(opt,'sessions');
   const autoSelect=opt.autoSelect!==false;
+  const limit=Math.max(20,Math.min(500,Number(opt.limit||SESSION_REFRESH_LIMIT)||SESSION_REFRESH_LIMIT));
   const cfgPromise=useProvidedCfg?Promise.resolve(opt.statsConfig):api('/api/config?stats=1').catch(()=>null);
-  const rowsPromise=useProvidedRows?Promise.resolve(Array.isArray(opt.sessions)?opt.sessions:[]):api('/api/sessions?limit=500');
+  const rowsPromise=useProvidedRows?Promise.resolve(opt.sessions):api('/api/sessions?limit='+limit);
   const [cfg,rowsRaw]=await Promise.all([cfgPromise,rowsPromise]);
-  const rows=Array.isArray(rowsRaw)?rowsRaw:(Array.isArray(rowsRaw?.sessions)?rowsRaw.sessions:[]);
   applyRuntimeConfigStats(cfg);
-  S.sessions=rows;
-  const sig=sessionsSignature(rows);
+  const page=applySessionPage(rowsRaw,{append:!!opt.append});
+  const sig=sessionsSignature(S.sessions);
   if(sig!==S.lastSessionsSig){S.lastSessionsSig=sig;renderSessions()}
   renderStats();
   let selectedId='';
-  if(!S.activeId&&rows.length&&autoSelect){
-    selectedId=String(rows[0]?.id||'').trim();
-    if(selectedId)await selectSession(selectedId);
+  if(!S.activeId&&S.sessions.length&&autoSelect){
+    selectedId=String(S.sessions[0]?.id||'').trim();
+    if(selectedId)await selectSession(selectedId,opt.selectOptions||{});
   }
-  return {rows,selectedId};
+  page.selectedId=selectedId;
+  return page;
+}
+async function loadMoreSessions(opt={}){
+  if(S.sessionLoadingMore||!S.sessionHasMore)return {loaded:0,hasMore:!!S.sessionHasMore};
+  const limit=Math.max(20,Math.min(500,Number(opt.limit||SESSION_REFRESH_LIMIT)||SESSION_REFRESH_LIMIT));
+  const offset=Math.max(0,Number(S.sessionNextOffset||S.sessions.length)||0);
+  S.sessionLoadingMore=true;
+  try{
+    const payload=await api('/api/sessions?limit='+limit+'&offset='+offset);
+    const before=S.sessions.length;
+    applySessionPage(payload,{append:true});
+    const sig=sessionsSignature(S.sessions);
+    if(sig!==S.lastSessionsSig){S.lastSessionsSig=sig;renderSessions()}
+    renderStats();
+    return {loaded:Math.max(0,S.sessions.length-before),hasMore:!!S.sessionHasMore};
+  }finally{
+    S.sessionLoadingMore=false;
+  }
+}
+function scheduleLoadRemainingSessions(delayMs=450){
+  if(S.sessionLoadAllTimer||!S.sessionHasMore)return;
+  const delay=Math.max(120,Number(delayMs)||450);
+  S.sessionLoadAllTimer=setTimeout(async()=>{
+    S.sessionLoadAllTimer=0;
+    if(document.visibilityState==='hidden')return;
+    try{await loadMoreSessions({limit:SESSION_REFRESH_LIMIT})}catch(_){}
+    if(S.sessionHasMore)scheduleLoadRemainingSessions(650);
+  },delay);
 }
 async function refreshDeferredCatalogs(){
-  const settled=await Promise.allSettled([
-    api('/api/skills'),
-    api('/api/tools'),
-    api('/api/skills/providers'),
-    api('/api/skills/protocols'),
-  ]);
-  const [skillsRes,toolsRes,providersRes,protocolsRes]=settled;
-  if(skillsRes.status==='fulfilled')S.skills=Array.isArray(skillsRes.value)?skillsRes.value:[];
-  if(toolsRes.status==='fulfilled')S.tools=Array.isArray(toolsRes.value)?toolsRes.value:[];
-  if(providersRes.status==='fulfilled')S.providers=Array.isArray(providersRes.value)?providersRes.value:[];
-  if(protocolsRes.status==='fulfilled')S.protocols=Array.isArray(protocolsRes.value)?protocolsRes.value:[];
-  renderCatalogPanel();
-  renderSkillsEntryLink();
+  if(S.catalogRefreshInFlight)return;
+  S.catalogRefreshInFlight=true;
+  try{
+    const settled=await Promise.allSettled([
+      api('/api/skills'),
+      api('/api/tools'),
+      api('/api/skills/providers'),
+      api('/api/skills/protocols'),
+    ]);
+    const [skillsRes,toolsRes,providersRes,protocolsRes]=settled;
+    if(skillsRes.status==='fulfilled')S.skills=Array.isArray(skillsRes.value)?skillsRes.value:[];
+    if(toolsRes.status==='fulfilled')S.tools=Array.isArray(toolsRes.value)?toolsRes.value:[];
+    if(providersRes.status==='fulfilled')S.providers=Array.isArray(providersRes.value)?providersRes.value:[];
+    if(protocolsRes.status==='fulfilled')S.protocols=Array.isArray(protocolsRes.value)?protocolsRes.value:[];
+    renderCatalogPanel();
+    renderSkillsEntryLink();
+  }finally{
+    S.catalogRefreshInFlight=false;
+  }
 }
 function _chatVirtIsUserScrolling(chatEl){
   if(!chatEl)return false;
@@ -58194,6 +62112,8 @@ function bindEvents(id){
   };
 }
 async function loadModelCatalog(forceRefresh=false){const q=forceRefresh?'?refresh=1':'';if(S.activeId){return await api('/api/sessions/'+S.activeId+'/models'+q)}return await api('/api/models'+q)}
+async function refreshModelCatalog(forceRefresh=false){if(S.modelCatalogInFlight)return null;S.modelCatalogInFlight=true;try{const cat=await loadModelCatalog(forceRefresh);if(!applyModelCatalog(cat))renderModelControls();return cat}catch(_){renderModelControls();return null}finally{S.modelCatalogInFlight=false}}
+function scheduleModelCatalogLoad(forceRefresh=false,delayMs=650){if(S.modelCatalogTimer){if(!forceRefresh)return;clearTimeout(S.modelCatalogTimer);S.modelCatalogTimer=0}const delay=Math.max(0,Number(delayMs)||0);S.modelCatalogTimer=setTimeout(()=>{S.modelCatalogTimer=0;refreshModelCatalog(forceRefresh).catch(()=>{})},delay)}
 function _chatVirtResetScrollState(chatEl){
   S.follow.chat=true;
   if(!chatEl)return;
@@ -58223,12 +62143,15 @@ function _chatVirtResetScrollState(chatEl){
   chatEl._virtLastWinStart=-1;
   chatEl._virtLastWinEnd=-1;
 }
-async function selectSession(id){
+async function selectSession(id,opt={}){
   S.activeId=id;
   S.frozen=false;
   S.lastEventSeq=0;
   S.deltaGapCount=0;
   S.lastDeltaTs=Date.now();
+  S.fileExplorerDeferUntil=Date.now()+1800;
+  if(S.deferredFullSnapshotTimer){clearTimeout(S.deferredFullSnapshotTimer);S.deferredFullSnapshotTimer=0}
+  if(S.deferredFileExplorerTimer){clearTimeout(S.deferredFileExplorerTimer);S.deferredFileExplorerTimer=0}
   S.diffCenterDisabled=Object.create(null);
   S.previewCenterDisabled=Object.create(null);
   S.diffCenteredDone=Object.create(null);
@@ -58240,10 +62163,15 @@ async function selectSession(id){
   bindEvents(id);
   _deltaStartWatchdog();
   pullRenderState(id,true);
-  await refreshSnapshot({forceFull:true,allowWhenFrozen:true});
+  const immediateFull=!!opt.forceFullImmediate;
+  await refreshSnapshot({forceFull:immediateFull,allowWhenFrozen:true});
   renderPreviewTabs();
   renderPreviewVisibility();
   renderActivePreview(false);
+  if(!immediateFull&&String(S.activeId||'')===String(id||'')){
+    S.deferredFullSnapshotTimer=setTimeout(()=>{S.deferredFullSnapshotTimer=0;if(String(S.activeId||'')===String(id||''))scheduleSnapshot({forceFull:true,delayMs:0,allowWhenFrozen:true})},520);
+    S.deferredFileExplorerTimer=setTimeout(()=>{S.deferredFileExplorerTimer=0;S.fileExplorerDeferUntil=0;if(String(S.activeId||'')===String(id||''))refreshFileExplorer(false).catch(()=>{})},1700);
+  }
   showError('');
 }
 async function createSession(opt={}){
@@ -58295,9 +62223,9 @@ async function togglePlanMode(){if(!S.activeId)return;const states=['auto','on',
 async function refreshAll(forceProbe=false){
   if(S.staticMode&&S.frozen){S.frozen=false;applyStaticUiClass()}
   const [cfg,rowsRaw,mc]=await Promise.all([
-    api('/api/config'),
-    api('/api/sessions?limit=500'),
-    loadModelCatalog(forceProbe).catch(()=>null),
+    api('/api/config?lite=1'),
+    api('/api/sessions?limit='+SESSION_BOOT_LIMIT),
+    Promise.resolve(null),
   ]);
   S.config=(cfg&&typeof cfg==='object')?cfg:{};
   applyRuntimeConfigStats(S.config);
@@ -58306,11 +62234,12 @@ async function refreshAll(forceProbe=false){
   applyMainI18n();
   renderUploadList();
   renderSkillsEntryLink();
-  const rows=Array.isArray(rowsRaw)?rowsRaw:(Array.isArray(rowsRaw?.sessions)?rowsRaw.sessions:[]);
-  const sessState=await refreshSessions({statsConfig:S.config,sessions:rows,autoSelect:true});
+  const sessState=await refreshSessions({statsConfig:S.config,sessions:rowsRaw,autoSelect:true,selectOptions:{forceFullImmediate:false},limit:SESSION_BOOT_LIMIT});
   if(!applyModelCatalog(mc)){renderModelControls()}
-  refreshDeferredCatalogs().catch(()=>{});
-  if(S.activeId&&!String(sessState?.selectedId||'').trim())await refreshSnapshot({forceFull:true,allowWhenFrozen:true});
+  scheduleModelCatalogLoad(forceProbe,forceProbe?80:650);
+  setTimeout(()=>refreshDeferredCatalogs().catch(()=>{}),forceProbe?80:900);
+  scheduleLoadRemainingSessions(forceProbe?180:550);
+  if(S.activeId&&!String(sessState?.selectedId||'').trim())await refreshSnapshot({forceFull:!!forceProbe,allowWhenFrozen:true});
 }
 function bindClick(id,fn){const el=E(id);if(el)el.onclick=fn}
 window.addEventListener('DOMContentLoaded',async()=>{for(const id of ['chat','sessionList','todos','tasks','activity','commands','diffs','fileExplorer','catalog']){bindPanelScrollState(id,E(id))}const drop=E('promptComposerShell');const fileInput=E('uploadInput');const promptPick=E('promptFilePick');const promptEl=E('prompt');if(promptPick&&fileInput){promptPick.onclick=(ev)=>{ev.preventDefault();fileInput.click()}}if(drop&&fileInput){let _dragC=0;drop.setAttribute('tabindex','0');drop.addEventListener('click',e=>{if(e.target===drop&&promptEl)promptEl.focus()});fileInput.onchange=()=>uploadFiles(fileInput.files).then(()=>{fileInput.value=''}).catch(err=>showError(err.message));for(const evt of ['dragenter','dragover']){drop.addEventListener(evt,e=>{e.preventDefault();if(evt==='dragenter')_dragC++;drop.classList.add('dragover')})}for(const evt of ['dragleave','dragend']){drop.addEventListener(evt,e=>{e.preventDefault();if(evt==='dragleave')_dragC--;if(_dragC<=0){_dragC=0;drop.classList.remove('dragover')}})}drop.addEventListener('drop',e=>{e.preventDefault();_dragC=0;drop.classList.remove('dragover');const files=e.dataTransfer?.files;if(files&&files.length)uploadFiles(files).catch(err=>showError(err.message))});drop.addEventListener('paste',e=>{const files=clipboardFilesFromEvent(e);if(!files.length)return;e.preventDefault();drop.classList.add('dragover');setTimeout(()=>drop.classList.remove('dragover'),220);uploadFiles(files).catch(err=>showError(err.message||String(err)))})}const configInput=E('configInput');if(configInput){configInput.onchange=()=>uploadLlmConfigFile(configInput.files&&configInput.files[0]).then(()=>{configInput.value=''}).catch(err=>showError(err.message||String(err)))}bindClick('newSessionBtn',createSession);bindClick('renameSessionBtn',renameSession);bindClick('deleteSessionBtn',deleteSession);bindClick('applyModelBtn',applyModel);bindClick('llmConfigBtn',openLlmConfigModal);bindClick('llmModalClose',()=>{E('llmConfigModal').style.display='none'});bindClick('llmConfigConfirm',submitLlmConfig);const llmProv=E('llmProvider');if(llmProv){llmProv.addEventListener('change',()=>renderLlmFields(llmProv.value))}const llmOverlay=E('llmConfigModal');if(llmOverlay){llmOverlay.addEventListener('click',e=>{if(e.target===llmOverlay)llmOverlay.style.display='none'})}bindClick('sendBtn',sendMessage);bindClick('interruptBtn',interruptRun);bindClick('clearStaleTodosBtn',clearStaleTodos);bindClick('planModeBtn',togglePlanMode);bindClick('refreshFilesBtn',()=>refreshFileExplorer(true));bindClick('previewReloadBtn',()=>renderActivePreview(true));bindClick('previewCopyBtn',()=>copyPreviewCode());bindPopupButton('toolsMenuBtn','toolsMenu');bindClick('compactAction',(e)=>{if(e)e.preventDefault();closePopups();compactNow()});bindClick('refreshAction',(e)=>{if(e)e.preventDefault();closePopups();refreshAll(true)});bindPopupButton('levelBtn','levelMenu',(menu)=>{for(const opt of menu.querySelectorAll('.level-option')){opt.addEventListener('click',e=>{e.preventDefault();const lvl=parseInt(opt.getAttribute('data-level')||'0',10);setTaskLevel(lvl);setPopupOpen('levelMenu',false)})}});bindPopupButton('exportMenuBtn','exportMenu',(menu)=>{for(const a of menu.querySelectorAll('.export-item')){a.addEventListener('click',()=>setPopupOpen('exportMenu',false))}});document.addEventListener('click',()=>closePopups());const langSel=E('langSelect');if(langSel){langSel.onchange=()=>setLanguage(langSel.value).catch(err=>showError(err.message||String(err)))}if(promptEl){promptEl.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter'){e.preventDefault();sendMessage()}})}applyUiStyle();applyStaticUiClass();applyMainI18n();_bindPreviewCopyGuard();try{await refreshAll(false);if(!S.sessions.length){const bootCreate=()=>createSession({prompt:false}).catch(err=>showError(err.message||String(err)));if(typeof requestAnimationFrame==='function'){requestAnimationFrame(()=>setTimeout(bootCreate,0))}else{setTimeout(bootCreate,0)}}}catch(err){showError(err.message||String(err))}_deltaStartWatchdog();scheduleSessionPoll(false);document.addEventListener('visibilitychange',()=>{const next=document.visibilityState||'visible';if(next===S.lastVisibilityState)return;S.lastVisibilityState=next;if(next==='hidden'){if(S.deltaWatchdogTimer){clearTimeout(S.deltaWatchdogTimer);S.deltaWatchdogTimer=null}if(S.sessionPollTimer){clearTimeout(S.sessionPollTimer);S.sessionPollTimer=null}if(S.staticMode)freezeAutoUpdates();return}if(S.staticMode&&S.frozen)resumeAutoUpdates();_deltaStartWatchdog();scheduleSessionPoll(true);scheduleSnapshot({forceFull:false,delayMs:40,allowWhenFrozen:true})})})
@@ -58320,12 +62249,12 @@ window.addEventListener('DOMContentLoaded',()=>{bindClick('memoryModeAction',(e)
 APP_TS = """type SessionSummary={id:string;title:string;running:boolean;updated_at:number;message_count:number};
 type Msg={role:string;text:string;type?:string;data?:Record<string,unknown>;thinking?:string;agent_role?:string;[key:string]:unknown};
 type UploadMeta={id:string;filename:string;workspace_path:string;kind:string;size:number;uploaded_at:number;preview?:string};
-type Snapshot={id:string;title:string;running:boolean;message_count?:number;model:string;ollama_base_url:string;thinking:boolean;thinking_stream?:boolean;live_thinking?:string;live_truncation_text?:string;live_truncation_kind?:string;live_truncation_tool?:string;live_truncation_active?:boolean;live_truncation_attempts?:number;live_truncation_tokens?:number;live_run_notice_active?:boolean;live_run_notice_label?:string;live_run_notice_started_at?:number;live_run_notice_elapsed?:number;execution_mode?:string;multi_agent_context_hud_enabled?:boolean;agent_active_role?:string;agent_contexts?:Array<{role:string;label?:string;active?:boolean;used?:number;left?:number;left_percent?:number;effective_limit?:number;tier?:number;message_count?:number;next_call_label?:string}>;max_agent_rounds?:number;max_run_seconds?:number;agent_round_index?:number;agent_phase?:string;agent_active_tool?:string;queued_user_inputs_count?:number;context_token_upper_bound?:number;context_token_limit_config?:number;context_token_limit_locked?:boolean;context_tokens_estimate?:number;context_left_tokens?:number;context_left_percent?:number;context_used_percent?:number;truncation_count?:number;compact_segments_count?:number;last_compact_reason?:string;last_compact_ts?:number;last_compact_segment_id?:string;event_seq?:number;render_bridge?:{seq:number;received?:number;last_ts?:number;last_kind?:string;latest?:Record<string,unknown>};blackboard?:{status?:string;original_goal?:string;manager_cycles?:number;active_agent?:string;approval?:Record<string,unknown>;last_delegate?:Record<string,unknown>};messages:Msg[];uploads?:UploadMeta[];llm_model_catalog?:ModelCatalog|null};
+type Snapshot={id:string;title:string;running:boolean;message_count?:number;model:string;ollama_base_url:string;thinking:boolean;thinking_stream?:boolean;response_stream?:boolean;live_thinking?:string;live_response_text?:string;live_response_role?:string;live_response_label?:string;live_response_stream_id?:string;live_response_active?:boolean;live_truncation_text?:string;live_truncation_kind?:string;live_truncation_tool?:string;live_truncation_active?:boolean;live_truncation_attempts?:number;live_truncation_tokens?:number;live_run_notice_active?:boolean;live_run_notice_label?:string;live_run_notice_started_at?:number;live_run_notice_elapsed?:number;execution_mode?:string;multi_agent_context_hud_enabled?:boolean;agent_active_role?:string;agent_contexts?:Array<{role:string;label?:string;active?:boolean;used?:number;left?:number;left_percent?:number;effective_limit?:number;tier?:number;message_count?:number;next_call_label?:string}>;max_agent_rounds?:number;max_run_seconds?:number;agent_round_index?:number;agent_phase?:string;agent_active_tool?:string;queued_user_inputs_count?:number;context_token_upper_bound?:number;context_token_limit_config?:number;context_token_limit_locked?:boolean;context_tokens_estimate?:number;context_left_tokens?:number;context_left_percent?:number;context_used_percent?:number;truncation_count?:number;compact_segments_count?:number;last_compact_reason?:string;last_compact_ts?:number;last_compact_segment_id?:string;event_seq?:number;render_bridge?:{seq:number;received?:number;last_ts?:number;last_kind?:string;latest?:Record<string,unknown>};blackboard?:{status?:string;original_goal?:string;manager_cycles?:number;active_agent?:string;approval?:Record<string,unknown>;last_delegate?:Record<string,unknown>};messages:Msg[];uploads?:UploadMeta[];llm_model_catalog?:ModelCatalog|null};
 type SkillMeta={name:string;qualified_name?:string;description:string;provider_id?:string;protocol?:string;meta:Record<string,string>};
 type SkillProvider={provider_id:string;protocol:string;protocol_version:string;skill_count:number;description:string};
 type SkillProtocol={protocol:string;version:string;active_providers:number;active_skills:number;description:string};
 type ToolMeta={name:string;description:string;parameters:Record<string,unknown>};
-type ModelOption={selection:string;profile_id:string;provider:string;model:string;label:string;source?:string;thinking_hint?:boolean;thinking_stream?:boolean};
+type ModelOption={selection:string;profile_id:string;provider:string;model:string;label:string;source?:string;thinking_hint?:boolean;thinking_stream?:boolean;response_stream?:boolean};
 type ModelCatalog={provider:string;models:string[];selected:string;thinking:boolean;thinking_mode?:string;note?:string;options?:ModelOption[]};
 async function api<T>(path:string,opt:RequestInit={}):Promise<T>{const r=await fetch(path,{headers:{'Content-Type':'application/json'},...opt});if(!r.ok)throw new Error(await r.text());return await r.json() as T}
 export const loadSessions=()=>api<SessionSummary[]>('/api/sessions');
@@ -73450,6 +77379,13 @@ window.addEventListener('DOMContentLoaded',async()=>{bind();try{await refreshCon
 # Runtime composition root: wires models, skills, session managers, storage,
 # background services, and the browser-facing admin/chat surfaces together.
 class AppContext:
+    def _llm_config_revision(self, config: dict | None) -> str:
+        try:
+            raw = json.dumps(config or {}, ensure_ascii=False, sort_keys=True, default=str)
+        except Exception:
+            raw = json_dumps(config or {})
+        return hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()[:16]
+
     def _discover_external_code_source_roots(self) -> list[str]:
         home = Path.home()
         candidate_seeds = [
@@ -73594,6 +77530,9 @@ class AppContext:
         self.skills_store = SkillStore(self.skills_root)
         self.skills_store_refresh_ts = 0.0
         self.default_llm_config = parse_json_object(try_read_text(self.workspace / "LLM.config.json") or "{}", {})
+        self.global_llm_config_revision = self._llm_config_revision(self.default_llm_config)
+        self.global_llm_config_source = ""
+        self.force_global_llm_config_for_users = False
         self.global_profiles_payload = parse_llm_config_profiles(
             self.default_llm_config, self.base_url, self.model
         )
@@ -73629,6 +77568,7 @@ class AppContext:
         self.web_ui_external_enabled = False
         self.web_ui_validation: dict = {"ok": False, "reason": "external_web_ui_disabled"}
         self.web_ui_assets_override: dict[str, str] = {}
+        self._builtin_web_ui_assets_cache: dict[str, str] | None = None
         self.show_upload_list = False
         self.ide_mounts_cache: dict[str, list[dict]] = {}
         self.ide_port = IDE_DEFAULT_PORT
@@ -73712,7 +77652,10 @@ class AppContext:
                     continue
 
     def _builtin_web_ui_assets(self) -> dict[str, str]:
-        return {
+        cached = getattr(self, "_builtin_web_ui_assets_cache", None)
+        if isinstance(cached, dict) and cached:
+            return cached
+        assets = {
             "index.html": INDEX_HTML,
             "style.css": APP_CSS,
             "app.js": APP_JS,
@@ -73721,6 +77664,8 @@ class AppContext:
             "skills.js": SKILLS_APP_JS,
             "skills-extra.css": SKILLS_EXTRA_CSS,
         }
+        self._builtin_web_ui_assets_cache = assets
+        return assets
 
     def _resolve_external_web_ui_file(self, root: Path, name: str) -> Path | None:
         candidates = [root / name, root / "frontend" / name]
@@ -76595,6 +80540,26 @@ class AppContext:
             mgr.web_search_setting_locked = bool(getattr(self, "web_search_setting_locked", False))
             mgr.user_memory_mode = normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
             mgr.user_memory_setting_locked = bool(getattr(self, "user_memory_setting_locked", False))
+            global_revision = str(getattr(self, "global_llm_config_revision", "") or "")
+            mgr_revision = str(getattr(mgr, "global_llm_config_revision", "") or "")
+            if (
+                bool(getattr(self, "force_global_llm_config_for_users", False))
+                and global_revision
+                and mgr_revision != global_revision
+            ):
+                mgr.global_llm_config_revision = global_revision
+                mgr.global_llm_config_source = str(getattr(self, "global_llm_config_source", "") or "global-config")
+                mgr.force_global_defaults_on_load = True
+                try:
+                    mgr.reset_to_llm_config(
+                        self.default_llm_config,
+                        source=mgr.global_llm_config_source or "global-config",
+                    )
+                except Exception as exc:
+                    print(
+                        "[web-agent] lazy user LLM config sync failed "
+                        f"(user={user_id}, error={trim(str(exc), 180)})"
+                    )
             self._session_mgrs[user_id] = mgr
             return mgr
 
@@ -76665,6 +80630,10 @@ class AppContext:
         OllamaClient.clear_global_probe_cache()
         parsed = parse_llm_config_profiles(cfg, self.base_url, self.model)
         self.default_llm_config = cfg
+        revision = self._llm_config_revision(cfg)
+        self.global_llm_config_revision = revision
+        self.global_llm_config_source = source or "global-config"
+        self.force_global_llm_config_for_users = True
         self.global_profiles_payload = parsed
         self.global_profiles = {str(p.get("id")): dict(p) for p in parsed.get("profiles", [])}
         self.global_active_profile_id = str(
@@ -76699,41 +80668,6 @@ class AppContext:
         if cfg_user_memory_mode is not None and not bool(getattr(self, "user_memory_setting_locked", False)):
             self.user_memory_mode = normalize_user_memory_mode(cfg_user_memory_mode)
 
-        def normalized_profiles() -> tuple[dict[str, dict], str]:
-            rows: dict[str, dict] = {}
-            for idx, profile in enumerate(parsed.get("profiles", [])):
-                pid = sanitize_profile_id(str(profile.get("id") or f"profile-{idx+1}"))
-                if pid in rows:
-                    n = 2
-                    while f"{pid}-{n}" in rows:
-                        n += 1
-                    pid = f"{pid}-{n}"
-                item = dict(profile)
-                item["id"] = pid
-                item["selection"] = f"{pid}::{item.get('model','')}"
-                if source:
-                    item["source"] = source
-                rows[pid] = item
-            if not rows:
-                rows["ollama"] = {
-                    "id": "ollama",
-                    "provider": "ollama",
-                    "label": "Ollama",
-                    "model": self.model,
-                    "base_url": self.base_url,
-                    "temperature": 0.2,
-                    "request_timeout": DEFAULT_REQUEST_TIMEOUT,
-                    "selection": f"ollama::{self.model}",
-                    "capabilities": infer_model_multimodal_capabilities("ollama", self.model),
-                    "media_endpoints": {},
-                    "source": source or "fallback",
-                }
-            requested = sanitize_profile_id(str(parsed.get("default_profile_id", "")))
-            active_id = requested if requested in rows else next(iter(rows.keys()))
-            return rows, active_id
-
-        profiles_map, active_id = normalized_profiles()
-
         persisted_path = ""
         persisted_error = ""
         try:
@@ -76754,6 +80688,9 @@ class AppContext:
             live_mgrs = list(self._session_mgrs.items())
         for uid, mgr in live_mgrs:
             try:
+                mgr.global_llm_config_revision = revision
+                mgr.global_llm_config_source = source or "global-config"
+                mgr.force_global_defaults_on_load = True
                 mgr.reset_to_llm_config(cfg, source=source or "global-config")
                 mgr.read_context_policy = normalize_read_context_policy(
                     getattr(self, "read_context_policy", DEFAULT_READ_CONTEXT_POLICY)
@@ -76787,85 +80724,8 @@ class AppContext:
             except Exception as exc:
                 errors.append(f"{uid}: {exc}")
 
-        live_user_ids = {uid for uid, _ in live_mgrs}
-        for user_dir in sorted(self.codes_root.glob("user_*")):
-            if not user_dir.is_dir():
-                continue
-            uid = user_dir.name
-            if uid in live_user_ids:
-                continue
-            try:
-                user_prefs_path = user_dir / "user_prefs.json"
-                ui_lang = self.default_language
-                if user_prefs_path.exists():
-                    raw = self.crypto.read_json(user_prefs_path, {})
-                    ui_lang = normalize_ui_language(raw.get("ui_language", ui_lang))
-                active_profile = dict(profiles_map.get(active_id, {}))
-                ollama_profile = {}
-                if str(active_profile.get("provider", "")).lower() == "ollama":
-                    ollama_profile = dict(active_profile)
-                else:
-                    for prow in profiles_map.values():
-                        if str(prow.get("provider", "")).lower() == "ollama":
-                            ollama_profile = dict(prow)
-                            break
-                model_text = str(ollama_profile.get("model", self.model) or self.model)
-                base_text = str(ollama_profile.get("base_url", self.base_url) or self.base_url)
-                user_prefs_payload = {
-                    "model_profiles": profiles_map,
-                    "active_profile_id": active_id,
-                    "model": model_text,
-                    "ollama_base": base_text,
-                    "thinking": False,
-                    "ui_language": ui_lang,
-                    "read_context_policy": normalize_read_context_policy(
-                        getattr(self, "read_context_policy", DEFAULT_READ_CONTEXT_POLICY)
-                    ),
-                    "tool_memory_policy": normalize_tool_memory_policy(
-                        getattr(self, "tool_memory_policy", getattr(self, "read_context_policy", DEFAULT_TOOL_MEMORY_POLICY))
-                    ),
-                    "auto_task_level_ceiling": normalize_auto_task_level_ceiling(
-                        getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
-                    ),
-                    "web_search_enabled": bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED)),
-                    "user_memory_mode": normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE)),
-                    "updated_at": now_ts(),
-                }
-                self.crypto.write_json(user_prefs_path, user_prefs_payload)
-                disk_users += 1
-
-                sessions_root = user_dir / "sessions"
-                if sessions_root.exists() and sessions_root.is_dir():
-                    for state_file in sorted(sessions_root.glob("*/state.json")):
-                        if not state_file.exists() or not state_file.is_file():
-                            continue
-                        try:
-                            sraw = self.crypto.read_json(state_file, {})
-                            sraw["model_profiles"] = profiles_map
-                            sraw["active_profile_id"] = active_id
-                            sraw["multimodal_capability_cache"] = {}
-                            sraw["auto_task_level_ceiling"] = normalize_auto_task_level_ceiling(
-                                getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
-                            )
-                            sraw["web_search_enabled"] = bool(
-                                getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED)
-                            )
-                            sraw["user_memory_mode"] = normalize_user_memory_mode(
-                                getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE)
-                            )
-                            sraw["read_context_policy"] = normalize_read_context_policy(
-                                getattr(self, "read_context_policy", DEFAULT_READ_CONTEXT_POLICY)
-                            )
-                            sraw["tool_memory_policy"] = normalize_tool_memory_policy(
-                                getattr(self, "tool_memory_policy", getattr(self, "read_context_policy", DEFAULT_TOOL_MEMORY_POLICY))
-                            )
-                            sraw["updated_at"] = now_ts()
-                            self.crypto.write_json(state_file, sraw)
-                            disk_sessions += 1
-                        except Exception as exc:
-                            errors.append(f"{uid}:{state_file.name}: {exc}")
-            except Exception as exc:
-                errors.append(f"{uid}: {exc}")
+        disk_users_deferred = True
+        disk_sessions_deferred = True
 
         updated_users = live_users + disk_users
         updated_sessions = live_sessions + disk_sessions
@@ -76881,6 +80741,9 @@ class AppContext:
             "disk_users_updated": disk_users,
             "live_sessions_updated": live_sessions,
             "disk_sessions_updated": disk_sessions,
+            "disk_users_deferred": disk_users_deferred,
+            "disk_sessions_deferred": disk_sessions_deferred,
+            "global_llm_config_revision": revision,
             "persisted_path": persisted_path,
         }
         if persisted_error:
@@ -77466,6 +81329,9 @@ Use this skill when tasks match this flow pattern and reusable execution is need
                     "model": model,
                     "label": f"{profile.get('label', pid)} | {model}",
                     "source": profile.get("source", ""),
+                    "thinking_hint": bool(profile.get("thinking_hint", False)),
+                    "thinking_stream": bool(profile.get("thinking_stream", False)),
+                    "response_stream": bool(profile.get("response_stream", False)),
                     "capabilities": caps,
                 }
             )
@@ -77482,6 +81348,9 @@ Use this skill when tasks match this flow pattern and reusable execution is need
                     "model": str(selected_profile.get("model", self.model) or self.model),
                     "label": f"{selected_profile.get('label', self.global_active_profile_id)} | {str(selected_profile.get('model', self.model) or self.model)}",
                     "source": selected_profile.get("source", "active-profile"),
+                    "thinking_hint": bool(selected_profile.get("thinking_hint", False)),
+                    "thinking_stream": bool(selected_profile.get("thinking_stream", False)),
+                    "response_stream": bool(selected_profile.get("response_stream", False)),
                     "capabilities": merge_multimodal_capabilities(
                         infer_model_multimodal_capabilities(
                             str(selected_profile.get("provider", "")),
@@ -77504,6 +81373,7 @@ Use this skill when tasks match this flow pattern and reusable execution is need
             "options": opts,
             "selected": selected,
             "thinking": self.thinking,
+            "response_stream": bool(selected_profile.get("response_stream", False)),
             "thinking_mode": "auto",
             "active_capabilities": active_caps,
         }
@@ -77524,6 +81394,8 @@ Use this skill when tasks match this flow pattern and reusable execution is need
                 "label": pid,
                 "model": selected_model or self.model,
                 "base_url": self.base_url,
+                "thinking_stream": False,
+                "response_stream": False,
                 "capabilities": infer_model_multimodal_capabilities("ollama", selected_model or self.model),
                 "media_endpoints": {},
                 "source": "runtime",
@@ -77559,6 +81431,7 @@ Use this skill when tasks match this flow pattern and reusable execution is need
 class AgentHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     block_on_close = False
+    request_queue_size = 128
 
     def __init__(self, addr: tuple[str, int], handler, app: AppContext):
         super().__init__(addr, handler)
@@ -77640,15 +81513,55 @@ class Handler(BaseHTTPRequestHandler):
                 return
             raise
 
-    def _send_text(self, text: str, content_type: str = "text/plain; charset=utf-8", status: int = 200):
-        body = text.encode("utf-8")
+    def _send_text(
+        self,
+        text: str,
+        content_type: str = "text/plain; charset=utf-8",
+        status: int = 200,
+        *,
+        revalidate_cache: bool = False,
+    ):
+        raw_body = text.encode("utf-8")
+        etag = ""
+        if revalidate_cache:
+            etag = f'W/"{len(raw_body):x}-{hashlib.sha1(raw_body).hexdigest()[:16]}"'
+            if str(self.headers.get("If-None-Match", "") or "").strip() == etag:
+                try:
+                    self.send_response(304)
+                    self.send_header("ETag", etag)
+                    self.send_header("Cache-Control", "no-cache")
+                    self.end_headers()
+                    return
+                except Exception as exc:
+                    if swallow_benign_socket_error(exc, "handler.send_text_304"):
+                        return
+                    raise
+        body = raw_body
+        content_encoding = ""
+        if len(raw_body) > 4096 and "gzip" in str(self.headers.get("Accept-Encoding", "") or "").lower():
+            try:
+                compressor = zlib.compressobj(6, zlib.DEFLATED, 16 + zlib.MAX_WBITS)
+                gz_body = compressor.compress(raw_body) + compressor.flush()
+                if len(gz_body) < len(raw_body):
+                    body = gz_body
+                    content_encoding = "gzip"
+            except Exception:
+                body = raw_body
+                content_encoding = ""
         try:
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Pragma", "no-cache")
-            self.send_header("Expires", "0")
+            if content_encoding:
+                self.send_header("Content-Encoding", content_encoding)
+                self.send_header("Vary", "Accept-Encoding")
+            if etag:
+                self.send_header("ETag", etag)
+                self.send_header("Cache-Control", "no-cache")
+            else:
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Pragma", "no-cache")
+                self.send_header("Expires", "0")
             self.end_headers()
             self.wfile.write(body)
         except Exception as exc:
@@ -77706,21 +81619,34 @@ class Handler(BaseHTTPRequestHandler):
             (query.get("probe", ["0"]) or ["0"])[0], default=False
         )
         stats_only = _to_bool_like((query.get("stats", ["0"]) or ["0"])[0], default=False)
-        mgr = self._session_mgr()
         if path == "/":
             return self._send_text(self.app.web_ui_agent_index_html(), "text/html; charset=utf-8")
         if path == "/assets/style.css":
-            return self._send_text(self.app.web_ui_agent_style_css(), "text/css; charset=utf-8")
+            return self._send_text(
+                self.app.web_ui_agent_style_css(),
+                "text/css; charset=utf-8",
+                revalidate_cache=True,
+            )
         if path == "/assets/app.js":
-            return self._send_text(self.app.web_ui_agent_app_js(), "application/javascript; charset=utf-8")
+            return self._send_text(
+                self.app.web_ui_agent_app_js(),
+                "application/javascript; charset=utf-8",
+                revalidate_cache=True,
+            )
         if path == "/assets/app.ts":
-            return self._send_text(self.app.web_ui_agent_app_ts(), "text/plain; charset=utf-8")
+            return self._send_text(
+                self.app.web_ui_agent_app_ts(),
+                "text/plain; charset=utf-8",
+                revalidate_cache=True,
+            )
         if path == "/api/health":
             return self._send_json({"ok": True, "version": APP_VERSION, "workspace": str(WORKDIR)})
         if path == "/api/webui/validate":
             reload_external = _to_bool_like((query.get("reload", ["0"]) or ["0"])[0], default=False)
             return self._send_json(self.app.refresh_web_ui_validation(reload_external=reload_external))
+        mgr = self._session_mgr()
         if path == "/api/config":
+            config_lite = _to_bool_like((query.get("lite", ["0"]) or ["0"])[0], default=False)
             skills_port = int(getattr(self.app, "skills_port", 0) or 0)
             skills_enabled = bool(getattr(self.app, "skills_ui_enabled", False))
             scheduler_state = self.app.scheduler_status(self._user_id())
@@ -77752,7 +81678,20 @@ class Handler(BaseHTTPRequestHandler):
                         ),
                     }
                 )
-            model_cat = mgr.model_catalog()
+            if config_lite:
+                active_profile = dict(mgr.user_model_profiles.get(mgr.user_active_profile_id, {}) or {})
+                selected_model = (
+                    f"{mgr.user_active_profile_id}::{active_profile.get('model','')}"
+                    if active_profile
+                    else str(mgr.model or "")
+                )
+                model_cat = {
+                    "selected": selected_model,
+                    "thinking": bool(mgr.thinking),
+                    "response_stream": bool(active_profile.get("response_stream", False)),
+                }
+            else:
+                model_cat = mgr.model_catalog()
             skills_url = ""
             if skills_enabled and skills_port > 0:
                 host = self.headers.get("Host", "").strip()
@@ -77772,6 +81711,7 @@ class Handler(BaseHTTPRequestHandler):
                     "ollama_base_url": mgr.ollama_base,
                     "model": model_cat.get("selected", mgr.model),
                     "thinking": model_cat.get("thinking", mgr.thinking),
+                    "response_stream": bool(model_cat.get("response_stream", False)),
                     "language": normalize_ui_language(getattr(mgr, "user_language", DEFAULT_UI_LANGUAGE)),
                     "ui_style": normalize_ui_style(getattr(self.app, "ui_style", DEFAULT_UI_STYLE)),
                     "ui_style_label": UI_STYLE_LABELS.get(
@@ -80532,7 +84472,8 @@ def main():
             "[web-agent] --config applied "
             f"(source={external_config_source}, provider={external_default_provider or 'mixed'}, "
             f"updated_users={config_apply_result.get('updated_users', 0)}, "
-            f"updated_sessions={config_apply_result.get('updated_sessions', 0)})"
+            f"updated_sessions={config_apply_result.get('updated_sessions', 0)}, "
+            f"disk_sessions_deferred={'on' if bool(config_apply_result.get('disk_sessions_deferred', False)) else 'off'})"
         )
         if config_apply_result.get("persisted_path"):
             print(f"[web-agent] llm_config persisted to {config_apply_result.get('persisted_path')}")
