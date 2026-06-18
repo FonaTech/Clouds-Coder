@@ -823,11 +823,15 @@ REVIEWER_DEBUG_TOOL_ALLOWLIST = {
 }
 EXPLORER_STALL_THRESHOLD = 3  # consecutive same-target delegations before forced switch
 DEVELOPER_EDIT_STALL_THRESHOLD = 3  # consecutive edit_file failures on same file before forced strategy change
-# Acceptance-gate anti-stall: after this many consecutive gate failures on the
-# same step we escalate (multi-agent: reviewer-debug to actively fix) and, with
-# any accumulated evidence, relax-and-advance so a step can never loop forever.
+# Acceptance-gate repair loop: once a step fails the heuristic gate this many
+# times, escalate from a plain rework hint to the active diagnose→repair→re-verify
+# driver (semantic judge + reviewer-debug + root-cause repair directives).
 ACCEPTANCE_GATE_STALL_THRESHOLD = 3
-ACCEPTANCE_GATE_HARD_CEILING = 6  # absolute max gate failures before forced advance
+# True-deadlock guard: only when the repair-progress signature stays IDENTICAL for
+# this many consecutive rounds (no progress at all) do we escalate to plan-mode
+# recovery and ask the user. We NEVER force-advance a step that has not genuinely
+# passed; repair continues unbounded as long as progress is being made.
+ACCEPTANCE_GATE_HARD_CEILING = 6  # consecutive no-progress rounds before escalating to the user
 PLAN_MODE_MANAGER_SYNTHESIS_MAX_TOKENS = 8192
 PLAN_MODE_MAX_OPTIONS = 3
 PLAN_FILE_RELATIVE_PATH = ".clouds_coder/plan.md"
@@ -14984,9 +14988,14 @@ class OllamaClient:
         main, thinking_inline = split_thinking_content(content or "")
         if thinking_inline:
             thinking_parts.append(thinking_inline)
-        extra = msg.get("reasoning_content") or msg.get("reasoning")
-        if extra:
-            thinking_parts.append(str(extra))
+        # Match the streaming path's 4-key coverage (some providers use
+        # `thinking`/`thought` on the message object, not just reasoning*).
+        seen_thinking = set()
+        for key in ("reasoning_content", "reasoning", "thinking", "thought"):
+            extra_text = str(msg.get(key) or "").strip()
+            if extra_text and extra_text not in seen_thinking:
+                thinking_parts.append(extra_text)
+                seen_thinking.add(extra_text)
         thinking = trim("\n\n".join(x for x in thinking_parts if str(x).strip()).strip(), 24_000)
         tool_calls = self._normalize_tool_calls(msg.get("tool_calls", []))
         return main, tool_calls, thinking
@@ -15521,8 +15530,28 @@ class OllamaClient:
                 )
                 return self._openai_stream_result_from_lines(lines, on_content_delta=on_content_delta)
             except OllamaError as exc:
+                err_text = str(exc).lower()
+                status_400 = int(getattr(exc, "status", 0) or 0) == 400
+                # Some providers (e.g. certain Chinese cloud APIs) reject role=tool.
+                # Collapse tool messages into user messages and retry the stream.
+                if status_400 and (
+                    "messages.role" in err_text or ("tool" in err_text and "role" in err_text)
+                ):
+                    fallback_msgs = self._collapse_tool_role_messages(req_messages)
+                    fallback_payload = {**payload, "messages": fallback_msgs}
+                    fallback_payload.pop("tools", None)
+                    fallback_payload["stream"] = True
+                    lines = self._iter_response_lines_url_with_retries(
+                        endpoint,
+                        fallback_payload,
+                        headers=self._render_headers(),
+                        max_attempts=http_retry_attempts,
+                        cancel_check=cancel_check,
+                        on_retry=on_http_retry,
+                    )
+                    return self._openai_stream_result_from_lines(lines, on_content_delta=on_content_delta)
                 # If the endpoint rejects the reasoning field, drop it and retry once.
-                if reasoning_strip and int(getattr(exc, "status", 0) or 0) == 400:
+                if reasoning_strip and status_400:
                     stripped = {k: v for k, v in payload.items() if k not in reasoning_strip}
                     lines = self._iter_response_lines_url_with_retries(
                         endpoint,
@@ -15960,65 +15989,57 @@ class OllamaClient:
             payload["think"] = True
         if tools:
             payload["tools"] = tools
-        req = Request(
-            f"{self.base_url}/api/chat",
-            data=json_dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
         full_content: list[str] = []
         full_thinking: list[str] = []
         tool_calls: list[dict] = []
         done_reason = ""
         final_raw: dict = {}
-        try:
-            with urlopen(req, timeout=self.timeout) as resp:
-                while True:
-                    line = resp.readline()
-                    if not line:
-                        break
-                    row = line.decode("utf-8", errors="ignore").strip()
-                    if not row:
-                        continue
+        # Use the retrying line iterator (same as /v1) so a flaky endpoint retries
+        # before any output is emitted. Its `emitted` guard never re-streams once
+        # data has started, so partial output is never duplicated. OllamaError
+        # (HTTP/connection) propagates directly.
+        for row_line in self._iter_response_lines_url_with_retries(
+            f"{self.base_url}/api/chat",
+            payload,
+            headers={"Content-Type": "application/json"},
+        ):
+            row = str(row_line or "").strip()
+            if not row:
+                continue
+            try:
+                part = json.loads(row)
+            except Exception:
+                continue
+            msg = part.get("message", {}) if isinstance(part, dict) else {}
+            raw_piece = msg.get("content") or ""
+            piece_main, piece_thinking = split_thinking_content(raw_piece)
+            if piece_main:
+                full_content.append(piece_main)
+                self._emit_content_delta(on_content_delta, piece_main)
+            if piece_thinking:
+                full_thinking.append(piece_thinking)
+                if on_thinking_chunk:
                     try:
-                        part = json.loads(row)
+                        on_thinking_chunk(piece_thinking)
                     except Exception:
-                        continue
-                    msg = part.get("message", {}) if isinstance(part, dict) else {}
-                    raw_piece = msg.get("content") or ""
-                    piece_main, piece_thinking = split_thinking_content(raw_piece)
-                    if piece_main:
-                        full_content.append(piece_main)
-                        self._emit_content_delta(on_content_delta, piece_main)
-                    if piece_thinking:
-                        full_thinking.append(piece_thinking)
-                        if on_thinking_chunk:
-                            try:
-                                on_thinking_chunk(piece_thinking)
-                            except Exception:
-                                pass
-                    for key in ("thinking", "reasoning", "reasoning_content"):
-                        extra = msg.get(key)
-                        if extra:
-                            extra_text = str(extra)
-                            full_thinking.append(extra_text)
-                            if on_thinking_chunk:
-                                try:
-                                    on_thinking_chunk(extra_text)
-                                except Exception:
-                                    pass
-                    tcs = msg.get("tool_calls", [])
-                    if tcs:
-                        tool_calls = self._normalize_tool_calls(tcs)
-                    if part.get("done"):
-                        final_raw = dict(part)
-                        done_reason = str(part.get("done_reason") or "").strip().lower()
-                        break
-        except HTTPError as exc:
-            text = exc.read().decode("utf-8", errors="replace")
-            raise OllamaError(f"HTTP {exc.code}: {text}", status=exc.code) from exc
-        except URLError as exc:
-            raise OllamaError(f"Connection error: {exc}") from exc
+                        pass
+            for key in ("thinking", "reasoning", "reasoning_content"):
+                extra = msg.get(key)
+                if extra:
+                    extra_text = str(extra)
+                    full_thinking.append(extra_text)
+                    if on_thinking_chunk:
+                        try:
+                            on_thinking_chunk(extra_text)
+                        except Exception:
+                            pass
+            tcs = msg.get("tool_calls", [])
+            if tcs:
+                tool_calls = self._normalize_tool_calls(tcs)
+            if part.get("done"):
+                final_raw = dict(part)
+                done_reason = str(part.get("done_reason") or "").strip().lower()
+                break
         content = "".join(full_content).strip()
         thinking_content = trim("\n\n".join(x for x in full_thinking if str(x).strip()).strip(), 24_000)
         return {
@@ -35303,25 +35324,10 @@ body{padding:18px}
         ])
         if plan_row_count > 0:
             board["plan_step_total"] = plan_row_count
-            active_row = next(
-                (
-                    t for t in board.get("project_todos", [])
-                    if isinstance(t, dict)
-                    and t.get("category") == "plan_step"
-                    and t.get("status") == "in_progress"
-                ),
-                None,
-            )
-            if isinstance(active_row, dict):
-                board["plan_step_cursor"] = int(active_row.get("plan_step_index", 0) or 0)
-            else:
-                board["plan_step_cursor"] = sum(
-                    1
-                    for t in board.get("project_todos", [])
-                    if isinstance(t, dict)
-                    and t.get("category") == "plan_step"
-                    and t.get("status") == "completed"
-                )
+            # Canonical invariant (shared with advance/reconcile): single
+            # lowest-index active step, cursor derived from its index. Operates
+            # in-place on the board being built; does not touch self.blackboard.
+            self._normalize_plan_step_progress(board)
         board["watchdog"] = self._normalize_watchdog_state(src.get("watchdog", {}))
         board["decomposition_queue"] = self._normalize_decomposition_queue_state(
             src.get("decomposition_queue", {})
@@ -37424,6 +37430,148 @@ body{padding:18px}
             summary="acceptance gate requires evidence",
         )
 
+    def _repair_progress_signature(self, plan_step: dict, gate: dict, bb: dict) -> str:
+        """A stable signature of the current failure state for a step.
+
+        If this signature CHANGES between repair rounds, the agent is making
+        progress (different error, different gate reason, new evidence) → keep
+        repairing without bound. If it stays IDENTICAL for N consecutive rounds,
+        the repair loop is truly deadlocked → escalate to the user. This is what
+        lets us "repair forever while progressing, escalate only on a real stall"
+        instead of force-advancing.
+        """
+        import hashlib
+        reason = str((gate or {}).get("reason", "") or "")
+        # Recent step-scoped error context (categories + messages + last error).
+        try:
+            err_ctx = self._recent_error_context(max_chars=600)
+        except Exception:
+            err_ctx = ""
+        # Evidence signature: which signal kinds are currently present.
+        try:
+            sig = self._plan_step_blackboard_signals(plan_step, bb)
+            ev = "".join(
+                k[0] for k in ("has_write", "has_read", "has_exec", "has_review", "has_research")
+                if sig.get(k)
+            )
+        except Exception:
+            ev = ""
+        # Completed subtask count (progress within the step).
+        try:
+            step_id = str((plan_step or {}).get("id", "") or "")
+            rows = self._active_plan_worker_todo_rows(step_id, role="")
+            done_n = sum(1 for r in rows if str(r.get("status", "") or "").lower() == "completed")
+        except Exception:
+            done_n = 0
+        raw = f"{reason}|{ev}|{done_n}|{err_ctx}"
+        return hashlib.sha1(raw.encode("utf-8", "ignore")).hexdigest()[:16]
+
+    def _diagnose_acceptance_gate_failure(self, plan_step: dict, gate: dict, bb: dict) -> dict:
+        """Map a gate failure to an actionable repair spec.
+
+        Returns: {root_cause, repair_action, fixer_role, error_category, error_context}
+        Routing is driven by the gate's `reason` plus the failure ledger so the
+        worker is told the real root cause and a concrete next action, not just
+        "record evidence".
+        """
+        reason = str((gate or {}).get("reason", "") or "")
+        try:
+            error_context = self._recent_error_context(max_chars=700)
+        except Exception:
+            error_context = ""
+        # Pick the dominant error category from the ledger, if any.
+        error_category = ""
+        try:
+            fl = bb.get("failure_ledger", {}) if isinstance(bb.get("failure_ledger"), dict) else {}
+            errs = [e for e in fl.get("errors", []) if isinstance(e, dict) and int(e.get("count", 0) or 0) > 0]
+            if errs:
+                error_category = str(sorted(errs, key=lambda e: int(e.get("count", 0) or 0))[-1].get("category", "") or "")
+        except Exception:
+            error_category = ""
+
+        if reason in ("missing-step-local-subtasks",):
+            return {
+                "root_cause": "No step-local subtasks exist; the worker never broke the step down.",
+                "repair_action": "Call TodoWrite now to create 3-6 step-local subtasks (parent_step_id set), the last one a concrete acceptance check.",
+                "fixer_role": self._current_plan_worker_owner(bb),
+                "error_category": error_category,
+                "error_context": error_context,
+            }
+        if reason in ("missing-final-acceptance-subtask", "empty-final-acceptance-subtask"):
+            return {
+                "root_cause": "The step has subtasks but no concrete final acceptance check.",
+                "repair_action": "Add a final TodoWrite subtask that performs the acceptance check (run/read/search) with a concrete success signal.",
+                "fixer_role": self._current_plan_worker_owner(bb),
+                "error_category": error_category,
+                "error_context": error_context,
+            }
+        if reason in ("final-acceptance-subtask-not-completed",):
+            return {
+                "root_cause": "The acceptance check subtask exists but was never actually executed.",
+                "repair_action": "Execute the acceptance check with a real tool call now (do not just mark it done), confirm the success signal, then complete it.",
+                "fixer_role": self._current_plan_worker_owner(bb),
+                "error_category": error_category,
+                "error_context": error_context,
+            }
+        # final-acceptance-evidence-missing (and anything else): genuine failure or
+        # the check ran but failed. Route to active repair (reviewer-debug in MA).
+        repair_action = (
+            "Diagnose the underlying problem, FIX it directly (edit code / re-run the command), "
+            "then re-run the acceptance check and confirm a clean success signal."
+        )
+        if error_category:
+            repair_action = (
+                f"The dominant failure category is '{error_category}'. " + repair_action
+                + " Do NOT repeat any fix already listed as failed above."
+            )
+        return {
+            "root_cause": "The acceptance check did not produce passing evidence — likely a real error to fix.",
+            "repair_action": repair_action,
+            "fixer_role": "reviewer" if (self._is_multi_agent_mode() and self.reviewer_debug_mode) else self._current_plan_worker_owner(bb),
+            "error_category": error_category,
+            "error_context": error_context,
+        }
+
+    def _seed_repair_directive(self, plan_step: dict, diagnosis: dict, bb: dict, *, round_no: int) -> bool:
+        """Inject a concrete, root-cause-driven repair directive for the fixer.
+
+        Carries the diagnosed root cause, the exact repair action, the dominant
+        error category, and the already-failed fix history (so the worker does
+        not repeat a fix that has already failed). In multi-agent mode this is
+        scoped to the fixer role (reviewer in debug mode).
+        """
+        if not isinstance(plan_step, dict) or not isinstance(diagnosis, dict):
+            return False
+        step_label = trim(str(plan_step.get("content", "") or ""), 160)
+        root = trim(str(diagnosis.get("root_cause", "") or ""), 240)
+        action = trim(str(diagnosis.get("repair_action", "") or ""), 400)
+        err_ctx = trim(str(diagnosis.get("error_context", "") or ""), 700)
+        fixer = self._sanitize_agent_role(str(diagnosis.get("fixer_role", "") or "")) or self._current_plan_worker_owner(bb)
+        roles = (fixer,) if fixer else ()
+        debug_note = ""
+        if fixer == "reviewer" and self.reviewer_debug_mode:
+            debug_note = (
+                "You are in REVIEWER DEBUG MODE: you may read_file, then fix directly with edit_file/write_file, "
+                "then bash to verify. "
+            )
+        err_block = f"\nKNOWN ERRORS / FAILED FIXES (do not repeat):\n{err_ctx}\n" if err_ctx else ""
+        content = (
+            "<acceptance-repair>\n"
+            f"Plan step still failing acceptance (repair round {round_no}): {step_label}\n"
+            f"ROOT CAUSE: {root}\n"
+            f"REQUIRED REPAIR: {action}\n"
+            f"{debug_note}"
+            f"{err_block}"
+            "Make a REAL change with concrete tools, then re-run the acceptance check this same turn and confirm the success signal. "
+            "Do not advance the plan or edit .clouds_coder/plan.md directly; just fix and re-verify.\n"
+            "</acceptance-repair>"
+        )
+        return self._append_plan_guidance_bubble(
+            content,
+            target_roles=roles,
+            summary=f"acceptance repair directive (round {round_no})",
+        )
+
     def _acceptance_gate_handle_failure(
         self,
         plan_step: dict,
@@ -37433,17 +37581,23 @@ body{padding:18px}
         actor: str = "developer",
         target_roles: tuple[str, ...] = (),
     ) -> bool:
-        """Track repeated acceptance-gate failures and escalate to prevent a stuck step.
+        """Drive a stuck step through diagnose → repair → re-verify instead of
+        force-advancing. Returns True only when the step GENUINELY passed (the
+        semantic judge confirmed real evidence); never force-advances.
 
-        Returns True if the step was force-advanced (relaxed), in which case the
-        caller must NOT keep blocking. Escalation ladder:
-          1. < threshold: inject the concrete rework hint (normal path).
-          2. >= threshold: in multi-agent, switch reviewer into debug mode so a
-             second role actively diagnoses+fixes; keep injecting the hint.
-          3. >= threshold WITH any accumulated/blackboard evidence: relax — the
-             gate heuristic is being too strict; advance with a recorded warning.
-          4. >= hard ceiling: force-advance regardless, recording that the gate
-             never matched, so the plan can make progress instead of looping.
+        Flow:
+          1. Below threshold: inject the concrete rework hint (normal path).
+          2. At/after threshold: run a strict semantic judge over the actual
+             evidence — if it confirms the step is genuinely done (heuristic was a
+             false-negative), advance as `semantic-verified`. This strengthens
+             verification; it is NOT a bypass (the judge cites real evidence).
+          3. Otherwise the failure is real: enable reviewer-debug (multi-agent),
+             diagnose the root cause from the gate reason + failure ledger, and
+             seed a concrete repair directive to the fixer. Re-verify next turn.
+          4. Keep repairing as long as the repair-progress signature changes
+             (still making progress). Only when it stays IDENTICAL for
+             ACCEPTANCE_GATE_HARD_CEILING consecutive rounds (a true deadlock) do
+             we escalate to plan-mode recovery and surface options to the user.
         """
         step_id = trim(str((plan_step or {}).get("id", "") or ""), 40)
         if not step_id:
@@ -37459,52 +37613,111 @@ body{padding:18px}
         except Exception:
             pass
 
-        has_evidence = bool(
-            self._step_has_accumulated_evidence(plan_step, bb)
-            or self._plan_step_has_blackboard_evidence(plan_step, bb)
-        )
+        # Below threshold: a plain rework hint is enough; give the worker a chance.
+        if count < ACCEPTANCE_GATE_STALL_THRESHOLD:
+            self._inject_acceptance_gate_rework_hint(plan_step, gate, target_roles=target_roles)
+            return False
 
-        # Step 2: wake the reviewer to actively debug in multi-agent mode.
-        if count >= ACCEPTANCE_GATE_STALL_THRESHOLD and self._is_multi_agent_mode() and not self.reviewer_debug_mode:
-            self.reviewer_debug_mode = True
-            self._blackboard_append_memory(
-                "decision",
-                f"acceptance gate stalled {count}x on step; enabled reviewer-debug mode to actively diagnose and fix",
-                actor="manager",
-                tier="long",
-                board=bb,
-            )
-            self._emit("status", {"summary": "acceptance gate stalled — reviewer debug mode enabled to fix the blocker"})
-
-        # Step 3/4: relax-and-advance so the plan never loops forever.
-        relax = (count >= ACCEPTANCE_GATE_STALL_THRESHOLD and has_evidence) or (count >= ACCEPTANCE_GATE_HARD_CEILING)
-        if relax:
-            reason = trim(str((gate or {}).get("reason", "") or "gate-never-matched"), 160)
+        # Step 2 — STRENGTHEN VERIFICATION: strict semantic judge over real evidence.
+        # This corrects heuristic false-negatives (e.g. tests passed but output had
+        # the word "failed"). A high/medium-confidence PASS that cites evidence is a
+        # genuine verification, so the step advances as semantic-verified.
+        try:
+            verdict = self._acceptance_semantic_judge(plan_step, gate, bb)
+        except Exception:
+            verdict = {"passed": False, "confidence": "low", "evidence": "", "rework_items": []}
+        if verdict.get("passed") and str(verdict.get("confidence", "")).lower() in ("high", "medium"):
             note = (
-                f"acceptance gate relaxed after {count} failures on this step "
-                f"({'accumulated evidence present' if has_evidence else 'hard ceiling reached'}; gate reason: {reason}); "
-                "advancing to avoid an infinite stall"
+                f"acceptance gate semantic-verified after {count} heuristic failures "
+                f"(confidence={verdict.get('confidence')}): {trim(str(verdict.get('evidence', '') or ''), 200)}"
             )
-            evidence = self._collect_step_evidence(plan_step, {}) or self._collect_blackboard_step_evidence(plan_step, bb)
-            self._blackboard_append_memory("decision", note, actor=str(actor or "manager"), tier="long", board=bb)
-            self._emit("status", {"summary": f"step advanced via gate-relax after {count} stalled acceptance checks"})
+            self._blackboard_append_memory("decision", note, actor="reviewer", tier="long", board=bb)
+            self._emit("status", {"summary": "step verified by semantic judge (heuristic false-negative corrected)"})
             advanced = self._advance_plan_step(
-                evidence=trim(f"[gate-relaxed] {evidence}", 200),
-                actor=str(actor or "developer"),
+                evidence=trim(f"[semantic-verified] {verdict.get('evidence', '')}", 200),
+                actor=str(actor or "reviewer"),
             )
             if advanced:
-                try:
-                    setattr(self, attr, 0)
-                except Exception:
-                    pass
+                for _a in (attr, f"_acceptance_gate_nopro_n_{step_id}", f"_acceptance_gate_sig_{step_id}"):
+                    try:
+                        if hasattr(self, _a):
+                            delattr(self, _a)
+                    except Exception:
+                        pass
                 try:
                     self._inject_current_plan_step_execution_hints()
                 except Exception:
                     pass
             return bool(advanced)
 
-        # Default: concrete rework hint.
-        self._inject_acceptance_gate_rework_hint(plan_step, gate, target_roles=target_roles)
+        # Step 3 — REAL FAILURE: enable reviewer-debug so a second role can fix directly.
+        if self._is_multi_agent_mode() and not self.reviewer_debug_mode:
+            self.reviewer_debug_mode = True
+            self._blackboard_append_memory(
+                "decision",
+                f"acceptance gate failed {count}x on step; enabled reviewer-debug mode to actively diagnose and fix",
+                actor="manager",
+                tier="long",
+                board=bb,
+            )
+            self._emit("status", {"summary": "acceptance gate failing — reviewer debug mode enabled to fix the blocker"})
+
+        # Track repair progress: a changing signature means we are still making
+        # headway; an unchanged signature means the loop is deadlocked.
+        sig_attr = f"_acceptance_gate_sig_{step_id}"
+        nopro_attr = f"_acceptance_gate_nopro_n_{step_id}"
+        try:
+            new_sig = self._repair_progress_signature(plan_step, gate, bb)
+        except Exception:
+            new_sig = ""
+        prev_sig = str(getattr(self, sig_attr, "") or "")
+        if new_sig and new_sig == prev_sig:
+            no_progress = int(getattr(self, nopro_attr, 0) or 0) + 1
+        else:
+            no_progress = 0
+        try:
+            setattr(self, sig_attr, new_sig)
+            setattr(self, nopro_attr, no_progress)
+        except Exception:
+            pass
+
+        # Step 4 — TRUE DEADLOCK: only escalate to the user (never force-advance).
+        if no_progress >= ACCEPTANCE_GATE_HARD_CEILING:
+            verdict_items = verdict.get("rework_items") or []
+            self._blackboard_append_memory(
+                "decision",
+                (
+                    f"acceptance repair deadlocked ({no_progress} rounds with no progress) on step; "
+                    f"escalating to plan-mode recovery for user decision. Outstanding: "
+                    f"{trim('; '.join(verdict_items) or str(gate.get('reason', '')), 200)}"
+                ),
+                actor="manager",
+                tier="long",
+                board=bb,
+            )
+            self._ledger_record_stall("acceptance-gate-deadlock", "plan-mode-escalation")
+            self._emit("status", {"summary": "acceptance repair deadlocked — escalating to recovery options for your decision"})
+            try:
+                escalated = self._escalate_stall_to_plan_mode(
+                    "acceptance-gate-deadlock",
+                    fault_counter=no_progress,
+                    last_fault_reason=trim(str(gate.get("reason", "") or "acceptance-gate-deadlock"), 160),
+                )
+            except Exception:
+                escalated = False
+            if not escalated:
+                # Plan-mode unavailable (e.g. user disabled it): keep the strongest
+                # repair directive active rather than silently advancing.
+                diagnosis = self._diagnose_acceptance_gate_failure(plan_step, gate, bb)
+                self._seed_repair_directive(plan_step, diagnosis, bb, round_no=count)
+            return False
+
+        # Otherwise: diagnose root cause and seed a concrete repair directive, then
+        # let the fixer act next turn. Repair continues unbounded while progressing.
+        diagnosis = self._diagnose_acceptance_gate_failure(plan_step, gate, bb)
+        if not self._seed_repair_directive(plan_step, diagnosis, bb, round_no=count):
+            # Fall back to the standard rework hint if the directive was throttled.
+            self._inject_acceptance_gate_rework_hint(plan_step, gate, target_roles=target_roles)
         return False
 
     def _step_has_accumulated_evidence(self, plan_step: dict, bb: dict | None = None) -> bool:
@@ -38090,22 +38303,10 @@ body{padding:18px}
                 )
             elif cat == "plan_step":
                 # Plan steps are never auto-completed here; only _advance_plan_step
-                # may close them. This block only activates the next eligible step.
-                if todo.get("status") == "pending":
-                    step_idx = int(todo.get("plan_step_index", 0) or 0)
-                    all_prior_done = all(
-                        t.get("status") == "completed"
-                        for t in todos
-                        if t.get("category") == "plan_step"
-                        and int(t.get("plan_step_index", 0) or 0) < step_idx
-                    )
-                    if all_prior_done and not any(
-                        t.get("status") == "in_progress"
-                        for t in todos
-                        if t.get("category") == "plan_step"
-                    ):
-                        todo["status"] = "in_progress"
-                        todo["activated_at"] = float(now_ts())
+                # may close them. Activation of the next eligible step is deferred
+                # to _normalize_plan_step_progress (called below) so this path uses
+                # the exact same invariant as advance/restore.
+                pass
 
         if not any(t.get("status") == "in_progress" for t in todos):
             for t in todos:
@@ -38116,6 +38317,10 @@ body{padding:18px}
                     break
 
         bb["project_todos"] = todos
+        # Canonical plan-step invariant: single lowest-index active step + derived
+        # cursor. Shared with advance/restore so all paths agree on "current step".
+        self._normalize_plan_step_progress(bb)
+        todos = bb.get("project_todos", todos)
         self.blackboard = bb
 
     # --- Step advancement inference ------------------------------------------
@@ -38169,11 +38374,73 @@ body{padding:18px}
                 return True
         return any(pat in text for pat in step_done_patterns)
 
+    def _normalize_plan_step_progress(self, bb: dict | None = None) -> dict:
+        """Single authority for the plan-step progress invariant.
+
+        Enforces, over all `plan_step` todos:
+          - ordered by plan_step_index;
+          - AT MOST one in_progress (if several, keep the lowest index, demote
+            the rest to pending);
+          - if NONE is in_progress, activate the lowest-index non-completed step;
+          - plan_step_cursor is DERIVED from the active step's index (never an
+            independent +1), and plan_step_total reflects the row count.
+
+        This is the canonical rule shared by advance / reconcile / restore so the
+        three paths can never disagree on "which step is current" (the cause of
+        same-tick contradictory switch notices and step-skips). It NEVER marks a
+        step completed — only advance does that. Returns the active step dict (or
+        {} when all steps are done).
+        """
+        bb = bb if isinstance(bb, dict) else self._ensure_blackboard()
+        todos = bb.get("project_todos", []) if isinstance(bb.get("project_todos"), list) else []
+        plan_rows = [
+            t for t in todos
+            if isinstance(t, dict) and str(t.get("category", "") or "") == "plan_step"
+        ]
+        if not plan_rows:
+            return {}
+        plan_rows.sort(key=lambda r: int(r.get("plan_step_index", 0) or 0))
+
+        # Collapse multiple in_progress down to the lowest-index one.
+        active_rows = [r for r in plan_rows if str(r.get("status", "") or "") == "in_progress"]
+        if len(active_rows) > 1:
+            keep = min(active_rows, key=lambda r: int(r.get("plan_step_index", 0) or 0))
+            keep_id = id(keep)
+            for row in active_rows:
+                if id(row) != keep_id:
+                    row["status"] = "pending"
+                    row["activated_at"] = None
+
+        # If nothing is active, activate the lowest-index non-completed step.
+        if not any(str(r.get("status", "") or "") == "in_progress" for r in plan_rows):
+            nxt = next((r for r in plan_rows if str(r.get("status", "") or "") != "completed"), None)
+            if nxt is not None:
+                nxt["status"] = "in_progress"
+                if not nxt.get("activated_at"):
+                    nxt["activated_at"] = float(now_ts())
+
+        active_step = next((r for r in plan_rows if str(r.get("status", "") or "") == "in_progress"), None)
+        if active_step is not None:
+            bb["plan_step_cursor"] = int(active_step.get("plan_step_index", 0) or 0)
+        else:
+            bb["plan_step_cursor"] = len(plan_rows)
+        bb["plan_step_total"] = len(plan_rows)
+        # Only adopt as the live blackboard when operating on it directly; callers
+        # building a fresh board (e.g. _normalize_blackboard) manage assignment.
+        if bb is getattr(self, "blackboard", None):
+            self.blackboard = bb
+        return active_step if isinstance(active_step, dict) else {}
+
     def _advance_plan_step(self, evidence: str = "", actor: str = "developer"):
         bb = self._ensure_blackboard()
         todos = bb.get("project_todos", [])
         if not todos:
             return False
+        # Defensive: if plan-step state was corrupted (e.g. several in_progress at
+        # once), normalize to the single lowest-index active step BEFORE deciding
+        # what to complete, so we never advance off a dirty state.
+        self._normalize_plan_step_progress(bb)
+        todos = bb.get("project_todos", todos)
         current = None
         for t in todos:
             if t.get("category") == "plan_step" and t.get("status") == "in_progress":
@@ -38207,17 +38474,13 @@ body{padding:18px}
                     pass
         except Exception:
             pass
-        # Advance the plan-step cursor and activate the next pending step.
-        cursor = int(bb.get("plan_step_cursor", 0) or 0)
-        bb["plan_step_cursor"] = cursor + 1
-        next_step = None
-        for t in todos:
-            if t.get("category") == "plan_step" and t.get("status") == "pending":
-                next_step = t
-                break
+        # Activate the next step via the canonical invariant: lowest-index
+        # non-completed step becomes in_progress, cursor derived from its index.
+        # (Never "first pending in list order" + independent cursor+1, which could
+        # skip a step left in a non-pending state by a prior reconcile/rescue.)
+        next_step = self._normalize_plan_step_progress(bb)
+        next_step = next_step if isinstance(next_step, dict) and next_step else None
         if next_step:
-            next_step["status"] = "in_progress"
-            next_step["activated_at"] = float(now_ts())
             try:
                 self._ensure_worker_todos_for_plan_step(next_step, force_refresh=False, owner=self._current_plan_worker_owner())
             except Exception:
@@ -38294,9 +38557,11 @@ body{padding:18px}
         except Exception:
             pass
         # Immediately sync todos so UI reflects plan step advancement
-        self._sync_todos_from_blackboard(reason=f"plan-step-advanced:{cursor + 1}", board=bb)
-        # Inject hint for the next step (works in both single and multi-agent mode)
-        if next_step:
+        _next_idx = int(next_step.get("plan_step_index", 0) or 0) + 1 if isinstance(next_step, dict) and next_step else int(bb.get("plan_step_cursor", 0) or 0)
+        self._sync_todos_from_blackboard(reason=f"plan-step-advanced:{_next_idx}", board=bb)
+        # Inject hint for the next step (works in both single and multi-agent mode).
+        # Dedup against the last-hinted step id so one transition emits one notice.
+        if next_step and str(getattr(self, "_last_step_hint_id", "") or "") != str(next_step.get("id", "") or ""):
             try:
                 _ns_idx = int(next_step.get("plan_step_index", 0) or 0) + 1
                 _ns_total = int(bb.get("plan_step_total", 0) or 0)
@@ -38315,11 +38580,13 @@ body{padding:18px}
                     active_role = str(bb.get("active_agent", "") or actor)
                     if active_role:
                         target_roles = (active_role,)
-                self._append_plan_guidance_bubble(
+                if self._append_plan_guidance_bubble(
                     _hint,
                     target_roles=target_roles,
                     summary=f"plan step bubble injected ({_ns_idx}/{_ns_total})",
-                )
+                ):
+                    if _ns_id:
+                        self._last_step_hint_id = _ns_id
             except Exception:
                 pass
         return True
@@ -38449,7 +38716,8 @@ body{padding:18px}
         else:
             if subtasks_all_done and not acceptance_gate_ok:
                 target_role = self._sanitize_agent_role(str(route.get("target", "") or ""))
-                # Track repeated failures and escalate/relax so the step can't loop forever.
+                # Drive diagnose→repair→re-verify; returns True only on a genuine
+                # (semantic-verified) pass. Never force-advances.
                 if self._acceptance_gate_handle_failure(
                     current,
                     acceptance_gate,
@@ -38457,7 +38725,7 @@ body{padding:18px}
                     actor=str(route.get("target", "developer") or "developer"),
                     target_roles=((target_role,) if target_role else ()),
                 ):
-                    return  # step force-advanced via gate-relax
+                    return  # step genuinely passed via semantic judge
             self._inject_rework_if_needed(current, worker_step)
 
     def _worker_step_has_evidence(self, step: dict) -> bool:
@@ -38828,6 +39096,120 @@ body{padding:18px}
         except Exception:
             pass
         return {"all_passed": False, "rework_items": []}
+
+    def _acceptance_semantic_judge(
+        self,
+        plan_step: dict,
+        gate: dict,
+        bb: dict,
+        worker_step: dict | None = None,
+    ) -> dict:
+        """Strict LLM judge that decides whether a step GENUINELY meets its
+        acceptance criteria, used when the heuristic gate keeps failing.
+
+        The heuristic gate (`_plan_step_acceptance_gate_status`) matches evidence
+        by keyword and CAN false-negative (e.g. tests passed but output contains
+        the word "failed" in a warning, or the worker used a different-but-valid
+        check). This judge reads the ACTUAL evidence and renders a verdict, so a
+        genuinely-complete step advances as semantic-verified rather than looping.
+        It is intentionally strict: it must PASS only on concrete evidence, never
+        on a completion claim. Returns:
+          {passed: bool, confidence: "high"|"medium"|"low",
+           evidence: str, rework_items: list[str]}
+        """
+        default = {"passed": False, "confidence": "low", "evidence": "", "rework_items": []}
+        try:
+            step_text = trim(
+                normalize_embedded_newlines(
+                    str(plan_step.get("full_content", "") or plan_step.get("content", "") or "")
+                ),
+                700,
+            )
+            step_id = str(plan_step.get("id", "") or "")
+            guidance = {}
+            try:
+                guidance = self._plan_step_acceptance_guidance(plan_step)
+            except Exception:
+                guidance = {}
+            gate_reason = trim(str((gate or {}).get("reason", "") or ""), 120)
+            gate_expected = trim(str((gate or {}).get("expected", "") or ""), 160)
+
+            # Acceptance subtask text (what the worker said it would verify).
+            acceptance = (gate or {}).get("acceptance", {}) if isinstance((gate or {}).get("acceptance"), dict) else {}
+            acceptance_text = trim(str(acceptance.get("content", "") or ""), 240)
+
+            # Concrete evidence: files touched, execution logs, current tool results.
+            step_files_raw = bb.get("step_files", {}) if isinstance(bb.get("step_files"), dict) else {}
+            step_entries = step_files_raw.get(step_id, []) if step_id else []
+            files_summary = [
+                f"{entry.get('op','?')}: {entry.get('path','?')}"
+                for entry in (step_entries[-15:] if isinstance(step_entries, list) else [])
+                if isinstance(entry, dict)
+            ]
+            exec_logs = bb.get("execution_logs", []) if isinstance(bb.get("execution_logs"), list) else []
+            recent_exec = []
+            for log in exec_logs[-10:]:
+                if isinstance(log, dict) and str(log.get("plan_step_id", "") or "") in ("", step_id):
+                    c = trim(str(log.get("content", "") or ""), 240)
+                    if c:
+                        recent_exec.append(c)
+            cur_results = []
+            if isinstance(worker_step, dict):
+                for r in (worker_step.get("tool_results", []) or []):
+                    if isinstance(r, dict) and r.get("ok", False):
+                        nm = str(r.get("name", "") or "")
+                        ex = self._tool_result_output_excerpt(r, 160)
+                        cur_results.append(f"{nm}: {ex}" if ex else nm)
+
+            prompt = (
+                "A heuristic acceptance gate flagged this plan step as NOT verified, but the heuristic "
+                "matches evidence by keyword and can be a FALSE NEGATIVE. As a strict QA judge, read the "
+                "ACTUAL evidence below and decide whether the step genuinely meets its acceptance criteria.\n\n"
+                f"PLAN STEP: {step_text}\n"
+                f"ACCEPTANCE CHECK (what should be verified): {acceptance_text or guidance.get('what','')}\n"
+                f"EXPECTED EVIDENCE KIND: {gate_expected or guidance.get('evidence_kind','')}\n"
+                f"GATE FAILURE REASON: {gate_reason}\n\n"
+                f"FILES CREATED/MODIFIED FOR THIS STEP:\n{chr(10).join(files_summary[-12:]) or '(none)'}\n\n"
+                f"EXECUTION OUTPUT (this step):\n{chr(10).join(recent_exec[-6:]) or '(none)'}\n\n"
+                f"CURRENT-TURN TOOL RESULTS:\n{chr(10).join(cur_results[-6:]) or '(none)'}\n\n"
+                "Decide STRICTLY:\n"
+                "- PASS only if concrete evidence shows the step's deliverable exists AND is correct "
+                "(e.g. file truly created with the right content; test/build actually ran and succeeded; "
+                "exit code 0; research produced cited findings). A warning word like 'failed' inside "
+                "otherwise-successful output is NOT a failure.\n"
+                "- FAIL if the deliverable is missing, the check never ran, or evidence shows a real error.\n"
+                "- Never PASS on a mere claim without evidence.\n\n"
+                "Reply ONLY as JSON: "
+                "{\"passed\": true/false, \"confidence\": \"high|medium|low\", "
+                "\"evidence\": \"<cite the specific evidence you relied on>\", "
+                "\"rework_items\": [\"<what concretely must still be fixed if FAIL>\"]}"
+            )
+            resp = self.ollama.chat(
+                [{"role": "user", "content": prompt}],
+                system=self._inject_runtime_environment_context(
+                    "You are a strict, evidence-driven QA judge for plan-step acceptance. "
+                    "You correct heuristic false-negatives but never rubber-stamp unproven claims. Reply ONLY valid JSON."
+                ),
+                max_tokens=400,
+                think=False,
+            )
+            import json
+            text = str(resp.get("content", "") or resp.get("text", "") or "").strip()
+            if "{" in text and "}" in text:
+                result = json.loads(text[text.index("{"):text.rindex("}") + 1])
+                if isinstance(result, dict):
+                    conf = str(result.get("confidence", "low") or "low").strip().lower()
+                    if conf not in ("high", "medium", "low"):
+                        conf = "low"
+                    return {
+                        "passed": bool(result.get("passed", False)),
+                        "confidence": conf,
+                        "evidence": trim(str(result.get("evidence", "") or ""), 300),
+                        "rework_items": [trim(str(x), 200) for x in (result.get("rework_items", []) or [])][:6],
+                    }
+        except Exception:
+            pass
+        return default
 
     def _collect_step_evidence(self, plan_step: dict, worker_step: dict) -> str:
         """Collect evidence summary from worker step for plan step completion."""
@@ -41999,11 +42381,12 @@ body{padding:18px}
                     actor="single",
                     tier="long",
                 )
-                # Track repeated failures and relax-advance so the step can't loop forever.
+                # Drive diagnose→repair→re-verify; returns True only on a genuine
+                # (semantic-verified) pass. Never force-advances.
                 if self._acceptance_gate_handle_failure(
                     current, acceptance_gate, bb, actor="single", target_roles=("developer",)
                 ):
-                    return True  # step force-advanced via gate-relax
+                    return True  # step genuinely passed via semantic judge
             self._inject_rework_if_needed(current, {"tool_results": tool_results})
             self._sync_todos_from_blackboard(reason="single-agent-round")
             if todo_progress_signal and not subtasks_done:
@@ -52800,6 +53183,18 @@ body{padding:18px}
         step_idx = int(step.get("plan_step_index", 0) or 0) + 1
         step_text = trim(str(step.get("content", "") or ""), 200)
         step_id = str(step.get("id", "") or "")
+        # Dedup: only emit the switch/hint bubble ONCE per active step. Multiple
+        # callers (advance, reconcile, restore) can fire in the same tick; without
+        # this guard the UI shows several contradictory "switched to step N/M"
+        # notices for one transition.
+        if step_id:
+            last_hinted = str(getattr(self, "_last_step_hint_id", "") or "")
+            if last_hinted == step_id:
+                return
+            try:
+                self._last_step_hint_id = step_id
+            except Exception:
+                pass
         step_label = self._ui_text("plan_step_label", step=step_idx, total=max(1, total))
         hint_rows: list[str] = []
         plan_msg = trim(self._plan_file_read_instruction(), 2000)
@@ -53437,6 +53832,8 @@ body{padding:18px}
             self._write_plan_file(self._format_plan_file_execution(choice_id))
         except Exception:
             pass
+        # Fresh plan: reset the switch-notice dedup so the first step always emits.
+        self._last_step_hint_id = ""
         try:
             self._inject_current_plan_step_execution_hints()
         except Exception:
