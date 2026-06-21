@@ -191,7 +191,20 @@ WEB_SEARCH_CONTEXT_NODE_MAX = 18
 WEB_SEARCH_CONTEXT_URL_MAX = 12
 RAG_CHUNK_CHARS = 1200
 RAG_CHUNK_OVERLAP = 180
-RAG_MAX_CHUNKS_PER_DOC = 500
+# Per-document chunk ceiling. Books need far more than a typical doc, so this is generous;
+# it is the hard upper bound that keeps a single pathological file from exhausting memory.
+RAG_MAX_CHUNKS_PER_DOC = 20000
+# Max characters retained from ONE source document before chunking. Sized for book-length
+# inputs (~12M chars ≈ several thousand pages) while staying bounded so ingest memory/time
+# can't run away. At RAG_CHUNK_CHARS/overlap this yields well under RAG_MAX_CHUNKS_PER_DOC,
+# so the two caps stay consistent. Env-overridable, clamped to a safe envelope.
+RAG_MAX_DOCUMENT_CHARS = max(
+    150_000,
+    min(
+        40_000_000,
+        int(str(os.getenv("AGENT_RAG_MAX_DOCUMENT_CHARS", str(12_000_000)) or str(12_000_000))),
+    ),
+)
 CODE_CHUNK_CHARS = 1800
 CODE_CHUNK_OVERLAP = 120
 CODE_MAX_CHUNKS_PER_DOC = 260
@@ -60037,6 +60050,8 @@ window.MathJax={
         </div>
         <button id="previewCopyBtn" class="subtle hidden">Copy Code</button>
         <button id="previewModeBtn" class="subtle hidden">Source</button>
+        <button id="previewCopyLinkBtn" class="subtle hidden">Copy Link</button>
+        <button id="previewOpenBtn" class="subtle hidden">Open in Browser</button>
         <button id="previewDownloadBtn" class="subtle hidden">Download</button>
         <button id="previewReloadBtn" class="subtle">Reload</button>
       </div>
@@ -60781,7 +60796,7 @@ Object.assign(I18N['en'],{
   event_auto_continue:'Auto Continue',event_arbiter_continue:'Arbiter Continue',event_continuation_briefing:'Continuation Briefing',event_reminder:'Reminder',event_todo_rescue:'Todo Rescue',event_tool_retry:'Tool Retry',event_segmented_retry:'Segmented Retry',event_forced_converge:'Forced Converge',event_no_tool_recovery:'No-Tool Recovery',event_context_recall:'Context Recall',event_failure_recovery:'Failure Recovery',event_truncate_rescue:'Truncation Rescue',event_thinking_recovery:'Thinking Recovery',event_fault_prefill:'Fault Prefill',event_edit_recovery:'Edit Recovery',
   state_on:'on',state_off:'off',
   rt_session:'session',rt_model:'model',rt_thinking:'thinking',rt_thinking_stream:'thinking_stream',rt_response_stream:'response_stream',rt_mode:'mode',rt_active_agent:'active_agent',rt_blackboard:'bb',rt_task:'task',rt_complexity:'complexity',rt_judgement:'judgement',rt_budget:'budget',rt_remaining:'remaining',rt_blackboard_cycles:'bb_cycles',rt_round_limit:'round_limit',rt_round:'round',rt_phase:'phase',rt_queued_inputs:'queued_inputs',rt_run_timeout:'run_timeout',rt_ctx_used:'ctx_used',rt_ctx_limit:'ctx_limit',rt_ctx_mode:'ctx_mode',rt_manual_lock:'manual-lock',rt_adaptive:'adaptive',rt_ctx_left:'ctx_left',rt_ctx_left_for:'{label} left',rt_ctx_live_title:'Remaining context budget by active call',rt_truncation:'truncation',rt_trunc_retry:'trunc_retry',rt_trunc_tokens:'trunc_tokens~',rt_archive:'archive',rt_last_compact:'last_compact',compact_ago:'ago',compact_just_now:'just now',rt_ollama:'ollama',rt_files:'files',rt_ui_mode:'ui_mode',rt_state:'state',rt_awaiting_user:'awaiting user',ask_user_title:'Agent needs your input',ask_user_free_hint:'Pick an option above, or type your answer below and send.',ask_user_pick_hint:'Pick one of the options above to continue.',
-  preview_download:'Download',preview_source:'Source',preview_rendered:'Preview',
+  preview_download:'Download',preview_source:'Source',preview_rendered:'Preview',preview_copy_link:'Copy Link',preview_open:'Open in Browser',preview_link_copied:'Link Copied',
   fe_nodes:'nodes={n}',fe_loading:'loading...',fe_tree_truncated:'tree truncated at {n} nodes',fe_items:'{n} item(s)',
   cmd_ui_preview_truncated:'UI preview truncated',cmd_model_context_truncated:'Model context truncated',cmd_temp_read_file_ready:'Temp read_file ready',cmd_buffered_copy:'Buffered copy',cmd_prev:'Prev',cmd_next:'Next',cmd_preview:'preview',cmd_of:'of',cmd_read_file_path:'read_file path',cmd_buffer_ref:'buffer_ref',cmd_chars:'chars',cmd_lines:'lines',cmd_strategy:'strategy',cmd_full_output:'full_output',cmd_exit:'exit',cmd_default_name:'command'
 });
@@ -60809,7 +60824,7 @@ Object.assign(I18N['zh-CN'],{
   event_auto_continue:'自动继续',event_arbiter_continue:'裁决继续',event_continuation_briefing:'续跑简报',event_reminder:'提醒',event_todo_rescue:'待办救援',event_tool_retry:'工具重试',event_segmented_retry:'分段重试',event_forced_converge:'强制收敛',event_no_tool_recovery:'无工具恢复',event_context_recall:'上下文召回',event_failure_recovery:'故障恢复',event_truncate_rescue:'截断救援',event_thinking_recovery:'思考恢复',event_fault_prefill:'故障预填',event_edit_recovery:'编辑恢复',
   state_on:'开',state_off:'关',
   rt_session:'会话',rt_model:'模型',rt_thinking:'思考',rt_thinking_stream:'思考流',rt_response_stream:'正文流',rt_mode:'模式',rt_active_agent:'活跃代理',rt_blackboard:'黑板',rt_task:'任务',rt_complexity:'复杂度',rt_judgement:'裁决',rt_budget:'预算',rt_remaining:'剩余',rt_blackboard_cycles:'黑板轮次',rt_round_limit:'轮次上限',rt_round:'轮次',rt_phase:'阶段',rt_queued_inputs:'排队输入',rt_run_timeout:'运行超时',rt_ctx_used:'上下文已用',rt_ctx_limit:'上下文上限',rt_ctx_mode:'上下文模式',rt_manual_lock:'手动锁定',rt_adaptive:'自适应',rt_ctx_left:'上下文剩余',rt_ctx_left_for:'{label}剩余',rt_ctx_live_title:'按真实调用显示上下文剩余',rt_truncation:'截断数',rt_trunc_retry:'截断重试',rt_trunc_tokens:'截断Token~',rt_archive:'归档',rt_last_compact:'最近压缩',compact_ago:'前',compact_just_now:'刚刚',rt_ollama:'Ollama',rt_files:'文件根目录',rt_ui_mode:'界面模式',rt_state:'状态',rt_awaiting_user:'等待用户',ask_user_title:'需要你的输入',ask_user_free_hint:'点击上方选项,或在下方输入答复后发送。',ask_user_pick_hint:'请选择上方其中一个选项以继续。',
-  preview_download:'下载',preview_source:'源码',preview_rendered:'预览',
+  preview_download:'下载',preview_source:'源码',preview_rendered:'预览',preview_copy_link:'复制链接',preview_open:'浏览器打开',preview_link_copied:'已复制链接',
   fe_nodes:'节点={n}',fe_loading:'加载中...',fe_tree_truncated:'目录树在 {n} 个节点处被截断',fe_items:'{n} 项',
   cmd_ui_preview_truncated:'UI 预览截断',cmd_model_context_truncated:'模型上下文截断',cmd_temp_read_file_ready:'临时 read_file 已就绪',cmd_buffered_copy:'缓冲副本',cmd_prev:'上一页',cmd_next:'下一页',cmd_preview:'预览',cmd_of:'共',cmd_read_file_path:'read_file 路径',cmd_buffer_ref:'缓冲引用',cmd_chars:'字符',cmd_lines:'行',cmd_strategy:'策略',cmd_full_output:'完整输出',cmd_exit:'退出码',cmd_default_name:'命令'
 });
@@ -60840,7 +60855,7 @@ Object.assign(I18N['zh-TW'],{
   event_auto_continue:'自動繼續',event_arbiter_continue:'裁決繼續',event_continuation_briefing:'續跑簡報',event_reminder:'提醒',event_todo_rescue:'待辦救援',event_tool_retry:'工具重試',event_segmented_retry:'分段重試',event_forced_converge:'強制收斂',event_no_tool_recovery:'無工具恢復',event_context_recall:'上下文召回',event_failure_recovery:'故障恢復',event_truncate_rescue:'截斷救援',event_thinking_recovery:'思考恢復',event_fault_prefill:'故障預填',event_edit_recovery:'編輯恢復',
   state_on:'開',state_off:'關',
   rt_session:'會話',rt_model:'模型',rt_thinking:'思考',rt_thinking_stream:'思考流',rt_response_stream:'正文串流',rt_mode:'模式',rt_active_agent:'活躍代理',rt_blackboard:'黑板',rt_task:'任務',rt_complexity:'複雜度',rt_judgement:'裁決',rt_budget:'預算',rt_remaining:'剩餘',rt_blackboard_cycles:'黑板輪次',rt_round_limit:'輪次上限',rt_round:'輪次',rt_phase:'階段',rt_queued_inputs:'排隊輸入',rt_run_timeout:'執行逾時',rt_ctx_used:'上下文已用',rt_ctx_limit:'上下文上限',rt_ctx_mode:'上下文模式',rt_manual_lock:'手動鎖定',rt_adaptive:'自適應',rt_ctx_left:'上下文剩餘',rt_ctx_left_for:'{label}剩餘',rt_ctx_live_title:'依真實呼叫顯示上下文剩餘',rt_truncation:'截斷數',rt_trunc_retry:'截斷重試',rt_trunc_tokens:'截斷Token~',rt_archive:'封存',rt_last_compact:'最近壓縮',compact_ago:'前',compact_just_now:'剛剛',rt_ollama:'Ollama',rt_files:'檔案根目錄',rt_ui_mode:'介面模式',rt_state:'狀態',rt_awaiting_user:'等待使用者',ask_user_title:'需要你的輸入',ask_user_free_hint:'點擊上方選項,或在下方輸入答覆後送出。',ask_user_pick_hint:'請選擇上方其中一個選項以繼續。',
-  preview_download:'下載',preview_source:'原始碼',preview_rendered:'預覽',
+  preview_download:'下載',preview_source:'原始碼',preview_rendered:'預覽',preview_copy_link:'複製連結',preview_open:'瀏覽器開啟',preview_link_copied:'已複製連結',
   fe_nodes:'節點={n}',fe_loading:'載入中...',fe_tree_truncated:'目錄樹在 {n} 個節點處被截斷',fe_items:'{n} 項',
   cmd_ui_preview_truncated:'UI 預覽截斷',cmd_model_context_truncated:'模型上下文截斷',cmd_temp_read_file_ready:'暫存 read_file 已就緒',cmd_buffered_copy:'緩衝副本',cmd_prev:'上一頁',cmd_next:'下一頁',cmd_preview:'預覽',cmd_of:'共',cmd_read_file_path:'read_file 路徑',cmd_buffer_ref:'緩衝引用',cmd_chars:'字元',cmd_lines:'行',cmd_strategy:'策略',cmd_full_output:'完整輸出',cmd_exit:'退出碼',cmd_default_name:'命令'
 });
@@ -60869,7 +60884,7 @@ Object.assign(I18N['ja'],{
   event_auto_continue:'自動継続',event_arbiter_continue:'判定継続',event_continuation_briefing:'継続ブリーフ',event_reminder:'リマインダー',event_todo_rescue:'Todo 救援',event_tool_retry:'ツール再試行',event_segmented_retry:'分割再試行',event_forced_converge:'強制収束',event_no_tool_recovery:'ツールなし復旧',event_context_recall:'コンテキスト再呼び出し',event_failure_recovery:'障害復旧',event_truncate_rescue:'切り詰め救援',event_thinking_recovery:'思考復旧',event_fault_prefill:'障害プリフィル',event_edit_recovery:'編集復旧',
   state_on:'オン',state_off:'オフ',
   rt_session:'セッション',rt_model:'モデル',rt_thinking:'思考',rt_thinking_stream:'思考ストリーム',rt_response_stream:'レスポンスストリーム',rt_mode:'モード',rt_active_agent:'アクティブAgent',rt_blackboard:'黒板',rt_task:'タスク',rt_complexity:'複雑度',rt_judgement:'判定',rt_budget:'予算',rt_remaining:'残り',rt_blackboard_cycles:'黒板サイクル',rt_round_limit:'ラウンド上限',rt_round:'ラウンド',rt_phase:'フェーズ',rt_queued_inputs:'待機入力',rt_run_timeout:'実行タイムアウト',rt_ctx_used:'コンテキスト使用量',rt_ctx_limit:'コンテキスト上限',rt_ctx_mode:'コンテキストモード',rt_manual_lock:'手動固定',rt_adaptive:'適応',rt_ctx_left:'残りコンテキスト',rt_ctx_left_for:'{label}残り',rt_ctx_live_title:'実際の呼び出し別の残りコンテキスト',rt_truncation:'切り詰め数',rt_trunc_retry:'切り詰め再試行',rt_trunc_tokens:'切り詰めToken~',rt_archive:'アーカイブ',rt_last_compact:'直近 compact',compact_ago:'前',compact_just_now:'たった今',rt_ollama:'Ollama',rt_files:'ファイルルート',rt_ui_mode:'UIモード',rt_state:'状態',rt_awaiting_user:'ユーザー待ち',ask_user_title:'入力が必要です',ask_user_free_hint:'上のオプションを選ぶか、下に回答を入力して送信してください。',ask_user_pick_hint:'続行するには上のオプションを選んでください。',
-  preview_download:'ダウンロード',preview_source:'ソース',preview_rendered:'プレビュー',
+  preview_download:'ダウンロード',preview_source:'ソース',preview_rendered:'プレビュー',preview_copy_link:'リンクをコピー',preview_open:'ブラウザで開く',preview_link_copied:'リンクをコピーしました',
   fe_nodes:'ノード={n}',fe_loading:'読み込み中...',fe_tree_truncated:'ツリーは {n} ノードで切り詰められました',fe_items:'{n} 件',
   cmd_ui_preview_truncated:'UI プレビュー切り詰め',cmd_model_context_truncated:'モデルコンテキスト切り詰め',cmd_temp_read_file_ready:'一時 read_file 準備完了',cmd_buffered_copy:'バッファコピー',cmd_prev:'前へ',cmd_next:'次へ',cmd_preview:'プレビュー',cmd_of:'全',cmd_read_file_path:'read_file パス',cmd_buffer_ref:'buffer_ref',cmd_chars:'文字',cmd_lines:'行',cmd_strategy:'戦略',cmd_full_output:'完全出力',cmd_exit:'終了コード',cmd_default_name:'コマンド'
 });
@@ -62458,6 +62473,8 @@ function _setPreviewToolbarState(tab){
   const btn=E('previewCopyBtn');
   const modeBtn=E('previewModeBtn');
   const dlBtn=E('previewDownloadBtn');
+  const linkBtn=E('previewCopyLinkBtn');
+  const openBtn=E('previewOpenBtn');
   const isCode=!!(tab&&tab.kind==='code');
   const isHtml=!!(tab&&tab.kind==='html');
   const hasDownload=!!(tab&&tab.path);
@@ -62472,11 +62489,68 @@ function _setPreviewToolbarState(tab){
     if(isHtml)modeBtn.textContent=(String(tab.htmlMode||'preview')==='source')?t('preview_rendered'):t('preview_source');
     modeBtn.onclick=(ev)=>{ev.preventDefault();togglePreviewMode()};
   }
+  // Copy-link + open-in-browser: available for any previewable file with a path. Opening the
+  // page in a real browser tab avoids the cramped/distorted in-pane rendering.
+  if(linkBtn){
+    linkBtn.classList.toggle('hidden',!hasDownload);
+    linkBtn.disabled=!hasDownload;
+    linkBtn.textContent=t('preview_copy_link');
+    linkBtn.onclick=(ev)=>{ev.preventDefault();copyPreviewLink()};
+  }
+  if(openBtn){
+    openBtn.classList.toggle('hidden',!hasDownload);
+    openBtn.disabled=!hasDownload;
+    openBtn.textContent=t('preview_open');
+    openBtn.onclick=(ev)=>{ev.preventDefault();openPreviewInBrowser()};
+  }
   if(dlBtn){
     dlBtn.classList.toggle('hidden',!hasDownload);
     dlBtn.disabled=!hasDownload;
     dlBtn.textContent=t('preview_download');
     dlBtn.onclick=(ev)=>{ev.preventDefault();downloadActivePreview()};
+  }
+}
+function previewAbsoluteUrl(tab){
+  if(!tab||!S.activeId||!tab.path)return'';
+  // Use the same endpoint the in-pane preview renders, so the opened/copied link shows the
+  // identical content (HTML is served with the right content-type and renders properly).
+  const rel=previewFileUrl(S.activeId,tab.path,false);
+  try{return new URL(rel,location.origin).href}catch(_){return location.origin+rel}
+}
+function openPreviewInBrowser(){
+  const tab=activePreviewTab();
+  const url=previewAbsoluteUrl(tab);
+  if(!url)return;
+  try{window.open(url,'_blank','noopener,noreferrer')}catch(_){location.href=url}
+}
+async function copyPreviewLink(){
+  const tab=activePreviewTab();
+  const url=previewAbsoluteUrl(tab);
+  if(!url)return;
+  const btn=E('previewCopyLinkBtn');
+  const restore=()=>{if(btn){btn.disabled=false;btn.textContent=t('preview_copy_link')}};
+  try{
+    if(btn)btn.disabled=true;
+    if(navigator.clipboard&&typeof navigator.clipboard.writeText==='function'){
+      await navigator.clipboard.writeText(url);
+    }else{
+      const ta=document.createElement('textarea');
+      ta.value=url;
+      ta.setAttribute('readonly','readonly');
+      ta.style.position='fixed';
+      ta.style.left='-9999px';
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+    }
+    if(btn){
+      btn.textContent=t('preview_link_copied');
+      setTimeout(restore,1100);
+    }
+  }catch(err){
+    restore();
+    showError(err?.message||String(err));
   }
 }
 function _setPreviewCopyState(tab){
@@ -71701,7 +71775,7 @@ class RAGContentParser:
 
             text = extract_text(str(pdf_path))
             if text and text.strip():
-                return trim(text.strip(), 800_000)
+                return trim(text.strip(), RAG_MAX_DOCUMENT_CHARS)
         except ImportError:
             pass
         except Exception:
@@ -71713,17 +71787,17 @@ class RAGContentParser:
                     [tool, "-layout", str(pdf_path), "-"],
                     capture_output=True,
                     text=True,
-                    timeout=60,
+                    timeout=max(60, int(RAG_PARSE_TIMEOUT_SECONDS)),
                 )
                 if r.returncode == 0 and r.stdout.strip():
-                    return trim(r.stdout.strip(), 800_000)
+                    return trim(r.stdout.strip(), RAG_MAX_DOCUMENT_CHARS)
             except Exception:
                 pass
         try:
             raw = pdf_path.read_bytes()
             text = raw.decode("latin-1", errors="ignore")
             chunks = re.findall(r"\(([^()]{4,2000})\)", text)
-            return trim("\n".join(chunks), 80_000)
+            return trim("\n".join(chunks), RAG_MAX_DOCUMENT_CHARS)
         except Exception:
             return ""
 
@@ -71751,7 +71825,7 @@ class RAGContentParser:
                     table_lines.append("\t".join(vals))
         except Exception:
             table_lines = lines[:300]
-        return trim("\n".join(table_lines), 120_000)
+        return trim("\n".join(table_lines), RAG_MAX_DOCUMENT_CHARS)
 
     def _extract_xlsx_text(self, fp: Path) -> str:
         if self._module_available("openpyxl"):
@@ -71773,7 +71847,7 @@ class RAGContentParser:
                             break
                 wb.close()
                 if lines:
-                    return trim("\n".join(lines), 120_000)
+                    return trim("\n".join(lines), RAG_MAX_DOCUMENT_CHARS)
             except Exception:
                 pass
         try:
@@ -71817,7 +71891,7 @@ class RAGContentParser:
                         if taken >= 160:
                             break
                 if lines:
-                    return trim("\n".join(lines), 120_000)
+                    return trim("\n".join(lines), RAG_MAX_DOCUMENT_CHARS)
         except Exception:
             pass
         return self._extract_strings_fallback(fp)
@@ -71838,12 +71912,12 @@ class RAGContentParser:
                             lines.append("\t".join(vals))
                 wb.release_resources()
                 if lines:
-                    return trim("\n".join(lines), 120_000)
+                    return trim("\n".join(lines), RAG_MAX_DOCUMENT_CHARS)
             except Exception:
                 pass
         xls2csv_text = self._run_text_extractor_cmd(["xls2csv", str(fp)], timeout=45)
         if xls2csv_text:
-            return trim(xls2csv_text, 120_000)
+            return trim(xls2csv_text, RAG_MAX_DOCUMENT_CHARS)
         return self._extract_strings_fallback(fp)
 
     def _extract_docx_text(self, fp: Path) -> str:
@@ -71864,7 +71938,7 @@ class RAGContentParser:
                         if vals:
                             lines.append("\t".join(vals))
                 if lines:
-                    return trim("\n".join(lines), 120_000)
+                    return trim("\n".join(lines), RAG_MAX_DOCUMENT_CHARS)
             except Exception:
                 pass
         try:
@@ -71877,7 +71951,7 @@ class RAGContentParser:
                         lines.append(f"[Part] {Path(name).name}")
                         lines.extend(tokens[:3000])
                 if lines:
-                    return trim("\n".join(lines), 120_000)
+                    return trim("\n".join(lines), RAG_MAX_DOCUMENT_CHARS)
         except Exception:
             pass
         return self._extract_strings_fallback(fp)
@@ -71890,7 +71964,7 @@ class RAGContentParser:
         ):
             out = self._run_text_extractor_cmd(cmd, timeout=45)
             if out:
-                return trim(out, 120_000)
+                return trim(out, RAG_MAX_DOCUMENT_CHARS)
         return self._extract_strings_fallback(fp)
 
     def _extract_pptx_text(self, fp: Path) -> str:
@@ -71909,7 +71983,7 @@ class RAGContentParser:
                         if text:
                             lines.append(text)
                 if lines:
-                    return trim("\n".join(lines), 120_000)
+                    return trim("\n".join(lines), RAG_MAX_DOCUMENT_CHARS)
             except Exception:
                 pass
         try:
@@ -71922,7 +71996,7 @@ class RAGContentParser:
                         lines.append(f"[Slide] {Path(name).stem}")
                         lines.extend(tokens[:1200])
                 if lines:
-                    return trim("\n".join(lines), 120_000)
+                    return trim("\n".join(lines), RAG_MAX_DOCUMENT_CHARS)
         except Exception:
             pass
         return self._extract_strings_fallback(fp)
@@ -71934,7 +72008,7 @@ class RAGContentParser:
         ):
             out = self._run_text_extractor_cmd(cmd, timeout=45)
             if out:
-                return trim(out, 120_000)
+                return trim(out, RAG_MAX_DOCUMENT_CHARS)
         return self._extract_strings_fallback(fp)
 
     def detect_kind(self, fp: Path, mime: str = "") -> str:
@@ -72066,7 +72140,7 @@ class RAGContentParser:
 
     def parse_file(self, fp: Path, *, mime: str = "", text_override: str = "") -> dict:
         kind = self.detect_kind(fp, mime)
-        text = trim(str(text_override or ""), 150_000)
+        text = trim(str(text_override or ""), RAG_MAX_DOCUMENT_CHARS)
         raw: bytes | None = None
         if not text and fp.exists() and fp.is_file():
             try:
@@ -72091,7 +72165,7 @@ class RAGContentParser:
             elif kind == "document":
                 text = self._extract_doc_text(fp)
             elif kind == "text" and raw is not None:
-                text = trim(self._decode_text_bytes(raw), 150_000)
+                text = trim(self._decode_text_bytes(raw), RAG_MAX_DOCUMENT_CHARS)
         lang = _rag_detect_language(text)
         cls = _rag_classify_document(fp.name, kind, text)
         meta = self.media_metadata(fp, mime=mime)
@@ -74229,7 +74303,7 @@ class RAGLibraryStore:
             backup_path.write_bytes(raw_bytes)
         elif source_fp and source_fp.exists():
             shutil.copy2(source_fp, backup_path)
-        semantic_text = trim(str(parse_result.get("text", "") or ""), 800_000)
+        semantic_text = trim(str(parse_result.get("text", "") or ""), RAG_MAX_DOCUMENT_CHARS)
         multimodal_row = dict(multimodal or {})
         mm_summary = trim(str(multimodal_row.get("summary", "") or ""), 2400)
         mm_tags = [str(x).strip() for x in (multimodal_row.get("tags", []) or []) if str(x).strip()]
@@ -76820,7 +76894,7 @@ class RAGIngestionService:
                     parsed_path = Path(str(job.get("parsed_path", "") or "")).resolve() if str(job.get("parsed_path", "") or "").strip() else None
                     text_override = ""
                     if parsed_path and parsed_path.exists():
-                        text_override = try_read_text(parsed_path, max_bytes=300_000) or ""
+                        text_override = try_read_text(parsed_path, max_bytes=RAG_MAX_DOCUMENT_CHARS * 4) or ""
                     _update_progress(1, 1, str(job.get("filename", src.name) or src.name))
                     _capture_ingest(
                         task_id=task_id,
@@ -82122,6 +82196,76 @@ class AppContext:
         except Exception:
             return ""
 
+    def _augment_query_cross_lingual(self, session: object, query: str) -> tuple[str, dict]:
+        """Make lexical retrieval cross-lingual: query in one language, hit content in another.
+
+        BM25 is purely lexical — a Chinese query and an English chunk share no tokens unless
+        a term happens to be in the curated RAG_TERM_GROUPS table. To cover ARBITRARY
+        vocabulary, we translate the (short) query into the other major language via the
+        session's chat model and append it, so ONE bilingual query string flows through the
+        existing tokenizer + BM25 and matches both CN and EN content in a single pass — no
+        embedding model, no second retrieval round.
+
+        Best-effort and fully degrading: returns the original query unchanged when there's no
+        model, the query is long, already bilingual, or translation fails. Cached per
+        normalized query so repeated/multi-stage retrieval pays the model cost at most once.
+        Returns (augmented_query, meta).
+        """
+        raw = str(query or "").strip()
+        meta = {"cross_lingual": False}
+        if not raw or len(raw) > 200:
+            return raw, meta
+        has_cjk = bool(re.search(r"[一-鿿]", raw))
+        has_latin = bool(re.search(r"[A-Za-z]{2,}", raw))
+        # If the query already mixes scripts it can hit both sides lexically; nothing to add.
+        if has_cjk == has_latin:
+            return raw, meta
+        ollama = getattr(session, "ollama", None) if session is not None else None
+        if ollama is None or not hasattr(ollama, "chat"):
+            return raw, meta
+        target_lang = "English" if has_cjk else "Chinese"
+        cache = getattr(self, "_xlingual_query_cache", None)
+        if cache is None:
+            cache = {}
+            try:
+                self._xlingual_query_cache = cache
+            except Exception:
+                pass
+        cache_key = f"{'cjk' if has_cjk else 'lat'}|{raw.lower()}"
+        if cache_key in cache:
+            translated = cache[cache_key]
+        else:
+            translated = ""
+            try:
+                rsp = ollama.chat(
+                    [{"role": "user", "content": (
+                        f"Translate this search query to {target_lang}. Output ONLY the translation, "
+                        f"no quotes, no explanation, keep proper nouns/code/acronyms as-is:\n{raw}"
+                    )}],
+                    system="/no_think\nYou are a terse bilingual search-query translator. Output only the translated query text.",
+                    max_tokens=120,
+                    think=False,
+                )
+                translated = str((rsp or {}).get("content", "") or "").strip()
+            except Exception:
+                translated = ""
+            # Sanitize: single line, drop any accidental wrapping quotes/prefixes.
+            translated = re.sub(r"\s+", " ", translated.replace("\n", " ")).strip().strip('"').strip("'")
+            translated = re.sub(r"(?i)^(translation|translated|译文|翻译)\s*[:：]\s*", "", translated).strip()
+            if len(translated) > 240:
+                translated = translated[:240]
+            # Reject no-ops / echoes that add nothing lexically.
+            if translated.lower() == raw.lower():
+                translated = ""
+            # Bound the cache so a long session can't grow it without limit.
+            if len(cache) < 512:
+                cache[cache_key] = translated
+        if not translated:
+            return raw, meta
+        meta = {"cross_lingual": True, "translated_to": target_lang.lower(), "translated_query": translated}
+        # Append so both the original and translated terms are tokenized into the query.
+        return f"{raw}\n{translated}", meta
+
     def rag_query(self, user_id: str, payload: dict) -> dict:
         body = dict(payload or {})
         query = str(body.get("query", "") or "").strip()
@@ -82135,6 +82279,17 @@ class AppContext:
         top_k = max(1, min(RAG_MAX_QUERY_RESULTS, int(body.get("top_k", budget.get("top_k", RAG_MAX_QUERY_RESULTS)) or budget.get("top_k", RAG_MAX_QUERY_RESULTS))))
         embed_model_override = str(body.get("embed_model", "") or "").strip()
         session = self._resolve_session_for_user(user_id, str(body.get("session_id", "") or ""))
+        # Cross-lingual augmentation: translate a single-language query into the other major
+        # language and search with both, so a CN query reaches EN content (and vice versa)
+        # over plain BM25. `query` stays the user's original text for display/synthesis;
+        # `retrieval_query` is what the lexical index actually sees. Opt-out via cross_lingual=false.
+        retrieval_query = query
+        xlingual_meta = {"cross_lingual": False}
+        if query and bool(body.get("cross_lingual", True)):
+            try:
+                retrieval_query, xlingual_meta = self._augment_query_cross_lingual(session, query)
+            except Exception:
+                retrieval_query, xlingual_meta = query, {"cross_lingual": False}
         dense_enabled, retrieval_mode, embedding_reason = self._embedding_request_mode(body, embed_model_override)
         embedding_used = False
         embeddings_built = 0
@@ -82152,7 +82307,7 @@ class AppContext:
                     pass
             if self.rag_store.index.has_dense_index():
                 try:
-                    qvec = _rag_embed_text(query, session, model=embed_model_override)
+                    qvec = _rag_embed_text(retrieval_query, session, model=embed_model_override)
                     embedding_used = bool(qvec)
                 except Exception:
                     qvec = None
@@ -82160,9 +82315,9 @@ class AppContext:
         raw_route = "hybrid" if requested_route in {"auto", "wiki", "raw"} else requested_route
         pool_k = max(top_k, min(RAG_MAX_QUERY_RESULTS, max(int(budget.get("pool", RAG_HIGH_RECALL_MIN_POOL) or RAG_HIGH_RECALL_MIN_POOL), top_k * RAG_HIGH_RECALL_POOL_MULTIPLIER)))
         if requested_route == "wiki":
-            result = self.rag_wiki.query(query, top_k=top_k, category=category, kind=kind)
+            result = self.rag_wiki.query(retrieval_query, top_k=top_k, category=category, kind=kind)
         elif requested_route in {"raw", "fast", "global", "hybrid"}:
-            result = self.rag_store.index.query(query, top_k=top_k, category=category, kind=kind, route=raw_route if requested_route != "raw" else "hybrid", qvec=qvec)
+            result = self.rag_store.index.query(retrieval_query, top_k=top_k, category=category, kind=kind, route=raw_route if requested_route != "raw" else "hybrid", qvec=qvec)
             if requested_route == "raw":
                 result["route"] = "raw"
                 result.setdefault("route_meta", {})
@@ -82171,13 +82326,13 @@ class AppContext:
         else:
             stage_results: list[dict] = []
             wide_top_k = max(top_k, min(pool_k, int(budget.get("pool", pool_k) or pool_k)))
-            wiki_result = self.rag_wiki.query(query, top_k=wide_top_k, category=category, kind=kind)
+            wiki_result = self.rag_wiki.query(retrieval_query, top_k=wide_top_k, category=category, kind=kind)
             stage_results.append(wiki_result)
             light_route = "fast" if not self._rag_has_global_intent(query) else "hybrid"
-            raw_light = self.rag_store.index.query(query, top_k=wide_top_k, category=category, kind=kind, route=light_route, qvec=qvec)
+            raw_light = self.rag_store.index.query(retrieval_query, top_k=wide_top_k, category=category, kind=kind, route=light_route, qvec=qvec)
             stage_results.append(raw_light)
             light_merged = self._merge_retrieval_results(
-                query,
+                retrieval_query,
                 stage_results,
                 top_k=top_k,
                 route="auto",
@@ -82185,15 +82340,15 @@ class AppContext:
             )
             light_metrics = self._rag_evidence_metrics(light_merged)
             if light_metrics.get("evidence_status") != "hit" or self._rag_has_global_intent(query) or budget_key == "deep":
-                raw_result = self.rag_store.index.query(query, top_k=pool_k, category=category, kind=kind, route=raw_route, qvec=qvec)
+                raw_result = self.rag_store.index.query(retrieval_query, top_k=pool_k, category=category, kind=kind, route=raw_route, qvec=qvec)
                 stage_results.append(raw_result)
                 if self._rag_has_global_intent(query) or budget_key == "deep":
-                    global_result = self.rag_store.index.query(query, top_k=max(top_k, min(pool_k, 24)), category=category, kind=kind, route="global", qvec=qvec)
+                    global_result = self.rag_store.index.query(retrieval_query, top_k=max(top_k, min(pool_k, 24)), category=category, kind=kind, route="global", qvec=qvec)
                     stage_results.append(global_result)
                 if light_metrics.get("evidence_status") != "hit" or budget_key == "deep":
                     stage_results.extend(
                         self._expand_retrieval_with_variants(
-                            query=query,
+                            query=retrieval_query,
                             user_id=user_id,
                             payload=body,
                             code=False,
@@ -82206,7 +82361,7 @@ class AppContext:
                         )
                     )
             result = self._merge_retrieval_results(
-                query,
+                retrieval_query,
                 stage_results,
                 top_k=top_k,
                 route="auto",
@@ -82240,11 +82395,15 @@ class AppContext:
                 "embedding_used": bool(embedding_used),
                 "embedding_reason": embedding_reason,
                 "embeddings_built": int(embeddings_built),
+                "cross_lingual": bool(xlingual_meta.get("cross_lingual", False)),
+                "cross_lingual_to": str(xlingual_meta.get("translated_to", "") or ""),
             }
         )
         result["route_meta"] = meta
         result["retrieval_mode"] = retrieval_mode
         result["embedding_used"] = bool(embedding_used)
+        # Keep the user's original query as the display value (retrieval used the augmented one).
+        result["query"] = query
         synthesize = bool(body.get("synthesize", False))
         if synthesize:
             answer = self._rag_synthesize_with_session(session, query, list(result.get("results", []) or []))
