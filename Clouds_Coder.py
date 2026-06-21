@@ -156,6 +156,10 @@ RAG_ADMIN_PORT_OFFSET = 2
 CODE_LIBRARY_DIRNAME = "Code_Library"
 CODE_ADMIN_PORT_OFFSET = 3
 MCP_SERVICE_PORT_OFFSET = 4
+# IDE follows the agent port like every other service (skills+1/rag+2/code+3/mcp+4),
+# at +5, instead of squatting on a fixed port that would collide with mcp-service at the
+# default --port. IDE_DEFAULT_PORT is kept only as a pre-config fallback constant.
+IDE_PORT_OFFSET = 5
 IDE_DEFAULT_PORT = 8084
 WEB_SEARCH_INDEX_DIRNAME = "Web_Search_Index"
 DEFAULT_WEB_SEARCH_ENABLED = True
@@ -78228,6 +78232,12 @@ const G={
     graphKey:'',
     activeHoverId:'',
     resizeObserver:null,
+    // Node-level expand/collapse morph (3D analogue of the 2D G.morph). `from` maps
+    // id→{x,y,z,scale} captured before a focus/clear layout switch; meshes ease from
+    // there to their new world transform. Continuous RAF runs while active.
+    morph:{active:false,started:0,duration:0,from:null,originId:'',reason:''},
+    // Camera-facing adaptive text labels (id→Sprite). Rebuilt with the scene graph.
+    labels:new Map(),
   },
 };
 const GOLDEN_ANGLE=Math.PI*(3-Math.sqrt(5));
@@ -79358,15 +79368,19 @@ function focusGraphNode(id){
   G.lastLayoutView='';
   if(G.mode==='static')drawGraph2D('focus');
   else if(G.mode==='3d'){
+    // Capture current mesh transforms BEFORE the scene rebuilds, so the neighborhood
+    // expands out from the clicked node (3D analogue of the 2D morph).
+    beginThreeMorph(next,'focus',520);
     G.three.graphKey='';
     renderGraph3D('focus').catch(err=>setGraphRuntime(err.message,true));
   }else setGraphOverlay();
 }
 function clearGraphFocus(){
   const had=Boolean(G.focusMode||String(G.selectedNodeId||''));
+  const prevSelected=String(G.selectedNodeId||'');
   // Collapse animation: morph the focused neighborhood back toward the overview, with
   // the previously-selected node as the convergence origin (static 2D mode only).
-  if(had&&G.mode==='static')beginGraphMorph(String(G.selectedNodeId||''),'return',440);
+  if(had&&G.mode==='static')beginGraphMorph(prevSelected,'return',440);
   G.focusMode=false;
   G.selectedNodeId='';
   G.hoverId='';
@@ -79374,6 +79388,9 @@ function clearGraphFocus(){
   G.lastLayoutView='';
   if(G.mode==='static')drawGraph2D(had?'return':'idle');
   else if(G.mode==='3d'){
+    // Collapse: ease the focused neighborhood back to the overview, converging on the
+    // previously-selected node's spot.
+    if(had)beginThreeMorph(String(prevSelected||''),'return',460);
     G.three.graphKey='';
     renderGraph3D(had?'return':'idle').catch(err=>setGraphRuntime(err.message,true));
   }else setGraphOverlay();
@@ -79522,8 +79539,14 @@ function disposeThreeObject(obj){
     obj.traverse(node=>{
       if(node.geometry&&typeof node.geometry.dispose==='function')node.geometry.dispose();
       const material=node.material;
-      if(Array.isArray(material))material.forEach(m=>m&&typeof m.dispose==='function'&&m.dispose());
-      else if(material&&typeof material.dispose==='function')material.dispose();
+      const _disposeMat=(m)=>{
+        if(!m)return;
+        // Free sprite/label CanvasTextures too, not just the material.
+        if(m.map&&typeof m.map.dispose==='function')m.map.dispose();
+        if(typeof m.dispose==='function')m.dispose();
+      };
+      if(Array.isArray(material))material.forEach(_disposeMat);
+      else _disposeMat(material);
     })
   }
 }
@@ -79582,9 +79605,14 @@ function scheduleThreeRender(reason='render'){
     G.three.pending=false;
     if(G.mode!=='3d'||!G.three.renderer||!G.three.scene||!G.three.camera)return;
     updateThreeCamera();
+    // Advance the node expand/collapse morph; keep the loop alive until it settles.
+    const morphing=_applyThreeMorphFrame();
+    // Labels track their (possibly morphing) nodes + adapt size to camera distance.
+    _updateThreeLabelScales();
     G.three.renderer.render(G.three.scene,G.three.camera);
     setGraphRuntime(`3d ${G.three.lastReason}`);
     setGraphOverlay();
+    if(morphing)scheduleThreeRender('morph');
   })
 }
 function applyThreeHover(id){
@@ -79640,6 +79668,202 @@ function resizeThreeRenderer(){
   fitThreeCameraToLayout(false);
   scheduleThreeRender('resize');
 }
+function _snapshotThreeMeshTransforms(){
+  // Capture each node's CURRENT world position + scale before the layout switches, so
+  // the 3D morph can ease meshes from where they are now to their new focus/overview
+  // transform (the 3D analogue of snapshotGraphScreenNodes). id→{x,y,z,scale}.
+  const out=new Map();
+  if(!(G.three.meshes instanceof Map))return out;
+  for(const [id,mesh] of G.three.meshes.entries()){
+    if(!mesh||!mesh.position)continue;
+    out.set(String(id),{
+      x:Number(mesh.position.x||0),
+      y:Number(mesh.position.y||0),
+      z:Number(mesh.position.z||0),
+      scale:Number(mesh.scale?.x||mesh.userData?.baseScale||1),
+    });
+  }
+  return out;
+}
+function beginThreeMorph(originId,reason='morph',duration=520){
+  const from=_snapshotThreeMeshTransforms();
+  if(!from.size){G.three.morph={active:false,started:0,duration:0,from:null,originId:'',reason:''};return}
+  G.three.morph={
+    active:true,
+    started:performance.now(),
+    duration:Math.max(140,Number(duration||520)),
+    from,
+    originId:String(originId||''),
+    reason,
+  };
+}
+function _applyThreeMorphFrame(){
+  // Ease every mesh from its captured transform to its target (the just-built layout
+  // position + the focus-styled resting scale stored in userData.targetScale). Newly
+  // revealed neighbors expand outward from the clicked node (origin), starting tiny.
+  // Returns true while animating, false once settled.
+  const morph=G.three.morph;
+  if(!morph||!morph.active||!(morph.from instanceof Map))return false;
+  const t=(performance.now()-Number(morph.started||0))/Math.max(1,Number(morph.duration||1));
+  if(t>=1){
+    morph.active=false;
+    // Snap to resting transforms.
+    for(const [,mesh] of G.three.meshes.entries()){
+      const tp=mesh.userData?.targetPos;
+      if(tp)mesh.position.set(Number(tp.x||0),Number(tp.y||0),Number(tp.z||0));
+      const ts=Number(mesh.userData?.targetScale);
+      if(Number.isFinite(ts))mesh.scale.setScalar(ts);
+    }
+    return false;
+  }
+  const k=easeGraph(t);
+  const originPrev=morph.from.get(String(morph.originId||''));
+  let originMesh=G.three.meshes.get(String(morph.originId||''))||null;
+  const originX=Number((originPrev?originPrev.x:originMesh?.userData?.targetPos?.x)||0);
+  const originY=Number((originPrev?originPrev.y:originMesh?.userData?.targetPos?.y)||0);
+  const originZ=Number((originPrev?originPrev.z:originMesh?.userData?.targetPos?.z)||0);
+  for(const [id,mesh] of G.three.meshes.entries()){
+    const tp=mesh.userData?.targetPos||{x:mesh.position.x,y:mesh.position.y,z:mesh.position.z};
+    const ts=Number(mesh.userData?.targetScale||mesh.userData?.baseScale||1);
+    const prev=morph.from.get(String(id));
+    const fx=prev?Number(prev.x||0):originX;
+    const fy=prev?Number(prev.y||0):originY;
+    const fz=prev?Number(prev.z||0):originZ;
+    const fs=prev?Number(prev.scale||0):Math.max(0.1,ts*0.18);
+    mesh.position.set(fx+(Number(tp.x||0)-fx)*k, fy+(Number(tp.y||0)-fy)*k, fz+(Number(tp.z||0)-fz)*k);
+    mesh.scale.setScalar(Math.max(0.05,fs+(ts-fs)*k));
+  }
+  return true;
+}
+function _three3dLabelIds(layout){
+  // Adaptive label set for 3D, matching the 2D cap: max(focus?24:16, heroCount). Prefer the
+  // layout's own labelIds (focus layout sets these); otherwise derive from hero/community +
+  // top score. Always include the selected + hovered node.
+  const ids=new Set();
+  const cap=Math.max(G.focusMode?24:16,Number(layout?.heroCount||0));
+  const explicit=(layout&&layout.labelIds instanceof Set)?layout.labelIds:null;
+  if(explicit&&explicit.size){
+    for(const id of explicit){if(ids.size>=cap)break;ids.add(String(id))}
+  }else{
+    const items=Array.isArray(layout?.items)?layout.items.slice():[];
+    items.sort((a,b)=>Number(b?.score||0)-Number(a?.score||0));
+    for(const it of items){
+      if(ids.size>=cap)break;
+      if(it&&(it.hero||String(it.type||'')==='community'||ids.size<Math.min(cap,10))){
+        ids.add(String(it.id||''));
+      }
+    }
+  }
+  const sel=String(G.selectedNodeId||'');if(sel)ids.add(sel);
+  const hov=String(G.hoverId||'');if(hov)ids.add(hov);
+  return ids;
+}
+function _makeThreeLabelSprite(text,selected){
+  const THREE=G.three.lib;
+  if(!THREE)return null;
+  const label=String(text||'').trim();
+  if(!label)return null;
+  // Match the 2D label format exactly: same font family, '...' truncation, maxChars
+  // (26 overview / 34 focus), dark-green text, NO background box (the 3D stage has the
+  // same light background as the 2D canvas, so dark text reads identically).
+  const maxChars=G.focusMode?34:26;
+  const display=label.length>maxChars?`${label.slice(0,maxChars-1)}...`:label;
+  const fontFamily='"Avenir Next","Helvetica Neue","PingFang SC",sans-serif';
+  // Render at high-res internally for crisp text; on-screen size is set by _updateThreeLabelScales.
+  const fontPx=44;
+  const dpr=Math.max(1,Math.min(window.devicePixelRatio||1,2));
+  const pad=Math.ceil(fontPx*0.34);
+  const canvas=document.createElement('canvas');
+  const ctx=canvas.getContext('2d');
+  ctx.font=`${fontPx}px ${fontFamily}`;
+  const textW=Math.ceil(ctx.measureText(display).width);
+  const cw=textW+pad*2, chh=Math.ceil(fontPx*1.5);
+  canvas.width=Math.ceil(cw*dpr);
+  canvas.height=Math.ceil(chh*dpr);
+  ctx.scale(dpr,dpr);
+  ctx.font=`${fontPx}px ${fontFamily}`;
+  ctx.textBaseline='middle';
+  // 2D colors: selected rgba(21,35,28,0.96), else rgba(23,49,34,0.74). No box.
+  ctx.fillStyle=selected?'rgba(21,35,28,0.96)':'rgba(23,49,34,0.84)';
+  ctx.fillText(display,pad,chh/2);
+  const texture=new THREE.CanvasTexture(canvas);
+  if('SRGBColorSpace' in THREE)texture.colorSpace=THREE.SRGBColorSpace;
+  texture.needsUpdate=true;
+  const material=new THREE.SpriteMaterial({map:texture,transparent:true,depthTest:false,depthWrite:false});
+  const sprite=new THREE.Sprite(material);
+  sprite.userData={aspect:cw/Math.max(1,chh)};
+  sprite.renderOrder=999;
+  return sprite;
+}
+function _updateThreeLabelScales(){
+  // Two jobs, run each rendered frame:
+  //  1. Distance-adaptive sizing — keep each label a roughly constant on-screen height
+  //     regardless of camera distance/zoom, floated just above its node.
+  //  2. Density culling — project every candidate label to SCREEN space, rank by importance
+  //     (selected/hovered > hero/community > score), then greedily place: a label is shown
+  //     only if its screen box doesn't collide with an already-placed, more-important one.
+  //     This surfaces the important labels and drops minor/overlapping ones as the camera
+  //     moves, so dense regions don't turn into an unreadable pile of text.
+  if(!(G.three.labels instanceof Map)||!G.three.labels.size||!G.three.camera||!G.three.renderer)return;
+  const cam=G.three.camera;
+  const camPos=cam.position;
+  const vFov=Math.max(0.2,(Number(cam.fov||42)*Math.PI)/180);
+  const heightFrac=G.focusMode?0.052:0.044;
+  const rect=G.three.renderer.domElement?G.three.renderer.domElement.getBoundingClientRect():{width:960,height:520};
+  const vw=Math.max(1,Number(rect.width||960)), vh=Math.max(1,Number(rect.height||520));
+  const THREE=G.three.lib;
+  const selectedId=String(G.selectedNodeId||'');
+  const hoverId=String(G.hoverId||'');
+  const cand=[];
+  for(const [id,sprite] of G.three.labels.entries()){
+    const mesh=G.three.meshes.get(String(id));
+    if(!mesh){sprite.visible=false;continue}
+    // World height for constant on-screen size.
+    const dx=mesh.position.x-camPos.x, dy=mesh.position.y-camPos.y, dz=mesh.position.z-camPos.z;
+    const dist=Math.sqrt(dx*dx+dy*dy+dz*dz)||1;
+    const worldH=clamp(2*dist*Math.tan(vFov/2)*heightFrac,3.2,46);
+    const aspect=Number(sprite.userData?.aspect||4)||4;
+    sprite.scale.set(worldH*aspect,worldH,1);
+    const r=Number(mesh.scale?.y||mesh.userData?.baseScale||2);
+    const wx=mesh.position.x, wy=mesh.position.y+r+worldH*0.62, wz=mesh.position.z;
+    sprite.position.set(wx,wy,wz);
+    // Project the label anchor to normalized device coords, then to screen pixels.
+    let ndc=null;
+    try{ndc=new THREE.Vector3(wx,wy,wz).project(cam)}catch(_){ndc=null}
+    if(!ndc||!Number.isFinite(ndc.x)||!Number.isFinite(ndc.y)||ndc.z>1||ndc.z<-1){
+      // Behind the camera or invalid → never show.
+      sprite.visible=false;continue;
+    }
+    const sx=(ndc.x*0.5+0.5)*vw;
+    const sy=(-ndc.y*0.5+0.5)*vh;
+    // Screen box: label height is ~heightFrac of the viewport by construction.
+    const boxH=Math.max(12,vh*heightFrac);
+    const boxW=boxH*aspect;
+    // Off-screen (with margin) → skip.
+    if(sx<-boxW||sx>vw+boxW||sy<-boxH||sy>vh+boxH){sprite.visible=false;continue}
+    let importance=Number(sprite.userData?.importance||0);
+    if(String(id)===selectedId)importance+=1000;     // selected always wins
+    else if(String(id)===hoverId)importance+=500;     // hovered next
+    // Closer-to-camera labels get a slight edge so foreground reads over background.
+    importance+=clamp(1/Math.max(1,dist)*40,0,2);
+    cand.push({sprite,sx,sy,boxW,boxH,importance});
+  }
+  // Greedy density placement, most important first.
+  cand.sort((a,b)=>b.importance-a.importance);
+  const placed=[];
+  for(const c of cand){
+    let collides=false;
+    for(const p of placed){
+      // Axis-aligned box overlap test in screen space, anchored at the label's left-middle.
+      if(Math.abs(c.sx-p.sx)*2 < (c.boxW+p.boxW) && Math.abs(c.sy-p.sy)*2 < (c.boxH+p.boxH)){
+        collides=true;break;
+      }
+    }
+    if(collides){c.sprite.visible=false;continue}
+    c.sprite.visible=true;
+    placed.push(c);
+  }
+}
 function buildThreeSceneGraph(){
   const THREE=G.three.lib;
   if(!THREE||!G.three.root)return;
@@ -79679,13 +79903,58 @@ function buildThreeSceneGraph(){
     const mesh=new THREE.Mesh(new THREE.SphereGeometry(1,14,12),material);
     mesh.position.set(Number(item.x||0),Number(item.y||0),Number(item.z||0));
     mesh.scale.setScalar(Number(item.radius3d||2));
-    mesh.userData={id:item.id,baseScale:Number(item.radius3d||2),baseColor:Number(item.colorHex||0x607565),baseOpacity:opacity};
+    mesh.userData={
+      id:item.id,
+      baseScale:Number(item.radius3d||2),
+      baseColor:Number(item.colorHex||0x607565),
+      baseOpacity:opacity,
+      // Resting world position for this layout; the morph eases toward it.
+      targetPos:{x:Number(item.x||0),y:Number(item.y||0),z:Number(item.z||0)},
+    };
     G.three.root.add(mesh);
     G.three.meshes.set(String(item.id),mesh);
   });
   fitThreeCameraToLayout(true);
   applyThreeFocusStyles();
+  // After focus styling sets each mesh's resting scale, record it as the morph target.
+  for(const [,mesh] of G.three.meshes.entries()){
+    mesh.userData.targetScale=Number(mesh.scale?.x||mesh.userData?.baseScale||1);
+  }
+  _buildThreeLabels(layout);
+  // If a focus/clear morph is queued, place meshes at their start now so frame 0 shows the
+  // pre-switch arrangement, then the continuous loop eases them in.
+  if(G.three.morph&&G.three.morph.active)_applyThreeMorphFrame();
+  _updateThreeLabelScales();
   G.three.graphKey=layout.signature;
+}
+function _buildThreeLabels(layout){
+  const THREE=G.three.lib;
+  if(!THREE||!G.three.root)return;
+  // Dispose any previous labels (textures freed via disposeThreeObject's map handling).
+  if(G.three.labels instanceof Map){
+    for(const [,sprite] of G.three.labels.entries()){
+      try{G.three.root.remove(sprite)}catch(_){}
+      disposeThreeObject(sprite);
+    }
+  }
+  G.three.labels=new Map();
+  const ids=_three3dLabelIds(layout);
+  const selectedId=String(G.selectedNodeId||'');
+  for(const id of ids){
+    const item=layout.itemById.get(String(id));
+    if(!item)continue;
+    const sprite=_makeThreeLabelSprite(item.label||item.id,String(id)===selectedId);
+    if(!sprite)continue;
+    // Base importance for density culling: hero/community/high-score rank above incidental
+    // neighbors. Selected/hovered get a live boost in _updateThreeLabelScales so they always win.
+    const base=Math.log1p(Math.max(0,Number(item.score||0)));
+    let imp=base;
+    if(item.hero)imp+=4;
+    if(String(item.type||'')==='community')imp+=3;
+    sprite.userData.importance=imp;
+    G.three.root.add(sprite);
+    G.three.labels.set(String(id),sprite);
+  }
 }
 async function ensureThreeRenderer(){
   const THREE=await ensureThreeLib();
@@ -86797,9 +87066,9 @@ def main():
     parser.add_argument(
         "--ide_port",
         "--IDE_port",
-        default=IDE_DEFAULT_PORT,
+        default=None,
         type=int,
-        help=f"Programming IDE web port (default: {IDE_DEFAULT_PORT})",
+        help=f"Programming IDE web port (default: agent port + {IDE_PORT_OFFSET})",
     )
     parser.add_argument(
         "--skills_root",
@@ -87665,7 +87934,7 @@ def main():
     skills_port = int(args.skills_port) if args.skills_port is not None else int(args.port) + 1
     rag_admin_port = int(args.rag_admin_port) if args.rag_admin_port is not None else int(args.port) + RAG_ADMIN_PORT_OFFSET
     code_admin_port = int(args.code_admin_port) if args.code_admin_port is not None else int(args.port) + CODE_ADMIN_PORT_OFFSET
-    ide_port = int(getattr(args, "ide_port", IDE_DEFAULT_PORT) or IDE_DEFAULT_PORT)
+    ide_port = int(args.ide_port) if getattr(args, "ide_port", None) is not None else int(args.port) + IDE_PORT_OFFSET
     setattr(app, "agent_port", int(args.port))
     setattr(app, "skills_port", int(skills_port))
     setattr(app, "skills_ui_enabled", False)
@@ -87744,12 +88013,21 @@ def main():
             print(f"[web-agent] code admin failed to start on {args.host}:{code_admin_port}: {exc}")
     ide_server = None
     ide_thread = None
+    # Ports already bound by servers that actually started (agent always; others only if
+    # their *_server is live). A disabled service must NOT block the IDE from binding.
+    _active_ports_for_ide = {int(args.port)}
+    if skills_server:
+        _active_ports_for_ide.add(int(skills_port))
+    if rag_admin_server:
+        _active_ports_for_ide.add(int(rag_admin_port))
+    if code_admin_server:
+        _active_ports_for_ide.add(int(code_admin_port))
     if args.no_ide:
         print("[web-agent] programming IDE disabled by --no_ide")
     elif not bool(getattr(args, "enable_ide", False)):
         print("[web-agent] programming IDE disabled by default; use --enable_ide to start it")
-    elif int(ide_port) in {int(args.port), int(skills_port), int(rag_admin_port), int(code_admin_port)}:
-        print("[web-agent] programming IDE disabled: ide_port conflicts with existing server port")
+    elif int(ide_port) in _active_ports_for_ide:
+        print(f"[web-agent] programming IDE disabled: ide_port {ide_port} conflicts with a running server port")
     else:
         try:
             ide_server = AgentHTTPServer((args.host, ide_port), IdeHandler, app)
@@ -87768,7 +88046,7 @@ def main():
             print(f"[web-agent] programming IDE failed to start on {args.host}:{ide_port}: {exc}")
     # Global MCP service: mounted on (agent port + 4) at startup, following the
     # same user-port-relative scheme as skills(+1)/rag-admin(+2)/code-admin(+3),
-    # so it tracks --port instead of the fixed IDE port. Connects servers + starts
+    # so it tracks --port instead of a fixed port. Connects servers + starts
     # the health monitor (crash-restart + on-disk config hot-swap). Bound to the
     # same host as the other servers.
     mcp_service_port = (
@@ -87780,10 +88058,22 @@ def main():
     setattr(app, "mcp_service_enabled", False)
     mcp_service_server = None
     mcp_service_thread = None
+    # Only ports of servers that actually started can conflict; the IDE is included
+    # only when it is genuinely running (ide_server is set), so a disabled IDE on the
+    # same default port never blocks the MCP service.
+    _active_ports_for_mcp = {int(args.port)}
+    if skills_server:
+        _active_ports_for_mcp.add(int(skills_port))
+    if rag_admin_server:
+        _active_ports_for_mcp.add(int(rag_admin_port))
+    if code_admin_server:
+        _active_ports_for_mcp.add(int(code_admin_port))
+    if ide_server:
+        _active_ports_for_mcp.add(int(ide_port))
     if getattr(args, "no_mcp_service", False):
         print("[web-agent] MCP service disabled by --no_mcp_service")
-    elif int(mcp_service_port) in {int(args.port), int(skills_port), int(rag_admin_port), int(code_admin_port), int(ide_port)}:
-        print(f"[web-agent] MCP service disabled: mcp_service_port {mcp_service_port} conflicts with an existing server port")
+    elif int(mcp_service_port) in _active_ports_for_mcp:
+        print(f"[web-agent] MCP service disabled: mcp_service_port {mcp_service_port} conflicts with a running server port")
     else:
         try:
             mcp_service_server = AgentHTTPServer((args.host, mcp_service_port), McpServiceHandler, app)
