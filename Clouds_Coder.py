@@ -16682,7 +16682,7 @@ class OllamaClient:
         chunk_count = 0
 
         def _handle_payload(raw_text: str):
-            nonlocal chunk_count, event_name
+            nonlocal chunk_count
             text = str(raw_text or "").strip()
             if not text:
                 return
