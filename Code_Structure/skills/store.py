@@ -29,6 +29,7 @@ ensure_generated_multimodal_comprehension_skills = _split_source_symbol('ensure_
 ensure_generated_runtime_skills_manifest = _split_source_symbol('ensure_generated_runtime_skills_manifest')
 ensure_generated_agent_web_search_skill = _split_source_symbol('ensure_generated_agent_web_search_skill')
 ensure_embedded_clawhub_skills = _split_source_symbol('ensure_embedded_clawhub_skills')
+ensure_generated_mcp_builder_skill = _split_source_symbol('ensure_generated_mcp_builder_skill')
 ensure_runtime_skills = _split_source_symbol('ensure_runtime_skills')
 _BUILTIN_SKILLS = _split_source_symbol('_BUILTIN_SKILLS')
 SkillStore = _split_source_symbol('SkillStore')

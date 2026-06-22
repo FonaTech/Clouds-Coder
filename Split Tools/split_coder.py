@@ -183,6 +183,7 @@ DEFAULT_LAYOUT: Dict[str, List[str]] = {
     ],
     "utils/text.py": [
         "MAX_TOOL_OUTPUT", "SOCKET_NOISE_LINE_PATTERNS",
+        "display_clean", "short_title_from",
         "trim", "_fmt_export_ts", "_html_esc", "_text_to_minimal_pdf",
         "normalize_embedded_newlines", "_map_todo_status_token",
         "split_todo_status_text", "extract_todo_rows_from_text",
@@ -206,6 +207,7 @@ DEFAULT_LAYOUT: Dict[str, List[str]] = {
         "JSON_FSYNC_ENABLED",
         "json_dumps", "parse_json_object", "extract_json_object_from_text",
         "repair_truncated_json_object", "parse_tool_arguments", "parse_tool_arguments_with_error",
+        "_is_valid_json_object", "_scan_top_level_json_objects", "reconstruct_streamed_tool_args",
         "_json_default_copy", "_read_json_file", "_write_json_file",
         "tool_def", "canonicalize_tool_name",
         "filter_tool_specs_for_runtime",
@@ -252,6 +254,7 @@ DEFAULT_LAYOUT: Dict[str, List[str]] = {
         "is_openai_like_provider", "openai_compat_probe_headers",
         "openai_compat_model_list_urls", "extract_openai_compat_model_ids",
         "_is_http_url", "_resolve_local_path",
+        "clamp_effort", "model_reasoning_style", "resolve_reasoning_payload",
         "_OLLAMA_TAG_CACHE", "_OLLAMA_TAG_CACHE_LOCK",
     ],
 
@@ -318,6 +321,15 @@ DEFAULT_LAYOUT: Dict[str, List[str]] = {
     "rag/web_search.py": [
         "AgentWebHTMLParser", "AgentWebSearchEngine",
         "~^_agent_web_",
+    ],
+
+    # ── MCP (Model Context Protocol) ──────────────────────────────────────
+    "mcp/__init__.py": [],
+    "mcp/driver.py": [
+        "_MCP_DEFAULT_HANDSHAKE_TIMEOUT", "_MCP_DEFAULT_CALL_TIMEOUT", "_MCP_MAX_RESULT_CHARS",
+        "mcp_normalize_name", "mcp_normalize_server_configs", "mcp_extract_server_configs",
+        "MCPServerProcess", "MCPManager",
+        "~^mcp_", "~^_mcp_", "~^MCP[A-Z]",
     ],
 
     # ── App ───────────────────────────────────────────────────────────────

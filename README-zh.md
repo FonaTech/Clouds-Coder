@@ -13,6 +13,7 @@
 </p>
 <p align="center">
   <a href="./RELEASE_NOTES.md">Release Notes</a> ·
+  <a href="./log/CHANGELOG-2026-06-22.md">2026-06-22 更新日志（EN/中文/日本語）</a> ·
   <a href="./log/CHANGELOG-2026-06-05.md">2026-06-05 更新日志（EN/中文/日本語）</a> ·
   <a href="./log/CHANGELOG-2026-05-28.md">2026-05-28 更新日志（EN/中文/日本語）</a> ·
   <a href="./log/CHANGELOG-2026-05-02.md">2026-05-02 更新日志（EN/中文/日本語）</a> ·
@@ -32,7 +33,7 @@ Clouds Coder 是一个以“CLI 执行层与 Web 用户层分离”为核心的�
 
 它的首要问题定义是：CLI 编程门槛高、环境分发困难、学习曲线陡。Clouds Coder 通过前后端分离（云端 CLI 执行 + Web 端交互控制）来降低 Vibe Coding 上手成本，同时把超时、截断、上下文预算、空想循环治理作为并列核心能力，保障复杂任务可执行、可收敛、可复盘。
 
-架构更新日志归档：[`CHANGELOG-2026-06-05.md`](./log/CHANGELOG-2026-06-05.md) | [`CHANGELOG-2026-05-28.md`](./log/CHANGELOG-2026-05-28.md) | [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md) | [`CHANGELOG-2026-03-31.md`](./log/CHANGELOG-2026-03-31.md) | [`CHANGELOG-2026-03-25.md`](./log/CHANGELOG-2026-03-25.md) | [`CHANGELOG-2026-03-20.md`](./log/CHANGELOG-2026-03-20.md) | [`CHANGELOG-2026-03-16.md`](./log/CHANGELOG-2026-03-16.md) | [`CHANGELOG-2026-03-07.md`](./log/CHANGELOG-2026-03-07.md)
+架构更新日志归档：[`CHANGELOG-2026-06-22.md`](./log/CHANGELOG-2026-06-22.md) | [`CHANGELOG-2026-06-05.md`](./log/CHANGELOG-2026-06-05.md) | [`CHANGELOG-2026-05-28.md`](./log/CHANGELOG-2026-05-28.md) | [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md) | [`CHANGELOG-2026-03-31.md`](./log/CHANGELOG-2026-03-31.md) | [`CHANGELOG-2026-03-25.md`](./log/CHANGELOG-2026-03-25.md) | [`CHANGELOG-2026-03-20.md`](./log/CHANGELOG-2026-03-20.md) | [`CHANGELOG-2026-03-16.md`](./log/CHANGELOG-2026-03-16.md) | [`CHANGELOG-2026-03-07.md`](./log/CHANGELOG-2026-03-07.md)
 
 ## 1. 项目定位
 
@@ -798,7 +799,7 @@ flowchart TB
 
 ## 4.1 RAG 知识架构：TF-Graph_IDF 引擎
 
-Clouds Coder 内置了名为 **TF-Graph_IDF** 的检索引擎，融合了词法评分、知识图谱拓扑、自动社区检测和多路由查询编排，在召回质量上显著优于标准 TF-IDF 或 BM25。
+Clouds Coder 内置了名为 **TF-Graph_IDF** 的检索引擎，融合了 **BM25 词法评分**、知识图谱拓扑、自动社区检测、符号精确加权与多路由查询编排——纯词法（无需嵌入模型），却在散文与源码上都为高召回做了调优。
 
 ### 双库设计架构
 
@@ -824,7 +825,7 @@ flowchart TB
   subgraph QUERY["查询层"]
     direction TB
     QR["查询路由器\n_decide_query_route()\nglobal_score vs local_score"]
-    F["FAST 路径\n向量检索\nlexical × 0.82 + graph_bonus"]
+    F["FAST 路径\n向量检索\nlexical × 0.80 + graph_bonus + symbol_boost"]
     G["GLOBAL 路径\n社区排序\n→ Map：社区内检索\n→ Bridge：跨社区实体链接\n→ Reduce：全局综合行"]
     H["HYBRID 路径\n1 global + 2 fast\n交错合并"]
   end
@@ -845,13 +846,22 @@ flowchart TB
 
 ### TF-Graph_IDF 评分公式
 
-每个检索到的 chunk 的分数由**词法分量**和**图奖励**组成：
+每个检索到的 chunk 的分数由 **BM25 词法分量**、**图奖励**和**符号精确加权**组成。检索全程纯词法，任何环节都不涉及嵌入模型：
 
 ```
-final_score = lexical × 0.82 + graph_bonus         （Data RAG）
-final_score = lexical × 0.78 + graph_bonus         （Code RAG — 图奖励权重更高）
+final_score = lexical × 0.80 + graph_bonus + symbol_boost   （Data RAG 与 Code RAG）
 
-lexical     = Σ(q_weight_i × c_weight_i) / (query_norm × chunk_norm)
+bm25        = Σ_t  q_weight_t × (tf_t × (k1+1)) / (tf_t + k1 × (1 − b + b × dl/avgdl))
+              k1 = RAG_BM25_K1 = 1.5，b = RAG_BM25_B = 0.6
+              dl = chunk 长度，avgdl = 语料平均 chunk 长度
+
+lexical     = bm25 / (bm25 + RAG_BM25_SATURATION)            RAG_BM25_SATURATION = 4.0
+              # 与候选池无关的饱和（非 min-max）：保留绝对相关性，
+              # 因此「无证据 / 最低综合分」阈值在弱候选池上仍然有效
+
+symbol_boost = 0.5 × (0.85 + 0.15 × rarity)   查询词与某 chunk 符号完全相等
+             = 0.5 × 0.35 × rarity            查询词与符号某部分部分匹配
+             rarity = min(1, idf / 6)         # 精确标识符查询是高精度意图
 
 graph_bonus = 0.18 × entity_overlap                 （共享命名实体）
             + 0.10 × doc_entity_overlap              （文档级实体匹配）
@@ -867,15 +877,17 @@ Code RAG 额外奖励：
             + min(0.12, log(import_degree+1)/9)      （导入图中心性）
 ```
 
-带动态噪声的 token 权重：
+BM25 词项权重与动态噪声：
 
 ```
-idf[token]    = log((1 + N_chunks) / (1 + df[token])) + 1.0
-tf_weight     = (1 + log(freq)) × idf[token] × dynamic_noise_penalty[token]
-chunk_norm    = √Σ(tf_weight²)
+idf[token]    = log(1 + (N − df + 0.5) / (df + 0.5))   # BM25 (Robertson) idf
+q_weight      = idf[token] × dynamic_noise_penalty[token]   # idf 在查询期仅施加一次
+postings      = 每个 chunk 的原始词频（长度归一化在 BM25 分母里）
 
 dynamic_noise_penalty ∈ [0.10, 1.0]  — 基于语料库计算，非静态停用词表
 ```
+
+> 索引快照带版本（`bm25-v1`）。格式不匹配时索引会从持久化的 `documents.json` / `chunks.json` 真源透明重建——无数据丢失、无需手动迁移。
 
 ### 动态噪声抑制 — 语料库自适应 Token 权重
 
@@ -903,7 +915,7 @@ flowchart TD
   RD -->|"其他情况\n或社区数 ≤ 1"| F
 
   subgraph F["FAST — 精确检索"]
-    F1["倒排索引点积"] --> F2["评分：lexical × 0.82 + graph_bonus"]
+    F1["BM25（原始词频倒排表）"] --> F2["评分：lexical × 0.80 + graph_bonus + symbol_boost"]
     F2 --> F3["返回 top-K chunks"]
   end
 
@@ -988,15 +1000,18 @@ flowchart LR
 | 能力维度 | 标准 TF-IDF | BM25 | Embedding/向量 RAG | **TF-Graph_IDF（Clouds Coder）** |
 |---|---|---|---|---|
 | 停用词处理 | 静态列表 | 静态列表 | 嵌入空间隐式 | **语料库自适应动态惩罚** |
-| IDF 平滑 | `log(N/df)` | BM25 饱和曲线 | 无 | `log((1+N)/(1+df)) + 1.0` |
+| IDF 平滑 | `log(N/df)` | BM25 饱和曲线 | 无 | **BM25 `log(1+(N−df+0.5)/(df+0.5))`** |
+| TF 饱和 | 无 | BM25 k₁ 参数 | 无 | **BM25 k₁/b 长度归一 + 饱和 `raw/(raw+4)`** |
+| 符号精确意图 | ✗ | ✗ | 近似 | **精确标识符加权（按 idf 稀有度缩放）** |
 | 知识图谱 | ✗ | ✗ | ✗ | **实体重叠 + 文档图度 + 社区拓扑** |
 | 多层检索 | 平铺 | 平铺 | 平铺 | **chunk → document → community** |
 | 跨域综合 | ✗ | ✗ | ✗ | **自动社区检测 + Map-Reduce** |
 | 跨社区桥接 | ✗ | ✗ | ✗ | **实体链接社区 Bridge** |
-| 代码原生图 | ✗ | ✗ | ✗ | **导入边 + 符号表 + 行号范围** |
+| 跨语言召回 | ✗ | ✗ | 部分（多语模型） | **同义词组 + 查询期翻译桥** |
+| 代码原生图 | ✗ | ✗ | ✗ | **导入边 + 符号表 + 行号范围（嵌套符号）** |
 | 查询路由 | 固定 | 固定 | 固定 | **自动：fast / global / hybrid** |
 | 无 GPU/嵌入模型 | ✓ | ✓ | ✗（必需） | **✓ — 纯进程内，无外部模型** |
-| 可解释性 | 分数可分解 | 分数可分解 | 黑盒 | **完整分解：lexical + entity + graph + community** |
+| 可解释性 | 分数可分解 | 分数可分解 | 黑盒 | **完整分解：lexical + entity + graph + community + symbol** |
 
 **核心设计抉择与理由：**
 
@@ -1009,6 +1024,18 @@ flowchart LR
 4. **社区 Map-Reduce 应对综合查询** — 当用户询问"比较各项目中的 ML 框架"时，FAST 检索返回零散 chunks；GLOBAL 检索按社区分组，生成 per-community 摘要，再综合为统一视图——更接近人类分析师的做法。
 
 5. **Code RAG 路径匹配奖励（+0.28）** — 当查询明确提到文件路径时，检索几乎必然将该文件排到第一，消除同名 token 导致的无关结果干扰。
+
+### 4.2 RAG 强化（纯词法，无嵌入）
+
+一次集中的强化在保持检索完全词法的前提下升级了两套 RAG 子系统：
+
+- **BM25 排序 + 符号精确加权** — 词法核心从 TF-IDF 余弦改为 BM25（`k1=1.5`、`b=0.6`）并采用与候选池无关的饱和，再加上精确/部分标识符加权，使指名函数或类的查询能高精度地命中其定义所在分块。
+- **保留结构的代码切分** — Python 切分器现在递归（深度 ≤ 4）进入嵌套函数、闭包、被装饰的辅助函数与内部类，使用 `outer.inner`、`Class.method` 层级名，并持久化每个分块的 `symbol`/`symbol_kind` 供符号加权使用。约 40 种语言可索引（Python AST 感知，其余走通用代码切分器）。
+- **边界安全的文档切分** — 超长块回退到最近的段落 / 句子 / 换行 / 空白边界并按边界对齐重叠，不再「字符中间硬切」。
+- **跨语言知识检索** — 用中文查询命中英文内容（反之亦然），全程基于普通 BM25、无需嵌入模型。两层：一张约 4000 组的中/英/缩写同义词表在索引期与查询期扩展；外加查询期翻译桥 `_augment_query_cross_lingual`，检测单一文种查询并追加模型的尽力翻译，使一条双语查询一次走完分词器。作用域仅为知识 RAG，代码检索保持字面。
+- **`rag_remember` 智能体自我入库工具** — 智能体可把好的参考或提炼结论直接写入知识库（`rag_remember(text, title?, tags?, category?)`），复用与管理端文本导入相同的去重/导入路径（无额外 LLM 调用、sha256 去重）。它只写知识库，因此即便在 plan / 调研模式下也开放。
+- **书籍级导入** — `RAG_MAX_CHUNKS_PER_DOC` 提升到 20000，并用统一的 `RAG_MAX_DOCUMENT_CHARS`（默认 12M，可经环境变量覆盖）取代各解析器散落的截断上限，让整本书安全载入。解析在带硬超时的子进程中运行，分块上限约束极端输入。
+- **带版本的索引快照** — 快照带 `bm25-v1` 格式标记；不匹配时从持久化的文档/分块真源透明重建。
 
 ## 5. 复杂任务可靠性设计
 

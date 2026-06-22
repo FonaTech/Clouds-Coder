@@ -1,0 +1,201 @@
+{
+  "_guide": {
+    "purpose": "Reference-only multi-source LLM config. Copy the profiles you need into LLM.config.json and replace placeholder keys.",
+    "default_profile_id": "Selects the active profile id at startup. It can be changed in WebUI later.",
+    "response_stream": "Global default for visible assistant response streaming. Missing or false means disabled. Internal JSON/tool/classifier calls are not shown as live bubbles.",
+    "thinking_stream": "Global default for live thinking stream when a provider/model supports it.",
+    "request_timeout": "Per LLM request timeout in seconds. Increase for slow local models or long generation tasks.",
+    "temperature": "Default sampling temperature. Use 0.1-0.3 for coding/reasoning, higher only for creative writing.",
+    "effort": "Optional reasoning effort: off|low|medium|high|max. Leave empty to let the task level decide (L1-L2 low, L3-L5 max). Maps to Claude extended-thinking budget, OpenAI/DeepSeek reasoning_effort, and GLM thinking. Per-profile 'effort' overrides this global default.",
+    "max_effort": "Optional ceiling for reasoning effort (off|low|medium|high|max). Caps the level chosen by task level or 'effort' so a low-tier profile never exceeds it. Per-profile 'max_effort' overrides this global default.",
+    "capabilities": "Set per-profile multimodal support when auto detection is wrong.",
+    "custom_http": "Only enable response_stream for custom_http when the endpoint returns OpenAI-compatible SSE or JSONL chunks."
+  },
+  "default_profile_id": "local-ollama",
+  "thinking_stream": false,
+  "response_stream": false,
+  "temperature": 0.2,
+  "request_timeout": 3600,
+  "max_output_tokens": 8192,
+  "context_token_limit": 200000,
+  "auto_model_switch": false,
+  "execution_mode": "sync",
+  "profiles": [
+    {
+      "id": "local-ollama",
+      "label": "Local Ollama",
+      "provider": "ollama",
+      "base_url": "http://127.0.0.1:11434",
+      "model": "qwen3-coder:latest",
+      "thinking_stream": true,
+      "response_stream": false,
+      "request_timeout": 3600,
+      "temperature": 0.2,
+      "capabilities": {
+        "text": true,
+        "image": false,
+        "audio": false,
+        "video": false
+      },
+      "_notes": "Best for local/offline work. Turn response_stream on only after the model endpoint is stable."
+    },
+    {
+      "id": "local-vllm",
+      "label": "Local vLLM",
+      "provider": "vllm",
+      "base_url": "http://127.0.0.1:8000/v1",
+      "model": "auto",
+      "api_key": "",
+      "thinking_stream": false,
+      "response_stream": true,
+      "request_timeout": 3600,
+      "temperature": 0.2,
+      "_notes": "OpenAI-compatible local server. model='auto' is useful when the server exposes exactly one model."
+    },
+    {
+      "id": "local-lmstudio",
+      "label": "Local LM Studio",
+      "provider": "lmstudio",
+      "base_url": "http://127.0.0.1:1234/v1",
+      "model": "auto",
+      "thinking_stream": false,
+      "response_stream": true,
+      "request_timeout": 3600,
+      "_notes": "Use after starting LM Studio's OpenAI-compatible server."
+    },
+    {
+      "id": "openai-main",
+      "label": "OpenAI Compatible",
+      "provider": "openai_compat",
+      "base_url": "https://api.openai.com/v1",
+      "model": "gpt-4o-mini",
+      "api_key": "REPLACE_WITH_OPENAI_API_KEY",
+      "thinking_stream": false,
+      "response_stream": true,
+      "request_timeout": 600,
+      "temperature": 0.2,
+      "_notes": "Use any OpenAI-compatible cloud by changing base_url/model/api_key."
+    },
+    {
+      "id": "siliconflow-main",
+      "label": "SiliconFlow",
+      "provider": "siliconflow",
+      "base_url": "https://api.siliconflow.cn/v1",
+      "model": "Qwen/Qwen3-Next-80B-A3B-Instruct",
+      "api_key": "REPLACE_WITH_SILICONFLOW_API_KEY",
+      "thinking_stream": false,
+      "response_stream": true,
+      "request_timeout": 900,
+      "_notes": "OpenAI-compatible provider. Keep request_timeout higher for large coding tasks."
+    },
+    {
+      "id": "anthropic-main",
+      "label": "Anthropic",
+      "provider": "anthropic",
+      "base_url": "https://api.anthropic.com",
+      "model": "claude-sonnet-4-20250514",
+      "api_key": "REPLACE_WITH_ANTHROPIC_API_KEY",
+      "thinking_stream": false,
+      "response_stream": true,
+      "request_timeout": 900,
+      "effort": "",
+      "max_effort": "max",
+      "_notes": "Uses Anthropic Messages API streaming, not OpenAI SSE parsing. effort empty = task level decides (L3-L5 run extended thinking at max budget)."
+    },
+    {
+      "id": "glm-main",
+      "label": "GLM",
+      "provider": "glm",
+      "base_url": "https://open.bigmodel.cn/api/paas/v4",
+      "model": "glm-4-flash",
+      "api_key": "REPLACE_WITH_GLM_API_KEY",
+      "thinking_stream": false,
+      "response_stream": true,
+      "request_timeout": 900,
+      "effort": "",
+      "max_effort": "max",
+      "_notes": "OpenAI-compatible GLM route. If using a proxy endpoint, replace base_url. effort maps to GLM thinking={type:enabled}; empty = task level decides."
+    },
+    {
+      "id": "kimi-main",
+      "label": "KIMI Moonshot",
+      "provider": "kimi",
+      "base_url": "https://api.moonshot.cn/v1",
+      "model": "moonshot-v1-32k",
+      "api_key": "REPLACE_WITH_MOONSHOT_API_KEY",
+      "thinking_stream": false,
+      "response_stream": true,
+      "request_timeout": 900,
+      "_notes": "Use moonshot-v1-128k when long context is more important than latency."
+    },
+    {
+      "id": "openrouter-main",
+      "label": "OpenRouter",
+      "provider": "openrouter",
+      "base_url": "https://openrouter.ai/api/v1",
+      "model": "anthropic/claude-sonnet-4",
+      "api_key": "REPLACE_WITH_OPENROUTER_API_KEY",
+      "headers": {
+        "HTTP-Referer": "http://127.0.0.1:8080",
+        "X-Title": "Clouds Coder"
+      },
+      "thinking_stream": false,
+      "response_stream": true,
+      "request_timeout": 900,
+      "_notes": "Model ids must match OpenRouter's model slug format."
+    },
+    {
+      "id": "custom-openai-sse",
+      "label": "Custom OpenAI SSE",
+      "provider": "custom_http",
+      "endpoint": "https://your-api.example.com/v1/chat/completions",
+      "model": "your-model-name",
+      "api_key": "REPLACE_WITH_CUSTOM_API_KEY",
+      "headers": {
+        "Authorization": "Bearer ${api_key}"
+      },
+      "payload_template": "",
+      "thinking_stream": false,
+      "response_stream": true,
+      "request_timeout": 900,
+      "_notes": "response_stream=true requires the endpoint to accept stream=true and return OpenAI-compatible data chunks."
+    },
+    {
+      "id": "custom-nonstream",
+      "label": "Custom Non-stream JSON",
+      "provider": "custom_http",
+      "endpoint": "https://your-api.example.com/chat",
+      "model": "your-model-name",
+      "api_key": "REPLACE_WITH_CUSTOM_API_KEY",
+      "headers": {
+        "Authorization": "Bearer ${api_key}",
+        "Content-Type": "application/json"
+      },
+      "payload_template": "{\"model\":\"${model}\",\"messages\":${messages_json},\"temperature\":${temperature},\"max_tokens\":${max_tokens},\"stream\":false}",
+      "thinking_stream": false,
+      "response_stream": false,
+      "request_timeout": 900,
+      "_notes": "Use this shape when the endpoint returns one final JSON response instead of streaming chunks."
+    }
+  ],
+  "model_capabilities": {
+    "gpt-4o-mini": {
+      "text": true,
+      "image": true,
+      "audio": false,
+      "video": false
+    },
+    "claude-sonnet-4-20250514": {
+      "text": true,
+      "image": true,
+      "audio": false,
+      "video": false
+    }
+  },
+  "media_endpoints": {
+    "openai": {
+      "image": "https://api.openai.com/v1/images/generations",
+      "audio": "https://api.openai.com/v1/audio/speech"
+    }
+  }
+}

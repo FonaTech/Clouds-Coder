@@ -13,6 +13,7 @@
 </p>
 <p align="center">
   <a href="./RELEASE_NOTES.md">Release Notes</a> ·
+  <a href="./log/CHANGELOG-2026-06-22.md">2026-06-22 Changelog (EN/中文/日本語)</a> ·
   <a href="./log/CHANGELOG-2026-06-05.md">2026-06-05 Changelog (EN/中文/日本語)</a> ·
   <a href="./log/CHANGELOG-2026-05-28.md">2026-05-28 Changelog (EN/中文/日本語)</a> ·
   <a href="./log/CHANGELOG-2026-05-02.md">2026-05-02 Changelog (EN/中文/日本語)</a> ·
@@ -32,7 +33,7 @@ Clouds Coder is a local-first, general-purpose task agent platform centered on s
 
 Its primary problem framing is that CLI coding remains hard to learn and difficult to distribute consistently across users. Clouds Coder addresses this through backend/frontend separation (cloud-side CLI execution + Web-side interaction) to lower Vibe Coding onboarding cost, while timeout/truncation/context/anti-drift controls are treated as co-equal core capabilities that keep complex tasks executable, convergent, and trustworthy.
 
-Architecture changelog archive (trilingual): [`CHANGELOG-2026-06-05.md`](./log/CHANGELOG-2026-06-05.md) | [`CHANGELOG-2026-05-28.md`](./log/CHANGELOG-2026-05-28.md) | [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md) | [`CHANGELOG-2026-03-31.md`](./log/CHANGELOG-2026-03-31.md) | [`CHANGELOG-2026-03-25.md`](./log/CHANGELOG-2026-03-25.md) | [`CHANGELOG-2026-03-20.md`](./log/CHANGELOG-2026-03-20.md) | [`CHANGELOG-2026-03-16.md`](./log/CHANGELOG-2026-03-16.md) | [`CHANGELOG-2026-03-07.md`](./log/CHANGELOG-2026-03-07.md)
+Architecture changelog archive (trilingual): [`CHANGELOG-2026-06-22.md`](./log/CHANGELOG-2026-06-22.md) | [`CHANGELOG-2026-06-05.md`](./log/CHANGELOG-2026-06-05.md) | [`CHANGELOG-2026-05-28.md`](./log/CHANGELOG-2026-05-28.md) | [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md) | [`CHANGELOG-2026-03-31.md`](./log/CHANGELOG-2026-03-31.md) | [`CHANGELOG-2026-03-25.md`](./log/CHANGELOG-2026-03-25.md) | [`CHANGELOG-2026-03-20.md`](./log/CHANGELOG-2026-03-20.md) | [`CHANGELOG-2026-03-16.md`](./log/CHANGELOG-2026-03-16.md) | [`CHANGELOG-2026-03-07.md`](./log/CHANGELOG-2026-03-07.md)
 
 ## 1. Project Positioning
 
@@ -809,7 +810,7 @@ The practical result is that Web service behavior is not just "chat over HTTP." 
 
 ## 4.1 RAG Knowledge Architecture: TF-Graph_IDF Engine
 
-Clouds Coder ships with a retrieval engine called **TF-Graph_IDF** that combines lexical scoring, knowledge graph topology, automatic community detection, and multi-route query orchestration — offering meaningfully better recall quality than standard TF-IDF or BM25.
+Clouds Coder ships with a retrieval engine called **TF-Graph_IDF** that combines **BM25 lexical scoring**, knowledge graph topology, automatic community detection, symbol-exact boosting, and multi-route query orchestration — lexical-only (no embedding model required) yet tuned for high recall on both prose and source code.
 
 ### Dual-Library Design
 
@@ -856,13 +857,22 @@ flowchart TB
 
 ### TF-Graph_IDF Scoring Formula
 
-Every retrieved chunk receives a score composed of a **lexical component** and a **graph bonus**:
+Every retrieved chunk receives a score composed of a **BM25 lexical component**, a **graph bonus**, and a **symbol-exact boost**. Retrieval is lexical-only — no embedding model is involved at any point:
 
 ```
-final_score = lexical × 0.82 + graph_bonus         (Data RAG)
-final_score = lexical × 0.78 + graph_bonus         (Code RAG — more graph weight)
+final_score = lexical × 0.80 + graph_bonus + symbol_boost   (Data RAG & Code RAG)
 
-lexical     = Σ(q_weight_i × c_weight_i) / (query_norm × chunk_norm)
+bm25        = Σ_t  q_weight_t × (tf_t × (k1+1)) / (tf_t + k1 × (1 − b + b × dl/avgdl))
+              k1 = RAG_BM25_K1 = 1.5,  b = RAG_BM25_B = 0.6
+              dl = chunk length,  avgdl = corpus average chunk length
+
+lexical     = bm25 / (bm25 + RAG_BM25_SATURATION)            RAG_BM25_SATURATION = 4.0
+              # pool-INDEPENDENT saturation (NOT min-max): preserves absolute relevance
+              # so the no-evidence / min-synthesis thresholds still mean something on a weak pool
+
+symbol_boost = 0.5 × (0.85 + 0.15 × rarity)   if a query token equals a chunk symbol exactly
+             = 0.5 × 0.35 × rarity            if a query token partially matches a symbol part
+             rarity = min(1, idf / 6)         # exact identifier queries are high-precision intent
 
 graph_bonus = 0.18 × entity_overlap                 (shared named entities)
             + 0.10 × doc_entity_overlap              (doc-level entity match)
@@ -878,15 +888,17 @@ Code RAG additional bonuses:
             + min(0.12, log(import_degree+1)/9)      (import graph centrality)
 ```
 
-Token weight with dynamic noise:
+BM25 term weighting with dynamic noise:
 
 ```
-idf[token]    = log((1 + N_chunks) / (1 + df[token])) + 1.0
-tf_weight     = (1 + log(freq)) × idf[token] × dynamic_noise_penalty[token]
-chunk_norm    = √Σ(tf_weight²)
+idf[token]    = log(1 + (N − df + 0.5) / (df + 0.5))   # BM25 (Robertson) idf
+q_weight      = idf[token] × dynamic_noise_penalty[token]   # idf applied once, at query time
+postings      = RAW term frequency per chunk (length normalization is in the BM25 denominator)
 
 dynamic_noise_penalty ∈ [0.10, 1.0]  — computed per corpus, not a static stopword list
 ```
+
+> Index snapshots are versioned (`bm25-v1`). On a format mismatch the index transparently rebuilds from the persisted `documents.json` / `chunks.json` source of truth — no data loss, no manual migration.
 
 ### Dynamic Noise Suppression — Corpus-Adaptive Token Weighting
 
@@ -914,7 +926,7 @@ flowchart TD
   RD -->|"otherwise\nor ≤1 community"| F
 
   subgraph F["FAST — Precise retrieval"]
-    F1["Dot-product on inverted index"] --> F2["Score: lexical × 0.82 + graph_bonus"]
+    F1["BM25 on inverted index (raw-tf postings)"] --> F2["Score: lexical × 0.80 + graph_bonus + symbol_boost"]
     F2 --> F3["Return top-K chunks"]
   end
 
@@ -1007,16 +1019,18 @@ When a query mentions `"RAGIngestionService"`, the symbol index directly surface
 | Capability | Standard TF-IDF | BM25 | Embedding / Vector RAG | **TF-Graph_IDF (Clouds Coder)** |
 |---|---|---|---|---|
 | Stopword handling | Static list | Static list | Implicit (embedding space) | **Corpus-adaptive dynamic penalties** |
-| IDF smoothing | `log(N/df)` | Saturated BM25 | N/A | `log((1+N)/(1+df)) + 1.0` |
-| TF saturation | None | BM25 k₁ parameter | N/A | `log(freq)` + noise penalty |
+| IDF smoothing | `log(N/df)` | Saturated BM25 | N/A | **BM25 `log(1+(N−df+0.5)/(df+0.5))`** |
+| TF saturation | None | BM25 k₁ parameter | N/A | **BM25 k₁/b length-normalized + saturation `raw/(raw+4)`** |
+| Symbol-exact intent | ✗ | ✗ | Approximate | **Exact identifier boost (idf-rarity scaled)** |
 | Knowledge graph | ✗ | ✗ | ✗ | **Entity overlap + doc graph degree + community topology** |
 | Multi-tier retrieval | Flat | Flat | Flat | **chunk → document → community** |
 | Community synthesis | ✗ | ✗ | ✗ | **Auto community detection + Map-Reduce across communities** |
 | Cross-domain bridges | ✗ | ✗ | ✗ | **Entity-linked community bridges** |
-| Code-native graph | ✗ | ✗ | ✗ | **Import edges + symbol table + line ranges** |
+| Cross-lingual recall | ✗ | ✗ | Partial (multilingual model) | **Synonym groups + query-time translation bridge** |
+| Code-native graph | ✗ | ✗ | ✗ | **Import edges + symbol table + line ranges (nested symbols)** |
 | Query routing | Fixed | Fixed | Fixed | **Auto: fast / global / hybrid** |
 | Out-of-vocabulary | Fails | Fails | Handles via embedding | Handled via entity extraction |
-| Explainability | Score decomposition | Score decomposition | Black box | **Full score breakdown: lexical + entity + graph + community** |
+| Explainability | Score decomposition | Score decomposition | Black box | **Full score breakdown: lexical + entity + graph + community + symbol** |
 | Requires GPU/embedding model | ✗ | ✗ | ✓ (required) | **✗ — pure in-process, no external model** |
 
 **Key design choices and their rationale:**
@@ -1030,6 +1044,18 @@ When a query mentions `"RAGIngestionService"`, the symbol index directly surface
 4. **Community Map-Reduce for synthesis queries** — When a user asks "compare ML frameworks across projects", FAST retrieval returns scattered chunks. GLOBAL retrieval groups by community, generates per-community summaries, and synthesizes a unified view — closer to what a human analyst would do.
 
 5. **Code RAG path match bonus (+0.28)** — When a query explicitly names a file path, the retrieval weights that file almost certainly to top-1, eliminating irrelevant results caused by overlapping token content between files.
+
+### 4.2 RAG Reinforcement (lexical-only, no embeddings)
+
+A focused reinforcement pass upgraded both RAG subsystems while keeping retrieval fully lexical:
+
+- **BM25 ranking + symbol-exact boost** — the lexical core moved from TF-IDF cosine to BM25 (`k1=1.5`, `b=0.6`) with pool-independent saturation, plus an exact/partial identifier boost so a query that names a function or class surfaces the defining chunk with high precision.
+- **Nested-symbol code chunking** — the Python chunker now recurses (depth ≤ 4) into nested functions, closures, decorated helpers, and inner classes with hierarchical names (`outer.inner`, `Class.method`), and persists each chunk's `symbol`/`symbol_kind` so the symbol boost can see them. ~40 languages are indexed (Python AST-aware, the rest via a generic code chunker).
+- **Boundary-safe document chunking** — oversized blocks are cut back to the nearest paragraph / sentence / newline / whitespace boundary with boundary-aligned overlap, instead of slicing mid-word.
+- **Cross-lingual knowledge retrieval** — query in Chinese, hit English content (and vice versa) over plain BM25 with no embedding model. Two layers: a curated ~4000-group CN/EN/acronym synonym table expanded at index- and query-time, plus a query-time translation bridge (`_augment_query_cross_lingual`) that detects a single-script query and appends a best-effort model translation so one bilingual query flows through the tokenizer in a single pass. Scope is the knowledge RAG; code retrieval is left literal.
+- **`rag_remember` agent self-ingestion tool** — the agent can persist a good reference or distilled finding straight into the knowledge library (`rag_remember(text, title?, tags?, category?)`), reusing the same dedup/import path as the admin text-import (no extra LLM call, sha256-deduped). It writes only to the RAG library, so it is allowed even in plan/research mode.
+- **Book-length ingestion** — `RAG_MAX_CHUNKS_PER_DOC` raised to 20000 and a single `RAG_MAX_DOCUMENT_CHARS` cap (default 12M, env-overridable) replaces the scattered per-extractor truncation limits, so full books load safely. Parsing runs in a hard-timeout subprocess and the chunk cap bounds even pathological input.
+- **Versioned index snapshots** — snapshots carry a `bm25-v1` format tag; a mismatch rebuilds transparently from the persisted documents/chunks source of truth.
 
 ## 5. Complex-Task Reliability Design
 
