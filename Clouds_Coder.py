@@ -2412,9 +2412,12 @@ def load_web_ui_config_file(path: Path) -> dict:
     if not path.exists() or not path.is_file():
         return {}
     try:
-        raw = decode_text_bytes(path.read_bytes())
+        raw = path.read_text(encoding="utf-8")
     except Exception:
-        return {}
+        try:
+            raw = path.read_text(encoding="utf-8-sig")
+        except Exception:
+            return {}
     try:
         parsed = json.loads(raw)
     except Exception:
@@ -3306,81 +3309,6 @@ def decode_utf8_replace(data: bytes | bytearray | str) -> str:
         return escape_invalid_utf8_text(data)
     return bytes(data).decode("utf-8", errors="replace")
 
-def text_decode_candidates(extra: list[str] | tuple[str, ...] | None = None) -> list[str]:
-    candidates: list[str] = []
-
-    def add(enc: object) -> None:
-        value = str(enc or "").strip().strip("'\"")
-        if not value:
-            return
-        low = value.lower()
-        if low in {"gb2312", "gbk", "cp936"}:
-            value = "gb18030"
-            low = value
-        if low not in {x.lower() for x in candidates}:
-            candidates.append(value)
-
-    for enc in extra or ():
-        add(enc)
-    for enc in ("utf-8-sig", "utf-8"):
-        add(enc)
-    try:
-        add(locale.getpreferredencoding(False))
-    except Exception:
-        pass
-    for enc in ("gb18030", "big5", "shift_jis", "cp1252", "latin-1"):
-        add(enc)
-    return candidates
-
-def decode_text_bytes(data: bytes | bytearray | str, extra_encodings: list[str] | tuple[str, ...] | None = None) -> str:
-    if isinstance(data, str):
-        return escape_invalid_utf8_text(data)
-    raw = bytes(data or b"")
-    if not raw:
-        return ""
-    for enc in text_decode_candidates(extra_encodings):
-        try:
-            return escape_invalid_utf8_text(raw.decode(enc))
-        except UnicodeDecodeError:
-            continue
-        except Exception:
-            continue
-    best = ""
-    best_bad = 10**9
-    for enc in text_decode_candidates(extra_encodings):
-        try:
-            text = raw.decode(enc, errors="replace")
-        except Exception:
-            continue
-        bad = text.count("\ufffd")
-        if bad < best_bad:
-            best = text
-            best_bad = bad
-        if bad == 0:
-            break
-    return escape_invalid_utf8_text(best)
-
-def configure_utf8_runtime() -> None:
-    os.environ.setdefault("PYTHONUTF8", "1")
-    os.environ.setdefault("PYTHONIOENCODING", "utf-8:backslashreplace")
-    for stream_name in ("stdout", "stderr"):
-        stream = getattr(sys, stream_name, None)
-        reconfigure = getattr(stream, "reconfigure", None)
-        if callable(reconfigure):
-            try:
-                reconfigure(encoding="utf-8", errors="backslashreplace")
-            except Exception:
-                pass
-
-def run_text_kwargs() -> dict[str, str | bool]:
-    return {"text": True, "encoding": "utf-8", "errors": "replace"}
-
-def utf8_env(base: dict | None = None) -> dict[str, str]:
-    env = {str(k): str(v) for k, v in (base or os.environ).items()}
-    env.setdefault("PYTHONUTF8", "1")
-    env.setdefault("PYTHONIOENCODING", "utf-8:backslashreplace")
-    return env
-
 def json_dumps(
     obj: object,
     *,
@@ -3416,8 +3344,6 @@ def read_http_json_body(handler: BaseHTTPRequestHandler) -> dict:
     parsed = sanitize_utf8_surrogates(parsed)
     return parsed if isinstance(parsed, dict) else {}
 
-configure_utf8_runtime()
-
 def make_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:8]}"
 
@@ -3431,7 +3357,7 @@ def detect_repo_root(cwd: Path) -> Path | None:
             ["git", "rev-parse", "--show-toplevel"],
             cwd=cwd,
             capture_output=True,
-            **run_text_kwargs(),
+            text=True,
             timeout=10,
         )
         if r.returncode != 0:
@@ -3600,7 +3526,7 @@ def _postprocess_offline_js_package(entry: dict[str, object], install_root: Path
         }
     else:
         try:
-            raw = decode_text_bytes(pkg_json.read_bytes())
+            raw = pkg_json.read_text(encoding="utf-8")
             loaded = json.loads(raw)
             if not isinstance(loaded, dict):
                 return
@@ -3684,7 +3610,7 @@ def load_offline_js_lib_index(js_root: Path) -> dict:
     if not fp.exists():
         return {}
     try:
-        raw = decode_text_bytes(fp.read_bytes())
+        raw = fp.read_text(encoding="utf-8")
         obj = json.loads(raw)
         return obj if isinstance(obj, dict) else {}
     except Exception:
@@ -6140,7 +6066,7 @@ def check_ollama_model_ready(base_url: str, model: str, timeout: int = 10) -> tu
             _ = resp.read()
         return True, ""
     except HTTPError as exc:
-        text = decode_text_bytes(exc.read())
+        text = exc.read().decode("utf-8", errors="replace")
         low = text.lower()
         if exc.code == 404 or "not found" in low:
             return False, f"not found: {model}"
@@ -6183,14 +6109,14 @@ def wake_ollama_model(base_url: str, model: str, timeout: int = 30) -> tuple[boo
     )
     try:
         with urlopen(req, timeout=timeout) as resp:
-            text = decode_text_bytes(resp.read())
+            text = resp.read().decode("utf-8", errors="replace")
         obj = parse_json_object(text, {})
         err = str(obj.get("error", "")).strip() if isinstance(obj, dict) else ""
         if err:
             return False, trim(err, 180)
         return True, "warmed"
     except HTTPError as exc:
-        text = decode_text_bytes(exc.read())
+        text = exc.read().decode("utf-8", errors="replace")
         return False, f"HTTP {exc.code}: {trim(text, 180)}"
     except Exception as exc:
         return False, trim(str(exc), 180)
@@ -6203,7 +6129,7 @@ def try_pull_ollama_model(model: str, timeout: int = 180) -> tuple[bool, str]:
         r = subprocess.run(
             [cli, "pull", model],
             capture_output=True,
-            **run_text_kwargs(),
+            text=True,
             timeout=timeout,
         )
         output = trim((r.stdout + r.stderr).strip() or "(no output)", 1200)
@@ -6688,9 +6614,9 @@ def load_llm_config_from_source(source: str, *, base_dir: Path = WORKDIR, timeou
         req = Request(raw, method="GET")
         try:
             with urlopen(req, timeout=max(3, int(timeout))) as resp:
-                text = decode_text_bytes(resp.read())
+                text = resp.read().decode("utf-8", errors="replace")
         except HTTPError as exc:
-            body = decode_text_bytes(exc.read())
+            body = exc.read().decode("utf-8", errors="replace")
             raise ValueError(f"failed to fetch config URL ({exc.code}): {trim(body, 240)}") from exc
         except URLError as exc:
             raise ValueError(f"failed to fetch config URL: {exc}") from exc
@@ -6699,7 +6625,7 @@ def load_llm_config_from_source(source: str, *, base_dir: Path = WORKDIR, timeou
         if not path.exists() or not path.is_file():
             raise ValueError(f"config file not found: {path}")
         try:
-            text = decode_text_bytes(path.read_bytes())
+            text = path.read_text(encoding="utf-8")
         except Exception as exc:
             raise ValueError(f"failed to read config file: {path} ({exc})") from exc
         source_desc = str(path)
@@ -7537,7 +7463,7 @@ class CryptoBox:
             if not fp.exists():
                 continue
             try:
-                raw = decode_text_bytes(fp.read_bytes())
+                raw = fp.read_text(encoding="utf-8")
             except Exception:
                 continue
             try:
@@ -7759,7 +7685,7 @@ def try_read_text(path: Path, max_bytes: int = 400_000) -> str | None:
             return None
         if path.stat().st_size > max_bytes:
             return None
-        return decode_text_bytes(path.read_bytes())
+        return path.read_text(encoding="utf-8")
     except Exception:
         return None
 
@@ -7778,7 +7704,7 @@ def _read_json_file(path: Path, default: object) -> object:
         if not fp.exists() or (not fp.is_file()):
             continue
         try:
-            raw = decode_text_bytes(fp.read_bytes())
+            raw = fp.read_text(encoding="utf-8")
         except Exception:
             continue
         try:
@@ -8593,7 +8519,7 @@ def ensure_embedded_skills_at_root(skills_root: Path, workdir: Path = WORKDIR, o
     if state_path.exists():
         state_hash = ""
         try:
-            state = json.loads(decode_text_bytes(state_path.read_bytes()))
+            state = json.loads(state_path.read_text(encoding="utf-8"))
             state_hash = str(state.get("sha256", ""))
         except Exception:
             state_hash = ""
@@ -10026,7 +9952,7 @@ def main() -> int:
     src = Path(args.input).expanduser().resolve()
     if not src.exists():
         raise SystemExit(f"input not found: {src}")
-    data = json.loads(decode_text_bytes(src.read_bytes()))
+    data = json.loads(src.read_text(encoding="utf-8"))
     md = render_md(data if isinstance(data, dict) else {})
     out = Path(args.output).expanduser().resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -10399,7 +10325,7 @@ def main() -> int:
     outdir = Path(args.outdir).expanduser().resolve()
     outdir.mkdir(parents=True, exist_ok=True)
 
-    payload = json.loads(decode_text_bytes(src.read_bytes()))
+    payload = json.loads(src.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise SystemExit("input JSON must be an object")
 
@@ -10663,7 +10589,7 @@ def main() -> int:
     src = Path(args.input).expanduser().resolve()
     if not src.exists():
         raise SystemExit(f"input not found: {src}")
-    payload = json.loads(decode_text_bytes(src.read_bytes()))
+    payload = json.loads(src.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise SystemExit("input JSON must be an object")
 
@@ -12076,7 +12002,7 @@ def ensure_embedded_clawhub_skills(skills_root: Path):
     ]
     if manifest_path.exists():
         try:
-            meta = parse_json_object(decode_text_bytes(manifest_path.read_bytes()), {})
+            meta = parse_json_object(manifest_path.read_text(encoding="utf-8"), {})
             if str(meta.get("version", "")) == BUILTIN_CLAWHUB_SKILLS_VERSION:
                 ok = True
                 for slug in expected:
@@ -13123,7 +13049,7 @@ class SkillStore:
             if not manifest_path.exists():
                 continue
             try:
-                raw = json.loads(decode_text_bytes(manifest_path.read_bytes()))
+                raw = json.loads(manifest_path.read_text(encoding="utf-8"))
                 if not isinstance(raw, dict):
                     continue
             except Exception:
@@ -13921,7 +13847,7 @@ class BackgroundManager:
                 shell=True,
                 cwd=self.workdir,
                 capture_output=True,
-                **run_text_kwargs(),
+                text=True,
                 timeout=timeout,
             )
             output = trim((r.stdout + r.stderr).strip())
@@ -14072,7 +13998,7 @@ class WorktreeManager:
                 ["git", "rev-parse", "--is-inside-work-tree"],
                 cwd=self.repo_root,
                 capture_output=True,
-                **run_text_kwargs(),
+                text=True,
                 timeout=10,
             )
             return r.returncode == 0
@@ -14115,7 +14041,7 @@ class WorktreeManager:
             ["git", *args],
             cwd=self.repo_root,
             capture_output=True,
-            **run_text_kwargs(),
+            text=True,
             timeout=240,
         )
         if r.returncode != 0:
@@ -14178,7 +14104,7 @@ class WorktreeManager:
             ["git", "status", "--short", "--branch"],
             cwd=path,
             capture_output=True,
-            **run_text_kwargs(),
+            text=True,
             timeout=60,
         )
         return (r.stdout + r.stderr).strip() or "Clean worktree"
@@ -14198,7 +14124,7 @@ class WorktreeManager:
                 shell=True,
                 cwd=path,
                 capture_output=True,
-                **run_text_kwargs(),
+                text=True,
                 timeout=300,
             )
             return trim((r.stdout + r.stderr).strip() or "(no output)")
@@ -14466,9 +14392,8 @@ class MCPServerProcess:
             self.error = "no command configured"
             return False
         argv = [command] + [str(a) for a in self.record.get("args", [])]
-        env = utf8_env()
+        env = dict(os.environ)
         env.update({str(k): str(v) for k, v in (self.record.get("env") or {}).items()})
-        env = utf8_env(env)
         cwd = str(self.record.get("cwd", "") or "") or None
         self.state = "starting"
         try:
@@ -15471,10 +15396,10 @@ class OllamaClient:
         )
         try:
             with urlopen(req, timeout=self.timeout) as resp:
-                body = decode_text_bytes(resp.read())
+                body = decode_utf8_replace(resp.read())
                 return json.loads(body) if body else {}
         except HTTPError as exc:
-            text = decode_text_bytes(exc.read())
+            text = exc.read().decode("utf-8", errors="replace")
             hdrs = self._headers_to_dict(getattr(exc, "headers", None))
             raise OllamaError(
                 f"HTTP {exc.code}: {text}",
@@ -15578,9 +15503,9 @@ class OllamaClient:
                     line = resp.readline()
                     if not line:
                         break
-                    yield decode_text_bytes(line)
+                    yield line.decode("utf-8", errors="replace")
         except HTTPError as exc:
-            text = decode_text_bytes(exc.read())
+            text = exc.read().decode("utf-8", errors="replace")
             hdrs = self._headers_to_dict(getattr(exc, "headers", None))
             raise OllamaError(
                 f"HTTP {exc.code}: {text}",
@@ -15674,7 +15599,7 @@ class OllamaClient:
                 body = resp.read()
                 return body, ctype
         except HTTPError as exc:
-            text = decode_text_bytes(exc.read())
+            text = exc.read().decode("utf-8", errors="replace")
             hdrs = self._headers_to_dict(getattr(exc, "headers", None))
             raise OllamaError(
                 f"HTTP {exc.code}: {text}",
@@ -15694,7 +15619,7 @@ class OllamaClient:
                 ctype = str(resp.headers.get("Content-Type", "") or "").strip()
                 return resp.read(), ctype
         except HTTPError as exc:
-            text = decode_text_bytes(exc.read())
+            text = exc.read().decode("utf-8", errors="replace")
             hdrs = self._headers_to_dict(getattr(exc, "headers", None))
             raise OllamaError(
                 f"HTTP {exc.code}: {text}",
@@ -16343,7 +16268,7 @@ class OllamaClient:
             body, ctype = self._post_raw_url(endpoint, payload, headers=self._render_headers())
             if body and ctype.lower().startswith(f"{mtype}/"):
                 return True, "binary response"
-            parsed = parse_json_object(decode_text_bytes(body), {})
+            parsed = parse_json_object(body.decode("utf-8", errors="ignore"), {})
             blob, blob_mime = self._extract_generated_media(parsed, mtype)
             mime = str(blob_mime or ctype or "").strip().lower()
             if blob and (not mime or mime.startswith(f"{mtype}/")):
@@ -16433,7 +16358,7 @@ class OllamaClient:
                 "source": "binary",
                 "endpoint": endpoint,
             }
-        parsed = parse_json_object(decode_text_bytes(body), {})
+        parsed = parse_json_object(body.decode("utf-8", errors="ignore"), {})
         blob, mime = self._extract_generated_media(parsed, mtype)
         if not blob:
             raise OllamaError(f"{mtype} generation returned no media payload")
@@ -25876,7 +25801,7 @@ class SessionState:
         if not fp.exists():
             return f"[file_buffer:{ref} file missing; expected path {self._session_rel(fp)}]"
         try:
-            return decode_text_bytes(fp.read_bytes())
+            return fp.read_text(encoding="utf-8")
         except Exception as exc:
             return f"[file_buffer:{ref} read error: {exc}]"
 
@@ -26694,7 +26619,7 @@ class SessionState:
                 ["git", "rev-parse", "--is-inside-work-tree"],
                 cwd=cwd,
                 capture_output=True,
-                **run_text_kwargs(),
+                text=True,
                 timeout=8,
             )
             if check.returncode != 0:
@@ -26703,7 +26628,7 @@ class SessionState:
                 ["git", "status", "--porcelain"],
                 cwd=cwd,
                 capture_output=True,
-                **run_text_kwargs(),
+                text=True,
                 timeout=8,
             )
             if r.returncode != 0:
@@ -28947,7 +28872,12 @@ body{padding:18px}
             return ""
         if b"\x00" in data[:4096]:
             return ""
-        return decode_text_bytes(data)
+        for enc in ("utf-8", "utf-8-sig", "gb18030"):
+            try:
+                return data.decode(enc)
+            except Exception:
+                continue
+        return data.decode("latin-1", errors="ignore")
 
     def _safe_read_head_bytes(self, fp: Path, max_bytes: int = CHAT_UPLOAD_PARSE_MAX_BYTES) -> bytes:
         try:
@@ -29037,7 +28967,7 @@ body{padding:18px}
                 r = subprocess.run(
                     [tool, "-layout", str(pdf_path), "-"],
                     capture_output=True,
-                    **run_text_kwargs(),
+                    text=True,
                     timeout=min(30, CHAT_UPLOAD_PARSE_TIMEOUT_SECONDS),
                 )
                 if r.returncode == 0 and r.stdout.strip():
@@ -29071,7 +29001,8 @@ body{padding:18px}
             r = subprocess.run(
                 real_cmd,
                 capture_output=True,
-                **run_text_kwargs(),
+                text=True,
+                errors="ignore",
                 timeout=timeout,
             )
             if r.returncode == 0 and r.stdout.strip():
@@ -33035,35 +32966,18 @@ body{padding:18px}
                 del target[:overflow]
 
         def _merge_output_text() -> str:
-            encodings = ["utf-8"]
+            # On Windows, cmd.exe outputs in the system OEM codepage (e.g. cp936/GBK),
+            # not UTF-8.  Detect and use the correct encoding for decoding.
             if os.name == "nt":
                 try:
-                    preferred = locale.getpreferredencoding(False) or ""
+                    import locale as _lc
+                    enc = _lc.getpreferredencoding(False) or "utf-8"
                 except Exception:
-                    preferred = ""
-                for enc in (preferred, "mbcs", "gb18030"):
-                    if enc and enc.lower() not in {x.lower() for x in encodings}:
-                        encodings.append(enc)
-
-            def _decode(buf: bytearray) -> str:
-                raw = bytes(buf)
-                best = ""
-                best_bad = 10**9
-                for enc in encodings:
-                    try:
-                        text = raw.decode(enc, errors="replace")
-                    except Exception:
-                        continue
-                    bad = text.count("\ufffd")
-                    if bad < best_bad:
-                        best = text
-                        best_bad = bad
-                    if bad == 0:
-                        break
-                return escape_invalid_utf8_text(best)
-
-            out_text = _decode(out_buf)
-            err_text = _decode(err_buf)
+                    enc = "utf-8"
+            else:
+                enc = "utf-8"
+            out_text = out_buf.decode(enc, errors="replace")
+            err_text = err_buf.decode(enc, errors="replace")
             return (out_text + err_text).strip()
 
         def _store_shell_output(output_value: str, exit_code: int | None = None):
@@ -33216,7 +33130,7 @@ body{padding:18px}
                 )
 
         try:
-            proc_env = utf8_env()
+            proc_env = os.environ.copy()
             proc_env["WORKSPACE_ROOT"] = str(self.root)
             proc_env["SESSION_ROOT"] = str(self.files_root)
             proc_env["SESSION_FILES_ROOT"] = str(self.files_root)
@@ -34028,7 +33942,7 @@ body{padding:18px}
             rel = self._normalize_tool_path_text(path)
             fp = self._fuzzy_resolve_path(self._session_path(rel))
             rel = self._session_rel(fp)
-            content = self._read_text_with_fallback(fp)
+            content = fp.read_text(encoding="utf-8")
             if old_text not in content:
                 diag = self._edit_mismatch_diagnostic(content, old_text)
                 return f"Error: text not found in {rel}. {diag}"
@@ -54864,7 +54778,7 @@ body{padding:18px}
         """Read plan.md; returns empty string if file does not exist."""
         try:
             p = self._plan_file_path()
-            return decode_text_bytes(p.read_bytes()) if p.exists() else ""
+            return p.read_text(encoding="utf-8") if p.exists() else ""
         except Exception:
             return ""
 
@@ -71333,7 +71247,12 @@ class CodeContentParser:
             return ""
         if b"\x00" in data[:4096]:
             return ""
-        return decode_text_bytes(data)
+        for enc in ("utf-8", "utf-8-sig", "gb18030"):
+            try:
+                return data.decode(enc)
+            except Exception:
+                continue
+        return data.decode("latin-1", errors="ignore")
 
     def detect_language(self, fp: Path, text: str = "") -> str:
         return _code_language_from_name(fp.name, text=text)
@@ -71849,7 +71768,12 @@ class RAGContentParser:
             return ""
         if b"\x00" in data[:4096]:
             return ""
-        return decode_text_bytes(data)
+        for enc in ("utf-8", "utf-8-sig", "gb18030"):
+            try:
+                return data.decode(enc)
+            except Exception:
+                continue
+        return data.decode("latin-1", errors="ignore")
 
     def _module_available(self, name: str) -> bool:
         try:
@@ -71867,7 +71791,8 @@ class RAGContentParser:
             r = subprocess.run(
                 [exe] + [str(x) for x in cmd[1:]],
                 capture_output=True,
-                **run_text_kwargs(),
+                text=True,
+                errors="ignore",
                 timeout=timeout,
             )
             if r.returncode == 0 and r.stdout.strip():
@@ -71929,7 +71854,7 @@ class RAGContentParser:
                 r = subprocess.run(
                     [tool, "-layout", str(pdf_path), "-"],
                     capture_output=True,
-                    **run_text_kwargs(),
+                    text=True,
                     timeout=max(60, int(RAG_PARSE_TIMEOUT_SECONDS)),
                 )
                 if r.returncode == 0 and r.stdout.strip():
@@ -72214,7 +72139,7 @@ class RAGContentParser:
                             str(fp),
                         ],
                         capture_output=True,
-                        **run_text_kwargs(),
+                        text=True,
                         timeout=30,
                     )
                     payload = parse_json_object(r.stdout, {})
@@ -81868,8 +81793,8 @@ class AppContext:
                 command,
                 cwd=str(cwd),
                 shell=True,
+                text=True,
                 capture_output=True,
-                **run_text_kwargs(),
                 timeout=timeout,
             )
             return {
@@ -84467,7 +84392,12 @@ class AppContext:
                 pass
 
     def _decode_uploaded_text(self, raw: bytes) -> str:
-        return decode_text_bytes(raw)
+        for enc in ("utf-8", "utf-8-sig", "gb18030", "latin-1"):
+            try:
+                return raw.decode(enc)
+            except Exception:
+                continue
+        return raw.decode("utf-8", errors="replace")
 
     def _normalize_skill_rel_dir(self, rel: str, fallback: str) -> str:
         src = str(rel or "").replace("\\", "/")
@@ -85417,7 +85347,7 @@ class Handler(BaseHTTPRequestHandler):
                             if str(hk or "").strip() and str(hv or "").strip():
                                 req.add_header(str(hk), str(hv))
                         with urlopen(req, timeout=8) as resp:
-                            body_text = decode_text_bytes(resp.read())
+                            body_text = resp.read().decode("utf-8", errors="replace")
                         reachable = True
                         try:
                             payload = json.loads(body_text)
@@ -85439,7 +85369,7 @@ class Handler(BaseHTTPRequestHandler):
                     except urllib.error.HTTPError as exc:
                         body_text = ""
                         try:
-                            body_text = decode_text_bytes(exc.read())
+                            body_text = exc.read().decode("utf-8", errors="replace")
                         except Exception:
                             body_text = ""
                         status_code = int(getattr(exc, "code", 0) or 0)
@@ -85609,7 +85539,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"error": str(exc)}, status=404)
             except Exception as exc:
                 return self._send_json({"error": str(exc)}, status=400)
-            return self._send_inline_bytes(safe_utf8_bytes(html_text), "text/html; charset=utf-8")
+            return self._send_inline_bytes(str(html_text).encode("utf-8", errors="ignore"), "text/html; charset=utf-8")
         m = re.match(r"^/api/sessions/([^/]+)/preview-html-bundle/(.+)$", path)
         if m:
             sess = mgr.get(m.group(1))
