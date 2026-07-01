@@ -892,6 +892,13 @@ ACCEPTANCE_GATE_STALL_THRESHOLD = 3
 # recovery and ask the user. We NEVER force-advance a step that has not genuinely
 # passed; repair continues unbounded as long as progress is being made.
 ACCEPTANCE_GATE_HARD_CEILING = 6  # consecutive no-progress rounds before escalating to the user
+# Fix 6 — per-step OUTCOME-progress deadlock guard. Independent of the repair
+# signature (which churns when the worker keeps changing APPROACH, masking a real
+# deadlock). This counts consecutive non-advancing rounds where the step's
+# OUTCOME did not improve (no new completed subtask AND no measured move toward
+# the quality bar). At the ceiling, escalate to the user — this is the escape a
+# genuinely-stuck-but-actively-working single-agent step never had.
+STEP_ACTIVE_STALL_CEILING = 8
 PLAN_MODE_MANAGER_SYNTHESIS_MAX_TOKENS = 8192
 PLAN_MODE_MAX_OPTIONS = 3
 PLAN_FILE_RELATIVE_PATH = ".clouds_coder/plan.md"
@@ -3284,8 +3291,65 @@ def runtime_environment_context_block(snapshot: dict) -> str:
         "Do not infer the current year from model memory. If a market or jurisdiction calendar matters and is not in this block, verify it with tools and state any uncertainty."
     )
 
-def json_dumps(obj: object, *, indent: int | None = None) -> str:
-    return json.dumps(obj, ensure_ascii=False, indent=indent)
+def safe_utf8_bytes(text: object) -> bytes:
+    return str(text).encode("utf-8", errors="backslashreplace")
+
+def escape_invalid_utf8_text(text: object) -> str:
+    return safe_utf8_bytes(text).decode("utf-8")
+
+def sanitize_utf8_surrogates(value: object) -> object:
+    if isinstance(value, str):
+        return escape_invalid_utf8_text(value)
+    if isinstance(value, list):
+        return [sanitize_utf8_surrogates(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(sanitize_utf8_surrogates(item) for item in value)
+    if isinstance(value, dict):
+        return {
+            sanitize_utf8_surrogates(key): sanitize_utf8_surrogates(val)
+            for key, val in value.items()
+        }
+    return value
+
+def decode_utf8_replace(data: bytes | bytearray | str) -> str:
+    if isinstance(data, str):
+        return escape_invalid_utf8_text(data)
+    return bytes(data).decode("utf-8", errors="replace")
+
+def json_dumps(
+    obj: object,
+    *,
+    indent: int | None = None,
+    ensure_ascii: bool = False,
+    sort_keys: bool = False,
+    separators: tuple[str, str] | None = None,
+    default=None,
+) -> str:
+    kwargs = {
+        "ensure_ascii": ensure_ascii,
+        "indent": indent,
+        "sort_keys": sort_keys,
+    }
+    if separators is not None:
+        kwargs["separators"] = separators
+    if default is not None:
+        kwargs["default"] = default
+    raw = json.dumps(obj, **kwargs)
+    return escape_invalid_utf8_text(raw)
+
+def json_response_bytes(obj: object) -> bytes:
+    return safe_utf8_bytes(json_dumps(obj))
+
+def read_http_json_body(handler: BaseHTTPRequestHandler) -> dict:
+    length = int(handler.headers.get("Content-Length", "0") or "0")
+    if length <= 0:
+        return {}
+    body = decode_utf8_replace(handler.rfile.read(length))
+    if not body:
+        return {}
+    parsed = json.loads(body)
+    parsed = sanitize_utf8_surrogates(parsed)
+    return parsed if isinstance(parsed, dict) else {}
 
 def make_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:8]}"
@@ -3740,7 +3804,7 @@ def cache_external_js_url(js_root: Path, url: str) -> tuple[Path | None, str]:
     parsed = urlparse(target_url)
     base = Path(parsed.path).name.strip()
     if not base or "." not in base:
-        h = _sha256_bytes(target_url.encode("utf-8"))[:10]
+        h = _sha256_bytes(safe_utf8_bytes(target_url))[:10]
         base = f"external_{h}.js"
     fname = _safe_js_filename(base, "external.js")
     ext_root = (js_root / "external").resolve()
@@ -5421,7 +5485,7 @@ def compress_text_blob(text: str) -> str:
     src = str(text or "")
     if not src:
         return ""
-    raw = src.encode("utf-8")
+    raw = safe_utf8_bytes(src)
     return base64.b64encode(zlib.compress(raw, 6)).decode("ascii")
 
 def decompress_text_blob(blob_b64: str) -> str:
@@ -5863,7 +5927,7 @@ def probe_ollama_environment(base_url: str, timeout: int = 4) -> tuple[bool, lis
     req = Request(url, method="GET")
     try:
         with urlopen(req, timeout=timeout) as resp:
-            raw = json.loads(resp.read().decode("utf-8"))
+            raw = json.loads(decode_utf8_replace(resp.read()))
         tags: list[str] = []
         for item in raw.get("models", []):
             name = item.get("name")
@@ -6000,7 +6064,7 @@ def check_ollama_model_ready(base_url: str, model: str, timeout: int = 10) -> tu
     }
     req = Request(
         url,
-        data=json_dumps(payload).encode("utf-8"),
+        data=safe_utf8_bytes(json_dumps(payload)),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
@@ -6022,7 +6086,7 @@ def list_loaded_ollama_models(base_url: str, timeout: int = 5) -> list[str]:
     req = Request(url, method="GET")
     try:
         with urlopen(req, timeout=timeout) as resp:
-            raw = json.loads(resp.read().decode("utf-8"))
+            raw = json.loads(decode_utf8_replace(resp.read()))
         out: list[str] = []
         for item in raw.get("models", []) if isinstance(raw, dict) else []:
             name = str(item.get("name", "") or "").strip()
@@ -6046,7 +6110,7 @@ def wake_ollama_model(base_url: str, model: str, timeout: int = 30) -> tuple[boo
     }
     req = Request(
         url,
-        data=json_dumps(payload).encode("utf-8"),
+        data=safe_utf8_bytes(json_dumps(payload)),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
@@ -7296,7 +7360,7 @@ def user_id_from_ip(ip: str) -> str:
     raw = str(ip or "").strip()
     if raw.lower().startswith("::ffff:"):
         raw = raw.split("::ffff:", 1)[1].strip()
-    token = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+    token = hashlib.sha256(safe_utf8_bytes(raw)).hexdigest()[:12]
     safe_ip = re.sub(r"[^A-Za-z0-9._-]", "_", raw)
     return f"user_{safe_ip}_{token}"
 
@@ -7336,7 +7400,7 @@ class CryptoBox:
         return bytes(out)
 
     def encrypt_text(self, text: str) -> str:
-        payload = text.encode("utf-8")
+        payload = safe_utf8_bytes(text)
         nonce = os.urandom(16)
         ct = self._stream_xor(payload, nonce)
         mac = hmac.new(self.key, nonce + ct, hashlib.sha256).hexdigest()
@@ -8508,7 +8572,7 @@ def ensure_embedded_skills_at_root(skills_root: Path, workdir: Path = WORKDIR, o
         "updated_at": int(time.time()),
         "root": str(target),
     }
-    state_path.write_text(json.dumps(state_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    state_path.write_text(json_dumps(state_payload, indent=2), encoding="utf-8")
     return target
 
 
@@ -8792,7 +8856,7 @@ def analyze_skill_building_knowledge(workdir: Path = WORKDIR) -> dict:
             rel = fp.resolve().relative_to(workdir.resolve()).as_posix()
         except Exception:
             rel = str(fp)
-        sources.append({"path": rel, "bytes": len(raw.encode("utf-8"))})
+        sources.append({"path": rel, "bytes": len(safe_utf8_bytes(raw))})
         low = raw.lower()
         if "layer 1" in low and "layer 2" in low:
             push(rules, "Use two-layer loading: keep skill metadata cheap in prompt, load full body only on demand.")
@@ -10292,7 +10356,7 @@ def main() -> int:
         "evidence_csv": str(csv_path.name),
         "experiment_md": str((outdir / "experiment_plan.md").name),
     }
-    _write_text(outdir / "report_bundle.json", json.dumps(bundle, indent=2, ensure_ascii=False) + "\n")
+    _write_text(outdir / "report_bundle.json", json_dumps(bundle, indent=2) + "\n")
     print(str(outdir))
     return 0
 
@@ -11601,6 +11665,7 @@ def ensure_generated_runtime_skills_manifest(skills_root: Path):
         "generated/frontend-composition-algorithm/SKILL.md",
         "generated/visualization-report-pipeline/SKILL.md",
         "generated/offline-html-js-bundling/SKILL.md",
+        "generated/novel-architect/SKILL.md",
     ]
     present = [rel for rel in tracked if (skills_root / rel).exists()]
     payload = {
@@ -12158,6 +12223,273 @@ def ensure_generated_mcp_builder_skill(skills_root: Path):
     root = skills_root / "mcp-builder"
     _write_text_if_changed(root / "SKILL.md", MCP_BUILDER_SKILL_MD)
 
+NOVEL_ARCHITECT_SKILL_MD = r'''---
+name: novel-architect
+description: Design and write long-form fiction with a closed-loop story bible,
+  chapter ledger, length control, continuity tracking, character arcs, plot
+  planning, and quality audits so later chapters do not shrink or degrade.
+---
+
+# Novel Architect / 小说架构师
+
+Use this skill when the user wants to create, plan, draft, revise, or continue a
+novel, web novel, series, novella, serialized story, or long-form fiction. This
+skill is optimized for stable long-run quality: outline, story thread,
+background, characters, plot, chapters, continuity, length, and revision are
+managed as one closed loop.
+
+当用户要求创作、规划、续写、改写、连载或完整生成小说时使用本 skill。核心目标是让模型始终
+知道“现在写到哪里、每章要写什么、目标多长、实际多长、质量是否下滑、前后是否衔接”，避免
+后期章节缩水、剧情变成摘要、人物失真、伏笔遗忘、质量和连贯性逐步变差。
+
+## Operating Principles / 工作原则
+
+- Treat long fiction as a managed production system, not one-shot prose.
+- Keep a living story bible before and during drafting.
+- Maintain a chapter ledger after every chapter or batch.
+- Track target length, actual length, plot function, continuity impact, and
+  quality state for each chapter.
+- Do not continue blindly if quality, word count, tone, pacing, or continuity
+  trends degrade. Diagnose and repair first.
+- Write complete scenes by default. Do not compress later chapters into summaries
+  unless the user explicitly asks for summary mode.
+- Prefer consistent, recoverable structure over improvising until the context is
+  lost.
+
+## Intake / 需求确认
+
+If the user has not provided enough constraints, ask only for the missing
+high-impact items. Otherwise infer reasonable defaults and state them briefly.
+
+Minimum useful inputs:
+
+- Language, genre, audience, rating, and tone.
+- Desired length: total words, chapter count, or target words per chapter.
+- POV, tense, style references, taboo content, and must-have elements.
+- Premise, protagonist, central conflict, ending direction, and serialization
+  cadence if relevant.
+
+Default assumptions when the user does not specify:
+
+- Language: follow the user's language.
+- Form: chaptered long-form fiction.
+- Chapter target: 2,500 to 4,000 Chinese characters or 1,500 to 2,500 English
+  words unless the user requests otherwise.
+- Length tolerance: each drafted chapter should stay within +/- 15% of target.
+- Audit cadence: review every 3 to 5 chapters, and always before a major arc
+  transition.
+
+## Closed-Loop Workflow / 闭环流程
+
+### 1. Story Bible / 故事圣经
+
+Create or refresh a compact but complete story bible before drafting long-form
+content.
+
+Required fields:
+
+- Logline / 一句话故事
+- Genre promise / 类型承诺
+- Theme and emotional thesis / 主题与情感命题
+- World and background / 世界观与背景
+- Rules, limits, and forbidden contradictions / 规则、限制、不能违反的设定
+- Main cast / 主要人物
+- Character goals, wounds, masks, relationships, and arcs / 人物目标、创伤、
+  伪装、关系与成长线
+- Antagonistic forces / 反派或阻力系统
+- Plot spine / 主线脊柱
+- Subplots / 支线
+- Timeline / 时间线
+- Foreshadowing and payoff register / 伏笔与回收表
+- Tone, style, POV, pacing, and narration constraints / 风格与叙事约束
+
+### 2. Chapter Map / 章节总表
+
+Before writing multiple chapters, build a chapter map. Each chapter needs a
+chapter card.
+
+Chapter card template:
+
+```markdown
+## Chapter <N>: <Title>
+- Target length:
+- Plot function:
+- Opening state:
+- Core beats:
+- Characters present:
+- Character movement:
+- World/background updates:
+- Continuity dependencies:
+- Foreshadowing planted or paid off:
+- Ending hook:
+- Risks to avoid:
+```
+
+Every chapter must have a reason to exist. If a chapter has no plot function,
+character movement, information change, pressure change, or emotional turn,
+merge it, replace it, or redesign it.
+
+### 3. Drafting Contract / 章节写作契约
+
+Before writing each chapter, restate the active chapter card in concise form.
+Then draft the chapter according to this contract:
+
+- Hit the agreed target length range unless the user asks for a different
+  length.
+- Maintain full scene density: action, dialogue, sensory detail, conflict,
+  decision, consequence.
+- Carry forward the previous chapter's ending state exactly.
+- Advance at least one of: main plot, character arc, relationship, mystery,
+  world pressure, or thematic contradiction.
+- Preserve the established POV, tense, tone, and prose style.
+- Do not skip promised confrontations, reveals, or emotional consequences.
+- Do not solve conflicts only because the outline needs progress; make causality
+  visible on the page.
+
+### 4. Chapter Ledger / 章节账本
+
+After each chapter or batch, update a ledger. If the user asks for only prose,
+keep this ledger internally or provide a compact version after the chapter.
+
+Ledger template:
+
+```markdown
+## Ledger After Chapter <N>
+- Actual length:
+- Length status: on target / short / long
+- Key events:
+- Character state changes:
+- Relationship changes:
+- World/background changes:
+- Foreshadowing planted:
+- Foreshadowing paid off:
+- Open hooks:
+- Continuity dependencies for next chapter:
+- Quality score, 1-10:
+- Revision flags:
+```
+
+### 5. Pre-Next-Chapter Check / 下一章前检查
+
+Before continuing, check:
+
+- Is the next chapter's opening state consistent with the previous ending?
+- Did any character forget knowledge, injury, motive, promise, or relationship
+  status?
+- Is the target length trend stable?
+- Is the prose becoming more compressed than earlier chapters?
+- Are subplots and foreshadowing still being maintained?
+- Is tension escalating, varying, or resolving intentionally?
+- Does the next chapter still serve the current arc and the book-level promise?
+
+If any answer is unsafe, repair the plan or revise the previous chapter before
+continuing.
+
+## Quality Drift Prevention / 防止后期质量下滑
+
+Use these gates throughout long generation:
+
+- Length gate: if two consecutive chapters are more than 15% short, stop and
+  restore scene density before continuing.
+- Compression gate: if narration turns into outline-like summary, expand into
+  scenes with conflict, dialogue, decision, and consequence.
+- Continuity gate: if a contradiction appears, list the conflict and choose one
+  canonical version before writing more.
+- Character gate: if a character acts only to satisfy the plot, reconnect the
+  action to goal, fear, pressure, relationship, or prior decision.
+- Pacing gate: if chapters repeat the same emotional shape, vary scene type,
+  pressure source, revelation, or consequence.
+- Promise gate: if the story drifts away from genre promise or core premise,
+  revise the next chapter map before drafting.
+- Arc gate: at chapter milestones, confirm each major arc has movement, delay,
+  reversal, or payoff.
+
+Never hide a quality drop. If quality is declining, say what changed, repair the
+chapter card or story bible, then continue.
+
+## Milestone Audit / 阶段审计
+
+Every 3 to 5 chapters, or before any major arc transition, run a compact audit:
+
+```markdown
+## Milestone Audit
+- Length stability:
+- Plot progress:
+- Character arc progress:
+- Continuity risks:
+- Unresolved hooks:
+- Foreshadowing status:
+- Tone/style drift:
+- Pacing balance:
+- Scenes needing expansion:
+- Plan adjustments:
+```
+
+## Output Modes / 输出模式
+
+Choose the smallest complete mode that satisfies the user:
+
+- Architecture mode: story bible + chapter map, no prose yet.
+- Chapter mode: one chapter with pre-card and post-ledger.
+- Batch mode: several chapters, each with ledger, plus batch audit.
+- Continuation mode: reconstruct current bible and ledger from provided text,
+  then continue without contradicting it.
+- Revision mode: diagnose and rewrite weak chapters while preserving canon.
+
+For very long novels, do not attempt to write the entire book in one response.
+Build the bible and chapter map first, then write in controlled chapters or
+batches with ledgers.
+
+## Response Shape / 推荐响应结构
+
+For planning:
+
+```markdown
+# Story Bible
+# Chapter Map
+# Quality Control Rules
+# Next Step
+```
+
+For a chapter:
+
+```markdown
+# Chapter Card
+# Chapter <N>: <Title>
+# Chapter Ledger
+```
+
+For continuation:
+
+```markdown
+# Reconstructed Current State
+# Continuity Risks
+# Next Chapter Card
+# Chapter <N>: <Title>
+# Chapter Ledger
+```
+
+## Hard Rules / 硬性规则
+
+- Do not let later chapters shrink unless the user explicitly requests shorter
+  chapters.
+- Do not replace scenes with summaries in later chapters.
+- Do not ignore the story bible when drafting.
+- Do not continue through continuity conflicts; resolve them first.
+- Do not introduce major new lore, powers, institutions, or relationships
+  without recording them in the bible or ledger.
+- Do not make every chapter the same rhythm. Vary pressure, scene type, emotional
+  charge, and information flow.
+- Do not end a chapter without knowing what state the next chapter inherits.
+- Always preserve the reader-facing illusion of a coherent novel, while using
+  the ledger privately or visibly to keep the production stable.
+'''
+
+def ensure_generated_novel_architect_skill(skills_root: Path):
+    """Materialize the novel-architect skill to disk on demand."""
+    root = skills_root / "generated" / "novel-architect"
+    _write_text_if_changed(root / "SKILL.md", NOVEL_ARCHITECT_SKILL_MD)
+
 def ensure_runtime_skills(skills_root: Path):
     ensure_embedded_skills_at_root(skills_root, workdir=WORKDIR, overwrite_existing=False)
     ensure_generated_mcp_builder_skill(skills_root)
@@ -12174,6 +12506,7 @@ def ensure_runtime_skills(skills_root: Path):
     ensure_generated_research_scientific_skills(skills_root)
     ensure_generated_rag_mastery_skills(skills_root)
     ensure_generated_multimodal_comprehension_skills(skills_root)
+    ensure_generated_novel_architect_skill(skills_root)
     ensure_generated_runtime_skills_manifest(skills_root)
     ensure_embedded_clawhub_skills(skills_root)
 
@@ -13037,7 +13370,7 @@ class SkillStore:
         req = Request(endpoint, method="GET")
         try:
             with urlopen(req, timeout=timeout) as resp:
-                payload = json.loads(resp.read().decode("utf-8"))
+                payload = json.loads(decode_utf8_replace(resp.read()))
         except Exception as exc:
             self.warnings.append(f"{manifest_path.name}: HTTP provider fetch failed: {exc}")
             return
@@ -14407,7 +14740,7 @@ class MCPServerProcess:
             if raw == b"" or raw == "":
                 break  # EOF — process exited
             try:
-                line = raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
+                line = decode_utf8_replace(raw) if isinstance(raw, (bytes, bytearray)) else escape_invalid_utf8_text(raw)
             except Exception:
                 continue
             line = line.strip()
@@ -14415,6 +14748,7 @@ class MCPServerProcess:
                 continue
             try:
                 msg = json.loads(line)
+                msg = sanitize_utf8_surrogates(msg)
             except Exception:
                 # Some servers emit non-JSON banner lines on stdout; ignore them.
                 continue
@@ -14434,7 +14768,11 @@ class MCPServerProcess:
             if not raw:
                 break
             try:
-                line = (raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else str(raw)).rstrip()
+                line = (
+                    decode_utf8_replace(raw)
+                    if isinstance(raw, (bytes, bytearray))
+                    else escape_invalid_utf8_text(raw)
+                ).rstrip()
             except Exception:
                 continue
             if line:
@@ -14475,7 +14813,7 @@ class MCPServerProcess:
     def _send_raw(self, obj: dict):
         if not self.proc or not self.proc.stdin:
             raise RuntimeError("process not running")
-        data = (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
+        data = safe_utf8_bytes(json_dumps(sanitize_utf8_surrogates(obj)) + "\n")
         with self._write_lock:
             try:
                 self.proc.stdin.write(data)
@@ -14533,24 +14871,25 @@ class MCPServerProcess:
         if isinstance(content, list):
             for block in content:
                 if not isinstance(block, dict):
-                    parts.append(str(block))
+                    parts.append(escape_invalid_utf8_text(block))
                     continue
                 btype = str(block.get("type", "") or "")
                 if btype == "text":
-                    parts.append(str(block.get("text", "")))
+                    parts.append(escape_invalid_utf8_text(block.get("text", "")))
                 elif btype in ("image", "audio"):
                     mime = str(block.get("mimeType", "") or "binary")
                     parts.append(f"[{btype} content: {mime}]")
                 elif btype == "resource":
                     rsrc = block.get("resource", {}) if isinstance(block.get("resource"), dict) else {}
-                    parts.append(str(rsrc.get("text", "") or f"[resource: {rsrc.get('uri','')}]"))
+                    parts.append(escape_invalid_utf8_text(rsrc.get("text", "") or f"[resource: {rsrc.get('uri','')}]"))
                 else:
-                    parts.append(json.dumps(block, ensure_ascii=False))
+                    parts.append(json_dumps(block))
         text = "\n".join(p for p in parts if p != "")
         if not text:
             sc = res.get("structuredContent")
             if sc is not None:
-                text = json.dumps(sc, ensure_ascii=False)
+                text = json_dumps(sc)
+        text = escape_invalid_utf8_text(text)
         if len(text) > _MCP_MAX_RESULT_CHARS:
             text = text[:_MCP_MAX_RESULT_CHARS] + "\n…(mcp result truncated)"
         if is_error:
@@ -15327,13 +15666,13 @@ class OllamaClient:
             req_headers.update(headers)
         req = Request(
             url,
-            data=json_dumps(payload).encode("utf-8"),
+            data=safe_utf8_bytes(json_dumps(payload)),
             headers=req_headers,
             method="POST",
         )
         try:
             with urlopen(req, timeout=self.timeout) as resp:
-                body = resp.read().decode("utf-8")
+                body = decode_utf8_replace(resp.read())
                 return json.loads(body) if body else {}
         except HTTPError as exc:
             text = exc.read().decode("utf-8", errors="replace")
@@ -15422,7 +15761,7 @@ class OllamaClient:
             req_headers.update(headers)
         req = Request(
             url,
-            data=json_dumps(payload).encode("utf-8"),
+            data=safe_utf8_bytes(json_dumps(payload)),
             headers=req_headers,
             method="POST",
         )
@@ -15526,7 +15865,7 @@ class OllamaClient:
             req_headers.update(headers)
         req = Request(
             url,
-            data=json_dumps(payload).encode("utf-8"),
+            data=safe_utf8_bytes(json_dumps(payload)),
             headers=req_headers,
             method="POST",
         )
@@ -16682,7 +17021,7 @@ class OllamaClient:
         chunk_count = 0
 
         def _handle_payload(raw_text: str):
-            nonlocal chunk_count, event_name
+            nonlocal chunk_count
             text = str(raw_text or "").strip()
             if not text:
                 return
@@ -17781,6 +18120,13 @@ class SessionState:
         # to break-and-pause without finalizing the run.
         self.pending_user_question: dict | None = None
         self._ask_user_pause_pending = False
+        # Mid-run steering (Fix 3): set when a live user message is classified as
+        # a steer (stop / change direction / redo), so the next round re-plans at
+        # the top before the model call — a genuine instruction, not a diluted
+        # background suggestion.
+        self._steer_pending = False
+        # Per-step acceptance quality-bar cache (Fix 5): step_id -> target dict.
+        self._acceptance_target_cache: dict = {}
         self.live_input_queue_lock = threading.Lock()
         self.deferred_start_inputs: list[dict] = []
         self.deferred_start_seq = 0
@@ -18358,13 +18704,18 @@ class SessionState:
         scope: str,
         media_inputs_round: list[dict] | None = None,
     ) -> dict:
+        _steer_pending = bool(getattr(self, "_steer_pending", False))
         if not (
             bool(getattr(self, "runtime_reclassify_required", False))
             or bool(getattr(self, "runtime_goal_reset_pending", False))
+            or _steer_pending
         ):
             return {}
-        if bool(getattr(self, "runtime_reclassify_required", False)):
-            if int(getattr(self, "user_task_level_override", 0) or 0) > 0:
+        if bool(getattr(self, "runtime_reclassify_required", False)) or _steer_pending:
+            # A steer (Fix 3) forces a re-plan even under a user task-level
+            # override — the user is explicitly redirecting the running work, so
+            # honoring it takes precedence over the pinned level.
+            if int(getattr(self, "user_task_level_override", 0) or 0) > 0 and not _steer_pending:
                 self._mark_runtime_goal_reset_handled(
                     reason=f"{scope}:user-level-override",
                     clear_reclassify=True,
@@ -18377,6 +18728,9 @@ class SessionState:
                 media_inputs=media_inputs_round,
                 roles=["manager"],
             )
+            if _steer_pending:
+                self._steer_pending = False
+                self._emit("status", {"summary": f"user steer applied — re-planning ({scope})"})
             decision = self._refresh_runtime_task_policy(
                 pinned_selection=pinned_selection,
                 force=True,
@@ -19910,6 +20264,7 @@ class SessionState:
         self.stall_severity_score = 0
         self.stall_severity_sources = []
         self.stall_escalation_triggered = False
+        self._steer_pending = False
         self.stall_escalation_round = 0
         self.live_thinking_text = ""
         self.live_thinking_last_emit = 0.0
@@ -20184,6 +20539,7 @@ class SessionState:
         previous_context: dict | None = None,
         clear_progress: bool = False,
         reset_agent_contexts: bool = False,
+        archive_messages: bool = False,
     ) -> None:
         """Clear plan/todo/skills state from a completed run so the next run starts fresh.
 
@@ -20191,8 +20547,46 @@ class SessionState:
         previous run finished (running=False, not awaiting plan choice).
         Prevents the manager from seeing status=COMPLETED + all todos done and
         immediately routing to 'finish' again on the very first round.
+
+        When `archive_messages` is True (a genuine task boundary), the prior
+        task's raw LLM transcript (`self.messages`) is archived to a context
+        segment and reset to a clean slate — otherwise the fresh instruction is
+        buried under the entire previous conversation and instruction-following
+        degrades (Fix 4). The handoff is preserved via `previous_task_context`
+        (injected into the system prompt) and display continuity via
+        `conversation_feed`/`user_bubble_log`, which are NOT touched here. This
+        mirrors how compaction already archives + windows messages.
         """
         bb = self._ensure_blackboard()
+        if archive_messages and isinstance(self.messages, list) and self.messages:
+            try:
+                archivable = [
+                    row for row in self.messages
+                    if isinstance(row, dict) and str(row.get("role", "") or "") != "system"
+                ]
+                if archivable:
+                    seg = self._archive_context_segment(archivable, reason="task-boundary")
+                    if seg:
+                        self._emit(
+                            "status",
+                            {
+                                "summary": (
+                                    "previous task transcript archived at task boundary "
+                                    f"(messages={seg.get('messages', 0)}); starting next task with a clean context"
+                                )
+                            },
+                        )
+                # Keep only non-user, non-assistant scaffolding (system prompts are
+                # rebuilt each call anyway) — a clean slate for the next task.
+                self.messages = [
+                    row for row in self.messages
+                    if isinstance(row, dict) and str(row.get("role", "") or "") == "system"
+                ]
+            except Exception as exc:
+                self._emit(
+                    "status",
+                    {"summary": f"task-boundary transcript archive skipped: {trim(str(exc), 120)}"},
+                )
         goal_text = trim(str(new_goal or "").strip(), 4000)
         previous = dict(previous_context or {}) if isinstance(previous_context, dict) else {}
         if clear_progress:
@@ -20266,6 +20660,21 @@ class SessionState:
         bb["plan_meta"] = {}
         bb["loaded_skills"] = {}
         bb["loaded_skills_goal_sig"] = ""
+        # Drop cached acceptance quality-bars from the previous task (Fix 5).
+        try:
+            self._acceptance_target_cache = {}
+        except Exception:
+            pass
+        # Drop per-step outcome-progress stall counters (Fix 6) — step ids can
+        # repeat across tasks, so stale counters must not carry over.
+        try:
+            for _attr in [
+                a for a in list(vars(self).keys())
+                if a.startswith(("_step_stuck_n_", "_step_best_done_", "_step_best_meas_"))
+            ]:
+                delattr(self, _attr)
+        except Exception:
+            pass
         if previous:
             bb["previous_task_context"] = previous
         self.blackboard = bb
@@ -25655,7 +26064,7 @@ class SessionState:
         with fp.open("w", encoding="utf-8") as handle:
             for idx, row in enumerate(rows):
                 line = json_dumps(row)
-                payload = (line + "\n").encode("utf-8")
+                payload = safe_utf8_bytes(line + "\n")
                 sha.update(payload)
                 handle.write(line + "\n")
                 msg_ts = float(row.get("ts", 0.0) or 0.0)
@@ -26167,12 +26576,12 @@ class SessionState:
         active_errors = len([e for e in comp_errors if isinstance(e, dict) and int(e.get("count", 0) or 0) > 0])
         artifacts = bb.get("code_artifacts", {})
         artifacts_keys = sorted(artifacts.keys()) if isinstance(artifacts, dict) else []
-        files_hash = hashlib.sha1(str(artifacts_keys).encode("utf-8")).hexdigest()[:12]
+        files_hash = hashlib.sha1(safe_utf8_bytes(artifacts_keys)).hexdigest()[:12]
         try:
             todo_snap = json_dumps(self.todo.snapshot()) if hasattr(self, "todo") else ""
         except Exception:
             todo_snap = ""
-        todos_hash = hashlib.sha1(todo_snap.encode("utf-8")).hexdigest()[:12]
+        todos_hash = hashlib.sha1(safe_utf8_bytes(todo_snap)).hexdigest()[:12]
         stall_events = fl.get("stall_events", [])
         delegations = fl.get("repeated_delegations", [])
         return {
@@ -34517,7 +34926,150 @@ body{padding:18px}
             "reason": reason or trim(str(base.get("reason", "")), 400),
             "goal_chars": int(goal_chars),
             "updated_at": float(updated_at),
+            "deliverable_target": self._infer_deliverable_target(goal, existing=src.get("deliverable_target")),
         }
+
+    # Units that signal a multi-unit generative deliverable (novel chapters,
+    # paper sections, batches of files, etc.). Chinese + English.
+    _DELIVERABLE_UNIT_MAP = {
+        "章": ("chapter", "content"), "章节": ("chapter", "content"), "节": ("section", "content"),
+        "篇": ("article", "content"), "页": ("page", "content"), "首": ("poem", "content"),
+        "集": ("episode", "content"), "回": ("chapter", "content"), "部": ("volume", "content"),
+        "段": ("paragraph", "content"), "份": ("document", "content"), "问": ("question", "content"),
+        "题": ("question", "content"), "个文件": ("file", "files"), "个脚本": ("file", "files"),
+        "chapters": ("chapter", "content"), "chapter": ("chapter", "content"),
+        "sections": ("section", "content"), "section": ("section", "content"),
+        "articles": ("article", "content"), "essays": ("essay", "content"),
+        "pages": ("page", "content"), "poems": ("poem", "content"),
+        "episodes": ("episode", "content"), "parts": ("part", "content"),
+        "files": ("file", "files"), "scripts": ("file", "files"), "modules": ("file", "files"),
+        "questions": ("question", "content"), "problems": ("question", "content"),
+        "papers": ("paper", "content"), "documents": ("document", "content"),
+        "reports": ("report", "content"), "stories": ("story", "content"),
+        "entries": ("entry", "content"), "records": ("record", "content"),
+    }
+
+    def _infer_deliverable_target(self, goal: str, existing: object = None) -> dict:
+        """Detect a multi-unit generative quota in the goal (e.g. '写20章小说',
+        'analyze 50 papers', 'generate 30 files'). Returns
+        {kind, unit, target_count, produced_count, verify} or {} when no quota.
+
+        A quota is a COUNT ('20 章', '50 chapters') — an INDEX ('第20章',
+        'chapter 20') is deliberately NOT matched. This is what lets a long task
+        block premature finish until the real target is met (Fix 2)."""
+        # Preserve an already-established target (keeps produced_count across
+        # re-normalizations) unless it is malformed.
+        if isinstance(existing, dict) and int(existing.get("target_count", 0) or 0) >= 2:
+            out = dict(existing)
+            out.setdefault("produced_count", 0)
+            out.setdefault("verify", "content")
+            out.setdefault("unit", "unit")
+            out.setdefault("kind", "generation")
+            return out
+        text = str(goal or "")
+        if not text.strip():
+            return {}
+        best: dict = {}
+        # Chinese: <count><unit>, NOT preceded by 第 (which marks an index).
+        zh_units = "章节|章|节|篇|页|首|集|回|部|段|份|题|问"
+        for m in re.finditer(r"(?<!第)(\d{1,4})\s*(" + zh_units + r")", text):
+            n = int(m.group(1))
+            unit_raw = m.group(2)
+            if n < 2 or n > 2000:
+                continue
+            unit, verify = self._DELIVERABLE_UNIT_MAP.get(unit_raw, ("unit", "content"))
+            if not best or n > best.get("target_count", 0):
+                best = {"kind": "generation", "unit": unit, "target_count": n, "produced_count": 0, "verify": verify}
+        # Chinese file/script count: "N个文件" / "N个脚本"
+        for m in re.finditer(r"(\d{1,4})\s*个?\s*(文件|脚本|模块|函数)", text):
+            n = int(m.group(1))
+            if n < 2 or n > 2000:
+                continue
+            if not best or n > best.get("target_count", 0):
+                best = {"kind": "generation", "unit": "file", "target_count": n, "produced_count": 0, "verify": "files"}
+        # English: <count> <plural-unit>. Plural (or explicit count noun) only —
+        # 'chapter 20' (singular after) is an index and is skipped.
+        for m in re.finditer(
+            r"(\d{1,4})\s+(chapters|sections|articles|essays|pages|poems|episodes|parts|files|scripts|modules|questions|problems|papers|documents|reports|stories|entries|records)\b",
+            text, re.IGNORECASE,
+        ):
+            n = int(m.group(1))
+            unit_raw = m.group(2).lower()
+            if n < 2 or n > 2000:
+                continue
+            unit, verify = self._DELIVERABLE_UNIT_MAP.get(unit_raw, ("unit", "content"))
+            if not best or n > best.get("target_count", 0):
+                best = {"kind": "generation", "unit": unit, "target_count": n, "produced_count": 0, "verify": verify}
+        return best
+
+    def _deliverable_progress(self, board: dict | None = None) -> dict:
+        """Count produced units of the deliverable target from REAL evidence
+        (files written, content markers in artifacts), never model self-claims.
+        Returns {active, target, produced, unit, verify, remaining}."""
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        profile = bb.get("task_profile", {}) if isinstance(bb.get("task_profile"), dict) else {}
+        target = profile.get("deliverable_target", {}) if isinstance(profile.get("deliverable_target"), dict) else {}
+        target_count = int(target.get("target_count", 0) or 0)
+        if target_count < 2:
+            return {"active": False, "target": 0, "produced": 0, "unit": "", "verify": "", "remaining": 0}
+        verify = str(target.get("verify", "content") or "content")
+        unit = str(target.get("unit", "unit") or "unit")
+        produced = 0
+        # File-based deliverables: count distinct written output paths.
+        if verify == "files":
+            paths: set[str] = set()
+            arts = bb.get("code_artifacts", {}) if isinstance(bb.get("code_artifacts"), dict) else {}
+            for p in arts.keys():
+                if str(p).strip():
+                    paths.add(str(p).strip())
+            step_files = bb.get("step_files", {}) if isinstance(bb.get("step_files"), dict) else {}
+            for entries in step_files.values():
+                if isinstance(entries, list):
+                    for item in entries:
+                        if isinstance(item, dict) and str(item.get("path", "") or "").strip():
+                            paths.add(str(item.get("path")).strip())
+            produced = len(paths)
+        else:
+            # Content-unit deliverables: scan written artifact text + research
+            # notes for the highest distinct unit index (第N章 / Chapter N / N.).
+            blob_parts: list[str] = []
+            arts = bb.get("code_artifacts", {}) if isinstance(bb.get("code_artifacts"), dict) else {}
+            for v in arts.values():
+                if isinstance(v, dict):
+                    blob_parts.append(str(v.get("content", "") or v.get("summary", "") or ""))
+                else:
+                    blob_parts.append(str(v or ""))
+            notes = bb.get("research_notes", []) if isinstance(bb.get("research_notes"), list) else []
+            for n in notes:
+                if isinstance(n, dict):
+                    blob_parts.append(str(n.get("content", "") or n.get("text", "") or ""))
+                else:
+                    blob_parts.append(str(n or ""))
+            blob = "\n".join(blob_parts)
+            indices: set[int] = set()
+            for m in re.finditer(r"第\s*(\d{1,4})\s*(?:章|节|篇|回|集|部|页|首)", blob):
+                indices.add(int(m.group(1)))
+            for m in re.finditer(r"\b(?:chapter|section|part|episode|page|article|essay)\s+(\d{1,4})\b", blob, re.IGNORECASE):
+                indices.add(int(m.group(1)))
+            produced = len(indices)
+            # Fallback: distinct completed plan-step count can stand in when the
+            # units aren't explicitly numbered in text but each maps to a step.
+            step_done = sum(
+                1 for t in (bb.get("project_todos", []) if isinstance(bb.get("project_todos"), list) else [])
+                if isinstance(t, dict) and str(t.get("category", "") or "") == "plan_step"
+                and str(t.get("status", "") or "").strip().lower() == "completed"
+            )
+            produced = max(produced, step_done)
+        produced = min(produced, target_count)
+        return {
+            "active": True,
+            "target": target_count,
+            "produced": produced,
+            "unit": unit,
+            "verify": verify,
+            "remaining": max(0, target_count - produced),
+        }
+
 
     def _ensure_blackboard_task_profile(self, board: dict | None = None, *, force: bool = False) -> dict:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
@@ -34809,6 +35361,25 @@ body{padding:18px}
             return {
                 "target": assigned,
                 "instruction": "Finish is blocked by unfinished plan steps. Re-open the active plan state and continue the next concrete step.",
+                "reason": reason_key,
+                "source": "finish-gate",
+                "is_mandatory": True,
+            }
+        if reason_key.startswith("deliverable-incomplete:"):
+            progress = self._deliverable_progress(bb)
+            unit = str(progress.get("unit", "unit") or "unit")
+            produced = int(progress.get("produced", 0) or 0)
+            target = int(progress.get("target", 0) or 0)
+            remaining = int(progress.get("remaining", 0) or 0)
+            instruction = (
+                f"Finish is blocked: this task requires {target} {unit}s and only {produced} are done "
+                f"({remaining} remaining). Do NOT stop or summarize early — continue producing the next "
+                f"{unit} now, with its full concrete content, and keep going until all {target} are complete. "
+                "Update TodoWrite as each unit is finished."
+            )
+            return {
+                "target": self._current_plan_worker_owner(bb) or assigned,
+                "instruction": trim(instruction, MANAGER_INSTRUCTION_MAX_CHARS),
                 "reason": reason_key,
                 "source": "finish-gate",
                 "is_mandatory": True,
@@ -35128,6 +35699,14 @@ body{padding:18px}
                     return False, f"project-todo-incomplete:{todo.get('category', '')}"
         if exec_mode == EXECUTION_MODE_SYNC and not self._manager_feedback_passed_from_blackboard(bb):
             return False, "sync-review-missing"
+        # Deliverable-quota gate (Fix 2): a multi-unit generative task (e.g.
+        # "write 20 chapters", "analyze 50 papers") must produce its target
+        # count of REAL units before finishing — this is what stops long tasks
+        # ending prematurely (虎头蛇尾). Progress is counted from evidence, not
+        # model self-claims.
+        progress = self._deliverable_progress(bb)
+        if progress.get("active") and int(progress.get("remaining", 0) or 0) > 0:
+            return False, f"deliverable-incomplete:{progress.get('produced', 0)}/{progress.get('target', 0)}"
         return True, "ok"
 
     def _invalidate_stale_approval_if_needed(
@@ -35389,8 +35968,8 @@ body{padding:18px}
             "last_worker_reply_role": last_reply_role,
             "last_worker_reply_text": last_reply_text,
         }
-        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+        raw = json_dumps(payload, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha1(safe_utf8_bytes(raw)).hexdigest()
 
     def _watchdog_extract_json_array(self, text: str) -> list[dict]:
         raw = str(text or "").strip()
@@ -35915,7 +36494,7 @@ body{padding:18px}
             else:
                 wd["repeat_no_tool_streak"] = 0
             wd["last_no_tool_text"] = text
-            wd["last_no_tool_hash"] = hashlib.sha1(text.encode("utf-8")).hexdigest() if text else ""
+            wd["last_no_tool_hash"] = hashlib.sha1(safe_utf8_bytes(text)).hexdigest() if text else ""
         else:
             wd["intent_no_tool_streak"] = max(0, int(wd.get("intent_no_tool_streak", 0) or 0) - 1)
             wd["repeat_no_tool_streak"] = max(0, int(wd.get("repeat_no_tool_streak", 0) or 0) - 1)
@@ -37048,7 +37627,7 @@ body{padding:18px}
         errors = fl.get("errors", [])
         focus = self._blackboard_focus_identity(bb)
         now_tick = float(now_ts())
-        fp = hashlib.sha1((str(category or "") + str(file or "") + str(error_msg or "")).encode("utf-8")).hexdigest()[:12]
+        fp = hashlib.sha1(safe_utf8_bytes(str(category or "") + str(file or "") + str(error_msg or ""))).hexdigest()[:12]
         for entry in errors:
             if entry.get("fingerprint") == fp:
                 entry["count"] = int(entry.get("count", 1) or 1) + 1
@@ -37277,7 +37856,7 @@ body{padding:18px}
             return
         delegations = fl.get("repeated_delegations", [])
         progress_fp = self._watchdog_state_fingerprint(bb)
-        fp = hashlib.sha1((str(instruction or "") + "|" + progress_fp).encode("utf-8")).hexdigest()[:12]
+        fp = hashlib.sha1(safe_utf8_bytes(str(instruction or "") + "|" + progress_fp)).hexdigest()[:12]
         for entry in delegations:
             if entry.get("instruction_hash") == fp and entry.get("target") == target:
                 entry["count"] = int(entry.get("count", 1) or 1) + 1
@@ -37325,7 +37904,7 @@ body{padding:18px}
             args_str = json_dumps(args) if isinstance(args, dict) else str(args or "")
         except Exception:
             args_str = str(args or "")
-        fp = hashlib.sha1((str(tool_name or "") + args_str).encode("utf-8")).hexdigest()[:16]
+        fp = hashlib.sha1(safe_utf8_bytes(str(tool_name or "") + args_str)).hexdigest()[:16]
         for entry in fps:
             if entry.get("fingerprint") == fp:
                 entry["count"] = int(entry.get("count", 1) or 1) + 1
@@ -38328,6 +38907,325 @@ body{padding:18px}
             return sig["has_exec"] or sig["has_read"] or sig["has_review"]
         return sig["has_write"] or sig["has_read"] or sig["has_research"] or sig["has_exec"] or sig["has_review"]
 
+    # Metric families whose numeric threshold is a genuine QUALITY bar (not an
+    # index/version/count). Used by _extract_acceptance_target.
+    _ACCEPTANCE_METRIC_TERMS = (
+        "误差", "相对误差", "绝对误差", "偏差", "error", "rel_err", "relative error",
+        "abs error", "absolute error", "deviation", "residual", "残差",
+        "coverage", "覆盖率", "覆盖", "accuracy", "准确率", "準確率", "精度", "精确度",
+        "precision", "recall", "f1", "tolerance", "容差", "误差率", "错误率", "loss",
+        "rmse", "mae", "mse", "perplexity", "困惑度",
+    )
+
+    def _resolve_acceptance_target(self, plan_step: dict, acceptance_row: dict | None = None) -> dict:
+        """Resolve the step's measurable QUALITY bar, LLM-primary with a regex
+        fallback (Fix 5). Cached per step id — the bar is a property of the step
+        and does not change round to round, so this costs at most one LLM call
+        per step, off the hot path.
+
+        Returns {kind:"numeric", metric, op, value, unit, desc, source} or {}.
+        The model PERCEIVES whether the step has a measurable bar (self-awareness)
+        rather than relying only on hardcoded metric keywords; regex is the
+        deterministic safety net when the LLM is unavailable or unsure."""
+        step_id = str((plan_step or {}).get("id", "") or "")
+        cache = getattr(self, "_acceptance_target_cache", None)
+        if cache is None:
+            cache = {}
+            self._acceptance_target_cache = cache
+        if step_id and step_id in cache:
+            return dict(cache[step_id])
+        llm = self._llm_acceptance_target(plan_step, acceptance_row)
+        resolved = llm if llm else self._extract_acceptance_target(plan_step, acceptance_row)
+        if resolved and not resolved.get("source"):
+            resolved["source"] = "llm" if llm else "regex"
+        if step_id:
+            cache[step_id] = dict(resolved)
+        return dict(resolved)
+
+    def _llm_acceptance_target(self, plan_step: dict, acceptance_row: dict | None = None) -> dict:
+        """LLM-primary perception of a measurable quality bar in the step text.
+        Returns a numeric-target dict or {} (no bar / unavailable / low
+        confidence → caller falls back to regex then category-only)."""
+        parts = [
+            str((plan_step or {}).get("full_content", "") or (plan_step or {}).get("content", "") or ""),
+        ]
+        if isinstance(acceptance_row, dict):
+            parts.append(str(acceptance_row.get("content", "") or ""))
+        text = trim("\n".join(p for p in parts if p), 900)
+        if not text.strip():
+            return {}
+        try:
+            prompt = (
+                "/no_think\n"
+                "Read this plan step + its acceptance check. Does it state a MEASURABLE numeric quality bar "
+                "that a result must satisfy (e.g. error < 2%, coverage >= 90%, accuracy >= 0.95, latency < 100ms, "
+                "exit code 0)? A plain count/index/version (like 'chapter 20', 'write 5 files', 'python 3.11') is "
+                "NOT a quality bar.\n\n"
+                f"STEP:\n{text}\n\n"
+                "Reply ONLY JSON. If there IS a measurable numeric bar:\n"
+                '{\"has_bar\": true, \"metric\": \"<what is measured, e.g. relative error>\", '
+                '\"op\": \"<|<=|>|>=|==\", \"value\": <number>, \"unit\": \"<% or empty>\"}\n'
+                "If there is NO measurable numeric bar: {\"has_bar\": false}"
+            )
+            resp = self.ollama.chat(
+                [{"role": "user", "content": prompt}],
+                system="/no_think\nDetect a measurable numeric quality bar in a task step. Reply ONLY valid JSON.",
+                max_tokens=120,
+                think=False,
+            )
+            import json
+            raw = str(resp.get("content", "") or resp.get("text", "") or "").strip()
+            if "{" not in raw or "}" not in raw:
+                return {}
+            data = json.loads(raw[raw.index("{"):raw.rindex("}") + 1])
+            if not isinstance(data, dict) or not bool(data.get("has_bar", False)):
+                return {}
+            op = str(data.get("op", "") or "").strip()
+            if op not in ("<", "<=", ">", ">=", "=="):
+                return {}
+            try:
+                value = float(data.get("value"))
+            except Exception:
+                return {}
+            unit = str(data.get("unit", "") or "").strip()
+            return {
+                "kind": "numeric",
+                "metric": trim(str(data.get("metric", "") or "").strip().lower(), 60) or "target",
+                "op": op,
+                "value": value,
+                "unit": "%" if "%" in unit or "percent" in unit.lower() else "",
+                "desc": trim(text, 120),
+                "source": "llm",
+            }
+        except Exception:
+            return {}
+
+    def _extract_acceptance_target(self, plan_step: dict, acceptance_row: dict | None = None) -> dict:
+        """Regex FALLBACK for _resolve_acceptance_target (Fix 5). Extracts an
+        explicit numeric QUALITY target from the step + acceptance text when the
+        LLM layer is unavailable. Returns {kind:"numeric", metric, op, value,
+        unit, raw} or {}.
+
+        Only matches a comparison operator adjacent to a known quality-metric
+        term (误差/error/coverage/accuracy/tolerance/…) so plain counts, indices,
+        and version numbers are NOT mistaken for a quality bar."""
+        parts = [
+            str((plan_step or {}).get("full_content", "") or (plan_step or {}).get("content", "") or ""),
+        ]
+        if isinstance(acceptance_row, dict):
+            parts.append(str(acceptance_row.get("content", "") or ""))
+        text = "\n".join(p for p in parts if p)
+        if not text.strip():
+            return {}
+        low = text.lower()
+        metric_alt = "|".join(re.escape(t) for t in self._ACCEPTANCE_METRIC_TERMS)
+        best: dict = {}
+        # metric ... op value   (e.g. "误差 < 2%", "error below 1%", "coverage > 90%")
+        pat_fwd = re.compile(
+            r"(" + metric_alt + r")\s*(?:[:：=]?\s*)?(<=|>=|<|>|≤|≥|below|under|less than|at most|no more than|不超过|不高于|至多|至少|不低于|大于|小于|超过|高于|低于)?\s*(\d+(?:\.\d+)?)\s*(%|percent|个百分点)?",
+            re.IGNORECASE,
+        )
+        # op value ... metric   (e.g. "< 2% 误差", "below 1% error")
+        pat_bwd = re.compile(
+            r"(<=|>=|<|>|≤|≥|below|under|less than|at most|no more than|至多|不超过)\s*(\d+(?:\.\d+)?)\s*(%|percent)?\s*(?:的\s*)?(" + metric_alt + r")",
+            re.IGNORECASE,
+        )
+        word_op = {
+            "不超过": "<=", "不高于": "<=", "至多": "<=", "no more than": "<=", "at most": "<=",
+            "below": "<", "under": "<", "less than": "<", "小于": "<", "低于": "<",
+            "大于": ">", "超过": ">", "高于": ">", "至少": ">=", "不低于": ">=",
+        }
+        def _norm_op(raw_op: str, metric: str) -> str:
+            o = (raw_op or "").strip().lower()
+            o = word_op.get(o, o)
+            o = {"≤": "<=", "≥": ">="}.get(o, o)
+            if o in ("<", ">", "<=", ">="):
+                return o
+            # No explicit operator: infer from metric semantics.
+            m = metric.lower()
+            if any(k in m for k in ("coverage", "覆盖", "accuracy", "准确", "準確", "精度", "精确", "precision", "recall", "f1")):
+                return ">="  # higher is better
+            return "<="  # error/deviation/loss/tolerance: lower is better
+        for m in pat_fwd.finditer(low):
+            metric, raw_op, val, unit = m.group(1), m.group(2), m.group(3), m.group(4)
+            try:
+                value = float(val)
+            except Exception:
+                continue
+            best = {
+                "kind": "numeric",
+                "metric": metric,
+                "op": _norm_op(raw_op, metric),
+                "value": value,
+                "unit": "%" if unit and ("%" in unit or "percent" in unit or "百分点" in unit) else "",
+                "raw": trim(m.group(0), 80),
+            }
+            break
+        if not best:
+            for m in pat_bwd.finditer(low):
+                raw_op, val, unit, metric = m.group(1), m.group(2), m.group(3), m.group(4)
+                try:
+                    value = float(val)
+                except Exception:
+                    continue
+                best = {
+                    "kind": "numeric",
+                    "metric": metric,
+                    "op": _norm_op(raw_op, metric),
+                    "value": value,
+                    "unit": "%" if unit and ("%" in unit or "percent" in unit) else "",
+                    "raw": trim(m.group(0), 80),
+                }
+                break
+        return best
+
+    def _acceptance_target_met(self, target: dict, bb: dict, results: list[dict]) -> dict:
+        """Measure whether an extracted numeric quality target is actually met,
+        from REAL evidence (current tool outputs first, then step execution
+        logs). Returns {met: True|False|None, measured}. None = not measurable
+        → caller falls back to category-only behavior (never a false block)."""
+        if not isinstance(target, dict) or target.get("kind") != "numeric":
+            return {"met": None, "measured": None}
+        metric = str(target.get("metric", "") or "").lower()
+        op = str(target.get("op", "<=") or "<=")
+        value = float(target.get("value", 0.0) or 0.0)
+        # Build the text corpus to scan: current tool outputs, then recent logs.
+        texts: list[str] = []
+        for row in (results or []):
+            if isinstance(row, dict):
+                exc = self._tool_result_output_excerpt(row, 2000)
+                if exc:
+                    texts.append(str(exc))
+        logs = bb.get("execution_logs", []) if isinstance(bb.get("execution_logs"), list) else []
+        for row in logs[-6:]:
+            if isinstance(row, dict):
+                texts.append(str(row.get("content", "") or ""))
+        blob = "\n".join(texts)
+        if not blob.strip():
+            return {"met": None, "measured": None}
+        low = blob.lower()
+        # Find a measured number reported next to the SAME metric family.
+        metric_alt = "|".join(re.escape(t) for t in self._ACCEPTANCE_METRIC_TERMS)
+        near = re.compile(
+            r"(" + metric_alt + r")[^\d\n\r]{0,16}(\d+(?:\.\d+)?)\s*(%?)",
+            re.IGNORECASE,
+        )
+        alt = re.compile(
+            r"(\d+(?:\.\d+)?)\s*(%?)[^\d\n\r]{0,10}(" + metric_alt + r")",
+            re.IGNORECASE,
+        )
+        measured_vals: list[float] = []
+        for m in near.finditer(low):
+            try:
+                measured_vals.append(float(m.group(2)))
+            except Exception:
+                pass
+        for m in alt.finditer(low):
+            try:
+                measured_vals.append(float(m.group(1)))
+            except Exception:
+                pass
+        if not measured_vals:
+            return {"met": None, "measured": None}
+        # Use the WORST measured value against the bar (most conservative — a
+        # rushing worker can't cherry-pick one good number among bad ones).
+        higher_better = op in (">", ">=")
+        measured = min(measured_vals) if higher_better else max(measured_vals)
+        if op == "<":
+            met = measured < value
+        elif op == "<=":
+            met = measured <= value
+        elif op == ">":
+            met = measured > value
+        elif op == ">=":
+            met = measured >= value
+        else:
+            met = None
+        return {"met": met, "measured": measured}
+
+    def _track_step_outcome_progress(self, plan_step: dict, bb: dict, gate: dict | None = None) -> dict:
+        """Track OUTCOME progress for an in_progress step that did NOT advance
+        this round, and escalate on a real deadlock (Fix 6).
+
+        The existing repair-signature guard (`_repair_progress_signature`) only
+        runs inside `_acceptance_gate_handle_failure`, which itself only fires
+        when `subtasks_done and not gate_ok`. A single-agent worker that never
+        marks its acceptance subtask done (because it honestly knows the result
+        misses the bar) therefore has NO stall counter at all, and loops forever
+        while changing its approach each round. This tracker runs EVERY
+        non-advancing round the step is in_progress and measures OUTCOME, not
+        approach: more completed subtasks, or a measured value that moved toward
+        the quality bar. Approach churn alone is NOT progress.
+
+        Returns {stuck_n, escalated}."""
+        step_id = str((plan_step or {}).get("id", "") or "")
+        if not step_id:
+            return {"stuck_n": 0, "escalated": False}
+        completed = 0
+        try:
+            rows = self._active_plan_worker_todo_rows(step_id, role="")
+            completed = sum(
+                1 for r in rows if str(r.get("status", "") or "").strip().lower() == "completed"
+            )
+        except Exception:
+            completed = 0
+        # Measured value toward the quality bar (if any).
+        measured = None
+        op = ""
+        try:
+            target = self._resolve_acceptance_target(plan_step, (gate or {}).get("acceptance", {}) if isinstance(gate, dict) else {})
+            if target:
+                op = str(target.get("op", "") or "")
+                verdict = self._acceptance_target_met(target, bb, [])
+                measured = verdict.get("measured")
+        except Exception:
+            measured = None
+        best_done_attr = f"_step_best_done_{step_id}"
+        best_meas_attr = f"_step_best_meas_{step_id}"
+        stuck_attr = f"_step_stuck_n_{step_id}"
+        prev_best_done = int(getattr(self, best_done_attr, -1))
+        prev_best_meas = getattr(self, best_meas_attr, None)
+        improved = False
+        if completed > prev_best_done:
+            improved = True
+        elif measured is not None:
+            if prev_best_meas is None:
+                improved = True
+            elif op in (">", ">="):
+                improved = measured > float(prev_best_meas)
+            else:  # lower is better (error/deviation/loss/tolerance) or unknown
+                improved = measured < float(prev_best_meas)
+        if improved:
+            setattr(self, best_done_attr, max(prev_best_done, completed))
+            if measured is not None:
+                if prev_best_meas is None:
+                    setattr(self, best_meas_attr, measured)
+                elif op in (">", ">="):
+                    setattr(self, best_meas_attr, max(float(prev_best_meas), measured))
+                else:
+                    setattr(self, best_meas_attr, min(float(prev_best_meas), measured))
+            setattr(self, stuck_attr, 0)
+            return {"stuck_n": 0, "escalated": False}
+        stuck_n = int(getattr(self, stuck_attr, 0) or 0) + 1
+        setattr(self, stuck_attr, stuck_n)
+        escalated = False
+        if stuck_n >= STEP_ACTIVE_STALL_CEILING:
+            try:
+                self.stall_severity_sources.append(
+                    f"step-outcome-stall:{step_id}:{stuck_n}"
+                )
+            except Exception:
+                pass
+            escalated = bool(
+                self._escalate_stall_to_plan_mode(
+                    trigger_source=f"step-outcome-stall:{step_id}",
+                    last_fault_reason=str((gate or {}).get("reason", "") or "step outcome not improving"),
+                )
+            )
+            if escalated:
+                setattr(self, stuck_attr, 0)
+        return {"stuck_n": stuck_n, "escalated": escalated}
+
     def _plan_step_acceptance_gate_status(
         self,
         plan_step: dict,
@@ -38448,12 +39346,35 @@ body{padding:18px}
         # available but the step-scoped evidence has already been recorded.
         if results:
             blackboard_match = False
+        # Quality-aware enforcement (Fix 5): if the step/acceptance text states an
+        # explicit numeric quality bar (e.g. "误差 < 2%"), a category match is NOT
+        # enough — the measured result must actually meet the bar. This stops a
+        # worker from passing a 23% result just because a check ran. When the bar
+        # is unmeasurable, fall back to category-only (never a false block).
+        target = self._resolve_acceptance_target(plan_step, acceptance)
+        if target and (current_match or blackboard_match):
+            verdict = self._acceptance_target_met(target, bb, results)
+            if verdict.get("met") is False:
+                unit = str(target.get("unit", "") or "")
+                measured = verdict.get("measured")
+                return {
+                    "ok": False,
+                    "reason": (
+                        "acceptance-target-unmet:"
+                        f"{measured}{unit} vs {target.get('op', '<=')}{target.get('value')}{unit}"
+                    ),
+                    "expected": expected,
+                    "target": target,
+                    "measured": measured,
+                    "acceptance": acceptance,
+                }
         if current_match:
             return {
                 "ok": True,
                 "reason": "current-tool-evidence-matches-final-acceptance",
                 "source": "current_tool_results",
                 "expected": expected,
+                "target": target or None,
                 "acceptance": acceptance,
             }
         if blackboard_match:
@@ -38462,6 +39383,7 @@ body{padding:18px}
                 "reason": "blackboard-evidence-matches-final-acceptance",
                 "source": "blackboard",
                 "expected": expected,
+                "target": target or None,
                 "acceptance": acceptance,
             }
         return {
@@ -38636,6 +39558,29 @@ body{padding:18px}
                 "repair_action": "Execute the acceptance check with a real tool call now (do not just mark it done), confirm the success signal, then complete it.",
                 "fixer_role": self._current_plan_worker_owner(bb),
                 "error_category": error_category,
+                "error_context": error_context,
+            }
+        if reason.startswith("acceptance-target-unmet:"):
+            # The check ran but the measured result misses the stated quality bar
+            # (e.g. 23% error vs the required <1%). This is NOT a "record evidence"
+            # problem — the deliverable itself is not good enough yet.
+            target = (gate or {}).get("target", {}) if isinstance((gate or {}).get("target"), dict) else {}
+            bar = f"{target.get('op', '<=')}{target.get('value', '')}{target.get('unit', '')}".strip()
+            measured = (gate or {}).get("measured")
+            repair_action = (
+                f"The acceptance check ran but the result ({measured}{target.get('unit', '')}) does NOT meet the "
+                f"required quality bar ({target.get('metric', 'target')} {bar}). Do NOT advance or mark this "
+                "accepted. Diagnose WHY the quality bar is missed (algorithm/params/precision/bug), FIX the "
+                "underlying cause, re-run the check, and only complete the acceptance subtask once the measured "
+                f"value actually satisfies {bar}."
+            )
+            if error_category:
+                repair_action += f" (dominant failure category: '{error_category}'; do not repeat a failed fix.)"
+            return {
+                "root_cause": f"Deliverable misses its quality bar ({target.get('metric', 'target')} {bar}); measured {measured}{target.get('unit', '')}.",
+                "repair_action": repair_action,
+                "fixer_role": "reviewer" if (self._is_multi_agent_mode() and self.reviewer_debug_mode) else self._current_plan_worker_owner(bb),
+                "error_category": error_category or "quality-bar",
                 "error_context": error_context,
             }
         # final-acceptance-evidence-missing (and anything else): genuine failure or
@@ -39716,6 +40661,133 @@ body{padding:18px}
                 pass
         return True
 
+    def _plan_step_advance_decision(
+        self, current: dict, evidence_input: dict, bb: dict, *, mode: str
+    ) -> dict:
+        """Single authority for the plan-step advance judgment shared by the
+        single-agent and sync/multi-agent paths.
+
+        Both callers previously computed the same evidence signals but combined
+        them into DIFFERENT should-advance rules (single-agent: 2 paths + a
+        `_gate_blocked` flag; sync: 5 OR'd paths). That divergence let the same
+        step advance in one mode and stall in the other. This function computes
+        the signals ONCE and applies ONE unified rule, so sync is a strict
+        extension of single-agent. Callers keep only their own dispatch/role
+        routing (single→"single"/developer; sync→route.target) and any
+        manager-request bookkeeping.
+
+        `mode` is "single" or "sync". `evidence_input` is the worker_step dict
+        (sync) or {"tool_results": [...]} (single) — both expose `tool_results`
+        and are accepted by the gate/evidence helpers unchanged.
+
+        Returns: {should_advance, needs_repair, gate, gate_ok, reason, signals}.
+        """
+        results = (
+            evidence_input.get("tool_results", []) or []
+            if isinstance(evidence_input, dict)
+            else []
+        )
+        step_content = str(
+            current.get("full_content", "") or current.get("content", "") or ""
+        ).lower()
+        phase = self._plan_step_phase_hint(step_content)
+        wrote_files = any(
+            isinstance(r, dict)
+            and r.get("ok", False)
+            and str(r.get("name", "")) in ("write_file", "edit_file")
+            for r in results
+        )
+        ran_bash_ok = any(
+            isinstance(r, dict) and r.get("ok", False) and str(r.get("name", "")) == "bash"
+            for r in results
+        )
+        validation_ok_current = self._tool_results_have_validation_evidence(current, results)
+        validation_ok_blackboard = self._plan_step_has_blackboard_evidence(current, bb)
+        validation_ok = validation_ok_current or validation_ok_blackboard
+        # single-agent historically read the verified tag without the agent-message
+        # window; sync passed messages=self.agent_messages. Preserve that.
+        if mode == "sync":
+            verified_tag_current = self._check_step_verified_tag(current, messages=self.agent_messages)
+        else:
+            verified_tag_current = self._check_step_verified_tag(current)
+        bb_sig = self._plan_step_blackboard_signals(current, bb)
+        phase_evidence = False
+        if phase in ("research", "design") and validation_ok:
+            phase_evidence = True
+        elif phase == "implement" and (
+            (wrote_files and validation_ok_current)
+            or (bb_sig["has_write"] and validation_ok_blackboard)
+        ):
+            phase_evidence = True
+        elif phase in ("test", "review") and (
+            (ran_bash_ok and validation_ok_current)
+            or ((bb_sig["has_exec"] or bb_sig["has_review"]) and validation_ok_blackboard)
+        ):
+            phase_evidence = True
+        subtasks_all_done = self._step_subtasks_all_completed(current)
+        _has_subtasks = bool(
+            self._active_plan_worker_todo_rows(str(current.get("id", "") or ""), role="")
+        )
+        accumulated_evidence_path = subtasks_all_done and self._step_has_accumulated_evidence(
+            current, bb
+        )
+        explicit_verified_path = (
+            subtasks_all_done
+            and verified_tag_current
+            and (validation_ok_blackboard or self._step_has_accumulated_evidence(current, bb))
+        )
+        acceptance_gate = self._plan_step_acceptance_gate_status(current, evidence_input, bb)
+        acceptance_gate_ok = bool(acceptance_gate.get("ok", False))
+        worker_produced_output = self._worker_step_has_evidence(evidence_input)
+        # Unified strong-evidence rule (superset of both prior rules): the
+        # step-local subtask chain is complete, the final acceptance gate passed,
+        # AND at least one concrete evidence form exists. Manager requests and
+        # phase heuristics never bypass an incomplete subtask chain or a failed gate.
+        should_advance = bool(
+            subtasks_all_done
+            and acceptance_gate_ok
+            and (
+                validation_ok
+                or phase_evidence
+                or accumulated_evidence_path
+                or explicit_verified_path
+            )
+        )
+        # Atomic-step escape: the step genuinely has NO step-local subtasks
+        # (bootstrap could not decompose it). Requires real phase/validation
+        # evidence; never advances on a bare claim.
+        if not should_advance and not _has_subtasks and worker_produced_output:
+            if phase_evidence or validation_ok:
+                should_advance = True
+        # Explicit structured-verification-tag path for subtask-less or
+        # subtask-complete steps. Disabled once the gate has blocked
+        # (subtasks_all_done and gate failed) so it cannot mask a real failure.
+        gate_blocked = bool(subtasks_all_done and not acceptance_gate_ok)
+        if not should_advance and not gate_blocked:
+            if (
+                verified_tag_current
+                and (subtasks_all_done or not _has_subtasks)
+                and (validation_ok or self._step_has_accumulated_evidence(current, bb))
+            ):
+                should_advance = True
+        return {
+            "should_advance": should_advance,
+            "needs_repair": gate_blocked,
+            "gate": acceptance_gate,
+            "gate_ok": acceptance_gate_ok,
+            "reason": str(acceptance_gate.get("reason", "") or ""),
+            "signals": {
+                "subtasks_all_done": subtasks_all_done,
+                "has_subtasks": _has_subtasks,
+                "worker_produced_output": worker_produced_output,
+                "phase_evidence": phase_evidence,
+                "validation_ok": validation_ok,
+                "validation_ok_blackboard": validation_ok_blackboard,
+                "verified_tag": verified_tag_current,
+                "phase": phase,
+            },
+        }
+
     def _post_execution_plan_step_check(self, route: dict, worker_step: dict):
         """After worker execution, check if current plan step should advance based on evidence."""
         bb = self._ensure_blackboard()
@@ -39764,77 +40836,15 @@ body{padding:18px}
                     )
             except Exception as exc:
                 self._emit("status", {"summary": f"plan subtask bootstrap failed: {trim(str(exc), 120)}"})
-        # 1. Manager explicitly requested advancement
+        # Unified advance decision (Fix 1): shared authority with single-agent.
         manager_requested = bool(route.get("advance_plan_step_requested", False))
-        # 2. Worker produced concrete tool outputs
-        worker_produced_output = self._worker_step_has_evidence(worker_step)
-        # 3. All subtasks for this step are completed
-        subtasks_all_done = self._step_subtasks_all_completed(current)
-        # 4. Phase-based file+bash evidence (implement requires BOTH write + bash)
-        step_content = str(current.get("full_content", "") or current.get("content", "") or "").lower()
-        phase = self._plan_step_phase_hint(step_content)
-        results = worker_step.get("tool_results", []) or []
-        wrote_files = any(
-            isinstance(r, dict) and r.get("ok", False)
-            and str(r.get("name", "")) in ("write_file", "edit_file")
-            for r in results
-        )
-        ran_bash_ok = any(
-            isinstance(r, dict) and r.get("ok", False) and str(r.get("name", "")) == "bash"
-            for r in results
-        )
-        validation_ok_current = self._tool_results_have_validation_evidence(current, results)
-        validation_ok_blackboard = self._plan_step_has_blackboard_evidence(current, bb)
-        validation_ok = validation_ok_current or validation_ok_blackboard
-        verified_tag_current = self._check_step_verified_tag(current, messages=self.agent_messages)
-        bb_sig = self._plan_step_blackboard_signals(current, bb)
-        phase_evidence = False
-        if phase in ("research", "design") and validation_ok:
-            phase_evidence = True
-        elif phase == "implement" and (
-            (wrote_files and validation_ok_current)
-            or (bb_sig["has_write"] and validation_ok_blackboard)
-        ):
-            phase_evidence = True
-        elif phase in ("test", "review") and (
-            (ran_bash_ok and validation_ok_current)
-            or ((bb_sig["has_exec"] or bb_sig["has_review"]) and validation_ok_blackboard)
-        ):
-            phase_evidence = True
-        # Advance when the step-local subtask chain is complete and concrete
-        # evidence exists. The final acceptance subtask is the validation gate;
-        # manager requests or phase heuristics cannot bypass incomplete subtasks.
-        _has_subtasks = bool(self._active_plan_worker_todo_rows(
-            str(current.get("id", "") or ""), role=""
-        ))
-        accumulated_evidence_path = (
-            subtasks_all_done
-            and self._step_has_accumulated_evidence(current, bb)
-        )
-        explicit_verified_path = (
-            subtasks_all_done
-            and verified_tag_current
-            and (validation_ok_blackboard or self._step_has_accumulated_evidence(current, bb))
-        )
-        acceptance_gate = self._plan_step_acceptance_gate_status(current, worker_step, bb)
-        acceptance_gate_ok = bool(acceptance_gate.get("ok", False))
-        has_strong_evidence = subtasks_all_done and acceptance_gate_ok and (
-            validation_ok
-            or validation_ok_blackboard
-            or phase_evidence
-            or accumulated_evidence_path
-            or explicit_verified_path
-        )
-        # Parity with single-agent (Fix 1): phase-heuristic escape when the step
-        # genuinely has NO step-local subtasks (bootstrap above couldn't decompose
-        # it — e.g. an atomic step). Single-agent allows this via
-        # `_can_use_phase_heuristic = subtasks_done or not _has_subtasks_s` (:42629).
-        # Without it, a subtask-less step can never satisfy `subtasks_all_done` and
-        # the multi-agent run stalls. Requires real phase evidence; never advances
-        # on a bare claim.
-        if not has_strong_evidence and not _has_subtasks and worker_produced_output:
-            if phase_evidence or validation_ok:
-                has_strong_evidence = True
+        decision = self._plan_step_advance_decision(current, worker_step, bb, mode="sync")
+        has_strong_evidence = bool(decision["should_advance"])
+        subtasks_all_done = bool(decision["signals"]["subtasks_all_done"])
+        _has_subtasks = bool(decision["signals"]["has_subtasks"])
+        worker_produced_output = bool(decision["signals"]["worker_produced_output"])
+        acceptance_gate = decision["gate"]
+        acceptance_gate_ok = bool(decision["gate_ok"])
         if manager_requested and worker_produced_output and not subtasks_all_done and _has_subtasks:
             self._blackboard_append_memory(
                 "decision",
@@ -39878,6 +40888,11 @@ body{padding:18px}
                     target_roles=((target_role,) if target_role else ()),
                 ):
                     return  # step genuinely passed via semantic judge
+            # Outcome-progress deadlock guard (Fix 6): runs every non-advancing
+            # round regardless of whether subtasks are done, so a step that keeps
+            # producing output but never improves its OUTCOME escalates instead
+            # of looping forever.
+            self._track_step_outcome_progress(current, bb, acceptance_gate)
             self._inject_rework_if_needed(current, worker_step)
 
     def _worker_step_has_evidence(self, step: dict) -> bool:
@@ -40285,6 +41300,21 @@ body{padding:18px}
                 guidance = {}
             gate_reason = trim(str((gate or {}).get("reason", "") or ""), 120)
             gate_expected = trim(str((gate or {}).get("expected", "") or ""), 160)
+            # Quality bar (Fix 5): if the step has a measurable target, the judge
+            # must check the measured result against it, not just "did a check run".
+            target = {}
+            try:
+                target = self._resolve_acceptance_target(plan_step, (gate or {}).get("acceptance", {}))
+            except Exception:
+                target = {}
+            bar_line = ""
+            if target:
+                bar_line = (
+                    f"REQUIRED QUALITY BAR: {target.get('metric','target')} "
+                    f"{target.get('op','<=')} {target.get('value')}{target.get('unit','')}. "
+                    "PASS only if the measured result actually satisfies this bar; "
+                    "a result that merely ran but misses the bar is a FAIL.\n"
+                )
 
             # Acceptance subtask text (what the worker said it would verify).
             acceptance = (gate or {}).get("acceptance", {}) if isinstance((gate or {}).get("acceptance"), dict) else {}
@@ -40320,7 +41350,8 @@ body{padding:18px}
                 f"PLAN STEP: {step_text}\n"
                 f"ACCEPTANCE CHECK (what should be verified): {acceptance_text or guidance.get('what','')}\n"
                 f"EXPECTED EVIDENCE KIND: {gate_expected or guidance.get('evidence_kind','')}\n"
-                f"GATE FAILURE REASON: {gate_reason}\n\n"
+                f"GATE FAILURE REASON: {gate_reason}\n"
+                f"{bar_line}\n"
                 f"FILES CREATED/MODIFIED FOR THIS STEP:\n{chr(10).join(files_summary[-12:]) or '(none)'}\n\n"
                 f"EXECUTION OUTPUT (this step):\n{chr(10).join(recent_exec[-6:]) or '(none)'}\n\n"
                 f"CURRENT-TURN TOOL RESULTS:\n{chr(10).join(cur_results[-6:]) or '(none)'}\n\n"
@@ -41816,10 +42847,18 @@ body{padding:18px}
                 f"Existing worker subtasks for this step: {len(completed)} completed, {len(pending)} pending. "
             )
             todo_state = "".join(state_parts)
-            # Hard prohibition: model must NOT re-create subtasks when they already exist
+            # Fix 7: allow REFINEMENT, forbid only wholesale recreate. The old
+            # absolute ban ("do NOT call TodoWrite … directly execute") pushed
+            # multi-agent workers into shallow, bundled execution (e.g. writing
+            # 4 subsections in one shot). The worker may now split a coarse
+            # subtask into finer child items, add a genuinely missing one, or
+            # update status — it just must not restate/duplicate existing rows
+            # or drop the final acceptance item. Symmetric across single & multi.
             subtasks_exist_ban = (
-                "🚫 STRICT: subtasks for this step already exist — do NOT call TodoWrite/TodoWriteRescue "
-                "to create new subtasks. Directly execute the in_progress subtask above. "
+                "Subtasks for this step already exist. Do NOT wholesale-recreate, renumber, or restate them. "
+                "You MAY refine: split a too-coarse subtask into finer child items, add a genuinely missing "
+                "subtask, or update status — reuse existing N.M ids and keep the final acceptance item. "
+                "If the current subtask is already concrete, just execute it. "
             )
         if for_manager:
             return (
@@ -42912,7 +43951,7 @@ body{padding:18px}
                 if len(prose) >= 2 and text and text != header and text not in picked:
                     picked.append(text)
         out: list[str] = []
-        max_items = max(2, min(int(limit or 6), 7))
+        max_items = max(2, min(int(limit or 6), 16))  # Fix 7: allow multi-unit steps (was 7)
         for text in picked:
             clean = normalize_work_text(text) or str(text or "").strip()
             if not clean or clean == header or clean in out:
@@ -42923,6 +43962,34 @@ body{padding:18px}
         if out:
             return out[: max_items - 1]
         return []
+
+    def _plan_step_subtask_limit(self, plan_step: dict, *, base: int = 6) -> tuple[int, str]:
+        """Fix 7: compute an adaptive subtask cap for a step. A multi-unit step
+        (N chapters/files/sections, or an active task-level deliverable target)
+        gets one subtask per unit (+setup/acceptance), capped at 16, plus a
+        per-unit decomposition note. Returns (limit, per_unit_note)."""
+        base = max(3, int(base or 6))
+        step_text = str((plan_step or {}).get("full_content", "") or (plan_step or {}).get("content", "") or "")
+        try:
+            step_target = self._infer_deliverable_target(step_text)
+            unit_n = int(step_target.get("target_count", 0) or 0) if step_target else 0
+            if unit_n < 2:
+                dp = self._deliverable_progress()
+                if dp.get("active"):
+                    unit_n = int(dp.get("remaining", 0) or dp.get("target", 0) or 0)
+                    step_target = step_target or {"unit": dp.get("unit", "unit")}
+            if unit_n >= 2:
+                limit = max(base, min(unit_n + 2, 16))
+                unit = str((step_target or {}).get("unit", "unit") or "unit")
+                note = (
+                    f"This step produces MULTIPLE {unit}s (~{unit_n}). Create ONE concrete subtask per "
+                    f"{unit} (not a single bundled 'write all {unit}s' item), in order, so each {unit} is "
+                    "executed and tracked individually. "
+                )
+                return limit, note
+        except Exception:
+            pass
+        return base, ""
 
     def _llm_plan_step_subtasks(self, plan_step: dict, *, limit: int = 5) -> list[str]:
         if not isinstance(plan_step, dict):
@@ -42935,7 +44002,9 @@ body{padding:18px}
         )
         if not step_text:
             return []
-        max_items = max(3, min(int(limit or 6), 6))
+        # Fix 7: adaptive cap — multi-unit steps decompose per-unit (not bundled).
+        adaptive_limit, per_unit_note = self._plan_step_subtask_limit(plan_step, base=int(limit or 6))
+        max_items = max(3, min(adaptive_limit, 16))
         try:
             terms = self._plan_step_acceptance_terms()
             lang = normalize_ui_language(getattr(self, "ui_language", DEFAULT_UI_LANGUAGE))
@@ -42945,6 +44014,7 @@ body{padding:18px}
                 "Create step-local execution subtasks for the active approved plan step.\n"
                 "Use the step semantics, not generic templates. Split only this step into concrete actions a worker can execute in order.\n"
                 "Do not include other plan steps, final delivery, or broad project management.\n"
+                f"{per_unit_note}"
                 f"Write all subtasks in UI language {lang}. "
                 f"The FINAL subtask is mandatory and must be a semantic acceptance subtask starting with '{terms['prefix']}{sep}'. "
                 "That final subtask must include both the check action and the evidence shape to record.\n"
@@ -42958,7 +44028,7 @@ body{padding:18px}
                 system=self._inject_runtime_environment_context(
                     "/no_think\nYou decompose one active plan step into concrete, ordered worker subtasks. Reply only valid JSON."
                 ),
-                max_tokens=360,
+                max_tokens=360 if max_items <= 6 else 720,
                 temperature=0.2,
                 think=False,
             )
@@ -42990,9 +44060,11 @@ body{padding:18px}
         step_id = trim(str(plan_step.get("id", "") or ""), 20)
         if not step_id:
             return False
-        expected = self._extract_plan_step_subtasks(plan_step, limit=6)
+        # Fix 7: adaptive cap so multi-unit steps aren't truncated to 6 bundled rows.
+        _sub_limit, _ = self._plan_step_subtask_limit(plan_step, base=6)
+        expected = self._extract_plan_step_subtasks(plan_step, limit=_sub_limit)
         if not expected:
-            expected = self._llm_plan_step_subtasks(plan_step, limit=6)
+            expected = self._llm_plan_step_subtasks(plan_step, limit=_sub_limit)
         if not expected:
             step_text = trim(str(plan_step.get("content", "") or "Execute and verify current plan step"), 180)
             expected = [f"Complete this plan step with concrete evidence: {step_text}"]
@@ -43000,7 +44072,7 @@ body{padding:18px}
             plan_step,
             expected,
             allow_llm=True,
-            limit=6,
+            limit=_sub_limit,
         )
         if not expected:
             return False
@@ -43672,77 +44744,19 @@ body{padding:18px}
                 if not any("<action-required>" in str(m.get("content", "") or "") for m in _recent_msgs if isinstance(m, dict)):
                     self._append_plan_guidance_bubble(_force_tw_msg, summary="action required: create subtasks first")
                 return False  # Wait for TodoWrite before doing other checks
-        # Heuristic: check if tool results indicate step completion
-        step_content = str(current.get("full_content", "") or current.get("content", "") or "").lower()
-        phase = self._plan_step_phase_hint(step_content)
-        wrote_files = any(
-            str(r.get("name", "")) in ("write_file", "edit_file") and r.get("ok", False)
-            for r in tool_results
-        )
-        ran_bash_ok = any(
-            str(r.get("name", "")) == "bash" and r.get("ok", False)
-            for r in tool_results
-        )
-        validation_ok_current = self._tool_results_have_validation_evidence(current, tool_results)
-        validation_ok_blackboard = self._plan_step_has_blackboard_evidence(current, bb)
-        validation_ok = validation_ok_current or validation_ok_blackboard
-        bb_sig = self._plan_step_blackboard_signals(current, bb)
+        # Unified advance decision (Fix 1): shared authority with sync mode.
         todo_progress_signal = any(
             isinstance(r, dict) and r.get("ok", False)
             and str(r.get("name", "")) in ("TodoWrite", "TodoWriteRescue")
             for r in tool_results
         )
-        # Auto-advance conditions:
-        should_advance = False
-        _gate_blocked = False  # True when validation gate fired and blocked — no other path may advance
-        # Priority 1: Check if worker subtasks are all completed (most reliable signal)
-        subtasks_done = self._step_subtasks_all_completed(current)
-        acceptance_gate = self._plan_step_acceptance_gate_status(current, {"tool_results": tool_results}, bb)
-        acceptance_gate_ok = bool(acceptance_gate.get("ok", False))
-        if subtasks_done:
-            # The final step-local acceptance subtask is the validation gate.
-            # Once all subtasks are completed, advancement only needs concrete
-            # current or accumulated evidence; no external semantic reviewer or
-            # extra structured verification tag.
-            if acceptance_gate_ok and (validation_ok or self._step_has_accumulated_evidence(current, bb)):
-                should_advance = True
-            else:
-                _gate_blocked = True  # Evidence missing — disable weaker advancement paths
-        # Priority 2: Phase-based heuristics — BUT gate by subtask completion when subtasks exist
-        # CRITICAL: A single write_file must NOT advance when 3+ subtasks remain
-        # Skipped when validation gate has blocked advancement (subtasks_done + gate failed)
-        if not should_advance and not _gate_blocked:
-            _has_subtasks_s = bool(self._active_plan_worker_todo_rows(
-                str(current.get("id", "") or ""), role=""
-            ))
-            _can_use_phase_heuristic = subtasks_done or not _has_subtasks_s
-            if _can_use_phase_heuristic:
-                if phase in ("research", "design") and validation_ok:
-                    should_advance = True
-                elif phase == "implement" and (
-                    (wrote_files and validation_ok_current)
-                    or (bb_sig["has_write"] and validation_ok_blackboard)
-                ):
-                    should_advance = True
-                elif phase in ("test", "review") and (
-                    (ran_bash_ok and validation_ok_current)
-                    or ((bb_sig["has_exec"] or bb_sig["has_review"]) and validation_ok_blackboard)
-                ):
-                    should_advance = True
-        # Also allow the explicit post-message verification contract to advance
-        # when there are no linked subtasks. Natural-language completion claims
-        # are intentionally ignored here; advancement must be backed by plan
-        # state, validation evidence, or the structured verification tag.
-        if not should_advance and not _gate_blocked:
-            _has_subtasks_s2 = bool(self._active_plan_worker_todo_rows(
-                str(current.get("id", "") or ""), role=""
-            ))
-            if (
-                self._check_step_verified_tag(current)
-                and (subtasks_done or not _has_subtasks_s2)
-                and (validation_ok or self._step_has_accumulated_evidence(current, bb))
-            ):
-                should_advance = True
+        decision = self._plan_step_advance_decision(
+            current, {"tool_results": tool_results}, bb, mode="single"
+        )
+        should_advance = bool(decision["should_advance"])
+        subtasks_done = bool(decision["signals"]["subtasks_all_done"])
+        acceptance_gate = decision["gate"]
+        acceptance_gate_ok = bool(decision["gate_ok"])
         if should_advance:
             evidence = self._collect_step_evidence(current, {"tool_results": tool_results})
             advanced = self._advance_plan_step(evidence=evidence, actor="single")
@@ -43770,6 +44784,12 @@ body{padding:18px}
                     current, acceptance_gate, bb, actor="single", target_roles=("developer",)
                 ):
                     return True  # step genuinely passed via semantic judge
+            # Outcome-progress deadlock guard (Fix 6): the key single-agent
+            # escape. Runs every non-advancing round — including when subtasks
+            # are NOT all done (the honest worker that never self-marks its
+            # failing acceptance subtask) — so a step whose OUTCOME stops
+            # improving escalates to the user instead of circling forever.
+            self._track_step_outcome_progress(current, bb, acceptance_gate)
             self._inject_rework_if_needed(current, {"tool_results": tool_results})
             self._sync_todos_from_blackboard(reason="single-agent-round")
             if todo_progress_signal and not subtasks_done:
@@ -47649,7 +48669,7 @@ body{padding:18px}
             _pmr = []
         _pmr.append({
             "target": target,
-            "instruction_hash": hashlib.sha1(str(instruction or "").encode("utf-8")).hexdigest()[:12],
+            "instruction_hash": hashlib.sha1(safe_utf8_bytes(instruction)).hexdigest()[:12],
             "round": int(getattr(self, "agent_round_index", 0) or 0),
             "ts": float(now_ts()),
             "focus_id": str(route_row.get("focus_id", "") or ""),
@@ -49674,7 +50694,7 @@ body{padding:18px}
             args_error = str(tc.get("args_error", "")).strip()
             try:
                 if isinstance(args, (dict, list)):
-                    args_text = json.dumps(args, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                    args_text = json_dumps(args, sort_keys=True, separators=(",", ":"))
                 else:
                     args_text = str(args)
             except Exception:
@@ -49684,7 +50704,7 @@ body{padding:18px}
         raw = "||".join(parts)
         if not raw:
             return ""
-        return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+        return hashlib.sha1(safe_utf8_bytes(raw)).hexdigest()
 
     def _inject_forced_convergence_hint(self, tool_names: list[str], reason: str):
         uniq = []
@@ -50830,9 +51850,8 @@ body{padding:18px}
             # Auto-serialize non-string content: if model passes a dict/list, convert to JSON string.
             raw_content = args.get("content", "")
             if not isinstance(raw_content, str):
-                import json as _json
                 try:
-                    raw_content = _json.dumps(raw_content, ensure_ascii=False, indent=2)
+                    raw_content = json_dumps(raw_content, indent=2)
                 except Exception:
                     raw_content = str(raw_content)
             args = dict(args)
@@ -51332,6 +52351,93 @@ body{padding:18px}
             return LIVE_INPUT_DELAY_TOOL_ROUNDS, "tool-phase"
         return LIVE_INPUT_DELAY_NORMAL_ROUNDS, "thinking-phase"
 
+    def _classify_live_input_intent(self, content: str) -> str:
+        """Classify a mid-run user message as 'steer' or 'addendum' (Fix 3).
+
+        steer  = a correction / change of direction / stop / redo — must take
+                 effect immediately and at full weight (the user is course-
+                 correcting the running work).
+        addendum = supplemental info / FYI / 'also do X later' — keep the
+                 existing gentle low-weight, multi-round dilution path.
+
+        Heuristic-first (fast, deterministic, bilingual); LLM fallback only when
+        the heuristic is ambiguous AND the message is short enough to be cheap.
+        Defaults to 'addendum' on any error (preserves prior behavior)."""
+        text = str(content or "").strip()
+        if not text:
+            return "addendum"
+        low = text.lower()
+        # Strong steer signals — imperative correction / stop / redo / redirect.
+        steer_markers_en = (
+            "stop", "wait", "hold on", "hold up", "cancel", "abort", "instead",
+            "don't", "do not", "dont", "no,", "no.", "not that", "change", "redo",
+            "rewrite", "revert", "undo", "scrap", "forget", "actually", "correction",
+            "instead of", "rather than", "switch to", "use ", "drop the", "remove the",
+        )
+        steer_markers_zh = (
+            "停", "停下", "停止", "暂停", "取消", "别", "不要", "不用", "不是", "错了",
+            "改成", "改为", "换成", "换个", "重来", "重写", "重新", "撤销", "回退",
+            "别再", "先别", "而是", "应该是", "不对", "算了", "放弃",
+        )
+        addendum_markers = (
+            "also", "additionally", "by the way", "btw", "fyi", "one more",
+            "and also", "另外", "顺便", "补充", "另外还", "再加", "还有一个", "此外",
+        )
+        has_steer = any(m in low for m in steer_markers_en) or any(m in text for m in steer_markers_zh)
+        has_addendum = any(m in low for m in addendum_markers) or any(m in text for m in addendum_markers)
+        # Clear cases.
+        if has_steer and not has_addendum:
+            return "steer"
+        if has_addendum and not has_steer:
+            return "addendum"
+        # Ambiguous (both or neither): short messages default to steer bias
+        # because a terse mid-run message is usually a course-correction; but a
+        # cheap LLM check resolves it when available.
+        if has_steer and has_addendum:
+            resolved = self._llm_live_input_intent(text)
+            if resolved:
+                return resolved
+            return "steer"
+        # Neither marker: LLM fallback for short messages; else addendum.
+        if len(text) <= 240:
+            resolved = self._llm_live_input_intent(text)
+            if resolved:
+                return resolved
+        return "addendum"
+
+    def _llm_live_input_intent(self, text: str) -> str:
+        """Cheap LLM tie-breaker for live-input intent. Returns 'steer',
+        'addendum', or '' (unavailable/failed → caller keeps its default)."""
+        try:
+            prompt = (
+                "/no_think\n"
+                "A user sent this message WHILE an AI agent was actively working on their task. "
+                "Classify the user's intent as exactly one word:\n"
+                "- steer: they want to STOP, CHANGE DIRECTION, CORRECT, or REDO the current work now.\n"
+                "- addendum: they are adding supplemental info or a low-priority extra request.\n\n"
+                f"Message: {trim(text, 500)}\n\n"
+                "Answer with only 'steer' or 'addendum'."
+            )
+            resp = self.ollama.chat(
+                [{"role": "user", "content": prompt}],
+                system="/no_think\nClassify live user-input intent. One word only.",
+                max_tokens=8,
+                think=False,
+            )
+            out = ""
+            if isinstance(resp, dict):
+                out = str(resp.get("content", "") or "")
+            else:
+                out = str(resp or "")
+            out = out.strip().lower()
+            if "steer" in out:
+                return "steer"
+            if "addendum" in out:
+                return "addendum"
+        except Exception:
+            pass
+        return ""
+
     def _enqueue_running_user_input(self, content: str, *, best_effort: bool = False) -> dict:
         text = trim(str(content or "").strip(), 6000)
         if not text:
@@ -51365,6 +52471,11 @@ body{padding:18px}
                 delay_rounds, delay_reason = LIVE_INPUT_DELAY_TOOL_ROUNDS, "tool-phase"
             else:
                 delay_rounds, delay_reason = LIVE_INPUT_DELAY_NORMAL_ROUNDS, "thinking-phase"
+            intent = self._classify_live_input_intent(text)
+            # A steer must land immediately at full weight — never deferred by
+            # write/tool-phase delay (Fix 3).
+            if intent == "steer":
+                delay_rounds, delay_reason = 0, "steer"
             round_idx = int(getattr(self, "agent_round_index", 0) or 0)
             with self.live_input_queue_lock:
                 self.live_input_seq += 1
@@ -51378,6 +52489,7 @@ body{padding:18px}
                     "applied_count": 0,
                     "last_applied_round": -1,
                     "delay_reason": delay_reason,
+                    "intent": intent,
                     "run_generation": int(getattr(self, "run_generation", 0) or 0),
                     "best_effort": True,
                 }
@@ -51400,6 +52512,9 @@ body{padding:18px}
         with self.lock:
             self.live_input_seq += 1
             delay_rounds, delay_reason = self._live_input_delay_locked()
+            intent = self._classify_live_input_intent(text)
+            if intent == "steer":
+                delay_rounds, delay_reason = 0, "steer"
             round_idx = int(self.agent_round_index)
             row = {
                 "id": int(self.live_input_seq),
@@ -51411,6 +52526,7 @@ body{padding:18px}
                 "applied_count": 0,
                 "last_applied_round": -1,
                 "delay_reason": delay_reason,
+                "intent": intent,
                 "run_generation": int(self.run_generation),
             }
             with self.live_input_queue_lock:
@@ -51541,26 +52657,44 @@ body{padding:18px}
                     self._refresh_runtime_code_reference(content)
                     applied = int(row.get("applied_count", 0) or 0) + 1
                     delay_rounds = int(row.get("delay_rounds", 0) or 0)
-                    base_weight = (
-                        float(LIVE_INPUT_WEIGHT_BASE_DELAYED)
-                        if delay_rounds > 0
-                        else float(LIVE_INPUT_WEIGHT_BASE_NORMAL)
-                    )
-                    weight_step = (
-                        float(LIVE_INPUT_WEIGHT_STEP_DELAYED)
-                        if delay_rounds > 0
-                        else float(LIVE_INPUT_WEIGHT_STEP_NORMAL)
-                    )
-                    weight = min(1.0, base_weight + weight_step * max(0, applied - 1))
-                    priority = "low" if weight < 0.55 else ("medium" if weight < 0.9 else "high")
-                    payload = (
-                        "<live-user-adjustment "
-                        f"id=\"{int(row.get('id', 0) or 0)}\" "
-                        f"priority=\"{priority}\" "
-                        f"weight=\"{weight:.2f}\">"
-                        f"\n{content}\n"
-                        "</live-user-adjustment>"
-                    )
+                    intent = str(row.get("intent", "") or "")
+                    is_steer = intent == "steer"
+                    if is_steer:
+                        # Steer (Fix 3): a genuine course-correction. Inject ONCE
+                        # at full weight with a directive marker, and flag the
+                        # loop to re-plan at the top of the next round — do not
+                        # dilute it across rounds like a background suggestion.
+                        weight = 1.0
+                        priority = "high"
+                        payload = (
+                            "<user-steer "
+                            f"id=\"{int(row.get('id', 0) or 0)}\" priority=\"high\" weight=\"1.00\">"
+                            f"\nThe user sent this instruction WHILE you were working. It is a course-"
+                            f"correction and takes priority NOW — adjust the current work to follow it "
+                            f"before continuing:\n{content}\n"
+                            "</user-steer>"
+                        )
+                    else:
+                        base_weight = (
+                            float(LIVE_INPUT_WEIGHT_BASE_DELAYED)
+                            if delay_rounds > 0
+                            else float(LIVE_INPUT_WEIGHT_BASE_NORMAL)
+                        )
+                        weight_step = (
+                            float(LIVE_INPUT_WEIGHT_STEP_DELAYED)
+                            if delay_rounds > 0
+                            else float(LIVE_INPUT_WEIGHT_STEP_NORMAL)
+                        )
+                        weight = min(1.0, base_weight + weight_step * max(0, applied - 1))
+                        priority = "low" if weight < 0.55 else ("medium" if weight < 0.9 else "high")
+                        payload = (
+                            "<live-user-adjustment "
+                            f"id=\"{int(row.get('id', 0) or 0)}\" "
+                            f"priority=\"{priority}\" "
+                            f"weight=\"{weight:.2f}\">"
+                            f"\n{content}\n"
+                            "</live-user-adjustment>"
+                        )
                     self.messages.append({"role": "user", "content": payload, "ts": now_ts()})
                     # Retain the genuine user text (not the wrapped payload) as a
                     # display bubble, once, on its first injection.
@@ -51572,7 +52706,11 @@ body{padding:18px}
                         self.runtime_reclassify_required = False
                     else:
                         self.runtime_reclassify_required = True
-                    self._mark_runtime_goal_reset_pending(content, reason="live-user-adjustment")
+                    if is_steer:
+                        # Force re-plan at top of next round even under a user
+                        # task-level override (the user is explicitly redirecting).
+                        self._steer_pending = True
+                    self._mark_runtime_goal_reset_pending(content, reason="user-steer" if is_steer else "live-user-adjustment")
                     injected.append(
                         {
                             "id": int(row.get("id", 0) or 0),
@@ -51580,11 +52718,14 @@ body{padding:18px}
                             "priority": priority,
                             "applied": applied,
                             "content": content,
+                            "intent": intent or "addendum",
                         }
                     )
                     row["applied_count"] = applied
                     row["last_applied_round"] = round_idx
-                    if applied < LIVE_INPUT_MAX_INJECTIONS and weight < 0.999:
+                    # Steers are single-shot (already full weight); only addenda
+                    # re-inject to build weight over rounds.
+                    if not is_steer and applied < LIVE_INPUT_MAX_INJECTIONS and weight < 0.999:
                         row["next_round"] = round_idx + LIVE_INPUT_REINJECT_INTERVAL
                         kept.append(row)
                 self.pending_user_inputs = kept[-40:]
@@ -51886,12 +53027,14 @@ body{padding:18px}
                         previous_context=_previous_task_context,
                         clear_progress=True,
                         reset_agent_contexts=True,
+                        archive_messages=True,
                     )
                 elif not (_awaiting_plan_choice or _continue_existing_plan or _resumable_work_state or _ask_user_answer):
                     self._reset_blackboard_plan_state_locked(
                         new_goal=clean_goal_pre,
                         clear_progress=True,
                         reset_agent_contexts=True,
+                        archive_messages=True,
                     )
                 self.run_generation = int(self.run_generation) + 1
                 clean_goal = trim(str(content or "").strip(), 4000)
@@ -52732,7 +53875,7 @@ body{padding:18px}
             # Detect manager loop: same instruction repeated with unchanged progress.
             import hashlib as _hl_mgr
             _delegate_progress_fp = self._watchdog_state_fingerprint(self._ensure_blackboard())
-            _cur_hash = _hl_mgr.sha1((target + "|" + instruction + "|" + _delegate_progress_fp).encode("utf-8")).hexdigest()[:12]
+            _cur_hash = _hl_mgr.sha1(safe_utf8_bytes(target + "|" + instruction + "|" + _delegate_progress_fp)).hexdigest()[:12]
             if _cur_hash == _prev_delegation_hash:
                 _repeat_delegation_count += 1
             else:
@@ -56142,18 +57285,49 @@ body{padding:18px}
                     self.current_phase = "model-call"
                     self.current_tool_name = ""
                 if level_budget > 0 and int(self.agent_round_index) > int(level_budget):
-                    force_single_tool_rounds = max(force_single_tool_rounds, 2)
-                    if not compact_budget_notified:
-                        compact_budget_notified = True
-                        self._emit(
-                            "status",
-                            {
-                                "summary": (
-                                    "single-agent compact mode enabled after internal budget threshold; "
-                                    "continuing with shorter reasoning and concrete actions"
-                                )
-                            },
-                        )
+                    # Anti-degradation (Fix 2): long-horizon tasks (an active
+                    # deliverable quota, or L4/L5) must NOT be forced into
+                    # one-tool-per-round "compact mode" the moment they cross the
+                    # tier budget — that degrades reasoning exactly when a novel /
+                    # paper / big-data task needs it most, producing the 虎头蛇尾
+                    # (strong start, weak finish) failure. Instead we keep full
+                    # reasoning and rely on progress-gated continuation: the round
+                    # loop and finish gate already stop a task that has genuinely
+                    # stalled, while a task still producing real units keeps going.
+                    _dp = self._deliverable_progress()
+                    _long_horizon = bool(_dp.get("active")) or int(self.runtime_task_level or 0) >= 4
+                    if _long_horizon:
+                        if not compact_budget_notified:
+                            compact_budget_notified = True
+                            _rem = int(_dp.get("remaining", 0) or 0)
+                            _detail = (
+                                f"deliverable progress {int(_dp.get('produced', 0))}/{int(_dp.get('target', 0))} "
+                                f"{_dp.get('unit', 'unit')}s remaining={_rem}; "
+                                if _dp.get("active")
+                                else ""
+                            )
+                            self._emit(
+                                "status",
+                                {
+                                    "summary": (
+                                        "single-agent budget threshold crossed on a long-horizon task; "
+                                        f"{_detail}keeping full reasoning (no compact mode) and continuing"
+                                    )
+                                },
+                            )
+                    else:
+                        force_single_tool_rounds = max(force_single_tool_rounds, 2)
+                        if not compact_budget_notified:
+                            compact_budget_notified = True
+                            self._emit(
+                                "status",
+                                {
+                                    "summary": (
+                                        "single-agent compact mode enabled after internal budget threshold; "
+                                        "continuing with shorter reasoning and concrete actions"
+                                    )
+                                },
+                            )
                 if self.cancel_requested:
                     self._emit("status", {"summary": "run interrupted"})
                     break
@@ -56192,12 +57366,18 @@ body{padding:18px}
                     self.messages.append({"role": "user", "content": f"<inbox>{json_dumps(inbox, indent=2)}</inbox>", "ts": now_ts()})
                     self._emit("inbox", {"summary": f"{len(inbox)} inbox messages"})
                 self._inject_pending_user_inputs()
-                if self.runtime_reclassify_required:
-                    # Skip reclassification if user has manually set task level
-                    if int(getattr(self, 'user_task_level_override', 0) or 0) > 0:
+                _sa_steer = bool(getattr(self, "_steer_pending", False))
+                if self.runtime_reclassify_required or _sa_steer:
+                    # Skip reclassification if user set task level — UNLESS this is
+                    # a steer (Fix 3): a mid-run course-correction must re-plan now
+                    # even under a manual level override.
+                    if int(getattr(self, 'user_task_level_override', 0) or 0) > 0 and not _sa_steer:
                         self.runtime_reclassify_required = False
                         self._mark_runtime_goal_reset_handled(reason="single-agent-user-level-override", clear_reclassify=True)
                     else:
+                        if _sa_steer:
+                            self._steer_pending = False
+                            self._emit("status", {"summary": "user steer applied — re-planning (single-agent)"})
                         policy_media_inputs = self._recent_multimodal_inputs()
                         self._emit_multimodal_attach_status(
                             scope="manager reclassify",
@@ -62493,17 +63673,19 @@ function _setPreviewToolbarState(tab){
     if(isHtml)modeBtn.textContent=(String(tab.htmlMode||'preview')==='source')?t('preview_rendered'):t('preview_source');
     modeBtn.onclick=(ev)=>{ev.preventDefault();togglePreviewMode()};
   }
-  // Copy-link + open-in-browser: available for any previewable file with a path. Opening the
-  // page in a real browser tab avoids the cramped/distorted in-pane rendering.
+  // Copy-link + open-in-browser: HTML only. The cramped in-pane iframe distorts rendered
+  // pages, so a real browser tab is the fix; other file kinds (code/images/text) preview
+  // fine in-pane and just get the download button.
+  const canOpen=isHtml&&hasDownload;
   if(linkBtn){
-    linkBtn.classList.toggle('hidden',!hasDownload);
-    linkBtn.disabled=!hasDownload;
+    linkBtn.classList.toggle('hidden',!canOpen);
+    linkBtn.disabled=!canOpen;
     linkBtn.textContent=t('preview_copy_link');
     linkBtn.onclick=(ev)=>{ev.preventDefault();copyPreviewLink()};
   }
   if(openBtn){
-    openBtn.classList.toggle('hidden',!hasDownload);
-    openBtn.disabled=!hasDownload;
+    openBtn.classList.toggle('hidden',!canOpen);
+    openBtn.disabled=!canOpen;
     openBtn.textContent=t('preview_open');
     openBtn.onclick=(ev)=>{ev.preventDefault();openPreviewInBrowser()};
   }
@@ -71667,7 +72849,7 @@ class CodeContentParser:
             "kind": "source_code",
             "mime": str(mime or guess_mime_from_name(fp.name, "text/plain")),
             "size": int(fp.stat().st_size) if fp.exists() and fp.is_file() else len((raw_bytes or b"")),
-            "sha256": _sha256_file(fp) if fp.exists() and fp.is_file() else _sha256_bytes((raw_text or "").encode("utf-8")),
+            "sha256": _sha256_file(fp) if fp.exists() and fp.is_file() else _sha256_bytes(safe_utf8_bytes(raw_text or "")),
             "language": language or "text",
             "text": raw_text,
             "text_chars": len(raw_text),
@@ -74587,9 +75769,9 @@ class WikiStore:
             if isinstance(value, list):
                 lines.append(f"{key}:")
                 for item in value:
-                    lines.append(f"  - {json.dumps(str(item), ensure_ascii=False)}")
+                    lines.append(f"  - {json_dumps(str(item))}")
             else:
-                lines.append(f"{key}: {json.dumps(value, ensure_ascii=False)}")
+                lines.append(f"{key}: {json_dumps(value)}")
         lines.append("---")
         return "\n".join(lines) + "\n\n"
 
@@ -75819,9 +77001,9 @@ class WorkflowMemoryStore:
             if isinstance(value, list):
                 lines.append(f"{key}:")
                 for item in value[:80]:
-                    lines.append(f"  - {json.dumps(str(item), ensure_ascii=False)}")
+                    lines.append(f"  - {json_dumps(str(item))}")
             elif isinstance(value, (str, int, float, bool)):
-                lines.append(f"{key}: {json.dumps(value, ensure_ascii=False)}")
+                lines.append(f"{key}: {json_dumps(value)}")
         lines.append("---")
         return "\n".join(lines) + "\n\n"
 
@@ -80674,7 +81856,7 @@ window.addEventListener('DOMContentLoaded',async()=>{bind();try{await refreshCon
 class AppContext:
     def _llm_config_revision(self, config: dict | None) -> str:
         try:
-            raw = json.dumps(config or {}, ensure_ascii=False, sort_keys=True, default=str)
+            raw = json_dumps(config or {}, sort_keys=True, default=str)
         except Exception:
             raw = json_dumps(config or {})
         return hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()[:16]
@@ -84963,14 +86145,10 @@ class Handler(BaseHTTPRequestHandler):
         return self.app.manager_for_user(self._user_id())
 
     def _read_json(self) -> dict:
-        length = int(self.headers.get("Content-Length", "0") or "0")
-        if length <= 0:
-            return {}
-        body = self.rfile.read(length).decode("utf-8")
-        return json.loads(body) if body else {}
+        return read_http_json_body(self)
 
     def _send_json(self, obj: object, status: int = 200):
-        body = json_dumps(obj).encode("utf-8")
+        body = json_response_bytes(obj)
         try:
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -84991,7 +86169,7 @@ class Handler(BaseHTTPRequestHandler):
         *,
         revalidate_cache: bool = False,
     ):
-        raw_body = text.encode("utf-8")
+        raw_body = safe_utf8_bytes(text)
         etag = ""
         if revalidate_cache:
             etag = f'W/"{len(raw_body):x}-{hashlib.sha1(raw_body).hexdigest()[:16]}"'
@@ -85044,7 +86222,7 @@ class Handler(BaseHTTPRequestHandler):
             raw_name = Path(str(filename or "download.bin")).name or "download.bin"
             ascii_name = unicodedata.normalize("NFKD", raw_name).encode("ascii", "ignore").decode("ascii")
             ascii_name = re.sub(r'[\r\n"\\;]+', "_", ascii_name).strip(" ._") or "download.bin"
-            encoded_name = quote(raw_name.encode("utf-8"), safe="")
+            encoded_name = quote(safe_utf8_bytes(raw_name), safe="")
             disposition = f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{encoded_name}'
             self.send_response(200)
             self.send_header("Content-Type", content_type)
@@ -85568,7 +86746,7 @@ class Handler(BaseHTTPRequestHandler):
             if not sess:
                 return self._send_json({"error": "session not found"}, status=404)
             md = sess.export_conversation_md()
-            return self._send_bytes(md.encode("utf-8"), "text/markdown; charset=utf-8", f"{sess.id}_conversation.md")
+            return self._send_bytes(safe_utf8_bytes(md), "text/markdown; charset=utf-8", f"{sess.id}_conversation.md")
         m = re.match(r"^/api/sessions/([^/]+)/export\.pdf$", path)
         if m:
             sess = mgr.get(m.group(1))
@@ -85830,7 +87008,7 @@ class Handler(BaseHTTPRequestHandler):
             if not sess:
                 return self._send_json({"error": "session not found"}, status=404)
             try:
-                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0) or 0)))
+                body = self._read_json()
             except Exception:
                 body = {}
             pref = str(body.get("preference", "auto") or "auto").strip().lower()
@@ -85844,7 +87022,7 @@ class Handler(BaseHTTPRequestHandler):
             if not sess:
                 return self._send_json({"error": "session not found"}, status=404)
             try:
-                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0) or 0)))
+                body = self._read_json()
             except Exception:
                 body = {}
             level = int(body.get("level", 0) or 0)
@@ -85924,16 +87102,16 @@ class Handler(BaseHTTPRequestHandler):
                 except (ValueError, TypeError):
                     pass
             current_seq = int(sess.event_seq or 0)
-            hello = (
+            hello = safe_utf8_bytes(
                 f"data: {json_dumps({'type': 'hello', 'session_id': sess.id, 'seq': current_seq})}\n\n"
-            ).encode("utf-8")
+            )
             if not self._sse_write(hello):
                 return
             # If client had a previous event ID and there's a gap, send resync
             if last_event_id > 0 and current_seq > last_event_id + 1:
-                resync = (
+                resync = safe_utf8_bytes(
                     f"data: {json_dumps({'type': 'resync', 'reason': 'event_gap', 'last_client_seq': last_event_id, 'current_seq': current_seq})}\n\n"
-                ).encode("utf-8")
+                )
                 if not self._sse_write(resync):
                     return
             while True:
@@ -85941,11 +87119,11 @@ class Handler(BaseHTTPRequestHandler):
                     event = sub.get(timeout=SSE_HEARTBEAT_SECONDS)
                     seq = int(event.get("seq", 0) or 0) if isinstance(event, dict) else 0
                     if seq > 0:
-                        chunk = f"id: {seq}\ndata: {json_dumps(event)}\n\n".encode("utf-8")
+                        chunk = safe_utf8_bytes(f"id: {seq}\ndata: {json_dumps(event)}\n\n")
                     else:
-                        chunk = f"data: {json_dumps(event)}\n\n".encode("utf-8")
+                        chunk = safe_utf8_bytes(f"data: {json_dumps(event)}\n\n")
                 except queue.Empty:
-                    chunk = f": ping {int(now_ts())}\n\n".encode("utf-8")
+                    chunk = safe_utf8_bytes(f": ping {int(now_ts())}\n\n")
                 if not self._sse_write(chunk):
                     break
         except Exception as exc:
@@ -85986,14 +87164,10 @@ class SkillsHandler(BaseHTTPRequestHandler):
         return self.app.manager_for_user(self._user_id())
 
     def _read_json(self) -> dict:
-        length = int(self.headers.get("Content-Length", "0") or "0")
-        if length <= 0:
-            return {}
-        body = self.rfile.read(length).decode("utf-8")
-        return json.loads(body) if body else {}
+        return read_http_json_body(self)
 
     def _send_json(self, obj: object, status: int = 200):
-        body = json_dumps(obj).encode("utf-8")
+        body = json_response_bytes(obj)
         try:
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -86007,7 +87181,7 @@ class SkillsHandler(BaseHTTPRequestHandler):
             raise
 
     def _send_text(self, text: str, content_type: str = "text/plain; charset=utf-8", status: int = 200):
-        body = text.encode("utf-8")
+        body = safe_utf8_bytes(text)
         try:
             self.send_response(status)
             self.send_header("Content-Type", content_type)
@@ -86190,14 +87364,10 @@ class RagAdminHandler(BaseHTTPRequestHandler):
         return user_id_from_ip(self._client_ip())
 
     def _read_json(self) -> dict:
-        length = int(self.headers.get("Content-Length", "0") or "0")
-        if length <= 0:
-            return {}
-        body = self.rfile.read(length).decode("utf-8")
-        return json.loads(body) if body else {}
+        return read_http_json_body(self)
 
     def _send_json(self, obj: object, status: int = 200):
-        body = json_dumps(obj).encode("utf-8")
+        body = json_response_bytes(obj)
         try:
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -86211,7 +87381,7 @@ class RagAdminHandler(BaseHTTPRequestHandler):
             raise
 
     def _send_text(self, text: str, content_type: str = "text/plain; charset=utf-8", status: int = 200):
-        body = text.encode("utf-8")
+        body = safe_utf8_bytes(text)
         try:
             self.send_response(status)
             self.send_header("Content-Type", content_type)
@@ -86361,14 +87531,10 @@ class CodeAdminHandler(BaseHTTPRequestHandler):
         return user_id_from_ip(self._client_ip())
 
     def _read_json(self) -> dict:
-        length = int(self.headers.get("Content-Length", "0") or "0")
-        if length <= 0:
-            return {}
-        body = self.rfile.read(length).decode("utf-8")
-        return json.loads(body) if body else {}
+        return read_http_json_body(self)
 
     def _send_json(self, obj: object, status: int = 200):
-        body = json_dumps(obj).encode("utf-8")
+        body = json_response_bytes(obj)
         try:
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -86382,7 +87548,7 @@ class CodeAdminHandler(BaseHTTPRequestHandler):
             raise
 
     def _send_text(self, text: str, content_type: str = "text/plain; charset=utf-8", status: int = 200):
-        body = text.encode("utf-8")
+        body = safe_utf8_bytes(text)
         try:
             self.send_response(status)
             self.send_header("Content-Type", content_type)
@@ -86550,14 +87716,10 @@ class IdeHandler(BaseHTTPRequestHandler):
         return user_id_from_ip(self._client_ip())
 
     def _read_json(self) -> dict:
-        length = int(self.headers.get("Content-Length", "0") or "0")
-        if length <= 0:
-            return {}
-        body = self.rfile.read(length).decode("utf-8")
-        return json.loads(body) if body else {}
+        return read_http_json_body(self)
 
     def _send_json(self, obj: object, status: int = 200):
-        body = json_dumps(obj).encode("utf-8")
+        body = json_response_bytes(obj)
         try:
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -86571,7 +87733,7 @@ class IdeHandler(BaseHTTPRequestHandler):
             raise
 
     def _send_text(self, text: str, content_type: str = "text/plain; charset=utf-8", status: int = 200):
-        body = text.encode("utf-8")
+        body = safe_utf8_bytes(text)
         try:
             self.send_response(status)
             self.send_header("Content-Type", content_type)
@@ -86815,14 +87977,10 @@ class McpServiceHandler(BaseHTTPRequestHandler):
         return getattr(self.app, "mcp", None)
 
     def _read_json(self) -> dict:
-        length = int(self.headers.get("Content-Length", "0") or "0")
-        if length <= 0:
-            return {}
-        body = self.rfile.read(length).decode("utf-8")
-        return json.loads(body) if body else {}
+        return read_http_json_body(self)
 
     def _send_json(self, obj: object, status: int = 200):
-        body = json_dumps(obj).encode("utf-8")
+        body = json_response_bytes(obj)
         try:
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -86836,7 +87994,7 @@ class McpServiceHandler(BaseHTTPRequestHandler):
             raise
 
     def _send_html(self, text: str, status: int = 200):
-        body = text.encode("utf-8")
+        body = safe_utf8_bytes(text)
         try:
             self.send_response(status)
             self.send_header("Content-Type", "text/html; charset=utf-8")
