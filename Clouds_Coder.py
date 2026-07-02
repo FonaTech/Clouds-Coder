@@ -155,6 +155,11 @@ RAG_LIBRARY_DIRNAME = "RAG_Library"
 RAG_ADMIN_PORT_OFFSET = 2
 CODE_LIBRARY_DIRNAME = "Code_Library"
 CODE_ADMIN_PORT_OFFSET = 3
+MCP_SERVICE_PORT_OFFSET = 4
+# IDE follows the agent port like every other service (skills+1/rag+2/code+3/mcp+4),
+# at +5, instead of squatting on a fixed port that would collide with mcp-service at the
+# default --port. IDE_DEFAULT_PORT is kept only as a pre-config fallback constant.
+IDE_PORT_OFFSET = 5
 IDE_DEFAULT_PORT = 8084
 WEB_SEARCH_INDEX_DIRNAME = "Web_Search_Index"
 DEFAULT_WEB_SEARCH_ENABLED = True
@@ -165,6 +170,10 @@ USER_MEMORY_MODE_CHOICES = {"off", "weak", "on"}
 DEFAULT_USER_MEMORY_MODE = "weak"
 USER_MEMORY_WEAK_CAPSULE_CHARS = 1200
 USER_MEMORY_ON_CAPSULE_CHARS = 2200
+# Uniform per-injection budget for the prompt capsule, applied regardless of mode
+# so per-turn token cost is the SAME whether memory is weak or on (mode governs how
+# much is stored/queried + capsule richness at build time, not hot-path weight).
+USER_MEMORY_CAPSULE_INJECT_CHARS = 600
 USER_MEMORY_MAX_SUMMARY_CHARS = 1200
 USER_MEMORY_QUERY_LIMIT = 8
 USER_MEMORY_DECAY_HALFLIFE_DAYS = 45.0
@@ -186,7 +195,20 @@ WEB_SEARCH_CONTEXT_NODE_MAX = 18
 WEB_SEARCH_CONTEXT_URL_MAX = 12
 RAG_CHUNK_CHARS = 1200
 RAG_CHUNK_OVERLAP = 180
-RAG_MAX_CHUNKS_PER_DOC = 500
+# Per-document chunk ceiling. Books need far more than a typical doc, so this is generous;
+# it is the hard upper bound that keeps a single pathological file from exhausting memory.
+RAG_MAX_CHUNKS_PER_DOC = 20000
+# Max characters retained from ONE source document before chunking. Sized for book-length
+# inputs (~12M chars ≈ several thousand pages) while staying bounded so ingest memory/time
+# can't run away. At RAG_CHUNK_CHARS/overlap this yields well under RAG_MAX_CHUNKS_PER_DOC,
+# so the two caps stay consistent. Env-overridable, clamped to a safe envelope.
+RAG_MAX_DOCUMENT_CHARS = max(
+    150_000,
+    min(
+        40_000_000,
+        int(str(os.getenv("AGENT_RAG_MAX_DOCUMENT_CHARS", str(12_000_000)) or str(12_000_000))),
+    ),
+)
 CODE_CHUNK_CHARS = 1800
 CODE_CHUNK_OVERLAP = 120
 CODE_MAX_CHUNKS_PER_DOC = 260
@@ -194,6 +216,26 @@ RAG_MAX_QUERY_RESULTS = 64
 RAG_HIGH_RECALL_POOL_MULTIPLIER = 4
 RAG_HIGH_RECALL_MIN_POOL = 64
 RAG_RETRIEVAL_MAX_PER_DOC = 5
+# BM25 lexical ranking (Okapi). k1 controls term-frequency saturation; b controls
+# length normalization (0 = none, 1 = full). These replace the older TF-IDF cosine
+# scoring which over-penalized long chunks and saturated term frequency poorly.
+RAG_BM25_K1 = 1.5
+RAG_BM25_B = 0.6
+# BM25 saturation constant for mapping a raw BM25 sum into [0,1] via raw/(raw+sat). This
+# is POOL-INDEPENDENT (unlike min-max), so a uniformly-weak result set stays low instead
+# of being forced to 1.0 — preserving the absolute-relevance signal the no-evidence and
+# synthesis thresholds (RAG_NO_EVIDENCE_THRESHOLD / RAG_MIN_SYNTHESIS_SCORE) depend on.
+# Calibrated so a single strong rare-term match (~idf 3-5) clears the no-evidence gate
+# while a near-zero match stays below it.
+RAG_BM25_SATURATION = 4.0
+# Exact-symbol / exact-identifier match boost added on top of normalized BM25 when a
+# query term equals a chunk's defining symbol or a document filename stem. Scaled by
+# symbol rarity (rarer symbol → closer to the full boost) so common names don't dominate.
+RAG_SYMBOL_EXACT_BOOST = 0.5
+# Index snapshot format tag. Bumping this invalidates older on-disk snapshots that lack
+# BM25 fields (raw-tf postings + chunk_lengths), forcing a one-time rebuild from the
+# persisted documents/chunks (the real source of truth) instead of scoring incorrectly.
+RAG_INDEX_SNAPSHOT_FORMAT = "bm25-v1"
 RAG_GRAPH_MAX_NODES = 2000
 RAG_TASK_HISTORY_LIMIT = 400
 RAG_MODEL_MEDIA_MAX_BYTES = 8 * 1024 * 1024
@@ -850,6 +892,13 @@ ACCEPTANCE_GATE_STALL_THRESHOLD = 3
 # recovery and ask the user. We NEVER force-advance a step that has not genuinely
 # passed; repair continues unbounded as long as progress is being made.
 ACCEPTANCE_GATE_HARD_CEILING = 6  # consecutive no-progress rounds before escalating to the user
+# Fix 6 — per-step OUTCOME-progress deadlock guard. Independent of the repair
+# signature (which churns when the worker keeps changing APPROACH, masking a real
+# deadlock). This counts consecutive non-advancing rounds where the step's
+# OUTCOME did not improve (no new completed subtask AND no measured move toward
+# the quality bar). At the ceiling, escalate to the user — this is the escape a
+# genuinely-stuck-but-actively-working single-agent step never had.
+STEP_ACTIVE_STALL_CEILING = 8
 PLAN_MODE_MANAGER_SYNTHESIS_MAX_TOKENS = 8192
 PLAN_MODE_MAX_OPTIONS = 3
 PLAN_FILE_RELATIVE_PATH = ".clouds_coder/plan.md"
@@ -861,6 +910,9 @@ PLAN_MODE_RESEARCH_TOOL_ALLOWLIST = {
     "bash", "read_file", "context_recall", "task_get", "task_list",
     "check_background", "read_from_blackboard", "write_to_blackboard",
     "list_skills", "load_skill", "compress", "agent_web_search",
+    # rag_remember writes only to the RAG knowledge library (never user files), so it is
+    # safe during read-only planning — analogous to write_to_blackboard scratch persistence.
+    "rag_remember",
 }
 FAILURE_LEDGER_MAX_FIXES = 20
 FAILURE_LEDGER_MAX_COMPILE_ERRORS = 15
@@ -3239,8 +3291,65 @@ def runtime_environment_context_block(snapshot: dict) -> str:
         "Do not infer the current year from model memory. If a market or jurisdiction calendar matters and is not in this block, verify it with tools and state any uncertainty."
     )
 
-def json_dumps(obj: object, *, indent: int | None = None) -> str:
-    return json.dumps(obj, ensure_ascii=False, indent=indent)
+def safe_utf8_bytes(text: object) -> bytes:
+    return str(text).encode("utf-8", errors="backslashreplace")
+
+def escape_invalid_utf8_text(text: object) -> str:
+    return safe_utf8_bytes(text).decode("utf-8")
+
+def sanitize_utf8_surrogates(value: object) -> object:
+    if isinstance(value, str):
+        return escape_invalid_utf8_text(value)
+    if isinstance(value, list):
+        return [sanitize_utf8_surrogates(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(sanitize_utf8_surrogates(item) for item in value)
+    if isinstance(value, dict):
+        return {
+            sanitize_utf8_surrogates(key): sanitize_utf8_surrogates(val)
+            for key, val in value.items()
+        }
+    return value
+
+def decode_utf8_replace(data: bytes | bytearray | str) -> str:
+    if isinstance(data, str):
+        return escape_invalid_utf8_text(data)
+    return bytes(data).decode("utf-8", errors="replace")
+
+def json_dumps(
+    obj: object,
+    *,
+    indent: int | None = None,
+    ensure_ascii: bool = False,
+    sort_keys: bool = False,
+    separators: tuple[str, str] | None = None,
+    default=None,
+) -> str:
+    kwargs = {
+        "ensure_ascii": ensure_ascii,
+        "indent": indent,
+        "sort_keys": sort_keys,
+    }
+    if separators is not None:
+        kwargs["separators"] = separators
+    if default is not None:
+        kwargs["default"] = default
+    raw = json.dumps(obj, **kwargs)
+    return escape_invalid_utf8_text(raw)
+
+def json_response_bytes(obj: object) -> bytes:
+    return safe_utf8_bytes(json_dumps(obj))
+
+def read_http_json_body(handler: BaseHTTPRequestHandler) -> dict:
+    length = int(handler.headers.get("Content-Length", "0") or "0")
+    if length <= 0:
+        return {}
+    body = decode_utf8_replace(handler.rfile.read(length))
+    if not body:
+        return {}
+    parsed = json.loads(body)
+    parsed = sanitize_utf8_surrogates(parsed)
+    return parsed if isinstance(parsed, dict) else {}
 
 def make_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:8]}"
@@ -3695,7 +3804,7 @@ def cache_external_js_url(js_root: Path, url: str) -> tuple[Path | None, str]:
     parsed = urlparse(target_url)
     base = Path(parsed.path).name.strip()
     if not base or "." not in base:
-        h = _sha256_bytes(target_url.encode("utf-8"))[:10]
+        h = _sha256_bytes(safe_utf8_bytes(target_url))[:10]
         base = f"external_{h}.js"
     fname = _safe_js_filename(base, "external.js")
     ext_root = (js_root / "external").resolve()
@@ -5376,7 +5485,7 @@ def compress_text_blob(text: str) -> str:
     src = str(text or "")
     if not src:
         return ""
-    raw = src.encode("utf-8")
+    raw = safe_utf8_bytes(src)
     return base64.b64encode(zlib.compress(raw, 6)).decode("ascii")
 
 def decompress_text_blob(blob_b64: str) -> str:
@@ -5818,7 +5927,7 @@ def probe_ollama_environment(base_url: str, timeout: int = 4) -> tuple[bool, lis
     req = Request(url, method="GET")
     try:
         with urlopen(req, timeout=timeout) as resp:
-            raw = json.loads(resp.read().decode("utf-8"))
+            raw = json.loads(decode_utf8_replace(resp.read()))
         tags: list[str] = []
         for item in raw.get("models", []):
             name = item.get("name")
@@ -5955,7 +6064,7 @@ def check_ollama_model_ready(base_url: str, model: str, timeout: int = 10) -> tu
     }
     req = Request(
         url,
-        data=json_dumps(payload).encode("utf-8"),
+        data=safe_utf8_bytes(json_dumps(payload)),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
@@ -5977,7 +6086,7 @@ def list_loaded_ollama_models(base_url: str, timeout: int = 5) -> list[str]:
     req = Request(url, method="GET")
     try:
         with urlopen(req, timeout=timeout) as resp:
-            raw = json.loads(resp.read().decode("utf-8"))
+            raw = json.loads(decode_utf8_replace(resp.read()))
         out: list[str] = []
         for item in raw.get("models", []) if isinstance(raw, dict) else []:
             name = str(item.get("name", "") or "").strip()
@@ -6001,7 +6110,7 @@ def wake_ollama_model(base_url: str, model: str, timeout: int = 30) -> tuple[boo
     }
     req = Request(
         url,
-        data=json_dumps(payload).encode("utf-8"),
+        data=safe_utf8_bytes(json_dumps(payload)),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
@@ -7251,7 +7360,7 @@ def user_id_from_ip(ip: str) -> str:
     raw = str(ip or "").strip()
     if raw.lower().startswith("::ffff:"):
         raw = raw.split("::ffff:", 1)[1].strip()
-    token = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+    token = hashlib.sha256(safe_utf8_bytes(raw)).hexdigest()[:12]
     safe_ip = re.sub(r"[^A-Za-z0-9._-]", "_", raw)
     return f"user_{safe_ip}_{token}"
 
@@ -7291,7 +7400,7 @@ class CryptoBox:
         return bytes(out)
 
     def encrypt_text(self, text: str) -> str:
-        payload = text.encode("utf-8")
+        payload = safe_utf8_bytes(text)
         nonce = os.urandom(16)
         ct = self._stream_xor(payload, nonce)
         mac = hmac.new(self.key, nonce + ct, hashlib.sha256).hexdigest()
@@ -8463,7 +8572,7 @@ def ensure_embedded_skills_at_root(skills_root: Path, workdir: Path = WORKDIR, o
         "updated_at": int(time.time()),
         "root": str(target),
     }
-    state_path.write_text(json.dumps(state_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    state_path.write_text(json_dumps(state_payload, indent=2), encoding="utf-8")
     return target
 
 
@@ -8747,7 +8856,7 @@ def analyze_skill_building_knowledge(workdir: Path = WORKDIR) -> dict:
             rel = fp.resolve().relative_to(workdir.resolve()).as_posix()
         except Exception:
             rel = str(fp)
-        sources.append({"path": rel, "bytes": len(raw.encode("utf-8"))})
+        sources.append({"path": rel, "bytes": len(safe_utf8_bytes(raw))})
         low = raw.lower()
         if "layer 1" in low and "layer 2" in low:
             push(rules, "Use two-layer loading: keep skill metadata cheap in prompt, load full body only on demand.")
@@ -10247,7 +10356,7 @@ def main() -> int:
         "evidence_csv": str(csv_path.name),
         "experiment_md": str((outdir / "experiment_plan.md").name),
     }
-    _write_text(outdir / "report_bundle.json", json.dumps(bundle, indent=2, ensure_ascii=False) + "\n")
+    _write_text(outdir / "report_bundle.json", json_dumps(bundle, indent=2) + "\n")
     print(str(outdir))
     return 0
 
@@ -11556,6 +11665,7 @@ def ensure_generated_runtime_skills_manifest(skills_root: Path):
         "generated/frontend-composition-algorithm/SKILL.md",
         "generated/visualization-report-pipeline/SKILL.md",
         "generated/offline-html-js-bundling/SKILL.md",
+        "generated/novel-architect/SKILL.md",
     ]
     present = [rel for rel in tracked if (skills_root / rel).exists()]
     payload = {
@@ -12113,6 +12223,273 @@ def ensure_generated_mcp_builder_skill(skills_root: Path):
     root = skills_root / "mcp-builder"
     _write_text_if_changed(root / "SKILL.md", MCP_BUILDER_SKILL_MD)
 
+NOVEL_ARCHITECT_SKILL_MD = r'''---
+name: novel-architect
+description: Design and write long-form fiction with a closed-loop story bible,
+  chapter ledger, length control, continuity tracking, character arcs, plot
+  planning, and quality audits so later chapters do not shrink or degrade.
+---
+
+# Novel Architect / 小说架构师
+
+Use this skill when the user wants to create, plan, draft, revise, or continue a
+novel, web novel, series, novella, serialized story, or long-form fiction. This
+skill is optimized for stable long-run quality: outline, story thread,
+background, characters, plot, chapters, continuity, length, and revision are
+managed as one closed loop.
+
+当用户要求创作、规划、续写、改写、连载或完整生成小说时使用本 skill。核心目标是让模型始终
+知道“现在写到哪里、每章要写什么、目标多长、实际多长、质量是否下滑、前后是否衔接”，避免
+后期章节缩水、剧情变成摘要、人物失真、伏笔遗忘、质量和连贯性逐步变差。
+
+## Operating Principles / 工作原则
+
+- Treat long fiction as a managed production system, not one-shot prose.
+- Keep a living story bible before and during drafting.
+- Maintain a chapter ledger after every chapter or batch.
+- Track target length, actual length, plot function, continuity impact, and
+  quality state for each chapter.
+- Do not continue blindly if quality, word count, tone, pacing, or continuity
+  trends degrade. Diagnose and repair first.
+- Write complete scenes by default. Do not compress later chapters into summaries
+  unless the user explicitly asks for summary mode.
+- Prefer consistent, recoverable structure over improvising until the context is
+  lost.
+
+## Intake / 需求确认
+
+If the user has not provided enough constraints, ask only for the missing
+high-impact items. Otherwise infer reasonable defaults and state them briefly.
+
+Minimum useful inputs:
+
+- Language, genre, audience, rating, and tone.
+- Desired length: total words, chapter count, or target words per chapter.
+- POV, tense, style references, taboo content, and must-have elements.
+- Premise, protagonist, central conflict, ending direction, and serialization
+  cadence if relevant.
+
+Default assumptions when the user does not specify:
+
+- Language: follow the user's language.
+- Form: chaptered long-form fiction.
+- Chapter target: 2,500 to 4,000 Chinese characters or 1,500 to 2,500 English
+  words unless the user requests otherwise.
+- Length tolerance: each drafted chapter should stay within +/- 15% of target.
+- Audit cadence: review every 3 to 5 chapters, and always before a major arc
+  transition.
+
+## Closed-Loop Workflow / 闭环流程
+
+### 1. Story Bible / 故事圣经
+
+Create or refresh a compact but complete story bible before drafting long-form
+content.
+
+Required fields:
+
+- Logline / 一句话故事
+- Genre promise / 类型承诺
+- Theme and emotional thesis / 主题与情感命题
+- World and background / 世界观与背景
+- Rules, limits, and forbidden contradictions / 规则、限制、不能违反的设定
+- Main cast / 主要人物
+- Character goals, wounds, masks, relationships, and arcs / 人物目标、创伤、
+  伪装、关系与成长线
+- Antagonistic forces / 反派或阻力系统
+- Plot spine / 主线脊柱
+- Subplots / 支线
+- Timeline / 时间线
+- Foreshadowing and payoff register / 伏笔与回收表
+- Tone, style, POV, pacing, and narration constraints / 风格与叙事约束
+
+### 2. Chapter Map / 章节总表
+
+Before writing multiple chapters, build a chapter map. Each chapter needs a
+chapter card.
+
+Chapter card template:
+
+```markdown
+## Chapter <N>: <Title>
+- Target length:
+- Plot function:
+- Opening state:
+- Core beats:
+- Characters present:
+- Character movement:
+- World/background updates:
+- Continuity dependencies:
+- Foreshadowing planted or paid off:
+- Ending hook:
+- Risks to avoid:
+```
+
+Every chapter must have a reason to exist. If a chapter has no plot function,
+character movement, information change, pressure change, or emotional turn,
+merge it, replace it, or redesign it.
+
+### 3. Drafting Contract / 章节写作契约
+
+Before writing each chapter, restate the active chapter card in concise form.
+Then draft the chapter according to this contract:
+
+- Hit the agreed target length range unless the user asks for a different
+  length.
+- Maintain full scene density: action, dialogue, sensory detail, conflict,
+  decision, consequence.
+- Carry forward the previous chapter's ending state exactly.
+- Advance at least one of: main plot, character arc, relationship, mystery,
+  world pressure, or thematic contradiction.
+- Preserve the established POV, tense, tone, and prose style.
+- Do not skip promised confrontations, reveals, or emotional consequences.
+- Do not solve conflicts only because the outline needs progress; make causality
+  visible on the page.
+
+### 4. Chapter Ledger / 章节账本
+
+After each chapter or batch, update a ledger. If the user asks for only prose,
+keep this ledger internally or provide a compact version after the chapter.
+
+Ledger template:
+
+```markdown
+## Ledger After Chapter <N>
+- Actual length:
+- Length status: on target / short / long
+- Key events:
+- Character state changes:
+- Relationship changes:
+- World/background changes:
+- Foreshadowing planted:
+- Foreshadowing paid off:
+- Open hooks:
+- Continuity dependencies for next chapter:
+- Quality score, 1-10:
+- Revision flags:
+```
+
+### 5. Pre-Next-Chapter Check / 下一章前检查
+
+Before continuing, check:
+
+- Is the next chapter's opening state consistent with the previous ending?
+- Did any character forget knowledge, injury, motive, promise, or relationship
+  status?
+- Is the target length trend stable?
+- Is the prose becoming more compressed than earlier chapters?
+- Are subplots and foreshadowing still being maintained?
+- Is tension escalating, varying, or resolving intentionally?
+- Does the next chapter still serve the current arc and the book-level promise?
+
+If any answer is unsafe, repair the plan or revise the previous chapter before
+continuing.
+
+## Quality Drift Prevention / 防止后期质量下滑
+
+Use these gates throughout long generation:
+
+- Length gate: if two consecutive chapters are more than 15% short, stop and
+  restore scene density before continuing.
+- Compression gate: if narration turns into outline-like summary, expand into
+  scenes with conflict, dialogue, decision, and consequence.
+- Continuity gate: if a contradiction appears, list the conflict and choose one
+  canonical version before writing more.
+- Character gate: if a character acts only to satisfy the plot, reconnect the
+  action to goal, fear, pressure, relationship, or prior decision.
+- Pacing gate: if chapters repeat the same emotional shape, vary scene type,
+  pressure source, revelation, or consequence.
+- Promise gate: if the story drifts away from genre promise or core premise,
+  revise the next chapter map before drafting.
+- Arc gate: at chapter milestones, confirm each major arc has movement, delay,
+  reversal, or payoff.
+
+Never hide a quality drop. If quality is declining, say what changed, repair the
+chapter card or story bible, then continue.
+
+## Milestone Audit / 阶段审计
+
+Every 3 to 5 chapters, or before any major arc transition, run a compact audit:
+
+```markdown
+## Milestone Audit
+- Length stability:
+- Plot progress:
+- Character arc progress:
+- Continuity risks:
+- Unresolved hooks:
+- Foreshadowing status:
+- Tone/style drift:
+- Pacing balance:
+- Scenes needing expansion:
+- Plan adjustments:
+```
+
+## Output Modes / 输出模式
+
+Choose the smallest complete mode that satisfies the user:
+
+- Architecture mode: story bible + chapter map, no prose yet.
+- Chapter mode: one chapter with pre-card and post-ledger.
+- Batch mode: several chapters, each with ledger, plus batch audit.
+- Continuation mode: reconstruct current bible and ledger from provided text,
+  then continue without contradicting it.
+- Revision mode: diagnose and rewrite weak chapters while preserving canon.
+
+For very long novels, do not attempt to write the entire book in one response.
+Build the bible and chapter map first, then write in controlled chapters or
+batches with ledgers.
+
+## Response Shape / 推荐响应结构
+
+For planning:
+
+```markdown
+# Story Bible
+# Chapter Map
+# Quality Control Rules
+# Next Step
+```
+
+For a chapter:
+
+```markdown
+# Chapter Card
+# Chapter <N>: <Title>
+# Chapter Ledger
+```
+
+For continuation:
+
+```markdown
+# Reconstructed Current State
+# Continuity Risks
+# Next Chapter Card
+# Chapter <N>: <Title>
+# Chapter Ledger
+```
+
+## Hard Rules / 硬性规则
+
+- Do not let later chapters shrink unless the user explicitly requests shorter
+  chapters.
+- Do not replace scenes with summaries in later chapters.
+- Do not ignore the story bible when drafting.
+- Do not continue through continuity conflicts; resolve them first.
+- Do not introduce major new lore, powers, institutions, or relationships
+  without recording them in the bible or ledger.
+- Do not make every chapter the same rhythm. Vary pressure, scene type, emotional
+  charge, and information flow.
+- Do not end a chapter without knowing what state the next chapter inherits.
+- Always preserve the reader-facing illusion of a coherent novel, while using
+  the ledger privately or visibly to keep the production stable.
+'''
+
+def ensure_generated_novel_architect_skill(skills_root: Path):
+    """Materialize the novel-architect skill to disk on demand."""
+    root = skills_root / "generated" / "novel-architect"
+    _write_text_if_changed(root / "SKILL.md", NOVEL_ARCHITECT_SKILL_MD)
+
 def ensure_runtime_skills(skills_root: Path):
     ensure_embedded_skills_at_root(skills_root, workdir=WORKDIR, overwrite_existing=False)
     ensure_generated_mcp_builder_skill(skills_root)
@@ -12129,6 +12506,7 @@ def ensure_runtime_skills(skills_root: Path):
     ensure_generated_research_scientific_skills(skills_root)
     ensure_generated_rag_mastery_skills(skills_root)
     ensure_generated_multimodal_comprehension_skills(skills_root)
+    ensure_generated_novel_architect_skill(skills_root)
     ensure_generated_runtime_skills_manifest(skills_root)
     ensure_embedded_clawhub_skills(skills_root)
 
@@ -12992,7 +13370,7 @@ class SkillStore:
         req = Request(endpoint, method="GET")
         try:
             with urlopen(req, timeout=timeout) as resp:
-                payload = json.loads(resp.read().decode("utf-8"))
+                payload = json.loads(decode_utf8_replace(resp.read()))
         except Exception as exc:
             self.warnings.append(f"{manifest_path.name}: HTTP provider fetch failed: {exc}")
             return
@@ -14362,7 +14740,7 @@ class MCPServerProcess:
             if raw == b"" or raw == "":
                 break  # EOF — process exited
             try:
-                line = raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
+                line = decode_utf8_replace(raw) if isinstance(raw, (bytes, bytearray)) else escape_invalid_utf8_text(raw)
             except Exception:
                 continue
             line = line.strip()
@@ -14370,6 +14748,7 @@ class MCPServerProcess:
                 continue
             try:
                 msg = json.loads(line)
+                msg = sanitize_utf8_surrogates(msg)
             except Exception:
                 # Some servers emit non-JSON banner lines on stdout; ignore them.
                 continue
@@ -14389,7 +14768,11 @@ class MCPServerProcess:
             if not raw:
                 break
             try:
-                line = (raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else str(raw)).rstrip()
+                line = (
+                    decode_utf8_replace(raw)
+                    if isinstance(raw, (bytes, bytearray))
+                    else escape_invalid_utf8_text(raw)
+                ).rstrip()
             except Exception:
                 continue
             if line:
@@ -14430,7 +14813,7 @@ class MCPServerProcess:
     def _send_raw(self, obj: dict):
         if not self.proc or not self.proc.stdin:
             raise RuntimeError("process not running")
-        data = (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
+        data = safe_utf8_bytes(json_dumps(sanitize_utf8_surrogates(obj)) + "\n")
         with self._write_lock:
             try:
                 self.proc.stdin.write(data)
@@ -14488,24 +14871,25 @@ class MCPServerProcess:
         if isinstance(content, list):
             for block in content:
                 if not isinstance(block, dict):
-                    parts.append(str(block))
+                    parts.append(escape_invalid_utf8_text(block))
                     continue
                 btype = str(block.get("type", "") or "")
                 if btype == "text":
-                    parts.append(str(block.get("text", "")))
+                    parts.append(escape_invalid_utf8_text(block.get("text", "")))
                 elif btype in ("image", "audio"):
                     mime = str(block.get("mimeType", "") or "binary")
                     parts.append(f"[{btype} content: {mime}]")
                 elif btype == "resource":
                     rsrc = block.get("resource", {}) if isinstance(block.get("resource"), dict) else {}
-                    parts.append(str(rsrc.get("text", "") or f"[resource: {rsrc.get('uri','')}]"))
+                    parts.append(escape_invalid_utf8_text(rsrc.get("text", "") or f"[resource: {rsrc.get('uri','')}]"))
                 else:
-                    parts.append(json.dumps(block, ensure_ascii=False))
+                    parts.append(json_dumps(block))
         text = "\n".join(p for p in parts if p != "")
         if not text:
             sc = res.get("structuredContent")
             if sc is not None:
-                text = json.dumps(sc, ensure_ascii=False)
+                text = json_dumps(sc)
+        text = escape_invalid_utf8_text(text)
         if len(text) > _MCP_MAX_RESULT_CHARS:
             text = text[:_MCP_MAX_RESULT_CHARS] + "\n…(mcp result truncated)"
         if is_error:
@@ -14580,7 +14964,7 @@ class MCPManager:
         a health snapshot that the prompt layer folds in so the model perceives
         live server state and hot-swapped tools at call time.
 
-    Mounted once at app level (one service on ide_port+1); all sessions share it.
+    Mounted once at app level (one service on agent port + 4); all sessions share it.
     Thread-safety: every mutation of servers/specs/route is lock-guarded.
     """
 
@@ -15282,13 +15666,13 @@ class OllamaClient:
             req_headers.update(headers)
         req = Request(
             url,
-            data=json_dumps(payload).encode("utf-8"),
+            data=safe_utf8_bytes(json_dumps(payload)),
             headers=req_headers,
             method="POST",
         )
         try:
             with urlopen(req, timeout=self.timeout) as resp:
-                body = resp.read().decode("utf-8")
+                body = decode_utf8_replace(resp.read())
                 return json.loads(body) if body else {}
         except HTTPError as exc:
             text = exc.read().decode("utf-8", errors="replace")
@@ -15377,7 +15761,7 @@ class OllamaClient:
             req_headers.update(headers)
         req = Request(
             url,
-            data=json_dumps(payload).encode("utf-8"),
+            data=safe_utf8_bytes(json_dumps(payload)),
             headers=req_headers,
             method="POST",
         )
@@ -15481,7 +15865,7 @@ class OllamaClient:
             req_headers.update(headers)
         req = Request(
             url,
-            data=json_dumps(payload).encode("utf-8"),
+            data=safe_utf8_bytes(json_dumps(payload)),
             headers=req_headers,
             method="POST",
         )
@@ -16637,7 +17021,7 @@ class OllamaClient:
         chunk_count = 0
 
         def _handle_payload(raw_text: str):
-            nonlocal chunk_count, event_name
+            nonlocal chunk_count
             text = str(raw_text or "").strip()
             if not text:
                 return
@@ -17230,6 +17614,26 @@ TOOLS = [
         },
     ),
     tool_def(
+        "rag_remember",
+        (
+            "Save a useful reference, finding, or snippet into the RAG knowledge library so it "
+            "is retrievable in this and future sessions. Use this when you discover a durable, "
+            "reusable piece of knowledge — an authoritative explanation, a resolved gotcha, a "
+            "well-structured summary, a canonical code/config example, or a vetted external "
+            "reference. Do NOT use it for transient chatter or unverified guesses. The text is "
+            "parsed, chunked, and indexed exactly like an imported document; duplicates (same "
+            "content) are de-duplicated automatically."
+        ),
+        {
+            "text": {"type": "string"},
+            "title": {"type": "string"},
+            "tags": {"type": "array", "items": {"type": "string"}},
+            "category": {"type": "string"},
+            "source": {"type": "string"},
+        },
+        ["text"],
+    ),
+    tool_def(
         "agent_web_search",
         (
             "Autonomous bounded web research without third-party search APIs. "
@@ -17503,6 +17907,7 @@ AGENT_TOOL_ALLOWLIST: dict[str, set[str]] = {
         "compress",
         "query_code_library",
         "query_knowledge_library",
+        "rag_remember",
         "agent_web_search",
     },
     "developer": {
@@ -17534,6 +17939,7 @@ AGENT_TOOL_ALLOWLIST: dict[str, set[str]] = {
         "compress",
         "query_code_library",
         "query_knowledge_library",
+        "rag_remember",
         "agent_web_search",
     },
 }
@@ -17583,6 +17989,7 @@ class SessionState:
         reference_prepare_callback=None,
         query_code_library_callback=None,
         query_knowledge_library_callback=None,
+        rag_remember_callback=None,
         code_library_root: Path | str | None = None,
         code_library_status_callback=None,
         knowledge_library_root: Path | str | None = None,
@@ -17617,6 +18024,7 @@ class SessionState:
         self.reference_prepare_callback = reference_prepare_callback
         self.query_code_library_callback = query_code_library_callback
         self.query_knowledge_library_callback = query_knowledge_library_callback
+        self.rag_remember_callback = rag_remember_callback
         try:
             self.code_library_root = (
                 str(Path(code_library_root).resolve()) if code_library_root else ""
@@ -17644,6 +18052,10 @@ class SessionState:
         self.user_memory_mode = DEFAULT_USER_MEMORY_MODE
         self.user_profile_capsule = ""
         self.user_profile_capsule_meta: dict = {"mode": DEFAULT_USER_MEMORY_MODE, "memory_count": 0}
+        # Hot-path capsule de-dup: the ts of the latest user message we already
+        # injected the capsule for on an execution turn — keeps execution-stage
+        # injection to once-per-user-request (turns 2..N pay nothing).
+        self._capsule_exec_injected_user_ts: float = 0.0
         env_ok, env_tags, _ = probe_ollama_environment(ollama_base)
         self.ollama_env_available = bool(env_ok)
         self.ollama_env_tags: list[str] = list(env_tags)
@@ -17708,6 +18120,13 @@ class SessionState:
         # to break-and-pause without finalizing the run.
         self.pending_user_question: dict | None = None
         self._ask_user_pause_pending = False
+        # Mid-run steering (Fix 3): set when a live user message is classified as
+        # a steer (stop / change direction / redo), so the next round re-plans at
+        # the top before the model call — a genuine instruction, not a diluted
+        # background suggestion.
+        self._steer_pending = False
+        # Per-step acceptance quality-bar cache (Fix 5): step_id -> target dict.
+        self._acceptance_target_cache: dict = {}
         self.live_input_queue_lock = threading.Lock()
         self.deferred_start_inputs: list[dict] = []
         self.deferred_start_seq = 0
@@ -18084,6 +18503,57 @@ class SessionState:
                 return 0.0
         return 0.0
 
+    def _latest_user_message_text(self) -> str:
+        with self.lock:
+            rows = list(self.messages)
+        for row in reversed(rows):
+            if not self._is_external_user_message_for_goal_tracking(row):
+                continue
+            return str(row.get("content", "") or "").strip()
+        return ""
+
+    def _user_profile_capsule_prompt_block(self, *, stage: str = "execution") -> str:
+        """Build the user-preference capsule prompt block.
+
+        Uniform + token-efficient across modes, and the MODEL — not a hardcoded
+        rule — decides whether the preferences apply:
+          * `off` → always empty.
+          * The capsule's own instruction tells the model to use it ONLY when the
+            current request is silent and that explicit instructions always win;
+            relevance is the model's autonomous judgment (no keyword/regex gate).
+          * `stage="execution"` (per-turn hot path) injects at most ONCE per user
+            request — turns 2..N of the same request pay nothing. `stage="intent"`
+            (one-shot classification / plan-decision) injects each time it's built.
+          * Capped to one uniform budget regardless of weak/on, so per-turn token
+            cost is identical across modes (mode governs capsule richness at build
+            time, not hot-path weight).
+        """
+        mode = normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
+        if mode == "off":
+            return ""
+        capsule = str(getattr(self, "user_profile_capsule", "") or "").strip()
+        if not capsule:
+            return ""
+        if stage == "execution":
+            # Once-per-request on the hot path: only inject when this user message
+            # hasn't been injected for yet (structural de-dup, not intent detection).
+            try:
+                cur_ts = self._latest_user_message_ts()
+            except Exception:
+                cur_ts = 0.0
+            if cur_ts and cur_ts <= float(getattr(self, "_capsule_exec_injected_user_ts", 0.0) or 0.0):
+                return ""
+            self._capsule_exec_injected_user_ts = float(cur_ts)
+        capsule = trim(capsule, USER_MEMORY_CAPSULE_INJECT_CHARS)
+        return (
+            "USER PROFILE CAPSULE (per-user summary memory; preference signal only):\n"
+            f"{capsule}\n"
+            "Apply these only when the latest request does not explicitly specify a technique, "
+            "framework, tool, output format, or constraint. Recognize implicitly congruent work "
+            "(requests silent on means) where these defaults fit naturally. Explicit current "
+            "instructions, manual Level, manual Plan, and explicit tool choices always override."
+        )
+
     def _mark_runtime_goal_reset_pending(self, goal_text: str = "", *, reason: str = "") -> None:
         stamp = float(now_ts())
         self.runtime_goal_reset_pending = True
@@ -18234,13 +18704,18 @@ class SessionState:
         scope: str,
         media_inputs_round: list[dict] | None = None,
     ) -> dict:
+        _steer_pending = bool(getattr(self, "_steer_pending", False))
         if not (
             bool(getattr(self, "runtime_reclassify_required", False))
             or bool(getattr(self, "runtime_goal_reset_pending", False))
+            or _steer_pending
         ):
             return {}
-        if bool(getattr(self, "runtime_reclassify_required", False)):
-            if int(getattr(self, "user_task_level_override", 0) or 0) > 0:
+        if bool(getattr(self, "runtime_reclassify_required", False)) or _steer_pending:
+            # A steer (Fix 3) forces a re-plan even under a user task-level
+            # override — the user is explicitly redirecting the running work, so
+            # honoring it takes precedence over the pinned level.
+            if int(getattr(self, "user_task_level_override", 0) or 0) > 0 and not _steer_pending:
                 self._mark_runtime_goal_reset_handled(
                     reason=f"{scope}:user-level-override",
                     clear_reclassify=True,
@@ -18253,6 +18728,9 @@ class SessionState:
                 media_inputs=media_inputs_round,
                 roles=["manager"],
             )
+            if _steer_pending:
+                self._steer_pending = False
+                self._emit("status", {"summary": f"user steer applied — re-planning ({scope})"})
             decision = self._refresh_runtime_task_policy(
                 pinned_selection=pinned_selection,
                 force=True,
@@ -19786,6 +20264,7 @@ class SessionState:
         self.stall_severity_score = 0
         self.stall_severity_sources = []
         self.stall_escalation_triggered = False
+        self._steer_pending = False
         self.stall_escalation_round = 0
         self.live_thinking_text = ""
         self.live_thinking_last_emit = 0.0
@@ -20060,6 +20539,7 @@ class SessionState:
         previous_context: dict | None = None,
         clear_progress: bool = False,
         reset_agent_contexts: bool = False,
+        archive_messages: bool = False,
     ) -> None:
         """Clear plan/todo/skills state from a completed run so the next run starts fresh.
 
@@ -20067,8 +20547,46 @@ class SessionState:
         previous run finished (running=False, not awaiting plan choice).
         Prevents the manager from seeing status=COMPLETED + all todos done and
         immediately routing to 'finish' again on the very first round.
+
+        When `archive_messages` is True (a genuine task boundary), the prior
+        task's raw LLM transcript (`self.messages`) is archived to a context
+        segment and reset to a clean slate — otherwise the fresh instruction is
+        buried under the entire previous conversation and instruction-following
+        degrades (Fix 4). The handoff is preserved via `previous_task_context`
+        (injected into the system prompt) and display continuity via
+        `conversation_feed`/`user_bubble_log`, which are NOT touched here. This
+        mirrors how compaction already archives + windows messages.
         """
         bb = self._ensure_blackboard()
+        if archive_messages and isinstance(self.messages, list) and self.messages:
+            try:
+                archivable = [
+                    row for row in self.messages
+                    if isinstance(row, dict) and str(row.get("role", "") or "") != "system"
+                ]
+                if archivable:
+                    seg = self._archive_context_segment(archivable, reason="task-boundary")
+                    if seg:
+                        self._emit(
+                            "status",
+                            {
+                                "summary": (
+                                    "previous task transcript archived at task boundary "
+                                    f"(messages={seg.get('messages', 0)}); starting next task with a clean context"
+                                )
+                            },
+                        )
+                # Keep only non-user, non-assistant scaffolding (system prompts are
+                # rebuilt each call anyway) — a clean slate for the next task.
+                self.messages = [
+                    row for row in self.messages
+                    if isinstance(row, dict) and str(row.get("role", "") or "") == "system"
+                ]
+            except Exception as exc:
+                self._emit(
+                    "status",
+                    {"summary": f"task-boundary transcript archive skipped: {trim(str(exc), 120)}"},
+                )
         goal_text = trim(str(new_goal or "").strip(), 4000)
         previous = dict(previous_context or {}) if isinstance(previous_context, dict) else {}
         if clear_progress:
@@ -20142,6 +20660,21 @@ class SessionState:
         bb["plan_meta"] = {}
         bb["loaded_skills"] = {}
         bb["loaded_skills_goal_sig"] = ""
+        # Drop cached acceptance quality-bars from the previous task (Fix 5).
+        try:
+            self._acceptance_target_cache = {}
+        except Exception:
+            pass
+        # Drop per-step outcome-progress stall counters (Fix 6) — step ids can
+        # repeat across tasks, so stale counters must not carry over.
+        try:
+            for _attr in [
+                a for a in list(vars(self).keys())
+                if a.startswith(("_step_stuck_n_", "_step_best_done_", "_step_best_meas_"))
+            ]:
+                delattr(self, _attr)
+        except Exception:
+            pass
         if previous:
             bb["previous_task_context"] = previous
         self.blackboard = bb
@@ -21486,19 +22019,6 @@ class SessionState:
 
     def _runtime_environment_context_prompt_block(self) -> str:
         return runtime_environment_context_block(self._runtime_environment_context_snapshot())
-
-    def _user_profile_capsule_prompt_block(self) -> str:
-        mode = normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
-        if mode == "off":
-            return ""
-        capsule = trim(str(getattr(self, "user_profile_capsule", "") or "").strip(), USER_MEMORY_ON_CAPSULE_CHARS)
-        if not capsule:
-            return ""
-        return (
-            "USER PROFILE CAPSULE (per-user summary memory; preference signal only):\n"
-            f"{capsule}\n"
-            "Use this only when the latest user request is silent. Current explicit instructions always win."
-        )
 
     def _inject_runtime_environment_context(self, system: str = "") -> str:
         base = str(system or "").strip()
@@ -25544,7 +26064,7 @@ class SessionState:
         with fp.open("w", encoding="utf-8") as handle:
             for idx, row in enumerate(rows):
                 line = json_dumps(row)
-                payload = (line + "\n").encode("utf-8")
+                payload = safe_utf8_bytes(line + "\n")
                 sha.update(payload)
                 handle.write(line + "\n")
                 msg_ts = float(row.get("ts", 0.0) or 0.0)
@@ -26056,12 +26576,12 @@ class SessionState:
         active_errors = len([e for e in comp_errors if isinstance(e, dict) and int(e.get("count", 0) or 0) > 0])
         artifacts = bb.get("code_artifacts", {})
         artifacts_keys = sorted(artifacts.keys()) if isinstance(artifacts, dict) else []
-        files_hash = hashlib.sha1(str(artifacts_keys).encode("utf-8")).hexdigest()[:12]
+        files_hash = hashlib.sha1(safe_utf8_bytes(artifacts_keys)).hexdigest()[:12]
         try:
             todo_snap = json_dumps(self.todo.snapshot()) if hasattr(self, "todo") else ""
         except Exception:
             todo_snap = ""
-        todos_hash = hashlib.sha1(todo_snap.encode("utf-8")).hexdigest()[:12]
+        todos_hash = hashlib.sha1(safe_utf8_bytes(todo_snap)).hexdigest()[:12]
         stall_events = fl.get("stall_events", [])
         delegations = fl.get("repeated_delegations", [])
         return {
@@ -34406,7 +34926,150 @@ body{padding:18px}
             "reason": reason or trim(str(base.get("reason", "")), 400),
             "goal_chars": int(goal_chars),
             "updated_at": float(updated_at),
+            "deliverable_target": self._infer_deliverable_target(goal, existing=src.get("deliverable_target")),
         }
+
+    # Units that signal a multi-unit generative deliverable (novel chapters,
+    # paper sections, batches of files, etc.). Chinese + English.
+    _DELIVERABLE_UNIT_MAP = {
+        "章": ("chapter", "content"), "章节": ("chapter", "content"), "节": ("section", "content"),
+        "篇": ("article", "content"), "页": ("page", "content"), "首": ("poem", "content"),
+        "集": ("episode", "content"), "回": ("chapter", "content"), "部": ("volume", "content"),
+        "段": ("paragraph", "content"), "份": ("document", "content"), "问": ("question", "content"),
+        "题": ("question", "content"), "个文件": ("file", "files"), "个脚本": ("file", "files"),
+        "chapters": ("chapter", "content"), "chapter": ("chapter", "content"),
+        "sections": ("section", "content"), "section": ("section", "content"),
+        "articles": ("article", "content"), "essays": ("essay", "content"),
+        "pages": ("page", "content"), "poems": ("poem", "content"),
+        "episodes": ("episode", "content"), "parts": ("part", "content"),
+        "files": ("file", "files"), "scripts": ("file", "files"), "modules": ("file", "files"),
+        "questions": ("question", "content"), "problems": ("question", "content"),
+        "papers": ("paper", "content"), "documents": ("document", "content"),
+        "reports": ("report", "content"), "stories": ("story", "content"),
+        "entries": ("entry", "content"), "records": ("record", "content"),
+    }
+
+    def _infer_deliverable_target(self, goal: str, existing: object = None) -> dict:
+        """Detect a multi-unit generative quota in the goal (e.g. '写20章小说',
+        'analyze 50 papers', 'generate 30 files'). Returns
+        {kind, unit, target_count, produced_count, verify} or {} when no quota.
+
+        A quota is a COUNT ('20 章', '50 chapters') — an INDEX ('第20章',
+        'chapter 20') is deliberately NOT matched. This is what lets a long task
+        block premature finish until the real target is met (Fix 2)."""
+        # Preserve an already-established target (keeps produced_count across
+        # re-normalizations) unless it is malformed.
+        if isinstance(existing, dict) and int(existing.get("target_count", 0) or 0) >= 2:
+            out = dict(existing)
+            out.setdefault("produced_count", 0)
+            out.setdefault("verify", "content")
+            out.setdefault("unit", "unit")
+            out.setdefault("kind", "generation")
+            return out
+        text = str(goal or "")
+        if not text.strip():
+            return {}
+        best: dict = {}
+        # Chinese: <count><unit>, NOT preceded by 第 (which marks an index).
+        zh_units = "章节|章|节|篇|页|首|集|回|部|段|份|题|问"
+        for m in re.finditer(r"(?<!第)(\d{1,4})\s*(" + zh_units + r")", text):
+            n = int(m.group(1))
+            unit_raw = m.group(2)
+            if n < 2 or n > 2000:
+                continue
+            unit, verify = self._DELIVERABLE_UNIT_MAP.get(unit_raw, ("unit", "content"))
+            if not best or n > best.get("target_count", 0):
+                best = {"kind": "generation", "unit": unit, "target_count": n, "produced_count": 0, "verify": verify}
+        # Chinese file/script count: "N个文件" / "N个脚本"
+        for m in re.finditer(r"(\d{1,4})\s*个?\s*(文件|脚本|模块|函数)", text):
+            n = int(m.group(1))
+            if n < 2 or n > 2000:
+                continue
+            if not best or n > best.get("target_count", 0):
+                best = {"kind": "generation", "unit": "file", "target_count": n, "produced_count": 0, "verify": "files"}
+        # English: <count> <plural-unit>. Plural (or explicit count noun) only —
+        # 'chapter 20' (singular after) is an index and is skipped.
+        for m in re.finditer(
+            r"(\d{1,4})\s+(chapters|sections|articles|essays|pages|poems|episodes|parts|files|scripts|modules|questions|problems|papers|documents|reports|stories|entries|records)\b",
+            text, re.IGNORECASE,
+        ):
+            n = int(m.group(1))
+            unit_raw = m.group(2).lower()
+            if n < 2 or n > 2000:
+                continue
+            unit, verify = self._DELIVERABLE_UNIT_MAP.get(unit_raw, ("unit", "content"))
+            if not best or n > best.get("target_count", 0):
+                best = {"kind": "generation", "unit": unit, "target_count": n, "produced_count": 0, "verify": verify}
+        return best
+
+    def _deliverable_progress(self, board: dict | None = None) -> dict:
+        """Count produced units of the deliverable target from REAL evidence
+        (files written, content markers in artifacts), never model self-claims.
+        Returns {active, target, produced, unit, verify, remaining}."""
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        profile = bb.get("task_profile", {}) if isinstance(bb.get("task_profile"), dict) else {}
+        target = profile.get("deliverable_target", {}) if isinstance(profile.get("deliverable_target"), dict) else {}
+        target_count = int(target.get("target_count", 0) or 0)
+        if target_count < 2:
+            return {"active": False, "target": 0, "produced": 0, "unit": "", "verify": "", "remaining": 0}
+        verify = str(target.get("verify", "content") or "content")
+        unit = str(target.get("unit", "unit") or "unit")
+        produced = 0
+        # File-based deliverables: count distinct written output paths.
+        if verify == "files":
+            paths: set[str] = set()
+            arts = bb.get("code_artifacts", {}) if isinstance(bb.get("code_artifacts"), dict) else {}
+            for p in arts.keys():
+                if str(p).strip():
+                    paths.add(str(p).strip())
+            step_files = bb.get("step_files", {}) if isinstance(bb.get("step_files"), dict) else {}
+            for entries in step_files.values():
+                if isinstance(entries, list):
+                    for item in entries:
+                        if isinstance(item, dict) and str(item.get("path", "") or "").strip():
+                            paths.add(str(item.get("path")).strip())
+            produced = len(paths)
+        else:
+            # Content-unit deliverables: scan written artifact text + research
+            # notes for the highest distinct unit index (第N章 / Chapter N / N.).
+            blob_parts: list[str] = []
+            arts = bb.get("code_artifacts", {}) if isinstance(bb.get("code_artifacts"), dict) else {}
+            for v in arts.values():
+                if isinstance(v, dict):
+                    blob_parts.append(str(v.get("content", "") or v.get("summary", "") or ""))
+                else:
+                    blob_parts.append(str(v or ""))
+            notes = bb.get("research_notes", []) if isinstance(bb.get("research_notes"), list) else []
+            for n in notes:
+                if isinstance(n, dict):
+                    blob_parts.append(str(n.get("content", "") or n.get("text", "") or ""))
+                else:
+                    blob_parts.append(str(n or ""))
+            blob = "\n".join(blob_parts)
+            indices: set[int] = set()
+            for m in re.finditer(r"第\s*(\d{1,4})\s*(?:章|节|篇|回|集|部|页|首)", blob):
+                indices.add(int(m.group(1)))
+            for m in re.finditer(r"\b(?:chapter|section|part|episode|page|article|essay)\s+(\d{1,4})\b", blob, re.IGNORECASE):
+                indices.add(int(m.group(1)))
+            produced = len(indices)
+            # Fallback: distinct completed plan-step count can stand in when the
+            # units aren't explicitly numbered in text but each maps to a step.
+            step_done = sum(
+                1 for t in (bb.get("project_todos", []) if isinstance(bb.get("project_todos"), list) else [])
+                if isinstance(t, dict) and str(t.get("category", "") or "") == "plan_step"
+                and str(t.get("status", "") or "").strip().lower() == "completed"
+            )
+            produced = max(produced, step_done)
+        produced = min(produced, target_count)
+        return {
+            "active": True,
+            "target": target_count,
+            "produced": produced,
+            "unit": unit,
+            "verify": verify,
+            "remaining": max(0, target_count - produced),
+        }
+
 
     def _ensure_blackboard_task_profile(self, board: dict | None = None, *, force: bool = False) -> dict:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
@@ -34698,6 +35361,25 @@ body{padding:18px}
             return {
                 "target": assigned,
                 "instruction": "Finish is blocked by unfinished plan steps. Re-open the active plan state and continue the next concrete step.",
+                "reason": reason_key,
+                "source": "finish-gate",
+                "is_mandatory": True,
+            }
+        if reason_key.startswith("deliverable-incomplete:"):
+            progress = self._deliverable_progress(bb)
+            unit = str(progress.get("unit", "unit") or "unit")
+            produced = int(progress.get("produced", 0) or 0)
+            target = int(progress.get("target", 0) or 0)
+            remaining = int(progress.get("remaining", 0) or 0)
+            instruction = (
+                f"Finish is blocked: this task requires {target} {unit}s and only {produced} are done "
+                f"({remaining} remaining). Do NOT stop or summarize early — continue producing the next "
+                f"{unit} now, with its full concrete content, and keep going until all {target} are complete. "
+                "Update TodoWrite as each unit is finished."
+            )
+            return {
+                "target": self._current_plan_worker_owner(bb) or assigned,
+                "instruction": trim(instruction, MANAGER_INSTRUCTION_MAX_CHARS),
                 "reason": reason_key,
                 "source": "finish-gate",
                 "is_mandatory": True,
@@ -35017,6 +35699,14 @@ body{padding:18px}
                     return False, f"project-todo-incomplete:{todo.get('category', '')}"
         if exec_mode == EXECUTION_MODE_SYNC and not self._manager_feedback_passed_from_blackboard(bb):
             return False, "sync-review-missing"
+        # Deliverable-quota gate (Fix 2): a multi-unit generative task (e.g.
+        # "write 20 chapters", "analyze 50 papers") must produce its target
+        # count of REAL units before finishing — this is what stops long tasks
+        # ending prematurely (虎头蛇尾). Progress is counted from evidence, not
+        # model self-claims.
+        progress = self._deliverable_progress(bb)
+        if progress.get("active") and int(progress.get("remaining", 0) or 0) > 0:
+            return False, f"deliverable-incomplete:{progress.get('produced', 0)}/{progress.get('target', 0)}"
         return True, "ok"
 
     def _invalidate_stale_approval_if_needed(
@@ -35278,8 +35968,8 @@ body{padding:18px}
             "last_worker_reply_role": last_reply_role,
             "last_worker_reply_text": last_reply_text,
         }
-        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+        raw = json_dumps(payload, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha1(safe_utf8_bytes(raw)).hexdigest()
 
     def _watchdog_extract_json_array(self, text: str) -> list[dict]:
         raw = str(text or "").strip()
@@ -35804,7 +36494,7 @@ body{padding:18px}
             else:
                 wd["repeat_no_tool_streak"] = 0
             wd["last_no_tool_text"] = text
-            wd["last_no_tool_hash"] = hashlib.sha1(text.encode("utf-8")).hexdigest() if text else ""
+            wd["last_no_tool_hash"] = hashlib.sha1(safe_utf8_bytes(text)).hexdigest() if text else ""
         else:
             wd["intent_no_tool_streak"] = max(0, int(wd.get("intent_no_tool_streak", 0) or 0) - 1)
             wd["repeat_no_tool_streak"] = max(0, int(wd.get("repeat_no_tool_streak", 0) or 0) - 1)
@@ -36937,7 +37627,7 @@ body{padding:18px}
         errors = fl.get("errors", [])
         focus = self._blackboard_focus_identity(bb)
         now_tick = float(now_ts())
-        fp = hashlib.sha1((str(category or "") + str(file or "") + str(error_msg or "")).encode("utf-8")).hexdigest()[:12]
+        fp = hashlib.sha1(safe_utf8_bytes(str(category or "") + str(file or "") + str(error_msg or ""))).hexdigest()[:12]
         for entry in errors:
             if entry.get("fingerprint") == fp:
                 entry["count"] = int(entry.get("count", 1) or 1) + 1
@@ -37166,7 +37856,7 @@ body{padding:18px}
             return
         delegations = fl.get("repeated_delegations", [])
         progress_fp = self._watchdog_state_fingerprint(bb)
-        fp = hashlib.sha1((str(instruction or "") + "|" + progress_fp).encode("utf-8")).hexdigest()[:12]
+        fp = hashlib.sha1(safe_utf8_bytes(str(instruction or "") + "|" + progress_fp)).hexdigest()[:12]
         for entry in delegations:
             if entry.get("instruction_hash") == fp and entry.get("target") == target:
                 entry["count"] = int(entry.get("count", 1) or 1) + 1
@@ -37214,7 +37904,7 @@ body{padding:18px}
             args_str = json_dumps(args) if isinstance(args, dict) else str(args or "")
         except Exception:
             args_str = str(args or "")
-        fp = hashlib.sha1((str(tool_name or "") + args_str).encode("utf-8")).hexdigest()[:16]
+        fp = hashlib.sha1(safe_utf8_bytes(str(tool_name or "") + args_str)).hexdigest()[:16]
         for entry in fps:
             if entry.get("fingerprint") == fp:
                 entry["count"] = int(entry.get("count", 1) or 1) + 1
@@ -38217,6 +38907,445 @@ body{padding:18px}
             return sig["has_exec"] or sig["has_read"] or sig["has_review"]
         return sig["has_write"] or sig["has_read"] or sig["has_research"] or sig["has_exec"] or sig["has_review"]
 
+    # Metric families whose numeric threshold is a genuine QUALITY bar (not an
+    # index/version/count). Used by _extract_acceptance_target.
+    _ACCEPTANCE_METRIC_TERMS = (
+        "误差", "相对误差", "绝对误差", "偏差", "error", "rel_err", "relative error",
+        "abs error", "absolute error", "deviation", "residual", "残差",
+        "coverage", "覆盖率", "覆盖", "accuracy", "准确率", "準確率", "精度", "精确度",
+        "precision", "recall", "f1", "tolerance", "容差", "误差率", "错误率", "loss",
+        "rmse", "mae", "mse", "perplexity", "困惑度",
+    )
+
+    def _resolve_acceptance_target(self, plan_step: dict, acceptance_row: dict | None = None) -> dict:
+        """Resolve the step's measurable QUALITY bar, LLM-primary with a regex
+        fallback (Fix 5). Cached per step id — the bar is a property of the step
+        and does not change round to round, so this costs at most one LLM call
+        per step, off the hot path.
+
+        Returns {kind:"numeric", metric, op, value, unit, desc, source} or {}.
+        The model PERCEIVES whether the step has a measurable bar (self-awareness)
+        rather than relying only on hardcoded metric keywords; regex is the
+        deterministic safety net when the LLM is unavailable or unsure."""
+        step_id = str((plan_step or {}).get("id", "") or "")
+        cache = getattr(self, "_acceptance_target_cache", None)
+        if cache is None:
+            cache = {}
+            self._acceptance_target_cache = cache
+        if step_id and step_id in cache:
+            return dict(cache[step_id])
+        llm = self._llm_acceptance_target(plan_step, acceptance_row)
+        resolved = llm if llm else self._extract_acceptance_target(plan_step, acceptance_row)
+        if resolved and not resolved.get("source"):
+            resolved["source"] = "llm" if llm else "regex"
+        if step_id:
+            cache[step_id] = dict(resolved)
+        return dict(resolved)
+
+    def _llm_acceptance_target(self, plan_step: dict, acceptance_row: dict | None = None) -> dict:
+        """LLM-primary perception of a measurable quality bar in the step text.
+        Returns a numeric-target dict or {} (no bar / unavailable / low
+        confidence → caller falls back to regex then category-only)."""
+        parts = [
+            str((plan_step or {}).get("full_content", "") or (plan_step or {}).get("content", "") or ""),
+        ]
+        if isinstance(acceptance_row, dict):
+            parts.append(str(acceptance_row.get("content", "") or ""))
+        text = trim("\n".join(p for p in parts if p), 900)
+        if not text.strip():
+            return {}
+        try:
+            prompt = (
+                "/no_think\n"
+                "Read this plan step + its acceptance check. Does it state a MEASURABLE numeric quality bar "
+                "that a result must satisfy (e.g. error < 2%, coverage >= 90%, accuracy >= 0.95, latency < 100ms, "
+                "exit code 0)? A plain count/index/version (like 'chapter 20', 'write 5 files', 'python 3.11') is "
+                "NOT a quality bar.\n\n"
+                f"STEP:\n{text}\n\n"
+                "Reply ONLY JSON. If there IS a measurable numeric bar:\n"
+                '{\"has_bar\": true, \"metric\": \"<what is measured, e.g. relative error>\", '
+                '\"op\": \"<|<=|>|>=|==\", \"value\": <number>, \"unit\": \"<% or empty>\"}\n'
+                "If there is NO measurable numeric bar: {\"has_bar\": false}"
+            )
+            resp = self.ollama.chat(
+                [{"role": "user", "content": prompt}],
+                system="/no_think\nDetect a measurable numeric quality bar in a task step. Reply ONLY valid JSON.",
+                max_tokens=120,
+                think=False,
+            )
+            import json
+            raw = str(resp.get("content", "") or resp.get("text", "") or "").strip()
+            if "{" not in raw or "}" not in raw:
+                return {}
+            data = json.loads(raw[raw.index("{"):raw.rindex("}") + 1])
+            if not isinstance(data, dict) or not bool(data.get("has_bar", False)):
+                return {}
+            op = str(data.get("op", "") or "").strip()
+            if op not in ("<", "<=", ">", ">=", "=="):
+                return {}
+            try:
+                value = float(data.get("value"))
+            except Exception:
+                return {}
+            unit = str(data.get("unit", "") or "").strip()
+            return {
+                "kind": "numeric",
+                "metric": trim(str(data.get("metric", "") or "").strip().lower(), 60) or "target",
+                "op": op,
+                "value": value,
+                "unit": "%" if "%" in unit or "percent" in unit.lower() else "",
+                "desc": trim(text, 120),
+                "source": "llm",
+            }
+        except Exception:
+            return {}
+
+    def _extract_acceptance_target(self, plan_step: dict, acceptance_row: dict | None = None) -> dict:
+        """Regex FALLBACK for _resolve_acceptance_target (Fix 5). Extracts an
+        explicit numeric QUALITY target from the step + acceptance text when the
+        LLM layer is unavailable. Returns {kind:"numeric", metric, op, value,
+        unit, raw} or {}.
+
+        Only matches a comparison operator adjacent to a known quality-metric
+        term (误差/error/coverage/accuracy/tolerance/…) so plain counts, indices,
+        and version numbers are NOT mistaken for a quality bar."""
+        parts = [
+            str((plan_step or {}).get("full_content", "") or (plan_step or {}).get("content", "") or ""),
+        ]
+        if isinstance(acceptance_row, dict):
+            parts.append(str(acceptance_row.get("content", "") or ""))
+        text = "\n".join(p for p in parts if p)
+        if not text.strip():
+            return {}
+        low = text.lower()
+        metric_alt = "|".join(re.escape(t) for t in self._ACCEPTANCE_METRIC_TERMS)
+        best: dict = {}
+        # metric ... op value   (e.g. "误差 < 2%", "error below 1%", "coverage > 90%")
+        pat_fwd = re.compile(
+            r"(" + metric_alt + r")\s*(?:[:：=]?\s*)?(<=|>=|<|>|≤|≥|below|under|less than|at most|no more than|不超过|不高于|至多|至少|不低于|大于|小于|超过|高于|低于)?\s*(\d+(?:\.\d+)?)\s*(%|percent|个百分点)?",
+            re.IGNORECASE,
+        )
+        # op value ... metric   (e.g. "< 2% 误差", "below 1% error")
+        pat_bwd = re.compile(
+            r"(<=|>=|<|>|≤|≥|below|under|less than|at most|no more than|至多|不超过)\s*(\d+(?:\.\d+)?)\s*(%|percent)?\s*(?:的\s*)?(" + metric_alt + r")",
+            re.IGNORECASE,
+        )
+        word_op = {
+            "不超过": "<=", "不高于": "<=", "至多": "<=", "no more than": "<=", "at most": "<=",
+            "below": "<", "under": "<", "less than": "<", "小于": "<", "低于": "<",
+            "大于": ">", "超过": ">", "高于": ">", "至少": ">=", "不低于": ">=",
+        }
+        def _norm_op(raw_op: str, metric: str) -> str:
+            o = (raw_op or "").strip().lower()
+            o = word_op.get(o, o)
+            o = {"≤": "<=", "≥": ">="}.get(o, o)
+            if o in ("<", ">", "<=", ">="):
+                return o
+            # No explicit operator: infer from metric semantics.
+            m = metric.lower()
+            if any(k in m for k in ("coverage", "覆盖", "accuracy", "准确", "準確", "精度", "精确", "precision", "recall", "f1")):
+                return ">="  # higher is better
+            return "<="  # error/deviation/loss/tolerance: lower is better
+        for m in pat_fwd.finditer(low):
+            metric, raw_op, val, unit = m.group(1), m.group(2), m.group(3), m.group(4)
+            try:
+                value = float(val)
+            except Exception:
+                continue
+            best = {
+                "kind": "numeric",
+                "metric": metric,
+                "op": _norm_op(raw_op, metric),
+                "value": value,
+                "unit": "%" if unit and ("%" in unit or "percent" in unit or "百分点" in unit) else "",
+                "raw": trim(m.group(0), 80),
+            }
+            break
+        if not best:
+            for m in pat_bwd.finditer(low):
+                raw_op, val, unit, metric = m.group(1), m.group(2), m.group(3), m.group(4)
+                try:
+                    value = float(val)
+                except Exception:
+                    continue
+                best = {
+                    "kind": "numeric",
+                    "metric": metric,
+                    "op": _norm_op(raw_op, metric),
+                    "value": value,
+                    "unit": "%" if unit and ("%" in unit or "percent" in unit) else "",
+                    "raw": trim(m.group(0), 80),
+                }
+                break
+        return best
+
+    def _acceptance_target_met(self, target: dict, bb: dict, results: list[dict]) -> dict:
+        """Measure whether an extracted numeric quality target is actually met,
+        from REAL evidence (current tool outputs first, then step execution
+        logs). Returns {met: True|False|None, measured}. None = not measurable
+        → caller falls back to category-only behavior (never a false block)."""
+        if not isinstance(target, dict) or target.get("kind") != "numeric":
+            return {"met": None, "measured": None}
+        metric = str(target.get("metric", "") or "").lower()
+        op = str(target.get("op", "<=") or "<=")
+        value = float(target.get("value", 0.0) or 0.0)
+        # Build the text corpus to scan: current tool outputs, then recent logs.
+        texts: list[str] = []
+        for row in (results or []):
+            if isinstance(row, dict):
+                exc = self._tool_result_output_excerpt(row, 2000)
+                if exc:
+                    texts.append(str(exc))
+        logs = bb.get("execution_logs", []) if isinstance(bb.get("execution_logs"), list) else []
+        for row in logs[-6:]:
+            if isinstance(row, dict):
+                texts.append(str(row.get("content", "") or ""))
+        blob = "\n".join(texts)
+        if not blob.strip():
+            return {"met": None, "measured": None}
+        low = blob.lower()
+        # Find a measured number reported next to the SAME metric family.
+        metric_alt = "|".join(re.escape(t) for t in self._ACCEPTANCE_METRIC_TERMS)
+        near = re.compile(
+            r"(" + metric_alt + r")[^\d\n\r]{0,16}(\d+(?:\.\d+)?)\s*(%?)",
+            re.IGNORECASE,
+        )
+        alt = re.compile(
+            r"(\d+(?:\.\d+)?)\s*(%?)[^\d\n\r]{0,10}(" + metric_alt + r")",
+            re.IGNORECASE,
+        )
+        measured_vals: list[float] = []
+        for m in near.finditer(low):
+            try:
+                measured_vals.append(float(m.group(2)))
+            except Exception:
+                pass
+        for m in alt.finditer(low):
+            try:
+                measured_vals.append(float(m.group(1)))
+            except Exception:
+                pass
+        if not measured_vals:
+            return {"met": None, "measured": None}
+        # Use the WORST measured value against the bar (most conservative — a
+        # rushing worker can't cherry-pick one good number among bad ones).
+        higher_better = op in (">", ">=")
+        measured = min(measured_vals) if higher_better else max(measured_vals)
+        if op == "<":
+            met = measured < value
+        elif op == "<=":
+            met = measured <= value
+        elif op == ">":
+            met = measured > value
+        elif op == ">=":
+            met = measured >= value
+        else:
+            met = None
+        return {"met": met, "measured": measured}
+
+    def _track_step_outcome_progress(self, plan_step: dict, bb: dict, gate: dict | None = None) -> dict:
+        """Track OUTCOME progress for an in_progress step that did NOT advance
+        this round, and escalate on a real deadlock (Fix 6).
+
+        The existing repair-signature guard (`_repair_progress_signature`) only
+        runs inside `_acceptance_gate_handle_failure`, which itself only fires
+        when `subtasks_done and not gate_ok`. A single-agent worker that never
+        marks its acceptance subtask done (because it honestly knows the result
+        misses the bar) therefore has NO stall counter at all, and loops forever
+        while changing its approach each round. This tracker runs EVERY
+        non-advancing round the step is in_progress and measures OUTCOME, not
+        approach: more completed subtasks, or a measured value that moved toward
+        the quality bar. Approach churn alone is NOT progress.
+
+        Returns {stuck_n, escalated}."""
+        step_id = str((plan_step or {}).get("id", "") or "")
+        if not step_id:
+            return {"stuck_n": 0, "escalated": False}
+        completed = 0
+        try:
+            rows = self._active_plan_worker_todo_rows(step_id, role="")
+            completed = sum(
+                1 for r in rows if str(r.get("status", "") or "").strip().lower() == "completed"
+            )
+        except Exception:
+            completed = 0
+        # Measured value toward the quality bar (if any).
+        measured = None
+        op = ""
+        try:
+            target = self._resolve_acceptance_target(plan_step, (gate or {}).get("acceptance", {}) if isinstance(gate, dict) else {})
+            if target:
+                op = str(target.get("op", "") or "")
+                verdict = self._acceptance_target_met(target, bb, [])
+                measured = verdict.get("measured")
+        except Exception:
+            measured = None
+        best_done_attr = f"_step_best_done_{step_id}"
+        best_meas_attr = f"_step_best_meas_{step_id}"
+        stuck_attr = f"_step_stuck_n_{step_id}"
+        prev_best_done = int(getattr(self, best_done_attr, -1))
+        prev_best_meas = getattr(self, best_meas_attr, None)
+        improved = False
+        if completed > prev_best_done:
+            improved = True
+        elif measured is not None:
+            if prev_best_meas is None:
+                improved = True
+            elif op in (">", ">="):
+                improved = measured > float(prev_best_meas)
+            else:  # lower is better (error/deviation/loss/tolerance) or unknown
+                improved = measured < float(prev_best_meas)
+        if improved:
+            setattr(self, best_done_attr, max(prev_best_done, completed))
+            if measured is not None:
+                if prev_best_meas is None:
+                    setattr(self, best_meas_attr, measured)
+                elif op in (">", ">="):
+                    setattr(self, best_meas_attr, max(float(prev_best_meas), measured))
+                else:
+                    setattr(self, best_meas_attr, min(float(prev_best_meas), measured))
+            setattr(self, stuck_attr, 0)
+            return {"stuck_n": 0, "escalated": False}
+        stuck_n = int(getattr(self, stuck_attr, 0) or 0) + 1
+        setattr(self, stuck_attr, stuck_n)
+        escalated = False
+        if stuck_n >= STEP_ACTIVE_STALL_CEILING:
+            try:
+                self.stall_severity_sources.append(
+                    f"step-outcome-stall:{step_id}:{stuck_n}"
+                )
+            except Exception:
+                pass
+            escalated = bool(
+                self._escalate_stall_to_plan_mode(
+                    trigger_source=f"step-outcome-stall:{step_id}",
+                    last_fault_reason=str((gate or {}).get("reason", "") or "step outcome not improving"),
+                )
+            )
+            if escalated:
+                setattr(self, stuck_attr, 0)
+        return {"stuck_n": stuck_n, "escalated": escalated}
+
+    def _llm_acceptance_failure_verdict(self, exec_text: str) -> dict:
+        """LLM-primary perception (Fix 5 steer): does this acceptance-check output
+        report that the check FAILED? Semantic self-awareness is the right judge
+        here — a script's output can report failure in unbounded ways ("residual
+        exceeds tolerance", "did not converge", "3 of 12 assertions broke") that no
+        regex enumerates. Returns {failed: True/False/None, marker}. None = model
+        unavailable/uncertain → caller falls back to the lexical scan."""
+        text = trim(str(exec_text or "").strip(), 1400)
+        if not text:
+            return {"failed": None, "marker": ""}
+        try:
+            prompt = (
+                "/no_think\n"
+                "This is the OUTPUT of an acceptance/verification check that was just run for a task step. "
+                "Decide whether the output reports that the check FAILED (an assertion broke, a test failed, a "
+                "convergence/tolerance/quality target was NOT met, a non-zero failure count, an error/traceback "
+                "that means the check did not pass). A clean pass, a zero failure count, or output that merely "
+                "mentions the word 'error' while still passing is NOT a failure.\n\n"
+                f"OUTPUT:\n{text}\n\n"
+                "Reply ONLY JSON: {\"failed\": true/false, \"marker\": \"<short quote of the failure line, or empty>\"}"
+            )
+            resp = self.ollama.chat(
+                [{"role": "user", "content": prompt}],
+                system="/no_think\nJudge whether a check's output reports failure. Reply ONLY valid JSON.",
+                max_tokens=120,
+                think=False,
+            )
+            import json
+            raw = str(resp.get("content", "") or resp.get("text", "") or "").strip()
+            if "{" not in raw or "}" not in raw:
+                return {"failed": None, "marker": ""}
+            data = json.loads(raw[raw.index("{"):raw.rindex("}") + 1])
+            if not isinstance(data, dict) or "failed" not in data:
+                return {"failed": None, "marker": ""}
+            failed = bool(data.get("failed", False))
+            return {"failed": failed, "marker": trim(str(data.get("marker", "") or "").strip(), 60)}
+        except Exception:
+            return {"failed": None, "marker": ""}
+
+    def _acceptance_results_lexical_failure(self, rows: list[dict]) -> dict:
+        """Lexical FALLBACK for _acceptance_results_show_failure. Scans exec output
+        for an explicit failure marker while excluding common false positives
+        ("0 checks failed", "failed=0"). Used only when LLM perception is
+        unavailable/uncertain."""
+        fail_pat = re.compile(
+            r"(?i)("
+            r"checks?\s+failed"
+            r"|\bassertion(?:error)?\s+fail"
+            r"|\bassertionerror\b"
+            r"|\bfailed\s*:\s*[1-9]"
+            r"|\b[1-9]\d*\s+(?:checks?|tests?|assertions?)\s+failed"
+            r"|\btest(?:s)?\s+failed"
+            r"|\b(?:验收|驗収|驗證|校验|校驗)?\s*(?:未通过|未通過|不通过|不通過|失败|失敗)"
+            r"|\bFAIL(?:ED)?\b(?!\s*=\s*0)(?!\s*:\s*0)"
+            r"|traceback \(most recent call last\)"
+            r")"
+        )
+        benign_pat = re.compile(
+            r"(?i)("
+            r"\b0\s+(?:checks?|tests?|assertions?)\s+failed"
+            r"|failed\s*[=:]\s*0"
+            r"|\bno\s+(?:checks?|tests?|assertions?|errors?)\s+failed"
+            r"|\bnone\s+failed"
+            r"|\b0\s+fail"
+            r")"
+        )
+        for row in rows:
+            name = str(row.get("name", "") or "")
+            if name not in {"bash", "worktree_run", "background_run"}:
+                continue
+            raw = str(row.get("output", "") or "")
+            if not raw.strip():
+                continue
+            for line in raw.replace("\r\n", "\n").split("\n"):
+                s = line.strip()
+                if not s:
+                    continue
+                if benign_pat.search(s):
+                    continue
+                m = fail_pat.search(s)
+                if m:
+                    return {"failed": True, "marker": trim(m.group(0), 40), "excerpt": trim(s, 120)}
+        return {"failed": False, "marker": "", "excerpt": ""}
+
+    def _acceptance_results_show_failure(self, results: list[dict]) -> dict:
+        """F10: did this turn's acceptance check report a FAILURE?
+
+        LLM-primary (per the Fix 5 steer): the model perceives failure from the
+        check output first, because failure is reported in unbounded natural ways.
+        The lexical scan is only a fallback for when the model is unavailable or
+        uncertain. This stops the gate being gamed by a script that prints an
+        `ALL CHECKS PASSED` banner while a real check failed, and stops a genuine
+        `1 CHECKS FAILED` from being rationalized away and advanced past.
+
+        Returns {failed: bool, marker: str, excerpt: str, source: str}."""
+        rows = [r for r in (results or []) if isinstance(r, dict) and r.get("ok", False)]
+        if not rows:
+            return {"failed": False, "marker": "", "excerpt": "", "source": "none"}
+        exec_rows = [r for r in rows if str(r.get("name", "") or "") in {"bash", "worktree_run", "background_run"}]
+        if not exec_rows:
+            return {"failed": False, "marker": "", "excerpt": "", "source": "none"}
+        # Concatenate this turn's exec output for the LLM to perceive as a whole.
+        exec_text = "\n".join(
+            trim(str(r.get("output", "") or "").strip(), 900)
+            for r in exec_rows
+            if str(r.get("output", "") or "").strip()
+        ).strip()
+        if exec_text:
+            verdict = self._llm_acceptance_failure_verdict(exec_text)
+            if verdict.get("failed") is True:
+                marker = verdict.get("marker", "") or "check reported failure"
+                return {"failed": True, "marker": marker, "excerpt": marker, "source": "llm"}
+            if verdict.get("failed") is False:
+                # LLM confidently says it passed; trust it over the lexical scan.
+                return {"failed": False, "marker": "", "excerpt": "", "source": "llm"}
+        # LLM unavailable/uncertain → lexical fallback.
+        fb = self._acceptance_results_lexical_failure(exec_rows)
+        fb["source"] = "lexical"
+        return fb
+
     def _plan_step_acceptance_gate_status(
         self,
         plan_step: dict,
@@ -38331,18 +39460,67 @@ body{padding:18px}
             current_match = bool(has_current_validation or has_current_read or has_current_exec or has_current_retrieval)
             blackboard_match = bool(sig.get("has_exec") or sig.get("has_review") or sig.get("has_read") or sig.get("has_research"))
 
-        # During a live worker/single-agent turn, the acceptance action must be
-        # visible in this turn's tool_results. Blackboard fallback is only for
-        # finish/resume reconciliation where current tool_results are no longer
-        # available but the step-scoped evidence has already been recorded.
-        if results:
+        # During a live worker/single-agent turn, the acceptance action should
+        # normally be visible in this turn's tool_results. Blackboard fallback is
+        # for finish/resume reconciliation where current tool_results are no
+        # longer available but the step-scoped evidence has already been recorded.
+        #
+        # F9: previously this wiped blackboard_match whenever ANY tool_results
+        # existed this turn. That broke prose/derivation steps: a worker that
+        # produced its acceptance evidence in a PRIOR round (recorded on the
+        # blackboard) and merely ran an unrelated tool this round would be told
+        # `final-acceptance-evidence-missing`, forcing redundant repair rounds
+        # (observed: sync run looped repair round 4/6 on already-passing steps).
+        # Only discard the blackboard fallback when this turn's OWN evidence
+        # already satisfies the category (current_match) — i.e. we don't need the
+        # fallback anyway. If this turn's tools don't match the category, keep the
+        # recorded blackboard evidence rather than falsely declaring it missing.
+        if results and current_match:
             blackboard_match = False
+        # F10: an explicit failure signal in this turn's own tool output blocks
+        # acceptance regardless of category match. A worker cannot pass a step by
+        # running a validator that prints `CHECKS FAILED` (or by cherry-printing a
+        # PASS banner while a real check failed). This runs before the
+        # category/target verdicts so a genuine failure is never rationalized away.
+        if results:
+            failure = self._acceptance_results_show_failure(results)
+            if failure.get("failed"):
+                return {
+                    "ok": False,
+                    "reason": f"acceptance-check-reported-failure:{failure.get('marker', '')}",
+                    "expected": expected,
+                    "failure_excerpt": failure.get("excerpt", ""),
+                    "acceptance": acceptance,
+                }
+        # Quality-aware enforcement (Fix 5): if the step/acceptance text states an
+        # explicit numeric quality bar (e.g. "误差 < 2%"), a category match is NOT
+        # enough — the measured result must actually meet the bar. This stops a
+        # worker from passing a 23% result just because a check ran. When the bar
+        # is unmeasurable, fall back to category-only (never a false block).
+        target = self._resolve_acceptance_target(plan_step, acceptance)
+        if target and (current_match or blackboard_match):
+            verdict = self._acceptance_target_met(target, bb, results)
+            if verdict.get("met") is False:
+                unit = str(target.get("unit", "") or "")
+                measured = verdict.get("measured")
+                return {
+                    "ok": False,
+                    "reason": (
+                        "acceptance-target-unmet:"
+                        f"{measured}{unit} vs {target.get('op', '<=')}{target.get('value')}{unit}"
+                    ),
+                    "expected": expected,
+                    "target": target,
+                    "measured": measured,
+                    "acceptance": acceptance,
+                }
         if current_match:
             return {
                 "ok": True,
                 "reason": "current-tool-evidence-matches-final-acceptance",
                 "source": "current_tool_results",
                 "expected": expected,
+                "target": target or None,
                 "acceptance": acceptance,
             }
         if blackboard_match:
@@ -38351,6 +39529,7 @@ body{padding:18px}
                 "reason": "blackboard-evidence-matches-final-acceptance",
                 "source": "blackboard",
                 "expected": expected,
+                "target": target or None,
                 "acceptance": acceptance,
             }
         return {
@@ -38525,6 +39704,51 @@ body{padding:18px}
                 "repair_action": "Execute the acceptance check with a real tool call now (do not just mark it done), confirm the success signal, then complete it.",
                 "fixer_role": self._current_plan_worker_owner(bb),
                 "error_category": error_category,
+                "error_context": error_context,
+            }
+        if reason.startswith("acceptance-target-unmet:"):
+            # The check ran but the measured result misses the stated quality bar
+            # (e.g. 23% error vs the required <1%). This is NOT a "record evidence"
+            # problem — the deliverable itself is not good enough yet.
+            target = (gate or {}).get("target", {}) if isinstance((gate or {}).get("target"), dict) else {}
+            bar = f"{target.get('op', '<=')}{target.get('value', '')}{target.get('unit', '')}".strip()
+            measured = (gate or {}).get("measured")
+            repair_action = (
+                f"The acceptance check ran but the result ({measured}{target.get('unit', '')}) does NOT meet the "
+                f"required quality bar ({target.get('metric', 'target')} {bar}). Do NOT advance or mark this "
+                "accepted. Diagnose WHY the quality bar is missed (algorithm/params/precision/bug), FIX the "
+                "underlying cause, re-run the check, and only complete the acceptance subtask once the measured "
+                f"value actually satisfies {bar}."
+            )
+            if error_category:
+                repair_action += f" (dominant failure category: '{error_category}'; do not repeat a failed fix.)"
+            return {
+                "root_cause": f"Deliverable misses its quality bar ({target.get('metric', 'target')} {bar}); measured {measured}{target.get('unit', '')}.",
+                "repair_action": repair_action,
+                "fixer_role": "reviewer" if (self._is_multi_agent_mode() and self.reviewer_debug_mode) else self._current_plan_worker_owner(bb),
+                "error_category": error_category or "quality-bar",
+                "error_context": error_context,
+            }
+        if reason.startswith("acceptance-check-reported-failure:"):
+            # F10: the acceptance check ran and its own output reported a failure
+            # (e.g. `1 CHECKS FAILED`, an AssertionError, a non-zero failed count).
+            # This must never be rationalized away as "an arbitrary threshold" and
+            # advanced past.
+            excerpt = str((gate or {}).get("failure_excerpt", "") or "")
+            repair_action = (
+                "The acceptance check EXECUTED but its own output reported a FAILURE"
+                + (f" (\"{excerpt}\")" if excerpt else "")
+                + ". Do NOT advance or mark this step accepted. Read the failing output, fix the underlying "
+                "cause (or, if the failing assertion is genuinely wrong/too strict, correct the check itself "
+                "and justify why in one line), then re-run until the check reports no failures."
+            )
+            if error_category:
+                repair_action += f" (dominant failure category: '{error_category}'; do not repeat a failed fix.)"
+            return {
+                "root_cause": "The acceptance check ran but reported a failure signal in its output.",
+                "repair_action": repair_action,
+                "fixer_role": self._current_plan_worker_owner(bb),
+                "error_category": error_category or "check-failed",
                 "error_context": error_context,
             }
         # final-acceptance-evidence-missing (and anything else): genuine failure or
@@ -39605,6 +40829,133 @@ body{padding:18px}
                 pass
         return True
 
+    def _plan_step_advance_decision(
+        self, current: dict, evidence_input: dict, bb: dict, *, mode: str
+    ) -> dict:
+        """Single authority for the plan-step advance judgment shared by the
+        single-agent and sync/multi-agent paths.
+
+        Both callers previously computed the same evidence signals but combined
+        them into DIFFERENT should-advance rules (single-agent: 2 paths + a
+        `_gate_blocked` flag; sync: 5 OR'd paths). That divergence let the same
+        step advance in one mode and stall in the other. This function computes
+        the signals ONCE and applies ONE unified rule, so sync is a strict
+        extension of single-agent. Callers keep only their own dispatch/role
+        routing (single→"single"/developer; sync→route.target) and any
+        manager-request bookkeeping.
+
+        `mode` is "single" or "sync". `evidence_input` is the worker_step dict
+        (sync) or {"tool_results": [...]} (single) — both expose `tool_results`
+        and are accepted by the gate/evidence helpers unchanged.
+
+        Returns: {should_advance, needs_repair, gate, gate_ok, reason, signals}.
+        """
+        results = (
+            evidence_input.get("tool_results", []) or []
+            if isinstance(evidence_input, dict)
+            else []
+        )
+        step_content = str(
+            current.get("full_content", "") or current.get("content", "") or ""
+        ).lower()
+        phase = self._plan_step_phase_hint(step_content)
+        wrote_files = any(
+            isinstance(r, dict)
+            and r.get("ok", False)
+            and str(r.get("name", "")) in ("write_file", "edit_file")
+            for r in results
+        )
+        ran_bash_ok = any(
+            isinstance(r, dict) and r.get("ok", False) and str(r.get("name", "")) == "bash"
+            for r in results
+        )
+        validation_ok_current = self._tool_results_have_validation_evidence(current, results)
+        validation_ok_blackboard = self._plan_step_has_blackboard_evidence(current, bb)
+        validation_ok = validation_ok_current or validation_ok_blackboard
+        # single-agent historically read the verified tag without the agent-message
+        # window; sync passed messages=self.agent_messages. Preserve that.
+        if mode == "sync":
+            verified_tag_current = self._check_step_verified_tag(current, messages=self.agent_messages)
+        else:
+            verified_tag_current = self._check_step_verified_tag(current)
+        bb_sig = self._plan_step_blackboard_signals(current, bb)
+        phase_evidence = False
+        if phase in ("research", "design") and validation_ok:
+            phase_evidence = True
+        elif phase == "implement" and (
+            (wrote_files and validation_ok_current)
+            or (bb_sig["has_write"] and validation_ok_blackboard)
+        ):
+            phase_evidence = True
+        elif phase in ("test", "review") and (
+            (ran_bash_ok and validation_ok_current)
+            or ((bb_sig["has_exec"] or bb_sig["has_review"]) and validation_ok_blackboard)
+        ):
+            phase_evidence = True
+        subtasks_all_done = self._step_subtasks_all_completed(current)
+        _has_subtasks = bool(
+            self._active_plan_worker_todo_rows(str(current.get("id", "") or ""), role="")
+        )
+        accumulated_evidence_path = subtasks_all_done and self._step_has_accumulated_evidence(
+            current, bb
+        )
+        explicit_verified_path = (
+            subtasks_all_done
+            and verified_tag_current
+            and (validation_ok_blackboard or self._step_has_accumulated_evidence(current, bb))
+        )
+        acceptance_gate = self._plan_step_acceptance_gate_status(current, evidence_input, bb)
+        acceptance_gate_ok = bool(acceptance_gate.get("ok", False))
+        worker_produced_output = self._worker_step_has_evidence(evidence_input)
+        # Unified strong-evidence rule (superset of both prior rules): the
+        # step-local subtask chain is complete, the final acceptance gate passed,
+        # AND at least one concrete evidence form exists. Manager requests and
+        # phase heuristics never bypass an incomplete subtask chain or a failed gate.
+        should_advance = bool(
+            subtasks_all_done
+            and acceptance_gate_ok
+            and (
+                validation_ok
+                or phase_evidence
+                or accumulated_evidence_path
+                or explicit_verified_path
+            )
+        )
+        # Atomic-step escape: the step genuinely has NO step-local subtasks
+        # (bootstrap could not decompose it). Requires real phase/validation
+        # evidence; never advances on a bare claim.
+        if not should_advance and not _has_subtasks and worker_produced_output:
+            if phase_evidence or validation_ok:
+                should_advance = True
+        # Explicit structured-verification-tag path for subtask-less or
+        # subtask-complete steps. Disabled once the gate has blocked
+        # (subtasks_all_done and gate failed) so it cannot mask a real failure.
+        gate_blocked = bool(subtasks_all_done and not acceptance_gate_ok)
+        if not should_advance and not gate_blocked:
+            if (
+                verified_tag_current
+                and (subtasks_all_done or not _has_subtasks)
+                and (validation_ok or self._step_has_accumulated_evidence(current, bb))
+            ):
+                should_advance = True
+        return {
+            "should_advance": should_advance,
+            "needs_repair": gate_blocked,
+            "gate": acceptance_gate,
+            "gate_ok": acceptance_gate_ok,
+            "reason": str(acceptance_gate.get("reason", "") or ""),
+            "signals": {
+                "subtasks_all_done": subtasks_all_done,
+                "has_subtasks": _has_subtasks,
+                "worker_produced_output": worker_produced_output,
+                "phase_evidence": phase_evidence,
+                "validation_ok": validation_ok,
+                "validation_ok_blackboard": validation_ok_blackboard,
+                "verified_tag": verified_tag_current,
+                "phase": phase,
+            },
+        }
+
     def _post_execution_plan_step_check(self, route: dict, worker_step: dict):
         """After worker execution, check if current plan step should advance based on evidence."""
         bb = self._ensure_blackboard()
@@ -39653,77 +41004,15 @@ body{padding:18px}
                     )
             except Exception as exc:
                 self._emit("status", {"summary": f"plan subtask bootstrap failed: {trim(str(exc), 120)}"})
-        # 1. Manager explicitly requested advancement
+        # Unified advance decision (Fix 1): shared authority with single-agent.
         manager_requested = bool(route.get("advance_plan_step_requested", False))
-        # 2. Worker produced concrete tool outputs
-        worker_produced_output = self._worker_step_has_evidence(worker_step)
-        # 3. All subtasks for this step are completed
-        subtasks_all_done = self._step_subtasks_all_completed(current)
-        # 4. Phase-based file+bash evidence (implement requires BOTH write + bash)
-        step_content = str(current.get("full_content", "") or current.get("content", "") or "").lower()
-        phase = self._plan_step_phase_hint(step_content)
-        results = worker_step.get("tool_results", []) or []
-        wrote_files = any(
-            isinstance(r, dict) and r.get("ok", False)
-            and str(r.get("name", "")) in ("write_file", "edit_file")
-            for r in results
-        )
-        ran_bash_ok = any(
-            isinstance(r, dict) and r.get("ok", False) and str(r.get("name", "")) == "bash"
-            for r in results
-        )
-        validation_ok_current = self._tool_results_have_validation_evidence(current, results)
-        validation_ok_blackboard = self._plan_step_has_blackboard_evidence(current, bb)
-        validation_ok = validation_ok_current or validation_ok_blackboard
-        verified_tag_current = self._check_step_verified_tag(current, messages=self.agent_messages)
-        bb_sig = self._plan_step_blackboard_signals(current, bb)
-        phase_evidence = False
-        if phase in ("research", "design") and validation_ok:
-            phase_evidence = True
-        elif phase == "implement" and (
-            (wrote_files and validation_ok_current)
-            or (bb_sig["has_write"] and validation_ok_blackboard)
-        ):
-            phase_evidence = True
-        elif phase in ("test", "review") and (
-            (ran_bash_ok and validation_ok_current)
-            or ((bb_sig["has_exec"] or bb_sig["has_review"]) and validation_ok_blackboard)
-        ):
-            phase_evidence = True
-        # Advance when the step-local subtask chain is complete and concrete
-        # evidence exists. The final acceptance subtask is the validation gate;
-        # manager requests or phase heuristics cannot bypass incomplete subtasks.
-        _has_subtasks = bool(self._active_plan_worker_todo_rows(
-            str(current.get("id", "") or ""), role=""
-        ))
-        accumulated_evidence_path = (
-            subtasks_all_done
-            and self._step_has_accumulated_evidence(current, bb)
-        )
-        explicit_verified_path = (
-            subtasks_all_done
-            and verified_tag_current
-            and (validation_ok_blackboard or self._step_has_accumulated_evidence(current, bb))
-        )
-        acceptance_gate = self._plan_step_acceptance_gate_status(current, worker_step, bb)
-        acceptance_gate_ok = bool(acceptance_gate.get("ok", False))
-        has_strong_evidence = subtasks_all_done and acceptance_gate_ok and (
-            validation_ok
-            or validation_ok_blackboard
-            or phase_evidence
-            or accumulated_evidence_path
-            or explicit_verified_path
-        )
-        # Parity with single-agent (Fix 1): phase-heuristic escape when the step
-        # genuinely has NO step-local subtasks (bootstrap above couldn't decompose
-        # it — e.g. an atomic step). Single-agent allows this via
-        # `_can_use_phase_heuristic = subtasks_done or not _has_subtasks_s` (:42629).
-        # Without it, a subtask-less step can never satisfy `subtasks_all_done` and
-        # the multi-agent run stalls. Requires real phase evidence; never advances
-        # on a bare claim.
-        if not has_strong_evidence and not _has_subtasks and worker_produced_output:
-            if phase_evidence or validation_ok:
-                has_strong_evidence = True
+        decision = self._plan_step_advance_decision(current, worker_step, bb, mode="sync")
+        has_strong_evidence = bool(decision["should_advance"])
+        subtasks_all_done = bool(decision["signals"]["subtasks_all_done"])
+        _has_subtasks = bool(decision["signals"]["has_subtasks"])
+        worker_produced_output = bool(decision["signals"]["worker_produced_output"])
+        acceptance_gate = decision["gate"]
+        acceptance_gate_ok = bool(decision["gate_ok"])
         if manager_requested and worker_produced_output and not subtasks_all_done and _has_subtasks:
             self._blackboard_append_memory(
                 "decision",
@@ -39767,6 +41056,11 @@ body{padding:18px}
                     target_roles=((target_role,) if target_role else ()),
                 ):
                     return  # step genuinely passed via semantic judge
+            # Outcome-progress deadlock guard (Fix 6): runs every non-advancing
+            # round regardless of whether subtasks are done, so a step that keeps
+            # producing output but never improves its OUTCOME escalates instead
+            # of looping forever.
+            self._track_step_outcome_progress(current, bb, acceptance_gate)
             self._inject_rework_if_needed(current, worker_step)
 
     def _worker_step_has_evidence(self, step: dict) -> bool:
@@ -40174,6 +41468,21 @@ body{padding:18px}
                 guidance = {}
             gate_reason = trim(str((gate or {}).get("reason", "") or ""), 120)
             gate_expected = trim(str((gate or {}).get("expected", "") or ""), 160)
+            # Quality bar (Fix 5): if the step has a measurable target, the judge
+            # must check the measured result against it, not just "did a check run".
+            target = {}
+            try:
+                target = self._resolve_acceptance_target(plan_step, (gate or {}).get("acceptance", {}))
+            except Exception:
+                target = {}
+            bar_line = ""
+            if target:
+                bar_line = (
+                    f"REQUIRED QUALITY BAR: {target.get('metric','target')} "
+                    f"{target.get('op','<=')} {target.get('value')}{target.get('unit','')}. "
+                    "PASS only if the measured result actually satisfies this bar; "
+                    "a result that merely ran but misses the bar is a FAIL.\n"
+                )
 
             # Acceptance subtask text (what the worker said it would verify).
             acceptance = (gate or {}).get("acceptance", {}) if isinstance((gate or {}).get("acceptance"), dict) else {}
@@ -40209,7 +41518,8 @@ body{padding:18px}
                 f"PLAN STEP: {step_text}\n"
                 f"ACCEPTANCE CHECK (what should be verified): {acceptance_text or guidance.get('what','')}\n"
                 f"EXPECTED EVIDENCE KIND: {gate_expected or guidance.get('evidence_kind','')}\n"
-                f"GATE FAILURE REASON: {gate_reason}\n\n"
+                f"GATE FAILURE REASON: {gate_reason}\n"
+                f"{bar_line}\n"
                 f"FILES CREATED/MODIFIED FOR THIS STEP:\n{chr(10).join(files_summary[-12:]) or '(none)'}\n\n"
                 f"EXECUTION OUTPUT (this step):\n{chr(10).join(recent_exec[-6:]) or '(none)'}\n\n"
                 f"CURRENT-TURN TOOL RESULTS:\n{chr(10).join(cur_results[-6:]) or '(none)'}\n\n"
@@ -41705,10 +43015,18 @@ body{padding:18px}
                 f"Existing worker subtasks for this step: {len(completed)} completed, {len(pending)} pending. "
             )
             todo_state = "".join(state_parts)
-            # Hard prohibition: model must NOT re-create subtasks when they already exist
+            # Fix 7: allow REFINEMENT, forbid only wholesale recreate. The old
+            # absolute ban ("do NOT call TodoWrite … directly execute") pushed
+            # multi-agent workers into shallow, bundled execution (e.g. writing
+            # 4 subsections in one shot). The worker may now split a coarse
+            # subtask into finer child items, add a genuinely missing one, or
+            # update status — it just must not restate/duplicate existing rows
+            # or drop the final acceptance item. Symmetric across single & multi.
             subtasks_exist_ban = (
-                "🚫 STRICT: subtasks for this step already exist — do NOT call TodoWrite/TodoWriteRescue "
-                "to create new subtasks. Directly execute the in_progress subtask above. "
+                "Subtasks for this step already exist. Do NOT wholesale-recreate, renumber, or restate them. "
+                "You MAY refine: split a too-coarse subtask into finer child items, add a genuinely missing "
+                "subtask, or update status — reuse existing N.M ids and keep the final acceptance item. "
+                "If the current subtask is already concrete, just execute it. "
             )
         if for_manager:
             return (
@@ -42801,7 +44119,7 @@ body{padding:18px}
                 if len(prose) >= 2 and text and text != header and text not in picked:
                     picked.append(text)
         out: list[str] = []
-        max_items = max(2, min(int(limit or 6), 7))
+        max_items = max(2, min(int(limit or 6), 16))  # Fix 7: allow multi-unit steps (was 7)
         for text in picked:
             clean = normalize_work_text(text) or str(text or "").strip()
             if not clean or clean == header or clean in out:
@@ -42812,6 +44130,34 @@ body{padding:18px}
         if out:
             return out[: max_items - 1]
         return []
+
+    def _plan_step_subtask_limit(self, plan_step: dict, *, base: int = 6) -> tuple[int, str]:
+        """Fix 7: compute an adaptive subtask cap for a step. A multi-unit step
+        (N chapters/files/sections, or an active task-level deliverable target)
+        gets one subtask per unit (+setup/acceptance), capped at 16, plus a
+        per-unit decomposition note. Returns (limit, per_unit_note)."""
+        base = max(3, int(base or 6))
+        step_text = str((plan_step or {}).get("full_content", "") or (plan_step or {}).get("content", "") or "")
+        try:
+            step_target = self._infer_deliverable_target(step_text)
+            unit_n = int(step_target.get("target_count", 0) or 0) if step_target else 0
+            if unit_n < 2:
+                dp = self._deliverable_progress()
+                if dp.get("active"):
+                    unit_n = int(dp.get("remaining", 0) or dp.get("target", 0) or 0)
+                    step_target = step_target or {"unit": dp.get("unit", "unit")}
+            if unit_n >= 2:
+                limit = max(base, min(unit_n + 2, 16))
+                unit = str((step_target or {}).get("unit", "unit") or "unit")
+                note = (
+                    f"This step produces MULTIPLE {unit}s (~{unit_n}). Create ONE concrete subtask per "
+                    f"{unit} (not a single bundled 'write all {unit}s' item), in order, so each {unit} is "
+                    "executed and tracked individually. "
+                )
+                return limit, note
+        except Exception:
+            pass
+        return base, ""
 
     def _llm_plan_step_subtasks(self, plan_step: dict, *, limit: int = 5) -> list[str]:
         if not isinstance(plan_step, dict):
@@ -42824,7 +44170,9 @@ body{padding:18px}
         )
         if not step_text:
             return []
-        max_items = max(3, min(int(limit or 6), 6))
+        # Fix 7: adaptive cap — multi-unit steps decompose per-unit (not bundled).
+        adaptive_limit, per_unit_note = self._plan_step_subtask_limit(plan_step, base=int(limit or 6))
+        max_items = max(3, min(adaptive_limit, 16))
         try:
             terms = self._plan_step_acceptance_terms()
             lang = normalize_ui_language(getattr(self, "ui_language", DEFAULT_UI_LANGUAGE))
@@ -42834,6 +44182,7 @@ body{padding:18px}
                 "Create step-local execution subtasks for the active approved plan step.\n"
                 "Use the step semantics, not generic templates. Split only this step into concrete actions a worker can execute in order.\n"
                 "Do not include other plan steps, final delivery, or broad project management.\n"
+                f"{per_unit_note}"
                 f"Write all subtasks in UI language {lang}. "
                 f"The FINAL subtask is mandatory and must be a semantic acceptance subtask starting with '{terms['prefix']}{sep}'. "
                 "That final subtask must include both the check action and the evidence shape to record.\n"
@@ -42847,7 +44196,7 @@ body{padding:18px}
                 system=self._inject_runtime_environment_context(
                     "/no_think\nYou decompose one active plan step into concrete, ordered worker subtasks. Reply only valid JSON."
                 ),
-                max_tokens=360,
+                max_tokens=360 if max_items <= 6 else 720,
                 temperature=0.2,
                 think=False,
             )
@@ -42879,9 +44228,11 @@ body{padding:18px}
         step_id = trim(str(plan_step.get("id", "") or ""), 20)
         if not step_id:
             return False
-        expected = self._extract_plan_step_subtasks(plan_step, limit=6)
+        # Fix 7: adaptive cap so multi-unit steps aren't truncated to 6 bundled rows.
+        _sub_limit, _ = self._plan_step_subtask_limit(plan_step, base=6)
+        expected = self._extract_plan_step_subtasks(plan_step, limit=_sub_limit)
         if not expected:
-            expected = self._llm_plan_step_subtasks(plan_step, limit=6)
+            expected = self._llm_plan_step_subtasks(plan_step, limit=_sub_limit)
         if not expected:
             step_text = trim(str(plan_step.get("content", "") or "Execute and verify current plan step"), 180)
             expected = [f"Complete this plan step with concrete evidence: {step_text}"]
@@ -42889,7 +44240,7 @@ body{padding:18px}
             plan_step,
             expected,
             allow_llm=True,
-            limit=6,
+            limit=_sub_limit,
         )
         if not expected:
             return False
@@ -43561,77 +44912,19 @@ body{padding:18px}
                 if not any("<action-required>" in str(m.get("content", "") or "") for m in _recent_msgs if isinstance(m, dict)):
                     self._append_plan_guidance_bubble(_force_tw_msg, summary="action required: create subtasks first")
                 return False  # Wait for TodoWrite before doing other checks
-        # Heuristic: check if tool results indicate step completion
-        step_content = str(current.get("full_content", "") or current.get("content", "") or "").lower()
-        phase = self._plan_step_phase_hint(step_content)
-        wrote_files = any(
-            str(r.get("name", "")) in ("write_file", "edit_file") and r.get("ok", False)
-            for r in tool_results
-        )
-        ran_bash_ok = any(
-            str(r.get("name", "")) == "bash" and r.get("ok", False)
-            for r in tool_results
-        )
-        validation_ok_current = self._tool_results_have_validation_evidence(current, tool_results)
-        validation_ok_blackboard = self._plan_step_has_blackboard_evidence(current, bb)
-        validation_ok = validation_ok_current or validation_ok_blackboard
-        bb_sig = self._plan_step_blackboard_signals(current, bb)
+        # Unified advance decision (Fix 1): shared authority with sync mode.
         todo_progress_signal = any(
             isinstance(r, dict) and r.get("ok", False)
             and str(r.get("name", "")) in ("TodoWrite", "TodoWriteRescue")
             for r in tool_results
         )
-        # Auto-advance conditions:
-        should_advance = False
-        _gate_blocked = False  # True when validation gate fired and blocked — no other path may advance
-        # Priority 1: Check if worker subtasks are all completed (most reliable signal)
-        subtasks_done = self._step_subtasks_all_completed(current)
-        acceptance_gate = self._plan_step_acceptance_gate_status(current, {"tool_results": tool_results}, bb)
-        acceptance_gate_ok = bool(acceptance_gate.get("ok", False))
-        if subtasks_done:
-            # The final step-local acceptance subtask is the validation gate.
-            # Once all subtasks are completed, advancement only needs concrete
-            # current or accumulated evidence; no external semantic reviewer or
-            # extra structured verification tag.
-            if acceptance_gate_ok and (validation_ok or self._step_has_accumulated_evidence(current, bb)):
-                should_advance = True
-            else:
-                _gate_blocked = True  # Evidence missing — disable weaker advancement paths
-        # Priority 2: Phase-based heuristics — BUT gate by subtask completion when subtasks exist
-        # CRITICAL: A single write_file must NOT advance when 3+ subtasks remain
-        # Skipped when validation gate has blocked advancement (subtasks_done + gate failed)
-        if not should_advance and not _gate_blocked:
-            _has_subtasks_s = bool(self._active_plan_worker_todo_rows(
-                str(current.get("id", "") or ""), role=""
-            ))
-            _can_use_phase_heuristic = subtasks_done or not _has_subtasks_s
-            if _can_use_phase_heuristic:
-                if phase in ("research", "design") and validation_ok:
-                    should_advance = True
-                elif phase == "implement" and (
-                    (wrote_files and validation_ok_current)
-                    or (bb_sig["has_write"] and validation_ok_blackboard)
-                ):
-                    should_advance = True
-                elif phase in ("test", "review") and (
-                    (ran_bash_ok and validation_ok_current)
-                    or ((bb_sig["has_exec"] or bb_sig["has_review"]) and validation_ok_blackboard)
-                ):
-                    should_advance = True
-        # Also allow the explicit post-message verification contract to advance
-        # when there are no linked subtasks. Natural-language completion claims
-        # are intentionally ignored here; advancement must be backed by plan
-        # state, validation evidence, or the structured verification tag.
-        if not should_advance and not _gate_blocked:
-            _has_subtasks_s2 = bool(self._active_plan_worker_todo_rows(
-                str(current.get("id", "") or ""), role=""
-            ))
-            if (
-                self._check_step_verified_tag(current)
-                and (subtasks_done or not _has_subtasks_s2)
-                and (validation_ok or self._step_has_accumulated_evidence(current, bb))
-            ):
-                should_advance = True
+        decision = self._plan_step_advance_decision(
+            current, {"tool_results": tool_results}, bb, mode="single"
+        )
+        should_advance = bool(decision["should_advance"])
+        subtasks_done = bool(decision["signals"]["subtasks_all_done"])
+        acceptance_gate = decision["gate"]
+        acceptance_gate_ok = bool(decision["gate_ok"])
         if should_advance:
             evidence = self._collect_step_evidence(current, {"tool_results": tool_results})
             advanced = self._advance_plan_step(evidence=evidence, actor="single")
@@ -43659,6 +44952,12 @@ body{padding:18px}
                     current, acceptance_gate, bb, actor="single", target_roles=("developer",)
                 ):
                     return True  # step genuinely passed via semantic judge
+            # Outcome-progress deadlock guard (Fix 6): the key single-agent
+            # escape. Runs every non-advancing round — including when subtasks
+            # are NOT all done (the honest worker that never self-marks its
+            # failing acceptance subtask) — so a step whose OUTCOME stops
+            # improving escalates to the user instead of circling forever.
+            self._track_step_outcome_progress(current, bb, acceptance_gate)
             self._inject_rework_if_needed(current, {"tool_results": tool_results})
             self._sync_todos_from_blackboard(reason="single-agent-round")
             if todo_progress_signal and not subtasks_done:
@@ -44468,7 +45767,7 @@ body{padding:18px}
 
     def _manager_classification_system_prompt(self) -> str:
         ceiling_prompt = self._auto_task_level_ceiling_prompt()
-        user_profile_block = self._user_profile_capsule_prompt_block()
+        user_profile_block = self._user_profile_capsule_prompt_block(stage="intent")
         user_profile_text = f"\n{user_profile_block}\n" if user_profile_block else ""
         base = (
             "You are Manager. Classify the latest user request by semantic intent, not by keyword templates.\n"
@@ -44611,7 +45910,7 @@ body{padding:18px}
             return {"requires_plan": False, "reason": "plan already approved", "source": "approved-plan"}
         if self._is_plan_choice_response(goal) or self._is_continuation_input(goal):
             return {"requires_plan": False, "reason": "continuation should execute without restarting plan mode", "source": "continuation"}
-        user_profile_block = self._user_profile_capsule_prompt_block()
+        user_profile_block = self._user_profile_capsule_prompt_block(stage="intent")
         user_profile_text = f"\nUser profile preference capsule:\n{user_profile_block}\n" if user_profile_block else ""
         row = dict(decision or {})
         try:
@@ -47538,7 +48837,7 @@ body{padding:18px}
             _pmr = []
         _pmr.append({
             "target": target,
-            "instruction_hash": hashlib.sha1(str(instruction or "").encode("utf-8")).hexdigest()[:12],
+            "instruction_hash": hashlib.sha1(safe_utf8_bytes(instruction)).hexdigest()[:12],
             "round": int(getattr(self, "agent_round_index", 0) or 0),
             "ts": float(now_ts()),
             "focus_id": str(route_row.get("focus_id", "") or ""),
@@ -49563,7 +50862,7 @@ body{padding:18px}
             args_error = str(tc.get("args_error", "")).strip()
             try:
                 if isinstance(args, (dict, list)):
-                    args_text = json.dumps(args, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                    args_text = json_dumps(args, sort_keys=True, separators=(",", ":"))
                 else:
                     args_text = str(args)
             except Exception:
@@ -49573,7 +50872,7 @@ body{padding:18px}
         raw = "||".join(parts)
         if not raw:
             return ""
-        return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+        return hashlib.sha1(safe_utf8_bytes(raw)).hexdigest()
 
     def _inject_forced_convergence_hint(self, tool_names: list[str], reason: str):
         uniq = []
@@ -50719,9 +52018,8 @@ body{padding:18px}
             # Auto-serialize non-string content: if model passes a dict/list, convert to JSON string.
             raw_content = args.get("content", "")
             if not isinstance(raw_content, str):
-                import json as _json
                 try:
-                    raw_content = _json.dumps(raw_content, ensure_ascii=False, indent=2)
+                    raw_content = json_dumps(raw_content, indent=2)
                 except Exception:
                     raw_content = str(raw_content)
             args = dict(args)
@@ -50966,6 +52264,15 @@ body{padding:18px}
                 return str(out if out is not None else "")
             except Exception as exc:
                 return f"Error: knowledge library query failed: {exc}"
+        if name == "rag_remember":
+            cb = getattr(self, "rag_remember_callback", None)
+            if not callable(cb):
+                return "Error: rag_remember is not available in this session"
+            try:
+                out = cb(self, dict(args or {}))
+                return str(out if out is not None else "")
+            except Exception as exc:
+                return f"Error: rag_remember failed: {exc}"
         if name == "agent_web_search":
             return self._agent_web_search_tool(args, role=role_key)
         if name == "generate_media":
@@ -51212,6 +52519,93 @@ body{padding:18px}
             return LIVE_INPUT_DELAY_TOOL_ROUNDS, "tool-phase"
         return LIVE_INPUT_DELAY_NORMAL_ROUNDS, "thinking-phase"
 
+    def _classify_live_input_intent(self, content: str) -> str:
+        """Classify a mid-run user message as 'steer' or 'addendum' (Fix 3).
+
+        steer  = a correction / change of direction / stop / redo — must take
+                 effect immediately and at full weight (the user is course-
+                 correcting the running work).
+        addendum = supplemental info / FYI / 'also do X later' — keep the
+                 existing gentle low-weight, multi-round dilution path.
+
+        Heuristic-first (fast, deterministic, bilingual); LLM fallback only when
+        the heuristic is ambiguous AND the message is short enough to be cheap.
+        Defaults to 'addendum' on any error (preserves prior behavior)."""
+        text = str(content or "").strip()
+        if not text:
+            return "addendum"
+        low = text.lower()
+        # Strong steer signals — imperative correction / stop / redo / redirect.
+        steer_markers_en = (
+            "stop", "wait", "hold on", "hold up", "cancel", "abort", "instead",
+            "don't", "do not", "dont", "no,", "no.", "not that", "change", "redo",
+            "rewrite", "revert", "undo", "scrap", "forget", "actually", "correction",
+            "instead of", "rather than", "switch to", "use ", "drop the", "remove the",
+        )
+        steer_markers_zh = (
+            "停", "停下", "停止", "暂停", "取消", "别", "不要", "不用", "不是", "错了",
+            "改成", "改为", "换成", "换个", "重来", "重写", "重新", "撤销", "回退",
+            "别再", "先别", "而是", "应该是", "不对", "算了", "放弃",
+        )
+        addendum_markers = (
+            "also", "additionally", "by the way", "btw", "fyi", "one more",
+            "and also", "另外", "顺便", "补充", "另外还", "再加", "还有一个", "此外",
+        )
+        has_steer = any(m in low for m in steer_markers_en) or any(m in text for m in steer_markers_zh)
+        has_addendum = any(m in low for m in addendum_markers) or any(m in text for m in addendum_markers)
+        # Clear cases.
+        if has_steer and not has_addendum:
+            return "steer"
+        if has_addendum and not has_steer:
+            return "addendum"
+        # Ambiguous (both or neither): short messages default to steer bias
+        # because a terse mid-run message is usually a course-correction; but a
+        # cheap LLM check resolves it when available.
+        if has_steer and has_addendum:
+            resolved = self._llm_live_input_intent(text)
+            if resolved:
+                return resolved
+            return "steer"
+        # Neither marker: LLM fallback for short messages; else addendum.
+        if len(text) <= 240:
+            resolved = self._llm_live_input_intent(text)
+            if resolved:
+                return resolved
+        return "addendum"
+
+    def _llm_live_input_intent(self, text: str) -> str:
+        """Cheap LLM tie-breaker for live-input intent. Returns 'steer',
+        'addendum', or '' (unavailable/failed → caller keeps its default)."""
+        try:
+            prompt = (
+                "/no_think\n"
+                "A user sent this message WHILE an AI agent was actively working on their task. "
+                "Classify the user's intent as exactly one word:\n"
+                "- steer: they want to STOP, CHANGE DIRECTION, CORRECT, or REDO the current work now.\n"
+                "- addendum: they are adding supplemental info or a low-priority extra request.\n\n"
+                f"Message: {trim(text, 500)}\n\n"
+                "Answer with only 'steer' or 'addendum'."
+            )
+            resp = self.ollama.chat(
+                [{"role": "user", "content": prompt}],
+                system="/no_think\nClassify live user-input intent. One word only.",
+                max_tokens=8,
+                think=False,
+            )
+            out = ""
+            if isinstance(resp, dict):
+                out = str(resp.get("content", "") or "")
+            else:
+                out = str(resp or "")
+            out = out.strip().lower()
+            if "steer" in out:
+                return "steer"
+            if "addendum" in out:
+                return "addendum"
+        except Exception:
+            pass
+        return ""
+
     def _enqueue_running_user_input(self, content: str, *, best_effort: bool = False) -> dict:
         text = trim(str(content or "").strip(), 6000)
         if not text:
@@ -51245,6 +52639,11 @@ body{padding:18px}
                 delay_rounds, delay_reason = LIVE_INPUT_DELAY_TOOL_ROUNDS, "tool-phase"
             else:
                 delay_rounds, delay_reason = LIVE_INPUT_DELAY_NORMAL_ROUNDS, "thinking-phase"
+            intent = self._classify_live_input_intent(text)
+            # A steer must land immediately at full weight — never deferred by
+            # write/tool-phase delay (Fix 3).
+            if intent == "steer":
+                delay_rounds, delay_reason = 0, "steer"
             round_idx = int(getattr(self, "agent_round_index", 0) or 0)
             with self.live_input_queue_lock:
                 self.live_input_seq += 1
@@ -51258,6 +52657,7 @@ body{padding:18px}
                     "applied_count": 0,
                     "last_applied_round": -1,
                     "delay_reason": delay_reason,
+                    "intent": intent,
                     "run_generation": int(getattr(self, "run_generation", 0) or 0),
                     "best_effort": True,
                 }
@@ -51280,6 +52680,9 @@ body{padding:18px}
         with self.lock:
             self.live_input_seq += 1
             delay_rounds, delay_reason = self._live_input_delay_locked()
+            intent = self._classify_live_input_intent(text)
+            if intent == "steer":
+                delay_rounds, delay_reason = 0, "steer"
             round_idx = int(self.agent_round_index)
             row = {
                 "id": int(self.live_input_seq),
@@ -51291,6 +52694,7 @@ body{padding:18px}
                 "applied_count": 0,
                 "last_applied_round": -1,
                 "delay_reason": delay_reason,
+                "intent": intent,
                 "run_generation": int(self.run_generation),
             }
             with self.live_input_queue_lock:
@@ -51421,26 +52825,44 @@ body{padding:18px}
                     self._refresh_runtime_code_reference(content)
                     applied = int(row.get("applied_count", 0) or 0) + 1
                     delay_rounds = int(row.get("delay_rounds", 0) or 0)
-                    base_weight = (
-                        float(LIVE_INPUT_WEIGHT_BASE_DELAYED)
-                        if delay_rounds > 0
-                        else float(LIVE_INPUT_WEIGHT_BASE_NORMAL)
-                    )
-                    weight_step = (
-                        float(LIVE_INPUT_WEIGHT_STEP_DELAYED)
-                        if delay_rounds > 0
-                        else float(LIVE_INPUT_WEIGHT_STEP_NORMAL)
-                    )
-                    weight = min(1.0, base_weight + weight_step * max(0, applied - 1))
-                    priority = "low" if weight < 0.55 else ("medium" if weight < 0.9 else "high")
-                    payload = (
-                        "<live-user-adjustment "
-                        f"id=\"{int(row.get('id', 0) or 0)}\" "
-                        f"priority=\"{priority}\" "
-                        f"weight=\"{weight:.2f}\">"
-                        f"\n{content}\n"
-                        "</live-user-adjustment>"
-                    )
+                    intent = str(row.get("intent", "") or "")
+                    is_steer = intent == "steer"
+                    if is_steer:
+                        # Steer (Fix 3): a genuine course-correction. Inject ONCE
+                        # at full weight with a directive marker, and flag the
+                        # loop to re-plan at the top of the next round — do not
+                        # dilute it across rounds like a background suggestion.
+                        weight = 1.0
+                        priority = "high"
+                        payload = (
+                            "<user-steer "
+                            f"id=\"{int(row.get('id', 0) or 0)}\" priority=\"high\" weight=\"1.00\">"
+                            f"\nThe user sent this instruction WHILE you were working. It is a course-"
+                            f"correction and takes priority NOW — adjust the current work to follow it "
+                            f"before continuing:\n{content}\n"
+                            "</user-steer>"
+                        )
+                    else:
+                        base_weight = (
+                            float(LIVE_INPUT_WEIGHT_BASE_DELAYED)
+                            if delay_rounds > 0
+                            else float(LIVE_INPUT_WEIGHT_BASE_NORMAL)
+                        )
+                        weight_step = (
+                            float(LIVE_INPUT_WEIGHT_STEP_DELAYED)
+                            if delay_rounds > 0
+                            else float(LIVE_INPUT_WEIGHT_STEP_NORMAL)
+                        )
+                        weight = min(1.0, base_weight + weight_step * max(0, applied - 1))
+                        priority = "low" if weight < 0.55 else ("medium" if weight < 0.9 else "high")
+                        payload = (
+                            "<live-user-adjustment "
+                            f"id=\"{int(row.get('id', 0) or 0)}\" "
+                            f"priority=\"{priority}\" "
+                            f"weight=\"{weight:.2f}\">"
+                            f"\n{content}\n"
+                            "</live-user-adjustment>"
+                        )
                     self.messages.append({"role": "user", "content": payload, "ts": now_ts()})
                     # Retain the genuine user text (not the wrapped payload) as a
                     # display bubble, once, on its first injection.
@@ -51452,7 +52874,11 @@ body{padding:18px}
                         self.runtime_reclassify_required = False
                     else:
                         self.runtime_reclassify_required = True
-                    self._mark_runtime_goal_reset_pending(content, reason="live-user-adjustment")
+                    if is_steer:
+                        # Force re-plan at top of next round even under a user
+                        # task-level override (the user is explicitly redirecting).
+                        self._steer_pending = True
+                    self._mark_runtime_goal_reset_pending(content, reason="user-steer" if is_steer else "live-user-adjustment")
                     injected.append(
                         {
                             "id": int(row.get("id", 0) or 0),
@@ -51460,11 +52886,14 @@ body{padding:18px}
                             "priority": priority,
                             "applied": applied,
                             "content": content,
+                            "intent": intent or "addendum",
                         }
                     )
                     row["applied_count"] = applied
                     row["last_applied_round"] = round_idx
-                    if applied < LIVE_INPUT_MAX_INJECTIONS and weight < 0.999:
+                    # Steers are single-shot (already full weight); only addenda
+                    # re-inject to build weight over rounds.
+                    if not is_steer and applied < LIVE_INPUT_MAX_INJECTIONS and weight < 0.999:
                         row["next_round"] = round_idx + LIVE_INPUT_REINJECT_INTERVAL
                         kept.append(row)
                 self.pending_user_inputs = kept[-40:]
@@ -51766,12 +53195,14 @@ body{padding:18px}
                         previous_context=_previous_task_context,
                         clear_progress=True,
                         reset_agent_contexts=True,
+                        archive_messages=True,
                     )
                 elif not (_awaiting_plan_choice or _continue_existing_plan or _resumable_work_state or _ask_user_answer):
                     self._reset_blackboard_plan_state_locked(
                         new_goal=clean_goal_pre,
                         clear_progress=True,
                         reset_agent_contexts=True,
+                        archive_messages=True,
                     )
                 self.run_generation = int(self.run_generation) + 1
                 clean_goal = trim(str(content or "").strip(), 4000)
@@ -52612,7 +54043,7 @@ body{padding:18px}
             # Detect manager loop: same instruction repeated with unchanged progress.
             import hashlib as _hl_mgr
             _delegate_progress_fp = self._watchdog_state_fingerprint(self._ensure_blackboard())
-            _cur_hash = _hl_mgr.sha1((target + "|" + instruction + "|" + _delegate_progress_fp).encode("utf-8")).hexdigest()[:12]
+            _cur_hash = _hl_mgr.sha1(safe_utf8_bytes(target + "|" + instruction + "|" + _delegate_progress_fp)).hexdigest()[:12]
             if _cur_hash == _prev_delegation_hash:
                 _repeat_delegation_count += 1
             else:
@@ -55255,8 +56686,21 @@ body{padding:18px}
             except Exception:
                 return False
             title = str(line[m.end():] or "").strip()
-            if major_num > len(raw_steps) + 2 and SessionState._looks_like_plan_data_fragment_title(title):
-                return False
+            if SessionState._looks_like_plan_data_fragment_title(title):
+                # Phantom high-numbered "step" whose title is a data fragment
+                # (original heuristic): almost certainly a stray value, not a step.
+                if major_num > len(raw_steps) + 2:
+                    return False
+                # F11: a data-fragment title that is PURELY numeric/operator with
+                # no descriptive word (no CJK char, no 2+ letter run) is a leaked
+                # acceptance value even at a low, in-range step number
+                # (observed: "2.0 ± 0.01" attached as a fake subtask of step 2).
+                # A genuine subtask always carries descriptive text, so this never
+                # drops a real subtask.
+                has_cjk = bool(re.search(r"[㐀-鿿豈-﫿]", title))
+                has_word = bool(re.search(r"[A-Za-z]{2,}", title))
+                if not has_cjk and not has_word:
+                    return False
             return True
 
         # Phase 1: Check if any N.N sub-step headers exist
@@ -56022,18 +57466,49 @@ body{padding:18px}
                     self.current_phase = "model-call"
                     self.current_tool_name = ""
                 if level_budget > 0 and int(self.agent_round_index) > int(level_budget):
-                    force_single_tool_rounds = max(force_single_tool_rounds, 2)
-                    if not compact_budget_notified:
-                        compact_budget_notified = True
-                        self._emit(
-                            "status",
-                            {
-                                "summary": (
-                                    "single-agent compact mode enabled after internal budget threshold; "
-                                    "continuing with shorter reasoning and concrete actions"
-                                )
-                            },
-                        )
+                    # Anti-degradation (Fix 2): long-horizon tasks (an active
+                    # deliverable quota, or L4/L5) must NOT be forced into
+                    # one-tool-per-round "compact mode" the moment they cross the
+                    # tier budget — that degrades reasoning exactly when a novel /
+                    # paper / big-data task needs it most, producing the 虎头蛇尾
+                    # (strong start, weak finish) failure. Instead we keep full
+                    # reasoning and rely on progress-gated continuation: the round
+                    # loop and finish gate already stop a task that has genuinely
+                    # stalled, while a task still producing real units keeps going.
+                    _dp = self._deliverable_progress()
+                    _long_horizon = bool(_dp.get("active")) or int(self.runtime_task_level or 0) >= 4
+                    if _long_horizon:
+                        if not compact_budget_notified:
+                            compact_budget_notified = True
+                            _rem = int(_dp.get("remaining", 0) or 0)
+                            _detail = (
+                                f"deliverable progress {int(_dp.get('produced', 0))}/{int(_dp.get('target', 0))} "
+                                f"{_dp.get('unit', 'unit')}s remaining={_rem}; "
+                                if _dp.get("active")
+                                else ""
+                            )
+                            self._emit(
+                                "status",
+                                {
+                                    "summary": (
+                                        "single-agent budget threshold crossed on a long-horizon task; "
+                                        f"{_detail}keeping full reasoning (no compact mode) and continuing"
+                                    )
+                                },
+                            )
+                    else:
+                        force_single_tool_rounds = max(force_single_tool_rounds, 2)
+                        if not compact_budget_notified:
+                            compact_budget_notified = True
+                            self._emit(
+                                "status",
+                                {
+                                    "summary": (
+                                        "single-agent compact mode enabled after internal budget threshold; "
+                                        "continuing with shorter reasoning and concrete actions"
+                                    )
+                                },
+                            )
                 if self.cancel_requested:
                     self._emit("status", {"summary": "run interrupted"})
                     break
@@ -56072,12 +57547,18 @@ body{padding:18px}
                     self.messages.append({"role": "user", "content": f"<inbox>{json_dumps(inbox, indent=2)}</inbox>", "ts": now_ts()})
                     self._emit("inbox", {"summary": f"{len(inbox)} inbox messages"})
                 self._inject_pending_user_inputs()
-                if self.runtime_reclassify_required:
-                    # Skip reclassification if user has manually set task level
-                    if int(getattr(self, 'user_task_level_override', 0) or 0) > 0:
+                _sa_steer = bool(getattr(self, "_steer_pending", False))
+                if self.runtime_reclassify_required or _sa_steer:
+                    # Skip reclassification if user set task level — UNLESS this is
+                    # a steer (Fix 3): a mid-run course-correction must re-plan now
+                    # even under a manual level override.
+                    if int(getattr(self, 'user_task_level_override', 0) or 0) > 0 and not _sa_steer:
                         self.runtime_reclassify_required = False
                         self._mark_runtime_goal_reset_handled(reason="single-agent-user-level-override", clear_reclassify=True)
                     else:
+                        if _sa_steer:
+                            self._steer_pending = False
+                            self._emit("status", {"summary": "user steer applied — re-planning (single-agent)"})
                         policy_media_inputs = self._recent_multimodal_inputs()
                         self._emit_multimodal_attach_status(
                             scope="manager reclassify",
@@ -56240,6 +57721,31 @@ body{padding:18px}
                     no_tool_rounds = 0
                     last_tool_fp = ""
                     repeated_tool_rounds = 0
+                    # F8: a thinking-only round is a NON-ADVANCING round for the
+                    # active plan step. Feed it into the outcome-progress tracker
+                    # so a step that stalls in analysis-paralysis (observed: single
+                    # run spent ~280 lines deriving SCF math across rounds and never
+                    # wrote the file, dying on a terse fault-prefill loop) escalates
+                    # to a user-facing plan proposal. This unifies counting with
+                    # executed-but-not-progressing rounds — the same step stall
+                    # counter now reflects BOTH churn modes.
+                    try:
+                        _f8_bb = self._ensure_blackboard()
+                        _f8_step = self._get_active_plan_step(_f8_bb)
+                        if isinstance(_f8_step, dict) and _f8_step:
+                            _f8 = self._track_step_outcome_progress(
+                                _f8_step,
+                                _f8_bb,
+                                {"reason": "thinking-only output without actionable content"},
+                            )
+                            if bool(_f8.get("escalated", False)):
+                                self._emit(
+                                    "status",
+                                    {"summary": "single-agent stall escalated to plan mode (thinking-only outcome stall)"},
+                                )
+                                break
+                    except Exception:
+                        pass
                     self._inject_thinking_empty_recovery_hint(
                         streak=consecutive_empty_action_rounds,
                         budget_forced=budget_forced,
@@ -56270,6 +57776,29 @@ body{padding:18px}
                             },
                         )
                         continue
+                    # F8: retry budget for thinking-only rounds is exhausted. Before
+                    # firing the terse circuit-breaker (which just dead-ends the run
+                    # with "split the task / switch model"), prefer a graceful
+                    # escalation to a user-facing plan proposal when a plan step is
+                    # active — the user then gets concrete re-plan options instead of
+                    # an opaque stop. Falls through to the breaker only if escalation
+                    # is unavailable (already escalated, or level/preference gates it).
+                    try:
+                        _f8b_bb = self._ensure_blackboard()
+                        if isinstance(self._get_active_plan_step(_f8b_bb), dict) and not self.stall_escalation_triggered:
+                            if self._escalate_stall_to_plan_mode(
+                                trigger_source="thinking-only-stall",
+                                fault_counter=fault_counter,
+                                last_fault_reason="thinking-only output without actionable content",
+                                pinned_selection=pinned_selection,
+                            ):
+                                self._emit(
+                                    "status",
+                                    {"summary": "single-agent thinking-only stall escalated to plan mode"},
+                                )
+                                break
+                    except Exception:
+                        pass
                     stop_note = (
                         "模型连续多轮仅输出思考而无动作，自动执行已熔断停止（fault_counter>=15）。"
                         "请尝试拆分任务，或切换更强的推理模型后继续。"
@@ -58556,6 +60085,7 @@ class SessionManager:
         reference_prepare_callback=None,
         query_code_library_callback=None,
         query_knowledge_library_callback=None,
+        rag_remember_callback=None,
         code_library_root: Path | str | None = None,
         code_library_status_callback=None,
         knowledge_library_root: Path | str | None = None,
@@ -58615,6 +60145,7 @@ class SessionManager:
         self.reference_prepare_callback = reference_prepare_callback
         self.query_code_library_callback = query_code_library_callback
         self.query_knowledge_library_callback = query_knowledge_library_callback
+        self.rag_remember_callback = rag_remember_callback
         self.code_library_root = code_library_root
         self.code_library_status_callback = code_library_status_callback
         self.knowledge_library_root = knowledge_library_root
@@ -59032,7 +60563,7 @@ class SessionManager:
         if mode == "off":
             return {"ok": True, "skipped": True, "mode": "off"}
         try:
-            return self.user_memory_store.capture_session(sess)
+            return self.user_memory_store.capture_session(sess, mode=mode)
         except Exception as exc:
             return {"ok": False, "error": trim(str(exc), 220)}
 
@@ -59143,6 +60674,7 @@ class SessionManager:
                 reference_prepare_callback=self.reference_prepare_callback,
                 query_code_library_callback=self.query_code_library_callback,
                 query_knowledge_library_callback=self.query_knowledge_library_callback,
+                rag_remember_callback=self.rag_remember_callback,
                 code_library_root=self.code_library_root,
                 code_library_status_callback=self.code_library_status_callback,
                 knowledge_library_root=self.knowledge_library_root,
@@ -59248,6 +60780,7 @@ class SessionManager:
                 reference_prepare_callback=self.reference_prepare_callback,
                 query_code_library_callback=self.query_code_library_callback,
                 query_knowledge_library_callback=self.query_knowledge_library_callback,
+                rag_remember_callback=self.rag_remember_callback,
                 code_library_root=self.code_library_root,
                 code_library_status_callback=self.code_library_status_callback,
                 knowledge_library_root=self.knowledge_library_root,
@@ -59930,6 +61463,8 @@ window.MathJax={
         </div>
         <button id="previewCopyBtn" class="subtle hidden">Copy Code</button>
         <button id="previewModeBtn" class="subtle hidden">Source</button>
+        <button id="previewCopyLinkBtn" class="subtle hidden">Copy Link</button>
+        <button id="previewOpenBtn" class="subtle hidden">Open in Browser</button>
         <button id="previewDownloadBtn" class="subtle hidden">Download</button>
         <button id="previewReloadBtn" class="subtle">Reload</button>
       </div>
@@ -60674,7 +62209,7 @@ Object.assign(I18N['en'],{
   event_auto_continue:'Auto Continue',event_arbiter_continue:'Arbiter Continue',event_continuation_briefing:'Continuation Briefing',event_reminder:'Reminder',event_todo_rescue:'Todo Rescue',event_tool_retry:'Tool Retry',event_segmented_retry:'Segmented Retry',event_forced_converge:'Forced Converge',event_no_tool_recovery:'No-Tool Recovery',event_context_recall:'Context Recall',event_failure_recovery:'Failure Recovery',event_truncate_rescue:'Truncation Rescue',event_thinking_recovery:'Thinking Recovery',event_fault_prefill:'Fault Prefill',event_edit_recovery:'Edit Recovery',
   state_on:'on',state_off:'off',
   rt_session:'session',rt_model:'model',rt_thinking:'thinking',rt_thinking_stream:'thinking_stream',rt_response_stream:'response_stream',rt_mode:'mode',rt_active_agent:'active_agent',rt_blackboard:'bb',rt_task:'task',rt_complexity:'complexity',rt_judgement:'judgement',rt_budget:'budget',rt_remaining:'remaining',rt_blackboard_cycles:'bb_cycles',rt_round_limit:'round_limit',rt_round:'round',rt_phase:'phase',rt_queued_inputs:'queued_inputs',rt_run_timeout:'run_timeout',rt_ctx_used:'ctx_used',rt_ctx_limit:'ctx_limit',rt_ctx_mode:'ctx_mode',rt_manual_lock:'manual-lock',rt_adaptive:'adaptive',rt_ctx_left:'ctx_left',rt_ctx_left_for:'{label} left',rt_ctx_live_title:'Remaining context budget by active call',rt_truncation:'truncation',rt_trunc_retry:'trunc_retry',rt_trunc_tokens:'trunc_tokens~',rt_archive:'archive',rt_last_compact:'last_compact',compact_ago:'ago',compact_just_now:'just now',rt_ollama:'ollama',rt_files:'files',rt_ui_mode:'ui_mode',rt_state:'state',rt_awaiting_user:'awaiting user',ask_user_title:'Agent needs your input',ask_user_free_hint:'Pick an option above, or type your answer below and send.',ask_user_pick_hint:'Pick one of the options above to continue.',
-  preview_download:'Download',preview_source:'Source',preview_rendered:'Preview',
+  preview_download:'Download',preview_source:'Source',preview_rendered:'Preview',preview_copy_link:'Copy Link',preview_open:'Open in Browser',preview_link_copied:'Link Copied',
   fe_nodes:'nodes={n}',fe_loading:'loading...',fe_tree_truncated:'tree truncated at {n} nodes',fe_items:'{n} item(s)',
   cmd_ui_preview_truncated:'UI preview truncated',cmd_model_context_truncated:'Model context truncated',cmd_temp_read_file_ready:'Temp read_file ready',cmd_buffered_copy:'Buffered copy',cmd_prev:'Prev',cmd_next:'Next',cmd_preview:'preview',cmd_of:'of',cmd_read_file_path:'read_file path',cmd_buffer_ref:'buffer_ref',cmd_chars:'chars',cmd_lines:'lines',cmd_strategy:'strategy',cmd_full_output:'full_output',cmd_exit:'exit',cmd_default_name:'command'
 });
@@ -60702,7 +62237,7 @@ Object.assign(I18N['zh-CN'],{
   event_auto_continue:'自动继续',event_arbiter_continue:'裁决继续',event_continuation_briefing:'续跑简报',event_reminder:'提醒',event_todo_rescue:'待办救援',event_tool_retry:'工具重试',event_segmented_retry:'分段重试',event_forced_converge:'强制收敛',event_no_tool_recovery:'无工具恢复',event_context_recall:'上下文召回',event_failure_recovery:'故障恢复',event_truncate_rescue:'截断救援',event_thinking_recovery:'思考恢复',event_fault_prefill:'故障预填',event_edit_recovery:'编辑恢复',
   state_on:'开',state_off:'关',
   rt_session:'会话',rt_model:'模型',rt_thinking:'思考',rt_thinking_stream:'思考流',rt_response_stream:'正文流',rt_mode:'模式',rt_active_agent:'活跃代理',rt_blackboard:'黑板',rt_task:'任务',rt_complexity:'复杂度',rt_judgement:'裁决',rt_budget:'预算',rt_remaining:'剩余',rt_blackboard_cycles:'黑板轮次',rt_round_limit:'轮次上限',rt_round:'轮次',rt_phase:'阶段',rt_queued_inputs:'排队输入',rt_run_timeout:'运行超时',rt_ctx_used:'上下文已用',rt_ctx_limit:'上下文上限',rt_ctx_mode:'上下文模式',rt_manual_lock:'手动锁定',rt_adaptive:'自适应',rt_ctx_left:'上下文剩余',rt_ctx_left_for:'{label}剩余',rt_ctx_live_title:'按真实调用显示上下文剩余',rt_truncation:'截断数',rt_trunc_retry:'截断重试',rt_trunc_tokens:'截断Token~',rt_archive:'归档',rt_last_compact:'最近压缩',compact_ago:'前',compact_just_now:'刚刚',rt_ollama:'Ollama',rt_files:'文件根目录',rt_ui_mode:'界面模式',rt_state:'状态',rt_awaiting_user:'等待用户',ask_user_title:'需要你的输入',ask_user_free_hint:'点击上方选项,或在下方输入答复后发送。',ask_user_pick_hint:'请选择上方其中一个选项以继续。',
-  preview_download:'下载',preview_source:'源码',preview_rendered:'预览',
+  preview_download:'下载',preview_source:'源码',preview_rendered:'预览',preview_copy_link:'复制链接',preview_open:'浏览器打开',preview_link_copied:'已复制链接',
   fe_nodes:'节点={n}',fe_loading:'加载中...',fe_tree_truncated:'目录树在 {n} 个节点处被截断',fe_items:'{n} 项',
   cmd_ui_preview_truncated:'UI 预览截断',cmd_model_context_truncated:'模型上下文截断',cmd_temp_read_file_ready:'临时 read_file 已就绪',cmd_buffered_copy:'缓冲副本',cmd_prev:'上一页',cmd_next:'下一页',cmd_preview:'预览',cmd_of:'共',cmd_read_file_path:'read_file 路径',cmd_buffer_ref:'缓冲引用',cmd_chars:'字符',cmd_lines:'行',cmd_strategy:'策略',cmd_full_output:'完整输出',cmd_exit:'退出码',cmd_default_name:'命令'
 });
@@ -60733,7 +62268,7 @@ Object.assign(I18N['zh-TW'],{
   event_auto_continue:'自動繼續',event_arbiter_continue:'裁決繼續',event_continuation_briefing:'續跑簡報',event_reminder:'提醒',event_todo_rescue:'待辦救援',event_tool_retry:'工具重試',event_segmented_retry:'分段重試',event_forced_converge:'強制收斂',event_no_tool_recovery:'無工具恢復',event_context_recall:'上下文召回',event_failure_recovery:'故障恢復',event_truncate_rescue:'截斷救援',event_thinking_recovery:'思考恢復',event_fault_prefill:'故障預填',event_edit_recovery:'編輯恢復',
   state_on:'開',state_off:'關',
   rt_session:'會話',rt_model:'模型',rt_thinking:'思考',rt_thinking_stream:'思考流',rt_response_stream:'正文串流',rt_mode:'模式',rt_active_agent:'活躍代理',rt_blackboard:'黑板',rt_task:'任務',rt_complexity:'複雜度',rt_judgement:'裁決',rt_budget:'預算',rt_remaining:'剩餘',rt_blackboard_cycles:'黑板輪次',rt_round_limit:'輪次上限',rt_round:'輪次',rt_phase:'階段',rt_queued_inputs:'排隊輸入',rt_run_timeout:'執行逾時',rt_ctx_used:'上下文已用',rt_ctx_limit:'上下文上限',rt_ctx_mode:'上下文模式',rt_manual_lock:'手動鎖定',rt_adaptive:'自適應',rt_ctx_left:'上下文剩餘',rt_ctx_left_for:'{label}剩餘',rt_ctx_live_title:'依真實呼叫顯示上下文剩餘',rt_truncation:'截斷數',rt_trunc_retry:'截斷重試',rt_trunc_tokens:'截斷Token~',rt_archive:'封存',rt_last_compact:'最近壓縮',compact_ago:'前',compact_just_now:'剛剛',rt_ollama:'Ollama',rt_files:'檔案根目錄',rt_ui_mode:'介面模式',rt_state:'狀態',rt_awaiting_user:'等待使用者',ask_user_title:'需要你的輸入',ask_user_free_hint:'點擊上方選項,或在下方輸入答覆後送出。',ask_user_pick_hint:'請選擇上方其中一個選項以繼續。',
-  preview_download:'下載',preview_source:'原始碼',preview_rendered:'預覽',
+  preview_download:'下載',preview_source:'原始碼',preview_rendered:'預覽',preview_copy_link:'複製連結',preview_open:'瀏覽器開啟',preview_link_copied:'已複製連結',
   fe_nodes:'節點={n}',fe_loading:'載入中...',fe_tree_truncated:'目錄樹在 {n} 個節點處被截斷',fe_items:'{n} 項',
   cmd_ui_preview_truncated:'UI 預覽截斷',cmd_model_context_truncated:'模型上下文截斷',cmd_temp_read_file_ready:'暫存 read_file 已就緒',cmd_buffered_copy:'緩衝副本',cmd_prev:'上一頁',cmd_next:'下一頁',cmd_preview:'預覽',cmd_of:'共',cmd_read_file_path:'read_file 路徑',cmd_buffer_ref:'緩衝引用',cmd_chars:'字元',cmd_lines:'行',cmd_strategy:'策略',cmd_full_output:'完整輸出',cmd_exit:'退出碼',cmd_default_name:'命令'
 });
@@ -60762,7 +62297,7 @@ Object.assign(I18N['ja'],{
   event_auto_continue:'自動継続',event_arbiter_continue:'判定継続',event_continuation_briefing:'継続ブリーフ',event_reminder:'リマインダー',event_todo_rescue:'Todo 救援',event_tool_retry:'ツール再試行',event_segmented_retry:'分割再試行',event_forced_converge:'強制収束',event_no_tool_recovery:'ツールなし復旧',event_context_recall:'コンテキスト再呼び出し',event_failure_recovery:'障害復旧',event_truncate_rescue:'切り詰め救援',event_thinking_recovery:'思考復旧',event_fault_prefill:'障害プリフィル',event_edit_recovery:'編集復旧',
   state_on:'オン',state_off:'オフ',
   rt_session:'セッション',rt_model:'モデル',rt_thinking:'思考',rt_thinking_stream:'思考ストリーム',rt_response_stream:'レスポンスストリーム',rt_mode:'モード',rt_active_agent:'アクティブAgent',rt_blackboard:'黒板',rt_task:'タスク',rt_complexity:'複雑度',rt_judgement:'判定',rt_budget:'予算',rt_remaining:'残り',rt_blackboard_cycles:'黒板サイクル',rt_round_limit:'ラウンド上限',rt_round:'ラウンド',rt_phase:'フェーズ',rt_queued_inputs:'待機入力',rt_run_timeout:'実行タイムアウト',rt_ctx_used:'コンテキスト使用量',rt_ctx_limit:'コンテキスト上限',rt_ctx_mode:'コンテキストモード',rt_manual_lock:'手動固定',rt_adaptive:'適応',rt_ctx_left:'残りコンテキスト',rt_ctx_left_for:'{label}残り',rt_ctx_live_title:'実際の呼び出し別の残りコンテキスト',rt_truncation:'切り詰め数',rt_trunc_retry:'切り詰め再試行',rt_trunc_tokens:'切り詰めToken~',rt_archive:'アーカイブ',rt_last_compact:'直近 compact',compact_ago:'前',compact_just_now:'たった今',rt_ollama:'Ollama',rt_files:'ファイルルート',rt_ui_mode:'UIモード',rt_state:'状態',rt_awaiting_user:'ユーザー待ち',ask_user_title:'入力が必要です',ask_user_free_hint:'上のオプションを選ぶか、下に回答を入力して送信してください。',ask_user_pick_hint:'続行するには上のオプションを選んでください。',
-  preview_download:'ダウンロード',preview_source:'ソース',preview_rendered:'プレビュー',
+  preview_download:'ダウンロード',preview_source:'ソース',preview_rendered:'プレビュー',preview_copy_link:'リンクをコピー',preview_open:'ブラウザで開く',preview_link_copied:'リンクをコピーしました',
   fe_nodes:'ノード={n}',fe_loading:'読み込み中...',fe_tree_truncated:'ツリーは {n} ノードで切り詰められました',fe_items:'{n} 件',
   cmd_ui_preview_truncated:'UI プレビュー切り詰め',cmd_model_context_truncated:'モデルコンテキスト切り詰め',cmd_temp_read_file_ready:'一時 read_file 準備完了',cmd_buffered_copy:'バッファコピー',cmd_prev:'前へ',cmd_next:'次へ',cmd_preview:'プレビュー',cmd_of:'全',cmd_read_file_path:'read_file パス',cmd_buffer_ref:'buffer_ref',cmd_chars:'文字',cmd_lines:'行',cmd_strategy:'戦略',cmd_full_output:'完全出力',cmd_exit:'終了コード',cmd_default_name:'コマンド'
 });
@@ -62351,6 +63886,8 @@ function _setPreviewToolbarState(tab){
   const btn=E('previewCopyBtn');
   const modeBtn=E('previewModeBtn');
   const dlBtn=E('previewDownloadBtn');
+  const linkBtn=E('previewCopyLinkBtn');
+  const openBtn=E('previewOpenBtn');
   const isCode=!!(tab&&tab.kind==='code');
   const isHtml=!!(tab&&tab.kind==='html');
   const hasDownload=!!(tab&&tab.path);
@@ -62365,11 +63902,70 @@ function _setPreviewToolbarState(tab){
     if(isHtml)modeBtn.textContent=(String(tab.htmlMode||'preview')==='source')?t('preview_rendered'):t('preview_source');
     modeBtn.onclick=(ev)=>{ev.preventDefault();togglePreviewMode()};
   }
+  // Copy-link + open-in-browser: HTML only. The cramped in-pane iframe distorts rendered
+  // pages, so a real browser tab is the fix; other file kinds (code/images/text) preview
+  // fine in-pane and just get the download button.
+  const canOpen=isHtml&&hasDownload;
+  if(linkBtn){
+    linkBtn.classList.toggle('hidden',!canOpen);
+    linkBtn.disabled=!canOpen;
+    linkBtn.textContent=t('preview_copy_link');
+    linkBtn.onclick=(ev)=>{ev.preventDefault();copyPreviewLink()};
+  }
+  if(openBtn){
+    openBtn.classList.toggle('hidden',!canOpen);
+    openBtn.disabled=!canOpen;
+    openBtn.textContent=t('preview_open');
+    openBtn.onclick=(ev)=>{ev.preventDefault();openPreviewInBrowser()};
+  }
   if(dlBtn){
     dlBtn.classList.toggle('hidden',!hasDownload);
     dlBtn.disabled=!hasDownload;
     dlBtn.textContent=t('preview_download');
     dlBtn.onclick=(ev)=>{ev.preventDefault();downloadActivePreview()};
+  }
+}
+function previewAbsoluteUrl(tab){
+  if(!tab||!S.activeId||!tab.path)return'';
+  // Use the same endpoint the in-pane preview renders, so the opened/copied link shows the
+  // identical content (HTML is served with the right content-type and renders properly).
+  const rel=previewFileUrl(S.activeId,tab.path,false);
+  try{return new URL(rel,location.origin).href}catch(_){return location.origin+rel}
+}
+function openPreviewInBrowser(){
+  const tab=activePreviewTab();
+  const url=previewAbsoluteUrl(tab);
+  if(!url)return;
+  try{window.open(url,'_blank','noopener,noreferrer')}catch(_){location.href=url}
+}
+async function copyPreviewLink(){
+  const tab=activePreviewTab();
+  const url=previewAbsoluteUrl(tab);
+  if(!url)return;
+  const btn=E('previewCopyLinkBtn');
+  const restore=()=>{if(btn){btn.disabled=false;btn.textContent=t('preview_copy_link')}};
+  try{
+    if(btn)btn.disabled=true;
+    if(navigator.clipboard&&typeof navigator.clipboard.writeText==='function'){
+      await navigator.clipboard.writeText(url);
+    }else{
+      const ta=document.createElement('textarea');
+      ta.value=url;
+      ta.setAttribute('readonly','readonly');
+      ta.style.position='fixed';
+      ta.style.left='-9999px';
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+    }
+    if(btn){
+      btn.textContent=t('preview_link_copied');
+      setTimeout(restore,1100);
+    }
+  }catch(err){
+    restore();
+    showError(err?.message||String(err));
   }
 }
 function _setPreviewCopyState(tab){
@@ -70667,6 +72263,64 @@ def _rag_parse_segments(content: str) -> list[tuple[str, int, str, str]]:
     return out
 
 
+def _rag_boundary_split(body: str, *, max_chars: int, overlap: int) -> list[str]:
+    """Split an oversized block into pieces that end on a natural boundary.
+
+    A plain ``body[i:i+max_chars]`` window cuts mid-sentence or mid-identifier, which
+    fragments tokens and hurts both recall (a split identifier matches nothing) and the
+    readability of retrieved excerpts. This backs each cut off to the nearest paragraph
+    break, sentence end, newline, or whitespace within a look-back window, then carries a
+    boundary-aligned overlap tail. Falls back to a hard cut only when no boundary exists
+    (e.g. one enormous unbroken token).
+    """
+    body = str(body or "")
+    if len(body) <= max_chars:
+        return [body] if body.strip() else []
+    step = max(200, max_chars - overlap)
+    # Look back at most ~20% of the window for a boundary so we don't shrink chunks too much.
+    lookback = max(40, min(max_chars // 5, 400))
+    pieces: list[str] = []
+    pos = 0
+    n = len(body)
+    # Boundary patterns in priority order, searched within [cut-lookback, cut].
+    boundary_res = [
+        re.compile(r"\n\s*\n"),          # paragraph break
+        re.compile(r"(?<=[.!?。！？])\s"), # sentence end (Latin + CJK)
+        re.compile(r"\n"),               # line break
+        re.compile(r"\s"),               # any whitespace
+    ]
+    while pos < n:
+        hard_end = min(pos + max_chars, n)
+        if hard_end >= n:
+            piece = body[pos:n]
+            if piece.strip():
+                pieces.append(piece)
+            break
+        cut = hard_end
+        window_start = max(pos + step // 2, hard_end - lookback)
+        for rex in boundary_res:
+            best = None
+            for m in rex.finditer(body, window_start, hard_end):
+                best = m
+            if best is not None:
+                cut = best.end()
+                break
+        piece = body[pos:cut]
+        if piece.strip():
+            pieces.append(piece)
+        if cut <= pos:  # safety: no progress → hard cut
+            cut = hard_end
+            pieces.append(body[pos:cut])
+        # Overlap tail, aligned to a whitespace boundary so we don't start mid-word.
+        next_pos = max(pos + 1, cut - overlap) if overlap else cut
+        if overlap and next_pos < cut:
+            ws = body.find(" ", next_pos, cut)
+            if ws != -1 and ws + 1 < cut:
+                next_pos = ws + 1
+        pos = next_pos if next_pos > pos else cut
+    return pieces
+
+
 def _rag_chunk_text(text: str, *, max_chars: int = RAG_CHUNK_CHARS, overlap: int = RAG_CHUNK_OVERLAP) -> list[dict]:
     """Semantic-boundary-aware text chunking.
 
@@ -70718,10 +72372,9 @@ def _rag_chunk_text(text: str, *, max_chars: int = RAG_CHUNK_CHARS, overlap: int
             if len(seg_body) <= max_code:
                 _flush(seg_body, current_heading, current_depth, is_code=True)
             else:
-                # Very large block — split by line-count chunks rather than mid-character
-                step = max(200, max_chars - overlap)
-                for ci in range(0, len(seg_body), step):
-                    _flush(seg_body[ci : ci + max_chars], current_heading, current_depth, is_code=True)
+                # Very large block — split on natural boundaries, not mid-character.
+                for piece in _rag_boundary_split(seg_body, max_chars=max_chars, overlap=overlap):
+                    _flush(piece, current_heading, current_depth, is_code=True)
                     if len(chunks) >= RAG_MAX_CHUNKS_PER_DOC:
                         break
         else:
@@ -70734,9 +72387,8 @@ def _rag_chunk_text(text: str, *, max_chars: int = RAG_CHUNK_CHARS, overlap: int
                     tail = current_text[-overlap:].strip() if overlap else ""
                     current_text = (tail + "\n\n" + seg_body).strip() if tail else seg_body
                 else:
-                    # Single oversized paragraph — split by step with overlap
-                    step = max(200, max_chars - overlap)
-                    pieces = [seg_body[ci : ci + max_chars] for ci in range(0, len(seg_body), step)]
+                    # Single oversized paragraph — split on natural boundaries with overlap
+                    pieces = _rag_boundary_split(seg_body, max_chars=max_chars, overlap=overlap)
                     for piece in pieces[:-1]:
                         _flush(piece, current_heading, current_depth)
                         if len(chunks) >= RAG_MAX_CHUNKS_PER_DOC:
@@ -71163,17 +72815,34 @@ class CodeContentParser:
             else:
                 out.extend(self._split_large_chunk(chunk_lines, line_start=start, symbol=symbol, kind=kind))
 
-        for node in list(tree.body):
-            if isinstance(node, ast.ClassDef):
-                add_symbol(node, str(node.name), "class")
-                for child in list(node.body):
-                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        prefix = f"{node.name}.{getattr(child, 'name', '')}"
-                        add_symbol(child, prefix.strip("."), "method")
-            elif isinstance(node, ast.FunctionDef):
-                add_symbol(node, str(node.name), "function")
-            elif isinstance(node, ast.AsyncFunctionDef):
-                add_symbol(node, str(node.name), "async_function")
+        # Recursive walk: emit a chunk for every class, function, and method at any nesting
+        # depth (nested functions, closures, decorated helpers, classes inside functions).
+        # Naming is hierarchical (outer.inner / Class.method) so the symbol-exact retrieval
+        # boost can resolve a query like "outer.inner" or just "inner". Depth-capped to keep
+        # pathological deeply-nested files bounded; overall output capped by CODE_MAX_CHUNKS_PER_DOC.
+        MAX_NEST_DEPTH = 4
+
+        def walk(node: ast.AST, prefix: str, depth: int):
+            for child in list(getattr(node, "body", []) or []):
+                if isinstance(child, ast.ClassDef):
+                    name = f"{prefix}.{child.name}".strip(".") if prefix else str(child.name)
+                    add_symbol(child, name, "class")
+                    if depth < MAX_NEST_DEPTH:
+                        walk(child, name, depth + 1)
+                elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    name = f"{prefix}.{child.name}".strip(".") if prefix else str(child.name)
+                    if prefix:
+                        kind = "method"  # function defined inside a class or another function
+                    elif isinstance(child, ast.AsyncFunctionDef):
+                        kind = "async_function"
+                    else:
+                        kind = "function"
+                    add_symbol(child, name, kind)
+                    # Recurse to capture nested helpers / closures defined inside this function.
+                    if depth < MAX_NEST_DEPTH:
+                        walk(child, name, depth + 1)
+
+        walk(tree, "", 0)
         return out[:CODE_MAX_CHUNKS_PER_DOC], symbols[:160]
 
     def _decl_matchers(self, language: str) -> list[tuple[re.Pattern[str], str]]:
@@ -71409,7 +73078,7 @@ class CodeContentParser:
             "kind": "source_code",
             "mime": str(mime or guess_mime_from_name(fp.name, "text/plain")),
             "size": int(fp.stat().st_size) if fp.exists() and fp.is_file() else len((raw_bytes or b"")),
-            "sha256": _sha256_file(fp) if fp.exists() and fp.is_file() else _sha256_bytes((raw_text or "").encode("utf-8")),
+            "sha256": _sha256_file(fp) if fp.exists() and fp.is_file() else _sha256_bytes(safe_utf8_bytes(raw_text or "")),
             "language": language or "text",
             "text": raw_text,
             "text_chars": len(raw_text),
@@ -71521,7 +73190,7 @@ class RAGContentParser:
 
             text = extract_text(str(pdf_path))
             if text and text.strip():
-                return trim(text.strip(), 800_000)
+                return trim(text.strip(), RAG_MAX_DOCUMENT_CHARS)
         except ImportError:
             pass
         except Exception:
@@ -71533,17 +73202,17 @@ class RAGContentParser:
                     [tool, "-layout", str(pdf_path), "-"],
                     capture_output=True,
                     text=True,
-                    timeout=60,
+                    timeout=max(60, int(RAG_PARSE_TIMEOUT_SECONDS)),
                 )
                 if r.returncode == 0 and r.stdout.strip():
-                    return trim(r.stdout.strip(), 800_000)
+                    return trim(r.stdout.strip(), RAG_MAX_DOCUMENT_CHARS)
             except Exception:
                 pass
         try:
             raw = pdf_path.read_bytes()
             text = raw.decode("latin-1", errors="ignore")
             chunks = re.findall(r"\(([^()]{4,2000})\)", text)
-            return trim("\n".join(chunks), 80_000)
+            return trim("\n".join(chunks), RAG_MAX_DOCUMENT_CHARS)
         except Exception:
             return ""
 
@@ -71571,7 +73240,7 @@ class RAGContentParser:
                     table_lines.append("\t".join(vals))
         except Exception:
             table_lines = lines[:300]
-        return trim("\n".join(table_lines), 120_000)
+        return trim("\n".join(table_lines), RAG_MAX_DOCUMENT_CHARS)
 
     def _extract_xlsx_text(self, fp: Path) -> str:
         if self._module_available("openpyxl"):
@@ -71593,7 +73262,7 @@ class RAGContentParser:
                             break
                 wb.close()
                 if lines:
-                    return trim("\n".join(lines), 120_000)
+                    return trim("\n".join(lines), RAG_MAX_DOCUMENT_CHARS)
             except Exception:
                 pass
         try:
@@ -71637,7 +73306,7 @@ class RAGContentParser:
                         if taken >= 160:
                             break
                 if lines:
-                    return trim("\n".join(lines), 120_000)
+                    return trim("\n".join(lines), RAG_MAX_DOCUMENT_CHARS)
         except Exception:
             pass
         return self._extract_strings_fallback(fp)
@@ -71658,12 +73327,12 @@ class RAGContentParser:
                             lines.append("\t".join(vals))
                 wb.release_resources()
                 if lines:
-                    return trim("\n".join(lines), 120_000)
+                    return trim("\n".join(lines), RAG_MAX_DOCUMENT_CHARS)
             except Exception:
                 pass
         xls2csv_text = self._run_text_extractor_cmd(["xls2csv", str(fp)], timeout=45)
         if xls2csv_text:
-            return trim(xls2csv_text, 120_000)
+            return trim(xls2csv_text, RAG_MAX_DOCUMENT_CHARS)
         return self._extract_strings_fallback(fp)
 
     def _extract_docx_text(self, fp: Path) -> str:
@@ -71684,7 +73353,7 @@ class RAGContentParser:
                         if vals:
                             lines.append("\t".join(vals))
                 if lines:
-                    return trim("\n".join(lines), 120_000)
+                    return trim("\n".join(lines), RAG_MAX_DOCUMENT_CHARS)
             except Exception:
                 pass
         try:
@@ -71697,7 +73366,7 @@ class RAGContentParser:
                         lines.append(f"[Part] {Path(name).name}")
                         lines.extend(tokens[:3000])
                 if lines:
-                    return trim("\n".join(lines), 120_000)
+                    return trim("\n".join(lines), RAG_MAX_DOCUMENT_CHARS)
         except Exception:
             pass
         return self._extract_strings_fallback(fp)
@@ -71710,7 +73379,7 @@ class RAGContentParser:
         ):
             out = self._run_text_extractor_cmd(cmd, timeout=45)
             if out:
-                return trim(out, 120_000)
+                return trim(out, RAG_MAX_DOCUMENT_CHARS)
         return self._extract_strings_fallback(fp)
 
     def _extract_pptx_text(self, fp: Path) -> str:
@@ -71729,7 +73398,7 @@ class RAGContentParser:
                         if text:
                             lines.append(text)
                 if lines:
-                    return trim("\n".join(lines), 120_000)
+                    return trim("\n".join(lines), RAG_MAX_DOCUMENT_CHARS)
             except Exception:
                 pass
         try:
@@ -71742,7 +73411,7 @@ class RAGContentParser:
                         lines.append(f"[Slide] {Path(name).stem}")
                         lines.extend(tokens[:1200])
                 if lines:
-                    return trim("\n".join(lines), 120_000)
+                    return trim("\n".join(lines), RAG_MAX_DOCUMENT_CHARS)
         except Exception:
             pass
         return self._extract_strings_fallback(fp)
@@ -71754,7 +73423,7 @@ class RAGContentParser:
         ):
             out = self._run_text_extractor_cmd(cmd, timeout=45)
             if out:
-                return trim(out, 120_000)
+                return trim(out, RAG_MAX_DOCUMENT_CHARS)
         return self._extract_strings_fallback(fp)
 
     def detect_kind(self, fp: Path, mime: str = "") -> str:
@@ -71886,7 +73555,7 @@ class RAGContentParser:
 
     def parse_file(self, fp: Path, *, mime: str = "", text_override: str = "") -> dict:
         kind = self.detect_kind(fp, mime)
-        text = trim(str(text_override or ""), 150_000)
+        text = trim(str(text_override or ""), RAG_MAX_DOCUMENT_CHARS)
         raw: bytes | None = None
         if not text and fp.exists() and fp.is_file():
             try:
@@ -71911,7 +73580,7 @@ class RAGContentParser:
             elif kind == "document":
                 text = self._extract_doc_text(fp)
             elif kind == "text" and raw is not None:
-                text = trim(self._decode_text_bytes(raw), 150_000)
+                text = trim(self._decode_text_bytes(raw), RAG_MAX_DOCUMENT_CHARS)
         lang = _rag_detect_language(text)
         cls = _rag_classify_document(fp.name, kind, text)
         meta = self.media_metadata(fp, mime=mime)
@@ -71946,6 +73615,11 @@ class TFGraphIDFIndex:
         self.idf: dict[str, float] = {}
         self.inverted: dict[str, list[tuple[str, float]]] = {}
         self.chunk_norms: dict[str, float] = {}
+        # BM25 state: postings hold raw term frequencies (in `inverted` as floats that are
+        # integer-valued); chunk_lengths is the token count per chunk; avg_chunk_len is the
+        # corpus mean. self.idf holds BM25 idf. chunk_norms is retained for field-compat only.
+        self.chunk_lengths: dict[str, int] = {}
+        self.avg_chunk_len: float = 0.0
         self.chunk_meta: dict[str, dict] = {}
         self.doc_meta: dict[str, dict] = {}
         self.doc_to_chunks: dict[str, list[str]] = {}
@@ -72026,6 +73700,7 @@ class TFGraphIDFIndex:
 
     def snapshot(self) -> dict:
         return {
+            "format": RAG_INDEX_SNAPSHOT_FORMAT,
             "built_at": float(self.built_at or 0.0),
             "include_filename_entities": bool(self.include_filename_entities),
             "idf": {str(k): float(v or 0.0) for k, v in self.idf.items()},
@@ -72034,6 +73709,8 @@ class TFGraphIDFIndex:
                 for token, rows in self.inverted.items()
             },
             "chunk_norms": {str(k): float(v or 0.0) for k, v in self.chunk_norms.items()},
+            "chunk_lengths": {str(k): int(v or 0) for k, v in self.chunk_lengths.items()},
+            "avg_chunk_len": float(self.avg_chunk_len or 0.0),
             "chunk_meta": {str(k): dict(v) for k, v in self.chunk_meta.items()},
             "doc_meta": {str(k): dict(v) for k, v in self.doc_meta.items()},
             "doc_to_chunks": {str(k): [str(x) for x in (v or []) if str(x).strip()] for k, v in self.doc_to_chunks.items()},
@@ -72092,10 +73769,22 @@ class TFGraphIDFIndex:
             return out
 
         try:
+            # Reject pre-BM25 snapshots: their postings hold pre-multiplied TF-IDF weights
+            # and lack chunk_lengths, so BM25 scoring would be wrong. Returning False makes
+            # the store rebuild from the persisted documents/chunks (the source of truth).
+            snapshot_format = str(payload.get("format", "") or "").strip()
+            if snapshot_format != RAG_INDEX_SNAPSHOT_FORMAT:
+                return False
+            if "chunk_lengths" not in payload:
+                return False
             self.built_at = float(payload.get("built_at", 0.0) or 0.0)
             self.idf = {str(k): float(v or 0.0) for k, v in (payload.get("idf", {}) or {}).items()}
             self.inverted = _restore_weight_rows(payload.get("inverted", {}))
             self.chunk_norms = {str(k): float(v or 0.0) for k, v in (payload.get("chunk_norms", {}) or {}).items()}
+            self.chunk_lengths = {str(k): int(v or 0) for k, v in (payload.get("chunk_lengths", {}) or {}).items()}
+            self.avg_chunk_len = float(payload.get("avg_chunk_len", 0.0) or 0.0)
+            if not self.avg_chunk_len and self.chunk_lengths:
+                self.avg_chunk_len = sum(self.chunk_lengths.values()) / float(len(self.chunk_lengths))
             self.chunk_meta = {
                 str(k): dict(v) for k, v in (payload.get("chunk_meta", {}) or {}).items() if isinstance(v, dict)
             }
@@ -72259,6 +73948,8 @@ class TFGraphIDFIndex:
         self.idf = {}
         self.inverted = {}
         self.chunk_norms = {}
+        self.chunk_lengths = {}
+        self.avg_chunk_len = 0.0
         self.chunk_meta = {}
         self.doc_meta = {}
         self.doc_to_chunks = {}
@@ -72331,6 +74022,9 @@ class TFGraphIDFIndex:
                 chunk_df.update(counts.keys())
                 doc_token_sets[doc_id].update(counts.keys())
             token_rows[chunk_id] = counts
+            # BM25 length = number of token occurrences in this chunk (post-expansion),
+            # floored at 1 so empty/whitespace chunks don't divide by zero downstream.
+            self.chunk_lengths[chunk_id] = max(1, sum(int(v) for v in counts.values()))
             doc_info = self.doc_meta.get(doc_id, {})
             entities = _rag_apply_filename_entity_policy(
                 list(chunk.get("entities", []) or []),
@@ -72346,6 +74040,10 @@ class TFGraphIDFIndex:
                 "text": text,
                 "anchor": str(chunk.get("anchor", "") or ""),
                 "entities": entities[:24],
+                # Persist the defining symbol so query-time symbol-exact boosting can match
+                # an identifier query to the chunk that defines it (code recall lever).
+                "symbol": str(chunk.get("symbol", "") or ""),
+                "symbol_kind": str(chunk.get("symbol_kind", "") or ""),
             }
             self.doc_to_chunks.setdefault(doc_id, []).append(chunk_id)
         doc_df: Counter[str] = Counter()
@@ -72555,28 +74253,32 @@ class TFGraphIDFIndex:
         self.dynamic_noise_penalties = dict(penalties)
         self.dynamic_noise_meta = {str(token): dict(info) for token, info in meta.items()}
         total_chunks = max(1, len(self.chunk_meta))
+        # BM25 idf: log(1 + (N - df + 0.5)/(df + 0.5)). Always positive, and rarer terms
+        # earn sharply higher weight than the old log((1+N)/(1+df))+1 TF-IDF idf.
         self.idf = {
-            token: math.log((1.0 + total_chunks) / (1.0 + freq)) + 1.0
+            token: math.log(1.0 + (total_chunks - freq + 0.5) / (freq + 0.5))
             for token, freq in chunk_df.items()
             if token not in hard_tokens
         }
+        # BM25 postings store RAW term frequency per chunk (not pre-multiplied weights);
+        # idf + length normalization are applied at query time in _fast_query.
         inverted: dict[str, list[tuple[str, float]]] = defaultdict(list)
         for chunk_id, counts in token_rows.items():
-            weights: dict[str, float] = {}
-            sq = 0.0
             for token, freq in counts.items():
                 if token in hard_tokens:
                     continue
-                weight = (1.0 + math.log(max(1, int(freq)))) * self.idf.get(token, 1.0) * penalties.get(token, 1.0)
-                if weight <= 0.0:
+                tf = float(int(freq))
+                if tf <= 0.0:
                     continue
-                weights[token] = weight
-                sq += weight * weight
-            norm = math.sqrt(sq) or 1.0
-            self.chunk_norms[chunk_id] = norm
-            for token, weight in weights.items():
-                inverted[token].append((chunk_id, weight))
+                inverted[token].append((chunk_id, tf))
+            # chunk_norms retained for snapshot field-compat; not used by BM25 scoring.
+            self.chunk_norms[chunk_id] = 1.0
         self.inverted = dict(inverted)
+        # Corpus mean chunk length for BM25 length normalization.
+        if self.chunk_lengths:
+            self.avg_chunk_len = sum(self.chunk_lengths.values()) / float(len(self.chunk_lengths))
+        else:
+            self.avg_chunk_len = 0.0
         self.community_idf = {
             token: math.log((1.0 + community_total) / (1.0 + freq)) + 1.0
             for token, freq in community_df.items()
@@ -72692,6 +74394,51 @@ class TFGraphIDFIndex:
             "route_meta": dict(route_meta or {}),
         }
 
+    def _symbol_match_boost(self, chunk: dict, doc: dict, qtoken_set: set[str]) -> float:
+        """Calibrated boost when a query token names this chunk's defining symbol.
+
+        Lexical BM25 alone often ranks a function's *callers* above its *definition*
+        (the definition mentions the name once, callers repeat it). This boost makes an
+        identifier query surface the defining chunk. Scaled by symbol rarity (idf) so a
+        common name like ``run`` earns less than a rare one like ``_drain_agentbus``.
+        Returns 0.0 when nothing matches.
+        """
+        if not qtoken_set:
+            return 0.0
+        symbol = str(chunk.get("symbol", "") or "").strip().lower()
+        candidates: set[str] = set()
+        if symbol:
+            candidates.add(symbol)
+            # Hierarchical (outer.inner / Class.method) and split parts.
+            for part in re.split(r"[.\s]+", symbol):
+                p = part.strip().lower()
+                if len(p) >= 2:
+                    candidates.add(p)
+            for part in symbol.split("_"):
+                p = part.strip().lower()
+                if len(p) >= 2:
+                    candidates.add(p)
+        # Document filename stem (e.g. querying "scheduler" should favor scheduler.py).
+        stem = str(doc.get("filename", "") or doc.get("title", "") or "").strip().lower()
+        stem = re.sub(r"\.[a-z0-9]{1,8}$", "", stem)
+        stem = stem.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+        if len(stem) >= 2:
+            candidates.add(stem)
+        hits = qtoken_set.intersection(candidates)
+        if not hits:
+            return 0.0
+        # A FULL-symbol-exact match (the symbol string itself is a query token) is a strong,
+        # high-precision intent signal — the user is naming this definition — so it earns
+        # near the full boost regardless of corpus idf (rarity only nudges it). A PARTIAL
+        # match (only a split part overlaps) is much weaker and is dampened by rarity so
+        # incidental token overlap on a common word like "user" doesn't dominate ranking.
+        best_idf = max((float(self.idf.get(tok, 0.0)) for tok in hits), default=0.0)
+        rarity = min(1.0, best_idf / 6.0) if best_idf > 0.0 else 0.25
+        boost_unit = float(RAG_SYMBOL_EXACT_BOOST)
+        if symbol and symbol in qtoken_set:
+            return round(boost_unit * (0.85 + 0.15 * rarity), 6)
+        return round(boost_unit * 0.35 * rarity, 6)
+
     def _fast_query(
         self,
         query_text: str,
@@ -72716,21 +74463,45 @@ class TFGraphIDFIndex:
             }
         qweights, qnorm, qentities, qcat = qbundle or self._query_weights(query)
         allowed = {str(x).strip() for x in (allowed_communities or set()) if str(x).strip()}
-        scores: dict[str, float] = defaultdict(float)
+        # BM25 accumulation. qweight already encodes per-term idf·penalty (query-side
+        # importance); the document side contributes BM25 tf-saturation + length
+        # normalization, so idf is applied exactly once. raw_scores hold un-normalized
+        # BM25 sums; they are saturation-normalized into [0,1] after the candidate loop
+        # (pool-independent) so they compose with graph_bonus on a stable scale.
+        k1 = float(RAG_BM25_K1)
+        b = float(RAG_BM25_B)
+        avgdl = float(self.avg_chunk_len or 1.0) or 1.0
+        raw_scores: dict[str, float] = defaultdict(float)
         for token, qweight in qweights.items():
-            for chunk_id, cweight in self.inverted.get(token, []):
-                scores[chunk_id] += qweight * cweight
+            postings = self.inverted.get(token, [])
+            if not postings:
+                continue
+            for chunk_id, tf in postings:
+                tf = float(tf)
+                if tf <= 0.0:
+                    continue
+                dl = float(self.chunk_lengths.get(chunk_id, avgdl) or avgdl)
+                denom = tf + k1 * (1.0 - b + b * (dl / avgdl))
+                if denom <= 0.0:
+                    continue
+                raw_scores[chunk_id] += qweight * (tf * (k1 + 1.0)) / denom
         # Dense retrieval — expand candidate pool with high-similarity embedding matches
         dense_scores: dict[str, float] = {}
         use_dense = self.has_dense_index() and qvec is not None
         if use_dense:
             dense_scores = self._dense_query(qvec, top_k=min(len(self.chunk_embeddings), top_k * 4))
-            # Ensure dense-only hits are included as candidates even with zero TF-IDF
+            # Ensure dense-only hits are included as candidates even with zero BM25
             for cid in dense_scores:
-                if cid not in scores:
-                    scores[cid] = 0.0
+                if cid not in raw_scores:
+                    raw_scores[cid] = 0.0
+        # Pool-independent saturation normalization: raw/(raw+sat) keeps absolute
+        # relevance meaning, so the no-evidence / synthesis thresholds stay valid (min-max
+        # would force the best candidate to 1.0 even when the whole pool is weak).
+        sat = float(RAG_BM25_SATURATION) or 4.0
+        # Query token set (expanded) for symbol-exact matching.
+        qtoken_set = {str(t).strip().lower() for t in qweights.keys() if str(t).strip()}
         rows: list[dict] = []
-        for chunk_id, dot in scores.items():
+        for chunk_id, raw in raw_scores.items():
             chunk = self.chunk_meta.get(chunk_id, {})
             doc = self.doc_meta.get(str(chunk.get("doc_id", "")), {})
             if not doc:
@@ -72741,8 +74512,8 @@ class TFGraphIDFIndex:
                 continue
             if allowed and str(doc.get("community", "") or "") not in allowed:
                 continue
-            chunk_norm = self.chunk_norms.get(chunk_id, 1.0) or 1.0
-            lexical = dot / (chunk_norm * qnorm) if dot > 0 else 0.0
+            # Normalized BM25 lexical score in [0,1], pool-independent.
+            lexical = (raw / (raw + sat)) if raw > 0.0 else 0.0
             chunk_entities = set(str(x) for x in (chunk.get("entities", []) or []))
             doc_entities = set(str(x) for x in (doc.get("entities", []) or []))
             ent_overlap = len(qentities.intersection(chunk_entities))
@@ -72753,17 +74524,22 @@ class TFGraphIDFIndex:
                 graph_bonus += 0.08
             if str(doc.get("community", "")) in self.community_counts:
                 graph_bonus += min(0.08, math.log1p(self.community_counts.get(str(doc.get("community", "")), 0)) / 16.0)
+            # Symbol-exact boost: when a query token equals this chunk's defining symbol
+            # (or a split part of it) or the doc filename stem, surface the defining chunk.
+            # Scaled by symbol rarity via idf so common names don't dominate.
+            symbol_boost = self._symbol_match_boost(chunk, doc, qtoken_set)
             if use_dense:
                 dense_sim = dense_scores.get(chunk_id, 0.0)
-                # Hybrid: 40% TF-IDF + 60% dense when embeddings available
-                final_score = lexical * 0.40 + dense_sim * 0.60 + graph_bonus * 0.60
+                # Hybrid: 40% BM25 + 60% dense when embeddings available
+                final_score = lexical * 0.40 + dense_sim * 0.60 + graph_bonus * 0.60 + symbol_boost
             else:
-                final_score = lexical * 0.82 + graph_bonus
+                final_score = lexical * 0.80 + graph_bonus + symbol_boost
             rows.append(
                 {
                     "score": round(final_score, 6),
                     "lexical_score": round(lexical, 6),
                     "graph_score": round(graph_bonus, 6),
+                    "symbol_score": round(symbol_boost, 6),
                     "doc_id": str(doc.get("id", "")),
                     "chunk_id": chunk_id,
                     "title": str(doc.get("title", "")),
@@ -72773,11 +74549,12 @@ class TFGraphIDFIndex:
                     "community": str(doc.get("community", "")),
                     "language": str(doc.get("language", "")),
                     "anchor": str(chunk.get("anchor", "")),
+                    "symbol": str(chunk.get("symbol", "")),
                     "text": _rag_focused_excerpt(
                         str(chunk.get("text", "")),
                         list(qweights.keys()),
                         window=_rag_window_for_query(query),
-                        dense_match=(use_dense and scores.get(chunk_id, 0.0) == 0.0),
+                        dense_match=(use_dense and raw_scores.get(chunk_id, 0.0) == 0.0),
                     ),
                     "entities": list(chunk.get("entities", []) or [])[:12],
                     "citation": f"[{doc.get('id', '')}:{chunk_id}]",
@@ -73941,7 +75718,7 @@ class RAGLibraryStore:
             backup_path.write_bytes(raw_bytes)
         elif source_fp and source_fp.exists():
             shutil.copy2(source_fp, backup_path)
-        semantic_text = trim(str(parse_result.get("text", "") or ""), 800_000)
+        semantic_text = trim(str(parse_result.get("text", "") or ""), RAG_MAX_DOCUMENT_CHARS)
         multimodal_row = dict(multimodal or {})
         mm_summary = trim(str(multimodal_row.get("summary", "") or ""), 2400)
         mm_tags = [str(x).strip() for x in (multimodal_row.get("tags", []) or []) if str(x).strip()]
@@ -74221,9 +75998,9 @@ class WikiStore:
             if isinstance(value, list):
                 lines.append(f"{key}:")
                 for item in value:
-                    lines.append(f"  - {json.dumps(str(item), ensure_ascii=False)}")
+                    lines.append(f"  - {json_dumps(str(item))}")
             else:
-                lines.append(f"{key}: {json.dumps(value, ensure_ascii=False)}")
+                lines.append(f"{key}: {json_dumps(value)}")
         lines.append("---")
         return "\n".join(lines) + "\n\n"
 
@@ -74724,6 +76501,7 @@ class UserMemoryStore:
             "user_id": self.user_id,
             "updated_at": now_ts(),
             "categories": {
+                "llm_distilled_preference": [],
                 "long_term_preferences": [],
                 "common_tech_stack": [],
                 "common_task_types": [],
@@ -74877,6 +76655,105 @@ class UserMemoryStore:
             "confidence": 0.52,
         }]
 
+    def _distill_session_preferences_lm(self, sess: object, base_text: str) -> list[dict]:
+        """On-mode-only, post-session LLM distillation of *durable user preferences*.
+
+        Runs OFF the hot path (called from the background session-finished callback,
+        never per turn) and is fully best-effort: any failure returns [] so memory
+        capture degrades to the regex items. This is the personalization upgrade —
+        instead of brittle keyword matches ("work involving python"), the model reads
+        the actual conversation and names the *stable working preferences* a future
+        session should honor (style, defaults, constraints), in the user's words.
+
+        Returns a list of memory-item dicts {kind, summary, tags, confidence}; the
+        model judges relevance, we only clamp confidence into a trustworthy band and
+        sanitize the text. No new threads are spawned here.
+        """
+        ollama = getattr(sess, "ollama", None)
+        if ollama is None or not hasattr(ollama, "chat"):
+            return []
+        snippet = trim(str(base_text or "").strip(), 2600)
+        if not snippet:
+            return []
+        objective = trim(str(getattr(sess, "runtime_direct_objective", "") or "").strip(), 300)
+        task_type = trim(str(getattr(sess, "runtime_task_type", "") or "general").strip(), 80)
+        ui_language = normalize_ui_language(getattr(sess, "ui_language", DEFAULT_UI_LANGUAGE))
+        prompt = (
+            "You distill DURABLE personalization signals from one finished coding session.\n"
+            "Read the recent exchange and emit ONLY preferences that should carry to FUTURE, "
+            "unrelated sessions — how this user likes work done (tone/verbosity, language, "
+            "preferred frameworks/tools/patterns, output format, recurring constraints or "
+            "do-nots). Ignore anything specific to this one task, and never invent.\n"
+            f"Objective: {objective or '(none)'}\nTask type: {task_type}\nUI language: {ui_language}\n\n"
+            f"Recent exchange (most recent last):\n{snippet}\n\n"
+            "Output a JSON array (0-6 objects). Each object:\n"
+            '  {"kind": one of '
+            '["long_term_preferences","interaction_style","common_tech_stack",'
+            '"common_task_types","output_formats"], '
+            '"summary": one concise sentence in the user\'s UI language naming the durable '
+            'preference, "tags": [short keywords], "confidence": 0..1 how durable it is}\n'
+            "Emit [] if nothing is durable. Output ONLY the JSON array."
+        )
+        try:
+            rsp = ollama.chat(
+                [{"role": "user", "content": prompt}],
+                system="/no_think\nYou output ONLY a compact JSON array. No prose, no code fences.",
+                max_tokens=400,
+                think=False,
+            )
+            raw = str((rsp or {}).get("content", "") or "").strip()
+        except Exception:
+            return []
+        if not raw:
+            return []
+        # Tolerate fences / leading prose: extract the first top-level [...] array.
+        if "```" in raw:
+            raw = re.sub(r"```[a-zA-Z]*", "", raw).replace("```", "").strip()
+        start = raw.find("[")
+        end = raw.rfind("]")
+        if start < 0 or end <= start:
+            return []
+        try:
+            parsed = json.loads(raw[start : end + 1])
+        except Exception:
+            return []
+        if not isinstance(parsed, list):
+            return []
+        allowed = {
+            "long_term_preferences",
+            "interaction_style",
+            "common_tech_stack",
+            "common_task_types",
+            "output_formats",
+        }
+        out: list[dict] = []
+        for entry in parsed[:6]:
+            if not isinstance(entry, dict):
+                continue
+            summary = self._sanitize_summary(entry.get("summary", ""), USER_MEMORY_MAX_SUMMARY_CHARS)
+            if not summary:
+                continue
+            src_kind = str(entry.get("kind", "") or "").strip()
+            kind = src_kind if src_kind in allowed else "long_term_preferences"
+            tags = [trim(str(x), 60) for x in (entry.get("tags", []) or []) if str(x).strip()][:8]
+            if kind not in [t.lower() for t in tags]:
+                tags = (tags + ["distilled"])[:9]
+            try:
+                conf = float(entry.get("confidence", 0.82) or 0.82)
+            except Exception:
+                conf = 0.82
+            # Clamp into a trustworthy-but-not-absolute band: LLM-distilled items should
+            # outrank low-signal regex items (≤0.62) without ever pinning to certainty.
+            conf = max(0.78, min(0.88, conf))
+            out.append({
+                "kind": "llm_distilled_preference",
+                "summary": summary,
+                "tags": tags,
+                "confidence": round(conf, 3),
+                "meta": {"distilled": True, "model_kind": kind},
+            })
+        return out
+
     def _capture_from_session(self, sess: object) -> dict:
         sid = str(getattr(sess, "id", "") or "").strip()
         title = trim(str(getattr(sess, "title", "") or sid or "session"), 160)
@@ -74966,6 +76843,10 @@ class UserMemoryStore:
             return
         tags = [trim(str(x), 80) for x in (row.get("tags", []) or []) if str(x).strip()][:20]
         confidence = max(0.05, min(1.0, float(row.get("confidence", 0.35) or 0.35)))
+        meta = row.get("meta", None)
+        meta_payload = {"summary_only": True}
+        if isinstance(meta, dict):
+            meta_payload.update({k: v for k, v in meta.items() if isinstance(k, str)})
         mid = self._memory_id(source_session_id, kind, summary)
         conn.execute(
             """
@@ -74983,18 +76864,31 @@ class UserMemoryStore:
                 ts,
                 ts,
                 1.0,
-                json_dumps({"summary_only": True}),
+                json_dumps(meta_payload),
             ),
         )
 
-    def capture_session(self, sess: object) -> dict:
+    def capture_session(self, sess: object, *, mode: str = "weak") -> dict:
         if sess is None:
             return {"ok": False, "error": "session missing"}
+        mode_key = normalize_user_memory_mode(mode)
         capture = self._capture_from_session(sess)
         sid = str(capture.get("session_id", "") or "").strip()
         if not sid:
             return {"ok": False, "error": "session_id missing"}
         ts = float(capture.get("updated_at", now_ts()) or now_ts())
+        # On-mode only: enrich the brittle regex items with model-distilled durable
+        # preferences. Runs here (background session-finished path), never per turn,
+        # so the hot path stays identical across off/weak/on. Best-effort: [] on any
+        # failure, weak mode skips it entirely.
+        distilled: list[dict] = []
+        if mode_key == "on":
+            try:
+                _, user_lines, _paths = self._extract_session_text(sess)
+                base_text = "\n".join(user_lines[-8:])
+                distilled = self._distill_session_preferences_lm(sess, base_text)
+            except Exception:
+                distilled = []
         with self.lock:
             with self._connect() as conn:
                 conn.execute(
@@ -75019,10 +76913,18 @@ class UserMemoryStore:
                 for item in list(capture.get("items", []) or [])[:40]:
                     if isinstance(item, dict):
                         self._insert_memory_item_locked(conn, item, sid, ts)
+                for item in distilled[:8]:
+                    if isinstance(item, dict):
+                        self._insert_memory_item_locked(conn, item, sid, ts)
                 conn.commit()
                 profile = self._rebuild_profile_locked(conn)
             self._write_profile_locked(profile)
-        return {"ok": True, "session_id": sid, "items": len(capture.get("items", []) or [])}
+        return {
+            "ok": True,
+            "session_id": sid,
+            "items": len(capture.get("items", []) or []),
+            "distilled": len(distilled),
+        }
 
     def _row_decay(self, updated_at: float) -> float:
         age = max(0.0, now_ts() - float(updated_at or 0.0))
@@ -75194,6 +77096,7 @@ class UserInteractionOptimizer:
             "Never infer sensitive identity attributes. Never override the latest user instruction, manual Level, manual Plan, or explicit tool preference.",
         ]
         category_labels = (
+            ("llm_distilled_preference", "Distilled preferences"),
             ("interaction_style", "Interaction style"),
             ("long_term_preferences", "Long-term preferences"),
             ("common_tech_stack", "Common tech stack"),
@@ -75206,6 +77109,9 @@ class UserInteractionOptimizer:
         per_category = 1 if mode_key == "weak" else 2
         for key, label in category_labels:
             rows = categories.get(key, []) if isinstance(categories.get(key, []), list) else []
+            # Distilled preferences are the highest-signal personalization items, so
+            # surface one extra (they only exist in on-mode where richness is wanted).
+            cap = per_category + 1 if key == "llm_distilled_preference" else per_category
             picked = []
             for row in rows:
                 if not isinstance(row, dict):
@@ -75213,7 +77119,7 @@ class UserInteractionOptimizer:
                 summary = trim(str(row.get("summary", "") or ""), 240)
                 if summary:
                     picked.append(summary)
-                if len(picked) >= per_category:
+                if len(picked) >= cap:
                     break
             if picked:
                 lines.append(f"{label}: " + " | ".join(picked))
@@ -75324,9 +77230,9 @@ class WorkflowMemoryStore:
             if isinstance(value, list):
                 lines.append(f"{key}:")
                 for item in value[:80]:
-                    lines.append(f"  - {json.dumps(str(item), ensure_ascii=False)}")
+                    lines.append(f"  - {json_dumps(str(item))}")
             elif isinstance(value, (str, int, float, bool)):
-                lines.append(f"{key}: {json.dumps(value, ensure_ascii=False)}")
+                lines.append(f"{key}: {json_dumps(value)}")
         lines.append("---")
         return "\n".join(lines) + "\n\n"
 
@@ -76403,7 +78309,7 @@ class RAGIngestionService:
                     parsed_path = Path(str(job.get("parsed_path", "") or "")).resolve() if str(job.get("parsed_path", "") or "").strip() else None
                     text_override = ""
                     if parsed_path and parsed_path.exists():
-                        text_override = try_read_text(parsed_path, max_bytes=300_000) or ""
+                        text_override = try_read_text(parsed_path, max_bytes=RAG_MAX_DOCUMENT_CHARS * 4) or ""
                     _update_progress(1, 1, str(job.get("filename", src.name) or src.name))
                     _capture_ingest(
                         task_id=task_id,
@@ -76821,26 +78727,44 @@ class CodeGraphIndex(TFGraphIDFIndex):
         # Detect algorithm intent for boosting algo-tagged chunks
         algo_intent = bool(re.search(r"algorithm|implement|how.*work|原理|实现|如何|怎么|步骤|算法|复杂度", query_low))
         allowed = {str(x).strip() for x in (allowed_communities or set()) if str(x).strip()}
-        scores: dict[str, float] = defaultdict(float)
+        # BM25 accumulation (raw term frequencies + length normalization), mirroring the
+        # base index. Code-specific symbol/path/call-graph bonuses are layered on below.
+        k1 = float(RAG_BM25_K1)
+        b = float(RAG_BM25_B)
+        avgdl = float(self.avg_chunk_len or 1.0) or 1.0
+        raw_scores: dict[str, float] = defaultdict(float)
         for token, qweight in qweights.items():
-            for chunk_id, cweight in self.inverted.get(token, []):
-                scores[chunk_id] += qweight * cweight
+            postings = self.inverted.get(token, [])
+            if not postings:
+                continue
+            for chunk_id, tf in postings:
+                tf = float(tf)
+                if tf <= 0.0:
+                    continue
+                dl = float(self.chunk_lengths.get(chunk_id, avgdl) or avgdl)
+                denom = tf + k1 * (1.0 - b + b * (dl / avgdl))
+                if denom <= 0.0:
+                    continue
+                raw_scores[chunk_id] += qweight * (tf * (k1 + 1.0)) / denom
         # "Who calls X" routing: inject callee_graph hits as extra candidates
         if who_calls_intent:
             for sym in list(qsymbols) + [str(e) for e in qentities]:
                 for caller_chunk_id in self.callee_graph.get(sym.lower(), []):
-                    if caller_chunk_id not in scores:
-                        scores[caller_chunk_id] = 0.0
+                    if caller_chunk_id not in raw_scores:
+                        raw_scores[caller_chunk_id] = 0.0
         # Dense retrieval — expand candidate pool with embedding matches
         dense_scores: dict[str, float] = {}
         use_dense = self.has_dense_index() and qvec is not None
         if use_dense:
             dense_scores = self._dense_query(qvec, top_k=min(len(self.chunk_embeddings), top_k * 4))
             for cid in dense_scores:
-                if cid not in scores:
-                    scores[cid] = 0.0
+                if cid not in raw_scores:
+                    raw_scores[cid] = 0.0
+        # Pool-independent saturation normalization (see base _fast_query): keeps absolute
+        # relevance so weak-but-best results don't get inflated to 1.0.
+        sat = float(RAG_BM25_SATURATION) or 4.0
         rows: list[dict] = []
-        for chunk_id, dot in scores.items():
+        for chunk_id, raw in raw_scores.items():
             chunk = self.chunk_meta.get(chunk_id, {})
             doc = self.doc_meta.get(str(chunk.get("doc_id", "")), {})
             if not doc:
@@ -76851,7 +78775,7 @@ class CodeGraphIndex(TFGraphIDFIndex):
                 continue
             if allowed and str(doc.get("community", "") or "") not in allowed:
                 continue
-            lexical = dot / ((self.chunk_norms.get(chunk_id, 1.0) or 1.0) * qnorm)
+            lexical = (raw / (raw + sat)) if raw > 0.0 else 0.0
             rel_path = str(doc.get("relative_path", "") or doc.get("filename", "") or "").strip()
             chunk_entities = {str(x).strip().lower() for x in (chunk.get("entities", []) or []) if str(x).strip()}
             doc_symbols = {
@@ -77719,6 +79643,12 @@ const G={
     graphKey:'',
     activeHoverId:'',
     resizeObserver:null,
+    // Node-level expand/collapse morph (3D analogue of the 2D G.morph). `from` maps
+    // id→{x,y,z,scale} captured before a focus/clear layout switch; meshes ease from
+    // there to their new world transform. Continuous RAF runs while active.
+    morph:{active:false,started:0,duration:0,from:null,originId:'',reason:''},
+    // Camera-facing adaptive text labels (id→Sprite). Rebuilt with the scene graph.
+    labels:new Map(),
   },
 };
 const GOLDEN_ANGLE=Math.PI*(3-Math.sqrt(5));
@@ -78638,6 +80568,7 @@ function ensureCanvasMetrics(){
 function resetGraphViewport(){
   G.viewport={x:0,y:0,scale:1,targetX:0,targetY:0,targetScale:1,fitScale:1,minScale:0.1,maxScale:8};
   G.animation={active:false,started:0,duration:420,from:null,to:null,reason:''};
+  G.morph={active:false,started:0,duration:0,from:null,originId:'',reason:''};
 }
 function computeGraphFitViewport(layout,width,height,pad=56){
   const dx=Math.max(1,Number(layout.bounds.maxX||0)-Number(layout.bounds.minX||0));
@@ -78686,6 +80617,58 @@ function beginGraphViewportAnimation(to,reason='view',duration=420){
 function easeGraph(t){
   const x=clamp(t,0,1);
   return x<0.5?4*x*x*x:1-Math.pow(-2*x+2,3)/2;
+}
+// ---- Node-level morph (expand/collapse) animation -------------------------
+// Focus and overview layouts live in different coordinate systems, so we morph in
+// SCREEN space: snapshot every node's current screen position+radius, switch the
+// layout, then ease each new projected node from its old screen spot. Neighbors that
+// only appear in the focused view expand outward from the clicked node (origin); on
+// collapse the reverse happens. Runs alongside the viewport animation.
+function snapshotGraphScreenNodes(){
+  const out=new Map();
+  for(const node of (G.screenNodes||[])){
+    const id=String(node?.id||'');
+    if(!id)continue;
+    out.set(id,{sx:Number(node.sx||0),sy:Number(node.sy||0),sr:Number(node.sr||0)});
+  }
+  return out;
+}
+function beginGraphMorph(originId,reason='morph',duration=460){
+  const from=snapshotGraphScreenNodes();
+  if(!from.size){G.morph={active:false,started:0,duration:0,from:null,originId:'',reason:''};return}
+  G.morph={
+    active:true,
+    started:performance.now(),
+    duration:Math.max(120,Number(duration||460)),
+    from,
+    originId:String(originId||''),
+    reason,
+  };
+}
+function applyGraphMorph(nodes){
+  const morph=G.morph;
+  if(!morph||!morph.active||!(morph.from instanceof Map))return nodes;
+  const t=(performance.now()-Number(morph.started||0))/Math.max(1,Number(morph.duration||1));
+  if(t>=1){morph.active=false;return nodes}
+  const k=easeGraph(t);
+  // Origin = where the clicked node sat before the switch (fallback: its new spot), so
+  // freshly-revealed neighbors fan out from it instead of popping in place.
+  const originPrev=morph.from.get(String(morph.originId||''));
+  let originNow=null;
+  for(const n of nodes){if(String(n.id||'')===String(morph.originId||'')){originNow=n;break}}
+  const originX=Number((originPrev?originPrev.sx:originNow?.sx)||0);
+  const originY=Number((originPrev?originPrev.sy:originNow?.sy)||0);
+  for(const node of nodes){
+    const prev=morph.from.get(String(node.id||''));
+    const fromX=prev?Number(prev.sx||0):originX;
+    const fromY=prev?Number(prev.sy||0):originY;
+    // New nodes start tiny so they visibly scale up while expanding outward.
+    const fromR=prev?Number(prev.sr||0):Math.max(0.6,Number(node.sr||3)*0.18);
+    node.sx=fromX+(Number(node.sx||0)-fromX)*k;
+    node.sy=fromY+(Number(node.sy||0)-fromY)*k;
+    node.sr=Math.max(1.4,fromR+(Number(node.sr||0)-fromR)*k);
+  }
+  return nodes;
 }
 function currentGraphViewport(){
   const vp=G.viewport||{x:0,y:0,scale:1};
@@ -78786,6 +80769,9 @@ function focusGraphNode(id){
     return clearGraphFocus();
   }
   if(String(G.selectedNodeId||'')===next&&G.focusMode)return;
+  // Capture current node screen positions BEFORE the layout switches so the morph can
+  // expand the focused neighborhood out from the clicked node (static 2D mode only).
+  if(G.mode==='static')beginGraphMorph(next,'focus',480);
   G.selectedNodeId=next;
   G.focusMode=true;
   G.hoverId=next;
@@ -78793,12 +80779,19 @@ function focusGraphNode(id){
   G.lastLayoutView='';
   if(G.mode==='static')drawGraph2D('focus');
   else if(G.mode==='3d'){
+    // Capture current mesh transforms BEFORE the scene rebuilds, so the neighborhood
+    // expands out from the clicked node (3D analogue of the 2D morph).
+    beginThreeMorph(next,'focus',520);
     G.three.graphKey='';
     renderGraph3D('focus').catch(err=>setGraphRuntime(err.message,true));
   }else setGraphOverlay();
 }
 function clearGraphFocus(){
   const had=Boolean(G.focusMode||String(G.selectedNodeId||''));
+  const prevSelected=String(G.selectedNodeId||'');
+  // Collapse animation: morph the focused neighborhood back toward the overview, with
+  // the previously-selected node as the convergence origin (static 2D mode only).
+  if(had&&G.mode==='static')beginGraphMorph(prevSelected,'return',440);
   G.focusMode=false;
   G.selectedNodeId='';
   G.hoverId='';
@@ -78806,6 +80799,9 @@ function clearGraphFocus(){
   G.lastLayoutView='';
   if(G.mode==='static')drawGraph2D(had?'return':'idle');
   else if(G.mode==='3d'){
+    // Collapse: ease the focused neighborhood back to the overview, converging on the
+    // previously-selected node's spot.
+    if(had)beginThreeMorph(String(prevSelected||''),'return',460);
     G.three.graphKey='';
     renderGraph3D(had?'return':'idle').catch(err=>setGraphRuntime(err.message,true));
   }else setGraphOverlay();
@@ -78818,6 +80814,7 @@ function drawGraph2D(reason='draw'){
   syncGraphViewportForLayout(layout,width,height,reason);
   const viewport=currentGraphViewport();
   const nodes=projectGraphTo2D(layout,width,height,viewport);
+  applyGraphMorph(nodes);
   G.screenNodes=nodes;
   const byId=new Map(nodes.map(row=>[row.id,row]));
   ctx.setTransform(1,0,0,1,0,0);
@@ -78894,7 +80891,7 @@ function drawGraph2D(reason='draw'){
   setChip('graphPerfTag','zero-idle');
   setGraphRuntime(`2d ${reason}`);
   setGraphOverlay();
-  if(G.animation?.active)requestAnimationFrame(()=>drawGraph2D(String(G.animation.reason||reason||'animate')));
+  if(G.animation?.active||G.morph?.active)requestAnimationFrame(()=>drawGraph2D(String(G.animation?.reason||G.morph?.reason||reason||'animate')));
 }
 function findGraphNodeAt(clientX,clientY){
   const canvas=E('graphCanvas2d');
@@ -78953,8 +80950,14 @@ function disposeThreeObject(obj){
     obj.traverse(node=>{
       if(node.geometry&&typeof node.geometry.dispose==='function')node.geometry.dispose();
       const material=node.material;
-      if(Array.isArray(material))material.forEach(m=>m&&typeof m.dispose==='function'&&m.dispose());
-      else if(material&&typeof material.dispose==='function')material.dispose();
+      const _disposeMat=(m)=>{
+        if(!m)return;
+        // Free sprite/label CanvasTextures too, not just the material.
+        if(m.map&&typeof m.map.dispose==='function')m.map.dispose();
+        if(typeof m.dispose==='function')m.dispose();
+      };
+      if(Array.isArray(material))material.forEach(_disposeMat);
+      else _disposeMat(material);
     })
   }
 }
@@ -79013,9 +81016,14 @@ function scheduleThreeRender(reason='render'){
     G.three.pending=false;
     if(G.mode!=='3d'||!G.three.renderer||!G.three.scene||!G.three.camera)return;
     updateThreeCamera();
+    // Advance the node expand/collapse morph; keep the loop alive until it settles.
+    const morphing=_applyThreeMorphFrame();
+    // Labels track their (possibly morphing) nodes + adapt size to camera distance.
+    _updateThreeLabelScales();
     G.three.renderer.render(G.three.scene,G.three.camera);
     setGraphRuntime(`3d ${G.three.lastReason}`);
     setGraphOverlay();
+    if(morphing)scheduleThreeRender('morph');
   })
 }
 function applyThreeHover(id){
@@ -79071,6 +81079,202 @@ function resizeThreeRenderer(){
   fitThreeCameraToLayout(false);
   scheduleThreeRender('resize');
 }
+function _snapshotThreeMeshTransforms(){
+  // Capture each node's CURRENT world position + scale before the layout switches, so
+  // the 3D morph can ease meshes from where they are now to their new focus/overview
+  // transform (the 3D analogue of snapshotGraphScreenNodes). id→{x,y,z,scale}.
+  const out=new Map();
+  if(!(G.three.meshes instanceof Map))return out;
+  for(const [id,mesh] of G.three.meshes.entries()){
+    if(!mesh||!mesh.position)continue;
+    out.set(String(id),{
+      x:Number(mesh.position.x||0),
+      y:Number(mesh.position.y||0),
+      z:Number(mesh.position.z||0),
+      scale:Number(mesh.scale?.x||mesh.userData?.baseScale||1),
+    });
+  }
+  return out;
+}
+function beginThreeMorph(originId,reason='morph',duration=520){
+  const from=_snapshotThreeMeshTransforms();
+  if(!from.size){G.three.morph={active:false,started:0,duration:0,from:null,originId:'',reason:''};return}
+  G.three.morph={
+    active:true,
+    started:performance.now(),
+    duration:Math.max(140,Number(duration||520)),
+    from,
+    originId:String(originId||''),
+    reason,
+  };
+}
+function _applyThreeMorphFrame(){
+  // Ease every mesh from its captured transform to its target (the just-built layout
+  // position + the focus-styled resting scale stored in userData.targetScale). Newly
+  // revealed neighbors expand outward from the clicked node (origin), starting tiny.
+  // Returns true while animating, false once settled.
+  const morph=G.three.morph;
+  if(!morph||!morph.active||!(morph.from instanceof Map))return false;
+  const t=(performance.now()-Number(morph.started||0))/Math.max(1,Number(morph.duration||1));
+  if(t>=1){
+    morph.active=false;
+    // Snap to resting transforms.
+    for(const [,mesh] of G.three.meshes.entries()){
+      const tp=mesh.userData?.targetPos;
+      if(tp)mesh.position.set(Number(tp.x||0),Number(tp.y||0),Number(tp.z||0));
+      const ts=Number(mesh.userData?.targetScale);
+      if(Number.isFinite(ts))mesh.scale.setScalar(ts);
+    }
+    return false;
+  }
+  const k=easeGraph(t);
+  const originPrev=morph.from.get(String(morph.originId||''));
+  let originMesh=G.three.meshes.get(String(morph.originId||''))||null;
+  const originX=Number((originPrev?originPrev.x:originMesh?.userData?.targetPos?.x)||0);
+  const originY=Number((originPrev?originPrev.y:originMesh?.userData?.targetPos?.y)||0);
+  const originZ=Number((originPrev?originPrev.z:originMesh?.userData?.targetPos?.z)||0);
+  for(const [id,mesh] of G.three.meshes.entries()){
+    const tp=mesh.userData?.targetPos||{x:mesh.position.x,y:mesh.position.y,z:mesh.position.z};
+    const ts=Number(mesh.userData?.targetScale||mesh.userData?.baseScale||1);
+    const prev=morph.from.get(String(id));
+    const fx=prev?Number(prev.x||0):originX;
+    const fy=prev?Number(prev.y||0):originY;
+    const fz=prev?Number(prev.z||0):originZ;
+    const fs=prev?Number(prev.scale||0):Math.max(0.1,ts*0.18);
+    mesh.position.set(fx+(Number(tp.x||0)-fx)*k, fy+(Number(tp.y||0)-fy)*k, fz+(Number(tp.z||0)-fz)*k);
+    mesh.scale.setScalar(Math.max(0.05,fs+(ts-fs)*k));
+  }
+  return true;
+}
+function _three3dLabelIds(layout){
+  // Adaptive label set for 3D, matching the 2D cap: max(focus?24:16, heroCount). Prefer the
+  // layout's own labelIds (focus layout sets these); otherwise derive from hero/community +
+  // top score. Always include the selected + hovered node.
+  const ids=new Set();
+  const cap=Math.max(G.focusMode?24:16,Number(layout?.heroCount||0));
+  const explicit=(layout&&layout.labelIds instanceof Set)?layout.labelIds:null;
+  if(explicit&&explicit.size){
+    for(const id of explicit){if(ids.size>=cap)break;ids.add(String(id))}
+  }else{
+    const items=Array.isArray(layout?.items)?layout.items.slice():[];
+    items.sort((a,b)=>Number(b?.score||0)-Number(a?.score||0));
+    for(const it of items){
+      if(ids.size>=cap)break;
+      if(it&&(it.hero||String(it.type||'')==='community'||ids.size<Math.min(cap,10))){
+        ids.add(String(it.id||''));
+      }
+    }
+  }
+  const sel=String(G.selectedNodeId||'');if(sel)ids.add(sel);
+  const hov=String(G.hoverId||'');if(hov)ids.add(hov);
+  return ids;
+}
+function _makeThreeLabelSprite(text,selected){
+  const THREE=G.three.lib;
+  if(!THREE)return null;
+  const label=String(text||'').trim();
+  if(!label)return null;
+  // Match the 2D label format exactly: same font family, '...' truncation, maxChars
+  // (26 overview / 34 focus), dark-green text, NO background box (the 3D stage has the
+  // same light background as the 2D canvas, so dark text reads identically).
+  const maxChars=G.focusMode?34:26;
+  const display=label.length>maxChars?`${label.slice(0,maxChars-1)}...`:label;
+  const fontFamily='"Avenir Next","Helvetica Neue","PingFang SC",sans-serif';
+  // Render at high-res internally for crisp text; on-screen size is set by _updateThreeLabelScales.
+  const fontPx=44;
+  const dpr=Math.max(1,Math.min(window.devicePixelRatio||1,2));
+  const pad=Math.ceil(fontPx*0.34);
+  const canvas=document.createElement('canvas');
+  const ctx=canvas.getContext('2d');
+  ctx.font=`${fontPx}px ${fontFamily}`;
+  const textW=Math.ceil(ctx.measureText(display).width);
+  const cw=textW+pad*2, chh=Math.ceil(fontPx*1.5);
+  canvas.width=Math.ceil(cw*dpr);
+  canvas.height=Math.ceil(chh*dpr);
+  ctx.scale(dpr,dpr);
+  ctx.font=`${fontPx}px ${fontFamily}`;
+  ctx.textBaseline='middle';
+  // 2D colors: selected rgba(21,35,28,0.96), else rgba(23,49,34,0.74). No box.
+  ctx.fillStyle=selected?'rgba(21,35,28,0.96)':'rgba(23,49,34,0.84)';
+  ctx.fillText(display,pad,chh/2);
+  const texture=new THREE.CanvasTexture(canvas);
+  if('SRGBColorSpace' in THREE)texture.colorSpace=THREE.SRGBColorSpace;
+  texture.needsUpdate=true;
+  const material=new THREE.SpriteMaterial({map:texture,transparent:true,depthTest:false,depthWrite:false});
+  const sprite=new THREE.Sprite(material);
+  sprite.userData={aspect:cw/Math.max(1,chh)};
+  sprite.renderOrder=999;
+  return sprite;
+}
+function _updateThreeLabelScales(){
+  // Two jobs, run each rendered frame:
+  //  1. Distance-adaptive sizing — keep each label a roughly constant on-screen height
+  //     regardless of camera distance/zoom, floated just above its node.
+  //  2. Density culling — project every candidate label to SCREEN space, rank by importance
+  //     (selected/hovered > hero/community > score), then greedily place: a label is shown
+  //     only if its screen box doesn't collide with an already-placed, more-important one.
+  //     This surfaces the important labels and drops minor/overlapping ones as the camera
+  //     moves, so dense regions don't turn into an unreadable pile of text.
+  if(!(G.three.labels instanceof Map)||!G.three.labels.size||!G.three.camera||!G.three.renderer)return;
+  const cam=G.three.camera;
+  const camPos=cam.position;
+  const vFov=Math.max(0.2,(Number(cam.fov||42)*Math.PI)/180);
+  const heightFrac=G.focusMode?0.052:0.044;
+  const rect=G.three.renderer.domElement?G.three.renderer.domElement.getBoundingClientRect():{width:960,height:520};
+  const vw=Math.max(1,Number(rect.width||960)), vh=Math.max(1,Number(rect.height||520));
+  const THREE=G.three.lib;
+  const selectedId=String(G.selectedNodeId||'');
+  const hoverId=String(G.hoverId||'');
+  const cand=[];
+  for(const [id,sprite] of G.three.labels.entries()){
+    const mesh=G.three.meshes.get(String(id));
+    if(!mesh){sprite.visible=false;continue}
+    // World height for constant on-screen size.
+    const dx=mesh.position.x-camPos.x, dy=mesh.position.y-camPos.y, dz=mesh.position.z-camPos.z;
+    const dist=Math.sqrt(dx*dx+dy*dy+dz*dz)||1;
+    const worldH=clamp(2*dist*Math.tan(vFov/2)*heightFrac,3.2,46);
+    const aspect=Number(sprite.userData?.aspect||4)||4;
+    sprite.scale.set(worldH*aspect,worldH,1);
+    const r=Number(mesh.scale?.y||mesh.userData?.baseScale||2);
+    const wx=mesh.position.x, wy=mesh.position.y+r+worldH*0.62, wz=mesh.position.z;
+    sprite.position.set(wx,wy,wz);
+    // Project the label anchor to normalized device coords, then to screen pixels.
+    let ndc=null;
+    try{ndc=new THREE.Vector3(wx,wy,wz).project(cam)}catch(_){ndc=null}
+    if(!ndc||!Number.isFinite(ndc.x)||!Number.isFinite(ndc.y)||ndc.z>1||ndc.z<-1){
+      // Behind the camera or invalid → never show.
+      sprite.visible=false;continue;
+    }
+    const sx=(ndc.x*0.5+0.5)*vw;
+    const sy=(-ndc.y*0.5+0.5)*vh;
+    // Screen box: label height is ~heightFrac of the viewport by construction.
+    const boxH=Math.max(12,vh*heightFrac);
+    const boxW=boxH*aspect;
+    // Off-screen (with margin) → skip.
+    if(sx<-boxW||sx>vw+boxW||sy<-boxH||sy>vh+boxH){sprite.visible=false;continue}
+    let importance=Number(sprite.userData?.importance||0);
+    if(String(id)===selectedId)importance+=1000;     // selected always wins
+    else if(String(id)===hoverId)importance+=500;     // hovered next
+    // Closer-to-camera labels get a slight edge so foreground reads over background.
+    importance+=clamp(1/Math.max(1,dist)*40,0,2);
+    cand.push({sprite,sx,sy,boxW,boxH,importance});
+  }
+  // Greedy density placement, most important first.
+  cand.sort((a,b)=>b.importance-a.importance);
+  const placed=[];
+  for(const c of cand){
+    let collides=false;
+    for(const p of placed){
+      // Axis-aligned box overlap test in screen space, anchored at the label's left-middle.
+      if(Math.abs(c.sx-p.sx)*2 < (c.boxW+p.boxW) && Math.abs(c.sy-p.sy)*2 < (c.boxH+p.boxH)){
+        collides=true;break;
+      }
+    }
+    if(collides){c.sprite.visible=false;continue}
+    c.sprite.visible=true;
+    placed.push(c);
+  }
+}
 function buildThreeSceneGraph(){
   const THREE=G.three.lib;
   if(!THREE||!G.three.root)return;
@@ -79110,13 +81314,58 @@ function buildThreeSceneGraph(){
     const mesh=new THREE.Mesh(new THREE.SphereGeometry(1,14,12),material);
     mesh.position.set(Number(item.x||0),Number(item.y||0),Number(item.z||0));
     mesh.scale.setScalar(Number(item.radius3d||2));
-    mesh.userData={id:item.id,baseScale:Number(item.radius3d||2),baseColor:Number(item.colorHex||0x607565),baseOpacity:opacity};
+    mesh.userData={
+      id:item.id,
+      baseScale:Number(item.radius3d||2),
+      baseColor:Number(item.colorHex||0x607565),
+      baseOpacity:opacity,
+      // Resting world position for this layout; the morph eases toward it.
+      targetPos:{x:Number(item.x||0),y:Number(item.y||0),z:Number(item.z||0)},
+    };
     G.three.root.add(mesh);
     G.three.meshes.set(String(item.id),mesh);
   });
   fitThreeCameraToLayout(true);
   applyThreeFocusStyles();
+  // After focus styling sets each mesh's resting scale, record it as the morph target.
+  for(const [,mesh] of G.three.meshes.entries()){
+    mesh.userData.targetScale=Number(mesh.scale?.x||mesh.userData?.baseScale||1);
+  }
+  _buildThreeLabels(layout);
+  // If a focus/clear morph is queued, place meshes at their start now so frame 0 shows the
+  // pre-switch arrangement, then the continuous loop eases them in.
+  if(G.three.morph&&G.three.morph.active)_applyThreeMorphFrame();
+  _updateThreeLabelScales();
   G.three.graphKey=layout.signature;
+}
+function _buildThreeLabels(layout){
+  const THREE=G.three.lib;
+  if(!THREE||!G.three.root)return;
+  // Dispose any previous labels (textures freed via disposeThreeObject's map handling).
+  if(G.three.labels instanceof Map){
+    for(const [,sprite] of G.three.labels.entries()){
+      try{G.three.root.remove(sprite)}catch(_){}
+      disposeThreeObject(sprite);
+    }
+  }
+  G.three.labels=new Map();
+  const ids=_three3dLabelIds(layout);
+  const selectedId=String(G.selectedNodeId||'');
+  for(const id of ids){
+    const item=layout.itemById.get(String(id));
+    if(!item)continue;
+    const sprite=_makeThreeLabelSprite(item.label||item.id,String(id)===selectedId);
+    if(!sprite)continue;
+    // Base importance for density culling: hero/community/high-score rank above incidental
+    // neighbors. Selected/hovered get a live boost in _updateThreeLabelScales so they always win.
+    const base=Math.log1p(Math.max(0,Number(item.score||0)));
+    let imp=base;
+    if(item.hero)imp+=4;
+    if(String(item.type||'')==='community')imp+=3;
+    sprite.userData.importance=imp;
+    G.three.root.add(sprite);
+    G.three.labels.set(String(id),sprite);
+  }
 }
 async function ensureThreeRenderer(){
   const THREE=await ensureThreeLib();
@@ -79836,7 +82085,7 @@ window.addEventListener('DOMContentLoaded',async()=>{bind();try{await refreshCon
 class AppContext:
     def _llm_config_revision(self, config: dict | None) -> str:
         try:
-            raw = json.dumps(config or {}, ensure_ascii=False, sort_keys=True, default=str)
+            raw = json_dumps(config or {}, sort_keys=True, default=str)
         except Exception:
             raw = json_dumps(config or {})
         return hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()[:16]
@@ -80054,7 +82303,7 @@ class AppContext:
             wiki_store=self.code_wiki,
         )
         self.code_source_roots = self._discover_external_code_source_roots()
-        # Global MCP manager (one per app, mounted on ide_port+1). Loaded from the
+        # Global MCP manager (one per app, mounted on agent port + 4). Loaded from the
         # trusted on-disk config; sessions reference this shared instance so health
         # and the available tool set are consistent everywhere and hot-swap is seen
         # at call time. Connection + health monitor start in main() after mount.
@@ -81627,6 +83876,76 @@ class AppContext:
         except Exception:
             return ""
 
+    def _augment_query_cross_lingual(self, session: object, query: str) -> tuple[str, dict]:
+        """Make lexical retrieval cross-lingual: query in one language, hit content in another.
+
+        BM25 is purely lexical — a Chinese query and an English chunk share no tokens unless
+        a term happens to be in the curated RAG_TERM_GROUPS table. To cover ARBITRARY
+        vocabulary, we translate the (short) query into the other major language via the
+        session's chat model and append it, so ONE bilingual query string flows through the
+        existing tokenizer + BM25 and matches both CN and EN content in a single pass — no
+        embedding model, no second retrieval round.
+
+        Best-effort and fully degrading: returns the original query unchanged when there's no
+        model, the query is long, already bilingual, or translation fails. Cached per
+        normalized query so repeated/multi-stage retrieval pays the model cost at most once.
+        Returns (augmented_query, meta).
+        """
+        raw = str(query or "").strip()
+        meta = {"cross_lingual": False}
+        if not raw or len(raw) > 200:
+            return raw, meta
+        has_cjk = bool(re.search(r"[一-鿿]", raw))
+        has_latin = bool(re.search(r"[A-Za-z]{2,}", raw))
+        # If the query already mixes scripts it can hit both sides lexically; nothing to add.
+        if has_cjk == has_latin:
+            return raw, meta
+        ollama = getattr(session, "ollama", None) if session is not None else None
+        if ollama is None or not hasattr(ollama, "chat"):
+            return raw, meta
+        target_lang = "English" if has_cjk else "Chinese"
+        cache = getattr(self, "_xlingual_query_cache", None)
+        if cache is None:
+            cache = {}
+            try:
+                self._xlingual_query_cache = cache
+            except Exception:
+                pass
+        cache_key = f"{'cjk' if has_cjk else 'lat'}|{raw.lower()}"
+        if cache_key in cache:
+            translated = cache[cache_key]
+        else:
+            translated = ""
+            try:
+                rsp = ollama.chat(
+                    [{"role": "user", "content": (
+                        f"Translate this search query to {target_lang}. Output ONLY the translation, "
+                        f"no quotes, no explanation, keep proper nouns/code/acronyms as-is:\n{raw}"
+                    )}],
+                    system="/no_think\nYou are a terse bilingual search-query translator. Output only the translated query text.",
+                    max_tokens=120,
+                    think=False,
+                )
+                translated = str((rsp or {}).get("content", "") or "").strip()
+            except Exception:
+                translated = ""
+            # Sanitize: single line, drop any accidental wrapping quotes/prefixes.
+            translated = re.sub(r"\s+", " ", translated.replace("\n", " ")).strip().strip('"').strip("'")
+            translated = re.sub(r"(?i)^(translation|translated|译文|翻译)\s*[:：]\s*", "", translated).strip()
+            if len(translated) > 240:
+                translated = translated[:240]
+            # Reject no-ops / echoes that add nothing lexically.
+            if translated.lower() == raw.lower():
+                translated = ""
+            # Bound the cache so a long session can't grow it without limit.
+            if len(cache) < 512:
+                cache[cache_key] = translated
+        if not translated:
+            return raw, meta
+        meta = {"cross_lingual": True, "translated_to": target_lang.lower(), "translated_query": translated}
+        # Append so both the original and translated terms are tokenized into the query.
+        return f"{raw}\n{translated}", meta
+
     def rag_query(self, user_id: str, payload: dict) -> dict:
         body = dict(payload or {})
         query = str(body.get("query", "") or "").strip()
@@ -81640,6 +83959,17 @@ class AppContext:
         top_k = max(1, min(RAG_MAX_QUERY_RESULTS, int(body.get("top_k", budget.get("top_k", RAG_MAX_QUERY_RESULTS)) or budget.get("top_k", RAG_MAX_QUERY_RESULTS))))
         embed_model_override = str(body.get("embed_model", "") or "").strip()
         session = self._resolve_session_for_user(user_id, str(body.get("session_id", "") or ""))
+        # Cross-lingual augmentation: translate a single-language query into the other major
+        # language and search with both, so a CN query reaches EN content (and vice versa)
+        # over plain BM25. `query` stays the user's original text for display/synthesis;
+        # `retrieval_query` is what the lexical index actually sees. Opt-out via cross_lingual=false.
+        retrieval_query = query
+        xlingual_meta = {"cross_lingual": False}
+        if query and bool(body.get("cross_lingual", True)):
+            try:
+                retrieval_query, xlingual_meta = self._augment_query_cross_lingual(session, query)
+            except Exception:
+                retrieval_query, xlingual_meta = query, {"cross_lingual": False}
         dense_enabled, retrieval_mode, embedding_reason = self._embedding_request_mode(body, embed_model_override)
         embedding_used = False
         embeddings_built = 0
@@ -81657,7 +83987,7 @@ class AppContext:
                     pass
             if self.rag_store.index.has_dense_index():
                 try:
-                    qvec = _rag_embed_text(query, session, model=embed_model_override)
+                    qvec = _rag_embed_text(retrieval_query, session, model=embed_model_override)
                     embedding_used = bool(qvec)
                 except Exception:
                     qvec = None
@@ -81665,9 +83995,9 @@ class AppContext:
         raw_route = "hybrid" if requested_route in {"auto", "wiki", "raw"} else requested_route
         pool_k = max(top_k, min(RAG_MAX_QUERY_RESULTS, max(int(budget.get("pool", RAG_HIGH_RECALL_MIN_POOL) or RAG_HIGH_RECALL_MIN_POOL), top_k * RAG_HIGH_RECALL_POOL_MULTIPLIER)))
         if requested_route == "wiki":
-            result = self.rag_wiki.query(query, top_k=top_k, category=category, kind=kind)
+            result = self.rag_wiki.query(retrieval_query, top_k=top_k, category=category, kind=kind)
         elif requested_route in {"raw", "fast", "global", "hybrid"}:
-            result = self.rag_store.index.query(query, top_k=top_k, category=category, kind=kind, route=raw_route if requested_route != "raw" else "hybrid", qvec=qvec)
+            result = self.rag_store.index.query(retrieval_query, top_k=top_k, category=category, kind=kind, route=raw_route if requested_route != "raw" else "hybrid", qvec=qvec)
             if requested_route == "raw":
                 result["route"] = "raw"
                 result.setdefault("route_meta", {})
@@ -81676,13 +84006,13 @@ class AppContext:
         else:
             stage_results: list[dict] = []
             wide_top_k = max(top_k, min(pool_k, int(budget.get("pool", pool_k) or pool_k)))
-            wiki_result = self.rag_wiki.query(query, top_k=wide_top_k, category=category, kind=kind)
+            wiki_result = self.rag_wiki.query(retrieval_query, top_k=wide_top_k, category=category, kind=kind)
             stage_results.append(wiki_result)
             light_route = "fast" if not self._rag_has_global_intent(query) else "hybrid"
-            raw_light = self.rag_store.index.query(query, top_k=wide_top_k, category=category, kind=kind, route=light_route, qvec=qvec)
+            raw_light = self.rag_store.index.query(retrieval_query, top_k=wide_top_k, category=category, kind=kind, route=light_route, qvec=qvec)
             stage_results.append(raw_light)
             light_merged = self._merge_retrieval_results(
-                query,
+                retrieval_query,
                 stage_results,
                 top_k=top_k,
                 route="auto",
@@ -81690,15 +84020,15 @@ class AppContext:
             )
             light_metrics = self._rag_evidence_metrics(light_merged)
             if light_metrics.get("evidence_status") != "hit" or self._rag_has_global_intent(query) or budget_key == "deep":
-                raw_result = self.rag_store.index.query(query, top_k=pool_k, category=category, kind=kind, route=raw_route, qvec=qvec)
+                raw_result = self.rag_store.index.query(retrieval_query, top_k=pool_k, category=category, kind=kind, route=raw_route, qvec=qvec)
                 stage_results.append(raw_result)
                 if self._rag_has_global_intent(query) or budget_key == "deep":
-                    global_result = self.rag_store.index.query(query, top_k=max(top_k, min(pool_k, 24)), category=category, kind=kind, route="global", qvec=qvec)
+                    global_result = self.rag_store.index.query(retrieval_query, top_k=max(top_k, min(pool_k, 24)), category=category, kind=kind, route="global", qvec=qvec)
                     stage_results.append(global_result)
                 if light_metrics.get("evidence_status") != "hit" or budget_key == "deep":
                     stage_results.extend(
                         self._expand_retrieval_with_variants(
-                            query=query,
+                            query=retrieval_query,
                             user_id=user_id,
                             payload=body,
                             code=False,
@@ -81711,7 +84041,7 @@ class AppContext:
                         )
                     )
             result = self._merge_retrieval_results(
-                query,
+                retrieval_query,
                 stage_results,
                 top_k=top_k,
                 route="auto",
@@ -81745,11 +84075,15 @@ class AppContext:
                 "embedding_used": bool(embedding_used),
                 "embedding_reason": embedding_reason,
                 "embeddings_built": int(embeddings_built),
+                "cross_lingual": bool(xlingual_meta.get("cross_lingual", False)),
+                "cross_lingual_to": str(xlingual_meta.get("translated_to", "") or ""),
             }
         )
         result["route_meta"] = meta
         result["retrieval_mode"] = retrieval_mode
         result["embedding_used"] = bool(embedding_used)
+        # Keep the user's original query as the display value (retrieval used the augmented one).
+        result["query"] = query
         synthesize = bool(body.get("synthesize", False))
         if synthesize:
             answer = self._rag_synthesize_with_session(session, query, list(result.get("results", []) or []))
@@ -82504,6 +84838,71 @@ class AppContext:
                 lines.append(snippet)
         return "\n".join(lines)
 
+    def _rag_remember_tool(self, session: SessionState, args: dict) -> str:
+        """Agent self-ingestion: save a vetted reference/snippet into the knowledge library.
+
+        Reuses the same text-import pipeline as admin uploads (parse → chunk → index),
+        with strict_local_only=True so it runs without any LLM call (fast, no model
+        dependency, honoring the lexical-only design). De-duplication by content hash is
+        handled inside ingest_document, so re-remembering the same text is a safe no-op.
+        """
+        body = dict(args or {})
+        text = str(body.get("text", "") or "").strip()
+        if not text:
+            return "Error: rag_remember requires non-empty 'text'"
+        # Size cap: keep a single remembered note bounded so the tool can't be used to dump
+        # an entire codebase in one call (that's what code-library import is for).
+        MAX_REMEMBER_CHARS = 60_000
+        truncated = False
+        if len(text) > MAX_REMEMBER_CHARS:
+            text = text[:MAX_REMEMBER_CHARS]
+            truncated = True
+        title = trim(str(body.get("title", "") or "").strip(), 160)
+        source = trim(str(body.get("source", "") or "").strip(), 300)
+        category = trim(str(body.get("category", "") or "").strip(), 60)
+        tags = [trim(str(x).strip(), 60) for x in (body.get("tags", []) or []) if str(x).strip()][:16]
+        if category:
+            tags = ([category] + tags)[:16]
+        # Build a small provenance header so retrieval shows where the note came from.
+        header_bits = []
+        if title:
+            header_bits.append(f"# {title}")
+        if source:
+            header_bits.append(f"Source: {source}")
+        header_bits.append(
+            f"Saved by agent from session {trim(str(getattr(session, 'id', '') or ''), 40)}."
+        )
+        note = "\n".join(header_bits) + "\n\n" + text if header_bits else text
+        fname_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", title or "agent_note").strip("_") or "agent_note"
+        try:
+            result = self.rag_service.enqueue_import(
+                session=session,
+                session_id=str(getattr(session, "id", "") or ""),
+                user_id=str(getattr(session, "owner_user_id", "") or ""),
+                title=title or "agent note",
+                text=note,
+                filename=f"{fname_stem}.md",
+                mime="text/markdown",
+                source_mode="agent",
+                tags=tags,
+                strict_local_only=True,
+            )
+        except Exception as exc:
+            return f"Error: rag_remember ingest failed: {trim(str(exc), 200)}"
+        ok = bool(result.get("ok", False)) if isinstance(result, dict) else False
+        task_id = str((result or {}).get("task_id", "") or "") if isinstance(result, dict) else ""
+        lines = [
+            "rag_remember: "
+            + ("queued" if ok or task_id else "submitted")
+            + (f" task_id={task_id}" if task_id else "")
+            + f" chars={len(text)}"
+            + (" (truncated)" if truncated else "")
+            + (f" tags={','.join(tags)}" if tags else ""),
+            "Saved to the knowledge library; it will be retrievable via query_knowledge_library "
+            "once indexing completes (usually immediately for text notes).",
+        ]
+        return "\n".join(lines)
+
     def _mcp_app_log(self, msg: str):
         try:
             print(f"[web-agent] {str(msg or '')}", flush=True)
@@ -83002,6 +85401,7 @@ class AppContext:
                 reference_prepare_callback=self._prepare_runtime_references,
                 query_code_library_callback=self._query_code_library_tool,
                 query_knowledge_library_callback=self._query_knowledge_library_tool,
+                rag_remember_callback=self._rag_remember_tool,
                 code_library_root=self.code_root,
                 code_library_status_callback=self._code_library_status_for_session,
                 knowledge_library_root=self.rag_root,
@@ -83974,14 +86374,10 @@ class Handler(BaseHTTPRequestHandler):
         return self.app.manager_for_user(self._user_id())
 
     def _read_json(self) -> dict:
-        length = int(self.headers.get("Content-Length", "0") or "0")
-        if length <= 0:
-            return {}
-        body = self.rfile.read(length).decode("utf-8")
-        return json.loads(body) if body else {}
+        return read_http_json_body(self)
 
     def _send_json(self, obj: object, status: int = 200):
-        body = json_dumps(obj).encode("utf-8")
+        body = json_response_bytes(obj)
         try:
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -84002,7 +86398,7 @@ class Handler(BaseHTTPRequestHandler):
         *,
         revalidate_cache: bool = False,
     ):
-        raw_body = text.encode("utf-8")
+        raw_body = safe_utf8_bytes(text)
         etag = ""
         if revalidate_cache:
             etag = f'W/"{len(raw_body):x}-{hashlib.sha1(raw_body).hexdigest()[:16]}"'
@@ -84055,7 +86451,7 @@ class Handler(BaseHTTPRequestHandler):
             raw_name = Path(str(filename or "download.bin")).name or "download.bin"
             ascii_name = unicodedata.normalize("NFKD", raw_name).encode("ascii", "ignore").decode("ascii")
             ascii_name = re.sub(r'[\r\n"\\;]+', "_", ascii_name).strip(" ._") or "download.bin"
-            encoded_name = quote(raw_name.encode("utf-8"), safe="")
+            encoded_name = quote(safe_utf8_bytes(raw_name), safe="")
             disposition = f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{encoded_name}'
             self.send_response(200)
             self.send_header("Content-Type", content_type)
@@ -84579,7 +86975,7 @@ class Handler(BaseHTTPRequestHandler):
             if not sess:
                 return self._send_json({"error": "session not found"}, status=404)
             md = sess.export_conversation_md()
-            return self._send_bytes(md.encode("utf-8"), "text/markdown; charset=utf-8", f"{sess.id}_conversation.md")
+            return self._send_bytes(safe_utf8_bytes(md), "text/markdown; charset=utf-8", f"{sess.id}_conversation.md")
         m = re.match(r"^/api/sessions/([^/]+)/export\.pdf$", path)
         if m:
             sess = mgr.get(m.group(1))
@@ -84841,7 +87237,7 @@ class Handler(BaseHTTPRequestHandler):
             if not sess:
                 return self._send_json({"error": "session not found"}, status=404)
             try:
-                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0) or 0)))
+                body = self._read_json()
             except Exception:
                 body = {}
             pref = str(body.get("preference", "auto") or "auto").strip().lower()
@@ -84855,7 +87251,7 @@ class Handler(BaseHTTPRequestHandler):
             if not sess:
                 return self._send_json({"error": "session not found"}, status=404)
             try:
-                body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0) or 0)))
+                body = self._read_json()
             except Exception:
                 body = {}
             level = int(body.get("level", 0) or 0)
@@ -84935,16 +87331,16 @@ class Handler(BaseHTTPRequestHandler):
                 except (ValueError, TypeError):
                     pass
             current_seq = int(sess.event_seq or 0)
-            hello = (
+            hello = safe_utf8_bytes(
                 f"data: {json_dumps({'type': 'hello', 'session_id': sess.id, 'seq': current_seq})}\n\n"
-            ).encode("utf-8")
+            )
             if not self._sse_write(hello):
                 return
             # If client had a previous event ID and there's a gap, send resync
             if last_event_id > 0 and current_seq > last_event_id + 1:
-                resync = (
+                resync = safe_utf8_bytes(
                     f"data: {json_dumps({'type': 'resync', 'reason': 'event_gap', 'last_client_seq': last_event_id, 'current_seq': current_seq})}\n\n"
-                ).encode("utf-8")
+                )
                 if not self._sse_write(resync):
                     return
             while True:
@@ -84952,11 +87348,11 @@ class Handler(BaseHTTPRequestHandler):
                     event = sub.get(timeout=SSE_HEARTBEAT_SECONDS)
                     seq = int(event.get("seq", 0) or 0) if isinstance(event, dict) else 0
                     if seq > 0:
-                        chunk = f"id: {seq}\ndata: {json_dumps(event)}\n\n".encode("utf-8")
+                        chunk = safe_utf8_bytes(f"id: {seq}\ndata: {json_dumps(event)}\n\n")
                     else:
-                        chunk = f"data: {json_dumps(event)}\n\n".encode("utf-8")
+                        chunk = safe_utf8_bytes(f"data: {json_dumps(event)}\n\n")
                 except queue.Empty:
-                    chunk = f": ping {int(now_ts())}\n\n".encode("utf-8")
+                    chunk = safe_utf8_bytes(f": ping {int(now_ts())}\n\n")
                 if not self._sse_write(chunk):
                     break
         except Exception as exc:
@@ -84997,14 +87393,10 @@ class SkillsHandler(BaseHTTPRequestHandler):
         return self.app.manager_for_user(self._user_id())
 
     def _read_json(self) -> dict:
-        length = int(self.headers.get("Content-Length", "0") or "0")
-        if length <= 0:
-            return {}
-        body = self.rfile.read(length).decode("utf-8")
-        return json.loads(body) if body else {}
+        return read_http_json_body(self)
 
     def _send_json(self, obj: object, status: int = 200):
-        body = json_dumps(obj).encode("utf-8")
+        body = json_response_bytes(obj)
         try:
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -85018,7 +87410,7 @@ class SkillsHandler(BaseHTTPRequestHandler):
             raise
 
     def _send_text(self, text: str, content_type: str = "text/plain; charset=utf-8", status: int = 200):
-        body = text.encode("utf-8")
+        body = safe_utf8_bytes(text)
         try:
             self.send_response(status)
             self.send_header("Content-Type", content_type)
@@ -85201,14 +87593,10 @@ class RagAdminHandler(BaseHTTPRequestHandler):
         return user_id_from_ip(self._client_ip())
 
     def _read_json(self) -> dict:
-        length = int(self.headers.get("Content-Length", "0") or "0")
-        if length <= 0:
-            return {}
-        body = self.rfile.read(length).decode("utf-8")
-        return json.loads(body) if body else {}
+        return read_http_json_body(self)
 
     def _send_json(self, obj: object, status: int = 200):
-        body = json_dumps(obj).encode("utf-8")
+        body = json_response_bytes(obj)
         try:
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -85222,7 +87610,7 @@ class RagAdminHandler(BaseHTTPRequestHandler):
             raise
 
     def _send_text(self, text: str, content_type: str = "text/plain; charset=utf-8", status: int = 200):
-        body = text.encode("utf-8")
+        body = safe_utf8_bytes(text)
         try:
             self.send_response(status)
             self.send_header("Content-Type", content_type)
@@ -85372,14 +87760,10 @@ class CodeAdminHandler(BaseHTTPRequestHandler):
         return user_id_from_ip(self._client_ip())
 
     def _read_json(self) -> dict:
-        length = int(self.headers.get("Content-Length", "0") or "0")
-        if length <= 0:
-            return {}
-        body = self.rfile.read(length).decode("utf-8")
-        return json.loads(body) if body else {}
+        return read_http_json_body(self)
 
     def _send_json(self, obj: object, status: int = 200):
-        body = json_dumps(obj).encode("utf-8")
+        body = json_response_bytes(obj)
         try:
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -85393,7 +87777,7 @@ class CodeAdminHandler(BaseHTTPRequestHandler):
             raise
 
     def _send_text(self, text: str, content_type: str = "text/plain; charset=utf-8", status: int = 200):
-        body = text.encode("utf-8")
+        body = safe_utf8_bytes(text)
         try:
             self.send_response(status)
             self.send_header("Content-Type", content_type)
@@ -85561,14 +87945,10 @@ class IdeHandler(BaseHTTPRequestHandler):
         return user_id_from_ip(self._client_ip())
 
     def _read_json(self) -> dict:
-        length = int(self.headers.get("Content-Length", "0") or "0")
-        if length <= 0:
-            return {}
-        body = self.rfile.read(length).decode("utf-8")
-        return json.loads(body) if body else {}
+        return read_http_json_body(self)
 
     def _send_json(self, obj: object, status: int = 200):
-        body = json_dumps(obj).encode("utf-8")
+        body = json_response_bytes(obj)
         try:
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -85582,7 +87962,7 @@ class IdeHandler(BaseHTTPRequestHandler):
             raise
 
     def _send_text(self, text: str, content_type: str = "text/plain; charset=utf-8", status: int = 200):
-        body = text.encode("utf-8")
+        body = safe_utf8_bytes(text)
         try:
             self.send_response(status)
             self.send_header("Content-Type", content_type)
@@ -85826,14 +88206,10 @@ class McpServiceHandler(BaseHTTPRequestHandler):
         return getattr(self.app, "mcp", None)
 
     def _read_json(self) -> dict:
-        length = int(self.headers.get("Content-Length", "0") or "0")
-        if length <= 0:
-            return {}
-        body = self.rfile.read(length).decode("utf-8")
-        return json.loads(body) if body else {}
+        return read_http_json_body(self)
 
     def _send_json(self, obj: object, status: int = 200):
-        body = json_dumps(obj).encode("utf-8")
+        body = json_response_bytes(obj)
         try:
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -85847,7 +88223,7 @@ class McpServiceHandler(BaseHTTPRequestHandler):
             raise
 
     def _send_html(self, text: str, status: int = 200):
-        body = text.encode("utf-8")
+        body = safe_utf8_bytes(text)
         try:
             self.send_response(status)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -86077,9 +88453,9 @@ def main():
     parser.add_argument(
         "--ide_port",
         "--IDE_port",
-        default=IDE_DEFAULT_PORT,
+        default=None,
         type=int,
-        help=f"Programming IDE web port (default: {IDE_DEFAULT_PORT})",
+        help=f"Programming IDE web port (default: agent port + {IDE_PORT_OFFSET})",
     )
     parser.add_argument(
         "--skills_root",
@@ -86129,14 +88505,14 @@ def main():
         dest="mcp_service_port",
         type=int,
         default=None,
-        help="Global MCP service/health port (default: ide_port + 1)",
+        help="Global MCP service/health port (default: agent port + 4)",
     )
     parser.add_argument(
         "--no_mcp_service",
         "--no-mcp-service",
         dest="no_mcp_service",
         action="store_true",
-        help="Disable the global MCP service mounted on ide_port+1 (enabled by default)",
+        help="Disable the global MCP service mounted on agent port + 4 (enabled by default)",
     )
     parser.add_argument(
         "--web_ui_config",
@@ -86945,7 +89321,7 @@ def main():
     skills_port = int(args.skills_port) if args.skills_port is not None else int(args.port) + 1
     rag_admin_port = int(args.rag_admin_port) if args.rag_admin_port is not None else int(args.port) + RAG_ADMIN_PORT_OFFSET
     code_admin_port = int(args.code_admin_port) if args.code_admin_port is not None else int(args.port) + CODE_ADMIN_PORT_OFFSET
-    ide_port = int(getattr(args, "ide_port", IDE_DEFAULT_PORT) or IDE_DEFAULT_PORT)
+    ide_port = int(args.ide_port) if getattr(args, "ide_port", None) is not None else int(args.port) + IDE_PORT_OFFSET
     setattr(app, "agent_port", int(args.port))
     setattr(app, "skills_port", int(skills_port))
     setattr(app, "skills_ui_enabled", False)
@@ -87024,12 +89400,21 @@ def main():
             print(f"[web-agent] code admin failed to start on {args.host}:{code_admin_port}: {exc}")
     ide_server = None
     ide_thread = None
+    # Ports already bound by servers that actually started (agent always; others only if
+    # their *_server is live). A disabled service must NOT block the IDE from binding.
+    _active_ports_for_ide = {int(args.port)}
+    if skills_server:
+        _active_ports_for_ide.add(int(skills_port))
+    if rag_admin_server:
+        _active_ports_for_ide.add(int(rag_admin_port))
+    if code_admin_server:
+        _active_ports_for_ide.add(int(code_admin_port))
     if args.no_ide:
         print("[web-agent] programming IDE disabled by --no_ide")
     elif not bool(getattr(args, "enable_ide", False)):
         print("[web-agent] programming IDE disabled by default; use --enable_ide to start it")
-    elif int(ide_port) in {int(args.port), int(skills_port), int(rag_admin_port), int(code_admin_port)}:
-        print("[web-agent] programming IDE disabled: ide_port conflicts with existing server port")
+    elif int(ide_port) in _active_ports_for_ide:
+        print(f"[web-agent] programming IDE disabled: ide_port {ide_port} conflicts with a running server port")
     else:
         try:
             ide_server = AgentHTTPServer((args.host, ide_port), IdeHandler, app)
@@ -87046,23 +89431,36 @@ def main():
             setattr(app, "ide_enabled", True)
         except Exception as exc:
             print(f"[web-agent] programming IDE failed to start on {args.host}:{ide_port}: {exc}")
-    # Global MCP service: mounted on ide_port+1 at startup (the request: auto-mount
-    # at the programming_ide address +1). Connects servers + starts the health
-    # monitor (crash-restart + on-disk config hot-swap). Bound to the same host as
-    # the IDE per chosen config.
+    # Global MCP service: mounted on (agent port + 4) at startup, following the
+    # same user-port-relative scheme as skills(+1)/rag-admin(+2)/code-admin(+3),
+    # so it tracks --port instead of a fixed port. Connects servers + starts
+    # the health monitor (crash-restart + on-disk config hot-swap). Bound to the
+    # same host as the other servers.
     mcp_service_port = (
         int(args.mcp_service_port)
         if getattr(args, "mcp_service_port", None) is not None
-        else int(ide_port) + 1
+        else int(args.port) + MCP_SERVICE_PORT_OFFSET
     )
     setattr(app, "mcp_service_port", int(mcp_service_port))
     setattr(app, "mcp_service_enabled", False)
     mcp_service_server = None
     mcp_service_thread = None
+    # Only ports of servers that actually started can conflict; the IDE is included
+    # only when it is genuinely running (ide_server is set), so a disabled IDE on the
+    # same default port never blocks the MCP service.
+    _active_ports_for_mcp = {int(args.port)}
+    if skills_server:
+        _active_ports_for_mcp.add(int(skills_port))
+    if rag_admin_server:
+        _active_ports_for_mcp.add(int(rag_admin_port))
+    if code_admin_server:
+        _active_ports_for_mcp.add(int(code_admin_port))
+    if ide_server:
+        _active_ports_for_mcp.add(int(ide_port))
     if getattr(args, "no_mcp_service", False):
         print("[web-agent] MCP service disabled by --no_mcp_service")
-    elif int(mcp_service_port) in {int(args.port), int(skills_port), int(rag_admin_port), int(code_admin_port), int(ide_port)}:
-        print(f"[web-agent] MCP service disabled: mcp_service_port {mcp_service_port} conflicts with an existing server port")
+    elif int(mcp_service_port) in _active_ports_for_mcp:
+        print(f"[web-agent] MCP service disabled: mcp_service_port {mcp_service_port} conflicts with a running server port")
     else:
         try:
             mcp_service_server = AgentHTTPServer((args.host, mcp_service_port), McpServiceHandler, app)
