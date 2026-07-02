@@ -14117,17 +14117,36 @@ class BackgroundManager:
         return f"Background task {task_id} started: {command[:80]}"
 
     def _exec(self, task_id: str, command: str, timeout: int):
+        def _decode_stream(data: bytes | None) -> str:
+            raw = bytes(data or b"")
+            if not raw:
+                return ""
+            encodings = ["utf-8", "utf-8-sig", locale.getpreferredencoding(False) or "", "gb18030", "gbk"]
+            seen: set[str] = set()
+            for enc in encodings:
+                enc = str(enc or "").strip()
+                if not enc or enc.lower() in seen:
+                    continue
+                seen.add(enc.lower())
+                try:
+                    return raw.decode(enc, errors="replace")
+                except Exception:
+                    continue
+            return raw.decode("utf-8", errors="replace")
+
         try:
             r = subprocess.run(
                 command,
                 shell=True,
                 cwd=self.workdir,
                 capture_output=True,
-                text=True,
+                text=False,
                 timeout=timeout,
             )
-            output = trim((r.stdout + r.stderr).strip())
-            status = "completed"
+            output = trim((_decode_stream(r.stdout) + _decode_stream(r.stderr)).strip())
+            if r.returncode:
+                output = trim(f"exit={r.returncode}\n{output or '(no output)'}")
+            status = "completed" if int(r.returncode or 0) == 0 else "error"
         except Exception as exc:
             output = f"Error: {exc}"
             status = "error"
@@ -24679,6 +24698,176 @@ class SessionState:
         )
         return any(marker in low for marker in markers)
 
+    @staticmethod
+    def _coerce_exit_code(raw: object) -> int | None:
+        if raw in (None, ""):
+            return None
+        try:
+            return int(raw)
+        except Exception:
+            return None
+
+    def _command_looks_like_count_search(self, command: str) -> bool:
+        low = str(command or "").lower()
+        if not low.strip():
+            return False
+        segments = re.split(r"\s*(?:&&|\|\||;|\|)\s*", low)
+        for segment in segments:
+            if not re.search(r"(?<![\w./-])(?:grep|ggrep|rg|ripgrep)\b", segment):
+                continue
+            if re.search(r"(?<!\S)--count(?:-matches)?(?!\S)", segment):
+                return True
+            if re.search(r"(?<!\S)-[a-z]*c[a-z]*(?!\S)", segment):
+                return True
+        return False
+
+    @staticmethod
+    def _count_search_output_values(output: str) -> list[int]:
+        values: list[int] = []
+        for raw_line in str(output or "").replace("\r\n", "\n").split("\n"):
+            line = raw_line.strip()
+            if not line or line.startswith("[long_output"):
+                continue
+            # grep -c prints either "0" or "path:0" for multi-file searches.
+            match = re.match(r"^(?:.*:)?(\d+)$", line)
+            if not match:
+                return []
+            try:
+                values.append(int(match.group(1)))
+            except Exception:
+                return []
+        return values
+
+    def _count_search_output_is_zero(self, command: str, output: str) -> bool:
+        if not self._command_looks_like_count_search(command):
+            return False
+        values = self._count_search_output_values(output)
+        return bool(values) and all(value == 0 for value in values)
+
+    def _count_search_output_has_positive_count(self, command: str, output: str) -> int | None:
+        if not self._command_looks_like_count_search(command):
+            return None
+        values = self._count_search_output_values(output)
+        if not values:
+            return None
+        positive = [value for value in values if value > 0]
+        return max(positive) if positive else 0
+
+    def _tool_exec_meta_matches(self, row: dict, name: str, args: dict | None) -> bool:
+        if not isinstance(row, dict):
+            return False
+        tool = canonicalize_tool_name(name)
+        if str(row.get("name", "") or "") != tool:
+            return False
+        src_args = args if isinstance(args, dict) else {}
+        command = str(src_args.get("command", "") or "")
+        row_command = str(row.get("command", "") or "")
+        if command and row_command and command != row_command:
+            return False
+        if tool == "worktree_run":
+            wanted = str(src_args.get("name", "") or "")
+            if wanted and str(row.get("worktree", "") or "") != wanted:
+                return False
+        return True
+
+    def _stash_tool_exec_meta(self, name: str, args: dict | None, meta: dict | None) -> None:
+        if not isinstance(meta, dict):
+            return
+        tool = canonicalize_tool_name(name)
+        if tool not in {"bash", "worktree_run", "background_run"}:
+            return
+        src_args = args if isinstance(args, dict) else {}
+        row = {
+            "name": tool,
+            "command": str(meta.get("command", src_args.get("command", "")) or ""),
+            "effective_command": str(meta.get("effective_command", meta.get("command", "")) or ""),
+            "cwd": str(meta.get("cwd", "") or ""),
+            "exit_code": self._coerce_exit_code(meta.get("exit_code")),
+            "duration_ms": int(meta.get("duration_ms", 0) or 0),
+            "changed_files": list(meta.get("changed_files", []) or [])[:24],
+            "worktree": str(src_args.get("name", "") or ""),
+            "ts": float(now_ts()),
+        }
+        try:
+            with self.lock:
+                queue_rows = list(getattr(self, "_tool_exec_meta_queue", []) or [])
+                queue_rows.append(row)
+                self._tool_exec_meta_queue = queue_rows[-48:]
+        except Exception:
+            self._tool_exec_meta_queue = [row]
+
+    def _lookup_tool_exec_meta(self, name: str, args: dict | None, *, pop: bool = False) -> dict:
+        try:
+            queue_rows = list(getattr(self, "_tool_exec_meta_queue", []) or [])
+        except Exception:
+            return {}
+        if not queue_rows:
+            return {}
+        found_idx = -1
+        found_row: dict = {}
+        for idx in range(len(queue_rows) - 1, -1, -1):
+            row = queue_rows[idx]
+            if self._tool_exec_meta_matches(row, name, args):
+                found_idx = idx
+                found_row = dict(row)
+                break
+        if found_idx >= 0 and pop:
+            try:
+                with self.lock:
+                    live = list(getattr(self, "_tool_exec_meta_queue", []) or [])
+                    for idx in range(len(live) - 1, -1, -1):
+                        if self._tool_exec_meta_matches(live[idx], name, args):
+                            live.pop(idx)
+                            break
+                    self._tool_exec_meta_queue = live[-48:]
+            except Exception:
+                pass
+        return found_row
+
+    def _tool_result_success(
+        self,
+        name: str,
+        args: dict | None,
+        output: str,
+        meta: dict | None = None,
+    ) -> bool:
+        text = str(output or "")
+        if text.startswith("Error:"):
+            return False
+        tool = canonicalize_tool_name(name)
+        if tool in {"bash", "worktree_run"}:
+            row = meta if isinstance(meta, dict) else self._lookup_tool_exec_meta(tool, args)
+            exit_code = self._coerce_exit_code((row or {}).get("exit_code"))
+            if exit_code is None:
+                return True
+            if exit_code == 0:
+                return True
+            command = str((row or {}).get("command", "") or (args or {}).get("command", "") or "")
+            return self._count_search_output_is_zero(command, text)
+        return True
+
+    def _build_tool_result_item(self, name: str, args: dict | None, output: str) -> dict:
+        src_args = args if isinstance(args, dict) else {}
+        meta = self._lookup_tool_exec_meta(name, src_args, pop=True)
+        item = {
+            "name": canonicalize_tool_name(name) or str(name or ""),
+            "args": src_args,
+            "output": trim(str(output or ""), 3000),
+            "ok": self._tool_result_success(name, src_args, str(output or ""), meta),
+        }
+        if meta:
+            item.update(
+                {
+                    "command": trim(str(meta.get("command", "") or ""), 800),
+                    "effective_command": trim(str(meta.get("effective_command", "") or ""), 1000),
+                    "cwd": trim(str(meta.get("cwd", "") or ""), 500),
+                    "exit_code": self._coerce_exit_code(meta.get("exit_code")),
+                    "duration_ms": int(meta.get("duration_ms", 0) or 0),
+                    "changed_files": list(meta.get("changed_files", []) or [])[:24],
+                }
+            )
+        return item
+
     def _tool_memory_summary_from_output(self, source_tool: str, args: dict | None, output: str) -> str:
         tool = canonicalize_tool_name(source_tool)
         text = str(output or "").replace("\r\n", "\n")
@@ -25544,7 +25733,7 @@ class SessionState:
             return
         src_args = args if isinstance(args, dict) else {}
         text = str(output or "")
-        ok = not text.startswith("Error:")
+        ok = self._tool_result_success(tool, src_args, text)
         if tool in {"write_file", "edit_file"}:
             path = trim(str(src_args.get("path", "") or "").replace("\\", "/"), 300)
             if path:
@@ -33312,18 +33501,45 @@ body{padding:18px}
                 del target[:overflow]
 
         def _merge_output_text() -> str:
-            # On Windows, cmd.exe outputs in the system OEM codepage (e.g. cp936/GBK),
-            # not UTF-8.  Detect and use the correct encoding for decoding.
+            def _decode_pipe(data: bytes) -> str:
+                raw = bytes(data or b"")
+                if not raw:
+                    return ""
+                encodings: list[str] = ["utf-8", "utf-8-sig"]
+                if os.name == "nt":
+                    # cmd.exe often uses a system codepage (e.g. cp936/GBK), while
+                    # modern tools/MCP shims commonly emit UTF-8. Try UTF-8 first
+                    # when it is valid, then locale and Chinese Windows fallbacks.
+                    try:
+                        encodings.append(str(locale.getpreferredencoding(False) or ""))
+                    except Exception:
+                        pass
+                    encodings.extend(["gb18030", "gbk", "cp936"])
+                else:
+                    try:
+                        encodings.append(str(locale.getpreferredencoding(False) or ""))
+                    except Exception:
+                        pass
+                seen: set[str] = set()
+                for enc in encodings:
+                    enc = str(enc or "").strip()
+                    if not enc or enc.lower() in seen:
+                        continue
+                    seen.add(enc.lower())
+                    try:
+                        return raw.decode(enc, errors="strict")
+                    except Exception:
+                        continue
+                return raw.decode("utf-8", errors="replace")
+
+            # On Windows, cmd.exe can output in the system codepage while some
+            # tools emit UTF-8. Decode bytes defensively instead of assuming one.
             if os.name == "nt":
-                try:
-                    import locale as _lc
-                    enc = _lc.getpreferredencoding(False) or "utf-8"
-                except Exception:
-                    enc = "utf-8"
+                out_text = _decode_pipe(out_buf)
+                err_text = _decode_pipe(err_buf)
             else:
-                enc = "utf-8"
-            out_text = out_buf.decode(enc, errors="replace")
-            err_text = err_buf.decode(enc, errors="replace")
+                out_text = _decode_pipe(out_buf)
+                err_text = _decode_pipe(err_buf)
             return (out_text + err_text).strip()
 
         def _store_shell_output(output_value: str, exit_code: int | None = None):
@@ -35183,10 +35399,29 @@ body{padding:18px}
                     return False
         return True
 
+    def _execution_log_count_search_zero_ok(self, row: dict) -> bool:
+        txt = str((row or {}).get("content", "") or "").strip()
+        if not txt:
+            return False
+        lines = [line.strip() for line in txt.replace("\r\n", "\n").split("\n") if line.strip()]
+        if not lines:
+            return False
+        first = lines[0]
+        if not first.startswith(("bash ", "worktree_run ", "background_run ")):
+            return False
+        command = first.split(" ", 1)[1] if " " in first else ""
+        output_lines = [
+            line for line in lines[1:]
+            if not re.match(r"(?i)^exit\s*[:=]\s*-?\d+\b", line)
+        ]
+        return self._count_search_output_is_zero(command, "\n".join(output_lines))
+
     def _execution_log_entry_is_success_evidence(self, row: dict) -> bool:
         txt = str((row or {}).get("content", "") or "").strip().lower()
         if not txt:
             return False
+        if self._execution_log_count_search_zero_ok(row):
+            return True
         if re.search(r"(?m)^\s*exit\s*[:=]\s*0\b", txt) and not self._command_output_has_error_shape(txt):
             return True
         success_markers = (
@@ -35218,6 +35453,8 @@ body{padding:18px}
             "workspace clean", "validation: workspace clean",
         )
         if any(phrase in low for phrase in benign_phrases):
+            return False
+        if self._execution_log_count_search_zero_ok(row):
             return False
         if re.search(r"(?m)^\s*exit\s*[:=]\s*0\b", low) and not self._command_output_has_error_shape(txt):
             return False
@@ -37462,6 +37699,43 @@ body{padding:18px}
             return False
         return True
 
+    def _agentbus_envelope_matches_active_focus(self, envelope: dict, board: dict | None = None) -> bool:
+        """Return whether an agent-bus handoff belongs to the current focus.
+
+        Plan-step execution is focus-scoped. A handoff created for step N must
+        not wake a worker after the plan has advanced to step N+1; otherwise a
+        stale repair hint can overwrite the active step and make the run appear
+        to jump or regress. Legacy envelopes without focus metadata are allowed
+        only when no plan step is active.
+        """
+        if not isinstance(envelope, dict):
+            return False
+        fields = self._route_focus_fields(board)
+        active_kind = str(fields.get("focus_kind", "") or "")
+        active_focus = str(fields.get("focus_id", "") or "")
+        active_step = str(fields.get("plan_step_id", "") or active_focus)
+        env_focus = str(envelope.get("focus_id", "") or "")
+        env_step = str(envelope.get("plan_step_id", "") or "")
+        if active_kind == "plan_step":
+            if not env_focus and not env_step:
+                return False
+            if env_step and env_step != active_step:
+                return False
+            if env_focus and env_focus != active_focus:
+                return False
+            try:
+                env_epoch = float(envelope.get("focus_epoch", 0.0) or envelope.get("plan_step_epoch", 0.0) or 0.0)
+                active_epoch = float(fields.get("focus_epoch", 0.0) or fields.get("plan_step_epoch", 0.0) or 0.0)
+            except Exception:
+                env_epoch = 0.0
+                active_epoch = 0.0
+            if env_epoch and active_epoch and abs(env_epoch - active_epoch) > 0.001:
+                return False
+            return True
+        if env_focus and active_focus and env_focus != active_focus:
+            return False
+        return True
+
     def _normalize_failure_ledger(self, raw: dict) -> dict:
         fl: dict = {
             "attempted_fixes": [],
@@ -37496,6 +37770,7 @@ body{padding:18px}
         if not isinstance(fl, dict):
             return
         fixes = fl.get("attempted_fixes", [])
+        focus = self._blackboard_focus_identity(bb)
         fixes.append({
             "file": trim(str(file or ""), 260),
             "error": trim(str(error or ""), 400),
@@ -37504,6 +37779,9 @@ body{padding:18px}
             "actor": trim(str(actor or ""), 40),
             "round": int(getattr(self, "agent_round_index", 0) or 0),
             "ts": float(now_ts()),
+            "focus_id": str(focus.get("id", "") or ""),
+            "focus_kind": str(focus.get("kind", "") or ""),
+            "plan_step_id": str(focus.get("id", "") or "") if str(focus.get("kind", "") or "") == "plan_step" else "",
         })
         fl["attempted_fixes"] = fixes[-FAILURE_LEDGER_MAX_FIXES:]
         bb["failure_ledger"] = fl
@@ -37516,8 +37794,12 @@ body{padding:18px}
         if not isinstance(fl, dict):
             return
         fixes = fl.get("attempted_fixes", [])
+        focus = self._blackboard_focus_identity(bb)
+        current_step_id = str(focus.get("id", "") or "") if str(focus.get("kind", "") or "") == "plan_step" else ""
         for fx in reversed(fixes):
             if not isinstance(fx, dict):
+                continue
+            if current_step_id and str(fx.get("plan_step_id", "") or "") != current_step_id:
                 continue
             fx_file = str(fx.get("file", "") or "")
             if fx_file and (fx_file.endswith(file) or file.endswith(fx_file)):
@@ -37535,8 +37817,14 @@ body{padding:18px}
         if not isinstance(fl, dict):
             return
         fixes = fl.get("attempted_fixes", [])
+        focus = self._blackboard_focus_identity(bb)
+        current_step_id = str(focus.get("id", "") or "") if str(focus.get("kind", "") or "") == "plan_step" else ""
         for fx in fixes:
-            if isinstance(fx, dict) and fx.get("result") == "applied":
+            if not isinstance(fx, dict):
+                continue
+            if current_step_id and str(fx.get("plan_step_id", "") or "") != current_step_id:
+                continue
+            if fx.get("result") == "applied":
                 fx["result"] = f"verified({category})"
         fl["attempted_fixes"] = fixes
         bb["failure_ledger"] = fl
@@ -37549,8 +37837,14 @@ body{padding:18px}
         if not isinstance(fl, dict):
             return
         fixes = fl.get("attempted_fixes", [])
+        focus = self._blackboard_focus_identity(bb)
+        current_step_id = str(focus.get("id", "") or "") if str(focus.get("kind", "") or "") == "plan_step" else ""
         for fx in fixes:
-            if isinstance(fx, dict) and fx.get("result") == "applied":
+            if not isinstance(fx, dict):
+                continue
+            if current_step_id and str(fx.get("plan_step_id", "") or "") != current_step_id:
+                continue
+            if fx.get("result") == "applied":
                 fx["result"] = f"failed({category}): {trim(error_msg, 120)}"
         fl["attempted_fixes"] = fixes
         bb["failure_ledger"] = fl
@@ -37724,8 +38018,8 @@ body{padding:18px}
                 self._ledger_update_fix_attempt_status(edit_path, "applied")
             return
 
-        # For bash results, classify the command and update the shared error ledger.
-        if name != "bash" or not isinstance(args, dict):
+        # For shell results, classify the command and update the shared error ledger.
+        if name not in {"bash", "worktree_run"} or not isinstance(args, dict):
             return
         cmd_str = str(args.get("command", "") or "").lower()
         category = self._detect_error_category(cmd_str)
@@ -37793,6 +38087,11 @@ body{padding:18px}
                         cnt = int(e.get("count", 1) or 1)
                         lines.append(f"  [{f}] {trim(msg, 200)} (seen {cnt}x)")
             fixes = fl.get("attempted_fixes", [])
+            if current_step_id:
+                fixes = [
+                    fx for fx in fixes
+                    if isinstance(fx, dict) and str(fx.get("plan_step_id", "") or "") == current_step_id
+                ]
             if fixes:
                 lines.append("PREVIOUSLY ATTEMPTED FIXES (all failed):")
                 for fx in fixes[-3:]:
@@ -38764,6 +39063,9 @@ body{padding:18px}
                 txt_low = txt.lower()
                 if PLAN_FILE_RELATIVE_PATH in txt_low or ".clouds_coder\\plan.md" in txt_low:
                     continue
+                row_step = str(row.get("plan_step_id", "") or "").strip()
+                if step_id and row_step and row_step != step_id:
+                    continue
                 try:
                     ts = float(row.get("ts", 0.0) or 0.0)
                 except Exception:
@@ -38806,6 +39108,9 @@ body{padding:18px}
                 continue
             if self._is_plan_infrastructure_path(path):
                 continue
+            meta_step = str(meta.get("plan_step_id", "") or "").strip()
+            if step_id and meta_step and meta_step != step_id:
+                continue
             try:
                 ts = float(meta.get("updated_at", 0.0) or 0.0)
             except Exception:
@@ -38844,6 +39149,8 @@ body{padding:18px}
                 low = str(row.get("content", "") or "").lower()
                 if not low or any(neg in low for neg in negative_hints):
                     continue
+                if self._execution_log_count_search_zero_ok(row):
+                    return True
                 if (
                     self._command_looks_like_validation(low)
                     or any(tok in low for tok in compile_hints)
@@ -39086,7 +39393,6 @@ body{padding:18px}
         → caller falls back to category-only behavior (never a false block)."""
         if not isinstance(target, dict) or target.get("kind") != "numeric":
             return {"met": None, "measured": None}
-        metric = str(target.get("metric", "") or "").lower()
         op = str(target.get("op", "<=") or "<=")
         value = float(target.get("value", 0.0) or 0.0)
         # Build the text corpus to scan: current tool outputs, then recent logs.
@@ -39265,6 +39571,59 @@ body{padding:18px}
         except Exception:
             return {"failed": None, "marker": ""}
 
+    def _acceptance_context_expects_zero_count(self, text: str) -> bool:
+        low = str(text or "").lower()
+        if not low.strip():
+            return False
+        zero_terms = (
+            "zero", "none", "no ", "without", "absence", "absent",
+            "无", "沒有", "没有", "不得", "不能", "未出现", "不应", "不應",
+        )
+        count_terms = ("count", "matches", "grep", "rg", "数量", "个数", "處數", "处数", "匹配", "残留")
+        has_zero = bool(re.search(r"(?<![\d.])0(?:\.0+)?(?![\d.])", low)) or any(term in low for term in zero_terms)
+        if any(term in low for term in count_terms) and has_zero:
+            return True
+        return has_zero
+
+    def _acceptance_results_structural_failure(self, rows: list[dict], acceptance_context: str = "") -> dict:
+        expects_zero_count = self._acceptance_context_expects_zero_count(acceptance_context)
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("name", "") or "")
+            if name not in {"bash", "worktree_run", "background_run"}:
+                continue
+            args = row.get("args", {}) if isinstance(row.get("args"), dict) else {}
+            command = str(row.get("command", "") or args.get("command", "") or "")
+            output = str(row.get("output", "") or "")
+            exit_code = self._coerce_exit_code(row.get("exit_code"))
+            positive_count = self._count_search_output_has_positive_count(command, output)
+            if positive_count is not None:
+                if positive_count == 0:
+                    continue
+                if expects_zero_count:
+                    return {
+                        "failed": True,
+                        "marker": f"count-search={positive_count}",
+                        "excerpt": trim(output, 120),
+                        "source": "structural",
+                        "command": trim(command, 500),
+                        "exit_code": exit_code,
+                    }
+            if exit_code is not None and exit_code != 0:
+                if self._count_search_output_is_zero(command, output):
+                    continue
+                excerpt = trim(output, 120) or f"exit={exit_code}"
+                return {
+                    "failed": True,
+                    "marker": f"exit={exit_code}",
+                    "excerpt": excerpt,
+                    "source": "structural",
+                    "command": trim(command, 500),
+                    "exit_code": exit_code,
+                }
+        return {"failed": False, "marker": "", "excerpt": "", "source": "structural"}
+
     def _acceptance_results_lexical_failure(self, rows: list[dict]) -> dict:
         """Lexical FALLBACK for _acceptance_results_show_failure. Scans exec output
         for an explicit failure marker while excluding common false positives
@@ -39281,6 +39640,11 @@ body{padding:18px}
             r"|\b(?:验收|驗収|驗證|校验|校驗)?\s*(?:未通过|未通過|不通过|不通過|失败|失敗)"
             r"|\bFAIL(?:ED)?\b(?!\s*=\s*0)(?!\s*:\s*0)"
             r"|traceback \(most recent call last\)"
+            r"|\b(?:not|did\s+not)\s+converge(?:d)?\b"
+            r"|\bnot\s+converged\b"
+            r"|\b(?:does\s+not|did\s+not|failed\s+to)\s+meet\b"
+            r"|\bexceeds?\s+(?:the\s+)?(?:tolerance|threshold|limit)\b"
+            r"|\bout\s+of\s+tolerance\b"
             r")"
         )
         benign_pat = re.compile(
@@ -39296,6 +39660,9 @@ body{padding:18px}
             name = str(row.get("name", "") or "")
             if name not in {"bash", "worktree_run", "background_run"}:
                 continue
+            args = row.get("args", {}) if isinstance(row.get("args"), dict) else {}
+            command = trim(str(row.get("command", "") or args.get("command", "") or ""), 500)
+            exit_code = self._coerce_exit_code(row.get("exit_code"))
             raw = str(row.get("output", "") or "")
             if not raw.strip():
                 continue
@@ -39305,12 +39672,35 @@ body{padding:18px}
                     continue
                 if benign_pat.search(s):
                     continue
+                partial = re.search(r"(?i)\b(\d+)\s*/\s*(\d+)\s+checks?\s+(?:pass|passed)\b", s)
+                if not partial:
+                    partial = re.search(r"(?i)\b(\d+)\s+of\s+(\d+)\s+checks?\s+(?:pass|passed)\b", s)
+                if partial:
+                    try:
+                        passed = int(partial.group(1))
+                        total = int(partial.group(2))
+                    except Exception:
+                        passed = total = 0
+                    if total > 0 and passed < total:
+                        return {
+                            "failed": True,
+                            "marker": trim(partial.group(0), 40),
+                            "excerpt": trim(s, 120),
+                            "command": command,
+                            "exit_code": exit_code,
+                        }
                 m = fail_pat.search(s)
                 if m:
-                    return {"failed": True, "marker": trim(m.group(0), 40), "excerpt": trim(s, 120)}
+                    return {
+                        "failed": True,
+                        "marker": trim(m.group(0), 40),
+                        "excerpt": trim(s, 120),
+                        "command": command,
+                        "exit_code": exit_code,
+                    }
         return {"failed": False, "marker": "", "excerpt": ""}
 
-    def _acceptance_results_show_failure(self, results: list[dict]) -> dict:
+    def _acceptance_results_show_failure(self, results: list[dict], acceptance_context: str = "") -> dict:
         """F10: did this turn's acceptance check report a FAILURE?
 
         LLM-primary (per the Fix 5 steer): the model perceives failure from the
@@ -39321,28 +39711,44 @@ body{padding:18px}
         `1 CHECKS FAILED` from being rationalized away and advanced past.
 
         Returns {failed: bool, marker: str, excerpt: str, source: str}."""
-        rows = [r for r in (results or []) if isinstance(r, dict) and r.get("ok", False)]
+        rows = [r for r in (results or []) if isinstance(r, dict)]
         if not rows:
             return {"failed": False, "marker": "", "excerpt": "", "source": "none"}
         exec_rows = [r for r in rows if str(r.get("name", "") or "") in {"bash", "worktree_run", "background_run"}]
         if not exec_rows:
             return {"failed": False, "marker": "", "excerpt": "", "source": "none"}
+        structural = self._acceptance_results_structural_failure(exec_rows, acceptance_context)
+        if structural.get("failed"):
+            return structural
         # Concatenate this turn's exec output for the LLM to perceive as a whole.
         exec_text = "\n".join(
             trim(str(r.get("output", "") or "").strip(), 900)
             for r in exec_rows
             if str(r.get("output", "") or "").strip()
         ).strip()
+        verdict = {"failed": None, "marker": ""}
         if exec_text:
             verdict = self._llm_acceptance_failure_verdict(exec_text)
             if verdict.get("failed") is True:
                 marker = verdict.get("marker", "") or "check reported failure"
-                return {"failed": True, "marker": marker, "excerpt": marker, "source": "llm"}
-            if verdict.get("failed") is False:
-                # LLM confidently says it passed; trust it over the lexical scan.
-                return {"failed": False, "marker": "", "excerpt": "", "source": "llm"}
-        # LLM unavailable/uncertain → lexical fallback.
+                first = exec_rows[0] if exec_rows else {}
+                first_args = first.get("args", {}) if isinstance(first.get("args"), dict) else {}
+                return {
+                    "failed": True,
+                    "marker": marker,
+                    "excerpt": marker,
+                    "source": "llm",
+                    "command": trim(str(first.get("command", "") or first_args.get("command", "") or ""), 500),
+                    "exit_code": self._coerce_exit_code(first.get("exit_code")),
+                }
+        # Lexical hard markers still run after the LLM. They catch deterministic
+        # validator phrases and protect against a false-negative LLM pass verdict.
         fb = self._acceptance_results_lexical_failure(exec_rows)
+        if fb.get("failed"):
+            fb["source"] = "lexical"
+            return fb
+        if verdict.get("failed") is False:
+            return {"failed": False, "marker": "", "excerpt": "", "source": "llm"}
         fb["source"] = "lexical"
         return fb
 
@@ -39378,18 +39784,22 @@ body{padding:18px}
         if not text:
             return {"ok": False, "reason": "empty-final-acceptance-subtask", "acceptance": acceptance}
 
-        results = [
+        raw_results = [
             row for row in ((worker_step or {}).get("tool_results", []) if isinstance(worker_step, dict) else [])
-            if isinstance(row, dict) and row.get("ok", False)
+            if isinstance(row, dict)
         ]
+        results = [row for row in raw_results if row.get("ok", False)]
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         try:
-            acceptance_started_ts = float(
-                acceptance.get("updated_at", 0.0)
-                or acceptance.get("created_at", 0.0)
-                or acceptance.get("completed_at", 0.0)
-                or 0.0
-            )
+            ts_candidates = []
+            for ts_key in ("created_at", "started_at", "in_progress_at", "updated_at", "completed_at"):
+                try:
+                    ts_value = float(acceptance.get(ts_key, 0.0) or 0.0)
+                except Exception:
+                    ts_value = 0.0
+                if ts_value > 0:
+                    ts_candidates.append(ts_value)
+            acceptance_started_ts = min(ts_candidates) if ts_candidates else 0.0
         except Exception:
             acceptance_started_ts = 0.0
         sig = self._plan_step_blackboard_signals(
@@ -39482,14 +39892,28 @@ body{padding:18px}
         # running a validator that prints `CHECKS FAILED` (or by cherry-printing a
         # PASS banner while a real check failed). This runs before the
         # category/target verdicts so a genuine failure is never rationalized away.
-        if results:
-            failure = self._acceptance_results_show_failure(results)
+        if raw_results:
+            acceptance_context = "\n".join(
+                part
+                for part in (
+                    str(plan_step.get("full_content", "") or plan_step.get("content", "") or ""),
+                    str(acceptance.get("content", "") or ""),
+                )
+                if part
+            )
+            failure = self._acceptance_results_show_failure(
+                raw_results,
+                acceptance_context=acceptance_context,
+            )
             if failure.get("failed"):
                 return {
                     "ok": False,
                     "reason": f"acceptance-check-reported-failure:{failure.get('marker', '')}",
                     "expected": expected,
                     "failure_excerpt": failure.get("excerpt", ""),
+                    "failure_command": failure.get("command", ""),
+                    "failure_exit_code": failure.get("exit_code"),
+                    "failure_source": failure.get("source", ""),
                     "acceptance": acceptance,
                 }
         # Quality-aware enforcement (Fix 5): if the step/acceptance text states an
@@ -39548,6 +39972,50 @@ body{padding:18px}
         """Hard gate: the final acceptance subtask must be completed with matching tool evidence."""
         return bool(self._plan_step_acceptance_gate_status(plan_step, worker_step, board).get("ok", False))
 
+    def _acceptance_gate_failure_context(
+        self,
+        plan_step: dict,
+        gate: dict | None,
+        bb: dict | None = None,
+        *,
+        max_chars: int = 1200,
+    ) -> str:
+        gate_row = gate if isinstance(gate, dict) else {}
+        board = bb if isinstance(bb, dict) else self._ensure_blackboard()
+        lines: list[str] = []
+        reason = trim(str(gate_row.get("reason", "") or ""), 220)
+        expected = trim(str(gate_row.get("expected", "") or ""), 220)
+        if reason:
+            lines.append(f"gate_reason: {reason}")
+        if expected:
+            lines.append(f"expected_evidence: {expected}")
+        acceptance = gate_row.get("acceptance", {}) if isinstance(gate_row.get("acceptance"), dict) else {}
+        acceptance_text = trim(str(acceptance.get("content", "") or ""), 260)
+        if acceptance_text:
+            lines.append(f"acceptance_subtask: {acceptance_text}")
+        command = trim(str(gate_row.get("failure_command", "") or ""), 700)
+        if command:
+            lines.append(f"failed_command: {command}")
+        if gate_row.get("failure_exit_code") not in (None, ""):
+            lines.append(f"failed_exit_code: {gate_row.get('failure_exit_code')}")
+        excerpt = trim(str(gate_row.get("failure_excerpt", "") or ""), 500)
+        if excerpt:
+            lines.append(f"failure_excerpt: {excerpt}")
+        target = gate_row.get("target", {}) if isinstance(gate_row.get("target"), dict) else {}
+        if target:
+            bar = f"{target.get('metric', 'target')} {target.get('op', '<=')}{target.get('value')}{target.get('unit', '')}"
+            measured = gate_row.get("measured", None)
+            lines.append(f"quality_bar: {trim(bar, 180)}; measured={measured}")
+        try:
+            sig = self._plan_step_blackboard_signals(plan_step, board)
+            if sig.get("recent_exec_excerpt"):
+                lines.append(f"recent_step_exec: {trim(str(sig.get('recent_exec_excerpt', '')), 260)}")
+            if sig.get("recent_review_excerpt"):
+                lines.append(f"recent_step_review: {trim(str(sig.get('recent_review_excerpt', '')), 220)}")
+        except Exception:
+            pass
+        return trim("\n".join(lines), max_chars)
+
     def _inject_acceptance_gate_rework_hint(
         self,
         plan_step: dict,
@@ -39597,6 +40065,8 @@ body{padding:18px}
         except Exception:
             already = ""
         already_line = f"Evidence already on record: {already}. " if already and already != "accumulated-step-evidence" else ""
+        failure_context = self._acceptance_gate_failure_context(plan_step, gate_row, self._ensure_blackboard(), max_chars=900)
+        failure_line = f"FAILED ACCEPTANCE CONTEXT:\n{failure_context}\n" if failure_context else ""
         roles = tuple(
             role for role in (self._sanitize_agent_role(x) for x in target_roles)
             if role
@@ -39611,6 +40081,7 @@ body{padding:18px}
             f"{('Expected evidence: ' + expected + '. ') if expected else ''}"
             f"{guidance_line}"
             f"{already_line}"
+            f"{failure_line}"
             f"{('Final acceptance subtask: ' + acceptance_text + '. ') if acceptance_text else ''}"
             "Now CALL THE TOOL described under HOW/EXAMPLE ACTION (do not just describe it), confirm the success signal in its output, "
             "then update the same acceptance TodoWrite row to completed. If the check FAILS, fix the underlying problem first, then re-run the check. "
@@ -39672,6 +40143,17 @@ body{padding:18px}
             error_context = self._recent_error_context(max_chars=700)
         except Exception:
             error_context = ""
+        try:
+            failure_context = self._acceptance_gate_failure_context(plan_step, gate, bb, max_chars=900)
+        except Exception:
+            failure_context = ""
+        if failure_context:
+            error_context = trim(
+                (error_context + "\n\n" if error_context else "")
+                + "FAILED ACCEPTANCE CONTEXT:\n"
+                + failure_context,
+                1400,
+            )
         # Pick the dominant error category from the ledger, if any.
         error_category = ""
         try:
@@ -39735,6 +40217,7 @@ body{padding:18px}
             # This must never be rationalized away as "an arbitrary threshold" and
             # advanced past.
             excerpt = str((gate or {}).get("failure_excerpt", "") or "")
+            command = str((gate or {}).get("failure_command", "") or "")
             repair_action = (
                 "The acceptance check EXECUTED but its own output reported a FAILURE"
                 + (f" (\"{excerpt}\")" if excerpt else "")
@@ -39742,6 +40225,12 @@ body{padding:18px}
                 "cause (or, if the failing assertion is genuinely wrong/too strict, correct the check itself "
                 "and justify why in one line), then re-run until the check reports no failures."
             )
+            if self._command_looks_like_count_search(command):
+                repair_action += (
+                    " Because this was a count-search check, if the count is positive first re-run the same "
+                    "pattern with line output (for example grep -n or rg -n) to identify the exact offending "
+                    "lines, then edit only those real matches."
+                )
             if error_category:
                 repair_action += f" (dominant failure category: '{error_category}'; do not repeat a failed fix.)"
             return {
@@ -39782,8 +40271,8 @@ body{padding:18px}
             return False
         step_label = trim(str(plan_step.get("content", "") or ""), 160)
         root = trim(str(diagnosis.get("root_cause", "") or ""), 240)
-        action = trim(str(diagnosis.get("repair_action", "") or ""), 400)
-        err_ctx = trim(str(diagnosis.get("error_context", "") or ""), 700)
+        action = trim(str(diagnosis.get("repair_action", "") or ""), 900)
+        err_ctx = trim(str(diagnosis.get("error_context", "") or ""), 1400)
         fixer = self._sanitize_agent_role(str(diagnosis.get("fixer_role", "") or "")) or self._current_plan_worker_owner(bb)
         roles = (fixer,) if fixer else ()
         debug_note = ""
@@ -40310,12 +40799,16 @@ body{padding:18px}
             row_step = str(row.get("plan_step_id", "") or "").strip()
             if step_id and row_step == step_id:
                 matched.append(clean)
+            elif step_id and row_step and row_step != step_id:
+                continue
             elif since_ts > 0 and ts > 0 and ts + 1e-6 >= since_ts:
                 matched.append(clean)
             else:
                 fallback.append(clean)
         if matched:
             return matched[-max(1, int(limit or 6)) :]
+        if step_id:
+            return []
         return fallback[-max(1, int(limit or 6)) :]
 
     def _build_plan_step_quality_review_context(
@@ -40921,20 +41414,13 @@ body{padding:18px}
                 or explicit_verified_path
             )
         )
-        # Atomic-step escape: the step genuinely has NO step-local subtasks
-        # (bootstrap could not decompose it). Requires real phase/validation
-        # evidence; never advances on a bare claim.
-        if not should_advance and not _has_subtasks and worker_produced_output:
-            if phase_evidence or validation_ok:
-                should_advance = True
-        # Explicit structured-verification-tag path for subtask-less or
-        # subtask-complete steps. Disabled once the gate has blocked
-        # (subtasks_all_done and gate failed) so it cannot mask a real failure.
+        # Explicit structured-verification-tag path for subtask-complete steps.
+        # It never bypasses missing step-local subtasks or a failed final gate.
         gate_blocked = bool(subtasks_all_done and not acceptance_gate_ok)
         if not should_advance and not gate_blocked:
             if (
                 verified_tag_current
-                and (subtasks_all_done or not _has_subtasks)
+                and subtasks_all_done
                 and (validation_ok or self._step_has_accumulated_evidence(current, bb))
             ):
                 should_advance = True
@@ -41498,11 +41984,22 @@ body{padding:18px}
             ]
             exec_logs = bb.get("execution_logs", []) if isinstance(bb.get("execution_logs"), list) else []
             recent_exec = []
+            since_ts = self._plan_step_activation_ts(plan_step)
             for log in exec_logs[-10:]:
-                if isinstance(log, dict) and str(log.get("plan_step_id", "") or "") in ("", step_id):
-                    c = trim(str(log.get("content", "") or ""), 240)
-                    if c:
-                        recent_exec.append(c)
+                if not isinstance(log, dict):
+                    continue
+                row_step_id = str(log.get("plan_step_id", "") or "")
+                if row_step_id and row_step_id != step_id:
+                    continue
+                try:
+                    log_ts = float(log.get("ts", 0.0) or 0.0)
+                except Exception:
+                    log_ts = 0.0
+                if (not row_step_id) and since_ts > 0 and log_ts > 0 and log_ts + 1e-6 < since_ts:
+                    continue
+                c = trim(str(log.get("content", "") or ""), 240)
+                if c:
+                    recent_exec.append(c)
             cur_results = []
             if isinstance(worker_step, dict):
                 for r in (worker_step.get("tool_results", []) or []):
@@ -42641,11 +43138,20 @@ body{padding:18px}
                         identity = _core_to_identity[check_core]
                         break
             merged = dict(merged_by_identity.get(identity, {}))
+            row_existed = bool(merged)
+            prev_owner = self._sanitize_agent_role(merged.get("owner", ""))
             prev_status = self._normalize_todo_status_value(merged.get("status", ""), "")
             incoming_status = self._normalize_todo_status_value(row.get("status", ""), "pending")
             if "activeForm" not in row and "active_form" not in row:
                 merged.pop("activeForm", None)
             prev_content = str(merged.get("content", "") or "")
+            # Preserve completion attribution BEFORE the blanket update so a bare
+            # cross-role re-mark can't drop it (F12).
+            prev_completion = {
+                k: merged.get(k)
+                for k in ("completed_at", "completed_by", "evidence", "updated_at")
+                if merged.get(k) not in (None, "")
+            }
             merged.update(row)
             if incoming_status:
                 merged["status"] = incoming_status
@@ -42663,7 +43169,24 @@ body{padding:18px}
                 merged["status"] = "in_progress"
                 if prev_content and len(prev_content) > len(str(row.get("content", "") or "")):
                     merged["content"] = prev_content
-            merged["owner"] = str(merged.get("owner", "") or role_key).strip().lower() or role_key
+            # F12: owner is a property of who OWNS the subtask (its creator/worker),
+            # NOT of whoever last touched the row. A reviewer re-marking the
+            # developer's acceptance row must not flip its owner dev→reviewer —
+            # that flip made _sync_plan_worker_todos_to_blackboard see a spurious
+            # diff and re-write the mirror every cross-role turn (redundant
+            # TodoWrite churn). Preserve the existing owner; only a genuinely new
+            # row takes the writer's role.
+            if row_existed and prev_owner:
+                merged["owner"] = prev_owner
+            else:
+                merged["owner"] = str(merged.get("owner", "") or role_key).strip().lower() or role_key
+            # F12: when an already-completed row is re-affirmed completed without
+            # fresh attribution, keep the original completed_by/at/evidence so the
+            # row stays byte-identical (no spurious mirror diff, no lost credit).
+            if prev_status == "completed" and incoming_status == "completed":
+                for field, val in prev_completion.items():
+                    if row.get(field) in (None, ""):
+                        merged[field] = val
             merged["parent_step_id"] = trim(str(merged.get("parent_step_id", "") or step_id), 20) or step_id
             # Fix 2 support: Timestamp new items for next-step detection
             if identity not in _existing_identities and "created_at" not in merged:
@@ -43772,6 +44295,28 @@ body{padding:18px}
             clean_items.append(acceptance_item)
         return clean_items[:max_items]
 
+    def _established_step_owner(self, rows: list[dict] | None) -> str:
+        """F12: the sticky canonical owner of a step's subtasks — the worker that
+        actually EXECUTED them, not whoever is writing this turn.
+
+        The single-owner invariant in `_plan_worker_rows_with_acceptance` collapses
+        all of a step's rows onto one owner. If that owner is recomputed as "the
+        current writer" every turn, a reviewer re-marking the developer's completed
+        acceptance row reassigns EVERY subtask dev→reviewer, which makes the
+        blackboard mirror diff and re-write on every cross-role turn (redundant
+        TodoWrite churn). Anchor the owner to the executor instead: the owner of
+        the first completed row, else the first in_progress row. Returns "" when no
+        row has been worked yet (caller falls back to the writer's role)."""
+        worker_owners = {"developer", "explorer", "reviewer"}
+        for status_pref in ("completed", "in_progress"):
+            for r in rows or []:
+                if not isinstance(r, dict):
+                    continue
+                o = self._sanitize_agent_role(r.get("owner", ""))
+                if o in worker_owners and str(r.get("status", "") or "").strip().lower() == status_pref:
+                    return o
+        return ""
+
     def _plan_worker_rows_with_acceptance(
         self,
         plan_step: dict,
@@ -43782,6 +44327,12 @@ body{padding:18px}
     ) -> list[dict]:
         step_id = trim(str((plan_step or {}).get("id", "") or ""), 20)
         owner_key = self._sanitize_agent_role(owner) or self._current_plan_worker_owner()
+        # F12: prefer the step's ESTABLISHED executor owner so a cross-role re-mark
+        # (reviewer verifying the developer's work) doesn't reassign every subtask
+        # to the verifier and churn the mirror. Sticky to whoever did the work.
+        established = self._established_step_owner(rows)
+        if established:
+            owner_key = established
         work_rows: list[dict] = []
         acceptance_rows: list[dict] = []
         import re as _re_acc
@@ -46917,13 +47468,17 @@ body{padding:18px}
             total = len(completed) + len(pending)
             step_content_low = str(cur.get("content", "") or "").lower()
             # Summarize blackboard evidence that may justify step completion.
-            research_count = len(bb.get("research_notes", []) or [])
-            code_count = len(bb.get("code_artifacts", {}) or {})
-            exec_count = len(bb.get("execution_logs", []) or [])
+            cur_step_id = trim(str(cur.get("id", "") or ""), 40)
+            try:
+                step_sig = self._plan_step_blackboard_signals(cur, bb)
+            except Exception:
+                step_sig = {}
+            research_count = 1 if bool(step_sig.get("has_research", False)) else 0
+            code_count = len(step_sig.get("recent_files", []) or [])
+            exec_count = 1 if bool(step_sig.get("has_exec", False)) else 0
             # Snapshot worker todos so the manager can see what was actually executed.
             worker_hint = ""
             try:
-                cur_step_id = trim(str(cur.get("id", "") or ""), 40)
                 worker_todos = [
                     r for r in self.todo.snapshot()
                     if str(r.get("owner", "") or "").lower() in {"developer", "explorer", "reviewer"}
@@ -47159,6 +47714,11 @@ body{padding:18px}
         candidates: list[tuple[int, float, dict]] = []
         for env in list(self.agent_bus_messages)[-72:]:
             if not isinstance(env, dict):
+                continue
+            if env.get("_stale_focus"):
+                continue
+            if not self._agentbus_envelope_matches_active_focus(env, bb):
+                env["_stale_focus"] = True
                 continue
             try:
                 ts = float(env.get("ts", 0.0) or 0.0)
@@ -49340,21 +49900,25 @@ body{padding:18px}
                 self._blackboard_upsert_artifact(rel_path, summary, role_key)
                 self._blackboard_set_status("CODING")
         elif name in {"bash", "worktree_run", "background_run"}:
-            cmd = trim(str(args.get("command", "") or "").strip(), 180)
+            cmd = trim(str(item.get("command", "") or args.get("command", "") or "").strip(), 180)
             line = f"{name} {cmd}".strip()
+            exit_code = self._coerce_exit_code(item.get("exit_code"))
+            if exit_code is not None:
+                line = f"{line}\nexit={exit_code}".strip()
             if output:
                 line = f"{line}\n{output}".strip()
             self._blackboard_append_section("execution_logs", role_key, line)
-            if self._command_looks_like_validation(str(args.get("command", "") or "")) or (not ok):
+            command_text = str(item.get("command", "") or args.get("command", "") or "")
+            if self._command_looks_like_validation(command_text) or (not ok):
                 self._blackboard_append_memory(
                     "validation" if ok else "command_error",
                     trim(line, 700),
                     actor=role_key,
                     tool=name,
-                    command=str(args.get("command", "") or ""),
+                    command=command_text,
                     tier="long",
                 )
-            bash_paths = self._bash_file_read_targets(str(args.get("command", "") or ""))
+            bash_paths = self._bash_file_read_targets(command_text)
             if bash_paths and ok:
                 self._blackboard_append_memory(
                     "file_read",
@@ -49362,7 +49926,7 @@ body{padding:18px}
                     actor=role_key,
                     paths=bash_paths,
                     tool=name,
-                    command=str(args.get("command", "") or ""),
+                    command=command_text,
                     tier="short",
                 )
             if role_key in {"reviewer"}:
@@ -49454,7 +50018,7 @@ body{padding:18px}
             file_path = trim(str(args.get("path", "") or "").strip(), 240)
             file_paths = [file_path] if file_path else []
             if name in {"bash", "worktree_run", "background_run"}:
-                file_paths = self._bash_file_read_targets(str(args.get("command", "") or ""))
+                file_paths = self._bash_file_read_targets(str(item.get("command", "") or args.get("command", "") or ""))
             file_paths = [
                 p for p in file_paths
                 if not self._is_plan_infrastructure_path(p)
@@ -50243,6 +50807,8 @@ body{padding:18px}
         dst = self._sanitize_agent_role(to_role)
         if not src or not dst:
             raise ValueError("invalid agent roles for bus envelope")
+        _bb = self._ensure_blackboard()
+        focus_fields = self._route_focus_fields(_bb)
         envelope = {
             "id": make_id("agentmsg"),
             "ts": now_ts(),
@@ -50251,6 +50817,13 @@ body{padding:18px}
             "intent": trim(str(intent or "").strip(), 80) or "message",
             "payload": trim(str(payload or "").strip(), 4000),
             "importance": str(importance or "normal").strip().lower() or "normal",
+            "focus_kind": str(focus_fields.get("focus_kind", "") or ""),
+            "focus_id": str(focus_fields.get("focus_id", "") or ""),
+            "focus_epoch": float(focus_fields.get("focus_epoch", 0.0) or 0.0),
+            "plan_step_id": str(focus_fields.get("plan_step_id", "") or ""),
+            "plan_step_index": int(focus_fields.get("plan_step_index", -1) or -1),
+            "plan_step_total": int(focus_fields.get("plan_step_total", 0) or 0),
+            "plan_step_epoch": float(focus_fields.get("plan_step_epoch", 0.0) or 0.0),
         }
         self.agent_bus_messages.append(envelope)
         self.agent_bus_messages = self.agent_bus_messages[-240:]
@@ -50261,7 +50834,6 @@ body{padding:18px}
         # instead of relying on the sender copying its work into the payload. This
         # is what turns the per-role split from a liability into the blackboard-bus
         # advantage: small contexts + addressable shared evidence that never gets lost.
-        _bb = self._ensure_blackboard()
         anchor = self._handoff_mainline_anchor(_bb)
         manifest = ""
         try:
@@ -50346,6 +50918,7 @@ body{padding:18px}
         if not self.agent_bus_messages:
             return None
         now = now_ts()
+        bb = self._ensure_blackboard()
         preferred_intents = {
             "handoff", "review_request", "fix_request",
             "final_summary_request", "implementation_ready",
@@ -50356,6 +50929,11 @@ body{padding:18px}
                 if not isinstance(env, dict):
                     continue
                 if env.get("_fast_routed"):
+                    continue
+                if env.get("_stale_focus"):
+                    continue
+                if not self._agentbus_envelope_matches_active_focus(env, bb):
+                    env["_stale_focus"] = True
                     continue
                 intent = str(env.get("intent", "") or "").strip().lower() or "message"
                 if require_preferred and intent not in preferred_intents:
@@ -50410,10 +50988,16 @@ body{padding:18px}
         if not self.agent_bus_messages:
             return None
         now = now_ts()
+        bb = self._ensure_blackboard()
         for env in reversed(self.agent_bus_messages[-60:]):
             if not isinstance(env, dict):
                 continue
             if env.get("_fast_routed"):
+                continue
+            if env.get("_stale_focus"):
+                continue
+            if not self._agentbus_envelope_matches_active_focus(env, bb):
+                env["_stale_focus"] = True
                 continue
             to_role = self._sanitize_agent_role(env.get("to", ""))
             if not to_role or to_role not in AGENT_ROLES:
@@ -51921,6 +52505,7 @@ body{padding:18px}
             if guard_error:
                 return guard_error
             meta = self._run_shell_meta(args["command"], self.files_root, self._shell_command_timeout())
+            self._stash_tool_exec_meta("bash", args, meta)
             self._emit(
                 "command",
                 {
@@ -52317,6 +52902,18 @@ body{padding:18px}
             out = self.bg.run(effective_command, int(args.get("timeout", 120)))
             out_filtered, _ = filter_runtime_noise_lines(str(out or ""))
             payload = self._prepare_shell_output_payload(raw_command, out_filtered or "(no output)", cwd=self.files_root)
+            self._stash_tool_exec_meta(
+                "background_run",
+                args,
+                {
+                    "command": raw_command,
+                    "effective_command": effective_command,
+                    "cwd": str(self.files_root),
+                    "exit_code": None,
+                    "duration_ms": 0,
+                    "changed_files": [],
+                },
+            )
             self._emit(
                 "command",
                 {
@@ -52469,6 +53066,7 @@ body{padding:18px}
             if guard_error:
                 return guard_error
             meta = self._run_shell_meta(args["command"], wt_path, self._shell_command_timeout())
+            self._stash_tool_exec_meta("worktree_run", args, meta)
             self._emit(
                 "command",
                 {
@@ -53582,12 +54180,7 @@ body{padding:18px}
                     "summary": f"{self._agent_display_name(role_key)} tool: {name}",
                 },
             )
-            item = {
-                "name": name,
-                "args": args if isinstance(args, dict) else {},
-                "output": trim(str(output or ""), 3000),
-                "ok": not str(output).startswith("Error:"),
-            }
+            item = self._build_tool_result_item(name, args if isinstance(args, dict) else {}, str(output or ""))
             is_finish_tool = name in {"finish_task", "finish_current_task", "mark_done"}
             # Atomic blackboard sync: update shared state immediately after each tool result.
             self._blackboard_update_from_tool_result(role_key, item)
@@ -58638,35 +59231,26 @@ body{padding:18px}
                         "content": self._tool_result_context_content(name, args if isinstance(args, dict) else {}, output),
                         "ts": now_ts(),
                     })
-                    single_round_tool_results.append(
-                        {
-                            "name": dispatched_name or name,
-                            "args": args if isinstance(args, dict) else {},
-                            "output": trim(str(output or ""), 3000),
-                            "ok": not str(output).startswith("Error:"),
-                        }
+                    tool_item = self._build_tool_result_item(
+                        dispatched_name or name,
+                        args if isinstance(args, dict) else {},
+                        str(output or ""),
                     )
+                    single_round_tool_results.append(tool_item)
                     is_finish_tool = (dispatched_name or name) in {"finish_task", "finish_current_task", "mark_done"}
                     # Update blackboard signals (step_files, execution_logs) for plan+single mode.
                     # In plan+sync this is handled by _blackboard_update_from_worker_step, but in
                     # plan+single there is no worker turn — we must update inline so that
                     # _plan_step_has_blackboard_evidence() can see the evidence when the gate fires.
                     try:
-                        self._blackboard_update_from_tool_result(
-                            "developer",
-                            {
-                                "name": dispatched_name or name,
-                                "args": args if isinstance(args, dict) else {},
-                                "output": trim(str(output or ""), 3000),
-                                "ok": not str(output).startswith("Error:"),
-                            },
-                        )
+                        self._blackboard_update_from_tool_result("developer", tool_item)
+                        tool_item["bb_applied"] = True
                     except Exception:
                         pass
                     # Failure ledger: record tool call and detect errors (single-agent, unified)
                     if not is_finish_tool:
                         self._ledger_record_tool_call(name, args if isinstance(args, dict) else {})
-                    _sa_ok = not str(output or "").startswith("Error")
+                    _sa_ok = bool(tool_item.get("ok", False))
                     if not is_finish_tool:
                         self._process_tool_result_errors(name, args if isinstance(args, dict) else {}, output, _sa_ok, "single")
                     if name in ("edit_file", "write_file") and isinstance(args, dict):
