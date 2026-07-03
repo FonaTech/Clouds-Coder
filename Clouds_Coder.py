@@ -39618,6 +39618,41 @@ body{padding:18px}
             deduped.append(row)
         return deduped[-8:]
 
+    def _llm_acceptance_quote_supported(
+        self,
+        target: dict,
+        evidence_rows: list[dict],
+        quote: str,
+        measured: float,
+    ) -> bool:
+        quote = trim(str(quote or ""), 300)
+        if quote and self._target_evidence_text_relevant(target, "", quote):
+            return True
+        metric_terms = self._acceptance_metric_terms_for_target(target)
+        metric_terms = [str(term).lower() for term in metric_terms if str(term or "").strip()]
+        number_token = re.compile(
+            r"(?<![A-Za-z0-9_.])(-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)(?![A-Za-z0-9_.])"
+        )
+        try:
+            quote_number = float(quote.rstrip("%")) if quote else None
+        except Exception:
+            quote_number = None
+        for row in evidence_rows:
+            text = str(row.get("text", "") or "")
+            for line in text.replace("\r\n", "\n").split("\n"):
+                line_low = line.lower()
+                if not any(term in line_low for term in metric_terms):
+                    continue
+                numeric_matches = [match.group(1) for match in number_token.finditer(line)]
+                if quote and quote in line and (
+                    quote_number is None
+                    or any(self._numeric_equivalent(raw, quote_number) for raw in numeric_matches)
+                ):
+                    return True
+                if any(self._numeric_equivalent(raw, measured) for raw in numeric_matches):
+                    return True
+        return False
+
     def _llm_acceptance_target_verdict(self, target: dict, evidence_rows: list[dict]) -> dict:
         if not evidence_rows:
             return {"met": None, "measured": None, "source": "none", "evidence": ""}
@@ -39672,7 +39707,7 @@ body{padding:18px}
             except Exception:
                 return {"met": None, "measured": None, "source": "llm", "evidence": trim(str(data.get("reason", "") or ""), 240)}
             quote = trim(str(data.get("quote", "") or ""), 300)
-            if quote and not self._target_evidence_text_relevant(target, "", quote):
+            if not self._llm_acceptance_quote_supported(target, evidence_rows, quote, measured_float):
                 return {"met": None, "measured": None, "source": "llm-rejected", "evidence": quote}
             met = data.get("met", None)
             if met is not None:
@@ -39692,26 +39727,45 @@ body{padding:18px}
         op = str(target.get("op", "<=") or "<=")
         value = float(target.get("value", 0.0) or 0.0)
         metric_terms = self._acceptance_metric_terms_for_target(target)
-        metric_alt = "|".join(re.escape(t) for t in metric_terms if t)
+        metric_terms = sorted((t for t in dict.fromkeys(metric_terms) if t), key=len, reverse=True)
+        metric_alt = "|".join(re.escape(t) for t in metric_terms)
         if not metric_alt:
             return {"met": None, "measured": None, "source": "deterministic", "evidence": ""}
-        near = re.compile(
-            r"(" + metric_alt + r")[^\d\n\r]{0,40}(-?\d+(?:\.\d+)?)\s*(%?)",
+        number_pat = r"(-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*(%|percent|pct|个百分点)?"
+        metric_suffix_pat = r"(?:\s*\((?:%|percent|pct)\)|[_\-\s]*(?:pct|percent|percentage|百分比))?"
+        separator_pat = r"\s*(?::|：|=|≈|~|->|=>|\bis\b|\bwas\b|为|是|约为|约)\s*"
+        metric_value = re.compile(
+            r"(?<![A-Za-z0-9])(?:"
+            + metric_alt
+            + r")"
+            + metric_suffix_pat
+            + separator_pat
+            + number_pat,
             re.IGNORECASE,
         )
-        alt = re.compile(
-            r"(-?\d+(?:\.\d+)?)\s*(%?)[^\d\n\r]{0,20}(" + metric_alt + r")",
+        value_metric = re.compile(
+            r"(?<![A-Za-z0-9])"
+            + number_pat
+            + r"\s*(?:for|as|of|on|的)?\s*(?:"
+            + metric_alt
+            + r")"
+            + metric_suffix_pat
+            + r"(?![A-Za-z0-9])",
             re.IGNORECASE,
         )
         measured_rows: list[tuple[float, str]] = []
         for row in evidence_rows:
             text = str(row.get("text", "") or "")
-            for pattern, group_idx in ((near, 2), (alt, 1)):
-                for match in pattern.finditer(text):
-                    try:
-                        measured_rows.append((float(match.group(group_idx)), trim(match.group(0), 180)))
-                    except Exception:
-                        pass
+            for line in text.replace("\r\n", "\n").split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                for pattern in (metric_value, value_metric):
+                    for match in pattern.finditer(line):
+                        try:
+                            measured_rows.append((float(match.group(1)), trim(match.group(0), 180)))
+                        except Exception:
+                            pass
         if not measured_rows:
             return {"met": None, "measured": None, "source": "deterministic", "evidence": ""}
         higher_better = op in (">", ">=")
