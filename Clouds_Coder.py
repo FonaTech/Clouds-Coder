@@ -892,13 +892,6 @@ ACCEPTANCE_GATE_STALL_THRESHOLD = 3
 # recovery and ask the user. We NEVER force-advance a step that has not genuinely
 # passed; repair continues unbounded as long as progress is being made.
 ACCEPTANCE_GATE_HARD_CEILING = 6  # consecutive no-progress rounds before escalating to the user
-# Fix 6 — per-step OUTCOME-progress deadlock guard. Independent of the repair
-# signature (which churns when the worker keeps changing APPROACH, masking a real
-# deadlock). This counts consecutive non-advancing rounds where the step's
-# OUTCOME did not improve (no new completed subtask AND no measured move toward
-# the quality bar). At the ceiling, escalate to the user — this is the escape a
-# genuinely-stuck-but-actively-working single-agent step never had.
-STEP_ACTIVE_STALL_CEILING = 8
 PLAN_MODE_MANAGER_SYNTHESIS_MAX_TOKENS = 8192
 PLAN_MODE_MAX_OPTIONS = 3
 PLAN_FILE_RELATIVE_PATH = ".clouds_coder/plan.md"
@@ -3316,25 +3309,8 @@ def decode_utf8_replace(data: bytes | bytearray | str) -> str:
         return escape_invalid_utf8_text(data)
     return bytes(data).decode("utf-8", errors="replace")
 
-def json_dumps(
-    obj: object,
-    *,
-    indent: int | None = None,
-    ensure_ascii: bool = False,
-    sort_keys: bool = False,
-    separators: tuple[str, str] | None = None,
-    default=None,
-) -> str:
-    kwargs = {
-        "ensure_ascii": ensure_ascii,
-        "indent": indent,
-        "sort_keys": sort_keys,
-    }
-    if separators is not None:
-        kwargs["separators"] = separators
-    if default is not None:
-        kwargs["default"] = default
-    raw = json.dumps(obj, **kwargs)
+def json_dumps(obj: object, *, indent: int | None = None, ensure_ascii: bool = False) -> str:
+    raw = json.dumps(obj, ensure_ascii=ensure_ascii, indent=indent)
     return escape_invalid_utf8_text(raw)
 
 def json_response_bytes(obj: object) -> bytes:
@@ -3804,7 +3780,7 @@ def cache_external_js_url(js_root: Path, url: str) -> tuple[Path | None, str]:
     parsed = urlparse(target_url)
     base = Path(parsed.path).name.strip()
     if not base or "." not in base:
-        h = _sha256_bytes(safe_utf8_bytes(target_url))[:10]
+        h = _sha256_bytes(target_url.encode("utf-8"))[:10]
         base = f"external_{h}.js"
     fname = _safe_js_filename(base, "external.js")
     ext_root = (js_root / "external").resolve()
@@ -5485,7 +5461,7 @@ def compress_text_blob(text: str) -> str:
     src = str(text or "")
     if not src:
         return ""
-    raw = safe_utf8_bytes(src)
+    raw = src.encode("utf-8")
     return base64.b64encode(zlib.compress(raw, 6)).decode("ascii")
 
 def decompress_text_blob(blob_b64: str) -> str:
@@ -5927,7 +5903,7 @@ def probe_ollama_environment(base_url: str, timeout: int = 4) -> tuple[bool, lis
     req = Request(url, method="GET")
     try:
         with urlopen(req, timeout=timeout) as resp:
-            raw = json.loads(decode_utf8_replace(resp.read()))
+            raw = json.loads(resp.read().decode("utf-8"))
         tags: list[str] = []
         for item in raw.get("models", []):
             name = item.get("name")
@@ -6064,7 +6040,7 @@ def check_ollama_model_ready(base_url: str, model: str, timeout: int = 10) -> tu
     }
     req = Request(
         url,
-        data=safe_utf8_bytes(json_dumps(payload)),
+        data=json_dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
@@ -6086,7 +6062,7 @@ def list_loaded_ollama_models(base_url: str, timeout: int = 5) -> list[str]:
     req = Request(url, method="GET")
     try:
         with urlopen(req, timeout=timeout) as resp:
-            raw = json.loads(decode_utf8_replace(resp.read()))
+            raw = json.loads(resp.read().decode("utf-8"))
         out: list[str] = []
         for item in raw.get("models", []) if isinstance(raw, dict) else []:
             name = str(item.get("name", "") or "").strip()
@@ -6110,7 +6086,7 @@ def wake_ollama_model(base_url: str, model: str, timeout: int = 30) -> tuple[boo
     }
     req = Request(
         url,
-        data=safe_utf8_bytes(json_dumps(payload)),
+        data=json_dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
@@ -7360,7 +7336,7 @@ def user_id_from_ip(ip: str) -> str:
     raw = str(ip or "").strip()
     if raw.lower().startswith("::ffff:"):
         raw = raw.split("::ffff:", 1)[1].strip()
-    token = hashlib.sha256(safe_utf8_bytes(raw)).hexdigest()[:12]
+    token = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
     safe_ip = re.sub(r"[^A-Za-z0-9._-]", "_", raw)
     return f"user_{safe_ip}_{token}"
 
@@ -7400,7 +7376,7 @@ class CryptoBox:
         return bytes(out)
 
     def encrypt_text(self, text: str) -> str:
-        payload = safe_utf8_bytes(text)
+        payload = text.encode("utf-8")
         nonce = os.urandom(16)
         ct = self._stream_xor(payload, nonce)
         mac = hmac.new(self.key, nonce + ct, hashlib.sha256).hexdigest()
@@ -8572,7 +8548,7 @@ def ensure_embedded_skills_at_root(skills_root: Path, workdir: Path = WORKDIR, o
         "updated_at": int(time.time()),
         "root": str(target),
     }
-    state_path.write_text(json_dumps(state_payload, indent=2), encoding="utf-8")
+    state_path.write_text(json.dumps(state_payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return target
 
 
@@ -8856,7 +8832,7 @@ def analyze_skill_building_knowledge(workdir: Path = WORKDIR) -> dict:
             rel = fp.resolve().relative_to(workdir.resolve()).as_posix()
         except Exception:
             rel = str(fp)
-        sources.append({"path": rel, "bytes": len(safe_utf8_bytes(raw))})
+        sources.append({"path": rel, "bytes": len(raw.encode("utf-8"))})
         low = raw.lower()
         if "layer 1" in low and "layer 2" in low:
             push(rules, "Use two-layer loading: keep skill metadata cheap in prompt, load full body only on demand.")
@@ -10356,7 +10332,7 @@ def main() -> int:
         "evidence_csv": str(csv_path.name),
         "experiment_md": str((outdir / "experiment_plan.md").name),
     }
-    _write_text(outdir / "report_bundle.json", json_dumps(bundle, indent=2) + "\n")
+    _write_text(outdir / "report_bundle.json", json.dumps(bundle, indent=2, ensure_ascii=False) + "\n")
     print(str(outdir))
     return 0
 
@@ -11665,7 +11641,6 @@ def ensure_generated_runtime_skills_manifest(skills_root: Path):
         "generated/frontend-composition-algorithm/SKILL.md",
         "generated/visualization-report-pipeline/SKILL.md",
         "generated/offline-html-js-bundling/SKILL.md",
-        "generated/novel-architect/SKILL.md",
     ]
     present = [rel for rel in tracked if (skills_root / rel).exists()]
     payload = {
@@ -12223,273 +12198,6 @@ def ensure_generated_mcp_builder_skill(skills_root: Path):
     root = skills_root / "mcp-builder"
     _write_text_if_changed(root / "SKILL.md", MCP_BUILDER_SKILL_MD)
 
-NOVEL_ARCHITECT_SKILL_MD = r'''---
-name: novel-architect
-description: Design and write long-form fiction with a closed-loop story bible,
-  chapter ledger, length control, continuity tracking, character arcs, plot
-  planning, and quality audits so later chapters do not shrink or degrade.
----
-
-# Novel Architect / 小说架构师
-
-Use this skill when the user wants to create, plan, draft, revise, or continue a
-novel, web novel, series, novella, serialized story, or long-form fiction. This
-skill is optimized for stable long-run quality: outline, story thread,
-background, characters, plot, chapters, continuity, length, and revision are
-managed as one closed loop.
-
-当用户要求创作、规划、续写、改写、连载或完整生成小说时使用本 skill。核心目标是让模型始终
-知道“现在写到哪里、每章要写什么、目标多长、实际多长、质量是否下滑、前后是否衔接”，避免
-后期章节缩水、剧情变成摘要、人物失真、伏笔遗忘、质量和连贯性逐步变差。
-
-## Operating Principles / 工作原则
-
-- Treat long fiction as a managed production system, not one-shot prose.
-- Keep a living story bible before and during drafting.
-- Maintain a chapter ledger after every chapter or batch.
-- Track target length, actual length, plot function, continuity impact, and
-  quality state for each chapter.
-- Do not continue blindly if quality, word count, tone, pacing, or continuity
-  trends degrade. Diagnose and repair first.
-- Write complete scenes by default. Do not compress later chapters into summaries
-  unless the user explicitly asks for summary mode.
-- Prefer consistent, recoverable structure over improvising until the context is
-  lost.
-
-## Intake / 需求确认
-
-If the user has not provided enough constraints, ask only for the missing
-high-impact items. Otherwise infer reasonable defaults and state them briefly.
-
-Minimum useful inputs:
-
-- Language, genre, audience, rating, and tone.
-- Desired length: total words, chapter count, or target words per chapter.
-- POV, tense, style references, taboo content, and must-have elements.
-- Premise, protagonist, central conflict, ending direction, and serialization
-  cadence if relevant.
-
-Default assumptions when the user does not specify:
-
-- Language: follow the user's language.
-- Form: chaptered long-form fiction.
-- Chapter target: 2,500 to 4,000 Chinese characters or 1,500 to 2,500 English
-  words unless the user requests otherwise.
-- Length tolerance: each drafted chapter should stay within +/- 15% of target.
-- Audit cadence: review every 3 to 5 chapters, and always before a major arc
-  transition.
-
-## Closed-Loop Workflow / 闭环流程
-
-### 1. Story Bible / 故事圣经
-
-Create or refresh a compact but complete story bible before drafting long-form
-content.
-
-Required fields:
-
-- Logline / 一句话故事
-- Genre promise / 类型承诺
-- Theme and emotional thesis / 主题与情感命题
-- World and background / 世界观与背景
-- Rules, limits, and forbidden contradictions / 规则、限制、不能违反的设定
-- Main cast / 主要人物
-- Character goals, wounds, masks, relationships, and arcs / 人物目标、创伤、
-  伪装、关系与成长线
-- Antagonistic forces / 反派或阻力系统
-- Plot spine / 主线脊柱
-- Subplots / 支线
-- Timeline / 时间线
-- Foreshadowing and payoff register / 伏笔与回收表
-- Tone, style, POV, pacing, and narration constraints / 风格与叙事约束
-
-### 2. Chapter Map / 章节总表
-
-Before writing multiple chapters, build a chapter map. Each chapter needs a
-chapter card.
-
-Chapter card template:
-
-```markdown
-## Chapter <N>: <Title>
-- Target length:
-- Plot function:
-- Opening state:
-- Core beats:
-- Characters present:
-- Character movement:
-- World/background updates:
-- Continuity dependencies:
-- Foreshadowing planted or paid off:
-- Ending hook:
-- Risks to avoid:
-```
-
-Every chapter must have a reason to exist. If a chapter has no plot function,
-character movement, information change, pressure change, or emotional turn,
-merge it, replace it, or redesign it.
-
-### 3. Drafting Contract / 章节写作契约
-
-Before writing each chapter, restate the active chapter card in concise form.
-Then draft the chapter according to this contract:
-
-- Hit the agreed target length range unless the user asks for a different
-  length.
-- Maintain full scene density: action, dialogue, sensory detail, conflict,
-  decision, consequence.
-- Carry forward the previous chapter's ending state exactly.
-- Advance at least one of: main plot, character arc, relationship, mystery,
-  world pressure, or thematic contradiction.
-- Preserve the established POV, tense, tone, and prose style.
-- Do not skip promised confrontations, reveals, or emotional consequences.
-- Do not solve conflicts only because the outline needs progress; make causality
-  visible on the page.
-
-### 4. Chapter Ledger / 章节账本
-
-After each chapter or batch, update a ledger. If the user asks for only prose,
-keep this ledger internally or provide a compact version after the chapter.
-
-Ledger template:
-
-```markdown
-## Ledger After Chapter <N>
-- Actual length:
-- Length status: on target / short / long
-- Key events:
-- Character state changes:
-- Relationship changes:
-- World/background changes:
-- Foreshadowing planted:
-- Foreshadowing paid off:
-- Open hooks:
-- Continuity dependencies for next chapter:
-- Quality score, 1-10:
-- Revision flags:
-```
-
-### 5. Pre-Next-Chapter Check / 下一章前检查
-
-Before continuing, check:
-
-- Is the next chapter's opening state consistent with the previous ending?
-- Did any character forget knowledge, injury, motive, promise, or relationship
-  status?
-- Is the target length trend stable?
-- Is the prose becoming more compressed than earlier chapters?
-- Are subplots and foreshadowing still being maintained?
-- Is tension escalating, varying, or resolving intentionally?
-- Does the next chapter still serve the current arc and the book-level promise?
-
-If any answer is unsafe, repair the plan or revise the previous chapter before
-continuing.
-
-## Quality Drift Prevention / 防止后期质量下滑
-
-Use these gates throughout long generation:
-
-- Length gate: if two consecutive chapters are more than 15% short, stop and
-  restore scene density before continuing.
-- Compression gate: if narration turns into outline-like summary, expand into
-  scenes with conflict, dialogue, decision, and consequence.
-- Continuity gate: if a contradiction appears, list the conflict and choose one
-  canonical version before writing more.
-- Character gate: if a character acts only to satisfy the plot, reconnect the
-  action to goal, fear, pressure, relationship, or prior decision.
-- Pacing gate: if chapters repeat the same emotional shape, vary scene type,
-  pressure source, revelation, or consequence.
-- Promise gate: if the story drifts away from genre promise or core premise,
-  revise the next chapter map before drafting.
-- Arc gate: at chapter milestones, confirm each major arc has movement, delay,
-  reversal, or payoff.
-
-Never hide a quality drop. If quality is declining, say what changed, repair the
-chapter card or story bible, then continue.
-
-## Milestone Audit / 阶段审计
-
-Every 3 to 5 chapters, or before any major arc transition, run a compact audit:
-
-```markdown
-## Milestone Audit
-- Length stability:
-- Plot progress:
-- Character arc progress:
-- Continuity risks:
-- Unresolved hooks:
-- Foreshadowing status:
-- Tone/style drift:
-- Pacing balance:
-- Scenes needing expansion:
-- Plan adjustments:
-```
-
-## Output Modes / 输出模式
-
-Choose the smallest complete mode that satisfies the user:
-
-- Architecture mode: story bible + chapter map, no prose yet.
-- Chapter mode: one chapter with pre-card and post-ledger.
-- Batch mode: several chapters, each with ledger, plus batch audit.
-- Continuation mode: reconstruct current bible and ledger from provided text,
-  then continue without contradicting it.
-- Revision mode: diagnose and rewrite weak chapters while preserving canon.
-
-For very long novels, do not attempt to write the entire book in one response.
-Build the bible and chapter map first, then write in controlled chapters or
-batches with ledgers.
-
-## Response Shape / 推荐响应结构
-
-For planning:
-
-```markdown
-# Story Bible
-# Chapter Map
-# Quality Control Rules
-# Next Step
-```
-
-For a chapter:
-
-```markdown
-# Chapter Card
-# Chapter <N>: <Title>
-# Chapter Ledger
-```
-
-For continuation:
-
-```markdown
-# Reconstructed Current State
-# Continuity Risks
-# Next Chapter Card
-# Chapter <N>: <Title>
-# Chapter Ledger
-```
-
-## Hard Rules / 硬性规则
-
-- Do not let later chapters shrink unless the user explicitly requests shorter
-  chapters.
-- Do not replace scenes with summaries in later chapters.
-- Do not ignore the story bible when drafting.
-- Do not continue through continuity conflicts; resolve them first.
-- Do not introduce major new lore, powers, institutions, or relationships
-  without recording them in the bible or ledger.
-- Do not make every chapter the same rhythm. Vary pressure, scene type, emotional
-  charge, and information flow.
-- Do not end a chapter without knowing what state the next chapter inherits.
-- Always preserve the reader-facing illusion of a coherent novel, while using
-  the ledger privately or visibly to keep the production stable.
-'''
-
-def ensure_generated_novel_architect_skill(skills_root: Path):
-    """Materialize the novel-architect skill to disk on demand."""
-    root = skills_root / "generated" / "novel-architect"
-    _write_text_if_changed(root / "SKILL.md", NOVEL_ARCHITECT_SKILL_MD)
-
 def ensure_runtime_skills(skills_root: Path):
     ensure_embedded_skills_at_root(skills_root, workdir=WORKDIR, overwrite_existing=False)
     ensure_generated_mcp_builder_skill(skills_root)
@@ -12506,7 +12214,6 @@ def ensure_runtime_skills(skills_root: Path):
     ensure_generated_research_scientific_skills(skills_root)
     ensure_generated_rag_mastery_skills(skills_root)
     ensure_generated_multimodal_comprehension_skills(skills_root)
-    ensure_generated_novel_architect_skill(skills_root)
     ensure_generated_runtime_skills_manifest(skills_root)
     ensure_embedded_clawhub_skills(skills_root)
 
@@ -13370,7 +13077,7 @@ class SkillStore:
         req = Request(endpoint, method="GET")
         try:
             with urlopen(req, timeout=timeout) as resp:
-                payload = json.loads(decode_utf8_replace(resp.read()))
+                payload = json.loads(resp.read().decode("utf-8"))
         except Exception as exc:
             self.warnings.append(f"{manifest_path.name}: HTTP provider fetch failed: {exc}")
             return
@@ -14117,36 +13824,17 @@ class BackgroundManager:
         return f"Background task {task_id} started: {command[:80]}"
 
     def _exec(self, task_id: str, command: str, timeout: int):
-        def _decode_stream(data: bytes | None) -> str:
-            raw = bytes(data or b"")
-            if not raw:
-                return ""
-            encodings = ["utf-8", "utf-8-sig", locale.getpreferredencoding(False) or "", "gb18030", "gbk"]
-            seen: set[str] = set()
-            for enc in encodings:
-                enc = str(enc or "").strip()
-                if not enc or enc.lower() in seen:
-                    continue
-                seen.add(enc.lower())
-                try:
-                    return raw.decode(enc, errors="replace")
-                except Exception:
-                    continue
-            return raw.decode("utf-8", errors="replace")
-
         try:
             r = subprocess.run(
                 command,
                 shell=True,
                 cwd=self.workdir,
                 capture_output=True,
-                text=False,
+                text=True,
                 timeout=timeout,
             )
-            output = trim((_decode_stream(r.stdout) + _decode_stream(r.stderr)).strip())
-            if r.returncode:
-                output = trim(f"exit={r.returncode}\n{output or '(no output)'}")
-            status = "completed" if int(r.returncode or 0) == 0 else "error"
+            output = trim((r.stdout + r.stderr).strip())
+            status = "completed"
         except Exception as exc:
             output = f"Error: {exc}"
             status = "error"
@@ -14890,17 +14578,17 @@ class MCPServerProcess:
         if isinstance(content, list):
             for block in content:
                 if not isinstance(block, dict):
-                    parts.append(escape_invalid_utf8_text(block))
+                    parts.append(str(block))
                     continue
                 btype = str(block.get("type", "") or "")
                 if btype == "text":
-                    parts.append(escape_invalid_utf8_text(block.get("text", "")))
+                    parts.append(str(block.get("text", "")))
                 elif btype in ("image", "audio"):
                     mime = str(block.get("mimeType", "") or "binary")
                     parts.append(f"[{btype} content: {mime}]")
                 elif btype == "resource":
                     rsrc = block.get("resource", {}) if isinstance(block.get("resource"), dict) else {}
-                    parts.append(escape_invalid_utf8_text(rsrc.get("text", "") or f"[resource: {rsrc.get('uri','')}]"))
+                    parts.append(str(rsrc.get("text", "") or f"[resource: {rsrc.get('uri','')}]"))
                 else:
                     parts.append(json_dumps(block))
         text = "\n".join(p for p in parts if p != "")
@@ -14908,7 +14596,6 @@ class MCPServerProcess:
             sc = res.get("structuredContent")
             if sc is not None:
                 text = json_dumps(sc)
-        text = escape_invalid_utf8_text(text)
         if len(text) > _MCP_MAX_RESULT_CHARS:
             text = text[:_MCP_MAX_RESULT_CHARS] + "\n…(mcp result truncated)"
         if is_error:
@@ -15685,13 +15372,13 @@ class OllamaClient:
             req_headers.update(headers)
         req = Request(
             url,
-            data=safe_utf8_bytes(json_dumps(payload)),
+            data=json_dumps(payload).encode("utf-8"),
             headers=req_headers,
             method="POST",
         )
         try:
             with urlopen(req, timeout=self.timeout) as resp:
-                body = decode_utf8_replace(resp.read())
+                body = resp.read().decode("utf-8")
                 return json.loads(body) if body else {}
         except HTTPError as exc:
             text = exc.read().decode("utf-8", errors="replace")
@@ -15780,7 +15467,7 @@ class OllamaClient:
             req_headers.update(headers)
         req = Request(
             url,
-            data=safe_utf8_bytes(json_dumps(payload)),
+            data=json_dumps(payload).encode("utf-8"),
             headers=req_headers,
             method="POST",
         )
@@ -15884,7 +15571,7 @@ class OllamaClient:
             req_headers.update(headers)
         req = Request(
             url,
-            data=safe_utf8_bytes(json_dumps(payload)),
+            data=json_dumps(payload).encode("utf-8"),
             headers=req_headers,
             method="POST",
         )
@@ -18139,13 +17826,6 @@ class SessionState:
         # to break-and-pause without finalizing the run.
         self.pending_user_question: dict | None = None
         self._ask_user_pause_pending = False
-        # Mid-run steering (Fix 3): set when a live user message is classified as
-        # a steer (stop / change direction / redo), so the next round re-plans at
-        # the top before the model call — a genuine instruction, not a diluted
-        # background suggestion.
-        self._steer_pending = False
-        # Per-step acceptance quality-bar cache (Fix 5): step_id -> target dict.
-        self._acceptance_target_cache: dict = {}
         self.live_input_queue_lock = threading.Lock()
         self.deferred_start_inputs: list[dict] = []
         self.deferred_start_seq = 0
@@ -18723,18 +18403,13 @@ class SessionState:
         scope: str,
         media_inputs_round: list[dict] | None = None,
     ) -> dict:
-        _steer_pending = bool(getattr(self, "_steer_pending", False))
         if not (
             bool(getattr(self, "runtime_reclassify_required", False))
             or bool(getattr(self, "runtime_goal_reset_pending", False))
-            or _steer_pending
         ):
             return {}
-        if bool(getattr(self, "runtime_reclassify_required", False)) or _steer_pending:
-            # A steer (Fix 3) forces a re-plan even under a user task-level
-            # override — the user is explicitly redirecting the running work, so
-            # honoring it takes precedence over the pinned level.
-            if int(getattr(self, "user_task_level_override", 0) or 0) > 0 and not _steer_pending:
+        if bool(getattr(self, "runtime_reclassify_required", False)):
+            if int(getattr(self, "user_task_level_override", 0) or 0) > 0:
                 self._mark_runtime_goal_reset_handled(
                     reason=f"{scope}:user-level-override",
                     clear_reclassify=True,
@@ -18747,9 +18422,6 @@ class SessionState:
                 media_inputs=media_inputs_round,
                 roles=["manager"],
             )
-            if _steer_pending:
-                self._steer_pending = False
-                self._emit("status", {"summary": f"user steer applied — re-planning ({scope})"})
             decision = self._refresh_runtime_task_policy(
                 pinned_selection=pinned_selection,
                 force=True,
@@ -20283,7 +19955,6 @@ class SessionState:
         self.stall_severity_score = 0
         self.stall_severity_sources = []
         self.stall_escalation_triggered = False
-        self._steer_pending = False
         self.stall_escalation_round = 0
         self.live_thinking_text = ""
         self.live_thinking_last_emit = 0.0
@@ -20558,7 +20229,6 @@ class SessionState:
         previous_context: dict | None = None,
         clear_progress: bool = False,
         reset_agent_contexts: bool = False,
-        archive_messages: bool = False,
     ) -> None:
         """Clear plan/todo/skills state from a completed run so the next run starts fresh.
 
@@ -20566,46 +20236,8 @@ class SessionState:
         previous run finished (running=False, not awaiting plan choice).
         Prevents the manager from seeing status=COMPLETED + all todos done and
         immediately routing to 'finish' again on the very first round.
-
-        When `archive_messages` is True (a genuine task boundary), the prior
-        task's raw LLM transcript (`self.messages`) is archived to a context
-        segment and reset to a clean slate — otherwise the fresh instruction is
-        buried under the entire previous conversation and instruction-following
-        degrades (Fix 4). The handoff is preserved via `previous_task_context`
-        (injected into the system prompt) and display continuity via
-        `conversation_feed`/`user_bubble_log`, which are NOT touched here. This
-        mirrors how compaction already archives + windows messages.
         """
         bb = self._ensure_blackboard()
-        if archive_messages and isinstance(self.messages, list) and self.messages:
-            try:
-                archivable = [
-                    row for row in self.messages
-                    if isinstance(row, dict) and str(row.get("role", "") or "") != "system"
-                ]
-                if archivable:
-                    seg = self._archive_context_segment(archivable, reason="task-boundary")
-                    if seg:
-                        self._emit(
-                            "status",
-                            {
-                                "summary": (
-                                    "previous task transcript archived at task boundary "
-                                    f"(messages={seg.get('messages', 0)}); starting next task with a clean context"
-                                )
-                            },
-                        )
-                # Keep only non-user, non-assistant scaffolding (system prompts are
-                # rebuilt each call anyway) — a clean slate for the next task.
-                self.messages = [
-                    row for row in self.messages
-                    if isinstance(row, dict) and str(row.get("role", "") or "") == "system"
-                ]
-            except Exception as exc:
-                self._emit(
-                    "status",
-                    {"summary": f"task-boundary transcript archive skipped: {trim(str(exc), 120)}"},
-                )
         goal_text = trim(str(new_goal or "").strip(), 4000)
         previous = dict(previous_context or {}) if isinstance(previous_context, dict) else {}
         if clear_progress:
@@ -20679,21 +20311,6 @@ class SessionState:
         bb["plan_meta"] = {}
         bb["loaded_skills"] = {}
         bb["loaded_skills_goal_sig"] = ""
-        # Drop cached acceptance quality-bars from the previous task (Fix 5).
-        try:
-            self._acceptance_target_cache = {}
-        except Exception:
-            pass
-        # Drop per-step outcome-progress stall counters (Fix 6) — step ids can
-        # repeat across tasks, so stale counters must not carry over.
-        try:
-            for _attr in [
-                a for a in list(vars(self).keys())
-                if a.startswith(("_step_stuck_n_", "_step_best_done_", "_step_best_meas_"))
-            ]:
-                delattr(self, _attr)
-        except Exception:
-            pass
         if previous:
             bb["previous_task_context"] = previous
         self.blackboard = bb
@@ -24698,176 +24315,6 @@ class SessionState:
         )
         return any(marker in low for marker in markers)
 
-    @staticmethod
-    def _coerce_exit_code(raw: object) -> int | None:
-        if raw in (None, ""):
-            return None
-        try:
-            return int(raw)
-        except Exception:
-            return None
-
-    def _command_looks_like_count_search(self, command: str) -> bool:
-        low = str(command or "").lower()
-        if not low.strip():
-            return False
-        segments = re.split(r"\s*(?:&&|\|\||;|\|)\s*", low)
-        for segment in segments:
-            if not re.search(r"(?<![\w./-])(?:grep|ggrep|rg|ripgrep)\b", segment):
-                continue
-            if re.search(r"(?<!\S)--count(?:-matches)?(?!\S)", segment):
-                return True
-            if re.search(r"(?<!\S)-[a-z]*c[a-z]*(?!\S)", segment):
-                return True
-        return False
-
-    @staticmethod
-    def _count_search_output_values(output: str) -> list[int]:
-        values: list[int] = []
-        for raw_line in str(output or "").replace("\r\n", "\n").split("\n"):
-            line = raw_line.strip()
-            if not line or line.startswith("[long_output"):
-                continue
-            # grep -c prints either "0" or "path:0" for multi-file searches.
-            match = re.match(r"^(?:.*:)?(\d+)$", line)
-            if not match:
-                return []
-            try:
-                values.append(int(match.group(1)))
-            except Exception:
-                return []
-        return values
-
-    def _count_search_output_is_zero(self, command: str, output: str) -> bool:
-        if not self._command_looks_like_count_search(command):
-            return False
-        values = self._count_search_output_values(output)
-        return bool(values) and all(value == 0 for value in values)
-
-    def _count_search_output_has_positive_count(self, command: str, output: str) -> int | None:
-        if not self._command_looks_like_count_search(command):
-            return None
-        values = self._count_search_output_values(output)
-        if not values:
-            return None
-        positive = [value for value in values if value > 0]
-        return max(positive) if positive else 0
-
-    def _tool_exec_meta_matches(self, row: dict, name: str, args: dict | None) -> bool:
-        if not isinstance(row, dict):
-            return False
-        tool = canonicalize_tool_name(name)
-        if str(row.get("name", "") or "") != tool:
-            return False
-        src_args = args if isinstance(args, dict) else {}
-        command = str(src_args.get("command", "") or "")
-        row_command = str(row.get("command", "") or "")
-        if command and row_command and command != row_command:
-            return False
-        if tool == "worktree_run":
-            wanted = str(src_args.get("name", "") or "")
-            if wanted and str(row.get("worktree", "") or "") != wanted:
-                return False
-        return True
-
-    def _stash_tool_exec_meta(self, name: str, args: dict | None, meta: dict | None) -> None:
-        if not isinstance(meta, dict):
-            return
-        tool = canonicalize_tool_name(name)
-        if tool not in {"bash", "worktree_run", "background_run"}:
-            return
-        src_args = args if isinstance(args, dict) else {}
-        row = {
-            "name": tool,
-            "command": str(meta.get("command", src_args.get("command", "")) or ""),
-            "effective_command": str(meta.get("effective_command", meta.get("command", "")) or ""),
-            "cwd": str(meta.get("cwd", "") or ""),
-            "exit_code": self._coerce_exit_code(meta.get("exit_code")),
-            "duration_ms": int(meta.get("duration_ms", 0) or 0),
-            "changed_files": list(meta.get("changed_files", []) or [])[:24],
-            "worktree": str(src_args.get("name", "") or ""),
-            "ts": float(now_ts()),
-        }
-        try:
-            with self.lock:
-                queue_rows = list(getattr(self, "_tool_exec_meta_queue", []) or [])
-                queue_rows.append(row)
-                self._tool_exec_meta_queue = queue_rows[-48:]
-        except Exception:
-            self._tool_exec_meta_queue = [row]
-
-    def _lookup_tool_exec_meta(self, name: str, args: dict | None, *, pop: bool = False) -> dict:
-        try:
-            queue_rows = list(getattr(self, "_tool_exec_meta_queue", []) or [])
-        except Exception:
-            return {}
-        if not queue_rows:
-            return {}
-        found_idx = -1
-        found_row: dict = {}
-        for idx in range(len(queue_rows) - 1, -1, -1):
-            row = queue_rows[idx]
-            if self._tool_exec_meta_matches(row, name, args):
-                found_idx = idx
-                found_row = dict(row)
-                break
-        if found_idx >= 0 and pop:
-            try:
-                with self.lock:
-                    live = list(getattr(self, "_tool_exec_meta_queue", []) or [])
-                    for idx in range(len(live) - 1, -1, -1):
-                        if self._tool_exec_meta_matches(live[idx], name, args):
-                            live.pop(idx)
-                            break
-                    self._tool_exec_meta_queue = live[-48:]
-            except Exception:
-                pass
-        return found_row
-
-    def _tool_result_success(
-        self,
-        name: str,
-        args: dict | None,
-        output: str,
-        meta: dict | None = None,
-    ) -> bool:
-        text = str(output or "")
-        if text.startswith("Error:"):
-            return False
-        tool = canonicalize_tool_name(name)
-        if tool in {"bash", "worktree_run"}:
-            row = meta if isinstance(meta, dict) else self._lookup_tool_exec_meta(tool, args)
-            exit_code = self._coerce_exit_code((row or {}).get("exit_code"))
-            if exit_code is None:
-                return True
-            if exit_code == 0:
-                return True
-            command = str((row or {}).get("command", "") or (args or {}).get("command", "") or "")
-            return self._count_search_output_is_zero(command, text)
-        return True
-
-    def _build_tool_result_item(self, name: str, args: dict | None, output: str) -> dict:
-        src_args = args if isinstance(args, dict) else {}
-        meta = self._lookup_tool_exec_meta(name, src_args, pop=True)
-        item = {
-            "name": canonicalize_tool_name(name) or str(name or ""),
-            "args": src_args,
-            "output": trim(str(output or ""), 3000),
-            "ok": self._tool_result_success(name, src_args, str(output or ""), meta),
-        }
-        if meta:
-            item.update(
-                {
-                    "command": trim(str(meta.get("command", "") or ""), 800),
-                    "effective_command": trim(str(meta.get("effective_command", "") or ""), 1000),
-                    "cwd": trim(str(meta.get("cwd", "") or ""), 500),
-                    "exit_code": self._coerce_exit_code(meta.get("exit_code")),
-                    "duration_ms": int(meta.get("duration_ms", 0) or 0),
-                    "changed_files": list(meta.get("changed_files", []) or [])[:24],
-                }
-            )
-        return item
-
     def _tool_memory_summary_from_output(self, source_tool: str, args: dict | None, output: str) -> str:
         tool = canonicalize_tool_name(source_tool)
         text = str(output or "").replace("\r\n", "\n")
@@ -25733,7 +25180,7 @@ class SessionState:
             return
         src_args = args if isinstance(args, dict) else {}
         text = str(output or "")
-        ok = self._tool_result_success(tool, src_args, text)
+        ok = not text.startswith("Error:")
         if tool in {"write_file", "edit_file"}:
             path = trim(str(src_args.get("path", "") or "").replace("\\", "/"), 300)
             if path:
@@ -26253,7 +25700,7 @@ class SessionState:
         with fp.open("w", encoding="utf-8") as handle:
             for idx, row in enumerate(rows):
                 line = json_dumps(row)
-                payload = safe_utf8_bytes(line + "\n")
+                payload = (line + "\n").encode("utf-8")
                 sha.update(payload)
                 handle.write(line + "\n")
                 msg_ts = float(row.get("ts", 0.0) or 0.0)
@@ -26765,12 +26212,12 @@ class SessionState:
         active_errors = len([e for e in comp_errors if isinstance(e, dict) and int(e.get("count", 0) or 0) > 0])
         artifacts = bb.get("code_artifacts", {})
         artifacts_keys = sorted(artifacts.keys()) if isinstance(artifacts, dict) else []
-        files_hash = hashlib.sha1(safe_utf8_bytes(artifacts_keys)).hexdigest()[:12]
+        files_hash = hashlib.sha1(str(artifacts_keys).encode("utf-8")).hexdigest()[:12]
         try:
             todo_snap = json_dumps(self.todo.snapshot()) if hasattr(self, "todo") else ""
         except Exception:
             todo_snap = ""
-        todos_hash = hashlib.sha1(safe_utf8_bytes(todo_snap)).hexdigest()[:12]
+        todos_hash = hashlib.sha1(todo_snap.encode("utf-8")).hexdigest()[:12]
         stall_events = fl.get("stall_events", [])
         delegations = fl.get("repeated_delegations", [])
         return {
@@ -33501,45 +32948,18 @@ body{padding:18px}
                 del target[:overflow]
 
         def _merge_output_text() -> str:
-            def _decode_pipe(data: bytes) -> str:
-                raw = bytes(data or b"")
-                if not raw:
-                    return ""
-                encodings: list[str] = ["utf-8", "utf-8-sig"]
-                if os.name == "nt":
-                    # cmd.exe often uses a system codepage (e.g. cp936/GBK), while
-                    # modern tools/MCP shims commonly emit UTF-8. Try UTF-8 first
-                    # when it is valid, then locale and Chinese Windows fallbacks.
-                    try:
-                        encodings.append(str(locale.getpreferredencoding(False) or ""))
-                    except Exception:
-                        pass
-                    encodings.extend(["gb18030", "gbk", "cp936"])
-                else:
-                    try:
-                        encodings.append(str(locale.getpreferredencoding(False) or ""))
-                    except Exception:
-                        pass
-                seen: set[str] = set()
-                for enc in encodings:
-                    enc = str(enc or "").strip()
-                    if not enc or enc.lower() in seen:
-                        continue
-                    seen.add(enc.lower())
-                    try:
-                        return raw.decode(enc, errors="strict")
-                    except Exception:
-                        continue
-                return raw.decode("utf-8", errors="replace")
-
-            # On Windows, cmd.exe can output in the system codepage while some
-            # tools emit UTF-8. Decode bytes defensively instead of assuming one.
+            # On Windows, cmd.exe outputs in the system OEM codepage (e.g. cp936/GBK),
+            # not UTF-8.  Detect and use the correct encoding for decoding.
             if os.name == "nt":
-                out_text = _decode_pipe(out_buf)
-                err_text = _decode_pipe(err_buf)
+                try:
+                    import locale as _lc
+                    enc = _lc.getpreferredencoding(False) or "utf-8"
+                except Exception:
+                    enc = "utf-8"
             else:
-                out_text = _decode_pipe(out_buf)
-                err_text = _decode_pipe(err_buf)
+                enc = "utf-8"
+            out_text = out_buf.decode(enc, errors="replace")
+            err_text = err_buf.decode(enc, errors="replace")
             return (out_text + err_text).strip()
 
         def _store_shell_output(output_value: str, exit_code: int | None = None):
@@ -35142,150 +34562,7 @@ body{padding:18px}
             "reason": reason or trim(str(base.get("reason", "")), 400),
             "goal_chars": int(goal_chars),
             "updated_at": float(updated_at),
-            "deliverable_target": self._infer_deliverable_target(goal, existing=src.get("deliverable_target")),
         }
-
-    # Units that signal a multi-unit generative deliverable (novel chapters,
-    # paper sections, batches of files, etc.). Chinese + English.
-    _DELIVERABLE_UNIT_MAP = {
-        "章": ("chapter", "content"), "章节": ("chapter", "content"), "节": ("section", "content"),
-        "篇": ("article", "content"), "页": ("page", "content"), "首": ("poem", "content"),
-        "集": ("episode", "content"), "回": ("chapter", "content"), "部": ("volume", "content"),
-        "段": ("paragraph", "content"), "份": ("document", "content"), "问": ("question", "content"),
-        "题": ("question", "content"), "个文件": ("file", "files"), "个脚本": ("file", "files"),
-        "chapters": ("chapter", "content"), "chapter": ("chapter", "content"),
-        "sections": ("section", "content"), "section": ("section", "content"),
-        "articles": ("article", "content"), "essays": ("essay", "content"),
-        "pages": ("page", "content"), "poems": ("poem", "content"),
-        "episodes": ("episode", "content"), "parts": ("part", "content"),
-        "files": ("file", "files"), "scripts": ("file", "files"), "modules": ("file", "files"),
-        "questions": ("question", "content"), "problems": ("question", "content"),
-        "papers": ("paper", "content"), "documents": ("document", "content"),
-        "reports": ("report", "content"), "stories": ("story", "content"),
-        "entries": ("entry", "content"), "records": ("record", "content"),
-    }
-
-    def _infer_deliverable_target(self, goal: str, existing: object = None) -> dict:
-        """Detect a multi-unit generative quota in the goal (e.g. '写20章小说',
-        'analyze 50 papers', 'generate 30 files'). Returns
-        {kind, unit, target_count, produced_count, verify} or {} when no quota.
-
-        A quota is a COUNT ('20 章', '50 chapters') — an INDEX ('第20章',
-        'chapter 20') is deliberately NOT matched. This is what lets a long task
-        block premature finish until the real target is met (Fix 2)."""
-        # Preserve an already-established target (keeps produced_count across
-        # re-normalizations) unless it is malformed.
-        if isinstance(existing, dict) and int(existing.get("target_count", 0) or 0) >= 2:
-            out = dict(existing)
-            out.setdefault("produced_count", 0)
-            out.setdefault("verify", "content")
-            out.setdefault("unit", "unit")
-            out.setdefault("kind", "generation")
-            return out
-        text = str(goal or "")
-        if not text.strip():
-            return {}
-        best: dict = {}
-        # Chinese: <count><unit>, NOT preceded by 第 (which marks an index).
-        zh_units = "章节|章|节|篇|页|首|集|回|部|段|份|题|问"
-        for m in re.finditer(r"(?<!第)(\d{1,4})\s*(" + zh_units + r")", text):
-            n = int(m.group(1))
-            unit_raw = m.group(2)
-            if n < 2 or n > 2000:
-                continue
-            unit, verify = self._DELIVERABLE_UNIT_MAP.get(unit_raw, ("unit", "content"))
-            if not best or n > best.get("target_count", 0):
-                best = {"kind": "generation", "unit": unit, "target_count": n, "produced_count": 0, "verify": verify}
-        # Chinese file/script count: "N个文件" / "N个脚本"
-        for m in re.finditer(r"(\d{1,4})\s*个?\s*(文件|脚本|模块|函数)", text):
-            n = int(m.group(1))
-            if n < 2 or n > 2000:
-                continue
-            if not best or n > best.get("target_count", 0):
-                best = {"kind": "generation", "unit": "file", "target_count": n, "produced_count": 0, "verify": "files"}
-        # English: <count> <plural-unit>. Plural (or explicit count noun) only —
-        # 'chapter 20' (singular after) is an index and is skipped.
-        for m in re.finditer(
-            r"(\d{1,4})\s+(chapters|sections|articles|essays|pages|poems|episodes|parts|files|scripts|modules|questions|problems|papers|documents|reports|stories|entries|records)\b",
-            text, re.IGNORECASE,
-        ):
-            n = int(m.group(1))
-            unit_raw = m.group(2).lower()
-            if n < 2 or n > 2000:
-                continue
-            unit, verify = self._DELIVERABLE_UNIT_MAP.get(unit_raw, ("unit", "content"))
-            if not best or n > best.get("target_count", 0):
-                best = {"kind": "generation", "unit": unit, "target_count": n, "produced_count": 0, "verify": verify}
-        return best
-
-    def _deliverable_progress(self, board: dict | None = None) -> dict:
-        """Count produced units of the deliverable target from REAL evidence
-        (files written, content markers in artifacts), never model self-claims.
-        Returns {active, target, produced, unit, verify, remaining}."""
-        bb = board if isinstance(board, dict) else self._ensure_blackboard()
-        profile = bb.get("task_profile", {}) if isinstance(bb.get("task_profile"), dict) else {}
-        target = profile.get("deliverable_target", {}) if isinstance(profile.get("deliverable_target"), dict) else {}
-        target_count = int(target.get("target_count", 0) or 0)
-        if target_count < 2:
-            return {"active": False, "target": 0, "produced": 0, "unit": "", "verify": "", "remaining": 0}
-        verify = str(target.get("verify", "content") or "content")
-        unit = str(target.get("unit", "unit") or "unit")
-        produced = 0
-        # File-based deliverables: count distinct written output paths.
-        if verify == "files":
-            paths: set[str] = set()
-            arts = bb.get("code_artifacts", {}) if isinstance(bb.get("code_artifacts"), dict) else {}
-            for p in arts.keys():
-                if str(p).strip():
-                    paths.add(str(p).strip())
-            step_files = bb.get("step_files", {}) if isinstance(bb.get("step_files"), dict) else {}
-            for entries in step_files.values():
-                if isinstance(entries, list):
-                    for item in entries:
-                        if isinstance(item, dict) and str(item.get("path", "") or "").strip():
-                            paths.add(str(item.get("path")).strip())
-            produced = len(paths)
-        else:
-            # Content-unit deliverables: scan written artifact text + research
-            # notes for the highest distinct unit index (第N章 / Chapter N / N.).
-            blob_parts: list[str] = []
-            arts = bb.get("code_artifacts", {}) if isinstance(bb.get("code_artifacts"), dict) else {}
-            for v in arts.values():
-                if isinstance(v, dict):
-                    blob_parts.append(str(v.get("content", "") or v.get("summary", "") or ""))
-                else:
-                    blob_parts.append(str(v or ""))
-            notes = bb.get("research_notes", []) if isinstance(bb.get("research_notes"), list) else []
-            for n in notes:
-                if isinstance(n, dict):
-                    blob_parts.append(str(n.get("content", "") or n.get("text", "") or ""))
-                else:
-                    blob_parts.append(str(n or ""))
-            blob = "\n".join(blob_parts)
-            indices: set[int] = set()
-            for m in re.finditer(r"第\s*(\d{1,4})\s*(?:章|节|篇|回|集|部|页|首)", blob):
-                indices.add(int(m.group(1)))
-            for m in re.finditer(r"\b(?:chapter|section|part|episode|page|article|essay)\s+(\d{1,4})\b", blob, re.IGNORECASE):
-                indices.add(int(m.group(1)))
-            produced = len(indices)
-            # Fallback: distinct completed plan-step count can stand in when the
-            # units aren't explicitly numbered in text but each maps to a step.
-            step_done = sum(
-                1 for t in (bb.get("project_todos", []) if isinstance(bb.get("project_todos"), list) else [])
-                if isinstance(t, dict) and str(t.get("category", "") or "") == "plan_step"
-                and str(t.get("status", "") or "").strip().lower() == "completed"
-            )
-            produced = max(produced, step_done)
-        produced = min(produced, target_count)
-        return {
-            "active": True,
-            "target": target_count,
-            "produced": produced,
-            "unit": unit,
-            "verify": verify,
-            "remaining": max(0, target_count - produced),
-        }
-
 
     def _ensure_blackboard_task_profile(self, board: dict | None = None, *, force: bool = False) -> dict:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
@@ -35399,29 +34676,10 @@ body{padding:18px}
                     return False
         return True
 
-    def _execution_log_count_search_zero_ok(self, row: dict) -> bool:
-        txt = str((row or {}).get("content", "") or "").strip()
-        if not txt:
-            return False
-        lines = [line.strip() for line in txt.replace("\r\n", "\n").split("\n") if line.strip()]
-        if not lines:
-            return False
-        first = lines[0]
-        if not first.startswith(("bash ", "worktree_run ", "background_run ")):
-            return False
-        command = first.split(" ", 1)[1] if " " in first else ""
-        output_lines = [
-            line for line in lines[1:]
-            if not re.match(r"(?i)^exit\s*[:=]\s*-?\d+\b", line)
-        ]
-        return self._count_search_output_is_zero(command, "\n".join(output_lines))
-
     def _execution_log_entry_is_success_evidence(self, row: dict) -> bool:
         txt = str((row or {}).get("content", "") or "").strip().lower()
         if not txt:
             return False
-        if self._execution_log_count_search_zero_ok(row):
-            return True
         if re.search(r"(?m)^\s*exit\s*[:=]\s*0\b", txt) and not self._command_output_has_error_shape(txt):
             return True
         success_markers = (
@@ -35453,8 +34711,6 @@ body{padding:18px}
             "workspace clean", "validation: workspace clean",
         )
         if any(phrase in low for phrase in benign_phrases):
-            return False
-        if self._execution_log_count_search_zero_ok(row):
             return False
         if re.search(r"(?m)^\s*exit\s*[:=]\s*0\b", low) and not self._command_output_has_error_shape(txt):
             return False
@@ -35598,25 +34854,6 @@ body{padding:18px}
             return {
                 "target": assigned,
                 "instruction": "Finish is blocked by unfinished plan steps. Re-open the active plan state and continue the next concrete step.",
-                "reason": reason_key,
-                "source": "finish-gate",
-                "is_mandatory": True,
-            }
-        if reason_key.startswith("deliverable-incomplete:"):
-            progress = self._deliverable_progress(bb)
-            unit = str(progress.get("unit", "unit") or "unit")
-            produced = int(progress.get("produced", 0) or 0)
-            target = int(progress.get("target", 0) or 0)
-            remaining = int(progress.get("remaining", 0) or 0)
-            instruction = (
-                f"Finish is blocked: this task requires {target} {unit}s and only {produced} are done "
-                f"({remaining} remaining). Do NOT stop or summarize early — continue producing the next "
-                f"{unit} now, with its full concrete content, and keep going until all {target} are complete. "
-                "Update TodoWrite as each unit is finished."
-            )
-            return {
-                "target": self._current_plan_worker_owner(bb) or assigned,
-                "instruction": trim(instruction, MANAGER_INSTRUCTION_MAX_CHARS),
                 "reason": reason_key,
                 "source": "finish-gate",
                 "is_mandatory": True,
@@ -35936,14 +35173,6 @@ body{padding:18px}
                     return False, f"project-todo-incomplete:{todo.get('category', '')}"
         if exec_mode == EXECUTION_MODE_SYNC and not self._manager_feedback_passed_from_blackboard(bb):
             return False, "sync-review-missing"
-        # Deliverable-quota gate (Fix 2): a multi-unit generative task (e.g.
-        # "write 20 chapters", "analyze 50 papers") must produce its target
-        # count of REAL units before finishing — this is what stops long tasks
-        # ending prematurely (虎头蛇尾). Progress is counted from evidence, not
-        # model self-claims.
-        progress = self._deliverable_progress(bb)
-        if progress.get("active") and int(progress.get("remaining", 0) or 0) > 0:
-            return False, f"deliverable-incomplete:{progress.get('produced', 0)}/{progress.get('target', 0)}"
         return True, "ok"
 
     def _invalidate_stale_approval_if_needed(
@@ -36205,8 +35434,8 @@ body{padding:18px}
             "last_worker_reply_role": last_reply_role,
             "last_worker_reply_text": last_reply_text,
         }
-        raw = json_dumps(payload, sort_keys=True, separators=(",", ":"))
-        return hashlib.sha1(safe_utf8_bytes(raw)).hexdigest()
+        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
     def _watchdog_extract_json_array(self, text: str) -> list[dict]:
         raw = str(text or "").strip()
@@ -36731,7 +35960,7 @@ body{padding:18px}
             else:
                 wd["repeat_no_tool_streak"] = 0
             wd["last_no_tool_text"] = text
-            wd["last_no_tool_hash"] = hashlib.sha1(safe_utf8_bytes(text)).hexdigest() if text else ""
+            wd["last_no_tool_hash"] = hashlib.sha1(text.encode("utf-8")).hexdigest() if text else ""
         else:
             wd["intent_no_tool_streak"] = max(0, int(wd.get("intent_no_tool_streak", 0) or 0) - 1)
             wd["repeat_no_tool_streak"] = max(0, int(wd.get("repeat_no_tool_streak", 0) or 0) - 1)
@@ -37699,43 +36928,6 @@ body{padding:18px}
             return False
         return True
 
-    def _agentbus_envelope_matches_active_focus(self, envelope: dict, board: dict | None = None) -> bool:
-        """Return whether an agent-bus handoff belongs to the current focus.
-
-        Plan-step execution is focus-scoped. A handoff created for step N must
-        not wake a worker after the plan has advanced to step N+1; otherwise a
-        stale repair hint can overwrite the active step and make the run appear
-        to jump or regress. Legacy envelopes without focus metadata are allowed
-        only when no plan step is active.
-        """
-        if not isinstance(envelope, dict):
-            return False
-        fields = self._route_focus_fields(board)
-        active_kind = str(fields.get("focus_kind", "") or "")
-        active_focus = str(fields.get("focus_id", "") or "")
-        active_step = str(fields.get("plan_step_id", "") or active_focus)
-        env_focus = str(envelope.get("focus_id", "") or "")
-        env_step = str(envelope.get("plan_step_id", "") or "")
-        if active_kind == "plan_step":
-            if not env_focus and not env_step:
-                return False
-            if env_step and env_step != active_step:
-                return False
-            if env_focus and env_focus != active_focus:
-                return False
-            try:
-                env_epoch = float(envelope.get("focus_epoch", 0.0) or envelope.get("plan_step_epoch", 0.0) or 0.0)
-                active_epoch = float(fields.get("focus_epoch", 0.0) or fields.get("plan_step_epoch", 0.0) or 0.0)
-            except Exception:
-                env_epoch = 0.0
-                active_epoch = 0.0
-            if env_epoch and active_epoch and abs(env_epoch - active_epoch) > 0.001:
-                return False
-            return True
-        if env_focus and active_focus and env_focus != active_focus:
-            return False
-        return True
-
     def _normalize_failure_ledger(self, raw: dict) -> dict:
         fl: dict = {
             "attempted_fixes": [],
@@ -37770,7 +36962,6 @@ body{padding:18px}
         if not isinstance(fl, dict):
             return
         fixes = fl.get("attempted_fixes", [])
-        focus = self._blackboard_focus_identity(bb)
         fixes.append({
             "file": trim(str(file or ""), 260),
             "error": trim(str(error or ""), 400),
@@ -37779,9 +36970,6 @@ body{padding:18px}
             "actor": trim(str(actor or ""), 40),
             "round": int(getattr(self, "agent_round_index", 0) or 0),
             "ts": float(now_ts()),
-            "focus_id": str(focus.get("id", "") or ""),
-            "focus_kind": str(focus.get("kind", "") or ""),
-            "plan_step_id": str(focus.get("id", "") or "") if str(focus.get("kind", "") or "") == "plan_step" else "",
         })
         fl["attempted_fixes"] = fixes[-FAILURE_LEDGER_MAX_FIXES:]
         bb["failure_ledger"] = fl
@@ -37794,12 +36982,8 @@ body{padding:18px}
         if not isinstance(fl, dict):
             return
         fixes = fl.get("attempted_fixes", [])
-        focus = self._blackboard_focus_identity(bb)
-        current_step_id = str(focus.get("id", "") or "") if str(focus.get("kind", "") or "") == "plan_step" else ""
         for fx in reversed(fixes):
             if not isinstance(fx, dict):
-                continue
-            if current_step_id and str(fx.get("plan_step_id", "") or "") != current_step_id:
                 continue
             fx_file = str(fx.get("file", "") or "")
             if fx_file and (fx_file.endswith(file) or file.endswith(fx_file)):
@@ -37817,14 +37001,8 @@ body{padding:18px}
         if not isinstance(fl, dict):
             return
         fixes = fl.get("attempted_fixes", [])
-        focus = self._blackboard_focus_identity(bb)
-        current_step_id = str(focus.get("id", "") or "") if str(focus.get("kind", "") or "") == "plan_step" else ""
         for fx in fixes:
-            if not isinstance(fx, dict):
-                continue
-            if current_step_id and str(fx.get("plan_step_id", "") or "") != current_step_id:
-                continue
-            if fx.get("result") == "applied":
+            if isinstance(fx, dict) and fx.get("result") == "applied":
                 fx["result"] = f"verified({category})"
         fl["attempted_fixes"] = fixes
         bb["failure_ledger"] = fl
@@ -37837,14 +37015,8 @@ body{padding:18px}
         if not isinstance(fl, dict):
             return
         fixes = fl.get("attempted_fixes", [])
-        focus = self._blackboard_focus_identity(bb)
-        current_step_id = str(focus.get("id", "") or "") if str(focus.get("kind", "") or "") == "plan_step" else ""
         for fx in fixes:
-            if not isinstance(fx, dict):
-                continue
-            if current_step_id and str(fx.get("plan_step_id", "") or "") != current_step_id:
-                continue
-            if fx.get("result") == "applied":
+            if isinstance(fx, dict) and fx.get("result") == "applied":
                 fx["result"] = f"failed({category}): {trim(error_msg, 120)}"
         fl["attempted_fixes"] = fixes
         bb["failure_ledger"] = fl
@@ -37921,7 +37093,7 @@ body{padding:18px}
         errors = fl.get("errors", [])
         focus = self._blackboard_focus_identity(bb)
         now_tick = float(now_ts())
-        fp = hashlib.sha1(safe_utf8_bytes(str(category or "") + str(file or "") + str(error_msg or ""))).hexdigest()[:12]
+        fp = hashlib.sha1((str(category or "") + str(file or "") + str(error_msg or "")).encode("utf-8")).hexdigest()[:12]
         for entry in errors:
             if entry.get("fingerprint") == fp:
                 entry["count"] = int(entry.get("count", 1) or 1) + 1
@@ -38018,8 +37190,8 @@ body{padding:18px}
                 self._ledger_update_fix_attempt_status(edit_path, "applied")
             return
 
-        # For shell results, classify the command and update the shared error ledger.
-        if name not in {"bash", "worktree_run"} or not isinstance(args, dict):
+        # For bash results, classify the command and update the shared error ledger.
+        if name != "bash" or not isinstance(args, dict):
             return
         cmd_str = str(args.get("command", "") or "").lower()
         category = self._detect_error_category(cmd_str)
@@ -38087,11 +37259,6 @@ body{padding:18px}
                         cnt = int(e.get("count", 1) or 1)
                         lines.append(f"  [{f}] {trim(msg, 200)} (seen {cnt}x)")
             fixes = fl.get("attempted_fixes", [])
-            if current_step_id:
-                fixes = [
-                    fx for fx in fixes
-                    if isinstance(fx, dict) and str(fx.get("plan_step_id", "") or "") == current_step_id
-                ]
             if fixes:
                 lines.append("PREVIOUSLY ATTEMPTED FIXES (all failed):")
                 for fx in fixes[-3:]:
@@ -38155,7 +37322,7 @@ body{padding:18px}
             return
         delegations = fl.get("repeated_delegations", [])
         progress_fp = self._watchdog_state_fingerprint(bb)
-        fp = hashlib.sha1(safe_utf8_bytes(str(instruction or "") + "|" + progress_fp)).hexdigest()[:12]
+        fp = hashlib.sha1((str(instruction or "") + "|" + progress_fp).encode("utf-8")).hexdigest()[:12]
         for entry in delegations:
             if entry.get("instruction_hash") == fp and entry.get("target") == target:
                 entry["count"] = int(entry.get("count", 1) or 1) + 1
@@ -38203,7 +37370,7 @@ body{padding:18px}
             args_str = json_dumps(args) if isinstance(args, dict) else str(args or "")
         except Exception:
             args_str = str(args or "")
-        fp = hashlib.sha1(safe_utf8_bytes(str(tool_name or "") + args_str)).hexdigest()[:16]
+        fp = hashlib.sha1((str(tool_name or "") + args_str).encode("utf-8")).hexdigest()[:16]
         for entry in fps:
             if entry.get("fingerprint") == fp:
                 entry["count"] = int(entry.get("count", 1) or 1) + 1
@@ -39063,9 +38230,6 @@ body{padding:18px}
                 txt_low = txt.lower()
                 if PLAN_FILE_RELATIVE_PATH in txt_low or ".clouds_coder\\plan.md" in txt_low:
                     continue
-                row_step = str(row.get("plan_step_id", "") or "").strip()
-                if step_id and row_step and row_step != step_id:
-                    continue
                 try:
                     ts = float(row.get("ts", 0.0) or 0.0)
                 except Exception:
@@ -39108,9 +38272,6 @@ body{padding:18px}
                 continue
             if self._is_plan_infrastructure_path(path):
                 continue
-            meta_step = str(meta.get("plan_step_id", "") or "").strip()
-            if step_id and meta_step and meta_step != step_id:
-                continue
             try:
                 ts = float(meta.get("updated_at", 0.0) or 0.0)
             except Exception:
@@ -39149,8 +38310,6 @@ body{padding:18px}
                 low = str(row.get("content", "") or "").lower()
                 if not low or any(neg in low for neg in negative_hints):
                     continue
-                if self._execution_log_count_search_zero_ok(row):
-                    return True
                 if (
                     self._command_looks_like_validation(low)
                     or any(tok in low for tok in compile_hints)
@@ -39214,904 +38373,6 @@ body{padding:18px}
             return sig["has_exec"] or sig["has_read"] or sig["has_review"]
         return sig["has_write"] or sig["has_read"] or sig["has_research"] or sig["has_exec"] or sig["has_review"]
 
-    # Metric families whose numeric threshold is a genuine QUALITY bar (not an
-    # index/version/count). Used by _extract_acceptance_target.
-    _ACCEPTANCE_METRIC_TERMS = (
-        "误差", "相对误差", "绝对误差", "偏差", "error", "rel_err", "relative error",
-        "abs error", "absolute error", "deviation", "residual", "残差",
-        "coverage", "覆盖率", "覆盖", "accuracy", "准确率", "準確率", "精度", "精确度",
-        "precision", "recall", "f1", "tolerance", "容差", "误差率", "错误率", "loss",
-        "rmse", "mae", "mse", "perplexity", "困惑度",
-    )
-
-    def _acceptance_target_source_text(self, plan_step: dict, acceptance_row: dict | None = None) -> str:
-        parts = [
-            str((plan_step or {}).get("full_content", "") or (plan_step or {}).get("content", "") or ""),
-        ]
-        if isinstance(acceptance_row, dict):
-            parts.append(str(acceptance_row.get("content", "") or ""))
-        return "\n".join(p for p in parts if p)
-
-    @staticmethod
-    def _numeric_equivalent(raw: str, target: float) -> bool:
-        try:
-            value = float(str(raw or "").strip())
-        except Exception:
-            return False
-        scale = max(1.0, abs(float(target)))
-        return abs(value - float(target)) <= max(1e-9, scale * 1e-9)
-
-    def _acceptance_text_has_explicit_target(self, target: dict, text: str) -> bool:
-        if not isinstance(target, dict) or not str(text or "").strip():
-            return False
-        try:
-            value = float(target.get("value"))
-        except Exception:
-            return False
-        metric = str(target.get("metric", "") or "").strip().lower()
-        metric_terms = [metric] if metric else []
-        metric_terms.extend(str(term).lower() for term in self._ACCEPTANCE_METRIC_TERMS)
-        metric_terms = [term for term in dict.fromkeys(metric_terms) if term]
-        comparison_terms = (
-            "<=", ">=", "<", ">", "≤", "≥", "below", "under", "less than", "at most",
-            "no more than", "above", "greater than", "at least", "不超过", "不高于",
-            "至多", "至少", "不低于", "大于", "小于", "超过", "高于", "低于",
-            "以内", "以下", "以上", "阈值", "门限", "质量线", "tolerance", "threshold",
-        )
-        ordinal_terms = (
-            "step", "subtask", "task", "todo", "chapter", "section", "item",
-            "步骤", "子任务", "任务", "编号", "第", "章", "节", "小节",
-        )
-        src = str(text or "")
-        for match in re.finditer(r"(?<![\d.])(\d+(?:\.\d+)?)(?![\d.])", src):
-            if not self._numeric_equivalent(match.group(1), value):
-                continue
-            line_start = src.rfind("\n", 0, match.start()) + 1
-            line_end = src.find("\n", match.end())
-            if line_end < 0:
-                line_end = len(src)
-            line = src[line_start:line_end]
-            line_low = line.lower()
-            prefix = src[line_start:match.start()]
-            # List labels such as "9.2 xxx", "9.2) xxx", or "Step 9.2" are
-            # ordinals, not thresholds. They must not become quality bars.
-            if re.match(r"^\s*(?:[-*•]\s*)?\d+(?:\.\d+)+[.)、:\s-]*", line):
-                if not any(term in line_low for term in comparison_terms):
-                    continue
-            if any(term in prefix.lower()[-24:] for term in ordinal_terms):
-                if not any(term in line_low for term in comparison_terms):
-                    continue
-            context = src[max(0, match.start() - 80): min(len(src), match.end() + 80)].lower()
-            if not any(term in context for term in metric_terms):
-                continue
-            if not any(term in context for term in comparison_terms):
-                continue
-            return True
-        return False
-
-    def _acceptance_target_candidate_valid(
-        self,
-        target: dict,
-        plan_step: dict,
-        acceptance_row: dict | None = None,
-    ) -> bool:
-        if not isinstance(target, dict) or target.get("kind") != "numeric":
-            return False
-        op = str(target.get("op", "") or "").strip()
-        if op not in ("<", "<=", ">", ">=", "=="):
-            return False
-        metric = str(target.get("metric", "") or "").strip().lower()
-        if not metric or metric == "target":
-            return False
-        try:
-            float(target.get("value"))
-        except Exception:
-            return False
-        text = self._acceptance_target_source_text(plan_step, acceptance_row)
-        return self._acceptance_text_has_explicit_target(target, text)
-
-    def _resolve_acceptance_target(self, plan_step: dict, acceptance_row: dict | None = None) -> dict:
-        """Resolve the step's measurable QUALITY bar, LLM-primary with a regex
-        fallback (Fix 5). Cached per step id — the bar is a property of the step
-        and does not change round to round, so this costs at most one LLM call
-        per step, off the hot path.
-
-        Returns {kind:"numeric", metric, op, value, unit, desc, source} or {}.
-        The model PERCEIVES whether the step has a measurable bar (self-awareness)
-        rather than relying only on hardcoded metric keywords; regex is the
-        deterministic safety net when the LLM is unavailable or unsure."""
-        step_id = str((plan_step or {}).get("id", "") or "")
-        cache = getattr(self, "_acceptance_target_cache", None)
-        if cache is None:
-            cache = {}
-            self._acceptance_target_cache = cache
-        if step_id and step_id in cache:
-            cached = dict(cache[step_id])
-            if cached and not self._acceptance_target_candidate_valid(cached, plan_step, acceptance_row):
-                cache.pop(step_id, None)
-                return {}
-            return cached
-        llm = self._llm_acceptance_target(plan_step, acceptance_row)
-        resolved = llm if llm else self._extract_acceptance_target(plan_step, acceptance_row)
-        if resolved and not self._acceptance_target_candidate_valid(resolved, plan_step, acceptance_row):
-            resolved = {}
-        if resolved and not resolved.get("source"):
-            resolved["source"] = "llm" if llm else "regex"
-        if step_id:
-            cache[step_id] = dict(resolved)
-        return dict(resolved)
-
-    def _llm_acceptance_target(self, plan_step: dict, acceptance_row: dict | None = None) -> dict:
-        """LLM-primary perception of a measurable quality bar in the step text.
-        Returns a numeric-target dict or {} (no bar / unavailable / low
-        confidence → caller falls back to regex then category-only)."""
-        text = trim(self._acceptance_target_source_text(plan_step, acceptance_row), 900)
-        if not text.strip():
-            return {}
-        try:
-            prompt = (
-                "/no_think\n"
-                "Read this plan step + its acceptance check. Does it state a MEASURABLE numeric quality bar "
-                "that a result must satisfy (e.g. error < 2%, coverage >= 90%, accuracy >= 0.95, latency < 100ms, "
-                "exit code 0)? A plain count/index/version/list label/subtask number (like 'chapter 20', "
-                "'write 5 files', 'python 3.11', 'Step 9.2', '子任务 9.2') is NOT a quality bar. "
-                "Only return has_bar=true when the text explicitly contains the metric, comparison, and value.\n\n"
-                f"STEP:\n{text}\n\n"
-                "Reply ONLY JSON. If there IS a measurable numeric bar:\n"
-                '{\"has_bar\": true, \"metric\": \"<what is measured, e.g. relative error>\", '
-                '\"op\": \"<|<=|>|>=|==\", \"value\": <number>, \"unit\": \"<% or empty>\", '
-                '\"quote\": \"<the exact source phrase containing metric+comparison+value>\"}\n'
-                "If there is NO measurable numeric bar: {\"has_bar\": false}"
-            )
-            resp = self.ollama.chat(
-                [{"role": "user", "content": prompt}],
-                system="/no_think\nDetect a measurable numeric quality bar in a task step. Reply ONLY valid JSON.",
-                max_tokens=120,
-                think=False,
-            )
-            import json
-            raw = str(resp.get("content", "") or resp.get("text", "") or "").strip()
-            if "{" not in raw or "}" not in raw:
-                return {}
-            data = json.loads(raw[raw.index("{"):raw.rindex("}") + 1])
-            if not isinstance(data, dict) or not bool(data.get("has_bar", False)):
-                return {}
-            op = str(data.get("op", "") or "").strip()
-            if op not in ("<", "<=", ">", ">=", "=="):
-                return {}
-            try:
-                value = float(data.get("value"))
-            except Exception:
-                return {}
-            unit = str(data.get("unit", "") or "").strip()
-            return {
-                "kind": "numeric",
-                "metric": trim(str(data.get("metric", "") or "").strip().lower(), 60) or "target",
-                "op": op,
-                "value": value,
-                "unit": "%" if "%" in unit or "percent" in unit.lower() else "",
-                "desc": trim(text, 120),
-                "raw": trim(str(data.get("quote", "") or "").strip(), 120),
-                "source": "llm",
-            }
-        except Exception:
-            return {}
-
-    def _extract_acceptance_target(self, plan_step: dict, acceptance_row: dict | None = None) -> dict:
-        """Regex FALLBACK for _resolve_acceptance_target (Fix 5). Extracts an
-        explicit numeric QUALITY target from the step + acceptance text when the
-        LLM layer is unavailable. Returns {kind:"numeric", metric, op, value,
-        unit, raw} or {}.
-
-        Only matches a comparison operator adjacent to a known quality-metric
-        term (误差/error/coverage/accuracy/tolerance/…) so plain counts, indices,
-        and version numbers are NOT mistaken for a quality bar."""
-        parts = [
-            str((plan_step or {}).get("full_content", "") or (plan_step or {}).get("content", "") or ""),
-        ]
-        if isinstance(acceptance_row, dict):
-            parts.append(str(acceptance_row.get("content", "") or ""))
-        text = "\n".join(p for p in parts if p)
-        if not text.strip():
-            return {}
-        low = text.lower()
-        metric_alt = "|".join(re.escape(t) for t in self._ACCEPTANCE_METRIC_TERMS)
-        best: dict = {}
-        # metric ... op value   (e.g. "误差 < 2%", "error below 1%", "coverage > 90%")
-        pat_fwd = re.compile(
-            r"(" + metric_alt + r")\s*(?:[:：=]?\s*)?(<=|>=|<|>|≤|≥|below|under|less than|at most|no more than|不超过|不高于|至多|至少|不低于|大于|小于|超过|高于|低于)?\s*(\d+(?:\.\d+)?)\s*(%|percent|个百分点)?",
-            re.IGNORECASE,
-        )
-        # op value ... metric   (e.g. "< 2% 误差", "below 1% error")
-        pat_bwd = re.compile(
-            r"(<=|>=|<|>|≤|≥|below|under|less than|at most|no more than|至多|不超过)\s*(\d+(?:\.\d+)?)\s*(%|percent)?\s*(?:的\s*)?(" + metric_alt + r")",
-            re.IGNORECASE,
-        )
-        word_op = {
-            "不超过": "<=", "不高于": "<=", "至多": "<=", "no more than": "<=", "at most": "<=",
-            "below": "<", "under": "<", "less than": "<", "小于": "<", "低于": "<",
-            "大于": ">", "超过": ">", "高于": ">", "至少": ">=", "不低于": ">=",
-        }
-        def _norm_op(raw_op: str, metric: str) -> str:
-            o = (raw_op or "").strip().lower()
-            o = word_op.get(o, o)
-            o = {"≤": "<=", "≥": ">="}.get(o, o)
-            if o in ("<", ">", "<=", ">="):
-                return o
-            # No explicit operator: infer from metric semantics.
-            m = metric.lower()
-            if any(k in m for k in ("coverage", "覆盖", "accuracy", "准确", "準確", "精度", "精确", "precision", "recall", "f1")):
-                return ">="  # higher is better
-            return "<="  # error/deviation/loss/tolerance: lower is better
-        for m in pat_fwd.finditer(low):
-            metric, raw_op, val, unit = m.group(1), m.group(2), m.group(3), m.group(4)
-            if not raw_op:
-                continue
-            try:
-                value = float(val)
-            except Exception:
-                continue
-            best = {
-                "kind": "numeric",
-                "metric": metric,
-                "op": _norm_op(raw_op, metric),
-                "value": value,
-                "unit": "%" if unit and ("%" in unit or "percent" in unit or "百分点" in unit) else "",
-                "raw": trim(m.group(0), 80),
-            }
-            break
-        if not best:
-            for m in pat_bwd.finditer(low):
-                raw_op, val, unit, metric = m.group(1), m.group(2), m.group(3), m.group(4)
-                try:
-                    value = float(val)
-                except Exception:
-                    continue
-                best = {
-                    "kind": "numeric",
-                    "metric": metric,
-                    "op": _norm_op(raw_op, metric),
-                    "value": value,
-                    "unit": "%" if unit and ("%" in unit or "percent" in unit) else "",
-                    "raw": trim(m.group(0), 80),
-                }
-                break
-        return best
-
-    def _acceptance_metric_terms_for_target(self, target: dict) -> list[str]:
-        metric = str((target or {}).get("metric", "") or "").strip().lower()
-        terms = [metric] if metric else []
-        if any(term in metric for term in ("误差", "error", "err", "deviation", "residual", "rmse", "mae", "mse")):
-            terms.extend(
-                [
-                    "误差",
-                    "相对误差",
-                    "绝对误差",
-                    "error",
-                    "err",
-                    "relative error",
-                    "absolute error",
-                    "density_l2_error",
-                    "density l2 error",
-                    "l2 error",
-                    "peak error",
-                    "rmse",
-                    "mae",
-                    "residual",
-                ]
-            )
-        if any(term in metric for term in ("coverage", "覆盖")):
-            terms.extend(["coverage", "覆盖率", "覆盖"])
-        if any(term in metric for term in ("accuracy", "准确", "精度", "precision", "recall", "f1")):
-            terms.extend(["accuracy", "准确率", "精度", "precision", "recall", "f1"])
-        if any(term in metric for term in ("loss", "损失")):
-            terms.extend(["loss", "损失"])
-        return [term for term in dict.fromkeys(terms) if term]
-
-    @staticmethod
-    def _target_metric_is_file_size(target: dict) -> bool:
-        metric = str((target or {}).get("metric", "") or "").strip().lower()
-        return any(term in metric for term in ("size", "bytes", "byte", "文件大小", "字节"))
-
-    def _command_is_file_listing_for_acceptance(self, command: str) -> bool:
-        low = str(command or "").strip().lower()
-        if not low:
-            return False
-        try:
-            tokens = shlex.split(low)
-        except Exception:
-            tokens = low.split()
-        if not tokens:
-            return False
-        while tokens and re.match(r"^[a-z_][a-z0-9_]*=", tokens[0]):
-            tokens = tokens[1:]
-        if not tokens:
-            return False
-        cmd = Path(tokens[0]).name.lower()
-        if cmd in {"bash", "sh", "zsh", "cmd", "powershell", "pwsh"} and any(tok in {"-c", "/c"} for tok in tokens[1:]):
-            for idx, tok in enumerate(tokens[1:], start=1):
-                if tok in {"-c", "/c"} and idx + 1 < len(tokens):
-                    return self._command_is_file_listing_for_acceptance(tokens[idx + 1])
-        return cmd in {"ls", "dir", "find", "stat", "du"} or (
-            cmd == "wc" and any(tok in {"-c", "--bytes"} for tok in tokens[1:])
-        )
-
-    def _target_evidence_text_relevant(self, target: dict, command: str, text: str) -> bool:
-        raw = str(text or "")
-        if not raw.strip():
-            return False
-        low = raw.lower()
-        metric_terms = self._acceptance_metric_terms_for_target(target)
-        has_metric = any(term in low for term in metric_terms)
-        validation_markers = (
-            "acceptance_check",
-            "all_pass",
-            "pass_",
-            "checks passed",
-            "tests passed",
-            "验证通过",
-            "quality",
-            "metric",
-            "measurement",
-        )
-        command_low = str(command or "").lower()
-        is_listing = self._command_is_file_listing_for_acceptance(command_low)
-        if is_listing and not self._target_metric_is_file_size(target) and not has_metric:
-            return False
-        if has_metric:
-            return True
-        if any(marker in low for marker in validation_markers):
-            return True
-        if "python" in command_low and (
-            "acceptance" in command_low
-            or "verify" in command_low
-            or "validation" in command_low
-            or "check" in command_low
-        ):
-            return True
-        return False
-
-    def _acceptance_target_evidence_rows(self, target: dict, bb: dict, results: list[dict]) -> list[dict]:
-        rows: list[dict] = []
-
-        def _add(source: str, command: str, text: str):
-            clean, _ = filter_runtime_noise_lines(str(text or ""))
-            clean = trim(clean.replace("\r\n", "\n"), 2400)
-            if not clean:
-                return
-            if not self._target_evidence_text_relevant(target, command, clean):
-                return
-            rows.append(
-                {
-                    "source": source,
-                    "command": trim(str(command or ""), 500),
-                    "text": clean,
-                }
-            )
-
-        for row in (results or []):
-            if not isinstance(row, dict):
-                continue
-            name = str(row.get("name", "") or "")
-            if name not in {"bash", "worktree_run", "background_run"}:
-                continue
-            args = row.get("args", {}) if isinstance(row.get("args"), dict) else {}
-            command = str(row.get("command", "") or args.get("command", "") or "")
-            _add("current_tool", command, str(row.get("output", "") or ""))
-
-        logs = bb.get("execution_logs", []) if isinstance(bb.get("execution_logs"), list) else []
-        for row in logs[-10:]:
-            if not isinstance(row, dict):
-                continue
-            content = str(row.get("content", "") or "")
-            first = content.replace("\r\n", "\n").split("\n", 1)[0].strip()
-            command = first.split(" ", 1)[1] if first.startswith(("bash ", "worktree_run ", "background_run ")) and " " in first else first
-            _add("execution_log", command, content)
-
-        deduped: list[dict] = []
-        seen: set[str] = set()
-        for row in rows:
-            key = hashlib.sha1(safe_utf8_bytes(str(row.get("command", "")) + "\n" + str(row.get("text", "")))).hexdigest()[:16]
-            if key in seen:
-                continue
-            seen.add(key)
-            deduped.append(row)
-        return deduped[-8:]
-
-    def _llm_acceptance_quote_supported(
-        self,
-        target: dict,
-        evidence_rows: list[dict],
-        quote: str,
-        measured: float,
-    ) -> bool:
-        quote = trim(str(quote or ""), 300)
-        if quote and self._target_evidence_text_relevant(target, "", quote):
-            return True
-        metric_terms = self._acceptance_metric_terms_for_target(target)
-        metric_terms = [str(term).lower() for term in metric_terms if str(term or "").strip()]
-        number_token = re.compile(
-            r"(?<![A-Za-z0-9_.])(-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)(?![A-Za-z0-9_.])"
-        )
-        try:
-            quote_number = float(quote.rstrip("%")) if quote else None
-        except Exception:
-            quote_number = None
-        for row in evidence_rows:
-            text = str(row.get("text", "") or "")
-            for line in text.replace("\r\n", "\n").split("\n"):
-                line_low = line.lower()
-                if not any(term in line_low for term in metric_terms):
-                    continue
-                numeric_matches = [match.group(1) for match in number_token.finditer(line)]
-                if quote and quote in line and (
-                    quote_number is None
-                    or any(self._numeric_equivalent(raw, quote_number) for raw in numeric_matches)
-                ):
-                    return True
-                if any(self._numeric_equivalent(raw, measured) for raw in numeric_matches):
-                    return True
-        return False
-
-    def _llm_acceptance_target_verdict(self, target: dict, evidence_rows: list[dict]) -> dict:
-        if not evidence_rows:
-            return {"met": None, "measured": None, "source": "none", "evidence": ""}
-        try:
-            target_payload = {
-                "metric": str(target.get("metric", "") or ""),
-                "op": str(target.get("op", "") or ""),
-                "value": target.get("value"),
-                "unit": str(target.get("unit", "") or ""),
-                "raw": str(target.get("raw", "") or ""),
-            }
-            evidence_payload = [
-                {
-                    "source": str(row.get("source", "") or ""),
-                    "command": trim(str(row.get("command", "") or ""), 260),
-                    "text": trim(str(row.get("text", "") or ""), 1200),
-                }
-                for row in evidence_rows[-6:]
-                if isinstance(row, dict)
-            ]
-            prompt = (
-                "/no_think\n"
-                "You are validating a numeric acceptance target from concrete tool evidence. "
-                "Actively find the measured value for the requested metric, then compare it to the target.\n\n"
-                "Rules:\n"
-                "- Use ONLY values that are explicitly tied to the requested metric in the evidence.\n"
-                "- Ignore file sizes, byte counts, line numbers, timestamps, iteration counts, list indices, subtask numbers, and version numbers unless the metric itself is file size.\n"
-                "- If the evidence only proves a non-numeric condition (for example files exist) but has no measured value for this metric, return measurable=false.\n"
-                "- If a validator says all_pass=true and also reports the metric value, use that metric value.\n\n"
-                f"TARGET:\n{json_dumps(target_payload, ensure_ascii=False)}\n\n"
-                f"EVIDENCE:\n{json_dumps(evidence_payload, ensure_ascii=False, indent=2)}\n\n"
-                "Reply ONLY JSON: "
-                "{\"measurable\": true/false, \"measured\": <number|null>, \"met\": true/false|null, "
-                "\"quote\": \"<exact evidence phrase used>\", \"reason\": \"<short>\"}"
-            )
-            resp = self.ollama.chat(
-                [{"role": "user", "content": prompt}],
-                system="/no_think\nVerify numeric acceptance targets from evidence. Reply ONLY valid JSON.",
-                max_tokens=180,
-                think=False,
-            )
-            import json
-            raw = str(resp.get("content", "") or resp.get("text", "") or "").strip()
-            if "{" not in raw or "}" not in raw:
-                return {"met": None, "measured": None, "source": "llm-unparseable", "evidence": ""}
-            data = json.loads(raw[raw.index("{"):raw.rindex("}") + 1])
-            if not isinstance(data, dict) or not bool(data.get("measurable", False)):
-                return {"met": None, "measured": None, "source": "llm", "evidence": trim(str(data.get("reason", "") if isinstance(data, dict) else ""), 240)}
-            measured = data.get("measured")
-            try:
-                measured_float = float(measured)
-            except Exception:
-                return {"met": None, "measured": None, "source": "llm", "evidence": trim(str(data.get("reason", "") or ""), 240)}
-            quote = trim(str(data.get("quote", "") or ""), 300)
-            if not self._llm_acceptance_quote_supported(target, evidence_rows, quote, measured_float):
-                return {"met": None, "measured": None, "source": "llm-rejected", "evidence": quote}
-            met = data.get("met", None)
-            if met is not None:
-                met = bool(met)
-            return {
-                "met": met,
-                "measured": measured_float,
-                "source": "llm",
-                "evidence": quote or trim(str(data.get("reason", "") or ""), 240),
-            }
-        except Exception:
-            return {"met": None, "measured": None, "source": "llm-error", "evidence": ""}
-
-    def _deterministic_acceptance_target_met(self, target: dict, evidence_rows: list[dict]) -> dict:
-        if not evidence_rows:
-            return {"met": None, "measured": None, "source": "deterministic", "evidence": ""}
-        op = str(target.get("op", "<=") or "<=")
-        value = float(target.get("value", 0.0) or 0.0)
-        metric_terms = self._acceptance_metric_terms_for_target(target)
-        metric_terms = sorted((t for t in dict.fromkeys(metric_terms) if t), key=len, reverse=True)
-        metric_alt = "|".join(re.escape(t) for t in metric_terms)
-        if not metric_alt:
-            return {"met": None, "measured": None, "source": "deterministic", "evidence": ""}
-        number_pat = r"(-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)\s*(%|percent|pct|个百分点)?"
-        metric_suffix_pat = r"(?:\s*\((?:%|percent|pct)\)|[_\-\s]*(?:pct|percent|percentage|百分比))?"
-        separator_pat = r"\s*(?::|：|=|≈|~|->|=>|\bis\b|\bwas\b|为|是|约为|约)\s*"
-        metric_value = re.compile(
-            r"(?<![A-Za-z0-9])(?:"
-            + metric_alt
-            + r")"
-            + metric_suffix_pat
-            + separator_pat
-            + number_pat,
-            re.IGNORECASE,
-        )
-        value_metric = re.compile(
-            r"(?<![A-Za-z0-9])"
-            + number_pat
-            + r"\s*(?:for|as|of|on|的)?\s*(?:"
-            + metric_alt
-            + r")"
-            + metric_suffix_pat
-            + r"(?![A-Za-z0-9])",
-            re.IGNORECASE,
-        )
-        measured_rows: list[tuple[float, str]] = []
-        for row in evidence_rows:
-            text = str(row.get("text", "") or "")
-            for line in text.replace("\r\n", "\n").split("\n"):
-                line = line.strip()
-                if not line:
-                    continue
-                for pattern in (metric_value, value_metric):
-                    for match in pattern.finditer(line):
-                        try:
-                            measured_rows.append((float(match.group(1)), trim(match.group(0), 180)))
-                        except Exception:
-                            pass
-        if not measured_rows:
-            return {"met": None, "measured": None, "source": "deterministic", "evidence": ""}
-        higher_better = op in (">", ">=")
-        measured, quote = (min(measured_rows, key=lambda row: row[0]) if higher_better else max(measured_rows, key=lambda row: row[0]))
-        if op == "<":
-            met = measured < value
-        elif op == "<=":
-            met = measured <= value
-        elif op == ">":
-            met = measured > value
-        elif op == ">=":
-            met = measured >= value
-        elif op == "==":
-            met = abs(measured - value) <= max(1e-9, abs(value) * 1e-9)
-        else:
-            met = None
-        return {"met": met, "measured": measured, "source": "deterministic", "evidence": quote}
-
-    def _acceptance_target_met(self, target: dict, bb: dict, results: list[dict]) -> dict:
-        """Measure whether an extracted numeric quality target is actually met,
-        from metric-specific evidence. LLM actively identifies the measured value
-        first; deterministic regex is only a fallback over pre-filtered validator
-        output. Returns {met: True|False|None, measured}. None = not measurable
-        → caller falls back to category-only behavior (never a false block)."""
-        if not isinstance(target, dict) or target.get("kind") != "numeric":
-            return {"met": None, "measured": None}
-        try:
-            evidence_rows = self._acceptance_target_evidence_rows(target, bb, results)
-        except Exception:
-            evidence_rows = []
-        llm_verdict = self._llm_acceptance_target_verdict(target, evidence_rows)
-        if llm_verdict.get("met") is not None:
-            return llm_verdict
-        fallback = self._deterministic_acceptance_target_met(target, evidence_rows)
-        if fallback.get("met") is not None:
-            return fallback
-        return {
-            "met": None,
-            "measured": None,
-            "source": llm_verdict.get("source", "none") or fallback.get("source", "none"),
-            "evidence": llm_verdict.get("evidence", "") or fallback.get("evidence", ""),
-        }
-
-    def _track_step_outcome_progress(self, plan_step: dict, bb: dict, gate: dict | None = None) -> dict:
-        """Track OUTCOME progress for an in_progress step that did NOT advance
-        this round, and escalate on a real deadlock (Fix 6).
-
-        The existing repair-signature guard (`_repair_progress_signature`) only
-        runs inside `_acceptance_gate_handle_failure`, which itself only fires
-        when `subtasks_done and not gate_ok`. A single-agent worker that never
-        marks its acceptance subtask done (because it honestly knows the result
-        misses the bar) therefore has NO stall counter at all, and loops forever
-        while changing its approach each round. This tracker runs EVERY
-        non-advancing round the step is in_progress and measures OUTCOME, not
-        approach: more completed subtasks, or a measured value that moved toward
-        the quality bar. Approach churn alone is NOT progress.
-
-        Returns {stuck_n, escalated}."""
-        step_id = str((plan_step or {}).get("id", "") or "")
-        if not step_id:
-            return {"stuck_n": 0, "escalated": False}
-        completed = 0
-        try:
-            rows = self._active_plan_worker_todo_rows(step_id, role="")
-            completed = sum(
-                1 for r in rows if str(r.get("status", "") or "").strip().lower() == "completed"
-            )
-        except Exception:
-            completed = 0
-        # Measured value toward the quality bar (if any).
-        measured = None
-        op = ""
-        try:
-            target = self._resolve_acceptance_target(plan_step, (gate or {}).get("acceptance", {}) if isinstance(gate, dict) else {})
-            if target:
-                op = str(target.get("op", "") or "")
-                verdict = self._acceptance_target_met(target, bb, [])
-                measured = verdict.get("measured")
-        except Exception:
-            measured = None
-        best_done_attr = f"_step_best_done_{step_id}"
-        best_meas_attr = f"_step_best_meas_{step_id}"
-        stuck_attr = f"_step_stuck_n_{step_id}"
-        prev_best_done = int(getattr(self, best_done_attr, -1))
-        prev_best_meas = getattr(self, best_meas_attr, None)
-        improved = False
-        if completed > prev_best_done:
-            improved = True
-        elif measured is not None:
-            if prev_best_meas is None:
-                improved = True
-            elif op in (">", ">="):
-                improved = measured > float(prev_best_meas)
-            else:  # lower is better (error/deviation/loss/tolerance) or unknown
-                improved = measured < float(prev_best_meas)
-        if improved:
-            setattr(self, best_done_attr, max(prev_best_done, completed))
-            if measured is not None:
-                if prev_best_meas is None:
-                    setattr(self, best_meas_attr, measured)
-                elif op in (">", ">="):
-                    setattr(self, best_meas_attr, max(float(prev_best_meas), measured))
-                else:
-                    setattr(self, best_meas_attr, min(float(prev_best_meas), measured))
-            setattr(self, stuck_attr, 0)
-            return {"stuck_n": 0, "escalated": False}
-        stuck_n = int(getattr(self, stuck_attr, 0) or 0) + 1
-        setattr(self, stuck_attr, stuck_n)
-        escalated = False
-        if stuck_n >= STEP_ACTIVE_STALL_CEILING:
-            try:
-                self.stall_severity_sources.append(
-                    f"step-outcome-stall:{step_id}:{stuck_n}"
-                )
-            except Exception:
-                pass
-            escalated = bool(
-                self._escalate_stall_to_plan_mode(
-                    trigger_source=f"step-outcome-stall:{step_id}",
-                    last_fault_reason=str((gate or {}).get("reason", "") or "step outcome not improving"),
-                )
-            )
-            if escalated:
-                setattr(self, stuck_attr, 0)
-        return {"stuck_n": stuck_n, "escalated": escalated}
-
-    def _llm_acceptance_failure_verdict(self, exec_text: str) -> dict:
-        """LLM-primary perception (Fix 5 steer): does this acceptance-check output
-        report that the check FAILED? Semantic self-awareness is the right judge
-        here — a script's output can report failure in unbounded ways ("residual
-        exceeds tolerance", "did not converge", "3 of 12 assertions broke") that no
-        regex enumerates. Returns {failed: True/False/None, marker}. None = model
-        unavailable/uncertain → caller falls back to the lexical scan."""
-        text = trim(str(exec_text or "").strip(), 1400)
-        if not text:
-            return {"failed": None, "marker": ""}
-        try:
-            prompt = (
-                "/no_think\n"
-                "This is the OUTPUT of an acceptance/verification check that was just run for a task step. "
-                "Decide whether the output reports that the check FAILED (an assertion broke, a test failed, a "
-                "convergence/tolerance/quality target was NOT met, a non-zero failure count, an error/traceback "
-                "that means the check did not pass). A clean pass, a zero failure count, or output that merely "
-                "mentions the word 'error' while still passing is NOT a failure.\n\n"
-                f"OUTPUT:\n{text}\n\n"
-                "Reply ONLY JSON: {\"failed\": true/false, \"marker\": \"<short quote of the failure line, or empty>\"}"
-            )
-            resp = self.ollama.chat(
-                [{"role": "user", "content": prompt}],
-                system="/no_think\nJudge whether a check's output reports failure. Reply ONLY valid JSON.",
-                max_tokens=120,
-                think=False,
-            )
-            import json
-            raw = str(resp.get("content", "") or resp.get("text", "") or "").strip()
-            if "{" not in raw or "}" not in raw:
-                return {"failed": None, "marker": ""}
-            data = json.loads(raw[raw.index("{"):raw.rindex("}") + 1])
-            if not isinstance(data, dict) or "failed" not in data:
-                return {"failed": None, "marker": ""}
-            failed = bool(data.get("failed", False))
-            return {"failed": failed, "marker": trim(str(data.get("marker", "") or "").strip(), 60)}
-        except Exception:
-            return {"failed": None, "marker": ""}
-
-    def _acceptance_context_expects_zero_count(self, text: str) -> bool:
-        low = str(text or "").lower()
-        if not low.strip():
-            return False
-        zero_terms = (
-            "zero", "none", "no ", "without", "absence", "absent",
-            "无", "沒有", "没有", "不得", "不能", "未出现", "不应", "不應",
-        )
-        count_terms = ("count", "matches", "grep", "rg", "数量", "个数", "處數", "处数", "匹配", "残留")
-        has_zero = bool(re.search(r"(?<![\d.])0(?:\.0+)?(?![\d.])", low)) or any(term in low for term in zero_terms)
-        if any(term in low for term in count_terms) and has_zero:
-            return True
-        return has_zero
-
-    def _acceptance_results_structural_failure(self, rows: list[dict], acceptance_context: str = "") -> dict:
-        expects_zero_count = self._acceptance_context_expects_zero_count(acceptance_context)
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            name = str(row.get("name", "") or "")
-            if name not in {"bash", "worktree_run", "background_run"}:
-                continue
-            args = row.get("args", {}) if isinstance(row.get("args"), dict) else {}
-            command = str(row.get("command", "") or args.get("command", "") or "")
-            output = str(row.get("output", "") or "")
-            exit_code = self._coerce_exit_code(row.get("exit_code"))
-            positive_count = self._count_search_output_has_positive_count(command, output)
-            if positive_count is not None:
-                if positive_count == 0:
-                    continue
-                if expects_zero_count:
-                    return {
-                        "failed": True,
-                        "marker": f"count-search={positive_count}",
-                        "excerpt": trim(output, 120),
-                        "source": "structural",
-                        "command": trim(command, 500),
-                        "exit_code": exit_code,
-                    }
-            if exit_code is not None and exit_code != 0:
-                if self._count_search_output_is_zero(command, output):
-                    continue
-                excerpt = trim(output, 120) or f"exit={exit_code}"
-                return {
-                    "failed": True,
-                    "marker": f"exit={exit_code}",
-                    "excerpt": excerpt,
-                    "source": "structural",
-                    "command": trim(command, 500),
-                    "exit_code": exit_code,
-                }
-        return {"failed": False, "marker": "", "excerpt": "", "source": "structural"}
-
-    def _acceptance_results_lexical_failure(self, rows: list[dict]) -> dict:
-        """Lexical FALLBACK for _acceptance_results_show_failure. Scans exec output
-        for an explicit failure marker while excluding common false positives
-        ("0 checks failed", "failed=0"). Used only when LLM perception is
-        unavailable/uncertain."""
-        fail_pat = re.compile(
-            r"(?i)("
-            r"checks?\s+failed"
-            r"|\bassertion(?:error)?\s+fail"
-            r"|\bassertionerror\b"
-            r"|\bfailed\s*:\s*[1-9]"
-            r"|\b[1-9]\d*\s+(?:checks?|tests?|assertions?)\s+failed"
-            r"|\btest(?:s)?\s+failed"
-            r"|\b(?:验收|驗収|驗證|校验|校驗)?\s*(?:未通过|未通過|不通过|不通過|失败|失敗)"
-            r"|\bFAIL(?:ED)?\b(?!\s*=\s*0)(?!\s*:\s*0)"
-            r"|traceback \(most recent call last\)"
-            r"|\b(?:not|did\s+not)\s+converge(?:d)?\b"
-            r"|\bnot\s+converged\b"
-            r"|\b(?:does\s+not|did\s+not|failed\s+to)\s+meet\b"
-            r"|\bexceeds?\s+(?:the\s+)?(?:tolerance|threshold|limit)\b"
-            r"|\bout\s+of\s+tolerance\b"
-            r")"
-        )
-        benign_pat = re.compile(
-            r"(?i)("
-            r"\b0\s+(?:checks?|tests?|assertions?)\s+failed"
-            r"|failed\s*[=:]\s*0"
-            r"|\bno\s+(?:checks?|tests?|assertions?|errors?)\s+failed"
-            r"|\bnone\s+failed"
-            r"|\b0\s+fail"
-            r")"
-        )
-        for row in rows:
-            name = str(row.get("name", "") or "")
-            if name not in {"bash", "worktree_run", "background_run"}:
-                continue
-            args = row.get("args", {}) if isinstance(row.get("args"), dict) else {}
-            command = trim(str(row.get("command", "") or args.get("command", "") or ""), 500)
-            exit_code = self._coerce_exit_code(row.get("exit_code"))
-            raw = str(row.get("output", "") or "")
-            if not raw.strip():
-                continue
-            for line in raw.replace("\r\n", "\n").split("\n"):
-                s = line.strip()
-                if not s:
-                    continue
-                if benign_pat.search(s):
-                    continue
-                partial = re.search(r"(?i)\b(\d+)\s*/\s*(\d+)\s+checks?\s+(?:pass|passed)\b", s)
-                if not partial:
-                    partial = re.search(r"(?i)\b(\d+)\s+of\s+(\d+)\s+checks?\s+(?:pass|passed)\b", s)
-                if partial:
-                    try:
-                        passed = int(partial.group(1))
-                        total = int(partial.group(2))
-                    except Exception:
-                        passed = total = 0
-                    if total > 0 and passed < total:
-                        return {
-                            "failed": True,
-                            "marker": trim(partial.group(0), 40),
-                            "excerpt": trim(s, 120),
-                            "command": command,
-                            "exit_code": exit_code,
-                        }
-                m = fail_pat.search(s)
-                if m:
-                    return {
-                        "failed": True,
-                        "marker": trim(m.group(0), 40),
-                        "excerpt": trim(s, 120),
-                        "command": command,
-                        "exit_code": exit_code,
-                    }
-        return {"failed": False, "marker": "", "excerpt": ""}
-
-    def _acceptance_results_show_failure(self, results: list[dict], acceptance_context: str = "") -> dict:
-        """F10: did this turn's acceptance check report a FAILURE?
-
-        LLM-primary (per the Fix 5 steer): the model perceives failure from the
-        check output first, because failure is reported in unbounded natural ways.
-        The lexical scan is only a fallback for when the model is unavailable or
-        uncertain. This stops the gate being gamed by a script that prints an
-        `ALL CHECKS PASSED` banner while a real check failed, and stops a genuine
-        `1 CHECKS FAILED` from being rationalized away and advanced past.
-
-        Returns {failed: bool, marker: str, excerpt: str, source: str}."""
-        rows = [r for r in (results or []) if isinstance(r, dict)]
-        if not rows:
-            return {"failed": False, "marker": "", "excerpt": "", "source": "none"}
-        exec_rows = [r for r in rows if str(r.get("name", "") or "") in {"bash", "worktree_run", "background_run"}]
-        if not exec_rows:
-            return {"failed": False, "marker": "", "excerpt": "", "source": "none"}
-        structural = self._acceptance_results_structural_failure(exec_rows, acceptance_context)
-        if structural.get("failed"):
-            return structural
-        # Concatenate this turn's exec output for the LLM to perceive as a whole.
-        exec_text = "\n".join(
-            trim(str(r.get("output", "") or "").strip(), 900)
-            for r in exec_rows
-            if str(r.get("output", "") or "").strip()
-        ).strip()
-        verdict = {"failed": None, "marker": ""}
-        if exec_text:
-            verdict = self._llm_acceptance_failure_verdict(exec_text)
-            if verdict.get("failed") is True:
-                marker = verdict.get("marker", "") or "check reported failure"
-                first = exec_rows[0] if exec_rows else {}
-                first_args = first.get("args", {}) if isinstance(first.get("args"), dict) else {}
-                return {
-                    "failed": True,
-                    "marker": marker,
-                    "excerpt": marker,
-                    "source": "llm",
-                    "command": trim(str(first.get("command", "") or first_args.get("command", "") or ""), 500),
-                    "exit_code": self._coerce_exit_code(first.get("exit_code")),
-                }
-        # Lexical hard markers still run after the LLM. They catch deterministic
-        # validator phrases and protect against a false-negative LLM pass verdict.
-        fb = self._acceptance_results_lexical_failure(exec_rows)
-        if fb.get("failed"):
-            fb["source"] = "lexical"
-            return fb
-        if verdict.get("failed") is False:
-            return {"failed": False, "marker": "", "excerpt": "", "source": "llm"}
-        fb["source"] = "lexical"
-        return fb
-
     def _plan_step_acceptance_gate_status(
         self,
         plan_step: dict,
@@ -40144,22 +38405,18 @@ body{padding:18px}
         if not text:
             return {"ok": False, "reason": "empty-final-acceptance-subtask", "acceptance": acceptance}
 
-        raw_results = [
+        results = [
             row for row in ((worker_step or {}).get("tool_results", []) if isinstance(worker_step, dict) else [])
-            if isinstance(row, dict)
+            if isinstance(row, dict) and row.get("ok", False)
         ]
-        results = [row for row in raw_results if row.get("ok", False)]
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         try:
-            ts_candidates = []
-            for ts_key in ("created_at", "started_at", "in_progress_at", "updated_at", "completed_at"):
-                try:
-                    ts_value = float(acceptance.get(ts_key, 0.0) or 0.0)
-                except Exception:
-                    ts_value = 0.0
-                if ts_value > 0:
-                    ts_candidates.append(ts_value)
-            acceptance_started_ts = min(ts_candidates) if ts_candidates else 0.0
+            acceptance_started_ts = float(
+                acceptance.get("updated_at", 0.0)
+                or acceptance.get("created_at", 0.0)
+                or acceptance.get("completed_at", 0.0)
+                or 0.0
+            )
         except Exception:
             acceptance_started_ts = 0.0
         sig = self._plan_step_blackboard_signals(
@@ -40230,81 +38487,18 @@ body{padding:18px}
             current_match = bool(has_current_validation or has_current_read or has_current_exec or has_current_retrieval)
             blackboard_match = bool(sig.get("has_exec") or sig.get("has_review") or sig.get("has_read") or sig.get("has_research"))
 
-        # During a live worker/single-agent turn, the acceptance action should
-        # normally be visible in this turn's tool_results. Blackboard fallback is
-        # for finish/resume reconciliation where current tool_results are no
-        # longer available but the step-scoped evidence has already been recorded.
-        #
-        # F9: previously this wiped blackboard_match whenever ANY tool_results
-        # existed this turn. That broke prose/derivation steps: a worker that
-        # produced its acceptance evidence in a PRIOR round (recorded on the
-        # blackboard) and merely ran an unrelated tool this round would be told
-        # `final-acceptance-evidence-missing`, forcing redundant repair rounds
-        # (observed: sync run looped repair round 4/6 on already-passing steps).
-        # Only discard the blackboard fallback when this turn's OWN evidence
-        # already satisfies the category (current_match) — i.e. we don't need the
-        # fallback anyway. If this turn's tools don't match the category, keep the
-        # recorded blackboard evidence rather than falsely declaring it missing.
-        if results and current_match:
+        # During a live worker/single-agent turn, the acceptance action must be
+        # visible in this turn's tool_results. Blackboard fallback is only for
+        # finish/resume reconciliation where current tool_results are no longer
+        # available but the step-scoped evidence has already been recorded.
+        if results:
             blackboard_match = False
-        # F10: an explicit failure signal in this turn's own tool output blocks
-        # acceptance regardless of category match. A worker cannot pass a step by
-        # running a validator that prints `CHECKS FAILED` (or by cherry-printing a
-        # PASS banner while a real check failed). This runs before the
-        # category/target verdicts so a genuine failure is never rationalized away.
-        if raw_results:
-            acceptance_context = "\n".join(
-                part
-                for part in (
-                    str(plan_step.get("full_content", "") or plan_step.get("content", "") or ""),
-                    str(acceptance.get("content", "") or ""),
-                )
-                if part
-            )
-            failure = self._acceptance_results_show_failure(
-                raw_results,
-                acceptance_context=acceptance_context,
-            )
-            if failure.get("failed"):
-                return {
-                    "ok": False,
-                    "reason": f"acceptance-check-reported-failure:{failure.get('marker', '')}",
-                    "expected": expected,
-                    "failure_excerpt": failure.get("excerpt", ""),
-                    "failure_command": failure.get("command", ""),
-                    "failure_exit_code": failure.get("exit_code"),
-                    "failure_source": failure.get("source", ""),
-                    "acceptance": acceptance,
-                }
-        # Quality-aware enforcement (Fix 5): if the step/acceptance text states an
-        # explicit numeric quality bar (e.g. "误差 < 2%"), a category match is NOT
-        # enough — the measured result must actually meet the bar. This stops a
-        # worker from passing a 23% result just because a check ran. When the bar
-        # is unmeasurable, fall back to category-only (never a false block).
-        target = self._resolve_acceptance_target(plan_step, acceptance)
-        if target and (current_match or blackboard_match):
-            verdict = self._acceptance_target_met(target, bb, results)
-            if verdict.get("met") is False:
-                unit = str(target.get("unit", "") or "")
-                measured = verdict.get("measured")
-                return {
-                    "ok": False,
-                    "reason": (
-                        "acceptance-target-unmet:"
-                        f"{measured}{unit} vs {target.get('op', '<=')}{target.get('value')}{unit}"
-                    ),
-                    "expected": expected,
-                    "target": target,
-                    "measured": measured,
-                    "acceptance": acceptance,
-                }
         if current_match:
             return {
                 "ok": True,
                 "reason": "current-tool-evidence-matches-final-acceptance",
                 "source": "current_tool_results",
                 "expected": expected,
-                "target": target or None,
                 "acceptance": acceptance,
             }
         if blackboard_match:
@@ -40313,7 +38507,6 @@ body{padding:18px}
                 "reason": "blackboard-evidence-matches-final-acceptance",
                 "source": "blackboard",
                 "expected": expected,
-                "target": target or None,
                 "acceptance": acceptance,
             }
         return {
@@ -40331,50 +38524,6 @@ body{padding:18px}
     ) -> bool:
         """Hard gate: the final acceptance subtask must be completed with matching tool evidence."""
         return bool(self._plan_step_acceptance_gate_status(plan_step, worker_step, board).get("ok", False))
-
-    def _acceptance_gate_failure_context(
-        self,
-        plan_step: dict,
-        gate: dict | None,
-        bb: dict | None = None,
-        *,
-        max_chars: int = 1200,
-    ) -> str:
-        gate_row = gate if isinstance(gate, dict) else {}
-        board = bb if isinstance(bb, dict) else self._ensure_blackboard()
-        lines: list[str] = []
-        reason = trim(str(gate_row.get("reason", "") or ""), 220)
-        expected = trim(str(gate_row.get("expected", "") or ""), 220)
-        if reason:
-            lines.append(f"gate_reason: {reason}")
-        if expected:
-            lines.append(f"expected_evidence: {expected}")
-        acceptance = gate_row.get("acceptance", {}) if isinstance(gate_row.get("acceptance"), dict) else {}
-        acceptance_text = trim(str(acceptance.get("content", "") or ""), 260)
-        if acceptance_text:
-            lines.append(f"acceptance_subtask: {acceptance_text}")
-        command = trim(str(gate_row.get("failure_command", "") or ""), 700)
-        if command:
-            lines.append(f"failed_command: {command}")
-        if gate_row.get("failure_exit_code") not in (None, ""):
-            lines.append(f"failed_exit_code: {gate_row.get('failure_exit_code')}")
-        excerpt = trim(str(gate_row.get("failure_excerpt", "") or ""), 500)
-        if excerpt:
-            lines.append(f"failure_excerpt: {excerpt}")
-        target = gate_row.get("target", {}) if isinstance(gate_row.get("target"), dict) else {}
-        if target:
-            bar = f"{target.get('metric', 'target')} {target.get('op', '<=')}{target.get('value')}{target.get('unit', '')}"
-            measured = gate_row.get("measured", None)
-            lines.append(f"quality_bar: {trim(bar, 180)}; measured={measured}")
-        try:
-            sig = self._plan_step_blackboard_signals(plan_step, board)
-            if sig.get("recent_exec_excerpt"):
-                lines.append(f"recent_step_exec: {trim(str(sig.get('recent_exec_excerpt', '')), 260)}")
-            if sig.get("recent_review_excerpt"):
-                lines.append(f"recent_step_review: {trim(str(sig.get('recent_review_excerpt', '')), 220)}")
-        except Exception:
-            pass
-        return trim("\n".join(lines), max_chars)
 
     def _inject_acceptance_gate_rework_hint(
         self,
@@ -40425,8 +38574,6 @@ body{padding:18px}
         except Exception:
             already = ""
         already_line = f"Evidence already on record: {already}. " if already and already != "accumulated-step-evidence" else ""
-        failure_context = self._acceptance_gate_failure_context(plan_step, gate_row, self._ensure_blackboard(), max_chars=900)
-        failure_line = f"FAILED ACCEPTANCE CONTEXT:\n{failure_context}\n" if failure_context else ""
         roles = tuple(
             role for role in (self._sanitize_agent_role(x) for x in target_roles)
             if role
@@ -40441,7 +38588,6 @@ body{padding:18px}
             f"{('Expected evidence: ' + expected + '. ') if expected else ''}"
             f"{guidance_line}"
             f"{already_line}"
-            f"{failure_line}"
             f"{('Final acceptance subtask: ' + acceptance_text + '. ') if acceptance_text else ''}"
             "Now CALL THE TOOL described under HOW/EXAMPLE ACTION (do not just describe it), confirm the success signal in its output, "
             "then update the same acceptance TodoWrite row to completed. If the check FAILS, fix the underlying problem first, then re-run the check. "
@@ -40503,17 +38649,6 @@ body{padding:18px}
             error_context = self._recent_error_context(max_chars=700)
         except Exception:
             error_context = ""
-        try:
-            failure_context = self._acceptance_gate_failure_context(plan_step, gate, bb, max_chars=900)
-        except Exception:
-            failure_context = ""
-        if failure_context:
-            error_context = trim(
-                (error_context + "\n\n" if error_context else "")
-                + "FAILED ACCEPTANCE CONTEXT:\n"
-                + failure_context,
-                1400,
-            )
         # Pick the dominant error category from the ledger, if any.
         error_category = ""
         try:
@@ -40548,58 +38683,6 @@ body{padding:18px}
                 "error_category": error_category,
                 "error_context": error_context,
             }
-        if reason.startswith("acceptance-target-unmet:"):
-            # The check ran but the measured result misses the stated quality bar
-            # (e.g. 23% error vs the required <1%). This is NOT a "record evidence"
-            # problem — the deliverable itself is not good enough yet.
-            target = (gate or {}).get("target", {}) if isinstance((gate or {}).get("target"), dict) else {}
-            bar = f"{target.get('op', '<=')}{target.get('value', '')}{target.get('unit', '')}".strip()
-            measured = (gate or {}).get("measured")
-            repair_action = (
-                f"The acceptance check ran but the result ({measured}{target.get('unit', '')}) does NOT meet the "
-                f"required quality bar ({target.get('metric', 'target')} {bar}). Do NOT advance or mark this "
-                "accepted. Diagnose WHY the quality bar is missed (algorithm/params/precision/bug), FIX the "
-                "underlying cause, re-run the check, and only complete the acceptance subtask once the measured "
-                f"value actually satisfies {bar}."
-            )
-            if error_category:
-                repair_action += f" (dominant failure category: '{error_category}'; do not repeat a failed fix.)"
-            return {
-                "root_cause": f"Deliverable misses its quality bar ({target.get('metric', 'target')} {bar}); measured {measured}{target.get('unit', '')}.",
-                "repair_action": repair_action,
-                "fixer_role": "reviewer" if (self._is_multi_agent_mode() and self.reviewer_debug_mode) else self._current_plan_worker_owner(bb),
-                "error_category": error_category or "quality-bar",
-                "error_context": error_context,
-            }
-        if reason.startswith("acceptance-check-reported-failure:"):
-            # F10: the acceptance check ran and its own output reported a failure
-            # (e.g. `1 CHECKS FAILED`, an AssertionError, a non-zero failed count).
-            # This must never be rationalized away as "an arbitrary threshold" and
-            # advanced past.
-            excerpt = str((gate or {}).get("failure_excerpt", "") or "")
-            command = str((gate or {}).get("failure_command", "") or "")
-            repair_action = (
-                "The acceptance check EXECUTED but its own output reported a FAILURE"
-                + (f" (\"{excerpt}\")" if excerpt else "")
-                + ". Do NOT advance or mark this step accepted. Read the failing output, fix the underlying "
-                "cause (or, if the failing assertion is genuinely wrong/too strict, correct the check itself "
-                "and justify why in one line), then re-run until the check reports no failures."
-            )
-            if self._command_looks_like_count_search(command):
-                repair_action += (
-                    " Because this was a count-search check, if the count is positive first re-run the same "
-                    "pattern with line output (for example grep -n or rg -n) to identify the exact offending "
-                    "lines, then edit only those real matches."
-                )
-            if error_category:
-                repair_action += f" (dominant failure category: '{error_category}'; do not repeat a failed fix.)"
-            return {
-                "root_cause": "The acceptance check ran but reported a failure signal in its output.",
-                "repair_action": repair_action,
-                "fixer_role": self._current_plan_worker_owner(bb),
-                "error_category": error_category or "check-failed",
-                "error_context": error_context,
-            }
         # final-acceptance-evidence-missing (and anything else): genuine failure or
         # the check ran but failed. Route to active repair (reviewer-debug in MA).
         repair_action = (
@@ -40631,8 +38714,8 @@ body{padding:18px}
             return False
         step_label = trim(str(plan_step.get("content", "") or ""), 160)
         root = trim(str(diagnosis.get("root_cause", "") or ""), 240)
-        action = trim(str(diagnosis.get("repair_action", "") or ""), 900)
-        err_ctx = trim(str(diagnosis.get("error_context", "") or ""), 1400)
+        action = trim(str(diagnosis.get("repair_action", "") or ""), 400)
+        err_ctx = trim(str(diagnosis.get("error_context", "") or ""), 700)
         fixer = self._sanitize_agent_role(str(diagnosis.get("fixer_role", "") or "")) or self._current_plan_worker_owner(bb)
         roles = (fixer,) if fixer else ()
         debug_note = ""
@@ -41159,16 +39242,12 @@ body{padding:18px}
             row_step = str(row.get("plan_step_id", "") or "").strip()
             if step_id and row_step == step_id:
                 matched.append(clean)
-            elif step_id and row_step and row_step != step_id:
-                continue
             elif since_ts > 0 and ts > 0 and ts + 1e-6 >= since_ts:
                 matched.append(clean)
             else:
                 fallback.append(clean)
         if matched:
             return matched[-max(1, int(limit or 6)) :]
-        if step_id:
-            return []
         return fallback[-max(1, int(limit or 6)) :]
 
     def _build_plan_step_quality_review_context(
@@ -41682,126 +39761,6 @@ body{padding:18px}
                 pass
         return True
 
-    def _plan_step_advance_decision(
-        self, current: dict, evidence_input: dict, bb: dict, *, mode: str
-    ) -> dict:
-        """Single authority for the plan-step advance judgment shared by the
-        single-agent and sync/multi-agent paths.
-
-        Both callers previously computed the same evidence signals but combined
-        them into DIFFERENT should-advance rules (single-agent: 2 paths + a
-        `_gate_blocked` flag; sync: 5 OR'd paths). That divergence let the same
-        step advance in one mode and stall in the other. This function computes
-        the signals ONCE and applies ONE unified rule, so sync is a strict
-        extension of single-agent. Callers keep only their own dispatch/role
-        routing (single→"single"/developer; sync→route.target) and any
-        manager-request bookkeeping.
-
-        `mode` is "single" or "sync". `evidence_input` is the worker_step dict
-        (sync) or {"tool_results": [...]} (single) — both expose `tool_results`
-        and are accepted by the gate/evidence helpers unchanged.
-
-        Returns: {should_advance, needs_repair, gate, gate_ok, reason, signals}.
-        """
-        results = (
-            evidence_input.get("tool_results", []) or []
-            if isinstance(evidence_input, dict)
-            else []
-        )
-        step_content = str(
-            current.get("full_content", "") or current.get("content", "") or ""
-        ).lower()
-        phase = self._plan_step_phase_hint(step_content)
-        wrote_files = any(
-            isinstance(r, dict)
-            and r.get("ok", False)
-            and str(r.get("name", "")) in ("write_file", "edit_file")
-            for r in results
-        )
-        ran_bash_ok = any(
-            isinstance(r, dict) and r.get("ok", False) and str(r.get("name", "")) == "bash"
-            for r in results
-        )
-        validation_ok_current = self._tool_results_have_validation_evidence(current, results)
-        validation_ok_blackboard = self._plan_step_has_blackboard_evidence(current, bb)
-        validation_ok = validation_ok_current or validation_ok_blackboard
-        # single-agent historically read the verified tag without the agent-message
-        # window; sync passed messages=self.agent_messages. Preserve that.
-        if mode == "sync":
-            verified_tag_current = self._check_step_verified_tag(current, messages=self.agent_messages)
-        else:
-            verified_tag_current = self._check_step_verified_tag(current)
-        bb_sig = self._plan_step_blackboard_signals(current, bb)
-        phase_evidence = False
-        if phase in ("research", "design") and validation_ok:
-            phase_evidence = True
-        elif phase == "implement" and (
-            (wrote_files and validation_ok_current)
-            or (bb_sig["has_write"] and validation_ok_blackboard)
-        ):
-            phase_evidence = True
-        elif phase in ("test", "review") and (
-            (ran_bash_ok and validation_ok_current)
-            or ((bb_sig["has_exec"] or bb_sig["has_review"]) and validation_ok_blackboard)
-        ):
-            phase_evidence = True
-        subtasks_all_done = self._step_subtasks_all_completed(current)
-        _has_subtasks = bool(
-            self._active_plan_worker_todo_rows(str(current.get("id", "") or ""), role="")
-        )
-        accumulated_evidence_path = subtasks_all_done and self._step_has_accumulated_evidence(
-            current, bb
-        )
-        explicit_verified_path = (
-            subtasks_all_done
-            and verified_tag_current
-            and (validation_ok_blackboard or self._step_has_accumulated_evidence(current, bb))
-        )
-        acceptance_gate = self._plan_step_acceptance_gate_status(current, evidence_input, bb)
-        acceptance_gate_ok = bool(acceptance_gate.get("ok", False))
-        worker_produced_output = self._worker_step_has_evidence(evidence_input)
-        # Unified strong-evidence rule (superset of both prior rules): the
-        # step-local subtask chain is complete, the final acceptance gate passed,
-        # AND at least one concrete evidence form exists. Manager requests and
-        # phase heuristics never bypass an incomplete subtask chain or a failed gate.
-        should_advance = bool(
-            subtasks_all_done
-            and acceptance_gate_ok
-            and (
-                validation_ok
-                or phase_evidence
-                or accumulated_evidence_path
-                or explicit_verified_path
-            )
-        )
-        # Explicit structured-verification-tag path for subtask-complete steps.
-        # It never bypasses missing step-local subtasks or a failed final gate.
-        gate_blocked = bool(subtasks_all_done and not acceptance_gate_ok)
-        if not should_advance and not gate_blocked:
-            if (
-                verified_tag_current
-                and subtasks_all_done
-                and (validation_ok or self._step_has_accumulated_evidence(current, bb))
-            ):
-                should_advance = True
-        return {
-            "should_advance": should_advance,
-            "needs_repair": gate_blocked,
-            "gate": acceptance_gate,
-            "gate_ok": acceptance_gate_ok,
-            "reason": str(acceptance_gate.get("reason", "") or ""),
-            "signals": {
-                "subtasks_all_done": subtasks_all_done,
-                "has_subtasks": _has_subtasks,
-                "worker_produced_output": worker_produced_output,
-                "phase_evidence": phase_evidence,
-                "validation_ok": validation_ok,
-                "validation_ok_blackboard": validation_ok_blackboard,
-                "verified_tag": verified_tag_current,
-                "phase": phase,
-            },
-        }
-
     def _post_execution_plan_step_check(self, route: dict, worker_step: dict):
         """After worker execution, check if current plan step should advance based on evidence."""
         bb = self._ensure_blackboard()
@@ -41850,15 +39809,77 @@ body{padding:18px}
                     )
             except Exception as exc:
                 self._emit("status", {"summary": f"plan subtask bootstrap failed: {trim(str(exc), 120)}"})
-        # Unified advance decision (Fix 1): shared authority with single-agent.
+        # 1. Manager explicitly requested advancement
         manager_requested = bool(route.get("advance_plan_step_requested", False))
-        decision = self._plan_step_advance_decision(current, worker_step, bb, mode="sync")
-        has_strong_evidence = bool(decision["should_advance"])
-        subtasks_all_done = bool(decision["signals"]["subtasks_all_done"])
-        _has_subtasks = bool(decision["signals"]["has_subtasks"])
-        worker_produced_output = bool(decision["signals"]["worker_produced_output"])
-        acceptance_gate = decision["gate"]
-        acceptance_gate_ok = bool(decision["gate_ok"])
+        # 2. Worker produced concrete tool outputs
+        worker_produced_output = self._worker_step_has_evidence(worker_step)
+        # 3. All subtasks for this step are completed
+        subtasks_all_done = self._step_subtasks_all_completed(current)
+        # 4. Phase-based file+bash evidence (implement requires BOTH write + bash)
+        step_content = str(current.get("full_content", "") or current.get("content", "") or "").lower()
+        phase = self._plan_step_phase_hint(step_content)
+        results = worker_step.get("tool_results", []) or []
+        wrote_files = any(
+            isinstance(r, dict) and r.get("ok", False)
+            and str(r.get("name", "")) in ("write_file", "edit_file")
+            for r in results
+        )
+        ran_bash_ok = any(
+            isinstance(r, dict) and r.get("ok", False) and str(r.get("name", "")) == "bash"
+            for r in results
+        )
+        validation_ok_current = self._tool_results_have_validation_evidence(current, results)
+        validation_ok_blackboard = self._plan_step_has_blackboard_evidence(current, bb)
+        validation_ok = validation_ok_current or validation_ok_blackboard
+        verified_tag_current = self._check_step_verified_tag(current, messages=self.agent_messages)
+        bb_sig = self._plan_step_blackboard_signals(current, bb)
+        phase_evidence = False
+        if phase in ("research", "design") and validation_ok:
+            phase_evidence = True
+        elif phase == "implement" and (
+            (wrote_files and validation_ok_current)
+            or (bb_sig["has_write"] and validation_ok_blackboard)
+        ):
+            phase_evidence = True
+        elif phase in ("test", "review") and (
+            (ran_bash_ok and validation_ok_current)
+            or ((bb_sig["has_exec"] or bb_sig["has_review"]) and validation_ok_blackboard)
+        ):
+            phase_evidence = True
+        # Advance when the step-local subtask chain is complete and concrete
+        # evidence exists. The final acceptance subtask is the validation gate;
+        # manager requests or phase heuristics cannot bypass incomplete subtasks.
+        _has_subtasks = bool(self._active_plan_worker_todo_rows(
+            str(current.get("id", "") or ""), role=""
+        ))
+        accumulated_evidence_path = (
+            subtasks_all_done
+            and self._step_has_accumulated_evidence(current, bb)
+        )
+        explicit_verified_path = (
+            subtasks_all_done
+            and verified_tag_current
+            and (validation_ok_blackboard or self._step_has_accumulated_evidence(current, bb))
+        )
+        acceptance_gate = self._plan_step_acceptance_gate_status(current, worker_step, bb)
+        acceptance_gate_ok = bool(acceptance_gate.get("ok", False))
+        has_strong_evidence = subtasks_all_done and acceptance_gate_ok and (
+            validation_ok
+            or validation_ok_blackboard
+            or phase_evidence
+            or accumulated_evidence_path
+            or explicit_verified_path
+        )
+        # Parity with single-agent (Fix 1): phase-heuristic escape when the step
+        # genuinely has NO step-local subtasks (bootstrap above couldn't decompose
+        # it — e.g. an atomic step). Single-agent allows this via
+        # `_can_use_phase_heuristic = subtasks_done or not _has_subtasks_s` (:42629).
+        # Without it, a subtask-less step can never satisfy `subtasks_all_done` and
+        # the multi-agent run stalls. Requires real phase evidence; never advances
+        # on a bare claim.
+        if not has_strong_evidence and not _has_subtasks and worker_produced_output:
+            if phase_evidence or validation_ok:
+                has_strong_evidence = True
         if manager_requested and worker_produced_output and not subtasks_all_done and _has_subtasks:
             self._blackboard_append_memory(
                 "decision",
@@ -41902,11 +39923,6 @@ body{padding:18px}
                     target_roles=((target_role,) if target_role else ()),
                 ):
                     return  # step genuinely passed via semantic judge
-            # Outcome-progress deadlock guard (Fix 6): runs every non-advancing
-            # round regardless of whether subtasks are done, so a step that keeps
-            # producing output but never improves its OUTCOME escalates instead
-            # of looping forever.
-            self._track_step_outcome_progress(current, bb, acceptance_gate)
             self._inject_rework_if_needed(current, worker_step)
 
     def _worker_step_has_evidence(self, step: dict) -> bool:
@@ -42314,21 +40330,6 @@ body{padding:18px}
                 guidance = {}
             gate_reason = trim(str((gate or {}).get("reason", "") or ""), 120)
             gate_expected = trim(str((gate or {}).get("expected", "") or ""), 160)
-            # Quality bar (Fix 5): if the step has a measurable target, the judge
-            # must check the measured result against it, not just "did a check run".
-            target = {}
-            try:
-                target = self._resolve_acceptance_target(plan_step, (gate or {}).get("acceptance", {}))
-            except Exception:
-                target = {}
-            bar_line = ""
-            if target:
-                bar_line = (
-                    f"REQUIRED QUALITY BAR: {target.get('metric','target')} "
-                    f"{target.get('op','<=')} {target.get('value')}{target.get('unit','')}. "
-                    "PASS only if the measured result actually satisfies this bar; "
-                    "a result that merely ran but misses the bar is a FAIL.\n"
-                )
 
             # Acceptance subtask text (what the worker said it would verify).
             acceptance = (gate or {}).get("acceptance", {}) if isinstance((gate or {}).get("acceptance"), dict) else {}
@@ -42344,22 +40345,11 @@ body{padding:18px}
             ]
             exec_logs = bb.get("execution_logs", []) if isinstance(bb.get("execution_logs"), list) else []
             recent_exec = []
-            since_ts = self._plan_step_activation_ts(plan_step)
             for log in exec_logs[-10:]:
-                if not isinstance(log, dict):
-                    continue
-                row_step_id = str(log.get("plan_step_id", "") or "")
-                if row_step_id and row_step_id != step_id:
-                    continue
-                try:
-                    log_ts = float(log.get("ts", 0.0) or 0.0)
-                except Exception:
-                    log_ts = 0.0
-                if (not row_step_id) and since_ts > 0 and log_ts > 0 and log_ts + 1e-6 < since_ts:
-                    continue
-                c = trim(str(log.get("content", "") or ""), 240)
-                if c:
-                    recent_exec.append(c)
+                if isinstance(log, dict) and str(log.get("plan_step_id", "") or "") in ("", step_id):
+                    c = trim(str(log.get("content", "") or ""), 240)
+                    if c:
+                        recent_exec.append(c)
             cur_results = []
             if isinstance(worker_step, dict):
                 for r in (worker_step.get("tool_results", []) or []):
@@ -42375,8 +40365,7 @@ body{padding:18px}
                 f"PLAN STEP: {step_text}\n"
                 f"ACCEPTANCE CHECK (what should be verified): {acceptance_text or guidance.get('what','')}\n"
                 f"EXPECTED EVIDENCE KIND: {gate_expected or guidance.get('evidence_kind','')}\n"
-                f"GATE FAILURE REASON: {gate_reason}\n"
-                f"{bar_line}\n"
+                f"GATE FAILURE REASON: {gate_reason}\n\n"
                 f"FILES CREATED/MODIFIED FOR THIS STEP:\n{chr(10).join(files_summary[-12:]) or '(none)'}\n\n"
                 f"EXECUTION OUTPUT (this step):\n{chr(10).join(recent_exec[-6:]) or '(none)'}\n\n"
                 f"CURRENT-TURN TOOL RESULTS:\n{chr(10).join(cur_results[-6:]) or '(none)'}\n\n"
@@ -43498,20 +41487,11 @@ body{padding:18px}
                         identity = _core_to_identity[check_core]
                         break
             merged = dict(merged_by_identity.get(identity, {}))
-            row_existed = bool(merged)
-            prev_owner = self._sanitize_agent_role(merged.get("owner", ""))
             prev_status = self._normalize_todo_status_value(merged.get("status", ""), "")
             incoming_status = self._normalize_todo_status_value(row.get("status", ""), "pending")
             if "activeForm" not in row and "active_form" not in row:
                 merged.pop("activeForm", None)
             prev_content = str(merged.get("content", "") or "")
-            # Preserve completion attribution BEFORE the blanket update so a bare
-            # cross-role re-mark can't drop it (F12).
-            prev_completion = {
-                k: merged.get(k)
-                for k in ("completed_at", "completed_by", "evidence", "updated_at")
-                if merged.get(k) not in (None, "")
-            }
             merged.update(row)
             if incoming_status:
                 merged["status"] = incoming_status
@@ -43529,24 +41509,7 @@ body{padding:18px}
                 merged["status"] = "in_progress"
                 if prev_content and len(prev_content) > len(str(row.get("content", "") or "")):
                     merged["content"] = prev_content
-            # F12: owner is a property of who OWNS the subtask (its creator/worker),
-            # NOT of whoever last touched the row. A reviewer re-marking the
-            # developer's acceptance row must not flip its owner dev→reviewer —
-            # that flip made _sync_plan_worker_todos_to_blackboard see a spurious
-            # diff and re-write the mirror every cross-role turn (redundant
-            # TodoWrite churn). Preserve the existing owner; only a genuinely new
-            # row takes the writer's role.
-            if row_existed and prev_owner:
-                merged["owner"] = prev_owner
-            else:
-                merged["owner"] = str(merged.get("owner", "") or role_key).strip().lower() or role_key
-            # F12: when an already-completed row is re-affirmed completed without
-            # fresh attribution, keep the original completed_by/at/evidence so the
-            # row stays byte-identical (no spurious mirror diff, no lost credit).
-            if prev_status == "completed" and incoming_status == "completed":
-                for field, val in prev_completion.items():
-                    if row.get(field) in (None, ""):
-                        merged[field] = val
+            merged["owner"] = str(merged.get("owner", "") or role_key).strip().lower() or role_key
             merged["parent_step_id"] = trim(str(merged.get("parent_step_id", "") or step_id), 20) or step_id
             # Fix 2 support: Timestamp new items for next-step detection
             if identity not in _existing_identities and "created_at" not in merged:
@@ -43898,18 +41861,10 @@ body{padding:18px}
                 f"Existing worker subtasks for this step: {len(completed)} completed, {len(pending)} pending. "
             )
             todo_state = "".join(state_parts)
-            # Fix 7: allow REFINEMENT, forbid only wholesale recreate. The old
-            # absolute ban ("do NOT call TodoWrite … directly execute") pushed
-            # multi-agent workers into shallow, bundled execution (e.g. writing
-            # 4 subsections in one shot). The worker may now split a coarse
-            # subtask into finer child items, add a genuinely missing one, or
-            # update status — it just must not restate/duplicate existing rows
-            # or drop the final acceptance item. Symmetric across single & multi.
+            # Hard prohibition: model must NOT re-create subtasks when they already exist
             subtasks_exist_ban = (
-                "Subtasks for this step already exist. Do NOT wholesale-recreate, renumber, or restate them. "
-                "You MAY refine: split a too-coarse subtask into finer child items, add a genuinely missing "
-                "subtask, or update status — reuse existing N.M ids and keep the final acceptance item. "
-                "If the current subtask is already concrete, just execute it. "
+                "🚫 STRICT: subtasks for this step already exist — do NOT call TodoWrite/TodoWriteRescue "
+                "to create new subtasks. Directly execute the in_progress subtask above. "
             )
         if for_manager:
             return (
@@ -44655,28 +42610,6 @@ body{padding:18px}
             clean_items.append(acceptance_item)
         return clean_items[:max_items]
 
-    def _established_step_owner(self, rows: list[dict] | None) -> str:
-        """F12: the sticky canonical owner of a step's subtasks — the worker that
-        actually EXECUTED them, not whoever is writing this turn.
-
-        The single-owner invariant in `_plan_worker_rows_with_acceptance` collapses
-        all of a step's rows onto one owner. If that owner is recomputed as "the
-        current writer" every turn, a reviewer re-marking the developer's completed
-        acceptance row reassigns EVERY subtask dev→reviewer, which makes the
-        blackboard mirror diff and re-write on every cross-role turn (redundant
-        TodoWrite churn). Anchor the owner to the executor instead: the owner of
-        the first completed row, else the first in_progress row. Returns "" when no
-        row has been worked yet (caller falls back to the writer's role)."""
-        worker_owners = {"developer", "explorer", "reviewer"}
-        for status_pref in ("completed", "in_progress"):
-            for r in rows or []:
-                if not isinstance(r, dict):
-                    continue
-                o = self._sanitize_agent_role(r.get("owner", ""))
-                if o in worker_owners and str(r.get("status", "") or "").strip().lower() == status_pref:
-                    return o
-        return ""
-
     def _plan_worker_rows_with_acceptance(
         self,
         plan_step: dict,
@@ -44687,12 +42620,6 @@ body{padding:18px}
     ) -> list[dict]:
         step_id = trim(str((plan_step or {}).get("id", "") or ""), 20)
         owner_key = self._sanitize_agent_role(owner) or self._current_plan_worker_owner()
-        # F12: prefer the step's ESTABLISHED executor owner so a cross-role re-mark
-        # (reviewer verifying the developer's work) doesn't reassign every subtask
-        # to the verifier and churn the mirror. Sticky to whoever did the work.
-        established = self._established_step_owner(rows)
-        if established:
-            owner_key = established
         work_rows: list[dict] = []
         acceptance_rows: list[dict] = []
         import re as _re_acc
@@ -45030,7 +42957,7 @@ body{padding:18px}
                 if len(prose) >= 2 and text and text != header and text not in picked:
                     picked.append(text)
         out: list[str] = []
-        max_items = max(2, min(int(limit or 6), 16))  # Fix 7: allow multi-unit steps (was 7)
+        max_items = max(2, min(int(limit or 6), 7))
         for text in picked:
             clean = normalize_work_text(text) or str(text or "").strip()
             if not clean or clean == header or clean in out:
@@ -45041,34 +42968,6 @@ body{padding:18px}
         if out:
             return out[: max_items - 1]
         return []
-
-    def _plan_step_subtask_limit(self, plan_step: dict, *, base: int = 6) -> tuple[int, str]:
-        """Fix 7: compute an adaptive subtask cap for a step. A multi-unit step
-        (N chapters/files/sections, or an active task-level deliverable target)
-        gets one subtask per unit (+setup/acceptance), capped at 16, plus a
-        per-unit decomposition note. Returns (limit, per_unit_note)."""
-        base = max(3, int(base or 6))
-        step_text = str((plan_step or {}).get("full_content", "") or (plan_step or {}).get("content", "") or "")
-        try:
-            step_target = self._infer_deliverable_target(step_text)
-            unit_n = int(step_target.get("target_count", 0) or 0) if step_target else 0
-            if unit_n < 2:
-                dp = self._deliverable_progress()
-                if dp.get("active"):
-                    unit_n = int(dp.get("remaining", 0) or dp.get("target", 0) or 0)
-                    step_target = step_target or {"unit": dp.get("unit", "unit")}
-            if unit_n >= 2:
-                limit = max(base, min(unit_n + 2, 16))
-                unit = str((step_target or {}).get("unit", "unit") or "unit")
-                note = (
-                    f"This step produces MULTIPLE {unit}s (~{unit_n}). Create ONE concrete subtask per "
-                    f"{unit} (not a single bundled 'write all {unit}s' item), in order, so each {unit} is "
-                    "executed and tracked individually. "
-                )
-                return limit, note
-        except Exception:
-            pass
-        return base, ""
 
     def _llm_plan_step_subtasks(self, plan_step: dict, *, limit: int = 5) -> list[str]:
         if not isinstance(plan_step, dict):
@@ -45081,9 +42980,7 @@ body{padding:18px}
         )
         if not step_text:
             return []
-        # Fix 7: adaptive cap — multi-unit steps decompose per-unit (not bundled).
-        adaptive_limit, per_unit_note = self._plan_step_subtask_limit(plan_step, base=int(limit or 6))
-        max_items = max(3, min(adaptive_limit, 16))
+        max_items = max(3, min(int(limit or 6), 6))
         try:
             terms = self._plan_step_acceptance_terms()
             lang = normalize_ui_language(getattr(self, "ui_language", DEFAULT_UI_LANGUAGE))
@@ -45093,7 +42990,6 @@ body{padding:18px}
                 "Create step-local execution subtasks for the active approved plan step.\n"
                 "Use the step semantics, not generic templates. Split only this step into concrete actions a worker can execute in order.\n"
                 "Do not include other plan steps, final delivery, or broad project management.\n"
-                f"{per_unit_note}"
                 f"Write all subtasks in UI language {lang}. "
                 f"The FINAL subtask is mandatory and must be a semantic acceptance subtask starting with '{terms['prefix']}{sep}'. "
                 "That final subtask must include both the check action and the evidence shape to record.\n"
@@ -45107,7 +43003,7 @@ body{padding:18px}
                 system=self._inject_runtime_environment_context(
                     "/no_think\nYou decompose one active plan step into concrete, ordered worker subtasks. Reply only valid JSON."
                 ),
-                max_tokens=360 if max_items <= 6 else 720,
+                max_tokens=360,
                 temperature=0.2,
                 think=False,
             )
@@ -45139,11 +43035,9 @@ body{padding:18px}
         step_id = trim(str(plan_step.get("id", "") or ""), 20)
         if not step_id:
             return False
-        # Fix 7: adaptive cap so multi-unit steps aren't truncated to 6 bundled rows.
-        _sub_limit, _ = self._plan_step_subtask_limit(plan_step, base=6)
-        expected = self._extract_plan_step_subtasks(plan_step, limit=_sub_limit)
+        expected = self._extract_plan_step_subtasks(plan_step, limit=6)
         if not expected:
-            expected = self._llm_plan_step_subtasks(plan_step, limit=_sub_limit)
+            expected = self._llm_plan_step_subtasks(plan_step, limit=6)
         if not expected:
             step_text = trim(str(plan_step.get("content", "") or "Execute and verify current plan step"), 180)
             expected = [f"Complete this plan step with concrete evidence: {step_text}"]
@@ -45151,7 +43045,7 @@ body{padding:18px}
             plan_step,
             expected,
             allow_llm=True,
-            limit=_sub_limit,
+            limit=6,
         )
         if not expected:
             return False
@@ -45823,19 +43717,77 @@ body{padding:18px}
                 if not any("<action-required>" in str(m.get("content", "") or "") for m in _recent_msgs if isinstance(m, dict)):
                     self._append_plan_guidance_bubble(_force_tw_msg, summary="action required: create subtasks first")
                 return False  # Wait for TodoWrite before doing other checks
-        # Unified advance decision (Fix 1): shared authority with sync mode.
+        # Heuristic: check if tool results indicate step completion
+        step_content = str(current.get("full_content", "") or current.get("content", "") or "").lower()
+        phase = self._plan_step_phase_hint(step_content)
+        wrote_files = any(
+            str(r.get("name", "")) in ("write_file", "edit_file") and r.get("ok", False)
+            for r in tool_results
+        )
+        ran_bash_ok = any(
+            str(r.get("name", "")) == "bash" and r.get("ok", False)
+            for r in tool_results
+        )
+        validation_ok_current = self._tool_results_have_validation_evidence(current, tool_results)
+        validation_ok_blackboard = self._plan_step_has_blackboard_evidence(current, bb)
+        validation_ok = validation_ok_current or validation_ok_blackboard
+        bb_sig = self._plan_step_blackboard_signals(current, bb)
         todo_progress_signal = any(
             isinstance(r, dict) and r.get("ok", False)
             and str(r.get("name", "")) in ("TodoWrite", "TodoWriteRescue")
             for r in tool_results
         )
-        decision = self._plan_step_advance_decision(
-            current, {"tool_results": tool_results}, bb, mode="single"
-        )
-        should_advance = bool(decision["should_advance"])
-        subtasks_done = bool(decision["signals"]["subtasks_all_done"])
-        acceptance_gate = decision["gate"]
-        acceptance_gate_ok = bool(decision["gate_ok"])
+        # Auto-advance conditions:
+        should_advance = False
+        _gate_blocked = False  # True when validation gate fired and blocked — no other path may advance
+        # Priority 1: Check if worker subtasks are all completed (most reliable signal)
+        subtasks_done = self._step_subtasks_all_completed(current)
+        acceptance_gate = self._plan_step_acceptance_gate_status(current, {"tool_results": tool_results}, bb)
+        acceptance_gate_ok = bool(acceptance_gate.get("ok", False))
+        if subtasks_done:
+            # The final step-local acceptance subtask is the validation gate.
+            # Once all subtasks are completed, advancement only needs concrete
+            # current or accumulated evidence; no external semantic reviewer or
+            # extra structured verification tag.
+            if acceptance_gate_ok and (validation_ok or self._step_has_accumulated_evidence(current, bb)):
+                should_advance = True
+            else:
+                _gate_blocked = True  # Evidence missing — disable weaker advancement paths
+        # Priority 2: Phase-based heuristics — BUT gate by subtask completion when subtasks exist
+        # CRITICAL: A single write_file must NOT advance when 3+ subtasks remain
+        # Skipped when validation gate has blocked advancement (subtasks_done + gate failed)
+        if not should_advance and not _gate_blocked:
+            _has_subtasks_s = bool(self._active_plan_worker_todo_rows(
+                str(current.get("id", "") or ""), role=""
+            ))
+            _can_use_phase_heuristic = subtasks_done or not _has_subtasks_s
+            if _can_use_phase_heuristic:
+                if phase in ("research", "design") and validation_ok:
+                    should_advance = True
+                elif phase == "implement" and (
+                    (wrote_files and validation_ok_current)
+                    or (bb_sig["has_write"] and validation_ok_blackboard)
+                ):
+                    should_advance = True
+                elif phase in ("test", "review") and (
+                    (ran_bash_ok and validation_ok_current)
+                    or ((bb_sig["has_exec"] or bb_sig["has_review"]) and validation_ok_blackboard)
+                ):
+                    should_advance = True
+        # Also allow the explicit post-message verification contract to advance
+        # when there are no linked subtasks. Natural-language completion claims
+        # are intentionally ignored here; advancement must be backed by plan
+        # state, validation evidence, or the structured verification tag.
+        if not should_advance and not _gate_blocked:
+            _has_subtasks_s2 = bool(self._active_plan_worker_todo_rows(
+                str(current.get("id", "") or ""), role=""
+            ))
+            if (
+                self._check_step_verified_tag(current)
+                and (subtasks_done or not _has_subtasks_s2)
+                and (validation_ok or self._step_has_accumulated_evidence(current, bb))
+            ):
+                should_advance = True
         if should_advance:
             evidence = self._collect_step_evidence(current, {"tool_results": tool_results})
             advanced = self._advance_plan_step(evidence=evidence, actor="single")
@@ -45863,12 +43815,6 @@ body{padding:18px}
                     current, acceptance_gate, bb, actor="single", target_roles=("developer",)
                 ):
                     return True  # step genuinely passed via semantic judge
-            # Outcome-progress deadlock guard (Fix 6): the key single-agent
-            # escape. Runs every non-advancing round — including when subtasks
-            # are NOT all done (the honest worker that never self-marks its
-            # failing acceptance subtask) — so a step whose OUTCOME stops
-            # improving escalates to the user instead of circling forever.
-            self._track_step_outcome_progress(current, bb, acceptance_gate)
             self._inject_rework_if_needed(current, {"tool_results": tool_results})
             self._sync_todos_from_blackboard(reason="single-agent-round")
             if todo_progress_signal and not subtasks_done:
@@ -47828,17 +45774,13 @@ body{padding:18px}
             total = len(completed) + len(pending)
             step_content_low = str(cur.get("content", "") or "").lower()
             # Summarize blackboard evidence that may justify step completion.
-            cur_step_id = trim(str(cur.get("id", "") or ""), 40)
-            try:
-                step_sig = self._plan_step_blackboard_signals(cur, bb)
-            except Exception:
-                step_sig = {}
-            research_count = 1 if bool(step_sig.get("has_research", False)) else 0
-            code_count = len(step_sig.get("recent_files", []) or [])
-            exec_count = 1 if bool(step_sig.get("has_exec", False)) else 0
+            research_count = len(bb.get("research_notes", []) or [])
+            code_count = len(bb.get("code_artifacts", {}) or {})
+            exec_count = len(bb.get("execution_logs", []) or [])
             # Snapshot worker todos so the manager can see what was actually executed.
             worker_hint = ""
             try:
+                cur_step_id = trim(str(cur.get("id", "") or ""), 40)
                 worker_todos = [
                     r for r in self.todo.snapshot()
                     if str(r.get("owner", "") or "").lower() in {"developer", "explorer", "reviewer"}
@@ -48074,11 +46016,6 @@ body{padding:18px}
         candidates: list[tuple[int, float, dict]] = []
         for env in list(self.agent_bus_messages)[-72:]:
             if not isinstance(env, dict):
-                continue
-            if env.get("_stale_focus"):
-                continue
-            if not self._agentbus_envelope_matches_active_focus(env, bb):
-                env["_stale_focus"] = True
                 continue
             try:
                 ts = float(env.get("ts", 0.0) or 0.0)
@@ -49757,7 +47694,7 @@ body{padding:18px}
             _pmr = []
         _pmr.append({
             "target": target,
-            "instruction_hash": hashlib.sha1(safe_utf8_bytes(instruction)).hexdigest()[:12],
+            "instruction_hash": hashlib.sha1(str(instruction or "").encode("utf-8")).hexdigest()[:12],
             "round": int(getattr(self, "agent_round_index", 0) or 0),
             "ts": float(now_ts()),
             "focus_id": str(route_row.get("focus_id", "") or ""),
@@ -50260,25 +48197,21 @@ body{padding:18px}
                 self._blackboard_upsert_artifact(rel_path, summary, role_key)
                 self._blackboard_set_status("CODING")
         elif name in {"bash", "worktree_run", "background_run"}:
-            cmd = trim(str(item.get("command", "") or args.get("command", "") or "").strip(), 180)
+            cmd = trim(str(args.get("command", "") or "").strip(), 180)
             line = f"{name} {cmd}".strip()
-            exit_code = self._coerce_exit_code(item.get("exit_code"))
-            if exit_code is not None:
-                line = f"{line}\nexit={exit_code}".strip()
             if output:
                 line = f"{line}\n{output}".strip()
             self._blackboard_append_section("execution_logs", role_key, line)
-            command_text = str(item.get("command", "") or args.get("command", "") or "")
-            if self._command_looks_like_validation(command_text) or (not ok):
+            if self._command_looks_like_validation(str(args.get("command", "") or "")) or (not ok):
                 self._blackboard_append_memory(
                     "validation" if ok else "command_error",
                     trim(line, 700),
                     actor=role_key,
                     tool=name,
-                    command=command_text,
+                    command=str(args.get("command", "") or ""),
                     tier="long",
                 )
-            bash_paths = self._bash_file_read_targets(command_text)
+            bash_paths = self._bash_file_read_targets(str(args.get("command", "") or ""))
             if bash_paths and ok:
                 self._blackboard_append_memory(
                     "file_read",
@@ -50286,7 +48219,7 @@ body{padding:18px}
                     actor=role_key,
                     paths=bash_paths,
                     tool=name,
-                    command=command_text,
+                    command=str(args.get("command", "") or ""),
                     tier="short",
                 )
             if role_key in {"reviewer"}:
@@ -50378,7 +48311,7 @@ body{padding:18px}
             file_path = trim(str(args.get("path", "") or "").strip(), 240)
             file_paths = [file_path] if file_path else []
             if name in {"bash", "worktree_run", "background_run"}:
-                file_paths = self._bash_file_read_targets(str(item.get("command", "") or args.get("command", "") or ""))
+                file_paths = self._bash_file_read_targets(str(args.get("command", "") or ""))
             file_paths = [
                 p for p in file_paths
                 if not self._is_plan_infrastructure_path(p)
@@ -51167,8 +49100,6 @@ body{padding:18px}
         dst = self._sanitize_agent_role(to_role)
         if not src or not dst:
             raise ValueError("invalid agent roles for bus envelope")
-        _bb = self._ensure_blackboard()
-        focus_fields = self._route_focus_fields(_bb)
         envelope = {
             "id": make_id("agentmsg"),
             "ts": now_ts(),
@@ -51177,13 +49108,6 @@ body{padding:18px}
             "intent": trim(str(intent or "").strip(), 80) or "message",
             "payload": trim(str(payload or "").strip(), 4000),
             "importance": str(importance or "normal").strip().lower() or "normal",
-            "focus_kind": str(focus_fields.get("focus_kind", "") or ""),
-            "focus_id": str(focus_fields.get("focus_id", "") or ""),
-            "focus_epoch": float(focus_fields.get("focus_epoch", 0.0) or 0.0),
-            "plan_step_id": str(focus_fields.get("plan_step_id", "") or ""),
-            "plan_step_index": int(focus_fields.get("plan_step_index", -1) or -1),
-            "plan_step_total": int(focus_fields.get("plan_step_total", 0) or 0),
-            "plan_step_epoch": float(focus_fields.get("plan_step_epoch", 0.0) or 0.0),
         }
         self.agent_bus_messages.append(envelope)
         self.agent_bus_messages = self.agent_bus_messages[-240:]
@@ -51194,6 +49118,7 @@ body{padding:18px}
         # instead of relying on the sender copying its work into the payload. This
         # is what turns the per-role split from a liability into the blackboard-bus
         # advantage: small contexts + addressable shared evidence that never gets lost.
+        _bb = self._ensure_blackboard()
         anchor = self._handoff_mainline_anchor(_bb)
         manifest = ""
         try:
@@ -51278,7 +49203,6 @@ body{padding:18px}
         if not self.agent_bus_messages:
             return None
         now = now_ts()
-        bb = self._ensure_blackboard()
         preferred_intents = {
             "handoff", "review_request", "fix_request",
             "final_summary_request", "implementation_ready",
@@ -51289,11 +49213,6 @@ body{padding:18px}
                 if not isinstance(env, dict):
                     continue
                 if env.get("_fast_routed"):
-                    continue
-                if env.get("_stale_focus"):
-                    continue
-                if not self._agentbus_envelope_matches_active_focus(env, bb):
-                    env["_stale_focus"] = True
                     continue
                 intent = str(env.get("intent", "") or "").strip().lower() or "message"
                 if require_preferred and intent not in preferred_intents:
@@ -51348,16 +49267,10 @@ body{padding:18px}
         if not self.agent_bus_messages:
             return None
         now = now_ts()
-        bb = self._ensure_blackboard()
         for env in reversed(self.agent_bus_messages[-60:]):
             if not isinstance(env, dict):
                 continue
             if env.get("_fast_routed"):
-                continue
-            if env.get("_stale_focus"):
-                continue
-            if not self._agentbus_envelope_matches_active_focus(env, bb):
-                env["_stale_focus"] = True
                 continue
             to_role = self._sanitize_agent_role(env.get("to", ""))
             if not to_role or to_role not in AGENT_ROLES:
@@ -51806,7 +49719,7 @@ body{padding:18px}
             args_error = str(tc.get("args_error", "")).strip()
             try:
                 if isinstance(args, (dict, list)):
-                    args_text = json_dumps(args, sort_keys=True, separators=(",", ":"))
+                    args_text = json.dumps(args, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
                 else:
                     args_text = str(args)
             except Exception:
@@ -51816,7 +49729,7 @@ body{padding:18px}
         raw = "||".join(parts)
         if not raw:
             return ""
-        return hashlib.sha1(safe_utf8_bytes(raw)).hexdigest()
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
     def _inject_forced_convergence_hint(self, tool_names: list[str], reason: str):
         uniq = []
@@ -52865,7 +50778,6 @@ body{padding:18px}
             if guard_error:
                 return guard_error
             meta = self._run_shell_meta(args["command"], self.files_root, self._shell_command_timeout())
-            self._stash_tool_exec_meta("bash", args, meta)
             self._emit(
                 "command",
                 {
@@ -52963,8 +50875,9 @@ body{padding:18px}
             # Auto-serialize non-string content: if model passes a dict/list, convert to JSON string.
             raw_content = args.get("content", "")
             if not isinstance(raw_content, str):
+                import json as _json
                 try:
-                    raw_content = json_dumps(raw_content, indent=2)
+                    raw_content = _json.dumps(raw_content, ensure_ascii=False, indent=2)
                 except Exception:
                     raw_content = str(raw_content)
             args = dict(args)
@@ -53262,18 +51175,6 @@ body{padding:18px}
             out = self.bg.run(effective_command, int(args.get("timeout", 120)))
             out_filtered, _ = filter_runtime_noise_lines(str(out or ""))
             payload = self._prepare_shell_output_payload(raw_command, out_filtered or "(no output)", cwd=self.files_root)
-            self._stash_tool_exec_meta(
-                "background_run",
-                args,
-                {
-                    "command": raw_command,
-                    "effective_command": effective_command,
-                    "cwd": str(self.files_root),
-                    "exit_code": None,
-                    "duration_ms": 0,
-                    "changed_files": [],
-                },
-            )
             self._emit(
                 "command",
                 {
@@ -53426,7 +51327,6 @@ body{padding:18px}
             if guard_error:
                 return guard_error
             meta = self._run_shell_meta(args["command"], wt_path, self._shell_command_timeout())
-            self._stash_tool_exec_meta("worktree_run", args, meta)
             self._emit(
                 "command",
                 {
@@ -53477,93 +51377,6 @@ body{padding:18px}
             return LIVE_INPUT_DELAY_TOOL_ROUNDS, "tool-phase"
         return LIVE_INPUT_DELAY_NORMAL_ROUNDS, "thinking-phase"
 
-    def _classify_live_input_intent(self, content: str) -> str:
-        """Classify a mid-run user message as 'steer' or 'addendum' (Fix 3).
-
-        steer  = a correction / change of direction / stop / redo — must take
-                 effect immediately and at full weight (the user is course-
-                 correcting the running work).
-        addendum = supplemental info / FYI / 'also do X later' — keep the
-                 existing gentle low-weight, multi-round dilution path.
-
-        Heuristic-first (fast, deterministic, bilingual); LLM fallback only when
-        the heuristic is ambiguous AND the message is short enough to be cheap.
-        Defaults to 'addendum' on any error (preserves prior behavior)."""
-        text = str(content or "").strip()
-        if not text:
-            return "addendum"
-        low = text.lower()
-        # Strong steer signals — imperative correction / stop / redo / redirect.
-        steer_markers_en = (
-            "stop", "wait", "hold on", "hold up", "cancel", "abort", "instead",
-            "don't", "do not", "dont", "no,", "no.", "not that", "change", "redo",
-            "rewrite", "revert", "undo", "scrap", "forget", "actually", "correction",
-            "instead of", "rather than", "switch to", "use ", "drop the", "remove the",
-        )
-        steer_markers_zh = (
-            "停", "停下", "停止", "暂停", "取消", "别", "不要", "不用", "不是", "错了",
-            "改成", "改为", "换成", "换个", "重来", "重写", "重新", "撤销", "回退",
-            "别再", "先别", "而是", "应该是", "不对", "算了", "放弃",
-        )
-        addendum_markers = (
-            "also", "additionally", "by the way", "btw", "fyi", "one more",
-            "and also", "另外", "顺便", "补充", "另外还", "再加", "还有一个", "此外",
-        )
-        has_steer = any(m in low for m in steer_markers_en) or any(m in text for m in steer_markers_zh)
-        has_addendum = any(m in low for m in addendum_markers) or any(m in text for m in addendum_markers)
-        # Clear cases.
-        if has_steer and not has_addendum:
-            return "steer"
-        if has_addendum and not has_steer:
-            return "addendum"
-        # Ambiguous (both or neither): short messages default to steer bias
-        # because a terse mid-run message is usually a course-correction; but a
-        # cheap LLM check resolves it when available.
-        if has_steer and has_addendum:
-            resolved = self._llm_live_input_intent(text)
-            if resolved:
-                return resolved
-            return "steer"
-        # Neither marker: LLM fallback for short messages; else addendum.
-        if len(text) <= 240:
-            resolved = self._llm_live_input_intent(text)
-            if resolved:
-                return resolved
-        return "addendum"
-
-    def _llm_live_input_intent(self, text: str) -> str:
-        """Cheap LLM tie-breaker for live-input intent. Returns 'steer',
-        'addendum', or '' (unavailable/failed → caller keeps its default)."""
-        try:
-            prompt = (
-                "/no_think\n"
-                "A user sent this message WHILE an AI agent was actively working on their task. "
-                "Classify the user's intent as exactly one word:\n"
-                "- steer: they want to STOP, CHANGE DIRECTION, CORRECT, or REDO the current work now.\n"
-                "- addendum: they are adding supplemental info or a low-priority extra request.\n\n"
-                f"Message: {trim(text, 500)}\n\n"
-                "Answer with only 'steer' or 'addendum'."
-            )
-            resp = self.ollama.chat(
-                [{"role": "user", "content": prompt}],
-                system="/no_think\nClassify live user-input intent. One word only.",
-                max_tokens=8,
-                think=False,
-            )
-            out = ""
-            if isinstance(resp, dict):
-                out = str(resp.get("content", "") or "")
-            else:
-                out = str(resp or "")
-            out = out.strip().lower()
-            if "steer" in out:
-                return "steer"
-            if "addendum" in out:
-                return "addendum"
-        except Exception:
-            pass
-        return ""
-
     def _enqueue_running_user_input(self, content: str, *, best_effort: bool = False) -> dict:
         text = trim(str(content or "").strip(), 6000)
         if not text:
@@ -53597,11 +51410,6 @@ body{padding:18px}
                 delay_rounds, delay_reason = LIVE_INPUT_DELAY_TOOL_ROUNDS, "tool-phase"
             else:
                 delay_rounds, delay_reason = LIVE_INPUT_DELAY_NORMAL_ROUNDS, "thinking-phase"
-            intent = self._classify_live_input_intent(text)
-            # A steer must land immediately at full weight — never deferred by
-            # write/tool-phase delay (Fix 3).
-            if intent == "steer":
-                delay_rounds, delay_reason = 0, "steer"
             round_idx = int(getattr(self, "agent_round_index", 0) or 0)
             with self.live_input_queue_lock:
                 self.live_input_seq += 1
@@ -53615,7 +51423,6 @@ body{padding:18px}
                     "applied_count": 0,
                     "last_applied_round": -1,
                     "delay_reason": delay_reason,
-                    "intent": intent,
                     "run_generation": int(getattr(self, "run_generation", 0) or 0),
                     "best_effort": True,
                 }
@@ -53638,9 +51445,6 @@ body{padding:18px}
         with self.lock:
             self.live_input_seq += 1
             delay_rounds, delay_reason = self._live_input_delay_locked()
-            intent = self._classify_live_input_intent(text)
-            if intent == "steer":
-                delay_rounds, delay_reason = 0, "steer"
             round_idx = int(self.agent_round_index)
             row = {
                 "id": int(self.live_input_seq),
@@ -53652,7 +51456,6 @@ body{padding:18px}
                 "applied_count": 0,
                 "last_applied_round": -1,
                 "delay_reason": delay_reason,
-                "intent": intent,
                 "run_generation": int(self.run_generation),
             }
             with self.live_input_queue_lock:
@@ -53783,44 +51586,26 @@ body{padding:18px}
                     self._refresh_runtime_code_reference(content)
                     applied = int(row.get("applied_count", 0) or 0) + 1
                     delay_rounds = int(row.get("delay_rounds", 0) or 0)
-                    intent = str(row.get("intent", "") or "")
-                    is_steer = intent == "steer"
-                    if is_steer:
-                        # Steer (Fix 3): a genuine course-correction. Inject ONCE
-                        # at full weight with a directive marker, and flag the
-                        # loop to re-plan at the top of the next round — do not
-                        # dilute it across rounds like a background suggestion.
-                        weight = 1.0
-                        priority = "high"
-                        payload = (
-                            "<user-steer "
-                            f"id=\"{int(row.get('id', 0) or 0)}\" priority=\"high\" weight=\"1.00\">"
-                            f"\nThe user sent this instruction WHILE you were working. It is a course-"
-                            f"correction and takes priority NOW — adjust the current work to follow it "
-                            f"before continuing:\n{content}\n"
-                            "</user-steer>"
-                        )
-                    else:
-                        base_weight = (
-                            float(LIVE_INPUT_WEIGHT_BASE_DELAYED)
-                            if delay_rounds > 0
-                            else float(LIVE_INPUT_WEIGHT_BASE_NORMAL)
-                        )
-                        weight_step = (
-                            float(LIVE_INPUT_WEIGHT_STEP_DELAYED)
-                            if delay_rounds > 0
-                            else float(LIVE_INPUT_WEIGHT_STEP_NORMAL)
-                        )
-                        weight = min(1.0, base_weight + weight_step * max(0, applied - 1))
-                        priority = "low" if weight < 0.55 else ("medium" if weight < 0.9 else "high")
-                        payload = (
-                            "<live-user-adjustment "
-                            f"id=\"{int(row.get('id', 0) or 0)}\" "
-                            f"priority=\"{priority}\" "
-                            f"weight=\"{weight:.2f}\">"
-                            f"\n{content}\n"
-                            "</live-user-adjustment>"
-                        )
+                    base_weight = (
+                        float(LIVE_INPUT_WEIGHT_BASE_DELAYED)
+                        if delay_rounds > 0
+                        else float(LIVE_INPUT_WEIGHT_BASE_NORMAL)
+                    )
+                    weight_step = (
+                        float(LIVE_INPUT_WEIGHT_STEP_DELAYED)
+                        if delay_rounds > 0
+                        else float(LIVE_INPUT_WEIGHT_STEP_NORMAL)
+                    )
+                    weight = min(1.0, base_weight + weight_step * max(0, applied - 1))
+                    priority = "low" if weight < 0.55 else ("medium" if weight < 0.9 else "high")
+                    payload = (
+                        "<live-user-adjustment "
+                        f"id=\"{int(row.get('id', 0) or 0)}\" "
+                        f"priority=\"{priority}\" "
+                        f"weight=\"{weight:.2f}\">"
+                        f"\n{content}\n"
+                        "</live-user-adjustment>"
+                    )
                     self.messages.append({"role": "user", "content": payload, "ts": now_ts()})
                     # Retain the genuine user text (not the wrapped payload) as a
                     # display bubble, once, on its first injection.
@@ -53832,11 +51617,7 @@ body{padding:18px}
                         self.runtime_reclassify_required = False
                     else:
                         self.runtime_reclassify_required = True
-                    if is_steer:
-                        # Force re-plan at top of next round even under a user
-                        # task-level override (the user is explicitly redirecting).
-                        self._steer_pending = True
-                    self._mark_runtime_goal_reset_pending(content, reason="user-steer" if is_steer else "live-user-adjustment")
+                    self._mark_runtime_goal_reset_pending(content, reason="live-user-adjustment")
                     injected.append(
                         {
                             "id": int(row.get("id", 0) or 0),
@@ -53844,14 +51625,11 @@ body{padding:18px}
                             "priority": priority,
                             "applied": applied,
                             "content": content,
-                            "intent": intent or "addendum",
                         }
                     )
                     row["applied_count"] = applied
                     row["last_applied_round"] = round_idx
-                    # Steers are single-shot (already full weight); only addenda
-                    # re-inject to build weight over rounds.
-                    if not is_steer and applied < LIVE_INPUT_MAX_INJECTIONS and weight < 0.999:
+                    if applied < LIVE_INPUT_MAX_INJECTIONS and weight < 0.999:
                         row["next_round"] = round_idx + LIVE_INPUT_REINJECT_INTERVAL
                         kept.append(row)
                 self.pending_user_inputs = kept[-40:]
@@ -54153,14 +51931,12 @@ body{padding:18px}
                         previous_context=_previous_task_context,
                         clear_progress=True,
                         reset_agent_contexts=True,
-                        archive_messages=True,
                     )
                 elif not (_awaiting_plan_choice or _continue_existing_plan or _resumable_work_state or _ask_user_answer):
                     self._reset_blackboard_plan_state_locked(
                         new_goal=clean_goal_pre,
                         clear_progress=True,
                         reset_agent_contexts=True,
-                        archive_messages=True,
                     )
                 self.run_generation = int(self.run_generation) + 1
                 clean_goal = trim(str(content or "").strip(), 4000)
@@ -54540,7 +52316,12 @@ body{padding:18px}
                     "summary": f"{self._agent_display_name(role_key)} tool: {name}",
                 },
             )
-            item = self._build_tool_result_item(name, args if isinstance(args, dict) else {}, str(output or ""))
+            item = {
+                "name": name,
+                "args": args if isinstance(args, dict) else {},
+                "output": trim(str(output or ""), 3000),
+                "ok": not str(output).startswith("Error:"),
+            }
             is_finish_tool = name in {"finish_task", "finish_current_task", "mark_done"}
             # Atomic blackboard sync: update shared state immediately after each tool result.
             self._blackboard_update_from_tool_result(role_key, item)
@@ -54996,7 +52777,7 @@ body{padding:18px}
             # Detect manager loop: same instruction repeated with unchanged progress.
             import hashlib as _hl_mgr
             _delegate_progress_fp = self._watchdog_state_fingerprint(self._ensure_blackboard())
-            _cur_hash = _hl_mgr.sha1(safe_utf8_bytes(target + "|" + instruction + "|" + _delegate_progress_fp)).hexdigest()[:12]
+            _cur_hash = _hl_mgr.sha1((target + "|" + instruction + "|" + _delegate_progress_fp).encode("utf-8")).hexdigest()[:12]
             if _cur_hash == _prev_delegation_hash:
                 _repeat_delegation_count += 1
             else:
@@ -57639,21 +55420,8 @@ body{padding:18px}
             except Exception:
                 return False
             title = str(line[m.end():] or "").strip()
-            if SessionState._looks_like_plan_data_fragment_title(title):
-                # Phantom high-numbered "step" whose title is a data fragment
-                # (original heuristic): almost certainly a stray value, not a step.
-                if major_num > len(raw_steps) + 2:
-                    return False
-                # F11: a data-fragment title that is PURELY numeric/operator with
-                # no descriptive word (no CJK char, no 2+ letter run) is a leaked
-                # acceptance value even at a low, in-range step number
-                # (observed: "2.0 ± 0.01" attached as a fake subtask of step 2).
-                # A genuine subtask always carries descriptive text, so this never
-                # drops a real subtask.
-                has_cjk = bool(re.search(r"[㐀-鿿豈-﫿]", title))
-                has_word = bool(re.search(r"[A-Za-z]{2,}", title))
-                if not has_cjk and not has_word:
-                    return False
+            if major_num > len(raw_steps) + 2 and SessionState._looks_like_plan_data_fragment_title(title):
+                return False
             return True
 
         # Phase 1: Check if any N.N sub-step headers exist
@@ -58419,49 +56187,18 @@ body{padding:18px}
                     self.current_phase = "model-call"
                     self.current_tool_name = ""
                 if level_budget > 0 and int(self.agent_round_index) > int(level_budget):
-                    # Anti-degradation (Fix 2): long-horizon tasks (an active
-                    # deliverable quota, or L4/L5) must NOT be forced into
-                    # one-tool-per-round "compact mode" the moment they cross the
-                    # tier budget — that degrades reasoning exactly when a novel /
-                    # paper / big-data task needs it most, producing the 虎头蛇尾
-                    # (strong start, weak finish) failure. Instead we keep full
-                    # reasoning and rely on progress-gated continuation: the round
-                    # loop and finish gate already stop a task that has genuinely
-                    # stalled, while a task still producing real units keeps going.
-                    _dp = self._deliverable_progress()
-                    _long_horizon = bool(_dp.get("active")) or int(self.runtime_task_level or 0) >= 4
-                    if _long_horizon:
-                        if not compact_budget_notified:
-                            compact_budget_notified = True
-                            _rem = int(_dp.get("remaining", 0) or 0)
-                            _detail = (
-                                f"deliverable progress {int(_dp.get('produced', 0))}/{int(_dp.get('target', 0))} "
-                                f"{_dp.get('unit', 'unit')}s remaining={_rem}; "
-                                if _dp.get("active")
-                                else ""
-                            )
-                            self._emit(
-                                "status",
-                                {
-                                    "summary": (
-                                        "single-agent budget threshold crossed on a long-horizon task; "
-                                        f"{_detail}keeping full reasoning (no compact mode) and continuing"
-                                    )
-                                },
-                            )
-                    else:
-                        force_single_tool_rounds = max(force_single_tool_rounds, 2)
-                        if not compact_budget_notified:
-                            compact_budget_notified = True
-                            self._emit(
-                                "status",
-                                {
-                                    "summary": (
-                                        "single-agent compact mode enabled after internal budget threshold; "
-                                        "continuing with shorter reasoning and concrete actions"
-                                    )
-                                },
-                            )
+                    force_single_tool_rounds = max(force_single_tool_rounds, 2)
+                    if not compact_budget_notified:
+                        compact_budget_notified = True
+                        self._emit(
+                            "status",
+                            {
+                                "summary": (
+                                    "single-agent compact mode enabled after internal budget threshold; "
+                                    "continuing with shorter reasoning and concrete actions"
+                                )
+                            },
+                        )
                 if self.cancel_requested:
                     self._emit("status", {"summary": "run interrupted"})
                     break
@@ -58500,18 +56237,12 @@ body{padding:18px}
                     self.messages.append({"role": "user", "content": f"<inbox>{json_dumps(inbox, indent=2)}</inbox>", "ts": now_ts()})
                     self._emit("inbox", {"summary": f"{len(inbox)} inbox messages"})
                 self._inject_pending_user_inputs()
-                _sa_steer = bool(getattr(self, "_steer_pending", False))
-                if self.runtime_reclassify_required or _sa_steer:
-                    # Skip reclassification if user set task level — UNLESS this is
-                    # a steer (Fix 3): a mid-run course-correction must re-plan now
-                    # even under a manual level override.
-                    if int(getattr(self, 'user_task_level_override', 0) or 0) > 0 and not _sa_steer:
+                if self.runtime_reclassify_required:
+                    # Skip reclassification if user has manually set task level
+                    if int(getattr(self, 'user_task_level_override', 0) or 0) > 0:
                         self.runtime_reclassify_required = False
                         self._mark_runtime_goal_reset_handled(reason="single-agent-user-level-override", clear_reclassify=True)
                     else:
-                        if _sa_steer:
-                            self._steer_pending = False
-                            self._emit("status", {"summary": "user steer applied — re-planning (single-agent)"})
                         policy_media_inputs = self._recent_multimodal_inputs()
                         self._emit_multimodal_attach_status(
                             scope="manager reclassify",
@@ -58674,31 +56405,6 @@ body{padding:18px}
                     no_tool_rounds = 0
                     last_tool_fp = ""
                     repeated_tool_rounds = 0
-                    # F8: a thinking-only round is a NON-ADVANCING round for the
-                    # active plan step. Feed it into the outcome-progress tracker
-                    # so a step that stalls in analysis-paralysis (observed: single
-                    # run spent ~280 lines deriving SCF math across rounds and never
-                    # wrote the file, dying on a terse fault-prefill loop) escalates
-                    # to a user-facing plan proposal. This unifies counting with
-                    # executed-but-not-progressing rounds — the same step stall
-                    # counter now reflects BOTH churn modes.
-                    try:
-                        _f8_bb = self._ensure_blackboard()
-                        _f8_step = self._get_active_plan_step(_f8_bb)
-                        if isinstance(_f8_step, dict) and _f8_step:
-                            _f8 = self._track_step_outcome_progress(
-                                _f8_step,
-                                _f8_bb,
-                                {"reason": "thinking-only output without actionable content"},
-                            )
-                            if bool(_f8.get("escalated", False)):
-                                self._emit(
-                                    "status",
-                                    {"summary": "single-agent stall escalated to plan mode (thinking-only outcome stall)"},
-                                )
-                                break
-                    except Exception:
-                        pass
                     self._inject_thinking_empty_recovery_hint(
                         streak=consecutive_empty_action_rounds,
                         budget_forced=budget_forced,
@@ -58729,29 +56435,6 @@ body{padding:18px}
                             },
                         )
                         continue
-                    # F8: retry budget for thinking-only rounds is exhausted. Before
-                    # firing the terse circuit-breaker (which just dead-ends the run
-                    # with "split the task / switch model"), prefer a graceful
-                    # escalation to a user-facing plan proposal when a plan step is
-                    # active — the user then gets concrete re-plan options instead of
-                    # an opaque stop. Falls through to the breaker only if escalation
-                    # is unavailable (already escalated, or level/preference gates it).
-                    try:
-                        _f8b_bb = self._ensure_blackboard()
-                        if isinstance(self._get_active_plan_step(_f8b_bb), dict) and not self.stall_escalation_triggered:
-                            if self._escalate_stall_to_plan_mode(
-                                trigger_source="thinking-only-stall",
-                                fault_counter=fault_counter,
-                                last_fault_reason="thinking-only output without actionable content",
-                                pinned_selection=pinned_selection,
-                            ):
-                                self._emit(
-                                    "status",
-                                    {"summary": "single-agent thinking-only stall escalated to plan mode"},
-                                )
-                                break
-                    except Exception:
-                        pass
                     stop_note = (
                         "模型连续多轮仅输出思考而无动作，自动执行已熔断停止（fault_counter>=15）。"
                         "请尝试拆分任务，或切换更强的推理模型后继续。"
@@ -59591,26 +57274,35 @@ body{padding:18px}
                         "content": self._tool_result_context_content(name, args if isinstance(args, dict) else {}, output),
                         "ts": now_ts(),
                     })
-                    tool_item = self._build_tool_result_item(
-                        dispatched_name or name,
-                        args if isinstance(args, dict) else {},
-                        str(output or ""),
+                    single_round_tool_results.append(
+                        {
+                            "name": dispatched_name or name,
+                            "args": args if isinstance(args, dict) else {},
+                            "output": trim(str(output or ""), 3000),
+                            "ok": not str(output).startswith("Error:"),
+                        }
                     )
-                    single_round_tool_results.append(tool_item)
                     is_finish_tool = (dispatched_name or name) in {"finish_task", "finish_current_task", "mark_done"}
                     # Update blackboard signals (step_files, execution_logs) for plan+single mode.
                     # In plan+sync this is handled by _blackboard_update_from_worker_step, but in
                     # plan+single there is no worker turn — we must update inline so that
                     # _plan_step_has_blackboard_evidence() can see the evidence when the gate fires.
                     try:
-                        self._blackboard_update_from_tool_result("developer", tool_item)
-                        tool_item["bb_applied"] = True
+                        self._blackboard_update_from_tool_result(
+                            "developer",
+                            {
+                                "name": dispatched_name or name,
+                                "args": args if isinstance(args, dict) else {},
+                                "output": trim(str(output or ""), 3000),
+                                "ok": not str(output).startswith("Error:"),
+                            },
+                        )
                     except Exception:
                         pass
                     # Failure ledger: record tool call and detect errors (single-agent, unified)
                     if not is_finish_tool:
                         self._ledger_record_tool_call(name, args if isinstance(args, dict) else {})
-                    _sa_ok = bool(tool_item.get("ok", False))
+                    _sa_ok = not str(output or "").startswith("Error")
                     if not is_finish_tool:
                         self._process_tool_result_errors(name, args if isinstance(args, dict) else {}, output, _sa_ok, "single")
                     if name in ("edit_file", "write_file") and isinstance(args, dict):
@@ -74022,7 +71714,7 @@ class CodeContentParser:
             "kind": "source_code",
             "mime": str(mime or guess_mime_from_name(fp.name, "text/plain")),
             "size": int(fp.stat().st_size) if fp.exists() and fp.is_file() else len((raw_bytes or b"")),
-            "sha256": _sha256_file(fp) if fp.exists() and fp.is_file() else _sha256_bytes(safe_utf8_bytes(raw_text or "")),
+            "sha256": _sha256_file(fp) if fp.exists() and fp.is_file() else _sha256_bytes((raw_text or "").encode("utf-8")),
             "language": language or "text",
             "text": raw_text,
             "text_chars": len(raw_text),
@@ -76942,9 +74634,9 @@ class WikiStore:
             if isinstance(value, list):
                 lines.append(f"{key}:")
                 for item in value:
-                    lines.append(f"  - {json_dumps(str(item))}")
+                    lines.append(f"  - {json.dumps(str(item), ensure_ascii=False)}")
             else:
-                lines.append(f"{key}: {json_dumps(value)}")
+                lines.append(f"{key}: {json.dumps(value, ensure_ascii=False)}")
         lines.append("---")
         return "\n".join(lines) + "\n\n"
 
@@ -78174,9 +75866,9 @@ class WorkflowMemoryStore:
             if isinstance(value, list):
                 lines.append(f"{key}:")
                 for item in value[:80]:
-                    lines.append(f"  - {json_dumps(str(item))}")
+                    lines.append(f"  - {json.dumps(str(item), ensure_ascii=False)}")
             elif isinstance(value, (str, int, float, bool)):
-                lines.append(f"{key}: {json_dumps(value)}")
+                lines.append(f"{key}: {json.dumps(value, ensure_ascii=False)}")
         lines.append("---")
         return "\n".join(lines) + "\n\n"
 
@@ -83029,7 +80721,7 @@ window.addEventListener('DOMContentLoaded',async()=>{bind();try{await refreshCon
 class AppContext:
     def _llm_config_revision(self, config: dict | None) -> str:
         try:
-            raw = json_dumps(config or {}, sort_keys=True, default=str)
+            raw = json.dumps(config or {}, ensure_ascii=False, sort_keys=True, default=str)
         except Exception:
             raw = json_dumps(config or {})
         return hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()[:16]
@@ -87395,7 +85087,7 @@ class Handler(BaseHTTPRequestHandler):
             raw_name = Path(str(filename or "download.bin")).name or "download.bin"
             ascii_name = unicodedata.normalize("NFKD", raw_name).encode("ascii", "ignore").decode("ascii")
             ascii_name = re.sub(r'[\r\n"\\;]+', "_", ascii_name).strip(" ._") or "download.bin"
-            encoded_name = quote(safe_utf8_bytes(raw_name), safe="")
+            encoded_name = quote(raw_name.encode("utf-8"), safe="")
             disposition = f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{encoded_name}'
             self.send_response(200)
             self.send_header("Content-Type", content_type)
@@ -87919,7 +85611,7 @@ class Handler(BaseHTTPRequestHandler):
             if not sess:
                 return self._send_json({"error": "session not found"}, status=404)
             md = sess.export_conversation_md()
-            return self._send_bytes(safe_utf8_bytes(md), "text/markdown; charset=utf-8", f"{sess.id}_conversation.md")
+            return self._send_bytes(md.encode("utf-8"), "text/markdown; charset=utf-8", f"{sess.id}_conversation.md")
         m = re.match(r"^/api/sessions/([^/]+)/export\.pdf$", path)
         if m:
             sess = mgr.get(m.group(1))
