@@ -64,6 +64,19 @@ APP_VERSION = "0.1.1"
 DEFAULT_OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 DEFAULT_OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:7b")
 SCRIPT_DIR = Path(__file__).resolve().parent
+ADMIN_STATE_DIRNAME = ".clouds_coder_admin"
+ADMIN_CONFIG_FILENAME = "startup_config.json"
+ADMIN_APPS_FILENAME = "shared_apps.json"
+ADMIN_TELEMETRY_FILENAME = "telemetry.sqlite"
+ADMIN_AUTH_FILENAME = "auth.sqlite"
+ADMIN_MAX_APP_SKILLS = 8
+ADMIN_MAX_APP_CAPSULE_CHARS = 12_000
+ADMIN_MAX_APP_RESOURCE_FILES = 128
+ADMIN_MAX_APP_RESOURCE_BYTES = 64_000_000
+ADMIN_APP_INLINE_BLOB_BYTES = 256_000
+ADMIN_AUTH_SESSION_TTL_SECONDS = 12 * 60 * 60
+ADMIN_AUTH_PASSWORD_ITERATIONS = 600_000
+ADMIN_AUTH_MAX_ACTIVE_SESSIONS = 32
 
 # ============================================================================
 # Architecture / 架构 / アーキテクチャ
@@ -1089,6 +1102,27 @@ WEB_UI_REQUIRED_FILES = (
     "skills-extra.css",
 )
 WEB_UI_OPTIONAL_FILES = ("app.ts",)
+WEB_UI_APPLICATION_CONTRACT_VERSION = "clouds-coder-app-store-v1"
+WEB_UI_APPLICATION_FEATURE_MARKERS = {
+    "index.html": (
+        WEB_UI_APPLICATION_CONTRACT_VERSION,
+        'id="appsSideTab"',
+        'id="personalAppsTab"',
+        'id="sharedAppsTab"',
+        'id="applicationEditor"',
+        'id="applicationSkillSearch"',
+    ),
+    "app.js": (
+        WEB_UI_APPLICATION_CONTRACT_VERSION,
+        "/api/apps/personal",
+        "/api/apps/shared",
+        "/api/apps/skills",
+        "/submit",
+        "/launch",
+        "openApplicationEditor",
+        "saveApplication",
+    ),
+}
 
 IMAGE_EXTS = {
     ".png",
@@ -3319,13 +3353,30 @@ def json_response_bytes(obj: object) -> bytes:
 def read_http_json_body(handler: BaseHTTPRequestHandler) -> dict:
     length = int(handler.headers.get("Content-Length", "0") or "0")
     if length <= 0:
+        handler._clouds_request_body_consumed = True
         return {}
-    body = decode_utf8_replace(handler.rfile.read(length))
+    raw = handler.rfile.read(length)
+    handler._clouds_request_body_consumed = len(raw) == length
+    body = decode_utf8_replace(raw)
     if not body:
         return {}
     parsed = json.loads(body)
     parsed = sanitize_utf8_surrogates(parsed)
     return parsed if isinstance(parsed, dict) else {}
+
+def close_if_http_request_body_unread(handler: BaseHTTPRequestHandler) -> bool:
+    """Prevent an unread write body from becoming the next keep-alive request line."""
+    method = str(getattr(handler, "command", "") or "").upper()
+    if method not in {"POST", "PUT", "PATCH", "DELETE"}:
+        return bool(getattr(handler, "close_connection", False))
+    try:
+        length = int(handler.headers.get("Content-Length", "0") or "0")
+    except Exception:
+        length = 0
+    transfer_encoding = str(handler.headers.get("Transfer-Encoding", "") or "").strip()
+    if (length > 0 or transfer_encoding) and not bool(getattr(handler, "_clouds_request_body_consumed", False)):
+        handler.close_connection = True
+    return bool(getattr(handler, "close_connection", False))
 
 def make_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:8]}"
@@ -7340,6 +7391,39 @@ def user_id_from_ip(ip: str) -> str:
     safe_ip = re.sub(r"[^A-Za-z0-9._-]", "_", raw)
     return f"user_{safe_ip}_{token}"
 
+def trusted_client_ip(handler: BaseHTTPRequestHandler) -> str:
+    peer = handler.client_address[0] if getattr(handler, "client_address", None) else "0.0.0.0"
+    if str(os.getenv("CLOUDS_CODER_TRUST_PROXY", "") or "").strip().lower() not in {"1", "true", "yes", "on"}:
+        return peer
+    raw_ranges = str(os.getenv("CLOUDS_CODER_TRUSTED_PROXIES", "127.0.0.1/32,::1/128") or "")
+    try:
+        peer_addr = ipaddress.ip_address(peer)
+        networks = [ipaddress.ip_network(x.strip(), strict=False) for x in raw_ranges.split(",") if x.strip()]
+        if not any(peer_addr in network for network in networks):
+            return peer
+    except Exception:
+        return peer
+    forwarded = str(handler.headers.get("X-Forwarded-For", "") or "").strip()
+    if not forwarded:
+        return peer
+    # Walk from the proxy-facing edge and strip only explicitly trusted hops.
+    # This prevents a client-prepended XFF value from becoming authoritative.
+    chain: list[str] = []
+    try:
+        chain = [str(ipaddress.ip_address(x.strip())) for x in forwarded.split(",") if x.strip()]
+    except Exception:
+        return peer
+    current = str(peer_addr)
+    for candidate in reversed(chain):
+        try:
+            current_addr = ipaddress.ip_address(current)
+        except Exception:
+            return peer
+        if not any(current_addr in network for network in networks):
+            break
+        current = candidate
+    return current
+
 class CryptoBox:
     def __init__(self, codes_root: Path):
         self.codes_root = codes_root
@@ -7729,6 +7813,552 @@ def _write_json_file(path: Path, obj: object):
                 tmp.unlink()
         except Exception:
             pass
+
+
+class AdminAuthError(Exception):
+    def __init__(self, code: str, message: str, status: int = 400, *, retry_after: int = 0):
+        super().__init__(message)
+        self.code = str(code or "admin_auth_error")
+        self.status = int(status or 400)
+        self.retry_after = max(0, int(retry_after or 0))
+
+
+class AdminAuthStore:
+    """Persistent single-admin credentials and revocable browser sessions."""
+
+    _USERNAME_RE = re.compile(r"^[A-Za-z0-9._-]{3,64}$")
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.lock = threading.RLock()
+        self.password_slots = threading.BoundedSemaphore(3)
+        self.login_failures: dict[tuple[str, str], deque[float]] = {}
+        self._initialize()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(str(self.path), timeout=10.0, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=10000")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=FULL")
+        return conn
+
+    def _initialize(self) -> None:
+        with self._connect() as conn:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS admin_credentials (
+                    id INTEGER PRIMARY KEY CHECK(id = 1),
+                    username TEXT NOT NULL,
+                    username_key TEXT NOT NULL UNIQUE,
+                    password_hash TEXT NOT NULL,
+                    password_salt TEXT NOT NULL,
+                    password_algorithm TEXT NOT NULL,
+                    password_iterations INTEGER NOT NULL,
+                    auth_version INTEGER NOT NULL DEFAULT 1,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS admin_sessions (
+                    token_digest TEXT PRIMARY KEY,
+                    username_key TEXT NOT NULL,
+                    auth_version INTEGER NOT NULL,
+                    created_at REAL NOT NULL,
+                    expires_at REAL NOT NULL,
+                    revoked_at REAL NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS admin_sessions_expiry
+                    ON admin_sessions(expires_at, revoked_at);
+                """
+            )
+        try:
+            os.chmod(self.path, 0o600)
+        except Exception:
+            pass
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(str(self.path) + suffix)
+            try:
+                if sidecar.exists():
+                    os.chmod(sidecar, 0o600)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _normalize_username(value: object) -> tuple[str, str]:
+        username = unicodedata.normalize("NFKC", str(value or "")).strip()
+        if not AdminAuthStore._USERNAME_RE.fullmatch(username):
+            raise AdminAuthError(
+                "invalid_username",
+                "管理员账号需为 3-64 位字母、数字、点、下划线或连字符",
+                400,
+            )
+        return username, username.casefold()
+
+    @staticmethod
+    def _validate_password(password: object, username: str) -> str:
+        value = str(password if password is not None else "")
+        size = len(value.encode("utf-8", errors="strict"))
+        if size < 12 or size > 512:
+            raise AdminAuthError("weak_password", "密码长度需为 12-512 个 UTF-8 字节", 400)
+        if value.casefold() == str(username or "").casefold():
+            raise AdminAuthError("weak_password", "密码不能与管理员账号相同", 400)
+        classes = sum(
+            bool(re.search(pattern, value))
+            for pattern in (r"[a-z]", r"[A-Z]", r"[0-9]", r"[^A-Za-z0-9]")
+        )
+        if classes < 3:
+            raise AdminAuthError("weak_password", "密码需包含大小写字母、数字或符号中的至少三类", 400)
+        return value
+
+    @staticmethod
+    def _password_digest(password: str, salt: bytes, iterations: int) -> bytes:
+        rounds = int(iterations or ADMIN_AUTH_PASSWORD_ITERATIONS)
+        if rounds < 100_000 or rounds > 2_000_000:
+            raise ValueError("unsupported password hash work factor")
+        return hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode("utf-8"),
+            salt,
+            rounds,
+            dklen=32,
+        )
+
+    def configured(self) -> bool:
+        try:
+            with self._connect() as conn:
+                row = conn.execute("SELECT 1 FROM admin_credentials WHERE id=1").fetchone()
+                return row is not None
+        except sqlite3.DatabaseError:
+            # A damaged credential store must never reopen first-run registration.
+            return True
+
+    def setup(self, username: object, password: object) -> dict:
+        clean_username, username_key = self._normalize_username(username)
+        clean_password = self._validate_password(password, clean_username)
+        salt = os.urandom(24)
+        with self.password_slots:
+            digest = self._password_digest(clean_password, salt, ADMIN_AUTH_PASSWORD_ITERATIONS)
+        now = now_ts()
+        try:
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                exists = conn.execute("SELECT 1 FROM admin_credentials WHERE id=1").fetchone()
+                if exists is not None:
+                    conn.execute("ROLLBACK")
+                    raise AdminAuthError("setup_already_completed", "管理员已经创建，请直接登录", 409)
+                conn.execute(
+                    """INSERT INTO admin_credentials
+                       (id,username,username_key,password_hash,password_salt,password_algorithm,
+                        password_iterations,auth_version,created_at,updated_at)
+                       VALUES(1,?,?,?,?,?,?,1,?,?)""",
+                    (
+                        clean_username,
+                        username_key,
+                        base64.b64encode(digest).decode("ascii"),
+                        base64.b64encode(salt).decode("ascii"),
+                        "pbkdf2_hmac_sha256",
+                        ADMIN_AUTH_PASSWORD_ITERATIONS,
+                        now,
+                        now,
+                    ),
+                )
+                conn.execute("COMMIT")
+        except sqlite3.IntegrityError as exc:
+            raise AdminAuthError("setup_already_completed", "管理员已经创建，请直接登录", 409) from exc
+        return self.issue_session(username_key=username_key, auth_version=1)
+
+    @staticmethod
+    def _failure_key(client_ip: str, username_key: str) -> tuple[str, str]:
+        return (str(client_ip or "unknown")[:96], hashlib.sha256(username_key.encode()).hexdigest()[:24])
+
+    @staticmethod
+    def _ip_failure_key(client_ip: str) -> tuple[str, str]:
+        return (str(client_ip or "unknown")[:96], "__all__")
+
+    def _check_rate_limit(self, client_ip: str, username_key: str) -> None:
+        key = self._failure_key(client_ip, username_key)
+        ip_key = self._ip_failure_key(client_ip)
+        now = now_ts()
+        with self.lock:
+            for target, limit in ((key, 8), (ip_key, 24)):
+                rows = self.login_failures.setdefault(target, deque())
+                while rows and now - rows[0] > 900:
+                    rows.popleft()
+                if len(rows) >= limit:
+                    retry = max(1, int(900 - (now - rows[0])))
+                    raise AdminAuthError("rate_limited", "登录尝试过多，请稍后再试", 429, retry_after=retry)
+
+    def _record_failure(self, client_ip: str, username_key: str) -> None:
+        keys = (self._failure_key(client_ip, username_key), self._ip_failure_key(client_ip))
+        now = now_ts()
+        with self.lock:
+            for key in keys:
+                rows = self.login_failures.setdefault(key, deque())
+                rows.append(now)
+                while rows and now - rows[0] > 900:
+                    rows.popleft()
+
+    def login(self, username: object, password: object, client_ip: str) -> dict:
+        try:
+            clean_username, username_key = self._normalize_username(username)
+        except AdminAuthError:
+            clean_username = "invalid-admin"
+            username_key = clean_username
+        self._check_rate_limit(client_ip, username_key)
+        try:
+            with self._connect() as conn:
+                row = conn.execute("SELECT * FROM admin_credentials WHERE id=1").fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise AdminAuthError("auth_store_unavailable", "管理员认证存储不可用", 503) from exc
+        iterations = ADMIN_AUTH_PASSWORD_ITERATIONS
+        salt = b"\0" * 24
+        expected = b"\0" * 32
+        valid_user = False
+        auth_version = 1
+        if row is not None:
+            iterations = int(row["password_iterations"] or ADMIN_AUTH_PASSWORD_ITERATIONS)
+            auth_version = int(row["auth_version"] or 1)
+            try:
+                if str(row["password_algorithm"] or "") != "pbkdf2_hmac_sha256":
+                    raise ValueError("unsupported password hash algorithm")
+                salt = base64.b64decode(str(row["password_salt"]), validate=True)
+                expected = base64.b64decode(str(row["password_hash"]), validate=True)
+                if len(salt) < 16 or len(expected) != 32:
+                    raise ValueError("invalid password hash material")
+                valid_user = hmac.compare_digest(username_key, str(row["username_key"] or ""))
+            except Exception:
+                valid_user = False
+        supplied = str(password if password is not None else "")
+        try:
+            with self.password_slots:
+                actual = self._password_digest(supplied, salt, iterations)
+        except Exception as exc:
+            raise AdminAuthError("auth_store_unavailable", "管理员认证存储不可用", 503) from exc
+        if not (valid_user and hmac.compare_digest(actual, expected)):
+            self._record_failure(client_ip, username_key)
+            raise AdminAuthError("invalid_credentials", "账号或密码错误", 401)
+        with self.lock:
+            self.login_failures.pop(self._failure_key(client_ip, username_key), None)
+        return self.issue_session(username_key=username_key, auth_version=auth_version)
+
+    def issue_session(self, *, username_key: str = "admin", auth_version: int = 1) -> dict:
+        raw = "cc_session_" + base64.urlsafe_b64encode(os.urandom(32)).decode("ascii").rstrip("=")
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        now = now_ts()
+        expires = now + ADMIN_AUTH_SESSION_TTL_SECONDS
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("DELETE FROM admin_sessions WHERE revoked_at > 0 OR expires_at <= ?", (now,))
+            conn.execute(
+                "INSERT INTO admin_sessions(token_digest,username_key,auth_version,created_at,expires_at,revoked_at) VALUES(?,?,?,?,?,0)",
+                (digest, username_key, int(auth_version if auth_version is not None else 1), now, expires),
+            )
+            extra = conn.execute(
+                "SELECT token_digest FROM admin_sessions WHERE revoked_at=0 ORDER BY created_at DESC LIMIT -1 OFFSET ?",
+                (ADMIN_AUTH_MAX_ACTIVE_SESSIONS,),
+            ).fetchall()
+            if extra:
+                conn.executemany("DELETE FROM admin_sessions WHERE token_digest=?", [(x[0],) for x in extra])
+            conn.execute("COMMIT")
+        return {"access_token": raw, "token_type": "Bearer", "expires_at": expires}
+
+    def verify_session(self, token: str) -> bool:
+        raw = str(token or "")
+        if not raw.startswith("cc_session_") or len(raw) < 40:
+            return False
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        now = now_ts()
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    """SELECT s.username_key,s.auth_version,c.auth_version AS current_version
+                       FROM admin_sessions s LEFT JOIN admin_credentials c ON c.username_key=s.username_key
+                       WHERE s.token_digest=? AND s.revoked_at=0 AND s.expires_at>?""",
+                    (digest, now),
+                ).fetchone()
+            if row is None:
+                return False
+            if str(row["username_key"] or "") == "__token__":
+                return int(row["auth_version"] or 0) == 0
+            return row["current_version"] is not None and int(row["auth_version"]) == int(row["current_version"])
+        except sqlite3.DatabaseError:
+            return False
+
+    def revoke_session(self, token: str) -> None:
+        raw = str(token or "")
+        if not raw.startswith("cc_session_"):
+            return
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        with self._connect() as conn:
+            conn.execute("UPDATE admin_sessions SET revoked_at=? WHERE token_digest=?", (now_ts(), digest))
+
+
+def _admin_config_schema() -> list[dict]:
+    """Canonical startup schema shared by validation, CLI compilation and WebUI."""
+    def row(
+        key: str,
+        group: str,
+        label: str,
+        value_type: str,
+        default: object,
+        flag: str = "",
+        **extra,
+    ) -> dict:
+        out = {
+            "key": key,
+            "group": group,
+            "label": label,
+            "type": value_type,
+            "factory_default": default,
+            "flag": flag,
+            "restart_required": True,
+        }
+        out.update(extra)
+        return out
+
+    return [
+        row("host", "network", "Bind host", "host", "0.0.0.0", "--host"),
+        row("port", "network", "Agent port", "integer", 8080, "--port", minimum=1, maximum=65535),
+        row("skills_port", "network", "Skills Studio port", "integer", None, "--skills_port", nullable=True, minimum=1, maximum=65535, derived="port + 1"),
+        row("rag_admin_port", "network", "RAG admin port", "integer", None, "--rag_admin_port", nullable=True, minimum=1, maximum=65535, derived="port + 2"),
+        row("code_admin_port", "network", "Code admin port", "integer", None, "--code_admin_port", nullable=True, minimum=1, maximum=65535, derived="port + 3"),
+        row("mcp_service_port", "network", "MCP service port", "integer", None, "--mcp_service_port", nullable=True, minimum=1, maximum=65535, derived="port + 4"),
+        row("ide_port", "network", "IDE port", "integer", None, "--ide_port", nullable=True, minimum=1, maximum=65535, derived="port + 5"),
+        row("ctx_limit", "runtime", "Context token limit", "integer", DEFAULT_CONTEXT_TOKEN_LIMIT, "--ctx_limit", minimum=MIN_CONTEXT_TOKEN_LIMIT, maximum=TOKEN_THRESHOLD),
+        row("max_rounds", "runtime", "Maximum agent rounds", "integer", MAX_AGENT_ROUNDS, "--max_rounds", minimum=MIN_AGENT_ROUNDS, maximum=MAX_AGENT_ROUNDS_CAP),
+        row("run_timeout", "runtime", "Run timeout (seconds)", "integer", MAX_RUN_SECONDS, "--run_timeout", minimum=MIN_RUN_TIMEOUT_SECONDS, maximum=MAX_RUN_TIMEOUT_SECONDS),
+        row("shell_command_timeout", "runtime", "Shell timeout (seconds)", "integer", DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS, "--shell_command_timeout", minimum=MIN_SHELL_COMMAND_TIMEOUT_SECONDS, maximum=MAX_SHELL_COMMAND_TIMEOUT_SECONDS),
+        row("live_input_delay_write", "live_input", "Write-phase delay rounds", "integer", LIVE_INPUT_DELAY_WRITE_ROUNDS, "--live_input_delay_write", minimum=0, maximum=20),
+        row("live_input_delay_tool", "live_input", "Tool-phase delay rounds", "integer", LIVE_INPUT_DELAY_TOOL_ROUNDS, "--live_input_delay_tool", minimum=0, maximum=20),
+        row("live_input_delay_normal", "live_input", "Normal-phase delay rounds", "integer", LIVE_INPUT_DELAY_NORMAL_ROUNDS, "--live_input_delay_normal", minimum=0, maximum=20),
+        row("live_input_max_injections", "live_input", "Maximum live injections", "integer", LIVE_INPUT_MAX_INJECTIONS, "--live_input_max_injections", minimum=1, maximum=20),
+        row("live_input_reinject_interval", "live_input", "Reinject interval", "integer", LIVE_INPUT_REINJECT_INTERVAL, "--live_input_reinject_interval", minimum=1, maximum=20),
+        row("live_input_weight_base_delayed", "live_input", "Delayed base weight", "number", LIVE_INPUT_WEIGHT_BASE_DELAYED, "--live_input_weight_base_delayed", minimum=0, maximum=1, step=0.05),
+        row("live_input_weight_base_normal", "live_input", "Normal base weight", "number", LIVE_INPUT_WEIGHT_BASE_NORMAL, "--live_input_weight_base_normal", minimum=0, maximum=1, step=0.05),
+        row("live_input_weight_step_delayed", "live_input", "Delayed weight step", "number", LIVE_INPUT_WEIGHT_STEP_DELAYED, "--live_input_weight_step_delayed", minimum=0, maximum=1, step=0.05),
+        row("live_input_weight_step_normal", "live_input", "Normal weight step", "number", LIVE_INPUT_WEIGHT_STEP_NORMAL, "--live_input_weight_step_normal", minimum=0, maximum=1, step=0.05),
+        row("skills_root", "paths", "Skills root", "directory", "", "--skills_root"),
+        row("web_ui_config", "paths", "WebUI config JSON", "file", "", "--web_ui_config", accept=".json"),
+        row("web_ui_dir", "paths", "External WebUI directory", "directory", "", "--web_ui_dir"),
+        row("config", "paths", "LLM config file or URL", "file_or_url", "", "--config", accept=".json"),
+        row("skills_ui_enabled", "services", "Skills Studio", "boolean", True, true_flag="", false_flag="--no_skills_ui"),
+        row("rag_admin_enabled", "services", "RAG admin", "boolean", True, true_flag="", false_flag="--no_rag_admin"),
+        row("code_admin_enabled", "services", "Code library admin", "boolean", True, true_flag="", false_flag="--no_code_admin"),
+        row("ide_enabled", "services", "Programming IDE", "boolean", False, true_flag="--enable_ide", false_flag=""),
+        row("mcp_service_enabled", "services", "MCP service", "boolean", True, true_flag="", false_flag="--no_mcp_service"),
+        row("use_external_web_ui", "webui", "External WebUI mode", "tri_state", "inherit", true_flag="--use_external_web_ui", false_flag="--no_external_web_ui", choices=["inherit", "enabled", "disabled"]),
+        row("export_web_ui", "webui", "Export built-in WebUI on start", "boolean", False, true_flag="--export_web_ui", false_flag=""),
+        row("export_web_ui_force", "webui", "Overwrite WebUI export", "boolean", False, true_flag="--export_web_ui_force", false_flag=""),
+        row("language", "webui", "UI language", "enum", DEFAULT_UI_LANGUAGE, "--language", choices=["zh-CN", "zh-TW", "ja", "en"]),
+        row("ui_style", "webui", "Chat UI style", "enum", DEFAULT_UI_STYLE, "--ui-style", choices=["neo", "trad"]),
+        row("show_upload_list", "webui", "Upload list", "tri_state", "inherit", true_flag="--show_upload_list", false_flag="--no_show_upload_list", choices=["inherit", "enabled", "disabled"]),
+        row("download_js_lib", "webui", "Download offline JS libraries", "tri_state", "inherit", true_flag="--download_js_lib", false_flag="--no_download_js_lib", choices=["inherit", "enabled", "disabled"]),
+        row("read_context_policy", "runtime", "Read context policy", "enum", "auto", "--read_context_policy", choices=["auto", "conservative", "balanced", "wide"]),
+        row("tool_memory_policy", "runtime", "Tool memory policy", "enum", "auto", "--tool_memory_policy", choices=["auto", "conservative", "balanced", "wide"]),
+        row("web_search_enabled", "runtime", "Web search", "tri_state", "inherit", true_flag="--enable-web-search", false_flag="--disable-web-search", choices=["inherit", "enabled", "disabled"]),
+        row("user_memory_mode", "runtime", "User memory mode", "enum", "weak", "--user-memory", choices=["off", "weak", "on"]),
+        row("auto_task_level_ceiling", "runtime", "Auto task level ceiling", "integer", DEFAULT_AUTO_TASK_LEVEL_CEILING, "--auto_task_level_ceiling", minimum=0, maximum=5),
+        row("daily_session_limit_per_ip", "limits", "Daily sessions per user", "integer", 0, "--daily_session_limit_per_ip", minimum=0, maximum=1_000_000),
+        row("ollama_base_url", "model", "Ollama base URL", "url", DEFAULT_OLLAMA_BASE_URL, "--ollama-base-url"),
+        row("model", "model", "Default model", "text", DEFAULT_OLLAMA_MODEL, "--model"),
+        row("auto_model_switch", "model", "Automatic model recovery", "boolean", False, true_flag="--auto_model_switch", false_flag="--no_auto_model_switch"),
+        row("arbiter_enabled", "arbiter", "Arbiter enabled", "boolean", True, true_flag="--arbiter-enabled", false_flag="--arbiter-disabled"),
+        row("arbiter_model", "arbiter", "Arbiter model override", "text", "", "--arbiter-model"),
+        row("arbiter_timeout", "arbiter", "Arbiter timeout (seconds)", "number", ARBITER_DEFAULT_TIMEOUT_SECONDS, "--arbiter-timeout", minimum=0.2, maximum=15, step=0.1),
+        row("arbiter_max_tokens", "arbiter", "Arbiter max tokens", "integer", ARBITER_DEFAULT_MAX_TOKENS, "--arbiter-max-tokens", minimum=24, maximum=256),
+        row("arbiter_temperature", "arbiter", "Arbiter temperature", "number", ARBITER_DEFAULT_TEMPERATURE, "--arbiter-temperature", minimum=0, maximum=1, step=0.05),
+        row("execution_mode", "runtime", "Agent execution mode", "enum", EXECUTION_MODE_SYNC, "--execution-mode", choices=["single", "sequential", "sync"]),
+        row("max_output_tokens", "runtime", "Max output tokens", "integer", AGENT_MAX_OUTPUT_TOKENS, "--max-output-tokens", minimum=256, maximum=1_000_000),
+        row("max_user", "limits", "Global concurrent tasks", "integer", 0, "--max_user", minimum=0, maximum=100_000),
+        row("max_user_sessions", "limits", "Concurrent tasks per user", "integer", 0, "--max_user_sessions", minimum=0, maximum=100_000),
+        row("rag_file_name", "runtime", "Use filenames as RAG entities", "boolean", False, true_flag="--RAG_File_Name=on", false_flag="--RAG_File_Name=off"),
+    ]
+
+
+def _admin_factory_config() -> dict:
+    return {row["key"]: row.get("factory_default") for row in _admin_config_schema()}
+
+
+def _admin_coerce_config(raw: object) -> tuple[dict, list[dict]]:
+    src = raw if isinstance(raw, dict) else {}
+    schema = _admin_config_schema()
+    out = _admin_factory_config()
+    errors: list[dict] = []
+    for spec in schema:
+        key = str(spec["key"])
+        if key not in src:
+            continue
+        value = src.get(key)
+        typ = str(spec.get("type", "text"))
+        nullable = bool(spec.get("nullable", False))
+        if nullable and (value is None or str(value).strip() == ""):
+            out[key] = None
+            continue
+        try:
+            if typ == "integer":
+                if isinstance(value, bool):
+                    raise ValueError("boolean is not an integer")
+                value = int(value)
+            elif typ == "number":
+                if isinstance(value, bool):
+                    raise ValueError("boolean is not a number")
+                value = float(value)
+            elif typ == "boolean":
+                if isinstance(value, bool):
+                    pass
+                elif str(value).strip().lower() in {"1", "true", "yes", "on"}:
+                    value = True
+                elif str(value).strip().lower() in {"0", "false", "no", "off"}:
+                    value = False
+                else:
+                    raise ValueError("expected boolean")
+            else:
+                value = str(value or "").strip()
+            if "minimum" in spec and value < spec["minimum"]:
+                raise ValueError(f"minimum is {spec['minimum']}")
+            if "maximum" in spec and value > spec["maximum"]:
+                raise ValueError(f"maximum is {spec['maximum']}")
+            choices = spec.get("choices", [])
+            if choices and value not in choices:
+                raise ValueError("expected one of: " + ", ".join(str(x) for x in choices))
+            if typ == "url" and value:
+                parsed = urlparse(value)
+                if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                    raise ValueError("expected an http(s) URL")
+            if typ == "file_or_url" and value and "://" in value:
+                parsed = urlparse(value)
+                if parsed.scheme not in {"http", "https", "file"}:
+                    raise ValueError("expected a local path or http(s)/file URL")
+            elif typ == "file_or_url" and value:
+                candidate = Path(value).expanduser()
+                if not candidate.is_absolute():
+                    candidate = WORKDIR / candidate
+                if not candidate.exists() or not candidate.is_file():
+                    raise ValueError("local config path must be an existing file")
+            if typ in {"file", "directory"} and value:
+                if "://" in value:
+                    raise ValueError("expected a local filesystem path")
+                candidate = Path(value).expanduser()
+                if not candidate.is_absolute():
+                    candidate = WORKDIR / candidate
+                if candidate.exists() and typ == "file" and not candidate.is_file():
+                    raise ValueError("path exists but is not a file")
+                if candidate.exists() and typ == "directory" and not candidate.is_dir():
+                    raise ValueError("path exists but is not a directory")
+                accept = str(spec.get("accept", "") or "").strip().lower()
+                if typ == "file" and accept and candidate.suffix.lower() != accept:
+                    raise ValueError(f"expected a {accept} file")
+            if typ == "host" and (not value or any(ch.isspace() for ch in value)):
+                raise ValueError("invalid host")
+            out[key] = value
+        except Exception as exc:
+            errors.append({"key": key, "error": str(exc)})
+    if bool(out.get("export_web_ui_force")) and not bool(out.get("export_web_ui")):
+        errors.append({"key": "export_web_ui_force", "error": "requires export_web_ui"})
+    effective_ports = {
+        "agent": int(out["port"]),
+        "skills": int(out["skills_port"] if out.get("skills_port") is not None else int(out["port"]) + 1),
+        "rag": int(out["rag_admin_port"] if out.get("rag_admin_port") is not None else int(out["port"]) + 2),
+        "code": int(out["code_admin_port"] if out.get("code_admin_port") is not None else int(out["port"]) + 3),
+        "mcp": int(out["mcp_service_port"] if out.get("mcp_service_port") is not None else int(out["port"]) + 4),
+        "ide": int(out["ide_port"] if out.get("ide_port") is not None else int(out["port"]) + 5),
+    }
+    enabled = {
+        "agent": True,
+        "skills": bool(out.get("skills_ui_enabled")),
+        "rag": bool(out.get("rag_admin_enabled")),
+        "code": bool(out.get("code_admin_enabled")),
+        "mcp": bool(out.get("mcp_service_enabled")),
+        "ide": bool(out.get("ide_enabled")),
+    }
+    seen: dict[int, str] = {}
+    port_error_keys = {
+        "agent": "port",
+        "skills": "skills_port",
+        "rag": "rag_admin_port",
+        "code": "code_admin_port",
+        "mcp": "mcp_service_port",
+        "ide": "ide_port",
+    }
+    for service, port in effective_ports.items():
+        if not enabled.get(service):
+            continue
+        error_key = port_error_keys[service]
+        if port < 1 or port > 65535:
+            errors.append({"key": error_key, "error": "effective port must be 1-65535"})
+        elif port in seen:
+            errors.append({"key": error_key, "error": f"port conflicts with {seen[port]}"})
+        else:
+            seen[port] = service
+    out["_effective_ports"] = effective_ports
+    return out, errors
+
+
+def _admin_config_to_argv(config: dict) -> list[str]:
+    schema = _admin_config_schema()
+    argv: list[str] = []
+    for spec in schema:
+        key = str(spec["key"])
+        value = config.get(key, spec.get("factory_default"))
+        typ = str(spec.get("type", "text"))
+        if typ == "boolean":
+            flag = str(spec.get("true_flag" if bool(value) else "false_flag", "") or "")
+            if flag:
+                argv.append(flag)
+            continue
+        if typ == "tri_state":
+            state = str(value or "inherit")
+            flag = str(spec.get("true_flag" if state == "enabled" else "false_flag", "") or "") if state != "inherit" else ""
+            if flag:
+                argv.append(flag)
+            continue
+        if value is None or (isinstance(value, str) and not value.strip()):
+            continue
+        flag = str(spec.get("flag", "") or "")
+        if flag:
+            argv.extend([flag, str(value)])
+    return argv
+
+def _admin_argparse_defaults(config: dict) -> dict:
+    """Map canonical Admin config keys to argparse destinations."""
+    out = dict(config or {})
+    out.update({
+        "no_skills_ui": not bool(config.get("skills_ui_enabled", True)),
+        "no_rag_admin": not bool(config.get("rag_admin_enabled", True)),
+        "no_code_admin": not bool(config.get("code_admin_enabled", True)),
+        "enable_ide": bool(config.get("ide_enabled", False)),
+        "no_ide": not bool(config.get("ide_enabled", False)),
+        "no_mcp_service": not bool(config.get("mcp_service_enabled", True)),
+        "use_external_web_ui": None if config.get("use_external_web_ui") == "inherit" else config.get("use_external_web_ui") == "enabled",
+        "show_upload_list": None if config.get("show_upload_list") == "inherit" else config.get("show_upload_list") == "enabled",
+        "download_js_lib": None if config.get("download_js_lib") == "inherit" else config.get("download_js_lib") == "enabled",
+        "web_search_enabled": None if config.get("web_search_enabled") == "inherit" else config.get("web_search_enabled") == "enabled",
+        "rag_file_name": "on" if bool(config.get("rag_file_name")) else "off",
+    })
+    for key in ("skills_ui_enabled", "rag_admin_enabled", "code_admin_enabled", "ide_enabled", "mcp_service_enabled"):
+        out.pop(key, None)
+    return out
+
+def _admin_config_from_namespace(args: argparse.Namespace) -> dict:
+    values = _admin_factory_config()
+    for spec in _admin_config_schema():
+        key = str(spec["key"])
+        if hasattr(args, key):
+            values[key] = getattr(args, key)
+    values.update({
+        "skills_ui_enabled": not bool(getattr(args, "no_skills_ui", False)),
+        "rag_admin_enabled": not bool(getattr(args, "no_rag_admin", False)),
+        "code_admin_enabled": not bool(getattr(args, "no_code_admin", False)),
+        "ide_enabled": bool(getattr(args, "enable_ide", False)) and not bool(getattr(args, "no_ide", False)),
+        "mcp_service_enabled": not bool(getattr(args, "no_mcp_service", False)),
+        "use_external_web_ui": "inherit" if getattr(args, "use_external_web_ui", None) is None else ("enabled" if bool(args.use_external_web_ui) else "disabled"),
+        "show_upload_list": "inherit" if getattr(args, "show_upload_list", None) is None else ("enabled" if bool(args.show_upload_list) else "disabled"),
+        "download_js_lib": "inherit" if getattr(args, "download_js_lib", None) is None else ("enabled" if bool(args.download_js_lib) else "disabled"),
+        "web_search_enabled": "inherit" if getattr(args, "web_search_enabled", None) is None else ("enabled" if bool(args.web_search_enabled) else "disabled"),
+        "rag_file_name": _to_bool_like(getattr(args, "rag_file_name", ""), default=False),
+    })
+    return values
 
 def make_unified_diff(path: str, old_text: str, new_text: str, max_lines: int = 400) -> tuple[str, int, int]:
     old_lines = old_text.splitlines()
@@ -8132,7 +8762,7 @@ class EventHub:
 
     def __init__(self):
         self._subs: list[queue.Queue] = []
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._seq = 0
 
     def subscribe(self) -> queue.Queue:
@@ -12519,15 +13149,6 @@ class SkillStore:
                 seen.add(low)
                 deduped.append(t)
         return deduped[:20]
-        # Deduplicate while preserving order
-        seen: set[str] = set()
-        deduped: list[str] = []
-        for t in triggers:
-            low = t.lower()
-            if low not in seen:
-                seen.add(low)
-                deduped.append(t)
-        return deduped[:20]
 
     def _skill_keywords(self, meta: dict) -> list[str]:
         """Extract keywords from SKILL.md metadata for universal skill matching.
@@ -12584,11 +13205,13 @@ class SkillStore:
         return out
 
     def _skill_runtime_contract(self, meta: dict) -> str:
-        contract = str(meta.get("runtime_contract", "") or "").strip()
+        raw = meta.get("runtime_contract", "") if isinstance(meta, dict) else ""
+        contract = raw.strip() if isinstance(raw, str) else ""
         cc = self._skill_meta_section(meta, "clouds_coder")
         if not contract:
-            contract = str(cc.get("runtime_contract", "") or "").strip()
-        return contract
+            nested = cc.get("runtime_contract", "")
+            contract = nested.strip() if isinstance(nested, str) else ""
+        return "".join(ch for ch in contract.replace("\r\n", "\n").replace("\r", "\n") if ch in "\n\t" or ord(ch) >= 32)
 
     def _skill_attachment_globs(self, meta: dict) -> list[str]:
         globs = _meta_string_list(meta.get("attachments"))
@@ -12882,12 +13505,24 @@ class SkillStore:
             target = (skill_dir / rel).resolve()
             if target.exists():
                 candidates.append(target)
+        try:
+            allowed_root = base.resolve()
+        except Exception:
+            allowed_root = base
         for fp in candidates:
-            if not fp.is_file():
+            try:
+                resolved_fp = fp.resolve()
+                resolved_fp.relative_to(allowed_root)
+            except Exception:
+                self.warnings.append(f"blocked skill resource outside provider root: {fp}")
+                continue
+            if fp.is_symlink() or not resolved_fp.is_file():
+                if fp.is_symlink():
+                    self.warnings.append(f"blocked symlink skill resource: {fp}")
                 continue
             if fp.name in {skip_name, ".DS_Store"}:
                 continue
-            rel = fp.relative_to(base).as_posix() if fp.is_relative_to(base) else fp.name
+            rel = resolved_fp.relative_to(allowed_root).as_posix()
             if rel in seen:
                 continue
             seen.add(rel)
@@ -12895,7 +13530,7 @@ class SkillStore:
             if text is None and rel not in entrypoint_set:
                 continue
             try:
-                skill_rel = fp.resolve().relative_to(self.skills_root.resolve()).as_posix()
+                skill_rel = resolved_fp.relative_to(self.skills_root.resolve()).as_posix()
             except Exception:
                 skill_rel = rel
             size = 0
@@ -12906,8 +13541,8 @@ class SkillStore:
             attachments.append(
                 {
                     "path": rel,
-                    "abs_path": str(fp.resolve()),
-                    "virtual_path": self._public_provider_path(provider_id, fp.resolve())
+                    "abs_path": str(resolved_fp),
+                    "virtual_path": self._public_provider_path(provider_id, resolved_fp)
                     or f"{SKILLS_VIRTUAL_PREFIX}/{skill_rel}".replace("//", "/"),
                     "provider_id": provider_id,
                     "content": text or "",
@@ -13802,8 +14437,9 @@ class TaskManager:
             return tasks
 
 class BackgroundManager:
-    def __init__(self, workdir: Path):
+    def __init__(self, workdir: Path, command_wrapper=None):
         self.workdir = workdir
+        self.command_wrapper = command_wrapper
         self.tasks: dict[str, dict] = {}
         self.notifications: queue.Queue = queue.Queue()
         self.lock = threading.Lock()
@@ -13825,9 +14461,15 @@ class BackgroundManager:
 
     def _exec(self, task_id: str, command: str, timeout: int):
         try:
+            run_command: object = command
+            run_shell = True
+            wrapper = self.command_wrapper() if callable(self.command_wrapper) else []
+            if wrapper:
+                run_command = [*wrapper, "/bin/sh", "-c", command]
+                run_shell = False
             r = subprocess.run(
-                command,
-                shell=True,
+                run_command,
+                shell=run_shell,
                 cwd=self.workdir,
                 capture_output=True,
                 text=True,
@@ -15104,6 +15746,147 @@ class OllamaClient:
         self.capabilities = default_multimodal_capabilities()
         self.media_endpoints: dict[str, str] = {}
         self.embed_model: str = ""  # embedding model name, e.g. "nomic-embed-text"
+        self.telemetry_callback = None
+        self.telemetry_context_provider = None
+        self.telemetry_name = "chat"
+
+    def set_telemetry(self, callback=None, context_provider=None, name: str = "chat") -> None:
+        self.telemetry_callback = callback
+        self.telemetry_context_provider = context_provider
+        self.telemetry_name = trim(str(name or "chat"), 80)
+
+    @staticmethod
+    def _usage_tokens(response: dict | None) -> dict:
+        if not isinstance(response, dict):
+            return {}
+        raw = response.get("raw") if isinstance(response.get("raw"), dict) else {}
+        usage = raw.get("usage") if isinstance(raw.get("usage"), dict) else {}
+
+        def _as_int(value: object) -> int:
+            try:
+                return max(0, int(float(value))) if value not in (None, "") else 0
+            except Exception:
+                return 0
+
+        prompt = _as_int(
+            usage.get("prompt_tokens") or usage.get("input_tokens")
+            or raw.get("prompt_eval_count") or raw.get("input_tokens")
+        )
+        completion = _as_int(
+            usage.get("completion_tokens") or usage.get("output_tokens")
+            or raw.get("eval_count") or raw.get("output_tokens")
+        )
+        total = _as_int(usage.get("total_tokens") or raw.get("total_tokens"))
+        if total <= 0 and (prompt or completion):
+            total = prompt + completion
+        if prompt <= 0 and total > completion:
+            prompt = total - completion
+        if not (prompt or completion or total):
+            return {}
+        source = "model-usage"
+        if usage:
+            source = "anthropic-usage" if ("input_tokens" in usage or "output_tokens" in usage) else "openai-usage"
+        elif "prompt_eval_count" in raw or "eval_count" in raw:
+            source = "ollama-usage"
+        return {
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "total_tokens": total,
+            "source": source,
+        }
+
+    @staticmethod
+    def _operation_status_from_exception(exc: Exception) -> str:
+        low = str(exc).lower()
+        status_code = int(getattr(exc, "status", 0) or 0)
+        if status_code in {408, 504} or isinstance(exc, (TimeoutError, socket.timeout)) or "timeout" in low or "timed out" in low:
+            return "timeout"
+        if status_code == 499 or "interrupted" in low or "cancelled" in low or "canceled" in low:
+            return "cancelled"
+        return "error"
+
+    def _emit_chat_telemetry(
+        self,
+        response: dict | None,
+        started: float,
+        status: str,
+        *,
+        probe_mode: bool = False,
+        provider_snapshot: str = "",
+        model_snapshot: str = "",
+    ) -> None:
+        callback = getattr(self, "telemetry_callback", None)
+        if not callable(callback):
+            return
+        context: dict = {}
+        provider = getattr(self, "telemetry_context_provider", None)
+        if callable(provider):
+            try:
+                supplied = provider()
+                if isinstance(supplied, dict):
+                    context = supplied
+            except Exception:
+                context = {}
+        usage = self._usage_tokens(response)
+        fields = {
+            **context,
+            "name": "capability_probe" if probe_mode else str(getattr(self, "telemetry_name", "chat") or "chat"),
+            "status": status,
+            "duration_ms": round((time.monotonic() - started) * 1000.0, 3),
+            "provider": str(provider_snapshot or self.provider or ""),
+            "model": str(model_snapshot or self.model or ""),
+        }
+        if usage:
+            fields.update({
+                "prompt_tokens": int(usage.get("prompt_tokens", 0) or 0),
+                "completion_tokens": int(usage.get("completion_tokens", 0) or 0),
+                "total_tokens": int(usage.get("total_tokens", 0) or 0),
+            })
+        try:
+            callback("llm_call", **fields)
+        except Exception:
+            pass
+
+    def _emit_model_operation_telemetry(
+        self,
+        name: str,
+        started: float,
+        status: str,
+        *,
+        model: str = "",
+        response: dict | None = None,
+    ) -> None:
+        callback = getattr(self, "telemetry_callback", None)
+        if not callable(callback):
+            return
+        context: dict = {}
+        provider = getattr(self, "telemetry_context_provider", None)
+        if callable(provider):
+            try:
+                supplied = provider()
+                if isinstance(supplied, dict):
+                    context = supplied
+            except Exception:
+                pass
+        fields = {
+            **context,
+            "name": trim(str(name or "model_operation"), 80),
+            "status": str(status or "error"),
+            "duration_ms": round((time.monotonic() - started) * 1000.0, 3),
+            "provider": str(self.provider or ""),
+            "model": str(model or self.model or ""),
+        }
+        usage = self._usage_tokens(response)
+        if usage:
+            fields.update({
+                "prompt_tokens": int(usage.get("prompt_tokens", 0) or 0),
+                "completion_tokens": int(usage.get("completion_tokens", 0) or 0),
+                "total_tokens": int(usage.get("total_tokens", 0) or 0),
+            })
+        try:
+            callback("llm_call", **fields)
+        except Exception:
+            pass
 
     def _http_retry_key(self, url: str) -> str:
         parsed = urlparse(str(url or ""))
@@ -15307,40 +16090,41 @@ class OllamaClient:
         Raises on failure — _rag_embed_text catches and falls back to TF-IDF.
         """
         m = str(model or self.embed_model or "").strip()
-        if not m:
-            raise ValueError("OllamaClient.embed() called with no model configured")
-        texts = input if isinstance(input, list) else [str(input)]
-
-        if self.provider == "ollama":
-            raw = self._post_json(
-                "/api/embed",
-                {"model": m, "input": texts[0] if len(texts) == 1 else texts},
-            )
-            vecs = raw.get("embeddings") or raw.get("embedding")
-            if isinstance(vecs, list) and vecs:
-                if isinstance(vecs[0], list):
-                    return {"embeddings": vecs}
-                return {"embeddings": [vecs]}
-            raise ValueError(f"Unexpected embed response shape: {str(raw)[:120]}")
-        else:
-            payload: dict = {"model": m, "input": texts}
-            if self.payload_template:
-                payload.update(
-                    {k: v for k, v in self.payload_template.items() if k not in payload}
+        started = time.monotonic()
+        status = "error"
+        raw: dict | None = None
+        try:
+            if not m:
+                raise ValueError("OllamaClient.embed() called with no model configured")
+            texts = input if isinstance(input, list) else [str(input)]
+            if self.provider == "ollama":
+                raw = self._post_json(
+                    "/api/embed",
+                    {"model": m, "input": texts[0] if len(texts) == 1 else texts},
                 )
-            headers = self._render_headers()
-            base = str(self.base_url or "").rstrip("/")
-            raw = self._post_json_url(f"{base}/v1/embeddings", payload, headers)
-            data = raw.get("data") or []
-            if data and isinstance(data[0], dict):
-                vecs = [
-                    item["embedding"]
-                    for item in data
-                    if isinstance(item.get("embedding"), list)
-                ]
-                if vecs:
-                    return {"embeddings": vecs}
+                vecs = raw.get("embeddings") or raw.get("embedding")
+                if isinstance(vecs, list) and vecs:
+                    status = "success"
+                    return {"embeddings": vecs if isinstance(vecs[0], list) else [vecs]}
+            else:
+                payload: dict = {"model": m, "input": texts}
+                if self.payload_template:
+                    payload.update({k: v for k, v in self.payload_template.items() if k not in payload})
+                headers = self._render_headers()
+                base = str(self.base_url or "").rstrip("/")
+                raw = self._post_json_url(f"{base}/v1/embeddings", payload, headers)
+                data = raw.get("data") or []
+                if data and isinstance(data[0], dict):
+                    vecs = [item["embedding"] for item in data if isinstance(item.get("embedding"), list)]
+                    if vecs:
+                        status = "success"
+                        return {"embeddings": vecs}
             raise ValueError(f"Unexpected embed response shape: {str(raw)[:120]}")
+        except Exception as exc:
+            status = self._operation_status_from_exception(exc)
+            raise
+        finally:
+            self._emit_model_operation_telemetry("embedding", started, status, model=m, response={"raw": raw or {}})
 
     def _probe_cache_key(self) -> str:
         endpoint = self.endpoint.strip() if self.endpoint else ""
@@ -16293,7 +17077,7 @@ class OllamaClient:
         row = self._probe_cache.get(key, {})
         return dict(row) if isinstance(row, dict) else {}
 
-    def generate_media(
+    def _generate_media_impl(
         self,
         media_type: str,
         prompt: str,
@@ -16352,6 +17136,45 @@ class OllamaClient:
             "endpoint": endpoint,
             "raw": parsed,
         }
+
+    def generate_media(
+        self,
+        media_type: str,
+        prompt: str,
+        *,
+        size: str = "",
+        duration: int = 0,
+        fmt: str = "",
+        extra: dict | None = None,
+    ) -> dict:
+        mtype = str(media_type or "").strip().lower()
+        started = time.monotonic()
+        status = "error"
+        response: dict | None = None
+        try:
+            response = self._generate_media_impl(
+                mtype,
+                prompt,
+                size=size,
+                duration=duration,
+                fmt=fmt,
+                extra=extra,
+            )
+            status = "success"
+            return response
+        except Exception as exc:
+            status = self._operation_status_from_exception(exc)
+            raise
+        finally:
+            telemetry_response = None
+            if isinstance(response, dict) and isinstance(response.get("raw"), dict):
+                telemetry_response = {"raw": response.get("raw")}
+            self._emit_model_operation_telemetry(
+                f"media_{mtype or 'generation'}",
+                started,
+                status,
+                response=telemetry_response,
+            )
 
     @staticmethod
     def _collapse_tool_role_messages(messages: list[dict]) -> list[dict]:
@@ -16949,7 +17772,7 @@ class OllamaClient:
             },
         }
 
-    def chat(
+    def _chat_impl(
         self,
         messages: list[dict],
         *,
@@ -17123,6 +17946,63 @@ class OllamaClient:
             raw_tool_calls = raw.get("tool_calls", [])
         tool_calls = self._normalize_tool_calls(raw_tool_calls)
         return {"content": content, "thinking": thinking_content, "tool_calls": tool_calls, "raw": raw}
+
+    def chat(
+        self,
+        messages: list[dict],
+        *,
+        tools: list[dict] | None = None,
+        system: str | None = None,
+        max_tokens: int = 2000,
+        temperature: float = 0.2,
+        think: bool = False,
+        stream_thinking: bool = False,
+        on_thinking_chunk=None,
+        response_stream: bool = False,
+        on_content_delta=None,
+        media_inputs: list[dict] | None = None,
+        probe_mode: bool = False,
+        cancel_check=None,
+        on_http_retry=None,
+        effort: str = "",
+    ) -> dict:
+        started = time.monotonic()
+        provider_snapshot = str(self.provider or "")
+        model_snapshot = str(self.model or "")
+        response: dict | None = None
+        status = "error"
+        try:
+            response = self._chat_impl(
+                messages,
+                tools=tools,
+                system=system,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                think=think,
+                stream_thinking=stream_thinking,
+                on_thinking_chunk=on_thinking_chunk,
+                response_stream=response_stream,
+                on_content_delta=on_content_delta,
+                media_inputs=media_inputs,
+                probe_mode=probe_mode,
+                cancel_check=cancel_check,
+                on_http_retry=on_http_retry,
+                effort=effort,
+            )
+            status = "success"
+            return response
+        except Exception as exc:
+            status = self._operation_status_from_exception(exc)
+            raise
+        finally:
+            self._emit_chat_telemetry(
+                response,
+                started,
+                status,
+                probe_mode=probe_mode,
+                provider_snapshot=provider_snapshot,
+                model_snapshot=model_snapshot,
+            )
 
 def tool_def(name: str, description: str, properties: dict, required: list[str] | None = None) -> dict:
     return {
@@ -17568,12 +18448,15 @@ def canonicalize_tool_name(raw: object) -> str:
 
 def filter_tool_specs_for_runtime(tools: list[dict] | None, *, web_search_enabled: bool = DEFAULT_WEB_SEARCH_ENABLED) -> list[dict]:
     src = tools if isinstance(tools, list) else []
-    if bool(web_search_enabled):
-        return list(src)
     out: list[dict] = []
     for tool in src:
         fn = tool.get("function", {}) if isinstance(tool, dict) else {}
-        if canonicalize_tool_name(fn.get("name", "")) == "agent_web_search":
+        name = canonicalize_tool_name(fn.get("name", ""))
+        # Global skills are executable policy. Ordinary sessions may inspect them,
+        # but mutation is restricted to the authenticated admin/Skills Studio path.
+        if name == "write_skill":
+            continue
+        if name == "agent_web_search" and not bool(web_search_enabled):
             continue
         out.append(tool)
     return out
@@ -17780,7 +18663,7 @@ class SessionState:
         self.skills_last_refresh_ts = 0.0
         self.skills_runtime_prepared = False
         self.tasks = TaskManager(self.root / "tasks", crypto)
-        self.bg = BackgroundManager(self.files_root)
+        self.bg = BackgroundManager(self.files_root, command_wrapper=self._hard_snapshot_shell_prefix)
         self.bus = MessageBus(self.root / "team" / "inbox", crypto)
         self.worktrees = WorktreeManager(self.id, self.tasks, self.root, crypto, repo_root)
         # External MCP (Model Context Protocol) tool driver. Prefer the shared
@@ -17978,6 +18861,10 @@ class SessionState:
         self.last_context_actual_context_label = ""
         self.last_context_actual_ts = 0.0
         self.last_context_estimated_prompt_tokens = 0
+        self.app_binding: dict = {}
+        self.bound_skill_ids: list[str] = []
+        self.bound_skill_capsule = ""
+        self.skill_mode = "dynamic"
         self.max_agent_rounds = max(
             MIN_AGENT_ROUNDS,
             min(MAX_AGENT_ROUNDS_CAP, int(max_rounds or MAX_AGENT_ROUNDS)),
@@ -18743,7 +19630,6 @@ class SessionState:
             if cached_caps:
                 merged = merge_multimodal_capabilities(self._capabilities_from_profile(row), cached_caps)
                 row["capabilities"] = merged
-                self.model_profiles[self.active_profile_id] = row
         self.model_profiles[self.active_profile_id] = row
         profile = row
         self.ollama.apply_profile(profile)
@@ -19185,6 +20071,17 @@ class SessionState:
                             "updated_at": float(srow.get("updated_at", 0.0) or 0.0),
                         }
                     self.skill_load_cache = clean_skill_cache
+                app_binding = raw.get("app_binding", {})
+                if isinstance(app_binding, dict):
+                    self.app_binding = dict(app_binding)
+                bound_ids = raw.get("bound_skill_ids", [])
+                if isinstance(bound_ids, list):
+                    self.bound_skill_ids = [str(x).strip() for x in bound_ids if str(x).strip()][:ADMIN_MAX_APP_SKILLS]
+                self.bound_skill_capsule = trim(
+                    str(raw.get("bound_skill_capsule", "") or ""),
+                    ADMIN_MAX_APP_CAPSULE_CHARS,
+                )
+                self.skill_mode = "hard" if self.bound_skill_ids and self.bound_skill_capsule else "dynamic"
                 active = raw.get("active_profile_id")
                 if isinstance(active, str) and active.strip():
                     self.active_profile_id = self._sanitize_profile_id(active)
@@ -19687,6 +20584,10 @@ class SessionState:
             "active_profile_id": self.active_profile_id,
             "multimodal_capability_cache": self.multimodal_capability_cache,
             "skill_load_cache": self.skill_load_cache,
+            "app_binding": dict(self.app_binding) if isinstance(self.app_binding, dict) else {},
+            "bound_skill_ids": list(self.bound_skill_ids)[:ADMIN_MAX_APP_SKILLS],
+            "bound_skill_capsule": trim(str(self.bound_skill_capsule or ""), ADMIN_MAX_APP_CAPSULE_CHARS),
+            "skill_mode": "hard" if self.skill_mode == "hard" else "dynamic",
             "todos": self.todo.snapshot(),
             "thinking": self.thinking,
             "context_limit_locked": bool(self.context_limit_locked),
@@ -20309,8 +21210,21 @@ class SessionState:
         bb["plan_proposal"] = ""
         bb["plan_risks"] = ""
         bb["plan_meta"] = {}
-        bb["loaded_skills"] = {}
-        bb["loaded_skills_goal_sig"] = ""
+        if self.skill_mode == "hard" and self.bound_skill_ids:
+            bb["loaded_skills"] = {
+                key: {
+                    "loaded_at": now_ts(),
+                    "size": 0,
+                    "preview": "immutable application skill snapshot",
+                    "skill_name": key,
+                    "pinned": True,
+                }
+                for key in self.bound_skill_ids
+            }
+            bb["loaded_skills_goal_sig"] = "hard-bound"
+        else:
+            bb["loaded_skills"] = {}
+            bb["loaded_skills_goal_sig"] = ""
         if previous:
             bb["previous_task_context"] = previous
         self.blackboard = bb
@@ -20810,6 +21724,15 @@ class SessionState:
             self.skill_load_cache = {}
 
     def _load_skill_with_cache(self, name: str, load_source: str = "manual") -> str:
+        if self.skill_mode == "hard":
+            requested = str(name or "").strip()
+            if requested not in set(self.bound_skill_ids):
+                return "Error: hard application mode only permits its bound skills: " + ", ".join(self.bound_skill_ids)
+            order = self.bound_skill_ids.index(requested) + 1
+            frozen = f"/workspace/.application_skills/{order:02d}/SKILL.md"
+            if (self._application_snapshot_root() / f"{order:02d}" / "SKILL.md").exists():
+                return f"Skill is hard-bound and active. Its complete immutable source is {frozen}; read that file before execution."
+            return "Skill is already active from the legacy immutable application snapshot."
         self._ensure_skills_ready(force=False)
         key, err = self.skills._resolve_name(name)
         if err or not key:
@@ -20999,6 +21922,23 @@ class SessionState:
         The original <loaded-skill> message may be compacted, so each model
         call gets a small workflow-critical copy from the skill cache/path.
         """
+        if self.skill_mode == "hard" and str(self.bound_skill_capsule or "").strip():
+            role = str(for_role or "agent").strip() or "agent"
+            header = (
+                "HARD-BOUND APPLICATION SKILLS (immutable approved snapshot):\n"
+                f"Application: {str((self.app_binding or {}).get('name', (self.app_binding or {}).get('app_id', 'application')))}. "
+                f"Role: {role}. The following workflows are mandatory for this session. "
+                "Do not unload, replace, bypass, or add unbound skills. When workflows overlap, "
+                "apply them in the listed order and preserve every hard constraint.\n"
+            )
+            if int((self.app_binding or {}).get("resource_count", 0) or 0) > 0:
+                header += (
+                    "Frozen skill scripts, templates, and references are mounted read-only under "
+                    "`/workspace/.application_skills/<skill-order>/`; consult "
+                    "`/workspace/.application_skills/MANIFEST.json` and use only those immutable copies. "
+                    "Do not access the mutable global `/skills` tree.\n"
+                )
+            return header + str(self.bound_skill_capsule or "")
         loaded = self._loaded_skill_rows()
         if not loaded:
             return ""
@@ -21064,6 +22004,13 @@ class SessionState:
         self.manager_context = _filter_rows(list(self.manager_context))[-400:]
 
     def _prepare_loaded_skills_for_goal(self, goal_text: str, trigger: str = "") -> dict:
+        if self.skill_mode == "hard":
+            return {
+                "goal_sig": self._loaded_skills_goal_signature(goal_text),
+                "current_sig": "hard-bound",
+                "goal_changed": False,
+                "loaded": {key: {"skill_name": key, "pinned": True} for key in self.bound_skill_ids},
+            }
         goal_sig = self._loaded_skills_goal_signature(goal_text)
         bb = self._ensure_blackboard()
         current_sig = str(bb.get("loaded_skills_goal_sig", "") or "")
@@ -21102,6 +22049,8 @@ class SessionState:
 
     def _auto_discover_and_load_skills(self, goal_text: str, trigger: str = ""):
         """Skill discovery: LLM semantic match (with timeout) → keyword fallback → lazy load."""
+        if self.skill_mode == "hard":
+            return
         try:
             self._ensure_skills_ready(force=False)
         except Exception:
@@ -21421,6 +22370,12 @@ class SessionState:
 
     def _loaded_skills_prompt_hint(self, *, for_role: str = "") -> str:
         """Unified skill awareness hint for any system prompt."""
+        if self.skill_mode == "hard" and self.bound_skill_ids:
+            return (
+                "HARD APPLICATION MODE: only these approved skills are active: "
+                + ", ".join(self.bound_skill_ids)
+                + ". Their immutable snapshot is mandatory. Do not call load_skill for any other skill. "
+            )
         bb = self._ensure_blackboard()
         loaded = bb.get("loaded_skills", {})
         skill_count = len(self.skills.skills) if hasattr(self.skills, "skills") else 0
@@ -21452,6 +22407,8 @@ class SessionState:
         Returns: loaded-skills hint  +  newline  +  'Skills:\\n<catalog>'
         Keeps all three modes in sync — change here propagates everywhere.
         """
+        if self.skill_mode == "hard":
+            return self._loaded_skills_context_block(for_role=for_role, max_chars=ADMIN_MAX_APP_CAPSULE_CHARS) + "\n"
         hint = self._loaded_skills_prompt_hint(for_role=for_role)
         active = self._loaded_skills_context_block(for_role=for_role, max_chars=6500)
         active_block = f"\n{active}\n" if active else "\n"
@@ -21658,10 +22615,20 @@ class SessionState:
 
     def _inject_runtime_environment_context(self, system: str = "") -> str:
         base = str(system or "").strip()
-        if "RUNTIME TEMPORAL AND LOCAL CONTEXT:" in base:
-            return base
-        block = self._runtime_environment_context_prompt_block()
-        return f"{base}\n\n{block}" if base else block
+        if "RUNTIME TEMPORAL AND LOCAL CONTEXT:" not in base:
+            block = self._runtime_environment_context_prompt_block()
+            base = f"{base}\n\n{block}" if base else block
+        if self.skill_mode == "hard" and "HARD-BOUND APPLICATION SKILLS (immutable approved snapshot):" not in base:
+            skills = self._loaded_skills_context_block(
+                for_role="system-helper",
+                max_chars=ADMIN_MAX_APP_CAPSULE_CHARS,
+            )
+            if skills:
+                base = f"{base}\n\n{skills}" if base else skills
+        return base
+
+    def _helper_system_prompt(self, system: str = "") -> str:
+        return self._inject_runtime_environment_context(system)
 
     def _system_prompt(self) -> str:
         try:
@@ -21724,6 +22691,7 @@ class SessionState:
         mm_block = self._multimodal_capability_block()
         mm_hint = f"{mm_block}\n" if mm_block else ""
         runtime_env_text = self._runtime_environment_context_prompt_block() + "\n\n"
+        skills_catalog_text = "" if self.skill_mode == "hard" else f"Skills:\n{self.skills.descriptions()}"
         return (
             f"You are a coding agent. Workspace: \"{self.files_root}\" ($SESSION_ROOT). "
             f"Offline JS libraries root: $JS_LIB_ROOT. "
@@ -21768,7 +22736,7 @@ class SessionState:
             f"{code_block}"
             f"{model_language_instruction(self.ui_language)}\n\n"
             f"Uploads:\n{uploads_ctx}\n\n"
-            f"Skills:\n{self.skills.descriptions()}"
+            f"{skills_catalog_text}"
         )
 
     def _char_token_divisor(self, text: str) -> float:
@@ -21811,54 +22779,18 @@ class SessionState:
 
     def _extract_model_usage_tokens(self, response: dict | None) -> dict:
         """Extract provider-reported token counts when a backend returns them."""
-        if not isinstance(response, dict):
-            return {}
-        raw = response.get("raw")
-        if not isinstance(raw, dict):
-            raw = {}
-        usage = raw.get("usage") if isinstance(raw.get("usage"), dict) else {}
+        return OllamaClient._usage_tokens(response)
 
-        def _as_int(value: object) -> int:
-            try:
-                if value is None or value == "":
-                    return 0
-                return max(0, int(float(value)))
-            except Exception:
-                return 0
-
-        prompt = _as_int(
-            usage.get("prompt_tokens")
-            or usage.get("input_tokens")
-            or raw.get("prompt_eval_count")
-            or raw.get("input_tokens")
+    def set_telemetry_callback(self, callback) -> None:
+        self.telemetry_callback = callback
+        self.ollama.set_telemetry(
+            callback,
+            context_provider=lambda: {
+                "session_id": self.id,
+                "app_id": str((self.app_binding or {}).get("app_id", "") or ""),
+            },
+            name="chat",
         )
-        completion = _as_int(
-            usage.get("completion_tokens")
-            or usage.get("output_tokens")
-            or raw.get("eval_count")
-            or raw.get("output_tokens")
-        )
-        total = _as_int(usage.get("total_tokens") or raw.get("total_tokens"))
-        if total <= 0 and (prompt or completion):
-            total = prompt + completion
-        if prompt <= 0 and total > completion:
-            prompt = total - completion
-        if not (prompt or completion or total):
-            return {}
-        source = "model-usage"
-        if usage:
-            if "input_tokens" in usage or "output_tokens" in usage:
-                source = "anthropic-usage"
-            else:
-                source = "openai-usage"
-        elif "prompt_eval_count" in raw or "eval_count" in raw:
-            source = "ollama-usage"
-        return {
-            "prompt_tokens": int(prompt),
-            "completion_tokens": int(completion),
-            "total_tokens": int(total),
-            "source": source,
-        }
 
     def _record_model_usage(
         self,
@@ -21923,14 +22855,17 @@ class SessionState:
             parts.append(trim(self._uploads_prompt_block(), 3000))
         except Exception:
             pass
-        try:
-            parts.append(trim(self.skills.descriptions(), 12000))
-        except Exception:
-            pass
-        try:
-            parts.append(trim(self._loaded_skills_context_block(for_role="developer", max_chars=5000), 5000))
-        except Exception:
-            pass
+        if self.skill_mode == "hard":
+            parts.append(self._loaded_skills_context_block(for_role="developer", max_chars=ADMIN_MAX_APP_CAPSULE_CHARS))
+        else:
+            try:
+                parts.append(trim(self.skills.descriptions(), 12000))
+            except Exception:
+                pass
+            try:
+                parts.append(trim(self._loaded_skills_context_block(for_role="developer", max_chars=5000), 5000))
+            except Exception:
+                pass
         try:
             parts.append(trim(self._plan_steps_context_for_manager(), 4000))
         except Exception:
@@ -31157,6 +32092,14 @@ body{padding:18px}
             client.model = model_override
         client.thinking_stream = False
         client.timeout = max(0.2, float(self.arbiter_timeout_seconds or ARBITER_DEFAULT_TIMEOUT_SECONDS))
+        client.set_telemetry(
+            getattr(self, "telemetry_callback", None),
+            context_provider=lambda: {
+                "session_id": self.id,
+                "app_id": str((self.app_binding or {}).get("app_id", "") or ""),
+            },
+            name="arbiter",
+        )
         return client
 
     def _call_arbiter_llm(self, assistant_text: str, thinking_text: str = "", *, force: bool = False) -> dict:
@@ -31179,6 +32122,7 @@ body{padding:18px}
             "TASK_COMPLETED, ACTION_REQUIRED, VALID_PLANNING, USER_INPUT_REQUIRED, or EMPTY_RAMBLING. "
             "Return strict JSON only."
         )
+        arbiter_system = self._inject_runtime_environment_context(arbiter_system)
         arbiter_user = (
             "Read the snapshot and classify the worker state.\n"
             "Status definitions:\n"
@@ -32683,10 +33627,6 @@ body{padding:18px}
         except Exception:
             return False
         roots: list[Path] = [self.root.resolve(), self.files_root.resolve()]
-        try:
-            roots.append(self.skills.skills_root.resolve())
-        except Exception:
-            pass
         for root in roots:
             try:
                 if target == root or target.is_relative_to(root):
@@ -32873,8 +33813,109 @@ body{padding:18px}
                 blocked.append(p)
         return blocked
 
+    def _command_targets_global_skills(self, command: str) -> bool:
+        text = str(command or "")
+        if not text.strip():
+            return False
+        try:
+            skills_root = str(self.skills.skills_root.resolve()).rstrip(os.sep)
+        except Exception:
+            skills_root = str(self.skills.skills_root).rstrip(os.sep)
+        if skills_root and (text == skills_root or skills_root in text):
+            return True
+        return bool(
+            re.search(r"(^|[^A-Za-z0-9_.~-])/skills(?:/|\b)", text)
+            or re.search(r"\$\{?SKILLS_ROOT\}?", text)
+        )
+
+    def _path_targets_global_skills(self, path_text: object) -> bool:
+        text = str(path_text or "").strip().strip("'\"")
+        low = text.lower().replace("\\", "/")
+        if low in {"/skills", "/skills/", "$skills_root", "${skills_root}"} or low.startswith("/skills/"):
+            return True
+        try:
+            target = Path(text).expanduser().resolve()
+            root = self.skills.skills_root.resolve()
+            return target == root or target.is_relative_to(root)
+        except Exception:
+            return False
+
+    def _application_snapshot_root(self) -> Path:
+        return self.files_root / ".application_skills"
+
+    def _path_targets_application_snapshot(self, path_text: object) -> bool:
+        text = str(path_text or "").strip().strip("'\"")
+        if not text:
+            return False
+        normalized = text.replace("\\", "/")
+        if normalized == "/workspace" or normalized.startswith("/workspace/"):
+            normalized = normalized[len("/workspace/") :] if normalized != "/workspace" else ""
+        if ".application_skills" in PurePosixPath(normalized.lstrip("/")).parts:
+            return True
+        try:
+            raw = Path(text).expanduser()
+            target = raw.resolve() if raw.is_absolute() else (self.files_root / raw).resolve()
+            root = self._application_snapshot_root().resolve()
+            return target == root or target.is_relative_to(root)
+        except Exception:
+            return False
+
+    def _hard_snapshot_shell_prefix(self) -> list[str]:
+        if self.skill_mode != "hard" or os.name != "posix" or sys.platform != "darwin":
+            return []
+        sandbox = shutil.which("sandbox-exec")
+        snapshot_root = self._application_snapshot_root()
+        if not sandbox or not snapshot_root.exists():
+            return []
+        # Seatbelt enforces the boundary at the syscall layer while allowing
+        # frozen scripts to execute and the rest of the session workspace to mutate.
+        policy = (
+            "(version 1) "
+            "(allow default) "
+            f"(deny file-write* (subpath {json.dumps(str(snapshot_root.resolve()))}))"
+        )
+        return [sandbox, "-p", policy]
+
+    def _hard_snapshot_shell_supported(self) -> bool:
+        return bool(self._hard_snapshot_shell_prefix())
+
+    def _restore_application_snapshot_permissions(self) -> None:
+        if self.skill_mode != "hard":
+            return
+        root = self._application_snapshot_root()
+        if not root.exists():
+            return
+        try:
+            for current, dirs, files in os.walk(root, topdown=False, followlinks=False):
+                current_path = Path(current)
+                for name in files:
+                    fp = current_path / name
+                    try:
+                        mode = 0o500 if fp.suffix.lower() in {".sh", ".py", ".js", ".mjs"} else 0o400
+                        os.chmod(fp, mode, follow_symlinks=False)
+                    except Exception:
+                        pass
+                for name in dirs:
+                    try:
+                        os.chmod(current_path / name, 0o500, follow_symlinks=False)
+                    except Exception:
+                        pass
+            os.chmod(root, 0o500, follow_symlinks=False)
+        except Exception:
+            pass
+
     def _guard_shell_write_scope(self, command: str, cwd: Path | None = None) -> str:
         effective = self._rewrite_shell_virtual_paths(command, cwd or self.files_root)
+        if self._command_targets_global_skills(command) or self._command_targets_global_skills(effective):
+            return (
+                "Error: shell access to global skills is disabled. "
+                "Use list_skills/load_skill/read_file for skill reads; only the authenticated administrator may mutate skills."
+            )
+        if self.skill_mode == "hard" and self._application_snapshot_root().exists() and not self._hard_snapshot_shell_prefix():
+            return (
+                "Error: shell execution is disabled for hard applications on this platform because "
+                "an OS-level read-only snapshot policy is unavailable. Use read_file and the bound Skill instructions."
+            )
         blocked = self._shell_write_targets_outside_scope(effective)
         if not blocked:
             return ""
@@ -32899,6 +33940,13 @@ body{padding:18px}
             "output": "",
             "error": "",
         }
+        if self._command_targets_global_skills(command) or self._command_targets_global_skills(effective_command):
+            meta["error"] = (
+                "Error: shell access to global skills is disabled. "
+                "Use list_skills/load_skill/read_file for skill reads; only the authenticated administrator may mutate skills."
+            )
+            meta["output"] = meta["error"]
+            return meta
         if any(x in effective_command for x in DANGEROUS_PATTERNS):
             meta["error"] = "Error: dangerous command blocked"
             meta["output"] = meta["error"]
@@ -33119,8 +34167,14 @@ body{padding:18px}
             proc_env["SKILLS_ROOT"] = str(self.skills.skills_root)
             proc_env["CLOUDS_CODER_ROOT"] = str(self.root)
             proc_env["JS_LIB_ROOT"] = str(self.js_lib_root)
+            shell_prefix = self._hard_snapshot_shell_prefix()
+            popen_command: object = effective_command
+            use_shell = True
+            if shell_prefix:
+                popen_command = [*shell_prefix, "/bin/sh", "-c", effective_command]
+                use_shell = False
             popen_kwargs = {
-                "shell": True,
+                "shell": use_shell,
                 "cwd": cwd,
                 "stdin": subprocess.PIPE,
                 "stdout": subprocess.PIPE,
@@ -33134,7 +34188,7 @@ body{padding:18px}
                 create_group = int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) or 0)
                 if create_group > 0:
                     popen_kwargs["creationflags"] = create_group
-            proc = subprocess.Popen(effective_command, **popen_kwargs)
+            proc = subprocess.Popen(popen_command, **popen_kwargs)
             self._running_bash_proc = proc
             if os.name == "nt":
                 # Windows: read PIPE output via blocking reader threads + queue.
@@ -33249,6 +34303,7 @@ body{padding:18px}
                 meta["exit_code"] = -1
         finally:
             self._running_bash_proc = None
+            self._restore_application_snapshot_permissions()
         meta["duration_ms"] = int((time.time() - start) * 1000)
         after = self._git_status_map(cwd)
         meta["changed_files"] = self._status_delta(before, after) if before or after else []
@@ -33910,8 +34965,13 @@ body{padding:18px}
 
     def _run_write(self, path: str, content: str) -> str:
         try:
+            if self.skill_mode == "hard" and self._path_targets_application_snapshot(path):
+                return "Error: immutable application skill resources are read-only."
             rel = self._normalize_tool_path_text(path)
             fp = self._fuzzy_resolve_path(self._session_path(rel))
+            skills_root = self.skills.skills_root.resolve()
+            if fp.resolve() == skills_root or fp.resolve().is_relative_to(skills_root):
+                return "Error: global skill mutation is restricted to the authenticated administrator."
             rel = self._session_rel(fp)
             fp.parent.mkdir(parents=True, exist_ok=True)
             fp.write_text(content, encoding="utf-8")
@@ -33921,8 +34981,13 @@ body{padding:18px}
 
     def _run_edit(self, path: str, old_text: str, new_text: str) -> str:
         try:
+            if self.skill_mode == "hard" and self._path_targets_application_snapshot(path):
+                return "Error: immutable application skill resources are read-only."
             rel = self._normalize_tool_path_text(path)
             fp = self._fuzzy_resolve_path(self._session_path(rel))
+            skills_root = self.skills.skills_root.resolve()
+            if fp.resolve() == skills_root or fp.resolve().is_relative_to(skills_root):
+                return "Error: global skill mutation is restricted to the authenticated administrator."
             rel = self._session_rel(fp)
             content = fp.read_text(encoding="utf-8")
             if old_text not in content:
@@ -34083,7 +35148,10 @@ body{padding:18px}
         pinned_selection = self._active_runtime_selection()
         for _ in range(20):
             try:
+                hard_skills = self._loaded_skills_context_block(for_role=str(agent_type or "subagent"), max_chars=ADMIN_MAX_APP_CAPSULE_CHARS)
                 sub_system = f"You are a focused subagent. {model_language_instruction(self.ui_language)}"
+                if hard_skills:
+                    sub_system += "\n\n" + hard_skills
                 response = self._chat_with_same_model_retry(
                     msgs,
                     tools=subtools,
@@ -34141,44 +35209,13 @@ body{padding:18px}
                     msgs.append({"role": "tool", "tool_call_id": tc["id"], "name": name, "content": trim(out)})
                     continue
                 if name == "bash":
-                    out = self._run_bash(args.get("command", ""))
-                    self._maybe_record_tool_memory_after_result(name, args if isinstance(args, dict) else {}, out, "single")
+                    out = self._dispatch_tool(name, args if isinstance(args, dict) else {}, str(agent_type or ""))
                 elif name == "read_file":
-                    out = self._run_read(
-                        args.get("path", ""),
-                        args.get("limit"),
-                        args.get("offset"),
-                        mode=args.get("mode"),
-                        target=args.get("target"),
-                        query=args.get("query"),
-                        line=args.get("line"),
-                        context=args.get("context"),
-                        regex=args.get("regex"),
-                        max_chars=args.get("max_chars"),
-                    )
-                    try:
-                        rel = self._session_rel(self._session_path(self._normalize_tool_path_text(args.get("path", ""))))
-                        self._record_read_context(rel, args if isinstance(args, dict) else {}, out, role="single")
-                    except Exception:
-                        pass
+                    out = self._dispatch_tool(name, args if isinstance(args, dict) else {}, str(agent_type or ""))
                 elif name == "write_file":
-                    out = self._run_write(args.get("path", ""), args.get("content", ""))
-                    if not str(out).startswith("Error:"):
-                        try:
-                            rel = self._session_rel(self._session_path(self._normalize_tool_path_text(args.get("path", ""))))
-                            self._mark_read_context_stale(rel, reason="subagent write_file changed file")
-                        except Exception:
-                            pass
-                    self._maybe_record_tool_memory_after_result(name, args if isinstance(args, dict) else {}, out, "single")
+                    out = self._dispatch_tool(name, args if isinstance(args, dict) else {}, str(agent_type or ""))
                 elif name == "edit_file":
-                    out = self._run_edit(args.get("path", ""), args.get("old_text", ""), args.get("new_text", ""))
-                    if not str(out).startswith("Error:"):
-                        try:
-                            rel = self._session_rel(self._session_path(self._normalize_tool_path_text(args.get("path", ""))))
-                            self._mark_read_context_stale(rel, reason="subagent edit_file changed file")
-                        except Exception:
-                            pass
-                    self._maybe_record_tool_memory_after_result(name, args if isinstance(args, dict) else {}, out, "single")
+                    out = self._dispatch_tool(name, args if isinstance(args, dict) else {}, str(agent_type or ""))
                 else:
                     out = f"Unknown tool: {name}"
                 msgs.append({
@@ -36546,6 +37583,10 @@ body{padding:18px}
                         "loaded_at": float(sinfo.get("loaded_at", 0.0) or 0.0),
                         "size": int(sinfo.get("size", 0) or 0),
                         "preview": trim(str(sinfo.get("preview", "") or ""), 300),
+                        "skill_name": trim(str(sinfo.get("skill_name", skey) or skey), 160),
+                        "skill_path": trim(str(sinfo.get("skill_path", "") or ""), 500),
+                        "aliases": [trim(str(x), 120) for x in (sinfo.get("aliases", []) or []) if str(x).strip()][:12],
+                        "pinned": bool(sinfo.get("pinned", False)),
                     }
             if clean_skills:
                 board["loaded_skills"] = clean_skills
@@ -48844,6 +49885,12 @@ body{padding:18px}
             TOOLS,
             web_search_enabled=bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED)),
         )
+        if self.skill_mode == "hard":
+            hidden = {"list_skill_providers", "list_skill_protocols", "scan_skills", "write_skill"}
+            base = [
+                tool for tool in base
+                if str((tool.get("function", {}) if isinstance(tool, dict) else {}).get("name", "") or "") not in hidden
+            ]
         mcp_specs = self._mcp_tool_specs()
         if mcp_specs:
             return list(base) + list(mcp_specs)
@@ -50604,6 +51651,7 @@ body{padding:18px}
 
     def _dispatch_tool(self, name: str, args: dict, agent_role: str = "") -> str:
         """Top-level tool dispatcher with error isolation and per-tool timeout."""
+        telemetry_started = time.monotonic()
         name = canonicalize_tool_name(name)
         if not name:
             return "Error: ValueError: tool name is required"
@@ -50621,11 +51669,13 @@ body{padding:18px}
             if name == "bash" or self._is_mcp_tool_name(name):
                 out = self._dispatch_tool_inner(name, args, role_key)
                 self._maybe_record_tool_memory_after_result(name, args, out, role_key)
+                self._record_tool_telemetry(name, out, telemetry_started)
                 return out
             timeout = _TOOL_TIMEOUT_MAP.get(name, _DEFAULT_TOOL_TIMEOUT)
             if timeout <= 0:
                 out = self._dispatch_tool_inner(name, args, role_key)
                 self._maybe_record_tool_memory_after_result(name, args, out, role_key)
+                self._record_tool_telemetry(name, out, telemetry_started)
                 return out
             pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"tool-{name}")
             future = pool.submit(self._dispatch_tool_inner, name, args, role_key)
@@ -50633,6 +51683,7 @@ body{padding:18px}
                 out = future.result(timeout=timeout)
                 self._maybe_record_tool_memory_after_result(name, args, out, role_key)
                 pool.shutdown(wait=True)
+                self._record_tool_telemetry(name, out, telemetry_started)
                 return out
             except concurrent.futures.TimeoutError:
                 future.cancel()
@@ -50655,6 +51706,7 @@ body{padding:18px}
                 })
                 out = f"Error: tool '{name}' timed out after {timeout} seconds. The operation may still be running in the background."
                 self._maybe_record_tool_memory_after_result(name, args, out, role_key)
+                self._record_tool_telemetry(name, out, telemetry_started, status="timeout")
                 return out
             except Exception:
                 pool.shutdown(wait=False, cancel_futures=True)
@@ -50667,7 +51719,25 @@ body{padding:18px}
             })
             out = f"Error: {type(exc).__name__}: {trim(str(exc), 500)}"
             self._maybe_record_tool_memory_after_result(name, args, out, role_key)
+            self._record_tool_telemetry(name, out, telemetry_started)
             return out
+
+    def _record_tool_telemetry(self, name: str, output: object, started: float, status: str = "") -> None:
+        try:
+            callback = getattr(self, "telemetry_callback", None)
+            if not callable(callback):
+                return
+            resolved = status or ("error" if str(output or "").startswith("Error") else "success")
+            callback(
+                "tool_call",
+                session_id=self.id,
+                app_id=str((self.app_binding or {}).get("app_id", "") or ""),
+                name=str(name or "unknown"),
+                status=resolved,
+                duration_ms=round((time.monotonic() - float(started)) * 1000.0, 3),
+            )
+        except Exception:
+            pass
 
     def _handle_ask_user_tool(self, args: dict, role_key: str = "") -> str:
         """Record a pending question and signal the run to pause for a user reply.
@@ -50814,6 +51884,13 @@ body{padding:18px}
             illegal = self._reject_non_workspace_absolute_tool_path(args.get("path", ""))
             if illegal:
                 return illegal
+            if self.skill_mode == "hard" and self._path_targets_global_skills(args.get("path", "")):
+                return (
+                    "Error: hard application mode cannot read the mutable global skills store. "
+                    "Use load_skill for one of the immutable bound skill ids."
+                )
+            if self.skill_mode == "hard" and str(args.get("path", "") or "").replace("\\", "/").lstrip("/").startswith("workspace/.application_skills"):
+                return "Error: use /workspace/.application_skills/... or .application_skills/... for the immutable application snapshot."
             try:
                 rel = self._normalize_tool_path_text(args["path"])
                 fp = self._session_path(rel)
@@ -50866,6 +51943,8 @@ body{padding:18px}
             protected = self._runtime_managed_path_tool_error(args.get("path", ""), "write_file")
             if protected:
                 return protected
+            if self.skill_mode == "hard" and ".application_skills" in str(args.get("path", "") or "").replace("\\", "/").split("/"):
+                return "Error: immutable application skill resources are read-only."
             try:
                 rel = self._normalize_tool_path_text(args["path"])
                 fp = self._session_path(rel)
@@ -50932,6 +52011,8 @@ body{padding:18px}
             protected = self._runtime_managed_path_tool_error(args.get("path", ""), "edit_file")
             if protected:
                 return protected
+            if self.skill_mode == "hard" and ".application_skills" in str(args.get("path", "") or "").replace("\\", "/").split("/"):
+                return "Error: immutable application skill resources are read-only."
             try:
                 rel = self._normalize_tool_path_text(args["path"])
                 fp = self._session_path(rel)
@@ -51081,20 +52162,37 @@ body{padding:18px}
         if name == "task":
             return self.run_subagent(args["prompt"], args.get("agent_type", "Explore"))
         if name == "list_skills":
+            if self.skill_mode == "hard":
+                return ", ".join(self.bound_skill_ids)
             self._ensure_skills_ready(force=False)
             return ", ".join(self.skills.list_names())
         if name == "load_skill":
+            if self.skill_mode == "hard":
+                requested = str(args.get("name", "") or "").strip()
+                if requested not in set(self.bound_skill_ids):
+                    return "Error: hard application mode only permits its bound skills: " + ", ".join(self.bound_skill_ids)
+                order = self.bound_skill_ids.index(requested) + 1
+                frozen = f"/workspace/.application_skills/{order:02d}/SKILL.md"
+                if (self._application_snapshot_root() / f"{order:02d}" / "SKILL.md").exists():
+                    return f"Skill is hard-bound and active. Its complete immutable source is {frozen}; read that file before execution."
+                return "Skill is already active from the legacy immutable application snapshot."
             source = f"manual:{role_key or 'single'}"
             return self._load_skill_with_cache(args["name"], load_source=source)
         if name == "list_skill_providers":
+            if self.skill_mode == "hard":
+                return "Error: hard application mode does not expose the global skill provider catalog."
             self._ensure_skills_ready(force=False)
             return json_dumps(self.skills.list_providers(), indent=2)
         if name == "list_skill_protocols":
+            if self.skill_mode == "hard":
+                return "Error: hard application mode does not expose the global skill protocol catalog."
             self._ensure_skills_ready(force=False)
             return json_dumps(self.skills.list_protocols(), indent=2)
         if name == "write_skill":
-            return self._write_global_skill(args)
+            return "Error: global skill mutation is restricted to the authenticated admin interface."
         if name == "scan_skills":
+            if self.skill_mode == "hard":
+                return "Error: hard application mode uses an immutable snapshot and cannot scan global skills."
             return self._scan_global_skills()
         if name == "compress":
             tool_policy_note = self._apply_tool_memory_policy(args, role=role_key)
@@ -55989,6 +57087,8 @@ body{padding:18px}
 
     def _preload_skills_from_plan_steps(self, steps: list):
         """Scan plan step text for skill names and auto-load any that aren't already loaded."""
+        if self.skill_mode == "hard":
+            return
         if not steps or not isinstance(steps, list):
             return
         self._ensure_skills_ready(force=False)
@@ -58280,6 +59380,9 @@ body{padding:18px}
                 "updated_at": self.updated_at,
                 "message_count": int(total_message_count),
                 "model": self.ollama.model,
+                "app_binding": dict(self.app_binding) if isinstance(self.app_binding, dict) else {},
+                "skill_mode": "hard" if self.skill_mode == "hard" else "dynamic",
+                "bound_skill_ids": list(self.bound_skill_ids)[:ADMIN_MAX_APP_SKILLS],
                 "provider": self.ollama.provider,
                 "ui_language": self.ui_language,
                 "ollama_base_url": self.ollama.base_url,
@@ -58774,6 +59877,7 @@ class SessionManager:
         self.web_search_setting_locked = bool(web_search_setting_locked)
         self.user_memory_mode = normalize_user_memory_mode(user_memory_mode)
         self.user_memory_setting_locked = bool(user_memory_setting_locked)
+        self.telemetry_callback = None
         self.single_advance_prompt_enhance = False
         self.read_context_policy = DEFAULT_READ_CONTEXT_POLICY
         self.tool_memory_policy = DEFAULT_TOOL_MEMORY_POLICY
@@ -59317,6 +60421,7 @@ class SessionManager:
                 knowledge_library_status_callback=self.knowledge_library_status_callback,
                 mcp_manager=getattr(self, "mcp_manager", None),
             )
+        sess.set_telemetry_callback(self.telemetry_callback)
         desired_mode = normalize_execution_mode(self.execution_mode, default=EXECUTION_MODE_SYNC)
         if normalize_execution_mode(getattr(sess, "execution_mode", ""), default=desired_mode) != desired_mode:
             sess.execution_mode = desired_mode
@@ -59423,6 +60528,7 @@ class SessionManager:
                 knowledge_library_status_callback=self.knowledge_library_status_callback,
                 mcp_manager=getattr(self, "mcp_manager", None),
             )
+            sess.set_telemetry_callback(self.telemetry_callback)
             self._apply_user_defaults_to_session(sess)
             self.sessions[sid] = sess
             self.session_index[sid] = {
@@ -59545,6 +60651,7 @@ class SessionManager:
             response_stream=bool(profile.get("response_stream", False)),
         )
         client.apply_profile(profile)
+        client.set_telemetry(self.telemetry_callback, context_provider=lambda: {}, name="capability_probe")
         caps = client.probe_multimodal_capabilities(force=True if force_probe else False)
         merged = merge_multimodal_capabilities(
             merge_multimodal_capabilities(
@@ -59952,6 +61059,7 @@ INDEX_HTML = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="clouds-coder-webui-contract" content="clouds-coder-app-store-v1">
 <title>Clouds Coder</title>
 <link rel="stylesheet" href="/assets/style.css">
 <script>
@@ -60019,11 +61127,30 @@ window.MathJax={
 <main>
   <aside class="panel">
     <div class="panel-title">Sessions</div>
-    <div id="sessionList"></div>
-    <div id="sessionsControls" class="sessions-controls">
-      <button id="newSessionBtn">New Session</button>
-      <button id="renameSessionBtn" class="subtle">Rename</button>
-      <button id="deleteSessionBtn" class="subtle danger">Delete</button>
+    <div class="side-primary-tabs">
+      <button id="sessionsSideTab" class="side-tab active" type="button">会话</button>
+      <button id="appsSideTab" class="side-tab" type="button">应用商店</button>
+    </div>
+    <div id="sessionsSideView" class="app-side-view">
+      <div id="sessionList"></div>
+      <div id="sessionsControls" class="sessions-controls">
+        <button id="newSessionBtn">New Session</button>
+        <button id="renameSessionBtn" class="subtle">Rename</button>
+        <button id="deleteSessionBtn" class="subtle danger">Delete</button>
+      </div>
+    </div>
+    <div id="appsSideView" class="app-side-view" hidden>
+      <div class="app-store-head">
+        <div class="side-secondary-tabs">
+          <button id="personalAppsTab" class="side-subtab active" type="button">个人应用</button>
+          <button id="sharedAppsTab" class="side-subtab" type="button">共享应用</button>
+        </div>
+        <div class="app-store-actions">
+          <button id="newApplicationBtn" type="button">创建应用</button>
+          <button id="refreshApplicationsBtn" class="subtle" type="button" title="刷新">↻</button>
+        </div>
+      </div>
+      <div id="applicationList"></div>
     </div>
   </aside>
   <section class="panel chat">
@@ -60138,6 +61265,35 @@ window.MathJax={
     </div>
   </aside>
 </main>
+</div>
+<div id="applicationEditor" class="application-modal" hidden>
+  <div class="application-dialog" role="dialog" aria-modal="true" aria-labelledby="applicationEditorTitle">
+    <div class="application-dialog-head">
+      <div>
+        <div class="application-kicker">SKILL APPLICATION</div>
+        <h2 id="applicationEditorTitle">创建个人应用</h2>
+      </div>
+      <button id="closeApplicationEditorBtn" class="subtle application-close" type="button" aria-label="Close">×</button>
+    </div>
+    <div class="application-editor-body">
+      <div class="application-fields">
+        <label><span id="applicationNameLabel">应用名称</span><input id="applicationName" maxlength="100" placeholder="例如：接口设计助手"></label>
+        <label><span id="applicationIconLabel">图标</span><input id="applicationIcon" maxlength="20" placeholder="可选，例如：🧩"></label>
+        <label><span id="applicationDescriptionLabel">应用说明</span><textarea id="applicationDescription" maxlength="1000" rows="4" placeholder="说明适用场景和预期输出"></textarea></label>
+        <div class="application-selection-head"><strong id="selectedSkillsLabel">已选 Skills</strong><span id="applicationSkillCount" class="tag">0 / 8</span></div>
+        <div id="applicationSelectedSkills" class="application-selected-skills"></div>
+      </div>
+      <div class="application-skill-browser">
+        <label><span id="scanSkillsLabel">扫描现有 Skills</span><input id="applicationSkillSearch" type="search" placeholder="搜索名称、ID 或说明"></label>
+        <div id="applicationSkillCatalog" class="application-skill-catalog"></div>
+      </div>
+    </div>
+    <div id="applicationEditorError" class="application-editor-error"></div>
+    <div class="application-dialog-footer">
+      <button id="cancelApplicationEditorBtn" class="subtle" type="button">取消</button>
+      <button id="saveApplicationBtn" type="button">保存个人应用</button>
+    </div>
+  </div>
 </div>
 <script src="/assets/app.js"></script>
 </body>
@@ -60595,9 +61751,33 @@ h3{font-size:.96rem;margin:10px 0 6px}
 .llm-modal-btn-primary:hover{opacity:.9}
 .llm-modal-btn-secondary{flex:1;padding:9px 16px;border-radius:8px;border:1px solid var(--line,#d9e1ec);background:var(--bg,#f5f7fa);color:var(--fg,#0f1b2d);font-weight:600;font-size:.88rem;cursor:pointer}
 .llm-modal-btn-secondary:hover{background:var(--line,#d9e1ec)}
+.side-primary-tabs,.side-secondary-tabs{display:flex;gap:5px;padding:4px;border:1px solid var(--line);border-radius:10px;background:#f5f8fc;margin-bottom:8px}
+.side-tab,.side-subtab{flex:1;padding:7px 8px;border-radius:8px;background:transparent;color:var(--muted);border-color:transparent;font-size:.78rem}
+.side-tab.active,.side-subtab.active{background:#fff;color:var(--brand);border-color:#cbd9ef;box-shadow:0 2px 7px rgba(15,27,45,.06)}
+.app-side-view{flex:1;min-height:0;display:flex;flex-direction:column}.app-side-view[hidden]{display:none}
+.app-store-head{display:flex;flex-direction:column;gap:7px;margin-bottom:8px}.app-store-head .side-secondary-tabs{margin:0}
+.app-store-actions{display:grid;grid-template-columns:1fr auto;gap:6px}.app-store-actions button{padding:7px 9px;font-size:.76rem}
+#applicationList{flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column;gap:8px;padding-right:1px}
+.application-card{border:1px solid var(--line);border-radius:11px;background:#fff;padding:10px;display:flex;flex-direction:column;gap:7px;min-width:0}
+.application-card-head{display:flex;align-items:flex-start;justify-content:space-between;gap:7px;min-width:0}.application-card-title{font-size:.86rem;font-weight:700;overflow-wrap:anywhere;word-break:break-word}
+.application-card-status{flex:none;border-radius:999px;padding:2px 6px;background:#f1f5fa;color:#5c6c82;font-size:.64rem;font-weight:700}.application-card-status.published{background:#e6faf2;color:#087757}.application-card-status.pending{background:#fff3df;color:#956000}.application-card-status.rejected{background:#ffeceb;color:#9f2921}
+.application-card-desc{color:var(--muted);font-size:.73rem;line-height:1.35;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word}.application-card-skills{display:flex;flex-wrap:wrap;gap:4px}.application-card-skills span{max-width:100%;padding:2px 6px;border-radius:999px;background:#eff4fb;border:1px solid #dbe5f2;color:#42546b;font-size:.64rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.application-card-actions{display:flex;flex-wrap:wrap;gap:5px}.application-card-actions button{flex:1 1 auto;padding:6px 7px;border-radius:8px;font-size:.69rem}.application-empty{border:1px dashed #cfd9e7;border-radius:10px;padding:20px 9px;text-align:center;color:var(--muted);font-size:.78rem}
+.application-modal{position:fixed;inset:0;z-index:10050;background:rgba(8,17,32,.52);display:flex;align-items:center;justify-content:center;padding:18px;backdrop-filter:blur(5px)}.application-modal[hidden]{display:none}
+.application-dialog{width:min(900px,96vw);max-height:90vh;background:#f6f8fb;border:1px solid #fff;border-radius:16px;box-shadow:0 24px 70px rgba(8,17,32,.27);display:flex;flex-direction:column;overflow:hidden}
+.application-dialog-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:16px 18px;border-bottom:1px solid var(--line);background:#fff}.application-dialog-head h2{margin:3px 0 0;font-size:1.15rem}.application-kicker{font-size:.65rem;font-weight:800;letter-spacing:.16em;color:var(--brand)}.application-close{padding:4px 10px;font-size:1.2rem}
+.application-editor-body{display:grid;grid-template-columns:minmax(260px,.8fr) minmax(320px,1.2fr);gap:12px;padding:14px;overflow:auto;min-height:0}.application-fields,.application-skill-browser{display:flex;flex-direction:column;gap:11px;background:#fff;border:1px solid var(--line);border-radius:12px;padding:13px;min-width:0}
+.application-fields label,.application-skill-browser label{display:flex;flex-direction:column;gap:5px;font-size:.76rem;font-weight:700;color:#46566d}.application-fields input,.application-fields textarea,.application-skill-browser input{width:100%;padding:8px 9px;border:1px solid #ccd8e8;border-radius:8px;background:#fff;color:var(--fg);font:inherit}.application-selection-head{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:.78rem}
+.application-selected-skills{display:flex;flex-wrap:wrap;gap:6px;min-height:36px;align-content:flex-start}.application-skill-chip{display:inline-flex;align-items:center;gap:4px;max-width:100%;border:1px solid #b9d7cf;border-radius:999px;background:#e8faf5;color:#08715b;padding:4px 7px;font-size:.69rem;font-weight:700}.application-skill-chip button{padding:0 2px;border:0;background:transparent;color:#08715b;box-shadow:none;transform:none}
+.application-skill-catalog{flex:1;min-height:300px;max-height:430px;overflow:auto;display:flex;flex-direction:column;gap:6px}.application-skill-row{display:flex;align-items:flex-start;gap:8px;border:1px solid #e0e7f1;border-radius:9px;padding:8px;background:#fbfdff;cursor:pointer;min-width:0}.application-skill-row.selected{border-color:#8bb1f5;background:#edf4ff}.application-skill-row input{width:16px;height:16px;margin:2px 0 0;flex:none}.application-skill-row strong,.application-skill-row small{display:block;overflow-wrap:anywhere;word-break:break-word}.application-skill-row small{color:var(--muted);font-size:.67rem;margin-top:2px}
+.application-editor-error{min-height:20px;padding:0 18px;color:var(--warn);font-size:.77rem;white-space:pre-wrap}.application-dialog-footer{display:flex;justify-content:flex-end;gap:8px;padding:12px 18px;border-top:1px solid var(--line);background:#fff}
+@media (max-width:1180px){#applicationList{height:40vh;max-height:40vh;flex:none}}
+@media (max-width:720px){.application-editor-body{grid-template-columns:1fr}.application-skill-catalog{min-height:240px}.application-dialog{max-height:94vh}}
 """
 
-APP_JS = """const S={sessions:[],sessionTotal:0,sessionHasMore:false,sessionNextOffset:0,sessionLoadingMore:false,sessionLoadAllTimer:0,activeId:null,snap:null,es:null,esId:'',skills:[],tools:[],providers:[],protocols:[],config:null,models:[],modelOptions:[],previewBySession:{},fileExplorerBySession:{},commandPageState:{},previewNonce:0,refreshTimer:null,refreshInFlight:false,pendingSnapshot:false,pendingFullSnapshot:false,scheduledFullSnapshot:false,sessionPollTimer:null,renderStateInFlight:false,lastRenderStatePullAt:0,lastFeedSig:'',lastBoardsSig:'',lastSessionsSig:'',lastVisibilityState:document.visibilityState||'visible',staticMode:false,frozen:false,bootRendered:false,panelHtml:{},renderSigs:Object.create(null),deferredHtml:Object.create(null),deferredHtmlTimer:0,openPopup:'',follow:{chat:true,sessionList:false,todos:false,tasks:false,activity:true,commands:true,diffs:true,catalog:true,fileExplorer:false},lastEventSeq:0,lastDeltaTs:0,deltaGapCount:0,deltaWatchdogTimer:null,deltaWatchdogStalls:0,deltaWatchdogSeq:0,deltaRenderRaf:0,deltaRenderChat:false,deltaRenderBoards:false,deltaRenderSessions:false,chatRenderRaf:0,chatRenderPendingReason:'',mathObserver:null,mathRoot:null,mdWorker:null,mdWorkerUrl:'',mdReqSeq:0,mdPending:Object.create(null),diffCenterDisabled:Object.create(null),previewCenterDisabled:Object.create(null),diffCenteredDone:Object.create(null),previewCenteredDone:Object.create(null),deferredFullSnapshotTimer:0,deferredFileExplorerTimer:0,modelCatalogTimer:0,modelCatalogInFlight:false,catalogRefreshInFlight:false,fileExplorerDeferUntil:0};
+APP_JS = """/* clouds-coder-app-store-v1 */
+const S={sessions:[],sessionTotal:0,sessionHasMore:false,sessionNextOffset:0,sessionLoadingMore:false,sessionLoadAllTimer:0,activeId:null,snap:null,es:null,esId:'',skills:[],tools:[],providers:[],protocols:[],config:null,models:[],modelOptions:[],previewBySession:{},fileExplorerBySession:{},commandPageState:{},previewNonce:0,refreshTimer:null,refreshInFlight:false,pendingSnapshot:false,pendingFullSnapshot:false,scheduledFullSnapshot:false,sessionPollTimer:null,renderStateInFlight:false,lastRenderStatePullAt:0,lastFeedSig:'',lastBoardsSig:'',lastSessionsSig:'',lastVisibilityState:document.visibilityState||'visible',staticMode:false,frozen:false,bootRendered:false,panelHtml:{},renderSigs:Object.create(null),deferredHtml:Object.create(null),deferredHtmlTimer:0,openPopup:'',follow:{chat:true,sessionList:false,todos:false,tasks:false,activity:true,commands:true,diffs:true,catalog:true,fileExplorer:false},lastEventSeq:0,lastDeltaTs:0,deltaGapCount:0,deltaWatchdogTimer:null,deltaWatchdogStalls:0,deltaWatchdogSeq:0,deltaRenderRaf:0,deltaRenderChat:false,deltaRenderBoards:false,deltaRenderSessions:false,chatRenderRaf:0,chatRenderPendingReason:'',mathObserver:null,mathRoot:null,mdWorker:null,mdWorkerUrl:'',mdReqSeq:0,mdPending:Object.create(null),diffCenterDisabled:Object.create(null),previewCenterDisabled:Object.create(null),diffCenteredDone:Object.create(null),previewCenteredDone:Object.create(null),deferredFullSnapshotTimer:0,deferredFileExplorerTimer:0,modelCatalogTimer:0,modelCatalogInFlight:false,catalogRefreshInFlight:false,fileExplorerDeferUntil:0};
+const APP_STORE={view:'sessions',scope:'personal',personal:[],shared:[],catalog:[],loaded:false,loading:false,editingId:'',selectedSkillIds:[]};
 const MD_CACHE=new Map();
 const MD_CACHE_MAX=280;
 const STATIC_UI=((new URLSearchParams(location.search)).get('static_ui')==='1');
@@ -64690,6 +65870,7 @@ async function refreshSnapshot(opt={}){
         S.config.language=snapLang;
         renderLanguageControls();
         applyMainI18n();
+        applyApplicationI18n();
       }
     }
     if(S.snap?.user_memory_mode){
@@ -64906,6 +66087,27 @@ async function clearStaleTodos(){if(!S.activeId){showError(t('select_session_fir
 async function toggleUserMemoryMode(e){if(e)e.preventDefault();if(S.config?.user_memory_setting_locked){showError(t('memory_mode_locked'));return}const cycle=['weak','on','off'];const cur=currentUserMemoryMode();const next=cycle[(cycle.indexOf(cur)+1+cycle.length)%cycle.length];try{const out=await api('/api/user-memory/config',{method:'POST',body:JSON.stringify({mode:next})});S.config=S.config||{};S.config.user_memory_mode=String(out?.user_memory_mode||next);renderMemoryModeAction();showError('')}catch(err){showError(err.message||String(err))}}
 async function exportUserMemory(e){if(e)e.preventDefault();try{const data=await api('/api/user-memory/export');const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json;charset=utf-8'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download='clouds-coder-user-memory.json';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);showError(t('memory_exported'))}catch(err){showError(err.message||String(err))}}
 async function clearUserMemory(e){if(e)e.preventDefault();const ok=confirm(t('memory_clear_confirm'));if(!ok)return;try{await api('/api/user-memory/clear',{method:'POST'});showError(t('memory_cleared'))}catch(err){showError(err.message||String(err))}}
+function appText(key){const packs={
+  'zh-CN':{sessions:'会话',store:'应用商店',personal:'个人应用',shared:'共享应用',create:'创建应用',edit_title:'编辑个人应用',create_title:'创建个人应用',name:'应用名称',icon:'图标',description:'应用说明',selected:'已选 Skills',scan:'扫描现有 Skills',name_placeholder:'例如：接口设计助手',icon_placeholder:'可选，例如：🧩',description_placeholder:'说明适用场景和预期输出',search_placeholder:'搜索名称、ID 或说明',cancel:'取消',save:'保存个人应用',run:'运行',edit:'编辑',submit:'提交共享审核',remove:'删除',empty_personal:'还没有个人应用，创建一个并组合现有 Skills。',empty_shared:'暂无已发布的共享应用。',loading:'正在扫描应用与 Skills...',no_match:'没有匹配的 Skill',refresh:'刷新',close:'关闭',draft:'草稿',pending:'审核中',published:'已发布',rejected:'已拒绝',skill_limit:'一个应用最多关联 8 个 Skills。',skill_required:'请至少选择一个 Skill。',name_required:'请输入应用名称。',saved:'应用已保存',submitted:'已提交管理员审核',deleted:'应用已删除',confirm_submit:'提交后将冻结当前版本供管理员审核，确定继续吗？',confirm_delete:'确定删除这个个人应用吗？'},
+  'zh-TW':{sessions:'會話',store:'應用商店',personal:'個人應用',shared:'共享應用',create:'建立應用',edit_title:'編輯個人應用',create_title:'建立個人應用',name:'應用名稱',icon:'圖示',description:'應用說明',selected:'已選 Skills',scan:'掃描現有 Skills',name_placeholder:'例如：介面設計助手',icon_placeholder:'選填，例如：🧩',description_placeholder:'說明適用情境和預期輸出',search_placeholder:'搜尋名稱、ID 或說明',cancel:'取消',save:'儲存個人應用',run:'執行',edit:'編輯',submit:'提交共享審核',remove:'刪除',empty_personal:'尚無個人應用，請建立並組合現有 Skills。',empty_shared:'暫無已發佈的共享應用。',loading:'正在掃描應用與 Skills...',no_match:'沒有符合的 Skill',draft:'草稿',pending:'審核中',published:'已發佈',rejected:'已拒絕',skill_limit:'一個應用最多關聯 8 個 Skills。',skill_required:'請至少選擇一個 Skill。',name_required:'請輸入應用名稱。',saved:'應用已儲存',submitted:'已提交管理員審核',deleted:'應用已刪除',confirm_submit:'提交後會凍結目前版本供管理員審核，確定繼續嗎？',confirm_delete:'確定刪除此個人應用嗎？'},
+  'ja':{sessions:'セッション',store:'アプリストア',personal:'個人アプリ',shared:'共有アプリ',create:'アプリ作成',edit_title:'個人アプリを編集',create_title:'個人アプリを作成',name:'アプリ名',icon:'アイコン',description:'説明',selected:'選択済み Skills',scan:'既存 Skills を検索',name_placeholder:'例：API 設計アシスタント',icon_placeholder:'任意、例：🧩',description_placeholder:'用途と期待する出力を説明',search_placeholder:'名前、ID、説明を検索',cancel:'キャンセル',save:'個人アプリを保存',run:'実行',edit:'編集',submit:'共有審査に提出',remove:'削除',empty_personal:'個人アプリはまだありません。既存 Skills を組み合わせて作成できます。',empty_shared:'公開済みの共有アプリはありません。',loading:'アプリと Skills を読み込み中...',no_match:'一致する Skill はありません',draft:'下書き',pending:'審査中',published:'公開済み',rejected:'却下',skill_limit:'1つのアプリには最大8個の Skills を関連付けられます。',skill_required:'少なくとも1つの Skill を選択してください。',name_required:'アプリ名を入力してください。',saved:'アプリを保存しました',submitted:'管理者審査に提出しました',deleted:'アプリを削除しました',confirm_submit:'現在の版を凍結して管理者審査へ提出します。続行しますか？',confirm_delete:'この個人アプリを削除しますか？'},
+  'en':{sessions:'Sessions',store:'App Store',personal:'Personal',shared:'Shared',create:'Create App',edit_title:'Edit Personal App',create_title:'Create Personal App',name:'Application name',icon:'Icon',description:'Description',selected:'Selected Skills',scan:'Scan existing Skills',name_placeholder:'e.g. API Design Assistant',icon_placeholder:'Optional, e.g. 🧩',description_placeholder:'Describe use cases and expected output',search_placeholder:'Search name, ID, or description',cancel:'Cancel',save:'Save Personal App',run:'Run',edit:'Edit',submit:'Submit for Sharing',remove:'Delete',empty_personal:'No personal apps yet. Create one by combining existing Skills.',empty_shared:'No shared applications have been published.',loading:'Scanning applications and Skills...',no_match:'No matching Skill',refresh:'Refresh',close:'Close',draft:'Draft',pending:'In review',published:'Published',rejected:'Rejected',skill_limit:'An application can bind at most 8 Skills.',skill_required:'Select at least one Skill.',name_required:'Enter an application name.',saved:'Application saved',submitted:'Submitted for administrator review',deleted:'Application deleted',confirm_submit:'This freezes the current revision for administrator review. Continue?',confirm_delete:'Delete this personal application?'}
+};const lang=currentLang();return String((packs[lang]||packs.en)[key]||packs.en[key]||key)}
+function applyApplicationI18n(){const map={sessionsSideTab:'sessions',appsSideTab:'store',personalAppsTab:'personal',sharedAppsTab:'shared',newApplicationBtn:'create',applicationNameLabel:'name',applicationIconLabel:'icon',applicationDescriptionLabel:'description',selectedSkillsLabel:'selected',scanSkillsLabel:'scan',cancelApplicationEditorBtn:'cancel',saveApplicationBtn:'save'};for(const [id,key] of Object.entries(map)){const el=E(id);if(el)el.textContent=appText(key)}if(E('applicationEditorTitle'))E('applicationEditorTitle').textContent=appText(APP_STORE.editingId?'edit_title':'create_title');const placeholders={applicationName:'name_placeholder',applicationIcon:'icon_placeholder',applicationDescription:'description_placeholder',applicationSkillSearch:'search_placeholder'};for(const [id,key] of Object.entries(placeholders)){const el=E(id);if(el)el.placeholder=appText(key)}const refresh=E('refreshApplicationsBtn');if(refresh)refresh.title=appText('refresh');const close=E('closeApplicationEditorBtn');if(close)close.setAttribute('aria-label',appText('close'));renderApplicationStore();renderApplicationSkillCatalog()}
+function switchApplicationSide(view){APP_STORE.view=view==='apps'?'apps':'sessions';const apps=APP_STORE.view==='apps';E('sessionsSideView').hidden=apps;E('appsSideView').hidden=!apps;E('sessionsSideTab').classList.toggle('active',!apps);E('appsSideTab').classList.toggle('active',apps);if(apps)loadApplicationStore().catch(err=>showError(err.message||String(err)));else renderSessions()}
+function switchApplicationScope(scope){APP_STORE.scope=scope==='shared'?'shared':'personal';E('personalAppsTab').classList.toggle('active',APP_STORE.scope==='personal');E('sharedAppsTab').classList.toggle('active',APP_STORE.scope==='shared');E('newApplicationBtn').style.display=APP_STORE.scope==='personal'?'':'none';renderApplicationStore()}
+async function loadApplicationStore(force=false){if(APP_STORE.loading)return;if(APP_STORE.loaded&&!force){renderApplicationStore();return}APP_STORE.loading=true;renderApplicationStore();try{const [personal,shared,catalog]=await Promise.all([api('/api/apps/personal'),api('/api/apps/shared'),api('/api/apps/skills')]);APP_STORE.personal=Array.isArray(personal)?personal:[];APP_STORE.shared=Array.isArray(shared)?shared:[];APP_STORE.catalog=Array.isArray(catalog)?catalog:[];APP_STORE.loaded=true}finally{APP_STORE.loading=false;renderApplicationStore();renderApplicationSkillCatalog()}}
+function makeAppButton(text,cls,handler){const b=document.createElement('button');b.type='button';b.className=cls||'';b.textContent=text;b.onclick=handler;return b}
+function renderApplicationStore(){const host=E('applicationList');if(!host)return;host.innerHTML='';if(APP_STORE.loading&&!APP_STORE.loaded){const d=document.createElement('div');d.className='application-empty';d.textContent=appText('loading');host.appendChild(d);return}const rows=APP_STORE.scope==='shared'?APP_STORE.shared:APP_STORE.personal;if(!rows.length){const d=document.createElement('div');d.className='application-empty';d.textContent=appText(APP_STORE.scope==='shared'?'empty_shared':'empty_personal');host.appendChild(d);return}for(const app of rows){const card=document.createElement('article');card.className='application-card';const head=document.createElement('div');head.className='application-card-head';const title=document.createElement('div');title.className='application-card-title';title.textContent=(String(app.icon||'').trim()?String(app.icon).trim()+' ':'')+String(app.name||'Application');const submissionCurrent=Number(app.latest_submission?.submitted_revision||0)===Number(app.revision||0);const displayStatus=String(submissionCurrent?app.latest_submission?.status:(app.status||'draft'));const status=document.createElement('span');status.className='application-card-status '+displayStatus;status.textContent=appText(displayStatus);head.append(title,status);card.appendChild(head);if(app.description){const desc=document.createElement('div');desc.className='application-card-desc';desc.textContent=String(app.description);card.appendChild(desc)}if(submissionCurrent&&app.latest_submission?.review?.note){const review=document.createElement('div');review.className='application-card-desc';review.textContent=String(app.latest_submission.review.note);card.appendChild(review)}const skills=document.createElement('div');skills.className='application-card-skills';for(const skill of [...(app.skills||[])].sort((a,b)=>(a.order||0)-(b.order||0))){const chip=document.createElement('span');chip.textContent=String(skill.name||skill.id||'Skill');chip.title=String(skill.id||'');skills.appendChild(chip)}card.appendChild(skills);const actions=document.createElement('div');actions.className='application-card-actions';actions.appendChild(makeAppButton(appText('run'),'application-run',()=>launchApplication(app).catch(err=>showError(err.message||String(err)))));if(APP_STORE.scope==='personal'){actions.appendChild(makeAppButton(appText('edit'),'subtle',()=>openApplicationEditor(app)));if(!submissionCurrent||displayStatus==='draft')actions.appendChild(makeAppButton(appText('submit'),'subtle',()=>submitApplication(app).catch(err=>showError(err.message||String(err)))));actions.appendChild(makeAppButton(appText('remove'),'subtle danger',()=>deleteApplication(app).catch(err=>showError(err.message||String(err)))))}card.appendChild(actions);host.appendChild(card)}}
+function openApplicationEditor(app=null){APP_STORE.editingId=String(app?.id||'');APP_STORE.selectedSkillIds=[...(app?.skills||[])].sort((a,b)=>(a.order||0)-(b.order||0)).map(x=>String(x.id||'')).filter(Boolean);E('applicationName').value=String(app?.name||'');E('applicationIcon').value=String(app?.icon||'');E('applicationDescription').value=String(app?.description||'');E('applicationEditorError').textContent='';E('applicationEditorTitle').textContent=appText(APP_STORE.editingId?'edit_title':'create_title');E('applicationEditor').hidden=false;renderApplicationSkillCatalog();setTimeout(()=>E('applicationName').focus(),0)}
+function closeApplicationEditor(){E('applicationEditor').hidden=true;APP_STORE.editingId='';APP_STORE.selectedSkillIds=[]}
+function toggleApplicationSkill(id){const idx=APP_STORE.selectedSkillIds.indexOf(id);if(idx>=0)APP_STORE.selectedSkillIds.splice(idx,1);else{if(APP_STORE.selectedSkillIds.length>=8){E('applicationEditorError').textContent=appText('skill_limit');return}APP_STORE.selectedSkillIds.push(id)}E('applicationEditorError').textContent='';renderApplicationSkillCatalog()}
+function renderApplicationSkillCatalog(){const host=E('applicationSkillCatalog'),selectedHost=E('applicationSelectedSkills');if(!host||!selectedHost)return;const q=String(E('applicationSkillSearch')?.value||'').trim().toLowerCase(),chosen=new Set(APP_STORE.selectedSkillIds);host.innerHTML='';selectedHost.innerHTML='';APP_STORE.selectedSkillIds.forEach((id,index)=>{const skill=APP_STORE.catalog.find(x=>String(x.id)===id),chip=document.createElement('span');chip.className='application-skill-chip';chip.textContent=(index+1)+'. '+String(skill?.name||id);const del=document.createElement('button');del.type='button';del.textContent='×';del.onclick=()=>toggleApplicationSkill(id);chip.appendChild(del);selectedHost.appendChild(chip)});E('applicationSkillCount').textContent=APP_STORE.selectedSkillIds.length+' / 8';const rows=APP_STORE.catalog.filter(x=>!q||[x.id,x.name,x.description].join(' ').toLowerCase().includes(q));if(!rows.length){const empty=document.createElement('div');empty.className='application-empty';empty.textContent=appText('no_match');host.appendChild(empty);return}for(const skill of rows){const row=document.createElement('label');row.className='application-skill-row'+(chosen.has(String(skill.id))?' selected':'');const box=document.createElement('input');box.type='checkbox';box.checked=chosen.has(String(skill.id));box.onchange=()=>toggleApplicationSkill(String(skill.id));const body=document.createElement('div'),name=document.createElement('strong'),id=document.createElement('small'),desc=document.createElement('small');name.textContent=String(skill.name||skill.id);id.textContent=String(skill.id||'');desc.textContent=String(skill.description||'');body.append(name,id,desc);row.append(box,body);host.appendChild(row)}}
+async function saveApplication(){const payload={name:E('applicationName').value.trim(),icon:E('applicationIcon').value.trim(),description:E('applicationDescription').value.trim(),skills:APP_STORE.selectedSkillIds};if(!payload.name){E('applicationEditorError').textContent=appText('name_required');return}if(!payload.skills.length){E('applicationEditorError').textContent=appText('skill_required');return}const path=APP_STORE.editingId?'/api/apps/'+encodeURIComponent(APP_STORE.editingId):'/api/apps/personal';await api(path,{method:APP_STORE.editingId?'PATCH':'POST',body:JSON.stringify(payload)});closeApplicationEditor();await loadApplicationStore(true);showError(appText('saved'))}
+async function submitApplication(app){if(!confirm(appText('confirm_submit')))return;await api('/api/apps/'+encodeURIComponent(app.id)+'/submit',{method:'POST',body:'{}'});await loadApplicationStore(true);showError(appText('submitted'))}
+async function deleteApplication(app){if(!confirm(appText('confirm_delete')))return;await api('/api/apps/'+encodeURIComponent(app.id),{method:'DELETE'});await loadApplicationStore(true);showError(appText('deleted'))}
+async function launchApplication(app){const out=await api('/api/apps/'+encodeURIComponent(app.id)+'/launch',{method:'POST',body:'{}'});applyRuntimeConfigStats({session_creation_limit:out?.session_creation_limit});const sid=String(out?.id||'').trim();if(!sid)throw new Error('application launch returned no session');const row={id:sid,title:String(out.title||app.name||sid),running:false,updated_at:Date.now()/1000,message_count:0,ui_language:String(out.ui_language||S.config?.language||currentLang()),app_binding:out.app_binding||{}};S.sessions=[row,...S.sessions.filter(x=>String(x?.id||'')!==sid)];S.lastSessionsSig=sessionsSignature(S.sessions);switchApplicationSide('sessions');renderSessions();renderStats();await selectSession(sid)}
+function bindApplicationStore(){bindClick('sessionsSideTab',()=>switchApplicationSide('sessions'));bindClick('appsSideTab',()=>switchApplicationSide('apps'));bindClick('personalAppsTab',()=>switchApplicationScope('personal'));bindClick('sharedAppsTab',()=>switchApplicationScope('shared'));bindClick('newApplicationBtn',()=>openApplicationEditor());bindClick('refreshApplicationsBtn',()=>loadApplicationStore(true));bindClick('closeApplicationEditorBtn',closeApplicationEditor);bindClick('cancelApplicationEditorBtn',closeApplicationEditor);bindClick('saveApplicationBtn',()=>saveApplication().catch(err=>{E('applicationEditorError').textContent=err.message||String(err)}));const search=E('applicationSkillSearch');if(search)search.oninput=renderApplicationSkillCatalog;const modal=E('applicationEditor');if(modal)modal.addEventListener('click',ev=>{if(ev.target===modal)closeApplicationEditor()});applyApplicationI18n()}
 async function togglePlanMode(){if(!S.activeId)return;const states=['auto','on','off'];const current=S.snap?.plan_mode_preference||'auto';const next=states[(states.indexOf(current)+1)%states.length];try{await api('/api/sessions/'+S.activeId+'/config/plan-mode',{method:'POST',body:JSON.stringify({preference:next})});if(S.snap)S.snap.plan_mode_preference=next;const btn=E('planModeBtn');if(btn)btn.textContent='Plan: '+next.charAt(0).toUpperCase()+next.slice(1)}catch(err){showError(err.message||String(err))}}
 async function refreshAll(forceProbe=false){
   if(S.staticMode&&S.frozen){S.frozen=false;applyStaticUiClass()}
@@ -64919,6 +66121,7 @@ async function refreshAll(forceProbe=false){
   applyUiStyle();
   renderLanguageControls();
   applyMainI18n();
+  applyApplicationI18n();
   renderUploadList();
   renderSkillsEntryLink();
   const sessState=await refreshSessions({statsConfig:S.config,sessions:rowsRaw,autoSelect:true,selectOptions:{forceFullImmediate:false},limit:SESSION_BOOT_LIMIT});
@@ -64929,7 +66132,7 @@ async function refreshAll(forceProbe=false){
   if(S.activeId&&!String(sessState?.selectedId||'').trim())await refreshSnapshot({forceFull:!!forceProbe,allowWhenFrozen:true});
 }
 function bindClick(id,fn){const el=E(id);if(el)el.onclick=fn}
-window.addEventListener('DOMContentLoaded',async()=>{for(const id of ['chat','sessionList','todos','tasks','activity','commands','diffs','fileExplorer','catalog']){bindPanelScrollState(id,E(id))}const drop=E('promptComposerShell');const fileInput=E('uploadInput');const promptPick=E('promptFilePick');const promptEl=E('prompt');if(promptPick&&fileInput){promptPick.onclick=(ev)=>{ev.preventDefault();fileInput.click()}}if(drop&&fileInput){let _dragC=0;drop.setAttribute('tabindex','0');drop.addEventListener('click',e=>{if(e.target===drop&&promptEl)promptEl.focus()});fileInput.onchange=()=>uploadFiles(fileInput.files).then(()=>{fileInput.value=''}).catch(err=>showError(err.message));for(const evt of ['dragenter','dragover']){drop.addEventListener(evt,e=>{e.preventDefault();if(evt==='dragenter')_dragC++;drop.classList.add('dragover')})}for(const evt of ['dragleave','dragend']){drop.addEventListener(evt,e=>{e.preventDefault();if(evt==='dragleave')_dragC--;if(_dragC<=0){_dragC=0;drop.classList.remove('dragover')}})}drop.addEventListener('drop',e=>{e.preventDefault();_dragC=0;drop.classList.remove('dragover');const files=e.dataTransfer?.files;if(files&&files.length)uploadFiles(files).catch(err=>showError(err.message))});drop.addEventListener('paste',e=>{const files=clipboardFilesFromEvent(e);if(!files.length)return;e.preventDefault();drop.classList.add('dragover');setTimeout(()=>drop.classList.remove('dragover'),220);uploadFiles(files).catch(err=>showError(err.message||String(err)))})}const configInput=E('configInput');if(configInput){configInput.onchange=()=>uploadLlmConfigFile(configInput.files&&configInput.files[0]).then(()=>{configInput.value=''}).catch(err=>showError(err.message||String(err)))}bindClick('newSessionBtn',createSession);bindClick('renameSessionBtn',renameSession);bindClick('deleteSessionBtn',deleteSession);bindClick('applyModelBtn',applyModel);bindClick('llmConfigBtn',openLlmConfigModal);bindClick('llmModalClose',()=>{E('llmConfigModal').style.display='none'});bindClick('llmConfigConfirm',submitLlmConfig);const llmProv=E('llmProvider');if(llmProv){llmProv.addEventListener('change',()=>renderLlmFields(llmProv.value))}const llmOverlay=E('llmConfigModal');if(llmOverlay){llmOverlay.addEventListener('click',e=>{if(e.target===llmOverlay)llmOverlay.style.display='none'})}bindClick('sendBtn',sendMessage);bindClick('interruptBtn',interruptRun);bindClick('clearStaleTodosBtn',clearStaleTodos);bindClick('planModeBtn',togglePlanMode);bindClick('refreshFilesBtn',()=>refreshFileExplorer(true));bindClick('previewReloadBtn',()=>renderActivePreview(true));bindClick('previewCopyBtn',()=>copyPreviewCode());bindPopupButton('toolsMenuBtn','toolsMenu');bindClick('compactAction',(e)=>{if(e)e.preventDefault();closePopups();compactNow()});bindClick('refreshAction',(e)=>{if(e)e.preventDefault();closePopups();refreshAll(true)});bindPopupButton('levelBtn','levelMenu',(menu)=>{for(const opt of menu.querySelectorAll('.level-option')){opt.addEventListener('click',e=>{e.preventDefault();const lvl=parseInt(opt.getAttribute('data-level')||'0',10);setTaskLevel(lvl);setPopupOpen('levelMenu',false)})}});bindPopupButton('exportMenuBtn','exportMenu',(menu)=>{for(const a of menu.querySelectorAll('.export-item')){a.addEventListener('click',()=>setPopupOpen('exportMenu',false))}});document.addEventListener('click',()=>closePopups());const langSel=E('langSelect');if(langSel){langSel.onchange=()=>setLanguage(langSel.value).catch(err=>showError(err.message||String(err)))}if(promptEl){promptEl.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter'){e.preventDefault();sendMessage()}})}applyUiStyle();applyStaticUiClass();applyMainI18n();_bindPreviewCopyGuard();try{await refreshAll(false);if(!S.sessions.length){const bootCreate=()=>createSession({prompt:false}).catch(err=>showError(err.message||String(err)));if(typeof requestAnimationFrame==='function'){requestAnimationFrame(()=>setTimeout(bootCreate,0))}else{setTimeout(bootCreate,0)}}}catch(err){showError(err.message||String(err))}_deltaStartWatchdog();scheduleSessionPoll(false);document.addEventListener('visibilitychange',()=>{const next=document.visibilityState||'visible';if(next===S.lastVisibilityState)return;S.lastVisibilityState=next;if(next==='hidden'){if(S.deltaWatchdogTimer){clearTimeout(S.deltaWatchdogTimer);S.deltaWatchdogTimer=null}if(S.sessionPollTimer){clearTimeout(S.sessionPollTimer);S.sessionPollTimer=null}if(S.staticMode)freezeAutoUpdates();return}if(S.staticMode&&S.frozen)resumeAutoUpdates();_deltaStartWatchdog();scheduleSessionPoll(true);scheduleSnapshot({forceFull:false,delayMs:40,allowWhenFrozen:true})})})
+window.addEventListener('DOMContentLoaded',async()=>{for(const id of ['chat','sessionList','todos','tasks','activity','commands','diffs','fileExplorer','catalog']){bindPanelScrollState(id,E(id))}const drop=E('promptComposerShell');const fileInput=E('uploadInput');const promptPick=E('promptFilePick');const promptEl=E('prompt');if(promptPick&&fileInput){promptPick.onclick=(ev)=>{ev.preventDefault();fileInput.click()}}if(drop&&fileInput){let _dragC=0;drop.setAttribute('tabindex','0');drop.addEventListener('click',e=>{if(e.target===drop&&promptEl)promptEl.focus()});fileInput.onchange=()=>uploadFiles(fileInput.files).then(()=>{fileInput.value=''}).catch(err=>showError(err.message));for(const evt of ['dragenter','dragover']){drop.addEventListener(evt,e=>{e.preventDefault();if(evt==='dragenter')_dragC++;drop.classList.add('dragover')})}for(const evt of ['dragleave','dragend']){drop.addEventListener(evt,e=>{e.preventDefault();if(evt==='dragleave')_dragC--;if(_dragC<=0){_dragC=0;drop.classList.remove('dragover')}})}drop.addEventListener('drop',e=>{e.preventDefault();_dragC=0;drop.classList.remove('dragover');const files=e.dataTransfer?.files;if(files&&files.length)uploadFiles(files).catch(err=>showError(err.message))});drop.addEventListener('paste',e=>{const files=clipboardFilesFromEvent(e);if(!files.length)return;e.preventDefault();drop.classList.add('dragover');setTimeout(()=>drop.classList.remove('dragover'),220);uploadFiles(files).catch(err=>showError(err.message||String(err)))})}const configInput=E('configInput');if(configInput){configInput.onchange=()=>uploadLlmConfigFile(configInput.files&&configInput.files[0]).then(()=>{configInput.value=''}).catch(err=>showError(err.message||String(err)))}bindClick('newSessionBtn',createSession);bindClick('renameSessionBtn',renameSession);bindClick('deleteSessionBtn',deleteSession);bindClick('applyModelBtn',applyModel);bindClick('llmConfigBtn',openLlmConfigModal);bindClick('llmModalClose',()=>{E('llmConfigModal').style.display='none'});bindClick('llmConfigConfirm',submitLlmConfig);const llmProv=E('llmProvider');if(llmProv){llmProv.addEventListener('change',()=>renderLlmFields(llmProv.value))}const llmOverlay=E('llmConfigModal');if(llmOverlay){llmOverlay.addEventListener('click',e=>{if(e.target===llmOverlay)llmOverlay.style.display='none'})}bindClick('sendBtn',sendMessage);bindClick('interruptBtn',interruptRun);bindClick('clearStaleTodosBtn',clearStaleTodos);bindClick('planModeBtn',togglePlanMode);bindClick('refreshFilesBtn',()=>refreshFileExplorer(true));bindClick('previewReloadBtn',()=>renderActivePreview(true));bindClick('previewCopyBtn',()=>copyPreviewCode());bindPopupButton('toolsMenuBtn','toolsMenu');bindClick('compactAction',(e)=>{if(e)e.preventDefault();closePopups();compactNow()});bindClick('refreshAction',(e)=>{if(e)e.preventDefault();closePopups();refreshAll(true)});bindPopupButton('levelBtn','levelMenu',(menu)=>{for(const opt of menu.querySelectorAll('.level-option')){opt.addEventListener('click',e=>{e.preventDefault();const lvl=parseInt(opt.getAttribute('data-level')||'0',10);setTaskLevel(lvl);setPopupOpen('levelMenu',false)})}});bindPopupButton('exportMenuBtn','exportMenu',(menu)=>{for(const a of menu.querySelectorAll('.export-item')){a.addEventListener('click',()=>setPopupOpen('exportMenu',false))}});document.addEventListener('click',()=>closePopups());const langSel=E('langSelect');if(langSel){langSel.onchange=()=>setLanguage(langSel.value).then(()=>applyApplicationI18n()).catch(err=>showError(err.message||String(err)))}if(promptEl){promptEl.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter'){e.preventDefault();sendMessage()}})}bindApplicationStore();applyUiStyle();applyStaticUiClass();applyMainI18n();applyApplicationI18n();_bindPreviewCopyGuard();try{await refreshAll(false);if(!S.sessions.length){const bootCreate=()=>createSession({prompt:false}).catch(err=>showError(err.message||String(err)));if(typeof requestAnimationFrame==='function'){requestAnimationFrame(()=>setTimeout(bootCreate,0))}else{setTimeout(bootCreate,0)}}}catch(err){showError(err.message||String(err))}_deltaStartWatchdog();scheduleSessionPoll(false);document.addEventListener('visibilitychange',()=>{const next=document.visibilityState||'visible';if(next===S.lastVisibilityState)return;S.lastVisibilityState=next;if(next==='hidden'){if(S.deltaWatchdogTimer){clearTimeout(S.deltaWatchdogTimer);S.deltaWatchdogTimer=null}if(S.sessionPollTimer){clearTimeout(S.sessionPollTimer);S.sessionPollTimer=null}if(S.staticMode)freezeAutoUpdates();return}if(S.staticMode&&S.frozen)resumeAutoUpdates();_deltaStartWatchdog();scheduleSessionPoll(true);scheduleSnapshot({forceFull:false,delayMs:40,allowWhenFrozen:true})})})
 window.addEventListener('DOMContentLoaded',()=>{bindClick('memoryModeAction',(e)=>{closePopups();toggleUserMemoryMode(e)});bindClick('memoryExportAction',(e)=>{closePopups();exportUserMemory(e)});bindClick('memoryClearAction',(e)=>{closePopups();clearUserMemory(e)});renderMemoryModeAction()});
 """
 
@@ -64943,6 +66146,10 @@ type SkillProtocol={protocol:string;version:string;active_providers:number;activ
 type ToolMeta={name:string;description:string;parameters:Record<string,unknown>};
 type ModelOption={selection:string;profile_id:string;provider:string;model:string;label:string;source?:string;thinking_hint?:boolean;thinking_stream?:boolean;response_stream?:boolean};
 type ModelCatalog={provider:string;models:string[];selected:string;thinking:boolean;thinking_mode?:string;note?:string;options?:ModelOption[]};
+type ApplicationSkillCatalog={id:string;name:string;description?:string};
+type ApplicationSkill=ApplicationSkillCatalog & {order:number;digest?:string};
+type ApplicationSubmission={id:string;status:'pending'|'published'|'rejected';submitted_revision:number;review?:{note?:string;decision?:string}};
+type Application={id:string;name:string;description:string;icon:string;scope:'personal'|'shared';status:'draft'|'pending'|'published'|'rejected';revision:number;skills:ApplicationSkill[];latest_submission?:ApplicationSubmission};
 async function api<T>(path:string,opt:RequestInit={}):Promise<T>{const r=await fetch(path,{headers:{'Content-Type':'application/json'},...opt});if(!r.ok)throw new Error(await r.text());return await r.json() as T}
 export const loadSessions=()=>api<SessionSummary[]>('/api/sessions');
 export const loadSnapshot=(id:string)=>api<Snapshot>(`/api/sessions/${id}`);
@@ -64960,6 +66167,13 @@ export const importDefaultLlmConfig=(id:string)=>api<{ok:boolean;catalog:ModelCa
 export const createSession=(title:string)=>api<{id:string;title:string}>('/api/sessions',{method:'POST',body:JSON.stringify({title})});
 export const renameSession=(id:string,title:string)=>api<{id:string;title:string}>(`/api/sessions/${id}`,{method:'PATCH',body:JSON.stringify({title})});
 export const deleteSession=(id:string)=>api<{ok:boolean}>(`/api/sessions/${id}`,{method:'DELETE'});
+export const loadPersonalApplications=()=>api<Application[]>('/api/apps/personal');
+export const loadSharedApplications=()=>api<Application[]>('/api/apps/shared');
+export const loadApplicationSkills=()=>api<ApplicationSkillCatalog[]>('/api/apps/skills');
+export const createApplication=(payload:Pick<Application,'name'|'description'|'icon'> & {skills:string[]})=>api<Application>('/api/apps/personal',{method:'POST',body:JSON.stringify(payload)});
+export const updateApplication=(id:string,payload:Pick<Application,'name'|'description'|'icon'> & {skills:string[]})=>api<Application>(`/api/apps/${id}`,{method:'PATCH',body:JSON.stringify(payload)});
+export const submitApplication=(id:string)=>api<Application>(`/api/apps/${id}/submit`,{method:'POST',body:'{}'});
+export const launchApplication=(id:string)=>api<{id:string;title:string;app_binding:Record<string,unknown>}>(`/api/apps/${id}/launch`,{method:'POST',body:'{}'});
 """
 
 SKILLS_INDEX_HTML = """<!doctype html>
@@ -65216,6 +66430,9 @@ SKILLS_EXTRA_CSS = """
 """
 
 SKILLS_APP_JS = """const S={config:null,rules:null,skillScan:{skills_count:0,skills:[],tree:{type:'dir',name:'skills',path:'',children:[]},warnings:[]},flow:{nodes:[],edges:[]},flowZoom:1,selectedNodeId:null,drag:null,linkDrag:null,pan:null,skillMap:{},activeSkillFile:'',uploadReports:[]};
+const ADMIN_TOKEN_KEY='clouds_coder_admin_token';
+function adminToken(){return String(sessionStorage.getItem(ADMIN_TOKEN_KEY)||'').trim()}
+function requireAdminToken(){let token=adminToken();if(!token){token=String(prompt('Admin token required for global Skill changes')||'').trim();if(token)sessionStorage.setItem(ADMIN_TOKEN_KEY,token)}return token}
 const E=id=>document.getElementById(id);
 const I18N={'en':{title:'Fona Skills Studio',subtitle:'Visual Skills authoring platform with the same WebUI style',flow_line:'Flowchart → LLM parse → SKILL.md inject into ./skills',apply_model:'Apply Model',refresh:'Refresh',open_agent:'Open Agent UI',rules_knowledge:'Rules & Knowledge',analyze:'Analyze agents/docs',scan:'Scan Skills',rules:'Rules',sources:'Sources',flow_builder:'Flow Builder',tab_node:'Node',tab_manual_link:'Manual Link',add_node:'Add Node',connect:'Connect',delete_node:'Delete Node',bidirectional:'Bidirectional',drag_tip:'Drag ports + hold Shift => bidirectional (n)',canvas_tips:'Canvas Tips',tip1:'1. Drag nodes to move',tip2:'2. Drag from side ports to create links',tip3:'3. Hold Shift while dragging => bidirectional',tip4:'4. Double-click near an edge => delete edge',tip5:'5. Use +/- buttons to zoom',reset_flow:'Reset Flow',export_flow:'Export Flow JSON',import_flow:'Import Flow JSON',draft_publish:'Skill Draft & Publish',generate_inject:'Generate + Inject',save_markdown:'Save Current Markdown',skills_explorer:'Skills Explorer',load_to_flow:'Load To Flow Builder',upload_drop:'Drop skills (SKILL.md / .zip) here, or use upload buttons below',upload_files:'Upload Files',upload_folder:'Upload Folder',selected_skill:'Selected Skill',stat_rules:'Rules',stat_skills:'Skills',stat_model:'Model',stat_nodes:'Flow Nodes',no_rules:'No rules',no_sources:'No sources',no_skill_selected:'No skill selected',no_uploads:'No uploads',select_skill_first:'select a skill first',no_model_selected:'no model selected',invalid_flow_json:'invalid flow json',summary:'summary',generated_at:'generated_at',skills_unit:'skills',upload_parse_failed:'upload parse failed',folder:'folder',empty:'(empty)'},
 'zh-CN':{title:'Fona Skills Studio',subtitle:'基于现有 WebUI 风格的图形化 Skills 制作平台',flow_line:'Flowchart → LLM 解析 → SKILL.md 注入 ./skills',apply_model:'应用模型',refresh:'刷新',open_agent:'打开 Agent UI',rules_knowledge:'Rules & Knowledge',analyze:'分析 agents/docs',scan:'扫描 Skills',rules:'规则',sources:'来源',flow_builder:'流程构建器',tab_node:'节点',tab_manual_link:'手动连线',add_node:'添加节点',connect:'连接',delete_node:'删除节点',bidirectional:'双向',drag_tip:'拖拽端口并按 Shift => 双向链路 (n)',canvas_tips:'画布提示',tip1:'1. 拖拽节点移动位置',tip2:'2. 从节点四边端口拖拽连线',tip3:'3. 按住 Shift 拖拽 => 双向链路',tip4:'4. 双击连线附近 => 删除连线',tip5:'5. 使用 +/- 按钮缩放',reset_flow:'重置流程',export_flow:'导出 Flow JSON',import_flow:'导入 Flow JSON',draft_publish:'技能草稿与发布',generate_inject:'生成并注入',save_markdown:'保存当前 Markdown',skills_explorer:'技能浏览器',load_to_flow:'载入到流程构建器',upload_drop:'拖拽上传 skills（SKILL.md / .zip），或使用下方上传按钮',upload_files:'上传文件',upload_folder:'上传文件夹',selected_skill:'已选 Skill',stat_rules:'规则',stat_skills:'技能',stat_model:'模型',stat_nodes:'流程节点',no_rules:'暂无规则',no_sources:'暂无来源',no_skill_selected:'未选择 Skill',no_uploads:'暂无上传',select_skill_first:'请先选择一个 skill',no_model_selected:'未选择模型',invalid_flow_json:'无效的 flow json',summary:'摘要',generated_at:'生成时间',skills_unit:'个 skills',upload_parse_failed:'上传解析失败',folder:'目录',empty:'(空)'},
@@ -65343,10 +66560,10 @@ function importFlow(){try{const obj=JSON.parse(E('flowJson').value||'{}');if(!Ar
 async function applyModel(){try{const selection=E('modelSelect').value;if(!selection){showError(t('no_model_selected'));return}S.config.model_catalog=await api('/api/skillslab/model',{method:'POST',body:JSON.stringify({selection})});renderModelControls();setStats();showError('')}catch(err){showError(err.message||String(err))}}
 async function analyzeRules(){try{S.rules=await api('/api/skillslab/rules');renderRules();setStats();showError('')}catch(err){showError(err.message||String(err))}}
 async function scanSkills(){try{const out=await api('/api/skillslab/skills');S.skillScan=normalizeSkillScan(out);if(!S.activeSkillFile&&S.skillScan.skills.length){S.activeSkillFile=String(S.skillScan.skills[0].skill_file||'')}renderSkills();showError('')}catch(err){showError(err.message||String(err))}}
-async function generateSkill(){try{const payload={skill_name:E('skillName').value.trim(),skill_path:E('skillPath').value.trim(),description:E('skillDesc').value.trim(),requirements:E('requirements').value.trim(),nodes:S.flow.nodes,edges:S.flow.edges,auto_inject:true,overwrite:true};const out=await api('/api/skillslab/generate',{method:'POST',body:JSON.stringify(payload)});if(out.skill_name)E('skillName').value=out.skill_name;if(out.skill_path)E('skillPath').value=out.skill_path;if(out.description)E('skillDesc').value=out.description;E('skillMarkdown').value=out.skill_markdown||'';await scanSkills();showError('')}catch(err){showError(err.message||String(err))}}
-async function saveSkill(){try{const payload={path:E('skillPath').value.trim()||E('skillName').value.trim(),content:E('skillMarkdown').value,overwrite:true};await api('/api/skillslab/save',{method:'POST',body:JSON.stringify(payload)});await scanSkills();showError('')}catch(err){showError(err.message||String(err))}}
+async function generateSkill(){try{const token=requireAdminToken();if(!token)throw new Error('Admin token required');const payload={skill_name:E('skillName').value.trim(),skill_path:E('skillPath').value.trim(),description:E('skillDesc').value.trim(),requirements:E('requirements').value.trim(),nodes:S.flow.nodes,edges:S.flow.edges,auto_inject:true,overwrite:true};const out=await api('/api/skillslab/generate',{method:'POST',headers:{Authorization:'Bearer '+token},body:JSON.stringify(payload)});if(out.skill_name)E('skillName').value=out.skill_name;if(out.skill_path)E('skillPath').value=out.skill_path;if(out.description)E('skillDesc').value=out.description;E('skillMarkdown').value=out.skill_markdown||'';await scanSkills();showError('')}catch(err){showError(err.message||String(err))}}
+async function saveSkill(){try{const token=requireAdminToken();if(!token)throw new Error('Admin token required');const payload={path:E('skillPath').value.trim()||E('skillName').value.trim(),content:E('skillMarkdown').value,overwrite:true};await api('/api/skillslab/save',{method:'POST',headers:{Authorization:'Bearer '+token},body:JSON.stringify(payload)});await scanSkills();showError('')}catch(err){showError(err.message||String(err))}}
 function isUploadSkillCandidate(name){const n=String(name||'').toLowerCase();if(n.endsWith('.zip')||n.endsWith('.md')||n.endsWith('.markdown')||n.endsWith('.txt'))return true;return n.endsWith('/skill.md')||n.endsWith('skill.md')}
-async function uploadSkillFiles(fileList){if(!fileList||!fileList.length)return;for(const file of Array.from(fileList)){const relName=String(file.webkitRelativePath||file.name||'').replace(/\\\\/g,'/');if(!isUploadSkillCandidate(relName)){S.uploadReports.push({filename:relName||file.name||'unknown',imported_count:0,skipped_count:1,error_count:0});continue}try{if(file.size>30*1024*1024){throw new Error(`${t('file_too_large')}: ${file.name} (>30MB)`)}const arr=await file.arrayBuffer();const payload={filename:relName||file.name,mime:file.type||'',content_b64:ab2b64(arr),overwrite:false};const out=await api('/api/skillslab/upload',{method:'POST',body:JSON.stringify(payload)});S.uploadReports.push({filename:relName||file.name,imported_count:Number(out.imported_count||0),skipped_count:Number(out.skipped_count||0),error_count:Number(out.error_count||0)});if(out.scan)S.skillScan=normalizeSkillScan(out.scan);if(Array.isArray(out.errors)&&out.errors.length){showError(String(out.errors[0].error||t('upload_parse_failed')))}else{showError('')}}catch(err){S.uploadReports.push({filename:relName||file.name,imported_count:0,skipped_count:0,error_count:1});showError(err.message||String(err))}}renderSkills()}
+async function uploadSkillFiles(fileList){if(!fileList||!fileList.length)return;const token=requireAdminToken();if(!token){showError('Admin token required');return}for(const file of Array.from(fileList)){const relName=String(file.webkitRelativePath||file.name||'').replace(/\\\\/g,'/');if(!isUploadSkillCandidate(relName)){S.uploadReports.push({filename:relName||file.name||'unknown',imported_count:0,skipped_count:1,error_count:0});continue}try{if(file.size>30*1024*1024){throw new Error(`${t('file_too_large')}: ${file.name} (>30MB)`)}const arr=await file.arrayBuffer();const payload={filename:relName||file.name,mime:file.type||'',content_b64:ab2b64(arr),overwrite:false};const out=await api('/api/skillslab/upload',{method:'POST',headers:{Authorization:'Bearer '+token},body:JSON.stringify(payload)});S.uploadReports.push({filename:relName||file.name,imported_count:Number(out.imported_count||0),skipped_count:Number(out.skipped_count||0),error_count:Number(out.error_count||0)});if(out.scan)S.skillScan=normalizeSkillScan(out.scan);if(Array.isArray(out.errors)&&out.errors.length){showError(String(out.errors[0].error||t('upload_parse_failed')))}else{showError('')}}catch(err){S.uploadReports.push({filename:relName||file.name,imported_count:0,skipped_count:0,error_count:1});showError(err.message||String(err))}}renderSkills()}
 function bindSkillUpload(){const drop=E('skillsUploadDrop');const input=E('skillsUploadInput');const dirInput=E('skillsUploadDirInput');const fileBtn=E('skillsUploadFileBtn');const folderBtn=E('skillsUploadFolderBtn');if(!drop||!input||!dirInput)return;const consume=async(files,resetter)=>{try{await uploadSkillFiles(files)}catch(err){showError(err.message||String(err))}if(typeof resetter==='function')resetter()};drop.onclick=()=>input.click();if(fileBtn)fileBtn.onclick=()=>input.click();if(folderBtn)folderBtn.onclick=()=>dirInput.click();input.onchange=()=>consume(input.files,()=>{input.value=''});dirInput.onchange=()=>consume(dirInput.files,()=>{dirInput.value=''});for(const evt of ['dragenter','dragover']){drop.addEventListener(evt,e=>{e.preventDefault();drop.classList.add('dragover')})}for(const evt of ['dragleave','dragend']){drop.addEventListener(evt,e=>{e.preventDefault();drop.classList.remove('dragover')})}drop.addEventListener('drop',e=>{e.preventDefault();drop.classList.remove('dragover');consume(e.dataTransfer?.files||[])})}
 function bindFlowZoom(){const outBtn=E('flowZoomOutBtn');const inBtn=E('flowZoomInBtn');if(outBtn)outBtn.onclick=()=>zoomFlowBy(-0.1);if(inBtn)inBtn.onclick=()=>zoomFlowBy(0.1);updateFlowZoomUI()}
 function bindFlowPan(){const wrap=E('flowWrap');if(!wrap)return;wrap.addEventListener('mousedown',ev=>{if(ev.button!==0)return;const target=ev.target;if(!target||!target.closest||!target.closest('#flowWrap'))return;if(target.closest('.flow-node,.flow-port,input,textarea,select,button,a,label,.flow-zoom-pill'))return;S.drag=null;S.linkDrag=null;S.pan={sx:ev.clientX,sy:ev.clientY,left:wrap.scrollLeft,top:wrap.scrollTop};wrap.classList.add('flow-panning');ev.preventDefault()})}
@@ -65356,6 +66573,362 @@ window.addEventListener('mouseup',ev=>{if(S.drag){S.drag=null;return}if(S.pan){c
 window.addEventListener('dblclick',ev=>{if(S.linkDrag)return;const wrap=E('flowWrap');const canvas=E('flowCanvas');if(!wrap||!canvas)return;const target=ev.target;const inFlow=Boolean(target&&target.closest&&target.closest('#flowWrap'));if(!inFlow)return;const rect=canvas.getBoundingClientRect();const px=ev.clientX-rect.left;const py=ev.clientY-rect.top;const idx=findNearestEdgeIndexAt(px,py,16);if(idx<0)return;ev.preventDefault();S.flow.edges.splice(idx,1);renderFlow();setStats()})
 window.addEventListener('resize',()=>scheduleFlowWrapAdjust())
 window.addEventListener('DOMContentLoaded',async()=>{E('addNodeBtn').onclick=addNode;E('removeNodeBtn').onclick=removeNode;E('addEdgeBtn').onclick=addEdge;E('resetFlowBtn').onclick=resetFlow;E('exportFlowBtn').onclick=exportFlow;E('importFlowBtn').onclick=importFlow;E('analyzeBtn').onclick=analyzeRules;E('scanBtn').onclick=scanSkills;E('generateBtn').onclick=generateSkill;E('saveBtn').onclick=saveSkill;E('applyModelBtn').onclick=applyModel;E('refreshBtn').onclick=()=>refreshAll(true);const langSel=E('skillsLangSelect');if(langSel){langSel.onchange=()=>setLanguage(langSel.value).catch(err=>showError(err.message||String(err)))}const tabNode=E('flowTabNodeBtn');const tabLink=E('flowTabLinkBtn');if(tabNode)tabNode.onclick=()=>switchFlowPanel('node');if(tabLink)tabLink.onclick=()=>switchFlowPanel('link');const loadBtn=E('previewToFlowBtn');if(loadBtn)loadBtn.onclick=()=>loadSelectedSkillToFlow().catch(err=>showError(err.message||String(err)));E('nodeTitle').oninput=syncNodeEditor;E('nodeType').onchange=syncNodeEditor;E('nodeContent').oninput=syncNodeEditor;bindSkillUpload();bindFlowZoom();bindFlowPan();switchFlowPanel('node');resetFlow();scheduleFlowWrapAdjust();applySkillsI18n();try{await refreshAll(false)}catch(err){showError(err.message||String(err))}})
+"""
+
+ADMIN_INDEX_HTML = """<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Clouds Coder Admin</title>
+<link rel="stylesheet" href="/assets/admin.css">
+</head>
+<body>
+<div class="admin-shell">
+  <header class="admin-header">
+    <div>
+      <div class="eyebrow">CONTROL PLANE</div>
+      <h1>Clouds Coder Admin</h1>
+      <p>启动参数、运行统计与共享应用治理</p>
+    </div>
+    <div class="header-actions">
+      <span id="connectionBadge" class="badge muted">未认证</span>
+      <a href="/" class="button ghost">返回会话</a>
+      <button id="logoutBtn" class="ghost" type="button">退出</button>
+    </div>
+  </header>
+
+  <nav class="admin-nav" aria-label="Admin sections">
+    <button class="nav-tab active" data-view="metrics" type="button">运行统计</button>
+    <button class="nav-tab" data-view="config" type="button">启动参数</button>
+    <button class="nav-tab" data-view="apps" type="button">应用管理</button>
+  </nav>
+
+  <main>
+    <section id="metricsView" class="admin-view active">
+      <div class="section-head">
+        <div><h2>运行洞察</h2><p>仅聚合匿名来源、计数、耗时与 Token；不保存提示词、工具参数、输出正文或原始 IP。</p></div>
+        <div class="inline-actions">
+          <select id="metricsHours" aria-label="统计范围">
+            <option value="1">最近 1 小时</option>
+            <option value="24" selected>最近 24 小时</option>
+            <option value="168">最近 7 天</option>
+            <option value="720">最近 30 天</option>
+          </select>
+          <button id="refreshMetricsBtn" type="button">刷新</button>
+        </div>
+      </div>
+      <div id="metricCards" class="metric-grid"></div>
+      <div id="metricsCoverage" class="metrics-coverage" role="status"></div>
+      <div class="chart-grid">
+        <article class="card chart-card"><div class="card-head"><div><h3>调用与错误趋势</h3><p>消息、模型、工具与应用启动</p></div></div><div id="activityTrend" class="chart-host"></div></article>
+        <article class="card chart-card"><div class="card-head"><div><h3>Token 趋势</h3><p>仅统计提供 usage 的模型调用</p></div></div><div id="tokenTrend" class="chart-host"></div></article>
+        <article class="card chart-card"><div class="card-head"><div><h3>调用结果分布</h3><p>模型与工具的成功、错误、超时和取消</p></div></div><div id="statusChart" class="chart-host"></div></article>
+        <article class="card chart-card"><div class="card-head"><div><h3>延迟分位</h3><p>平均、P50 与 P95 耗时</p></div></div><div id="latencyChart" class="chart-host"></div></article>
+        <article class="card chart-card"><div class="card-head"><div><h3>模型 Token 分布</h3><p>输入与输出 Token，未知 usage 不计入</p></div></div><div id="modelTokenChart" class="chart-host"></div></article>
+        <article class="card chart-card"><div class="card-head"><div><h3>应用使用排行</h3><p>启动量与匿名活跃来源</p></div></div><div id="appChart" class="chart-host"></div></article>
+      </div>
+      <article class="card user-tracking-card">
+        <div class="card-head user-tracking-head">
+          <div><h3>按匿名来源追踪</h3><p>标识由访问来源派生，仅用于本机聚合；共享网络可能合并多人。</p></div>
+          <div class="user-filter"><label for="metricUserSelect">匿名来源</label><select id="metricUserSelect"><option value="">全部来源</option></select></div>
+        </div>
+        <div id="focusUserSummary" class="focus-user-summary hidden"></div>
+        <div class="two-column metrics-detail-grid">
+          <div><h4>匿名来源排行</h4><div id="userMetrics" class="table-wrap"></div></div>
+          <div><h4 id="focusUserTitle">来源明细</h4><div id="focusUserMetrics" class="table-wrap"></div></div>
+        </div>
+      </article>
+      <div class="two-column metrics-tables">
+        <article class="card"><div class="card-head"><h3>模型调用</h3></div><div id="modelMetrics" class="table-wrap"></div></article>
+        <article class="card"><div class="card-head"><h3>工具调用</h3></div><div id="toolMetrics" class="table-wrap"></div></article>
+      </div>
+      <div class="two-column metrics-tables">
+        <article class="card"><div class="card-head"><h3>应用聚合</h3></div><div id="appMetrics" class="table-wrap"></div></article>
+        <article class="card"><div class="card-head"><h3>事件统计</h3></div><div id="eventMetrics" class="table-wrap"></div></article>
+      </div>
+    </section>
+
+    <section id="configView" class="admin-view">
+      <div class="section-head">
+        <div><h2>启动参数</h2><p>所有修改先保存为草稿；标记为“需重启”的参数在安全重启后生效。</p></div>
+        <div id="restartState" class="badge muted">读取中</div>
+      </div>
+      <div class="action-bar">
+        <button id="saveConfigBtn" type="button">保存参数</button>
+        <button id="saveRestartBtn" class="danger" type="button">保存并重启</button>
+        <button id="setDefaultBtn" class="secondary" type="button">设为默认参数</button>
+        <button id="restoreDefaultBtn" class="secondary" type="button">恢复默认参数</button>
+        <button id="resetInitialBtn" class="ghost" type="button">重置为初始参数</button>
+        <button id="importConfigBtn" class="ghost" type="button">导入 JSON</button>
+        <button id="exportConfigBtn" class="ghost" type="button">导出 JSON</button>
+        <input id="configFileInput" type="file" accept=".json,application/json" hidden>
+      </div>
+      <div id="configNotice" class="notice hidden" role="status"></div>
+      <div id="effectivePorts" class="port-strip"></div>
+      <form id="configForm" novalidate></form>
+    </section>
+
+    <section id="appsView" class="admin-view">
+      <div class="section-head">
+        <div><h2>共享应用</h2><p>管理员可直接组合 1-8 个 Skills 发布应用，也可审核用户提交的不可变版本。</p></div>
+        <button id="refreshAppsBtn" type="button">刷新</button>
+      </div>
+      <div class="apps-layout">
+        <article class="card app-builder">
+          <div class="card-head"><h3>创建共享应用</h3><span id="selectedSkillCount" class="badge">0 / 8</span></div>
+          <label>应用名称<input id="adminAppName" maxlength="100" placeholder="例如：代码安全审查"></label>
+          <label>图标<input id="adminAppIcon" maxlength="20" placeholder="可选，例如：🛡️"></label>
+          <label>说明<textarea id="adminAppDescription" maxlength="1000" rows="3" placeholder="说明适用场景与输出"></textarea></label>
+          <label>搜索 Skills<input id="adminSkillSearch" type="search" placeholder="按名称、ID 或说明搜索"></label>
+          <div id="adminSelectedSkills" class="selected-skills"></div>
+          <div id="adminSkillCatalog" class="skill-catalog"></div>
+          <button id="createSharedAppBtn" type="button">创建并发布</button>
+        </article>
+        <div class="review-column">
+          <div class="subtabs" role="tablist">
+            <button class="review-tab active" data-status="pending" type="button">待审核</button>
+            <button class="review-tab" data-status="published" type="button">已发布</button>
+            <button class="review-tab" data-status="unpublished" type="button">已下架</button>
+            <button class="review-tab" data-status="rejected" type="button">已拒绝</button>
+          </div>
+          <div id="adminAppList" class="admin-app-list"></div>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div id="loginOverlay" class="login-overlay">
+  <div class="login-card" role="dialog" aria-modal="true" aria-labelledby="authTitle">
+    <div class="eyebrow">ADMIN AUTHENTICATION</div>
+    <h2 id="authTitle">正在检查管理员状态</h2>
+    <p id="authDescription">请稍候，正在连接本机认证服务。</p>
+
+    <form id="setupForm" class="auth-form hidden" novalidate>
+      <label>管理员账号<input id="setupUsername" autocomplete="username" minlength="3" maxlength="64" placeholder="admin"></label>
+      <label>管理员密码<input id="setupPassword" type="password" autocomplete="new-password" maxlength="512" placeholder="至少 12 位，包含三类字符"></label>
+      <label>确认密码<input id="setupPasswordConfirm" type="password" autocomplete="new-password" maxlength="512"></label>
+      <button id="setupBtn" type="submit">创建管理员并进入</button>
+    </form>
+
+    <form id="passwordLoginForm" class="auth-form hidden" novalidate>
+      <label>管理员账号<input id="loginUsername" autocomplete="username" maxlength="64" placeholder="admin"></label>
+      <label>管理员密码<input id="loginPassword" type="password" autocomplete="current-password" maxlength="512"></label>
+      <button id="loginBtn" type="submit">登录控制台</button>
+    </form>
+
+    <details id="tokenLoginDetails" class="token-login hidden">
+      <summary>使用 Admin Token（高级/恢复入口）</summary>
+      <form id="tokenLoginForm" class="auth-form" novalidate>
+        <p id="tokenLoginHelp">令牌位于 <code>.clouds_coder_admin/admin.token</code>。验证后只保存换取的短期会话，不保存原始 Token。</p>
+        <label>Admin Token<input id="tokenInput" type="password" autocomplete="off"></label>
+        <button id="tokenLoginBtn" class="secondary" type="submit">使用 Token 进入</button>
+      </form>
+    </details>
+
+    <div id="loginError" class="form-error" role="alert"></div>
+    <button id="retryAuthBtn" class="ghost hidden" type="button">重试</button>
+  </div>
+</div>
+
+<div id="toast" class="toast hidden" role="status"></div>
+<script src="/assets/admin.js"></script>
+</body>
+</html>
+"""
+
+ADMIN_CSS = """
+:root{--bg:#f3f6fb;--surface:#fff;--surface2:#f7f9fc;--text:#172033;--muted:#667085;--line:#dce3ee;--brand:#2563eb;--brand2:#0f9f8f;--danger:#b42318;--warn:#b54708;--shadow:0 18px 44px rgba(27,39,71,.09)}
+*{box-sizing:border-box}
+body{margin:0;background:radial-gradient(900px 500px at 4% -10%,#dbeafe 0,transparent 68%),radial-gradient(700px 450px at 100% 0,#d8fff4 0,transparent 64%),var(--bg);color:var(--text);font-family:Inter,"Noto Sans SC","Segoe UI",sans-serif}
+button,.button,input,select,textarea{font:inherit}
+button,.button{border:1px solid transparent;border-radius:10px;padding:9px 14px;background:var(--brand);color:#fff;font-weight:700;cursor:pointer;text-decoration:none;transition:.15s ease}
+button:hover,.button:hover{filter:brightness(.97);transform:translateY(-1px)}
+button:disabled{opacity:.5;cursor:not-allowed;transform:none}
+button.secondary{background:#eaf1ff;color:#1849a9;border-color:#c8d8fb}
+button.ghost,.button.ghost{background:#fff;color:var(--text);border-color:var(--line)}
+button.danger{background:var(--danger)}
+input,select,textarea{width:100%;border:1px solid #cfd8e6;border-radius:9px;background:#fff;color:var(--text);padding:9px 10px;outline:none}
+input:focus,select:focus,textarea:focus{border-color:#79a2f5;box-shadow:0 0 0 3px rgba(37,99,235,.12)}
+input.invalid,select.invalid{border-color:#ef6c68;box-shadow:0 0 0 3px rgba(180,35,24,.1)}
+label{display:flex;flex-direction:column;gap:6px;color:#344054;font-size:.84rem;font-weight:700}
+code{background:#eef2f7;padding:2px 5px;border-radius:5px}
+.admin-shell{max-width:1500px;margin:0 auto;padding:24px}
+.admin-header{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;margin-bottom:18px}
+.admin-header h1{margin:4px 0 4px;font-size:2rem;letter-spacing:-.035em}
+.admin-header p,.section-head p{margin:0;color:var(--muted)}
+.eyebrow{color:var(--brand);font-size:.72rem;font-weight:800;letter-spacing:.18em}
+.header-actions,.inline-actions,.action-bar{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+.badge{display:inline-flex;align-items:center;border:1px solid #c8d8fb;border-radius:999px;background:#edf4ff;color:#1849a9;padding:5px 9px;font-size:.75rem;font-weight:800}
+.badge.muted{border-color:var(--line);background:#f4f6f9;color:var(--muted)}
+.badge.good{background:#e8fff7;border-color:#a9ead5;color:#067647}
+.badge.warn{background:#fff7e8;border-color:#f3d39d;color:var(--warn)}
+.admin-nav{display:flex;gap:6px;padding:5px;background:rgba(255,255,255,.75);border:1px solid #fff;border-radius:14px;box-shadow:0 8px 22px rgba(27,39,71,.05);margin-bottom:18px;position:sticky;top:8px;z-index:20;backdrop-filter:blur(12px)}
+.nav-tab{background:transparent;color:var(--muted);border-color:transparent}
+.nav-tab.active{background:#fff;color:var(--brand);border-color:var(--line);box-shadow:0 3px 10px rgba(27,39,71,.06)}
+.admin-view{display:none}
+.admin-view.active{display:block}
+.section-head{display:flex;align-items:center;justify-content:space-between;gap:18px;margin-bottom:14px}
+.section-head h2{margin:0 0 4px;font-size:1.35rem}
+.metric-grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px;margin-bottom:14px}
+.metric-card,.card{background:rgba(255,255,255,.94);border:1px solid #fff;border-radius:15px;box-shadow:var(--shadow)}
+.metric-card{padding:14px}
+.metric-card .key{font-size:.75rem;color:var(--muted);margin-bottom:6px}
+.metric-card .value{font-size:1.45rem;font-weight:800;word-break:break-word}
+.metric-card .detail{font-size:.72rem;color:var(--muted);margin-top:5px}
+.metrics-coverage{display:flex;gap:8px;flex-wrap:wrap;margin:-3px 0 14px;color:var(--muted);font-size:.74rem}
+.coverage-pill{display:inline-flex;align-items:center;gap:5px;background:rgba(255,255,255,.78);border:1px solid var(--line);border-radius:999px;padding:5px 9px}
+.chart-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-bottom:14px}
+.chart-card{min-width:0}
+.chart-card .card-head p,.user-tracking-head p{margin:3px 0 0;color:var(--muted);font-size:.75rem}
+.chart-host{min-height:245px;position:relative}
+.chart-host svg{display:block;width:100%;height:auto;overflow:visible}
+.chart-host .chart-grid-line{stroke:var(--line);stroke-width:1}
+.chart-host .chart-axis{fill:var(--muted);font-size:11px}
+.chart-host .chart-value{fill:var(--text);font-size:11px;font-weight:700}
+.chart-host .series-1{stroke:#2563eb;fill:#2563eb}.chart-host .series-2{stroke:#0f9f8f;fill:#0f9f8f}.chart-host .series-3{stroke:#9b51e0;fill:#9b51e0}.chart-host .series-4{stroke:#d97706;fill:#d97706}.chart-host .series-danger{stroke:#b42318;fill:#b42318}.chart-host .series-muted{stroke:#98a2b3;fill:#98a2b3}
+.chart-host .chart-line{fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.chart-host .chart-area{stroke:none;opacity:.08}
+.chart-host .chart-bar{stroke:none;opacity:.88}
+.chart-host .chart-point{stroke:var(--surface);stroke-width:1.5}
+.chart-legend{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:8px;color:var(--muted);font-size:.72rem}
+.chart-legend span{display:inline-flex;align-items:center;gap:5px}.legend-dot{width:9px;height:9px;border-radius:50%;display:inline-block}
+.chart-empty{min-height:225px;display:flex;align-items:center;justify-content:center;color:var(--muted);text-align:center;font-size:.82rem}
+.user-tracking-card{margin-bottom:14px}
+.user-tracking-head{align-items:flex-end}.user-filter{display:flex;align-items:center;gap:8px}.user-filter label{white-space:nowrap}.user-filter select{min-width:210px}
+.focus-user-summary{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px;margin-bottom:12px}
+.focus-user-stat{background:var(--surface2);border:1px solid var(--line);border-radius:10px;padding:9px}.focus-user-stat .k{font-size:.69rem;color:var(--muted)}.focus-user-stat .v{font-size:1rem;font-weight:800;margin-top:3px;overflow-wrap:anywhere}
+.metrics-detail-grid{margin:0}.metrics-detail-grid h4{margin:4px 0 9px;font-size:.85rem}.metrics-tables{margin-bottom:14px}
+.card{padding:15px}
+.card-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px}
+.card h3{margin:0;font-size:1rem}
+.two-column{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px}
+.table-wrap{overflow:auto}
+table{width:100%;border-collapse:collapse;font-size:.8rem}
+th,td{text-align:left;padding:8px;border-bottom:1px solid #edf0f5;white-space:nowrap}
+th{color:var(--muted);font-size:.72rem;text-transform:uppercase;letter-spacing:.04em}
+.empty{padding:28px 10px;text-align:center;color:var(--muted)}
+.action-bar{padding:12px;background:rgba(255,255,255,.9);border:1px solid #fff;border-radius:14px;margin-bottom:12px;box-shadow:0 8px 22px rgba(27,39,71,.05)}
+.notice{padding:11px 13px;border-radius:10px;background:#eef4ff;border:1px solid #c8d8fb;color:#1849a9;margin-bottom:12px;white-space:pre-wrap}
+.notice.error{background:#fff1f0;border-color:#f5b7b3;color:#912018}
+.hidden{display:none!important}
+.port-strip{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+.port-pill{background:#fff;border:1px solid var(--line);border-radius:9px;padding:7px 9px;font-size:.78rem;color:#475467}
+.config-group{background:rgba(255,255,255,.94);border:1px solid #fff;border-radius:15px;padding:15px;margin-bottom:12px;box-shadow:0 10px 26px rgba(27,39,71,.05)}
+.config-group h3{margin:0 0 13px;text-transform:capitalize}
+.config-grid{display:grid;grid-template-columns:repeat(3,minmax(220px,1fr));gap:13px}
+.config-field{position:relative;padding:11px;border:1px solid #e4e9f1;border-radius:11px;background:var(--surface2);min-width:0}
+.config-field .field-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:7px}
+.config-field .field-label{font-size:.82rem;font-weight:800;min-width:0}
+.config-field .type-tag{font-size:.65rem;color:#475467;background:#e9eef5;border-radius:999px;padding:3px 6px;white-space:nowrap}
+.config-field .field-key{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#667085;font-size:.69rem;margin-top:6px;overflow-wrap:anywhere}
+.config-field .field-error{min-height:15px;color:var(--danger);font-size:.69rem;margin-top:4px}
+.switch-row{display:flex;align-items:center;gap:9px;min-height:39px}
+.switch-row input{width:18px;height:18px;margin:0}
+.apps-layout{display:grid;grid-template-columns:minmax(320px,430px) 1fr;gap:14px;align-items:start}
+.app-builder{position:sticky;top:76px;display:flex;flex-direction:column;gap:11px}
+.skill-catalog{height:300px;overflow:auto;border:1px solid var(--line);border-radius:10px;background:#fbfcfe;padding:7px;display:flex;flex-direction:column;gap:6px}
+.skill-option{display:flex;align-items:flex-start;gap:8px;padding:8px;border:1px solid #e4e9f1;border-radius:9px;background:#fff;cursor:pointer}
+.skill-option.selected{border-color:#8cb2f7;background:#edf4ff}
+.skill-option input{width:16px;height:16px;margin:2px 0 0;flex:none}
+.skill-option strong,.skill-option span{display:block;overflow-wrap:anywhere}
+.skill-option span{color:var(--muted);font-size:.72rem;margin-top:2px}
+.selected-skills{display:flex;gap:6px;flex-wrap:wrap;min-height:28px}
+.skill-chip{display:inline-flex;align-items:center;gap:5px;background:#e8fff7;border:1px solid #b8ead9;border-radius:999px;padding:4px 8px;color:#067647;font-size:.72rem;font-weight:700}
+.skill-chip button{background:transparent;color:#067647;padding:0;border:0;transform:none}
+.subtabs{display:flex;gap:6px;margin-bottom:10px}
+.review-tab{background:#fff;color:var(--muted);border-color:var(--line)}
+.review-tab.active{background:#eaf1ff;color:#1849a9;border-color:#b8cdf7}
+.admin-app-list{display:flex;flex-direction:column;gap:10px}
+.admin-app-card{background:#fff;border:1px solid #fff;border-radius:14px;padding:14px;box-shadow:0 10px 26px rgba(27,39,71,.06)}
+.admin-app-title{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}
+.admin-app-title h3{margin:0;font-size:1rem}
+.admin-app-card p{color:var(--muted);font-size:.82rem;margin:8px 0;white-space:pre-wrap;overflow-wrap:anywhere}
+.app-meta,.app-skills{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0}
+.app-meta span,.app-skills span{font-size:.69rem;background:#f2f4f7;border-radius:999px;padding:4px 7px;color:#475467}
+.app-lifecycle{margin-top:10px;padding:9px;border:1px solid var(--line);border-radius:9px;background:#f8fafc;color:var(--muted);font-size:.7rem;line-height:1.55;max-height:180px;overflow:auto}
+.app-lifecycle strong{display:block;color:var(--text);margin-bottom:3px}
+.review-actions{display:flex;align-items:center;gap:7px;margin-top:10px;flex-wrap:wrap}
+.review-actions input{flex:1;min-width:180px}
+.login-overlay{position:fixed;inset:0;background:rgba(10,18,34,.66);display:flex;align-items:center;justify-content:center;z-index:100;backdrop-filter:blur(8px);padding:18px}
+.login-overlay.hidden{display:none}
+.login-card{width:min(440px,100%);background:#fff;border-radius:18px;padding:25px;box-shadow:0 28px 80px rgba(0,0,0,.28);display:flex;flex-direction:column;gap:14px}
+.login-card h2{margin:0}.login-card p{margin:0;color:var(--muted);line-height:1.5}
+.auth-form{display:flex;flex-direction:column;gap:12px}
+.token-login{border-top:1px solid var(--line);padding-top:12px}
+.token-login summary{cursor:pointer;color:#344054;font-size:.84rem;font-weight:800}
+.token-login .auth-form{padding-top:12px}.token-login p{font-size:.78rem}
+.form-error{color:var(--danger);font-size:.8rem;min-height:18px}
+.toast{position:fixed;right:22px;bottom:22px;max-width:440px;background:#172033;color:#fff;border-radius:11px;padding:11px 14px;z-index:120;box-shadow:var(--shadow);white-space:pre-wrap}
+.toast.error{background:#912018}
+@media(max-width:1100px){.metric-grid{grid-template-columns:repeat(3,1fr)}.config-grid{grid-template-columns:repeat(2,minmax(220px,1fr))}.apps-layout{grid-template-columns:1fr}.app-builder{position:static}.focus-user-summary{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media(max-width:720px){.admin-shell{padding:14px}.admin-header,.section-head{flex-direction:column;align-items:stretch}.header-actions{justify-content:flex-start}.metric-grid{grid-template-columns:repeat(2,1fr)}.two-column,.chart-grid{grid-template-columns:1fr}.config-grid{grid-template-columns:1fr}.admin-nav{overflow:auto}.action-bar button{flex:1 1 145px}.user-tracking-head{align-items:stretch}.user-filter{align-items:stretch;flex-direction:column}.user-filter select{min-width:0}.focus-user-summary{grid-template-columns:repeat(2,minmax(0,1fr))}.chart-host{min-height:215px}}
+"""
+
+ADMIN_JS = r"""
+const A={token:sessionStorage.getItem('clouds_coder_admin_token')||'',config:null,metrics:null,metricUserHash:'',metricResizeTimer:0,apps:[],skills:[],reviewStatus:'pending',selectedSkills:[],toastTimer:0,serverErrors:[],bootId:'',restartNonce:''};
+const E=id=>document.getElementById(id);
+const fmt=n=>new Intl.NumberFormat('zh-CN',{maximumFractionDigits:1}).format(Number(n||0));
+function toast(message,error=false){const el=E('toast');el.textContent=String(message||'');el.classList.toggle('error',!!error);el.classList.remove('hidden');clearTimeout(A.toastTimer);A.toastTimer=setTimeout(()=>el.classList.add('hidden'),4200)}
+function setAuthenticated(ok){E('loginOverlay').classList.toggle('hidden',!!ok);E('connectionBadge').textContent=ok?'已认证':'未认证';E('connectionBadge').className='badge '+(ok?'good':'muted')}
+async function request(path,opt={}){const headers={...(opt.headers||{})};if(opt.body!==undefined&&!headers['Content-Type'])headers['Content-Type']='application/json';const r=await fetch(path,{...opt,headers});const raw=await r.text();let body={};try{body=raw?JSON.parse(raw):{}}catch(_){body={error:raw||'请求失败'}}if(!r.ok){const details=Array.isArray(body.errors)?body.errors:[];const msg=[body.error||'请求失败',...details.map(x=>String(x.key||'参数')+': '+String(x.error||'无效'))].filter(Boolean).join('\n');const err=new Error(msg);err.status=r.status;err.code=String(body.code||'');err.details=details;err.body=body;throw err}return body}
+async function api(path,opt={}){const headers={...(opt.headers||{})};if(A.token)headers.Authorization='Bearer '+A.token;try{return await request(path,{...opt,headers})}catch(err){if(err.status===401){clearSession();setAuthenticated(false);E('loginError').textContent='登录会话已过期，请重新登录';loadAuthStatus().catch(()=>{});}throw err}}
+function clearSession(){sessionStorage.removeItem('clouds_coder_admin_token');A.token='';A.config=null;A.metrics=null;A.apps=[];A.skills=[]}
+function setAuthBusy(form,busy){const btn=form?.querySelector('button[type="submit"]');if(btn)btn.disabled=!!busy}
+function authError(err){const retry=Number(err?.body?.retry_after||0);E('loginError').textContent=retry?String(err.message)+'（约 '+retry+' 秒后重试）':String(err?.message||err||'认证失败')}
+function renderAuthState(status){const setup=!!status?.setup_required;E('retryAuthBtn').classList.add('hidden');E('setupForm').classList.toggle('hidden',!setup);E('passwordLoginForm').classList.toggle('hidden',setup);E('tokenLoginDetails').classList.toggle('hidden',!status?.token_login_enabled);E('tokenLoginBtn').textContent=setup?'用此 Token 创建管理员':'使用 Token 进入';E('tokenLoginHelp').textContent=setup?'远程首次初始化：输入现有 Admin Token，然后在上方填写账号密码并点击“创建管理员”。本机首次运行无需填写 Token。':'验证后只保存换取的短期会话，不保存原始 Admin Token。';E('authTitle').textContent=setup?'创建管理员账号':'管理员登录';if(setup){E('authDescription').textContent=status?.local_setup_allowed?'这是首次运行。请创建唯一管理员账号，密码只以强哈希形式保存在本机。':'首次创建仅允许在本机完成；远程初始化请展开高级入口并使用 Admin Token。';setTimeout(()=>E('setupUsername').focus(),0)}else{E('authDescription').textContent='使用管理员账号和密码登录。登录成功后本标签页只保存短期会话。';setTimeout(()=>E('loginUsername').focus(),0)}}
+async function loadAuthStatus(){E('loginError').textContent='';try{const status=await request('/api/admin/auth/status');renderAuthState(status);return status}catch(err){E('setupForm').classList.add('hidden');E('passwordLoginForm').classList.add('hidden');E('tokenLoginDetails').classList.add('hidden');E('authTitle').textContent='认证服务不可用';E('authDescription').textContent='无法确认管理员是否已创建，请检查服务后重试。';E('retryAuthBtn').classList.remove('hidden');throw err}}
+async function acceptSession(token){A.token=String(token||'');sessionStorage.setItem('clouds_coder_admin_token',A.token);setAuthenticated(true);E('loginError').textContent='';for(const id of ['setupPassword','setupPasswordConfirm','loginPassword','tokenInput']){const el=E(id);if(el)el.value=''}const results=await Promise.allSettled([loadMetrics(),loadConfig(),loadApps()]);const failed=results.filter(x=>x.status==='rejected');if(failed.length)toast('已登录，但部分控制台数据加载失败，请手动刷新。',true)}
+async function registerAdmin(){const form=E('setupForm'),username=E('setupUsername').value.trim(),password=E('setupPassword').value,confirm=E('setupPasswordConfirm').value;if(password!==confirm){E('loginError').textContent='两次输入的密码不一致';E('setupPasswordConfirm').focus();return}setAuthBusy(form,true);E('loginError').textContent='';try{const headers={};const bootstrap=E('tokenInput').value.trim();if(bootstrap)headers.Authorization='Bearer '+bootstrap;const out=await request('/api/admin/auth/setup',{method:'POST',headers,body:JSON.stringify({username,password})});await acceptSession(out.access_token)}catch(err){authError(err);if(err.status===409)await loadAuthStatus().catch(()=>{})}finally{setAuthBusy(form,false)}}
+async function loginWithPassword(){const form=E('passwordLoginForm');setAuthBusy(form,true);E('loginError').textContent='';try{const out=await request('/api/admin/auth/login',{method:'POST',body:JSON.stringify({username:E('loginUsername').value.trim(),password:E('loginPassword').value})});await acceptSession(out.access_token)}catch(err){authError(err);E('loginPassword').value='';E('loginPassword').focus()}finally{setAuthBusy(form,false)}}
+async function loginWithToken(){if(!E('setupForm').classList.contains('hidden')){await registerAdmin();return}const form=E('tokenLoginForm'),candidate=E('tokenInput').value.trim();if(!candidate){E('loginError').textContent='请输入 Admin Token';return}setAuthBusy(form,true);E('loginError').textContent='';try{const out=await request('/api/admin/auth/token-login',{method:'POST',headers:{Authorization:'Bearer '+candidate},body:'{}'});await acceptSession(out.access_token)}catch(err){authError(err);E('tokenInput').value='';E('tokenInput').focus()}finally{setAuthBusy(form,false)}}
+async function logoutAdmin(){const token=A.token;try{if(token)await request('/api/admin/auth/logout',{method:'POST',headers:{Authorization:'Bearer '+token},body:'{}'})}catch(_){}finally{clearSession();setAuthenticated(false);await loadAuthStatus().catch(err=>authError(err))}}
+async function bootstrapAuth(){setAuthenticated(false);if(A.token){try{const state=await request('/api/admin/auth/session',{headers:{Authorization:'Bearer '+A.token}});if(state.auth_kind==='token'){const out=await request('/api/admin/auth/token-login',{method:'POST',headers:{Authorization:'Bearer '+A.token},body:'{}'});await acceptSession(out.access_token)}else await acceptSession(A.token);return}catch(err){if(err.status===401)clearSession();else{E('authTitle').textContent='认证服务不可用';E('authDescription').textContent='暂时无法验证已保存的会话，请重试。';authError(err);E('retryAuthBtn').classList.remove('hidden');return}}}await loadAuthStatus()}
+function node(tag,attrs={},text=''){const el=document.createElement(tag);for(const [k,v] of Object.entries(attrs||{})){if(k==='class')el.className=v;else if(k==='dataset')Object.assign(el.dataset,v);else if(k==='type')el.type=v;else el.setAttribute(k,String(v))}if(text!==undefined&&text!==null)el.textContent=String(text);return el}
+function switchView(name){document.querySelectorAll('.nav-tab').forEach(x=>x.classList.toggle('active',x.dataset.view===name));document.querySelectorAll('.admin-view').forEach(x=>x.classList.toggle('active',x.id===name+'View'));if(name==='metrics')loadMetrics().catch(err=>toast(err.message,true));if(name==='config'&&!A.config)loadConfig().catch(err=>toast(err.message,true));if(name==='apps')loadApps().catch(err=>toast(err.message,true))}
+function table(headers,rows){if(!rows.length)return node('div',{class:'empty'},'暂无数据');const t=node('table');const thead=node('thead'),tr=node('tr');headers.forEach(h=>tr.appendChild(node('th',{},h[0])));thead.appendChild(tr);t.appendChild(thead);const tb=node('tbody');rows.forEach(row=>{const r=node('tr');headers.forEach(h=>r.appendChild(node('td',{},h[1](row))));tb.appendChild(r)});t.appendChild(tb);return t}
+const SVG_NS='http://www.w3.org/2000/svg',METRIC_COLORS=['series-1','series-2','series-3','series-4','series-danger','series-muted'];
+const num=v=>Number.isFinite(Number(v))?Number(v):0;
+function metricPct(value){const n=Math.max(0,Math.min(1,num(value)));return (n*100).toFixed(1)+'%'}
+function metricMs(value){const n=num(value);return n>=1000?(n/1000).toFixed(n>=10000?1:2)+' s':fmt(n)+' ms'}
+function metricTime(ts){const n=num(ts);return n?new Date(n*1000).toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}):'-'}
+function shortMetricLabel(value,max=26){const s=String(value||'-');return s.length>max?s.slice(0,max-1)+'…':s}
+function svgEl(tag,attrs={},text=''){const el=document.createElementNS(SVG_NS,tag);for(const [key,value] of Object.entries(attrs)){if(value!==undefined&&value!==null)el.setAttribute(key,String(value))}if(text!==undefined&&text!==null)el.textContent=String(text);return el}
+function metricChart(id,title,description,height=246){const host=E(id);host.innerHTML='';const width=Math.max(320,Math.round(host.getBoundingClientRect().width||640));const svg=svgEl('svg',{viewBox:`0 0 ${width} ${height}`,role:'img','aria-label':title+'. '+description,preserveAspectRatio:'xMidYMid meet'});svg.append(svgEl('title',{},title),svgEl('desc',{},description));return{host,svg,width,height}}
+function emptyChart(id,message='所选范围暂无数据'){const host=E(id);host.innerHTML='';host.appendChild(node('div',{class:'chart-empty'},message))}
+function metricLegend(host,items){const legend=node('div',{class:'chart-legend'});for(const item of items){const row=node('span');row.append(node('i',{class:'legend-dot '+item.class,'aria-hidden':'true'}),document.createTextNode(item.label));legend.appendChild(row)}host.appendChild(legend)}
+function lineMetricChart(id,rows,series,title,description,formatter=fmt){const data=Array.isArray(rows)?rows:[];if(!data.length||!series.some(def=>data.some(row=>num(row?.[def.key])>0))){emptyChart(id);return}const {host,svg,width,height}=metricChart(id,title,description);metricLegend(host,series.map((def,index)=>({label:def.label,class:def.class||METRIC_COLORS[index]})));const margin={left:49,right:15,top:12,bottom:34},pw=width-margin.left-margin.right,ph=height-margin.top-margin.bottom,max=Math.max(1,...data.flatMap(row=>series.map(def=>Math.max(0,num(row?.[def.key])))));for(let i=0;i<=4;i++){const value=max*(4-i)/4,y=margin.top+ph*i/4;svg.append(svgEl('line',{x1:margin.left,y1:y,x2:width-margin.right,y2:y,class:'chart-grid-line'}),svgEl('text',{x:margin.left-7,y:y+4,'text-anchor':'end',class:'chart-axis'},formatter(value)))}const xAt=index=>margin.left+(data.length<2?pw/2:pw*index/(data.length-1)),yAt=value=>margin.top+ph-Math.max(0,num(value))*ph/max;const tickIndexes=[0,Math.round((data.length-1)/3),Math.round((data.length-1)*2/3),data.length-1].filter((v,i,a)=>v>=0&&a.indexOf(v)===i);for(const index of tickIndexes){svg.appendChild(svgEl('text',{x:xAt(index),y:height-9,'text-anchor':index===0?'start':index===data.length-1?'end':'middle',class:'chart-axis'},metricTime(data[index]?.ts)))}series.forEach((def,seriesIndex)=>{const klass=def.class||METRIC_COLORS[seriesIndex],points=data.map((row,index)=>`${xAt(index)},${yAt(row?.[def.key])}`).join(' ');svg.appendChild(svgEl('polyline',{points,class:`chart-line ${klass}`}));const stride=Math.max(1,Math.ceil(data.length/18));data.forEach((row,index)=>{if(index%stride&&index!==data.length-1)return;const value=Math.max(0,num(row?.[def.key])),point=svgEl('circle',{cx:xAt(index),cy:yAt(value),r:3,class:`chart-point ${klass}`});point.appendChild(svgEl('title',{},metricTime(row?.ts)+' · '+def.label+': '+formatter(value)));svg.appendChild(point)})});host.appendChild(svg)}
+function statusMetricChart(summary={}){const groups=[{label:'模型',success:num(summary.llm_success),failures:num(summary.llm_failures),timeouts:num(summary.llm_timeouts),cancelled:num(summary.llm_cancelled)},{label:'工具',success:num(summary.tool_success),failures:num(summary.tool_failures),timeouts:num(summary.tool_timeouts),cancelled:num(summary.tool_cancelled)}];if(!groups.some(x=>x.success+x.failures+x.timeouts+x.cancelled)){emptyChart('statusChart');return}const {host,svg,width}=metricChart('statusChart','调用结果分布','模型与工具调用的成功、错误、超时及取消占比'),defs=[['成功','series-2'],['错误','series-danger'],['超时','series-4'],['取消','series-muted']];metricLegend(host,defs.map(x=>({label:x[0],class:x[1]})));const left=54,right=62,pw=width-left-right;groups.forEach((group,index)=>{const y=49+index*82,errorOnly=Math.max(0,group.failures-group.timeouts-group.cancelled),parts=[group.success,errorOnly,group.timeouts,group.cancelled],total=Math.max(1,parts.reduce((a,b)=>a+b,0));svg.appendChild(svgEl('text',{x:left-9,y:y+19,'text-anchor':'end',class:'chart-value'},group.label));let cursor=left;parts.forEach((value,pos)=>{const w=pw*value/total;if(w>0){const rect=svgEl('rect',{x:cursor,y,width:w,height:30,rx:4,class:`chart-bar ${defs[pos][1]}`});rect.appendChild(svgEl('title',{},group.label+' '+defs[pos][0]+': '+fmt(value)+' ('+metricPct(value/total)+')'));svg.appendChild(rect);if(w>42)svg.appendChild(svgEl('text',{x:cursor+w/2,y:y+20,'text-anchor':'middle',class:'chart-value'},fmt(value)))}cursor+=w});svg.appendChild(svgEl('text',{x:width-right+8,y:y+20,class:'chart-axis'},fmt(total)+' 次'))});host.appendChild(svg)}
+function latencyMetricChart(summary={}){const rows=[{label:'模型',avg:num(summary.avg_llm_ms),p50:num(summary.p50_llm_ms),p95:num(summary.p95_llm_ms)},{label:'工具',avg:num(summary.avg_tool_ms),p50:num(summary.p50_tool_ms),p95:num(summary.p95_tool_ms)}],max=Math.max(0,...rows.flatMap(x=>[x.avg,x.p50,x.p95]));if(max<=0){emptyChart('latencyChart');return}const {host,svg,width}=metricChart('latencyChart','延迟分位','模型与工具调用的平均、P50 和 P95 耗时'),defs=[['平均','series-1','avg'],['P50','series-2','p50'],['P95','series-4','p95']];metricLegend(host,defs.map(x=>({label:x[0],class:x[1]})));const left=58,right=76,pw=width-left-right;rows.forEach((row,group)=>{const base=37+group*95;svg.appendChild(svgEl('text',{x:left-9,y:base+33,'text-anchor':'end',class:'chart-value'},row.label));defs.forEach((def,index)=>{const value=row[def[2]],y=base+index*22,w=pw*value/max,rect=svgEl('rect',{x:left,y,width:w,height:14,rx:4,class:`chart-bar ${def[1]}`});rect.appendChild(svgEl('title',{},row.label+' '+def[0]+': '+metricMs(value)));svg.append(rect,svgEl('text',{x:Math.min(width-right+5,left+w+5),y:y+11,class:'chart-axis'},metricMs(value)))})});host.appendChild(svg)}
+function modelTokenMetricChart(models=[]){const rows=[...(models||[])].filter(x=>num(x.tokens)>0).sort((a,b)=>num(b.tokens)-num(a.tokens)).slice(0,6);if(!rows.length){emptyChart('modelTokenChart','暂无模型 Token usage 数据');return}const {host,svg,width}=metricChart('modelTokenChart','模型 Token 分布','各模型输入与输出 Token 的堆叠比较');metricLegend(host,[{label:'输入 Token',class:'series-1'},{label:'输出 Token',class:'series-2'}]);const left=Math.min(190,Math.max(108,width*.29)),right=64,pw=width-left-right,max=Math.max(1,...rows.map(x=>num(x.tokens)));rows.forEach((row,index)=>{const y=18+index*34,prompt=num(row.prompt_tokens),completion=num(row.completion_tokens),total=Math.max(num(row.tokens),prompt+completion),wp=pw*prompt/max,wc=pw*completion/max,label=shortMetricLabel([row.provider,row.model].filter(Boolean).join('/'),24);svg.appendChild(svgEl('text',{x:left-8,y:y+17,'text-anchor':'end',class:'chart-axis'},label));for(const [x,w,klass,text] of [[left,wp,'series-1','输入'],[left+wp,wc,'series-2','输出']]){if(w<=0)continue;const rect=svgEl('rect',{x,y,width:w,height:22,rx:4,class:`chart-bar ${klass}`});rect.appendChild(svgEl('title',{},text+' Token: '+fmt(klass==='series-1'?prompt:completion)));svg.appendChild(rect)}svg.appendChild(svgEl('text',{x:Math.min(width-right+4,left+pw*total/max+5),y:y+16,class:'chart-value'},fmt(total)))});host.appendChild(svg)}
+function appMetricChart(apps=[]){const source=[...(apps||[])],useLaunch=source.some(x=>num(x.launches)>0),rows=source.map(x=>({...x,_value:useLaunch?num(x.launches):num(x.messages)+num(x.llm_calls)+num(x.tool_calls)})).filter(x=>x._value>0).sort((a,b)=>b._value-a._value).slice(0,6);if(!rows.length){emptyChart('appChart');return}const {host,svg,width}=metricChart('appChart','应用使用排行','应用启动或绑定活动与匿名活跃来源排行'),left=Math.min(190,Math.max(108,width*.29)),right=98,pw=width-left-right,max=Math.max(1,...rows.map(x=>x._value));rows.forEach((row,index)=>{const y=22+index*34,w=pw*row._value/max,label=shortMetricLabel(row.name||row.app_id||'未知应用',24),rect=svgEl('rect',{x:left,y,width:w,height:22,rx:4,class:'chart-bar series-3'});rect.appendChild(svgEl('title',{},`${label}: ${fmt(row._value)} ${useLaunch?'次启动':'个事件'}，${fmt(row.active_users)} 个匿名来源`));svg.append(svgEl('text',{x:left-8,y:y+17,'text-anchor':'end',class:'chart-axis'},label),rect,svgEl('text',{x:Math.min(width-right+4,left+w+5),y:y+16,class:'chart-value'},fmt(row._value)+' · '+fmt(row.active_users)+' 来源'))});host.appendChild(svg)}
+function renderMetricCharts(m){const series=m.series||[];lineMetricChart('activityTrend',series,[{key:'messages',label:'消息',class:'series-1'},{key:'llm_calls',label:'模型',class:'series-2'},{key:'tool_calls',label:'工具',class:'series-3'},{key:'failures',label:'失败',class:'series-danger'}],'调用与错误趋势','按时间桶展示消息、模型、工具与失败事件');lineMetricChart('tokenTrend',series,[{key:'prompt_tokens',label:'输入 Token',class:'series-1'},{key:'completion_tokens',label:'输出 Token',class:'series-2'}],'Token 趋势','按时间桶展示已报告 usage 的输入与输出 Token');statusMetricChart(m.summary||{});latencyMetricChart(m.summary||{});modelTokenMetricChart(m.models||[]);appMetricChart(m.apps||[])}
+function renderMetricUserSelector(users=[]){const select=E('metricUserSelect'),current=A.metricUserHash||'';select.innerHTML='';select.appendChild(node('option',{value:''},'全部来源'));for(const row of users){const hash=String(row.user_hash||'');if(hash)select.appendChild(node('option',{value:hash},hash+' · '+fmt(row.llm_calls)+' 模型 / '+fmt(row.total_tokens)+' Token'))}if(current&&users.some(x=>String(x.user_hash||'')===current))select.value=current;else{A.metricUserHash='';select.value=''}}
+function renderFocusMetricUser(m){const focus=m.focus_user||null,summaryHost=E('focusUserSummary'),detailHost=E('focusUserMetrics');summaryHost.innerHTML='';detailHost.innerHTML='';if(!A.metricUserHash){summaryHost.classList.add('hidden');E('focusUserTitle').textContent='来源明细';detailHost.appendChild(node('div',{class:'empty'},'从左侧排行或上方选择一个匿名来源查看聚合明细。'));return}if(!focus){summaryHost.classList.add('hidden');E('focusUserTitle').textContent='来源明细';detailHost.appendChild(node('div',{class:'empty'},'所选范围内未找到该匿名来源。'));return}const s=focus.summary||focus,stats=[['匿名标识',focus.user_hash||A.metricUserHash],['会话',num(s.sessions)],['模型 / 工具',fmt(s.llm_calls)+' / '+fmt(s.tool_calls)],['失败',num(s.failures)],['Token',num(s.total_tokens)]];for(const [key,value] of stats){const cell=node('div',{class:'focus-user-stat'});cell.append(node('div',{class:'k'},key),node('div',{class:'v'},typeof value==='number'?fmt(value):value));summaryHost.appendChild(cell)}summaryHost.classList.remove('hidden');E('focusUserTitle').textContent='来源 '+String(focus.user_hash||A.metricUserHash)+' 的聚合明细';const details=[];for(const row of focus.models||[])details.push({type:'模型',name:[row.provider,row.model].filter(Boolean).join('/')||'-',calls:row.calls,failures:row.failures,tokens:row.tokens});for(const row of focus.tools||[])details.push({type:'工具',name:row.name||'-',calls:row.calls,failures:row.failures,tokens:0});for(const row of focus.apps||[])details.push({type:'应用',name:row.name||row.app_id||'-',calls:row.launches||row.llm_calls,failures:row.failures,tokens:row.total_tokens});detailHost.appendChild(table([['类型',x=>x.type],['名称',x=>x.name],['调用/启动',x=>fmt(x.calls)],['失败',x=>fmt(x.failures)],['Token',x=>fmt(x.tokens)]],details))}
+async function loadMetrics(userHash=A.metricUserHash||''){const hours=E('metricsHours').value||24,hash=String(userHash||'').trim(),query=new URLSearchParams({hours:String(hours)});if(hash)query.set('user_hash',hash);A.metrics=await api('/api/admin/metrics?'+query.toString());A.metricUserHash=hash;renderMetrics()}
+function renderMetrics(){const m=A.metrics||{},g=m.gauges||{},e=m.events||{},tok=m.tokens||{},s=m.summary||{},llmCalls=num(s.llm_calls??e.llm_call?.count),toolCalls=num(s.tool_calls??e.tool_call?.count),tokenCoverage=num(tok.coverage_rate??(llmCalls?num(tok.usage_covered_calls)/llmCalls:0)),llmRate=llmCalls?num(s.llm_success)/llmCalls:0,toolRate=toolCalls?num(s.tool_success)/toolCalls:0;const cards=[['匿名活跃来源',num(g.active_users),'已知目录 '+fmt(g.known_users)],['活跃会话',num(g.active_sessions),'全部 '+fmt(g.total_sessions)+' · 运行中 '+fmt(g.running_sessions)],['排队任务',num(g.queue_depth),'当前调度队列'],['模型调用',llmCalls,'成功率 '+metricPct(llmRate)],['工具调用',toolCalls,'成功率 '+metricPct(toolRate)],['调用失败',num(s.llm_failures)+num(s.tool_failures),'超时 '+fmt(num(s.llm_timeouts)+num(s.tool_timeouts))],['Token 总量',num(tok.total),'输入 '+fmt(tok.prompt)+' / 输出 '+fmt(tok.completion)],['Token 覆盖率',metricPct(tokenCoverage),'有 usage '+fmt(tok.usage_covered_calls)+' / '+fmt(llmCalls)],['模型 P95',metricMs(s.p95_llm_ms),'P50 '+metricMs(s.p50_llm_ms)],['工具 P95',metricMs(s.p95_tool_ms),'P50 '+metricMs(s.p50_tool_ms)],['消息提交',num(s.messages??e.message?.count),'所选范围'],['应用启动',num(s.app_launches??e.app_launch?.count),'所选范围']];const host=E('metricCards');host.innerHTML='';cards.forEach(([key,value,detail])=>{const card=node('div',{class:'metric-card'});card.append(node('div',{class:'key'},key),node('div',{class:'value'},typeof value==='number'?fmt(value):value),node('div',{class:'detail'},detail));host.appendChild(card)});const coverage=m.coverage||{},coverageRows=[['匿名来源覆盖',coverage.user_identified_events],['会话覆盖',coverage.session_identified_events],['应用覆盖',coverage.app_identified_events],['Token usage 覆盖',coverage.llm_token_calls??tokenCoverage],['时间桶',num(m.range?.bucket_seconds)/60],['内容采集',coverage.content_recorded?'已启用':'关闭']],coverageHost=E('metricsCoverage');coverageHost.innerHTML='';for(const [label,value] of coverageRows){const display=typeof value==='number'?(label==='时间桶'?fmt(value)+' 分钟':metricPct(value)):String(value??'-');coverageHost.appendChild(node('span',{class:'coverage-pill'},label+'：'+display))}renderMetricCharts(m);renderMetricUserSelector(m.users||[]);const modelHeaders=[['Provider',x=>x.provider||'-'],['Model',x=>x.model||'-'],['调用',x=>fmt(x.calls)],['成功率',x=>metricPct(num(x.calls)?num(x.success)/num(x.calls):0)],['Token',x=>fmt(x.tokens)],['平均 / P95',x=>metricMs(x.avg_ms)+' / '+metricMs(x.p95_ms)]];const toolHeaders=[['Tool',x=>x.name||'-'],['调用',x=>fmt(x.calls)],['成功',x=>fmt(x.success)],['失败 / 超时',x=>fmt(x.failures??x.errors)+' / '+fmt(x.timeouts)],['平均 / P95',x=>metricMs(x.avg_ms)+' / '+metricMs(x.p95_ms)]];const appHeaders=[['应用',x=>x.name||x.app_id||'-'],['启动',x=>fmt(x.launches)],['匿名来源',x=>fmt(x.active_users)],['消息',x=>fmt(x.messages)],['模型 / 工具',x=>fmt(x.llm_calls)+' / '+fmt(x.tool_calls)],['Token',x=>fmt(x.total_tokens)]];const userHeaders=[['匿名来源',x=>x.user_hash||'-'],['最近活动',x=>metricTime(x.last_seen)],['会话',x=>fmt(x.sessions)],['消息',x=>fmt(x.messages)],['模型 / 工具',x=>fmt(x.llm_calls)+' / '+fmt(x.tool_calls)],['失败',x=>fmt(x.failures)],['Token',x=>fmt(x.total_tokens)]];const eventHeaders=[['事件',x=>x.name],['次数',x=>fmt(x.count)],['失败',x=>fmt(x.failures??x.errors)],['总耗时',x=>metricMs(x.duration_ms)]];for(const [id,headers,rows] of [['modelMetrics',modelHeaders,m.models||[]],['toolMetrics',toolHeaders,m.tools||[]],['appMetrics',appHeaders,m.apps||[]],['userMetrics',userHeaders,m.users||[]],['eventMetrics',eventHeaders,Object.entries(e).map(([name,value])=>({name,...value}))]]){const container=E(id);container.innerHTML='';container.appendChild(table(headers,rows));if(id==='userMetrics')container.querySelectorAll('tbody tr').forEach((row,index)=>{row.style.cursor='pointer';row.onclick=()=>{const hash=String((m.users||[])[index]?.user_hash||'');if(hash){A.metricUserHash=hash;loadMetrics(hash).catch(err=>toast(err.message,true))}}})}renderFocusMetricUser(m)}
+async function loadConfig(){A.config=await api('/api/admin/config');A.bootId=String(A.config?.boot_id||A.bootId||'');renderConfig()}
+function configControl(spec,value){let input;if(spec.type==='boolean'){const wrap=node('div',{class:'switch-row'});input=node('input',{type:'checkbox'});input.checked=!!value;input.dataset.key=spec.key;wrap.append(input,node('span',{},value?'启用':'停用'));input.addEventListener('change',()=>wrap.lastChild.textContent=input.checked?'启用':'停用');return wrap}if(spec.type==='enum'||spec.type==='tri_state'){input=node('select');(spec.choices||[]).forEach(v=>{const op=node('option',{value:v},String(v));op.selected=String(value??'')===String(v);input.appendChild(op)})}else{const inputType=spec.type==='integer'||spec.type==='number'?'number':spec.type==='url'?'url':'text';input=node('input',{type:inputType});if(value!==null&&value!==undefined)input.value=String(value);if(spec.minimum!==undefined)input.min=String(spec.minimum);if(spec.maximum!==undefined)input.max=String(spec.maximum);if(inputType==='number')input.step=String(spec.step??(spec.type==='integer'?1:'any'));if(spec.nullable)input.placeholder=spec.derived?'留空自动计算：'+spec.derived:'可留空'}input.dataset.key=spec.key;return input}
+function renderConfig(values=null){const c=A.config||{},form=E('configForm');form.innerHTML='';const draft=values&&typeof values==='object'?values:(c.draft||{});const errors=new Map([...(c.validation_errors||[]),...(A.serverErrors||[])].map(x=>[x.key,x.error]));const groups=new Map();for(const spec of c.schema||[]){if(!groups.has(spec.group))groups.set(spec.group,[]);groups.get(spec.group).push(spec)}for(const [group,specs] of groups){const section=node('section',{class:'config-group'});section.appendChild(node('h3',{},group));const grid=node('div',{class:'config-grid'});for(const spec of specs){const field=node('div',{class:'config-field'}),head=node('div',{class:'field-head'});head.append(node('span',{class:'field-label'},spec.label),node('span',{class:'type-tag'},spec.type));field.appendChild(head);const control=configControl(spec,draft?.[spec.key]);if(control.matches?.('input,select')){control.dataset.key=spec.key;if(errors.has(spec.key))control.classList.add('invalid')}else{const nested=control.querySelector('input,select');if(nested){nested.dataset.key=spec.key;if(errors.has(spec.key))nested.classList.add('invalid')}}field.append(control,node('div',{class:'field-key'},spec.key+(spec.restart_required?' · restart':'')),node('div',{class:'field-error'},errors.get(spec.key)||''));grid.appendChild(field)}section.appendChild(grid);form.appendChild(section)}const ports=E('effectivePorts');ports.innerHTML='';for(const [name,port] of Object.entries(c.effective_ports||{}))ports.appendChild(node('span',{class:'port-pill'},name+' : '+port));const restart=!!c.restart_required;E('restartState').textContent=restart?'有未生效参数':'参数已生效';E('restartState').className='badge '+(restart?'warn':'good');if(errors.size)notice([...errors].map(([key,error])=>key+': '+error).join('\n'),true);else notice('')}
+function collectConfig(){const values={};for(const spec of A.config?.schema||[]){const el=document.querySelector('[data-key="'+CSS.escape(spec.key)+'"]');if(!el)continue;if(spec.type==='boolean')values[spec.key]=!!el.checked;else if(spec.nullable&&!String(el.value||'').trim())values[spec.key]=null;else values[spec.key]=el.value}return values}
+function notice(message,error=false){const el=E('configNotice');el.textContent=String(message||'');el.classList.toggle('hidden',!message);el.classList.toggle('error',!!error)}
+async function saveConfig(setDefault=false){A.serverErrors=[];const submitted=collectConfig();try{const out=await api('/api/admin/config',{method:'POST',body:JSON.stringify({values:submitted,set_default:setDefault,revision:A.config?.revision||''})});await loadConfig();toast(setDefault?'参数已保存并设为默认':'参数已保存');return out}catch(err){A.serverErrors=Array.isArray(err.details)?err.details:[];renderConfig(submitted);throw err}}
+async function resetConfig(target){await api('/api/admin/config/reset',{method:'POST',body:JSON.stringify({target})});await loadConfig();toast(target==='default'?'已恢复默认参数':'已重置为初始参数')}
+function downloadJson(name,data){const b=new Blob([JSON.stringify(data,null,2)],{type:'application/json;charset=utf-8'}),url=URL.createObjectURL(b),a=node('a',{href:url,download:name});document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000)}
+async function importConfigFile(file){const raw=JSON.parse(await file.text());const values=raw?.values||raw?.draft||raw;if(!values||typeof values!=='object'||Array.isArray(values))throw new Error('JSON 中未找到参数对象');const trueValues=new Set(['1','true','yes','on']),falseValues=new Set(['0','false','no','off']),errors=[];for(const spec of A.config?.schema||[]){if(!(spec.key in values))continue;const el=document.querySelector('[data-key="'+CSS.escape(spec.key)+'"]');if(!el)continue;if(spec.type==='boolean'){const v=values[spec.key],normalized=String(v??'').trim().toLowerCase();if(typeof v==='boolean')el.checked=v;else if(trueValues.has(normalized))el.checked=true;else if(falseValues.has(normalized))el.checked=false;else{errors.push({key:spec.key,error:'expected boolean'});continue}el.dispatchEvent(new Event('change',{bubbles:true}))}else el.value=values[spec.key]??''}A.serverErrors=errors;if(errors.length){renderConfig(collectConfig());throw new Error('导入失败：存在无效布尔参数')}notice('参数已导入到表单，请检查后保存。');toast('导入完成')}
+async function restartWithDraft(){if(!confirm('服务将保存所有会话并重启。确定继续吗？'))return;await saveConfig(false);const out=await api('/api/admin/restart',{method:'POST',body:JSON.stringify({boot_id:A.bootId})});toast('重启请求已接收，页面将在服务恢复后自动刷新。');E('saveRestartBtn').disabled=true;waitForRestart(out)}
+async function waitForRestart(info={}){const oldBoot=String(info.boot_id||A.bootId||'');const restartNonce=String(info.restart_nonce||'');const target=info.target||{};const host=String(target.host||'').trim();const port=Number(target.port||location.port||(location.protocol==='https:'?443:80));const publicHost=!host||host==='0.0.0.0'||host==='::'?'':host;const hostname=publicHost||location.hostname;const bracketed=hostname.includes(':')&&!hostname.startsWith('[')?'['+hostname+']':hostname;const targetOrigin=location.protocol+'//'+bracketed+((location.protocol==='https:'&&port===443)||(location.protocol==='http:'&&port===80)?'':':'+port);for(let i=0;i<120;i++){await new Promise(r=>setTimeout(r,1500));try{const url=targetOrigin+'/api/health?restart_nonce='+encodeURIComponent(restartNonce)+'&restart_from='+encodeURIComponent(oldBoot);const r=await fetch(url,{cache:'no-store',mode:'cors'});if(r.ok){const body=await r.json().catch(()=>({}));const newBoot=String(body.boot_id||'');if(newBoot&&oldBoot&&newBoot!==oldBoot&&body.restart_verified===true){location.assign(targetOrigin+'/admin');return}}}catch(_){}}toast('服务尚未恢复，新地址可能为 '+targetOrigin+'/admin，请稍后打开。',true);E('saveRestartBtn').disabled=false}
+async function loadApps(){const [apps,skills]=await Promise.all([api('/api/admin/apps'),api('/api/apps/skills')]);A.apps=Array.isArray(apps)?apps:[];A.skills=Array.isArray(skills)?skills:[];renderSkillCatalog();renderAdminApps()}
+function renderSkillCatalog(){const q=String(E('adminSkillSearch').value||'').trim().toLowerCase(),host=E('adminSkillCatalog');host.innerHTML='';const selected=new Set(A.selectedSkills);const rows=A.skills.filter(s=>!q||[s.id,s.name,s.description].join(' ').toLowerCase().includes(q));if(!rows.length){host.appendChild(node('div',{class:'empty'},'没有匹配的 Skill'));return}rows.forEach(s=>{const label=node('label',{class:'skill-option'+(selected.has(s.id)?' selected':'')}),check=node('input',{type:'checkbox'});check.checked=selected.has(s.id);check.addEventListener('change',()=>toggleAdminSkill(s.id));const text=node('div');text.append(node('strong',{},s.name||s.id),node('span',{},s.id),node('span',{},s.description||''));label.append(check,text);host.appendChild(label)});renderSelectedSkills()}
+function toggleAdminSkill(id){const idx=A.selectedSkills.indexOf(id);if(idx>=0)A.selectedSkills.splice(idx,1);else{if(A.selectedSkills.length>=8){toast('一个应用最多关联 8 个 Skills',true);renderSkillCatalog();return}A.selectedSkills.push(id)}renderSkillCatalog()}
+function renderSelectedSkills(){const host=E('adminSelectedSkills');host.innerHTML='';A.selectedSkills.forEach((id,index)=>{const skill=A.skills.find(x=>x.id===id);const chip=node('span',{class:'skill-chip'},(index+1)+'. '+(skill?.name||id));const del=node('button',{type:'button','aria-label':'移除'},'×');del.onclick=()=>toggleAdminSkill(id);chip.appendChild(del);host.appendChild(chip)});E('selectedSkillCount').textContent=A.selectedSkills.length+' / 8'}
+async function createSharedApp(){const payload={name:E('adminAppName').value.trim(),icon:E('adminAppIcon').value.trim(),description:E('adminAppDescription').value.trim(),skills:A.selectedSkills};if(!payload.name)throw new Error('请输入应用名称');if(!payload.skills.length)throw new Error('请至少选择一个 Skill');await api('/api/admin/apps',{method:'POST',body:JSON.stringify(payload)});E('adminAppName').value='';E('adminAppIcon').value='';E('adminAppDescription').value='';A.selectedSkills=[];await loadApps();toast('共享应用已发布')}
+function renderAdminApps(){const host=E('adminAppList');host.innerHTML='';document.querySelectorAll('.review-tab').forEach(x=>x.classList.toggle('active',x.dataset.status===A.reviewStatus));const rows=A.apps.filter(x=>x.status===A.reviewStatus);if(!rows.length){host.appendChild(node('div',{class:'card empty'},'此分类暂无应用'));return}rows.sort((a,b)=>(b.updated_at||0)-(a.updated_at||0)).forEach(app=>{const card=node('article',{class:'admin-app-card'}),title=node('div',{class:'admin-app-title'}),left=node('div'),h=node('h3',{},(app.icon?app.icon+' ':'')+(app.name||'未命名应用'));left.appendChild(h);title.append(left,node('span',{class:'badge '+(app.status==='published'?'good':app.status==='rejected'?'muted':'warn')},app.status));card.append(title,node('p',{},app.description||'暂无说明'));const meta=node('div',{class:'app-meta'});meta.append(node('span',{},'revision '+(app.submitted_revision||app.revision||1)),node('span',{},'owner '+(app.owner_hash||'admin')));card.appendChild(meta);const skills=node('div',{class:'app-skills'});(app.skills||[]).sort((a,b)=>(a.order||0)-(b.order||0)).forEach(s=>skills.appendChild(node('span',{},s.name||s.id)));card.appendChild(skills);if(app.review?.note)card.appendChild(node('p',{},'审核备注：'+app.review.note));const history=Array.isArray(app.lifecycle_history)?app.lifecycle_history:[];if(history.length){const lifecycle=node('div',{class:'app-lifecycle'});lifecycle.appendChild(node('strong',{},'治理历史'));[...history].reverse().forEach(item=>{const at=item.at?new Date(Number(item.at)*1000).toLocaleString('zh-CN'):'-';const text=at+' · '+String(item.action||'')+' · '+String(item.from||'')+' -> '+String(item.to||'')+' · revision '+String(item.revision||'')+(item.note?' · '+String(item.note):'');lifecycle.appendChild(node('div',{},text))});card.appendChild(lifecycle)}if(app.status==='pending'){const actions=node('div',{class:'review-actions'}),note=node('input',{placeholder:'审核备注（可选）',maxlength:'1000'}),approve=node('button',{type:'button'},'通过并发布'),reject=node('button',{type:'button',class:'danger'},'拒绝');approve.onclick=()=>reviewApp(app,true,note.value).catch(err=>toast(err.message,true));reject.onclick=()=>reviewApp(app,false,note.value).catch(err=>toast(err.message,true));actions.append(note,approve,reject);card.appendChild(actions)}else if(app.status==='published'||app.status==='unpublished'){const actions=node('div',{class:'review-actions'}),note=node('input',{placeholder:'治理备注（可选）',maxlength:'1000'}),publish=app.status==='unpublished',action=node('button',{type:'button',class:publish?'':'danger'},publish?'重新上架':'下架');action.onclick=()=>changePublication(app,publish,note.value).catch(err=>toast(err.message,true));actions.append(note,action);card.appendChild(actions)}host.appendChild(card)})}
+async function reviewApp(app,approve,note){await api('/api/admin/apps/'+encodeURIComponent(app.id)+'/'+(approve?'approve':'reject'),{method:'POST',body:JSON.stringify({note,revision:app.submitted_revision||app.revision})});await loadApps();toast(approve?'应用已发布':'应用已拒绝')}
+async function changePublication(app,publish,note){const label=publish?'重新上架':'下架';if(!confirm('确定'+label+'此共享应用吗？'))return;await api('/api/admin/apps/'+encodeURIComponent(app.id)+'/'+(publish?'republish':'unpublish'),{method:'POST',body:JSON.stringify({note,revision:app.submitted_revision||app.revision,lifecycle_revision:app.lifecycle_revision||0})});await loadApps();toast('应用已'+label)}
+function bind(){document.querySelectorAll('.nav-tab').forEach(x=>x.onclick=()=>switchView(x.dataset.view));document.querySelectorAll('.review-tab').forEach(x=>x.onclick=()=>{A.reviewStatus=x.dataset.status;renderAdminApps()});E('refreshMetricsBtn').onclick=()=>loadMetrics().catch(err=>toast(err.message,true));E('metricsHours').onchange=()=>{A.metricUserHash='';loadMetrics('').catch(err=>toast(err.message,true))};E('metricUserSelect').onchange=()=>{A.metricUserHash=E('metricUserSelect').value;loadMetrics(A.metricUserHash).catch(err=>toast(err.message,true))};E('saveConfigBtn').onclick=()=>saveConfig(false).catch(err=>{notice(err.message,true);toast(err.message,true)});E('setDefaultBtn').onclick=()=>saveConfig(true).catch(err=>toast(err.message,true));E('restoreDefaultBtn').onclick=()=>resetConfig('default').catch(err=>toast(err.message,true));E('resetInitialBtn').onclick=()=>{if(confirm('确定重置为程序初始参数吗？'))resetConfig('initial').catch(err=>toast(err.message,true))};E('saveRestartBtn').onclick=()=>restartWithDraft().catch(err=>toast(err.message,true));E('exportConfigBtn').onclick=()=>downloadJson('clouds-coder-startup-config.json',{version:1,values:collectConfig()});E('importConfigBtn').onclick=()=>E('configFileInput').click();E('configFileInput').onchange=()=>{const f=E('configFileInput').files?.[0];if(f)importConfigFile(f).catch(err=>toast(err.message,true));E('configFileInput').value=''};E('refreshAppsBtn').onclick=()=>loadApps().catch(err=>toast(err.message,true));E('adminSkillSearch').oninput=renderSkillCatalog;E('createSharedAppBtn').onclick=()=>createSharedApp().catch(err=>toast(err.message,true));E('logoutBtn').onclick=()=>logoutAdmin();E('setupForm').onsubmit=ev=>{ev.preventDefault();registerAdmin()};E('passwordLoginForm').onsubmit=ev=>{ev.preventDefault();loginWithPassword()};E('tokenLoginForm').onsubmit=ev=>{ev.preventDefault();loginWithToken()};E('retryAuthBtn').onclick=()=>bootstrapAuth();window.addEventListener('resize',()=>{clearTimeout(A.metricResizeTimer);A.metricResizeTimer=setTimeout(()=>{if(A.metrics&&E('metricsView').classList.contains('active'))renderMetricCharts(A.metrics)},160)})}
+window.addEventListener('DOMContentLoaded',async()=>{bind();await bootstrapAuth()});
 """
 
 RAG_TERM_GROUPS = (
@@ -75331,9 +76904,13 @@ class UserMemoryStore:
             "Emit [] if nothing is durable. Output ONLY the JSON array."
         )
         try:
+            system_prompt = "/no_think\nYou output ONLY a compact JSON array. No prose, no code fences."
+            inject = getattr(sess, "_helper_system_prompt", None)
+            if callable(inject):
+                system_prompt = inject(system_prompt)
             rsp = ollama.chat(
                 [{"role": "user", "content": prompt}],
-                system="/no_think\nYou output ONLY a compact JSON array. No prose, no code fences.",
+                system=system_prompt,
                 max_tokens=400,
                 think=False,
             )
@@ -76752,6 +78329,9 @@ class RAGIngestionService:
         try:
             rsp = session.ollama.chat(
                 [{"role": "user", "content": prompt}],
+                system=session._helper_system_prompt(
+                    "/no_think\nAnalyze only the supplied knowledge assets and return strict JSON."
+                ),
                 max_tokens=700,
                 temperature=0.1,
                 think=False,
@@ -78298,7 +79878,9 @@ const GRAPH_ZOOM_MIN_FACTOR=0.22;
 const GRAPH_ZOOM_MAX_FACTOR=14;
 const E=id=>document.getElementById(id);
 async function api(path,init){
-  const res=await fetch(path,Object.assign({headers:{'Content-Type':'application/json'}},init||{}));
+  const opts=Object.assign({},init||{}),headers=Object.assign({'Content-Type':'application/json'},opts.headers||{});
+  if(String(opts.method||'GET').toUpperCase()!=='GET'){let token=String(sessionStorage.getItem('clouds_coder_admin_token')||'').trim();if(!token){token=String(prompt('Admin token required for library changes')||'').trim();if(token)sessionStorage.setItem('clouds_coder_admin_token',token)}if(token)headers.Authorization='Bearer '+token}
+  const res=await fetch(path,Object.assign(opts,{headers}));
   const text=await res.text();
   let data=text;
   try{data=text?JSON.parse(text):{}}catch{}
@@ -80520,6 +82102,7 @@ const E=id=>document.getElementById(id);
 const S={config:null,sessions:[],roots:[],activeSession:'',activeRoot:'session',treeCache:new Map(),openFiles:new Map(),activeFile:null,dirty:false};
 async function api(path,opts={}){
   const headers=Object.assign({'Content-Type':'application/json'},opts.headers||{});
+  if(String(opts.method||'GET').toUpperCase()!=='GET'){let token=String(sessionStorage.getItem('clouds_coder_admin_token')||'').trim();if(!token){token=String(prompt('Admin token required for IDE changes')||'').trim();if(token)sessionStorage.setItem('clouds_coder_admin_token',token)}if(token)headers.Authorization='Bearer '+token}
   const res=await fetch(path,Object.assign({headers},opts));
   const text=await res.text();
   let data={};
@@ -80890,7 +82473,7 @@ class AppContext:
         self.codes_root.mkdir(parents=True, exist_ok=True)
         self.crypto = CryptoBox(self.codes_root)
         self._session_mgrs: dict[str, SessionManager] = {}
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self.max_user = max(0, int(max_user or 0))
         self.max_user_sessions = max(0, int(max_user_sessions or 0))
         self.daily_session_limit_per_ip = max(0, int(daily_session_limit_per_ip or 0))
@@ -80913,6 +82496,27 @@ class AppContext:
         self.ide_mounts_cache: dict[str, list[dict]] = {}
         self.ide_port = IDE_DEFAULT_PORT
         self.ide_enabled = False
+        self.admin_state_root = self.workspace / ADMIN_STATE_DIRNAME
+        self.admin_state_root.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(self.admin_state_root, 0o700)
+        except Exception:
+            pass
+        self.admin_config_path = self.admin_state_root / ADMIN_CONFIG_FILENAME
+        self.admin_token_path = self.admin_state_root / "admin.token"
+        self.admin_auth = AdminAuthStore(self.admin_state_root / ADMIN_AUTH_FILENAME)
+        self.admin_token = self._load_or_create_admin_token(allow_create=not self.admin_auth.configured())
+        self.admin_initial_config = _admin_factory_config()
+        self.admin_active_config = dict(self.admin_initial_config)
+        self.telemetry = TelemetryStore(self.admin_state_root / ADMIN_TELEMETRY_FILENAME)
+        self.applications = ApplicationRegistry(self, self.admin_state_root / ADMIN_APPS_FILENAME)
+        self.restart_callback = None
+        self.restart_pending = False
+        self.restart_config: dict | None = None
+        self.restart_nonce = ""
+        self.restart_from_boot_id = ""
+        self.restart_lock = threading.Lock()
+        self.admin_config_lock = threading.RLock()
         self.rag_include_filename_entities = bool(rag_include_filename_entities)
         self.rag_parser = RAGContentParser(include_filename_entities=self.rag_include_filename_entities)
         self.rag_root = self.workspace / RAG_LIBRARY_DIRNAME
@@ -80957,6 +82561,177 @@ class AppContext:
             daemon=True,
         )
         self._session_watchdog_thread.start()
+
+    def _load_or_create_admin_token(self, *, allow_create: bool = True) -> str:
+        env_token = str(os.getenv("CLOUDS_CODER_ADMIN_TOKEN", "") or "").strip()
+        if env_token:
+            return env_token
+        try:
+            if self.admin_token_path.exists():
+                token = self.admin_token_path.read_text(encoding="utf-8").strip()
+                if len(token) >= 24:
+                    return token
+        except Exception:
+            pass
+        if not allow_create:
+            return ""
+        token = "cc_admin_" + base64.urlsafe_b64encode(os.urandom(32)).decode("ascii").rstrip("=")
+        try:
+            fd = os.open(self.admin_token_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(token + "\n")
+                handle.flush()
+                try:
+                    os.fsync(handle.fileno())
+                except Exception:
+                    pass
+        except FileExistsError:
+            try:
+                existing = self.admin_token_path.read_text(encoding="utf-8").strip()
+                if len(existing) >= 24:
+                    return existing
+            except Exception:
+                pass
+            raise RuntimeError("admin token file already exists but is invalid")
+        return token
+
+    def verify_admin_token(self, token: str) -> str:
+        candidate = str(token or "").strip()
+        if not candidate:
+            return ""
+        expected = str(getattr(self, "admin_token", "") or "")
+        if expected and hmac.compare_digest(candidate, expected):
+            return "token"
+        try:
+            if self.admin_auth.verify_session(candidate):
+                return "session"
+        except Exception:
+            pass
+        return ""
+
+    def admin_auth_status(self, *, local_setup_allowed: bool) -> dict:
+        configured = bool(self.admin_auth.configured())
+        return {
+            "setup_required": not configured,
+            "password_login_enabled": configured,
+            "token_login_enabled": bool(str(self.admin_token or "").strip()),
+            "local_setup_allowed": bool((not configured) and local_setup_allowed),
+            "setup_local_only": True,
+            "session_ttl_seconds": ADMIN_AUTH_SESSION_TTL_SECONDS,
+        }
+
+    def setup_admin(
+        self,
+        username: object,
+        password: object,
+        *,
+        local_setup_allowed: bool,
+        bootstrap_token: str = "",
+    ) -> dict:
+        if self.admin_auth.configured():
+            raise AdminAuthError("setup_already_completed", "管理员已经创建，请直接登录", 409)
+        bootstrap_ok = self.verify_admin_token(bootstrap_token) == "token"
+        if not local_setup_allowed and not bootstrap_ok:
+            raise AdminAuthError(
+                "setup_local_only",
+                "首次创建管理员仅允许在本机进行；远程初始化需提供现有 Admin Token",
+                403,
+            )
+        return self.admin_auth.setup(username, password)
+
+    def login_admin(self, username: object, password: object, client_ip: str) -> dict:
+        if not self.admin_auth.configured():
+            raise AdminAuthError("setup_required", "请先创建管理员账号", 409)
+        return self.admin_auth.login(username, password, client_ip)
+
+    def exchange_admin_token(self, token: str) -> dict:
+        if self.verify_admin_token(token) != "token":
+            raise AdminAuthError("invalid_token", "Admin Token 无效", 401)
+        return self.admin_auth.issue_session(username_key="__token__", auth_version=0)
+
+    def logout_admin(self, token: str) -> None:
+        self.admin_auth.revoke_session(token)
+
+    def configure_admin_runtime(self, active_config: dict, initial_config: dict | None = None) -> None:
+        clean, errors = _admin_coerce_config(active_config)
+        if not errors:
+            clean.pop("_effective_ports", None)
+            self.admin_active_config = clean
+        if isinstance(initial_config, dict):
+            initial, initial_errors = _admin_coerce_config(initial_config)
+            if not initial_errors:
+                initial.pop("_effective_ports", None)
+                self.admin_initial_config = initial
+
+    def admin_config_payload(self) -> dict:
+        with self.admin_config_lock:
+            stored = _read_json_file(self.admin_config_path, {})
+            draft_raw = stored.get("draft", self.admin_active_config) if isinstance(stored, dict) else self.admin_active_config
+            defaults_raw = stored.get("defaults", self.admin_initial_config) if isinstance(stored, dict) else self.admin_initial_config
+            draft, draft_errors = _admin_coerce_config(draft_raw)
+            defaults, default_errors = _admin_coerce_config(defaults_raw)
+            ports = dict(draft.pop("_effective_ports", {}) or {})
+            defaults.pop("_effective_ports", None)
+            revision_material = json.dumps(
+                {"draft": draft, "defaults": defaults, "updated_at": float(stored.get("updated_at", 0.0) or 0.0) if isinstance(stored, dict) else 0.0},
+                ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            )
+            return {
+                "boot_id": str(getattr(self.telemetry, "boot_id", "") or ""),
+                "revision": hashlib.sha256(revision_material.encode("utf-8")).hexdigest()[:24],
+                "schema": _admin_config_schema(), "active": dict(self.admin_active_config), "draft": draft,
+                "defaults": defaults, "initial": dict(self.admin_initial_config), "effective_ports": ports,
+                "validation_errors": draft_errors + default_errors, "restart_required": draft != self.admin_active_config,
+                "updated_at": float(stored.get("updated_at", 0.0) or 0.0) if isinstance(stored, dict) else 0.0,
+            }
+
+    def save_admin_config(self, values: object, *, set_default: bool = False, expected_revision: str = "") -> dict:
+        clean, errors = _admin_coerce_config(values)
+        ports = dict(clean.pop("_effective_ports", {}) or {})
+        if errors:
+            return {"ok": False, "errors": errors, "config": clean, "effective_ports": ports}
+        with self.admin_config_lock:
+            current = _read_json_file(self.admin_config_path, {})
+            current_draft, _ = _admin_coerce_config(current.get("draft", self.admin_active_config) if isinstance(current, dict) else self.admin_active_config)
+            current_defaults, _ = _admin_coerce_config(current.get("defaults", self.admin_initial_config) if isinstance(current, dict) else self.admin_initial_config)
+            current_draft.pop("_effective_ports", None)
+            current_defaults.pop("_effective_ports", None)
+            current_material = json.dumps(
+                {"draft": current_draft, "defaults": current_defaults, "updated_at": float(current.get("updated_at", 0.0) or 0.0) if isinstance(current, dict) else 0.0},
+                ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            )
+            current_revision = hashlib.sha256(current_material.encode("utf-8")).hexdigest()[:24]
+            if expected_revision and not hmac.compare_digest(str(expected_revision), current_revision):
+                return {"ok": False, "conflict": True, "error": "startup config changed; reload before saving", "revision": current_revision}
+            defaults = current.get("defaults", self.admin_initial_config) if isinstance(current, dict) else self.admin_initial_config
+            payload = {"version": 1, "draft": clean, "defaults": clean if set_default else defaults, "updated_at": now_ts()}
+            _write_json_file(self.admin_config_path, payload)
+        try:
+            os.chmod(self.admin_config_path, 0o600)
+        except Exception:
+            pass
+        return {"ok": True, "draft": clean, "defaults": payload["defaults"], "effective_ports": ports, "restart_required": clean != self.admin_active_config}
+
+    def reset_admin_config(self, target: str = "initial") -> dict:
+        current = _read_json_file(self.admin_config_path, {})
+        if target == "default":
+            values = current.get("defaults", self.admin_initial_config) if isinstance(current, dict) else self.admin_initial_config
+        else:
+            values = self.admin_initial_config
+        return self.save_admin_config(values)
+
+    def claim_admin_restart(self, config: dict, *, expected_boot_id: str = "") -> tuple[bool, str]:
+        with self.restart_lock:
+            current_boot = str(getattr(self.telemetry, "boot_id", "") or "")
+            if not expected_boot_id or not hmac.compare_digest(str(expected_boot_id), current_boot):
+                return False, "boot_conflict"
+            if self.restart_pending:
+                return False, "pending"
+            self.restart_pending = True
+            self.restart_config = dict(config)
+            self.restart_nonce = uuid.uuid4().hex
+            self.restart_from_boot_id = current_boot
+            return True, self.restart_nonce
 
     def _session_watchdog_loop(self):
         while not self._session_watchdog_stop.is_set():
@@ -81063,6 +82838,11 @@ class AppContext:
             fp = self._resolve_external_web_ui_file(root, name)
             if fp:
                 out["resolved_files"][name] = str(fp)
+        for name, markers in WEB_UI_APPLICATION_FEATURE_MARKERS.items():
+            fp_raw = str(out["resolved_files"].get(name, "") or "")
+            txt = try_read_text(Path(fp_raw), max_bytes=4_000_000) if fp_raw else None
+            if txt is None or any(marker not in txt for marker in markers):
+                out["errors"].append(f"missing_application_store_contract:{name}")
         out["ok"] = not out["missing_files"] and not out["errors"]
         return out
 
@@ -81491,6 +83271,24 @@ class AppContext:
             "preview_kind": preview_kind_for_path(rel) if fp.is_file() else "",
         }
 
+    def _ide_reject_hard_snapshot_mutation(
+        self,
+        user_id: str,
+        session_id: str,
+        root_id: str,
+        *targets: Path,
+    ) -> None:
+        if str(root_id or "session").strip() != "session":
+            return
+        sess = self._ide_session(user_id, session_id)
+        if sess.skill_mode != "hard":
+            return
+        snapshot = sess._application_snapshot_root().resolve()
+        for target in targets:
+            resolved = Path(target).resolve()
+            if resolved == snapshot or resolved.is_relative_to(snapshot):
+                raise PermissionError("immutable application skill resources are read-only")
+
     def ide_tree_payload(
         self,
         user_id: str,
@@ -81638,6 +83436,7 @@ class AppContext:
         if not normalize_rel_preview_path(rel):
             raise ValueError("path required")
         root, target, meta = self.ide_resolve_workspace(user_id, session_id, root_id, rel)
+        self._ide_reject_hard_snapshot_mutation(user_id, session_id, root_id, target)
         if target.exists() and target.is_dir():
             raise IsADirectoryError("target is a directory")
         if "content_b64" in payload:
@@ -81656,6 +83455,7 @@ class AppContext:
         if not normalize_rel_preview_path(rel):
             raise ValueError("path required")
         root, target, meta = self.ide_resolve_workspace(user_id, session_id, root_id, rel)
+        self._ide_reject_hard_snapshot_mutation(user_id, session_id, root_id, target)
         target.mkdir(parents=True, exist_ok=bool(payload.get("exist_ok", True)))
         return {"ok": True, "root": meta, "file": self._ide_file_stat(root, target)}
 
@@ -81667,6 +83467,7 @@ class AppContext:
             raise ValueError("old_path and new_path required")
         root, old_target, meta = self.ide_resolve_workspace(user_id, session_id, root_id, old_rel)
         _, new_target, _ = self.ide_resolve_workspace(user_id, session_id, root_id, new_rel)
+        self._ide_reject_hard_snapshot_mutation(user_id, session_id, root_id, old_target, new_target)
         if not old_target.exists():
             raise FileNotFoundError("source not found")
         if new_target.exists() and not bool(payload.get("overwrite", False)):
@@ -81681,6 +83482,7 @@ class AppContext:
         if not normalize_rel_preview_path(rel):
             raise ValueError("path required")
         _, target, meta = self.ide_resolve_workspace(user_id, session_id, root_id, rel)
+        self._ide_reject_hard_snapshot_mutation(user_id, session_id, root_id, target)
         if not target.exists():
             raise FileNotFoundError("target not found")
         if target.is_dir():
@@ -81701,6 +83503,7 @@ class AppContext:
         if len(items) > IDE_UPLOAD_MAX_ITEMS:
             raise ValueError(f"too many upload items (max {IDE_UPLOAD_MAX_ITEMS})")
         root, dest_dir, meta = self.ide_resolve_workspace(user_id, session_id, root_id, dest or ".")
+        self._ide_reject_hard_snapshot_mutation(user_id, session_id, root_id, dest_dir)
         dest_dir.mkdir(parents=True, exist_ok=True)
         written: list[dict] = []
         total = 0
@@ -81717,6 +83520,7 @@ class AppContext:
             if total > IDE_UPLOAD_TOTAL_MAX_BYTES:
                 raise ValueError("upload batch is too large")
             target = safe_path(normalize_rel_preview_path(f"{dest}/{rel_item}" if dest else rel_item), root)
+            self._ide_reject_hard_snapshot_mutation(user_id, session_id, root_id, target)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(raw)
             written.append(self._ide_file_stat(root, target))
@@ -81764,6 +83568,11 @@ class AppContext:
         root_id = str(payload.get("root_id", payload.get("root", "session")) or "session")
         cwd_rel = str(payload.get("cwd", payload.get("path", "")) or "")
         root, cwd, meta = self.ide_resolve_workspace(user_id, session_id, root_id, cwd_rel or ".")
+        sess = self._ide_session(user_id, session_id)
+        if sess.skill_mode == "hard":
+            guard_error = sess._guard_shell_write_scope(command, cwd)
+            if guard_error:
+                raise PermissionError(guard_error)
         if cwd.exists() and cwd.is_file():
             cwd = cwd.parent
         if not cwd.exists() or not cwd.is_dir():
@@ -81772,10 +83581,17 @@ class AppContext:
         timeout = max(1, min(MAX_SHELL_COMMAND_TIMEOUT_SECONDS, requested_timeout))
         started = now_ts()
         try:
+            effective_command = sess._rewrite_shell_virtual_paths(command, cwd) if sess.skill_mode == "hard" else command
+            shell_prefix = sess._hard_snapshot_shell_prefix() if sess.skill_mode == "hard" else []
+            run_command: object = effective_command
+            run_shell = True
+            if shell_prefix:
+                run_command = [*shell_prefix, "/bin/sh", "-c", effective_command]
+                run_shell = False
             proc = subprocess.run(
-                command,
+                run_command,
                 cwd=str(cwd),
-                shell=True,
+                shell=run_shell,
                 text=True,
                 capture_output=True,
                 timeout=timeout,
@@ -82503,6 +84319,9 @@ class AppContext:
         try:
             rsp = session.ollama.chat(
                 [{"role": "user", "content": prompt}],
+                system=session._helper_system_prompt(
+                    "/no_think\nSynthesize only from the numbered evidence and preserve exact citations."
+                ),
                 max_tokens=900,
                 temperature=0.1,
                 think=False,
@@ -82553,12 +84372,16 @@ class AppContext:
         else:
             translated = ""
             try:
+                system_prompt = "/no_think\nYou are a terse bilingual search-query translator. Output only the translated query text."
+                inject = getattr(session, "_helper_system_prompt", None)
+                if callable(inject):
+                    system_prompt = inject(system_prompt)
                 rsp = ollama.chat(
                     [{"role": "user", "content": (
                         f"Translate this search query to {target_lang}. Output ONLY the translation, "
                         f"no quotes, no explanation, keep proper nouns/code/acronyms as-is:\n{raw}"
                     )}],
-                    system="/no_think\nYou are a terse bilingual search-query translator. Output only the translated query text.",
+                    system=system_prompt,
                     max_tokens=120,
                     think=False,
                 )
@@ -83648,17 +85471,185 @@ class AppContext:
             if bool(status_before.get("enabled")) and int(status_before.get("remaining", 0) or 0) <= 0:
                 raise SessionCreationLimitExceeded(status_before)
             sess = mgr.create(title)
-            state = self._load_session_daily_limit_state_locked(user_id)
-            if str(state.get("window_key", "") or "") != str(status_before.get("window_key", "")):
-                state = {
-                    "window_key": str(status_before.get("window_key", "")),
-                    "used": 0,
-                }
-            state["used"] = max(0, int(state.get("used", 0) or 0)) + 1
-            state["window_key"] = str(status_before.get("window_key", ""))
-            self._save_session_daily_limit_state_locked(user_id, state)
-            status_after = self._session_creation_quota_status_locked(user_id, client_ip=client_ip)
+            try:
+                state = self._load_session_daily_limit_state_locked(user_id)
+                if str(state.get("window_key", "") or "") != str(status_before.get("window_key", "")):
+                    state = {"window_key": str(status_before.get("window_key", "")), "used": 0}
+                state["used"] = max(0, int(state.get("used", 0) or 0)) + 1
+                state["window_key"] = str(status_before.get("window_key", ""))
+                self._save_session_daily_limit_state_locked(user_id, state)
+                status_after = self._session_creation_quota_status_locked(user_id, client_ip=client_ip)
+            except Exception:
+                try:
+                    mgr.delete(sess.id)
+                except Exception:
+                    # Force local cleanup so a failed quota write cannot materialize a hidden session.
+                    with mgr.lock:
+                        mgr.sessions.pop(sess.id, None)
+                        mgr.session_index.pop(sess.id, None)
+                    shutil.rmtree(sess.root, ignore_errors=True)
+                raise
+        try:
+            self.telemetry.record("session_create", user_id=user_id, session_id=sess.id, status="success")
+        except Exception:
+            pass
         return sess, status_after
+
+    def launch_application_for_user(
+        self,
+        user_id: str,
+        app_id: str,
+        *,
+        title: str = "",
+        prompt: str = "",
+        client_ip: str = "",
+    ) -> dict:
+        launch_started = time.monotonic()
+        launch_recorded = False
+        try:
+            app_row = self.applications.resolve_launch(user_id, app_id)
+            capsule = str(app_row.get("capsule", "") or "")
+            skills = [dict(x) for x in (app_row.get("skills", []) or []) if isinstance(x, dict)]
+            if not capsule or not skills:
+                raise ValueError("application has no immutable skill snapshot")
+            # Recompute the approved capsule digest before consuming session quota.
+            digest = hashlib.sha256(capsule.encode("utf-8", errors="ignore")).hexdigest()
+            if not hmac.compare_digest(digest, str(app_row.get("capsule_digest", "") or "")):
+                raise ValueError("application snapshot integrity check failed")
+            resources = [dict(x) for x in (app_row.get("resources", []) or []) if isinstance(x, dict)]
+            snapshot_version = int(app_row.get("snapshot_version", 1) or 1)
+            resources_digest = self.applications._resources_digest(resources, snapshot_version)
+            expected_resources_digest = str(app_row.get("resources_digest", "") or "")
+            if expected_resources_digest and not hmac.compare_digest(resources_digest, expected_resources_digest):
+                raise ValueError("application resource snapshot integrity check failed")
+            if snapshot_version >= 2:
+                capsule_data = json.loads(capsule)
+                capsule_skills = capsule_data.get("skills", []) if isinstance(capsule_data, dict) else []
+                if not isinstance(capsule_skills, list) or len(capsule_skills) != len(skills):
+                    raise ValueError("application v2 runtime contract manifest is incomplete")
+                source_rows = {
+                    int(x.get("skill_order", 0) or 0): x for x in resources
+                    if str(x.get("kind", "") or "") == "skill_source" and str(x.get("path", "") or "") == "SKILL.md"
+                }
+                if len(source_rows) != len(skills):
+                    raise ValueError("application v2 snapshot is missing an immutable SKILL.md source")
+                for pos, skill in enumerate(skills):
+                    order = int(skill.get("order", 0) or 0)
+                    source = source_rows.get(order)
+                    if source is None or not hmac.compare_digest(str(source.get("digest", "") or ""), str(skill.get("source_digest", "") or "")):
+                        raise ValueError("application v2 source manifest does not match the approved skill")
+                    contract_row = capsule_skills[pos] if isinstance(capsule_skills[pos], dict) else {}
+                    contract = str(contract_row.get("runtime_contract", "") or "")
+                    contract_digest = hashlib.sha256(contract.encode("utf-8")).hexdigest()
+                    if (
+                        int(contract_row.get("order", 0) or 0) != order
+                        or str(contract_row.get("id", "") or "") != str(skill.get("id", "") or "")
+                        or not hmac.compare_digest(str(contract_row.get("source_digest", "") or ""), str(skill.get("source_digest", "") or ""))
+                        or not hmac.compare_digest(contract_digest, str(skill.get("contract_digest", "") or ""))
+                        or not hmac.compare_digest(contract_digest, str(contract_row.get("contract_digest", "") or ""))
+                    ):
+                        raise ValueError("application v2 runtime contract does not match the approved skill")
+            decoded_resources: list[tuple[dict, bytes]] = []
+            for item in resources:
+                raw = self.applications.resource_bytes(item)
+                if len(raw) != int(item.get("size", len(raw)) or len(raw)):
+                    raise ValueError("resource size mismatch")
+                if not hmac.compare_digest(hashlib.sha256(raw).hexdigest(), str(item.get("digest", "") or "")):
+                    raise ValueError("resource digest mismatch")
+                rel = str(PurePosixPath(str(item.get("path", "") or "").replace("\\", "/"))).lstrip("/")
+                rel_parts = PurePosixPath(rel).parts
+                if not rel or "." in rel_parts or ".." in rel_parts or len(rel_parts) > 24 or any(len(x) > 180 for x in rel_parts):
+                    raise ValueError("invalid resource path")
+                decoded_resources.append((item, raw))
+            sess, quota_status = self.create_session_for_user(
+                user_id, title or str(app_row.get("name", "") or "Application"), client_ip=client_ip,
+            )
+            try:
+                with sess.lock:
+                    snapshot_root = sess.files_root / ".application_skills"
+                    if snapshot_root.exists():
+                        shutil.rmtree(snapshot_root)
+                    for item, raw in decoded_resources:
+                        skill_order = max(1, int(item.get("skill_order", 1) or 1))
+                        rel = str(PurePosixPath(str(item.get("path", "") or "").replace("\\", "/"))).lstrip("/")
+                        target = safe_path(f"{skill_order:02d}/{rel}", snapshot_root)
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.write_bytes(raw)
+                        try:
+                            os.chmod(target, 0o500 if target.suffix.lower() in {".sh", ".py", ".js", ".mjs"} else 0o400)
+                        except Exception:
+                            pass
+                    if resources:
+                        manifest = [{
+                            "skill_id": str(x.get("skill_id", "") or ""), "skill_order": int(x.get("skill_order", 0) or 0),
+                            "path": str(x.get("path", "") or ""), "digest": str(x.get("digest", "") or ""), "size": int(x.get("size", 0) or 0),
+                        } for x in resources]
+                        manifest_path = snapshot_root / "MANIFEST.json"
+                        manifest_path.write_text(json_dumps({"resources": manifest}, indent=2), encoding="utf-8")
+                        try:
+                            os.chmod(manifest_path, 0o400)
+                        except Exception:
+                            pass
+                    sess.app_binding = {
+                        "app_id": str(app_row.get("id", "") or ""), "source_app_id": str(app_row.get("source_app_id", "") or ""),
+                        "name": str(app_row.get("name", "") or ""), "scope": str(app_row.get("scope", "personal") or "personal"),
+                        "revision": int(app_row.get("submitted_revision", app_row.get("revision", 1)) or 1), "capsule_digest": digest,
+                        "resources_digest": resources_digest, "resource_count": len(resources),
+                    }
+                    sess.bound_skill_ids = [str(x.get("id", "") or "") for x in skills if str(x.get("id", "") or "")][:ADMIN_MAX_APP_SKILLS]
+                    sess.bound_skill_capsule = trim(capsule, ADMIN_MAX_APP_CAPSULE_CHARS)
+                    sess.skill_mode = "hard"
+                    sess._restore_application_snapshot_permissions()
+                    sess.updated_at = now_ts()
+                    sess._persist()
+                run = None
+                clean_prompt = str(prompt or "").strip()
+                if clean_prompt:
+                    run = self.submit_user_message(user_id, sess.id, clean_prompt)
+            except Exception:
+                deleted = False
+                try:
+                    manager = self.manager_for_user(user_id)
+                    deleted = bool(manager.delete(sess.id))
+                except Exception:
+                    try:
+                        manager = self.manager_for_user(user_id)
+                        with manager.lock:
+                            manager.sessions.pop(sess.id, None)
+                            manager.session_index.pop(sess.id, None)
+                        shutil.rmtree(sess.root, ignore_errors=True)
+                        deleted = not sess.root.exists()
+                    except Exception:
+                        deleted = False
+                if deleted:
+                    with self._lock:
+                        try:
+                            state = self._load_session_daily_limit_state_locked(user_id)
+                            state["used"] = max(0, int(state.get("used", 0) or 0) - 1)
+                            self._save_session_daily_limit_state_locked(user_id, state)
+                        except Exception:
+                            pass
+                raise
+            self.telemetry.record(
+                "app_launch", user_id=user_id, session_id=sess.id, app_id=str(app_row.get("id", "")), status="success",
+                duration_ms=round((time.monotonic() - launch_started) * 1000.0, 3),
+            )
+            launch_recorded = True
+            return {
+                "id": sess.id, "title": sess.title, "ui_language": sess.ui_language,
+                "app_binding": dict(sess.app_binding), "bound_skill_ids": list(sess.bound_skill_ids),
+                "session_creation_limit": quota_status, "run": run,
+            }
+        except Exception:
+            try:
+                if not launch_recorded:
+                    self.telemetry.record(
+                        "app_launch", user_id=user_id, app_id=str(app_id or ""), status="failed",
+                        duration_ms=round((time.monotonic() - launch_started) * 1000.0, 3),
+                    )
+            except Exception:
+                pass
+            raise
 
     def user_root(self, user_id: str) -> Path:
         root = self.codes_root / user_id
@@ -83870,6 +85861,16 @@ class AppContext:
         text = str(content or "").strip()
         if not text:
             raise ValueError("content required")
+        try:
+            self.telemetry.record(
+                "message",
+                user_id=user_id,
+                session_id=session_id,
+                app_id=str((getattr(sess, "app_binding", {}) or {}).get("app_id", "") or ""),
+                status="accepted",
+            )
+        except Exception:
+            pass
         if not self.scheduler_limits_enabled():
             mgr.prepare_user_intent_for_session(sess, text)
             return sess.submit_user_message(text)
@@ -84057,6 +86058,11 @@ class AppContext:
             mgr.web_search_setting_locked = bool(getattr(self, "web_search_setting_locked", False))
             mgr.user_memory_mode = normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
             mgr.user_memory_setting_locked = bool(getattr(self, "user_memory_setting_locked", False))
+            mgr.telemetry_callback = lambda kind, _uid=user_id, **fields: self.telemetry.record(kind, user_id=_uid, **fields)
+            with mgr.lock:
+                loaded_sessions = list(mgr.sessions.values())
+            for loaded_session in loaded_sessions:
+                loaded_session.set_telemetry_callback(mgr.telemetry_callback)
             global_revision = str(getattr(self, "global_llm_config_revision", "") or "")
             mgr_revision = str(getattr(mgr, "global_llm_config_revision", "") or "")
             if (
@@ -84572,6 +86578,24 @@ class AppContext:
         skipped: list[dict] = []
         errors: list[dict] = []
 
+        def safe_archive_path(raw_name: str) -> PurePosixPath:
+            normalized = str(raw_name or "").replace("\\", "/")
+            path = PurePosixPath(normalized)
+            if path.is_absolute() or not path.parts or any(part in {"", ".", ".."} for part in path.parts):
+                raise ValueError(f"unsafe archive path: {raw_name}")
+            return path
+
+        def save_resource(rel_file: PurePosixPath, data: bytes, source: str):
+            try:
+                target = safe_path(rel_file.as_posix(), self.skills_root)
+                if target.exists() and not overwrite:
+                    skipped.append({"source": source, "path": rel_file.as_posix(), "error": "already exists"})
+                    return
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(data)
+            except Exception as exc:
+                errors.append({"source": source, "path": rel_file.as_posix(), "error": str(exc)})
+
         def save_skill(rel_dir: str, text: str, source: str):
             rel_norm = self._normalize_skill_rel_dir(rel_dir, Path(source).stem or "uploaded-skill")
             meta, _ = parse_front_matter(str(text or ""))
@@ -84599,11 +86623,18 @@ class AppContext:
             if lower.endswith(".zip"):
                 with zipfile.ZipFile(io.BytesIO(raw), "r") as zf:
                     members = sorted(zf.infolist(), key=lambda x: x.filename.lower())
+                    if len(members) > ADMIN_MAX_APP_RESOURCE_FILES * 8:
+                        raise ValueError("skill archive contains too many files")
+                    total_uncompressed = sum(max(0, int(info.file_size or 0)) for info in members if not info.is_dir())
+                    if total_uncompressed > ADMIN_MAX_APP_RESOURCE_BYTES * 4:
+                        raise ValueError("skill archive is too large after extraction")
+                    skill_roots: list[tuple[PurePosixPath, PurePosixPath]] = []
                     for info in members:
                         if info.is_dir():
                             continue
-                        rel_name = str(info.filename or "").replace("\\", "/")
-                        if Path(rel_name).name.lower() != "skill.md":
+                        archive_path = safe_archive_path(info.filename)
+                        rel_name = archive_path.as_posix()
+                        if archive_path.name.lower() != "skill.md":
                             continue
                         try:
                             data = zf.read(info.filename)
@@ -84614,7 +86645,31 @@ class AppContext:
                         parent_rel = str(PurePosixPath(rel_name).parent)
                         if parent_rel in {"", "."}:
                             parent_rel = f"uploaded/{_sanitize_skill_slug(Path(safe_name).stem, 'zip-skill')}"
+                        destination_root = PurePosixPath(self._normalize_skill_rel_dir(parent_rel, archive_path.parent.name or "zip-skill"))
+                        skill_roots.append((archive_path.parent, destination_root))
                         save_skill(parent_rel, text, rel_name)
+                    for info in members:
+                        if info.is_dir():
+                            continue
+                        archive_path = safe_archive_path(info.filename)
+                        if archive_path.name.lower() == "skill.md":
+                            continue
+                        owner = next(
+                            (
+                                (source_root, destination_root)
+                                for source_root, destination_root in sorted(skill_roots, key=lambda row: len(row[0].parts), reverse=True)
+                                if archive_path.is_relative_to(source_root)
+                            ),
+                            None,
+                        )
+                        if owner is None:
+                            continue
+                        source_root, destination_root = owner
+                        relative_resource = archive_path.relative_to(source_root)
+                        data = zf.read(info.filename)
+                        save_resource(destination_root / relative_resource, data, archive_path.as_posix())
+                    if skill_roots:
+                        self._reload_skills_for_live_sessions()
             elif lower.endswith((".md", ".markdown", ".txt")):
                 text = self._decode_uploaded_text(raw)
                 raw_rel = str(PurePosixPath(str(filename or ""))).replace("\\", "/")
@@ -84662,6 +86717,11 @@ class AppContext:
             thinking_stream=bool(active.get("thinking_stream", False)),
         )
         client.apply_profile(active)
+        client.set_telemetry(
+            mgr.telemetry_callback,
+            context_provider=lambda: {},
+            name="skills_generation",
+        )
         think = False
         return client, think, active
 
@@ -84976,6 +87036,1055 @@ class AgentHTTPServer(ThreadingHTTPServer):
                 return
             raise
 
+
+class TelemetryStore:
+    """Low-contention aggregate telemetry; prompts, arguments and secrets are never stored."""
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.lock = threading.RLock()
+        self.boot_id = uuid.uuid4().hex
+        self.user_hash_key = self._load_user_hash_key()
+        self._init_db()
+
+    def _load_user_hash_key(self) -> bytes:
+        path = self.path.with_name("telemetry_user.key")
+        try:
+            raw = path.read_bytes()
+            if len(raw) >= 32:
+                return raw[:64]
+        except Exception:
+            pass
+        raw = os.urandom(32)
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(raw)
+                handle.flush()
+                if JSON_FSYNC_ENABLED:
+                    os.fsync(handle.fileno())
+        except FileExistsError:
+            existing = path.read_bytes()
+            if len(existing) >= 32:
+                return existing[:64]
+        return raw
+
+    def _connect(self):
+        conn = sqlite3.connect(str(self.path), timeout=8.0)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=8000")
+        return conn
+
+    def _init_db(self):
+        with self.lock, self._connect() as conn:
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS telemetry_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts REAL NOT NULL,
+                    boot_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    user_hash TEXT NOT NULL DEFAULT '',
+                    session_id TEXT NOT NULL DEFAULT '',
+                    app_id TEXT NOT NULL DEFAULT '',
+                    name TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT '',
+                    duration_ms REAL,
+                    prompt_tokens INTEGER,
+                    completion_tokens INTEGER,
+                    total_tokens INTEGER,
+                    provider TEXT NOT NULL DEFAULT '',
+                    model TEXT NOT NULL DEFAULT ''
+                )"""
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS telemetry_events_ts ON telemetry_events(ts)")
+            conn.execute("CREATE INDEX IF NOT EXISTS telemetry_events_kind ON telemetry_events(kind, ts)")
+            conn.execute("CREATE INDEX IF NOT EXISTS telemetry_events_user ON telemetry_events(user_hash, ts, kind)")
+            conn.execute("CREATE INDEX IF NOT EXISTS telemetry_events_app ON telemetry_events(app_id, ts, kind)")
+            conn.execute("CREATE INDEX IF NOT EXISTS telemetry_events_tool ON telemetry_events(kind, name, ts)")
+            conn.execute("CREATE INDEX IF NOT EXISTS telemetry_events_model ON telemetry_events(kind, provider, model, ts)")
+
+    def record(self, kind: str, **fields) -> None:
+        try:
+            user_raw = str(fields.get("user_id", "") or "")
+            user_hash = hmac.new(self.user_hash_key, user_raw.encode("utf-8", errors="ignore"), hashlib.sha256).hexdigest()[:24] if user_raw else ""
+            values = (
+                float(fields.get("ts", now_ts()) or now_ts()), self.boot_id, trim(str(kind or "unknown"), 60),
+                user_hash, trim(str(fields.get("session_id", "") or ""), 80), trim(str(fields.get("app_id", "") or ""), 80),
+                trim(str(fields.get("name", "") or ""), 120), trim(str(fields.get("status", "") or ""), 40),
+                fields.get("duration_ms"), fields.get("prompt_tokens"), fields.get("completion_tokens"), fields.get("total_tokens"),
+                trim(str(fields.get("provider", "") or ""), 80), trim(str(fields.get("model", "") or ""), 160),
+            )
+            with self.lock, self._connect() as conn:
+                conn.execute(
+                    "INSERT INTO telemetry_events(ts,boot_id,kind,user_hash,session_id,app_id,name,status,duration_ms,prompt_tokens,completion_tokens,total_tokens,provider,model) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    values,
+                )
+        except Exception:
+            pass
+
+    @staticmethod
+    def _percentile(values: list[float], percentile: float) -> float:
+        clean = sorted(float(x) for x in values if x is not None and float(x) >= 0)
+        if not clean:
+            return 0.0
+        rank = max(0, min(len(clean) - 1, int(math.ceil(len(clean) * percentile) - 1)))
+        return round(clean[rank], 1)
+
+    @staticmethod
+    def _bucket_seconds(hours: float) -> int:
+        if hours <= 6:
+            return 300
+        if hours <= 24:
+            return 900
+        if hours <= 24 * 7:
+            return 3600
+        if hours <= 24 * 30:
+            return 21600
+        return 86400
+
+    def dashboard(self, app: object, since_hours: float = 24.0, *, user_hash: str = "") -> dict:
+        hours = max(0.25, min(24.0 * 365.0, float(since_hours or 24.0)))
+        current = now_ts()
+        since = current - hours * 3600.0
+        bucket_seconds = self._bucket_seconds(hours)
+        failure_statuses = {"error", "timeout", "failed", "cancelled", "canceled"}
+        if user_hash and not re.fullmatch(r"(?:[0-9a-f]{16}|[0-9a-f]{24}|[0-9a-f]{32}|[0-9a-f]{64})", user_hash):
+            raise ValueError("invalid anonymous user hash")
+        with self.lock, self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            db_rows = [dict(row) for row in conn.execute(
+                "SELECT ts,kind,user_hash,session_id,app_id,name,status,duration_ms,prompt_tokens,completion_tokens,total_tokens,provider,model FROM telemetry_events WHERE ts>=? AND ts<=? ORDER BY ts LIMIT 1000000",
+                (since, current),
+            )]
+
+        def failed(row: dict) -> bool:
+            return str(row.get("status", "") or "").lower() in failure_statuses
+
+        def aggregate_dimension(rows: list[dict], dimension: str, kind: str, limit: int = 20) -> list[dict]:
+            groups: dict[object, list[dict]] = {}
+            for row in rows:
+                if row.get("kind") != kind:
+                    continue
+                if dimension == "model":
+                    key: object = (str(row.get("provider", "") or ""), str(row.get("model", "") or ""))
+                else:
+                    key = str(row.get(dimension, "") or "") or "unknown"
+                groups.setdefault(key, []).append(row)
+            out: list[dict] = []
+            for key, items in groups.items():
+                durations = [float(x["duration_ms"]) for x in items if x.get("duration_ms") is not None]
+                successes = sum(1 for x in items if str(x.get("status", "")).lower() == "success")
+                failures = sum(1 for x in items if failed(x))
+                base = {
+                    "calls": len(items), "success": successes, "failures": failures, "errors": failures,
+                    "timeouts": sum(1 for x in items if str(x.get("status", "")).lower() == "timeout"),
+                    "cancelled": sum(1 for x in items if str(x.get("status", "")).lower() in {"cancelled", "canceled"}),
+                    "avg_ms": round(sum(durations) / len(durations), 1) if durations else 0.0,
+                    "p50_ms": self._percentile(durations, 0.50), "p95_ms": self._percentile(durations, 0.95),
+                }
+                if dimension == "model":
+                    base.update({
+                        "provider": key[0], "model": key[1],
+                        "prompt_tokens": sum(int(x.get("prompt_tokens") or 0) for x in items),
+                        "completion_tokens": sum(int(x.get("completion_tokens") or 0) for x in items),
+                        "tokens": sum(int(x.get("total_tokens") or 0) for x in items),
+                    })
+                else:
+                    base["name"] = str(key)
+                out.append(base)
+            return sorted(out, key=lambda x: (-int(x.get("calls", 0)), str(x.get("name", x.get("model", "")))))[:limit]
+
+        totals: dict[str, dict] = {}
+        statuses: dict[tuple[str, str], int] = {}
+        for row in db_rows:
+            kind = str(row.get("kind", "unknown") or "unknown")
+            item = totals.setdefault(kind, {"count": 0, "errors": 0, "failures": 0, "duration_ms": 0.0})
+            item["count"] += 1
+            item["duration_ms"] += float(row.get("duration_ms") or 0.0)
+            if failed(row):
+                item["errors"] += 1
+                item["failures"] += 1
+            status = str(row.get("status", "unknown") or "unknown").lower()
+            statuses[(kind, status)] = statuses.get((kind, status), 0) + 1
+
+        buckets: dict[int, dict] = {}
+        first_bucket = int(since // bucket_seconds) * bucket_seconds
+        last_bucket = int(current // bucket_seconds) * bucket_seconds
+        for ts in range(first_bucket, last_bucket + 1, bucket_seconds):
+            buckets[ts] = {
+                "ts": ts, "active_users": 0, "active_sessions": 0, "messages": 0, "app_launches": 0,
+                "llm_calls": 0, "llm_success": 0, "llm_failures": 0, "tool_calls": 0, "tool_failures": 0,
+                "failures": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+                "avg_llm_ms": 0.0, "avg_tool_ms": 0.0,
+            }
+        bucket_users: dict[int, set[str]] = {}
+        bucket_sessions: dict[int, set[str]] = {}
+        bucket_llm_duration: dict[int, list[float]] = {}
+        bucket_tool_duration: dict[int, list[float]] = {}
+        for row in db_rows:
+            ts = int(float(row.get("ts") or 0) // bucket_seconds) * bucket_seconds
+            item = buckets.setdefault(ts, {"ts": ts})
+            kind = str(row.get("kind", "") or "")
+            if row.get("user_hash"):
+                bucket_users.setdefault(ts, set()).add(str(row["user_hash"]))
+            if row.get("session_id"):
+                bucket_sessions.setdefault(ts, set()).add(str(row["session_id"]))
+            mapping = {"message": "messages", "app_launch": "app_launches", "llm_call": "llm_calls", "tool_call": "tool_calls"}
+            if kind in mapping:
+                item[mapping[kind]] = int(item.get(mapping[kind], 0)) + 1
+            if failed(row):
+                item["failures"] = int(item.get("failures", 0)) + 1
+                if kind == "llm_call":
+                    item["llm_failures"] = int(item.get("llm_failures", 0)) + 1
+                if kind == "tool_call":
+                    item["tool_failures"] = int(item.get("tool_failures", 0)) + 1
+            elif kind == "llm_call" and str(row.get("status", "")).lower() == "success":
+                item["llm_success"] = int(item.get("llm_success", 0)) + 1
+            if kind == "llm_call":
+                item["prompt_tokens"] = int(item.get("prompt_tokens", 0)) + int(row.get("prompt_tokens") or 0)
+                item["completion_tokens"] = int(item.get("completion_tokens", 0)) + int(row.get("completion_tokens") or 0)
+                item["total_tokens"] = int(item.get("total_tokens", 0)) + int(row.get("total_tokens") or 0)
+                if row.get("duration_ms") is not None:
+                    bucket_llm_duration.setdefault(ts, []).append(float(row["duration_ms"]))
+            if kind == "tool_call" and row.get("duration_ms") is not None:
+                bucket_tool_duration.setdefault(ts, []).append(float(row["duration_ms"]))
+        series = []
+        for ts in sorted(buckets):
+            item = buckets[ts]
+            item["active_users"] = len(bucket_users.get(ts, set()))
+            item["active_sessions"] = len(bucket_sessions.get(ts, set()))
+            llm_duration = bucket_llm_duration.get(ts, [])
+            tool_duration = bucket_tool_duration.get(ts, [])
+            item["avg_llm_ms"] = round(sum(llm_duration) / len(llm_duration), 1) if llm_duration else 0.0
+            item["avg_tool_ms"] = round(sum(tool_duration) / len(tool_duration), 1) if tool_duration else 0.0
+            series.append(item)
+
+        llm_rows = [x for x in db_rows if x.get("kind") == "llm_call"]
+        tool_call_rows = [x for x in db_rows if x.get("kind") == "tool_call"]
+        llm_duration = [float(x["duration_ms"]) for x in llm_rows if x.get("duration_ms") is not None]
+        tool_duration = [float(x["duration_ms"]) for x in tool_call_rows if x.get("duration_ms") is not None]
+        models = aggregate_dimension(db_rows, "model", "llm_call")
+        tools = aggregate_dimension(db_rows, "name", "tool_call")
+
+        users_map: dict[str, list[dict]] = {}
+        apps_map: dict[str, list[dict]] = {}
+        for row in db_rows:
+            if row.get("user_hash"):
+                users_map.setdefault(str(row["user_hash"]), []).append(row)
+            if row.get("app_id"):
+                apps_map.setdefault(str(row["app_id"]), []).append(row)
+
+        def activity_summary(items: list[dict]) -> dict:
+            llm = [x for x in items if x.get("kind") == "llm_call"]
+            return {
+                "first_seen": min((float(x.get("ts") or 0) for x in items), default=0.0),
+                "last_seen": max((float(x.get("ts") or 0) for x in items), default=0.0),
+                "sessions": len({str(x.get("session_id")) for x in items if x.get("session_id")}),
+                "messages": sum(1 for x in items if x.get("kind") == "message"),
+                "app_launches": sum(1 for x in items if x.get("kind") == "app_launch"),
+                "llm_calls": len(llm), "tool_calls": sum(1 for x in items if x.get("kind") == "tool_call"),
+                "success": sum(1 for x in items if x.get("kind") in {"llm_call", "tool_call"} and str(x.get("status", "")).lower() == "success"),
+                "failures": sum(1 for x in items if x.get("kind") in {"llm_call", "tool_call"} and failed(x)),
+                "total_tokens": sum(int(x.get("total_tokens") or 0) for x in llm),
+                "avg_llm_ms": round(sum(float(x.get("duration_ms") or 0) for x in llm if x.get("duration_ms") is not None) / max(1, sum(1 for x in llm if x.get("duration_ms") is not None)), 1),
+                "apps_used": len({str(x.get("app_id")) for x in items if x.get("app_id")}),
+                "models_used": len({(str(x.get("provider", "")), str(x.get("model", ""))) for x in llm}),
+            }
+
+        users = []
+        for key, items in users_map.items():
+            users.append({"user_hash": key, **activity_summary(items)})
+        users = sorted(users, key=lambda x: (-int(x["llm_calls"]), -int(x["tool_calls"]), -float(x["last_seen"])))[:100]
+
+        app_names: dict[str, str] = {}
+        try:
+            for row in app.applications.list_admin(""):
+                app_names[str(row.get("id", ""))] = str(row.get("name", "") or "")
+        except Exception:
+            pass
+        apps = []
+        for key, items in apps_map.items():
+            base = activity_summary(items)
+            apps.append({
+                "app_id": key, "name": app_names.get(key, ""), "active_users": len({str(x.get("user_hash")) for x in items if x.get("user_hash")}),
+                "launches": base["app_launches"], **base,
+            })
+        apps = sorted(apps, key=lambda x: (-int(x["launches"]), -int(x["llm_calls"]), str(x["app_id"])))[:50]
+
+        focus_user = None
+        if user_hash and user_hash in users_map:
+            focus_rows = users_map[user_hash]
+            focus_summary = {"user_hash": user_hash, **activity_summary(focus_rows)}
+            focus_series = []
+            for global_bucket in series:
+                ts = int(global_bucket.get("ts", 0) or 0)
+                items = [x for x in focus_rows if int(float(x.get("ts") or 0) // bucket_seconds) * bucket_seconds == ts]
+                focus_series.append({
+                    "ts": ts,
+                    "messages": sum(1 for x in items if x.get("kind") == "message"),
+                    "app_launches": sum(1 for x in items if x.get("kind") == "app_launch"),
+                    "llm_calls": sum(1 for x in items if x.get("kind") == "llm_call"),
+                    "tool_calls": sum(1 for x in items if x.get("kind") == "tool_call"),
+                    "failures": sum(1 for x in items if failed(x)),
+                    "prompt_tokens": sum(int(x.get("prompt_tokens") or 0) for x in items if x.get("kind") == "llm_call"),
+                    "completion_tokens": sum(int(x.get("completion_tokens") or 0) for x in items if x.get("kind") == "llm_call"),
+                    "total_tokens": sum(int(x.get("total_tokens") or int(x.get("prompt_tokens") or 0) + int(x.get("completion_tokens") or 0)) for x in items if x.get("kind") == "llm_call"),
+                })
+            focus_user = {
+                "user_hash": user_hash, "summary": focus_summary,
+                "series": focus_series,
+                "models": aggregate_dimension(focus_rows, "model", "llm_call", 20),
+                "tools": aggregate_dimension(focus_rows, "name", "tool_call", 20),
+                "apps": [{"app_id": key, "name": app_names.get(key, ""), "launches": summary["app_launches"], **summary}
+                         for key, values in sorted(((k, v) for k, v in apps_map.items() if any(str(x.get("user_hash", "")) == user_hash for x in v)), key=lambda x: x[0])
+                         if (summary := activity_summary([x for x in values if str(x.get("user_hash", "")) == user_hash]))],
+            }
+        with getattr(app, "_lock", threading.RLock()):
+            managers = list(getattr(app, "_session_mgrs", {}).values())
+        running = 0
+        loaded_sessions = 0
+        for mgr in managers:
+            try:
+                with mgr.lock:
+                    sessions = list(mgr.sessions.values())
+                loaded_sessions += len(sessions)
+                running += sum(1 for sess in sessions if bool(getattr(sess, "running", False)))
+            except Exception:
+                continue
+        known_users = len(app._known_user_ids()) if hasattr(app, "_known_user_ids") else len(managers)
+        total_sessions = 0
+        if hasattr(app, "_known_user_ids"):
+            for uid in app._known_user_ids():
+                try:
+                    total_sessions += sum(1 for p in (app.user_root(uid) / "sessions").iterdir() if p.is_dir())
+                except Exception:
+                    pass
+        scheduler = app.scheduler_status("") if hasattr(app, "scheduler_status") else {}
+        llm_success = sum(1 for x in llm_rows if str(x.get("status", "")).lower() == "success")
+        tool_success = sum(1 for x in tool_call_rows if str(x.get("status", "")).lower() == "success")
+        llm_failures = sum(1 for x in llm_rows if failed(x))
+        tool_failures = sum(1 for x in tool_call_rows if failed(x))
+        covered_calls = sum(1 for x in llm_rows if any(x.get(key) is not None for key in ("prompt_tokens", "completion_tokens", "total_tokens")))
+        total_events = len(db_rows)
+        return {
+            "schema_version": 2,
+            "range": {"hours": hours, "from": since, "to": current, "bucket_seconds": bucket_seconds, "timezone": "local"},
+            "gauges": {
+                "known_users": known_users, "active_users": len(users_map), "total_sessions": total_sessions or loaded_sessions,
+                "active_sessions": len({str(x.get("session_id")) for x in db_rows if x.get("session_id")}),
+                "running_sessions": running, "queue_depth": int(scheduler.get("queue_size", 0) or 0),
+            },
+            "events": totals,
+            "summary": {
+                "messages": int((totals.get("message", {}) or {}).get("count", 0)),
+                "app_launches": int((totals.get("app_launch", {}) or {}).get("count", 0)),
+                "llm_calls": len(llm_rows), "tool_calls": len(tool_call_rows),
+                "llm_success": llm_success, "llm_failures": llm_failures,
+                "llm_timeouts": sum(1 for x in llm_rows if str(x.get("status", "")).lower() == "timeout"),
+                "llm_cancelled": sum(1 for x in llm_rows if str(x.get("status", "")).lower() in {"cancelled", "canceled"}),
+                "tool_success": tool_success, "tool_failures": tool_failures,
+                "tool_timeouts": sum(1 for x in tool_call_rows if str(x.get("status", "")).lower() == "timeout"),
+                "tool_cancelled": sum(1 for x in tool_call_rows if str(x.get("status", "")).lower() in {"cancelled", "canceled"}),
+                "llm_success_rate": llm_success / len(llm_rows) if llm_rows else 0.0,
+                "tool_success_rate": tool_success / len(tool_call_rows) if tool_call_rows else 0.0,
+                "avg_llm_ms": round(sum(llm_duration) / len(llm_duration), 1) if llm_duration else 0.0,
+                "p50_llm_ms": self._percentile(llm_duration, 0.50), "p95_llm_ms": self._percentile(llm_duration, 0.95),
+                "avg_tool_ms": round(sum(tool_duration) / len(tool_duration), 1) if tool_duration else 0.0,
+                "p50_tool_ms": self._percentile(tool_duration, 0.50), "p95_tool_ms": self._percentile(tool_duration, 0.95),
+            },
+            "tokens": {
+                "prompt": sum(int(x.get("prompt_tokens") or 0) for x in llm_rows),
+                "completion": sum(int(x.get("completion_tokens") or 0) for x in llm_rows),
+                "total": sum(int(x.get("total_tokens") or int(x.get("prompt_tokens") or 0) + int(x.get("completion_tokens") or 0)) for x in llm_rows),
+                "usage_covered_calls": covered_calls, "llm_calls": len(llm_rows),
+                "coverage_rate": covered_calls / len(llm_rows) if llm_rows else 0.0,
+            },
+            "series": series, "tools": tools, "models": models, "apps": apps, "users": users,
+            "statuses": [{"kind": kind, "status": status, "count": count} for (kind, status), count in sorted(statuses.items())],
+            "coverage": {
+                "user_identified_events": sum(1 for x in db_rows if x.get("user_hash")) / total_events if total_events else 0.0,
+                "session_identified_events": sum(1 for x in db_rows if x.get("session_id")) / total_events if total_events else 0.0,
+                "app_identified_events": sum(1 for x in db_rows if x.get("app_id")) / total_events if total_events else 0.0,
+                "llm_token_calls": covered_calls / len(llm_rows) if llm_rows else 0.0,
+                "content_recorded": False, "user_identity": "source-derived-anonymous-hmac-v1",
+            },
+            "focus_user": focus_user,
+            "generated_at": current,
+        }
+
+
+class ApplicationRegistry:
+    """Per-user applications plus immutable, admin-reviewed shared revisions."""
+    def __init__(self, app: object, system_path: Path):
+        self.app = app
+        self.system_path = Path(system_path)
+        self.blob_root = self.system_path.parent / "app_blobs"
+        self.blob_root.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(self.blob_root, 0o700)
+        except Exception:
+            pass
+        self.lock = threading.RLock()
+
+    def _store_blob(self, raw: bytes) -> str:
+        digest = hashlib.sha256(raw).hexdigest()
+        target = self.blob_root / digest
+        if not target.exists():
+            tmp = self.blob_root / f".{digest}.{uuid.uuid4().hex}.tmp"
+            try:
+                tmp.write_bytes(raw)
+                try:
+                    os.chmod(tmp, 0o400)
+                except Exception:
+                    pass
+                try:
+                    os.link(tmp, target)
+                except FileExistsError:
+                    pass
+                finally:
+                    try:
+                        tmp.unlink()
+                    except Exception:
+                        pass
+            except Exception:
+                try:
+                    tmp.unlink()
+                except Exception:
+                    pass
+                raise
+        return digest
+
+    def resource_bytes(self, item: dict) -> bytes:
+        content_b64 = str(item.get("content_b64", "") or "")
+        if content_b64:
+            return base64.b64decode(content_b64, validate=True)
+        digest = str(item.get("blob_digest", item.get("digest", "")) or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError("application resource blob reference is invalid")
+        path = self.blob_root / digest
+        raw = path.read_bytes()
+        if not hmac.compare_digest(hashlib.sha256(raw).hexdigest(), digest):
+            raise ValueError("application resource blob integrity check failed")
+        return raw
+
+    def _externalize_resources(self, resources: list[dict]) -> list[dict]:
+        out: list[dict] = []
+        for item in resources:
+            row = dict(item)
+            content_b64 = str(row.get("content_b64", "") or "")
+            if content_b64:
+                raw = base64.b64decode(content_b64, validate=True)
+                if len(raw) > ADMIN_APP_INLINE_BLOB_BYTES:
+                    row["blob_digest"] = self._store_blob(raw)
+                    row.pop("content_b64", None)
+            out.append(row)
+        return out
+
+    def _personal_path(self, user_id: str) -> Path:
+        return self.app.user_root(user_id) / "applications.json"
+
+    def _read_rows(self, path: Path) -> list[dict]:
+        raw = _read_json_file(path, {"applications": []})
+        rows = raw.get("applications", []) if isinstance(raw, dict) else []
+        return [dict(x) for x in rows if isinstance(x, dict)]
+
+    def _write_rows(self, path: Path, rows: list[dict]) -> None:
+        _write_json_file(path, {"version": 2, "applications": rows, "updated_at": now_ts()})
+        try:
+            os.chmod(path, 0o600)
+        except Exception:
+            pass
+
+    def _public(self, row: dict, *, admin: bool = False) -> dict:
+        out = {
+            "id": str(row.get("id", "") or ""),
+            "name": str(row.get("name", "") or ""),
+            "description": str(row.get("description", "") or ""),
+            "icon": str(row.get("icon", "") or ""),
+            "scope": str(row.get("scope", "personal") or "personal"),
+            "status": str(row.get("status", "draft") or "draft"),
+            "revision": int(row.get("revision", 1) or 1),
+            "lifecycle_revision": int(row.get("lifecycle_revision", 0) or 0),
+            "submitted_revision": int(row.get("submitted_revision", row.get("revision", 1)) or 1),
+            "skills": [dict(x) for x in (row.get("skills", []) or []) if isinstance(x, dict)],
+            "created_at": float(row.get("created_at", 0.0) or 0.0),
+            "updated_at": float(row.get("updated_at", 0.0) or 0.0),
+            "review": dict(row.get("review", {}) or {}),
+            "snapshot_version": int(row.get("snapshot_version", 1) or 1),
+        }
+        if admin:
+            out["owner_hash"] = hashlib.sha256(str(row.get("owner", "") or "").encode()).hexdigest()[:16]
+            out["capsule_digest"] = str(row.get("capsule_digest", "") or "")
+            out["lifecycle_history"] = [
+                dict(item)
+                for item in (row.get("lifecycle_history", []) or [])
+                if isinstance(item, dict)
+            ]
+        return out
+
+    @staticmethod
+    def _lifecycle_note(note: object) -> str:
+        value = str(note or "").strip()
+        if len(value) > 1000:
+            raise ValueError("lifecycle note must be at most 1000 characters")
+        return value
+
+    @staticmethod
+    def _lifecycle_revision(row: dict) -> int:
+        return int(row.get("submitted_revision", row.get("revision", 0)) or 0)
+
+    @staticmethod
+    def _append_lifecycle(
+        row: dict,
+        *,
+        action: str,
+        from_status: str,
+        to_status: str,
+        note: str,
+        revision: int,
+    ) -> None:
+        history = [dict(item) for item in (row.get("lifecycle_history", []) or []) if isinstance(item, dict)]
+        lifecycle_revision = int(row.get("lifecycle_revision", 0) or 0) + 1
+        row["lifecycle_revision"] = lifecycle_revision
+        history.append({
+            "action": str(action),
+            "from": str(from_status),
+            "to": str(to_status),
+            "at": now_ts(),
+            "actor": "admin",
+            "note": str(note or ""),
+            "revision": int(revision),
+            "lifecycle_revision": lifecycle_revision,
+        })
+        row["lifecycle_history"] = history
+
+    @staticmethod
+    def _resources_digest(resources: list[dict], snapshot_version: int = 1) -> str:
+        if int(snapshot_version or 1) < 2:
+            material = "\n".join(
+                f"{str(x.get('skill_id', '') or '')}:{str(x.get('path', '') or '')}:{str(x.get('digest', '') or '')}"
+                for x in resources
+            )
+        else:
+            material = json.dumps(
+                [
+                    {
+                        "skill_id": str(x.get("skill_id", "") or ""),
+                        "skill_order": int(x.get("skill_order", 0) or 0),
+                        "kind": str(x.get("kind", "attachment") or "attachment"),
+                        "path": str(x.get("path", "") or ""),
+                        "digest": str(x.get("digest", "") or ""),
+                        "size": int(x.get("size", 0) or 0),
+                    }
+                    for x in resources
+                ],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+    def skill_catalog(self) -> list[dict]:
+        store = self.app._ensure_skills_store(force=False)
+        rows: list[dict] = []
+        for item in store.list_metadata():
+            sid = str(item.get("qualified_name", item.get("id", "")) or "")
+            if not sid or sid == "_warnings":
+                continue
+            skill = store.skills.get(sid, {})
+            if str(skill.get("protocol", "") or "") not in {SKILL_PROTOCOL_LOCAL, "builtin", SKILL_PROTOCOL_CLAWHUB}:
+                continue
+            text = store.load(sid)
+            if not text or str(text).startswith("Error:"):
+                continue
+            digest = hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
+            rows.append({
+                "id": sid,
+                "name": str(item.get("name", sid) or sid),
+                "description": trim(str(item.get("description", "") or ""), 500),
+                "provider_id": str(item.get("provider_id", "") or ""),
+                "protocol": str(item.get("protocol", "") or ""),
+                "digest": digest,
+            })
+        return rows
+
+    def _skill_source_bytes(self, key: str, skill: dict) -> bytes:
+        source_path = str(skill.get("skill_abs_path", "") or "").strip()
+        if source_path:
+            try:
+                fp = Path(source_path).resolve()
+                if fp.exists() and fp.is_file() and not fp.is_symlink():
+                    raw = fp.read_bytes()
+                    if raw:
+                        return raw
+            except Exception:
+                pass
+        meta = skill.get("meta", {}) if isinstance(skill.get("meta"), dict) else {}
+        body = str(skill.get("body", "") or "")
+        canonical = (
+            "---\n"
+            + f"name: {json.dumps(str(skill.get('name', key) or key), ensure_ascii=False)}\n"
+            + f"description: {json.dumps(str(skill.get('description', '') or ''), ensure_ascii=False)}\n"
+            + "---\n\n"
+            + body
+            + ("\n\n<!-- frozen metadata -->\n" + json_dumps(meta, indent=2) if meta else "")
+            + "\n"
+        )
+        return canonical.encode("utf-8")
+
+    def _automatic_runtime_contract(self, key: str, skill: dict, source_text: str, index: int) -> str:
+        description = trim(str(skill.get("description", "") or "").strip(), 360)
+        mandatory_pattern = re.compile(
+            r"\b(?:MUST(?:\s+NOT)?|NEVER|DO\s+NOT|REQUIRED|ONLY|SHALL(?:\s+NOT)?)\b|"
+            r"(?:必须|不得|禁止|严禁|务必|不要|只能|仅限|应当)",
+            re.IGNORECASE,
+        )
+        workflow_pattern = re.compile(r"^\s*(?:[-*+]\s+|\d{1,3}[.)]\s+|#{1,6}\s+)")
+        mandatory: list[str] = []
+        workflow: list[str] = []
+        seen: set[str] = set()
+        for raw_line in source_text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+            line = " ".join(raw_line.strip().split())
+            if not line or len(line) > 900:
+                continue
+            fingerprint = line.casefold()
+            if fingerprint in seen:
+                continue
+            if mandatory_pattern.search(line):
+                mandatory.append(line)
+                seen.add(fingerprint)
+            elif workflow_pattern.match(raw_line) and len(workflow) < 18:
+                workflow.append(line)
+                seen.add(fingerprint)
+        source_ref = f"/workspace/.application_skills/{index:02d}/SKILL.md"
+        lines = [
+            f"Skill {key} is hard-bound to this application.",
+            f"The complete immutable source at {source_ref} is authoritative.",
+            "Before substantive execution, read that frozen SKILL.md completely; follow every constraint and workflow in it.",
+            "Never substitute the mutable global /skills copy and never bypass a stricter frozen instruction.",
+        ]
+        if description:
+            lines.append("Purpose: " + description)
+        if mandatory:
+            lines.append("Constraint index (verbatim; source remains authoritative):")
+            lines.extend("- " + line for line in mandatory)
+        if workflow:
+            lines.append("Workflow index:")
+            lines.extend("- " + line for line in workflow)
+        return "\n".join(lines)
+
+    def _bounded_skill_contracts(self, rows: list[dict]) -> list[str]:
+        count = max(1, len(rows))
+        # The wrapper is JSON, so leave ample room for escaping and structural overhead.
+        # JSON metadata and escaping consume roughly 280 chars per skill in addition to the contract.
+        per_skill = max(640, min(2200, (ADMIN_MAX_APP_CAPSULE_CHARS - 1000 - (320 * count)) // count))
+        contracts: list[str] = []
+        for row in rows:
+            contract = str(row.get("contract", "") or "").strip()
+            required_prefix = str(row.get("required_prefix", "") or "").strip()
+            if len(contract) <= per_skill:
+                contracts.append(contract)
+                continue
+            kept = required_prefix
+            for line in contract[len(required_prefix):].splitlines():
+                candidate = (kept + "\n" + line).strip()
+                if len(candidate) > per_skill:
+                    break
+                kept = candidate
+            kept += "\nAdditional immutable instructions remain in the frozen SKILL.md and must be read before execution."
+            contracts.append(kept)
+        return contracts
+
+    def _freeze_skills(self, refs: object) -> tuple[list[dict], str, str, list[dict], str]:
+        if not isinstance(refs, list):
+            raise ValueError("skills must be an array")
+        requested = [str(x.get("id", "") if isinstance(x, dict) else x).strip() for x in refs]
+        requested = [x for x in requested if x]
+        if not requested:
+            raise ValueError("select at least one skill")
+        if len(requested) > ADMIN_MAX_APP_SKILLS:
+            raise ValueError(f"an application supports at most {ADMIN_MAX_APP_SKILLS} skills")
+        if len(set(requested)) != len(requested):
+            raise ValueError("duplicate skill selection")
+        store = self.app._ensure_skills_store(force=False)
+        with self.app._lock:
+            # Freeze against one stable discovery snapshot while files and metadata are read.
+            return self._freeze_skills_from_store(store, requested)
+
+    def _freeze_skills_from_store(self, store: SkillStore, requested: list[str]) -> tuple[list[dict], str, str, list[dict], str]:
+        frozen: list[dict] = []
+        contract_rows: list[dict] = []
+        resource_rows: list[dict] = []
+        resource_bytes = 0
+        for index, ref in enumerate(requested, 1):
+            key, err = store._resolve_name(ref)
+            if err or not key or key != ref:
+                raise ValueError(err or f"use canonical skill id: {ref}")
+            skill = store.skills.get(key, {})
+            protocol = str(skill.get("protocol", "") or "")
+            if protocol not in {SKILL_PROTOCOL_LOCAL, "builtin", SKILL_PROTOCOL_CLAWHUB}:
+                raise ValueError(f"dynamic remote skill cannot be frozen: {key}")
+            text = store.load(key)
+            if not text or str(text).startswith("Error:"):
+                raise ValueError(str(text or f"skill unavailable: {key}"))
+            digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            meta = skill.get("meta", {}) if isinstance(skill.get("meta"), dict) else {}
+            source_bytes = self._skill_source_bytes(key, skill)
+            source_digest = hashlib.sha256(source_bytes).hexdigest()
+            if resource_bytes + len(source_bytes) > ADMIN_MAX_APP_RESOURCE_BYTES:
+                raise ValueError(f"immutable skill source snapshot is too large: {key}")
+            resource_rows.append({
+                "skill_id": key,
+                "skill_order": index,
+                "path": "SKILL.md",
+                "digest": source_digest,
+                "size": len(source_bytes),
+                "content_b64": base64.b64encode(source_bytes).decode("ascii"),
+                "kind": "skill_source",
+            })
+            resource_bytes += len(source_bytes)
+            source_text = source_bytes.decode("utf-8", errors="replace")
+            runtime_contract = store._skill_runtime_contract(meta)
+            mode = "explicit" if runtime_contract else "auto-v1"
+            required_prefix = (
+                f"Skill {key} is hard-bound to this application.\n"
+                f"The complete immutable source at /workspace/.application_skills/{index:02d}/SKILL.md is authoritative.\n"
+                "Before substantive execution, read that frozen SKILL.md completely; follow every constraint and workflow in it.\n"
+                "Never substitute the mutable global /skills copy and never bypass a stricter frozen instruction."
+            )
+            contract = runtime_contract if runtime_contract else self._automatic_runtime_contract(key, skill, source_text, index)
+            if runtime_contract:
+                contract = required_prefix + "\nAuthor-provided runtime contract:\n" + runtime_contract
+            contract_rows.append({"id": key, "order": index, "digest": digest, "contract": contract, "required_prefix": required_prefix, "mode": mode, "source_digest": source_digest})
+            frozen.append({
+                "id": key,
+                "name": str(skill.get("name", key) or key),
+                "description": trim(str(skill.get("description", "") or ""), 500),
+                "provider_id": str(skill.get("provider_id", "") or ""),
+                "protocol": protocol,
+                "digest": digest,
+                "snapshot_version": 2,
+                "source_digest": source_digest,
+                "source_size": len(source_bytes),
+                "source_path": f"{index:02d}/SKILL.md",
+                "contract_mode": mode,
+                "contract_digest": "",
+                "order": index,
+            })
+            for item in skill.get("attachments", []) if isinstance(skill.get("attachments"), list) else []:
+                if not isinstance(item, dict):
+                    continue
+                if len(resource_rows) >= ADMIN_MAX_APP_RESOURCE_FILES:
+                    raise ValueError("combined skill snapshot contains too many resource files")
+                if str(item.get("path", "") or "").replace("\\", "/").strip("/").lower() == "skill.md":
+                    continue
+                raw_bytes = b""
+                abs_path = str(item.get("abs_path", "") or "").strip()
+                try:
+                    if abs_path:
+                        fp = Path(abs_path).resolve()
+                        if fp.exists() and fp.is_file() and not fp.is_symlink():
+                            raw_bytes = fp.read_bytes()
+                except Exception:
+                    raw_bytes = b""
+                if not raw_bytes and bool(item.get("text_available", False)):
+                    raw_bytes = str(item.get("content", "") or "").encode("utf-8")
+                if not raw_bytes:
+                    continue
+                resource_bytes += len(raw_bytes)
+                if resource_bytes > ADMIN_MAX_APP_RESOURCE_BYTES:
+                    raise ValueError("combined skill resource snapshot is too large")
+                rel = str(PurePosixPath(str(item.get("path", "resource") or "resource").replace("\\", "/"))).lstrip("/")
+                if not rel or ".." in PurePosixPath(rel).parts:
+                    raise ValueError(f"invalid skill resource path: {rel}")
+                resource_rows.append({
+                    "skill_id": key,
+                    "skill_order": index,
+                    "path": rel,
+                    "digest": hashlib.sha256(raw_bytes).hexdigest(),
+                    "size": len(raw_bytes),
+                    "content_b64": base64.b64encode(raw_bytes).decode("ascii"),
+                    "kind": "attachment",
+                })
+        contracts = self._bounded_skill_contracts(contract_rows)
+        for pos, skill_row in enumerate(frozen):
+            skill_row["contract_digest"] = hashlib.sha256(contracts[pos].encode("utf-8")).hexdigest()
+        capsule_obj = {
+            "snapshot_version": 2,
+            "policy": "Frozen SKILL.md files are authoritative and must be read completely before substantive execution.",
+            "skills": [
+                {
+                    "order": row["order"],
+                    "id": row["id"],
+                    "render_digest": row["digest"],
+                    "source_digest": row["source_digest"],
+                    "contract_mode": row["mode"],
+                    "contract_digest": frozen[pos]["contract_digest"],
+                    "runtime_contract": contracts[pos],
+                }
+                for pos, row in enumerate(contract_rows)
+            ],
+        }
+        capsule = json_dumps(capsule_obj, indent=2)
+        if len(capsule) > ADMIN_MAX_APP_CAPSULE_CHARS:
+            raise ValueError("combined mandatory runtime contracts exceed the safe prompt budget")
+        resource_rows = self._externalize_resources(resource_rows)
+        resources_digest = self._resources_digest(resource_rows, 2)
+        return (
+            frozen,
+            capsule,
+            hashlib.sha256(capsule.encode("utf-8")).hexdigest(),
+            resource_rows,
+            resources_digest,
+        )
+
+    def list_personal(self, user_id: str) -> list[dict]:
+        with self.lock:
+            personal = [x for x in self._read_rows(self._personal_path(user_id)) if not x.get("deleted_at")]
+            submissions = self._read_rows(self.system_path)
+            latest: dict[str, dict] = {}
+            for row in submissions:
+                if str(row.get("owner", "") or "") != user_id:
+                    continue
+                source_id = str(row.get("source_app_id", "") or "")
+                if not source_id:
+                    continue
+                old = latest.get(source_id)
+                if old is None or float(row.get("updated_at", 0.0) or 0.0) > float(old.get("updated_at", 0.0) or 0.0):
+                    latest[source_id] = row
+            out: list[dict] = []
+            for row in personal:
+                public = self._public(row)
+                submission = latest.get(str(row.get("id", "") or ""))
+                if submission is not None:
+                    public["latest_submission"] = {
+                        "id": str(submission.get("id", "") or ""),
+                        "status": str(submission.get("status", "pending") or "pending"),
+                        "submitted_revision": int(submission.get("submitted_revision", 0) or 0),
+                        "submitted_at": float(submission.get("submitted_at", 0.0) or 0.0),
+                        "updated_at": float(submission.get("updated_at", 0.0) or 0.0),
+                        "review": dict(submission.get("review", {}) or {}),
+                    }
+                    if int(submission.get("submitted_revision", 0) or 0) == int(row.get("revision", 0) or 0):
+                        public["status"] = str(submission.get("status", "pending") or "pending")
+                out.append(public)
+            return out
+
+    def list_shared(self) -> list[dict]:
+        with self.lock:
+            rows = self._read_rows(self.system_path)
+            return [self._public(x) for x in rows if x.get("status") == "published" and not x.get("deleted_at")]
+
+    def list_admin(self, status: str = "") -> list[dict]:
+        target = str(status or "").strip().lower()
+        with self.lock:
+            rows = self._read_rows(self.system_path)
+            return [self._public(x, admin=True) for x in rows if not target or str(x.get("status", "")) == target]
+
+    def save_personal(self, user_id: str, payload: dict, app_id: str = "") -> dict:
+        name = trim(str(payload.get("name", "") or "").strip(), 100)
+        if not name:
+            raise ValueError("name is required")
+        description = trim(str(payload.get("description", "") or "").strip(), 1000)
+        frozen, capsule, capsule_digest, resources, resources_digest = self._freeze_skills(payload.get("skills", []))
+        now = now_ts()
+        with self.lock:
+            path = self._personal_path(user_id)
+            rows = self._read_rows(path)
+            idx = next((i for i, x in enumerate(rows) if str(x.get("id", "")) == str(app_id or "")), -1)
+            if app_id and idx < 0:
+                raise KeyError(app_id)
+            if idx >= 0 and str(rows[idx].get("owner", "")) != user_id:
+                raise PermissionError("application owner mismatch")
+            old = rows[idx] if idx >= 0 else {}
+            row = {
+                "id": str(old.get("id", "") or make_id("app")),
+                "owner": user_id,
+                "name": name,
+                "description": description,
+                "icon": trim(str(payload.get("icon", "") or ""), 20),
+                "scope": "personal",
+                "status": "draft",
+                "revision": int(old.get("revision", 0) or 0) + 1,
+                "skills": frozen,
+                "capsule": capsule,
+                "capsule_digest": capsule_digest,
+                "resources": resources,
+                "resources_digest": resources_digest,
+                "snapshot_version": 2,
+                "created_at": float(old.get("created_at", now) or now),
+                "updated_at": now,
+            }
+            if idx >= 0:
+                rows[idx] = row
+            else:
+                rows.append(row)
+            self._write_rows(path, rows)
+        return self._public(row)
+
+    def delete_personal(self, user_id: str, app_id: str) -> bool:
+        with self.lock:
+            path = self._personal_path(user_id)
+            rows = self._read_rows(path)
+            found = False
+            for row in rows:
+                if str(row.get("id", "")) == app_id and str(row.get("owner", "")) == user_id:
+                    row["deleted_at"] = now_ts()
+                    row["status"] = "deleted"
+                    found = True
+            if found:
+                self._write_rows(path, rows)
+            return found
+
+    def submit(self, user_id: str, app_id: str) -> dict:
+        with self.lock:
+            personal = self._read_rows(self._personal_path(user_id))
+            source = next((x for x in personal if str(x.get("id", "")) == app_id and not x.get("deleted_at")), None)
+            if not source or str(source.get("owner", "")) != user_id:
+                raise KeyError(app_id)
+            shared = self._read_rows(self.system_path)
+            source_revision = int(source.get("revision", 1) or 1)
+            duplicate = next(
+                (
+                    x for x in shared
+                    if str(x.get("source_app_id", "")) == app_id
+                    and int(x.get("submitted_revision", 0) or 0) == source_revision
+                ),
+                None,
+            )
+            if duplicate:
+                return self._public(duplicate)
+            submission_id = make_id("submission")
+            frozen = dict(source)
+            frozen.update({
+                "id": submission_id,
+                "source_app_id": app_id,
+                "scope": "shared",
+                "status": "pending",
+                "submitted_revision": source_revision,
+                "submitted_at": now_ts(),
+                "updated_at": now_ts(),
+                "review": {},
+                "lifecycle_revision": 0,
+            })
+            shared.append(frozen)
+            self._write_rows(self.system_path, shared)
+        return self._public(frozen)
+
+    def create_shared(self, payload: dict) -> dict:
+        frozen, capsule, capsule_digest, resources, resources_digest = self._freeze_skills(payload.get("skills", []))
+        now = now_ts()
+        row = {
+            "id": make_id("app"), "owner": "admin", "name": trim(str(payload.get("name", "") or ""), 100),
+            "description": trim(str(payload.get("description", "") or ""), 1000), "icon": trim(str(payload.get("icon", "") or ""), 20),
+            "scope": "shared", "status": "published", "revision": 1, "skills": frozen, "capsule": capsule,
+            "capsule_digest": capsule_digest, "resources": resources, "resources_digest": resources_digest,
+            "snapshot_version": 2, "lifecycle_revision": 1,
+            "created_at": now, "updated_at": now,
+            "review": {"decision": "approved", "reviewer": "admin", "reviewed_at": now},
+            "lifecycle_history": [{
+                "action": "publish", "from": "created", "to": "published", "at": now,
+                "actor": "admin", "note": "", "revision": 1, "lifecycle_revision": 1,
+            }],
+        }
+        if not row["name"]:
+            raise ValueError("name is required")
+        with self.lock:
+            rows = self._read_rows(self.system_path)
+            rows.append(row)
+            self._write_rows(self.system_path, rows)
+        return self._public(row, admin=True)
+
+    def review(self, app_id: str, approve: bool, note: str = "", expected_revision: int = 0) -> dict:
+        if int(expected_revision or 0) <= 0:
+            raise ValueError("a positive submitted revision is required")
+        clean_note = self._lifecycle_note(note)
+        with self.lock:
+            rows = self._read_rows(self.system_path)
+            idx = next((i for i, x in enumerate(rows) if str(x.get("id", "")) == app_id), -1)
+            if idx < 0:
+                raise KeyError(app_id)
+            row = rows[idx]
+            if expected_revision and int(row.get("submitted_revision", row.get("revision", 0)) or 0) != int(expected_revision):
+                raise RuntimeError("revision conflict")
+            decision = "published" if approve else "rejected"
+            current_status = str(row.get("status", ""))
+            if current_status == decision:
+                return self._public(row, admin=True)
+            if current_status != "pending":
+                raise RuntimeError("review decision is final")
+            row["status"] = decision
+            row["review"] = {"decision": "approved" if approve else "rejected", "note": clean_note, "reviewer": "admin", "reviewed_at": now_ts()}
+            self._append_lifecycle(
+                row,
+                action="publish" if approve else "reject",
+                from_status=current_status,
+                to_status=decision,
+                note=clean_note,
+                revision=self._lifecycle_revision(row),
+            )
+            row["updated_at"] = now_ts()
+            rows[idx] = row
+            self._write_rows(self.system_path, rows)
+        return self._public(row, admin=True)
+
+    def set_publication_status(
+        self,
+        app_id: str,
+        *,
+        publish: bool,
+        note: str = "",
+        expected_revision: int | None = None,
+        expected_lifecycle_revision: int | None = None,
+    ) -> dict:
+        clean_note = self._lifecycle_note(note)
+        if expected_revision is not None and int(expected_revision) <= 0:
+            raise ValueError("revision must be a positive integer when provided")
+        if expected_lifecycle_revision is not None and int(expected_lifecycle_revision) < 0:
+            raise ValueError("lifecycle revision must be a non-negative integer when provided")
+        with self.lock:
+            rows = self._read_rows(self.system_path)
+            idx = next((i for i, item in enumerate(rows) if str(item.get("id", "")) == app_id), -1)
+            if idx < 0:
+                raise KeyError(app_id)
+            row = rows[idx]
+            revision = self._lifecycle_revision(row)
+            if expected_revision is not None and revision != int(expected_revision):
+                raise RuntimeError("revision conflict")
+            lifecycle_revision = int(row.get("lifecycle_revision", 0) or 0)
+            if expected_lifecycle_revision is not None and lifecycle_revision != int(expected_lifecycle_revision):
+                raise RuntimeError("lifecycle revision conflict")
+            current_status = str(row.get("status", "") or "")
+            expected_status = "unpublished" if publish else "published"
+            target_status = "published" if publish else "unpublished"
+            if current_status != expected_status:
+                raise RuntimeError(f"application must be {expected_status} before this action")
+            row["status"] = target_status
+            self._append_lifecycle(
+                row,
+                action="republish" if publish else "unpublish",
+                from_status=current_status,
+                to_status=target_status,
+                note=clean_note,
+                revision=revision,
+            )
+            row["updated_at"] = now_ts()
+            rows[idx] = row
+            self._write_rows(self.system_path, rows)
+        return self._public(row, admin=True)
+
+    def resolve_launch(self, user_id: str, app_id: str) -> dict:
+        with self.lock:
+            personal = self._read_rows(self._personal_path(user_id))
+            row = next((x for x in personal if str(x.get("id", "")) == app_id and str(x.get("owner", "")) == user_id and not x.get("deleted_at")), None)
+            if row is None:
+                shared = self._read_rows(self.system_path)
+                row = next((x for x in shared if str(x.get("id", "")) == app_id and x.get("status") == "published" and not x.get("deleted_at")), None)
+            if row is None:
+                raise KeyError(app_id)
+            return dict(row)
+
+
 # Request router: serves chat APIs, admin APIs, SSE streams, asset endpoints,
 # and lightweight HTML entrypoints from one process-local handler.
 class Handler(BaseHTTPRequestHandler):
@@ -84984,6 +88093,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt: str, *args):
         return
+
+    def parse_request(self):
+        self._clouds_request_body_consumed = False
+        return super().parse_request()
 
     def handle(self):
         try:
@@ -84998,10 +88111,7 @@ class Handler(BaseHTTPRequestHandler):
         return self.server.app  # type: ignore[attr-defined]
 
     def _client_ip(self) -> str:
-        xff = self.headers.get("X-Forwarded-For", "").strip()
-        if xff:
-            return xff.split(",")[0].strip()
-        return self.client_address[0] if self.client_address else "0.0.0.0"
+        return trusted_client_ip(self)
 
     def _user_id(self) -> str:
         return user_id_from_ip(self._client_ip())
@@ -85009,16 +88119,80 @@ class Handler(BaseHTTPRequestHandler):
     def _session_mgr(self) -> SessionManager:
         return self.app.manager_for_user(self._user_id())
 
+    def _bearer_token(self) -> str:
+        auth = str(self.headers.get("Authorization", "") or "").strip()
+        if auth.lower().startswith("bearer "):
+            return auth[7:].strip()
+        return str(self.headers.get("X-Admin-Token", "") or "").strip()
+
+    def _local_admin_setup_request(self) -> bool:
+        peer = str(self.client_address[0] if getattr(self, "client_address", None) else "")
+        try:
+            if not ipaddress.ip_address(peer).is_loopback:
+                return False
+            if not ipaddress.ip_address(self._client_ip()).is_loopback:
+                return False
+        except Exception:
+            return False
+        host = str(self.headers.get("Host", "") or "").strip().lower()
+        if host.startswith("["):
+            hostname = host.split("]", 1)[0].lstrip("[")
+        else:
+            hostname = host.rsplit(":", 1)[0] if host.count(":") <= 1 else host
+        return hostname in {"localhost", "127.0.0.1", "::1"}
+
+    def _is_admin(self, query: dict | None = None) -> bool:
+        return bool(self.app.verify_admin_token(self._bearer_token()))
+
+    def _auth_error(self, exc: AdminAuthError):
+        payload = {"error": str(exc), "code": exc.code}
+        if exc.retry_after:
+            payload["retry_after"] = exc.retry_after
+        return self._send_json(payload, status=exc.status)
+
+    def _require_admin(self, query: dict | None = None) -> bool:
+        if self._is_admin(query):
+            return True
+        self._send_json({"error": "admin authentication required"}, status=401)
+        return False
+
+    def _same_origin_write(self) -> bool:
+        origin = str(self.headers.get("Origin", "") or "").strip()
+        if not origin:
+            return True
+        host = str(self.headers.get("Host", "") or "").strip()
+        parsed = urlparse(origin)
+        return bool(host and parsed.netloc == host and parsed.scheme in {"http", "https"})
+
     def _read_json(self) -> dict:
         return read_http_json_body(self)
 
-    def _send_json(self, obj: object, status: int = 200):
+    def _send_json(self, obj: object, status: int = 200, *, cors_origin: str = ""):
         body = json_response_bytes(obj)
         try:
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            if close_if_http_request_body_unread(self):
+                self.send_header("Connection", "close")
+            retry_after = int(obj.get("retry_after", 0) or 0) if isinstance(obj, dict) else 0
+            if status == 429 and retry_after > 0:
+                self.send_header("Retry-After", str(retry_after))
+            if cors_origin == "request":
+                origin = str(self.headers.get("Origin", "") or "").strip()
+                parsed = urlparse(origin)
+                host = str(parsed.hostname or "").strip().lower()
+                local_hosts = {
+                    "localhost",
+                    "127.0.0.1",
+                    "::1",
+                    str(self._client_ip() or "").strip().lower(),
+                    str(self.headers.get("Host", "") or "").split(":", 1)[0].strip().lower(),
+                }
+                if origin and parsed.scheme in {"http", "https"} and host in local_hosts:
+                    self.send_header("Access-Control-Allow-Origin", origin)
+                    self.send_header("Vary", "Origin")
             self.end_headers()
             self.wfile.write(body)
         except Exception as exc:
@@ -85134,6 +88308,12 @@ class Handler(BaseHTTPRequestHandler):
         stats_only = _to_bool_like((query.get("stats", ["0"]) or ["0"])[0], default=False)
         if path == "/":
             return self._send_text(self.app.web_ui_agent_index_html(), "text/html; charset=utf-8")
+        if path == "/admin":
+            return self._send_text(ADMIN_INDEX_HTML, "text/html; charset=utf-8")
+        if path == "/assets/admin.css":
+            return self._send_text(ADMIN_CSS, "text/css; charset=utf-8", revalidate_cache=True)
+        if path == "/assets/admin.js":
+            return self._send_text(ADMIN_JS, "application/javascript; charset=utf-8", revalidate_cache=True)
         if path == "/assets/style.css":
             return self._send_text(
                 self.app.web_ui_agent_style_css(),
@@ -85153,7 +88333,60 @@ class Handler(BaseHTTPRequestHandler):
                 revalidate_cache=True,
             )
         if path == "/api/health":
-            return self._send_json({"ok": True, "version": APP_VERSION, "workspace": str(WORKDIR)})
+            requested_nonce = str((query.get("restart_nonce", [""]) or [""])[0] or "").strip()
+            requested_from = str((query.get("restart_from", [""]) or [""])[0] or "").strip()
+            inherited_nonce = str(os.getenv("CLOUDS_CODER_RESTART_NONCE", "") or "").strip()
+            inherited_from = str(os.getenv("CLOUDS_CODER_RESTART_FROM_BOOT_ID", "") or "").strip()
+            restart_verified = bool(
+                requested_nonce
+                and requested_from
+                and inherited_nonce
+                and inherited_from
+                and hmac.compare_digest(requested_nonce, inherited_nonce)
+                and hmac.compare_digest(requested_from, inherited_from)
+            )
+            return self._send_json({
+                "ok": True,
+                "version": APP_VERSION,
+                "workspace": str(WORKDIR),
+                "boot_id": str(getattr(self.app.telemetry, "boot_id", "") or ""),
+                "restart_verified": restart_verified,
+            }, cors_origin="request" if requested_nonce or requested_from else "")
+        if path == "/api/admin/auth/status":
+            return self._send_json(
+                self.app.admin_auth_status(local_setup_allowed=self._local_admin_setup_request())
+            )
+        if path == "/api/admin/auth/session":
+            kind = self.app.verify_admin_token(self._bearer_token())
+            if not kind:
+                return self._send_json({"error": "admin authentication required", "code": "unauthorized"}, status=401)
+            return self._send_json({"ok": True, "auth_kind": kind})
+        if path == "/api/apps/skills":
+            return self._send_json(self.app.applications.skill_catalog())
+        if path == "/api/apps/personal":
+            return self._send_json(self.app.applications.list_personal(self._user_id()))
+        if path == "/api/apps/shared":
+            return self._send_json(self.app.applications.list_shared())
+        if path == "/api/admin/config":
+            if not self._require_admin(query):
+                return
+            return self._send_json(self.app.admin_config_payload())
+        if path == "/api/admin/metrics":
+            if not self._require_admin(query):
+                return
+            try:
+                hours = float((query.get("hours", ["24"]) or ["24"])[0])
+            except Exception:
+                hours = 24.0
+            user_hash = str((query.get("user_hash", [""]) or [""])[0] or "").strip().lower()
+            if user_hash and not re.fullmatch(r"(?:[0-9a-f]{16}|[0-9a-f]{24}|[0-9a-f]{32}|[0-9a-f]{64})", user_hash):
+                return self._send_json({"error": "invalid anonymous user hash"}, status=400)
+            return self._send_json(self.app.telemetry.dashboard(self.app, hours, user_hash=user_hash))
+        if path == "/api/admin/apps":
+            if not self._require_admin(query):
+                return
+            status = str((query.get("status", [""]) or [""])[0] or "")
+            return self._send_json(self.app.applications.list_admin(status))
         if path == "/api/webui/validate":
             reload_external = _to_bool_like((query.get("reload", ["0"]) or ["0"])[0], default=False)
             return self._send_json(self.app.refresh_web_ui_validation(reload_external=reload_external))
@@ -85636,7 +88869,196 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = unquote(urlparse(self.path).path)
+        if not self._same_origin_write():
+            return self._send_json({"error": "cross-origin write rejected"}, status=403)
+        if path in {
+            "/api/admin/auth/setup",
+            "/api/admin/auth/login",
+            "/api/admin/auth/token-login",
+            "/api/admin/auth/logout",
+        }:
+            content_type = str(self.headers.get("Content-Type", "") or "").split(";", 1)[0].strip().lower()
+            if content_type != "application/json":
+                return self._send_json({"error": "application/json is required", "code": "invalid_content_type"}, status=415)
+            try:
+                length = int(self.headers.get("Content-Length", "0") or "0")
+            except Exception:
+                length = 0
+            if length < 0 or length > 8192:
+                self.close_connection = True
+                return self._send_json({"error": "authentication request is too large", "code": "payload_too_large"}, status=413)
+            try:
+                payload = self._read_json()
+                if path == "/api/admin/auth/setup":
+                    out = self.app.setup_admin(
+                        payload.get("username"),
+                        payload.get("password"),
+                        local_setup_allowed=self._local_admin_setup_request(),
+                        bootstrap_token=self._bearer_token(),
+                    )
+                    return self._send_json(out, status=201)
+                if path == "/api/admin/auth/login":
+                    return self._send_json(
+                        self.app.login_admin(payload.get("username"), payload.get("password"), self._client_ip())
+                    )
+                if path == "/api/admin/auth/token-login":
+                    return self._send_json(self.app.exchange_admin_token(self._bearer_token()))
+                token = self._bearer_token()
+                if token:
+                    self.app.logout_admin(token)
+                return self._send_json({"ok": True})
+            except AdminAuthError as exc:
+                return self._auth_error(exc)
+            except Exception:
+                return self._send_json({"error": "invalid authentication request", "code": "invalid_request"}, status=400)
         mgr = self._session_mgr()
+        if path == "/api/apps/personal":
+            try:
+                return self._send_json(self.app.applications.save_personal(self._user_id(), self._read_json()), status=201)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        m = re.match(r"^/api/apps/([^/]+)/submit$", path)
+        if m:
+            try:
+                return self._send_json(self.app.applications.submit(self._user_id(), m.group(1)), status=201)
+            except KeyError:
+                return self._send_json({"error": "application not found"}, status=404)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        m = re.match(r"^/api/apps/([^/]+)/launch$", path)
+        if m:
+            payload = self._read_json()
+            try:
+                out = self.app.launch_application_for_user(
+                    self._user_id(), m.group(1), title=str(payload.get("title", "") or ""),
+                    prompt=str(payload.get("prompt", "") or ""), client_ip=self._client_ip(),
+                )
+                return self._send_json(out, status=201)
+            except KeyError:
+                return self._send_json({"error": "application not found"}, status=404)
+            except SessionCreationLimitExceeded as exc:
+                return self._send_json({"error": str(exc), "session_creation_limit": dict(exc.status or {})}, status=429)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        if path == "/api/admin/config":
+            if not self._require_admin():
+                return
+            payload = self._read_json()
+            out = self.app.save_admin_config(
+                payload.get("values", payload), set_default=bool(payload.get("set_default", False)),
+                expected_revision=str(payload.get("revision", "") or ""),
+            )
+            return self._send_json(out, status=200 if out.get("ok") else (409 if out.get("conflict") else 400))
+        if path == "/api/admin/config/reset":
+            if not self._require_admin():
+                return
+            payload = self._read_json()
+            out = self.app.reset_admin_config(str(payload.get("target", "initial") or "initial"))
+            return self._send_json(out, status=200 if out.get("ok") else 400)
+        if path == "/api/admin/restart":
+            if not self._require_admin():
+                return
+            payload = self._read_json()
+            cfg = self.app.admin_config_payload().get("draft", {})
+            clean, errors = _admin_coerce_config(cfg)
+            clean.pop("_effective_ports", None)
+            if errors:
+                return self._send_json({"error": "invalid startup config", "errors": errors}, status=400)
+            trigger = getattr(self.app, "restart_callback", None)
+            if not callable(trigger):
+                return self._send_json({"error": "restart controller is unavailable"}, status=503)
+            accepted, restart_state = self.app.claim_admin_restart(
+                clean,
+                expected_boot_id=str(payload.get("boot_id", "") or ""),
+            )
+            if not accepted:
+                error = "restart request targets a stale server boot" if restart_state == "boot_conflict" else "restart is already pending"
+                return self._send_json({"error": error, "boot_id": str(getattr(self.app.telemetry, "boot_id", "") or "")}, status=409)
+            self._send_json(
+                {
+                    "ok": True,
+                    "restarting": True,
+                    "argv": _admin_config_to_argv(clean),
+                    "boot_id": str(getattr(self.app.telemetry, "boot_id", "") or ""),
+                    "restart_nonce": restart_state,
+                    "target": {"host": str(clean.get("host", "") or ""), "port": int(clean.get("port", 0) or 0)},
+                },
+                status=202,
+            )
+            try:
+                self.wfile.flush()
+            except Exception:
+                pass
+            trigger()
+            return
+        if path == "/api/admin/apps":
+            if not self._require_admin():
+                return
+            try:
+                return self._send_json(self.app.applications.create_shared(self._read_json()), status=201)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        m = re.match(r"^/api/admin/apps/([^/]+)/(approve|reject)$", path)
+        if m:
+            if not self._require_admin():
+                return
+            payload = self._read_json()
+            try:
+                revision = int(payload.get("revision", 0) or 0)
+            except Exception:
+                revision = 0
+            if revision <= 0:
+                return self._send_json({"error": "a positive submitted revision is required"}, status=400)
+            try:
+                out = self.app.applications.review(
+                    m.group(1), m.group(2) == "approve", str(payload.get("note", "") or ""),
+                    revision,
+                )
+                return self._send_json(out)
+            except KeyError:
+                return self._send_json({"error": "application not found"}, status=404)
+            except RuntimeError as exc:
+                return self._send_json({"error": str(exc)}, status=409)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        m = re.match(r"^/api/admin/apps/([^/]+)/(unpublish|republish)$", path)
+        if m:
+            if not self._require_admin():
+                return
+            payload = self._read_json()
+            revision: int | None = None
+            lifecycle_revision: int | None = None
+            if "revision" in payload and payload.get("revision") not in {None, ""}:
+                try:
+                    revision = int(payload.get("revision"))
+                except Exception:
+                    return self._send_json({"error": "revision must be a positive integer"}, status=400)
+                if revision <= 0:
+                    return self._send_json({"error": "revision must be a positive integer"}, status=400)
+            if "lifecycle_revision" in payload and payload.get("lifecycle_revision") not in {None, ""}:
+                try:
+                    lifecycle_revision = int(payload.get("lifecycle_revision"))
+                except Exception:
+                    return self._send_json({"error": "lifecycle revision must be a non-negative integer"}, status=400)
+                if lifecycle_revision < 0:
+                    return self._send_json({"error": "lifecycle revision must be a non-negative integer"}, status=400)
+            try:
+                out = self.app.applications.set_publication_status(
+                    m.group(1),
+                    publish=m.group(2) == "republish",
+                    note=str(payload.get("note", "") or ""),
+                    expected_revision=revision,
+                    expected_lifecycle_revision=lifecycle_revision,
+                )
+                return self._send_json(out)
+            except KeyError:
+                return self._send_json({"error": "application not found"}, status=404)
+            except RuntimeError as exc:
+                return self._send_json({"error": str(exc)}, status=409)
+            except ValueError as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=500)
         if path == "/api/config/model":
             payload = self._read_json()
             model = str(payload.get("selection", payload.get("model", ""))).strip()
@@ -85672,6 +89094,8 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 return self._send_json({"error": str(exc)}, status=400)
         if path == "/api/webui/export":
+            if not self._require_admin():
+                return
             payload = self._read_json()
             ui_dir_raw = str(payload.get("dir", "") or "").strip()
             overwrite = bool(payload.get("overwrite", False))
@@ -85919,6 +89343,18 @@ class Handler(BaseHTTPRequestHandler):
     def do_PATCH(self):
         path = unquote(urlparse(self.path).path)
         mgr = self._session_mgr()
+        if not self._same_origin_write():
+            return self._send_json({"error": "cross-origin write rejected"}, status=403)
+        m = re.match(r"^/api/apps/([^/]+)$", path)
+        if m:
+            try:
+                return self._send_json(self.app.applications.save_personal(self._user_id(), self._read_json(), app_id=m.group(1)))
+            except KeyError:
+                return self._send_json({"error": "application not found"}, status=404)
+            except PermissionError:
+                return self._send_json({"error": "forbidden"}, status=403)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
         m = re.match(r"^/api/sessions/([^/]+)$", path)
         if not m:
             return self._send_json({"error": "not found"}, status=404)
@@ -85936,6 +89372,12 @@ class Handler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         path = unquote(urlparse(self.path).path)
         mgr = self._session_mgr()
+        if not self._same_origin_write():
+            return self._send_json({"error": "cross-origin write rejected"}, status=403)
+        m = re.match(r"^/api/apps/([^/]+)$", path)
+        if m:
+            ok = self.app.applications.delete_personal(self._user_id(), m.group(1))
+            return self._send_json({"ok": True}) if ok else self._send_json({"error": "application not found"}, status=404)
         m = re.match(r"^/api/sessions/([^/]+)$", path)
         if not m:
             return self._send_json({"error": "not found"}, status=404)
@@ -86004,6 +89446,10 @@ class SkillsHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args):
         return
 
+    def parse_request(self):
+        self._clouds_request_body_consumed = False
+        return super().parse_request()
+
     def handle(self):
         try:
             super().handle()
@@ -86017,10 +89463,7 @@ class SkillsHandler(BaseHTTPRequestHandler):
         return self.server.app  # type: ignore[attr-defined]
 
     def _client_ip(self) -> str:
-        xff = self.headers.get("X-Forwarded-For", "").strip()
-        if xff:
-            return xff.split(",")[0].strip()
-        return self.client_address[0] if self.client_address else "0.0.0.0"
+        return trusted_client_ip(self)
 
     def _user_id(self) -> str:
         return user_id_from_ip(self._client_ip())
@@ -86031,6 +89474,19 @@ class SkillsHandler(BaseHTTPRequestHandler):
     def _read_json(self) -> dict:
         return read_http_json_body(self)
 
+    def _is_admin(self) -> bool:
+        auth = str(self.headers.get("Authorization", "") or "").strip()
+        token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+        if not token:
+            token = str(self.headers.get("X-Admin-Token", "") or "").strip()
+        return bool(self.app.verify_admin_token(token))
+
+    def _require_admin(self) -> bool:
+        if self._is_admin():
+            return True
+        self._send_json({"error": "admin authentication required"}, status=401)
+        return False
+
     def _send_json(self, obj: object, status: int = 200):
         body = json_response_bytes(obj)
         try:
@@ -86038,6 +89494,8 @@ class SkillsHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            if close_if_http_request_body_unread(self):
+                self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(body)
         except Exception as exc:
@@ -86129,6 +89587,13 @@ class SkillsHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = unquote(urlparse(self.path).path)
         mgr = self._session_mgr()
+        if path in {"/api/webui/export", "/api/skillslab/generate", "/api/skillslab/save", "/api/skillslab/upload"}:
+            origin = str(self.headers.get("Origin", "") or "").strip()
+            parsed = urlparse(origin)
+            if origin and (parsed.scheme not in {"http", "https"} or parsed.netloc != str(self.headers.get("Host", "") or "")):
+                return self._send_json({"error": "cross-origin write rejected"}, status=403)
+            if not self._require_admin():
+                return
         if path == "/api/webui/export":
             payload = self._read_json()
             ui_dir_raw = str(payload.get("dir", "") or "").strip()
@@ -86207,6 +89672,10 @@ class RagAdminHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args):
         return
 
+    def parse_request(self):
+        self._clouds_request_body_consumed = False
+        return super().parse_request()
+
     def handle(self):
         try:
             super().handle()
@@ -86220,16 +89689,24 @@ class RagAdminHandler(BaseHTTPRequestHandler):
         return self.server.app  # type: ignore[attr-defined]
 
     def _client_ip(self) -> str:
-        xff = self.headers.get("X-Forwarded-For", "").strip()
-        if xff:
-            return xff.split(",")[0].strip()
-        return self.client_address[0] if self.client_address else "0.0.0.0"
+        return trusted_client_ip(self)
 
     def _user_id(self) -> str:
         return user_id_from_ip(self._client_ip())
 
     def _read_json(self) -> dict:
         return read_http_json_body(self)
+
+    def _require_admin_write(self) -> bool:
+        auth = str(self.headers.get("Authorization", "") or "").strip()
+        token = auth[7:].strip() if auth.lower().startswith("bearer ") else str(self.headers.get("X-Admin-Token", "") or "").strip()
+        origin = str(self.headers.get("Origin", "") or "").strip()
+        parsed = urlparse(origin)
+        same_origin = not origin or (parsed.scheme in {"http", "https"} and parsed.netloc == str(self.headers.get("Host", "") or ""))
+        if self.app.verify_admin_token(token) and same_origin:
+            return True
+        self._send_json({"error": "admin authentication and same-origin request required"}, status=401)
+        return False
 
     def _send_json(self, obj: object, status: int = 200):
         body = json_response_bytes(obj)
@@ -86238,6 +89715,8 @@ class RagAdminHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            if close_if_http_request_body_unread(self):
+                self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(body)
         except Exception as exc:
@@ -86252,6 +89731,8 @@ class RagAdminHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            if close_if_http_request_body_unread(self):
+                self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(body)
         except Exception as exc:
@@ -86340,6 +89821,8 @@ class RagAdminHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = unquote(urlparse(self.path).path)
+        if not self._require_admin_write():
+            return
         if path == "/api/rag/import":
             try:
                 out = self.app.rag_import_request(self._user_id(), self._read_json())
@@ -86374,6 +89857,10 @@ class CodeAdminHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args):
         return
 
+    def parse_request(self):
+        self._clouds_request_body_consumed = False
+        return super().parse_request()
+
     def handle(self):
         try:
             super().handle()
@@ -86387,16 +89874,24 @@ class CodeAdminHandler(BaseHTTPRequestHandler):
         return self.server.app  # type: ignore[attr-defined]
 
     def _client_ip(self) -> str:
-        xff = self.headers.get("X-Forwarded-For", "").strip()
-        if xff:
-            return xff.split(",")[0].strip()
-        return self.client_address[0] if self.client_address else "0.0.0.0"
+        return trusted_client_ip(self)
 
     def _user_id(self) -> str:
         return user_id_from_ip(self._client_ip())
 
     def _read_json(self) -> dict:
         return read_http_json_body(self)
+
+    def _require_admin_write(self) -> bool:
+        auth = str(self.headers.get("Authorization", "") or "").strip()
+        token = auth[7:].strip() if auth.lower().startswith("bearer ") else str(self.headers.get("X-Admin-Token", "") or "").strip()
+        origin = str(self.headers.get("Origin", "") or "").strip()
+        parsed = urlparse(origin)
+        same_origin = not origin or (parsed.scheme in {"http", "https"} and parsed.netloc == str(self.headers.get("Host", "") or ""))
+        if self.app.verify_admin_token(token) and same_origin:
+            return True
+        self._send_json({"error": "admin authentication and same-origin request required"}, status=401)
+        return False
 
     def _send_json(self, obj: object, status: int = 200):
         body = json_response_bytes(obj)
@@ -86405,6 +89900,8 @@ class CodeAdminHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            if close_if_http_request_body_unread(self):
+                self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(body)
         except Exception as exc:
@@ -86419,6 +89916,8 @@ class CodeAdminHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            if close_if_http_request_body_unread(self):
+                self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(body)
         except Exception as exc:
@@ -86513,6 +90012,8 @@ class CodeAdminHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = unquote(urlparse(self.path).path)
+        if not self._require_admin_write():
+            return
         if path == "/api/code/import":
             try:
                 out = self.app.code_import_request(self._user_id(), self._read_json())
@@ -86559,6 +90060,10 @@ class IdeHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args):
         return
 
+    def parse_request(self):
+        self._clouds_request_body_consumed = False
+        return super().parse_request()
+
     def handle(self):
         try:
             super().handle()
@@ -86572,16 +90077,24 @@ class IdeHandler(BaseHTTPRequestHandler):
         return self.server.app  # type: ignore[attr-defined]
 
     def _client_ip(self) -> str:
-        xff = self.headers.get("X-Forwarded-For", "").strip()
-        if xff:
-            return xff.split(",")[0].strip()
-        return self.client_address[0] if self.client_address else "0.0.0.0"
+        return trusted_client_ip(self)
 
     def _user_id(self) -> str:
         return user_id_from_ip(self._client_ip())
 
     def _read_json(self) -> dict:
         return read_http_json_body(self)
+
+    def _require_admin_write(self) -> bool:
+        auth = str(self.headers.get("Authorization", "") or "").strip()
+        token = auth[7:].strip() if auth.lower().startswith("bearer ") else str(self.headers.get("X-Admin-Token", "") or "").strip()
+        origin = str(self.headers.get("Origin", "") or "").strip()
+        parsed = urlparse(origin)
+        same_origin = not origin or (parsed.scheme in {"http", "https"} and parsed.netloc == str(self.headers.get("Host", "") or ""))
+        if self.app.verify_admin_token(token) and same_origin:
+            return True
+        self._send_json({"error": "admin authentication and same-origin request required"}, status=401)
+        return False
 
     def _send_json(self, obj: object, status: int = 200):
         body = json_response_bytes(obj)
@@ -86590,6 +90103,8 @@ class IdeHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            if close_if_http_request_body_unread(self):
+                self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(body)
         except Exception as exc:
@@ -86634,6 +90149,8 @@ class IdeHandler(BaseHTTPRequestHandler):
             return self._send_json({"error": str(exc) or "not found"}, status=404)
         if isinstance(exc, FileExistsError):
             return self._send_json({"error": str(exc) or "already exists"}, status=409)
+        if isinstance(exc, PermissionError):
+            return self._send_json({"error": str(exc) or "forbidden"}, status=403)
         if isinstance(exc, (ValueError, IsADirectoryError, NotADirectoryError)):
             return self._send_json({"error": str(exc)}, status=400)
         return self._send_json({"error": str(exc)}, status=500)
@@ -86712,6 +90229,8 @@ class IdeHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = unquote(urlparse(self.path).path)
+        if not self._require_admin_write():
+            return
         if path == "/api/ide/sessions":
             payload = self._read_json()
             try:
@@ -86777,6 +90296,8 @@ class IdeHandler(BaseHTTPRequestHandler):
 
     def do_PUT(self):
         path = unquote(urlparse(self.path).path)
+        if not self._require_admin_write():
+            return
         m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/file$", path)
         if not m:
             return self._send_json({"error": "not found"}, status=404)
@@ -86787,6 +90308,8 @@ class IdeHandler(BaseHTTPRequestHandler):
 
     def do_PATCH(self):
         path = unquote(urlparse(self.path).path)
+        if not self._require_admin_write():
+            return
         m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/rename$", path)
         if not m:
             return self._send_json({"error": "not found"}, status=404)
@@ -86797,6 +90320,8 @@ class IdeHandler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         path = unquote(urlparse(self.path).path)
+        if not self._require_admin_write():
+            return
         if path == "/api/ide/mounts":
             try:
                 payload = self._read_json()
@@ -86826,6 +90351,10 @@ class McpServiceHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args):
         return
 
+    def parse_request(self):
+        self._clouds_request_body_consumed = False
+        return super().parse_request()
+
     def handle(self):
         try:
             super().handle()
@@ -86844,6 +90373,17 @@ class McpServiceHandler(BaseHTTPRequestHandler):
     def _read_json(self) -> dict:
         return read_http_json_body(self)
 
+    def _require_admin_write(self) -> bool:
+        auth = str(self.headers.get("Authorization", "") or "").strip()
+        token = auth[7:].strip() if auth.lower().startswith("bearer ") else str(self.headers.get("X-Admin-Token", "") or "").strip()
+        origin = str(self.headers.get("Origin", "") or "").strip()
+        parsed = urlparse(origin)
+        same_origin = not origin or (parsed.scheme in {"http", "https"} and parsed.netloc == str(self.headers.get("Host", "") or ""))
+        if self.app.verify_admin_token(token) and same_origin:
+            return True
+        self._send_json({"error": "admin authentication and same-origin request required"}, status=401)
+        return False
+
     def _send_json(self, obj: object, status: int = 200):
         body = json_response_bytes(obj)
         try:
@@ -86851,6 +90391,8 @@ class McpServiceHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            if close_if_http_request_body_unread(self):
+                self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(body)
         except Exception as exc:
@@ -86923,6 +90465,8 @@ class McpServiceHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = unquote(urlparse(self.path).path)
+        if not self._require_admin_write():
+            return
         mgr = self._mgr()
         if mgr is None:
             return self._send_json({"error": "mcp manager unavailable"}, status=503)
@@ -87422,6 +90966,21 @@ def main():
         web_search_enabled=None,
         user_memory_mode=None,
     )
+    skip_admin_defaults = str(os.environ.pop("CLOUDS_CODER_SKIP_ADMIN_DEFAULTS", "") or "").strip().lower() in {"1", "true", "yes", "on"}
+    admin_default_keys: set[str] = set()
+    if not skip_admin_defaults:
+        stored_admin = _read_json_file(WORKDIR / ADMIN_STATE_DIRNAME / ADMIN_CONFIG_FILENAME, {})
+        stored_defaults = stored_admin.get("defaults") if isinstance(stored_admin, dict) else None
+        if isinstance(stored_defaults, dict):
+            schema_keys = {str(spec["key"]) for spec in _admin_config_schema()}
+            admin_default_keys = {
+                str(key) for key in stored_defaults.keys()
+                if str(key) in schema_keys
+            }
+            clean_defaults, default_errors = _admin_coerce_config(stored_defaults)
+            clean_defaults.pop("_effective_ports", None)
+            if not default_errors:
+                parser.set_defaults(**_admin_argparse_defaults(clean_defaults))
     args = parser.parse_args()
     web_ui_config_path = resolve_optional_file_path(str(getattr(args, "web_ui_config", "") or ""), WORKDIR)
     web_ui_config = load_web_ui_config_file(web_ui_config_path)
@@ -87618,7 +91177,7 @@ def main():
     ctx_limit_locked = any(
         str(arg).split("=", 1)[0] in {"--ctx_limit", "--ctx-limit"}
         for arg in sys.argv[1:]
-    )
+    ) or "ctx_limit" in admin_default_keys
     requested_ctx_limit = int(args.ctx_limit or DEFAULT_CONTEXT_TOKEN_LIMIT)
     if not ctx_limit_locked:
         cfg_ctx_limit = extract_context_token_limit_setting(external_config)
@@ -87958,6 +91517,53 @@ def main():
     rag_admin_port = int(args.rag_admin_port) if args.rag_admin_port is not None else int(args.port) + RAG_ADMIN_PORT_OFFSET
     code_admin_port = int(args.code_admin_port) if args.code_admin_port is not None else int(args.port) + CODE_ADMIN_PORT_OFFSET
     ide_port = int(args.ide_port) if getattr(args, "ide_port", None) is not None else int(args.port) + IDE_PORT_OFFSET
+    active_admin_config = _admin_config_from_namespace(args)
+    active_admin_config.update({
+        "host": str(args.host),
+        "port": int(args.port),
+        "skills_port": int(skills_port),
+        "rag_admin_port": int(rag_admin_port),
+        "code_admin_port": int(code_admin_port),
+        "mcp_service_port": int(args.mcp_service_port) if getattr(args, "mcp_service_port", None) is not None else int(args.port) + MCP_SERVICE_PORT_OFFSET,
+        "ide_port": int(ide_port),
+        "ctx_limit": int(resolved_ctx_limit),
+        "max_rounds": int(resolved_max_rounds),
+        "run_timeout": int(resolved_run_timeout),
+        "shell_command_timeout": int(resolved_shell_command_timeout),
+        "live_input_delay_write": int(resolved_live_input_delay_write),
+        "live_input_delay_tool": int(resolved_live_input_delay_tool),
+        "live_input_delay_normal": int(resolved_live_input_delay_normal),
+        "live_input_max_injections": int(resolved_live_input_max_injections),
+        "live_input_reinject_interval": int(resolved_live_input_reinject_interval),
+        "live_input_weight_base_delayed": float(resolved_live_input_weight_base_delayed),
+        "live_input_weight_base_normal": float(resolved_live_input_weight_base_normal),
+        "live_input_weight_step_delayed": float(resolved_live_input_weight_step_delayed),
+        "live_input_weight_step_normal": float(resolved_live_input_weight_step_normal),
+        "skills_root": str(skills_root),
+        "web_ui_config": str(web_ui_config_path),
+        "web_ui_dir": str(resolved_web_ui_dir),
+        "language": str(resolved_language),
+        "ui_style": str(resolved_ui_style),
+        "read_context_policy": str(resolved_read_context_policy),
+        "tool_memory_policy": str(resolved_tool_memory_policy),
+        "user_memory_mode": str(resolved_user_memory_mode),
+        "auto_task_level_ceiling": int(resolved_auto_task_level_ceiling),
+        "daily_session_limit_per_ip": int(resolved_daily_session_limit_per_ip),
+        "ollama_base_url": str(bootstrap_base_url),
+        "model": str(resolved_model),
+        "auto_model_switch": bool(resolved_auto_model_switch),
+        "arbiter_enabled": bool(resolved_arbiter_enabled),
+        "arbiter_model": str(resolved_arbiter_model),
+        "arbiter_timeout": float(resolved_arbiter_timeout),
+        "arbiter_max_tokens": int(resolved_arbiter_max_tokens),
+        "arbiter_temperature": float(resolved_arbiter_temperature),
+        "execution_mode": str(resolved_execution_mode),
+        "max_output_tokens": int(resolved_max_output_tokens),
+        "max_user": int(resolved_max_user),
+        "max_user_sessions": int(resolved_max_user_sessions),
+        "rag_file_name": bool(resolved_rag_include_filename_entities),
+    })
+    app.configure_admin_runtime(active_admin_config)
     setattr(app, "agent_port", int(args.port))
     setattr(app, "skills_port", int(skills_port))
     setattr(app, "skills_ui_enabled", False)
@@ -87968,6 +91574,16 @@ def main():
     setattr(app, "ide_port", int(ide_port))
     setattr(app, "ide_enabled", False)
     server = AgentHTTPServer((args.host, args.port), Handler, app)
+
+    def _request_admin_restart() -> None:
+        def _shutdown_after_response():
+            # Give the HTTP worker a short window to flush the 202 response.
+            time.sleep(0.15)
+            server.shutdown()
+
+        threading.Thread(target=_shutdown_after_response, name="admin-restart-shutdown", daemon=True).start()
+
+    app.restart_callback = _request_admin_restart
     skills_server = None
     skills_thread = None
     if args.no_skills_ui:
@@ -88123,6 +91739,7 @@ def main():
         except Exception as exc:
             print(f"[web-agent] MCP service failed to start on {args.host}:{mcp_service_port}: {exc}")
     print(f"[web-agent] workspace={WORKDIR}")
+    print(f"[admin] token_file={app.admin_token_path}")
     print(f"[web-agent] repo_root={REPO_ROOT}")
     print(f"[web-agent] codes_root={app.codes_root}")
     migration = getattr(app, "workspace_migration", {}) if hasattr(app, "workspace_migration") else {}
@@ -88261,6 +91878,7 @@ def main():
         lan_ip = detect_local_lan_ip()
         print("[web-agent] bind=all interfaces")
         print(f"[web-agent] open local: http://127.0.0.1:{args.port}")
+        print(f"[admin] open local: http://127.0.0.1:{args.port}/admin")
         print(f"[web-agent] open lan:   http://{lan_ip}:{args.port}")
         if skills_server:
             print(f"[skills-studio] open local: http://127.0.0.1:{skills_port}")
@@ -88279,6 +91897,7 @@ def main():
             print(f"[mcp-service] open lan:   http://{lan_ip}:{mcp_service_port}")
     else:
         print(f"[web-agent] open http://{args.host}:{args.port}")
+        print(f"[admin] open http://{args.host}:{args.port}/admin")
         if skills_server:
             print(f"[skills-studio] open http://{args.host}:{skills_port}")
         if rag_admin_server:
@@ -88362,6 +91981,18 @@ def main():
                 pass
         app.shutdown_services()
         server.server_close()
+    if app.restart_pending and isinstance(app.restart_config, dict):
+        restart_argv = _admin_config_to_argv(app.restart_config)
+        restart_env = os.environ.copy()
+        restart_env["CLOUDS_CODER_SKIP_ADMIN_DEFAULTS"] = "1"
+        restart_env["CLOUDS_CODER_RESTART_NONCE"] = str(app.restart_nonce or "")
+        restart_env["CLOUDS_CODER_RESTART_FROM_BOOT_ID"] = str(app.restart_from_boot_id or "")
+        print("[web-agent] restarting with Admin startup config")
+        os.execve(
+            sys.executable,
+            [sys.executable, str(Path(__file__).resolve()), *restart_argv],
+            restart_env,
+        )
 
 if __name__ == "__main__":
     main()
