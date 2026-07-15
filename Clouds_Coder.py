@@ -64,6 +64,19 @@ APP_VERSION = "0.1.1"
 DEFAULT_OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 DEFAULT_OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:7b")
 SCRIPT_DIR = Path(__file__).resolve().parent
+ADMIN_STATE_DIRNAME = ".clouds_coder_admin"
+ADMIN_CONFIG_FILENAME = "startup_config.json"
+ADMIN_APPS_FILENAME = "shared_apps.json"
+ADMIN_TELEMETRY_FILENAME = "telemetry.sqlite"
+ADMIN_AUTH_FILENAME = "auth.sqlite"
+ADMIN_MAX_APP_SKILLS = 8
+ADMIN_MAX_APP_CAPSULE_CHARS = 12_000
+ADMIN_MAX_APP_RESOURCE_FILES = 128
+ADMIN_MAX_APP_RESOURCE_BYTES = 64_000_000
+ADMIN_APP_INLINE_BLOB_BYTES = 256_000
+ADMIN_AUTH_SESSION_TTL_SECONDS = 12 * 60 * 60
+ADMIN_AUTH_PASSWORD_ITERATIONS = 600_000
+ADMIN_AUTH_MAX_ACTIVE_SESSIONS = 32
 
 # ============================================================================
 # Architecture / 架构 / アーキテクチャ
@@ -841,7 +854,7 @@ TASK_PHASE_ROUTING = {
     "research": "explorer",
     "design": "developer",
     "implement": "developer",
-    "test": "developer",
+    "test": "reviewer",
     "review": "reviewer",
     "deploy": "developer",
 }
@@ -872,7 +885,12 @@ USER_COMPLEXITY_EXPERT_TOKENS = (
     "expert", "advanced", "system-level", "production-ready", "enterprise", "mission-critical",
     "l5",
 )
-PLAN_MODE_EXPLORER_MAX_ROUNDS = 8
+# Planning research is a bounded evidence pass, not a second implementation
+# phase. Three productive rounds are enough to inspect local constraints and
+# hand concrete findings to synthesis; stalled/duplicate rounds stop earlier.
+PLAN_MODE_EXPLORER_MAX_ROUNDS = 4
+PLAN_MODE_EXPLORER_PRODUCTIVE_ROUNDS = 3
+PLAN_MODE_EXPLORER_STALE_ROUNDS = 2
 PLAN_MODE_SYNTHESIS_MAX_ATTEMPTS = 3
 # Reviewer debug mode
 REVIEWER_DEBUG_MODE_MAX_ROUNDS = 6
@@ -1089,6 +1107,27 @@ WEB_UI_REQUIRED_FILES = (
     "skills-extra.css",
 )
 WEB_UI_OPTIONAL_FILES = ("app.ts",)
+WEB_UI_APPLICATION_CONTRACT_VERSION = "clouds-coder-app-store-v1"
+WEB_UI_APPLICATION_FEATURE_MARKERS = {
+    "index.html": (
+        WEB_UI_APPLICATION_CONTRACT_VERSION,
+        'id="appsSideTab"',
+        'id="personalAppsTab"',
+        'id="sharedAppsTab"',
+        'id="applicationEditor"',
+        'id="applicationSkillSearch"',
+    ),
+    "app.js": (
+        WEB_UI_APPLICATION_CONTRACT_VERSION,
+        "/api/apps/personal",
+        "/api/apps/shared",
+        "/api/apps/skills",
+        "/submit",
+        "/launch",
+        "openApplicationEditor",
+        "saveApplication",
+    ),
+}
 
 IMAGE_EXTS = {
     ".png",
@@ -1968,7 +2007,7 @@ BACKEND_I18N["en"].update(
         "plan_bubble_risk": "Risk: {risk}",
         "plan_bubble_full_ref": "Full plan: `{path}`",
         "plan_bubble_reply": 'Reply with a choice (e.g. "Option A", "A", "choose 1"), or provide revisions.',
-        "plan_read_instruction": "Plan approved. Read `{path}` with `read_file {path}` for the authoritative step order and live status.\nExecute steps in order, finish the current step before advancing, and load any referenced skill or workflow before starting.",
+        "plan_read_instruction": "Plan approved. `{path}` is a read-only execution mirror; use it to inspect step order and current status.\nRuntime todos and tool-evidence events remain authoritative. Execute steps in order, finish the current step before advancing, and load any referenced skill or workflow before starting.",
         "plan_read_todo_note": "\nTODO PLANNING: At the START of your work, call TodoWrite to list ALL subtasks you plan to complete for {step_label} (status=pending, parent_step_id='{parent_step_id}'). Create 3-6 subtasks for THIS step ONLY; the final subtask must be an Acceptance item that states the check action and evidence shape. Do NOT list subtasks for other plan steps. BEFORE changing or adding subtasks: first READ the CANONICAL SUBTASKS list returned by your last TodoWrite (or the current todo list), THINK about how the new work fits the existing numbered items, and only THEN write — reuse the existing N.M items, do not renumber them yourself and do not restate an item as new free text (the runtime assigns canonical N.M numbering and one unnumbered Acceptance row for you). If subtasks already exist for this step, continue the current in_progress subtask first instead of replacing it. After EACH completed subtask, immediately call TodoWrite again to mark it completed and move the next subtask to in_progress. Do NOT wait until the end of the step to update todos. Do NOT call finish_current_task for a subtask or a single plan step; finish tools are reserved for the overall user task.\n",
         "plan_proposal_title": "## 📋 Execution Plans\n",
         "plan_proposal_background": "### Background Analysis\n{context}\n",
@@ -2062,7 +2101,7 @@ BACKEND_I18N["zh-CN"].update(
         "plan_bubble_risk": "风险：{risk}",
         "plan_bubble_full_ref": "完整方案详见：`{path}`",
         "plan_bubble_reply": "请回复选择（如“方案A”“A”“选1”），或输入修改意见。",
-        "plan_read_instruction": "计划已批准。请用 `read_file {path}` 读取 `{path}`，它是步骤顺序和实时状态的唯一权威来源。\n按顺序执行，完成当前步骤后再推进下一步；如果步骤引用了 skill 或 workflow，开始前先调用 load_skill。",
+        "plan_read_instruction": "计划已批准。`{path}` 是只读执行镜像，可用 `read_file {path}` 查看步骤顺序和当前状态；运行时 Todo 与工具证据事件才是权威状态。\n按顺序执行，完成当前步骤后再推进下一步；如果步骤引用了 skill 或 workflow，开始前先调用 load_skill。",
         "plan_read_todo_note": "\nTODO 更新：一开始就调用 TodoWrite，只为当前步骤（{step_label}）设置子任务。\n每个子任务都必须包含 parent_step_id='{parent_step_id}'。\n创建 3-6 个只属于当前步骤的子任务；最后一个必须是“验收”子任务，并写明检查动作和证据形态。\n在修改或新增子任务之前：先阅读上一次 TodoWrite 返回的“CANONICAL SUBTASKS”清单（或当前 todo 列表），思考新工作如何对应到已有的编号项，然后再写——复用已有的 N.M 项，不要自己重新编号，也不要把已有项用新的自由文本重述（运行时会自动分配规范的 N.M 编号和唯一的一条无编号“验收”行）。\n如果当前步骤已经有子任务，就先继续当前 in_progress 子任务，不要重写路线。\n每完成一个子任务后，都要立刻再次调用 TodoWrite，将它标记为 completed，并把下一个子任务切到 in_progress。\n不要等到整步结束后才统一更新。\n不要为其他计划步骤创建子任务。\n",
         "plan_proposal_title": "## 📋 执行方案\n",
         "plan_proposal_background": "### 背景分析\n{context}\n",
@@ -2156,7 +2195,7 @@ BACKEND_I18N["zh-TW"].update(
         "plan_bubble_risk": "風險：{risk}",
         "plan_bubble_full_ref": "完整方案詳見：`{path}`",
         "plan_bubble_reply": "請回覆選擇（如「方案A」「A」「選1」），或輸入修改意見。",
-        "plan_read_instruction": "計畫已核准。請用 `read_file {path}` 讀取 `{path}`，它是步驟順序與即時狀態的唯一權威來源。\n請依序執行，完成目前步驟後再推進下一步；如果步驟引用了 skill 或 workflow，開始前先呼叫 load_skill。",
+        "plan_read_instruction": "計畫已核准。`{path}` 是唯讀執行鏡像，可用 `read_file {path}` 查看步驟順序與目前狀態；執行階段 Todo 與工具證據事件才是權威狀態。\n請依序執行，完成目前步驟後再推進下一步；如果步驟引用了 skill 或 workflow，開始前先呼叫 load_skill。",
         "plan_read_todo_note": "\nTODO 更新：一開始就呼叫 TodoWrite，只為目前步驟（{step_label}）設定子任務。\n每個子任務都必須包含 parent_step_id='{parent_step_id}'。\n建立 3-6 個只屬於目前步驟的子任務；最後一個必須是「驗收」子任務，並寫明檢查動作與證據形態。\n在修改或新增子任務之前：先閱讀上一次 TodoWrite 回傳的「CANONICAL SUBTASKS」清單（或目前 todo 列表），思考新工作如何對應到既有的編號項，然後再寫——重用既有的 N.M 項，不要自己重新編號，也不要把既有項用新的自由文字重述（執行階段會自動分配規範的 N.M 編號與唯一一條無編號「驗收」行）。\n若目前步驟已經有子任務，請先延續目前的 in_progress 子任務，不要改寫路線。\n每完成一個子任務後，都要立刻再次呼叫 TodoWrite，把它標記為 completed，並把下一個子任務切到 in_progress。\n不要等到整個步驟結束後才一次更新。\n不要為其他計畫步驟建立子任務。\n",
         "plan_proposal_title": "## 📋 執行方案\n",
         "plan_proposal_background": "### 背景分析\n{context}\n",
@@ -2250,7 +2289,7 @@ BACKEND_I18N["ja"].update(
         "plan_bubble_risk": "リスク: {risk}",
         "plan_bubble_full_ref": "完全なプラン: `{path}`",
         "plan_bubble_reply": "選択肢（例: 「案A」「A」「1を選ぶ」）を返信するか、修正要望を入力してください。",
-        "plan_read_instruction": "計画が承認されました。`read_file {path}` で `{path}` を読み、正式な手順順序と進行状況を確認してください。\n必ず順番に実行し、現在のステップを完了してから次へ進んでください。ステップが skill や workflow を参照している場合は、開始前に load_skill を呼び出してください。",
+        "plan_read_instruction": "計画が承認されました。`{path}` は読み取り専用の実行ミラーです。`read_file {path}` で手順と現在状態を確認できますが、正式な状態はランタイム Todo とツール証拠イベントです。\n必ず順番に実行し、現在のステップを完了してから次へ進んでください。ステップが skill や workflow を参照している場合は、開始前に load_skill を呼び出してください。",
         "plan_read_todo_note": "\nTODO 更新: 最初に TodoWrite を呼び出し、現在のステップ（{step_label}）だけのサブタスクを設定してください。\n各サブタスクには parent_step_id='{parent_step_id}' を必ず含めてください。\n現在のステップだけを分解した 3-6 件のサブタスクを作成し、最後の項目は必ず「受入確認」サブタスクにして、確認内容と証拠の形を明記してください。\nサブタスクを変更・追加する前に: まず前回の TodoWrite が返した「CANONICAL SUBTASKS」一覧（または現在の todo 一覧）を読み、新しい作業が既存の番号付き項目にどう対応するか考えてから書いてください——既存の N.M 項目を再利用し、自分で番号を振り直さず、既存項目を新しい自由文で言い換えないでください（ランタイムが規範的な N.M 番号と番号なしの「受入確認」行を 1 つ自動付与します）。\n既存のサブタスクがある場合は現在の in_progress サブタスクから先に続行してください。\n各サブタスクを完了した直後に、必ずもう一度 TodoWrite を呼び出して completed に更新し、次のサブタスクを in_progress に切り替えてください。\nステップ全体の最後まで Todo 更新を先送りしないでください。\n他の計画ステップのサブタスクは作成しないでください。\n",
         "plan_proposal_title": "## 📋 実行プラン\n",
         "plan_proposal_background": "### 背景分析\n{context}\n",
@@ -3309,25 +3348,8 @@ def decode_utf8_replace(data: bytes | bytearray | str) -> str:
         return escape_invalid_utf8_text(data)
     return bytes(data).decode("utf-8", errors="replace")
 
-def json_dumps(
-    obj: object,
-    *,
-    indent: int | None = None,
-    ensure_ascii: bool = False,
-    sort_keys: bool = False,
-    separators: tuple[str, str] | None = None,
-    default=None,
-) -> str:
-    kwargs = {
-        "ensure_ascii": ensure_ascii,
-        "indent": indent,
-        "sort_keys": sort_keys,
-    }
-    if separators is not None:
-        kwargs["separators"] = separators
-    if default is not None:
-        kwargs["default"] = default
-    raw = json.dumps(obj, **kwargs)
+def json_dumps(obj: object, *, indent: int | None = None, ensure_ascii: bool = False) -> str:
+    raw = json.dumps(obj, ensure_ascii=ensure_ascii, indent=indent)
     return escape_invalid_utf8_text(raw)
 
 def json_response_bytes(obj: object) -> bytes:
@@ -3336,13 +3358,30 @@ def json_response_bytes(obj: object) -> bytes:
 def read_http_json_body(handler: BaseHTTPRequestHandler) -> dict:
     length = int(handler.headers.get("Content-Length", "0") or "0")
     if length <= 0:
+        handler._clouds_request_body_consumed = True
         return {}
-    body = decode_utf8_replace(handler.rfile.read(length))
+    raw = handler.rfile.read(length)
+    handler._clouds_request_body_consumed = len(raw) == length
+    body = decode_utf8_replace(raw)
     if not body:
         return {}
     parsed = json.loads(body)
     parsed = sanitize_utf8_surrogates(parsed)
     return parsed if isinstance(parsed, dict) else {}
+
+def close_if_http_request_body_unread(handler: BaseHTTPRequestHandler) -> bool:
+    """Prevent an unread write body from becoming the next keep-alive request line."""
+    method = str(getattr(handler, "command", "") or "").upper()
+    if method not in {"POST", "PUT", "PATCH", "DELETE"}:
+        return bool(getattr(handler, "close_connection", False))
+    try:
+        length = int(handler.headers.get("Content-Length", "0") or "0")
+    except Exception:
+        length = 0
+    transfer_encoding = str(handler.headers.get("Transfer-Encoding", "") or "").strip()
+    if (length > 0 or transfer_encoding) and not bool(getattr(handler, "_clouds_request_body_consumed", False)):
+        handler.close_connection = True
+    return bool(getattr(handler, "close_connection", False))
 
 def make_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:8]}"
@@ -3797,7 +3836,7 @@ def cache_external_js_url(js_root: Path, url: str) -> tuple[Path | None, str]:
     parsed = urlparse(target_url)
     base = Path(parsed.path).name.strip()
     if not base or "." not in base:
-        h = _sha256_bytes(safe_utf8_bytes(target_url))[:10]
+        h = _sha256_bytes(target_url.encode("utf-8"))[:10]
         base = f"external_{h}.js"
     fname = _safe_js_filename(base, "external.js")
     ext_root = (js_root / "external").resolve()
@@ -5478,7 +5517,7 @@ def compress_text_blob(text: str) -> str:
     src = str(text or "")
     if not src:
         return ""
-    raw = safe_utf8_bytes(src)
+    raw = src.encode("utf-8")
     return base64.b64encode(zlib.compress(raw, 6)).decode("ascii")
 
 def decompress_text_blob(blob_b64: str) -> str:
@@ -5920,7 +5959,7 @@ def probe_ollama_environment(base_url: str, timeout: int = 4) -> tuple[bool, lis
     req = Request(url, method="GET")
     try:
         with urlopen(req, timeout=timeout) as resp:
-            raw = json.loads(decode_utf8_replace(resp.read()))
+            raw = json.loads(resp.read().decode("utf-8"))
         tags: list[str] = []
         for item in raw.get("models", []):
             name = item.get("name")
@@ -6057,7 +6096,7 @@ def check_ollama_model_ready(base_url: str, model: str, timeout: int = 10) -> tu
     }
     req = Request(
         url,
-        data=safe_utf8_bytes(json_dumps(payload)),
+        data=json_dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
@@ -6079,7 +6118,7 @@ def list_loaded_ollama_models(base_url: str, timeout: int = 5) -> list[str]:
     req = Request(url, method="GET")
     try:
         with urlopen(req, timeout=timeout) as resp:
-            raw = json.loads(decode_utf8_replace(resp.read()))
+            raw = json.loads(resp.read().decode("utf-8"))
         out: list[str] = []
         for item in raw.get("models", []) if isinstance(raw, dict) else []:
             name = str(item.get("name", "") or "").strip()
@@ -6103,7 +6142,7 @@ def wake_ollama_model(base_url: str, model: str, timeout: int = 30) -> tuple[boo
     }
     req = Request(
         url,
-        data=safe_utf8_bytes(json_dumps(payload)),
+        data=json_dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
@@ -7353,9 +7392,42 @@ def user_id_from_ip(ip: str) -> str:
     raw = str(ip or "").strip()
     if raw.lower().startswith("::ffff:"):
         raw = raw.split("::ffff:", 1)[1].strip()
-    token = hashlib.sha256(safe_utf8_bytes(raw)).hexdigest()[:12]
+    token = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
     safe_ip = re.sub(r"[^A-Za-z0-9._-]", "_", raw)
     return f"user_{safe_ip}_{token}"
+
+def trusted_client_ip(handler: BaseHTTPRequestHandler) -> str:
+    peer = handler.client_address[0] if getattr(handler, "client_address", None) else "0.0.0.0"
+    if str(os.getenv("CLOUDS_CODER_TRUST_PROXY", "") or "").strip().lower() not in {"1", "true", "yes", "on"}:
+        return peer
+    raw_ranges = str(os.getenv("CLOUDS_CODER_TRUSTED_PROXIES", "127.0.0.1/32,::1/128") or "")
+    try:
+        peer_addr = ipaddress.ip_address(peer)
+        networks = [ipaddress.ip_network(x.strip(), strict=False) for x in raw_ranges.split(",") if x.strip()]
+        if not any(peer_addr in network for network in networks):
+            return peer
+    except Exception:
+        return peer
+    forwarded = str(handler.headers.get("X-Forwarded-For", "") or "").strip()
+    if not forwarded:
+        return peer
+    # Walk from the proxy-facing edge and strip only explicitly trusted hops.
+    # This prevents a client-prepended XFF value from becoming authoritative.
+    chain: list[str] = []
+    try:
+        chain = [str(ipaddress.ip_address(x.strip())) for x in forwarded.split(",") if x.strip()]
+    except Exception:
+        return peer
+    current = str(peer_addr)
+    for candidate in reversed(chain):
+        try:
+            current_addr = ipaddress.ip_address(current)
+        except Exception:
+            return peer
+        if not any(current_addr in network for network in networks):
+            break
+        current = candidate
+    return current
 
 class CryptoBox:
     def __init__(self, codes_root: Path):
@@ -7393,7 +7465,7 @@ class CryptoBox:
         return bytes(out)
 
     def encrypt_text(self, text: str) -> str:
-        payload = safe_utf8_bytes(text)
+        payload = text.encode("utf-8")
         nonce = os.urandom(16)
         ct = self._stream_xor(payload, nonce)
         mac = hmac.new(self.key, nonce + ct, hashlib.sha256).hexdigest()
@@ -7746,6 +7818,552 @@ def _write_json_file(path: Path, obj: object):
                 tmp.unlink()
         except Exception:
             pass
+
+
+class AdminAuthError(Exception):
+    def __init__(self, code: str, message: str, status: int = 400, *, retry_after: int = 0):
+        super().__init__(message)
+        self.code = str(code or "admin_auth_error")
+        self.status = int(status or 400)
+        self.retry_after = max(0, int(retry_after or 0))
+
+
+class AdminAuthStore:
+    """Persistent single-admin credentials and revocable browser sessions."""
+
+    _USERNAME_RE = re.compile(r"^[A-Za-z0-9._-]{3,64}$")
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.lock = threading.RLock()
+        self.password_slots = threading.BoundedSemaphore(3)
+        self.login_failures: dict[tuple[str, str], deque[float]] = {}
+        self._initialize()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(str(self.path), timeout=10.0, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=10000")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=FULL")
+        return conn
+
+    def _initialize(self) -> None:
+        with self._connect() as conn:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS admin_credentials (
+                    id INTEGER PRIMARY KEY CHECK(id = 1),
+                    username TEXT NOT NULL,
+                    username_key TEXT NOT NULL UNIQUE,
+                    password_hash TEXT NOT NULL,
+                    password_salt TEXT NOT NULL,
+                    password_algorithm TEXT NOT NULL,
+                    password_iterations INTEGER NOT NULL,
+                    auth_version INTEGER NOT NULL DEFAULT 1,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS admin_sessions (
+                    token_digest TEXT PRIMARY KEY,
+                    username_key TEXT NOT NULL,
+                    auth_version INTEGER NOT NULL,
+                    created_at REAL NOT NULL,
+                    expires_at REAL NOT NULL,
+                    revoked_at REAL NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS admin_sessions_expiry
+                    ON admin_sessions(expires_at, revoked_at);
+                """
+            )
+        try:
+            os.chmod(self.path, 0o600)
+        except Exception:
+            pass
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(str(self.path) + suffix)
+            try:
+                if sidecar.exists():
+                    os.chmod(sidecar, 0o600)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _normalize_username(value: object) -> tuple[str, str]:
+        username = unicodedata.normalize("NFKC", str(value or "")).strip()
+        if not AdminAuthStore._USERNAME_RE.fullmatch(username):
+            raise AdminAuthError(
+                "invalid_username",
+                "管理员账号需为 3-64 位字母、数字、点、下划线或连字符",
+                400,
+            )
+        return username, username.casefold()
+
+    @staticmethod
+    def _validate_password(password: object, username: str) -> str:
+        value = str(password if password is not None else "")
+        size = len(value.encode("utf-8", errors="strict"))
+        if size < 12 or size > 512:
+            raise AdminAuthError("weak_password", "密码长度需为 12-512 个 UTF-8 字节", 400)
+        if value.casefold() == str(username or "").casefold():
+            raise AdminAuthError("weak_password", "密码不能与管理员账号相同", 400)
+        classes = sum(
+            bool(re.search(pattern, value))
+            for pattern in (r"[a-z]", r"[A-Z]", r"[0-9]", r"[^A-Za-z0-9]")
+        )
+        if classes < 3:
+            raise AdminAuthError("weak_password", "密码需包含大小写字母、数字或符号中的至少三类", 400)
+        return value
+
+    @staticmethod
+    def _password_digest(password: str, salt: bytes, iterations: int) -> bytes:
+        rounds = int(iterations or ADMIN_AUTH_PASSWORD_ITERATIONS)
+        if rounds < 100_000 or rounds > 2_000_000:
+            raise ValueError("unsupported password hash work factor")
+        return hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode("utf-8"),
+            salt,
+            rounds,
+            dklen=32,
+        )
+
+    def configured(self) -> bool:
+        try:
+            with self._connect() as conn:
+                row = conn.execute("SELECT 1 FROM admin_credentials WHERE id=1").fetchone()
+                return row is not None
+        except sqlite3.DatabaseError:
+            # A damaged credential store must never reopen first-run registration.
+            return True
+
+    def setup(self, username: object, password: object) -> dict:
+        clean_username, username_key = self._normalize_username(username)
+        clean_password = self._validate_password(password, clean_username)
+        salt = os.urandom(24)
+        with self.password_slots:
+            digest = self._password_digest(clean_password, salt, ADMIN_AUTH_PASSWORD_ITERATIONS)
+        now = now_ts()
+        try:
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                exists = conn.execute("SELECT 1 FROM admin_credentials WHERE id=1").fetchone()
+                if exists is not None:
+                    conn.execute("ROLLBACK")
+                    raise AdminAuthError("setup_already_completed", "管理员已经创建，请直接登录", 409)
+                conn.execute(
+                    """INSERT INTO admin_credentials
+                       (id,username,username_key,password_hash,password_salt,password_algorithm,
+                        password_iterations,auth_version,created_at,updated_at)
+                       VALUES(1,?,?,?,?,?,?,1,?,?)""",
+                    (
+                        clean_username,
+                        username_key,
+                        base64.b64encode(digest).decode("ascii"),
+                        base64.b64encode(salt).decode("ascii"),
+                        "pbkdf2_hmac_sha256",
+                        ADMIN_AUTH_PASSWORD_ITERATIONS,
+                        now,
+                        now,
+                    ),
+                )
+                conn.execute("COMMIT")
+        except sqlite3.IntegrityError as exc:
+            raise AdminAuthError("setup_already_completed", "管理员已经创建，请直接登录", 409) from exc
+        return self.issue_session(username_key=username_key, auth_version=1)
+
+    @staticmethod
+    def _failure_key(client_ip: str, username_key: str) -> tuple[str, str]:
+        return (str(client_ip or "unknown")[:96], hashlib.sha256(username_key.encode()).hexdigest()[:24])
+
+    @staticmethod
+    def _ip_failure_key(client_ip: str) -> tuple[str, str]:
+        return (str(client_ip or "unknown")[:96], "__all__")
+
+    def _check_rate_limit(self, client_ip: str, username_key: str) -> None:
+        key = self._failure_key(client_ip, username_key)
+        ip_key = self._ip_failure_key(client_ip)
+        now = now_ts()
+        with self.lock:
+            for target, limit in ((key, 8), (ip_key, 24)):
+                rows = self.login_failures.setdefault(target, deque())
+                while rows and now - rows[0] > 900:
+                    rows.popleft()
+                if len(rows) >= limit:
+                    retry = max(1, int(900 - (now - rows[0])))
+                    raise AdminAuthError("rate_limited", "登录尝试过多，请稍后再试", 429, retry_after=retry)
+
+    def _record_failure(self, client_ip: str, username_key: str) -> None:
+        keys = (self._failure_key(client_ip, username_key), self._ip_failure_key(client_ip))
+        now = now_ts()
+        with self.lock:
+            for key in keys:
+                rows = self.login_failures.setdefault(key, deque())
+                rows.append(now)
+                while rows and now - rows[0] > 900:
+                    rows.popleft()
+
+    def login(self, username: object, password: object, client_ip: str) -> dict:
+        try:
+            clean_username, username_key = self._normalize_username(username)
+        except AdminAuthError:
+            clean_username = "invalid-admin"
+            username_key = clean_username
+        self._check_rate_limit(client_ip, username_key)
+        try:
+            with self._connect() as conn:
+                row = conn.execute("SELECT * FROM admin_credentials WHERE id=1").fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise AdminAuthError("auth_store_unavailable", "管理员认证存储不可用", 503) from exc
+        iterations = ADMIN_AUTH_PASSWORD_ITERATIONS
+        salt = b"\0" * 24
+        expected = b"\0" * 32
+        valid_user = False
+        auth_version = 1
+        if row is not None:
+            iterations = int(row["password_iterations"] or ADMIN_AUTH_PASSWORD_ITERATIONS)
+            auth_version = int(row["auth_version"] or 1)
+            try:
+                if str(row["password_algorithm"] or "") != "pbkdf2_hmac_sha256":
+                    raise ValueError("unsupported password hash algorithm")
+                salt = base64.b64decode(str(row["password_salt"]), validate=True)
+                expected = base64.b64decode(str(row["password_hash"]), validate=True)
+                if len(salt) < 16 or len(expected) != 32:
+                    raise ValueError("invalid password hash material")
+                valid_user = hmac.compare_digest(username_key, str(row["username_key"] or ""))
+            except Exception:
+                valid_user = False
+        supplied = str(password if password is not None else "")
+        try:
+            with self.password_slots:
+                actual = self._password_digest(supplied, salt, iterations)
+        except Exception as exc:
+            raise AdminAuthError("auth_store_unavailable", "管理员认证存储不可用", 503) from exc
+        if not (valid_user and hmac.compare_digest(actual, expected)):
+            self._record_failure(client_ip, username_key)
+            raise AdminAuthError("invalid_credentials", "账号或密码错误", 401)
+        with self.lock:
+            self.login_failures.pop(self._failure_key(client_ip, username_key), None)
+        return self.issue_session(username_key=username_key, auth_version=auth_version)
+
+    def issue_session(self, *, username_key: str = "admin", auth_version: int = 1) -> dict:
+        raw = "cc_session_" + base64.urlsafe_b64encode(os.urandom(32)).decode("ascii").rstrip("=")
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        now = now_ts()
+        expires = now + ADMIN_AUTH_SESSION_TTL_SECONDS
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("DELETE FROM admin_sessions WHERE revoked_at > 0 OR expires_at <= ?", (now,))
+            conn.execute(
+                "INSERT INTO admin_sessions(token_digest,username_key,auth_version,created_at,expires_at,revoked_at) VALUES(?,?,?,?,?,0)",
+                (digest, username_key, int(auth_version if auth_version is not None else 1), now, expires),
+            )
+            extra = conn.execute(
+                "SELECT token_digest FROM admin_sessions WHERE revoked_at=0 ORDER BY created_at DESC LIMIT -1 OFFSET ?",
+                (ADMIN_AUTH_MAX_ACTIVE_SESSIONS,),
+            ).fetchall()
+            if extra:
+                conn.executemany("DELETE FROM admin_sessions WHERE token_digest=?", [(x[0],) for x in extra])
+            conn.execute("COMMIT")
+        return {"access_token": raw, "token_type": "Bearer", "expires_at": expires}
+
+    def verify_session(self, token: str) -> bool:
+        raw = str(token or "")
+        if not raw.startswith("cc_session_") or len(raw) < 40:
+            return False
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        now = now_ts()
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    """SELECT s.username_key,s.auth_version,c.auth_version AS current_version
+                       FROM admin_sessions s LEFT JOIN admin_credentials c ON c.username_key=s.username_key
+                       WHERE s.token_digest=? AND s.revoked_at=0 AND s.expires_at>?""",
+                    (digest, now),
+                ).fetchone()
+            if row is None:
+                return False
+            if str(row["username_key"] or "") == "__token__":
+                return int(row["auth_version"] or 0) == 0
+            return row["current_version"] is not None and int(row["auth_version"]) == int(row["current_version"])
+        except sqlite3.DatabaseError:
+            return False
+
+    def revoke_session(self, token: str) -> None:
+        raw = str(token or "")
+        if not raw.startswith("cc_session_"):
+            return
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        with self._connect() as conn:
+            conn.execute("UPDATE admin_sessions SET revoked_at=? WHERE token_digest=?", (now_ts(), digest))
+
+
+def _admin_config_schema() -> list[dict]:
+    """Canonical startup schema shared by validation, CLI compilation and WebUI."""
+    def row(
+        key: str,
+        group: str,
+        label: str,
+        value_type: str,
+        default: object,
+        flag: str = "",
+        **extra,
+    ) -> dict:
+        out = {
+            "key": key,
+            "group": group,
+            "label": label,
+            "type": value_type,
+            "factory_default": default,
+            "flag": flag,
+            "restart_required": True,
+        }
+        out.update(extra)
+        return out
+
+    return [
+        row("host", "network", "Bind host", "host", "0.0.0.0", "--host"),
+        row("port", "network", "Agent port", "integer", 8080, "--port", minimum=1, maximum=65535),
+        row("skills_port", "network", "Skills Studio port", "integer", None, "--skills_port", nullable=True, minimum=1, maximum=65535, derived="port + 1"),
+        row("rag_admin_port", "network", "RAG admin port", "integer", None, "--rag_admin_port", nullable=True, minimum=1, maximum=65535, derived="port + 2"),
+        row("code_admin_port", "network", "Code admin port", "integer", None, "--code_admin_port", nullable=True, minimum=1, maximum=65535, derived="port + 3"),
+        row("mcp_service_port", "network", "MCP service port", "integer", None, "--mcp_service_port", nullable=True, minimum=1, maximum=65535, derived="port + 4"),
+        row("ide_port", "network", "IDE port", "integer", None, "--ide_port", nullable=True, minimum=1, maximum=65535, derived="port + 5"),
+        row("ctx_limit", "runtime", "Context token limit", "integer", DEFAULT_CONTEXT_TOKEN_LIMIT, "--ctx_limit", minimum=MIN_CONTEXT_TOKEN_LIMIT, maximum=TOKEN_THRESHOLD),
+        row("max_rounds", "runtime", "Maximum agent rounds", "integer", MAX_AGENT_ROUNDS, "--max_rounds", minimum=MIN_AGENT_ROUNDS, maximum=MAX_AGENT_ROUNDS_CAP),
+        row("run_timeout", "runtime", "Run timeout (seconds)", "integer", MAX_RUN_SECONDS, "--run_timeout", minimum=MIN_RUN_TIMEOUT_SECONDS, maximum=MAX_RUN_TIMEOUT_SECONDS),
+        row("shell_command_timeout", "runtime", "Shell timeout (seconds)", "integer", DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS, "--shell_command_timeout", minimum=MIN_SHELL_COMMAND_TIMEOUT_SECONDS, maximum=MAX_SHELL_COMMAND_TIMEOUT_SECONDS),
+        row("live_input_delay_write", "live_input", "Write-phase delay rounds", "integer", LIVE_INPUT_DELAY_WRITE_ROUNDS, "--live_input_delay_write", minimum=0, maximum=20),
+        row("live_input_delay_tool", "live_input", "Tool-phase delay rounds", "integer", LIVE_INPUT_DELAY_TOOL_ROUNDS, "--live_input_delay_tool", minimum=0, maximum=20),
+        row("live_input_delay_normal", "live_input", "Normal-phase delay rounds", "integer", LIVE_INPUT_DELAY_NORMAL_ROUNDS, "--live_input_delay_normal", minimum=0, maximum=20),
+        row("live_input_max_injections", "live_input", "Maximum live injections", "integer", LIVE_INPUT_MAX_INJECTIONS, "--live_input_max_injections", minimum=1, maximum=20),
+        row("live_input_reinject_interval", "live_input", "Reinject interval", "integer", LIVE_INPUT_REINJECT_INTERVAL, "--live_input_reinject_interval", minimum=1, maximum=20),
+        row("live_input_weight_base_delayed", "live_input", "Delayed base weight", "number", LIVE_INPUT_WEIGHT_BASE_DELAYED, "--live_input_weight_base_delayed", minimum=0, maximum=1, step=0.05),
+        row("live_input_weight_base_normal", "live_input", "Normal base weight", "number", LIVE_INPUT_WEIGHT_BASE_NORMAL, "--live_input_weight_base_normal", minimum=0, maximum=1, step=0.05),
+        row("live_input_weight_step_delayed", "live_input", "Delayed weight step", "number", LIVE_INPUT_WEIGHT_STEP_DELAYED, "--live_input_weight_step_delayed", minimum=0, maximum=1, step=0.05),
+        row("live_input_weight_step_normal", "live_input", "Normal weight step", "number", LIVE_INPUT_WEIGHT_STEP_NORMAL, "--live_input_weight_step_normal", minimum=0, maximum=1, step=0.05),
+        row("skills_root", "paths", "Skills root", "directory", "", "--skills_root"),
+        row("web_ui_config", "paths", "WebUI config JSON", "file", "", "--web_ui_config", accept=".json"),
+        row("web_ui_dir", "paths", "External WebUI directory", "directory", "", "--web_ui_dir"),
+        row("config", "paths", "LLM config file or URL", "file_or_url", "", "--config", accept=".json"),
+        row("skills_ui_enabled", "services", "Skills Studio", "boolean", True, true_flag="", false_flag="--no_skills_ui"),
+        row("rag_admin_enabled", "services", "RAG admin", "boolean", True, true_flag="", false_flag="--no_rag_admin"),
+        row("code_admin_enabled", "services", "Code library admin", "boolean", True, true_flag="", false_flag="--no_code_admin"),
+        row("ide_enabled", "services", "Programming IDE", "boolean", False, true_flag="--enable_ide", false_flag=""),
+        row("mcp_service_enabled", "services", "MCP service", "boolean", True, true_flag="", false_flag="--no_mcp_service"),
+        row("use_external_web_ui", "webui", "External WebUI mode", "tri_state", "inherit", true_flag="--use_external_web_ui", false_flag="--no_external_web_ui", choices=["inherit", "enabled", "disabled"]),
+        row("export_web_ui", "webui", "Export built-in WebUI on start", "boolean", False, true_flag="--export_web_ui", false_flag=""),
+        row("export_web_ui_force", "webui", "Overwrite WebUI export", "boolean", False, true_flag="--export_web_ui_force", false_flag=""),
+        row("language", "webui", "UI language", "enum", DEFAULT_UI_LANGUAGE, "--language", choices=["zh-CN", "zh-TW", "ja", "en"]),
+        row("ui_style", "webui", "Chat UI style", "enum", DEFAULT_UI_STYLE, "--ui-style", choices=["neo", "trad"]),
+        row("show_upload_list", "webui", "Upload list", "tri_state", "inherit", true_flag="--show_upload_list", false_flag="--no_show_upload_list", choices=["inherit", "enabled", "disabled"]),
+        row("download_js_lib", "webui", "Download offline JS libraries", "tri_state", "inherit", true_flag="--download_js_lib", false_flag="--no_download_js_lib", choices=["inherit", "enabled", "disabled"]),
+        row("read_context_policy", "runtime", "Read context policy", "enum", "auto", "--read_context_policy", choices=["auto", "conservative", "balanced", "wide"]),
+        row("tool_memory_policy", "runtime", "Tool memory policy", "enum", "auto", "--tool_memory_policy", choices=["auto", "conservative", "balanced", "wide"]),
+        row("web_search_enabled", "runtime", "Web search", "tri_state", "inherit", true_flag="--enable-web-search", false_flag="--disable-web-search", choices=["inherit", "enabled", "disabled"]),
+        row("user_memory_mode", "runtime", "User memory mode", "enum", "weak", "--user-memory", choices=["off", "weak", "on"]),
+        row("auto_task_level_ceiling", "runtime", "Auto task level ceiling", "integer", DEFAULT_AUTO_TASK_LEVEL_CEILING, "--auto_task_level_ceiling", minimum=0, maximum=5),
+        row("daily_session_limit_per_ip", "limits", "Daily sessions per user", "integer", 0, "--daily_session_limit_per_ip", minimum=0, maximum=1_000_000),
+        row("ollama_base_url", "model", "Ollama base URL", "url", DEFAULT_OLLAMA_BASE_URL, "--ollama-base-url"),
+        row("model", "model", "Default model", "text", DEFAULT_OLLAMA_MODEL, "--model"),
+        row("auto_model_switch", "model", "Automatic model recovery", "boolean", False, true_flag="--auto_model_switch", false_flag="--no_auto_model_switch"),
+        row("arbiter_enabled", "arbiter", "Arbiter enabled", "boolean", True, true_flag="--arbiter-enabled", false_flag="--arbiter-disabled"),
+        row("arbiter_model", "arbiter", "Arbiter model override", "text", "", "--arbiter-model"),
+        row("arbiter_timeout", "arbiter", "Arbiter timeout (seconds)", "number", ARBITER_DEFAULT_TIMEOUT_SECONDS, "--arbiter-timeout", minimum=0.2, maximum=15, step=0.1),
+        row("arbiter_max_tokens", "arbiter", "Arbiter max tokens", "integer", ARBITER_DEFAULT_MAX_TOKENS, "--arbiter-max-tokens", minimum=24, maximum=256),
+        row("arbiter_temperature", "arbiter", "Arbiter temperature", "number", ARBITER_DEFAULT_TEMPERATURE, "--arbiter-temperature", minimum=0, maximum=1, step=0.05),
+        row("execution_mode", "runtime", "Agent execution mode", "enum", EXECUTION_MODE_SYNC, "--execution-mode", choices=["single", "sequential", "sync"]),
+        row("max_output_tokens", "runtime", "Max output tokens", "integer", AGENT_MAX_OUTPUT_TOKENS, "--max-output-tokens", minimum=256, maximum=1_000_000),
+        row("max_user", "limits", "Global concurrent tasks", "integer", 0, "--max_user", minimum=0, maximum=100_000),
+        row("max_user_sessions", "limits", "Concurrent tasks per user", "integer", 0, "--max_user_sessions", minimum=0, maximum=100_000),
+        row("rag_file_name", "runtime", "Use filenames as RAG entities", "boolean", False, true_flag="--RAG_File_Name=on", false_flag="--RAG_File_Name=off"),
+    ]
+
+
+def _admin_factory_config() -> dict:
+    return {row["key"]: row.get("factory_default") for row in _admin_config_schema()}
+
+
+def _admin_coerce_config(raw: object) -> tuple[dict, list[dict]]:
+    src = raw if isinstance(raw, dict) else {}
+    schema = _admin_config_schema()
+    out = _admin_factory_config()
+    errors: list[dict] = []
+    for spec in schema:
+        key = str(spec["key"])
+        if key not in src:
+            continue
+        value = src.get(key)
+        typ = str(spec.get("type", "text"))
+        nullable = bool(spec.get("nullable", False))
+        if nullable and (value is None or str(value).strip() == ""):
+            out[key] = None
+            continue
+        try:
+            if typ == "integer":
+                if isinstance(value, bool):
+                    raise ValueError("boolean is not an integer")
+                value = int(value)
+            elif typ == "number":
+                if isinstance(value, bool):
+                    raise ValueError("boolean is not a number")
+                value = float(value)
+            elif typ == "boolean":
+                if isinstance(value, bool):
+                    pass
+                elif str(value).strip().lower() in {"1", "true", "yes", "on"}:
+                    value = True
+                elif str(value).strip().lower() in {"0", "false", "no", "off"}:
+                    value = False
+                else:
+                    raise ValueError("expected boolean")
+            else:
+                value = str(value or "").strip()
+            if "minimum" in spec and value < spec["minimum"]:
+                raise ValueError(f"minimum is {spec['minimum']}")
+            if "maximum" in spec and value > spec["maximum"]:
+                raise ValueError(f"maximum is {spec['maximum']}")
+            choices = spec.get("choices", [])
+            if choices and value not in choices:
+                raise ValueError("expected one of: " + ", ".join(str(x) for x in choices))
+            if typ == "url" and value:
+                parsed = urlparse(value)
+                if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                    raise ValueError("expected an http(s) URL")
+            if typ == "file_or_url" and value and "://" in value:
+                parsed = urlparse(value)
+                if parsed.scheme not in {"http", "https", "file"}:
+                    raise ValueError("expected a local path or http(s)/file URL")
+            elif typ == "file_or_url" and value:
+                candidate = Path(value).expanduser()
+                if not candidate.is_absolute():
+                    candidate = WORKDIR / candidate
+                if not candidate.exists() or not candidate.is_file():
+                    raise ValueError("local config path must be an existing file")
+            if typ in {"file", "directory"} and value:
+                if "://" in value:
+                    raise ValueError("expected a local filesystem path")
+                candidate = Path(value).expanduser()
+                if not candidate.is_absolute():
+                    candidate = WORKDIR / candidate
+                if candidate.exists() and typ == "file" and not candidate.is_file():
+                    raise ValueError("path exists but is not a file")
+                if candidate.exists() and typ == "directory" and not candidate.is_dir():
+                    raise ValueError("path exists but is not a directory")
+                accept = str(spec.get("accept", "") or "").strip().lower()
+                if typ == "file" and accept and candidate.suffix.lower() != accept:
+                    raise ValueError(f"expected a {accept} file")
+            if typ == "host" and (not value or any(ch.isspace() for ch in value)):
+                raise ValueError("invalid host")
+            out[key] = value
+        except Exception as exc:
+            errors.append({"key": key, "error": str(exc)})
+    if bool(out.get("export_web_ui_force")) and not bool(out.get("export_web_ui")):
+        errors.append({"key": "export_web_ui_force", "error": "requires export_web_ui"})
+    effective_ports = {
+        "agent": int(out["port"]),
+        "skills": int(out["skills_port"] if out.get("skills_port") is not None else int(out["port"]) + 1),
+        "rag": int(out["rag_admin_port"] if out.get("rag_admin_port") is not None else int(out["port"]) + 2),
+        "code": int(out["code_admin_port"] if out.get("code_admin_port") is not None else int(out["port"]) + 3),
+        "mcp": int(out["mcp_service_port"] if out.get("mcp_service_port") is not None else int(out["port"]) + 4),
+        "ide": int(out["ide_port"] if out.get("ide_port") is not None else int(out["port"]) + 5),
+    }
+    enabled = {
+        "agent": True,
+        "skills": bool(out.get("skills_ui_enabled")),
+        "rag": bool(out.get("rag_admin_enabled")),
+        "code": bool(out.get("code_admin_enabled")),
+        "mcp": bool(out.get("mcp_service_enabled")),
+        "ide": bool(out.get("ide_enabled")),
+    }
+    seen: dict[int, str] = {}
+    port_error_keys = {
+        "agent": "port",
+        "skills": "skills_port",
+        "rag": "rag_admin_port",
+        "code": "code_admin_port",
+        "mcp": "mcp_service_port",
+        "ide": "ide_port",
+    }
+    for service, port in effective_ports.items():
+        if not enabled.get(service):
+            continue
+        error_key = port_error_keys[service]
+        if port < 1 or port > 65535:
+            errors.append({"key": error_key, "error": "effective port must be 1-65535"})
+        elif port in seen:
+            errors.append({"key": error_key, "error": f"port conflicts with {seen[port]}"})
+        else:
+            seen[port] = service
+    out["_effective_ports"] = effective_ports
+    return out, errors
+
+
+def _admin_config_to_argv(config: dict) -> list[str]:
+    schema = _admin_config_schema()
+    argv: list[str] = []
+    for spec in schema:
+        key = str(spec["key"])
+        value = config.get(key, spec.get("factory_default"))
+        typ = str(spec.get("type", "text"))
+        if typ == "boolean":
+            flag = str(spec.get("true_flag" if bool(value) else "false_flag", "") or "")
+            if flag:
+                argv.append(flag)
+            continue
+        if typ == "tri_state":
+            state = str(value or "inherit")
+            flag = str(spec.get("true_flag" if state == "enabled" else "false_flag", "") or "") if state != "inherit" else ""
+            if flag:
+                argv.append(flag)
+            continue
+        if value is None or (isinstance(value, str) and not value.strip()):
+            continue
+        flag = str(spec.get("flag", "") or "")
+        if flag:
+            argv.extend([flag, str(value)])
+    return argv
+
+def _admin_argparse_defaults(config: dict) -> dict:
+    """Map canonical Admin config keys to argparse destinations."""
+    out = dict(config or {})
+    out.update({
+        "no_skills_ui": not bool(config.get("skills_ui_enabled", True)),
+        "no_rag_admin": not bool(config.get("rag_admin_enabled", True)),
+        "no_code_admin": not bool(config.get("code_admin_enabled", True)),
+        "enable_ide": bool(config.get("ide_enabled", False)),
+        "no_ide": not bool(config.get("ide_enabled", False)),
+        "no_mcp_service": not bool(config.get("mcp_service_enabled", True)),
+        "use_external_web_ui": None if config.get("use_external_web_ui") == "inherit" else config.get("use_external_web_ui") == "enabled",
+        "show_upload_list": None if config.get("show_upload_list") == "inherit" else config.get("show_upload_list") == "enabled",
+        "download_js_lib": None if config.get("download_js_lib") == "inherit" else config.get("download_js_lib") == "enabled",
+        "web_search_enabled": None if config.get("web_search_enabled") == "inherit" else config.get("web_search_enabled") == "enabled",
+        "rag_file_name": "on" if bool(config.get("rag_file_name")) else "off",
+    })
+    for key in ("skills_ui_enabled", "rag_admin_enabled", "code_admin_enabled", "ide_enabled", "mcp_service_enabled"):
+        out.pop(key, None)
+    return out
+
+def _admin_config_from_namespace(args: argparse.Namespace) -> dict:
+    values = _admin_factory_config()
+    for spec in _admin_config_schema():
+        key = str(spec["key"])
+        if hasattr(args, key):
+            values[key] = getattr(args, key)
+    values.update({
+        "skills_ui_enabled": not bool(getattr(args, "no_skills_ui", False)),
+        "rag_admin_enabled": not bool(getattr(args, "no_rag_admin", False)),
+        "code_admin_enabled": not bool(getattr(args, "no_code_admin", False)),
+        "ide_enabled": bool(getattr(args, "enable_ide", False)) and not bool(getattr(args, "no_ide", False)),
+        "mcp_service_enabled": not bool(getattr(args, "no_mcp_service", False)),
+        "use_external_web_ui": "inherit" if getattr(args, "use_external_web_ui", None) is None else ("enabled" if bool(args.use_external_web_ui) else "disabled"),
+        "show_upload_list": "inherit" if getattr(args, "show_upload_list", None) is None else ("enabled" if bool(args.show_upload_list) else "disabled"),
+        "download_js_lib": "inherit" if getattr(args, "download_js_lib", None) is None else ("enabled" if bool(args.download_js_lib) else "disabled"),
+        "web_search_enabled": "inherit" if getattr(args, "web_search_enabled", None) is None else ("enabled" if bool(args.web_search_enabled) else "disabled"),
+        "rag_file_name": _to_bool_like(getattr(args, "rag_file_name", ""), default=False),
+    })
+    return values
 
 def make_unified_diff(path: str, old_text: str, new_text: str, max_lines: int = 400) -> tuple[str, int, int]:
     old_lines = old_text.splitlines()
@@ -8149,7 +8767,7 @@ class EventHub:
 
     def __init__(self):
         self._subs: list[queue.Queue] = []
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._seq = 0
 
     def subscribe(self) -> queue.Queue:
@@ -8347,11 +8965,13 @@ class TodoManager:
             parent_step_id = trim(str(raw.get("parent_step_id", "") or ""), 20)
             if parent_step_id:
                 row["parent_step_id"] = parent_step_id
-            for meta_key in ("created_at", "updated_at", "completed_at", "completed_by", "evidence"):
+            for meta_key in ("created_at", "updated_at", "started_at", "completed_at", "completed_by", "evidence"):
                 if meta_key in raw and raw.get(meta_key) not in (None, ""):
                     row[meta_key] = raw.get(meta_key)
             if status == "completed" and not row.get("completed_at"):
                 row["completed_at"] = float(now_ts())
+            if status == "in_progress" and not row.get("started_at"):
+                row["started_at"] = float(now_ts())
             if status in {"completed", "in_progress"} and not row.get("updated_at"):
                 row["updated_at"] = float(now_ts())
             validated.append(row)
@@ -8565,7 +9185,7 @@ def ensure_embedded_skills_at_root(skills_root: Path, workdir: Path = WORKDIR, o
         "updated_at": int(time.time()),
         "root": str(target),
     }
-    state_path.write_text(json_dumps(state_payload, indent=2), encoding="utf-8")
+    state_path.write_text(json.dumps(state_payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return target
 
 
@@ -8849,7 +9469,7 @@ def analyze_skill_building_knowledge(workdir: Path = WORKDIR) -> dict:
             rel = fp.resolve().relative_to(workdir.resolve()).as_posix()
         except Exception:
             rel = str(fp)
-        sources.append({"path": rel, "bytes": len(safe_utf8_bytes(raw))})
+        sources.append({"path": rel, "bytes": len(raw.encode("utf-8"))})
         low = raw.lower()
         if "layer 1" in low and "layer 2" in low:
             push(rules, "Use two-layer loading: keep skill metadata cheap in prompt, load full body only on demand.")
@@ -10349,7 +10969,7 @@ def main() -> int:
         "evidence_csv": str(csv_path.name),
         "experiment_md": str((outdir / "experiment_plan.md").name),
     }
-    _write_text(outdir / "report_bundle.json", json_dumps(bundle, indent=2) + "\n")
+    _write_text(outdir / "report_bundle.json", json.dumps(bundle, indent=2, ensure_ascii=False) + "\n")
     print(str(outdir))
     return 0
 
@@ -12536,15 +13156,6 @@ class SkillStore:
                 seen.add(low)
                 deduped.append(t)
         return deduped[:20]
-        # Deduplicate while preserving order
-        seen: set[str] = set()
-        deduped: list[str] = []
-        for t in triggers:
-            low = t.lower()
-            if low not in seen:
-                seen.add(low)
-                deduped.append(t)
-        return deduped[:20]
 
     def _skill_keywords(self, meta: dict) -> list[str]:
         """Extract keywords from SKILL.md metadata for universal skill matching.
@@ -12601,11 +13212,13 @@ class SkillStore:
         return out
 
     def _skill_runtime_contract(self, meta: dict) -> str:
-        contract = str(meta.get("runtime_contract", "") or "").strip()
+        raw = meta.get("runtime_contract", "") if isinstance(meta, dict) else ""
+        contract = raw.strip() if isinstance(raw, str) else ""
         cc = self._skill_meta_section(meta, "clouds_coder")
         if not contract:
-            contract = str(cc.get("runtime_contract", "") or "").strip()
-        return contract
+            nested = cc.get("runtime_contract", "")
+            contract = nested.strip() if isinstance(nested, str) else ""
+        return "".join(ch for ch in contract.replace("\r\n", "\n").replace("\r", "\n") if ch in "\n\t" or ord(ch) >= 32)
 
     def _skill_attachment_globs(self, meta: dict) -> list[str]:
         globs = _meta_string_list(meta.get("attachments"))
@@ -12899,12 +13512,24 @@ class SkillStore:
             target = (skill_dir / rel).resolve()
             if target.exists():
                 candidates.append(target)
+        try:
+            allowed_root = base.resolve()
+        except Exception:
+            allowed_root = base
         for fp in candidates:
-            if not fp.is_file():
+            try:
+                resolved_fp = fp.resolve()
+                resolved_fp.relative_to(allowed_root)
+            except Exception:
+                self.warnings.append(f"blocked skill resource outside provider root: {fp}")
+                continue
+            if fp.is_symlink() or not resolved_fp.is_file():
+                if fp.is_symlink():
+                    self.warnings.append(f"blocked symlink skill resource: {fp}")
                 continue
             if fp.name in {skip_name, ".DS_Store"}:
                 continue
-            rel = fp.relative_to(base).as_posix() if fp.is_relative_to(base) else fp.name
+            rel = resolved_fp.relative_to(allowed_root).as_posix()
             if rel in seen:
                 continue
             seen.add(rel)
@@ -12912,7 +13537,7 @@ class SkillStore:
             if text is None and rel not in entrypoint_set:
                 continue
             try:
-                skill_rel = fp.resolve().relative_to(self.skills_root.resolve()).as_posix()
+                skill_rel = resolved_fp.relative_to(self.skills_root.resolve()).as_posix()
             except Exception:
                 skill_rel = rel
             size = 0
@@ -12923,8 +13548,8 @@ class SkillStore:
             attachments.append(
                 {
                     "path": rel,
-                    "abs_path": str(fp.resolve()),
-                    "virtual_path": self._public_provider_path(provider_id, fp.resolve())
+                    "abs_path": str(resolved_fp),
+                    "virtual_path": self._public_provider_path(provider_id, resolved_fp)
                     or f"{SKILLS_VIRTUAL_PREFIX}/{skill_rel}".replace("//", "/"),
                     "provider_id": provider_id,
                     "content": text or "",
@@ -13094,7 +13719,7 @@ class SkillStore:
         req = Request(endpoint, method="GET")
         try:
             with urlopen(req, timeout=timeout) as resp:
-                payload = json.loads(decode_utf8_replace(resp.read()))
+                payload = json.loads(resp.read().decode("utf-8"))
         except Exception as exc:
             self.warnings.append(f"{manifest_path.name}: HTTP provider fetch failed: {exc}")
             return
@@ -13819,8 +14444,9 @@ class TaskManager:
             return tasks
 
 class BackgroundManager:
-    def __init__(self, workdir: Path):
+    def __init__(self, workdir: Path, command_wrapper=None):
         self.workdir = workdir
+        self.command_wrapper = command_wrapper
         self.tasks: dict[str, dict] = {}
         self.notifications: queue.Queue = queue.Queue()
         self.lock = threading.Lock()
@@ -13842,25 +14468,34 @@ class BackgroundManager:
 
     def _exec(self, task_id: str, command: str, timeout: int):
         try:
+            run_command: object = command
+            run_shell = True
+            wrapper = self.command_wrapper() if callable(self.command_wrapper) else []
+            if wrapper:
+                run_command = [*wrapper, "/bin/sh", "-c", command]
+                run_shell = False
             r = subprocess.run(
-                command,
-                shell=True,
+                run_command,
+                shell=run_shell,
                 cwd=self.workdir,
                 capture_output=True,
                 text=True,
                 timeout=timeout,
             )
             output = trim((r.stdout + r.stderr).strip())
-            status = "completed"
+            exit_code = int(r.returncode)
+            status = "completed" if exit_code == 0 else "error"
         except Exception as exc:
             output = f"Error: {exc}"
             status = "error"
+            exit_code = -1
         with self.lock:
             task = self.tasks.get(task_id, {})
             task.update(
                 {
                     "status": status,
                     "result": output or "(no output)",
+                    "exit_code": exit_code,
                     "finished_at": now_ts(),
                 }
             )
@@ -13870,6 +14505,7 @@ class BackgroundManager:
                 "task_id": task_id,
                 "status": status,
                 "result": (output or "(no output)")[:500],
+                "exit_code": exit_code,
             }
         )
 
@@ -13879,7 +14515,11 @@ class BackgroundManager:
                 task = self.tasks.get(task_id)
                 if not task:
                     return f"Unknown task: {task_id}"
-                return f"[{task['status']}] {task.get('result') or '(running)'}"
+                exit_text = (
+                    f" exit_code={int(task.get('exit_code'))}"
+                    if task.get("exit_code") is not None else ""
+                )
+                return f"[{task['status']}]{exit_text} {task.get('result') or '(running)'}"
             if not self.tasks:
                 return "No bg tasks."
             lines = []
@@ -14595,17 +15235,17 @@ class MCPServerProcess:
         if isinstance(content, list):
             for block in content:
                 if not isinstance(block, dict):
-                    parts.append(escape_invalid_utf8_text(block))
+                    parts.append(str(block))
                     continue
                 btype = str(block.get("type", "") or "")
                 if btype == "text":
-                    parts.append(escape_invalid_utf8_text(block.get("text", "")))
+                    parts.append(str(block.get("text", "")))
                 elif btype in ("image", "audio"):
                     mime = str(block.get("mimeType", "") or "binary")
                     parts.append(f"[{btype} content: {mime}]")
                 elif btype == "resource":
                     rsrc = block.get("resource", {}) if isinstance(block.get("resource"), dict) else {}
-                    parts.append(escape_invalid_utf8_text(rsrc.get("text", "") or f"[resource: {rsrc.get('uri','')}]"))
+                    parts.append(str(rsrc.get("text", "") or f"[resource: {rsrc.get('uri','')}]"))
                 else:
                     parts.append(json_dumps(block))
         text = "\n".join(p for p in parts if p != "")
@@ -14613,7 +15253,6 @@ class MCPServerProcess:
             sc = res.get("structuredContent")
             if sc is not None:
                 text = json_dumps(sc)
-        text = escape_invalid_utf8_text(text)
         if len(text) > _MCP_MAX_RESULT_CHARS:
             text = text[:_MCP_MAX_RESULT_CHARS] + "\n…(mcp result truncated)"
         if is_error:
@@ -15122,6 +15761,147 @@ class OllamaClient:
         self.capabilities = default_multimodal_capabilities()
         self.media_endpoints: dict[str, str] = {}
         self.embed_model: str = ""  # embedding model name, e.g. "nomic-embed-text"
+        self.telemetry_callback = None
+        self.telemetry_context_provider = None
+        self.telemetry_name = "chat"
+
+    def set_telemetry(self, callback=None, context_provider=None, name: str = "chat") -> None:
+        self.telemetry_callback = callback
+        self.telemetry_context_provider = context_provider
+        self.telemetry_name = trim(str(name or "chat"), 80)
+
+    @staticmethod
+    def _usage_tokens(response: dict | None) -> dict:
+        if not isinstance(response, dict):
+            return {}
+        raw = response.get("raw") if isinstance(response.get("raw"), dict) else {}
+        usage = raw.get("usage") if isinstance(raw.get("usage"), dict) else {}
+
+        def _as_int(value: object) -> int:
+            try:
+                return max(0, int(float(value))) if value not in (None, "") else 0
+            except Exception:
+                return 0
+
+        prompt = _as_int(
+            usage.get("prompt_tokens") or usage.get("input_tokens")
+            or raw.get("prompt_eval_count") or raw.get("input_tokens")
+        )
+        completion = _as_int(
+            usage.get("completion_tokens") or usage.get("output_tokens")
+            or raw.get("eval_count") or raw.get("output_tokens")
+        )
+        total = _as_int(usage.get("total_tokens") or raw.get("total_tokens"))
+        if total <= 0 and (prompt or completion):
+            total = prompt + completion
+        if prompt <= 0 and total > completion:
+            prompt = total - completion
+        if not (prompt or completion or total):
+            return {}
+        source = "model-usage"
+        if usage:
+            source = "anthropic-usage" if ("input_tokens" in usage or "output_tokens" in usage) else "openai-usage"
+        elif "prompt_eval_count" in raw or "eval_count" in raw:
+            source = "ollama-usage"
+        return {
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "total_tokens": total,
+            "source": source,
+        }
+
+    @staticmethod
+    def _operation_status_from_exception(exc: Exception) -> str:
+        low = str(exc).lower()
+        status_code = int(getattr(exc, "status", 0) or 0)
+        if status_code in {408, 504} or isinstance(exc, (TimeoutError, socket.timeout)) or "timeout" in low or "timed out" in low:
+            return "timeout"
+        if status_code == 499 or "interrupted" in low or "cancelled" in low or "canceled" in low:
+            return "cancelled"
+        return "error"
+
+    def _emit_chat_telemetry(
+        self,
+        response: dict | None,
+        started: float,
+        status: str,
+        *,
+        probe_mode: bool = False,
+        provider_snapshot: str = "",
+        model_snapshot: str = "",
+    ) -> None:
+        callback = getattr(self, "telemetry_callback", None)
+        if not callable(callback):
+            return
+        context: dict = {}
+        provider = getattr(self, "telemetry_context_provider", None)
+        if callable(provider):
+            try:
+                supplied = provider()
+                if isinstance(supplied, dict):
+                    context = supplied
+            except Exception:
+                context = {}
+        usage = self._usage_tokens(response)
+        fields = {
+            **context,
+            "name": "capability_probe" if probe_mode else str(getattr(self, "telemetry_name", "chat") or "chat"),
+            "status": status,
+            "duration_ms": round((time.monotonic() - started) * 1000.0, 3),
+            "provider": str(provider_snapshot or self.provider or ""),
+            "model": str(model_snapshot or self.model or ""),
+        }
+        if usage:
+            fields.update({
+                "prompt_tokens": int(usage.get("prompt_tokens", 0) or 0),
+                "completion_tokens": int(usage.get("completion_tokens", 0) or 0),
+                "total_tokens": int(usage.get("total_tokens", 0) or 0),
+            })
+        try:
+            callback("llm_call", **fields)
+        except Exception:
+            pass
+
+    def _emit_model_operation_telemetry(
+        self,
+        name: str,
+        started: float,
+        status: str,
+        *,
+        model: str = "",
+        response: dict | None = None,
+    ) -> None:
+        callback = getattr(self, "telemetry_callback", None)
+        if not callable(callback):
+            return
+        context: dict = {}
+        provider = getattr(self, "telemetry_context_provider", None)
+        if callable(provider):
+            try:
+                supplied = provider()
+                if isinstance(supplied, dict):
+                    context = supplied
+            except Exception:
+                pass
+        fields = {
+            **context,
+            "name": trim(str(name or "model_operation"), 80),
+            "status": str(status or "error"),
+            "duration_ms": round((time.monotonic() - started) * 1000.0, 3),
+            "provider": str(self.provider or ""),
+            "model": str(model or self.model or ""),
+        }
+        usage = self._usage_tokens(response)
+        if usage:
+            fields.update({
+                "prompt_tokens": int(usage.get("prompt_tokens", 0) or 0),
+                "completion_tokens": int(usage.get("completion_tokens", 0) or 0),
+                "total_tokens": int(usage.get("total_tokens", 0) or 0),
+            })
+        try:
+            callback("llm_call", **fields)
+        except Exception:
+            pass
 
     def _http_retry_key(self, url: str) -> str:
         parsed = urlparse(str(url or ""))
@@ -15325,40 +16105,41 @@ class OllamaClient:
         Raises on failure — _rag_embed_text catches and falls back to TF-IDF.
         """
         m = str(model or self.embed_model or "").strip()
-        if not m:
-            raise ValueError("OllamaClient.embed() called with no model configured")
-        texts = input if isinstance(input, list) else [str(input)]
-
-        if self.provider == "ollama":
-            raw = self._post_json(
-                "/api/embed",
-                {"model": m, "input": texts[0] if len(texts) == 1 else texts},
-            )
-            vecs = raw.get("embeddings") or raw.get("embedding")
-            if isinstance(vecs, list) and vecs:
-                if isinstance(vecs[0], list):
-                    return {"embeddings": vecs}
-                return {"embeddings": [vecs]}
-            raise ValueError(f"Unexpected embed response shape: {str(raw)[:120]}")
-        else:
-            payload: dict = {"model": m, "input": texts}
-            if self.payload_template:
-                payload.update(
-                    {k: v for k, v in self.payload_template.items() if k not in payload}
+        started = time.monotonic()
+        status = "error"
+        raw: dict | None = None
+        try:
+            if not m:
+                raise ValueError("OllamaClient.embed() called with no model configured")
+            texts = input if isinstance(input, list) else [str(input)]
+            if self.provider == "ollama":
+                raw = self._post_json(
+                    "/api/embed",
+                    {"model": m, "input": texts[0] if len(texts) == 1 else texts},
                 )
-            headers = self._render_headers()
-            base = str(self.base_url or "").rstrip("/")
-            raw = self._post_json_url(f"{base}/v1/embeddings", payload, headers)
-            data = raw.get("data") or []
-            if data and isinstance(data[0], dict):
-                vecs = [
-                    item["embedding"]
-                    for item in data
-                    if isinstance(item.get("embedding"), list)
-                ]
-                if vecs:
-                    return {"embeddings": vecs}
+                vecs = raw.get("embeddings") or raw.get("embedding")
+                if isinstance(vecs, list) and vecs:
+                    status = "success"
+                    return {"embeddings": vecs if isinstance(vecs[0], list) else [vecs]}
+            else:
+                payload: dict = {"model": m, "input": texts}
+                if self.payload_template:
+                    payload.update({k: v for k, v in self.payload_template.items() if k not in payload})
+                headers = self._render_headers()
+                base = str(self.base_url or "").rstrip("/")
+                raw = self._post_json_url(f"{base}/v1/embeddings", payload, headers)
+                data = raw.get("data") or []
+                if data and isinstance(data[0], dict):
+                    vecs = [item["embedding"] for item in data if isinstance(item.get("embedding"), list)]
+                    if vecs:
+                        status = "success"
+                        return {"embeddings": vecs}
             raise ValueError(f"Unexpected embed response shape: {str(raw)[:120]}")
+        except Exception as exc:
+            status = self._operation_status_from_exception(exc)
+            raise
+        finally:
+            self._emit_model_operation_telemetry("embedding", started, status, model=m, response={"raw": raw or {}})
 
     def _probe_cache_key(self) -> str:
         endpoint = self.endpoint.strip() if self.endpoint else ""
@@ -15390,13 +16171,13 @@ class OllamaClient:
             req_headers.update(headers)
         req = Request(
             url,
-            data=safe_utf8_bytes(json_dumps(payload)),
+            data=json_dumps(payload).encode("utf-8"),
             headers=req_headers,
             method="POST",
         )
         try:
             with urlopen(req, timeout=self.timeout) as resp:
-                body = decode_utf8_replace(resp.read())
+                body = resp.read().decode("utf-8")
                 return json.loads(body) if body else {}
         except HTTPError as exc:
             text = exc.read().decode("utf-8", errors="replace")
@@ -15485,7 +16266,7 @@ class OllamaClient:
             req_headers.update(headers)
         req = Request(
             url,
-            data=safe_utf8_bytes(json_dumps(payload)),
+            data=json_dumps(payload).encode("utf-8"),
             headers=req_headers,
             method="POST",
         )
@@ -15589,7 +16370,7 @@ class OllamaClient:
             req_headers.update(headers)
         req = Request(
             url,
-            data=safe_utf8_bytes(json_dumps(payload)),
+            data=json_dumps(payload).encode("utf-8"),
             headers=req_headers,
             method="POST",
         )
@@ -16311,7 +17092,7 @@ class OllamaClient:
         row = self._probe_cache.get(key, {})
         return dict(row) if isinstance(row, dict) else {}
 
-    def generate_media(
+    def _generate_media_impl(
         self,
         media_type: str,
         prompt: str,
@@ -16370,6 +17151,45 @@ class OllamaClient:
             "endpoint": endpoint,
             "raw": parsed,
         }
+
+    def generate_media(
+        self,
+        media_type: str,
+        prompt: str,
+        *,
+        size: str = "",
+        duration: int = 0,
+        fmt: str = "",
+        extra: dict | None = None,
+    ) -> dict:
+        mtype = str(media_type or "").strip().lower()
+        started = time.monotonic()
+        status = "error"
+        response: dict | None = None
+        try:
+            response = self._generate_media_impl(
+                mtype,
+                prompt,
+                size=size,
+                duration=duration,
+                fmt=fmt,
+                extra=extra,
+            )
+            status = "success"
+            return response
+        except Exception as exc:
+            status = self._operation_status_from_exception(exc)
+            raise
+        finally:
+            telemetry_response = None
+            if isinstance(response, dict) and isinstance(response.get("raw"), dict):
+                telemetry_response = {"raw": response.get("raw")}
+            self._emit_model_operation_telemetry(
+                f"media_{mtype or 'generation'}",
+                started,
+                status,
+                response=telemetry_response,
+            )
 
     @staticmethod
     def _collapse_tool_role_messages(messages: list[dict]) -> list[dict]:
@@ -16967,7 +17787,7 @@ class OllamaClient:
             },
         }
 
-    def chat(
+    def _chat_impl(
         self,
         messages: list[dict],
         *,
@@ -17141,6 +17961,63 @@ class OllamaClient:
             raw_tool_calls = raw.get("tool_calls", [])
         tool_calls = self._normalize_tool_calls(raw_tool_calls)
         return {"content": content, "thinking": thinking_content, "tool_calls": tool_calls, "raw": raw}
+
+    def chat(
+        self,
+        messages: list[dict],
+        *,
+        tools: list[dict] | None = None,
+        system: str | None = None,
+        max_tokens: int = 2000,
+        temperature: float = 0.2,
+        think: bool = False,
+        stream_thinking: bool = False,
+        on_thinking_chunk=None,
+        response_stream: bool = False,
+        on_content_delta=None,
+        media_inputs: list[dict] | None = None,
+        probe_mode: bool = False,
+        cancel_check=None,
+        on_http_retry=None,
+        effort: str = "",
+    ) -> dict:
+        started = time.monotonic()
+        provider_snapshot = str(self.provider or "")
+        model_snapshot = str(self.model or "")
+        response: dict | None = None
+        status = "error"
+        try:
+            response = self._chat_impl(
+                messages,
+                tools=tools,
+                system=system,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                think=think,
+                stream_thinking=stream_thinking,
+                on_thinking_chunk=on_thinking_chunk,
+                response_stream=response_stream,
+                on_content_delta=on_content_delta,
+                media_inputs=media_inputs,
+                probe_mode=probe_mode,
+                cancel_check=cancel_check,
+                on_http_retry=on_http_retry,
+                effort=effort,
+            )
+            status = "success"
+            return response
+        except Exception as exc:
+            status = self._operation_status_from_exception(exc)
+            raise
+        finally:
+            self._emit_chat_telemetry(
+                response,
+                started,
+                status,
+                probe_mode=probe_mode,
+                provider_snapshot=provider_snapshot,
+                model_snapshot=model_snapshot,
+            )
 
 def tool_def(name: str, description: str, properties: dict, required: list[str] | None = None) -> dict:
     return {
@@ -17586,12 +18463,15 @@ def canonicalize_tool_name(raw: object) -> str:
 
 def filter_tool_specs_for_runtime(tools: list[dict] | None, *, web_search_enabled: bool = DEFAULT_WEB_SEARCH_ENABLED) -> list[dict]:
     src = tools if isinstance(tools, list) else []
-    if bool(web_search_enabled):
-        return list(src)
     out: list[dict] = []
     for tool in src:
         fn = tool.get("function", {}) if isinstance(tool, dict) else {}
-        if canonicalize_tool_name(fn.get("name", "")) == "agent_web_search":
+        name = canonicalize_tool_name(fn.get("name", ""))
+        # Global skills are executable policy. Ordinary sessions may inspect them,
+        # but mutation is restricted to the authenticated admin/Skills Studio path.
+        if name == "write_skill":
+            continue
+        if name == "agent_web_search" and not bool(web_search_enabled):
             continue
         out.append(tool)
     return out
@@ -17792,13 +18672,17 @@ class SessionState:
         self.multimodal_capability_cache: dict[str, dict] = {}
         self.failed_selections: list[str] = []
         self.todo = TodoManager(self.ui_language)
+        # Tool dispatch still returns text for protocol compatibility, while
+        # structured outcome metadata (notably the real shell exit code) is
+        # carried alongside it in thread-local state for the orchestrator.
+        self._tool_result_local = threading.local()
         self.single_advance_prompt_enhance = False
         self.skills = SkillStore(skills_root)
         self.skill_load_cache: dict[str, dict] = {}
         self.skills_last_refresh_ts = 0.0
         self.skills_runtime_prepared = False
         self.tasks = TaskManager(self.root / "tasks", crypto)
-        self.bg = BackgroundManager(self.files_root)
+        self.bg = BackgroundManager(self.files_root, command_wrapper=self._hard_snapshot_shell_prefix)
         self.bus = MessageBus(self.root / "team" / "inbox", crypto)
         self.worktrees = WorktreeManager(self.id, self.tasks, self.root, crypto, repo_root)
         # External MCP (Model Context Protocol) tool driver. Prefer the shared
@@ -17996,6 +18880,10 @@ class SessionState:
         self.last_context_actual_context_label = ""
         self.last_context_actual_ts = 0.0
         self.last_context_estimated_prompt_tokens = 0
+        self.app_binding: dict = {}
+        self.bound_skill_ids: list[str] = []
+        self.bound_skill_capsule = ""
+        self.skill_mode = "dynamic"
         self.max_agent_rounds = max(
             MIN_AGENT_ROUNDS,
             min(MAX_AGENT_ROUNDS_CAP, int(max_rounds or MAX_AGENT_ROUNDS)),
@@ -18761,7 +19649,6 @@ class SessionState:
             if cached_caps:
                 merged = merge_multimodal_capabilities(self._capabilities_from_profile(row), cached_caps)
                 row["capabilities"] = merged
-                self.model_profiles[self.active_profile_id] = row
         self.model_profiles[self.active_profile_id] = row
         profile = row
         self.ollama.apply_profile(profile)
@@ -19203,6 +20090,17 @@ class SessionState:
                             "updated_at": float(srow.get("updated_at", 0.0) or 0.0),
                         }
                     self.skill_load_cache = clean_skill_cache
+                app_binding = raw.get("app_binding", {})
+                if isinstance(app_binding, dict):
+                    self.app_binding = dict(app_binding)
+                bound_ids = raw.get("bound_skill_ids", [])
+                if isinstance(bound_ids, list):
+                    self.bound_skill_ids = [str(x).strip() for x in bound_ids if str(x).strip()][:ADMIN_MAX_APP_SKILLS]
+                self.bound_skill_capsule = trim(
+                    str(raw.get("bound_skill_capsule", "") or ""),
+                    ADMIN_MAX_APP_CAPSULE_CHARS,
+                )
+                self.skill_mode = "hard" if self.bound_skill_ids and self.bound_skill_capsule else "dynamic"
                 active = raw.get("active_profile_id")
                 if isinstance(active, str) and active.strip():
                     self.active_profile_id = self._sanitize_profile_id(active)
@@ -19705,6 +20603,10 @@ class SessionState:
             "active_profile_id": self.active_profile_id,
             "multimodal_capability_cache": self.multimodal_capability_cache,
             "skill_load_cache": self.skill_load_cache,
+            "app_binding": dict(self.app_binding) if isinstance(self.app_binding, dict) else {},
+            "bound_skill_ids": list(self.bound_skill_ids)[:ADMIN_MAX_APP_SKILLS],
+            "bound_skill_capsule": trim(str(self.bound_skill_capsule or ""), ADMIN_MAX_APP_CAPSULE_CHARS),
+            "skill_mode": "hard" if self.skill_mode == "hard" else "dynamic",
             "todos": self.todo.snapshot(),
             "thinking": self.thinking,
             "context_limit_locked": bool(self.context_limit_locked),
@@ -20265,6 +21167,8 @@ class SessionState:
             bb["review_feedback"] = []
             bb["conversation_history"] = []
             bb["step_files"] = {}
+            bb["plan_step_evidence"] = {}
+            bb["plan_step_quality_reviews"] = {}
             bb["failure_ledger"] = {
                 "attempted_fixes": [],
                 "compilation_errors": [],
@@ -20276,6 +21180,7 @@ class SessionState:
             bb["persisted_manager_routes"] = []
         bb["project_todos"] = []
         bb["plan"] = {}
+        bb["plan_worker_todos"] = {}
         bb["plan_steps"] = []
         bb["plan_step_cursor"] = 0
         bb["plan_step_total"] = 0
@@ -20327,8 +21232,21 @@ class SessionState:
         bb["plan_proposal"] = ""
         bb["plan_risks"] = ""
         bb["plan_meta"] = {}
-        bb["loaded_skills"] = {}
-        bb["loaded_skills_goal_sig"] = ""
+        if self.skill_mode == "hard" and self.bound_skill_ids:
+            bb["loaded_skills"] = {
+                key: {
+                    "loaded_at": now_ts(),
+                    "size": 0,
+                    "preview": "immutable application skill snapshot",
+                    "skill_name": key,
+                    "pinned": True,
+                }
+                for key in self.bound_skill_ids
+            }
+            bb["loaded_skills_goal_sig"] = "hard-bound"
+        else:
+            bb["loaded_skills"] = {}
+            bb["loaded_skills_goal_sig"] = ""
         if previous:
             bb["previous_task_context"] = previous
         self.blackboard = bb
@@ -20828,6 +21746,15 @@ class SessionState:
             self.skill_load_cache = {}
 
     def _load_skill_with_cache(self, name: str, load_source: str = "manual") -> str:
+        if self.skill_mode == "hard":
+            requested = str(name or "").strip()
+            if requested not in set(self.bound_skill_ids):
+                return "Error: hard application mode only permits its bound skills: " + ", ".join(self.bound_skill_ids)
+            order = self.bound_skill_ids.index(requested) + 1
+            frozen = f"/workspace/.application_skills/{order:02d}/SKILL.md"
+            if (self._application_snapshot_root() / f"{order:02d}" / "SKILL.md").exists():
+                return f"Skill is hard-bound and active. Its complete immutable source is {frozen}; read that file before execution."
+            return "Skill is already active from the legacy immutable application snapshot."
         self._ensure_skills_ready(force=False)
         key, err = self.skills._resolve_name(name)
         if err or not key:
@@ -21017,6 +21944,23 @@ class SessionState:
         The original <loaded-skill> message may be compacted, so each model
         call gets a small workflow-critical copy from the skill cache/path.
         """
+        if self.skill_mode == "hard" and str(self.bound_skill_capsule or "").strip():
+            role = str(for_role or "agent").strip() or "agent"
+            header = (
+                "HARD-BOUND APPLICATION SKILLS (immutable approved snapshot):\n"
+                f"Application: {str((self.app_binding or {}).get('name', (self.app_binding or {}).get('app_id', 'application')))}. "
+                f"Role: {role}. The following workflows are mandatory for this session. "
+                "Do not unload, replace, bypass, or add unbound skills. When workflows overlap, "
+                "apply them in the listed order and preserve every hard constraint.\n"
+            )
+            if int((self.app_binding or {}).get("resource_count", 0) or 0) > 0:
+                header += (
+                    "Frozen skill scripts, templates, and references are mounted read-only under "
+                    "`/workspace/.application_skills/<skill-order>/`; consult "
+                    "`/workspace/.application_skills/MANIFEST.json` and use only those immutable copies. "
+                    "Do not access the mutable global `/skills` tree.\n"
+                )
+            return header + str(self.bound_skill_capsule or "")
         loaded = self._loaded_skill_rows()
         if not loaded:
             return ""
@@ -21082,6 +22026,13 @@ class SessionState:
         self.manager_context = _filter_rows(list(self.manager_context))[-400:]
 
     def _prepare_loaded_skills_for_goal(self, goal_text: str, trigger: str = "") -> dict:
+        if self.skill_mode == "hard":
+            return {
+                "goal_sig": self._loaded_skills_goal_signature(goal_text),
+                "current_sig": "hard-bound",
+                "goal_changed": False,
+                "loaded": {key: {"skill_name": key, "pinned": True} for key in self.bound_skill_ids},
+            }
         goal_sig = self._loaded_skills_goal_signature(goal_text)
         bb = self._ensure_blackboard()
         current_sig = str(bb.get("loaded_skills_goal_sig", "") or "")
@@ -21120,6 +22071,8 @@ class SessionState:
 
     def _auto_discover_and_load_skills(self, goal_text: str, trigger: str = ""):
         """Skill discovery: LLM semantic match (with timeout) → keyword fallback → lazy load."""
+        if self.skill_mode == "hard":
+            return
         try:
             self._ensure_skills_ready(force=False)
         except Exception:
@@ -21439,6 +22392,12 @@ class SessionState:
 
     def _loaded_skills_prompt_hint(self, *, for_role: str = "") -> str:
         """Unified skill awareness hint for any system prompt."""
+        if self.skill_mode == "hard" and self.bound_skill_ids:
+            return (
+                "HARD APPLICATION MODE: only these approved skills are active: "
+                + ", ".join(self.bound_skill_ids)
+                + ". Their immutable snapshot is mandatory. Do not call load_skill for any other skill. "
+            )
         bb = self._ensure_blackboard()
         loaded = bb.get("loaded_skills", {})
         skill_count = len(self.skills.skills) if hasattr(self.skills, "skills") else 0
@@ -21470,6 +22429,8 @@ class SessionState:
         Returns: loaded-skills hint  +  newline  +  'Skills:\\n<catalog>'
         Keeps all three modes in sync — change here propagates everywhere.
         """
+        if self.skill_mode == "hard":
+            return self._loaded_skills_context_block(for_role=for_role, max_chars=ADMIN_MAX_APP_CAPSULE_CHARS) + "\n"
         hint = self._loaded_skills_prompt_hint(for_role=for_role)
         active = self._loaded_skills_context_block(for_role=for_role, max_chars=6500)
         active_block = f"\n{active}\n" if active else "\n"
@@ -21676,10 +22637,20 @@ class SessionState:
 
     def _inject_runtime_environment_context(self, system: str = "") -> str:
         base = str(system or "").strip()
-        if "RUNTIME TEMPORAL AND LOCAL CONTEXT:" in base:
-            return base
-        block = self._runtime_environment_context_prompt_block()
-        return f"{base}\n\n{block}" if base else block
+        if "RUNTIME TEMPORAL AND LOCAL CONTEXT:" not in base:
+            block = self._runtime_environment_context_prompt_block()
+            base = f"{base}\n\n{block}" if base else block
+        if self.skill_mode == "hard" and "HARD-BOUND APPLICATION SKILLS (immutable approved snapshot):" not in base:
+            skills = self._loaded_skills_context_block(
+                for_role="system-helper",
+                max_chars=ADMIN_MAX_APP_CAPSULE_CHARS,
+            )
+            if skills:
+                base = f"{base}\n\n{skills}" if base else skills
+        return base
+
+    def _helper_system_prompt(self, system: str = "") -> str:
+        return self._inject_runtime_environment_context(system)
 
     def _system_prompt(self) -> str:
         try:
@@ -21742,6 +22713,7 @@ class SessionState:
         mm_block = self._multimodal_capability_block()
         mm_hint = f"{mm_block}\n" if mm_block else ""
         runtime_env_text = self._runtime_environment_context_prompt_block() + "\n\n"
+        skills_catalog_text = "" if self.skill_mode == "hard" else f"Skills:\n{self.skills.descriptions()}"
         return (
             f"You are a coding agent. Workspace: \"{self.files_root}\" ($SESSION_ROOT). "
             f"Offline JS libraries root: $JS_LIB_ROOT. "
@@ -21786,7 +22758,7 @@ class SessionState:
             f"{code_block}"
             f"{model_language_instruction(self.ui_language)}\n\n"
             f"Uploads:\n{uploads_ctx}\n\n"
-            f"Skills:\n{self.skills.descriptions()}"
+            f"{skills_catalog_text}"
         )
 
     def _char_token_divisor(self, text: str) -> float:
@@ -21829,54 +22801,18 @@ class SessionState:
 
     def _extract_model_usage_tokens(self, response: dict | None) -> dict:
         """Extract provider-reported token counts when a backend returns them."""
-        if not isinstance(response, dict):
-            return {}
-        raw = response.get("raw")
-        if not isinstance(raw, dict):
-            raw = {}
-        usage = raw.get("usage") if isinstance(raw.get("usage"), dict) else {}
+        return OllamaClient._usage_tokens(response)
 
-        def _as_int(value: object) -> int:
-            try:
-                if value is None or value == "":
-                    return 0
-                return max(0, int(float(value)))
-            except Exception:
-                return 0
-
-        prompt = _as_int(
-            usage.get("prompt_tokens")
-            or usage.get("input_tokens")
-            or raw.get("prompt_eval_count")
-            or raw.get("input_tokens")
+    def set_telemetry_callback(self, callback) -> None:
+        self.telemetry_callback = callback
+        self.ollama.set_telemetry(
+            callback,
+            context_provider=lambda: {
+                "session_id": self.id,
+                "app_id": str((self.app_binding or {}).get("app_id", "") or ""),
+            },
+            name="chat",
         )
-        completion = _as_int(
-            usage.get("completion_tokens")
-            or usage.get("output_tokens")
-            or raw.get("eval_count")
-            or raw.get("output_tokens")
-        )
-        total = _as_int(usage.get("total_tokens") or raw.get("total_tokens"))
-        if total <= 0 and (prompt or completion):
-            total = prompt + completion
-        if prompt <= 0 and total > completion:
-            prompt = total - completion
-        if not (prompt or completion or total):
-            return {}
-        source = "model-usage"
-        if usage:
-            if "input_tokens" in usage or "output_tokens" in usage:
-                source = "anthropic-usage"
-            else:
-                source = "openai-usage"
-        elif "prompt_eval_count" in raw or "eval_count" in raw:
-            source = "ollama-usage"
-        return {
-            "prompt_tokens": int(prompt),
-            "completion_tokens": int(completion),
-            "total_tokens": int(total),
-            "source": source,
-        }
 
     def _record_model_usage(
         self,
@@ -21941,14 +22877,17 @@ class SessionState:
             parts.append(trim(self._uploads_prompt_block(), 3000))
         except Exception:
             pass
-        try:
-            parts.append(trim(self.skills.descriptions(), 12000))
-        except Exception:
-            pass
-        try:
-            parts.append(trim(self._loaded_skills_context_block(for_role="developer", max_chars=5000), 5000))
-        except Exception:
-            pass
+        if self.skill_mode == "hard":
+            parts.append(self._loaded_skills_context_block(for_role="developer", max_chars=ADMIN_MAX_APP_CAPSULE_CHARS))
+        else:
+            try:
+                parts.append(trim(self.skills.descriptions(), 12000))
+            except Exception:
+                pass
+            try:
+                parts.append(trim(self._loaded_skills_context_block(for_role="developer", max_chars=5000), 5000))
+            except Exception:
+                pass
         try:
             parts.append(trim(self._plan_steps_context_for_manager(), 4000))
         except Exception:
@@ -24289,7 +25228,7 @@ class SessionState:
             return "retrieval"
         if tool == "load_skill":
             return "skill_loaded"
-        if tool in {"bash", "background_run", "worktree_run"}:
+        if tool in {"bash", "worktree_run"}:
             if not ok or self._command_output_has_error_shape(output):
                 return "command_error"
             if self._bash_looks_like_file_read(command):
@@ -24412,7 +25351,7 @@ class SessionState:
         if not tool:
             return
         text = str(output or "")
-        ok = not text.startswith("Error:")
+        ok = self._tool_result_compat_ok(tool, text)
         status_text = (result_status or ("ok" if ok else "error")).strip().lower()
         if tool == "read_file" and not ok:
             return
@@ -25198,7 +26137,7 @@ class SessionState:
             return
         src_args = args if isinstance(args, dict) else {}
         text = str(output or "")
-        ok = not text.startswith("Error:")
+        ok = self._tool_result_compat_ok(tool, text)
         if tool in {"write_file", "edit_file"}:
             path = trim(str(src_args.get("path", "") or "").replace("\\", "/"), 300)
             if path:
@@ -25222,7 +26161,22 @@ class SessionState:
                 related_paths=[path] if path else [],
             )
             return
-        if tool in {"bash", "background_run", "worktree_run"}:
+        if tool == "background_run":
+            self._record_tool_memory(
+                tool,
+                src_args,
+                text,
+                role=role,
+                evidence_kind="background_started" if ok else "command_error",
+                result_status="started" if ok else "error",
+                command=str(src_args.get("command", "") or ""),
+                summary=trim(
+                    f"background task launch acknowledged; completion must be collected with check_background: {text}",
+                    TOOL_MEMORY_SUMMARY_MAX_CHARS,
+                ),
+            )
+            return
+        if tool in {"bash", "worktree_run"}:
             buffer_match = re.search(r"(?m)^buffer_ref=([^\s]+)", text)
             temp_match = re.search(r"(?m)^full_output_path=([^\s]+)", text)
             read_targets = self._bash_file_read_targets(str(src_args.get("command", "") or ""))
@@ -25718,7 +26672,7 @@ class SessionState:
         with fp.open("w", encoding="utf-8") as handle:
             for idx, row in enumerate(rows):
                 line = json_dumps(row)
-                payload = safe_utf8_bytes(line + "\n")
+                payload = (line + "\n").encode("utf-8")
                 sha.update(payload)
                 handle.write(line + "\n")
                 msg_ts = float(row.get("ts", 0.0) or 0.0)
@@ -26230,12 +27184,12 @@ class SessionState:
         active_errors = len([e for e in comp_errors if isinstance(e, dict) and int(e.get("count", 0) or 0) > 0])
         artifacts = bb.get("code_artifacts", {})
         artifacts_keys = sorted(artifacts.keys()) if isinstance(artifacts, dict) else []
-        files_hash = hashlib.sha1(safe_utf8_bytes(artifacts_keys)).hexdigest()[:12]
+        files_hash = hashlib.sha1(str(artifacts_keys).encode("utf-8")).hexdigest()[:12]
         try:
             todo_snap = json_dumps(self.todo.snapshot()) if hasattr(self, "todo") else ""
         except Exception:
             todo_snap = ""
-        todos_hash = hashlib.sha1(safe_utf8_bytes(todo_snap)).hexdigest()[:12]
+        todos_hash = hashlib.sha1(todo_snap.encode("utf-8")).hexdigest()[:12]
         stall_events = fl.get("stall_events", [])
         delegations = fl.get("repeated_delegations", [])
         return {
@@ -31175,6 +32129,14 @@ body{padding:18px}
             client.model = model_override
         client.thinking_stream = False
         client.timeout = max(0.2, float(self.arbiter_timeout_seconds or ARBITER_DEFAULT_TIMEOUT_SECONDS))
+        client.set_telemetry(
+            getattr(self, "telemetry_callback", None),
+            context_provider=lambda: {
+                "session_id": self.id,
+                "app_id": str((self.app_binding or {}).get("app_id", "") or ""),
+            },
+            name="arbiter",
+        )
         return client
 
     def _call_arbiter_llm(self, assistant_text: str, thinking_text: str = "", *, force: bool = False) -> dict:
@@ -31197,6 +32159,7 @@ body{padding:18px}
             "TASK_COMPLETED, ACTION_REQUIRED, VALID_PLANNING, USER_INPUT_REQUIRED, or EMPTY_RAMBLING. "
             "Return strict JSON only."
         )
+        arbiter_system = self._inject_runtime_environment_context(arbiter_system)
         arbiter_user = (
             "Read the snapshot and classify the worker state.\n"
             "Status definitions:\n"
@@ -32701,10 +33664,6 @@ body{padding:18px}
         except Exception:
             return False
         roots: list[Path] = [self.root.resolve(), self.files_root.resolve()]
-        try:
-            roots.append(self.skills.skills_root.resolve())
-        except Exception:
-            pass
         for root in roots:
             try:
                 if target == root or target.is_relative_to(root):
@@ -32891,8 +33850,109 @@ body{padding:18px}
                 blocked.append(p)
         return blocked
 
+    def _command_targets_global_skills(self, command: str) -> bool:
+        text = str(command or "")
+        if not text.strip():
+            return False
+        try:
+            skills_root = str(self.skills.skills_root.resolve()).rstrip(os.sep)
+        except Exception:
+            skills_root = str(self.skills.skills_root).rstrip(os.sep)
+        if skills_root and (text == skills_root or skills_root in text):
+            return True
+        return bool(
+            re.search(r"(^|[^A-Za-z0-9_.~-])/skills(?:/|\b)", text)
+            or re.search(r"\$\{?SKILLS_ROOT\}?", text)
+        )
+
+    def _path_targets_global_skills(self, path_text: object) -> bool:
+        text = str(path_text or "").strip().strip("'\"")
+        low = text.lower().replace("\\", "/")
+        if low in {"/skills", "/skills/", "$skills_root", "${skills_root}"} or low.startswith("/skills/"):
+            return True
+        try:
+            target = Path(text).expanduser().resolve()
+            root = self.skills.skills_root.resolve()
+            return target == root or target.is_relative_to(root)
+        except Exception:
+            return False
+
+    def _application_snapshot_root(self) -> Path:
+        return self.files_root / ".application_skills"
+
+    def _path_targets_application_snapshot(self, path_text: object) -> bool:
+        text = str(path_text or "").strip().strip("'\"")
+        if not text:
+            return False
+        normalized = text.replace("\\", "/")
+        if normalized == "/workspace" or normalized.startswith("/workspace/"):
+            normalized = normalized[len("/workspace/") :] if normalized != "/workspace" else ""
+        if ".application_skills" in PurePosixPath(normalized.lstrip("/")).parts:
+            return True
+        try:
+            raw = Path(text).expanduser()
+            target = raw.resolve() if raw.is_absolute() else (self.files_root / raw).resolve()
+            root = self._application_snapshot_root().resolve()
+            return target == root or target.is_relative_to(root)
+        except Exception:
+            return False
+
+    def _hard_snapshot_shell_prefix(self) -> list[str]:
+        if self.skill_mode != "hard" or os.name != "posix" or sys.platform != "darwin":
+            return []
+        sandbox = shutil.which("sandbox-exec")
+        snapshot_root = self._application_snapshot_root()
+        if not sandbox or not snapshot_root.exists():
+            return []
+        # Seatbelt enforces the boundary at the syscall layer while allowing
+        # frozen scripts to execute and the rest of the session workspace to mutate.
+        policy = (
+            "(version 1) "
+            "(allow default) "
+            f"(deny file-write* (subpath {json.dumps(str(snapshot_root.resolve()))}))"
+        )
+        return [sandbox, "-p", policy]
+
+    def _hard_snapshot_shell_supported(self) -> bool:
+        return bool(self._hard_snapshot_shell_prefix())
+
+    def _restore_application_snapshot_permissions(self) -> None:
+        if self.skill_mode != "hard":
+            return
+        root = self._application_snapshot_root()
+        if not root.exists():
+            return
+        try:
+            for current, dirs, files in os.walk(root, topdown=False, followlinks=False):
+                current_path = Path(current)
+                for name in files:
+                    fp = current_path / name
+                    try:
+                        mode = 0o500 if fp.suffix.lower() in {".sh", ".py", ".js", ".mjs"} else 0o400
+                        os.chmod(fp, mode, follow_symlinks=False)
+                    except Exception:
+                        pass
+                for name in dirs:
+                    try:
+                        os.chmod(current_path / name, 0o500, follow_symlinks=False)
+                    except Exception:
+                        pass
+            os.chmod(root, 0o500, follow_symlinks=False)
+        except Exception:
+            pass
+
     def _guard_shell_write_scope(self, command: str, cwd: Path | None = None) -> str:
         effective = self._rewrite_shell_virtual_paths(command, cwd or self.files_root)
+        if self._command_targets_global_skills(command) or self._command_targets_global_skills(effective):
+            return (
+                "Error: shell access to global skills is disabled. "
+                "Use list_skills/load_skill/read_file for skill reads; only the authenticated administrator may mutate skills."
+            )
+        if self.skill_mode == "hard" and self._application_snapshot_root().exists() and not self._hard_snapshot_shell_prefix():
+            return (
+                "Error: shell execution is disabled for hard applications on this platform because "
+                "an OS-level read-only snapshot policy is unavailable. Use read_file and the bound Skill instructions."
+            )
         blocked = self._shell_write_targets_outside_scope(effective)
         if not blocked:
             return ""
@@ -32917,6 +33977,13 @@ body{padding:18px}
             "output": "",
             "error": "",
         }
+        if self._command_targets_global_skills(command) or self._command_targets_global_skills(effective_command):
+            meta["error"] = (
+                "Error: shell access to global skills is disabled. "
+                "Use list_skills/load_skill/read_file for skill reads; only the authenticated administrator may mutate skills."
+            )
+            meta["output"] = meta["error"]
+            return meta
         if any(x in effective_command for x in DANGEROUS_PATTERNS):
             meta["error"] = "Error: dangerous command blocked"
             meta["output"] = meta["error"]
@@ -33137,8 +34204,14 @@ body{padding:18px}
             proc_env["SKILLS_ROOT"] = str(self.skills.skills_root)
             proc_env["CLOUDS_CODER_ROOT"] = str(self.root)
             proc_env["JS_LIB_ROOT"] = str(self.js_lib_root)
+            shell_prefix = self._hard_snapshot_shell_prefix()
+            popen_command: object = effective_command
+            use_shell = True
+            if shell_prefix:
+                popen_command = [*shell_prefix, "/bin/sh", "-c", effective_command]
+                use_shell = False
             popen_kwargs = {
-                "shell": True,
+                "shell": use_shell,
                 "cwd": cwd,
                 "stdin": subprocess.PIPE,
                 "stdout": subprocess.PIPE,
@@ -33152,7 +34225,7 @@ body{padding:18px}
                 create_group = int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) or 0)
                 if create_group > 0:
                     popen_kwargs["creationflags"] = create_group
-            proc = subprocess.Popen(effective_command, **popen_kwargs)
+            proc = subprocess.Popen(popen_command, **popen_kwargs)
             self._running_bash_proc = proc
             if os.name == "nt":
                 # Windows: read PIPE output via blocking reader threads + queue.
@@ -33267,6 +34340,7 @@ body{padding:18px}
                 meta["exit_code"] = -1
         finally:
             self._running_bash_proc = None
+            self._restore_application_snapshot_permissions()
         meta["duration_ms"] = int((time.time() - start) * 1000)
         after = self._git_status_map(cwd)
         meta["changed_files"] = self._status_delta(before, after) if before or after else []
@@ -33928,8 +35002,13 @@ body{padding:18px}
 
     def _run_write(self, path: str, content: str) -> str:
         try:
+            if self.skill_mode == "hard" and self._path_targets_application_snapshot(path):
+                return "Error: immutable application skill resources are read-only."
             rel = self._normalize_tool_path_text(path)
             fp = self._fuzzy_resolve_path(self._session_path(rel))
+            skills_root = self.skills.skills_root.resolve()
+            if fp.resolve() == skills_root or fp.resolve().is_relative_to(skills_root):
+                return "Error: global skill mutation is restricted to the authenticated administrator."
             rel = self._session_rel(fp)
             fp.parent.mkdir(parents=True, exist_ok=True)
             fp.write_text(content, encoding="utf-8")
@@ -33939,8 +35018,13 @@ body{padding:18px}
 
     def _run_edit(self, path: str, old_text: str, new_text: str) -> str:
         try:
+            if self.skill_mode == "hard" and self._path_targets_application_snapshot(path):
+                return "Error: immutable application skill resources are read-only."
             rel = self._normalize_tool_path_text(path)
             fp = self._fuzzy_resolve_path(self._session_path(rel))
+            skills_root = self.skills.skills_root.resolve()
+            if fp.resolve() == skills_root or fp.resolve().is_relative_to(skills_root):
+                return "Error: global skill mutation is restricted to the authenticated administrator."
             rel = self._session_rel(fp)
             content = fp.read_text(encoding="utf-8")
             if old_text not in content:
@@ -34101,7 +35185,10 @@ body{padding:18px}
         pinned_selection = self._active_runtime_selection()
         for _ in range(20):
             try:
+                hard_skills = self._loaded_skills_context_block(for_role=str(agent_type or "subagent"), max_chars=ADMIN_MAX_APP_CAPSULE_CHARS)
                 sub_system = f"You are a focused subagent. {model_language_instruction(self.ui_language)}"
+                if hard_skills:
+                    sub_system += "\n\n" + hard_skills
                 response = self._chat_with_same_model_retry(
                     msgs,
                     tools=subtools,
@@ -34159,44 +35246,13 @@ body{padding:18px}
                     msgs.append({"role": "tool", "tool_call_id": tc["id"], "name": name, "content": trim(out)})
                     continue
                 if name == "bash":
-                    out = self._run_bash(args.get("command", ""))
-                    self._maybe_record_tool_memory_after_result(name, args if isinstance(args, dict) else {}, out, "single")
+                    out = self._dispatch_tool(name, args if isinstance(args, dict) else {}, str(agent_type or ""))
                 elif name == "read_file":
-                    out = self._run_read(
-                        args.get("path", ""),
-                        args.get("limit"),
-                        args.get("offset"),
-                        mode=args.get("mode"),
-                        target=args.get("target"),
-                        query=args.get("query"),
-                        line=args.get("line"),
-                        context=args.get("context"),
-                        regex=args.get("regex"),
-                        max_chars=args.get("max_chars"),
-                    )
-                    try:
-                        rel = self._session_rel(self._session_path(self._normalize_tool_path_text(args.get("path", ""))))
-                        self._record_read_context(rel, args if isinstance(args, dict) else {}, out, role="single")
-                    except Exception:
-                        pass
+                    out = self._dispatch_tool(name, args if isinstance(args, dict) else {}, str(agent_type or ""))
                 elif name == "write_file":
-                    out = self._run_write(args.get("path", ""), args.get("content", ""))
-                    if not str(out).startswith("Error:"):
-                        try:
-                            rel = self._session_rel(self._session_path(self._normalize_tool_path_text(args.get("path", ""))))
-                            self._mark_read_context_stale(rel, reason="subagent write_file changed file")
-                        except Exception:
-                            pass
-                    self._maybe_record_tool_memory_after_result(name, args if isinstance(args, dict) else {}, out, "single")
+                    out = self._dispatch_tool(name, args if isinstance(args, dict) else {}, str(agent_type or ""))
                 elif name == "edit_file":
-                    out = self._run_edit(args.get("path", ""), args.get("old_text", ""), args.get("new_text", ""))
-                    if not str(out).startswith("Error:"):
-                        try:
-                            rel = self._session_rel(self._session_path(self._normalize_tool_path_text(args.get("path", ""))))
-                            self._mark_read_context_stale(rel, reason="subagent edit_file changed file")
-                        except Exception:
-                            pass
-                    self._maybe_record_tool_memory_after_result(name, args if isinstance(args, dict) else {}, out, "single")
+                    out = self._dispatch_tool(name, args if isinstance(args, dict) else {}, str(agent_type or ""))
                 else:
                     out = f"Unknown tool: {name}"
                 msgs.append({
@@ -35452,8 +36508,8 @@ body{padding:18px}
             "last_worker_reply_role": last_reply_role,
             "last_worker_reply_text": last_reply_text,
         }
-        raw = json_dumps(payload, sort_keys=True, separators=(",", ":"))
-        return hashlib.sha1(safe_utf8_bytes(raw)).hexdigest()
+        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
     def _watchdog_extract_json_array(self, text: str) -> list[dict]:
         raw = str(text or "").strip()
@@ -35978,7 +37034,7 @@ body{padding:18px}
             else:
                 wd["repeat_no_tool_streak"] = 0
             wd["last_no_tool_text"] = text
-            wd["last_no_tool_hash"] = hashlib.sha1(safe_utf8_bytes(text)).hexdigest() if text else ""
+            wd["last_no_tool_hash"] = hashlib.sha1(text.encode("utf-8")).hexdigest() if text else ""
         else:
             wd["intent_no_tool_streak"] = max(0, int(wd.get("intent_no_tool_streak", 0) or 0) - 1)
             wd["repeat_no_tool_streak"] = max(0, int(wd.get("repeat_no_tool_streak", 0) or 0) - 1)
@@ -36165,6 +37221,8 @@ body{padding:18px}
             "review_feedback": [],
             "conversation_history": [],
             "plan_worker_todos": {},
+            "plan_step_evidence": {},
+            "plan_step_quality_reviews": {},
             "status": "INITIALIZING",
             "task_epoch": float(now_ts()),
             "focus": {
@@ -36418,6 +37476,7 @@ body{padding:18px}
                         "parent_step_id": trim(str(row.get("parent_step_id", "") or step_id), 40) or step_id,
                         "created_at": float(row.get("created_at", 0.0) or 0.0),
                         "updated_at": float(row.get("updated_at", 0.0) or 0.0),
+                        "started_at": float(row.get("started_at", 0.0) or 0.0),
                         "completed_at": float(row.get("completed_at", 0.0) or 0.0) if row.get("completed_at") else None,
                         "completed_by": trim(str(row.get("completed_by", "") or ""), 40),
                         "evidence": trim(str(row.get("evidence", "") or ""), 300),
@@ -36426,6 +37485,47 @@ body{padding:18px}
                     clean_worker_todos[step_id] = clean_rows
             if clean_worker_todos:
                 board["plan_worker_todos"] = clean_worker_todos
+        raw_step_evidence = src.get("plan_step_evidence")
+        if isinstance(raw_step_evidence, dict):
+            clean_evidence: dict[str, list[dict]] = {}
+            for raw_step_id, raw_rows in list(raw_step_evidence.items())[:80]:
+                step_id = trim(str(raw_step_id or "").strip(), 40)
+                if not step_id or not isinstance(raw_rows, list):
+                    continue
+                rows: list[dict] = []
+                for raw_row in raw_rows[-40:]:
+                    row = self._normalize_plan_evidence_record(raw_row)
+                    if row.get("id") and row.get("step_id") == step_id:
+                        rows.append(row)
+                if rows:
+                    clean_evidence[step_id] = rows
+            if clean_evidence:
+                board["plan_step_evidence"] = clean_evidence
+        raw_quality_reviews = src.get("plan_step_quality_reviews")
+        if isinstance(raw_quality_reviews, dict):
+            clean_quality_reviews: dict[str, list[dict]] = {}
+            for raw_step_id, raw_rows in list(raw_quality_reviews.items())[:80]:
+                step_id = trim(str(raw_step_id or "").strip(), 40)
+                if not step_id or not isinstance(raw_rows, list):
+                    continue
+                rows: list[dict] = []
+                for raw_row in raw_rows[-8:]:
+                    if not isinstance(raw_row, dict):
+                        continue
+                    rows.append({
+                        "passed": bool(raw_row.get("passed", False)),
+                        "confidence": trim(str(raw_row.get("confidence", "low") or "low"), 20),
+                        "reason": trim(str(raw_row.get("reason", "") or ""), 500),
+                        "missing": [trim(str(x), 220) for x in (raw_row.get("missing", []) or [])[:8]],
+                        "evidence": [trim(str(x), 260) for x in (raw_row.get("evidence", []) or [])[:8]],
+                        "source": trim(str(raw_row.get("source", "") or ""), 40),
+                        "evidence_signature": trim(str(raw_row.get("evidence_signature", "") or ""), 80),
+                        "ts": float(raw_row.get("ts", 0.0) or 0.0),
+                    })
+                if rows:
+                    clean_quality_reviews[step_id] = rows
+            if clean_quality_reviews:
+                board["plan_step_quality_reviews"] = clean_quality_reviews
         raw_artifacts = src.get("code_artifacts", {})
         artifacts: dict[str, dict] = {}
         if isinstance(raw_artifacts, dict):
@@ -36564,6 +37664,10 @@ body{padding:18px}
                         "loaded_at": float(sinfo.get("loaded_at", 0.0) or 0.0),
                         "size": int(sinfo.get("size", 0) or 0),
                         "preview": trim(str(sinfo.get("preview", "") or ""), 300),
+                        "skill_name": trim(str(sinfo.get("skill_name", skey) or skey), 160),
+                        "skill_path": trim(str(sinfo.get("skill_path", "") or ""), 500),
+                        "aliases": [trim(str(x), 120) for x in (sinfo.get("aliases", []) or []) if str(x).strip()][:12],
+                        "pinned": bool(sinfo.get("pinned", False)),
                     }
             if clean_skills:
                 board["loaded_skills"] = clean_skills
@@ -37111,7 +38215,7 @@ body{padding:18px}
         errors = fl.get("errors", [])
         focus = self._blackboard_focus_identity(bb)
         now_tick = float(now_ts())
-        fp = hashlib.sha1(safe_utf8_bytes(str(category or "") + str(file or "") + str(error_msg or ""))).hexdigest()[:12]
+        fp = hashlib.sha1((str(category or "") + str(file or "") + str(error_msg or "")).encode("utf-8")).hexdigest()[:12]
         for entry in errors:
             if entry.get("fingerprint") == fp:
                 entry["count"] = int(entry.get("count", 1) or 1) + 1
@@ -37231,6 +38335,10 @@ body{padding:18px}
                     self._deactivate_reviewer_debug_mode("errors resolved")
                 self._ledger_verify_fix_attempts_on_success(category)
 
+    def _tool_result_compat_ok(self, name: str, output: object) -> bool:
+        """Compatibility success check for callers that only receive text."""
+        return self._tool_result_ok(name, output, self._peek_tool_result_meta())
+
     # --- Consolidated error-context assembly for recovery prompts ---
 
     def _recent_error_context(self, max_chars: int = 800) -> str:
@@ -37340,7 +38448,7 @@ body{padding:18px}
             return
         delegations = fl.get("repeated_delegations", [])
         progress_fp = self._watchdog_state_fingerprint(bb)
-        fp = hashlib.sha1(safe_utf8_bytes(str(instruction or "") + "|" + progress_fp)).hexdigest()[:12]
+        fp = hashlib.sha1((str(instruction or "") + "|" + progress_fp).encode("utf-8")).hexdigest()[:12]
         for entry in delegations:
             if entry.get("instruction_hash") == fp and entry.get("target") == target:
                 entry["count"] = int(entry.get("count", 1) or 1) + 1
@@ -37388,7 +38496,7 @@ body{padding:18px}
             args_str = json_dumps(args) if isinstance(args, dict) else str(args or "")
         except Exception:
             args_str = str(args or "")
-        fp = hashlib.sha1(safe_utf8_bytes(str(tool_name or "") + args_str)).hexdigest()[:16]
+        fp = hashlib.sha1((str(tool_name or "") + args_str).encode("utf-8")).hexdigest()[:16]
         for entry in fps:
             if entry.get("fingerprint") == fp:
                 entry["count"] = int(entry.get("count", 1) or 1) + 1
@@ -37440,6 +38548,10 @@ body{padding:18px}
         preserved_todos = old_bb.get("project_todos", [])
         preserved_cursor = old_bb.get("plan_step_cursor", None)
         preserved_total = old_bb.get("plan_step_total", None)
+        preserved_worker_todos = old_bb.get("plan_worker_todos", {})
+        preserved_step_evidence = old_bb.get("plan_step_evidence", {})
+        preserved_quality_reviews = old_bb.get("plan_step_quality_reviews", {})
+        preserved_step_files = old_bb.get("step_files", {})
         self.blackboard = self._new_blackboard(goal)
         if (
             isinstance(preserved_skills, dict)
@@ -37469,6 +38581,14 @@ body{padding:18px}
                 self.blackboard["plan_step_cursor"] = preserved_cursor
             if preserved_total is not None:
                 self.blackboard["plan_step_total"] = preserved_total
+            if isinstance(preserved_worker_todos, dict):
+                self.blackboard["plan_worker_todos"] = preserved_worker_todos
+            if isinstance(preserved_step_evidence, dict):
+                self.blackboard["plan_step_evidence"] = preserved_step_evidence
+            if isinstance(preserved_quality_reviews, dict):
+                self.blackboard["plan_step_quality_reviews"] = preserved_quality_reviews
+            if isinstance(preserved_step_files, dict):
+                self.blackboard["step_files"] = preserved_step_files
         self.manager_context = []
         try:
             self.contexts = {role: [] for role in AGENT_ROLES}
@@ -38053,6 +39173,40 @@ body{padding:18px}
             return ""
         return trim(lines[0], max_chars)
 
+    def _tool_result_exit_code(self, item: dict) -> int | None:
+        if not isinstance(item, dict):
+            return None
+        raw = item.get("exit_code", None)
+        if raw is not None:
+            try:
+                return int(raw)
+            except Exception:
+                pass
+        return self._effective_shell_exit_code(item.get("output", ""), None)
+
+    def _tool_result_is_passing_execution(self, item: dict, *, require_validation: bool = False) -> bool:
+        if not isinstance(item, dict) or not bool(item.get("ok", False)):
+            return False
+        name = str(item.get("name", "") or "")
+        if name not in {"bash", "worktree_run", "check_background"}:
+            return False
+        args = item.get("args", {}) if isinstance(item.get("args"), dict) else {}
+        command = str(args.get("command", "") or "")
+        if require_validation and not self._command_looks_like_validation(command):
+            return False
+        exit_code = self._tool_result_exit_code(item)
+        # check_background returning successfully only means the polling call
+        # worked. Until the task has a real terminal exit code, execution is
+        # still pending and cannot satisfy validation.
+        if name == "check_background" and exit_code is None:
+            return False
+        if exit_code is not None and exit_code != 0:
+            return False
+        output = str(item.get("output", "") or "")
+        if exit_code is None and self._command_output_has_error_shape(output):
+            return False
+        return True
+
     def _tool_result_has_positive_retrieval_signal(self, item: dict) -> bool:
         if not isinstance(item, dict) or not item.get("ok", False):
             return False
@@ -38151,7 +39305,7 @@ body{padding:18px}
             for r in rows
         )
         blackboard_read_signal = any(str(r.get("name", "")) == "read_from_blackboard" for r in rows)
-        bash_rows = [r for r in rows if str(r.get("name", "")) == "bash"]
+        bash_rows = [r for r in rows if str(r.get("name", "")) in {"bash", "worktree_run", "check_background"}]
         observed_signal = False
         compile_signal = False
         test_signal = False
@@ -38176,11 +39330,16 @@ body{padding:18px}
                 or bool(re.search(r"\b(?:http\s*)?200\b", low))
                 or bool(re.search(r"\bexit\s*[:=]\s*0\b", low))
             )
-            if (cmd_is_validation or output_has_positive) and low and not any(neg in low for neg in negative_hints):
+            execution_passed = self._tool_result_is_passing_execution(row)
+            if execution_passed and cmd_is_validation:
                 observed_signal = True
-            if low and any(tok in low for tok in compile_hints) and not any(neg in low for neg in negative_hints):
+            elif execution_passed and output_has_positive and not any(neg in low for neg in negative_hints):
+                observed_signal = True
+            if execution_passed and low and any(tok in low for tok in compile_hints) and not any(neg in low for neg in negative_hints):
                 compile_signal = True
-            if low and any(tok in low for tok in test_hints) and not any(neg in low for neg in negative_hints):
+            if execution_passed and cmd_is_validation:
+                test_signal = True
+            elif execution_passed and low and any(tok in low for tok in test_hints) and not any(neg in low for neg in negative_hints):
                 test_signal = True
         wants_test = phase in ("test", "review") or any(
             tok in step_text for tok in ("test", "pytest", "unit", "integration", "验证", "測試", "测试", "回归", "assert")
@@ -38317,7 +39476,11 @@ body{padding:18px}
         def _has_positive(rows: list[dict], hints: tuple[str, ...]) -> bool:
             for row in reversed(rows[-6:]):
                 low = str(row.get("content", "") or "").lower()
-                if not low or any(neg in low for neg in negative_hints):
+                if (
+                    not low
+                    or any(neg in low for neg in negative_hints)
+                    or re.search(r"\bexit[_ ]?code\s*[:=]\s*(?!0\b)-?\d+\b", low)
+                ):
                     continue
                 if any(tok in low for tok in hints):
                     return True
@@ -38326,7 +39489,11 @@ body{padding:18px}
         def _has_observed(rows: list[dict]) -> bool:
             for row in reversed(rows[-6:]):
                 low = str(row.get("content", "") or "").lower()
-                if not low or any(neg in low for neg in negative_hints):
+                if (
+                    not low
+                    or any(neg in low for neg in negative_hints)
+                    or re.search(r"\bexit[_ ]?code\s*[:=]\s*(?!0\b)-?\d+\b", low)
+                ):
                     continue
                 if (
                     self._command_looks_like_validation(low)
@@ -38360,6 +39527,365 @@ body{padding:18px}
             "recent_review_excerpt": _recent_excerpt(review_rows, 140),
             "recent_research_excerpt": _recent_excerpt(research_rows, 140),
         }
+
+    def _normalize_plan_evidence_record(self, raw: object) -> dict:
+        row = raw if isinstance(raw, dict) else {}
+        tool = canonicalize_tool_name(str(row.get("tool", "") or ""))
+        kind = str(row.get("kind", "") or "").strip().lower()
+        if kind not in {"runtime", "file", "research", "blackboard", "generic"}:
+            kind = "generic"
+        try:
+            ts = float(row.get("ts", 0.0) or 0.0)
+        except Exception:
+            ts = 0.0
+        exit_code = row.get("exit_code", None)
+        try:
+            exit_code = int(exit_code) if exit_code is not None else None
+        except Exception:
+            exit_code = None
+        return {
+            "id": trim(str(row.get("id", "") or ""), 80),
+            "step_id": trim(str(row.get("step_id", "") or ""), 40),
+            "kind": kind,
+            "tool": tool,
+            "ok": bool(row.get("ok", False)),
+            "command": trim(str(row.get("command", "") or ""), 500),
+            "path": trim(str(row.get("path", "") or ""), 300),
+            "summary": trim(str(row.get("summary", "") or ""), 900),
+            "changed_files": [
+                normalize_rel_preview_path(str(value or ""))
+                for value in (row.get("changed_files", []) if isinstance(row.get("changed_files"), list) else [])[:12]
+                if normalize_rel_preview_path(str(value or ""))
+            ],
+            "exit_code": exit_code,
+            "actor": trim(str(row.get("actor", "") or ""), 40),
+            "ts": ts,
+        }
+
+    def _plan_step_evidence_records(
+        self,
+        step_id: str,
+        *,
+        board: dict | None = None,
+        since_ts: float = 0.0,
+    ) -> list[dict]:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        raw_map = bb.get("plan_step_evidence", {}) if isinstance(bb.get("plan_step_evidence"), dict) else {}
+        raw_rows = raw_map.get(str(step_id or ""), []) if isinstance(raw_map.get(str(step_id or "")), list) else []
+        quality_since = float(since_ts or 0.0)
+        for raw in raw_rows[-40:]:
+            row = self._normalize_plan_evidence_record(raw)
+            if (
+                row.get("step_id") == str(step_id or "")
+                and (
+                    str(row.get("tool", "") or "") in {"write_file", "edit_file"}
+                    or bool(row.get("changed_files"))
+                )
+            ):
+                quality_since = max(quality_since, float(row.get("ts", 0.0) or 0.0))
+        step_files = bb.get("step_files", {}) if isinstance(bb.get("step_files"), dict) else {}
+        for entry in step_files.get(str(step_id or ""), []) if isinstance(step_files.get(str(step_id or "")), list) else []:
+            if not isinstance(entry, dict) or str(entry.get("op", "") or "") not in {"write_file", "edit_file"}:
+                continue
+            try:
+                quality_since = max(quality_since, float(entry.get("ts", 0.0) or 0.0))
+            except Exception:
+                pass
+        out: list[dict] = []
+        for raw in raw_rows[-40:]:
+            row = self._normalize_plan_evidence_record(raw)
+            if not row.get("id") or not row.get("step_id"):
+                continue
+            if since_ts > 0 and float(row.get("ts", 0.0) or 0.0) + 1e-6 < since_ts:
+                continue
+            if (
+                quality_since > 0
+                and str(row.get("kind", "") or "") in {"runtime", "file"}
+                and str(row.get("tool", "") or "") not in {"write_file", "edit_file"}
+                and float(row.get("ts", 0.0) or 0.0) + 1e-6 < quality_since
+            ):
+                continue
+            out.append(row)
+        return out
+
+    def _record_plan_step_tool_evidence(self, role: str, item: dict, board: dict | None = None) -> dict:
+        if not isinstance(item, dict):
+            return {}
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        step = self._get_active_plan_step(bb)
+        if not isinstance(step, dict):
+            return {}
+        step_id = trim(str(step.get("id", "") or ""), 40)
+        if not step_id:
+            return {}
+        tool = canonicalize_tool_name(str(item.get("name", "") or ""))
+        args = item.get("args", {}) if isinstance(item.get("args"), dict) else {}
+        output = str(item.get("output", "") or "")
+        changed_files: list[str] = []
+        if tool in {"write_file", "edit_file"}:
+            if self._is_plan_infrastructure_path(args.get("path", "")):
+                return {}
+            kind = "file"
+            command = ""
+            path = str(args.get("path", "") or "")
+            ok = bool(item.get("ok", False))
+            exit_code = None
+        elif tool in {"bash", "worktree_run", "check_background"}:
+            kind = "runtime"
+            command = str(args.get("command", "") or "")
+            path = ""
+            ok = self._tool_result_is_passing_execution(item)
+            exit_code = self._tool_result_exit_code(item)
+            changed_files = [
+                normalize_rel_preview_path(str(value or ""))
+                for value in (item.get("changed_files", []) if isinstance(item.get("changed_files"), list) else [])[:12]
+                if normalize_rel_preview_path(str(value or ""))
+            ]
+        elif tool == "read_file":
+            if self._is_plan_infrastructure_read_result(item):
+                return {}
+            kind = "file"
+            command = ""
+            path = str(args.get("path", "") or "")
+            ok = bool(item.get("ok", False)) and bool(self._tool_result_output_excerpt(item, 80))
+            exit_code = None
+        elif tool in {"query_code_library", "query_knowledge_library", "agent_web_search"}:
+            kind = "research"
+            command = ""
+            path = ""
+            ok = self._tool_result_has_positive_retrieval_signal(item)
+            exit_code = None
+        elif tool == "write_to_blackboard":
+            kind = "blackboard"
+            command = ""
+            path = ""
+            ok = bool(item.get("ok", False))
+            exit_code = None
+        else:
+            return {}
+        if kind == "runtime" and not command:
+            return {}
+        existing_event_id = trim(str(item.get("plan_evidence_id", "") or ""), 80)
+        if existing_event_id:
+            old = next(
+                (
+                    row for row in self._plan_step_evidence_records(step_id, board=bb)
+                    if str(row.get("id", "") or "") == existing_event_id
+                ),
+                None,
+            )
+            if isinstance(old, dict):
+                return old
+        stamp = float(now_ts())
+        digest = hashlib.sha1(
+            f"{step_id}|{tool}|{command}|{path}|{output}|{ok}".encode("utf-8", "ignore")
+        ).hexdigest()[:16]
+        event_id = f"ev:{time.time_ns():x}:{digest}"
+        item["plan_evidence_id"] = event_id
+        record = {
+            "id": event_id,
+            "step_id": step_id,
+            "kind": kind,
+            "tool": tool,
+            "ok": bool(ok),
+            "command": trim(command, 500),
+            "path": trim(path, 300),
+            "summary": trim(
+                (
+                    (f"changed_files={', '.join(changed_files)}\n" if changed_files else "")
+                    + (
+                        f"{tool}: {path}\n"
+                        if tool in {"write_file", "edit_file"} and path
+                        else ""
+                    )
+                    + (
+                        self._tool_result_compact_output(output, max_chars=900)
+                        or self._tool_result_output_excerpt(item, 500)
+                    )
+                ),
+                900,
+            ),
+            "changed_files": changed_files,
+            "exit_code": exit_code,
+            "actor": self._sanitize_agent_role(role) or "developer",
+            "ts": stamp,
+        }
+        raw_map = dict(bb.get("plan_step_evidence", {}) if isinstance(bb.get("plan_step_evidence"), dict) else {})
+        rows = list(raw_map.get(step_id, []) if isinstance(raw_map.get(step_id), list) else [])
+        rows.append(record)
+        raw_map[step_id] = rows[-40:]
+        bb["plan_step_evidence"] = raw_map
+        self.blackboard = bb
+        return record
+
+    def _acceptance_assertion_terms(self, acceptance_text: object) -> list[str]:
+        """Extract concrete named assertions that generic exit-0 cannot prove."""
+        text = unicodedata.normalize("NFKC", str(acceptance_text or "")).lower()
+        text = re.split(r"(?:证据|證據|証拠|evidence)\s*[:：]", text, maxsplit=1)[0]
+        candidates: list[str] = []
+        candidates.extend(re.findall(r"(?<![a-z0-9_])--?[a-z][a-z0-9_-]{2,}(?![a-z0-9_])", text))
+        candidates.extend(re.findall(r"\b[a-z][a-z0-9_./+-]{2,}\b", text))
+        candidates.extend(re.findall(r"\b\d+(?:\.\d+)?\s*(?:%|ms|s|kb|mb|gb|rows?|files?|tests?|passed|次|项|個|个|行|列)\b", text))
+        candidates.extend(re.findall(r"(?:>=|<=|==|>|<|≥|≤)\s*\d+(?:\.\d+)?", text))
+        candidates.extend(re.findall(r"[\u4e00-\u9fff]{2,10}(?:测试|測試|检查|檢查|通过|通過|收敛|收斂|原子|接口|模组|模組)", text))
+        stop = {
+            "acceptance", "final", "verification", "verify", "check", "run", "bash", "python",
+            "python3", "test", "tests", "passed", "pass", "exit", "code", "output", "result",
+            "file", "read", "build", "compile", "pytest", "验收", "驗收", "验证", "驗證",
+            "检查", "檢查", "通过", "通過", "运行", "執行", "输出", "輸出", "记录", "記錄",
+            "confirm", "ensure", "inspect", "open", "contains", "contain", "include", "includes",
+            "and", "with", "from", "into", "atom", "atomic", "mode",
+        }
+        out: list[str] = []
+        for raw in candidates:
+            term = re.sub(r"\s+", " ", str(raw or "").strip(" `\"'.,;:()[]{}"))
+            if len(term) < 3 or term in stop or term.isdigit():
+                continue
+            if term not in out:
+                out.append(term)
+            if len(out) >= 12:
+                break
+        return out
+
+    def _acceptance_file_content_terms(self, acceptance_text: object) -> list[str]:
+        """Return content constraints after removing file identity and check boilerplate."""
+        text = unicodedata.normalize("NFKC", str(acceptance_text or "")).lower()
+        paths = self._extract_plan_step_referenced_paths(text, limit=8)
+        path_identities: set[str] = set()
+        for raw_path in paths:
+            rel = normalize_rel_preview_path(raw_path).lower()
+            if not rel:
+                continue
+            path = PurePosixPath(rel)
+            path_identities.update({rel, path.name.lower(), path.stem.lower(), path.suffix.lower()})
+
+        generic = {
+            "acceptance", "final", "verification", "verify", "check", "inspect", "inspection",
+            "read", "open", "confirm", "ensure", "contains", "contain", "include", "includes",
+            "including", "complete", "completed", "correct", "valid", "file", "path", "directory",
+            "document", "report", "content", "output", "result", "evidence", "and", "with", "from",
+            "into", "that", "this", "then", "least", "most", "more", "less", "than",
+        }
+        terms: list[str] = []
+        for raw in self._acceptance_assertion_terms(text):
+            term = str(raw or "").strip().lower()
+            if not term or term in generic:
+                continue
+            normalized = normalize_rel_preview_path(term).lower()
+            if (
+                term in path_identities
+                or normalized in path_identities
+                or "/" in term
+                or (term.startswith(".") and term in {".md", ".txt", ".csv", ".json", ".yaml", ".yml"})
+            ):
+                continue
+            if term not in terms:
+                terms.append(term)
+
+        thresholds: list[str] = []
+        threshold_patterns = (
+            (r"(?:at\s+least|不少于|不少於|至少)\s*(\d+(?:\.\d+)?)", ">="),
+            (r"(?:at\s+most|不多于|不多於|至多|最多)\s*(\d+(?:\.\d+)?)", "<="),
+            (r"(?:more\s+than|超过|超過|大于|大於)\s*(\d+(?:\.\d+)?)", ">"),
+            (r"(?:less\s+than|少于|少於|小于|小於)\s*(\d+(?:\.\d+)?)", "<"),
+        )
+        for pattern, operator in threshold_patterns:
+            thresholds.extend(f"{operator}{value}" for value in re.findall(pattern, text))
+        thresholds.extend(
+            re.sub(r"\s+", "", value)
+            for value in re.findall(r"(?:>=|<=|==|>|<|≥|≤)\s*\d+(?:\.\d+)?", text)
+        )
+        if thresholds:
+            terms = [term for term in terms if not re.fullmatch(r"\d+(?:\.\d+)?\s*(?:个|個|项|項|行|列)", term)]
+        else:
+            counted = re.findall(
+                r"(?<!\d)(\d+(?:\.\d+)?)\s*(?:个|個|项|項|条|條|行|列|assumptions?|items?|rows?|columns?)",
+                text,
+            )
+            thresholds.extend(f"=={value}" for value in counted)
+
+        # Chinese content nouns are not reliably separated by word boundaries.
+        for keyword in (
+            "假设", "假設", "对比表", "對比表", "表格", "章节", "章節", "标题", "標題",
+            "字段", "条目", "條目", "来源", "來源", "引用", "案例", "场景", "場景",
+        ):
+            if keyword in text and keyword not in terms:
+                terms.append(keyword)
+        for threshold in thresholds:
+            threshold = threshold.replace("≥", ">=").replace("≤", "<=")
+            if threshold not in terms:
+                terms.append(threshold)
+        return terms[:12]
+
+    @staticmethod
+    def _acceptance_summary_covers_term(summary: object, term: object) -> bool:
+        summary_text = unicodedata.normalize("NFKC", str(summary or "")).lower()
+        expected = unicodedata.normalize("NFKC", str(term or "")).lower().strip()
+        threshold = re.fullmatch(r"(>=|<=|==|>|<)\s*(\d+(?:\.\d+)?)", expected)
+        if not threshold:
+            return bool(expected) and expected in summary_text
+        operator, raw_limit = threshold.groups()
+        limit = float(raw_limit)
+        values = [float(value) for value in re.findall(r"(?<![\w.])(\d+(?:\.\d+)?)(?![\w.])", summary_text)]
+        comparisons = {
+            ">=": lambda value: value >= limit,
+            "<=": lambda value: value <= limit,
+            "==": lambda value: value == limit,
+            ">": lambda value: value > limit,
+            "<": lambda value: value < limit,
+        }
+        return any(comparisons[operator](value) for value in values)
+
+    def _acceptance_evidence_record_matches(
+        self,
+        record: dict,
+        expected: str,
+        *,
+        acceptance_text: object = "",
+    ) -> bool:
+        if not isinstance(record, dict) or not bool(record.get("ok", False)):
+            return False
+        kind = str(record.get("kind", "") or "")
+        if expected == "runtime/test/build/browser execution evidence":
+            if kind != "runtime" or record.get("exit_code") not in (None, 0):
+                return False
+            terms = self._acceptance_assertion_terms(acceptance_text)
+            if not terms:
+                return True
+            haystack = f"{record.get('command', '')}\n{record.get('summary', '')}".lower()
+            command_low = str(record.get("command", "") or "").lower()
+            unresolved = [term for term in terms if term.lower() not in command_low]
+            if not unresolved:
+                return True
+            # Command-line switches and paths describe how the check was run;
+            # named behavior/entities left after removing them must be visible in
+            # the result itself. This catches a smoke-test command that exits 0
+            # without reporting the H/He (or analogous) assertions it promised.
+            summary_low = str(record.get("summary", "") or "").lower()
+            return all(term.lower() in summary_low for term in unresolved)
+        if expected == "file/path/directory inspection evidence":
+            if kind not in {"file", "runtime"}:
+                return False
+            paths = self._extract_plan_step_referenced_paths(acceptance_text, limit=8)
+            haystack = f"{record.get('path', '')}\n{record.get('command', '')}".lower()
+            path_matches = not paths or any(
+                normalize_rel_preview_path(path).lower() in haystack
+                or PurePosixPath(normalize_rel_preview_path(path)).name.lower() in haystack
+                for path in paths
+                if normalize_rel_preview_path(path)
+            )
+            if not path_matches:
+                return False
+            content_terms = self._acceptance_file_content_terms(acceptance_text)
+            if not content_terms:
+                return True
+            summary = str(record.get("summary", "") or "")
+            return all(self._acceptance_summary_covers_term(summary, term) for term in content_terms)
+        if expected == "research/retrieval evidence":
+            return kind in {"research", "file"}
+        if expected == "blackboard acceptance record":
+            return kind in {"blackboard", "runtime", "file", "research"}
+        return kind in {"runtime", "file", "research", "blackboard", "generic"}
 
     def _plan_step_has_blackboard_evidence(self, plan_step: dict, board: dict | None = None) -> bool:
         """Return whether blackboard history has candidate evidence for review."""
@@ -38413,30 +39939,17 @@ body{padding:18px}
         if not acceptance_rows:
             return {"ok": False, "reason": "missing-final-acceptance-subtask"}
         acceptance = dict(acceptance_rows[-1])
-        if str(acceptance.get("status", "") or "").strip().lower() != "completed":
-            return {
-                "ok": False,
-                "reason": "final-acceptance-subtask-not-completed",
-                "acceptance": acceptance,
-            }
         text = str(acceptance.get("content", "") or "").strip().lower()
         if not text:
             return {"ok": False, "reason": "empty-final-acceptance-subtask", "acceptance": acceptance}
+        acceptance_completed = str(acceptance.get("status", "") or "").strip().lower() == "completed"
 
         results = [
             row for row in ((worker_step or {}).get("tool_results", []) if isinstance(worker_step, dict) else [])
             if isinstance(row, dict) and row.get("ok", False)
         ]
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
-        try:
-            acceptance_started_ts = float(
-                acceptance.get("updated_at", 0.0)
-                or acceptance.get("created_at", 0.0)
-                or acceptance.get("completed_at", 0.0)
-                or 0.0
-            )
-        except Exception:
-            acceptance_started_ts = 0.0
+        acceptance_started_ts = self._acceptance_evidence_since_ts(acceptance, plan_step)
         sig = self._plan_step_blackboard_signals(
             plan_step,
             bb,
@@ -38448,7 +39961,7 @@ body{padding:18px}
             and bool(self._tool_result_output_excerpt(row, 80))
             for row in results
         )
-        has_current_exec = any(str(row.get("name", "") or "") in {"bash", "worktree_run", "background_run"} for row in results)
+        has_current_exec = any(self._tool_result_is_passing_execution(row) for row in results)
         has_current_validation = self._tool_results_have_validation_evidence(plan_step, results)
         has_current_retrieval = any(self._tool_result_has_positive_retrieval_signal(row) for row in results)
         has_current_blackboard_acceptance = any(
@@ -38457,69 +39970,99 @@ body{padding:18px}
             for row in results
         )
 
-        wants_file_inspection = any(
-            tok in text
-            for tok in (
-                "读取", "检查", "文件", "目录", "路径", "选择器", "read", "inspect", "file",
-                "directory", "path", "selector", "檢查", "讀取", "確認", "ファイル", "ディレクトリ",
-            )
-        ) or self._plan_text_file_content_subject(text)
-        wants_runtime = self._plan_text_explicit_runtime_check(text) or (
-            any(tok in text for tok in ("运行", "执行", "run", "実行"))
-            and self._plan_text_runtime_subject(text)
-        )
-        if wants_file_inspection and self._plan_text_prefers_file_content_evidence(text):
-            wants_runtime = False
-        wants_research = any(
-            tok in text
-            for tok in (
-                "检索", "搜索", "研究", "调研", "资料", "来源", "引用", "research", "search",
-                "source", "citation", "evidence chain", "搜集", "收集", "調査", "検索",
-            )
-        )
-        wants_blackboard_record = any(
-            tok in text
-            for tok in ("黑板", "blackboard", "记录", "記錄", "record", "status", "review_feedback")
-        )
-
         current_match = False
         blackboard_match = False
-        expected = "generic-observable-check"
-        if wants_runtime:
-            expected = "runtime/test/build/browser execution evidence"
+        expected = self._acceptance_expected_evidence(text)
+        current_candidate_match = False
+        current_records: list[dict] = []
+        if expected == "runtime/test/build/browser execution evidence":
             current_match = bool(has_current_validation or has_current_exec)
             blackboard_match = bool(sig.get("has_exec") or sig.get("has_review"))
-        elif wants_file_inspection:
-            expected = "file/path/directory inspection evidence"
+        elif expected == "file/path/directory inspection evidence":
             current_match = bool(has_current_read or has_current_exec)
             blackboard_match = bool(sig.get("has_read") or sig.get("has_exec") or sig.get("has_review"))
-        elif wants_research:
-            expected = "research/retrieval evidence"
+        elif expected == "research/retrieval evidence":
             current_match = bool(has_current_retrieval or has_current_read)
             blackboard_match = bool(sig.get("has_research") or sig.get("has_read") or sig.get("has_review"))
-        elif wants_blackboard_record:
-            expected = "blackboard acceptance record"
+        elif expected == "blackboard acceptance record":
             current_match = bool(has_current_blackboard_acceptance or has_current_validation)
             blackboard_match = bool(sig.get("has_exec") or sig.get("has_review") or sig.get("has_research"))
         else:
             current_match = bool(has_current_validation or has_current_read or has_current_exec or has_current_retrieval)
             blackboard_match = bool(sig.get("has_exec") or sig.get("has_review") or sig.get("has_read") or sig.get("has_research"))
 
-        # During a live worker/single-agent turn, the acceptance action must be
-        # visible in this turn's tool_results. Blackboard fallback is only for
-        # finish/resume reconciliation where current tool_results are no longer
-        # available but the step-scoped evidence has already been recorded.
-        if results:
-            blackboard_match = False
         if current_match:
+            current_candidate_match = True
+            for row in results:
+                tool = str(row.get("name", "") or "")
+                args = row.get("args", {}) if isinstance(row.get("args"), dict) else {}
+                if tool in {"bash", "worktree_run", "check_background"}:
+                    record = {
+                        "kind": "runtime",
+                        "ok": self._tool_result_is_passing_execution(row),
+                        "command": str(args.get("command", "") or ""),
+                        "path": "",
+                        "summary": str(row.get("output", "") or ""),
+                        "exit_code": self._tool_result_exit_code(row),
+                    }
+                elif tool == "read_file":
+                    record = {
+                        "kind": "file",
+                        "ok": bool(row.get("ok", False)),
+                        "command": "",
+                        "path": str(args.get("path", "") or ""),
+                        "summary": str(row.get("output", "") or ""),
+                        "exit_code": None,
+                    }
+                else:
+                    continue
+                if self._acceptance_evidence_record_matches(
+                    record,
+                    expected,
+                    acceptance_text=text,
+                ):
+                    current_records.append(record)
+            if acceptance_completed and (current_records or expected not in {
+                "runtime/test/build/browser execution evidence",
+                "file/path/directory inspection evidence",
+            }):
+                return {
+                    "ok": True,
+                    "reason": "current-tool-evidence-matches-final-acceptance",
+                    "source": "current_tool_results",
+                    "expected": expected,
+                    "acceptance": acceptance,
+                }
+        durable_matches = self._matching_acceptance_evidence_records(
+            plan_step,
+            acceptance,
+            board=bb,
+            expected=expected,
+        )
+        if acceptance_completed and durable_matches:
             return {
                 "ok": True,
-                "reason": "current-tool-evidence-matches-final-acceptance",
-                "source": "current_tool_results",
+                "reason": "step-evidence-ledger-matches-final-acceptance",
+                "source": "plan_step_evidence",
                 "expected": expected,
+                "evidence": durable_matches[-1],
                 "acceptance": acceptance,
             }
-        if blackboard_match:
+        # Legacy aggregate sections lack the full command/result relationship.
+        # They remain compatible for category-only acceptance, but cannot prove
+        # named runtime assertions or referenced paths; those require the
+        # step-scoped evidence ledger (or one semantic audit below).
+        assertion_terms = self._acceptance_assertion_terms(text)
+        file_content_terms = self._acceptance_file_content_terms(text)
+        referenced_paths = self._extract_plan_step_referenced_paths(text, limit=8)
+        needs_semantic_audit = bool(
+            (expected == "runtime/test/build/browser execution evidence" and assertion_terms)
+            or (
+                expected == "file/path/directory inspection evidence"
+                and (referenced_paths or file_content_terms)
+            )
+        )
+        if acceptance_completed and blackboard_match and not needs_semantic_audit:
             return {
                 "ok": True,
                 "reason": "blackboard-evidence-matches-final-acceptance",
@@ -38527,11 +40070,44 @@ body{padding:18px}
                 "expected": expected,
                 "acceptance": acceptance,
             }
+        candidate_records = [
+            row
+            for row in self._plan_step_evidence_records(step_id, board=bb, since_ts=acceptance_started_ts)
+            if bool(row.get("ok", False))
+        ]
+        has_candidate_evidence = bool(candidate_records or blackboard_match or current_candidate_match)
+        exact_candidate_match = bool(current_records or durable_matches)
+        if not acceptance_completed and not (needs_semantic_audit and has_candidate_evidence):
+            return {
+                "ok": False,
+                "reason": "final-acceptance-subtask-not-completed",
+                "expected": expected,
+                "acceptance": acceptance,
+                "candidate_evidence": candidate_records[-8:],
+                "current_results": results[-8:],
+            }
+        if not acceptance_completed and exact_candidate_match:
+            return {
+                "ok": False,
+                "reason": "final-acceptance-subtask-not-completed",
+                "expected": expected,
+                "acceptance": acceptance,
+                "candidate_evidence": candidate_records[-8:],
+                "current_results": results[-8:],
+            }
         return {
             "ok": False,
-            "reason": "final-acceptance-evidence-missing",
+            "reason": (
+                "final-acceptance-semantic-coverage-uncertain"
+                if needs_semantic_audit and has_candidate_evidence
+                else "final-acceptance-evidence-missing"
+            ),
             "expected": expected,
             "acceptance": acceptance,
+            "candidate_evidence": candidate_records[-8:],
+            "current_results": results[-8:],
+            "assertion_terms": assertion_terms,
+            "file_content_terms": file_content_terms,
         }
 
     def _plan_step_acceptance_gate_passed(
@@ -38694,6 +40270,20 @@ body{padding:18px}
                 "error_context": error_context,
             }
         if reason in ("final-acceptance-subtask-not-completed",):
+            acceptance = gate.get("acceptance", {}) if isinstance(gate.get("acceptance"), dict) else {}
+            durable = self._matching_acceptance_evidence_records(
+                plan_step,
+                acceptance,
+                board=bb,
+            )
+            if durable:
+                return {
+                    "root_cause": "Passing acceptance evidence exists, but the legacy Todo status was not reconciled.",
+                    "repair_action": "Reconcile the canonical acceptance row from the step evidence ledger; do not rerun the already-passing check.",
+                    "fixer_role": self._current_plan_worker_owner(bb),
+                    "error_category": error_category,
+                    "error_context": error_context,
+                }
             return {
                 "root_cause": "The acceptance check subtask exists but was never actually executed.",
                 "repair_action": "Execute the acceptance check with a real tool call now (do not just mark it done), confirm the success signal, then complete it.",
@@ -38703,6 +40293,21 @@ body{padding:18px}
             }
         # final-acceptance-evidence-missing (and anything else): genuine failure or
         # the check ran but failed. Route to active repair (reviewer-debug in MA).
+        if reason == "final-acceptance-semantic-coverage-uncertain":
+            missing = trim(str((gate or {}).get("semantic_missing", "") or ""), 500)
+            return {
+                "root_cause": (
+                    "A command passed, but its evidence does not prove the concrete assertions named by acceptance."
+                    + (f" Missing coverage: {missing}" if missing else "")
+                ),
+                "repair_action": (
+                    "Run or add a focused check that explicitly exercises the named behaviors/entities/thresholds, "
+                    "and make the result report those assertions. Do not repeat a generic smoke test."
+                ),
+                "fixer_role": self._current_plan_worker_owner(bb),
+                "error_category": error_category,
+                "error_context": error_context,
+            }
         repair_action = (
             "Diagnose the underlying problem, FIX it directly (edit code / re-run the command), "
             "then re-run the acceptance check and confirm a clean success signal."
@@ -38791,6 +40396,19 @@ body{padding:18px}
         if not step_id:
             self._inject_acceptance_gate_rework_hint(plan_step, gate, target_roles=target_roles)
             return False
+        # Reconcile event-sourced evidence before entering recovery. This closes
+        # the legacy two-call sequence (run check -> TodoWrite completed) without
+        # asking the model to repeat a passing command.
+        try:
+            if self._reconcile_plan_worker_progress_from_evidence(actor=str(actor or "developer")):
+                refreshed_gate = self._plan_step_acceptance_gate_status(plan_step, None, self._ensure_blackboard())
+                if refreshed_gate.get("ok", False) and self._step_subtasks_all_completed(plan_step):
+                    evidence = self._collect_accumulated_step_evidence(plan_step, self._ensure_blackboard())
+                    return bool(self._advance_plan_step(evidence=evidence, actor=str(actor or "developer")))
+                gate = refreshed_gate
+                bb = self._ensure_blackboard()
+        except Exception:
+            pass
         attr = f"_acceptance_gate_fail_n_{step_id}"
         try:
             count = int(getattr(self, attr, 0) or 0) + 1
@@ -38800,6 +40418,34 @@ body{padding:18px}
             setattr(self, attr, count)
         except Exception:
             pass
+
+        # Evidence exists but its relationship to named assertions is not
+        # mechanically provable. Audit once per evidence signature now instead
+        # of spending several repair rounds repeating the same command.
+        if str(gate.get("reason", "") or "") == "final-acceptance-semantic-coverage-uncertain":
+            review = self._llm_review_plan_step_quality(
+                plan_step,
+                {"tool_results": list(gate.get("current_results", []) or [])},
+                bb,
+                candidate_evidence={
+                    "gate": gate,
+                    "records": gate.get("candidate_evidence", []),
+                },
+            )
+            if (
+                review.get("available")
+                and review.get("passed")
+                and str(review.get("confidence", "") or "").lower() in {"high", "medium"}
+            ):
+                evidence_text = "; ".join(str(x) for x in (review.get("evidence", []) or [])[:3])
+                return bool(self._advance_plan_step(
+                    evidence=trim(f"[semantic-audit] {evidence_text or review.get('reason', '')}", 200),
+                    actor=str(actor or "reviewer"),
+                ))
+            if review.get("available") and not review.get("passed"):
+                missing = "; ".join(str(x) for x in (review.get("missing", []) or [])[:4])
+                gate = dict(gate)
+                gate["semantic_missing"] = missing
 
         # Below threshold: a plain rework hint is enough; give the worker a chance.
         if count < ACCEPTANCE_GATE_STALL_THRESHOLD:
@@ -38975,6 +40621,20 @@ body{padding:18px}
         }
         for raw in candidates:
             item = str(raw or "").strip().strip("'\"")
+            # Unquoted shell snippets can make the permissive path regex absorb
+            # a trailing option ("script.py --test-mode"). A path identity must
+            # never include command-line arguments.
+            item = re.split(r"\s+(?=--?[A-Za-z])", item, maxsplit=1)[0].strip()
+            # The same permissive regex may absorb following prose after a
+            # filename ("docs/report.md and confirm ..."). A recognized file
+            # suffix terminates an unquoted path before that prose begins.
+            suffix_end = re.match(
+                r"^(.+?\.(?:py|js|ts|tsx|jsx|css|html?|md|txt|csv|json|ya?ml|toml|ini|xml|rst|sql|sh|go|rs|java|c|cc|cpp|h|hpp|f90|glsl))(?=\s|$)",
+                item,
+                re.I,
+            )
+            if suffix_end:
+                item = str(suffix_end.group(1) or "").strip()
             if not item or "://" in item:
                 continue
             if item.split(None, 1)[0].strip().lower() in deny_prefixes:
@@ -39203,7 +40863,7 @@ body{padding:18px}
             args = result.get("args", {}) if isinstance(result.get("args"), dict) else {}
             if name in {"read_file", "write_file", "edit_file"}:
                 _add(args.get("path", "") or args.get("file_path", ""))
-            elif name in {"bash", "worktree_run", "background_run"}:
+            elif name in {"bash", "worktree_run"}:
                 for path in self._bash_file_read_targets(str(args.get("command", "") or ""))[:6]:
                     _add(path)
         path_inference = self._plan_step_quality_path_inference(plan_step, paths)
@@ -39356,23 +41016,164 @@ body{padding:18px}
         *,
         candidate_evidence: dict | None = None,
     ) -> dict:
-        """Compatibility stub: semantic review no longer gates plan advancement."""
-        return {
-            "available": True,
-            "passed": True,
-            "confidence": "disabled",
-            "reason": "plan-step semantic review is disabled; advancement is controlled by subtasks and concrete evidence",
+        """Run one cached semantic audit when deterministic evidence is ambiguous."""
+        default = {
+            "available": False,
+            "passed": False,
+            "confidence": "low",
+            "reason": "semantic review unavailable",
             "missing": [],
             "next_actions": [],
             "evidence": [],
             "raw": "",
-            "source": "disabled",
+            "source": "semantic-judge",
         }
+        if not isinstance(plan_step, dict):
+            return default
+        step_id = trim(str(plan_step.get("id", "") or ""), 40)
+        contract_text = ""
+        if isinstance(candidate_evidence, dict):
+            gate = candidate_evidence.get("gate", {}) if isinstance(candidate_evidence.get("gate"), dict) else {}
+            acceptance = gate.get("acceptance", {}) if isinstance(gate.get("acceptance"), dict) else {}
+            contract_text = str(acceptance.get("content", "") or "")
+        evidence_signature = self._plan_step_quality_evidence_signature(
+            plan_step,
+            bb,
+            contract_text=contract_text,
+        )
+        previous = self._active_plan_step_quality_review(plan_step, bb)
+        if previous and str(previous.get("evidence_signature", "") or "") == evidence_signature:
+            return dict(previous)
+        try:
+            context = self._build_plan_step_quality_review_context(
+                plan_step,
+                worker_step if isinstance(worker_step, dict) else {},
+                bb,
+                candidate_evidence=candidate_evidence,
+            )
+            prompt = (
+                "Audit one plan step against its exact acceptance semantics. Structural checks have already "
+                "confirmed that tool evidence exists; decide whether that evidence actually covers the named "
+                "behaviors, entities, thresholds, files, and commands. Do not accept exit code 0 alone when "
+                "the acceptance text also names concrete assertions. Do not require unrelated work from later "
+                "plan steps. Reply JSON only with: passed (bool), confidence (high|medium|low), reason, "
+                "missing (array), next_actions (array), evidence (array).\n\n"
+                f"REVIEW CONTEXT:\n{context}"
+            )
+            resp = self.ollama.chat(
+                [{"role": "user", "content": prompt}],
+                system=self._inject_runtime_environment_context(
+                    "/no_think\nYou are a strict, evidence-grounded acceptance auditor. Reply only valid JSON."
+                ),
+                max_tokens=420,
+                temperature=0.1,
+                think=False,
+            )
+            raw = str(resp.get("content", "") or resp.get("text", "") or "").strip()
+            payload = extract_json_object_from_text(raw, {})
+            if not isinstance(payload, dict) or "passed" not in payload:
+                return default
+            confidence = str(payload.get("confidence", "low") or "low").strip().lower()
+            if confidence not in {"high", "medium", "low"}:
+                confidence = "low"
+            review = {
+                "available": True,
+                "passed": bool(payload.get("passed", False)),
+                "confidence": confidence,
+                "reason": trim(str(payload.get("reason", "") or ""), 500),
+                "missing": [trim(str(x), 220) for x in (payload.get("missing", []) or [])[:8]],
+                "next_actions": [trim(str(x), 220) for x in (payload.get("next_actions", []) or [])[:8]],
+                "evidence": [trim(str(x), 260) for x in (payload.get("evidence", []) or [])[:8]],
+                "raw": trim(raw, 1200),
+                "source": "semantic-judge",
+                "evidence_signature": evidence_signature,
+                "step_id": step_id,
+            }
+            self._record_plan_step_quality_review(plan_step, review, board=bb)
+            return review
+        except Exception:
+            return default
 
     def _record_plan_step_quality_review(self, plan_step: dict, review: dict, *, board: dict | None = None):
-        return
+        if not isinstance(plan_step, dict) or not isinstance(review, dict):
+            return
+        step_id = trim(str(plan_step.get("id", "") or ""), 40)
+        if not step_id:
+            return
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        records = dict(bb.get("plan_step_quality_reviews", {}) if isinstance(bb.get("plan_step_quality_reviews"), dict) else {})
+        rows = list(records.get(step_id, []) if isinstance(records.get(step_id), list) else [])
+        row = {
+            "passed": bool(review.get("passed", False)),
+            "confidence": trim(str(review.get("confidence", "low") or "low"), 20),
+            "reason": trim(str(review.get("reason", "") or ""), 500),
+            "missing": [trim(str(x), 220) for x in (review.get("missing", []) or [])[:8]],
+            "evidence": [trim(str(x), 260) for x in (review.get("evidence", []) or [])[:8]],
+            "source": trim(str(review.get("source", "semantic-judge") or "semantic-judge"), 40),
+            "evidence_signature": trim(str(review.get("evidence_signature", "") or ""), 80),
+            "ts": float(now_ts()),
+        }
+        rows.append(row)
+        records[step_id] = rows[-8:]
+        bb["plan_step_quality_reviews"] = records
+        self.blackboard = bb
+
+    def _plan_step_quality_evidence_signature(
+        self,
+        plan_step: dict,
+        board: dict | None = None,
+        *,
+        contract_text: object = "",
+    ) -> str:
+        step_id = trim(str((plan_step or {}).get("id", "") or ""), 40)
+        rows = self._plan_step_evidence_records(step_id, board=board) if step_id else []
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        acceptance_text = trim(str(contract_text or ""), 800)
+        if not acceptance_text:
+            for row in reversed(self._active_plan_worker_todo_rows(step_id, role="") if step_id else []):
+                if self._is_plan_step_acceptance_subtask(row.get("content", "")):
+                    acceptance_text = trim(str(row.get("content", "") or ""), 800)
+                    break
+        if not acceptance_text and step_id:
+            mirror = bb.get("plan_worker_todos", {}) if isinstance(bb.get("plan_worker_todos"), dict) else {}
+            for row in reversed(mirror.get(step_id, []) if isinstance(mirror.get(step_id), list) else []):
+                if isinstance(row, dict) and self._is_plan_step_acceptance_subtask(row.get("content", "")):
+                    acceptance_text = trim(str(row.get("content", "") or ""), 800)
+                    break
+        payload = {
+            "step": trim(
+                str((plan_step or {}).get("full_content", "") or (plan_step or {}).get("content", "") or ""),
+                1600,
+            ),
+            "acceptance": acceptance_text,
+            "evidence": [
+                (
+                    str(row.get("id", "") or ""),
+                    bool(row.get("ok", False)),
+                    row.get("exit_code"),
+                    str(row.get("summary", "") or ""),
+                )
+                for row in rows[-12:]
+            ],
+        }
+        return hashlib.sha1(json_dumps(payload).encode("utf-8", "ignore")).hexdigest()[:20]
+
+    def _active_plan_step_quality_review(self, plan_step: dict, board: dict | None = None) -> dict | None:
+        step_id = trim(str((plan_step or {}).get("id", "") or ""), 40)
+        if not step_id:
+            return None
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        records = bb.get("plan_step_quality_reviews", {}) if isinstance(bb.get("plan_step_quality_reviews"), dict) else {}
+        rows = records.get(step_id, []) if isinstance(records.get(step_id), list) else []
+        return dict(rows[-1]) if rows and isinstance(rows[-1], dict) else None
 
     def _active_plan_step_quality_block(self, plan_step: dict, board: dict | None = None) -> dict | None:
+        review = self._active_plan_step_quality_review(plan_step, board)
+        if not review or bool(review.get("passed", False)):
+            return None
+        current_sig = self._plan_step_quality_evidence_signature(plan_step, board)
+        if current_sig and current_sig == str(review.get("evidence_signature", "") or ""):
+            return review
         return None
 
     def _semantic_followup_requires_write(self, review: dict | None) -> bool:
@@ -39670,7 +41471,11 @@ body{padding:18px}
         next_step = next_step if isinstance(next_step, dict) and next_step else None
         if next_step:
             try:
-                self._ensure_worker_todos_for_plan_step(next_step, force_refresh=False, owner=self._current_plan_worker_owner())
+                self._ensure_worker_todos_available_for_plan_step(
+                    next_step,
+                    force_refresh=False,
+                    owner=self._current_plan_worker_owner(bb),
+                )
             except Exception:
                 pass
             step_idx = int(next_step.get("plan_step_index", 0) or 0) + 1
@@ -39843,7 +41648,7 @@ body{padding:18px}
             for r in results
         )
         ran_bash_ok = any(
-            isinstance(r, dict) and r.get("ok", False) and str(r.get("name", "")) == "bash"
+            isinstance(r, dict) and self._tool_result_is_passing_execution(r)
             for r in results
         )
         validation_ok_current = self._tool_results_have_validation_evidence(current, results)
@@ -39929,7 +41734,7 @@ body{padding:18px}
                 actor=str(route.get("target", "developer") or "developer"),
             )
         else:
-            if subtasks_all_done and not acceptance_gate_ok:
+            if (subtasks_all_done or self._step_work_subtasks_completed(current)) and not acceptance_gate_ok:
                 target_role = self._sanitize_agent_role(str(route.get("target", "") or ""))
                 # Drive diagnose→repair→re-verify; returns True only on a genuine
                 # (semantic-verified) pass. Never force-advances.
@@ -40084,6 +41889,23 @@ body{padding:18px}
         if not all_marked_done:
             return False
         return True
+
+    def _step_work_subtasks_completed(self, plan_step: dict) -> bool:
+        """Return whether executable work is done, regardless of acceptance state."""
+        if not isinstance(plan_step, dict):
+            return False
+        step_id = str(plan_step.get("id", "") or "")
+        if not step_id:
+            return False
+        rows = self._active_plan_worker_todo_rows(step_id, role="")
+        work_rows = [
+            row for row in rows
+            if not self._is_plan_step_acceptance_subtask(row.get("content", ""))
+        ]
+        return bool(work_rows) and all(
+            str(row.get("status", "") or "").strip().lower() == "completed"
+            for row in work_rows
+        )
 
     def _verify_subtasks_acceptance(self, subtasks: list[dict], step_id: str, bb: dict) -> list[str]:
         """Verify each completed subtask has real evidence. Returns list of unverified subtask descriptions.
@@ -40353,26 +42175,35 @@ body{padding:18px}
             acceptance = (gate or {}).get("acceptance", {}) if isinstance((gate or {}).get("acceptance"), dict) else {}
             acceptance_text = trim(str(acceptance.get("content", "") or ""), 240)
 
-            # Concrete evidence: files touched, execution logs, current tool results.
-            step_files_raw = bb.get("step_files", {}) if isinstance(bb.get("step_files"), dict) else {}
-            step_entries = step_files_raw.get(step_id, []) if step_id else []
+            # Use only step-scoped, current evidence. Legacy aggregate logs can
+            # mix steps and include checks invalidated by later edits.
+            acceptance_since = self._acceptance_evidence_since_ts(acceptance, plan_step)
+            durable = self._plan_step_evidence_records(
+                step_id,
+                board=bb,
+                since_ts=acceptance_since,
+            ) if step_id else []
             files_summary = [
-                f"{entry.get('op','?')}: {entry.get('path','?')}"
-                for entry in (step_entries[-15:] if isinstance(step_entries, list) else [])
-                if isinstance(entry, dict)
+                f"{row.get('tool', '?')}: {row.get('path', '') or ', '.join(row.get('changed_files', []) or [])}"
+                for row in durable[-15:]
+                if str(row.get("kind", "") or "") == "file" or row.get("changed_files")
             ]
-            exec_logs = bb.get("execution_logs", []) if isinstance(bb.get("execution_logs"), list) else []
-            recent_exec = []
-            for log in exec_logs[-10:]:
-                if isinstance(log, dict) and str(log.get("plan_step_id", "") or "") in ("", step_id):
-                    c = trim(str(log.get("content", "") or ""), 240)
-                    if c:
-                        recent_exec.append(c)
+            recent_exec = [
+                trim(
+                    f"{row.get('tool', '?')} {row.get('command', '')}: "
+                    f"exit_code={row.get('exit_code')} {row.get('summary', '')}",
+                    320,
+                )
+                for row in durable[-10:]
+                if str(row.get("kind", "") or "") == "runtime"
+            ]
             cur_results = []
             if isinstance(worker_step, dict):
                 for r in (worker_step.get("tool_results", []) or []):
                     if isinstance(r, dict) and r.get("ok", False):
                         nm = str(r.get("name", "") or "")
+                        if nm in {"bash", "worktree_run", "check_background"} and not self._tool_result_is_passing_execution(r):
+                            continue
                         ex = self._tool_result_output_excerpt(r, 160)
                         cur_results.append(f"{nm}: {ex}" if ex else nm)
 
@@ -40501,6 +42332,17 @@ body{padding:18px}
 
     def _current_plan_worker_owner(self, board: dict | None = None) -> str:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        step = self._get_active_plan_step(bb)
+        phase = self._plan_step_phase_hint(
+            str((step or {}).get("full_content", "") or (step or {}).get("content", "") or "")
+        ) if isinstance(step, dict) else ""
+        preferred = TASK_PHASE_ROUTING.get(phase, "developer")
+        # In single mode the role is only a phase contract: the configured
+        # expert remains the sole executor. In collaborative modes, the phase
+        # owner is canonical so stale active-agent state cannot assign test
+        # subtasks back to the developer who authored the change.
+        if self._is_multi_agent_mode() and preferred in {"developer", "explorer", "reviewer"}:
+            return preferred
         delegate = bb.get("last_delegate", {}) if isinstance(bb.get("last_delegate"), dict) else {}
         candidates = [
             str(self.active_agent_role or "").strip().lower(),
@@ -40510,7 +42352,12 @@ body{padding:18px}
         for cand in candidates:
             if cand in {"developer", "explorer", "reviewer"}:
                 return cand
-        return "developer"
+        assigned = self._sanitize_agent_role(
+            (bb.get("task_profile", {}) if isinstance(bb.get("task_profile"), dict) else {}).get(
+                "assigned_expert", self.runtime_assigned_expert
+            )
+        )
+        return assigned or preferred or "developer"
 
     def _get_plan_step_by_id(self, step_id: str, board: dict | None = None) -> dict | None:
         step_key = trim(str(step_id or "").strip(), 40)
@@ -40671,6 +42518,7 @@ body{padding:18px}
                 "parent_step_id": step_key,
                 "created_at": float(row.get("created_at", 0.0) or 0.0),
                 "updated_at": float(row.get("updated_at", 0.0) or 0.0),
+                "started_at": float(row.get("started_at", 0.0) or 0.0),
                 "completed_at": float(row.get("completed_at", 0.0) or 0.0) if row.get("completed_at") else None,
                 "completed_by": trim(str(row.get("completed_by", "") or ""), 40),
                 "evidence": trim(str(row.get("evidence", "") or ""), 300),
@@ -40730,6 +42578,7 @@ body{padding:18px}
                 "parent_step_id": parent,
                 "created_at": float(raw.get("created_at", 0.0) or 0.0),
                 "updated_at": float(raw.get("updated_at", 0.0) or 0.0),
+                "started_at": float(raw.get("started_at", 0.0) or 0.0),
                 "completed_at": float(raw.get("completed_at", 0.0) or 0.0) if raw.get("completed_at") else None,
                 "completed_by": trim(str(raw.get("completed_by", "") or ""), 40),
                 "evidence": trim(str(raw.get("evidence", "") or ""), 300),
@@ -41039,6 +42888,11 @@ body{padding:18px}
             evidence_text = (
                 " Blackboard already contains partial evidence for this step; build on that work instead of restarting."
             )
+        progress_instruction = (
+            "Observable tool evidence is reconciled into the canonical subtask graph automatically; use TodoWrite only to correct structural state."
+            if not self._is_multi_agent_mode()
+            else "After the subtask is finished, immediately call TodoWrite to mark it completed and move the next subtask to in_progress."
+        )
         row["target"] = owner
         row["instruction"] = trim(
             (
@@ -41046,7 +42900,7 @@ body{padding:18px}
                 f"Stay on the current plan step: {step_text}. "
                 f"{action_text} "
                 "Do not branch to a different step or restate the whole plan. "
-                "After the subtask is finished, immediately call TodoWrite to mark it completed and move the next subtask to in_progress."
+                f"{progress_instruction}"
                 f"{evidence_text}"
             ),
             1200,
@@ -41164,7 +43018,7 @@ body{padding:18px}
         active_form = str(raw.get("activeForm", raw.get("active_form", "")) or "").strip()
         if active_form:
             row["activeForm"] = active_form
-        for meta_key in ("created_at", "updated_at", "completed_at", "completed_by", "evidence"):
+        for meta_key in ("created_at", "updated_at", "started_at", "completed_at", "completed_by", "evidence"):
             if meta_key in raw and raw.get(meta_key) not in (None, ""):
                 row[meta_key] = raw.get(meta_key)
         return row
@@ -41843,12 +43697,18 @@ body{padding:18px}
         current_text = str((current or {}).get("content", "") or "")
         current_is_acceptance = self._is_plan_step_acceptance_subtask(current_text)
         acceptance_terms = self._plan_step_acceptance_terms()
+        auto_progress = not self._is_multi_agent_mode()
         acceptance_hint = (
             f"The final subtask must be a semantic {acceptance_terms['prefix']} item with a concrete check action and evidence shape. "
         )
         if current_is_acceptance:
             acceptance_hint += (
-                "The current subtask is the acceptance gate: execute the check, record evidence, and only mark it completed when it passes. "
+                "The current subtask is the acceptance gate: execute the concrete check now. "
+                + (
+                    "The runtime records matching evidence and closes the acceptance row atomically; use TodoWrite only to correct an exceptional mismatch. "
+                    if auto_progress
+                    else "Record the evidence and only mark the row completed when the check passes. "
+                )
             )
         else:
             acceptance_hint += (
@@ -41881,7 +43741,7 @@ body{padding:18px}
             todo_state = "".join(state_parts)
             # Hard prohibition: model must NOT re-create subtasks when they already exist
             subtasks_exist_ban = (
-                "🚫 STRICT: subtasks for this step already exist — do NOT call TodoWrite/TodoWriteRescue "
+                "STRICT: subtasks for this step already exist — do NOT call TodoWrite/TodoWriteRescue "
                 "to create new subtasks. Directly execute the in_progress subtask above. "
             )
         if for_manager:
@@ -41899,6 +43759,11 @@ body{padding:18px}
                 "When subtasks exist, tell the owner to finish the current in_progress subtask first and update TodoWrite/TodoWriteRescue after real status changes. "
                 "Do not route to finish_current_task while the approved plan still has unfinished steps."
             )
+        tracking_rule = (
+            "Observable tool results are the authoritative progress events. The runtime records matching file/read/test evidence and may close the current subtask or acceptance gate atomically. "
+            if auto_progress
+            else "After EACH completed subtask, update TodoWrite or TodoWriteRescue before starting the next one. "
+        )
         return (
             f"PLAN/TODO DISCIPLINE: `{PLAN_FILE_RELATIVE_PATH}` is a read-only runtime mirror of the approved plan. "
             "Read it for status; never write/edit it directly. "
@@ -41908,7 +43773,7 @@ body{padding:18px}
             f"{subtasks_exist_ban}"
             f"{todo_state}"
             f"{acceptance_hint}"
-            "After EACH completed subtask, update TodoWrite or TodoWriteRescue before starting the next one. "
+            f"{tracking_rule}"
             "Do not call finish_current_task for a subtask or a single plan step; use it only when the overall user task is truly complete."
         )
 
@@ -42813,6 +44678,13 @@ body{padding:18px}
             if str(acceptance_row.get("status", "pending") or "pending").lower() != "completed":
                 acceptance_row["status"] = "in_progress"
 
+        now_value = float(now_ts())
+        for row in work_rows + [acceptance_row]:
+            if not row.get("created_at"):
+                row["created_at"] = now_value
+            if str(row.get("status", "pending") or "pending").lower() == "in_progress" and not row.get("started_at"):
+                row["started_at"] = now_value
+
         # Canonical renumber pass — the SINGLE source of numbering truth.
         # Whoever wrote a row (bootstrap skeleton, worker free-text, or a worker
         # restatement), numbering is a property of POSITION, not of the author:
@@ -42916,7 +44788,17 @@ body{padding:18px}
             "実行", "テスト", "ビルド", "コンパイル", "検証", "確認",
         )
         if any(term in low for term in validation_terms):
-            return self._plan_step_has_blackboard_evidence(plan_step, bb)
+            expected = self._acceptance_expected_evidence(text)
+            pseudo_acceptance = {
+                "content": text,
+                "created_at": since_ts,
+            }
+            return bool(self._matching_acceptance_evidence_records(
+                plan_step,
+                pseudo_acceptance,
+                board=bb,
+                expected=expected,
+            ))
         return False
 
     def _initial_plan_worker_row_status_from_evidence(
@@ -42929,6 +44811,189 @@ body{padding:18px}
         if self._plan_subtask_has_accumulated_evidence(plan_step, subtask_text, board=board):
             return "completed"
         return "pending"
+
+    def _acceptance_evidence_since_ts(self, acceptance: dict, plan_step: dict) -> float:
+        """Return when the acceptance action became eligible for evidence.
+
+        ``updated_at`` is deliberately excluded: completing a Todo updates that
+        timestamp after the command ran and used to erase the just-produced
+        evidence from the gate's time window.
+        """
+        # The graph creation timestamp is the stable lower bound. Acceptance
+        # often becomes the active row immediately after the same tool call that
+        # produced its proof; using the later activation timestamp would discard
+        # that valid event by a few microseconds.
+        for key in ("created_at", "started_at"):
+            try:
+                value = float((acceptance or {}).get(key, 0.0) or 0.0)
+            except Exception:
+                value = 0.0
+            if value > 0:
+                return value
+        return self._plan_step_activation_ts(plan_step)
+
+    def _acceptance_expected_evidence(self, acceptance_text: object) -> str:
+        text = str(acceptance_text or "").strip().lower()
+        wants_file = any(
+            tok in text
+            for tok in (
+                "读取", "检查", "文件", "目录", "路径", "选择器", "read", "inspect", "file",
+                "directory", "path", "selector", "檢查", "讀取", "確認", "ファイル", "ディレクトリ",
+            )
+        ) or self._plan_text_file_content_subject(text)
+        wants_runtime = self._plan_text_explicit_runtime_check(text) or (
+            any(tok in text for tok in ("运行", "执行", "run", "実行"))
+            and self._plan_text_runtime_subject(text)
+        )
+        if wants_file and self._plan_text_prefers_file_content_evidence(text):
+            wants_runtime = False
+        if wants_runtime:
+            return "runtime/test/build/browser execution evidence"
+        if wants_file:
+            return "file/path/directory inspection evidence"
+        if any(
+            tok in text
+            for tok in (
+                "检索", "搜索", "研究", "调研", "资料", "来源", "引用", "research", "search",
+                "source", "citation", "evidence chain", "搜集", "收集", "調査", "検索",
+            )
+        ):
+            return "research/retrieval evidence"
+        if any(tok in text for tok in ("黑板", "blackboard", "记录", "記錄", "record", "status", "review_feedback")):
+            return "blackboard acceptance record"
+        return "generic-observable-check"
+
+    def _matching_acceptance_evidence_records(
+        self,
+        plan_step: dict,
+        acceptance: dict,
+        *,
+        board: dict | None = None,
+        expected: str = "",
+    ) -> list[dict]:
+        step_id = trim(str((plan_step or {}).get("id", "") or ""), 40)
+        if not step_id:
+            return []
+        evidence_kind = expected or self._acceptance_expected_evidence(acceptance.get("content", ""))
+        since_ts = self._acceptance_evidence_since_ts(acceptance, plan_step)
+        return [
+            row
+            for row in self._plan_step_evidence_records(step_id, board=board, since_ts=since_ts)
+            if self._acceptance_evidence_record_matches(
+                row,
+                evidence_kind,
+                acceptance_text=acceptance.get("content", ""),
+            )
+        ]
+
+    def _replace_plan_worker_rows(self, step_id: str, rows: list[dict]) -> None:
+        step_key = trim(str(step_id or ""), 40)
+        if not step_key:
+            return
+        snap = self.todo.snapshot()
+        preserved = [
+            dict(row)
+            for row in snap
+            if not (
+                isinstance(row, dict)
+                and self._todo_row_kind(row) == "plan_worker"
+                and trim(str(row.get("parent_step_id", "") or ""), 40) == step_key
+            )
+        ]
+        clean_rows = [dict(row) for row in rows if isinstance(row, dict)]
+        clean_rows.sort(key=self._plan_worker_todo_sort_key)
+        for row in clean_rows:
+            row["activeForm"] = self.todo._default_active_form(
+                str(row.get("status", "pending") or "pending"),
+                str(row.get("content", "") or ""),
+                owner=str(row.get("owner", "") or ""),
+            )
+        with self.todo.lock:
+            self.todo.items = preserved + clean_rows
+        self._sync_plan_worker_todos_to_blackboard(step_key, rows=clean_rows)
+
+    def _reconcile_plan_worker_progress_from_evidence(self, *, actor: str = "developer") -> bool:
+        """Fold observable tool evidence into the canonical execution graph.
+
+        This is the compatibility bridge from the old manually-updated Todo
+        protocol to event-driven execution. Work rows may advance when their
+        concrete artifact/check is observed; the final acceptance row completes
+        automatically only on matching passing evidence.
+        """
+        bb = self._ensure_blackboard()
+        step = self._get_active_plan_step(bb)
+        if not isinstance(step, dict):
+            return False
+        step_id = trim(str(step.get("id", "") or ""), 40)
+        rows = self._active_plan_worker_todo_rows(step_id, role="")
+        if not rows:
+            return False
+        existing_records = self._plan_step_evidence_records(step_id, board=bb)
+        if not existing_records:
+            return False
+        changed = False
+        now_value = float(now_ts())
+        acceptance_index = -1
+        for idx, row in enumerate(rows):
+            if self._is_plan_step_acceptance_subtask(row.get("content", "")):
+                acceptance_index = idx
+                continue
+            if str(row.get("status", "pending") or "pending").lower() != "in_progress":
+                continue
+            if self._plan_subtask_has_accumulated_evidence(step, row.get("content", ""), board=bb):
+                row["status"] = "completed"
+                row["completed_at"] = now_value
+                row["completed_by"] = actor
+                row["updated_at"] = now_value
+                row["evidence"] = trim(self._collect_blackboard_step_evidence(step, bb), 300)
+                changed = True
+
+        work_open = [
+            row for row in rows
+            if not self._is_plan_step_acceptance_subtask(row.get("content", ""))
+            and str(row.get("status", "pending") or "pending").lower() != "completed"
+        ]
+        if work_open and not any(str(row.get("status", "") or "").lower() == "in_progress" for row in work_open):
+            work_open[0]["status"] = "in_progress"
+            work_open[0]["started_at"] = now_value
+            work_open[0]["updated_at"] = now_value
+            changed = True
+
+        if acceptance_index >= 0:
+            acceptance = rows[acceptance_index]
+            work_done = not any(
+                not self._is_plan_step_acceptance_subtask(row.get("content", ""))
+                and str(row.get("status", "pending") or "pending").lower() != "completed"
+                for row in rows
+            )
+            if work_done and str(acceptance.get("status", "pending") or "pending").lower() != "completed":
+                if str(acceptance.get("status", "pending") or "pending").lower() != "in_progress":
+                    acceptance["status"] = "in_progress"
+                    acceptance["started_at"] = now_value
+                    acceptance["updated_at"] = now_value
+                    changed = True
+                matches = self._matching_acceptance_evidence_records(step, acceptance, board=bb)
+                if matches:
+                    latest = matches[-1]
+                    acceptance["status"] = "completed"
+                    acceptance["completed_at"] = now_value
+                    acceptance["completed_by"] = actor
+                    acceptance["updated_at"] = now_value
+                    acceptance["evidence"] = trim(
+                        f"{latest.get('tool', 'tool')}"
+                        f"{(' exit_code=' + str(latest.get('exit_code'))) if latest.get('exit_code') is not None else ''}: "
+                        f"{latest.get('summary', '')}",
+                        300,
+                    )
+                    changed = True
+        if not changed:
+            return False
+        self._replace_plan_worker_rows(step_id, rows)
+        try:
+            self._update_plan_file_step_status()
+        except Exception:
+            pass
+        return True
 
     def _extract_plan_step_subtasks(self, plan_step: dict, limit: int = 6) -> list[str]:
         import re
@@ -43743,8 +45808,9 @@ body{padding:18px}
             for r in tool_results
         )
         ran_bash_ok = any(
-            str(r.get("name", "")) == "bash" and r.get("ok", False)
+            self._tool_result_is_passing_execution(r)
             for r in tool_results
+            if isinstance(r, dict)
         )
         validation_ok_current = self._tool_results_have_validation_evidence(current, tool_results)
         validation_ok_blackboard = self._plan_step_has_blackboard_evidence(current, bb)
@@ -43817,7 +45883,7 @@ body{padding:18px}
                 return True
             return False
         else:
-            if subtasks_done and not acceptance_gate_ok:
+            if (subtasks_done or self._step_work_subtasks_completed(current)) and not acceptance_gate_ok:
                 self._blackboard_append_memory(
                     "decision",
                     (
@@ -45557,6 +47623,7 @@ body{padding:18px}
 
     def _plan_steps_context_for_manager(self) -> str:
         bb = self._ensure_blackboard()
+        profile = self._ensure_blackboard_task_profile(bb)
         todos = bb.get("project_todos", [])
         if not todos or not any(t.get("category") == "plan_step" for t in todos):
             return ""
@@ -45608,6 +47675,10 @@ body{padding:18px}
         current_phase = self._infer_current_phase_from_blackboard()
         if current_phase:
             preferred = TASK_PHASE_ROUTING.get(current_phase, "developer")
+            if self._effective_execution_mode() == EXECUTION_MODE_SINGLE:
+                preferred = self._sanitize_agent_role(
+                    profile.get("assigned_expert", self.runtime_assigned_expert)
+                ) or "developer"
             # Directive (Fix 5), not advisory: each phase has a clear owner, and the
             # manager runs at low coordination effort now, so a soft "prefer" was too
             # easily ignored — collapsing everything onto developer. Make the default
@@ -45639,6 +47710,10 @@ body{padding:18px}
     def _plan_step_phase_hint(self, step_content: str) -> str:
         """Infer the task phase from a plan step's content."""
         c = str(step_content or "").lower()
+        # A major plan row is a phase boundary. Classify from its title first so
+        # acceptance/test details embedded in later substeps cannot silently
+        # turn an implementation phase into a review phase (or vice versa).
+        title = next((line.strip() for line in c.splitlines() if line.strip()), c)
         research_keywords = (
             "研究", "分析", "调研", "探索", "检索", "搜索", "查找", "查询", "收集", "采集",
             "整理", "提取", "资料", "数据", "排行", "资金流向", "走势", "来源", "交叉验证",
@@ -45650,21 +47725,33 @@ body{padding:18px}
             "implement", "develop", "code", "component", "module", "function", "shader",
             "scaffold", "mkdir", ".f90", ".py", ".cpp", ".js", ".ts", ".tsx", ".jsx", ".glsl",
         )
-        if any(kw in c for kw in strong_impl_keywords):
-            return "implement"
-        if any(kw in c for kw in research_keywords):
-            return "research"
-        if any(kw in c for kw in ("设计", "架构", "规划", "design", "architect", "plan", "interface", "接口")):
-            return "design"
-        if any(kw in c for kw in ("测试", "单测", "回归", "test", "pytest", "unit", "integration", "compile")):
-            return "test"
-        if any(kw in c for kw in ("审查", "评审", "review", "audit", "inspect code")):
-            return "review"
-        if any(kw in c for kw in ("部署", "发布", "deploy", "release", "publish", "配置")):
-            return "deploy"
-        if any(kw in c for kw in ("编写", "创建", "绘制", "生成", "写入", "制作",
-                                   "write", "create", "build", "generate", "draw")):
-            return "implement"
+
+        def _classify(text: str) -> str:
+            # Verification/review must win over incidental implementation words
+            # such as a filename or "code review" in a phase title.
+            if any(kw in text for kw in ("独立验收", "独立验证", "验收与审核", "审查", "评审", "review", "audit", "inspect code")):
+                return "review"
+            if any(kw in text for kw in ("测试", "单测", "回归", "验证", "驗證", "test", "pytest", "unit", "integration", "compile", "verification")):
+                return "test"
+            if any(kw in text for kw in ("部署", "发布", "deploy", "release", "publish", "配置")):
+                return "deploy"
+            if any(kw in text for kw in research_keywords):
+                return "research"
+            if any(kw in text for kw in ("设计", "架构", "规划", "design", "architect", "plan", "interface", "接口")):
+                return "design"
+            if any(kw in text for kw in strong_impl_keywords):
+                return "implement"
+            if any(kw in text for kw in ("编写", "创建", "绘制", "生成", "写入", "制作",
+                                          "write", "create", "build", "generate", "draw")):
+                return "implement"
+            return ""
+
+        title_phase = _classify(title)
+        if title_phase:
+            return title_phase
+        full_phase = _classify(c)
+        if full_phase:
+            return full_phase
         return ""
 
     def _plan_step_acceptance_guidance(self, plan_step: dict) -> dict:
@@ -47712,7 +49799,7 @@ body{padding:18px}
             _pmr = []
         _pmr.append({
             "target": target,
-            "instruction_hash": hashlib.sha1(safe_utf8_bytes(instruction)).hexdigest()[:12],
+            "instruction_hash": hashlib.sha1(str(instruction or "").encode("utf-8")).hexdigest()[:12],
             "round": int(getattr(self, "agent_round_index", 0) or 0),
             "ts": float(now_ts()),
             "focus_id": str(route_row.get("focus_id", "") or ""),
@@ -48208,17 +50295,20 @@ body{padding:18px}
         output_clean, _ = filter_runtime_noise_lines(output_raw)
         output = trim(output_clean, BLACKBOARD_MAX_TEXT)
         ok = bool(item.get("ok", False))
+        step_file_rows: list[tuple[str, str]] = []
         if name in {"write_file", "edit_file"}:
             rel_path = str(args.get("path", "") or "").strip()
             if ok and not self._is_plan_infrastructure_path(rel_path):
                 summary = output if output else f"{name} executed"
                 self._blackboard_upsert_artifact(rel_path, summary, role_key)
                 self._blackboard_set_status("CODING")
-        elif name in {"bash", "worktree_run", "background_run"}:
+        elif name in {"bash", "worktree_run", "check_background"}:
             cmd = trim(str(args.get("command", "") or "").strip(), 180)
             line = f"{name} {cmd}".strip()
             if output:
                 line = f"{line}\n{output}".strip()
+            if item.get("exit_code") is not None:
+                line = f"{line}\nexit_code={int(item.get('exit_code'))}".strip()
             self._blackboard_append_section("execution_logs", role_key, line)
             if self._command_looks_like_validation(str(args.get("command", "") or "")) or (not ok):
                 self._blackboard_append_memory(
@@ -48318,48 +50408,51 @@ body{padding:18px}
                     self._emit("status", {"summary": "finish deferred: sync mode requires reviewer approval"})
                 else:
                     self._blackboard_mark_approved(approval_note, role_key)
+        if name in ("read_file", "write_file", "edit_file") or name in {"bash", "worktree_run", "check_background"}:
+            file_path = trim(str(args.get("path", "") or "").strip(), 240)
+            file_paths = [file_path] if file_path else []
+            changed_paths = {
+                normalize_rel_preview_path(str(value or ""))
+                for value in (item.get("changed_files", []) if isinstance(item.get("changed_files"), list) else [])
+                if normalize_rel_preview_path(str(value or ""))
+            }
+            if name in {"bash", "worktree_run"}:
+                file_paths = list(dict.fromkeys(
+                    self._bash_file_read_targets(str(args.get("command", "") or ""))
+                    + list(changed_paths)
+                ))
+            for value in file_paths[:8]:
+                if self._is_plan_infrastructure_path(value):
+                    continue
+                op = "edit_file" if name in {"bash", "worktree_run"} and normalize_rel_preview_path(value) in changed_paths else name
+                step_file_rows.append((value, op))
+            if step_file_rows:
+                try:
+                    bb_files = self._ensure_blackboard()
+                    current_step = self._get_active_plan_step(bb_files)
+                    step_id = str((current_step or {}).get("id", "") or "") if isinstance(current_step, dict) else ""
+                    if step_id:
+                        entries = bb_files.setdefault("step_files", {}).setdefault(step_id, [])
+                        stamp = float(now_ts())
+                        for value, op in step_file_rows:
+                            entries.append({"path": value, "role": role_key, "op": op, "ts": stamp})
+                        if len(entries) > 30:
+                            bb_files["step_files"][step_id] = entries[-30:]
+                        self.blackboard = bb_files
+                        self._blackboard_touch()
+                except Exception:
+                    pass
+        try:
+            self._record_plan_step_tool_evidence(role_key, item)
+            self._reconcile_plan_worker_progress_from_evidence(actor=role_key)
+        except Exception:
+            pass
         if not ok and output and not self._is_plan_infrastructure_tool_error(name, args, output):
             self._blackboard_append_section(
                 "execution_logs",
                 role_key,
                 f"tool_error {name}: {output}",
             )
-        # Track file operations in step_files registry for cross-agent context
-        if name in ("read_file", "write_file", "edit_file") or name in {"bash", "worktree_run", "background_run"}:
-            file_path = trim(str(args.get("path", "") or "").strip(), 240)
-            file_paths = [file_path] if file_path else []
-            if name in {"bash", "worktree_run", "background_run"}:
-                file_paths = self._bash_file_read_targets(str(args.get("command", "") or ""))
-            file_paths = [
-                p for p in file_paths
-                if not self._is_plan_infrastructure_path(p)
-            ]
-            if file_paths:
-                try:
-                    bb = self._ensure_blackboard()
-                    current_step = next(
-                        (t for t in bb.get("project_todos", [])
-                         if t.get("category") == "plan_step" and t.get("status") == "in_progress"),
-                        None,
-                    )
-                    if current_step:
-                        step_id = str(current_step.get("id", "") or "")
-                        if step_id:
-                            sf = bb.setdefault("step_files", {})
-                            entries = sf.setdefault(step_id, [])
-                            for file_path in file_paths[:8]:
-                                entries.append({
-                                    "path": file_path,
-                                    "role": role_key,
-                                    "op": name,
-                                    "ts": float(now_ts()),
-                                })
-                            if len(entries) > 30:
-                                sf[step_id] = entries[-30:]
-                            self.blackboard = bb
-                            self._blackboard_touch()
-                except Exception:
-                    pass
 
     def _blackboard_update_from_worker_step(self, role: str, step: dict):
         role_key = self._sanitize_agent_role(role)
@@ -48855,6 +50948,8 @@ body{padding:18px}
         if not role_key:
             return True
         allowed = AGENT_TOOL_ALLOWLIST.get(role_key, set())
+        if role_key == "reviewer" and bool(self.reviewer_debug_mode):
+            allowed = set(allowed) | set(REVIEWER_DEBUG_TOOL_ALLOWLIST)
         return str(name or "").strip() in allowed
 
     def _available_tools(self) -> list[dict]:
@@ -48862,6 +50957,12 @@ body{padding:18px}
             TOOLS,
             web_search_enabled=bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED)),
         )
+        if self.skill_mode == "hard":
+            hidden = {"list_skill_providers", "list_skill_protocols", "scan_skills", "write_skill"}
+            base = [
+                tool for tool in base
+                if str((tool.get("function", {}) if isinstance(tool, dict) else {}).get("name", "") or "") not in hidden
+            ]
         mcp_specs = self._mcp_tool_specs()
         if mcp_specs:
             return list(base) + list(mcp_specs)
@@ -48873,6 +50974,8 @@ body{padding:18px}
         if not role_key:
             return base_tools
         allowed = AGENT_TOOL_ALLOWLIST.get(role_key, set())
+        if role_key == "reviewer" and bool(self.reviewer_debug_mode):
+            allowed = set(allowed) | set(REVIEWER_DEBUG_TOOL_ALLOWLIST)
         filtered = []
         for tool in base_tools:
             fn = tool.get("function", {}) if isinstance(tool, dict) else {}
@@ -49737,7 +51840,7 @@ body{padding:18px}
             args_error = str(tc.get("args_error", "")).strip()
             try:
                 if isinstance(args, (dict, list)):
-                    args_text = json_dumps(args, sort_keys=True, separators=(",", ":"))
+                    args_text = json.dumps(args, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
                 else:
                     args_text = str(args)
             except Exception:
@@ -49747,7 +51850,7 @@ body{padding:18px}
         raw = "||".join(parts)
         if not raw:
             return ""
-        return hashlib.sha1(safe_utf8_bytes(raw)).hexdigest()
+        return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
     def _inject_forced_convergence_hint(self, tool_names: list[str], reason: str):
         uniq = []
@@ -49948,8 +52051,8 @@ body{padding:18px}
                     f"Stay on the active plan step: {step_label}. "
                     f"{('Current subtask: ' + current_text + '. ') if current_text else ''}"
                     "Next turn must use exactly one concrete tool call. "
-                    "If the current subtask or final acceptance check is complete, update the same TodoWrite/TodoWriteRescue row to completed with evidence. "
-                    "If evidence is missing, run one focused read/bash/check tool to collect it. "
+                    "If evidence is missing, run one focused read/bash/check/write tool to produce it; matching tool evidence is recorded and reconciled automatically. "
+                    "Use TodoWrite/TodoWriteRescue only when the canonical subtask graph itself is missing or incorrect. "
                     "Do not ask the user to confirm routine plan advancement and do not summarize instead of updating the live plan state. "
                     f"{('Previous text: ' + latest) if latest else ''}"
                     "</plan-no-tool-recovery>"
@@ -50494,7 +52597,18 @@ body{padding:18px}
         mode = str(args.get("mode", "") or "").strip().lower()
         query = str(args.get("query", "") or "").strip()
         if task_id and not mode and not query:
-            return self.bg.check(task_id)
+            out = self.bg.check(task_id)
+            task = next(
+                (row for row in self.bg.list_objects() if str(row.get("id", "") or "") == task_id),
+                None,
+            )
+            if isinstance(task, dict) and str(task.get("status", "") or "") in {"completed", "error"}:
+                self._set_tool_result_meta(
+                    exit_code=task.get("exit_code", 0 if task.get("status") == "completed" else -1),
+                    shell_exit_code=task.get("exit_code", 0 if task.get("status") == "completed" else -1),
+                    error="" if task.get("status") == "completed" else str(task.get("result", "") or "background task failed"),
+                )
+            return out
         rows = self.bg.list_objects()
         if not rows:
             return "No bg tasks."
@@ -50522,6 +52636,24 @@ body{padding:18px}
             detail_fields=[],
             default_limit=20,
         )
+
+    def _check_background_result_meta(self, args: dict, output: object) -> dict:
+        task_id = str((args or {}).get("task_id", "") or "").strip() if isinstance(args, dict) else ""
+        if not task_id:
+            return {}
+        task = next(
+            (row for row in self.bg.list_objects() if str(row.get("id", "") or "") == task_id),
+            None,
+        )
+        if not isinstance(task, dict) or str(task.get("status", "") or "") not in {"completed", "error"}:
+            return {}
+        exit_code = task.get("exit_code", 0 if task.get("status") == "completed" else -1)
+        return {
+            "exit_code": exit_code,
+            "shell_exit_code": exit_code,
+            "error": "" if task.get("status") == "completed" else str(task.get("result", output) or "background task failed"),
+            "command": str(task.get("command", "") or ""),
+        }
 
     def _read_inbox_enhanced(self, args: dict) -> str:
         mode = str(args.get("mode", "") or "").strip().lower()
@@ -50620,8 +52752,120 @@ body{padding:18px}
                 missing.append(key)
         return missing
 
+    def _clear_tool_result_meta(self) -> None:
+        try:
+            self._tool_result_local.meta = {}
+        except Exception:
+            pass
+
+    def _set_tool_result_meta(self, **values) -> None:
+        try:
+            clean = {str(key): value for key, value in values.items() if value is not None}
+            self._tool_result_local.meta = clean
+        except Exception:
+            pass
+
+    def _peek_tool_result_meta(self) -> dict:
+        try:
+            raw = getattr(self._tool_result_local, "meta", {})
+            return dict(raw) if isinstance(raw, dict) else {}
+        except Exception:
+            return {}
+
+    def _take_tool_result_meta(self) -> dict:
+        meta = self._peek_tool_result_meta()
+        self._clear_tool_result_meta()
+        return meta
+
+    def _effective_shell_exit_code(self, output: object, fallback: object = None) -> int | None:
+        """Return the command's meaningful exit code.
+
+        The shell wrapper supplies the real process return code. Some generated
+        commands append ``echo EXIT_CODE=$?``, which makes the wrapper itself
+        exit zero; in that compatibility case the explicit final sentinel is
+        more informative and takes precedence.
+        """
+        matches = re.findall(
+            r"(?im)^\s*(?:exit[_ ]?code|return[_ ]?code|rc)\s*[:=]\s*(-?\d+)\s*$",
+            str(output or ""),
+        )
+        if matches:
+            try:
+                return int(matches[-1])
+            except Exception:
+                pass
+        try:
+            return int(fallback) if fallback is not None else None
+        except Exception:
+            return None
+
+    def _tool_result_ok(self, name: str, output: object, meta: dict | None = None) -> bool:
+        text = str(output or "")
+        if text.startswith("Error:"):
+            return False
+        tool = canonicalize_tool_name(name)
+        info = meta if isinstance(meta, dict) else self._peek_tool_result_meta()
+        if tool in {"bash", "worktree_run", "check_background"}:
+            exit_code = self._effective_shell_exit_code(text, info.get("exit_code"))
+            if exit_code is not None:
+                return exit_code == 0 and not bool(info.get("error"))
+        return True
+
+    def _build_tool_result_item(
+        self,
+        name: str,
+        args: dict | None,
+        output: object,
+        *,
+        dispatched_name: str = "",
+    ) -> dict:
+        meta = self._take_tool_result_meta()
+        tool_name = canonicalize_tool_name(dispatched_name or name) or str(dispatched_name or name or "")
+        if tool_name == "check_background":
+            background_meta = self._check_background_result_meta(args or {}, output)
+            if background_meta:
+                meta = {**background_meta, **meta}
+        item_args = dict(args) if isinstance(args, dict) else {}
+        if tool_name == "check_background" and meta.get("command"):
+            item_args.setdefault("command", str(meta.get("command", "") or ""))
+        item = {
+            "name": tool_name,
+            "args": item_args,
+            # Acceptance assertions and explicit EXIT_CODE sentinels are often
+            # printed at the end of a long test run. Preserve both ends in the
+            # durable result rather than dropping the decisive tail.
+            "output": self._tool_result_compact_output(output, max_chars=3000),
+            "ok": self._tool_result_ok(tool_name, output, meta),
+        }
+        if tool_name in {"bash", "worktree_run", "check_background"}:
+            exit_code = self._effective_shell_exit_code(output, meta.get("exit_code"))
+            if exit_code is not None:
+                item["exit_code"] = int(exit_code)
+            if meta.get("shell_exit_code") is not None:
+                item["shell_exit_code"] = int(meta.get("shell_exit_code"))
+        for key in ("duration_ms", "changed_files", "error"):
+            if meta.get(key) not in (None, "", []):
+                item[key] = meta.get(key)
+        return item
+
+    @staticmethod
+    def _tool_result_compact_output(output: object, *, max_chars: int = 3000) -> str:
+        text = str(output or "")
+        limit = max(200, int(max_chars or 3000))
+        if len(text) <= limit:
+            return text
+        head_chars = max(80, int(limit * 0.58))
+        tail_chars = max(80, limit - head_chars - 48)
+        return (
+            text[:head_chars].rstrip()
+            + "\n...[middle truncated; tail preserved]...\n"
+            + text[-tail_chars:].lstrip()
+        )
+
     def _dispatch_tool(self, name: str, args: dict, agent_role: str = "") -> str:
         """Top-level tool dispatcher with error isolation and per-tool timeout."""
+        telemetry_started = time.monotonic()
+        self._clear_tool_result_meta()
         name = canonicalize_tool_name(name)
         if not name:
             return "Error: ValueError: tool name is required"
@@ -50633,17 +52877,21 @@ body{padding:18px}
         if role_key and (not self._tool_allowed_for_agent(role_key, name)):
             return f"Error: tool '{name}' is not allowed for agent role '{role_key}'"
         try:
-            # Bash has its own timeout mechanism; skip external timeout for it.
+            # Shell-backed tools have their own timeout/state mechanism; keep
+            # them on this thread so structured outcome metadata is not lost at
+            # a ThreadPoolExecutor boundary.
             # MCP tools also enforce their own per-call timeout inside the
             # MCP client (and may legitimately run long), so don't double-wrap.
-            if name == "bash" or self._is_mcp_tool_name(name):
+            if name in {"bash", "worktree_run", "check_background"} or self._is_mcp_tool_name(name):
                 out = self._dispatch_tool_inner(name, args, role_key)
                 self._maybe_record_tool_memory_after_result(name, args, out, role_key)
+                self._record_tool_telemetry(name, out, telemetry_started)
                 return out
             timeout = _TOOL_TIMEOUT_MAP.get(name, _DEFAULT_TOOL_TIMEOUT)
             if timeout <= 0:
                 out = self._dispatch_tool_inner(name, args, role_key)
                 self._maybe_record_tool_memory_after_result(name, args, out, role_key)
+                self._record_tool_telemetry(name, out, telemetry_started)
                 return out
             pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"tool-{name}")
             future = pool.submit(self._dispatch_tool_inner, name, args, role_key)
@@ -50651,6 +52899,7 @@ body{padding:18px}
                 out = future.result(timeout=timeout)
                 self._maybe_record_tool_memory_after_result(name, args, out, role_key)
                 pool.shutdown(wait=True)
+                self._record_tool_telemetry(name, out, telemetry_started)
                 return out
             except concurrent.futures.TimeoutError:
                 future.cancel()
@@ -50673,6 +52922,7 @@ body{padding:18px}
                 })
                 out = f"Error: tool '{name}' timed out after {timeout} seconds. The operation may still be running in the background."
                 self._maybe_record_tool_memory_after_result(name, args, out, role_key)
+                self._record_tool_telemetry(name, out, telemetry_started, status="timeout")
                 return out
             except Exception:
                 pool.shutdown(wait=False, cancel_futures=True)
@@ -50685,7 +52935,25 @@ body{padding:18px}
             })
             out = f"Error: {type(exc).__name__}: {trim(str(exc), 500)}"
             self._maybe_record_tool_memory_after_result(name, args, out, role_key)
+            self._record_tool_telemetry(name, out, telemetry_started)
             return out
+
+    def _record_tool_telemetry(self, name: str, output: object, started: float, status: str = "") -> None:
+        try:
+            callback = getattr(self, "telemetry_callback", None)
+            if not callable(callback):
+                return
+            resolved = status or ("success" if self._tool_result_compat_ok(name, output) else "error")
+            callback(
+                "tool_call",
+                session_id=self.id,
+                app_id=str((self.app_binding or {}).get("app_id", "") or ""),
+                name=str(name or "unknown"),
+                status=resolved,
+                duration_ms=round((time.monotonic() - float(started)) * 1000.0, 3),
+            )
+        except Exception:
+            pass
 
     def _handle_ask_user_tool(self, args: dict, role_key: str = "") -> str:
         """Record a pending question and signal the run to pause for a user reply.
@@ -50794,8 +53062,17 @@ body{padding:18px}
         if name == "bash":
             guard_error = self._guard_shell_write_scope(str(args.get("command", "") or ""), self.files_root)
             if guard_error:
+                self._set_tool_result_meta(exit_code=-1, shell_exit_code=-1, error=guard_error)
                 return guard_error
             meta = self._run_shell_meta(args["command"], self.files_root, self._shell_command_timeout())
+            effective_exit = self._effective_shell_exit_code(meta.get("output", ""), meta.get("exit_code"))
+            self._set_tool_result_meta(
+                exit_code=effective_exit,
+                shell_exit_code=meta.get("exit_code"),
+                duration_ms=meta.get("duration_ms"),
+                changed_files=list(meta.get("changed_files", []) or []),
+                error=str(meta.get("error", "") or ""),
+            )
             self._emit(
                 "command",
                 {
@@ -50803,7 +53080,8 @@ body{padding:18px}
                     "command": meta["command"],
                     "effective_command": meta.get("effective_command", meta["command"]),
                     "cwd": meta["cwd"],
-                    "exit_code": meta["exit_code"],
+                    "exit_code": effective_exit,
+                    "shell_exit_code": meta.get("exit_code"),
                     "duration_ms": meta["duration_ms"],
                     "changed_files": meta["changed_files"],
                     "output": meta.get("ui_output_preview", trim(meta["output"], 1200)),
@@ -50821,7 +53099,7 @@ body{padding:18px}
                     "output_full_chars": int(meta.get("output_full_chars", 0) or 0),
                     "output_full_lines": int(meta.get("output_full_lines", 0) or 0),
                     "summary": (
-                        f"bash ({meta['exit_code']}) {meta['command'][:80]}"
+                        f"bash ({effective_exit}) {meta['command'][:80]}"
                         + (" · long-output buffered" if meta.get("temp_output_path") else "")
                         + (" · model-paged" if meta.get("model_truncated") else "")
                     ),
@@ -50832,6 +53110,13 @@ body{padding:18px}
             illegal = self._reject_non_workspace_absolute_tool_path(args.get("path", ""))
             if illegal:
                 return illegal
+            if self.skill_mode == "hard" and self._path_targets_global_skills(args.get("path", "")):
+                return (
+                    "Error: hard application mode cannot read the mutable global skills store. "
+                    "Use load_skill for one of the immutable bound skill ids."
+                )
+            if self.skill_mode == "hard" and str(args.get("path", "") or "").replace("\\", "/").lstrip("/").startswith("workspace/.application_skills"):
+                return "Error: use /workspace/.application_skills/... or .application_skills/... for the immutable application snapshot."
             try:
                 rel = self._normalize_tool_path_text(args["path"])
                 fp = self._session_path(rel)
@@ -50884,6 +53169,8 @@ body{padding:18px}
             protected = self._runtime_managed_path_tool_error(args.get("path", ""), "write_file")
             if protected:
                 return protected
+            if self.skill_mode == "hard" and ".application_skills" in str(args.get("path", "") or "").replace("\\", "/").split("/"):
+                return "Error: immutable application skill resources are read-only."
             try:
                 rel = self._normalize_tool_path_text(args["path"])
                 fp = self._session_path(rel)
@@ -50893,8 +53180,9 @@ body{padding:18px}
             # Auto-serialize non-string content: if model passes a dict/list, convert to JSON string.
             raw_content = args.get("content", "")
             if not isinstance(raw_content, str):
+                import json as _json
                 try:
-                    raw_content = json_dumps(raw_content, indent=2)
+                    raw_content = _json.dumps(raw_content, ensure_ascii=False, indent=2)
                 except Exception:
                     raw_content = str(raw_content)
             args = dict(args)
@@ -50949,6 +53237,8 @@ body{padding:18px}
             protected = self._runtime_managed_path_tool_error(args.get("path", ""), "edit_file")
             if protected:
                 return protected
+            if self.skill_mode == "hard" and ".application_skills" in str(args.get("path", "") or "").replace("\\", "/").split("/"):
+                return "Error: immutable application skill resources are read-only."
             try:
                 rel = self._normalize_tool_path_text(args["path"])
                 fp = self._session_path(rel)
@@ -51098,20 +53388,37 @@ body{padding:18px}
         if name == "task":
             return self.run_subagent(args["prompt"], args.get("agent_type", "Explore"))
         if name == "list_skills":
+            if self.skill_mode == "hard":
+                return ", ".join(self.bound_skill_ids)
             self._ensure_skills_ready(force=False)
             return ", ".join(self.skills.list_names())
         if name == "load_skill":
+            if self.skill_mode == "hard":
+                requested = str(args.get("name", "") or "").strip()
+                if requested not in set(self.bound_skill_ids):
+                    return "Error: hard application mode only permits its bound skills: " + ", ".join(self.bound_skill_ids)
+                order = self.bound_skill_ids.index(requested) + 1
+                frozen = f"/workspace/.application_skills/{order:02d}/SKILL.md"
+                if (self._application_snapshot_root() / f"{order:02d}" / "SKILL.md").exists():
+                    return f"Skill is hard-bound and active. Its complete immutable source is {frozen}; read that file before execution."
+                return "Skill is already active from the legacy immutable application snapshot."
             source = f"manual:{role_key or 'single'}"
             return self._load_skill_with_cache(args["name"], load_source=source)
         if name == "list_skill_providers":
+            if self.skill_mode == "hard":
+                return "Error: hard application mode does not expose the global skill provider catalog."
             self._ensure_skills_ready(force=False)
             return json_dumps(self.skills.list_providers(), indent=2)
         if name == "list_skill_protocols":
+            if self.skill_mode == "hard":
+                return "Error: hard application mode does not expose the global skill protocol catalog."
             self._ensure_skills_ready(force=False)
             return json_dumps(self.skills.list_protocols(), indent=2)
         if name == "write_skill":
-            return self._write_global_skill(args)
+            return "Error: global skill mutation is restricted to the authenticated admin interface."
         if name == "scan_skills":
+            if self.skill_mode == "hard":
+                return "Error: hard application mode uses an immutable snapshot and cannot scan global skills."
             return self._scan_global_skills()
         if name == "compress":
             tool_policy_note = self._apply_tool_memory_policy(args, role=role_key)
@@ -51187,6 +53494,7 @@ body{padding:18px}
             raw_command = str(args.get("command", "") or "")
             guard_error = self._guard_shell_write_scope(raw_command, self.files_root)
             if guard_error:
+                self._set_tool_result_meta(exit_code=-1, shell_exit_code=-1, error=guard_error)
                 return guard_error
             effective_command = self._rewrite_shell_virtual_paths(raw_command, self.files_root)
             out = self.bg.run(effective_command, int(args.get("timeout", 120)))
@@ -51342,8 +53650,17 @@ body{padding:18px}
                 return f"Error: unknown worktree '{args['name']}'"
             guard_error = self._guard_shell_write_scope(str(args.get("command", "") or ""), wt_path)
             if guard_error:
+                self._set_tool_result_meta(exit_code=-1, shell_exit_code=-1, error=guard_error)
                 return guard_error
             meta = self._run_shell_meta(args["command"], wt_path, self._shell_command_timeout())
+            effective_exit = self._effective_shell_exit_code(meta.get("output", ""), meta.get("exit_code"))
+            self._set_tool_result_meta(
+                exit_code=effective_exit,
+                shell_exit_code=meta.get("exit_code"),
+                duration_ms=meta.get("duration_ms"),
+                changed_files=list(meta.get("changed_files", []) or []),
+                error=str(meta.get("error", "") or ""),
+            )
             self._emit(
                 "command",
                 {
@@ -51352,7 +53669,8 @@ body{padding:18px}
                     "command": meta["command"],
                     "effective_command": meta.get("effective_command", meta["command"]),
                     "cwd": meta["cwd"],
-                    "exit_code": meta["exit_code"],
+                    "exit_code": effective_exit,
+                    "shell_exit_code": meta.get("exit_code"),
                     "duration_ms": meta["duration_ms"],
                     "changed_files": meta["changed_files"],
                     "output": meta.get("ui_output_preview", trim(meta["output"], 1200)),
@@ -51370,7 +53688,7 @@ body{padding:18px}
                     "output_full_chars": int(meta.get("output_full_chars", 0) or 0),
                     "output_full_lines": int(meta.get("output_full_lines", 0) or 0),
                     "summary": (
-                        f"worktree_run ({meta['exit_code']}) {args['name']}: {meta['command'][:70]}"
+                        f"worktree_run ({effective_exit}) {args['name']}: {meta['command'][:70]}"
                         + (" · long-output buffered" if meta.get("temp_output_path") else "")
                         + (" · model-paged" if meta.get("model_truncated") else "")
                     ),
@@ -52285,6 +54603,7 @@ body{padding:18px}
                 },
             )
             args_error = str(tc.get("args_error", "") or "").strip()
+            self._clear_tool_result_meta()
             if args_error:
                 output = (
                     f"Error: malformed arguments for tool '{name}'. {args_error}. "
@@ -52333,12 +54652,11 @@ body{padding:18px}
                     "summary": f"{self._agent_display_name(role_key)} tool: {name}",
                 },
             )
-            item = {
-                "name": name,
-                "args": args if isinstance(args, dict) else {},
-                "output": trim(str(output or ""), 3000),
-                "ok": not str(output).startswith("Error:"),
-            }
+            item = self._build_tool_result_item(
+                name,
+                args if isinstance(args, dict) else {},
+                output,
+            )
             is_finish_tool = name in {"finish_task", "finish_current_task", "mark_done"}
             # Atomic blackboard sync: update shared state immediately after each tool result.
             self._blackboard_update_from_tool_result(role_key, item)
@@ -52365,10 +54683,10 @@ body{padding:18px}
                         )
             item["bb_applied"] = True
             tool_results.append(item)
-            if name == "ask_user" and (not str(output).startswith("Error:")):
+            if name == "ask_user" and item["ok"]:
                 stop_due_to_ask_user = True
                 break
-            if name in {"finish_task", "finish_current_task", "mark_done"} and (not str(output).startswith("Error:")):
+            if name in {"finish_task", "finish_current_task", "mark_done"} and item["ok"]:
                 stop_due_to_finish = True
                 break
         with self.lock:
@@ -52794,7 +55112,7 @@ body{padding:18px}
             # Detect manager loop: same instruction repeated with unchanged progress.
             import hashlib as _hl_mgr
             _delegate_progress_fp = self._watchdog_state_fingerprint(self._ensure_blackboard())
-            _cur_hash = _hl_mgr.sha1(safe_utf8_bytes(target + "|" + instruction + "|" + _delegate_progress_fp)).hexdigest()[:12]
+            _cur_hash = _hl_mgr.sha1((target + "|" + instruction + "|" + _delegate_progress_fp).encode("utf-8")).hexdigest()[:12]
             if _cur_hash == _prev_delegation_hash:
                 _repeat_delegation_count += 1
             else:
@@ -53244,6 +55562,9 @@ body{padding:18px}
         research_prompt = self._plan_mode_research_prompt()
         self._seed_plan_mode_explorer_context(research_prompt)
 
+        productive_rounds = 0
+        stale_rounds = 0
+        research_sig = self._plan_mode_research_signature()
         for r in range(PLAN_MODE_EXPLORER_MAX_ROUNDS):
             if self.cancel_requested:
                 return {"status": "interrupted"}
@@ -53254,7 +55575,20 @@ body{padding:18px}
                 return {"status": "interrupted"}
             if status in {"ok", "findings-only", "no-tools"}:
                 self._plan_mode_update_findings(step)
+            new_sig = self._plan_mode_research_signature()
+            if new_sig != research_sig:
+                productive_rounds += 1
+                stale_rounds = 0
+                research_sig = new_sig
+            else:
+                stale_rounds += 1
             if status in ("no-tools", "findings-only", "skip"):
+                break
+            if productive_rounds >= PLAN_MODE_EXPLORER_PRODUCTIVE_ROUNDS:
+                self._emit("status", {"summary": "plan-mode: evidence budget satisfied; synthesizing now"})
+                break
+            if stale_rounds >= PLAN_MODE_EXPLORER_STALE_ROUNDS:
+                self._emit("status", {"summary": "plan-mode: no new evidence; synthesizing current findings"})
                 break
 
         # Phase 2: manager synthesis of structured executable options
@@ -53370,20 +55704,15 @@ body{padding:18px}
             f"## User Request\n{goal}\n\n"
             f"{skills_section}"
             f"## Instructions\n"
-            f"1. Call `list_skills` FIRST to discover available skills — identify which skills are relevant "
-            f"to this task and note their names and capabilities in your findings.\n"
-            f"2. List all uploaded/workspace files with `ls uploaded/` or `ls` to know what inputs are available\n"
-            f"3. Read uploaded files (.parsed.md preferred over .pdf) to understand their content and structure\n"
-            f"4. If relevant skills exist, call `load_skill` to load the most relevant one and analyze its "
-            f"workflow steps, scripts, tools, and file paths\n"
+            f"1. Start from the user request and inspect only evidence needed to choose an executable architecture. "
+            f"Use `list_skills` only when the requested artifact or workflow plausibly maps to a specialized skill.\n"
+            f"2. Inspect focused workspace paths or uploaded inputs that actually exist; do not perform a generic full-directory inventory.\n"
+            f"3. Read the minimum relevant files needed to identify architecture, interfaces, constraints, and validation commands.\n"
+            f"4. If a relevant skill exists, call `load_skill` and extract only the workflow constraints that must shape the plan.\n"
             f"5. Identify key technical details, data points, and structure needed for the output\n"
-            f"6. Assess risks and note any ambiguities that need user input\n"
-            f"7. DO NOT write, edit, or create any files. Read-only analysis only.\n"
-            f"8. Write your findings to the blackboard under 'plan_findings'. Include:\n"
-            f"   - Relevant skills found (names, what they do, how to invoke them)\n"
-            f"   - File inventory (uploaded files, their types, sizes, key content)\n"
-            f"   - Skill workflow breakdown (concrete tools, scripts, paths for each relevant skill)\n"
-            f"   - Content analysis (key themes, structure, data points extracted from inputs)\n"
+            f"6. Assess risks and note only ambiguities that materially require user input\n"
+            f"7. DO NOT write, edit, or create any files. Read-only analysis only. Stop once new reads no longer change the proposed execution path.\n"
+            f"8. Write only decision-relevant findings to the blackboard under 'plan_findings'. Include relevant paths/APIs, constraints, validation commands, and any loaded-skill workflow requirements. Omit empty sections and generic inventories.\n"
             f"9. For coding tasks, identify the test strategy:\n"
             f"   - What build/compilation commands are available? (Makefile, npm, cargo, cmake, etc.)\n"
             f"   - What test frameworks/suites exist? (pytest, jest, go test, etc.)\n"
@@ -53407,8 +55736,7 @@ body{padding:18px}
             "When reading files, choose the shape that matches the question: mode='window' for file:line, mode='symbol' for named code, mode='search' for keywords/errors, mode='overview' for structure, and mode='full' only when exact broad context is required. "
             "When reading blackboard or archived context, use mode='summary' first, then mode='search' or mode='window' for focused evidence. "
             f"{skills_block}"
-            "IMPORTANT: If the task requires specialized output (PPTX, reports, deep research, code review), "
-            "call list_skills first to discover relevant skills, then note in plan_findings which skills to use. "
+            "If the request plausibly needs a specialized artifact workflow, inspect the available skill list once; otherwise skip skill discovery. "
                 f"{os_note} "
                 f"{model_language_instruction(self.ui_language)}"
             ),
@@ -53528,6 +55856,7 @@ body{padding:18px}
                 }
             return {"status": "no-tools", "text": "", "thinking": thinking_text}
         # Execute tool calls (read-only)
+        evidence_rows: list[str] = []
         for tc in tool_calls:
             if self.cancel_requested:
                 return {"status": "interrupted"}
@@ -53559,6 +55888,14 @@ body{padding:18px}
             except Exception as exc:
                 raw_output = f"Error: {exc}"
             result_content = str(raw_output or "")
+            if result_content and not result_content.startswith("Error:"):
+                evidence_rows.append(
+                    trim(
+                        f"{fn_name} {json_dumps(fn_args) if isinstance(fn_args, dict) else ''}: "
+                        f"{self._tool_result_compact_output(result_content, max_chars=1200)}",
+                        1400,
+                    )
+                )
             self._append_agent_context_message("explorer", {
                 "role": "tool",
                 "tool_call_id": tc["id"],
@@ -53584,6 +55921,9 @@ body{padding:18px}
         if not finding_text and thinking_text:
             finding_text = trim(str(thinking_text or "").strip(), 2200)
             finding_source = "thinking"
+        if not finding_text and evidence_rows:
+            finding_text = trim("\n\n".join(evidence_rows[-4:]), 3000)
+            finding_source = "tool-evidence"
         return {
             "status": "ok",
             "tool_count": len(tool_calls),
@@ -53618,6 +55958,22 @@ body{padding:18px}
                 "summary": f"plan-mode: finding #{len(findings)} collected",
                 "agent_role": "planner",
             })
+
+    def _plan_mode_research_signature(self) -> str:
+        bb = self._ensure_blackboard()
+        plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
+        findings = plan.get("findings", []) if isinstance(plan.get("findings"), list) else []
+        finding_rows = [
+            trim(str(row.get("content", "") or ""), 1200)
+            for row in findings[-8:]
+            if isinstance(row, dict) and str(row.get("content", "") or "").strip()
+        ]
+        try:
+            trace = self._plan_mode_compact_research_trace(max_chars=2400)
+        except Exception:
+            trace = ""
+        raw = json_dumps({"findings": finding_rows, "trace": trace})
+        return hashlib.sha1(raw.encode("utf-8", "ignore")).hexdigest()[:16]
 
     def _plan_mode_compact_research_trace(self, max_chars: int = 6000) -> str:
         """Compact explorer research context when explicit plan_findings are sparse.
@@ -54200,6 +56556,10 @@ body{padding:18px}
             f"- Every major step must include an explicit acceptance signal: how to know the step is done.\n"
             f"- Acceptance signals must use observable evidence such as exit code, test summary, API response, rendered output, parsed rows, numerical thresholds, or screenshot/result inspection.\n"
             f"- File creation alone is NOT valid acceptance evidence.\n"
+            f"- PHASE PURITY: each major step must have exactly one primary phase and owner: research (Explorer), design/implementation (Developer), or verification/review (Reviewer).\n"
+            f"- Never combine implementation with independent testing/review in the same major step. Put independent verification in the following major step so it can have a distinct owner.\n"
+            f"- A developer may run a fast local smoke check while implementing, but the independent test/review major step remains separate for complex multi-agent plans.\n"
+            f"- Do not create a full research->implementation->review chain for every micro-task; add phase boundaries only when ownership or risk changes.\n"
             f"\nSTEP STRUCTURE — MAJOR STEPS WITH SUB-STEPS:\n"
             f"Organize steps into MAJOR numbered groups. Each major step has:\n"
             f"  1) A summary title line: \"N. Summary Title\" (e.g., \"1. Project Initialization\")\n"
@@ -54219,12 +56579,12 @@ body{padding:18px}
             f"Create src/models/data.py with schema definitions\\n"
             f"2.2 Implement business logic\\n"
             f"Create src/services/processor.py\",\n"
-            f"  \"3. Testing and Documentation\\n"
+            f"  \"3. Independent Verification\\n"
             f"3.1 Unit tests\\n"
             f"Create tests/test_models.py\\n"
             f"Run: pytest tests/\\n"
-            f"3.2 Write documentation\\n"
-            f"Create docs/README.md\"\n"
+            f"3.2 Regression check\\n"
+            f"Confirm exit code 0 and the named behavior assertions\"\n"
             f"]\n"
             f"\nRules:\n"
             f"- Each major step = one array element with summary title + 2-5 sub-steps\n"
@@ -54237,7 +56597,7 @@ body{padding:18px}
             "Judge from the task content and research findings whether the task involves writing, "
             "modifying, or generating code/scripts/configurations. If it does:\n"
             "- Include compile/build/lint verification steps after implementation steps.\n"
-            "- Include a dedicated testing step with SPECIFIC run commands (e.g. `python -m pytest`, `npm test`) before final review.\n"
+            "- Include a dedicated, independently owned testing/review step with SPECIFIC run commands (e.g. `python -m pytest`, `npm test`) after implementation.\n"
             "- Testing step sub-steps must end with: actually RUNNING the tests and checking exit code, not just writing test files.\n"
             "- Testing steps must include expected results or pass criteria (for example: exit code 0, `3 passed`, HTTP 200 with required fields, rendered page shows target widget).\n"
             "- Non-test implementation steps must also state the validation artifact to inspect before the step can be treated as done.\n"
@@ -55319,11 +57679,24 @@ body{padding:18px}
                 break
         todo_note = ""
         if active_step_id:
-            todo_note = self._ui_text(
-                "plan_read_todo_note",
-                step_label=self._ui_text("plan_step_label", step=active_step_idx, total=int(bb.get("plan_step_total", 0) or 0)),
-                parent_step_id=active_step_id,
-            )
+            existing_rows = self._active_plan_worker_todo_rows(active_step_id, role="")
+            if existing_rows:
+                current = next(
+                    (row for row in existing_rows if str(row.get("status", "") or "").lower() == "in_progress"),
+                    None,
+                )
+                current_text = trim(str((current or {}).get("content", "") or ""), 220)
+                todo_note = (
+                    "\nThe runtime already compiled this step into canonical subtasks. "
+                    f"Continue the current in_progress item{(': ' + current_text) if current_text else ''}; "
+                    "do not recreate the subtask list. Tool evidence is recorded automatically; TodoWrite remains available for explicit corrections.\n"
+                )
+            else:
+                todo_note = self._ui_text(
+                    "plan_read_todo_note",
+                    step_label=self._ui_text("plan_step_label", step=active_step_idx, total=int(bb.get("plan_step_total", 0) or 0)),
+                    parent_step_id=active_step_id,
+                )
         return (
             self._ui_text("plan_read_instruction", path=PLAN_FILE_RELATIVE_PATH)
             + todo_note
@@ -55353,19 +57726,38 @@ body{padding:18px}
                 pass
         step_label = self._ui_text("plan_step_label", step=step_idx, total=max(1, total))
         hint_rows: list[str] = []
-        plan_msg = trim(self._plan_file_read_instruction(), 2000)
+        # Single-agent already receives the plan charter and canonical current
+        # subtask in its system prompt. Re-reading the generated plan.md is a
+        # redundant tool/model round; keep that compatibility instruction only
+        # for multi-agent handoffs.
+        plan_msg = trim(self._plan_file_read_instruction(), 2000) if self._is_multi_agent_mode() else ""
         if plan_msg:
             hint_rows.append(plan_msg)
-        step_hint = trim(
-            self._ui_text(
-                "plan_step_hint",
-                step_label=step_label,
-                step_text=step_text,
-                plan_path=PLAN_FILE_RELATIVE_PATH,
-                parent_step_id=step_id,
-            ),
-            2000,
-        )
+        existing_rows = self._active_plan_worker_todo_rows(step_id, role="") if step_id else []
+        if existing_rows:
+            current = next(
+                (row for row in existing_rows if str(row.get("status", "") or "").lower() == "in_progress"),
+                None,
+            )
+            current_text = trim(str((current or {}).get("content", "") or ""), 240)
+            step_hint = trim(
+                f"Moved to {step_label}: {step_text}\n"
+                f"Canonical subtasks are already compiled. Continue ONLY the current item"
+                f"{(': ' + current_text) if current_text else ''}. "
+                "Do not recreate or renumber Todo rows; observable tool evidence updates execution state automatically.",
+                2000,
+            )
+        else:
+            step_hint = trim(
+                self._ui_text(
+                    "plan_step_hint",
+                    step_label=step_label,
+                    step_text=step_text,
+                    plan_path=PLAN_FILE_RELATIVE_PATH,
+                    parent_step_id=step_id,
+                ),
+                2000,
+            )
         if step_hint and step_hint not in hint_rows:
             hint_rows.append(step_hint)
         # Tell the worker up front WHAT to verify and HOW, so the acceptance
@@ -55787,7 +58179,8 @@ body{padding:18px}
             for step in grouped_step_rows
         )
         source_of_truth = (
-            "blackboard plan.steps, project_todos, and .clouds_coder/plan.md. "
+            "blackboard project_todos (roadmap), plan_worker_todos (current execution view), "
+            "and plan_step_evidence (authoritative progress events). .clouds_coder/plan.md is a read-only derived mirror. "
             "Old plan-mode research/proposal bubbles were compacted after approval; "
             "use context_recall only for missing evidence."
         )
@@ -55988,6 +58381,25 @@ body{padding:18px}
             self._write_plan_file(self._format_plan_file_execution(choice_id))
         except Exception:
             pass
+        # Compile the approved plan into its executable graph in the same
+        # transaction. Project rows are the durable roadmap; worker rows are the
+        # current-step view. Starting execution with only one of them creates a
+        # second, model-driven "repair the plan" phase before any useful work.
+        active_step = self._get_active_plan_step(bb)
+        if isinstance(active_step, dict):
+            try:
+                self._ensure_worker_todos_available_for_plan_step(
+                    active_step,
+                    owner=self._current_plan_worker_owner(bb),
+                    force_refresh=False,
+                )
+                self._sync_todos_from_blackboard(reason="plan-approved-compiled", board=self._ensure_blackboard())
+                self._update_plan_file_step_status()
+            except Exception as exc:
+                self._emit(
+                    "status",
+                    {"summary": f"approved plan execution graph bootstrap failed: {trim(str(exc), 120)}"},
+                )
         # Fresh plan: reset the switch-notice dedup so the first step always emits.
         self._last_step_hint_id = ""
         try:
@@ -56006,6 +58418,8 @@ body{padding:18px}
 
     def _preload_skills_from_plan_steps(self, steps: list):
         """Scan plan step text for skill names and auto-load any that aren't already loaded."""
+        if self.skill_mode == "hard":
+            return
         if not steps or not isinstance(steps, list):
             return
         self._ensure_skills_ready(force=False)
@@ -57073,6 +59487,7 @@ body{padding:18px}
                     dispatched_name = name
                     output = ""
                     skip_dispatch = False
+                    self._clear_tool_result_meta()
                     if args_error:
                         repaired, repaired_output = self._attempt_malformed_tool_repair(name, raw_args)
                         if repaired:
@@ -57219,8 +59634,14 @@ body{padding:18px}
                             output = "Error: runtime socket noise filtered"
                         else:
                             output = "(no output)"
+                    result_item = self._build_tool_result_item(
+                        name,
+                        args if isinstance(args, dict) else {},
+                        output,
+                        dispatched_name=dispatched_name,
+                    )
                     tool_key = str(dispatched_name or name).strip() or str(name or "").strip() or "unknown-tool"
-                    if str(output).startswith("Error"):
+                    if not result_item["ok"]:
                         round_error_count += 1
                         tool_error_streaks[tool_key] = int(tool_error_streaks.get(tool_key, 0) or 0) + 1
                     else:
@@ -57280,9 +59701,9 @@ body{padding:18px}
                                 force_single_tool_rounds = max(force_single_tool_rounds, 2)
                     if dispatched_name == "compress":
                         manual_compact = True
-                    if (dispatched_name or name) == "ask_user" and not str(output).startswith("Error:"):
+                    if (dispatched_name or name) == "ask_user" and result_item["ok"]:
                         stop_due_to_ask_user_single = True
-                    if dispatched_name in {"finish_task", "finish_current_task", "mark_done"} and not str(output).startswith("Error:"):
+                    if dispatched_name in {"finish_task", "finish_current_task", "mark_done"} and result_item["ok"]:
                         stop_due_to_finish_task = True
                     self.messages.append({
                         "role": "tool",
@@ -57291,35 +59712,20 @@ body{padding:18px}
                         "content": self._tool_result_context_content(name, args if isinstance(args, dict) else {}, output),
                         "ts": now_ts(),
                     })
-                    single_round_tool_results.append(
-                        {
-                            "name": dispatched_name or name,
-                            "args": args if isinstance(args, dict) else {},
-                            "output": trim(str(output or ""), 3000),
-                            "ok": not str(output).startswith("Error:"),
-                        }
-                    )
+                    single_round_tool_results.append(result_item)
                     is_finish_tool = (dispatched_name or name) in {"finish_task", "finish_current_task", "mark_done"}
                     # Update blackboard signals (step_files, execution_logs) for plan+single mode.
                     # In plan+sync this is handled by _blackboard_update_from_worker_step, but in
                     # plan+single there is no worker turn — we must update inline so that
                     # _plan_step_has_blackboard_evidence() can see the evidence when the gate fires.
                     try:
-                        self._blackboard_update_from_tool_result(
-                            "developer",
-                            {
-                                "name": dispatched_name or name,
-                                "args": args if isinstance(args, dict) else {},
-                                "output": trim(str(output or ""), 3000),
-                                "ok": not str(output).startswith("Error:"),
-                            },
-                        )
+                        self._blackboard_update_from_tool_result("developer", result_item)
                     except Exception:
                         pass
                     # Failure ledger: record tool call and detect errors (single-agent, unified)
                     if not is_finish_tool:
                         self._ledger_record_tool_call(name, args if isinstance(args, dict) else {})
-                    _sa_ok = not str(output or "").startswith("Error")
+                    _sa_ok = bool(result_item["ok"])
                     if not is_finish_tool:
                         self._process_tool_result_errors(name, args if isinstance(args, dict) else {}, output, _sa_ok, "single")
                     if name in ("edit_file", "write_file") and isinstance(args, dict):
@@ -57711,12 +60117,10 @@ body{padding:18px}
                 can_remind = (now_tick - self.last_todo_reminder_ts) >= 20
                 if can_remind and self.todo_reminder_count < 2:
                     if concrete_work_without_todo:
-                        self._append_plan_guidance_bubble(
-                            "<reminder>Update your todos now: finish the current subtask in TodoWrite before moving on.</reminder>",
-                            summary="todo reminder",
-                        )
-                        self.last_todo_reminder_ts = now_tick
-                        self.todo_reminder_count += 1
+                        # In plan+single, concrete tool events drive the
+                        # canonical graph. A TodoWrite reminder here used to add
+                        # one bookkeeping-only model round after every action.
+                        pass
                     elif not self._todo_runtime_has_worker_rows(single_role) and self.rounds_without_todo >= 2:
                         repair_issue = {}
                         try:
@@ -57745,12 +60149,10 @@ body{padding:18px}
                             self.last_todo_reminder_ts = now_tick
                             self.todo_reminder_count += 1
                     elif self._todo_should_block_auto_continue("") and self.rounds_without_todo >= 4:
-                        self._append_plan_guidance_bubble(
-                            "<reminder>Update your todos now: finish the current subtask in TodoWrite before moving on.</reminder>",
-                            summary="todo reminder",
-                        )
-                        self.last_todo_reminder_ts = now_tick
-                        self.todo_reminder_count += 1
+                        # Open rows are expected while execution continues; the
+                        # evidence reconciler advances them without model-side
+                        # status calls. Structural absence is handled above.
+                        pass
                 if manual_compact:
                     self._auto_compact("tool-requested")
                 if retry_requested_this_round:
@@ -58297,6 +60699,9 @@ body{padding:18px}
                 "updated_at": self.updated_at,
                 "message_count": int(total_message_count),
                 "model": self.ollama.model,
+                "app_binding": dict(self.app_binding) if isinstance(self.app_binding, dict) else {},
+                "skill_mode": "hard" if self.skill_mode == "hard" else "dynamic",
+                "bound_skill_ids": list(self.bound_skill_ids)[:ADMIN_MAX_APP_SKILLS],
                 "provider": self.ollama.provider,
                 "ui_language": self.ui_language,
                 "ollama_base_url": self.ollama.base_url,
@@ -58791,6 +61196,7 @@ class SessionManager:
         self.web_search_setting_locked = bool(web_search_setting_locked)
         self.user_memory_mode = normalize_user_memory_mode(user_memory_mode)
         self.user_memory_setting_locked = bool(user_memory_setting_locked)
+        self.telemetry_callback = None
         self.single_advance_prompt_enhance = False
         self.read_context_policy = DEFAULT_READ_CONTEXT_POLICY
         self.tool_memory_policy = DEFAULT_TOOL_MEMORY_POLICY
@@ -59334,6 +61740,7 @@ class SessionManager:
                 knowledge_library_status_callback=self.knowledge_library_status_callback,
                 mcp_manager=getattr(self, "mcp_manager", None),
             )
+        sess.set_telemetry_callback(self.telemetry_callback)
         desired_mode = normalize_execution_mode(self.execution_mode, default=EXECUTION_MODE_SYNC)
         if normalize_execution_mode(getattr(sess, "execution_mode", ""), default=desired_mode) != desired_mode:
             sess.execution_mode = desired_mode
@@ -59440,6 +61847,7 @@ class SessionManager:
                 knowledge_library_status_callback=self.knowledge_library_status_callback,
                 mcp_manager=getattr(self, "mcp_manager", None),
             )
+            sess.set_telemetry_callback(self.telemetry_callback)
             self._apply_user_defaults_to_session(sess)
             self.sessions[sid] = sess
             self.session_index[sid] = {
@@ -59562,6 +61970,7 @@ class SessionManager:
             response_stream=bool(profile.get("response_stream", False)),
         )
         client.apply_profile(profile)
+        client.set_telemetry(self.telemetry_callback, context_provider=lambda: {}, name="capability_probe")
         caps = client.probe_multimodal_capabilities(force=True if force_probe else False)
         merged = merge_multimodal_capabilities(
             merge_multimodal_capabilities(
@@ -59969,6 +62378,7 @@ INDEX_HTML = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="clouds-coder-webui-contract" content="clouds-coder-app-store-v1">
 <title>Clouds Coder</title>
 <link rel="stylesheet" href="/assets/style.css">
 <script>
@@ -60036,11 +62446,30 @@ window.MathJax={
 <main>
   <aside class="panel">
     <div class="panel-title">Sessions</div>
-    <div id="sessionList"></div>
-    <div id="sessionsControls" class="sessions-controls">
-      <button id="newSessionBtn">New Session</button>
-      <button id="renameSessionBtn" class="subtle">Rename</button>
-      <button id="deleteSessionBtn" class="subtle danger">Delete</button>
+    <div class="side-primary-tabs">
+      <button id="sessionsSideTab" class="side-tab active" type="button">会话</button>
+      <button id="appsSideTab" class="side-tab" type="button">应用商店</button>
+    </div>
+    <div id="sessionsSideView" class="app-side-view">
+      <div id="sessionList"></div>
+      <div id="sessionsControls" class="sessions-controls">
+        <button id="newSessionBtn">New Session</button>
+        <button id="renameSessionBtn" class="subtle">Rename</button>
+        <button id="deleteSessionBtn" class="subtle danger">Delete</button>
+      </div>
+    </div>
+    <div id="appsSideView" class="app-side-view" hidden>
+      <div class="app-store-head">
+        <div class="side-secondary-tabs">
+          <button id="personalAppsTab" class="side-subtab active" type="button">个人应用</button>
+          <button id="sharedAppsTab" class="side-subtab" type="button">共享应用</button>
+        </div>
+        <div class="app-store-actions">
+          <button id="newApplicationBtn" type="button">创建应用</button>
+          <button id="refreshApplicationsBtn" class="subtle" type="button" title="刷新">↻</button>
+        </div>
+      </div>
+      <div id="applicationList"></div>
     </div>
   </aside>
   <section class="panel chat">
@@ -60155,6 +62584,35 @@ window.MathJax={
     </div>
   </aside>
 </main>
+</div>
+<div id="applicationEditor" class="application-modal" hidden>
+  <div class="application-dialog" role="dialog" aria-modal="true" aria-labelledby="applicationEditorTitle">
+    <div class="application-dialog-head">
+      <div>
+        <div class="application-kicker">SKILL APPLICATION</div>
+        <h2 id="applicationEditorTitle">创建个人应用</h2>
+      </div>
+      <button id="closeApplicationEditorBtn" class="subtle application-close" type="button" aria-label="Close">×</button>
+    </div>
+    <div class="application-editor-body">
+      <div class="application-fields">
+        <label><span id="applicationNameLabel">应用名称</span><input id="applicationName" maxlength="100" placeholder="例如：接口设计助手"></label>
+        <label><span id="applicationIconLabel">图标</span><input id="applicationIcon" maxlength="20" placeholder="可选，例如：🧩"></label>
+        <label><span id="applicationDescriptionLabel">应用说明</span><textarea id="applicationDescription" maxlength="1000" rows="4" placeholder="说明适用场景和预期输出"></textarea></label>
+        <div class="application-selection-head"><strong id="selectedSkillsLabel">已选 Skills</strong><span id="applicationSkillCount" class="tag">0 / 8</span></div>
+        <div id="applicationSelectedSkills" class="application-selected-skills"></div>
+      </div>
+      <div class="application-skill-browser">
+        <label><span id="scanSkillsLabel">扫描现有 Skills</span><input id="applicationSkillSearch" type="search" placeholder="搜索名称、ID 或说明"></label>
+        <div id="applicationSkillCatalog" class="application-skill-catalog"></div>
+      </div>
+    </div>
+    <div id="applicationEditorError" class="application-editor-error"></div>
+    <div class="application-dialog-footer">
+      <button id="cancelApplicationEditorBtn" class="subtle" type="button">取消</button>
+      <button id="saveApplicationBtn" type="button">保存个人应用</button>
+    </div>
+  </div>
 </div>
 <script src="/assets/app.js"></script>
 </body>
@@ -60612,9 +63070,33 @@ h3{font-size:.96rem;margin:10px 0 6px}
 .llm-modal-btn-primary:hover{opacity:.9}
 .llm-modal-btn-secondary{flex:1;padding:9px 16px;border-radius:8px;border:1px solid var(--line,#d9e1ec);background:var(--bg,#f5f7fa);color:var(--fg,#0f1b2d);font-weight:600;font-size:.88rem;cursor:pointer}
 .llm-modal-btn-secondary:hover{background:var(--line,#d9e1ec)}
+.side-primary-tabs,.side-secondary-tabs{display:flex;gap:5px;padding:4px;border:1px solid var(--line);border-radius:10px;background:#f5f8fc;margin-bottom:8px}
+.side-tab,.side-subtab{flex:1;padding:7px 8px;border-radius:8px;background:transparent;color:var(--muted);border-color:transparent;font-size:.78rem}
+.side-tab.active,.side-subtab.active{background:#fff;color:var(--brand);border-color:#cbd9ef;box-shadow:0 2px 7px rgba(15,27,45,.06)}
+.app-side-view{flex:1;min-height:0;display:flex;flex-direction:column}.app-side-view[hidden]{display:none}
+.app-store-head{display:flex;flex-direction:column;gap:7px;margin-bottom:8px}.app-store-head .side-secondary-tabs{margin:0}
+.app-store-actions{display:grid;grid-template-columns:1fr auto;gap:6px}.app-store-actions button{padding:7px 9px;font-size:.76rem}
+#applicationList{flex:1;min-height:0;overflow:auto;display:flex;flex-direction:column;gap:8px;padding-right:1px}
+.application-card{border:1px solid var(--line);border-radius:11px;background:#fff;padding:10px;display:flex;flex-direction:column;gap:7px;min-width:0}
+.application-card-head{display:flex;align-items:flex-start;justify-content:space-between;gap:7px;min-width:0}.application-card-title{font-size:.86rem;font-weight:700;overflow-wrap:anywhere;word-break:break-word}
+.application-card-status{flex:none;border-radius:999px;padding:2px 6px;background:#f1f5fa;color:#5c6c82;font-size:.64rem;font-weight:700}.application-card-status.published{background:#e6faf2;color:#087757}.application-card-status.pending{background:#fff3df;color:#956000}.application-card-status.rejected{background:#ffeceb;color:#9f2921}
+.application-card-desc{color:var(--muted);font-size:.73rem;line-height:1.35;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word}.application-card-skills{display:flex;flex-wrap:wrap;gap:4px}.application-card-skills span{max-width:100%;padding:2px 6px;border-radius:999px;background:#eff4fb;border:1px solid #dbe5f2;color:#42546b;font-size:.64rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.application-card-actions{display:flex;flex-wrap:wrap;gap:5px}.application-card-actions button{flex:1 1 auto;padding:6px 7px;border-radius:8px;font-size:.69rem}.application-empty{border:1px dashed #cfd9e7;border-radius:10px;padding:20px 9px;text-align:center;color:var(--muted);font-size:.78rem}
+.application-modal{position:fixed;inset:0;z-index:10050;background:rgba(8,17,32,.52);display:flex;align-items:center;justify-content:center;padding:18px;backdrop-filter:blur(5px)}.application-modal[hidden]{display:none}
+.application-dialog{width:min(900px,96vw);max-height:90vh;background:#f6f8fb;border:1px solid #fff;border-radius:16px;box-shadow:0 24px 70px rgba(8,17,32,.27);display:flex;flex-direction:column;overflow:hidden}
+.application-dialog-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:16px 18px;border-bottom:1px solid var(--line);background:#fff}.application-dialog-head h2{margin:3px 0 0;font-size:1.15rem}.application-kicker{font-size:.65rem;font-weight:800;letter-spacing:.16em;color:var(--brand)}.application-close{padding:4px 10px;font-size:1.2rem}
+.application-editor-body{display:grid;grid-template-columns:minmax(260px,.8fr) minmax(320px,1.2fr);gap:12px;padding:14px;overflow:auto;min-height:0}.application-fields,.application-skill-browser{display:flex;flex-direction:column;gap:11px;background:#fff;border:1px solid var(--line);border-radius:12px;padding:13px;min-width:0}
+.application-fields label,.application-skill-browser label{display:flex;flex-direction:column;gap:5px;font-size:.76rem;font-weight:700;color:#46566d}.application-fields input,.application-fields textarea,.application-skill-browser input{width:100%;padding:8px 9px;border:1px solid #ccd8e8;border-radius:8px;background:#fff;color:var(--fg);font:inherit}.application-selection-head{display:flex;align-items:center;justify-content:space-between;gap:8px;font-size:.78rem}
+.application-selected-skills{display:flex;flex-wrap:wrap;gap:6px;min-height:36px;align-content:flex-start}.application-skill-chip{display:inline-flex;align-items:center;gap:4px;max-width:100%;border:1px solid #b9d7cf;border-radius:999px;background:#e8faf5;color:#08715b;padding:4px 7px;font-size:.69rem;font-weight:700}.application-skill-chip button{padding:0 2px;border:0;background:transparent;color:#08715b;box-shadow:none;transform:none}
+.application-skill-catalog{flex:1;min-height:300px;max-height:430px;overflow:auto;display:flex;flex-direction:column;gap:6px}.application-skill-row{display:flex;align-items:flex-start;gap:8px;border:1px solid #e0e7f1;border-radius:9px;padding:8px;background:#fbfdff;cursor:pointer;min-width:0}.application-skill-row.selected{border-color:#8bb1f5;background:#edf4ff}.application-skill-row input{width:16px;height:16px;margin:2px 0 0;flex:none}.application-skill-row strong,.application-skill-row small{display:block;overflow-wrap:anywhere;word-break:break-word}.application-skill-row small{color:var(--muted);font-size:.67rem;margin-top:2px}
+.application-editor-error{min-height:20px;padding:0 18px;color:var(--warn);font-size:.77rem;white-space:pre-wrap}.application-dialog-footer{display:flex;justify-content:flex-end;gap:8px;padding:12px 18px;border-top:1px solid var(--line);background:#fff}
+@media (max-width:1180px){#applicationList{height:40vh;max-height:40vh;flex:none}}
+@media (max-width:720px){.application-editor-body{grid-template-columns:1fr}.application-skill-catalog{min-height:240px}.application-dialog{max-height:94vh}}
 """
 
-APP_JS = """const S={sessions:[],sessionTotal:0,sessionHasMore:false,sessionNextOffset:0,sessionLoadingMore:false,sessionLoadAllTimer:0,activeId:null,snap:null,es:null,esId:'',skills:[],tools:[],providers:[],protocols:[],config:null,models:[],modelOptions:[],previewBySession:{},fileExplorerBySession:{},commandPageState:{},previewNonce:0,refreshTimer:null,refreshInFlight:false,pendingSnapshot:false,pendingFullSnapshot:false,scheduledFullSnapshot:false,sessionPollTimer:null,renderStateInFlight:false,lastRenderStatePullAt:0,lastFeedSig:'',lastBoardsSig:'',lastSessionsSig:'',lastVisibilityState:document.visibilityState||'visible',staticMode:false,frozen:false,bootRendered:false,panelHtml:{},renderSigs:Object.create(null),deferredHtml:Object.create(null),deferredHtmlTimer:0,openPopup:'',follow:{chat:true,sessionList:false,todos:false,tasks:false,activity:true,commands:true,diffs:true,catalog:true,fileExplorer:false},lastEventSeq:0,lastDeltaTs:0,deltaGapCount:0,deltaWatchdogTimer:null,deltaWatchdogStalls:0,deltaWatchdogSeq:0,deltaRenderRaf:0,deltaRenderChat:false,deltaRenderBoards:false,deltaRenderSessions:false,chatRenderRaf:0,chatRenderPendingReason:'',mathObserver:null,mathRoot:null,mdWorker:null,mdWorkerUrl:'',mdReqSeq:0,mdPending:Object.create(null),diffCenterDisabled:Object.create(null),previewCenterDisabled:Object.create(null),diffCenteredDone:Object.create(null),previewCenteredDone:Object.create(null),deferredFullSnapshotTimer:0,deferredFileExplorerTimer:0,modelCatalogTimer:0,modelCatalogInFlight:false,catalogRefreshInFlight:false,fileExplorerDeferUntil:0};
+APP_JS = """/* clouds-coder-app-store-v1 */
+const S={sessions:[],sessionTotal:0,sessionHasMore:false,sessionNextOffset:0,sessionLoadingMore:false,sessionLoadAllTimer:0,activeId:null,snap:null,es:null,esId:'',skills:[],tools:[],providers:[],protocols:[],config:null,models:[],modelOptions:[],previewBySession:{},fileExplorerBySession:{},commandPageState:{},previewNonce:0,refreshTimer:null,refreshInFlight:false,pendingSnapshot:false,pendingFullSnapshot:false,scheduledFullSnapshot:false,sessionPollTimer:null,renderStateInFlight:false,lastRenderStatePullAt:0,lastFeedSig:'',lastBoardsSig:'',lastSessionsSig:'',lastVisibilityState:document.visibilityState||'visible',staticMode:false,frozen:false,bootRendered:false,panelHtml:{},renderSigs:Object.create(null),deferredHtml:Object.create(null),deferredHtmlTimer:0,openPopup:'',follow:{chat:true,sessionList:false,todos:false,tasks:false,activity:true,commands:true,diffs:true,catalog:true,fileExplorer:false},lastEventSeq:0,lastDeltaTs:0,deltaGapCount:0,deltaWatchdogTimer:null,deltaWatchdogStalls:0,deltaWatchdogSeq:0,deltaRenderRaf:0,deltaRenderChat:false,deltaRenderBoards:false,deltaRenderSessions:false,chatRenderRaf:0,chatRenderPendingReason:'',mathObserver:null,mathRoot:null,mdWorker:null,mdWorkerUrl:'',mdReqSeq:0,mdPending:Object.create(null),diffCenterDisabled:Object.create(null),previewCenterDisabled:Object.create(null),diffCenteredDone:Object.create(null),previewCenteredDone:Object.create(null),deferredFullSnapshotTimer:0,deferredFileExplorerTimer:0,modelCatalogTimer:0,modelCatalogInFlight:false,catalogRefreshInFlight:false,fileExplorerDeferUntil:0};
+const APP_STORE={view:'sessions',scope:'personal',personal:[],shared:[],catalog:[],loaded:false,loading:false,editingId:'',selectedSkillIds:[]};
 const MD_CACHE=new Map();
 const MD_CACHE_MAX=280;
 const STATIC_UI=((new URLSearchParams(location.search)).get('static_ui')==='1');
@@ -64707,6 +67189,7 @@ async function refreshSnapshot(opt={}){
         S.config.language=snapLang;
         renderLanguageControls();
         applyMainI18n();
+        applyApplicationI18n();
       }
     }
     if(S.snap?.user_memory_mode){
@@ -64923,6 +67406,27 @@ async function clearStaleTodos(){if(!S.activeId){showError(t('select_session_fir
 async function toggleUserMemoryMode(e){if(e)e.preventDefault();if(S.config?.user_memory_setting_locked){showError(t('memory_mode_locked'));return}const cycle=['weak','on','off'];const cur=currentUserMemoryMode();const next=cycle[(cycle.indexOf(cur)+1+cycle.length)%cycle.length];try{const out=await api('/api/user-memory/config',{method:'POST',body:JSON.stringify({mode:next})});S.config=S.config||{};S.config.user_memory_mode=String(out?.user_memory_mode||next);renderMemoryModeAction();showError('')}catch(err){showError(err.message||String(err))}}
 async function exportUserMemory(e){if(e)e.preventDefault();try{const data=await api('/api/user-memory/export');const blob=new Blob([JSON.stringify(data,null,2)],{type:'application/json;charset=utf-8'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download='clouds-coder-user-memory.json';document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);showError(t('memory_exported'))}catch(err){showError(err.message||String(err))}}
 async function clearUserMemory(e){if(e)e.preventDefault();const ok=confirm(t('memory_clear_confirm'));if(!ok)return;try{await api('/api/user-memory/clear',{method:'POST'});showError(t('memory_cleared'))}catch(err){showError(err.message||String(err))}}
+function appText(key){const packs={
+  'zh-CN':{sessions:'会话',store:'应用商店',personal:'个人应用',shared:'共享应用',create:'创建应用',edit_title:'编辑个人应用',create_title:'创建个人应用',name:'应用名称',icon:'图标',description:'应用说明',selected:'已选 Skills',scan:'扫描现有 Skills',name_placeholder:'例如：接口设计助手',icon_placeholder:'可选，例如：🧩',description_placeholder:'说明适用场景和预期输出',search_placeholder:'搜索名称、ID 或说明',cancel:'取消',save:'保存个人应用',run:'运行',edit:'编辑',submit:'提交共享审核',remove:'删除',empty_personal:'还没有个人应用，创建一个并组合现有 Skills。',empty_shared:'暂无已发布的共享应用。',loading:'正在扫描应用与 Skills...',no_match:'没有匹配的 Skill',refresh:'刷新',close:'关闭',draft:'草稿',pending:'审核中',published:'已发布',rejected:'已拒绝',skill_limit:'一个应用最多关联 8 个 Skills。',skill_required:'请至少选择一个 Skill。',name_required:'请输入应用名称。',saved:'应用已保存',submitted:'已提交管理员审核',deleted:'应用已删除',confirm_submit:'提交后将冻结当前版本供管理员审核，确定继续吗？',confirm_delete:'确定删除这个个人应用吗？'},
+  'zh-TW':{sessions:'會話',store:'應用商店',personal:'個人應用',shared:'共享應用',create:'建立應用',edit_title:'編輯個人應用',create_title:'建立個人應用',name:'應用名稱',icon:'圖示',description:'應用說明',selected:'已選 Skills',scan:'掃描現有 Skills',name_placeholder:'例如：介面設計助手',icon_placeholder:'選填，例如：🧩',description_placeholder:'說明適用情境和預期輸出',search_placeholder:'搜尋名稱、ID 或說明',cancel:'取消',save:'儲存個人應用',run:'執行',edit:'編輯',submit:'提交共享審核',remove:'刪除',empty_personal:'尚無個人應用，請建立並組合現有 Skills。',empty_shared:'暫無已發佈的共享應用。',loading:'正在掃描應用與 Skills...',no_match:'沒有符合的 Skill',draft:'草稿',pending:'審核中',published:'已發佈',rejected:'已拒絕',skill_limit:'一個應用最多關聯 8 個 Skills。',skill_required:'請至少選擇一個 Skill。',name_required:'請輸入應用名稱。',saved:'應用已儲存',submitted:'已提交管理員審核',deleted:'應用已刪除',confirm_submit:'提交後會凍結目前版本供管理員審核，確定繼續嗎？',confirm_delete:'確定刪除此個人應用嗎？'},
+  'ja':{sessions:'セッション',store:'アプリストア',personal:'個人アプリ',shared:'共有アプリ',create:'アプリ作成',edit_title:'個人アプリを編集',create_title:'個人アプリを作成',name:'アプリ名',icon:'アイコン',description:'説明',selected:'選択済み Skills',scan:'既存 Skills を検索',name_placeholder:'例：API 設計アシスタント',icon_placeholder:'任意、例：🧩',description_placeholder:'用途と期待する出力を説明',search_placeholder:'名前、ID、説明を検索',cancel:'キャンセル',save:'個人アプリを保存',run:'実行',edit:'編集',submit:'共有審査に提出',remove:'削除',empty_personal:'個人アプリはまだありません。既存 Skills を組み合わせて作成できます。',empty_shared:'公開済みの共有アプリはありません。',loading:'アプリと Skills を読み込み中...',no_match:'一致する Skill はありません',draft:'下書き',pending:'審査中',published:'公開済み',rejected:'却下',skill_limit:'1つのアプリには最大8個の Skills を関連付けられます。',skill_required:'少なくとも1つの Skill を選択してください。',name_required:'アプリ名を入力してください。',saved:'アプリを保存しました',submitted:'管理者審査に提出しました',deleted:'アプリを削除しました',confirm_submit:'現在の版を凍結して管理者審査へ提出します。続行しますか？',confirm_delete:'この個人アプリを削除しますか？'},
+  'en':{sessions:'Sessions',store:'App Store',personal:'Personal',shared:'Shared',create:'Create App',edit_title:'Edit Personal App',create_title:'Create Personal App',name:'Application name',icon:'Icon',description:'Description',selected:'Selected Skills',scan:'Scan existing Skills',name_placeholder:'e.g. API Design Assistant',icon_placeholder:'Optional, e.g. 🧩',description_placeholder:'Describe use cases and expected output',search_placeholder:'Search name, ID, or description',cancel:'Cancel',save:'Save Personal App',run:'Run',edit:'Edit',submit:'Submit for Sharing',remove:'Delete',empty_personal:'No personal apps yet. Create one by combining existing Skills.',empty_shared:'No shared applications have been published.',loading:'Scanning applications and Skills...',no_match:'No matching Skill',refresh:'Refresh',close:'Close',draft:'Draft',pending:'In review',published:'Published',rejected:'Rejected',skill_limit:'An application can bind at most 8 Skills.',skill_required:'Select at least one Skill.',name_required:'Enter an application name.',saved:'Application saved',submitted:'Submitted for administrator review',deleted:'Application deleted',confirm_submit:'This freezes the current revision for administrator review. Continue?',confirm_delete:'Delete this personal application?'}
+};const lang=currentLang();return String((packs[lang]||packs.en)[key]||packs.en[key]||key)}
+function applyApplicationI18n(){const map={sessionsSideTab:'sessions',appsSideTab:'store',personalAppsTab:'personal',sharedAppsTab:'shared',newApplicationBtn:'create',applicationNameLabel:'name',applicationIconLabel:'icon',applicationDescriptionLabel:'description',selectedSkillsLabel:'selected',scanSkillsLabel:'scan',cancelApplicationEditorBtn:'cancel',saveApplicationBtn:'save'};for(const [id,key] of Object.entries(map)){const el=E(id);if(el)el.textContent=appText(key)}if(E('applicationEditorTitle'))E('applicationEditorTitle').textContent=appText(APP_STORE.editingId?'edit_title':'create_title');const placeholders={applicationName:'name_placeholder',applicationIcon:'icon_placeholder',applicationDescription:'description_placeholder',applicationSkillSearch:'search_placeholder'};for(const [id,key] of Object.entries(placeholders)){const el=E(id);if(el)el.placeholder=appText(key)}const refresh=E('refreshApplicationsBtn');if(refresh)refresh.title=appText('refresh');const close=E('closeApplicationEditorBtn');if(close)close.setAttribute('aria-label',appText('close'));renderApplicationStore();renderApplicationSkillCatalog()}
+function switchApplicationSide(view){APP_STORE.view=view==='apps'?'apps':'sessions';const apps=APP_STORE.view==='apps';E('sessionsSideView').hidden=apps;E('appsSideView').hidden=!apps;E('sessionsSideTab').classList.toggle('active',!apps);E('appsSideTab').classList.toggle('active',apps);if(apps)loadApplicationStore().catch(err=>showError(err.message||String(err)));else renderSessions()}
+function switchApplicationScope(scope){APP_STORE.scope=scope==='shared'?'shared':'personal';E('personalAppsTab').classList.toggle('active',APP_STORE.scope==='personal');E('sharedAppsTab').classList.toggle('active',APP_STORE.scope==='shared');E('newApplicationBtn').style.display=APP_STORE.scope==='personal'?'':'none';renderApplicationStore()}
+async function loadApplicationStore(force=false){if(APP_STORE.loading)return;if(APP_STORE.loaded&&!force){renderApplicationStore();return}APP_STORE.loading=true;renderApplicationStore();try{const [personal,shared,catalog]=await Promise.all([api('/api/apps/personal'),api('/api/apps/shared'),api('/api/apps/skills')]);APP_STORE.personal=Array.isArray(personal)?personal:[];APP_STORE.shared=Array.isArray(shared)?shared:[];APP_STORE.catalog=Array.isArray(catalog)?catalog:[];APP_STORE.loaded=true}finally{APP_STORE.loading=false;renderApplicationStore();renderApplicationSkillCatalog()}}
+function makeAppButton(text,cls,handler){const b=document.createElement('button');b.type='button';b.className=cls||'';b.textContent=text;b.onclick=handler;return b}
+function renderApplicationStore(){const host=E('applicationList');if(!host)return;host.innerHTML='';if(APP_STORE.loading&&!APP_STORE.loaded){const d=document.createElement('div');d.className='application-empty';d.textContent=appText('loading');host.appendChild(d);return}const rows=APP_STORE.scope==='shared'?APP_STORE.shared:APP_STORE.personal;if(!rows.length){const d=document.createElement('div');d.className='application-empty';d.textContent=appText(APP_STORE.scope==='shared'?'empty_shared':'empty_personal');host.appendChild(d);return}for(const app of rows){const card=document.createElement('article');card.className='application-card';const head=document.createElement('div');head.className='application-card-head';const title=document.createElement('div');title.className='application-card-title';title.textContent=(String(app.icon||'').trim()?String(app.icon).trim()+' ':'')+String(app.name||'Application');const submissionCurrent=Number(app.latest_submission?.submitted_revision||0)===Number(app.revision||0);const displayStatus=String(submissionCurrent?app.latest_submission?.status:(app.status||'draft'));const status=document.createElement('span');status.className='application-card-status '+displayStatus;status.textContent=appText(displayStatus);head.append(title,status);card.appendChild(head);if(app.description){const desc=document.createElement('div');desc.className='application-card-desc';desc.textContent=String(app.description);card.appendChild(desc)}if(submissionCurrent&&app.latest_submission?.review?.note){const review=document.createElement('div');review.className='application-card-desc';review.textContent=String(app.latest_submission.review.note);card.appendChild(review)}const skills=document.createElement('div');skills.className='application-card-skills';for(const skill of [...(app.skills||[])].sort((a,b)=>(a.order||0)-(b.order||0))){const chip=document.createElement('span');chip.textContent=String(skill.name||skill.id||'Skill');chip.title=String(skill.id||'');skills.appendChild(chip)}card.appendChild(skills);const actions=document.createElement('div');actions.className='application-card-actions';actions.appendChild(makeAppButton(appText('run'),'application-run',()=>launchApplication(app).catch(err=>showError(err.message||String(err)))));if(APP_STORE.scope==='personal'){actions.appendChild(makeAppButton(appText('edit'),'subtle',()=>openApplicationEditor(app)));if(!submissionCurrent||displayStatus==='draft')actions.appendChild(makeAppButton(appText('submit'),'subtle',()=>submitApplication(app).catch(err=>showError(err.message||String(err)))));actions.appendChild(makeAppButton(appText('remove'),'subtle danger',()=>deleteApplication(app).catch(err=>showError(err.message||String(err)))))}card.appendChild(actions);host.appendChild(card)}}
+function openApplicationEditor(app=null){APP_STORE.editingId=String(app?.id||'');APP_STORE.selectedSkillIds=[...(app?.skills||[])].sort((a,b)=>(a.order||0)-(b.order||0)).map(x=>String(x.id||'')).filter(Boolean);E('applicationName').value=String(app?.name||'');E('applicationIcon').value=String(app?.icon||'');E('applicationDescription').value=String(app?.description||'');E('applicationEditorError').textContent='';E('applicationEditorTitle').textContent=appText(APP_STORE.editingId?'edit_title':'create_title');E('applicationEditor').hidden=false;renderApplicationSkillCatalog();setTimeout(()=>E('applicationName').focus(),0)}
+function closeApplicationEditor(){E('applicationEditor').hidden=true;APP_STORE.editingId='';APP_STORE.selectedSkillIds=[]}
+function toggleApplicationSkill(id){const idx=APP_STORE.selectedSkillIds.indexOf(id);if(idx>=0)APP_STORE.selectedSkillIds.splice(idx,1);else{if(APP_STORE.selectedSkillIds.length>=8){E('applicationEditorError').textContent=appText('skill_limit');return}APP_STORE.selectedSkillIds.push(id)}E('applicationEditorError').textContent='';renderApplicationSkillCatalog()}
+function renderApplicationSkillCatalog(){const host=E('applicationSkillCatalog'),selectedHost=E('applicationSelectedSkills');if(!host||!selectedHost)return;const q=String(E('applicationSkillSearch')?.value||'').trim().toLowerCase(),chosen=new Set(APP_STORE.selectedSkillIds);host.innerHTML='';selectedHost.innerHTML='';APP_STORE.selectedSkillIds.forEach((id,index)=>{const skill=APP_STORE.catalog.find(x=>String(x.id)===id),chip=document.createElement('span');chip.className='application-skill-chip';chip.textContent=(index+1)+'. '+String(skill?.name||id);const del=document.createElement('button');del.type='button';del.textContent='×';del.onclick=()=>toggleApplicationSkill(id);chip.appendChild(del);selectedHost.appendChild(chip)});E('applicationSkillCount').textContent=APP_STORE.selectedSkillIds.length+' / 8';const rows=APP_STORE.catalog.filter(x=>!q||[x.id,x.name,x.description].join(' ').toLowerCase().includes(q));if(!rows.length){const empty=document.createElement('div');empty.className='application-empty';empty.textContent=appText('no_match');host.appendChild(empty);return}for(const skill of rows){const row=document.createElement('label');row.className='application-skill-row'+(chosen.has(String(skill.id))?' selected':'');const box=document.createElement('input');box.type='checkbox';box.checked=chosen.has(String(skill.id));box.onchange=()=>toggleApplicationSkill(String(skill.id));const body=document.createElement('div'),name=document.createElement('strong'),id=document.createElement('small'),desc=document.createElement('small');name.textContent=String(skill.name||skill.id);id.textContent=String(skill.id||'');desc.textContent=String(skill.description||'');body.append(name,id,desc);row.append(box,body);host.appendChild(row)}}
+async function saveApplication(){const payload={name:E('applicationName').value.trim(),icon:E('applicationIcon').value.trim(),description:E('applicationDescription').value.trim(),skills:APP_STORE.selectedSkillIds};if(!payload.name){E('applicationEditorError').textContent=appText('name_required');return}if(!payload.skills.length){E('applicationEditorError').textContent=appText('skill_required');return}const path=APP_STORE.editingId?'/api/apps/'+encodeURIComponent(APP_STORE.editingId):'/api/apps/personal';await api(path,{method:APP_STORE.editingId?'PATCH':'POST',body:JSON.stringify(payload)});closeApplicationEditor();await loadApplicationStore(true);showError(appText('saved'))}
+async function submitApplication(app){if(!confirm(appText('confirm_submit')))return;await api('/api/apps/'+encodeURIComponent(app.id)+'/submit',{method:'POST',body:'{}'});await loadApplicationStore(true);showError(appText('submitted'))}
+async function deleteApplication(app){if(!confirm(appText('confirm_delete')))return;await api('/api/apps/'+encodeURIComponent(app.id),{method:'DELETE'});await loadApplicationStore(true);showError(appText('deleted'))}
+async function launchApplication(app){const out=await api('/api/apps/'+encodeURIComponent(app.id)+'/launch',{method:'POST',body:'{}'});applyRuntimeConfigStats({session_creation_limit:out?.session_creation_limit});const sid=String(out?.id||'').trim();if(!sid)throw new Error('application launch returned no session');const row={id:sid,title:String(out.title||app.name||sid),running:false,updated_at:Date.now()/1000,message_count:0,ui_language:String(out.ui_language||S.config?.language||currentLang()),app_binding:out.app_binding||{}};S.sessions=[row,...S.sessions.filter(x=>String(x?.id||'')!==sid)];S.lastSessionsSig=sessionsSignature(S.sessions);switchApplicationSide('sessions');renderSessions();renderStats();await selectSession(sid)}
+function bindApplicationStore(){bindClick('sessionsSideTab',()=>switchApplicationSide('sessions'));bindClick('appsSideTab',()=>switchApplicationSide('apps'));bindClick('personalAppsTab',()=>switchApplicationScope('personal'));bindClick('sharedAppsTab',()=>switchApplicationScope('shared'));bindClick('newApplicationBtn',()=>openApplicationEditor());bindClick('refreshApplicationsBtn',()=>loadApplicationStore(true));bindClick('closeApplicationEditorBtn',closeApplicationEditor);bindClick('cancelApplicationEditorBtn',closeApplicationEditor);bindClick('saveApplicationBtn',()=>saveApplication().catch(err=>{E('applicationEditorError').textContent=err.message||String(err)}));const search=E('applicationSkillSearch');if(search)search.oninput=renderApplicationSkillCatalog;const modal=E('applicationEditor');if(modal)modal.addEventListener('click',ev=>{if(ev.target===modal)closeApplicationEditor()});applyApplicationI18n()}
 async function togglePlanMode(){if(!S.activeId)return;const states=['auto','on','off'];const current=S.snap?.plan_mode_preference||'auto';const next=states[(states.indexOf(current)+1)%states.length];try{await api('/api/sessions/'+S.activeId+'/config/plan-mode',{method:'POST',body:JSON.stringify({preference:next})});if(S.snap)S.snap.plan_mode_preference=next;const btn=E('planModeBtn');if(btn)btn.textContent='Plan: '+next.charAt(0).toUpperCase()+next.slice(1)}catch(err){showError(err.message||String(err))}}
 async function refreshAll(forceProbe=false){
   if(S.staticMode&&S.frozen){S.frozen=false;applyStaticUiClass()}
@@ -64936,6 +67440,7 @@ async function refreshAll(forceProbe=false){
   applyUiStyle();
   renderLanguageControls();
   applyMainI18n();
+  applyApplicationI18n();
   renderUploadList();
   renderSkillsEntryLink();
   const sessState=await refreshSessions({statsConfig:S.config,sessions:rowsRaw,autoSelect:true,selectOptions:{forceFullImmediate:false},limit:SESSION_BOOT_LIMIT});
@@ -64946,7 +67451,7 @@ async function refreshAll(forceProbe=false){
   if(S.activeId&&!String(sessState?.selectedId||'').trim())await refreshSnapshot({forceFull:!!forceProbe,allowWhenFrozen:true});
 }
 function bindClick(id,fn){const el=E(id);if(el)el.onclick=fn}
-window.addEventListener('DOMContentLoaded',async()=>{for(const id of ['chat','sessionList','todos','tasks','activity','commands','diffs','fileExplorer','catalog']){bindPanelScrollState(id,E(id))}const drop=E('promptComposerShell');const fileInput=E('uploadInput');const promptPick=E('promptFilePick');const promptEl=E('prompt');if(promptPick&&fileInput){promptPick.onclick=(ev)=>{ev.preventDefault();fileInput.click()}}if(drop&&fileInput){let _dragC=0;drop.setAttribute('tabindex','0');drop.addEventListener('click',e=>{if(e.target===drop&&promptEl)promptEl.focus()});fileInput.onchange=()=>uploadFiles(fileInput.files).then(()=>{fileInput.value=''}).catch(err=>showError(err.message));for(const evt of ['dragenter','dragover']){drop.addEventListener(evt,e=>{e.preventDefault();if(evt==='dragenter')_dragC++;drop.classList.add('dragover')})}for(const evt of ['dragleave','dragend']){drop.addEventListener(evt,e=>{e.preventDefault();if(evt==='dragleave')_dragC--;if(_dragC<=0){_dragC=0;drop.classList.remove('dragover')}})}drop.addEventListener('drop',e=>{e.preventDefault();_dragC=0;drop.classList.remove('dragover');const files=e.dataTransfer?.files;if(files&&files.length)uploadFiles(files).catch(err=>showError(err.message))});drop.addEventListener('paste',e=>{const files=clipboardFilesFromEvent(e);if(!files.length)return;e.preventDefault();drop.classList.add('dragover');setTimeout(()=>drop.classList.remove('dragover'),220);uploadFiles(files).catch(err=>showError(err.message||String(err)))})}const configInput=E('configInput');if(configInput){configInput.onchange=()=>uploadLlmConfigFile(configInput.files&&configInput.files[0]).then(()=>{configInput.value=''}).catch(err=>showError(err.message||String(err)))}bindClick('newSessionBtn',createSession);bindClick('renameSessionBtn',renameSession);bindClick('deleteSessionBtn',deleteSession);bindClick('applyModelBtn',applyModel);bindClick('llmConfigBtn',openLlmConfigModal);bindClick('llmModalClose',()=>{E('llmConfigModal').style.display='none'});bindClick('llmConfigConfirm',submitLlmConfig);const llmProv=E('llmProvider');if(llmProv){llmProv.addEventListener('change',()=>renderLlmFields(llmProv.value))}const llmOverlay=E('llmConfigModal');if(llmOverlay){llmOverlay.addEventListener('click',e=>{if(e.target===llmOverlay)llmOverlay.style.display='none'})}bindClick('sendBtn',sendMessage);bindClick('interruptBtn',interruptRun);bindClick('clearStaleTodosBtn',clearStaleTodos);bindClick('planModeBtn',togglePlanMode);bindClick('refreshFilesBtn',()=>refreshFileExplorer(true));bindClick('previewReloadBtn',()=>renderActivePreview(true));bindClick('previewCopyBtn',()=>copyPreviewCode());bindPopupButton('toolsMenuBtn','toolsMenu');bindClick('compactAction',(e)=>{if(e)e.preventDefault();closePopups();compactNow()});bindClick('refreshAction',(e)=>{if(e)e.preventDefault();closePopups();refreshAll(true)});bindPopupButton('levelBtn','levelMenu',(menu)=>{for(const opt of menu.querySelectorAll('.level-option')){opt.addEventListener('click',e=>{e.preventDefault();const lvl=parseInt(opt.getAttribute('data-level')||'0',10);setTaskLevel(lvl);setPopupOpen('levelMenu',false)})}});bindPopupButton('exportMenuBtn','exportMenu',(menu)=>{for(const a of menu.querySelectorAll('.export-item')){a.addEventListener('click',()=>setPopupOpen('exportMenu',false))}});document.addEventListener('click',()=>closePopups());const langSel=E('langSelect');if(langSel){langSel.onchange=()=>setLanguage(langSel.value).catch(err=>showError(err.message||String(err)))}if(promptEl){promptEl.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter'){e.preventDefault();sendMessage()}})}applyUiStyle();applyStaticUiClass();applyMainI18n();_bindPreviewCopyGuard();try{await refreshAll(false);if(!S.sessions.length){const bootCreate=()=>createSession({prompt:false}).catch(err=>showError(err.message||String(err)));if(typeof requestAnimationFrame==='function'){requestAnimationFrame(()=>setTimeout(bootCreate,0))}else{setTimeout(bootCreate,0)}}}catch(err){showError(err.message||String(err))}_deltaStartWatchdog();scheduleSessionPoll(false);document.addEventListener('visibilitychange',()=>{const next=document.visibilityState||'visible';if(next===S.lastVisibilityState)return;S.lastVisibilityState=next;if(next==='hidden'){if(S.deltaWatchdogTimer){clearTimeout(S.deltaWatchdogTimer);S.deltaWatchdogTimer=null}if(S.sessionPollTimer){clearTimeout(S.sessionPollTimer);S.sessionPollTimer=null}if(S.staticMode)freezeAutoUpdates();return}if(S.staticMode&&S.frozen)resumeAutoUpdates();_deltaStartWatchdog();scheduleSessionPoll(true);scheduleSnapshot({forceFull:false,delayMs:40,allowWhenFrozen:true})})})
+window.addEventListener('DOMContentLoaded',async()=>{for(const id of ['chat','sessionList','todos','tasks','activity','commands','diffs','fileExplorer','catalog']){bindPanelScrollState(id,E(id))}const drop=E('promptComposerShell');const fileInput=E('uploadInput');const promptPick=E('promptFilePick');const promptEl=E('prompt');if(promptPick&&fileInput){promptPick.onclick=(ev)=>{ev.preventDefault();fileInput.click()}}if(drop&&fileInput){let _dragC=0;drop.setAttribute('tabindex','0');drop.addEventListener('click',e=>{if(e.target===drop&&promptEl)promptEl.focus()});fileInput.onchange=()=>uploadFiles(fileInput.files).then(()=>{fileInput.value=''}).catch(err=>showError(err.message));for(const evt of ['dragenter','dragover']){drop.addEventListener(evt,e=>{e.preventDefault();if(evt==='dragenter')_dragC++;drop.classList.add('dragover')})}for(const evt of ['dragleave','dragend']){drop.addEventListener(evt,e=>{e.preventDefault();if(evt==='dragleave')_dragC--;if(_dragC<=0){_dragC=0;drop.classList.remove('dragover')}})}drop.addEventListener('drop',e=>{e.preventDefault();_dragC=0;drop.classList.remove('dragover');const files=e.dataTransfer?.files;if(files&&files.length)uploadFiles(files).catch(err=>showError(err.message))});drop.addEventListener('paste',e=>{const files=clipboardFilesFromEvent(e);if(!files.length)return;e.preventDefault();drop.classList.add('dragover');setTimeout(()=>drop.classList.remove('dragover'),220);uploadFiles(files).catch(err=>showError(err.message||String(err)))})}const configInput=E('configInput');if(configInput){configInput.onchange=()=>uploadLlmConfigFile(configInput.files&&configInput.files[0]).then(()=>{configInput.value=''}).catch(err=>showError(err.message||String(err)))}bindClick('newSessionBtn',createSession);bindClick('renameSessionBtn',renameSession);bindClick('deleteSessionBtn',deleteSession);bindClick('applyModelBtn',applyModel);bindClick('llmConfigBtn',openLlmConfigModal);bindClick('llmModalClose',()=>{E('llmConfigModal').style.display='none'});bindClick('llmConfigConfirm',submitLlmConfig);const llmProv=E('llmProvider');if(llmProv){llmProv.addEventListener('change',()=>renderLlmFields(llmProv.value))}const llmOverlay=E('llmConfigModal');if(llmOverlay){llmOverlay.addEventListener('click',e=>{if(e.target===llmOverlay)llmOverlay.style.display='none'})}bindClick('sendBtn',sendMessage);bindClick('interruptBtn',interruptRun);bindClick('clearStaleTodosBtn',clearStaleTodos);bindClick('planModeBtn',togglePlanMode);bindClick('refreshFilesBtn',()=>refreshFileExplorer(true));bindClick('previewReloadBtn',()=>renderActivePreview(true));bindClick('previewCopyBtn',()=>copyPreviewCode());bindPopupButton('toolsMenuBtn','toolsMenu');bindClick('compactAction',(e)=>{if(e)e.preventDefault();closePopups();compactNow()});bindClick('refreshAction',(e)=>{if(e)e.preventDefault();closePopups();refreshAll(true)});bindPopupButton('levelBtn','levelMenu',(menu)=>{for(const opt of menu.querySelectorAll('.level-option')){opt.addEventListener('click',e=>{e.preventDefault();const lvl=parseInt(opt.getAttribute('data-level')||'0',10);setTaskLevel(lvl);setPopupOpen('levelMenu',false)})}});bindPopupButton('exportMenuBtn','exportMenu',(menu)=>{for(const a of menu.querySelectorAll('.export-item')){a.addEventListener('click',()=>setPopupOpen('exportMenu',false))}});document.addEventListener('click',()=>closePopups());const langSel=E('langSelect');if(langSel){langSel.onchange=()=>setLanguage(langSel.value).then(()=>applyApplicationI18n()).catch(err=>showError(err.message||String(err)))}if(promptEl){promptEl.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter'){e.preventDefault();sendMessage()}})}bindApplicationStore();applyUiStyle();applyStaticUiClass();applyMainI18n();applyApplicationI18n();_bindPreviewCopyGuard();try{await refreshAll(false);if(!S.sessions.length){const bootCreate=()=>createSession({prompt:false}).catch(err=>showError(err.message||String(err)));if(typeof requestAnimationFrame==='function'){requestAnimationFrame(()=>setTimeout(bootCreate,0))}else{setTimeout(bootCreate,0)}}}catch(err){showError(err.message||String(err))}_deltaStartWatchdog();scheduleSessionPoll(false);document.addEventListener('visibilitychange',()=>{const next=document.visibilityState||'visible';if(next===S.lastVisibilityState)return;S.lastVisibilityState=next;if(next==='hidden'){if(S.deltaWatchdogTimer){clearTimeout(S.deltaWatchdogTimer);S.deltaWatchdogTimer=null}if(S.sessionPollTimer){clearTimeout(S.sessionPollTimer);S.sessionPollTimer=null}if(S.staticMode)freezeAutoUpdates();return}if(S.staticMode&&S.frozen)resumeAutoUpdates();_deltaStartWatchdog();scheduleSessionPoll(true);scheduleSnapshot({forceFull:false,delayMs:40,allowWhenFrozen:true})})})
 window.addEventListener('DOMContentLoaded',()=>{bindClick('memoryModeAction',(e)=>{closePopups();toggleUserMemoryMode(e)});bindClick('memoryExportAction',(e)=>{closePopups();exportUserMemory(e)});bindClick('memoryClearAction',(e)=>{closePopups();clearUserMemory(e)});renderMemoryModeAction()});
 """
 
@@ -64960,6 +67465,10 @@ type SkillProtocol={protocol:string;version:string;active_providers:number;activ
 type ToolMeta={name:string;description:string;parameters:Record<string,unknown>};
 type ModelOption={selection:string;profile_id:string;provider:string;model:string;label:string;source?:string;thinking_hint?:boolean;thinking_stream?:boolean;response_stream?:boolean};
 type ModelCatalog={provider:string;models:string[];selected:string;thinking:boolean;thinking_mode?:string;note?:string;options?:ModelOption[]};
+type ApplicationSkillCatalog={id:string;name:string;description?:string};
+type ApplicationSkill=ApplicationSkillCatalog & {order:number;digest?:string};
+type ApplicationSubmission={id:string;status:'pending'|'published'|'rejected';submitted_revision:number;review?:{note?:string;decision?:string}};
+type Application={id:string;name:string;description:string;icon:string;scope:'personal'|'shared';status:'draft'|'pending'|'published'|'rejected';revision:number;skills:ApplicationSkill[];latest_submission?:ApplicationSubmission};
 async function api<T>(path:string,opt:RequestInit={}):Promise<T>{const r=await fetch(path,{headers:{'Content-Type':'application/json'},...opt});if(!r.ok)throw new Error(await r.text());return await r.json() as T}
 export const loadSessions=()=>api<SessionSummary[]>('/api/sessions');
 export const loadSnapshot=(id:string)=>api<Snapshot>(`/api/sessions/${id}`);
@@ -64977,6 +67486,13 @@ export const importDefaultLlmConfig=(id:string)=>api<{ok:boolean;catalog:ModelCa
 export const createSession=(title:string)=>api<{id:string;title:string}>('/api/sessions',{method:'POST',body:JSON.stringify({title})});
 export const renameSession=(id:string,title:string)=>api<{id:string;title:string}>(`/api/sessions/${id}`,{method:'PATCH',body:JSON.stringify({title})});
 export const deleteSession=(id:string)=>api<{ok:boolean}>(`/api/sessions/${id}`,{method:'DELETE'});
+export const loadPersonalApplications=()=>api<Application[]>('/api/apps/personal');
+export const loadSharedApplications=()=>api<Application[]>('/api/apps/shared');
+export const loadApplicationSkills=()=>api<ApplicationSkillCatalog[]>('/api/apps/skills');
+export const createApplication=(payload:Pick<Application,'name'|'description'|'icon'> & {skills:string[]})=>api<Application>('/api/apps/personal',{method:'POST',body:JSON.stringify(payload)});
+export const updateApplication=(id:string,payload:Pick<Application,'name'|'description'|'icon'> & {skills:string[]})=>api<Application>(`/api/apps/${id}`,{method:'PATCH',body:JSON.stringify(payload)});
+export const submitApplication=(id:string)=>api<Application>(`/api/apps/${id}/submit`,{method:'POST',body:'{}'});
+export const launchApplication=(id:string)=>api<{id:string;title:string;app_binding:Record<string,unknown>}>(`/api/apps/${id}/launch`,{method:'POST',body:'{}'});
 """
 
 SKILLS_INDEX_HTML = """<!doctype html>
@@ -65233,6 +67749,9 @@ SKILLS_EXTRA_CSS = """
 """
 
 SKILLS_APP_JS = """const S={config:null,rules:null,skillScan:{skills_count:0,skills:[],tree:{type:'dir',name:'skills',path:'',children:[]},warnings:[]},flow:{nodes:[],edges:[]},flowZoom:1,selectedNodeId:null,drag:null,linkDrag:null,pan:null,skillMap:{},activeSkillFile:'',uploadReports:[]};
+const ADMIN_TOKEN_KEY='clouds_coder_admin_token';
+function adminToken(){return String(sessionStorage.getItem(ADMIN_TOKEN_KEY)||'').trim()}
+function requireAdminToken(){let token=adminToken();if(!token){token=String(prompt('Admin token required for global Skill changes')||'').trim();if(token)sessionStorage.setItem(ADMIN_TOKEN_KEY,token)}return token}
 const E=id=>document.getElementById(id);
 const I18N={'en':{title:'Fona Skills Studio',subtitle:'Visual Skills authoring platform with the same WebUI style',flow_line:'Flowchart → LLM parse → SKILL.md inject into ./skills',apply_model:'Apply Model',refresh:'Refresh',open_agent:'Open Agent UI',rules_knowledge:'Rules & Knowledge',analyze:'Analyze agents/docs',scan:'Scan Skills',rules:'Rules',sources:'Sources',flow_builder:'Flow Builder',tab_node:'Node',tab_manual_link:'Manual Link',add_node:'Add Node',connect:'Connect',delete_node:'Delete Node',bidirectional:'Bidirectional',drag_tip:'Drag ports + hold Shift => bidirectional (n)',canvas_tips:'Canvas Tips',tip1:'1. Drag nodes to move',tip2:'2. Drag from side ports to create links',tip3:'3. Hold Shift while dragging => bidirectional',tip4:'4. Double-click near an edge => delete edge',tip5:'5. Use +/- buttons to zoom',reset_flow:'Reset Flow',export_flow:'Export Flow JSON',import_flow:'Import Flow JSON',draft_publish:'Skill Draft & Publish',generate_inject:'Generate + Inject',save_markdown:'Save Current Markdown',skills_explorer:'Skills Explorer',load_to_flow:'Load To Flow Builder',upload_drop:'Drop skills (SKILL.md / .zip) here, or use upload buttons below',upload_files:'Upload Files',upload_folder:'Upload Folder',selected_skill:'Selected Skill',stat_rules:'Rules',stat_skills:'Skills',stat_model:'Model',stat_nodes:'Flow Nodes',no_rules:'No rules',no_sources:'No sources',no_skill_selected:'No skill selected',no_uploads:'No uploads',select_skill_first:'select a skill first',no_model_selected:'no model selected',invalid_flow_json:'invalid flow json',summary:'summary',generated_at:'generated_at',skills_unit:'skills',upload_parse_failed:'upload parse failed',folder:'folder',empty:'(empty)'},
 'zh-CN':{title:'Fona Skills Studio',subtitle:'基于现有 WebUI 风格的图形化 Skills 制作平台',flow_line:'Flowchart → LLM 解析 → SKILL.md 注入 ./skills',apply_model:'应用模型',refresh:'刷新',open_agent:'打开 Agent UI',rules_knowledge:'Rules & Knowledge',analyze:'分析 agents/docs',scan:'扫描 Skills',rules:'规则',sources:'来源',flow_builder:'流程构建器',tab_node:'节点',tab_manual_link:'手动连线',add_node:'添加节点',connect:'连接',delete_node:'删除节点',bidirectional:'双向',drag_tip:'拖拽端口并按 Shift => 双向链路 (n)',canvas_tips:'画布提示',tip1:'1. 拖拽节点移动位置',tip2:'2. 从节点四边端口拖拽连线',tip3:'3. 按住 Shift 拖拽 => 双向链路',tip4:'4. 双击连线附近 => 删除连线',tip5:'5. 使用 +/- 按钮缩放',reset_flow:'重置流程',export_flow:'导出 Flow JSON',import_flow:'导入 Flow JSON',draft_publish:'技能草稿与发布',generate_inject:'生成并注入',save_markdown:'保存当前 Markdown',skills_explorer:'技能浏览器',load_to_flow:'载入到流程构建器',upload_drop:'拖拽上传 skills（SKILL.md / .zip），或使用下方上传按钮',upload_files:'上传文件',upload_folder:'上传文件夹',selected_skill:'已选 Skill',stat_rules:'规则',stat_skills:'技能',stat_model:'模型',stat_nodes:'流程节点',no_rules:'暂无规则',no_sources:'暂无来源',no_skill_selected:'未选择 Skill',no_uploads:'暂无上传',select_skill_first:'请先选择一个 skill',no_model_selected:'未选择模型',invalid_flow_json:'无效的 flow json',summary:'摘要',generated_at:'生成时间',skills_unit:'个 skills',upload_parse_failed:'上传解析失败',folder:'目录',empty:'(空)'},
@@ -65360,10 +67879,10 @@ function importFlow(){try{const obj=JSON.parse(E('flowJson').value||'{}');if(!Ar
 async function applyModel(){try{const selection=E('modelSelect').value;if(!selection){showError(t('no_model_selected'));return}S.config.model_catalog=await api('/api/skillslab/model',{method:'POST',body:JSON.stringify({selection})});renderModelControls();setStats();showError('')}catch(err){showError(err.message||String(err))}}
 async function analyzeRules(){try{S.rules=await api('/api/skillslab/rules');renderRules();setStats();showError('')}catch(err){showError(err.message||String(err))}}
 async function scanSkills(){try{const out=await api('/api/skillslab/skills');S.skillScan=normalizeSkillScan(out);if(!S.activeSkillFile&&S.skillScan.skills.length){S.activeSkillFile=String(S.skillScan.skills[0].skill_file||'')}renderSkills();showError('')}catch(err){showError(err.message||String(err))}}
-async function generateSkill(){try{const payload={skill_name:E('skillName').value.trim(),skill_path:E('skillPath').value.trim(),description:E('skillDesc').value.trim(),requirements:E('requirements').value.trim(),nodes:S.flow.nodes,edges:S.flow.edges,auto_inject:true,overwrite:true};const out=await api('/api/skillslab/generate',{method:'POST',body:JSON.stringify(payload)});if(out.skill_name)E('skillName').value=out.skill_name;if(out.skill_path)E('skillPath').value=out.skill_path;if(out.description)E('skillDesc').value=out.description;E('skillMarkdown').value=out.skill_markdown||'';await scanSkills();showError('')}catch(err){showError(err.message||String(err))}}
-async function saveSkill(){try{const payload={path:E('skillPath').value.trim()||E('skillName').value.trim(),content:E('skillMarkdown').value,overwrite:true};await api('/api/skillslab/save',{method:'POST',body:JSON.stringify(payload)});await scanSkills();showError('')}catch(err){showError(err.message||String(err))}}
+async function generateSkill(){try{const token=requireAdminToken();if(!token)throw new Error('Admin token required');const payload={skill_name:E('skillName').value.trim(),skill_path:E('skillPath').value.trim(),description:E('skillDesc').value.trim(),requirements:E('requirements').value.trim(),nodes:S.flow.nodes,edges:S.flow.edges,auto_inject:true,overwrite:true};const out=await api('/api/skillslab/generate',{method:'POST',headers:{Authorization:'Bearer '+token},body:JSON.stringify(payload)});if(out.skill_name)E('skillName').value=out.skill_name;if(out.skill_path)E('skillPath').value=out.skill_path;if(out.description)E('skillDesc').value=out.description;E('skillMarkdown').value=out.skill_markdown||'';await scanSkills();showError('')}catch(err){showError(err.message||String(err))}}
+async function saveSkill(){try{const token=requireAdminToken();if(!token)throw new Error('Admin token required');const payload={path:E('skillPath').value.trim()||E('skillName').value.trim(),content:E('skillMarkdown').value,overwrite:true};await api('/api/skillslab/save',{method:'POST',headers:{Authorization:'Bearer '+token},body:JSON.stringify(payload)});await scanSkills();showError('')}catch(err){showError(err.message||String(err))}}
 function isUploadSkillCandidate(name){const n=String(name||'').toLowerCase();if(n.endsWith('.zip')||n.endsWith('.md')||n.endsWith('.markdown')||n.endsWith('.txt'))return true;return n.endsWith('/skill.md')||n.endsWith('skill.md')}
-async function uploadSkillFiles(fileList){if(!fileList||!fileList.length)return;for(const file of Array.from(fileList)){const relName=String(file.webkitRelativePath||file.name||'').replace(/\\\\/g,'/');if(!isUploadSkillCandidate(relName)){S.uploadReports.push({filename:relName||file.name||'unknown',imported_count:0,skipped_count:1,error_count:0});continue}try{if(file.size>30*1024*1024){throw new Error(`${t('file_too_large')}: ${file.name} (>30MB)`)}const arr=await file.arrayBuffer();const payload={filename:relName||file.name,mime:file.type||'',content_b64:ab2b64(arr),overwrite:false};const out=await api('/api/skillslab/upload',{method:'POST',body:JSON.stringify(payload)});S.uploadReports.push({filename:relName||file.name,imported_count:Number(out.imported_count||0),skipped_count:Number(out.skipped_count||0),error_count:Number(out.error_count||0)});if(out.scan)S.skillScan=normalizeSkillScan(out.scan);if(Array.isArray(out.errors)&&out.errors.length){showError(String(out.errors[0].error||t('upload_parse_failed')))}else{showError('')}}catch(err){S.uploadReports.push({filename:relName||file.name,imported_count:0,skipped_count:0,error_count:1});showError(err.message||String(err))}}renderSkills()}
+async function uploadSkillFiles(fileList){if(!fileList||!fileList.length)return;const token=requireAdminToken();if(!token){showError('Admin token required');return}for(const file of Array.from(fileList)){const relName=String(file.webkitRelativePath||file.name||'').replace(/\\\\/g,'/');if(!isUploadSkillCandidate(relName)){S.uploadReports.push({filename:relName||file.name||'unknown',imported_count:0,skipped_count:1,error_count:0});continue}try{if(file.size>30*1024*1024){throw new Error(`${t('file_too_large')}: ${file.name} (>30MB)`)}const arr=await file.arrayBuffer();const payload={filename:relName||file.name,mime:file.type||'',content_b64:ab2b64(arr),overwrite:false};const out=await api('/api/skillslab/upload',{method:'POST',headers:{Authorization:'Bearer '+token},body:JSON.stringify(payload)});S.uploadReports.push({filename:relName||file.name,imported_count:Number(out.imported_count||0),skipped_count:Number(out.skipped_count||0),error_count:Number(out.error_count||0)});if(out.scan)S.skillScan=normalizeSkillScan(out.scan);if(Array.isArray(out.errors)&&out.errors.length){showError(String(out.errors[0].error||t('upload_parse_failed')))}else{showError('')}}catch(err){S.uploadReports.push({filename:relName||file.name,imported_count:0,skipped_count:0,error_count:1});showError(err.message||String(err))}}renderSkills()}
 function bindSkillUpload(){const drop=E('skillsUploadDrop');const input=E('skillsUploadInput');const dirInput=E('skillsUploadDirInput');const fileBtn=E('skillsUploadFileBtn');const folderBtn=E('skillsUploadFolderBtn');if(!drop||!input||!dirInput)return;const consume=async(files,resetter)=>{try{await uploadSkillFiles(files)}catch(err){showError(err.message||String(err))}if(typeof resetter==='function')resetter()};drop.onclick=()=>input.click();if(fileBtn)fileBtn.onclick=()=>input.click();if(folderBtn)folderBtn.onclick=()=>dirInput.click();input.onchange=()=>consume(input.files,()=>{input.value=''});dirInput.onchange=()=>consume(dirInput.files,()=>{dirInput.value=''});for(const evt of ['dragenter','dragover']){drop.addEventListener(evt,e=>{e.preventDefault();drop.classList.add('dragover')})}for(const evt of ['dragleave','dragend']){drop.addEventListener(evt,e=>{e.preventDefault();drop.classList.remove('dragover')})}drop.addEventListener('drop',e=>{e.preventDefault();drop.classList.remove('dragover');consume(e.dataTransfer?.files||[])})}
 function bindFlowZoom(){const outBtn=E('flowZoomOutBtn');const inBtn=E('flowZoomInBtn');if(outBtn)outBtn.onclick=()=>zoomFlowBy(-0.1);if(inBtn)inBtn.onclick=()=>zoomFlowBy(0.1);updateFlowZoomUI()}
 function bindFlowPan(){const wrap=E('flowWrap');if(!wrap)return;wrap.addEventListener('mousedown',ev=>{if(ev.button!==0)return;const target=ev.target;if(!target||!target.closest||!target.closest('#flowWrap'))return;if(target.closest('.flow-node,.flow-port,input,textarea,select,button,a,label,.flow-zoom-pill'))return;S.drag=null;S.linkDrag=null;S.pan={sx:ev.clientX,sy:ev.clientY,left:wrap.scrollLeft,top:wrap.scrollTop};wrap.classList.add('flow-panning');ev.preventDefault()})}
@@ -65373,6 +67892,362 @@ window.addEventListener('mouseup',ev=>{if(S.drag){S.drag=null;return}if(S.pan){c
 window.addEventListener('dblclick',ev=>{if(S.linkDrag)return;const wrap=E('flowWrap');const canvas=E('flowCanvas');if(!wrap||!canvas)return;const target=ev.target;const inFlow=Boolean(target&&target.closest&&target.closest('#flowWrap'));if(!inFlow)return;const rect=canvas.getBoundingClientRect();const px=ev.clientX-rect.left;const py=ev.clientY-rect.top;const idx=findNearestEdgeIndexAt(px,py,16);if(idx<0)return;ev.preventDefault();S.flow.edges.splice(idx,1);renderFlow();setStats()})
 window.addEventListener('resize',()=>scheduleFlowWrapAdjust())
 window.addEventListener('DOMContentLoaded',async()=>{E('addNodeBtn').onclick=addNode;E('removeNodeBtn').onclick=removeNode;E('addEdgeBtn').onclick=addEdge;E('resetFlowBtn').onclick=resetFlow;E('exportFlowBtn').onclick=exportFlow;E('importFlowBtn').onclick=importFlow;E('analyzeBtn').onclick=analyzeRules;E('scanBtn').onclick=scanSkills;E('generateBtn').onclick=generateSkill;E('saveBtn').onclick=saveSkill;E('applyModelBtn').onclick=applyModel;E('refreshBtn').onclick=()=>refreshAll(true);const langSel=E('skillsLangSelect');if(langSel){langSel.onchange=()=>setLanguage(langSel.value).catch(err=>showError(err.message||String(err)))}const tabNode=E('flowTabNodeBtn');const tabLink=E('flowTabLinkBtn');if(tabNode)tabNode.onclick=()=>switchFlowPanel('node');if(tabLink)tabLink.onclick=()=>switchFlowPanel('link');const loadBtn=E('previewToFlowBtn');if(loadBtn)loadBtn.onclick=()=>loadSelectedSkillToFlow().catch(err=>showError(err.message||String(err)));E('nodeTitle').oninput=syncNodeEditor;E('nodeType').onchange=syncNodeEditor;E('nodeContent').oninput=syncNodeEditor;bindSkillUpload();bindFlowZoom();bindFlowPan();switchFlowPanel('node');resetFlow();scheduleFlowWrapAdjust();applySkillsI18n();try{await refreshAll(false)}catch(err){showError(err.message||String(err))}})
+"""
+
+ADMIN_INDEX_HTML = """<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Clouds Coder Admin</title>
+<link rel="stylesheet" href="/assets/admin.css">
+</head>
+<body>
+<div class="admin-shell">
+  <header class="admin-header">
+    <div>
+      <div class="eyebrow">CONTROL PLANE</div>
+      <h1>Clouds Coder Admin</h1>
+      <p>启动参数、运行统计与共享应用治理</p>
+    </div>
+    <div class="header-actions">
+      <span id="connectionBadge" class="badge muted">未认证</span>
+      <a href="/" class="button ghost">返回会话</a>
+      <button id="logoutBtn" class="ghost" type="button">退出</button>
+    </div>
+  </header>
+
+  <nav class="admin-nav" aria-label="Admin sections">
+    <button class="nav-tab active" data-view="metrics" type="button">运行统计</button>
+    <button class="nav-tab" data-view="config" type="button">启动参数</button>
+    <button class="nav-tab" data-view="apps" type="button">应用管理</button>
+  </nav>
+
+  <main>
+    <section id="metricsView" class="admin-view active">
+      <div class="section-head">
+        <div><h2>运行洞察</h2><p>仅聚合匿名来源、计数、耗时与 Token；不保存提示词、工具参数、输出正文或原始 IP。</p></div>
+        <div class="inline-actions">
+          <select id="metricsHours" aria-label="统计范围">
+            <option value="1">最近 1 小时</option>
+            <option value="24" selected>最近 24 小时</option>
+            <option value="168">最近 7 天</option>
+            <option value="720">最近 30 天</option>
+          </select>
+          <button id="refreshMetricsBtn" type="button">刷新</button>
+        </div>
+      </div>
+      <div id="metricCards" class="metric-grid"></div>
+      <div id="metricsCoverage" class="metrics-coverage" role="status"></div>
+      <div class="chart-grid">
+        <article class="card chart-card"><div class="card-head"><div><h3>调用与错误趋势</h3><p>消息、模型、工具与应用启动</p></div></div><div id="activityTrend" class="chart-host"></div></article>
+        <article class="card chart-card"><div class="card-head"><div><h3>Token 趋势</h3><p>仅统计提供 usage 的模型调用</p></div></div><div id="tokenTrend" class="chart-host"></div></article>
+        <article class="card chart-card"><div class="card-head"><div><h3>调用结果分布</h3><p>模型与工具的成功、错误、超时和取消</p></div></div><div id="statusChart" class="chart-host"></div></article>
+        <article class="card chart-card"><div class="card-head"><div><h3>延迟分位</h3><p>平均、P50 与 P95 耗时</p></div></div><div id="latencyChart" class="chart-host"></div></article>
+        <article class="card chart-card"><div class="card-head"><div><h3>模型 Token 分布</h3><p>输入与输出 Token，未知 usage 不计入</p></div></div><div id="modelTokenChart" class="chart-host"></div></article>
+        <article class="card chart-card"><div class="card-head"><div><h3>应用使用排行</h3><p>启动量与匿名活跃来源</p></div></div><div id="appChart" class="chart-host"></div></article>
+      </div>
+      <article class="card user-tracking-card">
+        <div class="card-head user-tracking-head">
+          <div><h3>按匿名来源追踪</h3><p>标识由访问来源派生，仅用于本机聚合；共享网络可能合并多人。</p></div>
+          <div class="user-filter"><label for="metricUserSelect">匿名来源</label><select id="metricUserSelect"><option value="">全部来源</option></select></div>
+        </div>
+        <div id="focusUserSummary" class="focus-user-summary hidden"></div>
+        <div class="two-column metrics-detail-grid">
+          <div><h4>匿名来源排行</h4><div id="userMetrics" class="table-wrap"></div></div>
+          <div><h4 id="focusUserTitle">来源明细</h4><div id="focusUserMetrics" class="table-wrap"></div></div>
+        </div>
+      </article>
+      <div class="two-column metrics-tables">
+        <article class="card"><div class="card-head"><h3>模型调用</h3></div><div id="modelMetrics" class="table-wrap"></div></article>
+        <article class="card"><div class="card-head"><h3>工具调用</h3></div><div id="toolMetrics" class="table-wrap"></div></article>
+      </div>
+      <div class="two-column metrics-tables">
+        <article class="card"><div class="card-head"><h3>应用聚合</h3></div><div id="appMetrics" class="table-wrap"></div></article>
+        <article class="card"><div class="card-head"><h3>事件统计</h3></div><div id="eventMetrics" class="table-wrap"></div></article>
+      </div>
+    </section>
+
+    <section id="configView" class="admin-view">
+      <div class="section-head">
+        <div><h2>启动参数</h2><p>所有修改先保存为草稿；标记为“需重启”的参数在安全重启后生效。</p></div>
+        <div id="restartState" class="badge muted">读取中</div>
+      </div>
+      <div class="action-bar">
+        <button id="saveConfigBtn" type="button">保存参数</button>
+        <button id="saveRestartBtn" class="danger" type="button">保存并重启</button>
+        <button id="setDefaultBtn" class="secondary" type="button">设为默认参数</button>
+        <button id="restoreDefaultBtn" class="secondary" type="button">恢复默认参数</button>
+        <button id="resetInitialBtn" class="ghost" type="button">重置为初始参数</button>
+        <button id="importConfigBtn" class="ghost" type="button">导入 JSON</button>
+        <button id="exportConfigBtn" class="ghost" type="button">导出 JSON</button>
+        <input id="configFileInput" type="file" accept=".json,application/json" hidden>
+      </div>
+      <div id="configNotice" class="notice hidden" role="status"></div>
+      <div id="effectivePorts" class="port-strip"></div>
+      <form id="configForm" novalidate></form>
+    </section>
+
+    <section id="appsView" class="admin-view">
+      <div class="section-head">
+        <div><h2>共享应用</h2><p>管理员可直接组合 1-8 个 Skills 发布应用，也可审核用户提交的不可变版本。</p></div>
+        <button id="refreshAppsBtn" type="button">刷新</button>
+      </div>
+      <div class="apps-layout">
+        <article class="card app-builder">
+          <div class="card-head"><h3>创建共享应用</h3><span id="selectedSkillCount" class="badge">0 / 8</span></div>
+          <label>应用名称<input id="adminAppName" maxlength="100" placeholder="例如：代码安全审查"></label>
+          <label>图标<input id="adminAppIcon" maxlength="20" placeholder="可选，例如：🛡️"></label>
+          <label>说明<textarea id="adminAppDescription" maxlength="1000" rows="3" placeholder="说明适用场景与输出"></textarea></label>
+          <label>搜索 Skills<input id="adminSkillSearch" type="search" placeholder="按名称、ID 或说明搜索"></label>
+          <div id="adminSelectedSkills" class="selected-skills"></div>
+          <div id="adminSkillCatalog" class="skill-catalog"></div>
+          <button id="createSharedAppBtn" type="button">创建并发布</button>
+        </article>
+        <div class="review-column">
+          <div class="subtabs" role="tablist">
+            <button class="review-tab active" data-status="pending" type="button">待审核</button>
+            <button class="review-tab" data-status="published" type="button">已发布</button>
+            <button class="review-tab" data-status="unpublished" type="button">已下架</button>
+            <button class="review-tab" data-status="rejected" type="button">已拒绝</button>
+          </div>
+          <div id="adminAppList" class="admin-app-list"></div>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div id="loginOverlay" class="login-overlay">
+  <div class="login-card" role="dialog" aria-modal="true" aria-labelledby="authTitle">
+    <div class="eyebrow">ADMIN AUTHENTICATION</div>
+    <h2 id="authTitle">正在检查管理员状态</h2>
+    <p id="authDescription">请稍候，正在连接本机认证服务。</p>
+
+    <form id="setupForm" class="auth-form hidden" novalidate>
+      <label>管理员账号<input id="setupUsername" autocomplete="username" minlength="3" maxlength="64" placeholder="admin"></label>
+      <label>管理员密码<input id="setupPassword" type="password" autocomplete="new-password" maxlength="512" placeholder="至少 12 位，包含三类字符"></label>
+      <label>确认密码<input id="setupPasswordConfirm" type="password" autocomplete="new-password" maxlength="512"></label>
+      <button id="setupBtn" type="submit">创建管理员并进入</button>
+    </form>
+
+    <form id="passwordLoginForm" class="auth-form hidden" novalidate>
+      <label>管理员账号<input id="loginUsername" autocomplete="username" maxlength="64" placeholder="admin"></label>
+      <label>管理员密码<input id="loginPassword" type="password" autocomplete="current-password" maxlength="512"></label>
+      <button id="loginBtn" type="submit">登录控制台</button>
+    </form>
+
+    <details id="tokenLoginDetails" class="token-login hidden">
+      <summary>使用 Admin Token（高级/恢复入口）</summary>
+      <form id="tokenLoginForm" class="auth-form" novalidate>
+        <p id="tokenLoginHelp">令牌位于 <code>.clouds_coder_admin/admin.token</code>。验证后只保存换取的短期会话，不保存原始 Token。</p>
+        <label>Admin Token<input id="tokenInput" type="password" autocomplete="off"></label>
+        <button id="tokenLoginBtn" class="secondary" type="submit">使用 Token 进入</button>
+      </form>
+    </details>
+
+    <div id="loginError" class="form-error" role="alert"></div>
+    <button id="retryAuthBtn" class="ghost hidden" type="button">重试</button>
+  </div>
+</div>
+
+<div id="toast" class="toast hidden" role="status"></div>
+<script src="/assets/admin.js"></script>
+</body>
+</html>
+"""
+
+ADMIN_CSS = """
+:root{--bg:#f3f6fb;--surface:#fff;--surface2:#f7f9fc;--text:#172033;--muted:#667085;--line:#dce3ee;--brand:#2563eb;--brand2:#0f9f8f;--danger:#b42318;--warn:#b54708;--shadow:0 18px 44px rgba(27,39,71,.09)}
+*{box-sizing:border-box}
+body{margin:0;background:radial-gradient(900px 500px at 4% -10%,#dbeafe 0,transparent 68%),radial-gradient(700px 450px at 100% 0,#d8fff4 0,transparent 64%),var(--bg);color:var(--text);font-family:Inter,"Noto Sans SC","Segoe UI",sans-serif}
+button,.button,input,select,textarea{font:inherit}
+button,.button{border:1px solid transparent;border-radius:10px;padding:9px 14px;background:var(--brand);color:#fff;font-weight:700;cursor:pointer;text-decoration:none;transition:.15s ease}
+button:hover,.button:hover{filter:brightness(.97);transform:translateY(-1px)}
+button:disabled{opacity:.5;cursor:not-allowed;transform:none}
+button.secondary{background:#eaf1ff;color:#1849a9;border-color:#c8d8fb}
+button.ghost,.button.ghost{background:#fff;color:var(--text);border-color:var(--line)}
+button.danger{background:var(--danger)}
+input,select,textarea{width:100%;border:1px solid #cfd8e6;border-radius:9px;background:#fff;color:var(--text);padding:9px 10px;outline:none}
+input:focus,select:focus,textarea:focus{border-color:#79a2f5;box-shadow:0 0 0 3px rgba(37,99,235,.12)}
+input.invalid,select.invalid{border-color:#ef6c68;box-shadow:0 0 0 3px rgba(180,35,24,.1)}
+label{display:flex;flex-direction:column;gap:6px;color:#344054;font-size:.84rem;font-weight:700}
+code{background:#eef2f7;padding:2px 5px;border-radius:5px}
+.admin-shell{max-width:1500px;margin:0 auto;padding:24px}
+.admin-header{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;margin-bottom:18px}
+.admin-header h1{margin:4px 0 4px;font-size:2rem;letter-spacing:-.035em}
+.admin-header p,.section-head p{margin:0;color:var(--muted)}
+.eyebrow{color:var(--brand);font-size:.72rem;font-weight:800;letter-spacing:.18em}
+.header-actions,.inline-actions,.action-bar{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+.badge{display:inline-flex;align-items:center;border:1px solid #c8d8fb;border-radius:999px;background:#edf4ff;color:#1849a9;padding:5px 9px;font-size:.75rem;font-weight:800}
+.badge.muted{border-color:var(--line);background:#f4f6f9;color:var(--muted)}
+.badge.good{background:#e8fff7;border-color:#a9ead5;color:#067647}
+.badge.warn{background:#fff7e8;border-color:#f3d39d;color:var(--warn)}
+.admin-nav{display:flex;gap:6px;padding:5px;background:rgba(255,255,255,.75);border:1px solid #fff;border-radius:14px;box-shadow:0 8px 22px rgba(27,39,71,.05);margin-bottom:18px;position:sticky;top:8px;z-index:20;backdrop-filter:blur(12px)}
+.nav-tab{background:transparent;color:var(--muted);border-color:transparent}
+.nav-tab.active{background:#fff;color:var(--brand);border-color:var(--line);box-shadow:0 3px 10px rgba(27,39,71,.06)}
+.admin-view{display:none}
+.admin-view.active{display:block}
+.section-head{display:flex;align-items:center;justify-content:space-between;gap:18px;margin-bottom:14px}
+.section-head h2{margin:0 0 4px;font-size:1.35rem}
+.metric-grid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px;margin-bottom:14px}
+.metric-card,.card{background:rgba(255,255,255,.94);border:1px solid #fff;border-radius:15px;box-shadow:var(--shadow)}
+.metric-card{padding:14px}
+.metric-card .key{font-size:.75rem;color:var(--muted);margin-bottom:6px}
+.metric-card .value{font-size:1.45rem;font-weight:800;word-break:break-word}
+.metric-card .detail{font-size:.72rem;color:var(--muted);margin-top:5px}
+.metrics-coverage{display:flex;gap:8px;flex-wrap:wrap;margin:-3px 0 14px;color:var(--muted);font-size:.74rem}
+.coverage-pill{display:inline-flex;align-items:center;gap:5px;background:rgba(255,255,255,.78);border:1px solid var(--line);border-radius:999px;padding:5px 9px}
+.chart-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-bottom:14px}
+.chart-card{min-width:0}
+.chart-card .card-head p,.user-tracking-head p{margin:3px 0 0;color:var(--muted);font-size:.75rem}
+.chart-host{min-height:245px;position:relative}
+.chart-host svg{display:block;width:100%;height:auto;overflow:visible}
+.chart-host .chart-grid-line{stroke:var(--line);stroke-width:1}
+.chart-host .chart-axis{fill:var(--muted);font-size:11px}
+.chart-host .chart-value{fill:var(--text);font-size:11px;font-weight:700}
+.chart-host .series-1{stroke:#2563eb;fill:#2563eb}.chart-host .series-2{stroke:#0f9f8f;fill:#0f9f8f}.chart-host .series-3{stroke:#9b51e0;fill:#9b51e0}.chart-host .series-4{stroke:#d97706;fill:#d97706}.chart-host .series-danger{stroke:#b42318;fill:#b42318}.chart-host .series-muted{stroke:#98a2b3;fill:#98a2b3}
+.chart-host .chart-line{fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.chart-host .chart-area{stroke:none;opacity:.08}
+.chart-host .chart-bar{stroke:none;opacity:.88}
+.chart-host .chart-point{stroke:var(--surface);stroke-width:1.5}
+.chart-legend{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:8px;color:var(--muted);font-size:.72rem}
+.chart-legend span{display:inline-flex;align-items:center;gap:5px}.legend-dot{width:9px;height:9px;border-radius:50%;display:inline-block}
+.chart-empty{min-height:225px;display:flex;align-items:center;justify-content:center;color:var(--muted);text-align:center;font-size:.82rem}
+.user-tracking-card{margin-bottom:14px}
+.user-tracking-head{align-items:flex-end}.user-filter{display:flex;align-items:center;gap:8px}.user-filter label{white-space:nowrap}.user-filter select{min-width:210px}
+.focus-user-summary{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px;margin-bottom:12px}
+.focus-user-stat{background:var(--surface2);border:1px solid var(--line);border-radius:10px;padding:9px}.focus-user-stat .k{font-size:.69rem;color:var(--muted)}.focus-user-stat .v{font-size:1rem;font-weight:800;margin-top:3px;overflow-wrap:anywhere}
+.metrics-detail-grid{margin:0}.metrics-detail-grid h4{margin:4px 0 9px;font-size:.85rem}.metrics-tables{margin-bottom:14px}
+.card{padding:15px}
+.card-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px}
+.card h3{margin:0;font-size:1rem}
+.two-column{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px}
+.table-wrap{overflow:auto}
+table{width:100%;border-collapse:collapse;font-size:.8rem}
+th,td{text-align:left;padding:8px;border-bottom:1px solid #edf0f5;white-space:nowrap}
+th{color:var(--muted);font-size:.72rem;text-transform:uppercase;letter-spacing:.04em}
+.empty{padding:28px 10px;text-align:center;color:var(--muted)}
+.action-bar{padding:12px;background:rgba(255,255,255,.9);border:1px solid #fff;border-radius:14px;margin-bottom:12px;box-shadow:0 8px 22px rgba(27,39,71,.05)}
+.notice{padding:11px 13px;border-radius:10px;background:#eef4ff;border:1px solid #c8d8fb;color:#1849a9;margin-bottom:12px;white-space:pre-wrap}
+.notice.error{background:#fff1f0;border-color:#f5b7b3;color:#912018}
+.hidden{display:none!important}
+.port-strip{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+.port-pill{background:#fff;border:1px solid var(--line);border-radius:9px;padding:7px 9px;font-size:.78rem;color:#475467}
+.config-group{background:rgba(255,255,255,.94);border:1px solid #fff;border-radius:15px;padding:15px;margin-bottom:12px;box-shadow:0 10px 26px rgba(27,39,71,.05)}
+.config-group h3{margin:0 0 13px;text-transform:capitalize}
+.config-grid{display:grid;grid-template-columns:repeat(3,minmax(220px,1fr));gap:13px}
+.config-field{position:relative;padding:11px;border:1px solid #e4e9f1;border-radius:11px;background:var(--surface2);min-width:0}
+.config-field .field-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:7px}
+.config-field .field-label{font-size:.82rem;font-weight:800;min-width:0}
+.config-field .type-tag{font-size:.65rem;color:#475467;background:#e9eef5;border-radius:999px;padding:3px 6px;white-space:nowrap}
+.config-field .field-key{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#667085;font-size:.69rem;margin-top:6px;overflow-wrap:anywhere}
+.config-field .field-error{min-height:15px;color:var(--danger);font-size:.69rem;margin-top:4px}
+.switch-row{display:flex;align-items:center;gap:9px;min-height:39px}
+.switch-row input{width:18px;height:18px;margin:0}
+.apps-layout{display:grid;grid-template-columns:minmax(320px,430px) 1fr;gap:14px;align-items:start}
+.app-builder{position:sticky;top:76px;display:flex;flex-direction:column;gap:11px}
+.skill-catalog{height:300px;overflow:auto;border:1px solid var(--line);border-radius:10px;background:#fbfcfe;padding:7px;display:flex;flex-direction:column;gap:6px}
+.skill-option{display:flex;align-items:flex-start;gap:8px;padding:8px;border:1px solid #e4e9f1;border-radius:9px;background:#fff;cursor:pointer}
+.skill-option.selected{border-color:#8cb2f7;background:#edf4ff}
+.skill-option input{width:16px;height:16px;margin:2px 0 0;flex:none}
+.skill-option strong,.skill-option span{display:block;overflow-wrap:anywhere}
+.skill-option span{color:var(--muted);font-size:.72rem;margin-top:2px}
+.selected-skills{display:flex;gap:6px;flex-wrap:wrap;min-height:28px}
+.skill-chip{display:inline-flex;align-items:center;gap:5px;background:#e8fff7;border:1px solid #b8ead9;border-radius:999px;padding:4px 8px;color:#067647;font-size:.72rem;font-weight:700}
+.skill-chip button{background:transparent;color:#067647;padding:0;border:0;transform:none}
+.subtabs{display:flex;gap:6px;margin-bottom:10px}
+.review-tab{background:#fff;color:var(--muted);border-color:var(--line)}
+.review-tab.active{background:#eaf1ff;color:#1849a9;border-color:#b8cdf7}
+.admin-app-list{display:flex;flex-direction:column;gap:10px}
+.admin-app-card{background:#fff;border:1px solid #fff;border-radius:14px;padding:14px;box-shadow:0 10px 26px rgba(27,39,71,.06)}
+.admin-app-title{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}
+.admin-app-title h3{margin:0;font-size:1rem}
+.admin-app-card p{color:var(--muted);font-size:.82rem;margin:8px 0;white-space:pre-wrap;overflow-wrap:anywhere}
+.app-meta,.app-skills{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0}
+.app-meta span,.app-skills span{font-size:.69rem;background:#f2f4f7;border-radius:999px;padding:4px 7px;color:#475467}
+.app-lifecycle{margin-top:10px;padding:9px;border:1px solid var(--line);border-radius:9px;background:#f8fafc;color:var(--muted);font-size:.7rem;line-height:1.55;max-height:180px;overflow:auto}
+.app-lifecycle strong{display:block;color:var(--text);margin-bottom:3px}
+.review-actions{display:flex;align-items:center;gap:7px;margin-top:10px;flex-wrap:wrap}
+.review-actions input{flex:1;min-width:180px}
+.login-overlay{position:fixed;inset:0;background:rgba(10,18,34,.66);display:flex;align-items:center;justify-content:center;z-index:100;backdrop-filter:blur(8px);padding:18px}
+.login-overlay.hidden{display:none}
+.login-card{width:min(440px,100%);background:#fff;border-radius:18px;padding:25px;box-shadow:0 28px 80px rgba(0,0,0,.28);display:flex;flex-direction:column;gap:14px}
+.login-card h2{margin:0}.login-card p{margin:0;color:var(--muted);line-height:1.5}
+.auth-form{display:flex;flex-direction:column;gap:12px}
+.token-login{border-top:1px solid var(--line);padding-top:12px}
+.token-login summary{cursor:pointer;color:#344054;font-size:.84rem;font-weight:800}
+.token-login .auth-form{padding-top:12px}.token-login p{font-size:.78rem}
+.form-error{color:var(--danger);font-size:.8rem;min-height:18px}
+.toast{position:fixed;right:22px;bottom:22px;max-width:440px;background:#172033;color:#fff;border-radius:11px;padding:11px 14px;z-index:120;box-shadow:var(--shadow);white-space:pre-wrap}
+.toast.error{background:#912018}
+@media(max-width:1100px){.metric-grid{grid-template-columns:repeat(3,1fr)}.config-grid{grid-template-columns:repeat(2,minmax(220px,1fr))}.apps-layout{grid-template-columns:1fr}.app-builder{position:static}.focus-user-summary{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media(max-width:720px){.admin-shell{padding:14px}.admin-header,.section-head{flex-direction:column;align-items:stretch}.header-actions{justify-content:flex-start}.metric-grid{grid-template-columns:repeat(2,1fr)}.two-column,.chart-grid{grid-template-columns:1fr}.config-grid{grid-template-columns:1fr}.admin-nav{overflow:auto}.action-bar button{flex:1 1 145px}.user-tracking-head{align-items:stretch}.user-filter{align-items:stretch;flex-direction:column}.user-filter select{min-width:0}.focus-user-summary{grid-template-columns:repeat(2,minmax(0,1fr))}.chart-host{min-height:215px}}
+"""
+
+ADMIN_JS = r"""
+const A={token:sessionStorage.getItem('clouds_coder_admin_token')||'',config:null,metrics:null,metricUserHash:'',metricResizeTimer:0,apps:[],skills:[],reviewStatus:'pending',selectedSkills:[],toastTimer:0,serverErrors:[],bootId:'',restartNonce:''};
+const E=id=>document.getElementById(id);
+const fmt=n=>new Intl.NumberFormat('zh-CN',{maximumFractionDigits:1}).format(Number(n||0));
+function toast(message,error=false){const el=E('toast');el.textContent=String(message||'');el.classList.toggle('error',!!error);el.classList.remove('hidden');clearTimeout(A.toastTimer);A.toastTimer=setTimeout(()=>el.classList.add('hidden'),4200)}
+function setAuthenticated(ok){E('loginOverlay').classList.toggle('hidden',!!ok);E('connectionBadge').textContent=ok?'已认证':'未认证';E('connectionBadge').className='badge '+(ok?'good':'muted')}
+async function request(path,opt={}){const headers={...(opt.headers||{})};if(opt.body!==undefined&&!headers['Content-Type'])headers['Content-Type']='application/json';const r=await fetch(path,{...opt,headers});const raw=await r.text();let body={};try{body=raw?JSON.parse(raw):{}}catch(_){body={error:raw||'请求失败'}}if(!r.ok){const details=Array.isArray(body.errors)?body.errors:[];const msg=[body.error||'请求失败',...details.map(x=>String(x.key||'参数')+': '+String(x.error||'无效'))].filter(Boolean).join('\n');const err=new Error(msg);err.status=r.status;err.code=String(body.code||'');err.details=details;err.body=body;throw err}return body}
+async function api(path,opt={}){const headers={...(opt.headers||{})};if(A.token)headers.Authorization='Bearer '+A.token;try{return await request(path,{...opt,headers})}catch(err){if(err.status===401){clearSession();setAuthenticated(false);E('loginError').textContent='登录会话已过期，请重新登录';loadAuthStatus().catch(()=>{});}throw err}}
+function clearSession(){sessionStorage.removeItem('clouds_coder_admin_token');A.token='';A.config=null;A.metrics=null;A.apps=[];A.skills=[]}
+function setAuthBusy(form,busy){const btn=form?.querySelector('button[type="submit"]');if(btn)btn.disabled=!!busy}
+function authError(err){const retry=Number(err?.body?.retry_after||0);E('loginError').textContent=retry?String(err.message)+'（约 '+retry+' 秒后重试）':String(err?.message||err||'认证失败')}
+function renderAuthState(status){const setup=!!status?.setup_required;E('retryAuthBtn').classList.add('hidden');E('setupForm').classList.toggle('hidden',!setup);E('passwordLoginForm').classList.toggle('hidden',setup);E('tokenLoginDetails').classList.toggle('hidden',!status?.token_login_enabled);E('tokenLoginBtn').textContent=setup?'用此 Token 创建管理员':'使用 Token 进入';E('tokenLoginHelp').textContent=setup?'远程首次初始化：输入现有 Admin Token，然后在上方填写账号密码并点击“创建管理员”。本机首次运行无需填写 Token。':'验证后只保存换取的短期会话，不保存原始 Admin Token。';E('authTitle').textContent=setup?'创建管理员账号':'管理员登录';if(setup){E('authDescription').textContent=status?.local_setup_allowed?'这是首次运行。请创建唯一管理员账号，密码只以强哈希形式保存在本机。':'首次创建仅允许在本机完成；远程初始化请展开高级入口并使用 Admin Token。';setTimeout(()=>E('setupUsername').focus(),0)}else{E('authDescription').textContent='使用管理员账号和密码登录。登录成功后本标签页只保存短期会话。';setTimeout(()=>E('loginUsername').focus(),0)}}
+async function loadAuthStatus(){E('loginError').textContent='';try{const status=await request('/api/admin/auth/status');renderAuthState(status);return status}catch(err){E('setupForm').classList.add('hidden');E('passwordLoginForm').classList.add('hidden');E('tokenLoginDetails').classList.add('hidden');E('authTitle').textContent='认证服务不可用';E('authDescription').textContent='无法确认管理员是否已创建，请检查服务后重试。';E('retryAuthBtn').classList.remove('hidden');throw err}}
+async function acceptSession(token){A.token=String(token||'');sessionStorage.setItem('clouds_coder_admin_token',A.token);setAuthenticated(true);E('loginError').textContent='';for(const id of ['setupPassword','setupPasswordConfirm','loginPassword','tokenInput']){const el=E(id);if(el)el.value=''}const results=await Promise.allSettled([loadMetrics(),loadConfig(),loadApps()]);const failed=results.filter(x=>x.status==='rejected');if(failed.length)toast('已登录，但部分控制台数据加载失败，请手动刷新。',true)}
+async function registerAdmin(){const form=E('setupForm'),username=E('setupUsername').value.trim(),password=E('setupPassword').value,confirm=E('setupPasswordConfirm').value;if(password!==confirm){E('loginError').textContent='两次输入的密码不一致';E('setupPasswordConfirm').focus();return}setAuthBusy(form,true);E('loginError').textContent='';try{const headers={};const bootstrap=E('tokenInput').value.trim();if(bootstrap)headers.Authorization='Bearer '+bootstrap;const out=await request('/api/admin/auth/setup',{method:'POST',headers,body:JSON.stringify({username,password})});await acceptSession(out.access_token)}catch(err){authError(err);if(err.status===409)await loadAuthStatus().catch(()=>{})}finally{setAuthBusy(form,false)}}
+async function loginWithPassword(){const form=E('passwordLoginForm');setAuthBusy(form,true);E('loginError').textContent='';try{const out=await request('/api/admin/auth/login',{method:'POST',body:JSON.stringify({username:E('loginUsername').value.trim(),password:E('loginPassword').value})});await acceptSession(out.access_token)}catch(err){authError(err);E('loginPassword').value='';E('loginPassword').focus()}finally{setAuthBusy(form,false)}}
+async function loginWithToken(){if(!E('setupForm').classList.contains('hidden')){await registerAdmin();return}const form=E('tokenLoginForm'),candidate=E('tokenInput').value.trim();if(!candidate){E('loginError').textContent='请输入 Admin Token';return}setAuthBusy(form,true);E('loginError').textContent='';try{const out=await request('/api/admin/auth/token-login',{method:'POST',headers:{Authorization:'Bearer '+candidate},body:'{}'});await acceptSession(out.access_token)}catch(err){authError(err);E('tokenInput').value='';E('tokenInput').focus()}finally{setAuthBusy(form,false)}}
+async function logoutAdmin(){const token=A.token;try{if(token)await request('/api/admin/auth/logout',{method:'POST',headers:{Authorization:'Bearer '+token},body:'{}'})}catch(_){}finally{clearSession();setAuthenticated(false);await loadAuthStatus().catch(err=>authError(err))}}
+async function bootstrapAuth(){setAuthenticated(false);if(A.token){try{const state=await request('/api/admin/auth/session',{headers:{Authorization:'Bearer '+A.token}});if(state.auth_kind==='token'){const out=await request('/api/admin/auth/token-login',{method:'POST',headers:{Authorization:'Bearer '+A.token},body:'{}'});await acceptSession(out.access_token)}else await acceptSession(A.token);return}catch(err){if(err.status===401)clearSession();else{E('authTitle').textContent='认证服务不可用';E('authDescription').textContent='暂时无法验证已保存的会话，请重试。';authError(err);E('retryAuthBtn').classList.remove('hidden');return}}}await loadAuthStatus()}
+function node(tag,attrs={},text=''){const el=document.createElement(tag);for(const [k,v] of Object.entries(attrs||{})){if(k==='class')el.className=v;else if(k==='dataset')Object.assign(el.dataset,v);else if(k==='type')el.type=v;else el.setAttribute(k,String(v))}if(text!==undefined&&text!==null)el.textContent=String(text);return el}
+function switchView(name){document.querySelectorAll('.nav-tab').forEach(x=>x.classList.toggle('active',x.dataset.view===name));document.querySelectorAll('.admin-view').forEach(x=>x.classList.toggle('active',x.id===name+'View'));if(name==='metrics')loadMetrics().catch(err=>toast(err.message,true));if(name==='config'&&!A.config)loadConfig().catch(err=>toast(err.message,true));if(name==='apps')loadApps().catch(err=>toast(err.message,true))}
+function table(headers,rows){if(!rows.length)return node('div',{class:'empty'},'暂无数据');const t=node('table');const thead=node('thead'),tr=node('tr');headers.forEach(h=>tr.appendChild(node('th',{},h[0])));thead.appendChild(tr);t.appendChild(thead);const tb=node('tbody');rows.forEach(row=>{const r=node('tr');headers.forEach(h=>r.appendChild(node('td',{},h[1](row))));tb.appendChild(r)});t.appendChild(tb);return t}
+const SVG_NS='http://www.w3.org/2000/svg',METRIC_COLORS=['series-1','series-2','series-3','series-4','series-danger','series-muted'];
+const num=v=>Number.isFinite(Number(v))?Number(v):0;
+function metricPct(value){const n=Math.max(0,Math.min(1,num(value)));return (n*100).toFixed(1)+'%'}
+function metricMs(value){const n=num(value);return n>=1000?(n/1000).toFixed(n>=10000?1:2)+' s':fmt(n)+' ms'}
+function metricTime(ts){const n=num(ts);return n?new Date(n*1000).toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}):'-'}
+function shortMetricLabel(value,max=26){const s=String(value||'-');return s.length>max?s.slice(0,max-1)+'…':s}
+function svgEl(tag,attrs={},text=''){const el=document.createElementNS(SVG_NS,tag);for(const [key,value] of Object.entries(attrs)){if(value!==undefined&&value!==null)el.setAttribute(key,String(value))}if(text!==undefined&&text!==null)el.textContent=String(text);return el}
+function metricChart(id,title,description,height=246){const host=E(id);host.innerHTML='';const width=Math.max(320,Math.round(host.getBoundingClientRect().width||640));const svg=svgEl('svg',{viewBox:`0 0 ${width} ${height}`,role:'img','aria-label':title+'. '+description,preserveAspectRatio:'xMidYMid meet'});svg.append(svgEl('title',{},title),svgEl('desc',{},description));return{host,svg,width,height}}
+function emptyChart(id,message='所选范围暂无数据'){const host=E(id);host.innerHTML='';host.appendChild(node('div',{class:'chart-empty'},message))}
+function metricLegend(host,items){const legend=node('div',{class:'chart-legend'});for(const item of items){const row=node('span');row.append(node('i',{class:'legend-dot '+item.class,'aria-hidden':'true'}),document.createTextNode(item.label));legend.appendChild(row)}host.appendChild(legend)}
+function lineMetricChart(id,rows,series,title,description,formatter=fmt){const data=Array.isArray(rows)?rows:[];if(!data.length||!series.some(def=>data.some(row=>num(row?.[def.key])>0))){emptyChart(id);return}const {host,svg,width,height}=metricChart(id,title,description);metricLegend(host,series.map((def,index)=>({label:def.label,class:def.class||METRIC_COLORS[index]})));const margin={left:49,right:15,top:12,bottom:34},pw=width-margin.left-margin.right,ph=height-margin.top-margin.bottom,max=Math.max(1,...data.flatMap(row=>series.map(def=>Math.max(0,num(row?.[def.key])))));for(let i=0;i<=4;i++){const value=max*(4-i)/4,y=margin.top+ph*i/4;svg.append(svgEl('line',{x1:margin.left,y1:y,x2:width-margin.right,y2:y,class:'chart-grid-line'}),svgEl('text',{x:margin.left-7,y:y+4,'text-anchor':'end',class:'chart-axis'},formatter(value)))}const xAt=index=>margin.left+(data.length<2?pw/2:pw*index/(data.length-1)),yAt=value=>margin.top+ph-Math.max(0,num(value))*ph/max;const tickIndexes=[0,Math.round((data.length-1)/3),Math.round((data.length-1)*2/3),data.length-1].filter((v,i,a)=>v>=0&&a.indexOf(v)===i);for(const index of tickIndexes){svg.appendChild(svgEl('text',{x:xAt(index),y:height-9,'text-anchor':index===0?'start':index===data.length-1?'end':'middle',class:'chart-axis'},metricTime(data[index]?.ts)))}series.forEach((def,seriesIndex)=>{const klass=def.class||METRIC_COLORS[seriesIndex],points=data.map((row,index)=>`${xAt(index)},${yAt(row?.[def.key])}`).join(' ');svg.appendChild(svgEl('polyline',{points,class:`chart-line ${klass}`}));const stride=Math.max(1,Math.ceil(data.length/18));data.forEach((row,index)=>{if(index%stride&&index!==data.length-1)return;const value=Math.max(0,num(row?.[def.key])),point=svgEl('circle',{cx:xAt(index),cy:yAt(value),r:3,class:`chart-point ${klass}`});point.appendChild(svgEl('title',{},metricTime(row?.ts)+' · '+def.label+': '+formatter(value)));svg.appendChild(point)})});host.appendChild(svg)}
+function statusMetricChart(summary={}){const groups=[{label:'模型',success:num(summary.llm_success),failures:num(summary.llm_failures),timeouts:num(summary.llm_timeouts),cancelled:num(summary.llm_cancelled)},{label:'工具',success:num(summary.tool_success),failures:num(summary.tool_failures),timeouts:num(summary.tool_timeouts),cancelled:num(summary.tool_cancelled)}];if(!groups.some(x=>x.success+x.failures+x.timeouts+x.cancelled)){emptyChart('statusChart');return}const {host,svg,width}=metricChart('statusChart','调用结果分布','模型与工具调用的成功、错误、超时及取消占比'),defs=[['成功','series-2'],['错误','series-danger'],['超时','series-4'],['取消','series-muted']];metricLegend(host,defs.map(x=>({label:x[0],class:x[1]})));const left=54,right=62,pw=width-left-right;groups.forEach((group,index)=>{const y=49+index*82,errorOnly=Math.max(0,group.failures-group.timeouts-group.cancelled),parts=[group.success,errorOnly,group.timeouts,group.cancelled],total=Math.max(1,parts.reduce((a,b)=>a+b,0));svg.appendChild(svgEl('text',{x:left-9,y:y+19,'text-anchor':'end',class:'chart-value'},group.label));let cursor=left;parts.forEach((value,pos)=>{const w=pw*value/total;if(w>0){const rect=svgEl('rect',{x:cursor,y,width:w,height:30,rx:4,class:`chart-bar ${defs[pos][1]}`});rect.appendChild(svgEl('title',{},group.label+' '+defs[pos][0]+': '+fmt(value)+' ('+metricPct(value/total)+')'));svg.appendChild(rect);if(w>42)svg.appendChild(svgEl('text',{x:cursor+w/2,y:y+20,'text-anchor':'middle',class:'chart-value'},fmt(value)))}cursor+=w});svg.appendChild(svgEl('text',{x:width-right+8,y:y+20,class:'chart-axis'},fmt(total)+' 次'))});host.appendChild(svg)}
+function latencyMetricChart(summary={}){const rows=[{label:'模型',avg:num(summary.avg_llm_ms),p50:num(summary.p50_llm_ms),p95:num(summary.p95_llm_ms)},{label:'工具',avg:num(summary.avg_tool_ms),p50:num(summary.p50_tool_ms),p95:num(summary.p95_tool_ms)}],max=Math.max(0,...rows.flatMap(x=>[x.avg,x.p50,x.p95]));if(max<=0){emptyChart('latencyChart');return}const {host,svg,width}=metricChart('latencyChart','延迟分位','模型与工具调用的平均、P50 和 P95 耗时'),defs=[['平均','series-1','avg'],['P50','series-2','p50'],['P95','series-4','p95']];metricLegend(host,defs.map(x=>({label:x[0],class:x[1]})));const left=58,right=76,pw=width-left-right;rows.forEach((row,group)=>{const base=37+group*95;svg.appendChild(svgEl('text',{x:left-9,y:base+33,'text-anchor':'end',class:'chart-value'},row.label));defs.forEach((def,index)=>{const value=row[def[2]],y=base+index*22,w=pw*value/max,rect=svgEl('rect',{x:left,y,width:w,height:14,rx:4,class:`chart-bar ${def[1]}`});rect.appendChild(svgEl('title',{},row.label+' '+def[0]+': '+metricMs(value)));svg.append(rect,svgEl('text',{x:Math.min(width-right+5,left+w+5),y:y+11,class:'chart-axis'},metricMs(value)))})});host.appendChild(svg)}
+function modelTokenMetricChart(models=[]){const rows=[...(models||[])].filter(x=>num(x.tokens)>0).sort((a,b)=>num(b.tokens)-num(a.tokens)).slice(0,6);if(!rows.length){emptyChart('modelTokenChart','暂无模型 Token usage 数据');return}const {host,svg,width}=metricChart('modelTokenChart','模型 Token 分布','各模型输入与输出 Token 的堆叠比较');metricLegend(host,[{label:'输入 Token',class:'series-1'},{label:'输出 Token',class:'series-2'}]);const left=Math.min(190,Math.max(108,width*.29)),right=64,pw=width-left-right,max=Math.max(1,...rows.map(x=>num(x.tokens)));rows.forEach((row,index)=>{const y=18+index*34,prompt=num(row.prompt_tokens),completion=num(row.completion_tokens),total=Math.max(num(row.tokens),prompt+completion),wp=pw*prompt/max,wc=pw*completion/max,label=shortMetricLabel([row.provider,row.model].filter(Boolean).join('/'),24);svg.appendChild(svgEl('text',{x:left-8,y:y+17,'text-anchor':'end',class:'chart-axis'},label));for(const [x,w,klass,text] of [[left,wp,'series-1','输入'],[left+wp,wc,'series-2','输出']]){if(w<=0)continue;const rect=svgEl('rect',{x,y,width:w,height:22,rx:4,class:`chart-bar ${klass}`});rect.appendChild(svgEl('title',{},text+' Token: '+fmt(klass==='series-1'?prompt:completion)));svg.appendChild(rect)}svg.appendChild(svgEl('text',{x:Math.min(width-right+4,left+pw*total/max+5),y:y+16,class:'chart-value'},fmt(total)))});host.appendChild(svg)}
+function appMetricChart(apps=[]){const source=[...(apps||[])],useLaunch=source.some(x=>num(x.launches)>0),rows=source.map(x=>({...x,_value:useLaunch?num(x.launches):num(x.messages)+num(x.llm_calls)+num(x.tool_calls)})).filter(x=>x._value>0).sort((a,b)=>b._value-a._value).slice(0,6);if(!rows.length){emptyChart('appChart');return}const {host,svg,width}=metricChart('appChart','应用使用排行','应用启动或绑定活动与匿名活跃来源排行'),left=Math.min(190,Math.max(108,width*.29)),right=98,pw=width-left-right,max=Math.max(1,...rows.map(x=>x._value));rows.forEach((row,index)=>{const y=22+index*34,w=pw*row._value/max,label=shortMetricLabel(row.name||row.app_id||'未知应用',24),rect=svgEl('rect',{x:left,y,width:w,height:22,rx:4,class:'chart-bar series-3'});rect.appendChild(svgEl('title',{},`${label}: ${fmt(row._value)} ${useLaunch?'次启动':'个事件'}，${fmt(row.active_users)} 个匿名来源`));svg.append(svgEl('text',{x:left-8,y:y+17,'text-anchor':'end',class:'chart-axis'},label),rect,svgEl('text',{x:Math.min(width-right+4,left+w+5),y:y+16,class:'chart-value'},fmt(row._value)+' · '+fmt(row.active_users)+' 来源'))});host.appendChild(svg)}
+function renderMetricCharts(m){const series=m.series||[];lineMetricChart('activityTrend',series,[{key:'messages',label:'消息',class:'series-1'},{key:'llm_calls',label:'模型',class:'series-2'},{key:'tool_calls',label:'工具',class:'series-3'},{key:'failures',label:'失败',class:'series-danger'}],'调用与错误趋势','按时间桶展示消息、模型、工具与失败事件');lineMetricChart('tokenTrend',series,[{key:'prompt_tokens',label:'输入 Token',class:'series-1'},{key:'completion_tokens',label:'输出 Token',class:'series-2'}],'Token 趋势','按时间桶展示已报告 usage 的输入与输出 Token');statusMetricChart(m.summary||{});latencyMetricChart(m.summary||{});modelTokenMetricChart(m.models||[]);appMetricChart(m.apps||[])}
+function renderMetricUserSelector(users=[]){const select=E('metricUserSelect'),current=A.metricUserHash||'';select.innerHTML='';select.appendChild(node('option',{value:''},'全部来源'));for(const row of users){const hash=String(row.user_hash||'');if(hash)select.appendChild(node('option',{value:hash},hash+' · '+fmt(row.llm_calls)+' 模型 / '+fmt(row.total_tokens)+' Token'))}if(current&&users.some(x=>String(x.user_hash||'')===current))select.value=current;else{A.metricUserHash='';select.value=''}}
+function renderFocusMetricUser(m){const focus=m.focus_user||null,summaryHost=E('focusUserSummary'),detailHost=E('focusUserMetrics');summaryHost.innerHTML='';detailHost.innerHTML='';if(!A.metricUserHash){summaryHost.classList.add('hidden');E('focusUserTitle').textContent='来源明细';detailHost.appendChild(node('div',{class:'empty'},'从左侧排行或上方选择一个匿名来源查看聚合明细。'));return}if(!focus){summaryHost.classList.add('hidden');E('focusUserTitle').textContent='来源明细';detailHost.appendChild(node('div',{class:'empty'},'所选范围内未找到该匿名来源。'));return}const s=focus.summary||focus,stats=[['匿名标识',focus.user_hash||A.metricUserHash],['会话',num(s.sessions)],['模型 / 工具',fmt(s.llm_calls)+' / '+fmt(s.tool_calls)],['失败',num(s.failures)],['Token',num(s.total_tokens)]];for(const [key,value] of stats){const cell=node('div',{class:'focus-user-stat'});cell.append(node('div',{class:'k'},key),node('div',{class:'v'},typeof value==='number'?fmt(value):value));summaryHost.appendChild(cell)}summaryHost.classList.remove('hidden');E('focusUserTitle').textContent='来源 '+String(focus.user_hash||A.metricUserHash)+' 的聚合明细';const details=[];for(const row of focus.models||[])details.push({type:'模型',name:[row.provider,row.model].filter(Boolean).join('/')||'-',calls:row.calls,failures:row.failures,tokens:row.tokens});for(const row of focus.tools||[])details.push({type:'工具',name:row.name||'-',calls:row.calls,failures:row.failures,tokens:0});for(const row of focus.apps||[])details.push({type:'应用',name:row.name||row.app_id||'-',calls:row.launches||row.llm_calls,failures:row.failures,tokens:row.total_tokens});detailHost.appendChild(table([['类型',x=>x.type],['名称',x=>x.name],['调用/启动',x=>fmt(x.calls)],['失败',x=>fmt(x.failures)],['Token',x=>fmt(x.tokens)]],details))}
+async function loadMetrics(userHash=A.metricUserHash||''){const hours=E('metricsHours').value||24,hash=String(userHash||'').trim(),query=new URLSearchParams({hours:String(hours)});if(hash)query.set('user_hash',hash);A.metrics=await api('/api/admin/metrics?'+query.toString());A.metricUserHash=hash;renderMetrics()}
+function renderMetrics(){const m=A.metrics||{},g=m.gauges||{},e=m.events||{},tok=m.tokens||{},s=m.summary||{},llmCalls=num(s.llm_calls??e.llm_call?.count),toolCalls=num(s.tool_calls??e.tool_call?.count),tokenCoverage=num(tok.coverage_rate??(llmCalls?num(tok.usage_covered_calls)/llmCalls:0)),llmRate=llmCalls?num(s.llm_success)/llmCalls:0,toolRate=toolCalls?num(s.tool_success)/toolCalls:0;const cards=[['匿名活跃来源',num(g.active_users),'已知目录 '+fmt(g.known_users)],['活跃会话',num(g.active_sessions),'全部 '+fmt(g.total_sessions)+' · 运行中 '+fmt(g.running_sessions)],['排队任务',num(g.queue_depth),'当前调度队列'],['模型调用',llmCalls,'成功率 '+metricPct(llmRate)],['工具调用',toolCalls,'成功率 '+metricPct(toolRate)],['调用失败',num(s.llm_failures)+num(s.tool_failures),'超时 '+fmt(num(s.llm_timeouts)+num(s.tool_timeouts))],['Token 总量',num(tok.total),'输入 '+fmt(tok.prompt)+' / 输出 '+fmt(tok.completion)],['Token 覆盖率',metricPct(tokenCoverage),'有 usage '+fmt(tok.usage_covered_calls)+' / '+fmt(llmCalls)],['模型 P95',metricMs(s.p95_llm_ms),'P50 '+metricMs(s.p50_llm_ms)],['工具 P95',metricMs(s.p95_tool_ms),'P50 '+metricMs(s.p50_tool_ms)],['消息提交',num(s.messages??e.message?.count),'所选范围'],['应用启动',num(s.app_launches??e.app_launch?.count),'所选范围']];const host=E('metricCards');host.innerHTML='';cards.forEach(([key,value,detail])=>{const card=node('div',{class:'metric-card'});card.append(node('div',{class:'key'},key),node('div',{class:'value'},typeof value==='number'?fmt(value):value),node('div',{class:'detail'},detail));host.appendChild(card)});const coverage=m.coverage||{},coverageRows=[['匿名来源覆盖',coverage.user_identified_events],['会话覆盖',coverage.session_identified_events],['应用覆盖',coverage.app_identified_events],['Token usage 覆盖',coverage.llm_token_calls??tokenCoverage],['时间桶',num(m.range?.bucket_seconds)/60],['内容采集',coverage.content_recorded?'已启用':'关闭']],coverageHost=E('metricsCoverage');coverageHost.innerHTML='';for(const [label,value] of coverageRows){const display=typeof value==='number'?(label==='时间桶'?fmt(value)+' 分钟':metricPct(value)):String(value??'-');coverageHost.appendChild(node('span',{class:'coverage-pill'},label+'：'+display))}renderMetricCharts(m);renderMetricUserSelector(m.users||[]);const modelHeaders=[['Provider',x=>x.provider||'-'],['Model',x=>x.model||'-'],['调用',x=>fmt(x.calls)],['成功率',x=>metricPct(num(x.calls)?num(x.success)/num(x.calls):0)],['Token',x=>fmt(x.tokens)],['平均 / P95',x=>metricMs(x.avg_ms)+' / '+metricMs(x.p95_ms)]];const toolHeaders=[['Tool',x=>x.name||'-'],['调用',x=>fmt(x.calls)],['成功',x=>fmt(x.success)],['失败 / 超时',x=>fmt(x.failures??x.errors)+' / '+fmt(x.timeouts)],['平均 / P95',x=>metricMs(x.avg_ms)+' / '+metricMs(x.p95_ms)]];const appHeaders=[['应用',x=>x.name||x.app_id||'-'],['启动',x=>fmt(x.launches)],['匿名来源',x=>fmt(x.active_users)],['消息',x=>fmt(x.messages)],['模型 / 工具',x=>fmt(x.llm_calls)+' / '+fmt(x.tool_calls)],['Token',x=>fmt(x.total_tokens)]];const userHeaders=[['匿名来源',x=>x.user_hash||'-'],['最近活动',x=>metricTime(x.last_seen)],['会话',x=>fmt(x.sessions)],['消息',x=>fmt(x.messages)],['模型 / 工具',x=>fmt(x.llm_calls)+' / '+fmt(x.tool_calls)],['失败',x=>fmt(x.failures)],['Token',x=>fmt(x.total_tokens)]];const eventHeaders=[['事件',x=>x.name],['次数',x=>fmt(x.count)],['失败',x=>fmt(x.failures??x.errors)],['总耗时',x=>metricMs(x.duration_ms)]];for(const [id,headers,rows] of [['modelMetrics',modelHeaders,m.models||[]],['toolMetrics',toolHeaders,m.tools||[]],['appMetrics',appHeaders,m.apps||[]],['userMetrics',userHeaders,m.users||[]],['eventMetrics',eventHeaders,Object.entries(e).map(([name,value])=>({name,...value}))]]){const container=E(id);container.innerHTML='';container.appendChild(table(headers,rows));if(id==='userMetrics')container.querySelectorAll('tbody tr').forEach((row,index)=>{row.style.cursor='pointer';row.onclick=()=>{const hash=String((m.users||[])[index]?.user_hash||'');if(hash){A.metricUserHash=hash;loadMetrics(hash).catch(err=>toast(err.message,true))}}})}renderFocusMetricUser(m)}
+async function loadConfig(){A.config=await api('/api/admin/config');A.bootId=String(A.config?.boot_id||A.bootId||'');renderConfig()}
+function configControl(spec,value){let input;if(spec.type==='boolean'){const wrap=node('div',{class:'switch-row'});input=node('input',{type:'checkbox'});input.checked=!!value;input.dataset.key=spec.key;wrap.append(input,node('span',{},value?'启用':'停用'));input.addEventListener('change',()=>wrap.lastChild.textContent=input.checked?'启用':'停用');return wrap}if(spec.type==='enum'||spec.type==='tri_state'){input=node('select');(spec.choices||[]).forEach(v=>{const op=node('option',{value:v},String(v));op.selected=String(value??'')===String(v);input.appendChild(op)})}else{const inputType=spec.type==='integer'||spec.type==='number'?'number':spec.type==='url'?'url':'text';input=node('input',{type:inputType});if(value!==null&&value!==undefined)input.value=String(value);if(spec.minimum!==undefined)input.min=String(spec.minimum);if(spec.maximum!==undefined)input.max=String(spec.maximum);if(inputType==='number')input.step=String(spec.step??(spec.type==='integer'?1:'any'));if(spec.nullable)input.placeholder=spec.derived?'留空自动计算：'+spec.derived:'可留空'}input.dataset.key=spec.key;return input}
+function renderConfig(values=null){const c=A.config||{},form=E('configForm');form.innerHTML='';const draft=values&&typeof values==='object'?values:(c.draft||{});const errors=new Map([...(c.validation_errors||[]),...(A.serverErrors||[])].map(x=>[x.key,x.error]));const groups=new Map();for(const spec of c.schema||[]){if(!groups.has(spec.group))groups.set(spec.group,[]);groups.get(spec.group).push(spec)}for(const [group,specs] of groups){const section=node('section',{class:'config-group'});section.appendChild(node('h3',{},group));const grid=node('div',{class:'config-grid'});for(const spec of specs){const field=node('div',{class:'config-field'}),head=node('div',{class:'field-head'});head.append(node('span',{class:'field-label'},spec.label),node('span',{class:'type-tag'},spec.type));field.appendChild(head);const control=configControl(spec,draft?.[spec.key]);if(control.matches?.('input,select')){control.dataset.key=spec.key;if(errors.has(spec.key))control.classList.add('invalid')}else{const nested=control.querySelector('input,select');if(nested){nested.dataset.key=spec.key;if(errors.has(spec.key))nested.classList.add('invalid')}}field.append(control,node('div',{class:'field-key'},spec.key+(spec.restart_required?' · restart':'')),node('div',{class:'field-error'},errors.get(spec.key)||''));grid.appendChild(field)}section.appendChild(grid);form.appendChild(section)}const ports=E('effectivePorts');ports.innerHTML='';for(const [name,port] of Object.entries(c.effective_ports||{}))ports.appendChild(node('span',{class:'port-pill'},name+' : '+port));const restart=!!c.restart_required;E('restartState').textContent=restart?'有未生效参数':'参数已生效';E('restartState').className='badge '+(restart?'warn':'good');if(errors.size)notice([...errors].map(([key,error])=>key+': '+error).join('\n'),true);else notice('')}
+function collectConfig(){const values={};for(const spec of A.config?.schema||[]){const el=document.querySelector('[data-key="'+CSS.escape(spec.key)+'"]');if(!el)continue;if(spec.type==='boolean')values[spec.key]=!!el.checked;else if(spec.nullable&&!String(el.value||'').trim())values[spec.key]=null;else values[spec.key]=el.value}return values}
+function notice(message,error=false){const el=E('configNotice');el.textContent=String(message||'');el.classList.toggle('hidden',!message);el.classList.toggle('error',!!error)}
+async function saveConfig(setDefault=false){A.serverErrors=[];const submitted=collectConfig();try{const out=await api('/api/admin/config',{method:'POST',body:JSON.stringify({values:submitted,set_default:setDefault,revision:A.config?.revision||''})});await loadConfig();toast(setDefault?'参数已保存并设为默认':'参数已保存');return out}catch(err){A.serverErrors=Array.isArray(err.details)?err.details:[];renderConfig(submitted);throw err}}
+async function resetConfig(target){await api('/api/admin/config/reset',{method:'POST',body:JSON.stringify({target})});await loadConfig();toast(target==='default'?'已恢复默认参数':'已重置为初始参数')}
+function downloadJson(name,data){const b=new Blob([JSON.stringify(data,null,2)],{type:'application/json;charset=utf-8'}),url=URL.createObjectURL(b),a=node('a',{href:url,download:name});document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000)}
+async function importConfigFile(file){const raw=JSON.parse(await file.text());const values=raw?.values||raw?.draft||raw;if(!values||typeof values!=='object'||Array.isArray(values))throw new Error('JSON 中未找到参数对象');const trueValues=new Set(['1','true','yes','on']),falseValues=new Set(['0','false','no','off']),errors=[];for(const spec of A.config?.schema||[]){if(!(spec.key in values))continue;const el=document.querySelector('[data-key="'+CSS.escape(spec.key)+'"]');if(!el)continue;if(spec.type==='boolean'){const v=values[spec.key],normalized=String(v??'').trim().toLowerCase();if(typeof v==='boolean')el.checked=v;else if(trueValues.has(normalized))el.checked=true;else if(falseValues.has(normalized))el.checked=false;else{errors.push({key:spec.key,error:'expected boolean'});continue}el.dispatchEvent(new Event('change',{bubbles:true}))}else el.value=values[spec.key]??''}A.serverErrors=errors;if(errors.length){renderConfig(collectConfig());throw new Error('导入失败：存在无效布尔参数')}notice('参数已导入到表单，请检查后保存。');toast('导入完成')}
+async function restartWithDraft(){if(!confirm('服务将保存所有会话并重启。确定继续吗？'))return;await saveConfig(false);const out=await api('/api/admin/restart',{method:'POST',body:JSON.stringify({boot_id:A.bootId})});toast('重启请求已接收，页面将在服务恢复后自动刷新。');E('saveRestartBtn').disabled=true;waitForRestart(out)}
+async function waitForRestart(info={}){const oldBoot=String(info.boot_id||A.bootId||'');const restartNonce=String(info.restart_nonce||'');const target=info.target||{};const host=String(target.host||'').trim();const port=Number(target.port||location.port||(location.protocol==='https:'?443:80));const publicHost=!host||host==='0.0.0.0'||host==='::'?'':host;const hostname=publicHost||location.hostname;const bracketed=hostname.includes(':')&&!hostname.startsWith('[')?'['+hostname+']':hostname;const targetOrigin=location.protocol+'//'+bracketed+((location.protocol==='https:'&&port===443)||(location.protocol==='http:'&&port===80)?'':':'+port);for(let i=0;i<120;i++){await new Promise(r=>setTimeout(r,1500));try{const url=targetOrigin+'/api/health?restart_nonce='+encodeURIComponent(restartNonce)+'&restart_from='+encodeURIComponent(oldBoot);const r=await fetch(url,{cache:'no-store',mode:'cors'});if(r.ok){const body=await r.json().catch(()=>({}));const newBoot=String(body.boot_id||'');if(newBoot&&oldBoot&&newBoot!==oldBoot&&body.restart_verified===true){location.assign(targetOrigin+'/admin');return}}}catch(_){}}toast('服务尚未恢复，新地址可能为 '+targetOrigin+'/admin，请稍后打开。',true);E('saveRestartBtn').disabled=false}
+async function loadApps(){const [apps,skills]=await Promise.all([api('/api/admin/apps'),api('/api/apps/skills')]);A.apps=Array.isArray(apps)?apps:[];A.skills=Array.isArray(skills)?skills:[];renderSkillCatalog();renderAdminApps()}
+function renderSkillCatalog(){const q=String(E('adminSkillSearch').value||'').trim().toLowerCase(),host=E('adminSkillCatalog');host.innerHTML='';const selected=new Set(A.selectedSkills);const rows=A.skills.filter(s=>!q||[s.id,s.name,s.description].join(' ').toLowerCase().includes(q));if(!rows.length){host.appendChild(node('div',{class:'empty'},'没有匹配的 Skill'));return}rows.forEach(s=>{const label=node('label',{class:'skill-option'+(selected.has(s.id)?' selected':'')}),check=node('input',{type:'checkbox'});check.checked=selected.has(s.id);check.addEventListener('change',()=>toggleAdminSkill(s.id));const text=node('div');text.append(node('strong',{},s.name||s.id),node('span',{},s.id),node('span',{},s.description||''));label.append(check,text);host.appendChild(label)});renderSelectedSkills()}
+function toggleAdminSkill(id){const idx=A.selectedSkills.indexOf(id);if(idx>=0)A.selectedSkills.splice(idx,1);else{if(A.selectedSkills.length>=8){toast('一个应用最多关联 8 个 Skills',true);renderSkillCatalog();return}A.selectedSkills.push(id)}renderSkillCatalog()}
+function renderSelectedSkills(){const host=E('adminSelectedSkills');host.innerHTML='';A.selectedSkills.forEach((id,index)=>{const skill=A.skills.find(x=>x.id===id);const chip=node('span',{class:'skill-chip'},(index+1)+'. '+(skill?.name||id));const del=node('button',{type:'button','aria-label':'移除'},'×');del.onclick=()=>toggleAdminSkill(id);chip.appendChild(del);host.appendChild(chip)});E('selectedSkillCount').textContent=A.selectedSkills.length+' / 8'}
+async function createSharedApp(){const payload={name:E('adminAppName').value.trim(),icon:E('adminAppIcon').value.trim(),description:E('adminAppDescription').value.trim(),skills:A.selectedSkills};if(!payload.name)throw new Error('请输入应用名称');if(!payload.skills.length)throw new Error('请至少选择一个 Skill');await api('/api/admin/apps',{method:'POST',body:JSON.stringify(payload)});E('adminAppName').value='';E('adminAppIcon').value='';E('adminAppDescription').value='';A.selectedSkills=[];await loadApps();toast('共享应用已发布')}
+function renderAdminApps(){const host=E('adminAppList');host.innerHTML='';document.querySelectorAll('.review-tab').forEach(x=>x.classList.toggle('active',x.dataset.status===A.reviewStatus));const rows=A.apps.filter(x=>x.status===A.reviewStatus);if(!rows.length){host.appendChild(node('div',{class:'card empty'},'此分类暂无应用'));return}rows.sort((a,b)=>(b.updated_at||0)-(a.updated_at||0)).forEach(app=>{const card=node('article',{class:'admin-app-card'}),title=node('div',{class:'admin-app-title'}),left=node('div'),h=node('h3',{},(app.icon?app.icon+' ':'')+(app.name||'未命名应用'));left.appendChild(h);title.append(left,node('span',{class:'badge '+(app.status==='published'?'good':app.status==='rejected'?'muted':'warn')},app.status));card.append(title,node('p',{},app.description||'暂无说明'));const meta=node('div',{class:'app-meta'});meta.append(node('span',{},'revision '+(app.submitted_revision||app.revision||1)),node('span',{},'owner '+(app.owner_hash||'admin')));card.appendChild(meta);const skills=node('div',{class:'app-skills'});(app.skills||[]).sort((a,b)=>(a.order||0)-(b.order||0)).forEach(s=>skills.appendChild(node('span',{},s.name||s.id)));card.appendChild(skills);if(app.review?.note)card.appendChild(node('p',{},'审核备注：'+app.review.note));const history=Array.isArray(app.lifecycle_history)?app.lifecycle_history:[];if(history.length){const lifecycle=node('div',{class:'app-lifecycle'});lifecycle.appendChild(node('strong',{},'治理历史'));[...history].reverse().forEach(item=>{const at=item.at?new Date(Number(item.at)*1000).toLocaleString('zh-CN'):'-';const text=at+' · '+String(item.action||'')+' · '+String(item.from||'')+' -> '+String(item.to||'')+' · revision '+String(item.revision||'')+(item.note?' · '+String(item.note):'');lifecycle.appendChild(node('div',{},text))});card.appendChild(lifecycle)}if(app.status==='pending'){const actions=node('div',{class:'review-actions'}),note=node('input',{placeholder:'审核备注（可选）',maxlength:'1000'}),approve=node('button',{type:'button'},'通过并发布'),reject=node('button',{type:'button',class:'danger'},'拒绝');approve.onclick=()=>reviewApp(app,true,note.value).catch(err=>toast(err.message,true));reject.onclick=()=>reviewApp(app,false,note.value).catch(err=>toast(err.message,true));actions.append(note,approve,reject);card.appendChild(actions)}else if(app.status==='published'||app.status==='unpublished'){const actions=node('div',{class:'review-actions'}),note=node('input',{placeholder:'治理备注（可选）',maxlength:'1000'}),publish=app.status==='unpublished',action=node('button',{type:'button',class:publish?'':'danger'},publish?'重新上架':'下架');action.onclick=()=>changePublication(app,publish,note.value).catch(err=>toast(err.message,true));actions.append(note,action);card.appendChild(actions)}host.appendChild(card)})}
+async function reviewApp(app,approve,note){await api('/api/admin/apps/'+encodeURIComponent(app.id)+'/'+(approve?'approve':'reject'),{method:'POST',body:JSON.stringify({note,revision:app.submitted_revision||app.revision})});await loadApps();toast(approve?'应用已发布':'应用已拒绝')}
+async function changePublication(app,publish,note){const label=publish?'重新上架':'下架';if(!confirm('确定'+label+'此共享应用吗？'))return;await api('/api/admin/apps/'+encodeURIComponent(app.id)+'/'+(publish?'republish':'unpublish'),{method:'POST',body:JSON.stringify({note,revision:app.submitted_revision||app.revision,lifecycle_revision:app.lifecycle_revision||0})});await loadApps();toast('应用已'+label)}
+function bind(){document.querySelectorAll('.nav-tab').forEach(x=>x.onclick=()=>switchView(x.dataset.view));document.querySelectorAll('.review-tab').forEach(x=>x.onclick=()=>{A.reviewStatus=x.dataset.status;renderAdminApps()});E('refreshMetricsBtn').onclick=()=>loadMetrics().catch(err=>toast(err.message,true));E('metricsHours').onchange=()=>{A.metricUserHash='';loadMetrics('').catch(err=>toast(err.message,true))};E('metricUserSelect').onchange=()=>{A.metricUserHash=E('metricUserSelect').value;loadMetrics(A.metricUserHash).catch(err=>toast(err.message,true))};E('saveConfigBtn').onclick=()=>saveConfig(false).catch(err=>{notice(err.message,true);toast(err.message,true)});E('setDefaultBtn').onclick=()=>saveConfig(true).catch(err=>toast(err.message,true));E('restoreDefaultBtn').onclick=()=>resetConfig('default').catch(err=>toast(err.message,true));E('resetInitialBtn').onclick=()=>{if(confirm('确定重置为程序初始参数吗？'))resetConfig('initial').catch(err=>toast(err.message,true))};E('saveRestartBtn').onclick=()=>restartWithDraft().catch(err=>toast(err.message,true));E('exportConfigBtn').onclick=()=>downloadJson('clouds-coder-startup-config.json',{version:1,values:collectConfig()});E('importConfigBtn').onclick=()=>E('configFileInput').click();E('configFileInput').onchange=()=>{const f=E('configFileInput').files?.[0];if(f)importConfigFile(f).catch(err=>toast(err.message,true));E('configFileInput').value=''};E('refreshAppsBtn').onclick=()=>loadApps().catch(err=>toast(err.message,true));E('adminSkillSearch').oninput=renderSkillCatalog;E('createSharedAppBtn').onclick=()=>createSharedApp().catch(err=>toast(err.message,true));E('logoutBtn').onclick=()=>logoutAdmin();E('setupForm').onsubmit=ev=>{ev.preventDefault();registerAdmin()};E('passwordLoginForm').onsubmit=ev=>{ev.preventDefault();loginWithPassword()};E('tokenLoginForm').onsubmit=ev=>{ev.preventDefault();loginWithToken()};E('retryAuthBtn').onclick=()=>bootstrapAuth();window.addEventListener('resize',()=>{clearTimeout(A.metricResizeTimer);A.metricResizeTimer=setTimeout(()=>{if(A.metrics&&E('metricsView').classList.contains('active'))renderMetricCharts(A.metrics)},160)})}
+window.addEventListener('DOMContentLoaded',async()=>{bind();await bootstrapAuth()});
 """
 
 RAG_TERM_GROUPS = (
@@ -71731,7 +74606,7 @@ class CodeContentParser:
             "kind": "source_code",
             "mime": str(mime or guess_mime_from_name(fp.name, "text/plain")),
             "size": int(fp.stat().st_size) if fp.exists() and fp.is_file() else len((raw_bytes or b"")),
-            "sha256": _sha256_file(fp) if fp.exists() and fp.is_file() else _sha256_bytes(safe_utf8_bytes(raw_text or "")),
+            "sha256": _sha256_file(fp) if fp.exists() and fp.is_file() else _sha256_bytes((raw_text or "").encode("utf-8")),
             "language": language or "text",
             "text": raw_text,
             "text_chars": len(raw_text),
@@ -74651,9 +77526,9 @@ class WikiStore:
             if isinstance(value, list):
                 lines.append(f"{key}:")
                 for item in value:
-                    lines.append(f"  - {json_dumps(str(item))}")
+                    lines.append(f"  - {json.dumps(str(item), ensure_ascii=False)}")
             else:
-                lines.append(f"{key}: {json_dumps(value)}")
+                lines.append(f"{key}: {json.dumps(value, ensure_ascii=False)}")
         lines.append("---")
         return "\n".join(lines) + "\n\n"
 
@@ -75348,9 +78223,13 @@ class UserMemoryStore:
             "Emit [] if nothing is durable. Output ONLY the JSON array."
         )
         try:
+            system_prompt = "/no_think\nYou output ONLY a compact JSON array. No prose, no code fences."
+            inject = getattr(sess, "_helper_system_prompt", None)
+            if callable(inject):
+                system_prompt = inject(system_prompt)
             rsp = ollama.chat(
                 [{"role": "user", "content": prompt}],
-                system="/no_think\nYou output ONLY a compact JSON array. No prose, no code fences.",
+                system=system_prompt,
                 max_tokens=400,
                 think=False,
             )
@@ -75883,9 +78762,9 @@ class WorkflowMemoryStore:
             if isinstance(value, list):
                 lines.append(f"{key}:")
                 for item in value[:80]:
-                    lines.append(f"  - {json_dumps(str(item))}")
+                    lines.append(f"  - {json.dumps(str(item), ensure_ascii=False)}")
             elif isinstance(value, (str, int, float, bool)):
-                lines.append(f"{key}: {json_dumps(value)}")
+                lines.append(f"{key}: {json.dumps(value, ensure_ascii=False)}")
         lines.append("---")
         return "\n".join(lines) + "\n\n"
 
@@ -76769,6 +79648,9 @@ class RAGIngestionService:
         try:
             rsp = session.ollama.chat(
                 [{"role": "user", "content": prompt}],
+                system=session._helper_system_prompt(
+                    "/no_think\nAnalyze only the supplied knowledge assets and return strict JSON."
+                ),
                 max_tokens=700,
                 temperature=0.1,
                 think=False,
@@ -78315,7 +81197,9 @@ const GRAPH_ZOOM_MIN_FACTOR=0.22;
 const GRAPH_ZOOM_MAX_FACTOR=14;
 const E=id=>document.getElementById(id);
 async function api(path,init){
-  const res=await fetch(path,Object.assign({headers:{'Content-Type':'application/json'}},init||{}));
+  const opts=Object.assign({},init||{}),headers=Object.assign({'Content-Type':'application/json'},opts.headers||{});
+  if(String(opts.method||'GET').toUpperCase()!=='GET'){let token=String(sessionStorage.getItem('clouds_coder_admin_token')||'').trim();if(!token){token=String(prompt('Admin token required for library changes')||'').trim();if(token)sessionStorage.setItem('clouds_coder_admin_token',token)}if(token)headers.Authorization='Bearer '+token}
+  const res=await fetch(path,Object.assign(opts,{headers}));
   const text=await res.text();
   let data=text;
   try{data=text?JSON.parse(text):{}}catch{}
@@ -80537,6 +83421,7 @@ const E=id=>document.getElementById(id);
 const S={config:null,sessions:[],roots:[],activeSession:'',activeRoot:'session',treeCache:new Map(),openFiles:new Map(),activeFile:null,dirty:false};
 async function api(path,opts={}){
   const headers=Object.assign({'Content-Type':'application/json'},opts.headers||{});
+  if(String(opts.method||'GET').toUpperCase()!=='GET'){let token=String(sessionStorage.getItem('clouds_coder_admin_token')||'').trim();if(!token){token=String(prompt('Admin token required for IDE changes')||'').trim();if(token)sessionStorage.setItem('clouds_coder_admin_token',token)}if(token)headers.Authorization='Bearer '+token}
   const res=await fetch(path,Object.assign({headers},opts));
   const text=await res.text();
   let data={};
@@ -80738,7 +83623,7 @@ window.addEventListener('DOMContentLoaded',async()=>{bind();try{await refreshCon
 class AppContext:
     def _llm_config_revision(self, config: dict | None) -> str:
         try:
-            raw = json_dumps(config or {}, sort_keys=True, default=str)
+            raw = json.dumps(config or {}, ensure_ascii=False, sort_keys=True, default=str)
         except Exception:
             raw = json_dumps(config or {})
         return hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()[:16]
@@ -80907,7 +83792,7 @@ class AppContext:
         self.codes_root.mkdir(parents=True, exist_ok=True)
         self.crypto = CryptoBox(self.codes_root)
         self._session_mgrs: dict[str, SessionManager] = {}
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self.max_user = max(0, int(max_user or 0))
         self.max_user_sessions = max(0, int(max_user_sessions or 0))
         self.daily_session_limit_per_ip = max(0, int(daily_session_limit_per_ip or 0))
@@ -80930,6 +83815,27 @@ class AppContext:
         self.ide_mounts_cache: dict[str, list[dict]] = {}
         self.ide_port = IDE_DEFAULT_PORT
         self.ide_enabled = False
+        self.admin_state_root = self.workspace / ADMIN_STATE_DIRNAME
+        self.admin_state_root.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(self.admin_state_root, 0o700)
+        except Exception:
+            pass
+        self.admin_config_path = self.admin_state_root / ADMIN_CONFIG_FILENAME
+        self.admin_token_path = self.admin_state_root / "admin.token"
+        self.admin_auth = AdminAuthStore(self.admin_state_root / ADMIN_AUTH_FILENAME)
+        self.admin_token = self._load_or_create_admin_token(allow_create=not self.admin_auth.configured())
+        self.admin_initial_config = _admin_factory_config()
+        self.admin_active_config = dict(self.admin_initial_config)
+        self.telemetry = TelemetryStore(self.admin_state_root / ADMIN_TELEMETRY_FILENAME)
+        self.applications = ApplicationRegistry(self, self.admin_state_root / ADMIN_APPS_FILENAME)
+        self.restart_callback = None
+        self.restart_pending = False
+        self.restart_config: dict | None = None
+        self.restart_nonce = ""
+        self.restart_from_boot_id = ""
+        self.restart_lock = threading.Lock()
+        self.admin_config_lock = threading.RLock()
         self.rag_include_filename_entities = bool(rag_include_filename_entities)
         self.rag_parser = RAGContentParser(include_filename_entities=self.rag_include_filename_entities)
         self.rag_root = self.workspace / RAG_LIBRARY_DIRNAME
@@ -80974,6 +83880,177 @@ class AppContext:
             daemon=True,
         )
         self._session_watchdog_thread.start()
+
+    def _load_or_create_admin_token(self, *, allow_create: bool = True) -> str:
+        env_token = str(os.getenv("CLOUDS_CODER_ADMIN_TOKEN", "") or "").strip()
+        if env_token:
+            return env_token
+        try:
+            if self.admin_token_path.exists():
+                token = self.admin_token_path.read_text(encoding="utf-8").strip()
+                if len(token) >= 24:
+                    return token
+        except Exception:
+            pass
+        if not allow_create:
+            return ""
+        token = "cc_admin_" + base64.urlsafe_b64encode(os.urandom(32)).decode("ascii").rstrip("=")
+        try:
+            fd = os.open(self.admin_token_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(token + "\n")
+                handle.flush()
+                try:
+                    os.fsync(handle.fileno())
+                except Exception:
+                    pass
+        except FileExistsError:
+            try:
+                existing = self.admin_token_path.read_text(encoding="utf-8").strip()
+                if len(existing) >= 24:
+                    return existing
+            except Exception:
+                pass
+            raise RuntimeError("admin token file already exists but is invalid")
+        return token
+
+    def verify_admin_token(self, token: str) -> str:
+        candidate = str(token or "").strip()
+        if not candidate:
+            return ""
+        expected = str(getattr(self, "admin_token", "") or "")
+        if expected and hmac.compare_digest(candidate, expected):
+            return "token"
+        try:
+            if self.admin_auth.verify_session(candidate):
+                return "session"
+        except Exception:
+            pass
+        return ""
+
+    def admin_auth_status(self, *, local_setup_allowed: bool) -> dict:
+        configured = bool(self.admin_auth.configured())
+        return {
+            "setup_required": not configured,
+            "password_login_enabled": configured,
+            "token_login_enabled": bool(str(self.admin_token or "").strip()),
+            "local_setup_allowed": bool((not configured) and local_setup_allowed),
+            "setup_local_only": True,
+            "session_ttl_seconds": ADMIN_AUTH_SESSION_TTL_SECONDS,
+        }
+
+    def setup_admin(
+        self,
+        username: object,
+        password: object,
+        *,
+        local_setup_allowed: bool,
+        bootstrap_token: str = "",
+    ) -> dict:
+        if self.admin_auth.configured():
+            raise AdminAuthError("setup_already_completed", "管理员已经创建，请直接登录", 409)
+        bootstrap_ok = self.verify_admin_token(bootstrap_token) == "token"
+        if not local_setup_allowed and not bootstrap_ok:
+            raise AdminAuthError(
+                "setup_local_only",
+                "首次创建管理员仅允许在本机进行；远程初始化需提供现有 Admin Token",
+                403,
+            )
+        return self.admin_auth.setup(username, password)
+
+    def login_admin(self, username: object, password: object, client_ip: str) -> dict:
+        if not self.admin_auth.configured():
+            raise AdminAuthError("setup_required", "请先创建管理员账号", 409)
+        return self.admin_auth.login(username, password, client_ip)
+
+    def exchange_admin_token(self, token: str) -> dict:
+        if self.verify_admin_token(token) != "token":
+            raise AdminAuthError("invalid_token", "Admin Token 无效", 401)
+        return self.admin_auth.issue_session(username_key="__token__", auth_version=0)
+
+    def logout_admin(self, token: str) -> None:
+        self.admin_auth.revoke_session(token)
+
+    def configure_admin_runtime(self, active_config: dict, initial_config: dict | None = None) -> None:
+        clean, errors = _admin_coerce_config(active_config)
+        if not errors:
+            clean.pop("_effective_ports", None)
+            self.admin_active_config = clean
+        if isinstance(initial_config, dict):
+            initial, initial_errors = _admin_coerce_config(initial_config)
+            if not initial_errors:
+                initial.pop("_effective_ports", None)
+                self.admin_initial_config = initial
+
+    def admin_config_payload(self) -> dict:
+        with self.admin_config_lock:
+            stored = _read_json_file(self.admin_config_path, {})
+            draft_raw = stored.get("draft", self.admin_active_config) if isinstance(stored, dict) else self.admin_active_config
+            defaults_raw = stored.get("defaults", self.admin_initial_config) if isinstance(stored, dict) else self.admin_initial_config
+            draft, draft_errors = _admin_coerce_config(draft_raw)
+            defaults, default_errors = _admin_coerce_config(defaults_raw)
+            ports = dict(draft.pop("_effective_ports", {}) or {})
+            defaults.pop("_effective_ports", None)
+            revision_material = json.dumps(
+                {"draft": draft, "defaults": defaults, "updated_at": float(stored.get("updated_at", 0.0) or 0.0) if isinstance(stored, dict) else 0.0},
+                ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            )
+            return {
+                "boot_id": str(getattr(self.telemetry, "boot_id", "") or ""),
+                "revision": hashlib.sha256(revision_material.encode("utf-8")).hexdigest()[:24],
+                "schema": _admin_config_schema(), "active": dict(self.admin_active_config), "draft": draft,
+                "defaults": defaults, "initial": dict(self.admin_initial_config), "effective_ports": ports,
+                "validation_errors": draft_errors + default_errors, "restart_required": draft != self.admin_active_config,
+                "updated_at": float(stored.get("updated_at", 0.0) or 0.0) if isinstance(stored, dict) else 0.0,
+            }
+
+    def save_admin_config(self, values: object, *, set_default: bool = False, expected_revision: str = "") -> dict:
+        clean, errors = _admin_coerce_config(values)
+        ports = dict(clean.pop("_effective_ports", {}) or {})
+        if errors:
+            return {"ok": False, "errors": errors, "config": clean, "effective_ports": ports}
+        with self.admin_config_lock:
+            current = _read_json_file(self.admin_config_path, {})
+            current_draft, _ = _admin_coerce_config(current.get("draft", self.admin_active_config) if isinstance(current, dict) else self.admin_active_config)
+            current_defaults, _ = _admin_coerce_config(current.get("defaults", self.admin_initial_config) if isinstance(current, dict) else self.admin_initial_config)
+            current_draft.pop("_effective_ports", None)
+            current_defaults.pop("_effective_ports", None)
+            current_material = json.dumps(
+                {"draft": current_draft, "defaults": current_defaults, "updated_at": float(current.get("updated_at", 0.0) or 0.0) if isinstance(current, dict) else 0.0},
+                ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            )
+            current_revision = hashlib.sha256(current_material.encode("utf-8")).hexdigest()[:24]
+            if expected_revision and not hmac.compare_digest(str(expected_revision), current_revision):
+                return {"ok": False, "conflict": True, "error": "startup config changed; reload before saving", "revision": current_revision}
+            defaults = current.get("defaults", self.admin_initial_config) if isinstance(current, dict) else self.admin_initial_config
+            payload = {"version": 1, "draft": clean, "defaults": clean if set_default else defaults, "updated_at": now_ts()}
+            _write_json_file(self.admin_config_path, payload)
+        try:
+            os.chmod(self.admin_config_path, 0o600)
+        except Exception:
+            pass
+        return {"ok": True, "draft": clean, "defaults": payload["defaults"], "effective_ports": ports, "restart_required": clean != self.admin_active_config}
+
+    def reset_admin_config(self, target: str = "initial") -> dict:
+        current = _read_json_file(self.admin_config_path, {})
+        if target == "default":
+            values = current.get("defaults", self.admin_initial_config) if isinstance(current, dict) else self.admin_initial_config
+        else:
+            values = self.admin_initial_config
+        return self.save_admin_config(values)
+
+    def claim_admin_restart(self, config: dict, *, expected_boot_id: str = "") -> tuple[bool, str]:
+        with self.restart_lock:
+            current_boot = str(getattr(self.telemetry, "boot_id", "") or "")
+            if not expected_boot_id or not hmac.compare_digest(str(expected_boot_id), current_boot):
+                return False, "boot_conflict"
+            if self.restart_pending:
+                return False, "pending"
+            self.restart_pending = True
+            self.restart_config = dict(config)
+            self.restart_nonce = uuid.uuid4().hex
+            self.restart_from_boot_id = current_boot
+            return True, self.restart_nonce
 
     def _session_watchdog_loop(self):
         while not self._session_watchdog_stop.is_set():
@@ -81080,6 +84157,11 @@ class AppContext:
             fp = self._resolve_external_web_ui_file(root, name)
             if fp:
                 out["resolved_files"][name] = str(fp)
+        for name, markers in WEB_UI_APPLICATION_FEATURE_MARKERS.items():
+            fp_raw = str(out["resolved_files"].get(name, "") or "")
+            txt = try_read_text(Path(fp_raw), max_bytes=4_000_000) if fp_raw else None
+            if txt is None or any(marker not in txt for marker in markers):
+                out["errors"].append(f"missing_application_store_contract:{name}")
         out["ok"] = not out["missing_files"] and not out["errors"]
         return out
 
@@ -81508,6 +84590,24 @@ class AppContext:
             "preview_kind": preview_kind_for_path(rel) if fp.is_file() else "",
         }
 
+    def _ide_reject_hard_snapshot_mutation(
+        self,
+        user_id: str,
+        session_id: str,
+        root_id: str,
+        *targets: Path,
+    ) -> None:
+        if str(root_id or "session").strip() != "session":
+            return
+        sess = self._ide_session(user_id, session_id)
+        if sess.skill_mode != "hard":
+            return
+        snapshot = sess._application_snapshot_root().resolve()
+        for target in targets:
+            resolved = Path(target).resolve()
+            if resolved == snapshot or resolved.is_relative_to(snapshot):
+                raise PermissionError("immutable application skill resources are read-only")
+
     def ide_tree_payload(
         self,
         user_id: str,
@@ -81655,6 +84755,7 @@ class AppContext:
         if not normalize_rel_preview_path(rel):
             raise ValueError("path required")
         root, target, meta = self.ide_resolve_workspace(user_id, session_id, root_id, rel)
+        self._ide_reject_hard_snapshot_mutation(user_id, session_id, root_id, target)
         if target.exists() and target.is_dir():
             raise IsADirectoryError("target is a directory")
         if "content_b64" in payload:
@@ -81673,6 +84774,7 @@ class AppContext:
         if not normalize_rel_preview_path(rel):
             raise ValueError("path required")
         root, target, meta = self.ide_resolve_workspace(user_id, session_id, root_id, rel)
+        self._ide_reject_hard_snapshot_mutation(user_id, session_id, root_id, target)
         target.mkdir(parents=True, exist_ok=bool(payload.get("exist_ok", True)))
         return {"ok": True, "root": meta, "file": self._ide_file_stat(root, target)}
 
@@ -81684,6 +84786,7 @@ class AppContext:
             raise ValueError("old_path and new_path required")
         root, old_target, meta = self.ide_resolve_workspace(user_id, session_id, root_id, old_rel)
         _, new_target, _ = self.ide_resolve_workspace(user_id, session_id, root_id, new_rel)
+        self._ide_reject_hard_snapshot_mutation(user_id, session_id, root_id, old_target, new_target)
         if not old_target.exists():
             raise FileNotFoundError("source not found")
         if new_target.exists() and not bool(payload.get("overwrite", False)):
@@ -81698,6 +84801,7 @@ class AppContext:
         if not normalize_rel_preview_path(rel):
             raise ValueError("path required")
         _, target, meta = self.ide_resolve_workspace(user_id, session_id, root_id, rel)
+        self._ide_reject_hard_snapshot_mutation(user_id, session_id, root_id, target)
         if not target.exists():
             raise FileNotFoundError("target not found")
         if target.is_dir():
@@ -81718,6 +84822,7 @@ class AppContext:
         if len(items) > IDE_UPLOAD_MAX_ITEMS:
             raise ValueError(f"too many upload items (max {IDE_UPLOAD_MAX_ITEMS})")
         root, dest_dir, meta = self.ide_resolve_workspace(user_id, session_id, root_id, dest or ".")
+        self._ide_reject_hard_snapshot_mutation(user_id, session_id, root_id, dest_dir)
         dest_dir.mkdir(parents=True, exist_ok=True)
         written: list[dict] = []
         total = 0
@@ -81734,6 +84839,7 @@ class AppContext:
             if total > IDE_UPLOAD_TOTAL_MAX_BYTES:
                 raise ValueError("upload batch is too large")
             target = safe_path(normalize_rel_preview_path(f"{dest}/{rel_item}" if dest else rel_item), root)
+            self._ide_reject_hard_snapshot_mutation(user_id, session_id, root_id, target)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(raw)
             written.append(self._ide_file_stat(root, target))
@@ -81781,6 +84887,11 @@ class AppContext:
         root_id = str(payload.get("root_id", payload.get("root", "session")) or "session")
         cwd_rel = str(payload.get("cwd", payload.get("path", "")) or "")
         root, cwd, meta = self.ide_resolve_workspace(user_id, session_id, root_id, cwd_rel or ".")
+        sess = self._ide_session(user_id, session_id)
+        if sess.skill_mode == "hard":
+            guard_error = sess._guard_shell_write_scope(command, cwd)
+            if guard_error:
+                raise PermissionError(guard_error)
         if cwd.exists() and cwd.is_file():
             cwd = cwd.parent
         if not cwd.exists() or not cwd.is_dir():
@@ -81789,10 +84900,17 @@ class AppContext:
         timeout = max(1, min(MAX_SHELL_COMMAND_TIMEOUT_SECONDS, requested_timeout))
         started = now_ts()
         try:
+            effective_command = sess._rewrite_shell_virtual_paths(command, cwd) if sess.skill_mode == "hard" else command
+            shell_prefix = sess._hard_snapshot_shell_prefix() if sess.skill_mode == "hard" else []
+            run_command: object = effective_command
+            run_shell = True
+            if shell_prefix:
+                run_command = [*shell_prefix, "/bin/sh", "-c", effective_command]
+                run_shell = False
             proc = subprocess.run(
-                command,
+                run_command,
                 cwd=str(cwd),
-                shell=True,
+                shell=run_shell,
                 text=True,
                 capture_output=True,
                 timeout=timeout,
@@ -82520,6 +85638,9 @@ class AppContext:
         try:
             rsp = session.ollama.chat(
                 [{"role": "user", "content": prompt}],
+                system=session._helper_system_prompt(
+                    "/no_think\nSynthesize only from the numbered evidence and preserve exact citations."
+                ),
                 max_tokens=900,
                 temperature=0.1,
                 think=False,
@@ -82570,12 +85691,16 @@ class AppContext:
         else:
             translated = ""
             try:
+                system_prompt = "/no_think\nYou are a terse bilingual search-query translator. Output only the translated query text."
+                inject = getattr(session, "_helper_system_prompt", None)
+                if callable(inject):
+                    system_prompt = inject(system_prompt)
                 rsp = ollama.chat(
                     [{"role": "user", "content": (
                         f"Translate this search query to {target_lang}. Output ONLY the translation, "
                         f"no quotes, no explanation, keep proper nouns/code/acronyms as-is:\n{raw}"
                     )}],
-                    system="/no_think\nYou are a terse bilingual search-query translator. Output only the translated query text.",
+                    system=system_prompt,
                     max_tokens=120,
                     think=False,
                 )
@@ -83665,17 +86790,176 @@ class AppContext:
             if bool(status_before.get("enabled")) and int(status_before.get("remaining", 0) or 0) <= 0:
                 raise SessionCreationLimitExceeded(status_before)
             sess = mgr.create(title)
-            state = self._load_session_daily_limit_state_locked(user_id)
-            if str(state.get("window_key", "") or "") != str(status_before.get("window_key", "")):
-                state = {
-                    "window_key": str(status_before.get("window_key", "")),
-                    "used": 0,
-                }
-            state["used"] = max(0, int(state.get("used", 0) or 0)) + 1
-            state["window_key"] = str(status_before.get("window_key", ""))
-            self._save_session_daily_limit_state_locked(user_id, state)
-            status_after = self._session_creation_quota_status_locked(user_id, client_ip=client_ip)
+            try:
+                state = self._load_session_daily_limit_state_locked(user_id)
+                if str(state.get("window_key", "") or "") != str(status_before.get("window_key", "")):
+                    state = {"window_key": str(status_before.get("window_key", "")), "used": 0}
+                state["used"] = max(0, int(state.get("used", 0) or 0)) + 1
+                state["window_key"] = str(status_before.get("window_key", ""))
+                self._save_session_daily_limit_state_locked(user_id, state)
+                status_after = self._session_creation_quota_status_locked(user_id, client_ip=client_ip)
+            except Exception:
+                try:
+                    mgr.delete(sess.id)
+                except Exception:
+                    # Force local cleanup so a failed quota write cannot materialize a hidden session.
+                    with mgr.lock:
+                        mgr.sessions.pop(sess.id, None)
+                        mgr.session_index.pop(sess.id, None)
+                    shutil.rmtree(sess.root, ignore_errors=True)
+                raise
+        try:
+            self.telemetry.record("session_create", user_id=user_id, session_id=sess.id, status="success")
+        except Exception:
+            pass
         return sess, status_after
+
+    def launch_application_for_user(
+        self,
+        user_id: str,
+        app_id: str,
+        *,
+        title: str = "",
+        prompt: str = "",
+        client_ip: str = "",
+    ) -> dict:
+        launch_started = time.monotonic()
+        launch_recorded = False
+        try:
+            app_row = self.applications.resolve_launch(user_id, app_id)
+            capsule = str(app_row.get("capsule", "") or "")
+            skills = [dict(x) for x in (app_row.get("skills", []) or []) if isinstance(x, dict)]
+            if not capsule or not skills:
+                raise ValueError("application has no immutable skill snapshot")
+            # Recompute the approved capsule digest before consuming session quota.
+            digest = hashlib.sha256(capsule.encode("utf-8", errors="ignore")).hexdigest()
+            if not hmac.compare_digest(digest, str(app_row.get("capsule_digest", "") or "")):
+                raise ValueError("application snapshot integrity check failed")
+            resources = [dict(x) for x in (app_row.get("resources", []) or []) if isinstance(x, dict)]
+            snapshot_version = int(app_row.get("snapshot_version", 1) or 1)
+            resources_digest = self.applications._resources_digest(resources, snapshot_version)
+            expected_resources_digest = str(app_row.get("resources_digest", "") or "")
+            if snapshot_version >= 2 and not expected_resources_digest:
+                raise ValueError("application resource snapshot integrity check failed")
+            if expected_resources_digest and not hmac.compare_digest(resources_digest, expected_resources_digest):
+                raise ValueError("application resource snapshot integrity check failed")
+            decoded_resources: list[tuple[dict, bytes]] = []
+            mounted_paths: set[tuple[int, str]] = set()
+            for item in resources:
+                raw = self.applications.resource_bytes(item)
+                try:
+                    expected_size = int(item.get("size", -1)) if snapshot_version >= 2 else int(item.get("size", len(raw)) or len(raw))
+                except (TypeError, ValueError):
+                    expected_size = -1
+                if expected_size < 0 or len(raw) != expected_size:
+                    raise ValueError("resource size mismatch")
+                if not hmac.compare_digest(hashlib.sha256(raw).hexdigest(), str(item.get("digest", "") or "")):
+                    raise ValueError("resource digest mismatch")
+                rel = str(PurePosixPath(str(item.get("path", "") or "").replace("\\", "/"))).lstrip("/")
+                rel_parts = PurePosixPath(rel).parts
+                if not rel or "." in rel_parts or ".." in rel_parts or len(rel_parts) > 24 or any(len(x) > 180 for x in rel_parts):
+                    raise ValueError("invalid resource path")
+                resource_order = int(item.get("skill_order", 0) or 0)
+                if snapshot_version >= 2 and not 1 <= resource_order <= len(skills):
+                    raise ValueError("application resource snapshot has an invalid skill order")
+                normalized_rel = unicodedata.normalize("NFC", rel).casefold()
+                mount_key = (resource_order, normalized_rel)
+                if mount_key in mounted_paths:
+                    raise ValueError("application resource snapshot contains a duplicate mount path")
+                mounted_paths.add(mount_key)
+                decoded_resources.append((item, raw))
+            if snapshot_version >= 2:
+                capsule_data = json.loads(capsule)
+                self.applications._verify_v2_runtime_contract_manifest(skills, capsule_data, decoded_resources)
+            sess, quota_status = self.create_session_for_user(
+                user_id, title or str(app_row.get("name", "") or "Application"), client_ip=client_ip,
+            )
+            try:
+                with sess.lock:
+                    snapshot_root = sess.files_root / ".application_skills"
+                    if snapshot_root.exists():
+                        shutil.rmtree(snapshot_root)
+                    for item, raw in decoded_resources:
+                        skill_order = max(1, int(item.get("skill_order", 1) or 1))
+                        rel = str(PurePosixPath(str(item.get("path", "") or "").replace("\\", "/"))).lstrip("/")
+                        target = safe_path(f"{skill_order:02d}/{rel}", snapshot_root)
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.write_bytes(raw)
+                        try:
+                            os.chmod(target, 0o500 if target.suffix.lower() in {".sh", ".py", ".js", ".mjs"} else 0o400)
+                        except Exception:
+                            pass
+                    if resources:
+                        manifest = [{
+                            "skill_id": str(x.get("skill_id", "") or ""), "skill_order": int(x.get("skill_order", 0) or 0),
+                            "path": str(x.get("path", "") or ""), "digest": str(x.get("digest", "") or ""), "size": int(x.get("size", 0) or 0),
+                        } for x in resources]
+                        manifest_path = snapshot_root / "MANIFEST.json"
+                        manifest_path.write_text(json_dumps({"resources": manifest}, indent=2), encoding="utf-8")
+                        try:
+                            os.chmod(manifest_path, 0o400)
+                        except Exception:
+                            pass
+                    sess.app_binding = {
+                        "app_id": str(app_row.get("id", "") or ""), "source_app_id": str(app_row.get("source_app_id", "") or ""),
+                        "name": str(app_row.get("name", "") or ""), "scope": str(app_row.get("scope", "personal") or "personal"),
+                        "revision": int(app_row.get("submitted_revision", app_row.get("revision", 1)) or 1), "capsule_digest": digest,
+                        "resources_digest": resources_digest, "resource_count": len(resources),
+                    }
+                    sess.bound_skill_ids = [str(x.get("id", "") or "") for x in skills if str(x.get("id", "") or "")][:ADMIN_MAX_APP_SKILLS]
+                    sess.bound_skill_capsule = trim(capsule, ADMIN_MAX_APP_CAPSULE_CHARS)
+                    sess.skill_mode = "hard"
+                    sess._restore_application_snapshot_permissions()
+                    sess.updated_at = now_ts()
+                    sess._persist()
+                run = None
+                clean_prompt = str(prompt or "").strip()
+                if clean_prompt:
+                    run = self.submit_user_message(user_id, sess.id, clean_prompt)
+            except Exception:
+                deleted = False
+                try:
+                    manager = self.manager_for_user(user_id)
+                    deleted = bool(manager.delete(sess.id))
+                except Exception:
+                    try:
+                        manager = self.manager_for_user(user_id)
+                        with manager.lock:
+                            manager.sessions.pop(sess.id, None)
+                            manager.session_index.pop(sess.id, None)
+                        shutil.rmtree(sess.root, ignore_errors=True)
+                        deleted = not sess.root.exists()
+                    except Exception:
+                        deleted = False
+                if deleted:
+                    with self._lock:
+                        try:
+                            state = self._load_session_daily_limit_state_locked(user_id)
+                            state["used"] = max(0, int(state.get("used", 0) or 0) - 1)
+                            self._save_session_daily_limit_state_locked(user_id, state)
+                        except Exception:
+                            pass
+                raise
+            self.telemetry.record(
+                "app_launch", user_id=user_id, session_id=sess.id, app_id=str(app_row.get("id", "")), status="success",
+                duration_ms=round((time.monotonic() - launch_started) * 1000.0, 3),
+            )
+            launch_recorded = True
+            return {
+                "id": sess.id, "title": sess.title, "ui_language": sess.ui_language,
+                "app_binding": dict(sess.app_binding), "bound_skill_ids": list(sess.bound_skill_ids),
+                "session_creation_limit": quota_status, "run": run,
+            }
+        except Exception:
+            try:
+                if not launch_recorded:
+                    self.telemetry.record(
+                        "app_launch", user_id=user_id, app_id=str(app_id or ""), status="failed",
+                        duration_ms=round((time.monotonic() - launch_started) * 1000.0, 3),
+                    )
+            except Exception:
+                pass
+            raise
 
     def user_root(self, user_id: str) -> Path:
         root = self.codes_root / user_id
@@ -83887,6 +87171,16 @@ class AppContext:
         text = str(content or "").strip()
         if not text:
             raise ValueError("content required")
+        try:
+            self.telemetry.record(
+                "message",
+                user_id=user_id,
+                session_id=session_id,
+                app_id=str((getattr(sess, "app_binding", {}) or {}).get("app_id", "") or ""),
+                status="accepted",
+            )
+        except Exception:
+            pass
         if not self.scheduler_limits_enabled():
             mgr.prepare_user_intent_for_session(sess, text)
             return sess.submit_user_message(text)
@@ -84074,6 +87368,11 @@ class AppContext:
             mgr.web_search_setting_locked = bool(getattr(self, "web_search_setting_locked", False))
             mgr.user_memory_mode = normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
             mgr.user_memory_setting_locked = bool(getattr(self, "user_memory_setting_locked", False))
+            mgr.telemetry_callback = lambda kind, _uid=user_id, **fields: self.telemetry.record(kind, user_id=_uid, **fields)
+            with mgr.lock:
+                loaded_sessions = list(mgr.sessions.values())
+            for loaded_session in loaded_sessions:
+                loaded_session.set_telemetry_callback(mgr.telemetry_callback)
             global_revision = str(getattr(self, "global_llm_config_revision", "") or "")
             mgr_revision = str(getattr(mgr, "global_llm_config_revision", "") or "")
             if (
@@ -84589,6 +87888,24 @@ class AppContext:
         skipped: list[dict] = []
         errors: list[dict] = []
 
+        def safe_archive_path(raw_name: str) -> PurePosixPath:
+            normalized = str(raw_name or "").replace("\\", "/")
+            path = PurePosixPath(normalized)
+            if path.is_absolute() or not path.parts or any(part in {"", ".", ".."} for part in path.parts):
+                raise ValueError(f"unsafe archive path: {raw_name}")
+            return path
+
+        def save_resource(rel_file: PurePosixPath, data: bytes, source: str):
+            try:
+                target = safe_path(rel_file.as_posix(), self.skills_root)
+                if target.exists() and not overwrite:
+                    skipped.append({"source": source, "path": rel_file.as_posix(), "error": "already exists"})
+                    return
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(data)
+            except Exception as exc:
+                errors.append({"source": source, "path": rel_file.as_posix(), "error": str(exc)})
+
         def save_skill(rel_dir: str, text: str, source: str):
             rel_norm = self._normalize_skill_rel_dir(rel_dir, Path(source).stem or "uploaded-skill")
             meta, _ = parse_front_matter(str(text or ""))
@@ -84616,11 +87933,18 @@ class AppContext:
             if lower.endswith(".zip"):
                 with zipfile.ZipFile(io.BytesIO(raw), "r") as zf:
                     members = sorted(zf.infolist(), key=lambda x: x.filename.lower())
+                    if len(members) > ADMIN_MAX_APP_RESOURCE_FILES * 8:
+                        raise ValueError("skill archive contains too many files")
+                    total_uncompressed = sum(max(0, int(info.file_size or 0)) for info in members if not info.is_dir())
+                    if total_uncompressed > ADMIN_MAX_APP_RESOURCE_BYTES * 4:
+                        raise ValueError("skill archive is too large after extraction")
+                    skill_roots: list[tuple[PurePosixPath, PurePosixPath]] = []
                     for info in members:
                         if info.is_dir():
                             continue
-                        rel_name = str(info.filename or "").replace("\\", "/")
-                        if Path(rel_name).name.lower() != "skill.md":
+                        archive_path = safe_archive_path(info.filename)
+                        rel_name = archive_path.as_posix()
+                        if archive_path.name.lower() != "skill.md":
                             continue
                         try:
                             data = zf.read(info.filename)
@@ -84631,7 +87955,31 @@ class AppContext:
                         parent_rel = str(PurePosixPath(rel_name).parent)
                         if parent_rel in {"", "."}:
                             parent_rel = f"uploaded/{_sanitize_skill_slug(Path(safe_name).stem, 'zip-skill')}"
+                        destination_root = PurePosixPath(self._normalize_skill_rel_dir(parent_rel, archive_path.parent.name or "zip-skill"))
+                        skill_roots.append((archive_path.parent, destination_root))
                         save_skill(parent_rel, text, rel_name)
+                    for info in members:
+                        if info.is_dir():
+                            continue
+                        archive_path = safe_archive_path(info.filename)
+                        if archive_path.name.lower() == "skill.md":
+                            continue
+                        owner = next(
+                            (
+                                (source_root, destination_root)
+                                for source_root, destination_root in sorted(skill_roots, key=lambda row: len(row[0].parts), reverse=True)
+                                if archive_path.is_relative_to(source_root)
+                            ),
+                            None,
+                        )
+                        if owner is None:
+                            continue
+                        source_root, destination_root = owner
+                        relative_resource = archive_path.relative_to(source_root)
+                        data = zf.read(info.filename)
+                        save_resource(destination_root / relative_resource, data, archive_path.as_posix())
+                    if skill_roots:
+                        self._reload_skills_for_live_sessions()
             elif lower.endswith((".md", ".markdown", ".txt")):
                 text = self._decode_uploaded_text(raw)
                 raw_rel = str(PurePosixPath(str(filename or ""))).replace("\\", "/")
@@ -84679,6 +88027,11 @@ class AppContext:
             thinking_stream=bool(active.get("thinking_stream", False)),
         )
         client.apply_profile(active)
+        client.set_telemetry(
+            mgr.telemetry_callback,
+            context_provider=lambda: {},
+            name="skills_generation",
+        )
         think = False
         return client, think, active
 
@@ -84993,6 +88346,1126 @@ class AgentHTTPServer(ThreadingHTTPServer):
                 return
             raise
 
+
+class TelemetryStore:
+    """Low-contention aggregate telemetry; prompts, arguments and secrets are never stored."""
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.lock = threading.RLock()
+        self.boot_id = uuid.uuid4().hex
+        self.user_hash_key = self._load_user_hash_key()
+        self._init_db()
+
+    def _load_user_hash_key(self) -> bytes:
+        path = self.path.with_name("telemetry_user.key")
+        try:
+            raw = path.read_bytes()
+            if len(raw) >= 32:
+                return raw[:64]
+        except Exception:
+            pass
+        raw = os.urandom(32)
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(raw)
+                handle.flush()
+                if JSON_FSYNC_ENABLED:
+                    os.fsync(handle.fileno())
+        except FileExistsError:
+            existing = path.read_bytes()
+            if len(existing) >= 32:
+                return existing[:64]
+        return raw
+
+    def _connect(self):
+        conn = sqlite3.connect(str(self.path), timeout=8.0)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=8000")
+        return conn
+
+    def _init_db(self):
+        with self.lock, self._connect() as conn:
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS telemetry_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts REAL NOT NULL,
+                    boot_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    user_hash TEXT NOT NULL DEFAULT '',
+                    session_id TEXT NOT NULL DEFAULT '',
+                    app_id TEXT NOT NULL DEFAULT '',
+                    name TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT '',
+                    duration_ms REAL,
+                    prompt_tokens INTEGER,
+                    completion_tokens INTEGER,
+                    total_tokens INTEGER,
+                    provider TEXT NOT NULL DEFAULT '',
+                    model TEXT NOT NULL DEFAULT ''
+                )"""
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS telemetry_events_ts ON telemetry_events(ts)")
+            conn.execute("CREATE INDEX IF NOT EXISTS telemetry_events_kind ON telemetry_events(kind, ts)")
+            conn.execute("CREATE INDEX IF NOT EXISTS telemetry_events_user ON telemetry_events(user_hash, ts, kind)")
+            conn.execute("CREATE INDEX IF NOT EXISTS telemetry_events_app ON telemetry_events(app_id, ts, kind)")
+            conn.execute("CREATE INDEX IF NOT EXISTS telemetry_events_tool ON telemetry_events(kind, name, ts)")
+            conn.execute("CREATE INDEX IF NOT EXISTS telemetry_events_model ON telemetry_events(kind, provider, model, ts)")
+
+    def record(self, kind: str, **fields) -> None:
+        try:
+            user_raw = str(fields.get("user_id", "") or "")
+            user_hash = hmac.new(self.user_hash_key, user_raw.encode("utf-8", errors="ignore"), hashlib.sha256).hexdigest()[:24] if user_raw else ""
+            values = (
+                float(fields.get("ts", now_ts()) or now_ts()), self.boot_id, trim(str(kind or "unknown"), 60),
+                user_hash, trim(str(fields.get("session_id", "") or ""), 80), trim(str(fields.get("app_id", "") or ""), 80),
+                trim(str(fields.get("name", "") or ""), 120), trim(str(fields.get("status", "") or ""), 40),
+                fields.get("duration_ms"), fields.get("prompt_tokens"), fields.get("completion_tokens"), fields.get("total_tokens"),
+                trim(str(fields.get("provider", "") or ""), 80), trim(str(fields.get("model", "") or ""), 160),
+            )
+            with self.lock, self._connect() as conn:
+                conn.execute(
+                    "INSERT INTO telemetry_events(ts,boot_id,kind,user_hash,session_id,app_id,name,status,duration_ms,prompt_tokens,completion_tokens,total_tokens,provider,model) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    values,
+                )
+        except Exception:
+            pass
+
+    @staticmethod
+    def _percentile(values: list[float], percentile: float) -> float:
+        clean = sorted(float(x) for x in values if x is not None and float(x) >= 0)
+        if not clean:
+            return 0.0
+        rank = max(0, min(len(clean) - 1, int(math.ceil(len(clean) * percentile) - 1)))
+        return round(clean[rank], 1)
+
+    @staticmethod
+    def _bucket_seconds(hours: float) -> int:
+        if hours <= 6:
+            return 300
+        if hours <= 24:
+            return 900
+        if hours <= 24 * 7:
+            return 3600
+        if hours <= 24 * 30:
+            return 21600
+        return 86400
+
+    def dashboard(self, app: object, since_hours: float = 24.0, *, user_hash: str = "") -> dict:
+        hours = max(0.25, min(24.0 * 365.0, float(since_hours or 24.0)))
+        current = now_ts()
+        since = current - hours * 3600.0
+        bucket_seconds = self._bucket_seconds(hours)
+        failure_statuses = {"error", "timeout", "failed", "cancelled", "canceled"}
+        if user_hash and not re.fullmatch(r"(?:[0-9a-f]{16}|[0-9a-f]{24}|[0-9a-f]{32}|[0-9a-f]{64})", user_hash):
+            raise ValueError("invalid anonymous user hash")
+        with self.lock, self._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            db_rows = [dict(row) for row in conn.execute(
+                "SELECT ts,kind,user_hash,session_id,app_id,name,status,duration_ms,prompt_tokens,completion_tokens,total_tokens,provider,model FROM telemetry_events WHERE ts>=? AND ts<=? ORDER BY ts LIMIT 1000000",
+                (since, current),
+            )]
+
+        def failed(row: dict) -> bool:
+            return str(row.get("status", "") or "").lower() in failure_statuses
+
+        def aggregate_dimension(rows: list[dict], dimension: str, kind: str, limit: int = 20) -> list[dict]:
+            groups: dict[object, list[dict]] = {}
+            for row in rows:
+                if row.get("kind") != kind:
+                    continue
+                if dimension == "model":
+                    key: object = (str(row.get("provider", "") or ""), str(row.get("model", "") or ""))
+                else:
+                    key = str(row.get(dimension, "") or "") or "unknown"
+                groups.setdefault(key, []).append(row)
+            out: list[dict] = []
+            for key, items in groups.items():
+                durations = [float(x["duration_ms"]) for x in items if x.get("duration_ms") is not None]
+                successes = sum(1 for x in items if str(x.get("status", "")).lower() == "success")
+                failures = sum(1 for x in items if failed(x))
+                base = {
+                    "calls": len(items), "success": successes, "failures": failures, "errors": failures,
+                    "timeouts": sum(1 for x in items if str(x.get("status", "")).lower() == "timeout"),
+                    "cancelled": sum(1 for x in items if str(x.get("status", "")).lower() in {"cancelled", "canceled"}),
+                    "avg_ms": round(sum(durations) / len(durations), 1) if durations else 0.0,
+                    "p50_ms": self._percentile(durations, 0.50), "p95_ms": self._percentile(durations, 0.95),
+                }
+                if dimension == "model":
+                    base.update({
+                        "provider": key[0], "model": key[1],
+                        "prompt_tokens": sum(int(x.get("prompt_tokens") or 0) for x in items),
+                        "completion_tokens": sum(int(x.get("completion_tokens") or 0) for x in items),
+                        "tokens": sum(int(x.get("total_tokens") or 0) for x in items),
+                    })
+                else:
+                    base["name"] = str(key)
+                out.append(base)
+            return sorted(out, key=lambda x: (-int(x.get("calls", 0)), str(x.get("name", x.get("model", "")))))[:limit]
+
+        totals: dict[str, dict] = {}
+        statuses: dict[tuple[str, str], int] = {}
+        for row in db_rows:
+            kind = str(row.get("kind", "unknown") or "unknown")
+            item = totals.setdefault(kind, {"count": 0, "errors": 0, "failures": 0, "duration_ms": 0.0})
+            item["count"] += 1
+            item["duration_ms"] += float(row.get("duration_ms") or 0.0)
+            if failed(row):
+                item["errors"] += 1
+                item["failures"] += 1
+            status = str(row.get("status", "unknown") or "unknown").lower()
+            statuses[(kind, status)] = statuses.get((kind, status), 0) + 1
+
+        buckets: dict[int, dict] = {}
+        first_bucket = int(since // bucket_seconds) * bucket_seconds
+        last_bucket = int(current // bucket_seconds) * bucket_seconds
+        for ts in range(first_bucket, last_bucket + 1, bucket_seconds):
+            buckets[ts] = {
+                "ts": ts, "active_users": 0, "active_sessions": 0, "messages": 0, "app_launches": 0,
+                "llm_calls": 0, "llm_success": 0, "llm_failures": 0, "tool_calls": 0, "tool_failures": 0,
+                "failures": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+                "avg_llm_ms": 0.0, "avg_tool_ms": 0.0,
+            }
+        bucket_users: dict[int, set[str]] = {}
+        bucket_sessions: dict[int, set[str]] = {}
+        bucket_llm_duration: dict[int, list[float]] = {}
+        bucket_tool_duration: dict[int, list[float]] = {}
+        for row in db_rows:
+            ts = int(float(row.get("ts") or 0) // bucket_seconds) * bucket_seconds
+            item = buckets.setdefault(ts, {"ts": ts})
+            kind = str(row.get("kind", "") or "")
+            if row.get("user_hash"):
+                bucket_users.setdefault(ts, set()).add(str(row["user_hash"]))
+            if row.get("session_id"):
+                bucket_sessions.setdefault(ts, set()).add(str(row["session_id"]))
+            mapping = {"message": "messages", "app_launch": "app_launches", "llm_call": "llm_calls", "tool_call": "tool_calls"}
+            if kind in mapping:
+                item[mapping[kind]] = int(item.get(mapping[kind], 0)) + 1
+            if failed(row):
+                item["failures"] = int(item.get("failures", 0)) + 1
+                if kind == "llm_call":
+                    item["llm_failures"] = int(item.get("llm_failures", 0)) + 1
+                if kind == "tool_call":
+                    item["tool_failures"] = int(item.get("tool_failures", 0)) + 1
+            elif kind == "llm_call" and str(row.get("status", "")).lower() == "success":
+                item["llm_success"] = int(item.get("llm_success", 0)) + 1
+            if kind == "llm_call":
+                item["prompt_tokens"] = int(item.get("prompt_tokens", 0)) + int(row.get("prompt_tokens") or 0)
+                item["completion_tokens"] = int(item.get("completion_tokens", 0)) + int(row.get("completion_tokens") or 0)
+                item["total_tokens"] = int(item.get("total_tokens", 0)) + int(row.get("total_tokens") or 0)
+                if row.get("duration_ms") is not None:
+                    bucket_llm_duration.setdefault(ts, []).append(float(row["duration_ms"]))
+            if kind == "tool_call" and row.get("duration_ms") is not None:
+                bucket_tool_duration.setdefault(ts, []).append(float(row["duration_ms"]))
+        series = []
+        for ts in sorted(buckets):
+            item = buckets[ts]
+            item["active_users"] = len(bucket_users.get(ts, set()))
+            item["active_sessions"] = len(bucket_sessions.get(ts, set()))
+            llm_duration = bucket_llm_duration.get(ts, [])
+            tool_duration = bucket_tool_duration.get(ts, [])
+            item["avg_llm_ms"] = round(sum(llm_duration) / len(llm_duration), 1) if llm_duration else 0.0
+            item["avg_tool_ms"] = round(sum(tool_duration) / len(tool_duration), 1) if tool_duration else 0.0
+            series.append(item)
+
+        llm_rows = [x for x in db_rows if x.get("kind") == "llm_call"]
+        tool_call_rows = [x for x in db_rows if x.get("kind") == "tool_call"]
+        llm_duration = [float(x["duration_ms"]) for x in llm_rows if x.get("duration_ms") is not None]
+        tool_duration = [float(x["duration_ms"]) for x in tool_call_rows if x.get("duration_ms") is not None]
+        models = aggregate_dimension(db_rows, "model", "llm_call")
+        tools = aggregate_dimension(db_rows, "name", "tool_call")
+
+        users_map: dict[str, list[dict]] = {}
+        apps_map: dict[str, list[dict]] = {}
+        for row in db_rows:
+            if row.get("user_hash"):
+                users_map.setdefault(str(row["user_hash"]), []).append(row)
+            if row.get("app_id"):
+                apps_map.setdefault(str(row["app_id"]), []).append(row)
+
+        def activity_summary(items: list[dict]) -> dict:
+            llm = [x for x in items if x.get("kind") == "llm_call"]
+            return {
+                "first_seen": min((float(x.get("ts") or 0) for x in items), default=0.0),
+                "last_seen": max((float(x.get("ts") or 0) for x in items), default=0.0),
+                "sessions": len({str(x.get("session_id")) for x in items if x.get("session_id")}),
+                "messages": sum(1 for x in items if x.get("kind") == "message"),
+                "app_launches": sum(1 for x in items if x.get("kind") == "app_launch"),
+                "llm_calls": len(llm), "tool_calls": sum(1 for x in items if x.get("kind") == "tool_call"),
+                "success": sum(1 for x in items if x.get("kind") in {"llm_call", "tool_call"} and str(x.get("status", "")).lower() == "success"),
+                "failures": sum(1 for x in items if x.get("kind") in {"llm_call", "tool_call"} and failed(x)),
+                "total_tokens": sum(int(x.get("total_tokens") or 0) for x in llm),
+                "avg_llm_ms": round(sum(float(x.get("duration_ms") or 0) for x in llm if x.get("duration_ms") is not None) / max(1, sum(1 for x in llm if x.get("duration_ms") is not None)), 1),
+                "apps_used": len({str(x.get("app_id")) for x in items if x.get("app_id")}),
+                "models_used": len({(str(x.get("provider", "")), str(x.get("model", ""))) for x in llm}),
+            }
+
+        users = []
+        for key, items in users_map.items():
+            users.append({"user_hash": key, **activity_summary(items)})
+        users = sorted(users, key=lambda x: (-int(x["llm_calls"]), -int(x["tool_calls"]), -float(x["last_seen"])))[:100]
+
+        app_names: dict[str, str] = {}
+        try:
+            for row in app.applications.list_admin(""):
+                app_names[str(row.get("id", ""))] = str(row.get("name", "") or "")
+        except Exception:
+            pass
+        apps = []
+        for key, items in apps_map.items():
+            base = activity_summary(items)
+            apps.append({
+                "app_id": key, "name": app_names.get(key, ""), "active_users": len({str(x.get("user_hash")) for x in items if x.get("user_hash")}),
+                "launches": base["app_launches"], **base,
+            })
+        apps = sorted(apps, key=lambda x: (-int(x["launches"]), -int(x["llm_calls"]), str(x["app_id"])))[:50]
+
+        focus_user = None
+        if user_hash and user_hash in users_map:
+            focus_rows = users_map[user_hash]
+            focus_summary = {"user_hash": user_hash, **activity_summary(focus_rows)}
+            focus_series = []
+            for global_bucket in series:
+                ts = int(global_bucket.get("ts", 0) or 0)
+                items = [x for x in focus_rows if int(float(x.get("ts") or 0) // bucket_seconds) * bucket_seconds == ts]
+                focus_series.append({
+                    "ts": ts,
+                    "messages": sum(1 for x in items if x.get("kind") == "message"),
+                    "app_launches": sum(1 for x in items if x.get("kind") == "app_launch"),
+                    "llm_calls": sum(1 for x in items if x.get("kind") == "llm_call"),
+                    "tool_calls": sum(1 for x in items if x.get("kind") == "tool_call"),
+                    "failures": sum(1 for x in items if failed(x)),
+                    "prompt_tokens": sum(int(x.get("prompt_tokens") or 0) for x in items if x.get("kind") == "llm_call"),
+                    "completion_tokens": sum(int(x.get("completion_tokens") or 0) for x in items if x.get("kind") == "llm_call"),
+                    "total_tokens": sum(int(x.get("total_tokens") or int(x.get("prompt_tokens") or 0) + int(x.get("completion_tokens") or 0)) for x in items if x.get("kind") == "llm_call"),
+                })
+            focus_user = {
+                "user_hash": user_hash, "summary": focus_summary,
+                "series": focus_series,
+                "models": aggregate_dimension(focus_rows, "model", "llm_call", 20),
+                "tools": aggregate_dimension(focus_rows, "name", "tool_call", 20),
+                "apps": [{"app_id": key, "name": app_names.get(key, ""), "launches": summary["app_launches"], **summary}
+                         for key, values in sorted(((k, v) for k, v in apps_map.items() if any(str(x.get("user_hash", "")) == user_hash for x in v)), key=lambda x: x[0])
+                         if (summary := activity_summary([x for x in values if str(x.get("user_hash", "")) == user_hash]))],
+            }
+        with getattr(app, "_lock", threading.RLock()):
+            managers = list(getattr(app, "_session_mgrs", {}).values())
+        running = 0
+        loaded_sessions = 0
+        for mgr in managers:
+            try:
+                with mgr.lock:
+                    sessions = list(mgr.sessions.values())
+                loaded_sessions += len(sessions)
+                running += sum(1 for sess in sessions if bool(getattr(sess, "running", False)))
+            except Exception:
+                continue
+        known_users = len(app._known_user_ids()) if hasattr(app, "_known_user_ids") else len(managers)
+        total_sessions = 0
+        if hasattr(app, "_known_user_ids"):
+            for uid in app._known_user_ids():
+                try:
+                    total_sessions += sum(1 for p in (app.user_root(uid) / "sessions").iterdir() if p.is_dir())
+                except Exception:
+                    pass
+        scheduler = app.scheduler_status("") if hasattr(app, "scheduler_status") else {}
+        llm_success = sum(1 for x in llm_rows if str(x.get("status", "")).lower() == "success")
+        tool_success = sum(1 for x in tool_call_rows if str(x.get("status", "")).lower() == "success")
+        llm_failures = sum(1 for x in llm_rows if failed(x))
+        tool_failures = sum(1 for x in tool_call_rows if failed(x))
+        covered_calls = sum(1 for x in llm_rows if any(x.get(key) is not None for key in ("prompt_tokens", "completion_tokens", "total_tokens")))
+        total_events = len(db_rows)
+        return {
+            "schema_version": 2,
+            "range": {"hours": hours, "from": since, "to": current, "bucket_seconds": bucket_seconds, "timezone": "local"},
+            "gauges": {
+                "known_users": known_users, "active_users": len(users_map), "total_sessions": total_sessions or loaded_sessions,
+                "active_sessions": len({str(x.get("session_id")) for x in db_rows if x.get("session_id")}),
+                "running_sessions": running, "queue_depth": int(scheduler.get("queue_size", 0) or 0),
+            },
+            "events": totals,
+            "summary": {
+                "messages": int((totals.get("message", {}) or {}).get("count", 0)),
+                "app_launches": int((totals.get("app_launch", {}) or {}).get("count", 0)),
+                "llm_calls": len(llm_rows), "tool_calls": len(tool_call_rows),
+                "llm_success": llm_success, "llm_failures": llm_failures,
+                "llm_timeouts": sum(1 for x in llm_rows if str(x.get("status", "")).lower() == "timeout"),
+                "llm_cancelled": sum(1 for x in llm_rows if str(x.get("status", "")).lower() in {"cancelled", "canceled"}),
+                "tool_success": tool_success, "tool_failures": tool_failures,
+                "tool_timeouts": sum(1 for x in tool_call_rows if str(x.get("status", "")).lower() == "timeout"),
+                "tool_cancelled": sum(1 for x in tool_call_rows if str(x.get("status", "")).lower() in {"cancelled", "canceled"}),
+                "llm_success_rate": llm_success / len(llm_rows) if llm_rows else 0.0,
+                "tool_success_rate": tool_success / len(tool_call_rows) if tool_call_rows else 0.0,
+                "avg_llm_ms": round(sum(llm_duration) / len(llm_duration), 1) if llm_duration else 0.0,
+                "p50_llm_ms": self._percentile(llm_duration, 0.50), "p95_llm_ms": self._percentile(llm_duration, 0.95),
+                "avg_tool_ms": round(sum(tool_duration) / len(tool_duration), 1) if tool_duration else 0.0,
+                "p50_tool_ms": self._percentile(tool_duration, 0.50), "p95_tool_ms": self._percentile(tool_duration, 0.95),
+            },
+            "tokens": {
+                "prompt": sum(int(x.get("prompt_tokens") or 0) for x in llm_rows),
+                "completion": sum(int(x.get("completion_tokens") or 0) for x in llm_rows),
+                "total": sum(int(x.get("total_tokens") or int(x.get("prompt_tokens") or 0) + int(x.get("completion_tokens") or 0)) for x in llm_rows),
+                "usage_covered_calls": covered_calls, "llm_calls": len(llm_rows),
+                "coverage_rate": covered_calls / len(llm_rows) if llm_rows else 0.0,
+            },
+            "series": series, "tools": tools, "models": models, "apps": apps, "users": users,
+            "statuses": [{"kind": kind, "status": status, "count": count} for (kind, status), count in sorted(statuses.items())],
+            "coverage": {
+                "user_identified_events": sum(1 for x in db_rows if x.get("user_hash")) / total_events if total_events else 0.0,
+                "session_identified_events": sum(1 for x in db_rows if x.get("session_id")) / total_events if total_events else 0.0,
+                "app_identified_events": sum(1 for x in db_rows if x.get("app_id")) / total_events if total_events else 0.0,
+                "llm_token_calls": covered_calls / len(llm_rows) if llm_rows else 0.0,
+                "content_recorded": False, "user_identity": "source-derived-anonymous-hmac-v1",
+            },
+            "focus_user": focus_user,
+            "generated_at": current,
+        }
+
+
+class ApplicationRegistry:
+    """Per-user applications plus immutable, admin-reviewed shared revisions."""
+    def __init__(self, app: object, system_path: Path):
+        self.app = app
+        self.system_path = Path(system_path)
+        self.blob_root = self.system_path.parent / "app_blobs"
+        self.blob_root.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(self.blob_root, 0o700)
+        except Exception:
+            pass
+        self.lock = threading.RLock()
+
+    def _store_blob(self, raw: bytes) -> str:
+        digest = hashlib.sha256(raw).hexdigest()
+        target = self.blob_root / digest
+        if not target.exists():
+            tmp = self.blob_root / f".{digest}.{uuid.uuid4().hex}.tmp"
+            try:
+                tmp.write_bytes(raw)
+                try:
+                    os.chmod(tmp, 0o400)
+                except Exception:
+                    pass
+                try:
+                    os.link(tmp, target)
+                except FileExistsError:
+                    pass
+                finally:
+                    try:
+                        tmp.unlink()
+                    except Exception:
+                        pass
+            except Exception:
+                try:
+                    tmp.unlink()
+                except Exception:
+                    pass
+                raise
+        return digest
+
+    def resource_bytes(self, item: dict) -> bytes:
+        content_b64 = str(item.get("content_b64", "") or "")
+        if content_b64:
+            return base64.b64decode(content_b64, validate=True)
+        digest = str(item.get("blob_digest", item.get("digest", "")) or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError("application resource blob reference is invalid")
+        path = self.blob_root / digest
+        raw = path.read_bytes()
+        if not hmac.compare_digest(hashlib.sha256(raw).hexdigest(), digest):
+            raise ValueError("application resource blob integrity check failed")
+        return raw
+
+    def _externalize_resources(self, resources: list[dict]) -> list[dict]:
+        out: list[dict] = []
+        for item in resources:
+            row = dict(item)
+            content_b64 = str(row.get("content_b64", "") or "")
+            if content_b64:
+                raw = base64.b64decode(content_b64, validate=True)
+                if len(raw) > ADMIN_APP_INLINE_BLOB_BYTES:
+                    row["blob_digest"] = self._store_blob(raw)
+                    row.pop("content_b64", None)
+            out.append(row)
+        return out
+
+    def _personal_path(self, user_id: str) -> Path:
+        return self.app.user_root(user_id) / "applications.json"
+
+    def _read_rows(self, path: Path) -> list[dict]:
+        raw = _read_json_file(path, {"applications": []})
+        rows = raw.get("applications", []) if isinstance(raw, dict) else []
+        return [dict(x) for x in rows if isinstance(x, dict)]
+
+    def _write_rows(self, path: Path, rows: list[dict]) -> None:
+        _write_json_file(path, {"version": 2, "applications": rows, "updated_at": now_ts()})
+        try:
+            os.chmod(path, 0o600)
+        except Exception:
+            pass
+
+    def _public(self, row: dict, *, admin: bool = False) -> dict:
+        out = {
+            "id": str(row.get("id", "") or ""),
+            "name": str(row.get("name", "") or ""),
+            "description": str(row.get("description", "") or ""),
+            "icon": str(row.get("icon", "") or ""),
+            "scope": str(row.get("scope", "personal") or "personal"),
+            "status": str(row.get("status", "draft") or "draft"),
+            "revision": int(row.get("revision", 1) or 1),
+            "lifecycle_revision": int(row.get("lifecycle_revision", 0) or 0),
+            "submitted_revision": int(row.get("submitted_revision", row.get("revision", 1)) or 1),
+            "skills": [dict(x) for x in (row.get("skills", []) or []) if isinstance(x, dict)],
+            "created_at": float(row.get("created_at", 0.0) or 0.0),
+            "updated_at": float(row.get("updated_at", 0.0) or 0.0),
+            "review": dict(row.get("review", {}) or {}),
+            "snapshot_version": int(row.get("snapshot_version", 1) or 1),
+        }
+        if admin:
+            out["owner_hash"] = hashlib.sha256(str(row.get("owner", "") or "").encode()).hexdigest()[:16]
+            out["capsule_digest"] = str(row.get("capsule_digest", "") or "")
+            out["lifecycle_history"] = [
+                dict(item)
+                for item in (row.get("lifecycle_history", []) or [])
+                if isinstance(item, dict)
+            ]
+        return out
+
+    @staticmethod
+    def _lifecycle_note(note: object) -> str:
+        value = str(note or "").strip()
+        if len(value) > 1000:
+            raise ValueError("lifecycle note must be at most 1000 characters")
+        return value
+
+    @staticmethod
+    def _lifecycle_revision(row: dict) -> int:
+        return int(row.get("submitted_revision", row.get("revision", 0)) or 0)
+
+    @staticmethod
+    def _append_lifecycle(
+        row: dict,
+        *,
+        action: str,
+        from_status: str,
+        to_status: str,
+        note: str,
+        revision: int,
+    ) -> None:
+        history = [dict(item) for item in (row.get("lifecycle_history", []) or []) if isinstance(item, dict)]
+        lifecycle_revision = int(row.get("lifecycle_revision", 0) or 0) + 1
+        row["lifecycle_revision"] = lifecycle_revision
+        history.append({
+            "action": str(action),
+            "from": str(from_status),
+            "to": str(to_status),
+            "at": now_ts(),
+            "actor": "admin",
+            "note": str(note or ""),
+            "revision": int(revision),
+            "lifecycle_revision": lifecycle_revision,
+        })
+        row["lifecycle_history"] = history
+
+    @staticmethod
+    def _resources_digest(resources: list[dict], snapshot_version: int = 1) -> str:
+        if int(snapshot_version or 1) < 2:
+            material = "\n".join(
+                f"{str(x.get('skill_id', '') or '')}:{str(x.get('path', '') or '')}:{str(x.get('digest', '') or '')}"
+                for x in resources
+            )
+        else:
+            material = json.dumps(
+                [
+                    {
+                        "skill_id": str(x.get("skill_id", "") or ""),
+                        "skill_order": int(x.get("skill_order", 0) or 0),
+                        "kind": str(x.get("kind", "attachment") or "attachment"),
+                        "path": str(x.get("path", "") or ""),
+                        "digest": str(x.get("digest", "") or ""),
+                        "size": int(x.get("size", 0) or 0),
+                    }
+                    for x in resources
+                ],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+    def _verify_v2_runtime_contract_manifest(
+        self,
+        skills: list[dict],
+        capsule_data: object,
+        decoded_resources: list[tuple[dict, bytes]],
+    ) -> None:
+        capsule_skills = capsule_data.get("skills", []) if isinstance(capsule_data, dict) else []
+        if (
+            not isinstance(capsule_data, dict)
+            or int(capsule_data.get("snapshot_version", 0) or 0) != 2
+            or not isinstance(capsule_skills, list)
+            or len(capsule_skills) != len(skills)
+            or any(not isinstance(row, dict) for row in capsule_skills)
+        ):
+            raise ValueError("application v2 runtime contract manifest is incomplete")
+        source_items = [(row, raw) for row, raw in decoded_resources if str(row.get("kind", "") or "") == "skill_source" and str(row.get("path", "") or "") == "SKILL.md"]
+        source_rows = {int(row.get("skill_order", 0) or 0): (row, raw) for row, raw in source_items}
+        if len(source_items) != len(skills) or len(source_rows) != len(skills) or set(source_rows) != set(range(1, len(skills) + 1)):
+            raise ValueError("application v2 snapshot is missing an immutable SKILL.md source")
+        digest_presence = ["contract_digest" in row for row in capsule_skills]
+        if any(digest_presence) and not all(digest_presence):
+            raise ValueError("application v2 runtime contract manifest is incomplete")
+        legacy_v382 = bool(capsule_skills) and not any(digest_presence)
+        legacy_contract_rows: list[dict] = []
+        legacy_has_prebounded_digest = False
+        legacy_row_keys = {"order", "id", "render_digest", "source_digest", "contract_mode", "runtime_contract"}
+        for pos, skill in enumerate(skills):
+            contract_row = capsule_skills[pos]
+            order = int(skill.get("order", 0) or 0)
+            source_pair = source_rows.get(order)
+            source = source_pair[0] if source_pair is not None else None
+            if source is None or not hmac.compare_digest(str(source.get("digest", "") or ""), str(skill.get("source_digest", "") or "")) \
+                or not hmac.compare_digest(hashlib.sha256(source_pair[1]).hexdigest(), str(source.get("digest", "") or "")) \
+                or len(source_pair[1]) != int(source.get("size", -1) or -1) \
+                or int(source.get("size", -1) or -1) != int(skill.get("source_size", -2) or -2) \
+                or int(source.get("skill_order", 0) or 0) != order \
+                or str(skill.get("source_path", "") or "") != f"{order:02d}/SKILL.md" \
+                or str(source.get("skill_id", "") or "") != str(skill.get("id", "") or ""):
+                raise ValueError("application v2 source manifest does not match the approved skill")
+            contract = contract_row.get("runtime_contract")
+            if not isinstance(contract, str) or not contract:
+                raise ValueError("application v2 runtime contract does not match the approved skill")
+            contract_digest = hashlib.sha256(contract.encode("utf-8")).hexdigest()
+            if order != pos + 1 or int(skill.get("snapshot_version", 0) or 0) != 2 \
+                or int(contract_row.get("order", 0) or 0) != order \
+                or str(contract_row.get("id", "") or "") != str(skill.get("id", "") or "") \
+                or not hmac.compare_digest(str(contract_row.get("render_digest", "") or ""), str(skill.get("digest", "") or "")) \
+                or not hmac.compare_digest(str(contract_row.get("source_digest", "") or ""), str(skill.get("source_digest", "") or "")) \
+                or str(contract_row.get("contract_mode", "") or "") != str(skill.get("contract_mode", "") or "") \
+                or (not legacy_v382 and (not hmac.compare_digest(contract_digest, str(skill.get("contract_digest", "") or "")) or not hmac.compare_digest(contract_digest, str(contract_row.get("contract_digest", "") or "")))):
+                raise ValueError("application v2 runtime contract does not match the approved skill")
+            if legacy_v382:
+                old_digest = str(skill.get("contract_digest", "") or "")
+                if set(contract_row) != legacy_row_keys or str(skill.get("contract_mode", "") or "") != "auto-v1" or not re.fullmatch(r"[0-9a-f]{64}", old_digest) or source_pair is None:
+                    raise ValueError("application v2 runtime contract does not match the approved skill")
+                source_text = source_pair[1].decode("utf-8", errors="replace")
+                source_meta, source_body = parse_front_matter(source_text)
+                reconstructed_skill = {"description": str(source_meta.get("description", "") or ""), "meta": source_meta, "body": source_body}
+                prebounded = self._automatic_runtime_contract(str(skill.get("id", "") or ""), reconstructed_skill, source_text, order)
+                if not hmac.compare_digest(hashlib.sha256(prebounded.encode("utf-8")).hexdigest(), old_digest):
+                    raise ValueError("application v2 runtime contract does not match the approved skill")
+                if not hmac.compare_digest(contract_digest, old_digest):
+                    legacy_has_prebounded_digest = True
+                legacy_contract_rows.append({"contract": prebounded, "required_prefix": "\n".join(prebounded.splitlines()[:4])})
+        if legacy_v382:
+            if not legacy_has_prebounded_digest:
+                raise ValueError("application v2 runtime contract does not match the approved skill")
+            reconstructed_contracts = self._bounded_skill_contracts(legacy_contract_rows)
+            if any(not hmac.compare_digest(reconstructed_contracts[pos].encode("utf-8"), str(row.get("runtime_contract", "") or "").encode("utf-8")) for pos, row in enumerate(capsule_skills)):
+                raise ValueError("application v2 runtime contract does not match the approved skill")
+
+    def skill_catalog(self) -> list[dict]:
+        store = self.app._ensure_skills_store(force=False)
+        rows: list[dict] = []
+        for item in store.list_metadata():
+            sid = str(item.get("qualified_name", item.get("id", "")) or "")
+            if not sid or sid == "_warnings":
+                continue
+            skill = store.skills.get(sid, {})
+            if str(skill.get("protocol", "") or "") not in {SKILL_PROTOCOL_LOCAL, "builtin", SKILL_PROTOCOL_CLAWHUB}:
+                continue
+            text = store.load(sid)
+            if not text or str(text).startswith("Error:"):
+                continue
+            digest = hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()
+            rows.append({
+                "id": sid,
+                "name": str(item.get("name", sid) or sid),
+                "description": trim(str(item.get("description", "") or ""), 500),
+                "provider_id": str(item.get("provider_id", "") or ""),
+                "protocol": str(item.get("protocol", "") or ""),
+                "digest": digest,
+            })
+        return rows
+
+    def _skill_source_bytes(self, key: str, skill: dict) -> bytes:
+        source_path = str(skill.get("skill_abs_path", "") or "").strip()
+        if source_path:
+            try:
+                fp = Path(source_path).resolve()
+                if fp.exists() and fp.is_file() and not fp.is_symlink():
+                    raw = fp.read_bytes()
+                    if raw:
+                        return raw
+            except Exception:
+                pass
+        meta = skill.get("meta", {}) if isinstance(skill.get("meta"), dict) else {}
+        body = str(skill.get("body", "") or "")
+        canonical = (
+            "---\n"
+            + f"name: {json.dumps(str(skill.get('name', key) or key), ensure_ascii=False)}\n"
+            + f"description: {json.dumps(str(skill.get('description', '') or ''), ensure_ascii=False)}\n"
+            + "---\n\n"
+            + body
+            + ("\n\n<!-- frozen metadata -->\n" + json_dumps(meta, indent=2) if meta else "")
+            + "\n"
+        )
+        return canonical.encode("utf-8")
+
+    def _automatic_runtime_contract(self, key: str, skill: dict, source_text: str, index: int) -> str:
+        description = trim(str(skill.get("description", "") or "").strip(), 360)
+        mandatory_pattern = re.compile(
+            r"\b(?:MUST(?:\s+NOT)?|NEVER|DO\s+NOT|REQUIRED|ONLY|SHALL(?:\s+NOT)?)\b|"
+            r"(?:必须|不得|禁止|严禁|务必|不要|只能|仅限|应当)",
+            re.IGNORECASE,
+        )
+        workflow_pattern = re.compile(r"^\s*(?:[-*+]\s+|\d{1,3}[.)]\s+|#{1,6}\s+)")
+        mandatory: list[str] = []
+        workflow: list[str] = []
+        seen: set[str] = set()
+        for raw_line in source_text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+            line = " ".join(raw_line.strip().split())
+            if not line or len(line) > 900:
+                continue
+            fingerprint = line.casefold()
+            if fingerprint in seen:
+                continue
+            if mandatory_pattern.search(line):
+                mandatory.append(line)
+                seen.add(fingerprint)
+            elif workflow_pattern.match(raw_line) and len(workflow) < 18:
+                workflow.append(line)
+                seen.add(fingerprint)
+        source_ref = f"/workspace/.application_skills/{index:02d}/SKILL.md"
+        lines = [
+            f"Skill {key} is hard-bound to this application.",
+            f"The complete immutable source at {source_ref} is authoritative.",
+            "Before substantive execution, read that frozen SKILL.md completely; follow every constraint and workflow in it.",
+            "Never substitute the mutable global /skills copy and never bypass a stricter frozen instruction.",
+        ]
+        if description:
+            lines.append("Purpose: " + description)
+        if mandatory:
+            lines.append("Constraint index (verbatim; source remains authoritative):")
+            lines.extend("- " + line for line in mandatory)
+        if workflow:
+            lines.append("Workflow index:")
+            lines.extend("- " + line for line in workflow)
+        return "\n".join(lines)
+
+    def _bounded_skill_contracts(self, rows: list[dict]) -> list[str]:
+        count = max(1, len(rows))
+        # The wrapper is JSON, so leave ample room for escaping and structural overhead.
+        # JSON metadata and escaping consume roughly 280 chars per skill in addition to the contract.
+        per_skill = max(640, min(2200, (ADMIN_MAX_APP_CAPSULE_CHARS - 1000 - (320 * count)) // count))
+        contracts: list[str] = []
+        for row in rows:
+            contract = str(row.get("contract", "") or "").strip()
+            required_prefix = str(row.get("required_prefix", "") or "").strip()
+            if len(contract) <= per_skill:
+                contracts.append(contract)
+                continue
+            kept = required_prefix
+            for line in contract[len(required_prefix):].splitlines():
+                candidate = (kept + "\n" + line).strip()
+                if len(candidate) > per_skill:
+                    break
+                kept = candidate
+            kept += "\nAdditional immutable instructions remain in the frozen SKILL.md and must be read before execution."
+            contracts.append(kept)
+        return contracts
+
+    def _freeze_skills(self, refs: object) -> tuple[list[dict], str, str, list[dict], str]:
+        if not isinstance(refs, list):
+            raise ValueError("skills must be an array")
+        requested = [str(x.get("id", "") if isinstance(x, dict) else x).strip() for x in refs]
+        requested = [x for x in requested if x]
+        if not requested:
+            raise ValueError("select at least one skill")
+        if len(requested) > ADMIN_MAX_APP_SKILLS:
+            raise ValueError(f"an application supports at most {ADMIN_MAX_APP_SKILLS} skills")
+        if len(set(requested)) != len(requested):
+            raise ValueError("duplicate skill selection")
+        store = self.app._ensure_skills_store(force=False)
+        with self.app._lock:
+            # Freeze against one stable discovery snapshot while files and metadata are read.
+            return self._freeze_skills_from_store(store, requested)
+
+    def _freeze_skills_from_store(self, store: SkillStore, requested: list[str]) -> tuple[list[dict], str, str, list[dict], str]:
+        frozen: list[dict] = []
+        contract_rows: list[dict] = []
+        resource_rows: list[dict] = []
+        resource_bytes = 0
+        for index, ref in enumerate(requested, 1):
+            key, err = store._resolve_name(ref)
+            if err or not key or key != ref:
+                raise ValueError(err or f"use canonical skill id: {ref}")
+            skill = store.skills.get(key, {})
+            protocol = str(skill.get("protocol", "") or "")
+            if protocol not in {SKILL_PROTOCOL_LOCAL, "builtin", SKILL_PROTOCOL_CLAWHUB}:
+                raise ValueError(f"dynamic remote skill cannot be frozen: {key}")
+            text = store.load(key)
+            if not text or str(text).startswith("Error:"):
+                raise ValueError(str(text or f"skill unavailable: {key}"))
+            digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            meta = skill.get("meta", {}) if isinstance(skill.get("meta"), dict) else {}
+            source_bytes = self._skill_source_bytes(key, skill)
+            source_digest = hashlib.sha256(source_bytes).hexdigest()
+            if resource_bytes + len(source_bytes) > ADMIN_MAX_APP_RESOURCE_BYTES:
+                raise ValueError(f"immutable skill source snapshot is too large: {key}")
+            resource_rows.append({
+                "skill_id": key,
+                "skill_order": index,
+                "path": "SKILL.md",
+                "digest": source_digest,
+                "size": len(source_bytes),
+                "content_b64": base64.b64encode(source_bytes).decode("ascii"),
+                "kind": "skill_source",
+            })
+            resource_bytes += len(source_bytes)
+            source_text = source_bytes.decode("utf-8", errors="replace")
+            runtime_contract = store._skill_runtime_contract(meta)
+            mode = "explicit" if runtime_contract else "auto-v1"
+            required_prefix = (
+                f"Skill {key} is hard-bound to this application.\n"
+                f"The complete immutable source at /workspace/.application_skills/{index:02d}/SKILL.md is authoritative.\n"
+                "Before substantive execution, read that frozen SKILL.md completely; follow every constraint and workflow in it.\n"
+                "Never substitute the mutable global /skills copy and never bypass a stricter frozen instruction."
+            )
+            contract = runtime_contract if runtime_contract else self._automatic_runtime_contract(key, skill, source_text, index)
+            if runtime_contract:
+                contract = required_prefix + "\nAuthor-provided runtime contract:\n" + runtime_contract
+            contract_rows.append({"id": key, "order": index, "digest": digest, "contract": contract, "required_prefix": required_prefix, "mode": mode, "source_digest": source_digest})
+            frozen.append({
+                "id": key,
+                "name": str(skill.get("name", key) or key),
+                "description": trim(str(skill.get("description", "") or ""), 500),
+                "provider_id": str(skill.get("provider_id", "") or ""),
+                "protocol": protocol,
+                "digest": digest,
+                "snapshot_version": 2,
+                "source_digest": source_digest,
+                "source_size": len(source_bytes),
+                "source_path": f"{index:02d}/SKILL.md",
+                "contract_mode": mode,
+                "contract_digest": "",
+                "order": index,
+            })
+            for item in skill.get("attachments", []) if isinstance(skill.get("attachments"), list) else []:
+                if not isinstance(item, dict):
+                    continue
+                if len(resource_rows) >= ADMIN_MAX_APP_RESOURCE_FILES:
+                    raise ValueError("combined skill snapshot contains too many resource files")
+                if str(item.get("path", "") or "").replace("\\", "/").strip("/").lower() == "skill.md":
+                    continue
+                raw_bytes = b""
+                abs_path = str(item.get("abs_path", "") or "").strip()
+                try:
+                    if abs_path:
+                        fp = Path(abs_path).resolve()
+                        if fp.exists() and fp.is_file() and not fp.is_symlink():
+                            raw_bytes = fp.read_bytes()
+                except Exception:
+                    raw_bytes = b""
+                if not raw_bytes and bool(item.get("text_available", False)):
+                    raw_bytes = str(item.get("content", "") or "").encode("utf-8")
+                if not raw_bytes:
+                    continue
+                resource_bytes += len(raw_bytes)
+                if resource_bytes > ADMIN_MAX_APP_RESOURCE_BYTES:
+                    raise ValueError("combined skill resource snapshot is too large")
+                rel = str(PurePosixPath(str(item.get("path", "resource") or "resource").replace("\\", "/"))).lstrip("/")
+                if not rel or ".." in PurePosixPath(rel).parts:
+                    raise ValueError(f"invalid skill resource path: {rel}")
+                resource_rows.append({
+                    "skill_id": key,
+                    "skill_order": index,
+                    "path": rel,
+                    "digest": hashlib.sha256(raw_bytes).hexdigest(),
+                    "size": len(raw_bytes),
+                    "content_b64": base64.b64encode(raw_bytes).decode("ascii"),
+                    "kind": "attachment",
+                })
+        contracts = self._bounded_skill_contracts(contract_rows)
+        for pos, skill_row in enumerate(frozen):
+            skill_row["contract_digest"] = hashlib.sha256(contracts[pos].encode("utf-8")).hexdigest()
+        capsule_obj = {
+            "snapshot_version": 2,
+            "policy": "Frozen SKILL.md files are authoritative and must be read completely before substantive execution.",
+            "skills": [
+                {
+                    "order": row["order"],
+                    "id": row["id"],
+                    "render_digest": row["digest"],
+                    "source_digest": row["source_digest"],
+                    "contract_mode": row["mode"],
+                    "contract_digest": frozen[pos]["contract_digest"],
+                    "runtime_contract": contracts[pos],
+                }
+                for pos, row in enumerate(contract_rows)
+            ],
+        }
+        capsule = json_dumps(capsule_obj, indent=2)
+        if len(capsule) > ADMIN_MAX_APP_CAPSULE_CHARS:
+            raise ValueError("combined mandatory runtime contracts exceed the safe prompt budget")
+        resource_rows = self._externalize_resources(resource_rows)
+        resources_digest = self._resources_digest(resource_rows, 2)
+        return (
+            frozen,
+            capsule,
+            hashlib.sha256(capsule.encode("utf-8")).hexdigest(),
+            resource_rows,
+            resources_digest,
+        )
+
+    def list_personal(self, user_id: str) -> list[dict]:
+        with self.lock:
+            personal = [x for x in self._read_rows(self._personal_path(user_id)) if not x.get("deleted_at")]
+            submissions = self._read_rows(self.system_path)
+            latest: dict[str, dict] = {}
+            for row in submissions:
+                if str(row.get("owner", "") or "") != user_id:
+                    continue
+                source_id = str(row.get("source_app_id", "") or "")
+                if not source_id:
+                    continue
+                old = latest.get(source_id)
+                if old is None or float(row.get("updated_at", 0.0) or 0.0) > float(old.get("updated_at", 0.0) or 0.0):
+                    latest[source_id] = row
+            out: list[dict] = []
+            for row in personal:
+                public = self._public(row)
+                submission = latest.get(str(row.get("id", "") or ""))
+                if submission is not None:
+                    public["latest_submission"] = {
+                        "id": str(submission.get("id", "") or ""),
+                        "status": str(submission.get("status", "pending") or "pending"),
+                        "submitted_revision": int(submission.get("submitted_revision", 0) or 0),
+                        "submitted_at": float(submission.get("submitted_at", 0.0) or 0.0),
+                        "updated_at": float(submission.get("updated_at", 0.0) or 0.0),
+                        "review": dict(submission.get("review", {}) or {}),
+                    }
+                    if int(submission.get("submitted_revision", 0) or 0) == int(row.get("revision", 0) or 0):
+                        public["status"] = str(submission.get("status", "pending") or "pending")
+                out.append(public)
+            return out
+
+    def list_shared(self) -> list[dict]:
+        with self.lock:
+            rows = self._read_rows(self.system_path)
+            return [self._public(x) for x in rows if x.get("status") == "published" and not x.get("deleted_at")]
+
+    def list_admin(self, status: str = "") -> list[dict]:
+        target = str(status or "").strip().lower()
+        with self.lock:
+            rows = self._read_rows(self.system_path)
+            return [self._public(x, admin=True) for x in rows if not target or str(x.get("status", "")) == target]
+
+    def save_personal(self, user_id: str, payload: dict, app_id: str = "") -> dict:
+        name = trim(str(payload.get("name", "") or "").strip(), 100)
+        if not name:
+            raise ValueError("name is required")
+        description = trim(str(payload.get("description", "") or "").strip(), 1000)
+        frozen, capsule, capsule_digest, resources, resources_digest = self._freeze_skills(payload.get("skills", []))
+        now = now_ts()
+        with self.lock:
+            path = self._personal_path(user_id)
+            rows = self._read_rows(path)
+            idx = next((i for i, x in enumerate(rows) if str(x.get("id", "")) == str(app_id or "")), -1)
+            if app_id and idx < 0:
+                raise KeyError(app_id)
+            if idx >= 0 and str(rows[idx].get("owner", "")) != user_id:
+                raise PermissionError("application owner mismatch")
+            old = rows[idx] if idx >= 0 else {}
+            row = {
+                "id": str(old.get("id", "") or make_id("app")),
+                "owner": user_id,
+                "name": name,
+                "description": description,
+                "icon": trim(str(payload.get("icon", "") or ""), 20),
+                "scope": "personal",
+                "status": "draft",
+                "revision": int(old.get("revision", 0) or 0) + 1,
+                "skills": frozen,
+                "capsule": capsule,
+                "capsule_digest": capsule_digest,
+                "resources": resources,
+                "resources_digest": resources_digest,
+                "snapshot_version": 2,
+                "created_at": float(old.get("created_at", now) or now),
+                "updated_at": now,
+            }
+            if idx >= 0:
+                rows[idx] = row
+            else:
+                rows.append(row)
+            self._write_rows(path, rows)
+        return self._public(row)
+
+    def delete_personal(self, user_id: str, app_id: str) -> bool:
+        with self.lock:
+            path = self._personal_path(user_id)
+            rows = self._read_rows(path)
+            found = False
+            for row in rows:
+                if str(row.get("id", "")) == app_id and str(row.get("owner", "")) == user_id:
+                    row["deleted_at"] = now_ts()
+                    row["status"] = "deleted"
+                    found = True
+            if found:
+                self._write_rows(path, rows)
+            return found
+
+    def submit(self, user_id: str, app_id: str) -> dict:
+        with self.lock:
+            personal = self._read_rows(self._personal_path(user_id))
+            source = next((x for x in personal if str(x.get("id", "")) == app_id and not x.get("deleted_at")), None)
+            if not source or str(source.get("owner", "")) != user_id:
+                raise KeyError(app_id)
+            shared = self._read_rows(self.system_path)
+            source_revision = int(source.get("revision", 1) or 1)
+            duplicate = next(
+                (
+                    x for x in shared
+                    if str(x.get("source_app_id", "")) == app_id
+                    and int(x.get("submitted_revision", 0) or 0) == source_revision
+                ),
+                None,
+            )
+            if duplicate:
+                return self._public(duplicate)
+            submission_id = make_id("submission")
+            frozen = dict(source)
+            frozen.update({
+                "id": submission_id,
+                "source_app_id": app_id,
+                "scope": "shared",
+                "status": "pending",
+                "submitted_revision": source_revision,
+                "submitted_at": now_ts(),
+                "updated_at": now_ts(),
+                "review": {},
+                "lifecycle_revision": 0,
+            })
+            shared.append(frozen)
+            self._write_rows(self.system_path, shared)
+        return self._public(frozen)
+
+    def create_shared(self, payload: dict) -> dict:
+        frozen, capsule, capsule_digest, resources, resources_digest = self._freeze_skills(payload.get("skills", []))
+        now = now_ts()
+        row = {
+            "id": make_id("app"), "owner": "admin", "name": trim(str(payload.get("name", "") or ""), 100),
+            "description": trim(str(payload.get("description", "") or ""), 1000), "icon": trim(str(payload.get("icon", "") or ""), 20),
+            "scope": "shared", "status": "published", "revision": 1, "skills": frozen, "capsule": capsule,
+            "capsule_digest": capsule_digest, "resources": resources, "resources_digest": resources_digest,
+            "snapshot_version": 2, "lifecycle_revision": 1,
+            "created_at": now, "updated_at": now,
+            "review": {"decision": "approved", "reviewer": "admin", "reviewed_at": now},
+            "lifecycle_history": [{
+                "action": "publish", "from": "created", "to": "published", "at": now,
+                "actor": "admin", "note": "", "revision": 1, "lifecycle_revision": 1,
+            }],
+        }
+        if not row["name"]:
+            raise ValueError("name is required")
+        with self.lock:
+            rows = self._read_rows(self.system_path)
+            rows.append(row)
+            self._write_rows(self.system_path, rows)
+        return self._public(row, admin=True)
+
+    def review(self, app_id: str, approve: bool, note: str = "", expected_revision: int = 0) -> dict:
+        if int(expected_revision or 0) <= 0:
+            raise ValueError("a positive submitted revision is required")
+        clean_note = self._lifecycle_note(note)
+        with self.lock:
+            rows = self._read_rows(self.system_path)
+            idx = next((i for i, x in enumerate(rows) if str(x.get("id", "")) == app_id), -1)
+            if idx < 0:
+                raise KeyError(app_id)
+            row = rows[idx]
+            if expected_revision and int(row.get("submitted_revision", row.get("revision", 0)) or 0) != int(expected_revision):
+                raise RuntimeError("revision conflict")
+            decision = "published" if approve else "rejected"
+            current_status = str(row.get("status", ""))
+            if current_status == decision:
+                return self._public(row, admin=True)
+            if current_status != "pending":
+                raise RuntimeError("review decision is final")
+            row["status"] = decision
+            row["review"] = {"decision": "approved" if approve else "rejected", "note": clean_note, "reviewer": "admin", "reviewed_at": now_ts()}
+            self._append_lifecycle(
+                row,
+                action="publish" if approve else "reject",
+                from_status=current_status,
+                to_status=decision,
+                note=clean_note,
+                revision=self._lifecycle_revision(row),
+            )
+            row["updated_at"] = now_ts()
+            rows[idx] = row
+            self._write_rows(self.system_path, rows)
+        return self._public(row, admin=True)
+
+    def set_publication_status(
+        self,
+        app_id: str,
+        *,
+        publish: bool,
+        note: str = "",
+        expected_revision: int | None = None,
+        expected_lifecycle_revision: int | None = None,
+    ) -> dict:
+        clean_note = self._lifecycle_note(note)
+        if expected_revision is not None and int(expected_revision) <= 0:
+            raise ValueError("revision must be a positive integer when provided")
+        if expected_lifecycle_revision is not None and int(expected_lifecycle_revision) < 0:
+            raise ValueError("lifecycle revision must be a non-negative integer when provided")
+        with self.lock:
+            rows = self._read_rows(self.system_path)
+            idx = next((i for i, item in enumerate(rows) if str(item.get("id", "")) == app_id), -1)
+            if idx < 0:
+                raise KeyError(app_id)
+            row = rows[idx]
+            revision = self._lifecycle_revision(row)
+            if expected_revision is not None and revision != int(expected_revision):
+                raise RuntimeError("revision conflict")
+            lifecycle_revision = int(row.get("lifecycle_revision", 0) or 0)
+            if expected_lifecycle_revision is not None and lifecycle_revision != int(expected_lifecycle_revision):
+                raise RuntimeError("lifecycle revision conflict")
+            current_status = str(row.get("status", "") or "")
+            expected_status = "unpublished" if publish else "published"
+            target_status = "published" if publish else "unpublished"
+            if current_status != expected_status:
+                raise RuntimeError(f"application must be {expected_status} before this action")
+            row["status"] = target_status
+            self._append_lifecycle(
+                row,
+                action="republish" if publish else "unpublish",
+                from_status=current_status,
+                to_status=target_status,
+                note=clean_note,
+                revision=revision,
+            )
+            row["updated_at"] = now_ts()
+            rows[idx] = row
+            self._write_rows(self.system_path, rows)
+        return self._public(row, admin=True)
+
+    def resolve_launch(self, user_id: str, app_id: str) -> dict:
+        with self.lock:
+            personal = self._read_rows(self._personal_path(user_id))
+            row = next((x for x in personal if str(x.get("id", "")) == app_id and str(x.get("owner", "")) == user_id and not x.get("deleted_at")), None)
+            if row is None:
+                shared = self._read_rows(self.system_path)
+                row = next((x for x in shared if str(x.get("id", "")) == app_id and x.get("status") == "published" and not x.get("deleted_at")), None)
+            if row is None:
+                raise KeyError(app_id)
+            return dict(row)
+
+
 # Request router: serves chat APIs, admin APIs, SSE streams, asset endpoints,
 # and lightweight HTML entrypoints from one process-local handler.
 class Handler(BaseHTTPRequestHandler):
@@ -85001,6 +89474,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt: str, *args):
         return
+
+    def parse_request(self):
+        self._clouds_request_body_consumed = False
+        return super().parse_request()
 
     def handle(self):
         try:
@@ -85015,10 +89492,7 @@ class Handler(BaseHTTPRequestHandler):
         return self.server.app  # type: ignore[attr-defined]
 
     def _client_ip(self) -> str:
-        xff = self.headers.get("X-Forwarded-For", "").strip()
-        if xff:
-            return xff.split(",")[0].strip()
-        return self.client_address[0] if self.client_address else "0.0.0.0"
+        return trusted_client_ip(self)
 
     def _user_id(self) -> str:
         return user_id_from_ip(self._client_ip())
@@ -85026,16 +89500,80 @@ class Handler(BaseHTTPRequestHandler):
     def _session_mgr(self) -> SessionManager:
         return self.app.manager_for_user(self._user_id())
 
+    def _bearer_token(self) -> str:
+        auth = str(self.headers.get("Authorization", "") or "").strip()
+        if auth.lower().startswith("bearer "):
+            return auth[7:].strip()
+        return str(self.headers.get("X-Admin-Token", "") or "").strip()
+
+    def _local_admin_setup_request(self) -> bool:
+        peer = str(self.client_address[0] if getattr(self, "client_address", None) else "")
+        try:
+            if not ipaddress.ip_address(peer).is_loopback:
+                return False
+            if not ipaddress.ip_address(self._client_ip()).is_loopback:
+                return False
+        except Exception:
+            return False
+        host = str(self.headers.get("Host", "") or "").strip().lower()
+        if host.startswith("["):
+            hostname = host.split("]", 1)[0].lstrip("[")
+        else:
+            hostname = host.rsplit(":", 1)[0] if host.count(":") <= 1 else host
+        return hostname in {"localhost", "127.0.0.1", "::1"}
+
+    def _is_admin(self, query: dict | None = None) -> bool:
+        return bool(self.app.verify_admin_token(self._bearer_token()))
+
+    def _auth_error(self, exc: AdminAuthError):
+        payload = {"error": str(exc), "code": exc.code}
+        if exc.retry_after:
+            payload["retry_after"] = exc.retry_after
+        return self._send_json(payload, status=exc.status)
+
+    def _require_admin(self, query: dict | None = None) -> bool:
+        if self._is_admin(query):
+            return True
+        self._send_json({"error": "admin authentication required"}, status=401)
+        return False
+
+    def _same_origin_write(self) -> bool:
+        origin = str(self.headers.get("Origin", "") or "").strip()
+        if not origin:
+            return True
+        host = str(self.headers.get("Host", "") or "").strip()
+        parsed = urlparse(origin)
+        return bool(host and parsed.netloc == host and parsed.scheme in {"http", "https"})
+
     def _read_json(self) -> dict:
         return read_http_json_body(self)
 
-    def _send_json(self, obj: object, status: int = 200):
+    def _send_json(self, obj: object, status: int = 200, *, cors_origin: str = ""):
         body = json_response_bytes(obj)
         try:
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            if close_if_http_request_body_unread(self):
+                self.send_header("Connection", "close")
+            retry_after = int(obj.get("retry_after", 0) or 0) if isinstance(obj, dict) else 0
+            if status == 429 and retry_after > 0:
+                self.send_header("Retry-After", str(retry_after))
+            if cors_origin == "request":
+                origin = str(self.headers.get("Origin", "") or "").strip()
+                parsed = urlparse(origin)
+                host = str(parsed.hostname or "").strip().lower()
+                local_hosts = {
+                    "localhost",
+                    "127.0.0.1",
+                    "::1",
+                    str(self._client_ip() or "").strip().lower(),
+                    str(self.headers.get("Host", "") or "").split(":", 1)[0].strip().lower(),
+                }
+                if origin and parsed.scheme in {"http", "https"} and host in local_hosts:
+                    self.send_header("Access-Control-Allow-Origin", origin)
+                    self.send_header("Vary", "Origin")
             self.end_headers()
             self.wfile.write(body)
         except Exception as exc:
@@ -85104,7 +89642,7 @@ class Handler(BaseHTTPRequestHandler):
             raw_name = Path(str(filename or "download.bin")).name or "download.bin"
             ascii_name = unicodedata.normalize("NFKD", raw_name).encode("ascii", "ignore").decode("ascii")
             ascii_name = re.sub(r'[\r\n"\\;]+', "_", ascii_name).strip(" ._") or "download.bin"
-            encoded_name = quote(safe_utf8_bytes(raw_name), safe="")
+            encoded_name = quote(raw_name.encode("utf-8"), safe="")
             disposition = f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{encoded_name}'
             self.send_response(200)
             self.send_header("Content-Type", content_type)
@@ -85151,6 +89689,12 @@ class Handler(BaseHTTPRequestHandler):
         stats_only = _to_bool_like((query.get("stats", ["0"]) or ["0"])[0], default=False)
         if path == "/":
             return self._send_text(self.app.web_ui_agent_index_html(), "text/html; charset=utf-8")
+        if path == "/admin":
+            return self._send_text(ADMIN_INDEX_HTML, "text/html; charset=utf-8")
+        if path == "/assets/admin.css":
+            return self._send_text(ADMIN_CSS, "text/css; charset=utf-8", revalidate_cache=True)
+        if path == "/assets/admin.js":
+            return self._send_text(ADMIN_JS, "application/javascript; charset=utf-8", revalidate_cache=True)
         if path == "/assets/style.css":
             return self._send_text(
                 self.app.web_ui_agent_style_css(),
@@ -85170,7 +89714,60 @@ class Handler(BaseHTTPRequestHandler):
                 revalidate_cache=True,
             )
         if path == "/api/health":
-            return self._send_json({"ok": True, "version": APP_VERSION, "workspace": str(WORKDIR)})
+            requested_nonce = str((query.get("restart_nonce", [""]) or [""])[0] or "").strip()
+            requested_from = str((query.get("restart_from", [""]) or [""])[0] or "").strip()
+            inherited_nonce = str(os.getenv("CLOUDS_CODER_RESTART_NONCE", "") or "").strip()
+            inherited_from = str(os.getenv("CLOUDS_CODER_RESTART_FROM_BOOT_ID", "") or "").strip()
+            restart_verified = bool(
+                requested_nonce
+                and requested_from
+                and inherited_nonce
+                and inherited_from
+                and hmac.compare_digest(requested_nonce, inherited_nonce)
+                and hmac.compare_digest(requested_from, inherited_from)
+            )
+            return self._send_json({
+                "ok": True,
+                "version": APP_VERSION,
+                "workspace": str(WORKDIR),
+                "boot_id": str(getattr(self.app.telemetry, "boot_id", "") or ""),
+                "restart_verified": restart_verified,
+            }, cors_origin="request" if requested_nonce or requested_from else "")
+        if path == "/api/admin/auth/status":
+            return self._send_json(
+                self.app.admin_auth_status(local_setup_allowed=self._local_admin_setup_request())
+            )
+        if path == "/api/admin/auth/session":
+            kind = self.app.verify_admin_token(self._bearer_token())
+            if not kind:
+                return self._send_json({"error": "admin authentication required", "code": "unauthorized"}, status=401)
+            return self._send_json({"ok": True, "auth_kind": kind})
+        if path == "/api/apps/skills":
+            return self._send_json(self.app.applications.skill_catalog())
+        if path == "/api/apps/personal":
+            return self._send_json(self.app.applications.list_personal(self._user_id()))
+        if path == "/api/apps/shared":
+            return self._send_json(self.app.applications.list_shared())
+        if path == "/api/admin/config":
+            if not self._require_admin(query):
+                return
+            return self._send_json(self.app.admin_config_payload())
+        if path == "/api/admin/metrics":
+            if not self._require_admin(query):
+                return
+            try:
+                hours = float((query.get("hours", ["24"]) or ["24"])[0])
+            except Exception:
+                hours = 24.0
+            user_hash = str((query.get("user_hash", [""]) or [""])[0] or "").strip().lower()
+            if user_hash and not re.fullmatch(r"(?:[0-9a-f]{16}|[0-9a-f]{24}|[0-9a-f]{32}|[0-9a-f]{64})", user_hash):
+                return self._send_json({"error": "invalid anonymous user hash"}, status=400)
+            return self._send_json(self.app.telemetry.dashboard(self.app, hours, user_hash=user_hash))
+        if path == "/api/admin/apps":
+            if not self._require_admin(query):
+                return
+            status = str((query.get("status", [""]) or [""])[0] or "")
+            return self._send_json(self.app.applications.list_admin(status))
         if path == "/api/webui/validate":
             reload_external = _to_bool_like((query.get("reload", ["0"]) or ["0"])[0], default=False)
             return self._send_json(self.app.refresh_web_ui_validation(reload_external=reload_external))
@@ -85628,7 +90225,7 @@ class Handler(BaseHTTPRequestHandler):
             if not sess:
                 return self._send_json({"error": "session not found"}, status=404)
             md = sess.export_conversation_md()
-            return self._send_bytes(safe_utf8_bytes(md), "text/markdown; charset=utf-8", f"{sess.id}_conversation.md")
+            return self._send_bytes(md.encode("utf-8"), "text/markdown; charset=utf-8", f"{sess.id}_conversation.md")
         m = re.match(r"^/api/sessions/([^/]+)/export\.pdf$", path)
         if m:
             sess = mgr.get(m.group(1))
@@ -85653,7 +90250,196 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = unquote(urlparse(self.path).path)
+        if not self._same_origin_write():
+            return self._send_json({"error": "cross-origin write rejected"}, status=403)
+        if path in {
+            "/api/admin/auth/setup",
+            "/api/admin/auth/login",
+            "/api/admin/auth/token-login",
+            "/api/admin/auth/logout",
+        }:
+            content_type = str(self.headers.get("Content-Type", "") or "").split(";", 1)[0].strip().lower()
+            if content_type != "application/json":
+                return self._send_json({"error": "application/json is required", "code": "invalid_content_type"}, status=415)
+            try:
+                length = int(self.headers.get("Content-Length", "0") or "0")
+            except Exception:
+                length = 0
+            if length < 0 or length > 8192:
+                self.close_connection = True
+                return self._send_json({"error": "authentication request is too large", "code": "payload_too_large"}, status=413)
+            try:
+                payload = self._read_json()
+                if path == "/api/admin/auth/setup":
+                    out = self.app.setup_admin(
+                        payload.get("username"),
+                        payload.get("password"),
+                        local_setup_allowed=self._local_admin_setup_request(),
+                        bootstrap_token=self._bearer_token(),
+                    )
+                    return self._send_json(out, status=201)
+                if path == "/api/admin/auth/login":
+                    return self._send_json(
+                        self.app.login_admin(payload.get("username"), payload.get("password"), self._client_ip())
+                    )
+                if path == "/api/admin/auth/token-login":
+                    return self._send_json(self.app.exchange_admin_token(self._bearer_token()))
+                token = self._bearer_token()
+                if token:
+                    self.app.logout_admin(token)
+                return self._send_json({"ok": True})
+            except AdminAuthError as exc:
+                return self._auth_error(exc)
+            except Exception:
+                return self._send_json({"error": "invalid authentication request", "code": "invalid_request"}, status=400)
         mgr = self._session_mgr()
+        if path == "/api/apps/personal":
+            try:
+                return self._send_json(self.app.applications.save_personal(self._user_id(), self._read_json()), status=201)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        m = re.match(r"^/api/apps/([^/]+)/submit$", path)
+        if m:
+            try:
+                return self._send_json(self.app.applications.submit(self._user_id(), m.group(1)), status=201)
+            except KeyError:
+                return self._send_json({"error": "application not found"}, status=404)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        m = re.match(r"^/api/apps/([^/]+)/launch$", path)
+        if m:
+            payload = self._read_json()
+            try:
+                out = self.app.launch_application_for_user(
+                    self._user_id(), m.group(1), title=str(payload.get("title", "") or ""),
+                    prompt=str(payload.get("prompt", "") or ""), client_ip=self._client_ip(),
+                )
+                return self._send_json(out, status=201)
+            except KeyError:
+                return self._send_json({"error": "application not found"}, status=404)
+            except SessionCreationLimitExceeded as exc:
+                return self._send_json({"error": str(exc), "session_creation_limit": dict(exc.status or {})}, status=429)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        if path == "/api/admin/config":
+            if not self._require_admin():
+                return
+            payload = self._read_json()
+            out = self.app.save_admin_config(
+                payload.get("values", payload), set_default=bool(payload.get("set_default", False)),
+                expected_revision=str(payload.get("revision", "") or ""),
+            )
+            return self._send_json(out, status=200 if out.get("ok") else (409 if out.get("conflict") else 400))
+        if path == "/api/admin/config/reset":
+            if not self._require_admin():
+                return
+            payload = self._read_json()
+            out = self.app.reset_admin_config(str(payload.get("target", "initial") or "initial"))
+            return self._send_json(out, status=200 if out.get("ok") else 400)
+        if path == "/api/admin/restart":
+            if not self._require_admin():
+                return
+            payload = self._read_json()
+            cfg = self.app.admin_config_payload().get("draft", {})
+            clean, errors = _admin_coerce_config(cfg)
+            clean.pop("_effective_ports", None)
+            if errors:
+                return self._send_json({"error": "invalid startup config", "errors": errors}, status=400)
+            trigger = getattr(self.app, "restart_callback", None)
+            if not callable(trigger):
+                return self._send_json({"error": "restart controller is unavailable"}, status=503)
+            accepted, restart_state = self.app.claim_admin_restart(
+                clean,
+                expected_boot_id=str(payload.get("boot_id", "") or ""),
+            )
+            if not accepted:
+                error = "restart request targets a stale server boot" if restart_state == "boot_conflict" else "restart is already pending"
+                return self._send_json({"error": error, "boot_id": str(getattr(self.app.telemetry, "boot_id", "") or "")}, status=409)
+            self._send_json(
+                {
+                    "ok": True,
+                    "restarting": True,
+                    "argv": _admin_config_to_argv(clean),
+                    "boot_id": str(getattr(self.app.telemetry, "boot_id", "") or ""),
+                    "restart_nonce": restart_state,
+                    "target": {"host": str(clean.get("host", "") or ""), "port": int(clean.get("port", 0) or 0)},
+                },
+                status=202,
+            )
+            try:
+                self.wfile.flush()
+            except Exception:
+                pass
+            trigger()
+            return
+        if path == "/api/admin/apps":
+            if not self._require_admin():
+                return
+            try:
+                return self._send_json(self.app.applications.create_shared(self._read_json()), status=201)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        m = re.match(r"^/api/admin/apps/([^/]+)/(approve|reject)$", path)
+        if m:
+            if not self._require_admin():
+                return
+            payload = self._read_json()
+            try:
+                revision = int(payload.get("revision", 0) or 0)
+            except Exception:
+                revision = 0
+            if revision <= 0:
+                return self._send_json({"error": "a positive submitted revision is required"}, status=400)
+            try:
+                out = self.app.applications.review(
+                    m.group(1), m.group(2) == "approve", str(payload.get("note", "") or ""),
+                    revision,
+                )
+                return self._send_json(out)
+            except KeyError:
+                return self._send_json({"error": "application not found"}, status=404)
+            except RuntimeError as exc:
+                return self._send_json({"error": str(exc)}, status=409)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        m = re.match(r"^/api/admin/apps/([^/]+)/(unpublish|republish)$", path)
+        if m:
+            if not self._require_admin():
+                return
+            payload = self._read_json()
+            revision: int | None = None
+            lifecycle_revision: int | None = None
+            if "revision" in payload and payload.get("revision") not in {None, ""}:
+                try:
+                    revision = int(payload.get("revision"))
+                except Exception:
+                    return self._send_json({"error": "revision must be a positive integer"}, status=400)
+                if revision <= 0:
+                    return self._send_json({"error": "revision must be a positive integer"}, status=400)
+            if "lifecycle_revision" in payload and payload.get("lifecycle_revision") not in {None, ""}:
+                try:
+                    lifecycle_revision = int(payload.get("lifecycle_revision"))
+                except Exception:
+                    return self._send_json({"error": "lifecycle revision must be a non-negative integer"}, status=400)
+                if lifecycle_revision < 0:
+                    return self._send_json({"error": "lifecycle revision must be a non-negative integer"}, status=400)
+            try:
+                out = self.app.applications.set_publication_status(
+                    m.group(1),
+                    publish=m.group(2) == "republish",
+                    note=str(payload.get("note", "") or ""),
+                    expected_revision=revision,
+                    expected_lifecycle_revision=lifecycle_revision,
+                )
+                return self._send_json(out)
+            except KeyError:
+                return self._send_json({"error": "application not found"}, status=404)
+            except RuntimeError as exc:
+                return self._send_json({"error": str(exc)}, status=409)
+            except ValueError as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=500)
         if path == "/api/config/model":
             payload = self._read_json()
             model = str(payload.get("selection", payload.get("model", ""))).strip()
@@ -85689,6 +90475,8 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 return self._send_json({"error": str(exc)}, status=400)
         if path == "/api/webui/export":
+            if not self._require_admin():
+                return
             payload = self._read_json()
             ui_dir_raw = str(payload.get("dir", "") or "").strip()
             overwrite = bool(payload.get("overwrite", False))
@@ -85936,6 +90724,18 @@ class Handler(BaseHTTPRequestHandler):
     def do_PATCH(self):
         path = unquote(urlparse(self.path).path)
         mgr = self._session_mgr()
+        if not self._same_origin_write():
+            return self._send_json({"error": "cross-origin write rejected"}, status=403)
+        m = re.match(r"^/api/apps/([^/]+)$", path)
+        if m:
+            try:
+                return self._send_json(self.app.applications.save_personal(self._user_id(), self._read_json(), app_id=m.group(1)))
+            except KeyError:
+                return self._send_json({"error": "application not found"}, status=404)
+            except PermissionError:
+                return self._send_json({"error": "forbidden"}, status=403)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
         m = re.match(r"^/api/sessions/([^/]+)$", path)
         if not m:
             return self._send_json({"error": "not found"}, status=404)
@@ -85953,6 +90753,12 @@ class Handler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         path = unquote(urlparse(self.path).path)
         mgr = self._session_mgr()
+        if not self._same_origin_write():
+            return self._send_json({"error": "cross-origin write rejected"}, status=403)
+        m = re.match(r"^/api/apps/([^/]+)$", path)
+        if m:
+            ok = self.app.applications.delete_personal(self._user_id(), m.group(1))
+            return self._send_json({"ok": True}) if ok else self._send_json({"error": "application not found"}, status=404)
         m = re.match(r"^/api/sessions/([^/]+)$", path)
         if not m:
             return self._send_json({"error": "not found"}, status=404)
@@ -86021,6 +90827,10 @@ class SkillsHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args):
         return
 
+    def parse_request(self):
+        self._clouds_request_body_consumed = False
+        return super().parse_request()
+
     def handle(self):
         try:
             super().handle()
@@ -86034,10 +90844,7 @@ class SkillsHandler(BaseHTTPRequestHandler):
         return self.server.app  # type: ignore[attr-defined]
 
     def _client_ip(self) -> str:
-        xff = self.headers.get("X-Forwarded-For", "").strip()
-        if xff:
-            return xff.split(",")[0].strip()
-        return self.client_address[0] if self.client_address else "0.0.0.0"
+        return trusted_client_ip(self)
 
     def _user_id(self) -> str:
         return user_id_from_ip(self._client_ip())
@@ -86048,6 +90855,19 @@ class SkillsHandler(BaseHTTPRequestHandler):
     def _read_json(self) -> dict:
         return read_http_json_body(self)
 
+    def _is_admin(self) -> bool:
+        auth = str(self.headers.get("Authorization", "") or "").strip()
+        token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+        if not token:
+            token = str(self.headers.get("X-Admin-Token", "") or "").strip()
+        return bool(self.app.verify_admin_token(token))
+
+    def _require_admin(self) -> bool:
+        if self._is_admin():
+            return True
+        self._send_json({"error": "admin authentication required"}, status=401)
+        return False
+
     def _send_json(self, obj: object, status: int = 200):
         body = json_response_bytes(obj)
         try:
@@ -86055,6 +90875,8 @@ class SkillsHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            if close_if_http_request_body_unread(self):
+                self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(body)
         except Exception as exc:
@@ -86146,6 +90968,13 @@ class SkillsHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = unquote(urlparse(self.path).path)
         mgr = self._session_mgr()
+        if path in {"/api/webui/export", "/api/skillslab/generate", "/api/skillslab/save", "/api/skillslab/upload"}:
+            origin = str(self.headers.get("Origin", "") or "").strip()
+            parsed = urlparse(origin)
+            if origin and (parsed.scheme not in {"http", "https"} or parsed.netloc != str(self.headers.get("Host", "") or "")):
+                return self._send_json({"error": "cross-origin write rejected"}, status=403)
+            if not self._require_admin():
+                return
         if path == "/api/webui/export":
             payload = self._read_json()
             ui_dir_raw = str(payload.get("dir", "") or "").strip()
@@ -86224,6 +91053,10 @@ class RagAdminHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args):
         return
 
+    def parse_request(self):
+        self._clouds_request_body_consumed = False
+        return super().parse_request()
+
     def handle(self):
         try:
             super().handle()
@@ -86237,16 +91070,24 @@ class RagAdminHandler(BaseHTTPRequestHandler):
         return self.server.app  # type: ignore[attr-defined]
 
     def _client_ip(self) -> str:
-        xff = self.headers.get("X-Forwarded-For", "").strip()
-        if xff:
-            return xff.split(",")[0].strip()
-        return self.client_address[0] if self.client_address else "0.0.0.0"
+        return trusted_client_ip(self)
 
     def _user_id(self) -> str:
         return user_id_from_ip(self._client_ip())
 
     def _read_json(self) -> dict:
         return read_http_json_body(self)
+
+    def _require_admin_write(self) -> bool:
+        auth = str(self.headers.get("Authorization", "") or "").strip()
+        token = auth[7:].strip() if auth.lower().startswith("bearer ") else str(self.headers.get("X-Admin-Token", "") or "").strip()
+        origin = str(self.headers.get("Origin", "") or "").strip()
+        parsed = urlparse(origin)
+        same_origin = not origin or (parsed.scheme in {"http", "https"} and parsed.netloc == str(self.headers.get("Host", "") or ""))
+        if self.app.verify_admin_token(token) and same_origin:
+            return True
+        self._send_json({"error": "admin authentication and same-origin request required"}, status=401)
+        return False
 
     def _send_json(self, obj: object, status: int = 200):
         body = json_response_bytes(obj)
@@ -86255,6 +91096,8 @@ class RagAdminHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            if close_if_http_request_body_unread(self):
+                self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(body)
         except Exception as exc:
@@ -86269,6 +91112,8 @@ class RagAdminHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            if close_if_http_request_body_unread(self):
+                self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(body)
         except Exception as exc:
@@ -86357,6 +91202,8 @@ class RagAdminHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = unquote(urlparse(self.path).path)
+        if not self._require_admin_write():
+            return
         if path == "/api/rag/import":
             try:
                 out = self.app.rag_import_request(self._user_id(), self._read_json())
@@ -86391,6 +91238,10 @@ class CodeAdminHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args):
         return
 
+    def parse_request(self):
+        self._clouds_request_body_consumed = False
+        return super().parse_request()
+
     def handle(self):
         try:
             super().handle()
@@ -86404,16 +91255,24 @@ class CodeAdminHandler(BaseHTTPRequestHandler):
         return self.server.app  # type: ignore[attr-defined]
 
     def _client_ip(self) -> str:
-        xff = self.headers.get("X-Forwarded-For", "").strip()
-        if xff:
-            return xff.split(",")[0].strip()
-        return self.client_address[0] if self.client_address else "0.0.0.0"
+        return trusted_client_ip(self)
 
     def _user_id(self) -> str:
         return user_id_from_ip(self._client_ip())
 
     def _read_json(self) -> dict:
         return read_http_json_body(self)
+
+    def _require_admin_write(self) -> bool:
+        auth = str(self.headers.get("Authorization", "") or "").strip()
+        token = auth[7:].strip() if auth.lower().startswith("bearer ") else str(self.headers.get("X-Admin-Token", "") or "").strip()
+        origin = str(self.headers.get("Origin", "") or "").strip()
+        parsed = urlparse(origin)
+        same_origin = not origin or (parsed.scheme in {"http", "https"} and parsed.netloc == str(self.headers.get("Host", "") or ""))
+        if self.app.verify_admin_token(token) and same_origin:
+            return True
+        self._send_json({"error": "admin authentication and same-origin request required"}, status=401)
+        return False
 
     def _send_json(self, obj: object, status: int = 200):
         body = json_response_bytes(obj)
@@ -86422,6 +91281,8 @@ class CodeAdminHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            if close_if_http_request_body_unread(self):
+                self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(body)
         except Exception as exc:
@@ -86436,6 +91297,8 @@ class CodeAdminHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            if close_if_http_request_body_unread(self):
+                self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(body)
         except Exception as exc:
@@ -86530,6 +91393,8 @@ class CodeAdminHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = unquote(urlparse(self.path).path)
+        if not self._require_admin_write():
+            return
         if path == "/api/code/import":
             try:
                 out = self.app.code_import_request(self._user_id(), self._read_json())
@@ -86576,6 +91441,10 @@ class IdeHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args):
         return
 
+    def parse_request(self):
+        self._clouds_request_body_consumed = False
+        return super().parse_request()
+
     def handle(self):
         try:
             super().handle()
@@ -86589,16 +91458,24 @@ class IdeHandler(BaseHTTPRequestHandler):
         return self.server.app  # type: ignore[attr-defined]
 
     def _client_ip(self) -> str:
-        xff = self.headers.get("X-Forwarded-For", "").strip()
-        if xff:
-            return xff.split(",")[0].strip()
-        return self.client_address[0] if self.client_address else "0.0.0.0"
+        return trusted_client_ip(self)
 
     def _user_id(self) -> str:
         return user_id_from_ip(self._client_ip())
 
     def _read_json(self) -> dict:
         return read_http_json_body(self)
+
+    def _require_admin_write(self) -> bool:
+        auth = str(self.headers.get("Authorization", "") or "").strip()
+        token = auth[7:].strip() if auth.lower().startswith("bearer ") else str(self.headers.get("X-Admin-Token", "") or "").strip()
+        origin = str(self.headers.get("Origin", "") or "").strip()
+        parsed = urlparse(origin)
+        same_origin = not origin or (parsed.scheme in {"http", "https"} and parsed.netloc == str(self.headers.get("Host", "") or ""))
+        if self.app.verify_admin_token(token) and same_origin:
+            return True
+        self._send_json({"error": "admin authentication and same-origin request required"}, status=401)
+        return False
 
     def _send_json(self, obj: object, status: int = 200):
         body = json_response_bytes(obj)
@@ -86607,6 +91484,8 @@ class IdeHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            if close_if_http_request_body_unread(self):
+                self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(body)
         except Exception as exc:
@@ -86651,6 +91530,8 @@ class IdeHandler(BaseHTTPRequestHandler):
             return self._send_json({"error": str(exc) or "not found"}, status=404)
         if isinstance(exc, FileExistsError):
             return self._send_json({"error": str(exc) or "already exists"}, status=409)
+        if isinstance(exc, PermissionError):
+            return self._send_json({"error": str(exc) or "forbidden"}, status=403)
         if isinstance(exc, (ValueError, IsADirectoryError, NotADirectoryError)):
             return self._send_json({"error": str(exc)}, status=400)
         return self._send_json({"error": str(exc)}, status=500)
@@ -86729,6 +91610,8 @@ class IdeHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = unquote(urlparse(self.path).path)
+        if not self._require_admin_write():
+            return
         if path == "/api/ide/sessions":
             payload = self._read_json()
             try:
@@ -86794,6 +91677,8 @@ class IdeHandler(BaseHTTPRequestHandler):
 
     def do_PUT(self):
         path = unquote(urlparse(self.path).path)
+        if not self._require_admin_write():
+            return
         m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/file$", path)
         if not m:
             return self._send_json({"error": "not found"}, status=404)
@@ -86804,6 +91689,8 @@ class IdeHandler(BaseHTTPRequestHandler):
 
     def do_PATCH(self):
         path = unquote(urlparse(self.path).path)
+        if not self._require_admin_write():
+            return
         m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/rename$", path)
         if not m:
             return self._send_json({"error": "not found"}, status=404)
@@ -86814,6 +91701,8 @@ class IdeHandler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         path = unquote(urlparse(self.path).path)
+        if not self._require_admin_write():
+            return
         if path == "/api/ide/mounts":
             try:
                 payload = self._read_json()
@@ -86843,6 +91732,10 @@ class McpServiceHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args):
         return
 
+    def parse_request(self):
+        self._clouds_request_body_consumed = False
+        return super().parse_request()
+
     def handle(self):
         try:
             super().handle()
@@ -86861,6 +91754,17 @@ class McpServiceHandler(BaseHTTPRequestHandler):
     def _read_json(self) -> dict:
         return read_http_json_body(self)
 
+    def _require_admin_write(self) -> bool:
+        auth = str(self.headers.get("Authorization", "") or "").strip()
+        token = auth[7:].strip() if auth.lower().startswith("bearer ") else str(self.headers.get("X-Admin-Token", "") or "").strip()
+        origin = str(self.headers.get("Origin", "") or "").strip()
+        parsed = urlparse(origin)
+        same_origin = not origin or (parsed.scheme in {"http", "https"} and parsed.netloc == str(self.headers.get("Host", "") or ""))
+        if self.app.verify_admin_token(token) and same_origin:
+            return True
+        self._send_json({"error": "admin authentication and same-origin request required"}, status=401)
+        return False
+
     def _send_json(self, obj: object, status: int = 200):
         body = json_response_bytes(obj)
         try:
@@ -86868,6 +91772,8 @@ class McpServiceHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            if close_if_http_request_body_unread(self):
+                self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(body)
         except Exception as exc:
@@ -86940,6 +91846,8 @@ class McpServiceHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = unquote(urlparse(self.path).path)
+        if not self._require_admin_write():
+            return
         mgr = self._mgr()
         if mgr is None:
             return self._send_json({"error": "mcp manager unavailable"}, status=503)
@@ -87439,6 +92347,21 @@ def main():
         web_search_enabled=None,
         user_memory_mode=None,
     )
+    skip_admin_defaults = str(os.environ.pop("CLOUDS_CODER_SKIP_ADMIN_DEFAULTS", "") or "").strip().lower() in {"1", "true", "yes", "on"}
+    admin_default_keys: set[str] = set()
+    if not skip_admin_defaults:
+        stored_admin = _read_json_file(WORKDIR / ADMIN_STATE_DIRNAME / ADMIN_CONFIG_FILENAME, {})
+        stored_defaults = stored_admin.get("defaults") if isinstance(stored_admin, dict) else None
+        if isinstance(stored_defaults, dict):
+            schema_keys = {str(spec["key"]) for spec in _admin_config_schema()}
+            admin_default_keys = {
+                str(key) for key in stored_defaults.keys()
+                if str(key) in schema_keys
+            }
+            clean_defaults, default_errors = _admin_coerce_config(stored_defaults)
+            clean_defaults.pop("_effective_ports", None)
+            if not default_errors:
+                parser.set_defaults(**_admin_argparse_defaults(clean_defaults))
     args = parser.parse_args()
     web_ui_config_path = resolve_optional_file_path(str(getattr(args, "web_ui_config", "") or ""), WORKDIR)
     web_ui_config = load_web_ui_config_file(web_ui_config_path)
@@ -87635,7 +92558,7 @@ def main():
     ctx_limit_locked = any(
         str(arg).split("=", 1)[0] in {"--ctx_limit", "--ctx-limit"}
         for arg in sys.argv[1:]
-    )
+    ) or "ctx_limit" in admin_default_keys
     requested_ctx_limit = int(args.ctx_limit or DEFAULT_CONTEXT_TOKEN_LIMIT)
     if not ctx_limit_locked:
         cfg_ctx_limit = extract_context_token_limit_setting(external_config)
@@ -87975,6 +92898,53 @@ def main():
     rag_admin_port = int(args.rag_admin_port) if args.rag_admin_port is not None else int(args.port) + RAG_ADMIN_PORT_OFFSET
     code_admin_port = int(args.code_admin_port) if args.code_admin_port is not None else int(args.port) + CODE_ADMIN_PORT_OFFSET
     ide_port = int(args.ide_port) if getattr(args, "ide_port", None) is not None else int(args.port) + IDE_PORT_OFFSET
+    active_admin_config = _admin_config_from_namespace(args)
+    active_admin_config.update({
+        "host": str(args.host),
+        "port": int(args.port),
+        "skills_port": int(skills_port),
+        "rag_admin_port": int(rag_admin_port),
+        "code_admin_port": int(code_admin_port),
+        "mcp_service_port": int(args.mcp_service_port) if getattr(args, "mcp_service_port", None) is not None else int(args.port) + MCP_SERVICE_PORT_OFFSET,
+        "ide_port": int(ide_port),
+        "ctx_limit": int(resolved_ctx_limit),
+        "max_rounds": int(resolved_max_rounds),
+        "run_timeout": int(resolved_run_timeout),
+        "shell_command_timeout": int(resolved_shell_command_timeout),
+        "live_input_delay_write": int(resolved_live_input_delay_write),
+        "live_input_delay_tool": int(resolved_live_input_delay_tool),
+        "live_input_delay_normal": int(resolved_live_input_delay_normal),
+        "live_input_max_injections": int(resolved_live_input_max_injections),
+        "live_input_reinject_interval": int(resolved_live_input_reinject_interval),
+        "live_input_weight_base_delayed": float(resolved_live_input_weight_base_delayed),
+        "live_input_weight_base_normal": float(resolved_live_input_weight_base_normal),
+        "live_input_weight_step_delayed": float(resolved_live_input_weight_step_delayed),
+        "live_input_weight_step_normal": float(resolved_live_input_weight_step_normal),
+        "skills_root": str(skills_root),
+        "web_ui_config": str(web_ui_config_path),
+        "web_ui_dir": str(resolved_web_ui_dir),
+        "language": str(resolved_language),
+        "ui_style": str(resolved_ui_style),
+        "read_context_policy": str(resolved_read_context_policy),
+        "tool_memory_policy": str(resolved_tool_memory_policy),
+        "user_memory_mode": str(resolved_user_memory_mode),
+        "auto_task_level_ceiling": int(resolved_auto_task_level_ceiling),
+        "daily_session_limit_per_ip": int(resolved_daily_session_limit_per_ip),
+        "ollama_base_url": str(bootstrap_base_url),
+        "model": str(resolved_model),
+        "auto_model_switch": bool(resolved_auto_model_switch),
+        "arbiter_enabled": bool(resolved_arbiter_enabled),
+        "arbiter_model": str(resolved_arbiter_model),
+        "arbiter_timeout": float(resolved_arbiter_timeout),
+        "arbiter_max_tokens": int(resolved_arbiter_max_tokens),
+        "arbiter_temperature": float(resolved_arbiter_temperature),
+        "execution_mode": str(resolved_execution_mode),
+        "max_output_tokens": int(resolved_max_output_tokens),
+        "max_user": int(resolved_max_user),
+        "max_user_sessions": int(resolved_max_user_sessions),
+        "rag_file_name": bool(resolved_rag_include_filename_entities),
+    })
+    app.configure_admin_runtime(active_admin_config)
     setattr(app, "agent_port", int(args.port))
     setattr(app, "skills_port", int(skills_port))
     setattr(app, "skills_ui_enabled", False)
@@ -87985,6 +92955,16 @@ def main():
     setattr(app, "ide_port", int(ide_port))
     setattr(app, "ide_enabled", False)
     server = AgentHTTPServer((args.host, args.port), Handler, app)
+
+    def _request_admin_restart() -> None:
+        def _shutdown_after_response():
+            # Give the HTTP worker a short window to flush the 202 response.
+            time.sleep(0.15)
+            server.shutdown()
+
+        threading.Thread(target=_shutdown_after_response, name="admin-restart-shutdown", daemon=True).start()
+
+    app.restart_callback = _request_admin_restart
     skills_server = None
     skills_thread = None
     if args.no_skills_ui:
@@ -88140,6 +93120,7 @@ def main():
         except Exception as exc:
             print(f"[web-agent] MCP service failed to start on {args.host}:{mcp_service_port}: {exc}")
     print(f"[web-agent] workspace={WORKDIR}")
+    print(f"[admin] token_file={app.admin_token_path}")
     print(f"[web-agent] repo_root={REPO_ROOT}")
     print(f"[web-agent] codes_root={app.codes_root}")
     migration = getattr(app, "workspace_migration", {}) if hasattr(app, "workspace_migration") else {}
@@ -88278,6 +93259,7 @@ def main():
         lan_ip = detect_local_lan_ip()
         print("[web-agent] bind=all interfaces")
         print(f"[web-agent] open local: http://127.0.0.1:{args.port}")
+        print(f"[admin] open local: http://127.0.0.1:{args.port}/admin")
         print(f"[web-agent] open lan:   http://{lan_ip}:{args.port}")
         if skills_server:
             print(f"[skills-studio] open local: http://127.0.0.1:{skills_port}")
@@ -88296,6 +93278,7 @@ def main():
             print(f"[mcp-service] open lan:   http://{lan_ip}:{mcp_service_port}")
     else:
         print(f"[web-agent] open http://{args.host}:{args.port}")
+        print(f"[admin] open http://{args.host}:{args.port}/admin")
         if skills_server:
             print(f"[skills-studio] open http://{args.host}:{skills_port}")
         if rag_admin_server:
@@ -88379,6 +93362,18 @@ def main():
                 pass
         app.shutdown_services()
         server.server_close()
+    if app.restart_pending and isinstance(app.restart_config, dict):
+        restart_argv = _admin_config_to_argv(app.restart_config)
+        restart_env = os.environ.copy()
+        restart_env["CLOUDS_CODER_SKIP_ADMIN_DEFAULTS"] = "1"
+        restart_env["CLOUDS_CODER_RESTART_NONCE"] = str(app.restart_nonce or "")
+        restart_env["CLOUDS_CODER_RESTART_FROM_BOOT_ID"] = str(app.restart_from_boot_id or "")
+        print("[web-agent] restarting with Admin startup config")
+        os.execve(
+            sys.executable,
+            [sys.executable, str(Path(__file__).resolve()), *restart_argv],
+            restart_env,
+        )
 
 if __name__ == "__main__":
     main()
