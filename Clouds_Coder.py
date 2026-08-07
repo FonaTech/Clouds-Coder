@@ -511,6 +511,20 @@ DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS = max(
         ),
     ),
 )
+# Optional single-agent/no-plan bootstrap for lightweight (L1) sessions.  It is
+# deliberately disabled by default so existing L1 sessions keep their current
+# execution posture.  L2 uses the independent ``l2_todo_policy`` setting,
+# whose default is ``force`` and whose explicit alternatives are ``auto`` and
+# ``off``.
+DEFAULT_SINGLE_NO_PLAN_TODO_PROMPT = (
+    "Use the evidence from the completed read-only perception round to think "
+    "through the actual user goal for one planning turn. Then call TodoWrite "
+    "(or TodoWriteRescue) now and create a compact, realistic list of 3-7 "
+    "next actions. Keep exactly one item in_progress, base items on observed "
+    "evidence, and do not implement or modify files in this turn. Do not "
+    "invent unrelated work or switch to plan mode."
+)
+SINGLE_NO_PLAN_TODO_BOOTSTRAP_MAX_ATTEMPTS = 2
 AUTO_CONTINUE_BUDGET_DEFAULT = 30
 AGENT_MAX_OUTPUT_TOKENS = 16384
 OLLAMA_THINKING_TOOL_BUFFER = 4096
@@ -679,6 +693,8 @@ RUNTIME_CONTROL_HINT_PREFIXES = (
     "<truncate-rescue>",
     "<thinking-empty-recovery>",
     "<fault-prefill>",
+    "<single-no-plan-todo-bootstrap>",
+    "<single-no-plan-todo-bootstrap-retry>",
 )
 RETRY_RUNTIME_HINT_PREFIXES = (
     "<todo-rescue>",
@@ -746,6 +762,12 @@ TASK_PROFILE_TYPES = (
 TASK_LEVEL_CHOICES = (1, 2, 3, 4, 5)
 TASK_SCALE_PREFERENCES = ("fast", "balanced", "thorough")
 SEMANTIC_CONFIDENCE_CHOICES = ("high", "medium", "low")
+# Level-2 Todo behavior is configurable at startup.  ``force`` preserves the
+# default safety contract, ``auto`` lets the semantic classifier decide for the
+# current request, and ``off`` is an explicit escape hatch for callers that do
+# not want Todo scaffolding at this tier.
+L2_TODO_POLICY_CHOICES = ("force", "auto", "off")
+DEFAULT_L2_TODO_POLICY = "force"
 TASK_LEVEL_POLICIES: dict[int, dict] = {
     1: {
         "name": "simple_direct_answer",
@@ -754,6 +776,7 @@ TASK_LEVEL_POLICIES: dict[int, dict] = {
         "assigned_expert": "developer",
         "round_budget": 2,
         "requires_user_confirmation": False,
+        "requires_todos": False,
         "complexity": "simple",
     },
     2: {
@@ -763,6 +786,9 @@ TASK_LEVEL_POLICIES: dict[int, dict] = {
         "assigned_expert": "developer",
         "round_budget": 6,
         "requires_user_confirmation": False,
+        # This remains the default L2 behavior. ``l2_todo_policy`` may
+        # explicitly override it with semantic auto judgment or off.
+        "requires_todos": True,
         "complexity": "simple",
     },
     3: {
@@ -772,6 +798,7 @@ TASK_LEVEL_POLICIES: dict[int, dict] = {
         "assigned_expert": "developer",
         "round_budget": 16,
         "requires_user_confirmation": False,
+        "requires_todos": True,
         "complexity": "moderate",
     },
     4: {
@@ -781,6 +808,7 @@ TASK_LEVEL_POLICIES: dict[int, dict] = {
         "assigned_expert": "developer",
         "round_budget": 24,
         "requires_user_confirmation": False,
+        "requires_todos": True,
         "complexity": "complex",
     },
     5: {
@@ -790,6 +818,7 @@ TASK_LEVEL_POLICIES: dict[int, dict] = {
         "assigned_expert": "explorer",
         "round_budget": 0,  # 0 means unlimited by tier budget (still guarded by global safeguards).
         "requires_user_confirmation": True,
+        "requires_todos": True,
         "complexity": "expert",
     },
 }
@@ -904,12 +933,12 @@ DEVELOPER_EDIT_STALL_THRESHOLD = 3  # consecutive edit_file failures on same fil
 # Acceptance-gate repair loop: once a step fails the heuristic gate this many
 # times, escalate from a plain rework hint to the active diagnose→repair→re-verify
 # driver (semantic judge + reviewer-debug + root-cause repair directives).
-ACCEPTANCE_GATE_STALL_THRESHOLD = 3
+ACCEPTANCE_GATE_STALL_THRESHOLD = 10
 # Deadlock guards: repeated no-progress rounds and an absolute repair-round cap.
 # The absolute cap prevents cosmetic evidence changes from resetting the
 # no-progress signature forever while the same acceptance decision remains stuck.
-ACCEPTANCE_GATE_HARD_CEILING = 6  # consecutive no-progress rounds before escalating to the user
-ACCEPTANCE_GATE_TOTAL_ROUND_CEILING = 6
+ACCEPTANCE_GATE_HARD_CEILING = 10  # consecutive no-progress rounds before escalating to the user
+ACCEPTANCE_GATE_TOTAL_ROUND_CEILING = 10
 PLAN_MODE_MANAGER_SYNTHESIS_MAX_TOKENS = 8192
 PLAN_MODE_MAX_OPTIONS = 3
 PLAN_FILE_RELATIVE_PATH = ".clouds_coder/plan.md"
@@ -2700,6 +2729,85 @@ def normalize_auto_task_level_ceiling(value: object, default: int = DEFAULT_AUTO
     return 0
 
 
+def normalize_l2_todo_policy(value: object, default: str = DEFAULT_L2_TODO_POLICY) -> str:
+    """Normalize the level-2 Todo contract mode.
+
+    The public values are ``force``, ``auto`` and ``off``.  A few natural
+    aliases are accepted so JSON/config and CLI callers can use terms such as
+    ``required`` or ``disabled`` without silently changing the default.
+    Invalid or empty values intentionally fall back to the safe default.
+    """
+    aliases = {
+        "force": "force",
+        "required": "force",
+        "mandatory": "force",
+        "on": "force",
+        "enabled": "force",
+        "true": "force",
+        "1": "force",
+        "auto": "auto",
+        "automatic": "auto",
+        "semantic": "auto",
+        "llm": "auto",
+        "judge": "auto",
+        "off": "off",
+        "disabled": "off",
+        "disable": "off",
+        "none": "off",
+        "false": "off",
+        "0": "off",
+    }
+    raw = str(value if value is not None else "").strip().lower().replace("_", "-")
+    normalized = aliases.get(raw)
+    if normalized in L2_TODO_POLICY_CHOICES:
+        return normalized
+    fallback = str(default or DEFAULT_L2_TODO_POLICY).strip().lower().replace("_", "-")
+    return aliases.get(fallback, DEFAULT_L2_TODO_POLICY)
+
+
+def extract_l2_todo_policy_setting(raw: object) -> str | None:
+    """Read the optional level-2 Todo policy from a config mapping.
+
+    ``None`` means the setting was absent.  A shallow, explicit section walk
+    mirrors the other startup settings and prevents arbitrary provider payloads
+    from being interpreted as execution policy.
+    """
+    if not isinstance(raw, dict):
+        return None
+    policy_keys = (
+        "l2_todo_policy",
+        "l2TodoPolicy",
+        "level2_todo_policy",
+        "level_2_todo_policy",
+        "todo_policy_l2",
+        "level2_todo_mode",
+        "l2_todo_mode",
+    )
+    bool_keys = ("l2_requires_todos", "level2_requires_todos", "l2_todos_required")
+    sections: list[dict] = [raw]
+    for section_name in (
+        "runtime",
+        "startup",
+        "classification",
+        "task_policy",
+        "todo",
+        "todos",
+        "agent",
+        "execution",
+    ):
+        section = raw.get(section_name)
+        if isinstance(section, dict):
+            sections.append(section)
+    for section in sections:
+        for key in policy_keys:
+            if key in section:
+                return normalize_l2_todo_policy(section.get(key))
+        for key in bool_keys:
+            if key in section:
+                return "force" if _to_bool_like(section.get(key), default=True) else "off"
+    return None
+
+
 def extract_auto_task_level_ceiling_setting(raw: object) -> int | None:
     if not isinstance(raw, dict):
         return None
@@ -2844,6 +2952,106 @@ def extract_web_search_enabled_setting(raw: object) -> bool | None:
         if isinstance(section, dict) and key in section:
             return _to_bool_like(section.get(key), default=DEFAULT_WEB_SEARCH_ENABLED)
     return None
+
+
+def _single_no_plan_todo_setting_sections(raw: dict) -> list[dict]:
+    """Return bounded config sections for the single/no-plan Todo setting."""
+    if not isinstance(raw, dict):
+        return []
+    sections: list[dict] = [raw]
+    # Keep this traversal shallow and explicit: configuration files may contain
+    # arbitrary provider payloads, and those must not accidentally become policy.
+    section_names = (
+        "runtime",
+        "single",
+        "agent",
+        "execution",
+        "startup",
+        "todos",
+        "todo",
+    )
+    for name in section_names:
+        section = raw.get(name)
+        if isinstance(section, dict):
+            sections.append(section)
+            for child_name in ("single", "agent", "execution", "todos", "todo"):
+                child = section.get(child_name)
+                if isinstance(child, dict):
+                    sections.append(child)
+    return sections
+
+
+def _single_no_plan_todo_setting_present(raw: object) -> bool:
+    if not isinstance(raw, dict):
+        return False
+    enabled_keys = {
+        "single_no_plan_todo_enabled",
+        "singleNoPlanTodoEnabled",
+        "todo_bootstrap_enabled",
+        "todoBootstrapEnabled",
+        "single_todo_bootstrap_enabled",
+        "singleTodoBootstrapEnabled",
+    }
+    prompt_keys = {
+        "single_no_plan_todo_prompt",
+        "singleNoPlanTodoPrompt",
+        "todo_bootstrap_prompt",
+        "todoBootstrapPrompt",
+        "single_todo_bootstrap_prompt",
+        "singleTodoBootstrapPrompt",
+    }
+    return any(
+        key in section
+        for section in _single_no_plan_todo_setting_sections(raw)
+        for key in (*enabled_keys, *prompt_keys)
+    )
+
+
+def extract_single_no_plan_todo_settings(raw: object) -> tuple[bool, str]:
+    """Read the optional single/no-plan perception-to-Todo bootstrap policy.
+
+    Explicit ``enabled`` wins over a prompt-only setting.  A non-empty prompt
+    enables the feature when no explicit flag is supplied; an explicitly empty
+    prompt with ``enabled=true`` falls back to the built-in protocol prompt.
+    """
+    if not isinstance(raw, dict):
+        return False, ""
+    enabled_keys = (
+        "single_no_plan_todo_enabled",
+        "singleNoPlanTodoEnabled",
+        "todo_bootstrap_enabled",
+        "todoBootstrapEnabled",
+        "single_todo_bootstrap_enabled",
+        "singleTodoBootstrapEnabled",
+    )
+    prompt_keys = (
+        "single_no_plan_todo_prompt",
+        "singleNoPlanTodoPrompt",
+        "todo_bootstrap_prompt",
+        "todoBootstrapPrompt",
+        "single_todo_bootstrap_prompt",
+        "singleTodoBootstrapPrompt",
+    )
+    explicit_enabled: bool | None = None
+    prompt = ""
+    for section in _single_no_plan_todo_setting_sections(raw):
+        if explicit_enabled is None:
+            for key in enabled_keys:
+                if key in section:
+                    explicit_enabled = _to_bool_like(section.get(key), default=False)
+                    break
+        if not prompt:
+            for key in prompt_keys:
+                if key in section:
+                    prompt = trim(str(section.get(key) or "").strip(), 6000)
+                    break
+        if explicit_enabled is not None and prompt:
+            break
+    if explicit_enabled is False:
+        return False, prompt
+    if explicit_enabled is True or prompt:
+        return True, prompt or DEFAULT_SINGLE_NO_PLAN_TODO_PROMPT
+    return False, ""
 
 
 def normalize_user_memory_mode(value: object, default: str = DEFAULT_USER_MEMORY_MODE) -> str:
@@ -5574,13 +5782,34 @@ def _map_todo_status_token(token: str) -> str:
     raw = re.sub(r"\s+", " ", raw)
     return {
         "pending": "pending",
+        "todo": "pending",
+        "open": "pending",
+        "not started": "pending",
+        "notstarted": "pending",
         "待处理": "pending",
         "待處理": "pending",
         "未着手": "pending",
+        "未开始": "pending",
+        "未開始": "pending",
         "in progress": "in_progress",
+        "inprogress": "in_progress",
+        "doing": "in_progress",
+        "working": "in_progress",
+        "active": "in_progress",
         "进行中": "in_progress",
         "進行中": "in_progress",
+        "处理中": "in_progress",
+        "處理中": "in_progress",
         "completed": "completed",
+        "complete": "completed",
+        "done": "completed",
+        "finish": "completed",
+        "finished": "completed",
+        "success": "completed",
+        "succeeded": "completed",
+        "passed": "completed",
+        "完成": "completed",
+        "完成了": "completed",
         "已完成": "completed",
         "完了": "completed",
         "blocked": "pending",
@@ -5628,8 +5857,10 @@ def split_todo_status_text(text: object) -> tuple[str, str]:
             continue
         m = re.match(
             rf"^(?:{marker_prefix})"
-            rf"(pending|in[_\-\s]?progress|completed|blocked|"
-            rf"待处理|待處理|未着手|进行中|進行中|已完成|完了)"
+            rf"(pending|todo|open|not[_\-\s]?started|doing|working|active|"
+            rf"in[_\-\s]?progress|completed|complete|done|finish(?:ed)?|"
+            rf"success(?:ful)?|succeed(?:ed)?|passed|blocked|"
+            rf"待处理|待處理|未着手|未开始|未開始|进行中|進行中|处理中|處理中|完成|完成了|已完成|完了)"
             rf"\s*[：:\-\]]\s*",
             probe,
             flags=re.IGNORECASE,
@@ -5713,6 +5944,25 @@ def extract_todo_rows_from_text(
         if matched and len(out) >= capped:
             break
     return out
+
+
+def decode_structured_todo_container(value: object) -> object:
+    """Decode JSON or Python-literal Todo containers without executing code."""
+    if not isinstance(value, str):
+        return value
+    text = normalize_embedded_newlines(value).strip()
+    if len(text) < 2 or text[0] not in "[{" or text[-1] not in "]}":
+        return value
+    if len(text) > 200_000:
+        return value
+    for decoder in (json.loads, ast.literal_eval):
+        try:
+            decoded = decoder(text)
+        except Exception:
+            continue
+        if isinstance(decoded, (list, dict)):
+            return decoded
+    return value
 
 
 def infer_todo_status_from_text(text: object, default: str = "pending") -> str:
@@ -8192,6 +8442,15 @@ def _admin_config_schema() -> list[dict]:
         row("web_search_enabled", "runtime", "Web search", "tri_state", "inherit", true_flag="--enable-web-search", false_flag="--disable-web-search", choices=["inherit", "enabled", "disabled"]),
         row("user_memory_mode", "runtime", "User memory mode", "enum", "weak", "--user-memory", choices=["off", "weak", "on"]),
         row("auto_task_level_ceiling", "runtime", "Auto task level ceiling", "integer", DEFAULT_AUTO_TASK_LEVEL_CEILING, "--auto_task_level_ceiling", minimum=0, maximum=5),
+        row(
+            "l2_todo_policy",
+            "runtime",
+            "Level-2 Todo policy",
+            "enum",
+            DEFAULT_L2_TODO_POLICY,
+            "--l2-todo-policy",
+            choices=list(L2_TODO_POLICY_CHOICES),
+        ),
         row("daily_session_limit_per_ip", "limits", "Daily sessions per user", "integer", 0, "--daily_session_limit_per_ip", minimum=0, maximum=1_000_000),
         row("ollama_base_url", "model", "Ollama base URL", "url", DEFAULT_OLLAMA_BASE_URL, "--ollama-base-url"),
         row("model", "model", "Default model", "text", DEFAULT_OLLAMA_MODEL, "--model"),
@@ -8202,6 +8461,23 @@ def _admin_config_schema() -> list[dict]:
         row("arbiter_max_tokens", "arbiter", "Arbiter max tokens", "integer", ARBITER_DEFAULT_MAX_TOKENS, "--arbiter-max-tokens", minimum=24, maximum=256),
         row("arbiter_temperature", "arbiter", "Arbiter temperature", "number", ARBITER_DEFAULT_TEMPERATURE, "--arbiter-temperature", minimum=0, maximum=1, step=0.05),
         row("execution_mode", "runtime", "Agent execution mode", "enum", EXECUTION_MODE_SYNC, "--execution-mode", choices=["single", "sequential", "sync"]),
+        row(
+            "single_no_plan_todo_enabled",
+            "runtime",
+            "Optional single/no-plan Todo bootstrap (L2 follows policy)",
+            "boolean",
+            False,
+            true_flag="--single-no-plan-todo",
+            false_flag="--no-single-no-plan-todo",
+        ),
+        row(
+            "single_no_plan_todo_prompt",
+            "runtime",
+            "Single/no-plan Todo prompt",
+            "text",
+            "",
+            "--single-no-plan-todo-prompt",
+        ),
         row("max_output_tokens", "runtime", "Max output tokens", "integer", AGENT_MAX_OUTPUT_TOKENS, "--max-output-tokens", minimum=256, maximum=1_000_000),
         row("max_user", "limits", "Global concurrent tasks", "integer", 0, "--max_user", minimum=0, maximum=100_000),
         row("max_user_sessions", "limits", "Concurrent tasks per user", "integer", 0, "--max_user_sessions", minimum=0, maximum=100_000),
@@ -8228,6 +8504,12 @@ def _admin_coerce_config(raw: object) -> tuple[dict, list[dict]]:
         if nullable and (value is None or str(value).strip() == ""):
             out[key] = None
             continue
+        if value is None or (isinstance(value, str) and not value.strip()):
+            # Admin forms can submit an empty string after a field is
+            # cleared. Nullable fields intentionally remain None; every
+            # other startup field resets to its schema default so restart
+            # never emits an invalid empty argparse value.
+            value = spec.get("factory_default")
         try:
             if typ == "integer":
                 if isinstance(value, bool):
@@ -8329,11 +8611,20 @@ def _admin_coerce_config(raw: object) -> tuple[dict, list[dict]]:
 
 
 def _admin_config_to_argv(config: dict) -> list[str]:
+    clean, errors = _admin_coerce_config(config)
+    clean.pop("_effective_ports", None)
+    if errors:
+        details = "; ".join(
+            f"{str(row.get('key', '') or 'config')}: {str(row.get('error', '') or 'invalid value')}"
+            for row in errors[:8]
+            if isinstance(row, dict)
+        )
+        raise ValueError(f"invalid Admin startup config: {details or 'validation failed'}")
     schema = _admin_config_schema()
     argv: list[str] = []
     for spec in schema:
         key = str(spec["key"])
-        value = config.get(key, spec.get("factory_default"))
+        value = clean.get(key, spec.get("factory_default"))
         typ = str(spec.get("type", "text"))
         if typ == "boolean":
             flag = str(spec.get("true_flag" if bool(value) else "false_flag", "") or "")
@@ -8350,7 +8641,9 @@ def _admin_config_to_argv(config: dict) -> list[str]:
             continue
         flag = str(spec.get("flag", "") or "")
         if flag:
-            argv.extend([flag, str(value)])
+            value_text = str(value).strip()
+            if value_text:
+                argv.extend([flag, value_text])
     return argv
 
 
@@ -9010,12 +9303,32 @@ class TodoManager:
                     raw = {"content": str(item).strip(), "status": "pending"}
                 except Exception:
                     continue
-            raw_content = str(raw.get("content", raw.get("text", raw.get("title", "")))).strip()
+            raw_content = str(
+                raw.get(
+                    "content",
+                    raw.get(
+                        "text",
+                        raw.get(
+                            "title",
+                            raw.get(
+                                "task",
+                                raw.get("description", raw.get("label", raw.get("name", ""))),
+                            ),
+                        ),
+                    ),
+                )
+            ).strip()
             split_rows = split_structured_todo_content(raw_content, limit=7)
             if len(split_rows) <= 1:
                 expanded_items.append(raw)
                 continue
-            base_status = str(raw.get("status", raw.get("state", "pending")) or "pending").strip().lower()
+            base_status = raw.get("status", raw.get("state", ""))
+            if base_status in (None, ""):
+                if _to_bool_like(raw.get("completed", raw.get("done", False)), default=False):
+                    base_status = "completed"
+                elif _to_bool_like(raw.get("in_progress", raw.get("active", False)), default=False):
+                    base_status = "in_progress"
+            base_status = str(base_status or "pending").strip().lower()
             for split_idx, split_content in enumerate(split_rows):
                 split_raw = dict(raw)
                 split_raw["content"] = split_content
@@ -9032,15 +9345,35 @@ class TodoManager:
         worker_in_progress_seen_by_owner: set[str] = set()
         status_alias = {
             "todo": "pending",
+            "open": "pending",
+            "not_started": "pending",
+            "notstarted": "pending",
+            "待处理": "pending",
+            "待處理": "pending",
+            "未开始": "pending",
+            "未開始": "pending",
             "[_]": "pending",
             "[]": "pending",
             "[ ]": "pending",
             "doing": "in_progress",
+            "working": "in_progress",
+            "active": "in_progress",
+            "started": "in_progress",
+            "进行中": "in_progress",
+            "進行中": "in_progress",
+            "处理中": "in_progress",
+            "處理中": "in_progress",
             "inprogress": "in_progress",
             "in-progress": "in_progress",
             "[>]": "in_progress",
             ">": "in_progress",
             "done": "completed",
+            "complete": "completed",
+            "success": "completed",
+            "succeeded": "completed",
+            "passed": "completed",
+            "完成": "completed",
+            "已完成": "completed",
             "finish": "completed",
             "finished": "completed",
             "[x]": "completed",
@@ -9048,15 +9381,37 @@ class TodoManager:
         }
         for idx, item in enumerate(expanded_items):
             raw = item if isinstance(item, dict) else {"content": str(item or "").strip(), "status": "pending"}
-            raw_content = str(raw.get("content", raw.get("text", raw.get("title", "")))).strip()
+            raw_content = str(
+                raw.get(
+                    "content",
+                    raw.get(
+                        "text",
+                        raw.get(
+                            "title",
+                            raw.get(
+                                "task",
+                                raw.get("description", raw.get("label", raw.get("name", ""))),
+                            ),
+                        ),
+                    ),
+                )
+            ).strip()
             inferred_status = infer_todo_status_from_text(raw_content, default="")
             content = normalize_work_text(raw_content)
             if not content:
                 content = raw_content
             if not content:
                 continue  # Skip empty items instead of raising
-            raw_status = str(raw.get("status", raw.get("state", "pending"))).strip().lower()
+            raw_status_value = raw.get("status", raw.get("state", ""))
+            if raw_status_value in (None, ""):
+                if _to_bool_like(raw.get("completed", raw.get("done", False)), default=False):
+                    raw_status_value = "completed"
+                elif _to_bool_like(raw.get("in_progress", raw.get("active", False)), default=False):
+                    raw_status_value = "in_progress"
+            raw_status = str(raw_status_value or "pending").strip().lower().replace("-", "_").replace(" ", "_")
             status = status_alias.get(raw_status, raw_status or "pending")
+            if status not in {"pending", "in_progress", "completed"}:
+                status = _map_todo_status_token(raw_status) or status
             if inferred_status and status in {"", "pending", "todo"}:
                 status = inferred_status
             if status not in {"pending", "in_progress", "completed"}:
@@ -9073,6 +9428,7 @@ class TodoManager:
                 owner = ""
             key = trim(str(raw.get("key", "") or "").strip(), 120)
             is_plan_step = key.startswith("bb:proj:")
+            parent_step_id = trim(str(raw.get("parent_step_id", "") or ""), 20)
             if status == "in_progress":
                 if is_plan_step:
                     if plan_in_progress_seen:
@@ -9085,7 +9441,15 @@ class TodoManager:
                         status = "pending"
                     else:
                         worker_in_progress_seen_by_owner.add(owner_bucket)
-            if not active_form:
+            # Worker rows are a canonical state view. Never retain a stale
+            # localized activeForm after reconciliation changed the status.
+            # Rebuild the display form from the normalized status. Keeping an
+            # old activeForm after a status-only update made the UI claim a row
+            # was completed while the canonical status was still pending (and
+            # vice versa), especially after a resume/compaction handoff.
+            if parent_step_id and owner in {"explorer", "developer", "reviewer"}:
+                active_form = self._default_active_form(status, content, owner=owner)
+            else:
                 active_form = self._default_active_form(status, content, owner=owner)
             row = {"content": content, "status": status, "activeForm": active_form}
             if owner:
@@ -9093,12 +9457,12 @@ class TodoManager:
             if key:
                 row["key"] = key
             # Preserve parent_step_id for subtask-to-plan-step linkage
-            parent_step_id = trim(str(raw.get("parent_step_id", "") or ""), 20)
             if parent_step_id:
                 row["parent_step_id"] = parent_step_id
             for meta_key in (
                 "subtask_id", "created_at", "updated_at", "started_at", "completed_at",
-                "completed_by", "evidence", "revision_reason", "revision_evidence",
+                "completed_by", "evidence", "evidence_binding", "evidence_ids",
+                "revision_reason", "revision_evidence", "external_subtask_id",
             ):
                 if meta_key in raw and raw.get(meta_key) not in (None, ""):
                     row[meta_key] = raw.get(meta_key)
@@ -9711,8 +10075,8 @@ Use this skill when the agent shows model degradation symptoms:
 1. If context may be missing, call `context_recall` with `mode="summary"` first, then use `mode="search"` or `mode="window"` for focused evidence.
 2. Inspect the authoritative current task/plan/todo state before touching todos:
    - if an approved plan or canonical todo list already exists, preserve it and repair only the current broken row;
-   - if the task is simple, normally needs no todos, or can continue with one repaired tool call, do not create recovery todos;
-   - create a minimal 3-7 item todo list only when the original user task is genuinely multi-step, still unfinished, has no usable tracking state, and the items describe user work rather than recovery machinery.
+   - preserve/create a Todo graph only when the current runtime policy says `requires_todos=true`; L3+ remains required, while L2 may be force, auto, or off;
+   - when L2 currently requires Todos, create a compact 3-7 item list whenever no usable tracking state exists; when L2 does not require Todos, do not invent a recovery list. For optional L1 tracking, use the original multi-step/uncertainty test. Items must describe user work rather than recovery machinery.
 3. Enter strict execution mode:
    - execute exactly ONE tool call per round,
    - keep tool arguments complete JSON,
@@ -9746,7 +10110,7 @@ Never publish internal recovery mechanics such as "triage failure", "recover con
 # Fast Decision Rules
 
 1. Missing context -> `context_recall mode="summary"`, then `mode="search"` or `mode="window"` for focused evidence.
-2. No todo plan -> continue without todos unless the original user task is genuinely multi-step and needs durable tracking; never create todos solely because recovery was triggered.
+2. No todo plan -> establish/repair a Todo plan only when current runtime `requires_todos=true`; L3+ is required and L2 follows its configured force|auto|off decision. Effective L1 may continue without todos unless optional tracking is enabled. Never create recovery todos solely because recovery was triggered.
 3. Repeated tool failure -> one-tool strict retry with smaller chunk.
 4. Still failing -> explicit blocker, stop loop.
 """
@@ -13051,9 +13415,9 @@ _BUILTIN_SKILLS: dict[str, dict] = {
         "body": (
             "# Task Management Guide\n"
             "- For level 1 tasks: skip todo scaffolding and give the direct response, UNLESS an approved plan step is active.\n"
-            "- For level 2 tasks: decide semantically whether todos will improve execution. Create a compact TodoWrite plan only when the request has enough moving parts, uncertainty, state tracking, or verification burden that todos would reduce mistakes; skip todos when the work can be completed cleanly in one coherent pass. Do not rely on fixed task-type or keyword lists.\n"
+            "- For level 2 tasks: follow the runtime-injected L2 Todo policy and requires_todos decision. When true, maintain a compact TodoWrite/TodoWriteRescue list with exactly one item in_progress; when false, do not create Todo scaffolding solely because the task is L2.\n"
             "- When an approved plan step is active, ALWAYS maintain step-local TodoWrite subtasks scoped to the active parent_step_id. Execute one subtask at a time and update status after each real change.\n"
-            "- For level 3+ tasks: call TodoWrite early with 3-7 concise items, one marked in_progress.\n"
+            "- For level 3+ tasks: the approved Plan is the parent roadmap; TodoWrite contains only the active parent step's rolling subtasks.\n"
             "- Update todos only when plan or status actually changes. Avoid redundant calls.\n"
             "- If TodoWrite fails or repeats unchanged, use TodoWriteRescue with simple string items.\n"
             "- Use task_create/task_update/task_list for multi-step structured work.\n"
@@ -18216,31 +18580,104 @@ TOOLS = [
         ),
         {
             "items": {"type": "array", "items": {}},
+            # Provider-compatible aliases. Runtime validation intentionally
+            # treats these as equivalent to `items` so a compact/resume model
+            # does not get trapped by the historical required-key spelling.
+            "todos": {"type": "array", "items": {}},
+            "todo_items": {"type": "array", "items": {}},
+            "subtasks": {"type": "array", "items": {}},
+            "rows": {"type": "array", "items": {}},
+            "updates": {"type": "array", "items": {}},
+            "tasks": {"type": "array", "items": {}},
+            "data": {},
+            "content": {"type": "string"},
+            "text": {"type": "string"},
+            "title": {"type": "string"},
+            "task": {"type": "string"},
+            "description": {"type": "string"},
+            "label": {"type": "string"},
+            "resume": {"type": "boolean"},
+            "continue": {"type": "boolean"},
+            "resume_existing": {"type": "boolean"},
+            "in_progress_index": {"type": "integer"},
             "update_mode": {
                 "type": "string",
                 "enum": ["status_update", "revise_open", "rework_completed"],
                 "description": "status_update changes statuses only; revise_open replaces the current open-subtask snapshot after evidence audit; rework_completed requires failure/reviewer evidence.",
             },
             "revision_reason": {"type": "string", "description": "Concrete new finding that justifies a structural rolling-plan revision."},
-            "revision_evidence": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Exact current-step evidence references such as event id, tool+path/command, error excerpt, or reviewer finding.",
-            },
+            "revision_evidence": {},
+            "evidence": {},
         },
-        ["items"],
+        [],
     ),
     tool_def(
         "TodoWriteRescue",
         "Fallback todo writer. Preferred format: objects with content/status/owner/parent_step_id. String fallback should use only '[ ] task', '[>] task', or '[x] task'.",
         {
             "items": {"type": "array", "items": {}},
+            "todos": {"type": "array", "items": {}},
+            "todo_items": {"type": "array", "items": {}},
+            "subtasks": {"type": "array", "items": {}},
+            "rows": {"type": "array", "items": {}},
+            "updates": {"type": "array", "items": {}},
+            "tasks": {"type": "array", "items": {}},
+            "data": {},
+            "content": {"type": "string"},
+            "text": {"type": "string"},
+            "title": {"type": "string"},
+            "task": {"type": "string"},
+            "description": {"type": "string"},
+            "label": {"type": "string"},
+            "resume": {"type": "boolean"},
+            "continue": {"type": "boolean"},
+            "resume_existing": {"type": "boolean"},
             "in_progress_index": {"type": "integer"},
             "update_mode": {"type": "string", "enum": ["status_update", "revise_open", "rework_completed"]},
             "revision_reason": {"type": "string"},
+            "revision_evidence": {},
+            "evidence": {},
+        },
+        [],
+    ),
+    tool_def(
+        "TodoWriteResume",
+        (
+            "Resume and reconcile the existing todo graph after compaction, a handoff, or a partial tool call. "
+            "This is an alias of TodoWrite with elastic item/status recognition; it preserves completed rows and "
+            "updates only the active owner/current plan step. Items may be supplied as items, todos, todo_items, "
+            "subtasks, rows, or a structured text payload."
+        ),
+        {
+            "items": {"type": "array", "items": {}},
+            "todos": {"type": "array", "items": {}},
+            "todo_items": {"type": "array", "items": {}},
+            "subtasks": {"type": "array", "items": {}},
+            "rows": {"type": "array", "items": {}},
+            "updates": {"type": "array", "items": {}},
+            "tasks": {"type": "array", "items": {}},
+            "data": {},
+            "content": {"type": "string"},
+            "text": {"type": "string"},
+            "title": {"type": "string"},
+            "task": {"type": "string"},
+            "description": {"type": "string"},
+            "label": {"type": "string"},
+            "resume": {"type": "boolean"},
+            "continue": {"type": "boolean"},
+            "resume_existing": {"type": "boolean"},
+            "in_progress_index": {"type": "integer"},
+            "update_mode": {"type": "string"},
+            "mode": {"type": "string"},
+            "operation": {"type": "string"},
+            "reason": {"type": "string"},
+            # Keep this unconstrained: providers differ in whether they accept
+            # `oneOf`, while the runtime already normalizes strings and arrays.
+            "evidence": {},
+            "revision_reason": {"type": "string"},
             "revision_evidence": {"type": "array", "items": {"type": "string"}},
         },
-        ["items"],
+        [],
     ),
     tool_def(
         "finish_task",
@@ -18608,22 +19045,51 @@ for _alias, _target in {
     "finishcurrenttask": "finish_current_task",
     "finishtask": "finish_task",
     "markdone": "mark_done",
+    # Todo protocol aliases seen in older providers and compact-resume traces.
+    # They intentionally collapse to the same canonical dispatcher so a resume
+    # call cannot create a second, disconnected todo graph.
+    "todowrite": "TodoWrite",
+    "todowriteresume": "TodoWrite",
+    "todowriteresumeexisting": "TodoWrite",
+    "todoresume": "TodoWrite",
+    "resumetodos": "TodoWrite",
 }.items():
-    if _target in TOOL_SPEC_BY_NAME:
-        TOOL_NAME_FUZZY_MAP[_alias] = _target
+    TOOL_NAME_FUZZY_MAP[_alias] = _target
+
+
+def is_todo_resume_tool_name(raw: object) -> bool:
+    """Return whether a provider tool name carries resume semantics.
+
+    Resume aliases intentionally share TodoWrite's canonical state machine, but
+    the alias itself still conveys an operation when no payload is present.
+    Keeping this tiny bit of provenance avoids losing that meaning during
+    canonicalization.
+    """
+    key = re.sub(r"[^a-z0-9]+", "", str(raw or "").strip().lower())
+    return key in {
+        "todowriteresume",
+        "todowriteresumeexisting",
+        "todoresume",
+        "resumetodos",
+    }
 
 
 def canonicalize_tool_name(raw: object) -> str:
     name = str(raw or "").strip()
     if not name:
         return ""
+    lowered = name.lower()
+    key = re.sub(r"[^a-z0-9]+", "", lowered)
+    # Check aliases before the exact-name path.  ``TodoWriteResume`` is exposed
+    # as a compatibility schema, but must execute through TodoWrite's canonical
+    # reconciliation logic rather than a separate state writer.
+    mapped = TOOL_NAME_FUZZY_MAP.get(key, "") if key else ""
+    if mapped:
+        return mapped
     if name in TOOL_SPEC_BY_NAME:
         return name
-    lowered = name.lower()
     if lowered in TOOL_SPEC_BY_NAME:
         return lowered
-    key = re.sub(r"[^a-z0-9]+", "", lowered)
-    mapped = TOOL_NAME_FUZZY_MAP.get(key, "") if key else ""
     return mapped or name
 
 
@@ -18742,6 +19208,7 @@ class SessionState:
         max_run_seconds: int = MAX_RUN_SECONDS,
         shell_command_timeout_seconds: int = DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
         auto_task_level_ceiling: int = DEFAULT_AUTO_TASK_LEVEL_CEILING,
+        l2_todo_policy: str | None = None,
         auto_model_switch: bool = False,
         arbiter_enabled: bool = True,
         arbiter_model: str = "",
@@ -18843,6 +19310,15 @@ class SessionState:
         # carried alongside it in thread-local state for the orchestrator.
         self._tool_result_local = threading.local()
         self.single_advance_prompt_enhance = False
+        cfg_single_todo_enabled, cfg_single_todo_prompt = extract_single_no_plan_todo_settings(
+            default_llm_config or {}
+        )
+        self.single_no_plan_todo_enabled = bool(cfg_single_todo_enabled)
+        self.single_no_plan_todo_prompt = str(cfg_single_todo_prompt or "").strip()
+        self.single_no_plan_todo_bootstrap_state = "idle"
+        self.single_no_plan_todo_bootstrap_attempts = 0
+        self.single_no_plan_todo_perception_seen = False
+        self.single_no_plan_todo_bootstrap_write_seen = False
         self.skills = SkillStore(skills_root)
         self.skill_load_cache: dict[str, dict] = {}
         self.skills_last_refresh_ts = 0.0
@@ -18932,6 +19408,11 @@ class SessionState:
         self.runtime_task_level_floor = 0
         self.runtime_task_level_ceiling = 0  # 0 = no ceiling; set from plan risk on approval
         self.auto_task_level_ceiling = normalize_auto_task_level_ceiling(auto_task_level_ceiling)
+        cfg_l2_todo_policy = extract_l2_todo_policy_setting(default_llm_config or {})
+        self.l2_todo_policy = normalize_l2_todo_policy(
+            l2_todo_policy if l2_todo_policy is not None else (cfg_l2_todo_policy or DEFAULT_L2_TODO_POLICY)
+        )
+        self.runtime_requires_todos: bool | None = None
         self._todowrite_step_counter: dict[str, int] = {}  # Fix 5: track consecutive TodoWrite per step for loop detection
         self.runtime_scale_preference = "balanced"
         self.runtime_direct_objective = ""
@@ -20270,7 +20751,10 @@ class SessionState:
                 active = raw.get("active_profile_id")
                 if isinstance(active, str) and active.strip():
                     self.active_profile_id = self._sanitize_profile_id(active)
-                self.todo.items = raw.get("todos", [])
+                self.todo.items = self._normalize_loaded_todo_rows(
+                    raw.get("todos", []),
+                    self.messages,
+                )
                 self.thinking = False
                 # context_token_upper_bound is a runtime probe, not config — do not restore from disk.
                 # It will be reset to max after load (see below). Only exception: context_limit_locked.
@@ -20308,6 +20792,17 @@ class SessionState:
                         "auto_task_level_ceiling",
                         getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING),
                     )
+                )
+                if "l2_todo_policy" in raw:
+                    self.l2_todo_policy = normalize_l2_todo_policy(
+                        raw.get("l2_todo_policy"),
+                        default=getattr(self, "l2_todo_policy", DEFAULT_L2_TODO_POLICY),
+                    )
+                raw_requires_todos = raw.get("runtime_requires_todos", None)
+                self.runtime_requires_todos = (
+                    _to_bool_like(raw_requires_todos, default=False)
+                    if raw_requires_todos is not None
+                    else None
                 )
                 self.context_last_compact_before = (
                     dict(raw.get("context_last_compact_before", {}) or {})
@@ -20452,6 +20947,15 @@ class SessionState:
                         "role": str(_pq.get("role", "") or "agent"),
                         "ts": float(_pq.get("ts", 0.0) or 0.0),
                     }
+                    for _pq_scope_key in (
+                        "kind",
+                        "parent_step_id",
+                        "task_epoch",
+                        "step_epoch",
+                        "plan_signature",
+                    ):
+                        if _pq_scope_key in _pq and _pq.get(_pq_scope_key) not in (None, ""):
+                            self.pending_user_question[_pq_scope_key] = _pq.get(_pq_scope_key)
                 else:
                     self.pending_user_question = None
                 deferred_inputs = raw.get("deferred_start_inputs", [])
@@ -20636,6 +21140,34 @@ class SessionState:
                 raw_proposal = raw.get("runtime_plan_proposal", {})
                 self.runtime_plan_proposal = dict(raw_proposal) if isinstance(raw_proposal, dict) else {}
                 self.runtime_plan_choice = str(raw.get("runtime_plan_choice", "") or "")
+                raw_bootstrap_state = str(
+                    raw.get(
+                        "single_no_plan_todo_bootstrap_state",
+                        getattr(self, "single_no_plan_todo_bootstrap_state", "idle"),
+                    )
+                    or "idle"
+                ).strip().lower()
+                self.single_no_plan_todo_bootstrap_state = (
+                    raw_bootstrap_state
+                    if raw_bootstrap_state in {"idle", "waiting", "completed", "skipped", "blocked"}
+                    else "idle"
+                )
+                try:
+                    self.single_no_plan_todo_bootstrap_attempts = max(
+                        0,
+                        min(
+                            SINGLE_NO_PLAN_TODO_BOOTSTRAP_MAX_ATTEMPTS,
+                            int(raw.get("single_no_plan_todo_bootstrap_attempts", 0) or 0),
+                        ),
+                    )
+                except Exception:
+                    self.single_no_plan_todo_bootstrap_attempts = 0
+                self.single_no_plan_todo_perception_seen = bool(
+                    raw.get("single_no_plan_todo_perception_seen", False)
+                )
+                self.single_no_plan_todo_bootstrap_write_seen = bool(
+                    raw.get("single_no_plan_todo_bootstrap_write_seen", False)
+                )
                 self.active_agent_role = str(raw.get("active_agent_role", self.active_agent_role) or "").strip().lower()
                 raw_contexts = raw.get("contexts", {})
                 if isinstance(raw_contexts, dict):
@@ -20867,6 +21399,14 @@ class SessionState:
             "auto_task_level_ceiling": normalize_auto_task_level_ceiling(
                 getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
             ),
+            "l2_todo_policy": normalize_l2_todo_policy(
+                getattr(self, "l2_todo_policy", DEFAULT_L2_TODO_POLICY)
+            ),
+            "runtime_requires_todos": (
+                bool(self.runtime_requires_todos)
+                if isinstance(getattr(self, "runtime_requires_todos", None), bool)
+                else None
+            ),
             "runtime_goal_reset_pending": bool(self.runtime_goal_reset_pending),
             "runtime_goal_reset_ts": float(getattr(self, "runtime_goal_reset_ts", 0.0) or 0.0),
             "runtime_goal_reset_handled_ts": float(getattr(self, "runtime_goal_reset_handled_ts", 0.0) or 0.0),
@@ -20875,6 +21415,25 @@ class SessionState:
             "runtime_plan_approved": bool(self.runtime_plan_approved),
             "runtime_plan_proposal": dict(self.runtime_plan_proposal) if self.runtime_plan_proposal else {},
             "runtime_plan_choice": str(self.runtime_plan_choice or ""),
+            "single_no_plan_todo_enabled": bool(
+                getattr(self, "single_no_plan_todo_enabled", False)
+            ),
+            "single_no_plan_todo_prompt": trim(
+                str(getattr(self, "single_no_plan_todo_prompt", "") or ""),
+                6000,
+            ),
+            "single_no_plan_todo_bootstrap_state": str(
+                getattr(self, "single_no_plan_todo_bootstrap_state", "idle") or "idle"
+            ),
+            "single_no_plan_todo_bootstrap_attempts": int(
+                getattr(self, "single_no_plan_todo_bootstrap_attempts", 0) or 0
+            ),
+            "single_no_plan_todo_perception_seen": bool(
+                getattr(self, "single_no_plan_todo_perception_seen", False)
+            ),
+            "single_no_plan_todo_bootstrap_write_seen": bool(
+                getattr(self, "single_no_plan_todo_bootstrap_write_seen", False)
+            ),
             "active_agent_role": str(self.active_agent_role or ""),
             "contexts": {role: list(self.contexts.get(role, []))[-400:] for role in AGENT_ROLES},
             "manager_context": list(self.manager_context)[-400:],
@@ -21069,6 +21628,7 @@ class SessionState:
         self.runtime_assigned_expert = ""
         self.runtime_participants = []
         self.runtime_round_budget = 0
+        self.runtime_requires_todos = None
         self.runtime_requires_confirmation = False
         self.runtime_confirmation_needed = False
         self.runtime_task_judgement = ""
@@ -21082,6 +21642,10 @@ class SessionState:
         self.runtime_goal_reset_ts = 0.0
         self.runtime_goal_reset_handled_ts = 0.0
         self.runtime_plan_mode_needed = False
+        self.single_no_plan_todo_bootstrap_state = "idle"
+        self.single_no_plan_todo_bootstrap_attempts = 0
+        self.single_no_plan_todo_perception_seen = False
+        self.single_no_plan_todo_bootstrap_write_seen = False
         self.runtime_code_reference_text = ""
         self.runtime_code_reference_meta = {}
         self.runtime_knowledge_reference_text = ""
@@ -21104,10 +21668,6 @@ class SessionState:
             return
         self.runtime_task_level = int(level)
         self._prev_applied_task_level = int(level)
-        self.runtime_execution_mode = normalize_execution_mode(
-            profile.get("execution_mode", judgement.get("execution_mode", self.execution_mode or EXECUTION_MODE_SYNC)),
-            default=EXECUTION_MODE_SYNC,
-        )
         assigned = self._sanitize_agent_role(
             str(
                 profile.get(
@@ -21127,8 +21687,15 @@ class SessionState:
                 role = self._sanitize_agent_role(item)
                 if role and role not in participants:
                     participants.append(role)
-        self.runtime_assigned_expert = assigned
-        self.runtime_participants = participants or [assigned]
+        restored_mode, restored_participants, restored_assigned = self._resolve_level_assignment(
+            level,
+            assigned=assigned,
+            participants=participants,
+            mode=str(profile.get("execution_mode", judgement.get("execution_mode", "")) or ""),
+        )
+        self.runtime_execution_mode = restored_mode
+        self.runtime_assigned_expert = restored_assigned
+        self.runtime_participants = restored_participants
         try:
             round_budget = int(profile.get("round_budget", self.runtime_round_budget or 0) or 0)
         except Exception:
@@ -21140,6 +21707,19 @@ class SessionState:
                 remaining = 0
             round_budget = int(remaining)
         self.runtime_round_budget = int(round_budget)
+        raw_requires_todos = profile.get(
+            "requires_todos",
+            judgement.get("requires_todos", None),
+        )
+        self.runtime_requires_todos = self._resolve_todo_requirement(
+            level,
+            raw_requires_todos,
+            raw_provided=(
+                "requires_todos" in profile or "requires_todos" in judgement
+            ),
+            allow_context=False,
+            fallback=True,
+        )
         self.runtime_requires_confirmation = bool(
             profile.get("requires_user_confirmation", self.runtime_requires_confirmation)
         )
@@ -21335,6 +21915,7 @@ class SessionState:
             bb["step_files"] = {}
             bb["plan_step_evidence"] = {}
             bb["plan_step_quality_reviews"] = {}
+            bb["plan_step_recovery"] = {}
             bb["failure_ledger"] = {
                 "attempted_fixes": [],
                 "compilation_errors": [],
@@ -21347,6 +21928,7 @@ class SessionState:
         bb["project_todos"] = []
         bb["plan"] = {}
         bb["plan_worker_todos"] = {}
+        bb["plan_step_recovery"] = {}
         bb["plan_steps"] = []
         bb["plan_step_cursor"] = 0
         bb["plan_step_total"] = 0
@@ -21359,6 +21941,7 @@ class SessionState:
                 "task_type": str(bb["task_profile"].get("task_type", "general")),
                 "complexity": str(bb["task_profile"].get("complexity", "simple")),
                 "scale_preference": str(bb["task_profile"].get("scale_preference", "balanced") or "balanced"),
+                "requires_todos": bool(bb["task_profile"].get("requires_todos", False)),
                 "progress": "initializing",
                 "remaining_rounds": int(bb["task_profile"].get("round_budget", 1) or 1),
                 "task_level": int(bb["task_profile"].get("task_level", 1) or 1),
@@ -22818,6 +23401,41 @@ class SessionState:
     def _helper_system_prompt(self, system: str = "") -> str:
         return self._inject_runtime_environment_context(system)
 
+    def _todo_contract_prompt_block(self) -> str:
+        """Build the level-driven Todo contract injected into agent prompts."""
+        level = self._runtime_task_level_for_todo_policy()
+        if level != 2 or not self._runtime_level_requires_todos():
+            return ""
+        l2_policy = normalize_l2_todo_policy(
+            getattr(self, "l2_todo_policy", DEFAULT_L2_TODO_POLICY)
+        )
+        contract_label = (
+            "MANDATORY L2 TODO CONTRACT"
+            if l2_policy == "force"
+            else "L2 TODO CONTRACT (semantic classifier decided Todo tracking is required)"
+        )
+        plan_active = bool(
+            getattr(self, "runtime_plan_mode_needed", False)
+            or getattr(self, "runtime_plan_approved", False)
+        )
+        if plan_active:
+            return (
+                f"{contract_label}: this run is level 2, so progress must be "
+                "represented by Todo rows. Because a plan is active, use the existing "
+                "plan/runtime step-local Todo graph and preserve its parent scope; do "
+                "not create a second flat graph. Keep exactly one current item "
+                "in_progress and update it after each real status change."
+            )
+        return (
+            f"{contract_label}: this run is level 2 and must have a compact, "
+            "evidence-based Todo list even when the startup single/no-plan Todo option "
+            "is disabled. First perform a short read-only perception pass, then call "
+            "TodoWrite or TodoWriteRescue before any mutation. Create 3-7 realistic "
+            "next actions with exactly one item in_progress; update the same list after "
+            "each real status change. Do not write files or claim completion while the "
+            "required Todo list is absent."
+        )
+
     def _system_prompt(self) -> str:
         try:
             self._ensure_skills_ready(force=False)
@@ -22876,6 +23494,8 @@ class SessionState:
             plan_steps_block = f"{plan_ctx}\n"
         plan_todo_note = self._plan_todo_discipline_prompt(role="developer")
         plan_todo_block = f"{plan_todo_note}\n" if plan_todo_note else ""
+        todo_contract_note = self._todo_contract_prompt_block()
+        todo_contract_block = f"{todo_contract_note}\n\n" if todo_contract_note else ""
         mm_block = self._multimodal_capability_block()
         mm_hint = f"{mm_block}\n" if mm_block else ""
         runtime_env_text = self._runtime_environment_context_prompt_block() + "\n\n"
@@ -22910,6 +23530,7 @@ class SessionState:
             f"{mm_hint}"
             f"{plan_steps_block}"
             f"{plan_todo_block}"
+            f"{todo_contract_block}"
             f"{html_block}"
             f"{research_block}"
             f"{knowledge_block}"
@@ -25433,18 +26054,40 @@ class SessionState:
             "compiled successfully", "syntax ok", "验收通过", "驗收通過", "验证通过",
             "驗證通過", "审核通过", "審核通過", "全部通过", "全部通過",
         )
-        hard_errors = (
-            "traceback", "syntax error", "fatal error", "build failed",
-            "test failed", "assertionerror", "error:", "failed:", "exception:",
+        explicit_failed_assertion = bool(
+            re.search(
+                r"(?im)^\s*(?:all\s+(?:checks?\s+)?passed|全部通过|全部通過)\s*[:=：]\s*(?:false|no|0)\b",
+                raw,
+            )
+            or re.search(r"(?im)^\s*(?:success|passed|pass|ok)\s*[:=：]\s*false\b", raw)
+            or re.search(r"(?im)^\s*(?:[-*]\s*)?(?:fail|failed)\s*[.!]?\s*$", raw)
+            or re.search(r"(?m)^\s*[❌✗✘]", raw)
+            or re.search(
+                r"(?im)^\s*(?:[-*]\s*)?(?:[\w./@+ -]+\s*[:：]\s*)?"
+                r"(?:missing|not found|absent|不存在|缺失|未找到|未创建|未建立)\s*$",
+                raw,
+            )
         )
+        hard_errors = (
+            "traceback", "syntax error", "syntaxerror:", "fatal error", "build failed",
+            "test failed", "assertionerror", "referenceerror:", "typeerror:",
+            "valueerror:", "runtimeerror:", "modulenotfounderror:", "importerror:",
+            "nameerror:", "filenotfounderror:", "error:", "failed:", "exception:",
+            "command not found", "cannot find module", "no such file or directory",
+        )
+        if explicit_failed_assertion:
+            return True
         if (explicit_zero_exit or any(token in low for token in benign)) and not any(
             token in low
             for token in hard_errors
         ):
             return False
         markers = (
-            "traceback", "exception", "syntax error", "fatal error", "build failed",
-            "test failed", "assertionerror", "error:", "failed:",
+            "traceback", "exception", "syntax error", "syntaxerror:", "fatal error", "build failed",
+            "test failed", "assertionerror", "referenceerror:", "typeerror:", "valueerror:",
+            "runtimeerror:", "modulenotfounderror:", "importerror:", "nameerror:",
+            "filenotfounderror:", "error:", "failed:", "command not found",
+            "cannot find module", "no such file or directory",
         )
         return explicit_nonzero_exit or any(marker in low for marker in markers)
 
@@ -26356,14 +26999,43 @@ class SessionState:
             buffer_match = re.search(r"(?m)^buffer_ref=([^\s]+)", text)
             temp_match = re.search(r"(?m)^full_output_path=([^\s]+)", text)
             read_targets = self._bash_file_read_targets(str(src_args.get("command", "") or ""))
-            evidence_kind = self._tool_memory_evidence_kind(tool, src_args, text, ok)
+            result_probe = {
+                "name": tool,
+                "args": dict(src_args),
+                "output": text,
+                "ok": bool(ok),
+            }
+            result_meta = self._peek_tool_result_meta()
+            exit_code = self._effective_shell_exit_code(text, result_meta.get("exit_code"))
+            if exit_code is not None:
+                result_probe["exit_code"] = int(exit_code)
+            if result_meta.get("error"):
+                result_probe["error"] = str(result_meta.get("error") or "")
+            self._annotate_negative_search_assertion(result_probe)
+            negative_assertion = bool(
+                str(result_probe.get("assertion_kind", "") or "") == "negative_search_no_match"
+                and result_probe.get("assertion_ok", False)
+            )
+            evidence_kind = (
+                "validation"
+                if negative_assertion
+                else self._tool_memory_evidence_kind(tool, src_args, text, ok)
+            )
             self._record_tool_memory(
                 tool,
                 src_args,
                 text,
                 role=role,
                 evidence_kind=evidence_kind,
-                result_status="ok" if ok else "error",
+                result_status=(
+                    "assertion_passed"
+                    if negative_assertion and result_probe.get("assertion_complete", False)
+                    else (
+                        "assertion_partial"
+                        if negative_assertion
+                        else ("ok" if ok else "error")
+                    )
+                ),
                 command=str(src_args.get("command", "") or ""),
                 target_path=read_targets[0] if read_targets else "",
                 related_paths=read_targets,
@@ -35472,7 +36144,7 @@ body{padding:18px}
                 args_error = str(tc.get("args_error", "") or "").strip()
                 raw_args = tc.get("raw_arguments")
                 if args_error:
-                    if name in {"TodoWrite", "TodoWriteRescue"}:
+                    if canonicalize_tool_name(name) in {"TodoWrite", "TodoWriteRescue"}:
                         repaired, repaired_out = self._attempt_malformed_tool_repair(name, raw_args)
                         if repaired:
                             msgs.append({"role": "tool", "tool_call_id": tc["id"], "name": name, "content": trim(repaired_out)})
@@ -35831,6 +36503,12 @@ body{padding:18px}
                     role = self._sanitize_agent_role(item)
                     if role and role not in participants:
                         participants.append(role)
+        execution_mode, participants, assigned_expert = self._resolve_level_assignment(
+            task_level,
+            assigned=assigned_expert,
+            participants=participants,
+            mode=execution_mode,
+        )
         if execution_mode == EXECUTION_MODE_SINGLE:
             participants = [assigned_expert]
         else:
@@ -35871,6 +36549,13 @@ body{padding:18px}
             updated_at = float(src.get("updated_at", base.get("updated_at", now_ts())) or now_ts())
         except Exception:
             updated_at = float(now_ts())
+        requires_todos = self._resolve_todo_requirement(
+            task_level,
+            src.get("requires_todos"),
+            raw_provided="requires_todos" in src,
+            allow_context=False,
+            fallback=True,
+        )
         return {
             "task_type": task_type,
             "complexity": complexity,
@@ -35881,6 +36566,7 @@ body{padding:18px}
             "participants": list(participants),
             "assigned_expert": assigned_expert,
             "requires_user_confirmation": bool(requires_user_confirmation),
+            "requires_todos": bool(requires_todos),
             "scale_preference": scale_preference,
             "round_budget": int(round_budget),
             "reason": reason or trim(str(base.get("reason", "")), 400),
@@ -36031,6 +36717,11 @@ body{padding:18px}
         return True
 
     def _execution_log_entry_is_success_evidence(self, row: dict) -> bool:
+        if (
+            str((row or {}).get("assertion_kind", "") or "") == "negative_search_no_match"
+            and bool((row or {}).get("assertion_ok", False))
+        ):
+            return bool((row or {}).get("assertion_complete", False))
         txt = str((row or {}).get("content", "") or "").strip().lower()
         if not txt:
             return False
@@ -36056,6 +36747,11 @@ body{padding:18px}
         )
 
     def _execution_log_entry_is_blocking_error(self, row: dict) -> bool:
+        if (
+            str((row or {}).get("assertion_kind", "") or "") == "negative_search_no_match"
+            and bool((row or {}).get("assertion_ok", False))
+        ):
+            return False
         txt = str((row or {}).get("content", "") or "").strip()
         if not txt:
             return False
@@ -36682,6 +37378,10 @@ body{padding:18px}
             "focus_epoch": 0.0,
             "plan_step_id": "",
             "plan_step_index": -1,
+            "plan_subtask_id": "",
+            "plan_subtask_content": "",
+            "baseline_todo_signature": [],
+            "baseline_evidence_ids": [],
         }
 
     def _watchdog_normalize_steps(self, rows: object) -> list[dict]:
@@ -36760,6 +37460,22 @@ body{padding:18px}
         out["focus_epoch"] = float(src.get("focus_epoch", 0.0) or 0.0)
         out["plan_step_id"] = trim(str(src.get("plan_step_id", "") or "").strip(), 80)
         out["plan_step_index"] = int(src.get("plan_step_index")) if src.get("plan_step_index") not in (None, "") else -1
+        out["plan_subtask_id"] = trim(str(src.get("plan_subtask_id", "") or "").strip(), 100)
+        out["plan_subtask_content"] = trim(str(src.get("plan_subtask_content", "") or "").strip(), 500)
+        raw_todo_signature = src.get("baseline_todo_signature", [])
+        if isinstance(raw_todo_signature, list):
+            out["baseline_todo_signature"] = [
+                [trim(str(value or ""), 500) for value in row[:4]]
+                for row in raw_todo_signature[:12]
+                if isinstance(row, (list, tuple))
+            ]
+        raw_evidence_ids = src.get("baseline_evidence_ids", [])
+        if isinstance(raw_evidence_ids, list):
+            out["baseline_evidence_ids"] = [
+                trim(str(value or ""), 100)
+                for value in raw_evidence_ids[-40:]
+                if str(value or "").strip()
+            ]
         out["steps"] = self._watchdog_normalize_steps(src.get("steps", []))
         if out["cursor"] >= len(out["steps"]):
             out["active"] = False
@@ -37018,14 +37734,75 @@ body{padding:18px}
         dq = self._normalize_decomposition_queue_state(board.get("decomposition_queue", {}))
         if bool(dq.get("active", False)):
             return False
-        steps, snapshot, raw_text = self._watchdog_decompose_steps(
-            board,
-            reason,
-            pinned_selection=pinned_selection,
-        )
+        active_plan_step = self._get_active_plan_step(board)
+        current_subtask = self._current_plan_worker_subtask_snapshot(
+            board=board,
+            role="",
+        ) if isinstance(active_plan_step, dict) else {}
+        current_subtask_id = trim(str(current_subtask.get("subtask_id", "") or ""), 100)
+        current_subtask_content = trim(str(current_subtask.get("subtask_content", "") or ""), 500)
+        if isinstance(active_plan_step, dict) and not current_subtask_id:
+            try:
+                self._activate_plan_step_execution(
+                    active_plan_step,
+                    board=board,
+                    owner=self._current_plan_worker_owner(board),
+                    reason="watchdog-current-step-bootstrap",
+                    sync_todos=False,
+                )
+                board = self._ensure_blackboard()
+                active_plan_step = self._get_active_plan_step(board)
+                current_subtask = self._current_plan_worker_subtask_snapshot(board=board, role="")
+                current_subtask_id = trim(str(current_subtask.get("subtask_id", "") or ""), 100)
+                current_subtask_content = trim(str(current_subtask.get("subtask_content", "") or ""), 500)
+            except Exception:
+                current_subtask_id = ""
+        if isinstance(active_plan_step, dict):
+            if not current_subtask_id:
+                # Never fall back to decomposing the whole original objective
+                # while a parent plan step is active. Normal routing can repair
+                # the missing child graph without mutating the roadmap.
+                return False
+            # An approved plan already owns decomposition. Recovery must never
+            # split the original project again; it gets one narrow execution
+            # timeslice for the canonical child that is currently in progress.
+            target = self._sanitize_agent_role(role) or self._current_plan_worker_owner(board)
+            action_type = "validate" if self._is_plan_step_acceptance_subtask(current_subtask_content) else "execute"
+            steps = self._watchdog_normalize_steps([{
+                "step": 1,
+                "target": target,
+                "action_type": action_type,
+                "description": (
+                    "Recover ONLY the canonical current subtask below. Do not decompose the original goal, "
+                    "do not create work for later parent steps, and do not replace the current subplan. "
+                    "Use one focused tool call that either advances this Todo or produces evidence directly matching it.\n"
+                    f"CURRENT SUBTASK: {current_subtask_content}"
+                ),
+            }])
+            snapshot = self._watchdog_snapshot_payload(board, reason, role, step)
+            raw_text = "approved-plan-current-subtask-recovery"
+        else:
+            steps, snapshot, raw_text = self._watchdog_decompose_steps(
+                board,
+                reason,
+                pinned_selection=pinned_selection,
+            )
         if not steps:
             return False
         focus_fields = self._route_focus_fields(board)
+        baseline_rows = self._active_plan_worker_todo_rows(
+            str(focus_fields.get("plan_step_id", "") or ""),
+            role="",
+        ) if focus_fields.get("plan_step_id") else []
+        baseline_signature = [list(row) for row in self._todo_progress_signature(baseline_rows)]
+        baseline_evidence_ids = [
+            str(row.get("id", "") or "")
+            for row in self._plan_step_evidence_records(
+                str(focus_fields.get("plan_step_id", "") or ""),
+                board=board,
+            )
+            if str(row.get("id", "") or "")
+        ] if focus_fields.get("plan_step_id") else []
         dq = {
             "active": True,
             "trigger_reason": trim(str(reason or "").strip(), 200),
@@ -37040,6 +37817,10 @@ body{padding:18px}
             "focus_epoch": focus_fields.get("focus_epoch", 0.0),
             "plan_step_id": focus_fields.get("plan_step_id", ""),
             "plan_step_index": focus_fields.get("plan_step_index", -1),
+            "plan_subtask_id": current_subtask_id,
+            "plan_subtask_content": current_subtask_content,
+            "baseline_todo_signature": baseline_signature,
+            "baseline_evidence_ids": baseline_evidence_ids,
         }
         wd = self._normalize_watchdog_state(board.get("watchdog", {}))
         wd["intent_no_tool_streak"] = 0
@@ -37071,17 +37852,33 @@ body{padding:18px}
         return True
 
     def _watchdog_escalate_to_single_developer(self, board: dict, *, reason: str = ""):
-        """Escalate repeated watchdog stalls by forcing Single+Developer mode."""
+        """Escalate a stall without overwriting the configured collaboration mode."""
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
-        self.runtime_execution_mode = EXECUTION_MODE_SINGLE
-        self.runtime_participants = ["developer"]
+        configured_mode = normalize_execution_mode(
+            getattr(self, "execution_mode", ""),
+            default=self._effective_execution_mode(),
+        )
+        preserve_collaboration = configured_mode in {EXECUTION_MODE_SEQUENTIAL, EXECUTION_MODE_SYNC}
+        if preserve_collaboration:
+            self.runtime_execution_mode = configured_mode
+            participants = [
+                self._sanitize_agent_role(item)
+                for item in (self.runtime_participants or [])
+                if self._sanitize_agent_role(item)
+            ]
+            if "developer" not in participants:
+                participants.insert(0, "developer")
+            self.runtime_participants = participants[:3] or ["developer"]
+        else:
+            self.runtime_execution_mode = EXECUTION_MODE_SINGLE
+            self.runtime_participants = ["developer"]
         self.runtime_assigned_expert = "developer"
         dq = self._normalize_decomposition_queue_state(bb.get("decomposition_queue", {}))
         dq["active"] = False
         bb["decomposition_queue"] = dq
         profile = self._ensure_blackboard_task_profile(bb)
-        profile["execution_mode"] = EXECUTION_MODE_SINGLE
-        profile["participants"] = ["developer"]
+        profile["execution_mode"] = self.runtime_execution_mode
+        profile["participants"] = list(self.runtime_participants)
         profile["assigned_expert"] = "developer"
         bb["task_profile"] = profile
         self.blackboard = bb
@@ -37089,7 +37886,11 @@ body{padding:18px}
         self._blackboard_history(
             "manager",
             trim(
-                f"watchdog escalation: forced Single+Developer (trigger_count={int(bb.get('watchdog', {}).get('trigger_count', 0))}, reason={reason})",
+                (
+                    "watchdog escalation: assigned Developer recovery "
+                    f"without changing configured mode={self.runtime_execution_mode} "
+                    f"(trigger_count={int(bb.get('watchdog', {}).get('trigger_count', 0))}, reason={reason})"
+                ),
                 520,
             ),
         )
@@ -37097,8 +37898,8 @@ body{padding:18px}
             "status",
             {
                 "summary": (
-                    "watchdog escalation: multi-agent stall detected, "
-                    "downgrading to Single+Developer mode"
+                    "watchdog escalation: Developer recovery activated; "
+                    f"configured {self.runtime_execution_mode} mode retained"
                 )
             },
         )
@@ -37133,6 +37934,17 @@ body{padding:18px}
             self.blackboard = bb
             self._blackboard_touch()
             return None
+        bound_subtask_id = trim(str(dq.get("plan_subtask_id", "") or ""), 100)
+        if bound_subtask_id:
+            current_subtask = self._current_plan_worker_subtask_snapshot(board=bb, role="")
+            current_subtask_id = trim(str(current_subtask.get("subtask_id", "") or ""), 100)
+            if current_subtask_id != bound_subtask_id:
+                dq["active"] = False
+                dq["last_error"] = "deactivated stale executor queue after canonical subtask changed"
+                bb["decomposition_queue"] = dq
+                self.blackboard = bb
+                self._blackboard_touch()
+                return None
         steps = list(dq.get("steps", []) or [])
         if not steps:
             return None
@@ -37199,6 +38011,8 @@ body{padding:18px}
             "plan_step_index": active_fields.get("plan_step_index", -1),
             "plan_step_total": active_fields.get("plan_step_total", 0),
             "plan_step_epoch": active_fields.get("plan_step_epoch", 0.0),
+            "plan_subtask_id": bound_subtask_id,
+            "plan_subtask_content": trim(str(dq.get("plan_subtask_content", "") or ""), 500),
         }
         bb["decomposition_queue"] = dq
         self.blackboard = bb
@@ -37224,10 +38038,17 @@ body{padding:18px}
         dq_focus = str(dq.get("focus_id", "") or "")
         if dq_focus and dq_focus != str(active_fields.get("focus_id", "") or ""):
             dq["active"] = False
-            dq["last_error"] = "queue focus changed before worker progress accounting"
+            bound_step_id = trim(str(dq.get("plan_step_id", "") or ""), 80)
+            active_step_id = trim(str(active_fields.get("plan_step_id", "") or ""), 80)
+            progressed = bool(bound_step_id and bound_step_id != active_step_id)
+            dq["last_error"] = (
+                "executor queue closed because its plan step advanced"
+                if progressed
+                else "queue focus changed before worker progress accounting"
+            )
             bb["decomposition_queue"] = dq
             self.blackboard = bb
-            return {"queue_active": False, "step_advanced": False}
+            return {"queue_active": False, "step_advanced": progressed}
         rows = list(dq.get("steps", []) or [])
         cursor = max(0, int(dq.get("cursor", 0) or 0))
         if cursor >= len(rows):
@@ -37247,9 +38068,54 @@ body{padding:18px}
         text = trim(strip_thinking_content(str((step or {}).get("text", "") or "").strip()), 1200)
         tool_results = (step or {}).get("tool_results", []) if isinstance((step or {}).get("tool_results"), list) else []
         has_ok_tool = any(isinstance(row, dict) and bool(row.get("ok", False)) for row in tool_results)
-        success = bool(status == "tools" and has_ok_tool)
-        if (not success) and status == "no-tools" and role_key in {"explorer", "reviewer"} and len(text) >= 120:
-            success = True
+        bound_subtask_id = trim(str(dq.get("plan_subtask_id", "") or ""), 100)
+        success = False
+        stale_subtask = False
+        if bound_subtask_id:
+            bound_step_id = trim(str(dq.get("plan_step_id", "") or ""), 80)
+            plan_step = self._get_plan_step_by_id(bound_step_id, bb)
+            rows_for_step = self._active_plan_worker_todo_rows(bound_step_id, role="") if bound_step_id else []
+            bound_row = next(
+                (
+                    row for row in rows_for_step
+                    if self._stable_plan_worker_subtask_id(bound_step_id, row) == bound_subtask_id
+                ),
+                None,
+            )
+            current_subtask = self._current_plan_worker_subtask_snapshot(board=bb, role="")
+            current_subtask_id = trim(str(current_subtask.get("subtask_id", "") or ""), 100)
+            completed = bool(
+                isinstance(bound_row, dict)
+                and str(bound_row.get("status", "") or "").strip().lower() == "completed"
+            )
+            baseline_ids = {
+                str(value or "") for value in (dq.get("baseline_evidence_ids", []) or [])
+                if str(value or "")
+            }
+            new_bound_records = [
+                record for record in self._plan_step_evidence_records(bound_step_id, board=bb)
+                if str(record.get("id", "") or "") not in baseline_ids
+                and str(record.get("subtask_id", "") or "") == bound_subtask_id
+                and self._plan_evidence_record_passes(record)
+            ] if bound_step_id else []
+            evidence_matched = bool(
+                isinstance(plan_step, dict)
+                and isinstance(bound_row, dict)
+                and new_bound_records
+                and self._plan_subtask_has_accumulated_evidence(
+                    plan_step,
+                    bound_row.get("content", ""),
+                    board=bb,
+                    subtask_id=bound_subtask_id,
+                    since_ts=float(bound_row.get("created_at", 0.0) or bound_row.get("started_at", 0.0) or 0.0),
+                )
+            )
+            success = bool(completed or evidence_matched)
+            stale_subtask = bool(current_subtask_id != bound_subtask_id and not completed)
+        else:
+            success = bool(status == "tools" and has_ok_tool)
+            if (not success) and status == "no-tools" and role_key in {"explorer", "reviewer"} and len(text) >= 120:
+                success = True
         attempts = max(0, int(current.get("attempts", 0) or 0)) + 1
         current["attempts"] = attempts
         current["updated_at"] = float(now_ts())
@@ -37258,15 +38124,29 @@ body{padding:18px}
             dq["cursor"] = cursor + 1
             out["step_advanced"] = True
             dq["last_error"] = ""
+        elif stale_subtask:
+            current["status"] = "stale"
+            dq["active"] = False
+            dq["last_error"] = "executor queue invalidated because canonical subtask changed"
+            out["queue_active"] = False
         elif status in {"no-tools", "tools", "skip"}:
             if attempts >= int(WATCHDOG_STEP_MAX_ATTEMPTS):
-                current["status"] = "skipped"
-                dq["cursor"] = cursor + 1
-                out["step_advanced"] = True
-                dq["last_error"] = trim(
-                    f"step {cursor + 1} skipped after {attempts} attempts ({status})",
-                    300,
-                )
+                if bound_subtask_id:
+                    current["status"] = "failed"
+                    dq["active"] = False
+                    out["queue_active"] = False
+                    dq["last_error"] = trim(
+                        f"current-subtask recovery stopped after {attempts} attempts without matching Todo/evidence progress",
+                        300,
+                    )
+                else:
+                    current["status"] = "skipped"
+                    dq["cursor"] = cursor + 1
+                    out["step_advanced"] = True
+                    dq["last_error"] = trim(
+                        f"step {cursor + 1} skipped after {attempts} attempts ({status})",
+                        300,
+                    )
             else:
                 current["status"] = "retry"
                 dq["last_error"] = trim(
@@ -37297,6 +38177,7 @@ body{padding:18px}
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         wd = self._normalize_watchdog_state(bb.get("watchdog", {}))
         dq = self._normalize_decomposition_queue_state(bb.get("decomposition_queue", {}))
+        queue_was_active = bool(dq.get("active", False))
         status = str((step or {}).get("status", "") or "").strip().lower()
         text = trim(strip_thinking_content(str((step or {}).get("text", "") or "").strip()), 1200)
         wd["last_state_fp"] = self._watchdog_state_fingerprint(bb)
@@ -37331,11 +38212,19 @@ body{padding:18px}
         progress_row = self._watchdog_mark_step_progress(bb, role, step)
         bb = self._ensure_blackboard()
         dq = self._normalize_decomposition_queue_state(bb.get("decomposition_queue", {}))
+        if bool(progress_row.get("step_advanced", False)):
+            wd["intent_no_tool_streak"] = 0
+            wd["repeat_no_tool_streak"] = 0
+            wd["state_unchanged_streak"] = 0
+            wd["trigger_count"] = 0
+            wd["last_trigger_reason"] = ""
+            bb["watchdog"] = wd
+            self.blackboard = bb
         trigger_reason = ""
         _is_single = self._effective_execution_mode() == EXECUTION_MODE_SINGLE
         _intent_th = WATCHDOG_INTENT_NO_TOOL_THRESHOLD_SINGLE if _is_single else WATCHDOG_INTENT_NO_TOOL_THRESHOLD
         _repeat_th = WATCHDOG_REPEAT_NO_TOOL_THRESHOLD_SINGLE if _is_single else WATCHDOG_REPEAT_NO_TOOL_THRESHOLD
-        if not bool(dq.get("active", False)):
+        if not bool(dq.get("active", False)) and not queue_was_active:
             if int(wd.get("intent_no_tool_streak", 0) or 0) >= int(_intent_th):
                 trigger_reason = "intent-without-tool-call"
             elif int(wd.get("repeat_no_tool_streak", 0) or 0) >= int(_repeat_th):
@@ -37365,7 +38254,22 @@ body{padding:18px}
                 self._blackboard_touch()
                 # Failure ledger: record stall event
                 self._ledger_record_stall(trigger_reason, "unresolved")
-                if int(wd["trigger_count"]) >= 2:
+                approved_plan_active = isinstance(self._get_active_plan_step(bb), dict) and (
+                    bool(self.runtime_plan_approved)
+                    or str((bb.get("plan", {}) or {}).get("phase", "") or "").strip().lower() == "executing"
+                )
+                if approved_plan_active:
+                    # Repeated watchdog activation inside an approved plan stays
+                    # scoped to the current child. It must not open a new plan,
+                    # request a whole-tree recovery choice, or pause normal work.
+                    triggered = self._watchdog_activate_decomposition(
+                        bb,
+                        reason=trigger_reason,
+                        role=role,
+                        step=step,
+                        pinned_selection=pinned_selection,
+                    )
+                elif int(wd["trigger_count"]) >= 2:
                     _wd_sev = self._bump_stall_severity("watchdog", STALL_SEVERITY_WEIGHT_WATCHDOG)
                     if _wd_sev >= STALL_SEVERITY_ESCALATION_THRESHOLD:
                         if not self._escalate_stall_to_plan_mode(
@@ -37422,6 +38326,7 @@ body{padding:18px}
         )
         safe_step = step if isinstance(step, dict) else {}
         self._blackboard_update_from_worker_step(role, safe_step)
+        plan_step_advanced = self._post_execution_plan_step_check(queue_args, safe_step)
         board_after = self._ensure_blackboard()
         board_after_fp = self._watchdog_state_fingerprint(board_after)
         wd_event = self._watchdog_process_worker_step(
@@ -37449,6 +38354,7 @@ body{padding:18px}
             "role": role,
             "status": status,
             "wd_event": wd_event,
+            "plan_step_advanced": bool(plan_step_advanced),
             "trigger_reason": trim(str(meta.get("trigger_reason", "") or "").strip(), 120),
             "finish_gate_reason": finish_gate_reason,
         }
@@ -37508,8 +38414,13 @@ body{padding:18px}
             "review_feedback": [],
             "conversation_history": [],
             "plan_worker_todos": {},
+            # Durable completion proof for worker rows.  The event ledger is
+            # intentionally bounded, so this compact index survives compaction
+            # and restart without retaining full tool output.
+            "plan_subtask_evidence_bindings": {},
             "plan_step_evidence": {},
             "plan_step_quality_reviews": {},
+            "plan_step_recovery": {},
             "plan_todo_revisions": [],
             "status": "INITIALIZING",
             "task_epoch": float(now_ts()),
@@ -37545,12 +38456,15 @@ body{padding:18px}
                 "progress_fp": "",
                 "is_mandatory": False,
                 "ts": 0.0,
+                "plan_subtask_id": "",
+                "plan_subtask_content": "",
             },
             "task_profile": profile,
             "manager_judgement": {
                 "task_type": str(profile.get("task_type", "general")),
                 "complexity": str(profile.get("complexity", "simple")),
                 "scale_preference": str(profile.get("scale_preference", "balanced") or "balanced"),
+                "requires_todos": bool(profile.get("requires_todos", False)),
                 "progress": progress,
                 "remaining_rounds": (
                     -1
@@ -37574,6 +38488,14 @@ body{padding:18px}
                 "repeated_delegations": [],
                 "stall_events": [],
                 "tool_call_fingerprints": [],
+            },
+            "failure_recovery": {
+                "reason": "",
+                "count": 0,
+                "ts": 0.0,
+                "focus_kind": "",
+                "focus_id": "",
+                "focus_epoch": 0.0,
             },
             "checkpoints": [],
             "persisted_manager_routes": [],
@@ -37612,6 +38534,8 @@ body{padding:18px}
                 "plan_step_index": int(raw_delegate.get("plan_step_index")) if raw_delegate.get("plan_step_index") not in (None, "") else -1,
                 "plan_step_total": int(raw_delegate.get("plan_step_total", 0) or 0),
                 "plan_step_epoch": float(raw_delegate.get("plan_step_epoch", 0.0) or 0.0),
+                "plan_subtask_id": trim(str(raw_delegate.get("plan_subtask_id", "") or "").strip(), 100),
+                "plan_subtask_content": trim(str(raw_delegate.get("plan_subtask_content", "") or "").strip(), 500),
             }
         raw_approval = src.get("approval", {})
         if isinstance(raw_approval, dict):
@@ -37655,6 +38579,19 @@ body{padding:18px}
                     .strip()
                     .lower()
                 ),
+                "requires_todos": self._resolve_todo_requirement(
+                    board["task_profile"].get("task_level", 0),
+                    raw_judgement.get(
+                        "requires_todos",
+                        board["task_profile"].get("requires_todos"),
+                    ),
+                    raw_provided=(
+                        "requires_todos" in raw_judgement
+                        or "requires_todos" in board["task_profile"]
+                    ),
+                    allow_context=False,
+                    fallback=True,
+                ),
                 "progress": trim(str(raw_judgement.get("progress", "initializing") or "").strip().lower(), 40),
                 "remaining_rounds": max(
                     -1,
@@ -37682,6 +38619,7 @@ body{padding:18px}
                 "task_type": str(board["task_profile"].get("task_type", "")),
                 "complexity": str(board["task_profile"].get("complexity", "")),
                 "scale_preference": str(board["task_profile"].get("scale_preference", "balanced") or "balanced"),
+                "requires_todos": bool(board["task_profile"].get("requires_todos", False)),
                 "progress": "initializing",
                 "remaining_rounds": (
                     -1
@@ -37715,21 +38653,28 @@ body{padding:18px}
                 }
                 if "status" in row:
                     clean_row["status"] = trim(str(row.get("status", "") or "").strip(), 80)
-                for meta_key in ("focus_kind", "focus_id", "focus_epoch", "plan_step_id", "plan_step_index"):
+                for meta_key in (
+                    "focus_kind", "focus_id", "focus_epoch", "plan_step_id", "plan_step_index",
+                    "assertion_kind", "assertion_ok", "assertion_complete", "assertion_command", "exit_code",
+                ):
                     if meta_key not in row:
                         continue
-                    if meta_key == "plan_step_index":
+                    if meta_key in {"plan_step_index", "exit_code"}:
                         try:
-                            clean_row[meta_key] = int(row.get(meta_key, -1) or -1)
+                            default_value = -1 if meta_key == "plan_step_index" else 0
+                            clean_row[meta_key] = int(row.get(meta_key, default_value))
                         except Exception:
-                            clean_row[meta_key] = -1
+                            clean_row[meta_key] = -1 if meta_key == "plan_step_index" else 0
                     elif meta_key == "focus_epoch":
                         try:
                             clean_row[meta_key] = float(row.get(meta_key, 0.0) or 0.0)
                         except Exception:
                             clean_row[meta_key] = 0.0
+                    elif meta_key in {"assertion_ok", "assertion_complete"}:
+                        clean_row[meta_key] = bool(row.get(meta_key, False))
                     else:
-                        clean_row[meta_key] = trim(str(row.get(meta_key, "") or "").strip(), 120)
+                        max_len = 500 if meta_key == "assertion_command" else 120
+                        clean_row[meta_key] = trim(str(row.get(meta_key, "") or "").strip(), max_len)
                 out.append(clean_row)
             return out[-BLACKBOARD_MAX_LOG_ENTRIES:]
 
@@ -37773,7 +38718,19 @@ body{padding:18px}
                     }
                     subtask_id = trim(str(row.get("subtask_id", "") or ""), 80)
                     if subtask_id:
-                        clean_row["subtask_id"] = subtask_id
+                        if self._is_canonical_plan_worker_subtask_id(subtask_id, step_id):
+                            clean_row["subtask_id"] = subtask_id
+                        else:
+                            clean_row["external_subtask_id"] = subtask_id
+                    external_subtask_id = trim(
+                        str(row.get("external_subtask_id", "") or "").strip(),
+                        120,
+                    )
+                    if external_subtask_id:
+                        clean_row["external_subtask_id"] = external_subtask_id
+                    row_key = trim(str(row.get("key", "") or "").strip(), 120)
+                    if row_key and not row_key.startswith("bb:"):
+                        clean_row["key"] = row_key
                     clean_rows.append(clean_row)
                 plan_step = next(
                     (
@@ -37809,6 +38766,38 @@ body{padding:18px}
                     clean_evidence[step_id] = rows
             if clean_evidence:
                 board["plan_step_evidence"] = clean_evidence
+        raw_bindings = src.get("plan_subtask_evidence_bindings")
+        if isinstance(raw_bindings, dict):
+            clean_bindings: dict[str, dict[str, dict]] = {}
+            for raw_step_id, raw_step_bindings in list(raw_bindings.items())[:80]:
+                step_id = trim(str(raw_step_id or "").strip(), 40)
+                if not step_id or not isinstance(raw_step_bindings, dict):
+                    continue
+                step_out: dict[str, dict] = {}
+                for raw_subtask_id, raw_binding in list(raw_step_bindings.items())[:40]:
+                    subtask_id = trim(str(raw_subtask_id or "").strip(), 100)
+                    if not subtask_id or not isinstance(raw_binding, dict):
+                        continue
+                    evidence_ids = [
+                        trim(str(value or ""), 80)
+                        for value in (raw_binding.get("evidence_ids", []) if isinstance(raw_binding.get("evidence_ids"), list) else [])[:12]
+                        if str(value or "").strip()
+                    ]
+                    if not evidence_ids:
+                        continue
+                    step_out[subtask_id] = {
+                        "subtask_id": trim(str(raw_binding.get("subtask_id", subtask_id) or subtask_id), 100),
+                        "content_core": trim(str(raw_binding.get("content_core", "") or ""), 500),
+                        "source": trim(str(raw_binding.get("source", "direct") or "direct"), 40),
+                        "actor": trim(str(raw_binding.get("actor", "developer") or "developer"), 40),
+                        "evidence_ids": evidence_ids,
+                        "evidence": trim(str(raw_binding.get("evidence", "") or ""), 300),
+                        "ts": float(raw_binding.get("ts", 0.0) or 0.0),
+                    }
+                if step_out:
+                    clean_bindings[step_id] = step_out
+            if clean_bindings:
+                board["plan_subtask_evidence_bindings"] = clean_bindings
         raw_quality_reviews = src.get("plan_step_quality_reviews")
         if isinstance(raw_quality_reviews, dict):
             clean_quality_reviews: dict[str, list[dict]] = {}
@@ -37822,9 +38811,11 @@ body{padding:18px}
                         continue
                     rows.append({
                         "passed": bool(raw_row.get("passed", False)),
+                        "decision": trim(str(raw_row.get("decision", "verify") or "verify"), 20),
                         "confidence": trim(str(raw_row.get("confidence", "low") or "low"), 20),
                         "reason": trim(str(raw_row.get("reason", "") or ""), 500),
                         "missing": [trim(str(x), 220) for x in (raw_row.get("missing", []) or [])[:8]],
+                        "next_actions": [trim(str(x), 220) for x in (raw_row.get("next_actions", []) or [])[:8]],
                         "evidence": [trim(str(x), 260) for x in (raw_row.get("evidence", []) or [])[:8]],
                         "source": trim(str(raw_row.get("source", "") or ""), 40),
                         "evidence_signature": trim(str(raw_row.get("evidence_signature", "") or ""), 80),
@@ -37834,6 +38825,24 @@ body{padding:18px}
                     clean_quality_reviews[step_id] = rows
             if clean_quality_reviews:
                 board["plan_step_quality_reviews"] = clean_quality_reviews
+        raw_step_recovery = src.get("plan_step_recovery")
+        if isinstance(raw_step_recovery, dict) and raw_step_recovery:
+            board["plan_step_recovery"] = {
+                "active": bool(raw_step_recovery.get("active", False)),
+                "parent_step_id": trim(str(raw_step_recovery.get("parent_step_id", "") or ""), 40),
+                "step_epoch": float(raw_step_recovery.get("step_epoch", 0.0) or 0.0),
+                "task_epoch": float(raw_step_recovery.get("task_epoch", 0.0) or 0.0),
+                "plan_signature": trim(str(raw_step_recovery.get("plan_signature", "") or ""), 80),
+                "evidence_signature": trim(str(raw_step_recovery.get("evidence_signature", "") or ""), 80),
+                "reason": trim(str(raw_step_recovery.get("reason", "") or ""), 300),
+                "decision": trim(str(raw_step_recovery.get("decision", "verify") or "verify"), 20),
+                "selected_action": trim(str(raw_step_recovery.get("selected_action", "") or ""), 20),
+                "missing": [trim(str(x), 220) for x in (raw_step_recovery.get("missing", []) or [])[:8]],
+                "next_actions": [trim(str(x), 220) for x in (raw_step_recovery.get("next_actions", []) or [])[:8]],
+                "attempt": max(1, int(raw_step_recovery.get("attempt", 1) or 1)),
+                "created_at": float(raw_step_recovery.get("created_at", 0.0) or 0.0),
+                "selected_at": float(raw_step_recovery.get("selected_at", 0.0) or 0.0),
+            }
         raw_artifacts = src.get("code_artifacts", {})
         artifacts: dict[str, dict] = {}
         if isinstance(raw_artifacts, dict):
@@ -37985,6 +38994,16 @@ body{padding:18px}
             "stall_events": [],
             "tool_call_fingerprints": [],
         }
+        raw_recovery = src.get("failure_recovery")
+        if isinstance(raw_recovery, dict):
+            board["failure_recovery"] = {
+                "reason": trim(str(raw_recovery.get("reason", "") or ""), 240),
+                "count": max(0, int(raw_recovery.get("count", 0) or 0)),
+                "ts": float(raw_recovery.get("ts", 0.0) or 0.0),
+                "focus_kind": trim(str(raw_recovery.get("focus_kind", "") or ""), 40),
+                "focus_id": trim(str(raw_recovery.get("focus_id", "") or ""), 120),
+                "focus_epoch": float(raw_recovery.get("focus_epoch", 0.0) or 0.0),
+            }
         raw_cp = src.get("checkpoints")
         board["checkpoints"] = list(raw_cp)[-CHECKPOINT_MAX_COUNT:] if isinstance(raw_cp, list) else []
         raw_pmr = src.get("persisted_manager_routes")
@@ -38933,10 +39952,13 @@ body{padding:18px}
         preserved_cursor = old_bb.get("plan_step_cursor", None)
         preserved_total = old_bb.get("plan_step_total", None)
         preserved_worker_todos = old_bb.get("plan_worker_todos", {})
+        preserved_subtask_bindings = old_bb.get("plan_subtask_evidence_bindings", {})
         preserved_step_evidence = old_bb.get("plan_step_evidence", {})
         preserved_quality_reviews = old_bb.get("plan_step_quality_reviews", {})
         preserved_todo_revisions = old_bb.get("plan_todo_revisions", [])
         preserved_step_files = old_bb.get("step_files", {})
+        if not preserve_active_state:
+            self.runtime_requires_todos = None
         self.blackboard = self._new_blackboard(goal)
         if (
             isinstance(preserved_skills, dict)
@@ -38968,6 +39990,8 @@ body{padding:18px}
                 self.blackboard["plan_step_total"] = preserved_total
             if isinstance(preserved_worker_todos, dict):
                 self.blackboard["plan_worker_todos"] = preserved_worker_todos
+            if isinstance(preserved_subtask_bindings, dict):
+                self.blackboard["plan_subtask_evidence_bindings"] = preserved_subtask_bindings
             if isinstance(preserved_step_evidence, dict):
                 self.blackboard["plan_step_evidence"] = preserved_step_evidence
             if isinstance(preserved_quality_reviews, dict):
@@ -39001,7 +40025,15 @@ body{padding:18px}
         board["conversation_history"] = rows[-BLACKBOARD_MAX_LOG_ENTRIES:]
         self._blackboard_touch()
 
-    def _blackboard_append_section(self, section: str, actor: str, content: str, *, status: str = ""):
+    def _blackboard_append_section(
+        self,
+        section: str,
+        actor: str,
+        content: str,
+        *,
+        status: str = "",
+        metadata: dict | None = None,
+    ):
         key = str(section or "").strip()
         _ALLOWED = {"research_notes", "execution_logs", "review_feedback",
                      "plan_findings", "plan_proposal", "plan_steps", "plan_risks",
@@ -39025,6 +40057,22 @@ body{padding:18px}
             "plan_step_id": str(focus.get("id", "") or "") if str(focus.get("kind", "") or "") == "plan_step" else "",
             "plan_step_index": int(focus.get("index")) if focus.get("index") not in (None, "") else -1,
         }
+        if isinstance(metadata, dict):
+            assertion_kind = trim(str(metadata.get("assertion_kind", "") or ""), 80)
+            if assertion_kind:
+                row["assertion_kind"] = assertion_kind
+                row["assertion_ok"] = bool(metadata.get("assertion_ok", False))
+                row["assertion_complete"] = bool(metadata.get("assertion_complete", False))
+                row["assertion_command"] = trim(
+                    str(metadata.get("assertion_command", "") or ""),
+                    500,
+                )
+            exit_code = metadata.get("exit_code", None)
+            if exit_code is not None:
+                try:
+                    row["exit_code"] = int(exit_code)
+                except Exception:
+                    pass
         rows.append(row)
         board[key] = rows[-BLACKBOARD_MAX_LOG_ENTRIES:]
         self.blackboard = board
@@ -39572,6 +40620,186 @@ body{padding:18px}
                 pass
         return self._effective_shell_exit_code(item.get("output", ""), None)
 
+    def _annotate_tool_control_feedback(self, item: dict) -> dict:
+        """Separate plan/todo policy feedback from real tool execution faults."""
+        if not isinstance(item, dict) or bool(item.get("ok", False)):
+            return item
+        control_outcome = self._tool_control_feedback_outcome(
+            item.get("name", ""),
+            item.get("output", ""),
+        )
+        if control_outcome:
+            item["control_feedback"] = True
+            item["control_outcome"] = control_outcome
+            item["error_kind"] = "plan_control_gate"
+        return item
+
+    @staticmethod
+    def _plan_control_feedback(outcome: object, message: object) -> str:
+        outcome_key = re.sub(r"[^a-z0-9_]+", "_", str(outcome or "continue").strip().lower()).strip("_")
+        return f"Control[{outcome_key or 'continue'}]: {str(message or '').strip()}"
+
+    def _tool_control_feedback_outcome(self, name: object, output: object) -> str:
+        del name
+        match = re.match(
+            r"(?is)^\s*control\[([a-z][a-z0-9_]*)\]\s*:",
+            unicodedata.normalize("NFKC", str(output or "")),
+        )
+        return str(match.group(1) or "").lower() if match else ""
+
+    @staticmethod
+    def _tool_result_is_control_feedback(item: dict | None) -> bool:
+        return bool(isinstance(item, dict) and item.get("control_feedback", False))
+
+    def _annotate_negative_search_assertion(self, item: dict) -> dict:
+        if not isinstance(item, dict):
+            return item
+        if str(item.get("name", "") or "") not in {"bash", "worktree_run"}:
+            return item
+        if self._tool_result_exit_code(item) != 1 or item.get("error"):
+            return item
+        args = item.get("args", {}) if isinstance(item.get("args"), dict) else {}
+        command = str(args.get("command", "") or "").strip()
+        if not command:
+            return item
+        output = str(item.get("output", "") or "").strip()
+        output_low = output.lower()
+        if any(
+            marker in output_low
+            for marker in (
+                "no such file", "permission denied", "invalid option", "unrecognized option",
+                "regex parse error", "regular expression error", "command not found",
+            )
+        ):
+            return item
+
+        split_parts = re.split(r"(\&\&|;|\n)", command)
+        command_segments = [
+            (idx, part.strip())
+            for idx, part in enumerate(split_parts)
+            if idx % 2 == 0 and str(part or "").strip()
+        ]
+        search_segments = [
+            (idx, segment)
+            for idx, segment in command_segments
+            if re.search(r"(?:^|[\s|!])(?:grep|rg)(?:\s|$)", segment, flags=re.I)
+        ]
+        if not search_segments:
+            return item
+        search_part_index, search_segment = search_segments[0]
+        active_step = self._get_active_plan_step(self._ensure_blackboard())
+        context = "\n".join(
+            value
+            for value in (
+                str(item.get("plan_subtask_content", "") or ""),
+                str((active_step or {}).get("content", "") or "") if isinstance(active_step, dict) else "",
+                str((active_step or {}).get("full_content", "") or "") if isinstance(active_step, dict) else "",
+                command,
+            )
+            if value
+        ).lower()
+        explicit_absence = any(
+            marker in context
+            for marker in (
+                "无匹配", "無匹配", "无输出", "無輸出", "无外链", "無外鏈",
+                "无外部", "無外部", "不包含", "不得包含", "不能包含", "禁止出现",
+                "禁止出現", "零外部", "no match", "no matches", "no output",
+                "no external", "must not contain", "must not include", "should not contain",
+                "forbidden", "absence", "zero matches",
+            )
+        )
+        url_absence = bool(
+            any(token in search_segment.lower() for token in ("http", "https", "cdn"))
+            and any(token in context for token in ("离线", "離線", "offline", "本地化", "localiz"))
+        )
+        explicitly_negated_search = bool(
+            re.search(r"(?:^|[;&|]\s*)!\s*(?:grep|rg)\b", command, flags=re.I)
+            or re.search(r"\bif\s+!\s*(?:grep|rg)\b", command, flags=re.I)
+        )
+        if not (explicit_absence or url_absence or explicitly_negated_search):
+            return item
+
+        later_segments = [
+            segment
+            for idx, segment in command_segments
+            if idx > search_part_index and segment
+        ]
+        item["assertion_kind"] = "negative_search_no_match"
+        item["assertion_ok"] = True
+        item["assertion_complete"] = not bool(later_segments)
+        item["assertion_command"] = trim(search_segment, 500)
+        item["assertion_summary"] = trim(
+            "negative search assertion passed: no matches"
+            + (
+                "; later compound-command checks were not proven by this exit code"
+                if later_segments
+                else ""
+            ),
+            500,
+        )
+        item["ok"] = True
+        return item
+
+    def _active_plan_recovery_progress_fingerprint(self, board: dict | None = None) -> str:
+        """Fingerprint meaningful current-step progress without counting duplicate failures."""
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        step = self._get_active_plan_step(bb)
+        if not isinstance(step, dict):
+            return ""
+        step_id = trim(str(step.get("id", "") or ""), 40)
+        if not step_id:
+            return ""
+        todo_rows = []
+        for row in self._active_plan_worker_todo_rows(step_id, role=""):
+            if not isinstance(row, dict):
+                continue
+            todo_rows.append(
+                (
+                    self._stable_plan_worker_subtask_id(step_id, row),
+                    self._normalize_todo_status_value(row.get("status", ""), "pending"),
+                    self._plan_worker_content_core(row.get("content", "")),
+                    trim(str(row.get("evidence", "") or ""), 300),
+                )
+            )
+        evidence_rows = self._plan_step_evidence_records(
+            step_id,
+            board=bb,
+            since_ts=self._plan_step_activation_ts(step),
+        )
+        evidence_rows.extend(self._plan_step_acceptance_review_records(
+            step,
+            board=bb,
+            since_ts=self._plan_step_activation_ts(step),
+        ))
+        evidence = {
+            (
+                trim(str(row.get("kind", "") or ""), 40),
+                trim(str(row.get("tool", "") or ""), 80),
+                trim(str(row.get("command", "") or ""), 500),
+                trim(str(row.get("path", "") or ""), 300),
+                bool(row.get("ok", False)),
+                row.get("exit_code"),
+                trim(str(row.get("summary", "") or row.get("content", "") or ""), 900),
+            )
+            for row in evidence_rows
+            if isinstance(row, dict)
+        }
+        plan_states = [
+            (
+                trim(str(row.get("id", "") or ""), 40),
+                self._normalize_todo_status_value(row.get("status", ""), "pending"),
+            )
+            for row in (bb.get("project_todos", []) if isinstance(bb.get("project_todos"), list) else [])
+            if isinstance(row, dict) and str(row.get("category", "") or "") == "plan_step"
+        ]
+        payload = {
+            "active_step": step_id,
+            "plan_states": plan_states,
+            "todos": todo_rows,
+            "evidence": sorted(evidence, key=lambda value: json_dumps(value)),
+        }
+        return hashlib.sha1(json_dumps(payload).encode("utf-8", "ignore")).hexdigest()[:20]
+
     def _tool_result_is_passing_execution(self, item: dict, *, require_validation: bool = False) -> bool:
         if not isinstance(item, dict) or not bool(item.get("ok", False)):
             return False
@@ -39588,10 +40816,12 @@ body{padding:18px}
         # still pending and cannot satisfy validation.
         if name == "check_background" and exit_code is None:
             return False
+        if str(item.get("assertion_kind", "") or "") == "negative_search_no_match":
+            return bool(item.get("assertion_ok", False) and item.get("assertion_complete", False))
         if exit_code is not None and exit_code != 0:
             return False
         output = str(item.get("output", "") or "")
-        if exit_code is None and self._command_output_has_error_shape(output):
+        if self._command_output_has_error_shape(output):
             return False
         return True
 
@@ -39695,6 +40925,12 @@ body{padding:18px}
         )
         blackboard_read_signal = any(str(r.get("name", "")) == "read_from_blackboard" for r in rows)
         bash_rows = [r for r in rows if str(r.get("name", "")) in {"bash", "worktree_run", "check_background"}]
+        browser_rows = [
+            self._browser_runtime_tool_result_record(r)
+            for r in rows
+            if self._is_browser_runtime_tool_name(r.get("name", ""))
+        ]
+        browser_rows = [row for row in browser_rows if row]
         observed_signal = False
         compile_signal = False
         test_signal = False
@@ -39730,6 +40966,9 @@ body{padding:18px}
                 test_signal = True
             elif execution_passed and low and any(tok in low for tok in test_hints) and not any(neg in low for neg in negative_hints):
                 test_signal = True
+        if any(self._acceptance_record_is_browser_runtime(row) for row in browser_rows):
+            observed_signal = True
+            test_signal = True
         wants_test = phase in ("test", "review") or any(
             tok in step_text for tok in ("test", "pytest", "unit", "integration", "验证", "測試", "测试", "回归", "assert")
         )
@@ -39802,7 +41041,14 @@ body{padding:18px}
                     ts = 0.0
                 if since_ts > 0 and ts > 0 and ts + 1e-6 < since_ts:
                     continue
-                out.append({"ts": ts, "content": txt, "actor": trim(str(row.get("actor", "") or ""), 40)})
+                out.append({
+                    "ts": ts,
+                    "content": txt,
+                    "actor": trim(str(row.get("actor", "") or ""), 40),
+                    "assertion_kind": trim(str(row.get("assertion_kind", "") or ""), 80),
+                    "assertion_ok": bool(row.get("assertion_ok", False)),
+                    "assertion_complete": bool(row.get("assertion_complete", False)),
+                })
             return out
 
         def _recent_excerpt(rows: list[dict], max_chars: int = 120) -> str:
@@ -39877,6 +41123,13 @@ body{padding:18px}
 
         def _has_observed(rows: list[dict]) -> bool:
             for row in reversed(rows[-6:]):
+                if (
+                    str(row.get("assertion_kind", "") or "") == "negative_search_no_match"
+                    and bool(row.get("assertion_ok", False))
+                ):
+                    if bool(row.get("assertion_complete", False)):
+                        return True
+                    continue
                 low = str(row.get("content", "") or "").lower()
                 if (
                     not low
@@ -39949,6 +41202,10 @@ body{padding:18px}
                 if normalize_rel_preview_path(str(value or ""))
             ],
             "exit_code": exit_code,
+            "assertion_kind": trim(str(row.get("assertion_kind", "") or ""), 80),
+            "assertion_ok": bool(row.get("assertion_ok", False)),
+            "assertion_complete": bool(row.get("assertion_complete", False)),
+            "assertion_command": trim(str(row.get("assertion_command", "") or ""), 500),
             "actor": trim(str(row.get("actor", "") or ""), 40),
             "ts": ts,
         }
@@ -40081,6 +41338,16 @@ body{padding:18px}
             exit_code = None
             evidence_context = f"blackboard_args={trim(json_dumps(args), 700)}\n"
         else:
+            browser_record = self._browser_runtime_tool_result_record(item)
+            if not browser_record:
+                return {}
+            kind = "runtime"
+            command = str(browser_record.get("command", "") or "")
+            path = str(browser_record.get("path", "") or "")
+            ok = bool(browser_record.get("ok", False))
+            exit_code = browser_record.get("exit_code", None)
+            evidence_context = "browser_runtime_observation\n"
+        if self._tool_result_is_control_feedback(item):
             return {}
         if kind == "runtime" and not command:
             return {}
@@ -40129,6 +41396,10 @@ body{padding:18px}
             ),
             "changed_files": changed_files,
             "exit_code": exit_code,
+            "assertion_kind": trim(str(item.get("assertion_kind", "") or ""), 80),
+            "assertion_ok": bool(item.get("assertion_ok", False)),
+            "assertion_complete": bool(item.get("assertion_complete", False)),
+            "assertion_command": trim(str(item.get("assertion_command", "") or ""), 500),
             "actor": self._sanitize_agent_role(role) or "developer",
             "ts": stamp,
         }
@@ -40158,11 +41429,97 @@ body{padding:18px}
             "检查", "檢查", "通过", "通過", "运行", "執行", "输出", "輸出", "记录", "記錄",
             "confirm", "ensure", "inspect", "open", "contains", "contain", "include", "includes",
             "and", "with", "from", "into", "atom", "atomic", "mode",
+            # Evidence-form words are descriptive metadata, not artifact
+            # assertions. Treating them as required literals made a normal
+            # contract such as "record screenshot/canvas evidence" impossible
+            # to satisfy.
+            "record", "records", "evidence", "key", "keys", "command", "commands",
+            "assertion", "assertions", "content", "browser", "runtime", "visual",
+            "screenshot", "screenshots", "canvas", "page", "pages", "visible",
+            "display", "displays", "render", "rendered", "rendering", "loaded",
+            "http", "url", "urls", "directory", "path", "paths", "entry",
+            "main", "source", "sources", "identity", "status", "statuses",
         }
+
+        def is_procedural_check_phrase(value: str) -> bool:
+            compact = re.sub(r"[\s\W_]+", "", value, flags=re.UNICODE)
+            if not compact:
+                return True
+            if re.fullmatch(
+                r"(?:(?:运行|執行|执行|进行|進行|确认|確認|确保|確保|验证|驗證|检查|檢查|测试|測試))?"
+                r"(?:(?:行为|行為)(?:以及|及其|并且|並且|和|与|與)?)?"
+                r"(?:相关|相關|有关|有關|相应|相應|对应|對應)"
+                r"(?:测试|測試|检查|檢查|验证|驗證|校验|校驗)"
+                r"(?:输出|輸出|结果|結果)?",
+                compact,
+            ):
+                return True
+            procedural_prefixes = (
+                "运行", "執行", "执行", "进行", "進行", "确认", "確認", "确保", "確保",
+                "验证", "驗證", "校验", "校驗", "检查", "檢查", "测试", "測試",
+            )
+            procedural_suffixes = (
+                "测试", "測試", "检查", "檢查", "验证", "驗證", "校验", "校驗",
+                "构建", "構建", "建置", "编译", "編譯", "通过", "通過", "成功",
+                "无报错", "無報錯", "无错误", "無錯誤",
+            )
+            procedural_fillers = (
+                "相关", "相關", "有关", "有關", "相应", "相應", "对应", "對應",
+                "当前", "目前", "本步骤", "本步驟", "本步", "最终", "最終", "完整",
+                "以及", "及其", "并且", "並且", "或者", "或", "和", "与", "與",
+            )
+            remainder = compact
+            changed = True
+            while changed and remainder:
+                changed = False
+                for prefix in procedural_prefixes:
+                    if remainder.startswith(prefix):
+                        remainder = remainder[len(prefix):]
+                        changed = True
+                        break
+                for suffix in procedural_suffixes:
+                    if remainder.endswith(suffix):
+                        remainder = remainder[:-len(suffix)]
+                        changed = True
+                        break
+                for filler in procedural_fillers:
+                    if remainder.startswith(filler):
+                        remainder = remainder[len(filler):]
+                        changed = True
+                        break
+                    if remainder.endswith(filler):
+                        remainder = remainder[:-len(filler)]
+                        changed = True
+                        break
+            return not remainder
+
         out: list[str] = []
+        evidence_form_tokens = {
+            "record", "records", "evidence", "key", "keys", "command", "commands",
+            "screenshot", "screenshots", "canvas", "browser", "runtime", "visual",
+            "page", "pages", "visible", "display", "render", "rendered", "loaded",
+        }
         for raw in candidates:
             term = re.sub(r"\s+", " ", str(raw or "").strip(" `\"'.,;:()[]{}"))
-            if len(term) < 3 or term in stop or term.isdigit():
+            compact_parts = [
+                part for part in re.split(r"[/|,+&]", term)
+                if part and part not in {"/", "|", "+", "&"}
+            ]
+            # A phrase such as ``screenshot/canvas evidence`` describes the
+            # shape of proof, not a literal assertion the artifact must contain.
+            # Keep this generic: only discard it when every component is an
+            # evidence-form word; real paths and named artifacts remain intact.
+            evidence_form_only = bool(compact_parts) and all(
+                re.sub(r"\s+", " ", part.strip()) in evidence_form_tokens
+                for part in compact_parts
+            )
+            if (
+                len(term) < 3
+                or term in stop
+                or term.isdigit()
+                or evidence_form_only
+                or is_procedural_check_phrase(term)
+            ):
                 continue
             if term not in out:
                 out.append(term)
@@ -40248,6 +41605,128 @@ body{padding:18px}
                 terms.append(threshold)
         return terms[:12]
 
+    def _acceptance_requires_browser_evidence(self, acceptance_text: object) -> bool:
+        """Return whether browser/runtime observation is the preferred evidence.
+
+        This classifier is shared by single and sync routes.  It must not act as
+        an extra hard gate for visual work: when a browser record is unavailable,
+        the aggregate evidence is handed to the semantic judge instead of being
+        rejected solely because of its tool/provider shape.
+        """
+        text = unicodedata.normalize("NFKC", str(acceptance_text or "")).lower()
+        visual_tokens = (
+            "browser", "浏览器", "瀏覽器", "playwright", "selenium", "cypress", "puppeteer",
+            "screenshot", "截图", "截圖", "canvas", "webgl", "three.js", "threejs",
+            "render", "rendered", "rendering", "渲染", "画面", "畫面", "视觉", "視覺",
+            "frontend", "front-end", "前端", "页面", "頁面", "dom", "ui", "交互", "互動",
+            "可旋转", "可旋轉", "visible", "display", "显示", "顯示", "fps",
+        )
+        return any(token in text for token in visual_tokens)
+
+    @staticmethod
+    def _is_browser_runtime_tool_name(tool_name: object) -> bool:
+        """Recognize browser-capable tool providers for evidence plumbing only.
+
+        The semantic acceptance judge still decides whether the observation
+        satisfies the task.  This classifier merely prevents successful MCP or
+        browser-driver results from disappearing before they reach that judge.
+        """
+        name = unicodedata.normalize("NFKC", str(tool_name or "")).lower()
+        return any(
+            token in name
+            for token in (
+                "browser", "playwright", "selenium", "cypress", "puppeteer",
+                "chromium", "chrome", "firefox", "webkit", "webdriver",
+                "screenshot", "page_snapshot", "page-snapshot",
+            )
+        )
+
+    def _browser_runtime_tool_result_record(self, item: dict) -> dict:
+        """Normalize one native browser/MCP result into the step evidence shape."""
+        if not isinstance(item, dict):
+            return {}
+        tool = canonicalize_tool_name(item.get("name", ""))
+        if not self._is_browser_runtime_tool_name(tool):
+            return {}
+        args = item.get("args", {}) if isinstance(item.get("args"), dict) else {}
+        output = str(item.get("output", "") or "")
+        command = trim(
+            f"{tool} {json_dumps(args) if args else ''}".strip(),
+            500,
+        )
+        return {
+            "kind": "runtime",
+            "tool": tool,
+            "ok": bool(item.get("ok", False)) and not self._command_output_has_error_shape(output),
+            "command": command,
+            "path": trim(
+                str(
+                    args.get("path", "")
+                    or args.get("url", "")
+                    or args.get("uri", "")
+                    or ""
+                ),
+                300,
+            ),
+            "summary": trim(output or json_dumps(args), 900),
+            "changed_files": [],
+            # Native browser tools expose successful structured results rather
+            # than a process return code.  The browser-runtime validator knows
+            # this distinction and still requires an observable page signal.
+            "exit_code": None,
+            "assertion_kind": trim(str(item.get("assertion_kind", "") or ""), 80),
+            "assertion_ok": bool(item.get("assertion_ok", False)),
+            "assertion_complete": bool(item.get("assertion_complete", False)),
+            "assertion_command": trim(str(item.get("assertion_command", "") or ""), 500),
+        }
+
+    def _acceptance_record_is_browser_runtime(self, record: dict) -> bool:
+        """Check that one runtime record contains an observable browser signal."""
+        if not isinstance(record, dict) or str(record.get("kind", "") or "") != "runtime":
+            return False
+        if not bool(record.get("ok", False)):
+            return False
+        try:
+            exit_code = record.get("exit_code", None)
+            exit_ok = exit_code == 0
+        except Exception:
+            exit_ok = False
+        tool = canonicalize_tool_name(record.get("tool", record.get("name", "")))
+        tool_low = str(tool or "").lower()
+        browser_tool = any(
+            token in tool_low
+            for token in ("browser", "playwright", "selenium", "cypress", "puppeteer", "chromium", "chrome", "firefox")
+        )
+        # Shell/runtime evidence must carry a real terminal exit code. A
+        # browser-native tool can instead expose its own successful tool result.
+        if not exit_ok and not (browser_tool and exit_code is None):
+            return False
+        command = str(record.get("command", "") or "")
+        summary = str(record.get("summary", "") or "")
+        haystack = f"{tool_low}\n{command}\n{summary}".lower()
+        if self._command_output_has_error_shape(summary):
+            return False
+        runner_signal = any(
+            token in haystack
+            for token in (
+                "playwright", "selenium", "cypress", "puppeteer", "chromium", "chrome", "firefox",
+                "browser", "page.", "goto(", "locator", "webdriver", "http://", "https://",
+                "localhost", "127.0.0.1", "static server", "静态服务", "靜態服務",
+            )
+        )
+        observation_signal = any(
+            token in haystack
+            for token in (
+                "screenshot", ".png", ".jpg", ".jpeg", "canvas", "webgl", "dom", "http 200",
+                "status 200", "page loaded", "loaded", "rendered", "visible", "console",
+                "image content", "image/png", "image/jpeg", "accessibility tree", "snapshot",
+                "fps", "runtime_ok", "browser_runtime_ok", "页面正常", "頁面正常", "加载成功", "載入成功",
+            )
+        )
+        # A browser tool's structured result is itself the runner signal, but
+        # it still needs an observed page/canvas/network result.
+        return bool((runner_signal or browser_tool) and observation_signal)
+
     @staticmethod
     def _acceptance_summary_covers_term(summary: object, term: object) -> bool:
         summary_text = unicodedata.normalize("NFKC", str(summary or "")).lower()
@@ -40283,6 +41762,20 @@ body{padding:18px}
             )
         if semantic_key in {"目标声明", "目標聲明", "objectivestatement", "goalstatement"}:
             return any(token in summary_text for token in ("目标声明", "目標聲明", "主目标", "主目標", "子目标", "子目標", "objective", "goal"))
+        if semantic_key in {"javascript", "javascriptfile", "jsfile", "ecmascript"}:
+            if any(token in summary_text for token in ("javascript", "ecmascript")):
+                return True
+            script_paths = re.findall(r"(?<![\w.-])([\w./@+-]+\.(?:js|mjs|cjs))(?![\w.-])", summary_text)
+            product_names = {"three.js", "node.js", "react.js", "vue.js", "next.js", "nuxt.js", "d3.js", "p5.js", "chart.js"}
+            return any(PurePosixPath(path).name.lower() not in product_names for path in script_paths)
+        if semantic_key in {"typescript", "typescriptfile", "tsfile"}:
+            return "typescript" in summary_text or bool(
+                re.search(r"(?<![\w.-])[\w./@+-]+\.(?:ts|tsx)(?![\w.-])", summary_text)
+            )
+        if semantic_key in {"python", "pythonfile", "pyfile"}:
+            return "python" in summary_text or bool(
+                re.search(r"(?<![\w.-])[\w./@+-]+\.py(?![\w.-])", summary_text)
+            )
         threshold = re.fullmatch(r"(>=|<=|==|>|<)\s*(\d+(?:\.\d+)?)", expected)
         if not threshold:
             return bool(expected) and expected in summary_text
@@ -40304,21 +41797,53 @@ body{padding:18px}
         expected: str,
         *,
         acceptance_text: object = "",
+        subject_text: object = "",
     ) -> dict:
         """Actively judge a step's evidence set instead of one record at a time."""
-        rows = [dict(row) for row in (records or []) if isinstance(row, dict)]
+        # Acceptance must be an observation distinct from the mutation under
+        # review. A successful write/edit proves that bytes changed, not that
+        # the result satisfies the acceptance contract. Reads, executions,
+        # retrievals, and reviewer/blackboard verdicts remain eligible and are
+        # still judged against the contract below.
+        mutation_tools = {"write_file", "edit_file"}
+        rows = [
+            dict(row)
+            for row in (records or [])
+            if isinstance(row, dict)
+            and canonicalize_tool_name(row.get("tool", row.get("name", ""))) not in mutation_tools
+        ]
+
+        def negative_assertion_passes(row: dict) -> bool:
+            return bool(
+                str(row.get("kind", "") or "") == "runtime"
+                and str(row.get("assertion_kind", "") or "") == "negative_search_no_match"
+                and row.get("assertion_ok", False)
+            )
+
+        def negative_assertion_completes(row: dict) -> bool:
+            return bool(negative_assertion_passes(row) and row.get("assertion_complete", False))
 
         def runtime_passes(row: dict) -> bool:
             return (
                 str(row.get("kind", "") or "") == "runtime"
                 and bool(row.get("ok", False))
                 and row.get("exit_code") in (None, 0)
+                and not self._command_output_has_error_shape(str(row.get("summary", "") or ""))
             )
 
-        passing_rows = [row for row in rows if bool(row.get("ok", False))]
+        passing_rows = [
+            row for row in rows
+            if (
+                runtime_passes(row)
+                if str(row.get("kind", "") or "") == "runtime"
+                else bool(row.get("ok", False))
+            ) or negative_assertion_passes(row)
+        ]
         if expected == "runtime/test/build/browser execution evidence":
             runtime_rows = [row for row in rows if str(row.get("kind", "") or "") == "runtime"]
-            if runtime_rows and not runtime_passes(runtime_rows[-1]):
+            if runtime_rows and not (
+                runtime_passes(runtime_rows[-1]) or negative_assertion_passes(runtime_rows[-1])
+            ):
                 return {
                     "passed": False,
                     "status": "failed",
@@ -40328,58 +41853,112 @@ body{padding:18px}
                     "matched_records": [],
                     "candidate": True,
                 }
-            core_rows = [row for row in runtime_rows if runtime_passes(row)]
+            core_rows = [
+                row for row in runtime_rows
+                if runtime_passes(row) or negative_assertion_completes(row)
+            ]
+            prefers_browser = self._acceptance_requires_browser_evidence(
+                "\n".join(
+                    value for value in (
+                        str(acceptance_text or ""),
+                        str(subject_text or ""),
+                    )
+                    if value
+                )
+            )
+            browser_observation_missing = False
+            if prefers_browser:
+                browser_rows = [
+                    row for row in core_rows
+                    if self._acceptance_record_is_browser_runtime(row)
+                ]
+                if browser_rows:
+                    core_rows = browser_rows
+                else:
+                    # Browser evidence is the strongest direct observation, but
+                    # its absence is not a visual-only barrier.  Preserve the
+                    # real runtime candidates and request one semantic audit.
+                    browser_observation_missing = True
             assertion_terms = list(dict.fromkeys(
                 self._acceptance_assertion_terms(acceptance_text)
                 + self._acceptance_file_content_terms(acceptance_text)
             ))
         elif expected == "file/path/directory inspection evidence":
+            browser_observation_missing = False
             core_rows = [
                 row for row in passing_rows
                 if str(row.get("kind", "") or "") == "file" or runtime_passes(row)
             ]
             assertion_terms = self._acceptance_file_content_terms(acceptance_text)
         elif expected == "research/retrieval evidence":
+            browser_observation_missing = False
             core_rows = [
                 row for row in passing_rows
                 if str(row.get("kind", "") or "") in {"research", "file"}
+                and not (
+                    negative_assertion_passes(row)
+                    and not negative_assertion_completes(row)
+                )
             ]
             assertion_terms = []
         elif expected == "blackboard acceptance record":
+            browser_observation_missing = False
             core_rows = [
                 row for row in passing_rows
                 if str(row.get("kind", "") or "") in {"blackboard", "runtime", "file", "research"}
+                and not (
+                    negative_assertion_passes(row)
+                    and not negative_assertion_completes(row)
+                )
             ]
             assertion_terms = []
         else:
+            browser_observation_missing = False
             core_rows = [
                 row for row in passing_rows
                 if str(row.get("kind", "") or "") in {"runtime", "file", "research", "blackboard", "generic"}
+                and not (
+                    negative_assertion_passes(row)
+                    and not negative_assertion_completes(row)
+                )
             ]
             assertion_terms = []
 
+        only_partial_negative_assertions = bool(passing_rows) and all(
+            negative_assertion_passes(row) and not negative_assertion_completes(row)
+            for row in passing_rows
+        )
         if not core_rows:
             return {
                 "passed": False,
-                "status": "missing",
-                "reason": "required-evidence-kind-missing",
+                "status": "partial" if only_partial_negative_assertions else "missing",
+                "reason": (
+                    "negative-assertion-passed-but-compound-check-incomplete"
+                    if only_partial_negative_assertions
+                    else "required-evidence-kind-missing"
+                ),
                 "missing_terms": assertion_terms,
                 "missing_paths": self._extract_plan_step_referenced_paths(acceptance_text, limit=8),
                 "matched_records": [],
                 "candidate": bool(rows),
             }
 
+        coverage_rows = core_rows if expected == "runtime/test/build/browser execution evidence" else passing_rows
         combined = "\n".join(
             "\n".join(
                 part for part in (
                     str(row.get("path", "") or ""),
                     " ".join(str(value or "") for value in (row.get("changed_files", []) or [])),
-                    str(row.get("command", "") or ""),
+                    str(
+                        row.get("assertion_command", "")
+                        if negative_assertion_passes(row) and not row.get("assertion_complete", False)
+                        else row.get("command", "")
+                    ),
                     str(row.get("summary", "") or ""),
                 )
                 if part
             )
-            for row in passing_rows
+            for row in coverage_rows
         )
         identity_haystack = combined.lower()
         referenced_paths = self._extract_plan_step_referenced_paths(acceptance_text, limit=8)
@@ -40393,15 +41972,27 @@ body{padding:18px}
             term for term in assertion_terms
             if not self._acceptance_summary_covers_term(combined, term)
         ]
-        passed = not missing_paths and not missing_terms
+        deterministic_pass = bool(core_rows and not missing_paths and not missing_terms)
+        semantic_review_required = bool(browser_observation_missing and core_rows)
+        passed = bool(deterministic_pass and not semantic_review_required)
         return {
             "passed": passed,
             "status": "passed" if passed else "ambiguous",
-            "reason": "aggregate-evidence-covers-acceptance" if passed else "aggregate-evidence-missing-coverage",
+            "reason": (
+                "aggregate-evidence-covers-acceptance"
+                if passed
+                else (
+                    "visual-runtime-needs-semantic-review"
+                    if semantic_review_required
+                    else "aggregate-evidence-missing-coverage"
+                )
+            ),
             "missing_terms": missing_terms,
             "missing_paths": missing_paths,
-            "matched_records": passing_rows[-16:] if passed else [],
+            "matched_records": coverage_rows[-16:] if passed else [],
             "candidate": True,
+            "semantic_review_required": semantic_review_required,
+            "browser_observation_missing": bool(browser_observation_missing),
         }
 
     def _acceptance_evidence_record_matches(
@@ -40555,15 +42146,21 @@ body{padding:18px}
             if tool in {"bash", "worktree_run", "check_background"}:
                 current_evidence_records.append({
                     "kind": "runtime",
+                    "tool": tool,
                     "ok": self._tool_result_is_passing_execution(row),
                     "command": str(args.get("command", "") or ""),
                     "path": "",
                     "summary": str(row.get("output", "") or ""),
                     "exit_code": self._tool_result_exit_code(row),
+                    "assertion_kind": str(row.get("assertion_kind", "") or ""),
+                    "assertion_ok": bool(row.get("assertion_ok", False)),
+                    "assertion_complete": bool(row.get("assertion_complete", False)),
+                    "assertion_command": str(row.get("assertion_command", "") or ""),
                 })
             elif tool == "read_file":
                 current_evidence_records.append({
                     "kind": "file",
+                    "tool": tool,
                     "ok": bool(row.get("ok", False)),
                     "command": "",
                     "path": str(args.get("path", "") or ""),
@@ -40573,16 +42170,26 @@ body{padding:18px}
             elif tool == "write_to_blackboard":
                 current_evidence_records.append({
                     "kind": "blackboard",
+                    "tool": tool,
                     "ok": bool(row.get("ok", False)),
                     "command": "",
                     "path": "",
                     "summary": f"{args}\n{row.get('output', '')}",
                     "exit_code": None,
                 })
+            else:
+                browser_record = self._browser_runtime_tool_result_record(row)
+                if browser_record:
+                    current_evidence_records.append(browser_record)
         current_evaluation = self._evaluate_acceptance_evidence_records(
             current_evidence_records,
             expected,
             acceptance_text=text,
+            subject_text=str(
+                plan_step.get("full_content", "")
+                or plan_step.get("content", "")
+                or ""
+            ),
         )
         current_candidate_match = bool(current_evaluation.get("candidate", False) or current_match)
         if current_evaluation.get("passed", False):
@@ -40609,6 +42216,22 @@ body{padding:18px}
                 "source": "plan_step_evidence",
                 "expected": expected,
                 "evidence": durable_matches[-1],
+                "acceptance": acceptance,
+                "acceptance_contract": contract_text,
+            }
+        trusted_acceptance = self._trusted_plan_step_acceptance_records(
+            plan_step,
+            acceptance,
+            board=bb,
+            since_ts=acceptance_started_ts,
+        )
+        if acceptance_completed and trusted_acceptance:
+            return {
+                "ok": True,
+                "reason": "trusted-acceptance-decision-matches-final-acceptance",
+                "source": "plan_step_evidence",
+                "expected": expected,
+                "evidence": trusted_acceptance[-1],
                 "acceptance": acceptance,
                 "acceptance_contract": contract_text,
             }
@@ -40649,11 +42272,43 @@ body{padding:18px}
             candidate_records,
             expected,
             acceptance_text=text,
+            subject_text=str(
+                plan_step.get("full_content", "")
+                or plan_step.get("content", "")
+                or ""
+            ),
         )
+        # Visual/browser wording selects the strongest evidence shape, but it
+        # is not an additional hard restriction.  If deterministic matching
+        # cannot see a native browser observation, let the LLM audit the real
+        # step-local evidence once instead of repeating the same shell check.
+        if bool(aggregate_evaluation.get("semantic_review_required", False)):
+            needs_semantic_audit = True
         has_candidate_evidence = bool(candidate_records or blackboard_match or current_candidate_match)
         exact_candidate_match = bool(
             current_records or durable_matches or aggregate_evaluation.get("passed", False)
         )
+        # A concrete failed check is more actionable than the bookkeeping fact
+        # that the acceptance row was not marked completed. Surface it first so
+        # both single and sync routes seed a repair directive for the actual
+        # failing command instead of asking the worker to repeat TodoWrite.
+        if (
+            has_candidate_evidence
+            and str(aggregate_evaluation.get("status", "") or "") == "failed"
+        ):
+            return {
+                "ok": False,
+                "reason": "final-acceptance-check-failed",
+                "expected": expected,
+                "acceptance": acceptance,
+                "acceptance_contract": contract_text,
+                "candidate_evidence": candidate_records[-8:],
+                "current_results": results[-8:],
+                "semantic_missing": "; ".join(
+                    str(value) for value in (aggregate_evaluation.get("missing_terms", []) or [])[:12]
+                ),
+                "evidence_evaluation": aggregate_evaluation,
+            }
         if not acceptance_completed and not (needs_semantic_audit and has_candidate_evidence):
             return {
                 "ok": False,
@@ -40706,6 +42361,67 @@ body{padding:18px}
     ) -> bool:
         """Hard gate: the final acceptance subtask must be completed with matching tool evidence."""
         return bool(self._plan_step_acceptance_gate_status(plan_step, worker_step, board).get("ok", False))
+
+    def _plan_step_acceptance_ready_for_advance(
+        self,
+        plan_step: dict,
+        gate: dict,
+        board: dict | None = None,
+    ) -> bool:
+        """Close a verified current step without requiring a second evidence heuristic."""
+        if not isinstance(plan_step, dict) or not isinstance(gate, dict) or not gate.get("ok", False):
+            return False
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        active = self._get_active_plan_step(bb)
+        step_id = trim(str(plan_step.get("id", "") or ""), 40)
+        active_id = trim(str((active or {}).get("id", "") or ""), 40) if isinstance(active, dict) else ""
+        if not step_id or step_id != active_id or not self._step_subtasks_all_completed(active):
+            return False
+        acceptance = gate.get("acceptance", {}) if isinstance(gate.get("acceptance"), dict) else {}
+        if str(acceptance.get("status", "") or "").strip().lower() != "completed":
+            return False
+        source = str(gate.get("source", "") or "").strip()
+        reason = str(gate.get("reason", "") or "").strip()
+        if source == "current_tool_results":
+            return reason == "current-aggregate-evidence-matches-final-acceptance"
+        if source == "blackboard":
+            return reason == "blackboard-evidence-matches-final-acceptance"
+        if source != "plan_step_evidence":
+            return False
+        evidence = gate.get("evidence", {}) if isinstance(gate.get("evidence"), dict) else {}
+        evidence_step_id = trim(str(evidence.get("step_id", "") or ""), 40)
+        return bool(
+            evidence
+            and evidence.get("ok", False)
+            and (not evidence_step_id or evidence_step_id == step_id)
+            and reason in {
+                "step-evidence-ledger-matches-final-acceptance",
+                "trusted-acceptance-decision-matches-final-acceptance",
+            }
+        )
+
+    def _try_advance_verified_current_plan_step(self, *, actor: str) -> bool:
+        """Recover the narrow persisted state between acceptance and advancement."""
+        bb = self._ensure_blackboard()
+        current = self._get_active_plan_step(bb)
+        if not isinstance(current, dict):
+            return False
+        try:
+            self._reconcile_plan_worker_progress_from_evidence(actor=str(actor or "developer"))
+            bb = self._ensure_blackboard()
+            current = self._get_active_plan_step(bb) or current
+        except Exception:
+            pass
+        gate = self._plan_step_acceptance_gate_status(current, None, bb)
+        if not self._plan_step_acceptance_ready_for_advance(current, gate, bb):
+            return False
+        record = gate.get("evidence", {}) if isinstance(gate.get("evidence"), dict) else {}
+        evidence = trim(
+            str(record.get("summary", "") or "").strip()
+            or f"{gate.get('source', 'acceptance-gate')}: {gate.get('reason', 'verified')}",
+            200,
+        )
+        return bool(self._advance_plan_step(evidence=evidence, actor=str(actor or "developer")))
 
     def _inject_acceptance_gate_rework_hint(
         self,
@@ -41093,6 +42809,418 @@ body{padding:18px}
                 return trim(raw.replace("\n", " "), 300)
         return ""
 
+    def _approved_plan_scope_signature(self, board: dict | None = None) -> str:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        rows = [
+            row for row in (bb.get("project_todos", []) if isinstance(bb.get("project_todos"), list) else [])
+            if isinstance(row, dict) and str(row.get("category", "") or "") == "plan_step"
+        ]
+        rows.sort(key=lambda row: int(row.get("plan_step_index", 0) or 0))
+        payload = [
+            (
+                trim(str(row.get("id", "") or ""), 40),
+                int(row.get("plan_step_index", 0) or 0),
+                trim(str(row.get("full_content", "") or row.get("content", "") or ""), 1200),
+            )
+            for row in rows
+        ]
+        return hashlib.sha1(json_dumps(payload).encode("utf-8", "ignore")).hexdigest()[:20]
+
+    def _plan_step_recovery_scope_matches(
+        self,
+        recovery: dict | None,
+        board: dict | None = None,
+    ) -> bool:
+        if not isinstance(recovery, dict) or not recovery:
+            return False
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        current = self._get_active_plan_step(bb)
+        if not isinstance(current, dict):
+            return False
+        if trim(str(recovery.get("parent_step_id", "") or ""), 40) != trim(
+            str(current.get("id", "") or ""), 40
+        ):
+            return False
+        try:
+            expected_task_epoch = float(recovery.get("task_epoch", 0.0) or 0.0)
+            actual_task_epoch = float(bb.get("task_epoch", 0.0) or 0.0)
+        except Exception:
+            return False
+        if expected_task_epoch and abs(expected_task_epoch - actual_task_epoch) > 1e-6:
+            return False
+        try:
+            expected_step_epoch = float(recovery.get("step_epoch", 0.0) or 0.0)
+            actual_step_epoch = float(current.get("activated_at", 0.0) or 0.0)
+        except Exception:
+            return False
+        if expected_step_epoch and abs(expected_step_epoch - actual_step_epoch) > 1e-6:
+            return False
+        expected_plan_sig = trim(str(recovery.get("plan_signature", "") or ""), 80)
+        return not expected_plan_sig or expected_plan_sig == self._approved_plan_scope_signature(bb)
+
+    def _complete_plan_step_acceptance_atomically(
+        self,
+        plan_step: dict,
+        *,
+        evidence: str,
+        actor: str,
+        decision_source: str = "",
+    ) -> bool:
+        if not isinstance(plan_step, dict) or not self._step_work_subtasks_completed(plan_step):
+            return False
+        step_id = trim(str(plan_step.get("id", "") or ""), 40)
+        rows = self._active_plan_worker_todo_rows(step_id, role="")
+        acceptance_index = next(
+            (
+                idx for idx, row in enumerate(rows)
+                if self._is_plan_step_acceptance_subtask(row.get("content", ""))
+            ),
+            -1,
+        )
+        if acceptance_index < 0:
+            return False
+        now_value = float(now_ts())
+        accepted = dict(rows[acceptance_index])
+        contract_text = self._effective_plan_step_acceptance_text(
+            plan_step,
+            accepted.get("content", ""),
+        )
+        accepted["status"] = "completed"
+        accepted["completed_at"] = now_value
+        accepted["updated_at"] = now_value
+        accepted["completed_by"] = trim(str(actor or "reviewer"), 40)
+        accepted["evidence"] = trim(str(evidence or "accepted with bound evidence"), 300)
+        rows[acceptance_index] = accepted
+        if decision_source and not self._record_trusted_plan_step_acceptance_event(
+            plan_step,
+            accepted,
+            evidence=evidence,
+            actor=actor,
+            source=decision_source,
+        ):
+            return False
+        self._replace_plan_worker_rows(step_id, rows)
+        return self._step_subtasks_all_completed(plan_step)
+
+    def _record_trusted_plan_step_acceptance_event(
+        self,
+        plan_step: dict,
+        acceptance: dict,
+        *,
+        evidence: str,
+        actor: str,
+        source: str,
+    ) -> dict:
+        """Persist an internally-authorized acceptance decision in the evidence ledger."""
+        trusted_sources = {
+            "semantic_audit",
+            "semantic_reaudit",
+            "semantic_verified",
+            "explicit_user_waiver",
+        }
+        source_key = trim(str(source or "").strip().lower(), 40)
+        if source_key not in trusted_sources or not isinstance(plan_step, dict) or not isinstance(acceptance, dict):
+            return {}
+        step_id = trim(str(plan_step.get("id", "") or ""), 40)
+        if not step_id:
+            return {}
+        contract_text = self._effective_plan_step_acceptance_text(
+            plan_step,
+            acceptance.get("content", ""),
+        )
+        if not contract_text.strip():
+            return {}
+        contract_signature = hashlib.sha1(
+            unicodedata.normalize("NFKC", contract_text).strip().encode("utf-8", "ignore")
+        ).hexdigest()[:20]
+        stamp = float(now_ts())
+        event_id = f"accept:{source_key}:{time.time_ns():x}:{contract_signature}"
+        record = {
+            "id": event_id,
+            "step_id": step_id,
+            "subtask_id": self._stable_plan_worker_subtask_id(step_id, acceptance),
+            "subtask_content": trim(str(acceptance.get("content", "") or ""), 500),
+            "kind": "blackboard",
+            "tool": f"acceptance_{source_key}",
+            "ok": True,
+            "command": "",
+            "path": "",
+            "summary": trim(str(evidence or source_key), 900),
+            "changed_files": [],
+            "exit_code": None,
+            "assertion_kind": "trusted_acceptance_decision",
+            "assertion_ok": True,
+            "assertion_complete": True,
+            "assertion_command": contract_signature,
+            "actor": trim(str(actor or "reviewer"), 40),
+            "ts": stamp,
+        }
+        bb = self._ensure_blackboard()
+        raw_map = dict(bb.get("plan_step_evidence", {}) if isinstance(bb.get("plan_step_evidence"), dict) else {})
+        records = list(raw_map.get(step_id, []) if isinstance(raw_map.get(step_id), list) else [])
+        records.append(record)
+        raw_map[step_id] = records[-40:]
+        bb["plan_step_evidence"] = raw_map
+        self.blackboard = bb
+        return record
+
+    def _trusted_plan_step_acceptance_records(
+        self,
+        plan_step: dict,
+        acceptance: dict,
+        *,
+        board: dict | None = None,
+        since_ts: float = 0.0,
+    ) -> list[dict]:
+        if not isinstance(plan_step, dict) or not isinstance(acceptance, dict):
+            return []
+        step_id = trim(str(plan_step.get("id", "") or ""), 40)
+        contract_text = self._effective_plan_step_acceptance_text(
+            plan_step,
+            acceptance.get("content", ""),
+        )
+        if not step_id or not contract_text.strip():
+            return []
+        contract_signature = hashlib.sha1(
+            unicodedata.normalize("NFKC", contract_text).strip().encode("utf-8", "ignore")
+        ).hexdigest()[:20]
+        expected_subtask_id = self._stable_plan_worker_subtask_id(step_id, acceptance)
+        trusted_tools = {
+            "acceptance_semantic_audit",
+            "acceptance_semantic_reaudit",
+            "acceptance_semantic_verified",
+            "acceptance_explicit_user_waiver",
+        }
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        artifact_revision_ts = self._plan_step_artifact_revision_ts(
+            step_id,
+            board=bb,
+            since_ts=since_ts,
+        )
+        matches: list[dict] = []
+        scoped_records = self._plan_step_evidence_records(step_id, board=bb, since_ts=since_ts)
+        for record in scoped_records:
+            if (
+                str(record.get("kind", "") or "") != "blackboard"
+                or str(record.get("tool", "") or "") not in trusted_tools
+                or str(record.get("assertion_kind", "") or "") != "trusted_acceptance_decision"
+                or not bool(record.get("ok", False))
+                or not bool(record.get("assertion_ok", False))
+                or not bool(record.get("assertion_complete", False))
+                or str(record.get("assertion_command", "") or "") != contract_signature
+                or (
+                    expected_subtask_id
+                    and str(record.get("subtask_id", "") or "") != expected_subtask_id
+                )
+                or float(record.get("ts", 0.0) or 0.0) + 1e-6 < artifact_revision_ts
+            ):
+                continue
+            matches.append(record)
+        if matches:
+            latest_trusted_ts = max(float(row.get("ts", 0.0) or 0.0) for row in matches)
+            later_runtime = [
+                row for row in scoped_records
+                if str(row.get("kind", "") or "") == "runtime"
+                and float(row.get("ts", 0.0) or 0.0) > latest_trusted_ts + 1e-6
+            ]
+            if later_runtime and not (
+                self._plan_evidence_record_passes(later_runtime[-1])
+                or (
+                    str(later_runtime[-1].get("assertion_kind", "") or "") == "negative_search_no_match"
+                    and bool(later_runtime[-1].get("assertion_ok", False))
+                    and bool(later_runtime[-1].get("assertion_complete", False))
+                )
+            ):
+                # A trusted semantic decision describes the evidence available
+                # at its timestamp. A later failing check is newer ground truth
+                # and invalidates that decision until repaired/re-audited.
+                return []
+        return matches
+
+    def _request_active_plan_step_recovery(
+        self,
+        plan_step: dict,
+        *,
+        reason: str,
+        gate: dict | None = None,
+        verdict: dict | None = None,
+        actor: str = "manager",
+    ) -> bool:
+        if not isinstance(plan_step, dict):
+            return False
+        bb = self._ensure_blackboard()
+        step_id = trim(str(plan_step.get("id", "") or ""), 40)
+        if not step_id or self._get_active_plan_step(bb) is not plan_step:
+            current = self._get_active_plan_step(bb)
+            if not isinstance(current, dict) or trim(str(current.get("id", "") or ""), 40) != step_id:
+                return False
+            plan_step = current
+        existing = bb.get("plan_step_recovery", {}) if isinstance(bb.get("plan_step_recovery"), dict) else {}
+        if bool(existing.get("active", False)) and self._plan_step_recovery_scope_matches(existing, bb):
+            return True
+        gate_row = gate if isinstance(gate, dict) else {}
+        verdict_row = verdict if isinstance(verdict, dict) else {}
+        decision = trim(
+            str(verdict_row.get("decision", gate_row.get("semantic_decision", "verify")) or "verify"),
+            20,
+        ).lower()
+        if decision not in {"pass", "verify", "repair"}:
+            decision = "verify"
+        missing = verdict_row.get("rework_items", []) or verdict_row.get("missing", []) or []
+        if not missing and gate_row.get("semantic_missing"):
+            missing = [gate_row.get("semantic_missing")]
+        next_actions = verdict_row.get("next_actions", []) or gate_row.get("semantic_next_actions", []) or []
+        recovery = {
+            "active": True,
+            "parent_step_id": step_id,
+            "step_epoch": float(plan_step.get("activated_at", 0.0) or 0.0),
+            "task_epoch": float(bb.get("task_epoch", 0.0) or 0.0),
+            "plan_signature": self._approved_plan_scope_signature(bb),
+            "evidence_signature": self._plan_step_quality_evidence_signature(plan_step, bb),
+            "reason": trim(str(reason or gate_row.get("reason", "plan-step-deadlock") or ""), 300),
+            "decision": decision,
+            "selected_action": "",
+            "missing": [trim(str(item), 220) for item in missing[:8] if str(item).strip()],
+            "next_actions": [trim(str(item), 220) for item in next_actions[:8] if str(item).strip()],
+            "attempt": max(1, int(existing.get("attempt", 0) or 0) + 1),
+            "created_at": float(now_ts()),
+            "selected_at": 0.0,
+        }
+        bb["plan_step_recovery"] = recovery
+        self.blackboard = bb
+        self._blackboard_touch()
+        step_label = trim(str(plan_step.get("content", "") or ""), 180)
+        missing_text = "; ".join(recovery["missing"][:3]) or recovery["reason"]
+        question = (
+            f"当前计划步骤“{step_label}”的验收仍缺少决定性证据。只恢复这个步骤，不会重置或替换母计划。"
+            f"\n缺口：{missing_text}\n请选择当前步骤的恢复动作："
+        )
+        self._handle_ask_user_tool(
+            {
+                "question": question,
+                "options": [
+                    "A 重新审核当前证据",
+                    "B 只运行一次决定性验证",
+                    "C 仅在确认真实缺陷后修复当前步骤",
+                ],
+                "allow_free_text": True,
+            },
+            actor,
+        )
+        if isinstance(self.pending_user_question, dict):
+            self.pending_user_question.update({
+                "kind": "plan_step_recovery",
+                "parent_step_id": step_id,
+                "task_epoch": recovery["task_epoch"],
+                "step_epoch": recovery["step_epoch"],
+                "plan_signature": recovery["plan_signature"],
+            })
+        self._blackboard_set_status("PAUSED", f"awaiting scoped recovery choice for {step_id}")
+        self._emit("status", {"summary": f"current step recovery requested ({step_id}); parent plan preserved"})
+        return True
+
+    def _apply_plan_step_recovery_answer(self, answer: str, question: dict | None = None) -> dict:
+        bb = self._ensure_blackboard()
+        recovery = bb.get("plan_step_recovery", {}) if isinstance(bb.get("plan_step_recovery"), dict) else {}
+        if isinstance(question, dict) and str(question.get("kind", "") or "") != "plan_step_recovery":
+            return {"handled": False, "reason": "not-step-recovery"}
+        if not self._plan_step_recovery_scope_matches(recovery, bb):
+            bb["plan_step_recovery"] = {}
+            self.blackboard = bb
+            self._blackboard_touch()
+            self._emit("status", {"summary": "stale step recovery choice ignored; active plan scope changed"})
+            return {"handled": True, "applied": False, "reason": "stale-scope"}
+        step = self._get_active_plan_step(bb)
+        if not isinstance(step, dict):
+            return {"handled": True, "applied": False, "reason": "no-active-step"}
+        normalized = unicodedata.normalize("NFKC", str(answer or "")).strip().lower()
+        if re.match(r"^(?:a|1)(?:\b|\s|[.、:：])", normalized) or any(
+            token in normalized for token in ("重新审核", "重新審核", "re-audit", "reaudit")
+        ):
+            action = "reaudit"
+        elif re.match(r"^(?:c|3)(?:\b|\s|[.、:：])", normalized) or any(
+            token in normalized for token in ("修复", "修復", "repair", "fix")
+        ):
+            action = "repair"
+        else:
+            action = "verify"
+        recovery = dict(recovery)
+        recovery["active"] = False
+        recovery["selected_action"] = action
+        recovery["selected_at"] = float(now_ts())
+        bb["plan_step_recovery"] = recovery
+        self.blackboard = bb
+        for attr_name in (
+            f"_acceptance_gate_fail_n_{recovery.get('parent_step_id', '')}",
+            f"_acceptance_gate_nopro_n_{recovery.get('parent_step_id', '')}",
+            f"_acceptance_gate_sig_{recovery.get('parent_step_id', '')}",
+        ):
+            try:
+                if hasattr(self, attr_name):
+                    delattr(self, attr_name)
+            except Exception:
+                pass
+        gate = self._plan_step_acceptance_gate_status(step, None, bb)
+        if action == "reaudit":
+            review = self._llm_review_plan_step_quality(
+                step,
+                {"tool_results": list(gate.get("current_results", []) or [])},
+                bb,
+                candidate_evidence={"gate": gate, "records": gate.get("candidate_evidence", [])},
+            )
+            if (
+                review.get("available")
+                and review.get("passed")
+                and str(review.get("confidence", "") or "").lower() in {"high", "medium"}
+            ):
+                evidence = "; ".join(str(item) for item in (review.get("evidence", []) or [])[:3])
+                if self._complete_plan_step_acceptance_atomically(
+                    step,
+                    evidence=f"[scoped re-audit] {evidence or review.get('reason', '')}",
+                    actor="reviewer",
+                    decision_source="semantic_reaudit",
+                ):
+                    advanced = self._advance_plan_step(
+                        evidence=trim(f"[scoped re-audit] {evidence or review.get('reason', '')}", 200),
+                        actor="reviewer",
+                    )
+                    return {"handled": True, "applied": bool(advanced), "action": action, "advanced": bool(advanced)}
+            action = str(review.get("decision", "verify") or "verify").lower()
+            if action not in {"verify", "repair"}:
+                action = "verify"
+            recovery["selected_action"] = action
+            recovery["missing"] = [trim(str(item), 220) for item in (review.get("missing", []) or [])[:8]]
+            recovery["next_actions"] = [trim(str(item), 220) for item in (review.get("next_actions", []) or [])[:8]]
+            bb["plan_step_recovery"] = recovery
+            self.blackboard = bb
+        diagnosis = self._diagnose_acceptance_gate_failure(step, gate, bb)
+        if action == "repair" and not bool(diagnosis.get("requires_change", True)):
+            action = "verify"
+            diagnosis = dict(diagnosis)
+            diagnosis["repair_action"] = (
+                "; ".join(recovery.get("next_actions", [])[:4])
+                or "Run one focused verification for the still-unproven acceptance assertions; preserve the artifact unless it fails."
+            )
+            diagnosis["requires_change"] = False
+            self._blackboard_append_memory(
+                "decision",
+                "scoped recovery downgraded repair to verify because no concrete defect evidence exists",
+                actor="reviewer",
+                tier="long",
+                board=bb,
+            )
+        elif action == "verify":
+            diagnosis = dict(diagnosis)
+            diagnosis["repair_action"] = (
+                "; ".join(recovery.get("next_actions", [])[:4])
+                or str(diagnosis.get("repair_action", "") or "")
+            )
+            diagnosis["requires_change"] = False
+        self._seed_repair_directive(step, diagnosis, bb, round_no=max(1, int(recovery.get("attempt", 1) or 1)))
+        self._blackboard_set_status("CODING", f"scoped {action} recovery for {recovery.get('parent_step_id', '')}")
+        self._sync_todos_from_blackboard(reason=f"scoped-step-recovery:{action}", board=self._ensure_blackboard())
+        return {"handled": True, "applied": True, "action": action, "advanced": False}
+
     def _acceptance_gate_handle_failure(
         self,
         plan_step: dict,
@@ -41128,6 +43256,14 @@ body{padding:18px}
             note = f"acceptance explicitly waived by user: {user_override}"
             self._blackboard_append_memory("decision", note, actor="user", tier="long", board=bb)
             self._emit("status", {"summary": "acceptance gate waived by explicit user instruction"})
+            if not self._complete_plan_step_acceptance_atomically(
+                plan_step,
+                evidence=trim(f"[user-waived acceptance] {user_override}", 200),
+                actor="user",
+                decision_source="explicit_user_waiver",
+            ):
+                self._emit("status", {"summary": "acceptance waiver retained current step because work subtasks remain open"})
+                return False
             return bool(self._advance_plan_step(
                 evidence=trim(f"[user-waived acceptance] {user_override}", 200),
                 actor="user",
@@ -41155,6 +43291,35 @@ body{padding:18px}
         except Exception:
             pass
 
+        # Count acceptance cycles by an unchanged failure/evidence state, not by
+        # raw tool rounds. Creating/fixing an artifact or producing a new check
+        # is real progress and starts a fresh ten-cycle window. Previously the
+        # absolute counter kept increasing during active edits, so a worker could
+        # hit the recovery chooser while it was still constructing the step.
+        sig_attr = f"_acceptance_gate_sig_{step_id}"
+        nopro_attr = f"_acceptance_gate_nopro_n_{step_id}"
+        try:
+            new_sig = self._repair_progress_signature(plan_step, gate, bb)
+        except Exception:
+            new_sig = ""
+        prev_sig = str(getattr(self, sig_attr, "") or "")
+        if new_sig and prev_sig and new_sig != prev_sig:
+            count = 1
+            no_progress = 0
+            try:
+                setattr(self, attr, count)
+            except Exception:
+                pass
+        elif new_sig and new_sig == prev_sig:
+            no_progress = int(getattr(self, nopro_attr, 0) or 0) + 1
+        else:
+            no_progress = 0
+        try:
+            setattr(self, sig_attr, new_sig)
+            setattr(self, nopro_attr, no_progress)
+        except Exception:
+            pass
+
         # Evidence exists but its relationship to named assertions is not
         # mechanically provable. Audit once per evidence signature now instead
         # of spending several repair rounds repeating the same command.
@@ -41174,6 +43339,14 @@ body{padding:18px}
                 and str(review.get("confidence", "") or "").lower() in {"high", "medium"}
             ):
                 evidence_text = "; ".join(str(x) for x in (review.get("evidence", []) or [])[:3])
+                if not self._complete_plan_step_acceptance_atomically(
+                    plan_step,
+                    evidence=trim(f"[semantic-audit] {evidence_text or review.get('reason', '')}", 300),
+                    actor=str(actor or "reviewer"),
+                    decision_source="semantic_audit",
+                ):
+                    self._emit("status", {"summary": "semantic audit passed acceptance, but current work subtasks remain open"})
+                    return False
                 return bool(self._advance_plan_step(
                     evidence=trim(f"[semantic-audit] {evidence_text or review.get('reason', '')}", 200),
                     actor=str(actor or "reviewer"),
@@ -41212,6 +43385,14 @@ body{padding:18px}
             )
             self._blackboard_append_memory("decision", note, actor="reviewer", tier="long", board=bb)
             self._emit("status", {"summary": "step verified by semantic judge (heuristic false-negative corrected)"})
+            if not self._complete_plan_step_acceptance_atomically(
+                plan_step,
+                evidence=trim(f"[semantic-verified] {verdict.get('evidence', '')}", 300),
+                actor=str(actor or "reviewer"),
+                decision_source="semantic_verified",
+            ):
+                self._emit("status", {"summary": "semantic verification retained current step because work subtasks remain open"})
+                return False
             advanced = self._advance_plan_step(
                 evidence=trim(f"[semantic-verified] {verdict.get('evidence', '')}", 200),
                 actor=str(actor or "reviewer"),
@@ -41241,26 +43422,8 @@ body{padding:18px}
             )
             self._emit("status", {"summary": "acceptance gate failing — reviewer debug mode enabled to fix the blocker"})
 
-        # Track repair progress: a changing signature means we are still making
-        # headway; an unchanged signature means the loop is deadlocked.
-        sig_attr = f"_acceptance_gate_sig_{step_id}"
-        nopro_attr = f"_acceptance_gate_nopro_n_{step_id}"
-        try:
-            new_sig = self._repair_progress_signature(plan_step, gate, bb)
-        except Exception:
-            new_sig = ""
-        prev_sig = str(getattr(self, sig_attr, "") or "")
-        if new_sig and new_sig == prev_sig:
-            no_progress = int(getattr(self, nopro_attr, 0) or 0) + 1
-        else:
-            no_progress = 0
-        try:
-            setattr(self, sig_attr, new_sig)
-            setattr(self, nopro_attr, no_progress)
-        except Exception:
-            pass
-
-        # Step 4 — TRUE DEADLOCK: only escalate to the user (never force-advance).
+        # Step 4 — TRUE DEADLOCK: pause only this parent step. The approved
+        # roadmap is immutable unless the user explicitly requests a full replan.
         if (
             no_progress >= ACCEPTANCE_GATE_HARD_CEILING
             or count >= ACCEPTANCE_GATE_TOTAL_ROUND_CEILING
@@ -41270,20 +43433,22 @@ body{padding:18px}
                 "decision",
                 (
                     f"acceptance repair deadlocked (repair_rounds={count}, no_progress={no_progress}) on step; "
-                    f"escalating to plan-mode recovery for user decision. Outstanding: "
+                    f"requesting current-step recovery for user decision. Outstanding: "
                     f"{trim('; '.join(verdict_items) or str(gate.get('reason', '')), 200)}"
                 ),
                 actor="manager",
                 tier="long",
                 board=bb,
             )
-            self._ledger_record_stall("acceptance-gate-deadlock", "plan-mode-escalation")
-            self._emit("status", {"summary": "acceptance repair deadlocked — escalating to recovery options for your decision"})
+            self._ledger_record_stall("acceptance-gate-deadlock", "current-step-recovery")
+            self._emit("status", {"summary": "acceptance repair deadlocked — pausing only the current step for recovery"})
             try:
-                escalated = self._escalate_stall_to_plan_mode(
-                    "acceptance-gate-deadlock",
-                    fault_counter=no_progress,
-                    last_fault_reason=trim(str(gate.get("reason", "") or "acceptance-gate-deadlock"), 160),
+                escalated = self._request_active_plan_step_recovery(
+                    plan_step,
+                    reason=trim(str(gate.get("reason", "") or "acceptance-gate-deadlock"), 160),
+                    gate=gate,
+                    verdict=verdict,
+                    actor=str(actor or "manager"),
                 )
             except Exception:
                 escalated = False
@@ -41349,7 +43514,10 @@ body{padding:18px}
             candidates.append(str(match.group(1) or ""))
         candidates.extend(
             re.findall(
-                r"(?<![\w./-])([A-Za-z0-9_.@+~-]+(?:/[A-Za-z0-9_.@+~ -]+)+)(?![\w./-])",
+                # Keep unquoted path segments tight. A permissive space inside
+                # this expression turns prose such as
+                # "screenshot/canvas evidence" into a fake required path.
+                r"(?<![\w./-])([A-Za-z0-9_.@+~-]+(?:/[A-Za-z0-9_.@+~-]+)+)(?![\w./-])",
                 src,
             )
         )
@@ -41358,6 +43526,18 @@ body{padding:18px}
                 r"(?<![\w./-])([A-Za-z0-9_.@+~-]+\.(?:py|js|ts|tsx|jsx|css|html?|md|txt|csv|json|ya?ml|toml|ini|xml|rst|sql|sh|go|rs|java|c|cc|cpp|h|hpp|f90|glsl))(?![\w./-])",
                 src,
                 flags=re.I,
+            )
+        )
+        # Directory requirements are commonly written as bare names ending
+        # in a slash (``src/、assets/、public/``).  The old extractor only
+        # accepted file suffixes or paths containing a following segment, so
+        # these requirements silently disappeared and a package/build result
+        # could be mistaken for completion.  Keep the slash while parsing and
+        # normalize it to the directory identity used by read_file evidence.
+        candidates.extend(
+            re.findall(
+                r"(?<![\w./-])([A-Za-z0-9_.@+~-]+(?:/[A-Za-z0-9_.@+~-]+)*/)(?![\w./-])",
+                src,
             )
         )
         out: list[str] = []
@@ -41373,6 +43553,16 @@ body{padding:18px}
             "mkdir",
             "touch",
             "ls",
+        }
+        product_names = {
+            "three.js", "node.js", "react.js", "vue.js", "next.js", "nuxt.js",
+            "d3.js", "p5.js", "chart.js", "babylon.js", "anime.js",
+        }
+        prose_path_segments = {
+            "record", "records", "evidence", "key", "keys", "command", "commands",
+            "assertion", "assertions", "content", "output", "outputs", "result", "results",
+            "screenshot", "screenshots", "canvas", "browser", "runtime", "visual", "page", "pages",
+            "file", "files", "path", "paths", "directory", "directories", "status", "statuses",
         }
         for raw in candidates:
             item = str(raw or "").strip().strip("'\"")
@@ -41392,9 +43582,23 @@ body{padding:18px}
                 item = str(suffix_end.group(1) or "").strip()
             if not item or "://" in item:
                 continue
+            # Backtick content may be a concrete path with spaces, but prose
+            # without a file suffix is not an identity to audit.
+            if re.search(r"\s", item) and not re.search(
+                r"\.(?:py|js|ts|tsx|jsx|css|html?|md|txt|csv|json|ya?ml|toml|ini|xml|rst|sql|sh|go|rs|java|c|cc|cpp|h|hpp|f90|glsl)(?:/)?$",
+                item,
+                flags=re.I,
+            ):
+                continue
+            is_directory_hint = item.endswith("/")
+            if "/" not in item and item.lower() in product_names:
+                continue
             if item.split(None, 1)[0].strip().lower() in deny_prefixes:
                 continue
-            if not ("/" in item or re.search(r"\.[A-Za-z0-9]{1,8}$", item)):
+            if not is_directory_hint and not ("/" in item or re.search(r"\.[A-Za-z0-9]{1,8}$", item)):
+                continue
+            segments = [segment.lower() for segment in item.rstrip("/").split("/") if segment]
+            if len(segments) >= 2 and all(segment in prose_path_segments for segment in segments):
                 continue
             rel = normalize_rel_preview_path(item.replace("\\", "/"))
             if not rel or self._is_plan_infrastructure_path(rel):
@@ -41428,6 +43632,8 @@ body{padding:18px}
             return 1.0, "exact"
         exp_path = PurePosixPath(exp)
         act_path = PurePosixPath(act)
+        if exp_path.parent.as_posix() in {"", "."} and exp_path.name == act_path.name:
+            return 0.93, "exact basename match for unqualified expected path"
         exp_key = SessionState._semantic_path_key(exp)
         act_key = SessionState._semantic_path_key(act)
         if exp_key and exp_key == act_key:
@@ -41436,6 +43642,35 @@ body{padding:18px}
         act_stem = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", act_path.stem.lower())
         same_parent = exp_path.parent.as_posix() == act_path.parent.as_posix()
         same_suffix = exp_path.suffix.lower() == act_path.suffix.lower()
+        # Build/distribution variants are the same artifact for acceptance
+        # purposes (for example ``three.min.js`` vs
+        # ``js/three.module.js``). Keep this deliberately narrow: extensions
+        # must match, the base stem must be identical after removing a known
+        # trailing build qualifier, and at least one path must be unqualified
+        # or both directories must already match.
+        def _build_variant_stem(path: PurePosixPath) -> str:
+            stem = path.stem.lower()
+            stripped = re.sub(
+                r"(?:[._-](?:min|module|bundle|umd|esm))+$",
+                "",
+                stem,
+                flags=re.IGNORECASE,
+            )
+            return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", stripped)
+
+        exp_family = _build_variant_stem(exp_path)
+        act_family = _build_variant_stem(act_path)
+        either_unqualified = (
+            exp_path.parent.as_posix() in {"", "."}
+            or act_path.parent.as_posix() in {"", "."}
+        )
+        if (
+            same_suffix
+            and exp_family
+            and exp_family == act_family
+            and (same_parent or either_unqualified)
+        ):
+            return 0.91, "equivalent build-variant filename"
         if exp_stem and act_stem and same_parent and same_suffix:
             if exp_stem == act_stem:
                 return 0.94, "separator-insensitive filename match"
@@ -41449,6 +43684,34 @@ body{padding:18px}
             if same_parent and same_suffix and overlap >= 0.5:
                 return 0.62 + overlap * 0.2, "token-overlap filename match"
         return 0.0, ""
+
+    def _plan_evidence_path_matches(
+        self,
+        expected: object,
+        actual: object,
+        *,
+        threshold: float = 0.72,
+    ) -> bool:
+        """Match evidence paths, including child paths proving a directory."""
+        exp = normalize_rel_preview_path(str(expected or "")).lower()
+        act = normalize_rel_preview_path(str(actual or "")).lower()
+        if not exp or not act:
+            return False
+        if exp == act or self._semantic_path_score(exp, act)[0] >= float(threshold):
+            return True
+        expected_path = PurePosixPath(exp)
+        actual_path = PurePosixPath(act)
+        # Bare/suffixless plan paths commonly denote directories.  Observing a
+        # child is constructive proof that the parent exists.  For an
+        # unqualified directory name, allow that name at any directory segment
+        # (``assets/`` is proved by ``src/assets/texture.png``), but never match
+        # it against an unrelated filename.
+        if not expected_path.suffix:
+            if act.startswith(exp.rstrip("/") + "/"):
+                return True
+            if expected_path.parent.as_posix() in {"", "."}:
+                return expected_path.name in actual_path.parts
+        return False
 
     def _workspace_text_files_for_review(self, *, limit: int = 480) -> list[str]:
         rows: list[str] = []
@@ -42234,10 +44497,7 @@ body{padding:18px}
                 and trim(str(row.get("parent_step_id", "") or ""), 40) == step_id
             ):
                 if str(row.get("status", "pending") or "pending").strip().lower() != "completed":
-                    row["status"] = "completed"
-                    row["completed_at"] = closed_at
-                    row["completed_by"] = trim(str(actor or "developer"), 40)
-                    row["evidence"] = trim(str(evidence or "closed with accepted plan step"), 300)
+                    return False
                 row["updated_at"] = closed_at
                 closed_rows.append(row)
                 continue
@@ -42411,6 +44671,17 @@ body{padding:18px}
                 current = t
                 break
         if not current:
+            return False
+        if not self._step_subtasks_all_completed(current):
+            self._emit(
+                "status",
+                {
+                    "summary": (
+                        "plan step advancement blocked: current-step subtasks are not all completed; "
+                        "the roadmap and subtask states were preserved"
+                    )
+                },
+            )
             return False
         previous_focus = self._blackboard_focus_identity(bb)
         # Fix 5c: Reset TodoWrite loop counter on step advancement
@@ -42669,12 +44940,10 @@ body{padding:18px}
         )
         acceptance_gate = self._plan_step_acceptance_gate_status(current, worker_step, bb)
         acceptance_gate_ok = bool(acceptance_gate.get("ok", False))
-        has_strong_evidence = subtasks_all_done and acceptance_gate_ok and (
-            validation_ok
-            or validation_ok_blackboard
-            or phase_evidence
-            or accumulated_evidence_path
-            or explicit_verified_path
+        has_strong_evidence = self._plan_step_acceptance_ready_for_advance(
+            current,
+            acceptance_gate,
+            bb,
         )
         # Parity with single-agent (Fix 1): phase-heuristic escape when the step
         # genuinely has NO step-local subtasks (bootstrap above couldn't decompose
@@ -42747,6 +45016,7 @@ body{padding:18px}
                     str(r.get("name", "")) == "read_file"
                     and not self._is_plan_infrastructure_read_result(r)
                 )
+                or self._is_browser_runtime_tool_name(r.get("name", ""))
             )
             for r in results
             if isinstance(r, dict)
@@ -42800,6 +45070,15 @@ body{padding:18px}
                 relevant.append(r)
             if relevant:
                 worker_items = relevant
+        acceptance_items = [
+            row for row in worker_items
+            if self._is_plan_step_acceptance_subtask(row.get("content", ""))
+        ]
+        if not acceptance_items or any(
+            str(row.get("status", "") or "").lower() != "completed"
+            for row in acceptance_items
+        ):
+            return False
         # Fix 6: Exclude "next-step intent" pending items when all other items are completed.
         # When the worker completes step N and creates step N+1 subtasks in the same TodoWrite call,
         # the new pending items get parent_step_id of step N, blocking its advancement.
@@ -43457,26 +45736,192 @@ body{padding:18px}
         raw = re.sub(r"\s+", " ", raw.strip().lower())
         return raw
 
+    def _plan_worker_semantic_core(self, text: object) -> str:
+        """Normalize harmless Todo phrasing differences without changing IDs."""
+        raw = unicodedata.normalize(
+            "NFKC",
+            normalize_work_text(str(text or "")) or str(text or ""),
+        ).strip().lower()
+        _status, parsed = split_todo_status_text(raw)
+        raw = parsed or raw
+        raw = re.sub(
+            r"^\s*(?:(?:step|subtask|task|步骤|步驟|子任务|子任務)\s*)?"
+            r"\d+(?:\.\d+)*\s*[.)、:：-]?\s*",
+            "",
+            raw,
+            flags=re.IGNORECASE,
+        )
+        raw = re.split(
+            r"\s*[;；]\s*(?:evidence|证据|證據|証拠)\s*[:：]",
+            raw,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0]
+        raw = re.sub(r"[\s\W_]+", " ", raw, flags=re.UNICODE).strip()
+        return raw
+
+    def _plan_worker_todo_match_score(self, incoming: dict | None, existing: dict | None) -> float:
+        """Score two active-step rows; only high, unique scores are canonical matches."""
+        if not isinstance(incoming, dict) or not isinstance(existing, dict):
+            return 0.0
+        incoming_acceptance = self._is_plan_step_acceptance_subtask(incoming.get("content", ""))
+        existing_acceptance = self._is_plan_step_acceptance_subtask(existing.get("content", ""))
+        if incoming_acceptance or existing_acceptance:
+            return 1.0 if incoming_acceptance and existing_acceptance else 0.0
+        incoming_id = trim(str(incoming.get("subtask_id", "") or ""), 80)
+        existing_id = trim(str(existing.get("subtask_id", "") or ""), 80)
+        if incoming_id and existing_id and incoming_id == existing_id:
+            return 1.0
+        incoming_aliases = self._plan_worker_external_identity_values(incoming)
+        existing_aliases = self._plan_worker_external_identity_values(existing)
+        if incoming_aliases and existing_aliases and incoming_aliases.intersection(existing_aliases):
+            return 0.999
+        left = self._plan_worker_semantic_core(incoming.get("content", ""))
+        right = self._plan_worker_semantic_core(existing.get("content", ""))
+        if not left or not right:
+            return 0.0
+        if left == right:
+            return 0.99
+        if min(len(left), len(right)) >= 6 and (left in right or right in left):
+            containment = min(len(left), len(right)) / max(len(left), len(right))
+            if containment >= 0.55:
+                return max(0.80, min(0.94, 0.72 + containment * 0.22))
+        sequence_score = difflib.SequenceMatcher(None, left, right).ratio()
+        left_tokens = self._plan_revision_relation_tokens(left)
+        right_tokens = self._plan_revision_relation_tokens(right)
+        token_score = (
+            len(left_tokens & right_tokens) / max(1, min(len(left_tokens), len(right_tokens)))
+            if left_tokens and right_tokens
+            else 0.0
+        )
+        left_paths = {
+            normalize_rel_preview_path(value).lower()
+            for value in self._extract_plan_step_referenced_paths(left, limit=8)
+            if normalize_rel_preview_path(value)
+        }
+        right_paths = {
+            normalize_rel_preview_path(value).lower()
+            for value in self._extract_plan_step_referenced_paths(right, limit=8)
+            if normalize_rel_preview_path(value)
+        }
+        path_score = 0.0
+        if left_paths and right_paths and left_paths.intersection(right_paths):
+            path_score = 0.90
+        base_score = max(sequence_score, token_score, path_score)
+        left_number = re.match(r"^\s*(\d+\.\d+)\b", str(incoming.get("content", "") or ""))
+        right_number = re.match(r"^\s*(\d+\.\d+)\b", str(existing.get("content", "") or ""))
+        if (
+            left_number
+            and right_number
+            and left_number.group(1) == right_number.group(1)
+            and base_score >= 0.34
+        ):
+            base_score = max(base_score, 0.88)
+        return float(min(1.0, base_score))
+
+    def _plan_worker_rows_equivalent(self, incoming: dict | None, existing: dict | None) -> bool:
+        return self._plan_worker_todo_match_score(incoming, existing) >= 0.64
+
+    @staticmethod
+    def _is_canonical_plan_worker_subtask_id(value: object, step_id: object = "") -> bool:
+        subtask_id = trim(str(value or "").strip(), 100)
+        if not subtask_id.startswith("pst:"):
+            return False
+        step_key = trim(str(step_id or "").strip(), 40)
+        return not step_key or subtask_id.startswith(f"pst:{step_key}:")
+
+    def _plan_worker_external_identity_values(self, row: dict | None) -> set[str]:
+        """Return provider identities without confusing them with canonical IDs."""
+        if not isinstance(row, dict):
+            return set()
+        values: set[str] = set()
+        for field in (
+            "external_subtask_id", "external_id", "todo_id", "task_id",
+            "item_id", "row_id", "id", "key",
+        ):
+            value = trim(str(row.get(field, "") or "").strip(), 120)
+            if value and not value.startswith("bb:"):
+                values.add(value.casefold())
+        supplied = trim(str(row.get("subtask_id", "") or "").strip(), 100)
+        if supplied and not self._is_canonical_plan_worker_subtask_id(supplied):
+            values.add(supplied.casefold())
+        return values
+
+    def _capture_plan_worker_external_identity(self, row: dict, step_id: object) -> dict:
+        """Preserve a legacy/provider subtask id before assigning a pst: id."""
+        if not isinstance(row, dict):
+            return row
+        supplied = trim(str(row.get("subtask_id", "") or "").strip(), 100)
+        if supplied and not self._is_canonical_plan_worker_subtask_id(supplied, step_id):
+            row.setdefault("external_subtask_id", supplied)
+        return row
+
     def _stable_plan_worker_subtask_id(
         self,
         step_id: object,
         row: dict | None,
     ) -> str:
         item = row if isinstance(row, dict) else {}
-        existing = trim(str(item.get("subtask_id", "") or "").strip(), 80)
-        if existing:
-            return existing
         step_key = trim(str(step_id or item.get("parent_step_id", "") or "").strip(), 40)
         if not step_key:
             return ""
         content = str(item.get("content", "") or "")
         if self._is_plan_step_acceptance_subtask(content):
             return f"pst:{step_key}:acceptance"
+        existing = trim(str(item.get("subtask_id", "") or "").strip(), 80)
+        if existing and self._is_canonical_plan_worker_subtask_id(existing, step_key):
+            return existing
         core = self._plan_worker_content_core(content)
         if not core:
             return ""
         digest = hashlib.sha1(f"{step_key}|{core}".encode("utf-8", "ignore")).hexdigest()[:16]
         return f"pst:{step_key}:{digest}"
+
+    def _dedupe_plan_worker_rows(self, rows: list[dict], step_id: object) -> list[dict]:
+        step_key = trim(str(step_id or "").strip(), 40)
+        if not step_key:
+            return [dict(row) for row in (rows or []) if isinstance(row, dict)]
+        status_rank = {"completed": 3, "in_progress": 2, "pending": 1, "blocked": 0}
+        merged: dict[str, dict] = {}
+        order: list[str] = []
+        for index, raw in enumerate(rows or []):
+            if not isinstance(raw, dict):
+                continue
+            row = dict(raw)
+            self._capture_plan_worker_external_identity(row, step_key)
+            identity = self._stable_plan_worker_subtask_id(step_key, row)
+            if not identity:
+                identity = f"anonymous:{index}:{self._plan_worker_content_core(row.get('content', ''))}"
+            row["parent_step_id"] = step_key
+            row["subtask_id"] = identity
+            prior = merged.get(identity)
+            if prior is None:
+                merged[identity] = row
+                order.append(identity)
+                continue
+            prior_status = self._normalize_todo_status_value(prior.get("status", ""), "pending")
+            row_status = self._normalize_todo_status_value(row.get("status", ""), "pending")
+            winner = row if status_rank.get(row_status, 0) > status_rank.get(prior_status, 0) else prior
+            combined = dict(prior)
+            for field in (
+                "status", "completed_at", "completed_by", "evidence", "started_at",
+                "updated_at", "owner", "key", "external_subtask_id",
+            ):
+                if winner.get(field) not in (None, "", 0, 0.0):
+                    combined[field] = winner.get(field)
+            prior_content = str(prior.get("content", "") or "")
+            row_content = str(row.get("content", "") or "")
+            if self._is_plan_step_acceptance_subtask(prior_content or row_content):
+                prior_numbered = bool(re.match(r"^\s*\d+\.\d+\s+", normalize_work_text(prior_content) or prior_content))
+                row_numbered = bool(re.match(r"^\s*\d+\.\d+\s+", normalize_work_text(row_content) or row_content))
+                if row_numbered and not prior_numbered:
+                    combined["content"] = row_content
+            elif not prior_content and row_content:
+                combined["content"] = row_content
+            combined["parent_step_id"] = step_key
+            combined["subtask_id"] = identity
+            merged[identity] = combined
+        return [merged[key] for key in order if key in merged]
 
     def _migrate_plan_worker_todo_partitions(self, board: dict) -> bool:
         """Merge legacy step aliases into canonical parent partitions without losing history."""
@@ -43503,6 +45948,7 @@ body{padding:18px}
                 if trim(str(row.get("parent_step_id", "") or "").strip(), 40) != canonical:
                     changed = True
                 row["parent_step_id"] = canonical
+                self._capture_plan_worker_external_identity(row, canonical)
                 row["subtask_id"] = self._stable_plan_worker_subtask_id(canonical, row)
                 grouped.setdefault(canonical, []).append(row)
 
@@ -43642,11 +46088,10 @@ body{padding:18px}
         if not isinstance(row, dict) or not isinstance(plan_step, dict):
             return False
         content = normalize_embedded_newlines(str(row.get("content", "") or "")).strip()
-        if not content or self._is_plan_step_acceptance_subtask(content):
+        if not content:
             return False
         active_ordinal = self._plan_step_ordinal(plan_step, board)
         head = next((line.strip() for line in content.splitlines() if line.strip()), content)
-        head = re.sub(r"^\s*\d+\.\d+\s+", "", head).strip()
         marker = self._plan_line_marker(head)
         if isinstance(marker, dict):
             marker_kind = str(marker.get("kind", "") or "")
@@ -43655,6 +46100,9 @@ body{padding:18px}
                 return True
             if marker_kind == "sub" and marker_major != active_ordinal:
                 return True
+        if self._is_plan_step_acceptance_subtask(content):
+            return False
+        head = re.sub(r"^\s*\d+\.\d+\s+", "", head).strip()
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         todos = bb.get("project_todos", []) if isinstance(bb.get("project_todos"), list) else []
         row_forms = self._plan_todo_compare_forms(head)
@@ -43723,6 +46171,7 @@ body{padding:18px}
             return self._plan_worker_todo_rows_from_blackboard(step_key, role=role_key)
         plan_step = self._get_plan_step_by_id(step_key)
         all_rows = self._filter_parent_step_duplicate_worker_rows(all_rows, plan_step)
+        all_rows = self._dedupe_plan_worker_rows(all_rows, step_key)
         rows = [r for r in all_rows if str(r.get("owner", "") or "").strip().lower() == role_key] if role_key else list(all_rows)
         if role_key and not rows:
             rows = list(all_rows)
@@ -43742,7 +46191,10 @@ body{padding:18px}
         step_id = trim(str(step.get("id", "") or ""), 40)
         if not step_id:
             return {}
-        rows = self._active_plan_worker_todo_rows(step_id, role=role)
+        # The current subtask is one shared execution cursor. In Sync mode a
+        # role-filtered view can hide another agent's in-progress row and make
+        # the manager delegate a pending sibling or rebuild the subplan.
+        rows = self._active_plan_worker_todo_rows(step_id, role="")
         current = next(
             (
                 row for row in rows
@@ -43758,6 +46210,580 @@ body{padding:18px}
             "subtask_id": subtask_id,
             "subtask_content": trim(str(current.get("content", "") or ""), 500),
         }
+
+    def _plan_subtask_route_fields(
+        self,
+        *,
+        board: dict | None = None,
+        role: str = "",
+    ) -> dict:
+        snapshot = self._current_plan_worker_subtask_snapshot(board=board, role=role)
+        return {
+            "plan_subtask_id": trim(str(snapshot.get("subtask_id", "") or ""), 100),
+            "plan_subtask_content": trim(str(snapshot.get("subtask_content", "") or ""), 500),
+        }
+
+    def _plan_worker_completed_status_has_evidence(
+        self,
+        row: dict | None,
+        plan_step: dict | None,
+        board: dict | None = None,
+    ) -> bool:
+        """Return whether a persisted completed worker row is evidence-backed.
+
+        TodoManager and the blackboard are intentionally two durable views of
+        the same execution graph.  A stale view can contain ``completed`` even
+        though the tool event that justified it was never recorded (or belongs
+        to another parent step).  Never let that stale bit win a merge.  The
+        check is deliberately step-local and uses the stable subtask identity,
+        so sync handoffs cannot manufacture completion or move the cursor back
+        to an earlier child.
+        """
+        if not isinstance(row, dict) or not isinstance(plan_step, dict):
+            return False
+        status = self._normalize_todo_status_value(row.get("status", ""), "pending")
+        if status != "completed":
+            return True
+        if self._normalize_todo_status_value(plan_step.get("status", ""), "pending") == "completed":
+            return True
+        step_id = trim(str(plan_step.get("id", "") or ""), 40)
+        if not step_id:
+            return False
+        subtask_id = trim(str(row.get("subtask_id", "") or ""), 80)
+        if not subtask_id:
+            subtask_id = self._stable_plan_worker_subtask_id(step_id, row)
+        content = str(row.get("content", "") or "").strip()
+        if not content:
+            return False
+        if self._is_plan_step_acceptance_subtask(content):
+            # Acceptance completion is validated by the dedicated gate. A
+            # non-empty evidence field is only a hint: accept either concrete
+            # tool evidence or an internally-authorized, contract-bound audit
+            # event. Arbitrary Todo text can satisfy neither branch.
+            records = self._matching_acceptance_evidence_records(
+                plan_step,
+                row,
+                board=board,
+                expected=self._acceptance_expected_evidence(
+                    self._effective_plan_step_acceptance_text(plan_step, content)
+                ),
+            )
+            if records:
+                return True
+            try:
+                since_ts = self._acceptance_evidence_since_ts(row, plan_step)
+            except Exception:
+                since_ts = 0.0
+            return bool(self._trusted_plan_step_acceptance_records(
+                plan_step,
+                row,
+                board=board,
+                since_ts=since_ts,
+            ))
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        bindings = bb.get("plan_subtask_evidence_bindings", {}) if isinstance(bb.get("plan_subtask_evidence_bindings"), dict) else {}
+        step_bindings = bindings.get(step_id, {}) if isinstance(bindings.get(step_id), dict) else {}
+        binding = step_bindings.get(subtask_id, {}) if isinstance(step_bindings.get(subtask_id), dict) else {}
+        if (
+            binding
+            and str(binding.get("source", "") or "") in {
+                "direct", "semantic", "status_update", "evidence_reconcile", "trusted_restore",
+            }
+            and bool(binding.get("evidence_ids"))
+        ):
+            return True
+        try:
+            since_ts = float(row.get("created_at", 0.0) or row.get("started_at", 0.0) or 0.0)
+        except Exception:
+            since_ts = 0.0
+        if self._plan_subtask_has_accumulated_evidence(
+            plan_step,
+            content,
+            board=board,
+            subtask_id=subtask_id,
+            since_ts=since_ts,
+        ):
+            return True
+        return bool(self._plan_subtask_semantic_completion_records(
+            plan_step,
+            row,
+            board=board,
+            subtask_id=subtask_id,
+            since_ts=since_ts,
+        ))
+
+    def _plan_subtask_semantic_evidence_signature(
+        self,
+        plan_step: dict,
+        row: dict,
+        *,
+        board: dict | None = None,
+        subtask_id: str = "",
+        since_ts: float = 0.0,
+    ) -> tuple[str, list[dict]]:
+        """Return a stable review signature and real current-step candidates."""
+        if not isinstance(plan_step, dict) or not isinstance(row, dict):
+            return "", []
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        step_id = trim(str(plan_step.get("id", "") or ""), 40)
+        stable_id = trim(str(subtask_id or row.get("subtask_id", "") or ""), 80)
+        if not stable_id and step_id:
+            stable_id = self._stable_plan_worker_subtask_id(step_id, row)
+        lower_bound = max(float(since_ts or 0.0), self._plan_step_activation_ts(plan_step))
+        candidates = self._plan_step_evidence_records(
+            step_id,
+            board=bb,
+            since_ts=lower_bound,
+        ) if step_id else []
+        payload = {
+            "step_id": step_id,
+            "subtask_id": stable_id,
+            "subtask": trim(str(row.get("content", "") or ""), 800),
+            "evidence": [
+                (
+                    str(record.get("id", "") or ""),
+                    str(record.get("kind", "") or ""),
+                    str(record.get("tool", "") or ""),
+                    bool(record.get("ok", False)),
+                    record.get("exit_code"),
+                    str(record.get("path", "") or ""),
+                    tuple(str(value or "") for value in (record.get("changed_files", []) or [])),
+                    trim(str(record.get("summary", "") or ""), 500),
+                )
+                for record in candidates[-16:]
+            ],
+        }
+        signature = hashlib.sha1(json_dumps(payload).encode("utf-8", "ignore")).hexdigest()[:20]
+        return signature, candidates[-16:]
+
+    def _cached_plan_subtask_semantic_review(
+        self,
+        plan_step: dict,
+        row: dict,
+        *,
+        board: dict | None = None,
+        subtask_id: str = "",
+        since_ts: float = 0.0,
+    ) -> tuple[dict, list[dict]]:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        step_id = trim(str((plan_step or {}).get("id", "") or ""), 40)
+        stable_id = trim(str(subtask_id or (row or {}).get("subtask_id", "") or ""), 80)
+        if not stable_id and step_id and isinstance(row, dict):
+            stable_id = self._stable_plan_worker_subtask_id(step_id, row)
+        signature, candidates = self._plan_subtask_semantic_evidence_signature(
+            plan_step,
+            row,
+            board=bb,
+            subtask_id=stable_id,
+            since_ts=since_ts,
+        )
+        all_reviews = bb.get("plan_subtask_semantic_reviews", {}) if isinstance(bb.get("plan_subtask_semantic_reviews"), dict) else {}
+        step_reviews = all_reviews.get(step_id, {}) if isinstance(all_reviews.get(step_id), dict) else {}
+        review = step_reviews.get(stable_id, {}) if isinstance(step_reviews.get(stable_id), dict) else {}
+        if not review or str(review.get("evidence_signature", "") or "") != signature:
+            return {}, candidates
+        return dict(review), candidates
+
+    def _record_plan_subtask_semantic_review(
+        self,
+        plan_step: dict,
+        row: dict,
+        review: dict,
+        *,
+        board: dict | None = None,
+        subtask_id: str = "",
+    ) -> None:
+        if not isinstance(plan_step, dict) or not isinstance(row, dict) or not isinstance(review, dict):
+            return
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        step_id = trim(str(plan_step.get("id", "") or ""), 40)
+        stable_id = trim(str(subtask_id or row.get("subtask_id", "") or ""), 80)
+        if not stable_id and step_id:
+            stable_id = self._stable_plan_worker_subtask_id(step_id, row)
+        if not step_id or not stable_id:
+            return
+        all_reviews = dict(bb.get("plan_subtask_semantic_reviews", {}) if isinstance(bb.get("plan_subtask_semantic_reviews"), dict) else {})
+        step_reviews = dict(all_reviews.get(step_id, {}) if isinstance(all_reviews.get(step_id), dict) else {})
+        step_reviews[stable_id] = dict(review)
+        all_reviews[step_id] = step_reviews
+        bb["plan_subtask_semantic_reviews"] = all_reviews
+        bb["updated_at"] = float(now_ts())
+        self.blackboard = bb
+
+    def _llm_review_plan_subtask_completion(
+        self,
+        plan_step: dict,
+        row: dict,
+        *,
+        board: dict | None = None,
+        subtask_id: str = "",
+        since_ts: float = 0.0,
+    ) -> dict:
+        """Use one cached LLM audit when deterministic evidence binding fails.
+
+        The deterministic matcher remains the fast path.  This fallback runs
+        only for an explicit completion request with passing, step-local tool
+        evidence, so action verbs and path wording remain hints rather than a
+        brittle source of permanent Todo deadlocks.
+        """
+        default = {
+            "available": False,
+            "passed": False,
+            "decision": "verify",
+            "confidence": "low",
+            "reason": "semantic subtask review unavailable",
+            "evidence": "",
+            "evidence_ids": [],
+            "source": "subtask-semantic-judge",
+        }
+        if (
+            not isinstance(plan_step, dict)
+            or not isinstance(row, dict)
+            or self._is_plan_step_acceptance_subtask(row.get("content", ""))
+        ):
+            return default
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        stable_id = trim(str(subtask_id or row.get("subtask_id", "") or ""), 80)
+        if not stable_id:
+            stable_id = self._stable_plan_worker_subtask_id(
+                trim(str(plan_step.get("id", "") or ""), 40),
+                row,
+            )
+        cached, candidates = self._cached_plan_subtask_semantic_review(
+            plan_step,
+            row,
+            board=bb,
+            subtask_id=stable_id,
+            since_ts=since_ts,
+        )
+        if cached:
+            return cached
+        signature, candidates = self._plan_subtask_semantic_evidence_signature(
+            plan_step,
+            row,
+            board=bb,
+            subtask_id=stable_id,
+            since_ts=since_ts,
+        )
+        if not candidates:
+            return default
+        evidence_lines = [
+            trim(
+                f"ID={record.get('id', '')} kind={record.get('kind', '')} "
+                f"tool={record.get('tool', '')} ok={record.get('ok')} exit={record.get('exit_code')} "
+                f"path={record.get('path', '')} changed={record.get('changed_files', [])} "
+                f"summary={record.get('summary', '')}",
+                700,
+            )
+            for record in candidates
+        ]
+        review = dict(default)
+        review["evidence_signature"] = signature
+        review["subtask_id"] = stable_id
+        try:
+            prompt = (
+                "A deterministic Todo evidence matcher could not decide whether one current subtask is complete. "
+                "Audit the REAL step-local records semantically; action verbs, numbering, and exact path wording are hints, "
+                "not the verdict. Decide pass only when the records concretely prove this subtask's intended result. "
+                "Equivalent implementation/verification methods are allowed, but evidence for another subtask is not. "
+                "Use verify when proof is insufficient and repair only when a real defect is shown. Never pass a claim without tool evidence.\n\n"
+                f"PARENT STEP:\n{trim(str(plan_step.get('full_content', '') or plan_step.get('content', '') or ''), 1400)}\n\n"
+                f"SUBTASK:\n{trim(str(row.get('content', '') or ''), 800)}\n\n"
+                f"EVIDENCE RECORDS:\n{chr(10).join(evidence_lines)}\n\n"
+                "Reply JSON only: {\"decision\":\"pass|verify|repair\",\"passed\":true|false,"
+                "\"confidence\":\"high|medium|low\",\"reason\":\"...\",\"evidence\":\"...\","
+                "\"evidence_ids\":[\"ID from records\"]}"
+            )
+            resp = self.ollama.chat(
+                [{"role": "user", "content": prompt}],
+                system=self._inject_runtime_environment_context(
+                    "/no_think\nYou are a strict evidence-grounded subtask auditor. Reply only valid JSON."
+                ),
+                max_tokens=360,
+                temperature=0.1,
+                think=False,
+            )
+            raw = str(resp.get("content", "") or resp.get("text", "") or "").strip()
+            payload = extract_json_object_from_text(raw, {})
+            if isinstance(payload, dict) and "passed" in payload:
+                confidence = str(payload.get("confidence", "low") or "low").strip().lower()
+                if confidence not in {"high", "medium", "low"}:
+                    confidence = "low"
+                decision = str(payload.get("decision", "") or "").strip().lower()
+                if decision not in {"pass", "verify", "repair"}:
+                    decision = "pass" if bool(payload.get("passed", False)) else "verify"
+                evidence_text = trim(str(payload.get("evidence", "") or ""), 500)
+                valid_ids = {
+                    str(record.get("id", "") or "")
+                    for record in candidates
+                    if record.get("id") and self._plan_evidence_record_passes(record)
+                }
+                cited_ids = [
+                    trim(str(value or ""), 80)
+                    for value in (payload.get("evidence_ids", []) if isinstance(payload.get("evidence_ids"), list) else [])
+                    if trim(str(value or ""), 80) in valid_ids
+                ]
+                requested_pass = bool(
+                    payload.get("passed", False)
+                    and decision == "pass"
+                    and confidence in {"high", "medium"}
+                    and evidence_text
+                )
+                if requested_pass and not cited_ids:
+                    cited_ids = [
+                        str(record.get("id", "") or "")
+                        for record in candidates
+                        if record.get("id") and self._plan_evidence_record_passes(record)
+                    ]
+                passed = bool(requested_pass and cited_ids)
+                review.update({
+                    "available": True,
+                    "passed": passed,
+                    "decision": decision,
+                    "confidence": confidence,
+                    "reason": trim(str(payload.get("reason", "") or ""), 500),
+                    "evidence": evidence_text,
+                    "evidence_ids": cited_ids[-16:] if passed else [],
+                    "raw": trim(raw, 1200),
+                })
+        except Exception as exc:
+            review["reason"] = trim(f"semantic subtask review unavailable: {exc}", 300)
+        review["ts"] = float(now_ts())
+        self._record_plan_subtask_semantic_review(
+            plan_step,
+            row,
+            review,
+            board=bb,
+            subtask_id=stable_id,
+        )
+        return review
+
+    def _plan_subtask_semantic_completion_records(
+        self,
+        plan_step: dict,
+        row: dict,
+        *,
+        board: dict | None = None,
+        subtask_id: str = "",
+        since_ts: float = 0.0,
+    ) -> list[dict]:
+        review, candidates = self._cached_plan_subtask_semantic_review(
+            plan_step,
+            row,
+            board=board,
+            subtask_id=subtask_id,
+            since_ts=since_ts,
+        )
+        if not (
+            review.get("available")
+            and review.get("passed")
+            and str(review.get("confidence", "") or "").lower() in {"high", "medium"}
+        ):
+            return []
+        evidence_ids = {str(value or "") for value in (review.get("evidence_ids", []) or []) if str(value or "")}
+        return [
+            record for record in candidates
+            if str(record.get("id", "") or "") in evidence_ids
+            and self._plan_evidence_record_passes(record)
+        ]
+
+    def _plan_subtask_completion_audit_warning(
+        self,
+        plan_step: dict,
+        row: dict,
+        *,
+        board: dict | None = None,
+        subtask_id: str = "",
+        since_ts: float = 0.0,
+    ) -> str:
+        label = trim(str((row or {}).get("content", "") or ""), 120)
+        review, _candidates = self._cached_plan_subtask_semantic_review(
+            plan_step,
+            row,
+            board=board,
+            subtask_id=subtask_id,
+            since_ts=since_ts,
+        )
+        if not review.get("available"):
+            return label
+        decision = trim(str(review.get("decision", "verify") or "verify"), 16)
+        reason = trim(str(review.get("reason", "") or ""), 120)
+        return trim(
+            f"{label} [LLM audit={decision}{(': ' + reason) if reason else ''}]",
+            260,
+        )
+
+    def _plan_worker_completion_has_evidence(
+        self,
+        plan_step: dict,
+        row: dict,
+        *,
+        board: dict | None = None,
+        subtask_id: str = "",
+        since_ts: float = 0.0,
+        evidence: object = None,
+    ) -> bool:
+        """Audit a requested completion using the row's own semantic type."""
+        if not isinstance(plan_step, dict) or not isinstance(row, dict):
+            return False
+        candidate = dict(row)
+        candidate["status"] = "completed"
+        if subtask_id:
+            candidate["subtask_id"] = subtask_id
+        if self._is_plan_step_acceptance_subtask(candidate.get("content", "")):
+            return self._plan_worker_completed_status_has_evidence(candidate, plan_step, board)
+        if self._plan_subtask_has_accumulated_evidence(
+            plan_step,
+            candidate.get("content", ""),
+            board=board,
+            subtask_id=subtask_id,
+            since_ts=since_ts,
+            evidence=evidence,
+        ):
+            return True
+        review = self._llm_review_plan_subtask_completion(
+            plan_step,
+            candidate,
+            board=board,
+            subtask_id=subtask_id,
+            since_ts=since_ts,
+        )
+        return bool(
+            review.get("available")
+            and review.get("passed")
+            and str(review.get("confidence", "") or "").lower() in {"high", "medium"}
+        )
+
+    def _plan_worker_completion_evidence_records(
+        self,
+        plan_step: dict,
+        row: dict,
+        *,
+        board: dict | None = None,
+        subtask_id: str = "",
+        since_ts: float = 0.0,
+        evidence: object = None,
+    ) -> list[dict]:
+        """Return the exact records that justified one accepted completion."""
+        if not isinstance(plan_step, dict) or not isinstance(row, dict):
+            return []
+        if self._is_plan_step_acceptance_subtask(row.get("content", "")):
+            records = self._matching_acceptance_evidence_records(
+                plan_step,
+                row,
+                board=board,
+                expected=self._acceptance_expected_evidence(
+                    self._effective_plan_step_acceptance_text(
+                        plan_step,
+                        row.get("content", ""),
+                    )
+                ),
+            )
+            if records:
+                return records
+            return self._trusted_plan_step_acceptance_records(
+                plan_step,
+                row,
+                board=board,
+                since_ts=since_ts,
+            )
+        records = self._plan_subtask_evidence_records(
+            plan_step,
+            row.get("content", ""),
+            board=board,
+            subtask_id=subtask_id,
+            since_ts=since_ts,
+            evidence=evidence,
+        )
+        if records:
+            return records
+        return self._plan_subtask_semantic_completion_records(
+            plan_step,
+            row,
+            board=board,
+            subtask_id=subtask_id,
+            since_ts=since_ts,
+        )
+
+    def _record_plan_subtask_evidence_binding(
+        self,
+        plan_step: dict,
+        row: dict,
+        records: list[dict],
+        *,
+        source: str,
+        actor: str,
+        board: dict | None = None,
+    ) -> dict:
+        """Persist the runtime's evidence decision beyond the rolling ledger window."""
+        if not isinstance(plan_step, dict) or not isinstance(row, dict):
+            return {}
+        step_id = trim(str(plan_step.get("id", "") or ""), 40)
+        subtask_id = self._stable_plan_worker_subtask_id(step_id, row)
+        passing = [
+            dict(record)
+            for record in (records or [])
+            if isinstance(record, dict)
+            and self._plan_evidence_record_passes(record)
+            and (not record.get("step_id") or str(record.get("step_id", "") or "") == step_id)
+        ]
+        evidence_ids = [trim(str(record.get("id", "") or ""), 80) for record in passing if record.get("id")]
+        if not step_id or not subtask_id or not evidence_ids:
+            return {}
+        latest = passing[-1]
+        binding = {
+            "subtask_id": subtask_id,
+            "content_core": self._plan_worker_content_core(row.get("content", "")),
+            "source": trim(str(source or "direct"), 40),
+            "actor": trim(str(actor or "developer"), 40),
+            "evidence_ids": evidence_ids[-12:],
+            "evidence": trim(
+                f"{latest.get('tool', 'tool')}: {latest.get('summary', '')}",
+                300,
+            ),
+            "ts": float(now_ts()),
+        }
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        all_bindings = dict(
+            bb.get("plan_subtask_evidence_bindings", {})
+            if isinstance(bb.get("plan_subtask_evidence_bindings"), dict)
+            else {}
+        )
+        step_bindings = dict(all_bindings.get(step_id, {}) if isinstance(all_bindings.get(step_id), dict) else {})
+        step_bindings[subtask_id] = binding
+        all_bindings[step_id] = step_bindings
+        bb["plan_subtask_evidence_bindings"] = all_bindings
+        bb["updated_at"] = float(now_ts())
+        self.blackboard = bb
+        return binding
+
+    def _clear_plan_subtask_evidence_binding(
+        self,
+        step_id: object,
+        subtask_id: object,
+        *,
+        board: dict | None = None,
+    ) -> bool:
+        step_key = trim(str(step_id or ""), 40)
+        subtask_key = trim(str(subtask_id or ""), 80)
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        all_bindings = dict(
+            bb.get("plan_subtask_evidence_bindings", {})
+            if isinstance(bb.get("plan_subtask_evidence_bindings"), dict)
+            else {}
+        )
+        step_bindings = dict(all_bindings.get(step_key, {}) if isinstance(all_bindings.get(step_key), dict) else {})
+        if not step_key or not subtask_key or subtask_key not in step_bindings:
+            return False
+        step_bindings.pop(subtask_key, None)
+        if step_bindings:
+            all_bindings[step_key] = step_bindings
+        else:
+            all_bindings.pop(step_key, None)
+        bb["plan_subtask_evidence_bindings"] = all_bindings
+        bb["updated_at"] = float(now_ts())
+        self.blackboard = bb
+        return True
 
     def _bind_tool_result_to_plan_subtask(self, item: dict, snapshot: dict | None) -> dict:
         if not isinstance(item, dict) or not isinstance(snapshot, dict):
@@ -43780,6 +46806,7 @@ body{padding:18px}
         bb = board if isinstance(board, dict) else (self.blackboard if isinstance(getattr(self, "blackboard", None), dict) else {})
         mirror = bb.get("plan_worker_todos", {}) if isinstance(bb.get("plan_worker_todos"), dict) else {}
         raw_rows = mirror.get(step_key, []) if isinstance(mirror.get(step_key), list) else []
+        plan_step = self._get_plan_step_by_id(step_key, bb)
         role_key = self._sanitize_agent_role(role)
         rows: list[dict] = []
         for row in raw_rows:
@@ -43811,10 +46838,34 @@ body{padding:18px}
                 "completed_by": trim(str(row.get("completed_by", "") or ""), 40),
                 "evidence": trim(str(row.get("evidence", "") or ""), 300),
             }
+            external_subtask_id = trim(
+                str(row.get("external_subtask_id", "") or "").strip(),
+                120,
+            )
+            supplied_subtask_id = trim(str(row.get("subtask_id", "") or "").strip(), 100)
+            if supplied_subtask_id and not self._is_canonical_plan_worker_subtask_id(
+                supplied_subtask_id,
+                step_key,
+            ):
+                external_subtask_id = external_subtask_id or supplied_subtask_id
+            if external_subtask_id:
+                item["external_subtask_id"] = external_subtask_id
+            row_key = trim(str(row.get("key", "") or "").strip(), 120)
+            if row_key and not row_key.startswith("bb:"):
+                item["key"] = row_key
             item["subtask_id"] = self._stable_plan_worker_subtask_id(step_key, row)
+            if (
+                item["status"] == "completed"
+                and isinstance(plan_step, dict)
+                and not self._plan_worker_completed_status_has_evidence(item, plan_step, bb)
+            ):
+                item["status"] = "pending"
+                item["completed_at"] = None
+                item["completed_by"] = ""
+                item["evidence"] = ""
             rows.append(item)
-        plan_step = self._get_plan_step_by_id(step_key, bb)
         rows = self._filter_parent_step_duplicate_worker_rows(rows, plan_step, bb)
+        rows = self._dedupe_plan_worker_rows(rows, step_key)
         if role_key and not rows:
             return self._plan_worker_todo_rows_from_blackboard(step_key, role="", board=bb)
         rows.sort(key=self._plan_worker_todo_sort_key)
@@ -43849,6 +46900,23 @@ body{padding:18px}
                 plan_step_cache[parent_key],
                 bb,
             )
+            protected_existing: list[dict] = []
+            for existing_row in clean_existing:
+                normalized_existing = dict(existing_row)
+                if (
+                    self._normalize_todo_status_value(normalized_existing.get("status", ""), "pending") == "completed"
+                    and not self._plan_worker_completed_status_has_evidence(
+                        normalized_existing,
+                        plan_step_cache[parent_key],
+                        bb,
+                    )
+                ):
+                    normalized_existing["status"] = "pending"
+                    normalized_existing["completed_at"] = None
+                    normalized_existing["completed_by"] = ""
+                    normalized_existing["evidence"] = ""
+                protected_existing.append(normalized_existing)
+            clean_existing = protected_existing
             if clean_existing != existing_rows or parent_key != parent:
                 mirror.pop(parent, None)
                 if clean_existing:
@@ -43896,7 +46964,30 @@ body{padding:18px}
                 "completed_by": trim(str(raw.get("completed_by", "") or ""), 40),
                 "evidence": trim(str(raw.get("evidence", "") or ""), 300),
             }
+            external_subtask_id = trim(
+                str(raw.get("external_subtask_id", "") or "").strip(),
+                120,
+            )
+            supplied_subtask_id = trim(str(raw.get("subtask_id", "") or "").strip(), 100)
+            if supplied_subtask_id and not self._is_canonical_plan_worker_subtask_id(
+                supplied_subtask_id,
+                parent,
+            ):
+                external_subtask_id = external_subtask_id or supplied_subtask_id
+            if external_subtask_id:
+                item["external_subtask_id"] = external_subtask_id
+            row_key = trim(str(raw.get("key", "") or "").strip(), 120)
+            if row_key and not row_key.startswith("bb:"):
+                item["key"] = row_key
             item["subtask_id"] = self._stable_plan_worker_subtask_id(parent, raw)
+            if (
+                item["status"] == "completed"
+                and not self._plan_worker_completed_status_has_evidence(item, plan_step_cache.get(parent), bb)
+            ):
+                item["status"] = "pending"
+                item["completed_at"] = None
+                item["completed_by"] = ""
+                item["evidence"] = ""
             grouped.setdefault(parent, []).append(item)
         target_steps = {step_filter} if step_filter else set(grouped.keys())
         if not step_filter:
@@ -43916,6 +47007,7 @@ body{padding:18px}
                 plan_step_cache.get(parent),
                 bb,
             )
+            clean_rows = self._dedupe_plan_worker_rows(clean_rows, parent)
             clean_rows.sort(key=self._plan_worker_todo_sort_key)
             if clean_rows:
                 if mirror.get(parent) != clean_rows:
@@ -43956,6 +47048,72 @@ body{padding:18px}
             if raw_mirror or memory_rows:
                 return self._sync_plan_worker_todos_to_blackboard(step_key, rows=memory_rows, board=bb)
             return False
+        # Merge the two persistence views before restoring them.  The blackboard
+        # mirror and TodoManager are written by different event paths and one can
+        # legitimately lag the other by a turn.  Restore is monotonic: a completed
+        # row (and its evidence) can never be downgraded by an older pending or
+        # in_progress snapshot.  This keeps sync from visually moving a finished
+        # child back to the first open child after a manager handoff.
+        status_rank = {"pending": 1, "in_progress": 2, "completed": 3}
+        merged_by_id: dict[str, dict] = {}
+        merged_order: list[str] = []
+        for source_row in mirror_rows + memory_rows:
+            row = dict(source_row)
+            identity = self._stable_plan_worker_subtask_id(step_key, row)
+            if not identity:
+                continue
+            row["subtask_id"] = identity
+            row["parent_step_id"] = step_key
+            if (
+                self._normalize_todo_status_value(row.get("status", ""), "pending") == "completed"
+                and not self._plan_worker_completed_status_has_evidence(row, plan_step, bb)
+            ):
+                row["status"] = "pending"
+                row["completed_at"] = None
+                row["completed_by"] = ""
+                row["evidence"] = ""
+            prior = merged_by_id.get(identity)
+            if prior is None:
+                merged_by_id[identity] = row
+                merged_order.append(identity)
+                continue
+            prior_status = self._normalize_todo_status_value(prior.get("status", ""), "pending")
+            incoming_status = self._normalize_todo_status_value(row.get("status", ""), "pending")
+            if status_rank.get(incoming_status, 0) >= status_rank.get(prior_status, 0):
+                winner, loser = row, prior
+            else:
+                winner, loser = prior, row
+            combined = dict(loser)
+            combined.update(winner)
+            # Preserve completion metadata even if the winning copy is an old
+            # serialized row without its optional fields.
+            for field in ("completed_at", "completed_by", "evidence", "created_at", "started_at"):
+                if combined.get(field) in (None, "", 0, 0.0):
+                    value = prior.get(field, row.get(field))
+                    if value not in (None, "", 0, 0.0):
+                        combined[field] = value
+            combined["status"] = "completed" if max(
+                status_rank.get(prior_status, 0), status_rank.get(incoming_status, 0)
+            ) >= status_rank["completed"] else self._normalize_todo_status_value(
+                winner.get("status", ""), "pending"
+            )
+            combined["parent_step_id"] = step_key
+            combined["subtask_id"] = identity
+            if (
+                self._normalize_todo_status_value(combined.get("status", ""), "pending") == "completed"
+                and not self._plan_worker_completed_status_has_evidence(combined, plan_step, bb)
+            ):
+                # A completed bit from one persistence view is not proof by
+                # itself.  Downgrade only the unproven row; keep its identity
+                # and content so the active child remains resumable.
+                combined["status"] = "pending"
+                combined["completed_at"] = None
+                combined["completed_by"] = ""
+                combined["evidence"] = ""
+            merged_by_id[identity] = combined
+        restore_rows = [merged_by_id[key] for key in merged_order if key in merged_by_id]
+        if not restore_rows:
+            return False
         before = [
             (
                 self._plan_worker_todo_identity(row),
@@ -43967,7 +47125,7 @@ body{padding:18px}
         ]
         role_key = self._current_plan_worker_owner(bb)
         self._merge_plan_worker_todo_items(
-            mirror_rows + memory_rows,
+            restore_rows,
             role=role_key,
             trusted_restore=True,
         )
@@ -44272,16 +47430,35 @@ body{padding:18px}
         raw = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
         aliases = {
             "todo": "pending",
+            "open": "pending",
+            "not_started": "pending",
+            "notstarted": "pending",
+            "待处理": "pending",
+            "待處理": "pending",
+            "未开始": "pending",
+            "未開始": "pending",
             "[_]": "pending",
             "[]": "pending",
             "[ ]": "pending",
             "doing": "in_progress",
             "working": "in_progress",
+            "active": "in_progress",
+            "started": "in_progress",
+            "进行中": "in_progress",
+            "進行中": "in_progress",
+            "处理中": "in_progress",
+            "處理中": "in_progress",
             "inprogress": "in_progress",
             "in_progress": "in_progress",
             "[>]": "in_progress",
             ">": "in_progress",
             "done": "completed",
+            "complete": "completed",
+            "success": "completed",
+            "succeeded": "completed",
+            "passed": "completed",
+            "完成": "completed",
+            "已完成": "completed",
             "finish": "completed",
             "finished": "completed",
             "[x]": "completed",
@@ -44301,7 +47478,7 @@ body{padding:18px}
         default_status: str = "pending",
     ) -> dict:
         worker_owners = {"developer", "explorer", "reviewer"}
-        step_key = trim(str(step_id or "").strip(), 20)
+        step_key = trim(str(step_id or "").strip(), 40)
         owner_hint = self._sanitize_agent_role(role_key) or self._current_plan_worker_owner()
         if isinstance(item, str):
             raw: dict = {"content": item}
@@ -44312,13 +47489,43 @@ body{padding:18px}
         key = trim(str(raw.get("key", "") or "").strip(), 120)
         if key.startswith("bb:"):
             return raw
-        raw_content = str(raw.get("content", raw.get("text", raw.get("title", ""))) or "").strip()
+        raw_content = str(
+            raw.get(
+                "content",
+                raw.get(
+                        "text",
+                        raw.get(
+                            "title",
+                            raw.get(
+                                "task",
+                                raw.get("description", raw.get("label", raw.get("name", raw.get("summary", "")))),
+                            ),
+                        ),
+                ),
+            )
+            or ""
+        ).strip()
         parsed_status, parsed_content = split_todo_status_text(raw_content)
         content = normalize_work_text(parsed_content or raw_content) or (parsed_content or raw_content)
         content = trim(str(content or "").strip(), 500)
         if not content:
             return {}
-        raw_status = str(raw.get("status", raw.get("state", "")) or "").strip()
+        # Accept provider-specific aliases without changing the canonical row
+        # identity.  A resume payload often uses ``done``/``finished`` booleans
+        # instead of a status string.
+        raw_status_value = raw.get("status", raw.get("state", raw.get("phase", "")))
+        if raw_status_value in (None, ""):
+            if any(
+                _to_bool_like(raw.get(key, False), default=False)
+                for key in ("completed", "complete", "done", "finished", "passed", "success")
+            ):
+                raw_status_value = "completed"
+            elif any(
+                _to_bool_like(raw.get(key, False), default=False)
+                for key in ("in_progress", "inprogress", "active", "working", "started")
+            ):
+                raw_status_value = "in_progress"
+        raw_status = str(raw_status_value or "").strip()
         raw_status_key = raw_status.lower().replace("-", "_").replace(" ", "_")
         status = self._normalize_todo_status_value(raw_status, parsed_status or default_status)
         if parsed_status and raw_status_key in {"", "todo", "pending"}:
@@ -44336,17 +47543,43 @@ body{padding:18px}
             "status": status,
             "owner": owner,
         }
+        if key:
+            row["key"] = key
         if parent_step_id:
             row["parent_step_id"] = parent_step_id
         active_form = str(raw.get("activeForm", raw.get("active_form", "")) or "").strip()
         if active_form:
             row["activeForm"] = active_form
         for meta_key in (
-            "subtask_id", "created_at", "updated_at", "started_at", "completed_at",
-            "completed_by", "evidence", "revision_reason", "revision_evidence",
+            "created_at", "updated_at", "started_at", "completed_at",
+            "completed_by", "evidence", "evidence_binding", "evidence_ids",
+            "revision_reason", "revision_evidence",
         ):
             if meta_key in raw and raw.get(meta_key) not in (None, ""):
                 row[meta_key] = raw.get(meta_key)
+        for source_key in ("proof", "evidence_ref", "evidence_refs"):
+            if not row.get("evidence") and raw.get(source_key) not in (None, ""):
+                row["evidence"] = raw.get(source_key)
+        supplied_subtask_id = trim(
+            str(raw.get("subtask_id", raw.get("subtaskId", "")) or "").strip(),
+            100,
+        )
+        if supplied_subtask_id:
+            if self._is_canonical_plan_worker_subtask_id(supplied_subtask_id, step_key):
+                row["subtask_id"] = supplied_subtask_id
+            else:
+                row["external_subtask_id"] = supplied_subtask_id
+        for alias_key in (
+            "external_subtask_id", "externalSubtaskId", "external_id", "externalId",
+            "todo_id", "todoId", "task_id", "taskId", "item_id", "itemId",
+            "row_id", "rowId", "id",
+        ):
+            alias = trim(str(raw.get(alias_key, "") or "").strip(), 120)
+            if alias:
+                row.setdefault("external_subtask_id", alias)
+                break
+        if key and not key.startswith("bb:"):
+            row.setdefault("external_subtask_id", key)
         row["subtask_id"] = self._stable_plan_worker_subtask_id(step_key, row)
         return row
 
@@ -44416,7 +47649,16 @@ body{padding:18px}
                     return scoped
             return owner_rows
         if route_kind == "pure_single":
-            return [row for row in snap if self._todo_row_kind(row) == "flat"]
+            # Normal TodoWrite calls are stamped with the active owner so the
+            # UI can show who is working.  Older sessions may still contain
+            # owner-less ``flat`` rows, while newer sessions contain
+            # ``owner_worker`` rows.  A payload-less resume must see both
+            # representations; filtering to only ``flat`` made
+            # TodoWriteResume fail immediately after a normal TodoWrite.
+            return [
+                row for row in snap
+                if self._todo_row_kind(row) in {"flat", "owner_worker"}
+            ]
         return []
 
     def _filter_plan_fragment_todo_rows(self, rows: list[dict]) -> list[dict]:
@@ -44682,6 +47924,128 @@ body{padding:18px}
                 "unsupported_changes": [],
             }
 
+    @staticmethod
+    def _plan_revision_relation_tokens(value: object) -> set[str]:
+        text = unicodedata.normalize("NFKC", str(value or "")).lower()
+        tokens = set(re.findall(r"[a-z0-9][a-z0-9_.+-]{2,}", text))
+        for run in re.findall(r"[\u4e00-\u9fff]{2,}", text):
+            tokens.update(run[index:index + 2] for index in range(max(1, len(run) - 1)))
+        stop = {
+            "the", "and", "with", "from", "this", "that", "error", "failed", "failure",
+            "tool", "result", "output", "step", "task", "运行", "執行", "验证", "驗證",
+            "检查", "檢查", "当前", "當前", "步骤", "步驟", "任务", "任務", "报错", "報錯",
+        }
+        return {token for token in tokens if token not in stop}
+
+    def _plan_revision_texts_related(self, left: object, right: object, minimum: float) -> bool:
+        left_text = normalize_work_text(str(left or "")) or str(left or "")
+        right_text = normalize_work_text(str(right or "")) or str(right or "")
+        left_tokens = self._plan_revision_relation_tokens(left_text)
+        right_tokens = self._plan_revision_relation_tokens(right_text)
+        token_score = (
+            len(left_tokens & right_tokens) / max(1, min(len(left_tokens), len(right_tokens)))
+            if left_tokens and right_tokens
+            else 0.0
+        )
+        sequence_score = difflib.SequenceMatcher(None, left_text.lower(), right_text.lower()).ratio()
+        return max(token_score, sequence_score) >= float(minimum)
+
+    def _bounded_current_subtask_revision_audit(
+        self,
+        plan_step: dict,
+        existing_rows: list[dict],
+        proposed_rows: list[dict],
+        matched_evidence: list[dict],
+        *,
+        reason: str,
+        mode: str,
+        step_id: str,
+    ) -> dict:
+        if mode != "revise_open":
+            return {}
+        existing_open = [
+            row for row in existing_rows
+            if isinstance(row, dict)
+            and str(row.get("status", "pending") or "pending").lower() != "completed"
+            and not self._is_plan_step_acceptance_subtask(row.get("content", ""))
+        ]
+        proposed_open = [
+            row for row in proposed_rows
+            if isinstance(row, dict)
+            and str(row.get("status", "pending") or "pending").lower() != "completed"
+            and not self._is_plan_step_acceptance_subtask(row.get("content", ""))
+        ]
+        if len(existing_open) != len(proposed_open):
+            return {}
+        existing_acceptance = [
+            self._normalize_plan_step_acceptance_subtask_text(row.get("content", ""))
+            for row in existing_rows
+            if isinstance(row, dict) and self._is_plan_step_acceptance_subtask(row.get("content", ""))
+        ]
+        proposed_acceptance = [
+            self._normalize_plan_step_acceptance_subtask_text(row.get("content", ""))
+            for row in proposed_rows
+            if isinstance(row, dict) and self._is_plan_step_acceptance_subtask(row.get("content", ""))
+        ]
+        if existing_acceptance != proposed_acceptance:
+            return {}
+        before_core = [self._plan_worker_content_core(row.get("content", "")) for row in existing_open]
+        after_core = [self._plan_worker_content_core(row.get("content", "")) for row in proposed_open]
+        changed_indexes = [
+            index for index, pair in enumerate(zip(before_core, after_core))
+            if pair[0] != pair[1]
+        ]
+        if len(changed_indexes) != 1:
+            return {}
+        changed_index = changed_indexes[0]
+        prior = existing_open[changed_index]
+        revised = proposed_open[changed_index]
+        if self._normalize_todo_status_value(prior.get("status", ""), "pending") != "in_progress":
+            return {}
+        if self._normalize_todo_status_value(revised.get("status", ""), "pending") != "in_progress":
+            return {}
+        prior_id = self._stable_plan_worker_subtask_id(step_id, prior)
+        directly_bound = [
+            row for row in matched_evidence
+            if prior_id and str(row.get("subtask_id", "") or "").strip() == prior_id
+        ]
+        if not directly_bound:
+            return {}
+        prior_core = self._plan_worker_content_core(prior.get("content", ""))
+        revised_core = self._plan_worker_content_core(revised.get("content", ""))
+        if not prior_core or prior_core not in revised_core:
+            return {}
+        added_detail = revised_core.replace(prior_core, "", 1).strip(" ：:;；,.，。()（）[]【】-")
+        if not added_detail:
+            return {}
+        scope_change_markers = (
+            "remove", "delete", "drop", "skip", "replace", "instead", "without", "no longer",
+            "删除", "刪除", "移除", "跳过", "跳過", "替换", "替換", "取代", "取消",
+            "不再", "无需", "無需", "改为", "改為", "舍弃", "捨棄",
+        )
+        normalized_added_detail = unicodedata.normalize("NFKC", added_detail).lower()
+        if any(marker in normalized_added_detail for marker in scope_change_markers):
+            return {}
+        evidence_text = "\n".join(
+            " ".join(
+                str(row.get(field, "") or "")
+                for field in ("summary", "command", "path", "subtask_content")
+            )
+            for row in directly_bound
+        )
+        if not self._plan_revision_texts_related(added_detail, evidence_text, 0.18):
+            return {}
+        if not self._plan_revision_texts_related(reason, evidence_text, 0.18):
+            return {}
+        return {
+            "ok": True,
+            "structural": True,
+            "reason": "bounded current-subtask revision accepted by direct evidence audit",
+            "before_open": before_core,
+            "after_open": after_core,
+            "evidence_ids": [str(row.get("id", "") or "") for row in directly_bound],
+        }
+
     def _review_plan_worker_revision(
         self,
         plan_step: dict,
@@ -44777,6 +48141,17 @@ body{padding:18px}
                 "after_open": after_open,
                 "evidence_ids": [str(row.get("id", "") or "") for row in matched],
             }
+        bounded_review = self._bounded_current_subtask_revision_audit(
+            plan_step,
+            existing_rows,
+            proposed_rows,
+            matched,
+            reason=reason,
+            mode=mode,
+            step_id=step_id,
+        )
+        if bounded_review:
+            return bounded_review
         semantic_audit = self._semantic_audit_plan_worker_revision(
             plan_step,
             reason=reason,
@@ -44826,6 +48201,13 @@ body{padding:18px}
         key = trim(str(row.get("key", "") or "").strip(), 120)
         if key.startswith("bb:"):
             return f"system:{key}"
+        for field in (
+            "key", "external_subtask_id", "external_id", "todo_id", "task_id",
+            "item_id", "row_id", "id", "subtask_id",
+        ):
+            external_id = trim(str(row.get(field, "") or "").strip(), 120)
+            if external_id and not external_id.startswith("bb:"):
+                return f"external:{external_id.casefold()}"
         content = normalize_work_text(str(row.get("content", "") or "")) or str(row.get("content", "") or "")
         content = re.sub(r"\s+", " ", content.strip().lower())
         if not content:
@@ -44856,59 +48238,42 @@ body{padding:18px}
             if identity not in existing_by_identity:
                 existing_by_identity[identity] = dict(row)
 
-        status_alias = {
-            "todo": "pending",
-            "[_]": "pending",
-            "[]": "pending",
-            "[ ]": "pending",
-            "doing": "in_progress",
-            "inprogress": "in_progress",
-            "in-progress": "in_progress",
-            "[>]": "in_progress",
-            ">": "in_progress",
-            "done": "completed",
-            "finish": "completed",
-            "finished": "completed",
-            "[x]": "completed",
-            "x": "completed",
-        }
         passthrough_rows: list[dict] = []
         merged_rows: list[dict] = []
         seen_identities: set[str] = set()
         for idx, item in enumerate(items):
-            if isinstance(item, str):
-                raw = {"content": item}
-            elif isinstance(item, dict):
-                raw = dict(item)
-            else:
-                raise ValueError(f"item {idx}: invalid type")
+            raw = self._normalize_generic_todo_row(item, owner=role_key)
+            if not raw:
+                continue
             key = trim(str(raw.get("key", "") or "").strip(), 120)
             if key.startswith("bb:"):
                 passthrough_rows.append(raw)
                 continue
-            raw_content = str(raw.get("content", raw.get("text", raw.get("title", "")))).strip()
-            content = normalize_work_text(raw_content) or raw_content
-            if not content:
-                continue
-            normalized: dict[str, object] = {"content": content}
-            raw_status = str(raw.get("status", raw.get("state", "")) or "").strip().lower()
-            if raw_status:
-                normalized["status"] = status_alias.get(raw_status, raw_status)
-            owner = str(raw.get("owner", "") or "").strip().lower()
-            if owner in {"manager", "explorer", "developer", "reviewer"}:
-                normalized["owner"] = owner
-            elif role_key == "manager" and owner == "":
-                normalized["owner"] = role_key
-            active_form = str(raw.get("activeForm", raw.get("active_form", "")) or "").strip()
-            if active_form:
-                normalized["activeForm"] = active_form
+            normalized = dict(raw)
+            normalized["owner"] = role_key if role_key in {"manager", "explorer", "developer", "reviewer"} else str(normalized.get("owner", "") or "")
             identity = self._flat_todo_identity(normalized)
             if not identity:
-                identity = f"ad-hoc:{idx}:{trim(content, 80)}"
-            merged = dict(existing_by_identity.get(identity, {}))
-            if "activeForm" not in normalized:
-                merged.pop("activeForm", None)
+                identity = f"ad-hoc:{idx}:{trim(str(normalized.get('content', '')), 80)}"
+            prior = existing_by_identity.get(identity)
+            if prior is None:
+                candidates = []
+                for candidate_id, candidate in existing_by_identity.items():
+                    if candidate_id in seen_identities:
+                        continue
+                    score = self._plan_worker_todo_match_score(normalized, candidate)
+                    if score >= 0.64:
+                        candidates.append((score, candidate_id, candidate))
+                candidates.sort(key=lambda value: value[0], reverse=True)
+                if candidates and (candidates[0][0] >= 0.86 or len(candidates) == 1 or candidates[0][0] - candidates[1][0] >= 0.08):
+                    _score, identity, prior = candidates[0]
+            merged = dict(prior or {})
+            prior_status = self._normalize_todo_status_value(merged.get("status", ""), "pending")
+            incoming_status = self._normalize_todo_status_value(normalized.get("status", ""), prior_status)
+            if prior_status == "completed" and incoming_status != "completed":
+                incoming_status = "completed"
             merged.update(normalized)
+            merged["status"] = incoming_status
+            merged["owner"] = normalized.get("owner", role_key)
             if identity in seen_identities:
                 continue
             seen_identities.add(identity)
@@ -44961,11 +48326,13 @@ body{padding:18px}
             ) or raw_row_step_id
             migrated_row = dict(row)
             migrated_row["parent_step_id"] = row_step_id
+            self._capture_plan_worker_external_identity(migrated_row, row_step_id)
             migrated_row["subtask_id"] = self._stable_plan_worker_subtask_id(row_step_id, migrated_row)
             if owner in worker_owners and row_step_id == step_id:
                 target_rows.append(migrated_row)
             else:
                 preserved.append(migrated_row)
+        target_rows = self._dedupe_plan_worker_rows(target_rows, step_id)
 
         incoming_normalized: list[dict] = []
         for idx, item in enumerate(items):
@@ -44981,8 +48348,9 @@ body{padding:18px}
                     )
                     if supplied_canonical != step_id:
                         canonical = self._render_plan_worker_todo_canonical(step_id, target_rows)
-                        return (
-                            "Error: TodoWrite rejected a cross-step update. "
+                        return self._plan_control_feedback(
+                            "preserve_current_subplan",
+                            "TodoWrite rejected a cross-step update. "
                             f"The active parent_step_id is '{step_id}', but the payload supplied "
                             f"'{supplied_parent}'. Update only the active parent step."
                             + (f"\n\n{canonical}" if canonical else "")
@@ -45002,6 +48370,15 @@ body{padding:18px}
             parent_step_id = trim(str(raw.get("parent_step_id", "") or ""), 20)
             if not parent_step_id:
                 raw["parent_step_id"] = step_id
+            if self._plan_worker_row_is_foreign_plan_step(raw, active_step, bb):
+                canonical = self._render_plan_worker_todo_canonical(step_id, target_rows)
+                return self._plan_control_feedback(
+                    "preserve_current_subplan",
+                    "TodoWrite rejected a cross-step row in the proposed subplan. "
+                    "Submit only rows whose N.M prefix belongs to the active parent step; "
+                    "the entire current subplan was preserved atomically."
+                    + (f"\n\n{canonical}" if canonical else "")
+                )
             if self._plan_worker_row_duplicates_parent_step(raw, active_step):
                 continue
             incoming_normalized.append(raw)
@@ -45009,13 +48386,42 @@ body{padding:18px}
         incoming_worker_rows = [row for row in incoming_normalized if not str(row.get("key", "") or "").startswith("bb:")]
         if not incoming_worker_rows:
             canonical = self._render_plan_worker_todo_canonical(step_id, target_rows)
-            return "Error: TodoWrite requires at least one current-step subtask." + (f"\n\n{canonical}" if canonical else "")
+            if target_rows:
+                # A resume/status call may carry only the parent bb: row (or an
+                # empty structural envelope). Preserve the current canonical
+                # children instead of turning a valid handoff into an error.
+                return self._plan_control_feedback(
+                    "preserve_current_subplan",
+                    "No worker rows were supplied; the canonical current-step subtasks were preserved. "
+                    "Continue the existing [>] subtask and send its status/evidence when it changes."
+                    + (f"\n\n{canonical}" if canonical else ""),
+                )
+            return self._plan_control_feedback(
+                "preserve_current_subplan",
+                "No current-step worker rows were supplied; keep the active plan step and create its step-local subtasks before executing."
+                + (f"\n\n{canonical}" if canonical else ""),
+            )
 
         mode = str(update_mode or "status_update").strip().lower().replace("-", "_")
         if mode not in {"status_update", "revise_open", "rework_completed"}:
             mode = "status_update"
         if mode == "status_update" and (str(revision_reason or "").strip() or self._plan_worker_revision_references(revision_evidence)):
             mode = "revise_open"
+
+        completion_audit_warnings: list[str] = []
+
+        def _resolved_row_owner(prior: dict | None, incoming: dict | None = None) -> str:
+            """Keep Sync ownership stable while Single retains one executor."""
+            if self._is_multi_agent_mode():
+                for candidate in (
+                    (prior or {}).get("owner", ""),
+                    (incoming or {}).get("owner", ""),
+                    role_key,
+                ):
+                    owner = self._sanitize_agent_role(candidate)
+                    if owner in worker_owners:
+                        return owner
+            return role_key
 
         def _number_key(row: dict) -> str:
             match = re.match(r"^\s*(\d+\.\d+)\b", normalize_work_text(str(row.get("content", "") or "")) or str(row.get("content", "") or ""))
@@ -45037,47 +48443,133 @@ body{padding:18px}
             if _number_key(row)
         }
 
+        existing_entries = [
+            (key, value)
+            for key, value in existing_by_id.items()
+            if isinstance(value, dict)
+        ]
+        match_cache: dict[int, tuple[str, dict | None]] = {}
+        used_match_ids: set[str] = set()
+
         def _existing_match(row: dict) -> tuple[str, dict | None]:
+            cached = match_cache.get(id(row))
+            if cached is not None:
+                return cached
             subtask_id = trim(str(row.get("subtask_id", "") or ""), 80)
             if subtask_id and subtask_id in existing_by_id:
-                return subtask_id, existing_by_id[subtask_id]
+                result = (subtask_id, existing_by_id[subtask_id])
+                match_cache[id(row)] = result
+                used_match_ids.add(subtask_id)
+                return result
             core = self._plan_worker_content_core(row.get("content", ""))
             core_id = existing_by_core.get(core, "")
-            if core_id:
-                return core_id, existing_by_id.get(core_id)
+            if core_id and core_id not in used_match_ids:
+                result = (core_id, existing_by_id.get(core_id))
+                match_cache[id(row)] = result
+                used_match_ids.add(core_id)
+                return result
             number_id = existing_by_number.get(_number_key(row), "")
-            if number_id:
-                return number_id, existing_by_id.get(number_id)
+            if number_id and number_id not in used_match_ids:
+                result = (number_id, existing_by_id.get(number_id))
+                match_cache[id(row)] = result
+                used_match_ids.add(number_id)
+                return result
+            # Last resort: semantic matching tolerates a changed N.M prefix,
+            # translated wording, and small evidence annotations. Require a
+            # strong/unique score so unrelated open rows are still audited as a
+            # structural revision instead of silently merged.
+            scored: list[tuple[float, str, dict]] = []
+            for candidate_id, candidate in existing_entries:
+                if candidate_id in used_match_ids:
+                    continue
+                score = self._plan_worker_todo_match_score(row, candidate)
+                if score >= 0.64:
+                    scored.append((score, candidate_id, candidate))
+            scored.sort(key=lambda value: value[0], reverse=True)
+            if scored:
+                best = scored[0]
+                second_score = scored[1][0] if len(scored) > 1 else 0.0
+                if best[0] >= 0.86 or best[0] - second_score >= 0.08:
+                    result = (best[1], best[2])
+                    match_cache[id(row)] = result
+                    used_match_ids.add(best[1])
+                    return result
             generated = self._stable_plan_worker_subtask_id(step_id, row)
-            return generated, existing_by_id.get(generated)
+            result = (generated, existing_by_id.get(generated))
+            match_cache[id(row)] = result
+            if generated and generated in existing_by_id:
+                used_match_ids.add(generated)
+            return result
 
         for row in incoming_worker_rows:
             subtask_id, _matched = _existing_match(row)
             row["subtask_id"] = subtask_id or self._stable_plan_worker_subtask_id(step_id, row)
 
-        if not target_rows:
+        if trusted_restore:
+            current_step_rows = [dict(row) for row in incoming_worker_rows]
+        elif not target_rows:
             current_step_rows = [dict(row) for row in incoming_worker_rows]
             for row in current_step_rows:
-                if str(row.get("status", "pending") or "pending").lower() == "completed" and not self._plan_subtask_has_accumulated_evidence(
+                row["owner"] = _resolved_row_owner(None, row)
+                if str(row.get("status", "pending") or "pending").lower() != "completed":
+                    continue
+                since_value = float(row.get("created_at", 0.0) or row.get("started_at", 0.0) or 0.0)
+                subtask_id = str(row.get("subtask_id", "") or "")
+                if not self._plan_worker_completion_has_evidence(
                     active_step,
-                    row.get("content", ""),
+                    row,
                     board=bb,
-                    subtask_id=str(row.get("subtask_id", "") or ""),
-                    since_ts=float(row.get("created_at", 0.0) or row.get("started_at", 0.0) or 0.0),
+                    subtask_id=subtask_id,
+                    since_ts=since_value,
+                    evidence=row.get("evidence", ""),
                 ):
                     row["status"] = "pending"
-        elif trusted_restore:
-            current_step_rows = [dict(row) for row in incoming_worker_rows]
+                    row.pop("completed_at", None)
+                    row.pop("completed_by", None)
+                    completion_audit_warnings.append(
+                        self._plan_subtask_completion_audit_warning(
+                            active_step,
+                            row,
+                            board=bb,
+                            subtask_id=subtask_id,
+                            since_ts=since_value,
+                        )
+                    )
+                else:
+                    records = self._plan_worker_completion_evidence_records(
+                        active_step,
+                        row,
+                        board=bb,
+                        subtask_id=subtask_id,
+                        since_ts=since_value,
+                        evidence=row.get("evidence", ""),
+                    )
+                    binding = self._record_plan_subtask_evidence_binding(
+                        active_step,
+                        row,
+                        records,
+                        source="direct",
+                        actor=role_key,
+                        board=bb,
+                    )
+                    if binding:
+                        row["evidence_ids"] = list(binding.get("evidence_ids", []) or [])
+                        row["evidence_binding"] = binding
         elif mode == "status_update":
-            unknown = [
-                row for row in incoming_worker_rows
-                if _existing_match(row)[1] is None
-                and not self._is_plan_step_acceptance_subtask(row.get("content", ""))
-            ]
-            if unknown:
+            structural_changes: list[dict] = []
+            for row in incoming_worker_rows:
+                _subtask_id, prior = _existing_match(row)
+                if prior is None:
+                    if not self._is_plan_step_acceptance_subtask(row.get("content", "")):
+                        structural_changes.append(row)
+                    continue
+                if not self._plan_worker_rows_equivalent(row, prior):
+                    structural_changes.append(row)
+            if structural_changes:
                 canonical = self._render_plan_worker_todo_canonical(step_id, target_rows)
-                return (
-                    "Error: TodoWrite status_update cannot add, replace, remove, split, merge, or reorder open subtasks. "
+                return self._plan_control_feedback(
+                    "preserve_current_subplan",
+                    "TodoWrite status_update cannot add, replace, remove, split, merge, or reorder open subtasks. "
                     "Use update_mode='revise_open' with revision_reason and revision_evidence that cite a current-step tool result or review finding."
                     + (f"\n\n{canonical}" if canonical else "")
                 )
@@ -45092,19 +48584,50 @@ body{padding:18px}
                 if prior_status == "completed" and incoming_status != "completed":
                     incoming_status = "completed"
                 if prior_status != "completed" and incoming_status == "completed":
-                    if not self._plan_subtask_has_accumulated_evidence(
+                    since_value = float(prior.get("created_at", 0.0) or prior.get("started_at", 0.0) or 0.0)
+                    completion_candidate = {**prior, **incoming, "subtask_id": subtask_id}
+                    if not self._plan_worker_completion_has_evidence(
                         active_step,
-                        prior.get("content", incoming.get("content", "")),
+                        completion_candidate,
                         board=bb,
                         subtask_id=subtask_id,
-                        since_ts=float(prior.get("created_at", 0.0) or prior.get("started_at", 0.0) or 0.0),
+                        since_ts=since_value,
+                        evidence=incoming.get("evidence", ""),
                     ):
-                        canonical = self._render_plan_worker_todo_canonical(step_id, target_rows)
-                        return (
-                            "Error: TodoWrite cannot mark a subtask completed without tool evidence bound to that subtask. "
-                            "Execute the concrete action/check first, then update its status."
-                            + (f"\n\n{canonical}" if canonical else "")
+                        # A normal status update is not a structural transaction.
+                        # Commit the evidence-backed siblings and leave only this
+                        # unsupported completion open, so a missing final browser
+                        # check cannot roll back real implementation progress.
+                        incoming_status = prior_status
+                        completion_audit_warnings.append(
+                            self._plan_subtask_completion_audit_warning(
+                                active_step,
+                                completion_candidate,
+                                board=bb,
+                                subtask_id=subtask_id,
+                                since_ts=since_value,
+                            )
                         )
+                        binding = {}
+                    else:
+                        completion_records = self._plan_worker_completion_evidence_records(
+                            active_step,
+                            completion_candidate,
+                            board=bb,
+                            subtask_id=subtask_id,
+                            since_ts=since_value,
+                            evidence=incoming.get("evidence", ""),
+                        )
+                        binding = self._record_plan_subtask_evidence_binding(
+                            active_step,
+                            completion_candidate,
+                            completion_records,
+                            source="status_update",
+                            actor=role_key,
+                            board=bb,
+                        )
+                else:
+                    binding = {}
                 merged = dict(prior)
                 merged["status"] = incoming_status
                 if incoming_status == "completed":
@@ -45112,8 +48635,11 @@ body{padding:18px}
                     merged["completed_by"] = trim(str(incoming.get("completed_by", "") or role_key), 40)
                     if incoming.get("evidence"):
                         merged["evidence"] = trim(str(incoming.get("evidence", "") or ""), 300)
+                    if binding:
+                        merged["evidence_ids"] = list(binding.get("evidence_ids", []) or [])
+                        merged["evidence_binding"] = binding
                 merged["updated_at"] = float(now_ts())
-                merged["owner"] = role_key
+                merged["owner"] = _resolved_row_owner(prior, incoming)
                 merged["parent_step_id"] = step_id
                 merged["subtask_id"] = subtask_id
                 patched_by_id[subtask_id] = merged
@@ -45143,8 +48669,9 @@ body{padding:18px}
                     board=bb,
                 )
                 canonical = self._render_plan_worker_todo_canonical(step_id, target_rows)
-                return (
-                    f"Error: rolling subplan revision rejected: {review.get('reason', 'evidence audit failed')}. "
+                return self._plan_control_feedback(
+                    "preserve_current_subplan",
+                    f"Rolling subplan revision rejected: {review.get('reason', 'evidence audit failed')}. "
                     "Keep executing the current canonical subtask or collect concrete current-step evidence before revising."
                     + (f"\n\n{canonical}" if canonical else "")
                 )
@@ -45167,26 +48694,51 @@ body{padding:18px}
                     if mode != "rework_completed" or incoming_status == "completed":
                         continue
                     completed_by_id.pop(subtask_id, None)
+                    self._clear_plan_subtask_evidence_binding(step_id, subtask_id, board=bb)
                 if incoming_status == "completed":
                     source = prior if isinstance(prior, dict) else incoming
-                    if not self._plan_subtask_has_accumulated_evidence(
+                    source_since = float(source.get("created_at", 0.0) or source.get("started_at", 0.0) or 0.0)
+                    completion_candidate = {**(prior or {}), **incoming, "subtask_id": subtask_id}
+                    if not self._plan_worker_completion_has_evidence(
                         active_step,
-                        source.get("content", incoming.get("content", "")),
+                        completion_candidate,
                         board=bb,
                         subtask_id=subtask_id,
-                        since_ts=float(source.get("created_at", 0.0) or source.get("started_at", 0.0) or 0.0),
+                        since_ts=source_since,
+                        evidence=incoming.get("evidence", ""),
                     ):
                         canonical = self._render_plan_worker_todo_canonical(step_id, target_rows)
-                        return (
-                            "Error: revised subplan attempted to mark work completed without bound evidence."
+                        return self._plan_control_feedback(
+                            "preserve_current_subplan",
+                            "Revised subplan attempted to mark work completed without bound evidence."
                             + (f"\n\n{canonical}" if canonical else "")
                         )
+                    completion_records = self._plan_worker_completion_evidence_records(
+                        active_step,
+                        completion_candidate,
+                        board=bb,
+                        subtask_id=subtask_id,
+                        since_ts=source_since,
+                        evidence=incoming.get("evidence", ""),
+                    )
                     completed = dict(prior or incoming)
                     completed.update(incoming)
                     completed["status"] = "completed"
                     completed["subtask_id"] = subtask_id
                     completed["completed_at"] = float(completed.get("completed_at", 0.0) or now_ts())
                     completed["completed_by"] = trim(str(completed.get("completed_by", "") or role_key), 40)
+                    completed["owner"] = _resolved_row_owner(prior, incoming)
+                    binding = self._record_plan_subtask_evidence_binding(
+                        active_step,
+                        {**completed, "subtask_id": subtask_id},
+                        completion_records,
+                        source="status_update" if mode == "status_update" else "semantic",
+                        actor=role_key,
+                        board=bb,
+                    )
+                    if binding:
+                        completed["evidence_ids"] = list(binding.get("evidence_ids", []) or [])
+                        completed["evidence_binding"] = binding
                     completed_by_id[subtask_id] = completed
                     continue
                 revised = dict(prior or {})
@@ -45196,7 +48748,7 @@ body{padding:18px}
                     for field in ("completed_at", "completed_by", "evidence"):
                         revised.pop(field, None)
                     revised["started_at"] = float(now_ts()) if revised["status"] == "in_progress" else 0.0
-                revised["owner"] = role_key
+                revised["owner"] = _resolved_row_owner(prior, incoming)
                 revised["parent_step_id"] = step_id
                 revised["subtask_id"] = subtask_id or self._stable_plan_worker_subtask_id(step_id, revised)
                 revised["updated_at"] = float(now_ts())
@@ -45234,7 +48786,10 @@ body{padding:18px}
         )
         for row in current_step_rows:
             row["parent_step_id"] = step_id
-            row["owner"] = role_key
+            if self._is_multi_agent_mode():
+                row["owner"] = self._sanitize_agent_role(row.get("owner", "")) or role_key
+            else:
+                row["owner"] = role_key
             row["subtask_id"] = self._stable_plan_worker_subtask_id(step_id, row)
 
         # Insert current-step rows right after the active plan step's bb: row in preserved,
@@ -45263,7 +48818,15 @@ body{padding:18px}
             revision_note = ""
             if mode in {"revise_open", "rework_completed"} and target_rows:
                 revision_note = "\nROLLING SUBPLAN REVISION: accepted after current-step evidence audit."
-            return f"{result}{revision_note}\n\n{canonical}"
+            audit_note = ""
+            if completion_audit_warnings:
+                unique_open = list(dict.fromkeys(value for value in completion_audit_warnings if value))[:4]
+                audit_note = (
+                    "\nSTATUS EVIDENCE AUDIT: applied every evidence-backed transition and kept "
+                    "only the following requested completion(s) open pending a matching current-step check: "
+                    + "; ".join(unique_open)
+                )
+            return f"{result}{revision_note}{audit_note}\n\n{canonical}"
         return result
 
     def _render_plan_worker_todo_canonical(self, step_id: str, rows: list[dict]) -> str:
@@ -45296,6 +48859,7 @@ body{padding:18px}
             return self.todo.update(items)
         existing = self.todo.snapshot()
         preserved: list[dict] = []
+        existing_owner_rows: list[dict] = []
         for row in existing:
             if not isinstance(row, dict):
                 continue
@@ -45305,22 +48869,68 @@ body{padding:18px}
                 preserved.append(dict(row))
                 continue
             if owner == role_key:
+                existing_owner_rows.append(dict(row))
                 continue
             preserved.append(dict(row))
         normalized: list[dict] = []
         for idx, item in enumerate(items):
-            if isinstance(item, str):
-                row = {"content": item, "status": "pending"}
-            elif isinstance(item, dict):
-                row = dict(item)
-            else:
-                raise ValueError(f"item {idx}: invalid type")
+            row = self._normalize_generic_todo_row(item, owner=role_key)
+            if not row:
+                continue
             if str(row.get("key", "") or "").startswith("bb:"):
                 normalized.append(row)
                 continue
             row["owner"] = role_key
             normalized.append(row)
-        return self.todo.update(preserved + normalized)
+        if not normalized:
+            return self.todo.update(preserved + existing_owner_rows)
+
+        def identity(row: dict) -> str:
+            return self._flat_todo_identity(row)
+
+        existing_by_id = {identity(row): row for row in existing_owner_rows if identity(row)}
+        merged: list[dict] = []
+        used: set[str] = set()
+        for incoming in normalized:
+            incoming_id = identity(incoming)
+            prior_id = incoming_id if incoming_id in existing_by_id else ""
+            prior = existing_by_id.get(prior_id) if prior_id else None
+            if prior is None:
+                scored = []
+                for candidate_id, candidate in existing_by_id.items():
+                    if candidate_id in used:
+                        continue
+                    score = self._plan_worker_todo_match_score(incoming, candidate)
+                    if score >= 0.64:
+                        scored.append((score, candidate_id, candidate))
+                scored.sort(key=lambda value: value[0], reverse=True)
+                if scored and (scored[0][0] >= 0.86 or len(scored) == 1 or scored[0][0] - scored[1][0] >= 0.08):
+                    _score, prior_id, prior = scored[0]
+            if isinstance(prior, dict):
+                used.add(prior_id)
+                merged_row = dict(prior)
+                prior_status = self._normalize_todo_status_value(prior.get("status", ""), "pending")
+                incoming_status = self._normalize_todo_status_value(incoming.get("status", ""), prior_status)
+                if prior_status == "completed" and incoming_status != "completed":
+                    incoming_status = "completed"
+                merged_row.update(incoming)
+                merged_row["status"] = incoming_status
+                merged_row["owner"] = role_key
+                if prior_status == "completed":
+                    for key in ("completed_at", "completed_by", "evidence", "evidence_ids", "evidence_binding"):
+                        if merged_row.get(key) in (None, "", []):
+                            if prior.get(key) not in (None, "", []):
+                                merged_row[key] = prior.get(key)
+                merged.append(merged_row)
+            else:
+                incoming["owner"] = role_key
+                merged.append(incoming)
+        # A worker often sends only the row that changed. Keep untouched rows in
+        # sync mode so a handoff cannot erase another completed/current row.
+        for candidate_id, candidate in existing_by_id.items():
+            if candidate_id not in used:
+                merged.append(dict(candidate))
+        return self.todo.update(preserved + merged)
 
     def _append_instruction_bubble(self, content: str, *, target_roles: tuple[str, ...] = (), summary: str = "") -> bool:
         text = trim(str(content or "").strip(), PLAN_NOTICE_BODY_MAX_CHARS)
@@ -45666,11 +49276,12 @@ body{padding:18px}
         if not raw.strip():
             return ""
         marker = re.compile(
-            r"^\s*(?:[-*•>]\s*)?(?:"
-            r"验收信号|验收标准|验收条件|完成标准|"
-            r"驗收信號|驗收標準|驗收條件|完成標準|"
+            r"^\s*(?:[-*•>]\s*)?(?:\d+(?:\.\d+)*[.)、]?\s*)?(?:"
+            r"(?:最终)?验收(?:信号|标准|条件)?|验证(?:结果|标准|条件)?|完成标准|"
+            r"(?:最終)?驗收(?:信號|標準|條件)?|驗證(?:結果|標準|條件)?|完成標準|"
             r"acceptance(?:\s+(?:signal|criteria|condition))?|pass\s+criteria|"
-            r"受入基準|受入条件|完了条件"
+            r"verification|validation|verify|"
+            r"受入確認|受入基準|受入条件|検証|確認|完了条件"
             r")\s*[:：]\s*(.+?)\s*$",
             flags=re.IGNORECASE,
         )
@@ -45942,7 +49553,7 @@ body{padding:18px}
             ".cpp", ".cc", ".cxx", ".c", ".h", ".hpp", ".cs", ".php", ".rb", ".lua", ".r", ".scala", ".dart",
             ".sh", ".bash", ".zsh", ".ps1", ".sql",
         )
-        if any(ext in low for ext in source_extensions) or any(
+        if any(re.search(re.escape(ext) + r"(?![A-Za-z0-9])", low) for ext in source_extensions) or any(
             token in low
             for token in (
                 "source code", "module", "function", "class", "源码", "源代码", "代码", "模块", "函数", "类",
@@ -45957,6 +49568,13 @@ body{padding:18px}
                 "swift", "c++", "cpp", " c ", "c#", "dotnet", ".net", "php", "ruby", "rails", "lua", "scala",
                 "dart", "flutter", "shell", "bash", "powershell", "sql",
             )
+        ) and not (
+            # Product/library names such as Three.js must not imply that the
+            # active step asks to inspect language source modules. HTML-only
+            # delivery/verification steps otherwise inherit a bogus source-code
+            # acceptance dimension.
+            "three.js" in low
+            and not any(token in low for token in ("javascript", ".js", " js ", "js/", "/js", "脚本", "腳本", "スクリプト"))
         ):
             add("language_code")
         if any(token in low for token in ("three.js", "threejs", "three min", "three.min", "three ")):
@@ -46020,7 +49638,8 @@ body{padding:18px}
             token in low
             for token in (
                 "database", "schema", "migration", "sql", "sqlite", "postgres", "postgresql", "mysql", "redis",
-                "mongodb", "table", "index", "数据库", "表结构", "迁移", "資料庫", "遷移", "テーブル", "データベース",
+                "mongodb", "db table", "database table", "database index", "db index",
+                "数据库", "表结构", "迁移", "資料庫", "遷移", "データベース",
             )
         ):
             add("database_schema")
@@ -46407,8 +50026,28 @@ body{padding:18px}
             # The approved plan already defines the contract. Do not let an LLM
             # broaden it into unrelated API/deploy/test requirements.
             acceptance_item = self._default_plan_step_acceptance_subtask(plan_step, clean_items)
-        elif allow_llm and (not acceptance_item or self._is_generic_plan_step_acceptance_subtask(acceptance_item)):
+        elif acceptance_item and not self._plan_step_acceptance_subtask_is_specific(
+            acceptance_item,
+            plan_step,
+            clean_items,
+        ):
+            # A concrete-looking legacy/LLM row can still contain unrelated
+            # domains (for example database migrations in an HTML-only step).
+            # Rebuild it from the same deterministic context inference shared by
+            # single and sync, rather than preserving a poisoned contract.
+            acceptance_item = ""
+        if (
+            not explicit_contract
+            and allow_llm
+            and (not acceptance_item or self._is_generic_plan_step_acceptance_subtask(acceptance_item))
+        ):
             acceptance_item = self._llm_plan_step_acceptance_subtask(plan_step, clean_items)
+            if not self._plan_step_acceptance_subtask_is_specific(
+                acceptance_item,
+                plan_step,
+                clean_items,
+            ):
+                acceptance_item = ""
         if not acceptance_item:
             acceptance_item = self._default_plan_step_acceptance_subtask(plan_step, clean_items)
         acceptance_item = self._normalize_plan_step_acceptance_subtask_text(acceptance_item)
@@ -46431,8 +50070,6 @@ body{padding:18px}
         owner_key = self._sanitize_agent_role(owner) or self._current_plan_worker_owner()
         work_rows: list[dict] = []
         acceptance_rows: list[dict] = []
-        import re as _re_acc
-        _re_acc_num = _re_acc.compile(r"^\s*\d+\.\d+\s+")
         isolated_rows = self._filter_parent_step_duplicate_worker_rows(rows or [], plan_step)
         isolated_expected_rows = self._filter_parent_step_duplicate_worker_rows(
             [{"content": str(item or "")} for item in (expected or [])],
@@ -46448,22 +50085,17 @@ body{padding:18px}
                 continue
             cloned = dict(row)
             cloned["parent_step_id"] = trim(str(cloned.get("parent_step_id", "") or step_id), 20) or step_id
-            # Single-owner invariant: every step-local worker subtask belongs to ONE
-            # canonical owner (the current plan worker). In multi-agent mode the active
-            # role changes between bootstrap (e.g. explorer) and execution (e.g. developer),
-            # which previously split the same step into two coexisting owner buckets. Force
-            # all rows onto owner_key so both sets collapse into one — matching single-agent
-            # where the owner is always "developer" (this is a no-op there).
-            cloned["owner"] = owner_key
-            # The canonical generated acceptance subtask is ALWAYS unnumbered
-            # ("验收：…；证据：…"). A row that carries an "N.M " numbering prefix but reads
-            # like acceptance (e.g. "1.3 验收：…") is a worker's restatement of plan subtask
-            # N.M, not the step's final acceptance gate. Route it to work_rows so it dedups
-            # against the matching numbered work row instead of competing as a second
-            # acceptance row that never collapses against work rows.
-            _content_str = str(cloned.get("content", "") or "")
-            _has_number_prefix = bool(_re_acc_num.match(normalize_work_text(_content_str) or _content_str))
-            if self._is_plan_step_acceptance_subtask(cloned.get("content", "")) and not _has_number_prefix:
+            # Ownership is execution metadata, not row identity. Single mode has
+            # one executor, while Sync must preserve a valid existing owner across
+            # reviewer/developer handoffs instead of repainting the whole subplan
+            # on every TodoWrite call.
+            existing_owner = self._sanitize_agent_role(cloned.get("owner", ""))
+            cloned["owner"] = (
+                existing_owner
+                if self._is_multi_agent_mode() and existing_owner in {"developer", "explorer", "reviewer"}
+                else owner_key
+            )
+            if self._is_plan_step_acceptance_subtask(cloned.get("content", "")):
                 acceptance_rows.append(cloned)
             else:
                 work_rows.append(cloned)
@@ -46573,6 +50205,7 @@ body{padding:18px}
             (item for item in reversed(expected_items) if self._is_plan_step_acceptance_subtask(item)),
             self._default_plan_step_acceptance_subtask(plan_step, []),
         )
+        explicit_contract = self._explicit_plan_step_acceptance_contract(plan_step)
 
         acceptance_row: dict
         if acceptance_rows:
@@ -46583,11 +50216,17 @@ body{padding:18px}
                 acceptance_row.get("content", "")
             )
             work_texts = [str(row.get("content", "") or "") for row in work_rows]
-            if not self._plan_step_acceptance_subtask_is_specific(existing_acceptance, plan_step, work_texts):
-                if str(acceptance_row.get("status", "pending") or "pending").lower() == "completed":
-                    acceptance_row["content"] = existing_acceptance or expected_acceptance
-                else:
-                    acceptance_row["content"] = expected_acceptance
+            if explicit_contract:
+                acceptance_row["content"] = expected_acceptance
+            elif not self._plan_step_acceptance_subtask_is_specific(existing_acceptance, plan_step, work_texts):
+                acceptance_row["content"] = expected_acceptance
+                # The old completion bit belongs to a different contract. The
+                # evidence ledger can immediately complete the rebuilt row when
+                # current proof covers it; arbitrary legacy Todo text cannot.
+                acceptance_row["status"] = "pending"
+                acceptance_row.pop("completed_at", None)
+                acceptance_row.pop("completed_by", None)
+                acceptance_row.pop("evidence", None)
             else:
                 acceptance_row["content"] = existing_acceptance or expected_acceptance
         else:
@@ -46643,6 +50282,285 @@ body{padding:18px}
                 row["content"] = f"{step_ord}.{j} {stripped_head}" + (sep + tail if sep else "")
         return work_rows + [acceptance_row]
 
+    def _plan_evidence_record_passes(self, record: dict) -> bool:
+        if not isinstance(record, dict) or not bool(record.get("ok", False)):
+            return False
+        if str(record.get("kind", "") or "") != "runtime":
+            return True
+        if record.get("exit_code") not in (None, 0):
+            return False
+        return not self._command_output_has_error_shape(str(record.get("summary", "") or ""))
+
+    def _plan_subtask_evidence_identifiers(self, text: object) -> dict:
+        source = normalize_work_text(str(text or "")) or str(text or "")
+        source = re.sub(r"^\s*\d+\.\d+\s+", "", source).strip()
+        if not source:
+            return {"paths": [], "commands": [], "command_specs": [], "technical_tokens": []}
+
+        def normalize_phrase(value: object) -> str:
+            return re.sub(r"\s+", " ", str(value or "").strip().lower()).strip(" `\"'")
+
+        paths = [
+            normalize_rel_preview_path(path).lower()
+            for path in self._extract_plan_step_referenced_paths(source, limit=12)
+            if normalize_rel_preview_path(path)
+        ]
+        command_specs: list[dict] = []
+        shell_programs = r"npm|pnpm|yarn|pip3?|python3?|pytest|node|npx|cargo|go|make|uv"
+        command_start = re.compile(rf"(?i)\b({shell_programs})\b")
+        for match in command_start.finditer(source):
+            tail = source[match.start():]
+            tail = re.split(r"(?:&&|\|\||;|\n|[，。；！？]|\s+(?:后|然后|之后|并且|确保|并确认|再))", tail, maxsplit=1)[0]
+            words = re.findall(r"[A-Za-z][A-Za-z0-9_.+/@:-]*|--?[A-Za-z0-9_-]+", tail)
+            if not words:
+                continue
+            program = words[0].lower()
+            subcommand = words[1].lower() if len(words) > 1 else ""
+            script = ""
+            if program in {"npm", "pnpm", "yarn"} and subcommand == "run" and len(words) > 2:
+                script = words[2].lower()
+            elif program in {"npm", "pnpm", "yarn"} and subcommand not in {"init", "install", "i", "add", "build", "test", "run"}:
+                script = subcommand
+            args = [word.lower() for word in words[2 if subcommand == "run" else 2:]]
+            if program in {"npm", "pnpm", "yarn"} and subcommand in {"init", "install", "i", "add", "build", "test", "run"}:
+                kind = {
+                    "init": "init", "install": "install", "i": "install", "add": "install",
+                    "build": "build", "test": "test", "run": "run",
+                }[subcommand]
+            else:
+                kind = "run" if subcommand in {"serve", "start", "dev", "preview"} else "command"
+            canonical_words = words[:3] if kind == "run" and subcommand == "run" else words[:2]
+            command_specs.append({
+                "text": normalize_phrase(" ".join(canonical_words)),
+                "program": program,
+                "subcommand": subcommand,
+                "script": script,
+                "args": args,
+                "kind": kind,
+            })
+
+        technical_tokens: list[str] = []
+        for spec in command_specs:
+            for value in ([spec.get("script", "")] + list(spec.get("args", []) or [])):
+                value = normalize_phrase(value)
+                if not value or value.startswith("-") or len(value) < 3:
+                    continue
+                if re.fullmatch(r"[a-z]+", value) and value in {
+                    "init", "install", "add", "run", "build", "test", "dev", "serve", "start", "preview",
+                }:
+                    continue
+                if value not in technical_tokens:
+                    technical_tokens.append(value)
+        for value in re.findall(r"(?<![A-Za-z0-9])(?:[A-Z][A-Za-z0-9]{2,}|[a-z][a-z0-9_-]{3,}(?:\.js|\.mjs|\.cjs|\.config\.js))(?![A-Za-z0-9])", source):
+            low = value.lower()
+            if low not in technical_tokens and low not in {"current", "step", "project", "scene", "basic"}:
+                technical_tokens.append(low)
+        for path in paths:
+            stem = PurePosixPath(path).name.lower()
+            if stem and stem not in technical_tokens:
+                technical_tokens.append(stem)
+        return {
+            "paths": list(dict.fromkeys(paths))[:12],
+            "commands": [str(spec.get("text", "")) for spec in command_specs if spec.get("text")][:12],
+            "command_specs": command_specs[:12],
+            "technical_tokens": list(dict.fromkeys(technical_tokens))[:24],
+        }
+
+    def _plan_subtask_evidence_semantically_matches(self, subtask_text: object, record: dict) -> bool:
+        """Bind unlabelled evidence only when concrete identifiers agree."""
+        if not isinstance(record, dict) or not self._plan_evidence_record_passes(record):
+            return False
+        identifiers = self._plan_subtask_evidence_identifiers(subtask_text)
+        paths = identifiers.get("paths", [])
+        commands = identifiers.get("commands", [])
+        command_specs = identifiers.get("command_specs", [])
+        technical_tokens = identifiers.get("technical_tokens", [])
+        observed_paths = [normalize_rel_preview_path(str(record.get("path", "") or "")).lower()]
+        observed_paths.extend(
+            normalize_rel_preview_path(str(value or "")).lower()
+            for value in (record.get("changed_files", []) if isinstance(record.get("changed_files"), list) else [])
+            if normalize_rel_preview_path(str(value or ""))
+        )
+        command = re.sub(r"\s+", " ", str(record.get("command", "") or "").strip().lower())
+        summary = re.sub(r"\s+", " ", str(record.get("summary", "") or "").strip().lower())
+        haystack = " ".join(value for value in (command, summary, " ".join(observed_paths)) if value)
+        for expected in paths:
+            for actual in observed_paths:
+                if self._plan_evidence_path_matches(expected, actual, threshold=0.93):
+                    return True
+        for spec in command_specs:
+            kind = str(spec.get("kind", "") or "")
+            program = str(spec.get("program", "") or "")
+            subcommand = str(spec.get("subcommand", "") or "")
+            script = str(spec.get("script", "") or "")
+            args = [str(value or "") for value in (spec.get("args", []) or [])]
+            if kind == "run" or (subcommand == "run" and script):
+                if re.search(rf"\b{re.escape(program)}\s+run\s+{re.escape(script)}\b", command):
+                    return True
+                if script and script in summary and any(marker in summary for marker in ("server", "localhost", "http://", "ready", "listening", "浏览器", "页面")):
+                    return True
+                continue
+            if kind == "install":
+                package_names = [value for value in args if value and not value.startswith("-")]
+                if re.search(rf"\b{re.escape(program)}\s+(?:install|i|add)\b", command) and any(
+                    name in command for name in package_names
+                ):
+                    return True
+                package_context = any(marker in haystack for marker in ("package.json", "node_modules", "dependencies", "installed", "install", "安装"))
+                if package_context and any(name in haystack for name in package_names):
+                    return True
+                continue
+            if kind in {"build", "test"}:
+                if re.search(rf"\b{re.escape(program)}\s+{re.escape(subcommand)}\b", command):
+                    return True
+                continue
+            fragment = str(spec.get("text", "") or "")
+            if fragment and len(fragment) >= 8 and fragment in command:
+                return True
+        # Once a subtask names a concrete path, that path is the binding
+        # contract.  A generic file/technical keyword (for example
+        # ``package.json`` or ``module``) must not be allowed to stand in for
+        # an unrelated required path merely because the record is a successful
+        # file operation.  This was the source of false completions in sync
+        # mode when an install/build command happened before the requested
+        # directory or entry file existed.
+        if not command_specs and not paths:
+            observed_file_context = any(
+                str(record.get("kind", "") or "") == "file"
+                or any(marker in haystack for marker in ("package.json", "node_modules", "config", "module"))
+                for _ in (0,)
+            )
+            matches = [token for token in technical_tokens if len(token) >= 4 and token in haystack]
+            if observed_file_context and matches:
+                return True
+        return False
+
+    def _plan_subtask_evidence_records(
+        self,
+        plan_step: dict,
+        subtask_text: object,
+        *,
+        board: dict | None = None,
+        subtask_id: str = "",
+        since_ts: float = 0.0,
+        evidence: object = None,
+    ) -> list[dict]:
+        if not isinstance(plan_step, dict):
+            return []
+        text = str(subtask_text or "").strip()
+        step_id = trim(str(plan_step.get("id", "") or ""), 20)
+        if not text or not step_id:
+            return []
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        lower_bound = max(float(since_ts or 0.0), self._plan_step_activation_ts(plan_step))
+        records = self._plan_step_evidence_records(step_id, board=bb, since_ts=lower_bound)
+        if not records:
+            return []
+        stable_id = trim(str(subtask_id or "").strip(), 80)
+        if not stable_id:
+            stable_id = self._stable_plan_worker_subtask_id(
+                step_id,
+                {"content": text, "parent_step_id": step_id},
+            )
+        selected: list[dict] = [
+            record for record in records
+            if stable_id and str(record.get("subtask_id", "") or "").strip() == stable_id
+        ]
+        normalized = normalize_work_text(text) or text
+        number_match = re.match(r"^\s*(\d+\.\d+)\b", normalized)
+        number = number_match.group(1) if number_match else ""
+        core = self._plan_worker_content_core(text)
+        expected_paths = self._extract_plan_step_referenced_paths(text, limit=10)
+
+        def target_strength(record: dict) -> int:
+            record_core = self._plan_worker_content_core(record.get("subtask_content", ""))
+            if core and record_core and core == record_core:
+                return 4
+            summary = str(record.get("summary", "") or "")
+            command = str(record.get("command", "") or "")
+            if number:
+                escaped = re.escape(number)
+                marker = rf"(?:子任务|子任務|subtask|task|step)\s*#?\s*{escaped}(?!\d)"
+                line_marker = rf"(?m)^\s*(?:[✅☑✓]\s*)?{escaped}(?!\d)"
+                if re.search(marker, summary, flags=re.I) or re.search(line_marker, summary, flags=re.I):
+                    return 3
+                if re.search(marker, command, flags=re.I):
+                    return 3
+                # Validation output commonly decorates a heading (for example
+                # ``=== 1.3 验证 ===`` or ``1.2+1.3 content assertions``).
+                # The number plus check semantics on the same line is a strong
+                # target signal even when the event was captured under the
+                # previously-active Todo row.
+                validation_heading_terms = (
+                    "验证", "驗證", "校验", "校驗", "检查", "檢查", "断言", "斷言",
+                    "专项", "專項", "verify", "validation", "check", "assert", "all_ok",
+                )
+                for evidence_line in summary.splitlines():
+                    line_low = evidence_line.lower()
+                    if (
+                        re.search(rf"(?<!\d){escaped}(?!\d)", evidence_line)
+                        and any(term in line_low for term in validation_heading_terms)
+                    ):
+                        return 3
+            if expected_paths:
+                observed = [normalize_rel_preview_path(str(record.get("path", "") or ""))]
+                observed.extend(
+                    normalize_rel_preview_path(str(value or ""))
+                    for value in (record.get("changed_files", []) if isinstance(record.get("changed_files"), list) else [])
+                )
+                if str(record.get("kind", "") or "") == "runtime" and self._command_looks_like_validation(command):
+                    observed.extend(self._extract_plan_step_referenced_paths(command, limit=10))
+                observed = [value for value in observed if value]
+                if any(
+                    self._plan_evidence_path_matches(expected, actual, threshold=0.72)
+                    for expected in expected_paths
+                    for actual in observed
+                ):
+                    return 2
+            if self._plan_subtask_evidence_semantically_matches(text, record):
+                return 1
+            # Evidence may have been recorded while a neighbouring row was
+            # active. A compacted/reordered Todo snapshot can still carry the
+            # target row's wording in the result summary; use that as a soft
+            # binding signal rather than requiring the old subtask_id.
+            observed_text = " ".join(
+                str(record.get(field, "") or "")
+                for field in ("subtask_content", "summary", "command", "path")
+            )
+            score = self._plan_worker_todo_match_score(
+                {"content": text},
+                {"content": observed_text},
+            )
+            return 1 if score >= 0.48 else 0
+
+        selected_ids = {str(record.get("id", "") or "") for record in selected}
+        for record in records:
+            record_id = str(record.get("id", "") or "")
+            strength = target_strength(record)
+            if record_id in selected_ids or strength <= 0:
+                continue
+            bound_subtask_id = trim(str(record.get("subtask_id", "") or "").strip(), 80)
+            if bound_subtask_id and stable_id and bound_subtask_id != stable_id:
+                bound_content = str(record.get("subtask_content", "") or "")
+                # A concrete number/path/content match is stronger than the
+                # stale binding captured before the worker's TodoWrite call.
+                if strength < 2 and not self._plan_worker_rows_equivalent(
+                    {"content": text},
+                    {"content": bound_content},
+                ):
+                    continue
+            selected.append(record)
+            selected_ids.add(record_id)
+        if not selected and evidence:
+            refs = self._plan_worker_revision_references(evidence)
+            for record in records:
+                if not self._plan_evidence_record_passes(record):
+                    continue
+                if any(self._plan_worker_revision_reference_matches(ref, record) for ref in refs):
+                    selected.append(record)
+        selected.sort(key=lambda record: float(record.get("ts", 0.0) or 0.0))
+        return selected
+
     def _plan_subtask_has_accumulated_evidence(
         self,
         plan_step: dict,
@@ -46651,6 +50569,7 @@ body{padding:18px}
         board: dict | None = None,
         subtask_id: str = "",
         since_ts: float = 0.0,
+        evidence: object = None,
     ) -> bool:
         if not isinstance(plan_step, dict):
             return False
@@ -46659,27 +50578,42 @@ body{padding:18px}
             return False
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         step_id = trim(str(plan_step.get("id", "") or ""), 20)
-        lower_bound = max(float(since_ts or 0.0), self._plan_step_activation_ts(plan_step))
-        stable_id = trim(str(subtask_id or "").strip(), 80)
-        if not stable_id:
-            probe_row = {"content": text, "parent_step_id": step_id}
-            stable_id = self._stable_plan_worker_subtask_id(step_id, probe_row)
-        all_records = self._plan_step_evidence_records(step_id, board=bb, since_ts=lower_bound)
-        has_bound_records = any(str(record.get("subtask_id", "") or "").strip() for record in all_records)
-        if has_bound_records:
-            records = [
-                record for record in all_records
-                if not stable_id or str(record.get("subtask_id", "") or "").strip() == stable_id
-            ]
-            if not records:
-                return False
-        else:
-            records = list(all_records)
+        records = self._plan_subtask_evidence_records(
+            plan_step,
+            text,
+            board=bb,
+            subtask_id=subtask_id,
+            since_ts=since_ts,
+            evidence=evidence,
+        )
+        # Use the whole current-step ledger for one soft reconciliation pass
+        # when the original event was bound to a neighbouring Todo row. This
+        # is intentionally step-local and still requires a passing observable
+        # record; a natural-language completion claim alone never suffices.
+        if not records:
+            all_records = self._plan_step_evidence_records(step_id, board=bb, since_ts=max(float(since_ts or 0.0), self._plan_step_activation_ts(plan_step)))
+            related: list[dict] = []
+            for record in all_records:
+                if not self._plan_evidence_record_passes(record):
+                    continue
+                observed_text = " ".join(
+                    str(record.get(field, "") or "")
+                    for field in ("subtask_content", "summary", "command", "path")
+                )
+                score = self._plan_worker_todo_match_score(
+                    {"content": text},
+                    {"content": observed_text},
+                )
+                if score >= 0.48:
+                    related.append(record)
+            records = related
+        if not records:
+            return False
         expected_paths = self._extract_plan_step_referenced_paths(text, limit=10)
         if expected_paths:
             known_paths: list[str] = []
             for record in records:
-                if not bool(record.get("ok", False)):
+                if not self._plan_evidence_record_passes(record):
                     continue
                 path = normalize_rel_preview_path(str(record.get("path", "") or ""))
                 if path and not self._is_plan_infrastructure_path(path):
@@ -46688,6 +50622,9 @@ body{padding:18px}
                     rel = normalize_rel_preview_path(str(changed or ""))
                     if rel and not self._is_plan_infrastructure_path(rel):
                         known_paths.append(rel)
+                command = str(record.get("command", "") or "")
+                if str(record.get("kind", "") or "") == "runtime" and self._command_looks_like_validation(command):
+                    known_paths.extend(self._extract_plan_step_referenced_paths(command, limit=10))
             known_paths = list(dict.fromkeys(known_paths))
             if not known_paths:
                 return False
@@ -46696,7 +50633,7 @@ body{padding:18px}
                 if not rel:
                     continue
                 if not any(
-                    rel == actual or self._semantic_path_score(rel, actual)[0] >= 0.72
+                    self._plan_evidence_path_matches(rel, actual, threshold=0.72)
                     for actual in known_paths
                 ):
                     return False
@@ -46730,20 +50667,21 @@ body{padding:18px}
         )
         if any(term in low for term in implementation_terms):
             return any(
-                bool(record.get("ok", False))
+                self._plan_evidence_record_passes(record)
                 and (
                     str(record.get("tool", "") or "") in {"write_file", "edit_file"}
                     or bool(record.get("changed_files"))
+                    or str(record.get("kind", "") or "") in {"runtime", "file"}
                 )
                 for record in records
             )
         if any(term in low for term in research_terms):
             return any(
-                bool(record.get("ok", False))
+                self._plan_evidence_record_passes(record)
                 and str(record.get("kind", "") or "") in {"file", "research", "blackboard"}
                 for record in records
             )
-        return any(bool(record.get("ok", False)) for record in records)
+        return any(self._plan_evidence_record_passes(record) for record in records)
 
     def _initial_plan_worker_row_status_from_evidence(
         self,
@@ -46915,22 +50853,45 @@ body{padding:18px}
             return []
         records = self._plan_step_evidence_records(step_id, board=board, since_ts=since_ts)
         acceptance_subtask_id = self._stable_plan_worker_subtask_id(step_id, acceptance)
-        if any(str(row.get("subtask_id", "") or "").strip() for row in records):
-            records = [
-                row for row in records
-                if str(row.get("subtask_id", "") or "").strip() == acceptance_subtask_id
-            ]
-        records.extend(self._plan_step_acceptance_review_records(
+        acceptance_records = [
+            row for row in records
+            if str(row.get("subtask_id", "") or "").strip() == acceptance_subtask_id
+        ]
+        review_records = self._plan_step_acceptance_review_records(
             plan_step,
             board=board,
             since_ts=since_ts,
-        ))
+        )
+        candidate_records = list(acceptance_records or records)
+        candidate_records.extend(review_records)
         evaluation = self._evaluate_acceptance_evidence_records(
-            records,
+            candidate_records,
             evidence_kind,
             acceptance_text=contract_text,
+            subject_text=str(
+                (plan_step or {}).get("full_content", "")
+                or (plan_step or {}).get("content", "")
+                or ""
+            ),
         )
-        return list(evaluation.get("matched_records", []) or []) if evaluation.get("passed") else []
+        if evaluation.get("passed"):
+            return list(evaluation.get("matched_records", []) or [])
+        if acceptance_records and str(evaluation.get("status", "") or "") != "failed":
+            aggregate_records = list(records)
+            aggregate_records.extend(review_records)
+            evaluation = self._evaluate_acceptance_evidence_records(
+                aggregate_records,
+                evidence_kind,
+                acceptance_text=contract_text,
+                subject_text=str(
+                    (plan_step or {}).get("full_content", "")
+                    or (plan_step or {}).get("content", "")
+                    or ""
+                ),
+            )
+            if evaluation.get("passed"):
+                return list(evaluation.get("matched_records", []) or [])
+        return []
 
     def _replace_plan_worker_rows(self, step_id: str, rows: list[dict]) -> None:
         step_key = trim(str(step_id or ""), 40)
@@ -46961,10 +50922,10 @@ body{padding:18px}
     def _reconcile_plan_worker_progress_from_evidence(self, *, actor: str = "developer") -> bool:
         """Fold observable tool evidence into the canonical execution graph.
 
-        This is the compatibility bridge from the old manually-updated Todo
-        protocol to event-driven execution. Work rows may advance when their
-        concrete artifact/check is observed; the final acceptance row completes
-        automatically only on matching passing evidence.
+        Tool evidence is retained for later TodoWrite status audits, but cannot
+        itself change ordinary work-row status. The final acceptance row may
+        complete automatically only after all explicit work statuses are done
+        and a separate matching observation passes.
         """
         bb = self._ensure_blackboard()
         step = self._get_active_plan_step(bb)
@@ -46979,47 +50940,49 @@ body{padding:18px}
             return False
         changed = False
         now_value = float(now_ts())
+        work_texts = [
+            str(row.get("content", "") or "")
+            for row in rows
+            if not self._is_plan_step_acceptance_subtask(row.get("content", ""))
+        ]
+        expected_acceptance = self._default_plan_step_acceptance_subtask(step, work_texts)
+        for row in rows:
+            if not self._is_plan_step_acceptance_subtask(row.get("content", "")):
+                continue
+            existing_acceptance = self._normalize_plan_step_acceptance_subtask_text(row.get("content", ""))
+            if not self._plan_step_acceptance_subtask_is_specific(existing_acceptance, step, work_texts):
+                row["content"] = expected_acceptance
+                row["subtask_id"] = self._stable_plan_worker_subtask_id(step_id, row)
+                row["updated_at"] = now_value
+                changed = True
         acceptance_index = -1
         for idx, row in enumerate(rows):
             if self._is_plan_step_acceptance_subtask(row.get("content", "")):
                 acceptance_index = idx
-                continue
-            if str(row.get("status", "pending") or "pending").lower() != "in_progress":
-                continue
-            if self._plan_subtask_has_accumulated_evidence(
-                step,
-                row.get("content", ""),
-                board=bb,
-                subtask_id=str(row.get("subtask_id", "") or ""),
-                since_ts=float(row.get("created_at", 0.0) or row.get("started_at", 0.0) or 0.0),
-            ):
-                row["status"] = "completed"
-                row["completed_at"] = now_value
-                row["completed_by"] = actor
-                row["updated_at"] = now_value
-                matching = [
-                    record for record in existing_records
-                    if str(record.get("subtask_id", "") or "").strip()
-                    == str(row.get("subtask_id", "") or "").strip()
-                    and bool(record.get("ok", False))
-                ]
-                latest = matching[-1] if matching else {}
-                row["evidence"] = trim(
-                    f"{latest.get('tool', 'tool')}: {latest.get('summary', '')}",
-                    300,
-                )
-                changed = True
-
         work_open = [
             row for row in rows
             if not self._is_plan_step_acceptance_subtask(row.get("content", ""))
             and str(row.get("status", "pending") or "pending").lower() != "completed"
         ]
-        if work_open and not any(str(row.get("status", "") or "").lower() == "in_progress" for row in work_open):
-            work_open[0]["status"] = "in_progress"
-            work_open[0]["started_at"] = now_value
-            work_open[0]["updated_at"] = now_value
-            changed = True
+        if work_open:
+            active = next(
+                (row for row in work_open if str(row.get("status", "") or "").lower() == "in_progress"),
+                work_open[0],
+            )
+            for row in work_open:
+                desired = "in_progress" if row is active else "pending"
+                if str(row.get("status", "pending") or "pending").lower() != desired:
+                    row["status"] = desired
+                    row["updated_at"] = now_value
+                    changed = True
+            if not active.get("started_at"):
+                active["started_at"] = now_value
+                active["updated_at"] = now_value
+                changed = True
+            # Tool events are evidence, not status commands. A pre-call
+            # snapshot identifies the active row but cannot prove it is done.
+            # TodoWrite/Resume requests completion; the merge path then audits
+            # and binds the matching evidence before changing status.
 
         if acceptance_index >= 0:
             acceptance = rows[acceptance_index]
@@ -47897,7 +51860,7 @@ body{padding:18px}
         bb_sig = self._plan_step_blackboard_signals(current, bb)
         todo_progress_signal = any(
             isinstance(r, dict) and r.get("ok", False)
-            and str(r.get("name", "")) in ("TodoWrite", "TodoWriteRescue")
+            and canonicalize_tool_name(r.get("name", "")) in {"TodoWrite", "TodoWriteRescue"}
             for r in tool_results
         )
         # Auto-advance conditions:
@@ -47912,7 +51875,7 @@ body{padding:18px}
             # Once all subtasks are completed, advancement only needs concrete
             # current or accumulated evidence; no external semantic reviewer or
             # extra structured verification tag.
-            if acceptance_gate_ok and (validation_ok or self._step_has_accumulated_evidence(current, bb)):
+            if self._plan_step_acceptance_ready_for_advance(current, acceptance_gate, bb):
                 should_advance = True
             else:
                 _gate_blocked = True  # Evidence missing — disable weaker advancement paths
@@ -48081,9 +52044,19 @@ body{padding:18px}
         non_system_rows = self._filter_plan_fragment_todo_rows(non_system_rows)
         # Smart trim: keep all active (in_progress/pending) system rows,
         # but only recent 3 completed system rows to save capacity for worker subtasks
-        active_system = [r for r in system_rows if r.get("status") != "completed"]
         completed_system = [r for r in system_rows if r.get("status") == "completed"]
-        trimmed_system = active_system + completed_system[-3:]
+        keep_completed_keys = {
+            str(row.get("key", "") or "")
+            for row in completed_system[-3:]
+        }
+        # Preserve roadmap order even when old completed steps are trimmed. The
+        # previous active-first concatenation moved completed parent steps to the
+        # bottom and made their child list appear detached from the plan tree.
+        trimmed_system = [
+            row for row in system_rows
+            if row.get("status") != "completed"
+            or str(row.get("key", "") or "") in keep_completed_keys
+        ]
         # ── Subtask conflict guard ──
         # Remove worker subtasks whose content duplicates a plan step to prevent
         # the UI from showing the same task twice (once as plan step, once as subtask).
@@ -48137,8 +52110,33 @@ body{padding:18px}
                         continue
                 deduped_worker.append(wr)
             worker_rows = deduped_worker
-        remaining_cap = max(0, 40 - len(trimmed_system) - len(worker_rows))
-        merged = list(trimmed_system) + worker_rows + non_system_rows[:remaining_cap]
+        workers_by_parent: dict[str, list[dict]] = {}
+        unbound_workers: list[dict] = []
+        known_parent_ids = {
+            str(row.get("key", "") or "").removeprefix("bb:proj:")
+            for row in trimmed_system
+            if str(row.get("key", "") or "").startswith("bb:proj:")
+        }
+        for row in worker_rows:
+            parent_id = trim(str(row.get("parent_step_id", "") or ""), 40)
+            if parent_id and parent_id in known_parent_ids:
+                workers_by_parent.setdefault(parent_id, []).append(row)
+            else:
+                unbound_workers.append(row)
+
+        merged: list[dict] = []
+        for parent in trimmed_system:
+            merged.append(parent)
+            parent_id = str(parent.get("key", "") or "").removeprefix("bb:proj:")
+            merged.extend(workers_by_parent.pop(parent_id, []))
+        # Unknown/stale parent IDs remain visible as a bounded fallback instead
+        # of silently disappearing; canonical reconciliation will reattach them.
+        for rows in workers_by_parent.values():
+            unbound_workers.extend(rows)
+        merged.extend(unbound_workers)
+        remaining_cap = max(0, 40 - len(merged))
+        merged.extend(non_system_rows[:remaining_cap])
+        merged = merged[:40]
         try:
             todo_out = self.todo.update(merged)
         except Exception:
@@ -48147,6 +52145,11 @@ body{padding:18px}
             self._emit(
                 "status",
                 {"summary": "flat todos attached to current plan step"},
+            )
+        if unbound_workers:
+            self._emit(
+                "status",
+                {"summary": f"{len(unbound_workers)} current-step todo row(s) awaiting parent reconciliation"},
             )
         if todo_out != self.todo.no_changes_text() and reason:
             self._emit(
@@ -48453,9 +52456,33 @@ body{padding:18px}
                     "task_type": {"type": "string"},
                     "complexity": {"type": "string", "enum": list(TASK_COMPLEXITY_LEVELS)},
                     "scale_preference": {"type": "string", "enum": list(TASK_SCALE_PREFERENCES)},
+                    "requires_todos": {
+                        "type": "boolean",
+                        "description": (
+                            "Whether this request needs a Todo graph. L1 must be false and L3-L5 must be true. "
+                            "For L2 follow the configured l2_todo_policy: force=true, off=false, auto=semantic judgment."
+                        ),
+                    },
                     "semantic_confidence": {"type": "string", "enum": list(SEMANTIC_CONFIDENCE_CHOICES)},
                     "low_confidence_reason": {"type": "string"},
                     "inherit_previous_state": {"type": "boolean"},
+                    "plan_change_scope": {
+                        "type": "string",
+                        "enum": ["preserve", "replace_entire_plan"],
+                        "description": (
+                            "When an approved plan is executing, use preserve for continuation, feedback, "
+                            "current-step repair, acceptance work, or evidence-backed subtask revision. Use "
+                            "replace_entire_plan only when the latest user message explicitly asks to discard "
+                            "or rebuild the whole approved roadmap."
+                        ),
+                    },
+                    "plan_change_evidence": {
+                        "type": "string",
+                        "description": (
+                            "For replace_entire_plan, copy the shortest exact quote from the latest user "
+                            "message that explicitly requests whole-roadmap replacement; otherwise empty."
+                        ),
+                    },
                     "judgement": {"type": "string"},
                     "round_budget": {"type": "integer"},
                     "direct_objective": {"type": "string"},
@@ -48476,7 +52503,15 @@ body{padding:18px}
                             ),
                         },
                     },
-                    ["level", "judgement", "inherit_previous_state", "requires_plan"],
+                    [
+                        "level",
+                        "judgement",
+                        "requires_todos",
+                        "inherit_previous_state",
+                        "plan_change_scope",
+                        "plan_change_evidence",
+                        "requires_plan",
+                    ],
                 )
         ]
 
@@ -48541,6 +52576,16 @@ body{padding:18px}
             )
         if bool(row.get("requires_user_confirmation", False)):
             merged["requires_user_confirmation"] = True
+        try:
+            merged_level = int(merged.get("level", 0) or 0)
+        except Exception:
+            merged_level = 0
+        merged = self._normalize_todo_requirement_in_decision(
+            merged,
+            level=merged_level,
+            allow_context=False,
+            fallback=True,
+        )
         objective = trim(str(row.get("direct_objective", "") or "").strip(), 800)
         if objective:
             merged["direct_objective"] = objective
@@ -48582,6 +52627,13 @@ body{padding:18px}
         policy = dict(TASK_LEVEL_POLICIES.get(cap, TASK_LEVEL_POLICIES[3]))
         out["level"] = int(cap)
         out["task_level"] = int(cap)
+        out["requires_todos"] = self._resolve_todo_requirement(
+            cap,
+            out.get("requires_todos"),
+            raw_provided="requires_todos" in out,
+            allow_context=False,
+            fallback=True,
+        )
         out["auto_task_level_capped"] = True
         out["auto_task_level_ceiling"] = int(cap)
         capped_complexity = normalize_task_complexity(policy.get("complexity", "simple"), default="simple")
@@ -48720,6 +52772,13 @@ body{padding:18px}
             inherited_requires_confirmation = bool(
                 self.runtime_requires_confirmation or current_profile.get("requires_user_confirmation", False)
             )
+            inherited_requires_todos = self._resolve_todo_requirement(
+                inherited_level,
+                getattr(self, "runtime_requires_todos", None),
+                raw_provided=isinstance(getattr(self, "runtime_requires_todos", None), bool),
+                allow_context=True,
+                fallback=True,
+            )
             return {
                 "level": int(inherited_level),
                 "task_type": inherited_task_type,
@@ -48740,6 +52799,7 @@ body{padding:18px}
                     "participants": list(inherited_participants),
                     "assigned_expert": inherited_assigned,
                     "requires_user_confirmation": bool(inherited_requires_confirmation if inherited_level == 5 else False),
+                    "requires_todos": bool(inherited_requires_todos),
                     "requires_plan": False,
                     "semantic_confidence": "low",
                 "low_confidence_reason": "rule fallback inherited previous runtime state",
@@ -48766,6 +52826,12 @@ body{padding:18px}
         requires_confirmation = bool(policy.get("requires_user_confirmation", False))
         if level == 5 and self._looks_like_positive_confirmation(goal_text):
             requires_confirmation = False
+        requires_todos = self._resolve_todo_requirement(
+            level,
+            raw_provided=False,
+            allow_context=False,
+            fallback=True,
+        )
         return {
             "level": int(level),
             "task_type": task_type,
@@ -48775,10 +52841,14 @@ body{padding:18px}
             "judgement": trim(str(profile.get("reason", "") or "manager fallback classification"), 200),
             "round_budget": int(policy.get("round_budget", profile.get("round_budget", self.max_agent_rounds)) or 0),
             "direct_objective": trim(str(profile.get("direct_objective", "") or ""), 800),
-            "execution_mode": (EXECUTION_MODE_SINGLE if normalize_execution_mode(self.execution_mode, default="") == EXECUTION_MODE_SINGLE else str(policy.get("execution_mode", EXECUTION_MODE_SYNC))),
+            "execution_mode": (
+                normalize_execution_mode(self.execution_mode, default="")
+                or str(policy.get("execution_mode", EXECUTION_MODE_SYNC))
+            ),
                 "participants": participants,
                 "assigned_expert": assigned,
                 "requires_user_confirmation": bool(requires_confirmation),
+                "requires_todos": bool(requires_todos),
                 "requires_plan": False,
                 "semantic_confidence": "low",
             "low_confidence_reason": "rule fallback classification",
@@ -48789,19 +52859,50 @@ body{padding:18px}
         ceiling_prompt = self._auto_task_level_ceiling_prompt()
         user_profile_block = self._user_profile_capsule_prompt_block(stage="intent")
         user_profile_text = f"\n{user_profile_block}\n" if user_profile_block else ""
+        l2_policy = normalize_l2_todo_policy(
+            getattr(self, "l2_todo_policy", DEFAULT_L2_TODO_POLICY)
+        )
+        if l2_policy == "force":
+            l2_todo_rule = (
+                "The configured L2 Todo policy is force: you MUST set requires_todos=true for L2. "
+                "This is the default safety behavior.\n"
+            )
+        elif l2_policy == "off":
+            l2_todo_rule = (
+                "The configured L2 Todo policy is off: you MUST set requires_todos=false for L2. "
+                "Do not add a Todo gate solely because the task is L2. L3-L5 still require Todos.\n"
+            )
+        else:
+            l2_todo_rule = (
+                "The configured L2 Todo policy is auto: judge requires_todos from the actual task semantics. "
+                "Set true for work that benefits from concrete multi-action tracking, file/tool changes, "
+                "verification, or progress across turns; set false for a self-contained answer that can be "
+                "completed in one response. Do not decide from keywords alone. Missing/uncertain output is "
+                "treated conservatively by the runtime.\n"
+            )
         base = (
             "You are Manager. Classify the latest user request by semantic intent, not by keyword templates.\n"
             "Decide whether this latest turn should inherit the previous blackboard/task state.\n"
             "Set inherit_previous_state=true only for genuine follow-up/continuation/refinement of the same ongoing work; "
-            "set it false for a new independent objective.\n\n"
+            "set it false for a new independent objective.\n"
+            "If an approved plan is executing, default plan_change_scope='preserve' and inherit_previous_state=true. "
+            "Feedback, current-step repair, acceptance work, and current-subtask changes preserve the roadmap. "
+            "Use plan_change_scope='replace_entire_plan' only when the latest user message explicitly asks to discard, "
+            "replace, or redesign the whole approved roadmap. plan_change_evidence must be the shortest exact quote "
+            "from that latest message proving whole-roadmap intent. Never infer whole-plan replacement from a failed "
+            "tool, a stuck step, a local change, or a request to revise current subtasks.\n\n"
             f"{user_profile_text}"
             "LEVEL SELECTION CRITERIA (choose the single best-fit level):\n"
             "Level 1 — Instant answer: pure Q&A, factual lookup, brief explanation, single-concept clarification. "
             "No file I/O, no tool use, no multi-turn needed. Budget: 2-4 rounds.\n"
             "Level 2 — Multi-turn answer / light task: longer explanation, code snippet review, minor single-file edit, "
-            "short script, quick translation or summary. Single agent, no collaboration needed. Budget: 4-8 rounds.\n"
-            "Level 3 — Coordinated execution: moderately complex coding task, multi-file edits, bug fix requiring investigation, "
-            "API integration, documentation generation, data processing script. Sync mode with 2 participants. Budget: 8-15 rounds.\n"
+            "short script, quick translation or summary. Single agent, no collaboration needed. Budget: 4-8 rounds. "
+            "The Todo requirement for L2 is controlled by the runtime policy below; when requires_todos=true, "
+            "make a compact evidence-based list before mutation, with exactly one item in_progress, and keep it "
+            "updated as work advances.\n"
+            f"{l2_todo_rule}"
+            "Level 3 — Planned single-agent execution: moderately complex coding task, multi-file edits, bug fix requiring investigation, "
+            "API integration, documentation generation, data processing script. Plan-capable single mode with one executor. Budget: 8-15 rounds.\n"
             "Level 4 — Full-stack collaborative: system-level feature implementation, architecture change, "
             "multi-component refactoring, research-and-implement workflow, PPT/report generation from raw materials, "
             "crawler/agent/service development. Sync mode with 3 participants. Budget: 15-25 rounds.\n"
@@ -48817,16 +52918,13 @@ body{padding:18px}
                 "SCALE PREFERENCE: Infer fast|balanced|thorough from user wording. "
                 "User-stated preference overrides your default strategy. "
                 "Budget controls internal depth/compactness, NOT early-stop messaging to user.\n\n"
-                "PLAN MODE DECISION: Task level and plan mode are separate decisions. "
-                "L3/L4/L5, multi-agent routing, or multi-file work does not automatically require plan mode. "
-                "When Plan is Auto, set requires_plan=true only if this latest request needs a user-visible "
-                "proposal/research phase before execution, such as a ground-up rebuild, system-wide inspection, "
-                "architecture redesign, migration with alternatives, or an ambiguous high-risk scope. "
-                "Set requires_plan=false for direct implementation, continuation, concrete bug fixes, reviews, "
-                "bounded feature work, or explanations even if the task remains level 3+.\n\n"
+                "PLAN MODE DECISION: L3/L4/L5 use Plan for a new task; L1/L2 do not. "
+                "For an already approved plan, a continuation, or current-step repair/review, set requires_plan=false "
+                "so execution resumes the existing plan instead of generating a replacement. "
+                "User Plan Off/On remains authoritative in runtime policy.\n\n"
                 "CRITICAL OUTPUT CONTRACT: You MUST output exactly one classify_task_level tool call and no plain-text answer. "
             "A prose-only response is invalid and will be discarded.\n"
-            "The tool call must include concise judgement, inherit_previous_state, "
+            "The tool call must include concise judgement, requires_todos, inherit_previous_state, "
             "and semantic_confidence (high|medium|low). "
             "Use low confidence only when semantic ambiguity is substantial, then set low_confidence_reason briefly.\n"
             f"{ceiling_prompt}"
@@ -48838,6 +52936,34 @@ body{padding:18px}
                 "Favor level 1-2 for straightforward tasks; only assign level 3+ when genuine multi-step complexity demands it."
             )
         return base
+
+    def _runtime_decision_requests_full_replan(self, goal_text: str, decision: dict | None) -> bool:
+        """Allow roadmap replacement only with an explicit, auditable user instruction."""
+        goal = unicodedata.normalize("NFKC", str(goal_text or "")).strip()
+        if not goal:
+            return False
+        if goal.lower().startswith("/replan"):
+            return True
+        row = decision if isinstance(decision, dict) else {}
+        if str(row.get("plan_change_scope", "preserve") or "preserve").strip().lower() != "replace_entire_plan":
+            return False
+        if not _to_bool_like(row.get("requires_plan", False), default=False):
+            return False
+        confidence = self._normalize_semantic_confidence(
+            row.get("semantic_confidence", "medium"),
+            default="medium",
+        )
+        if confidence == "low":
+            return False
+        evidence = unicodedata.normalize(
+            "NFKC",
+            str(row.get("plan_change_evidence", "") or ""),
+        ).strip()
+        if len(evidence) < 4:
+            return False
+        normalized_goal = re.sub(r"\s+", " ", goal).casefold()
+        normalized_evidence = re.sub(r"\s+", " ", evidence).casefold()
+        return normalized_evidence in normalized_goal
 
     def _extract_classify_task_level_row(self, response: dict | None) -> dict:
         if not isinstance(response, dict):
@@ -48951,12 +53077,9 @@ body{padding:18px}
             f"Current blackboard progress: {progress_state}\n\n"
             f"{user_profile_text}"
             "Use semantic intent only. Do not decide from keywords alone.\n"
-            "Return requires_plan=true only if the user needs a proposal/research/choice phase before action: "
-            "ground-up rebuild or restart, system-wide inspection, architecture redesign, migration with real alternatives, "
-            "ambiguous high-risk scope, or multiple viable implementation strategies that should be selected by the user.\n"
-            "Return requires_plan=false for direct implementation, continuation, bounded feature work, direct bug fixes, "
-            "code review, explanation, concrete incremental changes, or 'continue/implement the plan' style execution, "
-            "even if the task is L3/L4/L5 or multi-agent.\n\n"
+            "For a NEW L3/L4/L5 task, return requires_plan=true so it receives an approved execution roadmap.\n"
+            "Return requires_plan=false only for continuation of an existing approved plan, current-step repair/review, "
+            "or a plan-choice response that should resume execution rather than replace the roadmap.\n\n"
             "Output strict JSON only: {\"requires_plan\": true|false, \"reason\": \"short semantic reason\"}"
         )
         try:
@@ -49002,15 +53125,38 @@ body{padding:18px}
     def _apply_runtime_task_decision(self, goal_text: str, decision: dict):
         row = dict(decision or {})
         inherit_previous_state = _to_bool_like(row.get("inherit_previous_state", False), default=False)
+        board_before_decision = self._ensure_blackboard()
+        active_plan_protected = self._approved_plan_has_unfinished_steps(board_before_decision)
+        explicit_full_replan = self._runtime_decision_requests_full_replan(goal_text, row)
+        if explicit_full_replan:
+            inherit_previous_state = False
+            row["inherit_previous_state"] = False
+        elif active_plan_protected:
+            inherit_previous_state = True
+            row["inherit_previous_state"] = True
+            row["requires_plan"] = False
+            self._emit(
+                "status",
+                {
+                    "summary": (
+                        "active approved plan preserved; latest input is scoped to the current "
+                        "parent step unless the user explicitly requests a whole-roadmap replan"
+                    )
+                },
+            )
         if bool(self.runtime_goal_reset_pending):
             if bool(inherit_previous_state):
-                board = self._ensure_blackboard()
+                board = board_before_decision
                 if not str(board.get("original_goal", "") or "").strip():
                     board["original_goal"] = trim(str(goal_text or "").strip(), 4000)
                 self.blackboard = board
                 self._blackboard_history("manager", f"follow-up inherited: {trim(str(goal_text or ''), 300)}")
             else:
                 self._blackboard_reset_for_goal(goal_text)
+                if explicit_full_replan:
+                    self.runtime_plan_approved = False
+                    self.runtime_plan_choice = ""
+                    self.runtime_plan_proposal = {}
             self._mark_runtime_goal_reset_handled(reason="runtime-task-decision")
         try:
             level = int(row.get("level", 3) or 3)
@@ -49062,6 +53208,17 @@ body{padding:18px}
         ):
             level = _auto_level_ceiling
             row = self._apply_auto_task_level_ceiling_to_decision(row, source="runtime-apply")
+        # Resolve the final level after all manual/runtime ceilings.  For a
+        # fresh task, an absent auto-classifier field uses the conservative
+        # fallback; only an explicit continuation may reuse prior context.
+        requires_todos = self._resolve_todo_requirement(
+            level,
+            row.get("requires_todos"),
+            raw_provided="requires_todos" in row,
+            allow_context=bool(inherit_previous_state),
+            fallback=True,
+        )
+        row["requires_todos"] = bool(requires_todos)
         policy = dict(TASK_LEVEL_POLICIES.get(level, TASK_LEVEL_POLICIES[3]))
         policy_mode = str(policy.get("execution_mode", EXECUTION_MODE_SYNC))
         config_mode = normalize_execution_mode(self.execution_mode, default="")
@@ -49198,6 +53355,7 @@ body{padding:18px}
         self.runtime_assigned_expert = assigned
         self.runtime_participants = list(participants)
         self.runtime_round_budget = int(round_budget)
+        self.runtime_requires_todos = bool(requires_todos)
         self.runtime_requires_confirmation = bool(requires_confirmation)
         self.runtime_confirmation_needed = bool(requires_confirmation)
         self.runtime_task_judgement = judgement
@@ -49210,19 +53368,20 @@ body{padding:18px}
         # Decide plan mode with a strict precedence chain:
         # user preference > approved-plan state > semantic plan-needed signal.
         # Task level only gates whether auto-plan is eligible; it never forces plan mode.
-        raw_requires_plan = _to_bool_like(decision.get("requires_plan", False), default=False)
         user_pref = str(self.plan_mode_user_preference or "auto").lower()
-        if user_pref == "off":
+        if explicit_full_replan:
+            requires_plan = True
+        elif user_pref == "off":
             requires_plan = False
         elif user_pref == "on":
             requires_plan = True
         elif bool(getattr(self, "runtime_first_task_in_session", False)) and level in PLAN_MODE_ENABLED_LEVELS:
             requires_plan = True
         elif level in PLAN_MODE_ENABLED_LEVELS:
-            requires_plan = raw_requires_plan
+            requires_plan = not bool(inherit_previous_state)
         else:
             requires_plan = False
-        if self.runtime_plan_approved:
+        if self.runtime_plan_approved and not explicit_full_replan:
             requires_plan = False
         self.runtime_plan_mode_needed = requires_plan
         # Check if user is replying with a plan choice
@@ -49244,6 +53403,7 @@ body{padding:18px}
         profile["participants"] = list(participants)
         profile["assigned_expert"] = assigned
         profile["requires_user_confirmation"] = bool(requires_confirmation)
+        profile["requires_todos"] = bool(requires_todos)
         profile["task_type"] = task_type
         profile["complexity"] = complexity
         profile["scale_preference"] = scale_preference
@@ -49267,6 +53427,7 @@ body{padding:18px}
             "execution_mode": mode,
             "participants": list(participants),
             "assigned_expert": assigned,
+            "requires_todos": bool(requires_todos),
             "semantic_confidence": semantic_confidence,
             "low_confidence_reason": low_confidence_reason,
             "updated_at": float(now_ts()),
@@ -49344,6 +53505,9 @@ body{padding:18px}
             f"participants={','.join(self.runtime_participants or []) or '-'}, "
             f"assigned={self.runtime_assigned_expert or '-'}, "
             f"budget={int(self.runtime_round_budget or 0)}.\n\n"
+            f"L2 Todo policy={normalize_l2_todo_policy(getattr(self, 'l2_todo_policy', DEFAULT_L2_TODO_POLICY))}. "
+            "You must emit requires_todos as a boolean: L1=false, L3-L5=true; for L2 obey the configured "
+            "policy (force=true, off=false, auto=semantic judgment).\n\n"
             f"{dims_ctx}"
             f"{skills_ctx}"
             f"Workspace root: \"{self.files_root}\" ($SESSION_ROOT)\n"
@@ -49413,6 +53577,14 @@ body{padding:18px}
             row["inherit_previous_state"] = _to_bool_like(
                 row.get("inherit_previous_state", False),
                 default=False,
+            )
+            # Normalize the classifier's Todo decision before any confidence
+            # merge.  A fresh classification must not inherit a previous
+            # task's boolean when the model omitted the optional field.
+            row = self._normalize_todo_requirement_in_decision(
+                row,
+                allow_context=False,
+                fallback=True,
             )
             row["semantic_confidence"] = self._normalize_semantic_confidence(
                 row.get("semantic_confidence", "medium"),
@@ -49563,7 +53735,13 @@ body{padding:18px}
         if config_mode == EXECUTION_MODE_SINGLE:
             resolved_mode = EXECUTION_MODE_SINGLE
         else:
-            resolved_mode = normalize_execution_mode(mode, default=policy_mode)
+            requested_mode = normalize_execution_mode(mode, default=policy_mode)
+            if policy_mode == EXECUTION_MODE_SINGLE:
+                resolved_mode = EXECUTION_MODE_SINGLE
+            elif requested_mode in {EXECUTION_MODE_SEQUENTIAL, EXECUTION_MODE_SYNC}:
+                resolved_mode = requested_mode
+            else:
+                resolved_mode = policy_mode
         resolved_participants: list[str] = []
         raw_participants = participants if isinstance(participants, list) else []
         for item in raw_participants:
@@ -49667,6 +53845,34 @@ body{padding:18px}
             )
             if current_complexity not in TASK_COMPLEXITY_LEVELS:
                 current_complexity = str(policy.get("complexity", "simple") or "simple")
+            manual_requires_todos = self._resolve_todo_requirement(
+                _utlo,
+                getattr(self, "runtime_requires_todos", None),
+                raw_provided=isinstance(getattr(self, "runtime_requires_todos", None), bool),
+                allow_context=True,
+                fallback=True,
+            )
+            if (
+                _utlo == 2
+                and normalize_l2_todo_policy(
+                    getattr(self, "l2_todo_policy", DEFAULT_L2_TODO_POLICY)
+                ) == "auto"
+                and not self._is_continuation_input(goal)
+            ):
+                # A manual level pins topology only.  In auto Todo mode the
+                # manager still owns the semantic yes/no decision.
+                semantic_row = self._manager_classify_task_level(
+                    goal,
+                    pinned_selection=pinned_selection,
+                    media_inputs_round=media_inputs_round,
+                )
+                manual_requires_todos = self._resolve_todo_requirement(
+                    _utlo,
+                    semantic_row.get("requires_todos"),
+                    raw_provided="requires_todos" in semantic_row,
+                    allow_context=False,
+                    fallback=True,
+                )
             decision = {
                 "level": _utlo,
                 "execution_mode": self._effective_execution_mode(),
@@ -49677,6 +53883,7 @@ body{padding:18px}
                 "scale_preference": "thorough" if _utlo >= 4 else str(self.runtime_scale_preference or "balanced"),
                 "round_budget": int(policy.get("round_budget", self.runtime_round_budget or 0) or 0),
                 "requires_user_confirmation": False,
+                "requires_todos": bool(manual_requires_todos),
                 "inherit_previous_state": True,
                 "judgement": f"user_task_level_override={_utlo} — skipping manager evaluation",
                 "source": "user-override",
@@ -49718,6 +53925,13 @@ body{padding:18px}
                 "scale_preference": str(self.runtime_scale_preference or "balanced"),
                 "round_budget": int(self.runtime_round_budget or 0),
                 "requires_user_confirmation": False,
+                "requires_todos": self._resolve_todo_requirement(
+                    prev_level,
+                    getattr(self, "runtime_requires_todos", None),
+                    raw_provided=isinstance(getattr(self, "runtime_requires_todos", None), bool),
+                    allow_context=True,
+                    fallback=True,
+                ),
                 "inherit_previous_state": True,
                     "judgement": "continuation input detected — inheriting previous complexity",
                     "source": "continuation-inherit",
@@ -49742,6 +53956,7 @@ body{padding:18px}
                 "scale_preference": str(self.runtime_scale_preference or "balanced"),
                 "round_budget": int(self.runtime_round_budget or 0),
                 "requires_user_confirmation": bool(self.runtime_requires_confirmation),
+                "requires_todos": self._runtime_level_requires_todos(),
                 "inherit_previous_state": False,
                 "source": "cached",
             }
@@ -51188,7 +55403,10 @@ body{padding:18px}
             if str(text or "").strip():
                 parsed["reason"] = trim(str(text or "").strip(), 600)
         parsed = self._manager_apply_anti_stall(parsed)
-        return self._manager_apply_task_policy(parsed)
+        parsed = self._manager_apply_task_policy(parsed)
+        if str(parsed.get("target", "") or "") in AGENT_ROLES:
+            parsed = self._align_route_with_current_plan_step(parsed, self._ensure_blackboard())
+        return parsed
 
     def _manager_coordination_context_for_delegate(
         self,
@@ -51366,6 +55584,10 @@ body{padding:18px}
             if focus_kind == "plan_step":
                 focus_text += f" ({plan_step_index + 1}/{max(1, plan_step_total)})"
             lines.append(focus_text)
+        plan_subtask_id = trim(str(row.get("plan_subtask_id", "") or ""), 100)
+        plan_subtask_content = trim(str(row.get("plan_subtask_content", "") or ""), 500)
+        if plan_subtask_content:
+            lines.append(f"canonical subtask: {plan_subtask_content}")
         if instruction:
             lines.append(f"instruction: {instruction}")
         if coordination_context:
@@ -51393,6 +55615,8 @@ body{padding:18px}
             "plan_step_index": plan_step_index,
             "plan_step_total": plan_step_total,
             "plan_step_epoch": float(row.get("plan_step_epoch", 0.0) or 0.0),
+            "plan_subtask_id": plan_subtask_id,
+            "plan_subtask_content": plan_subtask_content,
         }
         return text, data
 
@@ -51454,8 +55678,10 @@ body{padding:18px}
                 return False
             action_tokens = (
                 "start", "begin", "execute", "implement", "create", "write", "continue",
+                "build", "construct", "generate", "draw", "configure", "initialize",
                 "then", "next", "advance", "move to", "进入", "開始", "开始", "执行",
                 "實施", "实现", "創建", "创建", "写", "寫", "继续", "繼續", "然后",
+                "构建", "構建", "搭建", "生成", "绘制", "繪製", "配置", "初始化",
                 "接着", "下一步", "推进", "推進",
             )
             return any(tok in line_low for tok in action_tokens) or any(tok in line for tok in ("进入", "开始", "执行", "创建", "继续", "然后"))
@@ -51555,16 +55781,31 @@ body{padding:18px}
             str(row.get("instruction", "") or "").strip(),
             current_step=current,
         )
+        subtask_snapshot = self._current_plan_worker_subtask_snapshot(board=bb, role="")
+        current_subtask = trim(str(subtask_snapshot.get("subtask_content", "") or ""), 500)
+        subtask_guard = ""
+        if current_subtask:
+            subtask_guard = (
+                "Canonical current subtask (shared Single/Sync cursor): "
+                f"{current_subtask}\n"
+                "Execute or verify this subtask first, then update its canonical Todo status from concrete evidence. "
+                "Treat any conflicting detail below as stale coordination context.\n"
+            )
         preface = (
             f"Execute ONLY the approved current plan step.\n"
             f"Current plan step {step_idx}/{max(1, total)}:\n{full_text}\n"
             "Do not replace it with a different project, destination, domain, or file target. "
             "Do not rewrite the plan or invent a new one.\n"
+            f"{subtask_guard}"
         )
         instruction = trim(f"{preface}{instruction}", MANAGER_INSTRUCTION_MAX_CHARS)
         row["direct_objective"] = canonical_objective
         row["instruction"] = instruction
         row.update(focus_fields)
+        row.update(self._plan_subtask_route_fields(
+            board=bb,
+            role="",
+        ))
         return row
 
     def _manager_delegate_turn(
@@ -51925,6 +56166,10 @@ body{padding:18px}
             "remaining_rounds": int(remaining_rounds),
         }
         route_row.update(self._route_focus_fields(board))
+        route_row.update(self._plan_subtask_route_fields(
+            board=board,
+            role="" if isinstance(self._current_plan_step_row(board), dict) else target,
+        ))
         if target in AGENT_ROLES:
             route_row["coordination_context"] = self._manager_coordination_context_for_delegate(
                 target,
@@ -52142,7 +56387,11 @@ body{padding:18px}
         bb_focus = self._ensure_blackboard()
         delegate_focus_row = bb_focus.get("last_delegate", {}) if isinstance(bb_focus.get("last_delegate"), dict) else {}
         if delegate_focus_row and self._sanitize_agent_role(delegate_focus_row.get("target", "")) == role_key:
-            if not self._route_matches_active_focus(delegate_focus_row, bb_focus):
+            current_subtask = self._current_plan_worker_subtask_snapshot(board=bb_focus, role="")
+            bound_subtask_id = trim(str(delegate_focus_row.get("plan_subtask_id", "") or ""), 100)
+            current_subtask_id = trim(str(current_subtask.get("subtask_id", "") or ""), 100)
+            stale_subtask = bool(bound_subtask_id and bound_subtask_id != current_subtask_id)
+            if not self._route_matches_active_focus(delegate_focus_row, bb_focus) or stale_subtask:
                 repaired = self._align_route_with_current_plan_step(
                     {
                         "target": role_key,
@@ -52153,6 +56402,7 @@ body{padding:18px}
                 )
                 instruction = trim(str(repaired.get("instruction", instruction) or instruction), MANAGER_INSTRUCTION_MAX_CHARS)
                 delegate_focus_row.update(self._route_focus_fields(bb_focus))
+                delegate_focus_row.update(self._plan_subtask_route_fields(board=bb_focus, role=""))
                 delegate_focus_row["instruction"] = instruction
                 delegate_focus_row["source"] = "focus-repair"
                 delegate_focus_row["ts"] = float(now_ts())
@@ -52468,10 +56718,30 @@ body{padding:18px}
                 line = f"{line}\n{output}".strip()
             if item.get("exit_code") is not None:
                 line = f"{line}\nexit_code={int(item.get('exit_code'))}".strip()
-            self._blackboard_append_section("execution_logs", role_key, line)
+            negative_assertion = bool(
+                str(item.get("assertion_kind", "") or "") == "negative_search_no_match"
+                and item.get("assertion_ok", False)
+            )
+            self._blackboard_append_section(
+                "execution_logs",
+                role_key,
+                line,
+                metadata={
+                    "exit_code": self._tool_result_exit_code(item),
+                    "assertion_kind": str(item.get("assertion_kind", "") or ""),
+                    "assertion_ok": bool(item.get("assertion_ok", False)),
+                    "assertion_complete": bool(item.get("assertion_complete", False)),
+                    "assertion_command": str(item.get("assertion_command", "") or ""),
+                },
+            )
             if self._command_looks_like_validation(str(args.get("command", "") or "")) or (not ok):
+                memory_kind = (
+                    "validation"
+                    if ok or negative_assertion
+                    else "command_error"
+                )
                 self._blackboard_append_memory(
-                    "validation" if ok else "command_error",
+                    memory_kind,
                     trim(line, 700),
                     actor=role_key,
                     tool=name,
@@ -52491,6 +56761,36 @@ body{padding:18px}
                 )
             if role_key in {"reviewer"}:
                 self._blackboard_set_status("TESTING")
+        elif self._is_browser_runtime_tool_name(name):
+            browser_record = self._browser_runtime_tool_result_record(item)
+            line = trim(
+                "\n".join(
+                    part for part in (
+                        f"{name} {json_dumps(args) if args else ''}".strip(),
+                        output,
+                    )
+                    if part
+                ),
+                BLACKBOARD_MAX_TEXT,
+            )
+            self._blackboard_append_section(
+                "execution_logs",
+                role_key,
+                line or f"{name} returned no observable output",
+                metadata={
+                    "evidence_kind": "browser_runtime",
+                    "ok": bool(browser_record.get("ok", False)),
+                    "exit_code": None,
+                },
+            )
+            self._blackboard_append_memory(
+                "validation" if browser_record.get("ok", False) else "command_error",
+                line or f"{name} returned no observable output",
+                actor=role_key,
+                tool=name,
+                tier="long",
+            )
+            self._blackboard_set_status("TESTING")
         elif name == "read_file":
             p = trim(str(args.get("path", "") or "").strip(), 240)
             note = f"read_file: {p}"
@@ -52606,7 +56906,17 @@ body{padding:18px}
             self._reconcile_plan_worker_progress_from_evidence(actor=role_key)
         except Exception:
             pass
-        if not ok and output and not self._is_plan_infrastructure_tool_error(name, args, output):
+        negative_assertion = bool(
+            str(item.get("assertion_kind", "") or "") == "negative_search_no_match"
+            and item.get("assertion_ok", False)
+        )
+        if (
+            not ok
+            and not negative_assertion
+            and not self._tool_result_is_control_feedback(item)
+            and output
+            and not self._is_plan_infrastructure_tool_error(name, args, output)
+        ):
             self._blackboard_append_section(
                 "execution_logs",
                 role_key,
@@ -52639,7 +56949,8 @@ body{padding:18px}
                 if self._reviewer_deems_done(text):
                     self._blackboard_mark_approved(text, role_key)
         explicit_todo_write = any(
-            isinstance(item, dict) and str(item.get("name", "") or "") in {"TodoWrite", "TodoWriteRescue"}
+            isinstance(item, dict)
+            and canonicalize_tool_name(item.get("name", "")) in {"TodoWrite", "TodoWriteRescue"}
             for item in tool_results
         )
         if role_key and not explicit_todo_write:
@@ -53008,6 +57319,590 @@ body{padding:18px}
         mode = self._effective_execution_mode()
         return mode in {EXECUTION_MODE_SEQUENTIAL, EXECUTION_MODE_SYNC}
 
+    def _single_no_plan_todo_has_rows(self) -> bool:
+        """Whether a normal (non-plan) Todo graph already exists."""
+        try:
+            rows = self.todo.snapshot()
+        except Exception:
+            rows = []
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict) or not str(row.get("content", "") or "").strip():
+                continue
+            # Plan/system rows belong to a different graph and are handled by
+            # the plan runtime; they should never be mistaken for a bootstrap.
+            try:
+                kind = self._todo_row_kind(row)
+            except Exception:
+                kind = "system" if str(row.get("key", "") or "").startswith("bb:") else "flat"
+            if kind in {"flat", "owner_worker", "plan_worker"}:
+                return True
+        return False
+
+    def _runtime_task_level_for_todo_policy(self) -> int:
+        """Return the effective level used by the Todo contract.
+
+        Runtime classification is normally authoritative, but a restored or
+        partially constructed session can have the level only in its
+        blackboard.  Resolve those sources in the same order as the rest of
+        the runtime policy and apply the automatic ceiling once more as a
+        defensive read.  Manual level selection deliberately bypasses that
+        automatic cap, matching ``_apply_runtime_task_decision``.
+        """
+        candidates: list[object] = []
+        try:
+            override = int(getattr(self, "user_task_level_override", 0) or 0)
+        except Exception:
+            override = 0
+        if override in TASK_LEVEL_CHOICES:
+            candidates.append(override)
+        try:
+            candidates.append(int(getattr(self, "runtime_task_level", 0) or 0))
+        except Exception:
+            pass
+        try:
+            board = getattr(self, "blackboard", {})
+            if isinstance(board, dict):
+                profile = board.get("task_profile", {})
+                judgement = board.get("manager_judgement", {})
+                if isinstance(profile, dict):
+                    candidates.append(int(profile.get("task_level", 0) or 0))
+                if isinstance(judgement, dict):
+                    candidates.append(int(judgement.get("task_level", 0) or 0))
+        except Exception:
+            pass
+        level = next(
+            (value for value in candidates if int(value or 0) in TASK_LEVEL_CHOICES),
+            0,
+        )
+        level = int(level or 0)
+        if override not in TASK_LEVEL_CHOICES:
+            # ``SessionState`` always initializes this field.  A missing field
+            # means a lightweight test/restore object, not an implicit default
+            # cap; avoid silently turning an otherwise explicit L3 into L2.
+            raw_ceiling = getattr(self, "auto_task_level_ceiling", None)
+            if raw_ceiling is None:
+                ceiling = 0
+            else:
+                try:
+                    ceiling = int(self._auto_task_level_ceiling_value())
+                except Exception:
+                    ceiling = normalize_auto_task_level_ceiling(raw_ceiling)
+            if ceiling > 0:
+                level = min(level, ceiling)
+        return level
+
+    def _runtime_level_requires_todos(self) -> bool:
+        """Return the effective Todo requirement for the current run.
+
+        L1 remains direct, L3-L5 retain their existing Todo contract, and L2
+        is resolved by the configured three-state policy.  In ``auto`` mode a
+        boolean emitted by the manager classifier is authoritative; an absent
+        or malformed value falls back conservatively so a classifier/tool
+        formatting failure cannot silently bypass the execution guard.
+        """
+        level = self._runtime_task_level_for_todo_policy()
+        return self._resolve_todo_requirement(level, allow_context=True, fallback=True)
+
+    @staticmethod
+    def _optional_bool_value(value: object) -> bool | None:
+        """Parse a boolean only when the input is an explicit boolean-like value."""
+        if isinstance(value, bool):
+            return bool(value)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            if value in (0, 1):
+                return bool(value)
+            return None
+        text = str(value or "").strip().lower()
+        if text in {"true", "1", "yes", "y", "on", "required", "force", "enabled"}:
+            return True
+        if text in {"false", "0", "no", "n", "off", "disabled", "none"}:
+            return False
+        return None
+
+    def _resolve_todo_requirement(
+        self,
+        level: object,
+        raw: object = None,
+        *,
+        raw_provided: bool = False,
+        allow_context: bool = True,
+        fallback: bool = True,
+    ) -> bool:
+        """Resolve Todo policy without changing plan/step-local Todo state.
+
+        ``raw_provided`` distinguishes an explicit classifier ``false`` from
+        a missing field.  ``allow_context`` is disabled for a fresh classifier
+        or rule fallback so a previous task's decision cannot leak into a new
+        request.
+        """
+        try:
+            level_value = int(level or 0)
+        except Exception:
+            level_value = 0
+        if level_value == 1:
+            return False
+        if level_value in {3, 4, 5}:
+            return True
+        if level_value != 2:
+            return bool(fallback)
+        policy = normalize_l2_todo_policy(
+            getattr(self, "l2_todo_policy", DEFAULT_L2_TODO_POLICY)
+        )
+        if policy == "force":
+            return True
+        if policy == "off":
+            return False
+        if raw_provided:
+            parsed = self._optional_bool_value(raw)
+            if parsed is not None:
+                return bool(parsed)
+        if allow_context:
+            current = getattr(self, "runtime_requires_todos", None)
+            if isinstance(current, bool):
+                return bool(current)
+            try:
+                board = getattr(self, "blackboard", {})
+                if isinstance(board, dict):
+                    for section_name in ("manager_judgement", "task_profile"):
+                        section = board.get(section_name, {})
+                        if not isinstance(section, dict) or "requires_todos" not in section:
+                            continue
+                        parsed = self._optional_bool_value(section.get("requires_todos"))
+                        if parsed is not None:
+                            return bool(parsed)
+            except Exception:
+                pass
+        # Conservative fallback for auto mode: requiring a Todo is safer than
+        # allowing a malformed/missing classifier field to bypass the guard.
+        return bool(fallback)
+
+    def _normalize_todo_requirement_in_decision(
+        self,
+        decision: object,
+        *,
+        level: object = None,
+        allow_context: bool = False,
+        fallback: bool = True,
+    ) -> dict:
+        row = dict(decision) if isinstance(decision, dict) else {}
+        if level is None:
+            level = row.get("level", row.get("task_level", 0))
+        row["requires_todos"] = self._resolve_todo_requirement(
+            level,
+            row.get("requires_todos"),
+            raw_provided="requires_todos" in row,
+            allow_context=allow_context,
+            fallback=fallback,
+        )
+        return row
+
+    def _single_no_plan_todo_policy_enabled(self) -> bool:
+        """Return whether the bounded single/no-plan Todo gate is enabled.
+
+        The startup flag remains an opt-in for L1 and other lightweight
+        sessions.  Effective L2 follows the explicit three-state policy rather
+        than the legacy optional bootstrap switch.
+        """
+        level = self._runtime_task_level_for_todo_policy()
+        if level == 2:
+            # The explicit L2 policy wins over the legacy optional bootstrap
+            # switch.  This is what makes ``--l2-todo-policy off`` effective.
+            return bool(self._runtime_level_requires_todos())
+        return bool(getattr(self, "single_no_plan_todo_enabled", False))
+
+    def _single_no_plan_todo_initial_gate_active(self) -> bool:
+        """Whether an L2 run is still in its pre-Todo orientation window."""
+        return bool(
+            self._runtime_task_level_for_todo_policy() == 2
+            and self._effective_execution_mode() == EXECUTION_MODE_SINGLE
+            and self._single_no_plan_todo_bootstrap_allowed()
+        )
+
+    def _single_no_plan_todo_perception_tools(self) -> list[dict]:
+        """Expose only observation tools until the mandatory L2 Todo exists.
+
+        This is a narrow, one-turn safety boundary.  It prevents a model from
+        bypassing the level contract by emitting ``write_file`` before the
+        normal perception-to-Todo bootstrap has had a chance to run.  MCP and
+        browser tools are admitted only when their names advertise a read-only
+        capability; mutation-prone shell tools stay hidden until the gate
+        closes.
+        """
+        read_names = {
+            "read_file", "list_files", "search_files", "context_recall", "tool_memory",
+            "task_get", "task_list", "read_from_blackboard", "check_background", "read_inbox",
+            "list_teammates", "worktree_list", "worktree_status", "worktree_events",
+            "query_code_library", "query_knowledge_library", "agent_web_search",
+            "list_skills", "list_skill_providers", "list_skill_protocols", "scan_skills", "load_skill",
+        }
+        tools: list[dict] = []
+        for spec in self._available_tools():
+            fn = spec.get("function", {}) if isinstance(spec, dict) else {}
+            name = str(fn.get("name", "") or "").strip()
+            canonical = canonicalize_tool_name(name)
+            if canonical == "TodoWrite" or canonical in read_names:
+                tools.append(spec)
+                continue
+            # Keep this capability check generic for dynamically mounted MCP
+            # and browser tools; it does not encode a task-specific provider.
+            if name.startswith(MCP_TOOL_PREFIX) or self._is_browser_runtime_tool_name(name):
+                if self._single_no_plan_todo_is_perception_result(
+                    {"name": name, "args": {}, "ok": True}
+                ):
+                    tools.append(spec)
+        return tools
+
+    def _single_no_plan_todo_mutation_blocked(self, name: object, args: object = None) -> bool:
+        """Return true when an L2 mutation would bypass the initial Todo gate."""
+        if not self._single_no_plan_todo_initial_gate_active():
+            return False
+        payload = args if isinstance(args, dict) else {}
+        return self._single_no_plan_todo_is_mutation_result(
+            {"name": str(name or ""), "args": payload, "ok": True}
+        )
+
+    def _single_no_plan_todo_bootstrap_allowed(self) -> bool:
+        """Check the semantic boundary before starting a perception bootstrap."""
+        l2_required = self._runtime_task_level_for_todo_policy() == 2
+        if not self._single_no_plan_todo_policy_enabled():
+            return False
+        if self._effective_execution_mode() != EXECUTION_MODE_SINGLE:
+            return False
+        # ``on`` is an explicit plan request.  ``auto`` is allowed only after
+        # classification has established that this particular run needs no plan.
+        preference = str(getattr(self, "plan_mode_user_preference", "auto") or "auto").strip().lower()
+        if preference == "on":
+            return False
+        if bool(getattr(self, "runtime_plan_mode_needed", False)):
+            return False
+        if bool(getattr(self, "runtime_plan_approved", False)):
+            return False
+        try:
+            if self._has_resumable_plan_state():
+                return False
+        except Exception:
+            # A partially constructed/test session has no resumable plan state.
+            pass
+        task_type = str(getattr(self, "runtime_task_type", "") or "").strip().lower()
+        # A manually pinned/semantically classified L2 is still required to
+        # have todos even when its task type happens to be simple_qa.  Preserve
+        # the historical simple-QA exclusion for the optional L1 bootstrap.
+        if task_type == "simple_qa" and not l2_required:
+            return False
+        state = str(getattr(self, "single_no_plan_todo_bootstrap_state", "idle") or "idle").strip().lower()
+        if state != "idle":
+            return False
+        if bool(getattr(self, "single_no_plan_todo_perception_seen", False)):
+            return False
+        if bool(getattr(self, "single_no_plan_todo_bootstrap_write_seen", False)):
+            return False
+        return not self._single_no_plan_todo_has_rows()
+
+    def _single_no_plan_todo_bootstrap_turn_active(self) -> bool:
+        """Check whether a persisted waiting turn may safely resume."""
+        if str(getattr(self, "single_no_plan_todo_bootstrap_state", "idle") or "idle").strip().lower() != "waiting":
+            return False
+        l2_required = self._runtime_task_level_for_todo_policy() == 2
+        if not self._single_no_plan_todo_policy_enabled():
+            return False
+        if self._effective_execution_mode() != EXECUTION_MODE_SINGLE:
+            return False
+        preference = str(getattr(self, "plan_mode_user_preference", "auto") or "auto").strip().lower()
+        if preference == "on" or bool(getattr(self, "runtime_plan_mode_needed", False)):
+            return False
+        if bool(getattr(self, "runtime_plan_approved", False)):
+            return False
+        if (
+            str(getattr(self, "runtime_task_type", "") or "").strip().lower() == "simple_qa"
+            and not l2_required
+        ):
+            return False
+        try:
+            if self._has_resumable_plan_state():
+                return False
+        except Exception:
+            pass
+        return True
+
+    @staticmethod
+    def _single_no_plan_todo_bash_is_read_only(command: object) -> bool:
+        """Conservatively classify a shell command as observation-only."""
+        text = str(command or "").strip()
+        if not text:
+            return False
+        # Command substitution can hide a write behind an otherwise harmless
+        # executable (for example, ``echo $(touch marker)``).
+        if "$(" in text or "`" in text:
+            return False
+        # Redirection and common mutation primitives make the whole command
+        # ineligible, even when an earlier segment is a read.
+        if re.search(r"(?:^|[^\\])(?:>>?|<<?|\|\s*tee\b)", text):
+            return False
+        if re.search(
+            r"\b(?:rm|rmdir|mv|cp|mkdir|mkfile|touch|chmod|chown|ln|install|truncate|dd|sed\s+-i|perl\s+-i|python(?:3)?\s+-c|write|edit)\b",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            return False
+        allowed_commands = {
+            "pwd", "ls", "find", "rg", "grep", "egrep", "fgrep", "cat", "head", "tail",
+            "sed", "awk", "cut", "sort", "uniq", "wc", "file", "stat", "du", "tree",
+            "realpath", "readlink", "env", "which", "type", "echo", "printf", "git",
+        }
+        segments = re.split(r"\s*(?:&&|\|\||[;|])\s*", text)
+        for segment in segments:
+            part = segment.strip()
+            if not part:
+                continue
+            try:
+                tokens = shlex.split(part)
+            except Exception:
+                return False
+            while tokens and tokens[0] in {"env", "command", "builtin", "sudo"}:
+                tokens.pop(0)
+            if not tokens:
+                return False
+            executable = Path(tokens[0]).name.lower()
+            if executable not in allowed_commands:
+                return False
+            if executable == "find" and any(
+                str(token).lower() in {
+                    "-delete", "-exec", "-execdir", "-ok", "-okdir",
+                    "-fprint", "-fprint0", "-fprintf",
+                }
+                for token in tokens[1:]
+            ):
+                return False
+            if executable == "sort" and any(
+                str(token).lower() == "-o"
+                or str(token).lower().startswith("--output")
+                for token in tokens[1:]
+            ):
+                return False
+            if executable == "git":
+                if len(tokens) < 2 or str(tokens[1]).lower() not in {
+                    "status", "diff", "log", "show", "ls-files", "rev-parse",
+                }:
+                    return False
+                if any(
+                    str(token).lower().startswith(("--output", "--ext-diff", "--textconv"))
+                    for token in tokens[2:]
+                ):
+                    return False
+        return True
+
+    @staticmethod
+    def _single_no_plan_todo_browser_is_read_only(name: object, args: object = None) -> bool:
+        """Classify browser/MCP calls by capability, not by provider name."""
+        tool_name = unicodedata.normalize("NFKC", str(name or "")).lower()
+        # These actions can change page/application state or write a local
+        # artifact, so a round containing them must never start the bootstrap.
+        mutation_tokens = (
+            "click", "dblclick", "doubleclick", "type", "fill", "press",
+            "select", "check", "uncheck", "upload", "download", "drag",
+            "drop", "evaluate", "execute", "submit", "setvalue", "set_value",
+            "insert", "scroll", "hover",
+        )
+        if any(token in tool_name for token in mutation_tokens):
+            return False
+        payload = args if isinstance(args, dict) else {}
+        for key in ("action", "operation", "event", "method", "command"):
+            value = unicodedata.normalize("NFKC", str(payload.get(key, "") or "")).lower()
+            if value and any(token in value for token in mutation_tokens):
+                return False
+        return True
+
+    def _single_no_plan_todo_is_perception_result(self, item: dict | None) -> bool:
+        """Return true for a successful, read-only observation result."""
+        if not isinstance(item, dict) or not bool(item.get("ok", False)):
+            return False
+        name = canonicalize_tool_name(item.get("name", ""))
+        args = item.get("args", {}) if isinstance(item.get("args"), dict) else {}
+        if name in {
+            "read_file", "list_files", "search_files", "context_recall", "tool_memory",
+            "task_get", "task_list", "read_from_blackboard", "check_background", "read_inbox",
+            "list_teammates", "worktree_list", "worktree_status", "worktree_events",
+            "query_code_library", "query_knowledge_library", "agent_web_search",
+            "list_skills", "list_skill_providers", "list_skill_protocols",
+            "scan_skills", "load_skill",
+        }:
+            return True
+        if name == "bash" or name == "worktree_run":
+            return self._single_no_plan_todo_bash_is_read_only(args.get("command", ""))
+        if self._is_browser_runtime_tool_name(name):
+            return self._single_no_plan_todo_browser_is_read_only(name, args)
+        # MCP tools are intentionally recognized by capability-shaped names,
+        # not by a task-specific provider list.
+        if name.startswith(MCP_TOOL_PREFIX):
+            low = name.lower()
+            if any(token in low for token in ("write", "edit", "create", "delete", "remove", "execute", "run")):
+                return False
+            return any(token in low for token in ("read", "list", "search", "inspect", "snapshot", "status", "get", "query", "fetch", "observe", "browser", "page"))
+        return False
+
+    def _single_no_plan_todo_is_mutation_result(self, item: dict | None) -> bool:
+        """Return true when a tool result represents a write or other side effect.
+
+        Bootstrap is allowed only after a genuinely observation-only tool round.
+        A model can emit several calls in one response, so checking just
+        ``write_file``/``edit_file`` is insufficient: a mutating shell command,
+        background job, blackboard write, or worktree operation must also block
+        the bootstrap even when a read call appeared earlier in that round.
+        Failed side-effect attempts count as attempts too; otherwise a failed
+        write followed by a read could unexpectedly create a planning turn.
+        """
+        if not isinstance(item, dict):
+            return False
+        name = canonicalize_tool_name(item.get("name", ""))
+        args = item.get("args", {}) if isinstance(item.get("args"), dict) else {}
+        if name in {
+            "write_file", "edit_file", "background_run", "task_create", "task_update",
+            "claim_task", "task", "spawn_teammate", "ask_colleague", "send_message", "broadcast",
+            "shutdown_request", "plan_approval", "write_skill", "write_to_blackboard", "rag_remember",
+            "generate_media", "worktree_create", "worktree_keep", "worktree_remove",
+            "ask_user", "finish_task", "finish_current_task", "mark_done", "compress",
+        }:
+            return True
+        if name in {"bash", "worktree_run"}:
+            return not self._single_no_plan_todo_bash_is_read_only(args.get("command", ""))
+        if self._is_browser_runtime_tool_name(name):
+            return not self._single_no_plan_todo_browser_is_read_only(name, args)
+        if name.startswith(MCP_TOOL_PREFIX):
+            name_tokens = set(re.split(r"[^a-z0-9]+", name.lower()))
+            mutation_tokens = {
+                "write", "edit", "create", "delete", "remove", "execute", "run",
+                "update", "patch", "put", "post", "send", "upload", "commit", "merge",
+            }
+            if name_tokens & mutation_tokens:
+                return True
+            for key in ("action", "operation", "method"):
+                value_tokens = set(
+                    re.split(r"[^a-z0-9]+", str(args.get(key, "") or "").lower())
+                )
+                if value_tokens & mutation_tokens:
+                    return True
+        return False
+
+    def _single_no_plan_todo_bootstrap_tools(self) -> list[dict]:
+        allowed = {"TodoWrite", "TodoWriteRescue"}
+        tools: list[dict] = []
+        for spec in self._available_tools():
+            fn = spec.get("function", {}) if isinstance(spec, dict) else {}
+            # Do not canonicalize here: TodoWriteResume is a compatibility
+            # alias, but this bounded turn intentionally exposes only the two
+            # explicit writers accepted by the bootstrap gate below.
+            name = str(fn.get("name", "") or "").strip()
+            if name in allowed:
+                tools.append(spec)
+        return tools
+
+    def _single_no_plan_todo_remove_bootstrap_hints(self) -> None:
+        if not isinstance(getattr(self, "messages", None), list):
+            return
+        prefixes = ("<single-no-plan-todo-bootstrap>", "<single-no-plan-todo-bootstrap-retry>")
+        self.messages = [
+            row for row in self.messages
+            if not (
+                isinstance(row, dict)
+                and str(row.get("role", "") or "").strip() == "user"
+                and str(row.get("content", "") or "").lstrip().lower().startswith(prefixes)
+            )
+        ][-400:]
+
+    def _start_single_no_plan_todo_bootstrap(self) -> bool:
+        if not self._single_no_plan_todo_bootstrap_allowed():
+            return False
+        prompt = str(
+            getattr(self, "single_no_plan_todo_prompt", "") or DEFAULT_SINGLE_NO_PLAN_TODO_PROMPT
+        ).strip() or DEFAULT_SINGLE_NO_PLAN_TODO_PROMPT
+        self._single_no_plan_todo_remove_bootstrap_hints()
+        self.single_no_plan_todo_bootstrap_state = "waiting"
+        self.single_no_plan_todo_bootstrap_attempts = 0
+        self.single_no_plan_todo_perception_seen = True
+        self.messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "<single-no-plan-todo-bootstrap>\n"
+                    f"{trim(prompt, 6000)}\n\n"
+                    "This is a planning-only turn after real read-only perception. "
+                    "Use the preceding tool result as evidence. Call exactly one "
+                    "TodoWrite or TodoWriteRescue tool now; do not call implementation "
+                    "tools or finish_task.\n"
+                    "</single-no-plan-todo-bootstrap>"
+                ),
+                "ts": now_ts(),
+            }
+        )
+        self._emit(
+            "status",
+            {"summary": "single/no-plan perception complete; Todo bootstrap turn required"},
+        )
+        try:
+            self._persist()
+        except Exception:
+            pass
+        return True
+
+    def _single_no_plan_todo_bootstrap_failure(self, reason: str) -> str:
+        """Record one failed bootstrap turn and return ``retry``, ``skip`` or ``blocked``."""
+        if str(getattr(self, "single_no_plan_todo_bootstrap_state", "") or "").strip().lower() != "waiting":
+            return "skip"
+        attempts = int(getattr(self, "single_no_plan_todo_bootstrap_attempts", 0) or 0) + 1
+        self.single_no_plan_todo_bootstrap_attempts = min(
+            SINGLE_NO_PLAN_TODO_BOOTSTRAP_MAX_ATTEMPTS,
+            attempts,
+        )
+        reason_text = trim(str(reason or "TodoWrite was not emitted"), 260)
+        if attempts < SINGLE_NO_PLAN_TODO_BOOTSTRAP_MAX_ATTEMPTS:
+            self._single_no_plan_todo_remove_bootstrap_hints()
+            self.messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "<single-no-plan-todo-bootstrap-retry>\n"
+                        f"The required Todo bootstrap turn did not complete: {reason_text}. "
+                        "Retry once now. Call exactly one TodoWrite or TodoWriteRescue "
+                        "with 3-7 evidence-based items and exactly one in_progress item; "
+                        "do not use any implementation tool.\n"
+                        "</single-no-plan-todo-bootstrap-retry>"
+                    ),
+                    "ts": now_ts(),
+                }
+            )
+            self._emit(
+                "status",
+                {"summary": f"single/no-plan Todo bootstrap retry ({attempts}/{SINGLE_NO_PLAN_TODO_BOOTSTRAP_MAX_ATTEMPTS})"},
+            )
+            return "retry"
+        # A required L2 Todo contract must not silently restore mutation tools
+        # after bounded writer failures.  L2-off and optional L1 bootstraps keep
+        # the historical finite skip behavior.
+        if (
+            self._runtime_task_level_for_todo_policy() == 2
+            and self._runtime_level_requires_todos()
+        ):
+            self.single_no_plan_todo_bootstrap_state = "blocked"
+            self._emit(
+                "status",
+                {"summary": f"L2 Todo bootstrap blocked after bounded failures: {reason_text}"},
+            )
+            return "blocked"
+        self.single_no_plan_todo_bootstrap_state = "skipped"
+        self._emit(
+            "status",
+            {"summary": f"single/no-plan Todo bootstrap skipped after bounded failures: {reason_text}"},
+        )
+        return "skip"
+
+    def _single_no_plan_todo_bootstrap_succeeded(self) -> None:
+        self.single_no_plan_todo_bootstrap_state = "completed"
+        self.single_no_plan_todo_bootstrap_attempts = 0
+        self._emit(
+            "status",
+            {"summary": "single/no-plan Todo bootstrap completed; normal tools restored"},
+        )
+
     def _mcp_prompt_block(self) -> str:
         """Awareness block about external MCP tools.
 
@@ -53109,7 +58004,8 @@ body{padding:18px}
         allowed = AGENT_TOOL_ALLOWLIST.get(role_key, set())
         if role_key == "reviewer" and bool(self.reviewer_debug_mode):
             allowed = set(allowed) | set(REVIEWER_DEBUG_TOOL_ALLOWLIST)
-        return str(name or "").strip() in allowed
+        raw_name = str(name or "").strip()
+        return raw_name in allowed or canonicalize_tool_name(raw_name) in allowed
 
     def _available_tools(self) -> list[dict]:
         base = filter_tool_specs_for_runtime(
@@ -53140,7 +58036,7 @@ body{padding:18px}
             fn = tool.get("function", {}) if isinstance(tool, dict) else {}
             name = str(fn.get("name", "")).strip()
             # MCP tools bypass the per-role built-in allowlist (every role may use them).
-            if name in allowed or name.startswith(MCP_TOOL_PREFIX):
+            if name in allowed or canonicalize_tool_name(name) in allowed or name.startswith(MCP_TOOL_PREFIX):
                 filtered.append(tool)
         return filtered or base_tools
 
@@ -53592,6 +58488,7 @@ body{padding:18px}
         engineering_note = self._engineering_execution_boost_instruction()
         html_note = self._html_frontend_boost_instruction()
         plan_todo_note = self._plan_todo_discipline_prompt(role=role_key)
+        todo_contract_note = self._todo_contract_prompt_block()
         read_context_note = self._read_context_prompt_block(for_role=role_key)
         web_search_enabled = bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED))
         web_search_context_note = self._web_search_context_prompt_block(for_role=role_key) if web_search_enabled else ""
@@ -53637,6 +58534,8 @@ body{padding:18px}
             base = base + task_memory_note + " "
         if plan_todo_note:
             base = base + plan_todo_note + " "
+        if todo_contract_note:
+            base = base + todo_contract_note + " "
         mcp_note = self._mcp_prompt_block()
         if mcp_note:
             base = base + mcp_note + " "
@@ -53793,80 +58692,566 @@ body{padding:18px}
                 mirror_to_global=False,
             )
 
-    def _todo_write_rescue(self, args: dict) -> str:
-        """Rescue todo writer — accepts both strings and dicts, auto-normalizes.
-        FIXED: Now preserves status from incoming items (especially 'completed')
-        instead of resetting everything to 'pending'."""
-        raw_items = args.get("items", [])
-        if not isinstance(raw_items, list) or not raw_items:
-            raise ValueError("items must be a non-empty array")
-        limited = raw_items[:12]  # Allow more items (was 7) — plans can have 5+ subtasks
-        active_step = self._get_active_plan_step()
-        active_step_id = trim(str((active_step or {}).get("id", "") or ""), 20)
-        owner_hint = self._current_plan_worker_owner()
-        clean_items = []
-        _status_alias = {
-            "todo": "pending", "doing": "in_progress", "inprogress": "in_progress",
-            "in-progress": "in_progress", "done": "completed", "finish": "completed",
-            "finished": "completed", "[_]": "pending", "[]": "pending",
-            "[ ]": "pending", "[>]": "in_progress", ">": "in_progress",
-            "[x]": "completed", "x": "completed",
+    def _todo_payload_items(
+        self,
+        args: object,
+        *,
+        default_parent_step_id: str = "",
+        limit: int = 40,
+    ) -> list[object]:
+        """Normalize provider-specific TodoWrite/Resume payloads into rows."""
+        source = args if isinstance(args, dict) else {}
+        max_items = max(1, min(int(limit or 40), 40))
+
+        def _key_token(value: object) -> str:
+            return re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
+
+        field_aliases = {
+            "content": {"content", "text", "title", "task", "todo", "subtask", "item", "row", "description", "label", "name", "summary", "current", "next"},
+            "status": {"status", "state", "phase"},
+            "completed": {"completed", "complete", "done", "finished", "passed", "success", "iscompleted"},
+            "in_progress": {"inprogress", "active", "working", "started", "isinprogress"},
+            "owner": {"owner", "assignee", "agent", "role"},
+            "key": {"key"},
+            "subtask_id": {"subtaskid"},
+            "external_subtask_id": {"externalsubtaskid", "externalid", "todoid", "taskid", "itemid", "rowid"},
+            "parent_step_id": {"parentstepid", "parentid", "stepid"},
+            "activeForm": {"activeform"},
+            "evidence": {"evidence", "proof", "evidenceref", "evidencerefs"},
         }
-        for idx, item in enumerate(limited):
-            if isinstance(item, dict):
-                content = str(item.get("content", item.get("text", item.get("title", "")))).strip()
-                owner = str(item.get("owner", "") or owner_hint).strip().lower()
-                parent_step_id = trim(str(item.get("parent_step_id", "") or active_step_id), 20)
-                # Preserve status from incoming dict (critical for subtask state tracking)
-                raw_status = str(item.get("status", item.get("state", "pending"))).strip().lower()
-                status = _status_alias.get(raw_status, raw_status)
-                if status not in {"pending", "in_progress", "completed"}:
-                    status = "pending"
-            else:
-                content = str(item).strip()
-                owner = owner_hint
-                parent_step_id = active_step_id
-                parsed_status, parsed_content = split_todo_status_text(content)
-                status = parsed_status or "pending"
-                content = parsed_content or content
-            content = normalize_work_text(content) or content
-            if not content:
-                continue
-            row = {
-                "content": content,
-                "status": status,
-            }
-            if owner in {"developer", "explorer", "reviewer"}:
-                row["owner"] = owner
-            if parent_step_id:
-                row["parent_step_id"] = parent_step_id
-            clean_items.append(row)
-        if not clean_items:
-            raise ValueError("no valid todo item text")
-        # Only apply in_progress_index if NO items already have in_progress status
-        has_in_progress = any(r["status"] == "in_progress" for r in clean_items)
-        if not has_in_progress:
-            in_progress_index = int(args.get("in_progress_index", 0) or 0)
-            if in_progress_index < 0 or in_progress_index >= len(clean_items):
-                in_progress_index = 0
-            # Only set in_progress on a pending item
-            for i, r in enumerate(clean_items):
-                if r["status"] == "pending":
-                    if i >= in_progress_index:
-                        r["status"] = "in_progress"
+        normalized_aliases = {
+            field: {_key_token(alias) for alias in aliases}
+            for field, aliases in field_aliases.items()
+        }
+        plural_containers = {
+            "items", "todos", "todoitems", "subtasks", "rows", "updates",
+            "todolist", "tasks", "planitems", "data",
+        }
+        singular_containers = {"todo", "subtask", "item", "row", "task"}
+        control_tokens = {
+            "resume", "continue", "resumeexisting", "inprogressindex", "activeindex",
+            "currentindex", "nextindex", "updatemode", "mode", "operation", "update",
+            "action", "revisionreason", "reason", "changereason", "why",
+            "revisionevidence", "references", "options", "meta", "control",
+        }
+
+        def _decode_json_container(value: object) -> object:
+            return decode_structured_todo_container(value)
+
+        def _canonicalize_row(value: dict) -> dict:
+            row = dict(value)
+            by_token: dict[str, object] = {}
+            for raw_key, raw_value in value.items():
+                token = _key_token(raw_key)
+                if token and token not in by_token:
+                    by_token[token] = raw_value
+            for field, aliases in normalized_aliases.items():
+                if row.get(field) not in (None, ""):
+                    continue
+                for alias in aliases:
+                    if alias in by_token and by_token[alias] not in (None, ""):
+                        row[field] = by_token[alias]
                         break
-        route_kind = self._todo_route_kind(role=owner_hint)
+            return row
+
+        def _looks_like_row(value: object) -> bool:
+            if not isinstance(value, dict):
+                return False
+            row = _canonicalize_row(value)
+            return any(
+                row.get(key) not in (None, "")
+                for key in (
+                    "content", "status", "completed", "in_progress", "owner", "key",
+                    "subtask_id", "external_subtask_id", "parent_step_id", "activeForm",
+                )
+            )
+
+        def _bind_mapping_identity(row: dict, mapping_key: object) -> dict:
+            external_id = trim(str(mapping_key or "").strip(), 120)
+            if external_id:
+                if not str(row.get("key", "") or "").strip():
+                    row["key"] = external_id
+                if not str(row.get("external_subtask_id", "") or "").strip():
+                    row["external_subtask_id"] = external_id
+            return row
+
+        def _mapping_candidates(value: object) -> list[object]:
+            value = _decode_json_container(value)
+            if isinstance(value, list):
+                return [_canonicalize_row(item) if isinstance(item, dict) else item for item in value]
+            if isinstance(value, str):
+                return [value] if value.strip() else []
+            if not isinstance(value, dict):
+                return []
+
+            # Prefer explicit plural containers over compatibility text fields.
+            # Some providers emit both ``todos=[...]`` and ``content="[...]"``;
+            # treating the outer mapping as a row first collapses the valid array
+            # into one display string.
+            for raw_key, nested in value.items():
+                if _key_token(raw_key) not in plural_containers:
+                    continue
+                nested_rows = _mapping_candidates(nested)
+                if nested_rows:
+                    return nested_rows
+
+            # Singular wrappers may carry row metadata beside the nested row.
+            for raw_key, nested in value.items():
+                if _key_token(raw_key) not in singular_containers or not isinstance(nested, dict):
+                    continue
+                outer = {
+                    key: item
+                    for key, item in value.items()
+                    if key != raw_key and _key_token(key) not in control_tokens
+                }
+                merged = _canonicalize_row({**nested, **outer})
+                if _looks_like_row(merged):
+                    return [merged]
+
+            row = _canonicalize_row(value)
+            content_value = row.get("content")
+            decoded_content = _decode_json_container(content_value)
+            if decoded_content is not content_value and isinstance(decoded_content, (list, dict)):
+                nested_rows = _mapping_candidates(decoded_content)
+                if nested_rows:
+                    return nested_rows
+            if _looks_like_row(row):
+                return [row]
+
+            for raw_key, nested in value.items():
+                if _key_token(raw_key) not in plural_containers | singular_containers:
+                    continue
+                nested_rows = _mapping_candidates(nested)
+                if nested_rows:
+                    return nested_rows
+
+            # ID-keyed maps are common after compaction. Bind the map key to
+            # every recovered row so a later status-only call can find it even
+            # when the display text changed.
+            recovered: list[object] = []
+            for mapping_key, nested in value.items():
+                if _key_token(mapping_key) in control_tokens:
+                    continue
+                nested_rows = _mapping_candidates(nested)
+                for nested_row in nested_rows:
+                    if isinstance(nested_row, dict):
+                        recovered.append(_bind_mapping_identity(_canonicalize_row(nested_row), mapping_key))
+                    elif str(nested_row or "").strip():
+                        recovered.append(
+                            _bind_mapping_identity(
+                                {"content": str(nested_row).strip()},
+                                mapping_key,
+                            )
+                        )
+                    if len(recovered) >= max_items:
+                        return recovered
+            return recovered
+
+        candidates = _mapping_candidates(source)
+        if not candidates:
+            return []
+
+        out: list[object] = []
+        for item in candidates:
+            if len(out) >= max_items:
+                break
+            if isinstance(item, dict):
+                row = _canonicalize_row(item)
+                if default_parent_step_id and not str(row.get("parent_step_id", "") or "").strip():
+                    row["parent_step_id"] = default_parent_step_id
+                raw_content = row.get("content")
+                if isinstance(raw_content, str) and raw_content.strip():
+                    parsed_rows = extract_todo_rows_from_text(
+                        raw_content,
+                        default_parent_step_id=default_parent_step_id,
+                        limit=max_items - len(out),
+                    )
+                    structured_rows = (
+                        split_structured_todo_content(
+                            raw_content,
+                            limit=max_items - len(out),
+                        )
+                        if len(parsed_rows) < 2
+                        else []
+                    )
+                    expanded = parsed_rows if len(parsed_rows) >= 2 else structured_rows
+                    if len(expanded) >= 2:
+                        shared = {
+                            key: value
+                            for key, value in row.items()
+                            if key not in {"content", "status", "state", "phase", "completed", "done", "in_progress", "active"}
+                        }
+                        for expanded_row in expanded[: max_items - len(out)]:
+                            merged_row = dict(shared)
+                            merged_row.update(expanded_row)
+                            out.append(merged_row)
+                        continue
+                out.append(row)
+                continue
+            text = str(item or "").strip()
+            if not text:
+                continue
+            parsed_rows = extract_todo_rows_from_text(
+                text,
+                default_parent_step_id=default_parent_step_id,
+                limit=max_items - len(out),
+            )
+            if len(parsed_rows) >= 2:
+                out.extend(parsed_rows[: max_items - len(out)])
+                continue
+            structured_rows = split_structured_todo_content(
+                text,
+                limit=max_items - len(out),
+            )
+            if len(structured_rows) >= 2:
+                out.extend(structured_rows[: max_items - len(out)])
+                continue
+            out.append(text)
+        return out[:max_items]
+
+    def _normalize_loaded_todo_rows(
+        self,
+        raw_rows: object,
+        messages: object,
+    ) -> list[dict]:
+        """Repair only the legacy one-row stringified Todo payload shape.
+
+        Normal persisted lists are returned byte-for-byte equivalent. When an
+        older run stored a truncated Python representation as the sole Todo, the
+        corresponding structured TodoWrite arguments remain in the conversation
+        and provide a bounded, same-session recovery source.
+        """
+        rows = [dict(row) for row in raw_rows if isinstance(row, dict)] if isinstance(raw_rows, list) else []
+        if len(rows) != 1:
+            return rows
+        content = str(rows[0].get("content", "") or "").strip()
+        if not (content.startswith("[") and "content" in content.casefold()):
+            return rows
+
+        recovered: list[object] = []
+        decoded = decode_structured_todo_container(content)
+        if isinstance(decoded, (list, dict)):
+            recovered = self._todo_payload_items({"items": decoded}, limit=40)
+
+        if len(recovered) < 2 and isinstance(messages, list):
+            for message in reversed(messages[-160:]):
+                if not isinstance(message, dict):
+                    continue
+                calls = message.get("tool_calls", [])
+                if not isinstance(calls, list):
+                    continue
+                for call in reversed(calls):
+                    if not isinstance(call, dict):
+                        continue
+                    function = call.get("function", {}) if isinstance(call.get("function"), dict) else {}
+                    name = canonicalize_tool_name(function.get("name", ""))
+                    if name not in {"TodoWrite", "TodoWriteRescue", "TodoWriteResume"}:
+                        continue
+                    args = decode_structured_todo_container(function.get("arguments", {}))
+                    if not isinstance(args, dict):
+                        continue
+                    candidates = self._todo_payload_items(args, limit=40)
+                    if len(candidates) < 2:
+                        continue
+                    candidate_texts = [
+                        str(row.get("content", "") or "").strip()
+                        for row in candidates
+                        if isinstance(row, dict) and str(row.get("content", "") or "").strip()
+                    ]
+                    overlap = sum(1 for text in candidate_texts if text in content)
+                    if overlap < min(2, len(candidate_texts)):
+                        continue
+                    recovered = candidates
+                    break
+                if len(recovered) >= 2:
+                    break
+
+        if len(recovered) < 2:
+            return rows
+        normalized = TodoManager(getattr(self, "ui_language", DEFAULT_UI_LANGUAGE))
+        try:
+            normalized.update(recovered)
+        except Exception:
+            return rows
+        return normalized.snapshot() or rows
+
+    def _todo_payload_in_progress_index(self, args: object) -> int | None:
+        """Read legacy/current cursor aliases without treating an empty value as 0."""
+        source = args if isinstance(args, dict) else {}
+        for key in (
+            "in_progress_index", "inProgressIndex", "active_index", "activeIndex",
+            "current_index", "currentIndex", "next_index", "nextIndex",
+        ):
+            if key not in source:
+                continue
+            raw = source.get(key)
+            if isinstance(raw, bool) or raw in (None, ""):
+                continue
+            try:
+                value = int(float(str(raw).strip()))
+            except Exception:
+                continue
+            return max(0, value)
+        for key in ("options", "meta", "control"):
+            nested = source.get(key)
+            if isinstance(nested, dict):
+                value = self._todo_payload_in_progress_index(nested)
+                if value is not None:
+                    return value
+        return None
+
+    def _apply_todo_payload_in_progress_index(
+        self,
+        items: list[object],
+        args: object,
+    ) -> list[object]:
+        """Apply a supplied active-row cursor only when no row has explicit progress.
+
+        This preserves the historical TodoWriteRescue contract while allowing
+        normal TodoWrite/Resume payloads to use the same elastic mapping.
+        """
+        index = self._todo_payload_in_progress_index(args)
+        if index is None or not isinstance(items, list) or not items:
+            return items
+
+        normalized: list[object] = []
+        explicit_active = False
+        pending_positions: list[int] = []
+        for item in items:
+            if isinstance(item, dict):
+                row = dict(item)
+                raw_content = str(
+                    row.get(
+                        "content",
+                        row.get(
+                            "text",
+                            row.get(
+                                "title",
+                                row.get("task", row.get("description", row.get("label", row.get("name", "")))),
+                            ),
+                        ),
+                    )
+                    or ""
+                ).strip()
+                parsed_status, _ = split_todo_status_text(raw_content)
+                raw_status = row.get("status", row.get("state", row.get("phase", "")))
+                if raw_status in (None, ""):
+                    if any(
+                        _to_bool_like(row.get(key, False), default=False)
+                        for key in ("in_progress", "inprogress", "active", "working", "started")
+                    ):
+                        raw_status = "in_progress"
+                    elif any(
+                        _to_bool_like(row.get(key, False), default=False)
+                        for key in ("completed", "complete", "done", "finished", "passed", "success")
+                    ):
+                        raw_status = "completed"
+                status = self._normalize_todo_status_value(raw_status, parsed_status or "pending")
+                if parsed_status and str(raw_status or "").strip().lower() in {"", "todo", "pending"}:
+                    status = parsed_status
+                normalized.append(row)
+            else:
+                raw_text = str(item or "").strip()
+                parsed_status, parsed_content = split_todo_status_text(raw_text)
+                status = parsed_status or "pending"
+                normalized.append(
+                    {"content": parsed_content or raw_text, "status": status}
+                )
+            status = self._normalize_todo_status_value(status, "pending")
+            if status == "in_progress":
+                explicit_active = True
+            elif status == "pending":
+                pending_positions.append(len(normalized) - 1)
+        if explicit_active:
+            return normalized
+        if not pending_positions:
+            return normalized
+        target_pos = pending_positions[min(index, len(pending_positions) - 1)]
+        target = normalized[target_pos]
+        if isinstance(target, dict):
+            target["status"] = "in_progress"
+            target.pop("state", None)
+            target.pop("phase", None)
+            target.pop("in_progress", None)
+            target.pop("active", None)
+        return normalized
+
+    def _todo_payload_controls(self, args: object, *, resume: bool = False) -> tuple[str, str, object]:
+        source = args if isinstance(args, dict) else {}
+        mode = ""
+        for key in ("update_mode", "mode", "operation", "update", "action"):
+            value = str(source.get(key, "") or "").strip()
+            if value:
+                mode = value
+                break
+        if not mode:
+            mode = "status_update"
+        reason = ""
+        for key in ("revision_reason", "reason", "change_reason", "why"):
+            value = str(source.get(key, "") or "").strip()
+            if value:
+                reason = value
+                break
+        evidence: object = []
+        for key in ("revision_evidence", "evidence", "evidence_refs", "proof", "references"):
+            if source.get(key) not in (None, ""):
+                evidence = source.get(key)
+                break
+        # Resume is deliberately status-only unless the caller explicitly asks
+        # for an audited structural revision.
+        if resume and not reason and not str(evidence or "").strip():
+            mode = "status_update"
+        return mode, reason, evidence
+
+    def _todo_resume_current_rows(self, role: str = "") -> list[dict]:
+        """Return the existing scoped rows for a payload-less resume call."""
+        bb = self._ensure_blackboard()
+        route_kind = self._todo_route_kind(role=role, board=bb)
+        rows = self._todo_route_rows(route_kind, role=role, board=bb)
+        # After compaction/load the blackboard mirror can be newer than the
+        # in-memory TodoManager. Restore from that canonical mirror instead of
+        # reporting that a payload-less resume has no items.
+        if not rows and route_kind in {"plan_single", "plan_sync"}:
+            step = self._get_active_plan_step(bb)
+            step_id = trim(str((step or {}).get("id", "") or ""), 40)
+            if step_id:
+                rows = self._active_plan_worker_todo_rows(step_id, role="")
+        if not rows and route_kind == "pure_single":
+            rows = [
+                dict(row)
+                for row in self.todo.snapshot()
+                if isinstance(row, dict) and self._todo_row_kind(row) in {"flat", "owner_worker"}
+            ]
+        return [dict(row) for row in rows if isinstance(row, dict)]
+
+    def _normalize_generic_todo_row(self, item: object, *, owner: str = "") -> dict:
+        """Normalize a non-plan todo row before owner/flat reconciliation."""
+        raw = {"content": item} if isinstance(item, str) else dict(item) if isinstance(item, dict) else {"content": str(item or "")}
+        content = str(
+            raw.get(
+                "content",
+                raw.get(
+                    "text",
+                    raw.get(
+                        "title",
+                        raw.get("task", raw.get("description", raw.get("label", raw.get("name", "")))),
+                    ),
+                ),
+            )
+            or ""
+        ).strip()
+        parsed_status, parsed_content = split_todo_status_text(content)
+        content = trim(normalize_work_text(parsed_content or content) or (parsed_content or content), 500)
+        if not content:
+            return {}
+        raw_status_value = raw.get("status", raw.get("state", raw.get("phase", "")))
+        if raw_status_value in (None, ""):
+            if any(_to_bool_like(raw.get(key, False), default=False) for key in ("completed", "complete", "done", "finished", "passed", "success")):
+                raw_status_value = "completed"
+            elif any(_to_bool_like(raw.get(key, False), default=False) for key in ("in_progress", "inprogress", "active", "working", "started")):
+                raw_status_value = "in_progress"
+        status = self._normalize_todo_status_value(raw_status_value, parsed_status or "pending")
+        raw_status_key = str(raw_status_value or "").strip().lower().replace("-", "_").replace(" ", "_")
+        if parsed_status and raw_status_key in {"", "todo", "pending"}:
+            status = parsed_status
+        if status == "blocked":
+            status = "pending"
+        row = {
+            "content": content,
+            "status": status,
+        }
+        role_key = self._sanitize_agent_role(raw.get("owner", "")) or self._sanitize_agent_role(owner)
+        if role_key in {"manager", "explorer", "developer", "reviewer"}:
+            row["owner"] = role_key
+        key = trim(str(raw.get("key", "") or "").strip(), 120)
+        if key:
+            row["key"] = key
+        for alias_key in (
+            "external_subtask_id", "externalSubtaskId", "external_id", "externalId",
+            "todo_id", "todoId", "task_id", "taskId", "item_id", "itemId",
+            "row_id", "rowId", "id",
+        ):
+            alias = trim(str(raw.get(alias_key, "") or "").strip(), 120)
+            if alias:
+                row["external_subtask_id"] = alias
+                break
+        for meta_key in (
+            "activeForm", "active_form", "subtask_id", "created_at", "updated_at", "started_at",
+            "completed_at", "completed_by", "evidence", "evidence_binding", "evidence_ids",
+        ):
+            if raw.get(meta_key) not in (None, ""):
+                row[meta_key] = raw.get(meta_key)
+        for source_key in ("proof", "evidence_ref", "evidence_refs"):
+            if not row.get("evidence") and raw.get(source_key) not in (None, ""):
+                row["evidence"] = raw.get(source_key)
+        return row
+
+    def _todo_write_rescue(self, args: dict, role: str = "") -> str:
+        """Compatibility wrapper over the canonical TodoWrite dispatcher."""
+        source = args if isinstance(args, dict) else {}
+        is_resume = _to_bool_like(
+            source.get("resume", source.get("continue", source.get("resume_existing", False))),
+            default=False,
+        )
+        forwarded = dict(source)
+        # Preserve the historical Rescue convenience: when no row/cursor is
+        # explicitly active, start the first pending row. The canonical cursor
+        # normalizer will leave an explicit in_progress row untouched.
+        if not is_resume and self._todo_payload_in_progress_index(forwarded) is None:
+            forwarded["in_progress_index"] = 0
+        return self._dispatch_todo_update(
+            forwarded,
+            role=role,
+            resume=is_resume,
+        )
+
+    def _dispatch_todo_update(self, args: dict, *, role: str = "", resume: bool = False) -> str:
+        """Canonical dispatcher shared by TodoWrite, Rescue, and Resume aliases."""
+        source = args if isinstance(args, dict) else {}
+        bb = self._ensure_blackboard()
+        active_step = self._get_active_plan_step(bb)
+        active_step_id = trim(str((active_step or {}).get("id", "") or ""), 40)
+        role_key = self._sanitize_agent_role(role) or self._current_plan_worker_owner(bb)
+        items = self._todo_payload_items(
+            source,
+            default_parent_step_id=active_step_id,
+            limit=40,
+        )
+        is_resume = resume or _to_bool_like(
+            source.get("resume", source.get("continue", source.get("resume_existing", False))),
+            default=False,
+        )
+        if not items and is_resume:
+            items = self._todo_resume_current_rows(role_key)
+        if not items:
+            raise ValueError("no valid todo item text; provide items/todos/subtasks/rows or content")
+        items = self._apply_todo_payload_in_progress_index(items, source)
+        # Apply the active role only when a payload did not explicitly identify a
+        # system row. Plan rows are scoped to the active parent by the merge path.
+        normalized_items: list[object] = []
+        for item in items:
+            if isinstance(item, dict):
+                row = dict(item)
+                if not str(row.get("key", "") or "").startswith("bb:"):
+                    row["owner"] = role_key
+                    if active_step_id and not str(row.get("parent_step_id", "") or "").strip():
+                        row["parent_step_id"] = active_step_id
+                normalized_items.append(row)
+            else:
+                normalized_items.append(item)
+        mode, reason, revision_evidence = self._todo_payload_controls(source, resume=is_resume)
+        route_kind = self._todo_route_kind(role=role_key, board=bb)
         if route_kind in {"plan_single", "plan_sync"}:
             return self._merge_plan_worker_todo_items(
-                clean_items,
-                role=owner_hint,
-                update_mode=str(args.get("update_mode", "status_update") or "status_update"),
-                revision_reason=str(args.get("revision_reason", "") or ""),
-                revision_evidence=args.get("revision_evidence", []),
+                normalized_items,
+                role=role_key,
+                update_mode=mode,
+                revision_reason=reason,
+                revision_evidence=revision_evidence,
             )
         if route_kind == "pure_sync":
-            return self._merge_owner_scoped_todo_items(clean_items, role=owner_hint)
-        return self.todo.update(clean_items)
+            return self._merge_owner_scoped_todo_items(normalized_items, role=role_key)
+        return self._merge_flat_todo_items(normalized_items, role=role_key)
 
     def _todo_progress_signature(self, rows: list[dict] | None = None) -> list[tuple[str, str, str, str]]:
         items = rows if isinstance(rows, list) else self.todo.snapshot()
@@ -53895,13 +59280,17 @@ body{padding:18px}
         before_rows: list[dict] | None = None,
         after_rows: list[dict] | None = None,
     ) -> tuple[str, str]:
+        tool_name = canonicalize_tool_name(tool_name)
         txt = str(output or "").strip()
         low = txt.lower()
         has_worker_rows = self._todo_runtime_has_worker_rows()
+        changed = self._todo_progress_changed(before_rows, after_rows) if before_rows is not None else False
         if not txt:
             return ("failed", "empty output")
         if txt.startswith("Error:"):
             return ("failed", txt[6:].strip() or "unknown error")
+        if changed:
+            return ("ok", "todo updated")
         if txt == self.todo.no_changes_text() or "no todo changes" in low:
             if has_worker_rows:
                 return ("ok", "todo already up to date")
@@ -54366,9 +59755,18 @@ body{padding:18px}
         try:
             bb = self._ensure_blackboard()
             recovery = dict(bb.get("failure_recovery", {}) if isinstance(bb.get("failure_recovery"), dict) else {})
+            focus = self._blackboard_focus_identity(bb)
+            if (
+                str(recovery.get("focus_id", "") or "") != str(focus.get("id", "") or "")
+                or abs(float(recovery.get("focus_epoch", 0.0) or 0.0) - float(focus.get("epoch", 0.0) or 0.0)) > 1e-6
+            ):
+                recovery = {}
             recovery["reason"] = note
             recovery["count"] = int(recovery.get("count", 0) or 0) + 1
             recovery["ts"] = float(now_ts())
+            recovery["focus_kind"] = trim(str(focus.get("kind", "") or ""), 40)
+            recovery["focus_id"] = trim(str(focus.get("id", "") or ""), 120)
+            recovery["focus_epoch"] = float(focus.get("epoch", 0.0) or 0.0)
             bb["failure_recovery"] = recovery
             self.blackboard = bb
             self._blackboard_touch()
@@ -54410,12 +59808,25 @@ body{padding:18px}
 
     def _extract_text_items_from_raw_args(self, raw: object) -> list[str]:
         if isinstance(raw, dict):
-            items = raw.get("items")
+            items = None
+            for key in ("items", "todos", "todo_items", "subtasks", "rows", "updates", "tasks"):
+                candidate = raw.get(key)
+                if isinstance(candidate, list) and candidate:
+                    items = candidate
+                    break
             if isinstance(items, list):
                 out = []
                 for item in items:
                     if isinstance(item, dict):
-                        text = str(item.get("content", item.get("text", item.get("title", "")))).strip()
+                        text = str(
+                            item.get(
+                                "content",
+                                item.get(
+                                    "text",
+                                    item.get("title", item.get("task", item.get("description", item.get("label", "")))),
+                                ),
+                            )
+                        ).strip()
                     else:
                         text = str(item).strip()
                     if text and text not in out:
@@ -54430,7 +59841,10 @@ body{padding:18px}
         for m in re.finditer(r'"([^"\\]*(?:\\.[^"\\]*)*)"', text):
             token = m.group(1)
             low = token.strip().lower()
-            if low in {"items", "content", "status", "activeform", "in_progress_index"}:
+            if low in {
+                "items", "todos", "todo_items", "subtasks", "rows", "updates", "content", "status",
+                "state", "activeform", "in_progress_index", "update_mode", "revision_reason",
+            }:
                 continue
             try:
                 token_decoded = bytes(token, "utf-8").decode("unicode_escape")
@@ -54450,7 +59864,10 @@ body{padding:18px}
             s = re.sub(r"^[\-\*\d\.\)\s]+", "", s).strip()
             if not s:
                 continue
-            if s.lower() in {"items", "content", "status", "activeform"}:
+            if s.lower() in {
+                "items", "todos", "todo_items", "subtasks", "rows", "updates", "content", "status",
+                "state", "activeform", "update_mode", "revision_reason",
+            }:
                 continue
             if s not in out:
                 out.append(s)
@@ -54881,13 +60298,18 @@ body{padding:18px}
 
     def _attempt_malformed_tool_repair(self, name: str, raw_args: object) -> tuple[bool, str]:
         # Safe auto-repair only for todo tools; file/code tools require regenerate.
-        if name not in {"TodoWrite", "TodoWriteRescue"}:
+        if canonicalize_tool_name(name) not in {"TodoWrite", "TodoWriteRescue"}:
             return False, ""
-        items = self._extract_text_items_from_raw_args(raw_args)
+        items = self._todo_payload_items(raw_args, limit=40) if isinstance(raw_args, dict) else []
+        if not items:
+            items = self._extract_text_items_from_raw_args(raw_args)
         if not items:
             return False, "no recoverable todo items from malformed arguments"
         try:
-            output = self._dispatch_tool("TodoWriteRescue", {"items": items, "in_progress_index": 0})
+            output = self._dispatch_tool(
+                "TodoWrite",
+                {"items": items, "in_progress_index": 0, "resume": True},
+            )
             return True, output
         except Exception as exc:
             return False, f"rescue failed: {exc}"
@@ -54904,6 +60326,15 @@ body{padding:18px}
                     required = []
         if not required:
             return []
+        # Todo providers use several equivalent payload keys.  Treat a
+        # recoverable alias as satisfying the schema's historical ``items``
+        # requirement; the canonical dispatcher will normalize it.
+        if canon in {"TodoWrite", "TodoWriteRescue"} and isinstance(args, dict):
+            if self._todo_payload_items(args, limit=40) or _to_bool_like(
+                args.get("resume", args.get("continue", args.get("resume_existing", False))),
+                default=False,
+            ):
+                return []
         if not isinstance(args, dict):
             return list(required)
         missing = []
@@ -54961,7 +60392,7 @@ body{padding:18px}
 
     def _tool_result_ok(self, name: str, output: object, meta: dict | None = None) -> bool:
         text = str(output or "")
-        if text.startswith("Error:"):
+        if text.startswith("Error:") or self._tool_control_feedback_outcome(name, text):
             return False
         tool = canonicalize_tool_name(name)
         info = meta if isinstance(meta, dict) else self._peek_tool_result_meta()
@@ -55006,7 +60437,8 @@ body{padding:18px}
         for key in ("duration_ms", "changed_files", "error"):
             if meta.get(key) not in (None, "", []):
                 item[key] = meta.get(key)
-        return item
+        item = self._annotate_negative_search_assertion(item)
+        return self._annotate_tool_control_feedback(item)
 
     @staticmethod
     def _tool_result_compact_output(output: object, *, max_chars: int = 3000) -> str:
@@ -55026,11 +60458,19 @@ body{padding:18px}
         """Top-level tool dispatcher with error isolation and per-tool timeout."""
         telemetry_started = time.monotonic()
         self._clear_tool_result_meta()
-        name = canonicalize_tool_name(name)
+        raw_name = str(name or "").strip()
+        # Canonicalize Resume aliases without discarding their implicit
+        # operation.  A payload-less TodoWriteResume must reconcile the current
+        # rows, while an ordinary TodoWrite call still requires an explicit
+        # payload.  Copy the dict so callers' tool-call arguments remain intact.
+        resume_alias = is_todo_resume_tool_name(raw_name)
+        name = canonicalize_tool_name(raw_name)
         if not name:
             return "Error: ValueError: tool name is required"
         if not isinstance(args, dict):
             return "Error: TypeError: tool arguments must be a JSON object"
+        if resume_alias and "resume" not in args and "continue" not in args and "resume_existing" not in args:
+            args = {**args, "resume": True}
         if name == "agent_web_search" and not bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED)):
             return "Error: agent_web_search is disabled by startup/config (--enable-web-search to enable)."
         role_key = self._sanitize_agent_role(agent_role)
@@ -55107,7 +60547,12 @@ body{padding:18px}
             callback = getattr(self, "telemetry_callback", None)
             if not callable(callback):
                 return
-            resolved = status or ("success" if self._tool_result_compat_ok(name, output) else "error")
+            if status:
+                resolved = status
+            elif self._tool_control_feedback_outcome(name, output):
+                resolved = "success"
+            else:
+                resolved = "success" if self._tool_result_compat_ok(name, output) else "error"
             callback(
                 "tool_call",
                 session_id=self.id,
@@ -55452,36 +60897,24 @@ body{padding:18px}
                 )
             return out
         if name == "TodoWrite":
-            bb = self._ensure_blackboard()
-            route_kind = self._todo_route_kind(role=str(role_key or ""), board=bb)
-            if route_kind in {"plan_single", "plan_sync"}:
-                items = args.get("items", [])
-                if isinstance(items, list):
-                    for item in items:
-                        if isinstance(item, dict) and not item.get("key", "").startswith("bb:"):
-                            item["owner"] = str(role_key or "developer")
-                result = self._merge_plan_worker_todo_items(
-                    items,
-                    role=str(role_key or "developer"),
-                    update_mode=str(args.get("update_mode", "status_update") or "status_update"),
-                    revision_reason=str(args.get("revision_reason", "") or ""),
-                    revision_evidence=args.get("revision_evidence", []),
-                )
-            elif route_kind == "pure_sync":
-                items = args.get("items", [])
-                if isinstance(items, list):
-                    for item in items:
-                        if isinstance(item, dict) and not item.get("key", "").startswith("bb:"):
-                            item["owner"] = str(role_key)
-                result = self._merge_owner_scoped_todo_items(items, role=str(role_key))
-            else:
-                result = self.todo.update(args["items"])
+            result = self._dispatch_todo_update(
+                args,
+                role=str(role_key or "developer"),
+                resume=_to_bool_like(
+                    args.get("resume", args.get("continue", args.get("resume_existing", False))),
+                    default=False,
+                ),
+            )
             # Step completion skill recheck: if any item just got marked completed, re-evaluate skills
             # This fires in ALL modes (single/sync/plan) when developer writes todos
             try:
-                new_items = args.get("items", [])
-                if isinstance(new_items, list) and any(
-                    isinstance(it, dict) and str(it.get("status", it.get("state", ""))).lower() in {"completed", "done", "finished", "finish"}
+                new_items = self._todo_payload_items(args, limit=40)
+                if any(
+                    isinstance(it, dict)
+                    and self._normalize_todo_status_value(
+                        it.get("status", it.get("state", "")),
+                        "pending",
+                    ) == "completed"
                     for it in new_items
                 ):
                     self._refresh_loaded_skills_for_execution_focus(trigger="step-completed")  # noqa: E501
@@ -55490,7 +60923,7 @@ body{padding:18px}
                 pass
             return result
         if name == "TodoWriteRescue":
-            result = self._todo_write_rescue(args)
+            result = self._todo_write_rescue(args, role=str(role_key or "developer"))
             # Also recheck skills on rescue write (likely a recovery situation)
             try:
                 pass  # Skills are loaded on-demand by the model via load_skill
@@ -55525,8 +60958,9 @@ body{padding:18px}
                 active_total = max(1, int(bb_finish.get("plan_step_total", 0) or len(plan_steps) or 1))
                 active_label = self._ui_text("plan_step_label", step=active_idx, total=active_total)
                 active_text = trim(str(active_step.get("content", "") or ""), 140)
-                return (
-                    f"Error: {name} is reserved for finishing the overall user task, not a subtask or a single plan step. "
+                return self._plan_control_feedback(
+                    "continue_current_plan_step",
+                    f"{name} is reserved for finishing the overall user task, not a subtask or a single plan step. "
                     f"The approved plan is still active at {active_label}: {active_text}. "
                     "Update TodoWrite/TodoWriteRescue for the current subtask and keep following the current plan step."
                 )
@@ -55537,15 +60971,17 @@ body{padding:18px}
                     lookback=24,
                     max_age_seconds=420.0,
                 ):
-                    return (
-                        "Error: reviewer finalization requires blackboard evidence read. "
+                    return self._plan_control_feedback(
+                        "read_finish_evidence",
+                        "Reviewer finalization requires blackboard evidence read. "
                         "Call read_from_blackboard with mode='summary' or mode='search' "
                         "(sections: code_artifacts, execution_logs, review_feedback, status), "
                         "then call finish_task with structured summary."
                     )
                 if not self._final_summary_sufficient(summary, strict=True):
-                    return (
-                        "Error: structured final summary is required before finish. "
+                    return self._plan_control_feedback(
+                        "complete_finish_summary",
+                        "Structured final summary is required before finish. "
                         "Provide finish_task.summary with: "
                         "(1) changes/files touched, "
                         "(2) validation evidence (tests/commands/results), "
@@ -56393,7 +61829,12 @@ body{padding:18px}
                 # IS the answer. Treat it as a continuation — preserve all task/plan/todo
                 # state, skip reclassification and blackboard reset (same posture as a
                 # plan-choice response), and let the loop resume with the answer woven in.
-                _ask_user_answer = self.pending_user_question is not None
+                _pending_user_question = (
+                    dict(self.pending_user_question)
+                    if isinstance(self.pending_user_question, dict)
+                    else None
+                )
+                _ask_user_answer = _pending_user_question is not None
                 bb_before_submit = self._ensure_blackboard()
                 _finished_boundary = bool(self._blackboard_is_finished_or_aborted(bb_before_submit))
                 _resumable_work_state = bool(self._has_resumable_work_state(bb_before_submit))
@@ -56403,7 +61844,7 @@ body{padding:18px}
                     else {}
                 )
                 # Preserve plan state if awaiting user choice or continuing an approved plan.
-                _awaiting_plan_choice = bool(
+                _awaiting_plan_choice = (not _ask_user_answer) and bool(
                     (
                         self.runtime_plan_proposal
                         and not self.runtime_plan_approved
@@ -56481,11 +61922,19 @@ body{padding:18px}
                 if _ask_user_answer:
                     # This message answers a pending ask_user question. Clear the pending
                     # question and resume without reclassification (preserve task posture).
+                    _recovery_answer = self._apply_plan_step_recovery_answer(
+                        clean_goal,
+                        question=_pending_user_question,
+                    )
                     self.pending_user_question = None
                     self._ask_user_pause_pending = False
                     self.runtime_reclassify_required = False
                     self._mark_runtime_goal_reset_handled(
-                        reason="ask-user-answer",
+                        reason=(
+                            "plan-step-recovery-answer"
+                            if bool(_recovery_answer.get("handled", False))
+                            else "ask-user-answer"
+                        ),
                         clear_reclassify=True,
                     )
                 elif _continue_existing_plan:
@@ -56760,10 +62209,10 @@ body{padding:18px}
         stop_due_to_finish = False
         stop_due_to_ask_user = False
         tool_results: list[dict] = []
-        plan_subtask_snapshot = self._current_plan_worker_subtask_snapshot(role=role_key)
         for tc in tool_calls:
             if self.cancel_requested:
                 return {"status": "interrupted", "role": role_key}
+            plan_subtask_snapshot = self._current_plan_worker_subtask_snapshot(role="")
             name = tc["function"]["name"]
             with self.lock:
                 self.current_phase = f"agent:{role_key}:tool:{name}"
@@ -56833,6 +62282,21 @@ body{padding:18px}
                 args if isinstance(args, dict) else {},
                 output,
             )
+            delegate = self._ensure_blackboard().get("last_delegate", {})
+            delegate = delegate if isinstance(delegate, dict) else {}
+            if (
+                str(delegate.get("plan_step_id", "") or "")
+                == str(plan_subtask_snapshot.get("step_id", "") or "")
+            ):
+                bound_subtask_id = trim(str(delegate.get("plan_subtask_id", "") or ""), 100)
+                bound_subtask_content = trim(str(delegate.get("plan_subtask_content", "") or ""), 500)
+                if bound_subtask_id:
+                    plan_subtask_snapshot = {
+                        **dict(plan_subtask_snapshot),
+                        "subtask_id": bound_subtask_id,
+                        "subtask_content": bound_subtask_content
+                        or str(plan_subtask_snapshot.get("subtask_content", "") or ""),
+                    }
             self._bind_tool_result_to_plan_subtask(item, plan_subtask_snapshot)
             is_finish_tool = name in {"finish_task", "finish_current_task", "mark_done"}
             # Atomic blackboard sync: update shared state immediately after each tool result.
@@ -57084,6 +62548,25 @@ body{padding:18px}
             active_id = str((active_step or {}).get("id", "") or "").strip() if isinstance(active_step, dict) else ""
             if active_id and active_id != bound_step:
                 return False
+        # In plan mode momentum is also bound to the canonical in-progress
+        # subtask.  A parent step can remain in_progress while its child moves
+        # from 1.1 to 1.2 (or to acceptance); reusing the old instruction in
+        # that situation sends the worker back to a completed child and is the
+        # main source of the sync-mode "stuck on first subtask" loop.
+        active_step = self._get_active_plan_step(bb)
+        if isinstance(active_step, dict):
+            bound_subtask = trim(str(route.get("plan_subtask_id", "") or ""), 100)
+            bound_content = self._plan_worker_content_core(route.get("plan_subtask_content", ""))
+            current_subtask = self._current_plan_worker_subtask_snapshot(
+                board=bb,
+                role="",
+            )
+            current_id = trim(str(current_subtask.get("subtask_id", "") or ""), 100)
+            current_content = self._plan_worker_content_core(current_subtask.get("subtask_content", ""))
+            if not bound_subtask or not current_id or bound_subtask != current_id:
+                return False
+            if bound_content and current_content and bound_content != current_content:
+                return False
         # Don't keep hammering a worker that has no remaining subtasks for the step.
         if not self._active_plan_step_has_worker_todos(target):
             return False
@@ -57178,6 +62661,13 @@ body{padding:18px}
                     pinned_selection=pinned_selection,
                     scope="multi-agent sync",
                 )
+            if self._try_advance_verified_current_plan_step(actor="manager"):
+                idle_counts = {agent_role: 0 for agent_role in AGENT_ROLES}
+                _momentum_route = None
+                _momentum_skips = 0
+                _prev_delegation_hash = ""
+                _repeat_delegation_count = 0
+                continue
             self._apply_auto_compact_if_needed("auto:multi-sync", role="manager")
             # Periodic checkpoint in multi-agent sync loop
             if rounds_used % CHECKPOINT_INTERVAL_ROUNDS == 0:
@@ -57231,6 +62721,27 @@ body{padding:18px}
                 # LLM call to re-decide the obvious continuation. Capped + revalidated.
                 _momentum_skips += 1
                 route = self._align_route_with_current_plan_step(dict(_momentum_route), self._ensure_blackboard())
+                # Refresh the instruction from the canonical child row.  The
+                # parent step may be unchanged while the active child has just
+                # advanced; validation above guarantees this is the same child
+                # that produced the momentum token.
+                _momentum_bb = self._ensure_blackboard()
+                _momentum_subtask = self._current_plan_worker_subtask_snapshot(
+                    board=_momentum_bb,
+                    role="",
+                )
+                _momentum_subtask_text = trim(
+                    str(_momentum_subtask.get("subtask_content", "") or ""),
+                    500,
+                )
+                if _momentum_subtask_text:
+                    route["instruction"] = trim(
+                        f"{route.get('instruction', '')}\n"
+                        "CURRENT CANONICAL SUBTASK (execute this one only):\n"
+                        f"{_momentum_subtask_text}\n"
+                        "Produce one concrete tool result for this subtask, then update its Todo status.",
+                        MANAGER_INSTRUCTION_MAX_CHARS,
+                    )
                 route["source"] = "manager-momentum"
                 self._emit(
                     "status",
@@ -57366,11 +62877,19 @@ body{padding:18px}
                 media_inputs_round=role_media_inputs,
             )
             self._blackboard_update_from_worker_step(role, step)
+            if self._consume_ask_user_pause():
+                self._enter_ask_user_paused_state(role)
+                self._emit("status", {"summary": "sync run paused at the current plan step awaiting user reply"})
+                break
             # Post-execution plan step advancement (replaces pre-execution advancement)
             plan_step_advanced = self._post_execution_plan_step_check(
                 route,
                 step if isinstance(step, dict) else {},
             )
+            if self._consume_ask_user_pause():
+                self._enter_ask_user_paused_state(role)
+                self._emit("status", {"summary": "sync step recovery requested; parent plan preserved"})
+                break
             # Fix 2: trim idle owners' contexts now that control left the worker, so
             # they don't overflow from accumulated broadcasts before their next turn.
             self._compact_idle_agent_contexts(active_role=role)
@@ -57423,7 +62942,11 @@ body{padding:18px}
             _step_dict = step if isinstance(step, dict) else {}
             _step_results = _step_dict.get("tool_results", []) or []
             _wrote = any(isinstance(r, dict) and r.get("ok") and str(r.get("name", "")) in ("write_file", "edit_file") for r in _step_results)
-            _did_todo = any(isinstance(r, dict) and str(r.get("name", "")) in {"TodoWrite", "TodoWriteRescue"} for r in _step_results)
+            _did_todo = any(
+                isinstance(r, dict)
+                and canonicalize_tool_name(r.get("name", "")) in {"TodoWrite", "TodoWriteRescue"}
+                for r in _step_results
+            )
             if _wrote and not _did_todo:
                 _bb_nudge = self._ensure_blackboard()
                 _cur_step = next(
@@ -57484,6 +63007,10 @@ body{padding:18px}
                 state_changed=bool(board_after_fp != board_before_fp),
                 pinned_selection=pinned_selection,
             )
+            if self._consume_ask_user_pause():
+                self._enter_ask_user_paused_state(role)
+                self._emit("status", {"summary": "sync watchdog paused only the current plan step"})
+                break
             status = str(step.get("status", "") or "")
             # Fix C: remember a productive route so the next round can continue the
             # same worker without a fresh manager LLM call. Productive = used tools,
@@ -57496,6 +63023,22 @@ body{padding:18px}
                 and self._active_plan_step_in_progress(board_after)
             ):
                 _mom_step = self._get_active_plan_step(board_after)
+                _mom_subtask = self._current_plan_worker_subtask_snapshot(
+                    board=board_after,
+                    role="",
+                )
+                _mom_subtask_id = trim(str(_mom_subtask.get("subtask_id", "") or ""), 100)
+                _mom_subtask_content = trim(
+                    str(_mom_subtask.get("subtask_content", "") or ""),
+                    500,
+                )
+                # Do not carry momentum when reconciliation has no current
+                # child (for example, the acceptance row is being activated).
+                # The manager must make a fresh phase-aware decision then.
+                if isinstance(_mom_step, dict) and not _mom_subtask_id:
+                    _momentum_route = None
+                    _momentum_skips = 0
+                    continue
                 _momentum_route = {
                     "target": role,
                     "instruction": instruction,
@@ -57505,6 +63048,8 @@ body{padding:18px}
                     # fresh manager turn so the next step is routed by phase (research->
                     # explorer, review->reviewer) instead of blindly following this owner.
                     "plan_step_id": str((_mom_step or {}).get("id", "") or "") if isinstance(_mom_step, dict) else "",
+                    "plan_subtask_id": _mom_subtask_id,
+                    "plan_subtask_content": _mom_subtask_content,
                 }
             else:
                 _momentum_route = None
@@ -58296,6 +63841,25 @@ body{padding:18px}
         last_fault_reason: str = "",
         pinned_selection: str = "",
     ) -> bool:
+        bb = self._ensure_blackboard()
+        active_step = self._get_active_plan_step(bb)
+        plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
+        if isinstance(active_step, dict) and (
+            bool(self.runtime_plan_approved)
+            or str(plan.get("phase", "") or "").strip().lower() == "executing"
+        ):
+            if self.stall_escalation_triggered:
+                recovery = bb.get("plan_step_recovery", {}) if isinstance(bb.get("plan_step_recovery"), dict) else {}
+                return bool(recovery.get("active", False) and self._plan_step_recovery_scope_matches(recovery, bb))
+            self.stall_escalation_triggered = True
+            self.stall_escalation_round = int(self.agent_round_index or 0)
+            self._ledger_record_stall(f"stall-escalation:{trigger_source}", "current-step-recovery")
+            return self._request_active_plan_step_recovery(
+                active_step,
+                reason=trim(str(last_fault_reason or trigger_source), 300),
+                gate={"reason": trim(str(last_fault_reason or trigger_source), 300)},
+                actor="manager",
+            )
         if self.stall_escalation_triggered:
             return False
         if self.runtime_plan_mode_needed or (
@@ -58321,6 +63885,20 @@ body{padding:18px}
         return True
 
     def _escalate_stall_single_mode(self, stall_context: dict, pinned_selection: str):
+        bb = self._ensure_blackboard()
+        active_step = self._get_active_plan_step(bb)
+        plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
+        if isinstance(active_step, dict) and (
+            bool(self.runtime_plan_approved)
+            or str(plan.get("phase", "") or "").strip().lower() == "executing"
+        ):
+            self._request_active_plan_step_recovery(
+                active_step,
+                reason=trim(str(stall_context.get("last_fault_reason", "") or "execution-stall"), 300),
+                gate={"reason": trim(str(stall_context.get("last_fault_reason", "") or "execution-stall"), 300)},
+                actor="manager",
+            )
+            return
         proposal = self._plan_mode_synthesize_stall_proposal(stall_context, pinned_selection)
         if not proposal or not proposal.get("options"):
             proposal = self._stall_programmatic_recovery_proposal(stall_context)
@@ -59679,6 +65257,9 @@ body{padding:18px}
 
     def _build_plan_todos_from_steps(self, raw_steps: list, *, limit: int = 40) -> list[dict]:
         grouped_steps = self._group_plan_steps(raw_steps if isinstance(raw_steps, list) else [])
+        bb = self._ensure_blackboard()
+        plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
+        plan_epoch = re.sub(r"[^a-zA-Z0-9_-]+", "", str(plan.get("epoch", "") or ""))[:16]
         plan_todos: list[dict] = []
         for i, step in enumerate(grouped_steps[:max(1, int(limit))]):
             step_text = trim(normalize_embedded_newlines(step).strip(), PLAN_STEP_FULL_CONTENT_MAX_CHARS)
@@ -59688,7 +65269,7 @@ body{padding:18px}
             step_header = trim(step_lines[0].strip(), 400)
             plan_todos.append(
                 {
-                    "id": f"pt:{i:03d}",
+                    "id": f"pt:{plan_epoch}:{i:03d}" if plan_epoch else f"pt:{i:03d}",
                     "content": step_header,
                     "full_content": step_text,
                     "status": "in_progress" if not plan_todos else "pending",
@@ -60755,6 +66336,24 @@ body{padding:18px}
         if not chosen:
             return
         bb = self._ensure_blackboard()
+        current_plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
+        current_phase = str(current_plan.get("phase", "") or "").strip().lower()
+        current_plan_rows = [
+            row
+            for row in (bb.get("project_todos", []) if isinstance(bb.get("project_todos"), list) else [])
+            if isinstance(row, dict) and str(row.get("category", "") or "") == "plan_step"
+        ]
+        if current_phase == "executing" and current_plan_rows:
+            self._emit(
+                "status",
+                {
+                    "summary": (
+                        "ignored global plan injection while an approved plan is executing; "
+                        "the current parent step and roadmap were preserved"
+                    )
+                },
+            )
+            return
         profile = bb.get("task_profile", {}) if isinstance(bb.get("task_profile"), dict) else {}
         judgement = bb.get("manager_judgement", {}) if isinstance(bb.get("manager_judgement"), dict) else {}
         grouped_steps = self._group_plan_steps(chosen.get("steps", []))
@@ -60791,8 +66390,15 @@ body{padding:18px}
             _current_level = 3
         _user_override = int(getattr(self, "user_task_level_override", 0) or 0)
         _target_level = self._plan_risk_target_task_level(_current_level, _plan_risk, _user_override)
+        plan_epoch = hashlib.sha1(
+            (
+                f"{float(bb.get('task_epoch', 0.0) or 0.0):.6f}|{choice_id}|"
+                f"{float(now_ts()):.6f}|{uuid.uuid4().hex}"
+            ).encode("utf-8", "ignore")
+        ).hexdigest()[:10]
         bb["plan"] = {
             "phase": "executing",
+            "epoch": plan_epoch,
             "chosen": choice_id,
             "title": chosen_title,
             "summary": chosen_summary,
@@ -61130,6 +66736,7 @@ body{padding:18px}
             force_single_tool_rounds = 0
             recovery_retry_rounds = 0
             tool_error_streaks: dict[str, int] = {}
+            recovery_progress_fp = self._active_plan_recovery_progress_fingerprint()
             with self.lock:
                 self.current_phase = "run-loop"
                 self.current_tool_name = ""
@@ -61215,6 +66822,14 @@ body{padding:18px}
                             self._seed_multi_agent_contexts_if_needed(self.runtime_reclassify_goal or "")
                             self._multi_agent_worker(pinned_selection=pinned_selection)
                             return
+                if self._try_advance_verified_current_plan_step(actor="single"):
+                    force_single_tool_rounds = 0
+                    recovery_retry_rounds = 0
+                    fault_counter = 0
+                    last_fault_reason = ""
+                    last_tool_fp = ""
+                    repeated_tool_rounds = 0
+                    continue
                 dq = self._normalize_decomposition_queue_state(
                     self._ensure_blackboard().get("decomposition_queue", {})
                 )
@@ -61269,9 +66884,29 @@ body{padding:18px}
                         )
                 self._clear_live_thinking()
                 self._clear_live_truncation()
+                bootstrap_waiting_for_turn = self._single_no_plan_todo_bootstrap_turn_active()
+                if (
+                    str(getattr(self, "single_no_plan_todo_bootstrap_state", "idle") or "idle").strip().lower()
+                    == "waiting"
+                    and not bootstrap_waiting_for_turn
+                ):
+                    self.single_no_plan_todo_bootstrap_state = "skipped"
+                    self._emit(
+                        "status",
+                        {"summary": "stale single/no-plan Todo bootstrap discarded; normal tools restored"},
+                    )
+                model_tools = (
+                    self._single_no_plan_todo_bootstrap_tools()
+                    if bootstrap_waiting_for_turn
+                    else (
+                        self._single_no_plan_todo_perception_tools()
+                        if self._single_no_plan_todo_initial_gate_active()
+                        else self._available_tools()
+                    )
+                )
                 response = self._chat_with_same_model_retry(
                     self.messages,
-                    tools=self._available_tools(),
+                    tools=model_tools,
                     system=self._system_prompt(),
                     max_tokens=self.max_output_tokens,
                     think=False,
@@ -61295,6 +66930,27 @@ body{padding:18px}
                     with self.lock:
                         thinking_text = str(self.live_thinking_text or "").strip()
                 tool_calls = response.get("tool_calls", [])
+                bootstrap_invalid_tool_call = False
+                if bootstrap_waiting_for_turn:
+                    raw_bootstrap_calls = tool_calls if isinstance(tool_calls, list) else []
+                    valid_bootstrap_calls = []
+                    invalid_bootstrap_calls = []
+                    for call in raw_bootstrap_calls:
+                        fn = call.get("function", {}) if isinstance(call, dict) else {}
+                        call_name = canonicalize_tool_name(fn.get("name", ""))
+                        if call_name in {"TodoWrite", "TodoWriteRescue"}:
+                            valid_bootstrap_calls.append(call)
+                        else:
+                            invalid_bootstrap_calls.append(call_name or "unknown-tool")
+                    if invalid_bootstrap_calls or len(valid_bootstrap_calls) != len(raw_bootstrap_calls):
+                        bootstrap_invalid_tool_call = True
+                        tool_calls = []
+                    else:
+                        # One planning call is enough; duplicate Todo calls in
+                        # the same response only create ambiguous status.
+                        tool_calls = valid_bootstrap_calls[:1]
+                    if not tool_calls and not str(text or "").strip() and not str(thinking_text or "").strip():
+                        text = "Todo bootstrap turn produced no TodoWrite action."
                 if force_single_tool_rounds > 0 and isinstance(tool_calls, list) and len(tool_calls) > 1:
                     original_count = len(tool_calls)
                     tool_calls = list(tool_calls[:1])
@@ -61351,6 +67007,12 @@ body{padding:18px}
                     if self._is_empty_action_turn(text, thinking_text, tool_calls):
                         raise EmptyActionError("assistant returned empty action after stripping thinking")
                 except EmptyActionError:
+                    if self._single_no_plan_todo_initial_gate_active() and self._start_single_no_plan_todo_bootstrap():
+                        self._emit(
+                            "status",
+                            {"summary": "L2 empty action replaced with mandatory Todo bootstrap"},
+                        )
+                        continue
                     consecutive_empty_action_rounds += 1
                     fault_counter += 1
                     last_fault_reason = "empty-action"
@@ -61423,7 +67085,40 @@ body{padding:18px}
                         self._maybe_auto_rename_session_title("task-progress")
                     except Exception:
                         pass
+                if bootstrap_waiting_for_turn and not tool_calls:
+                    bootstrap_reason = (
+                        "model emitted a non-Todo tool call"
+                        if bootstrap_invalid_tool_call
+                        else "model did not call TodoWrite/TodoWriteRescue"
+                    )
+                    bootstrap_failure_state = self._single_no_plan_todo_bootstrap_failure(bootstrap_reason)
+                    if bootstrap_failure_state == "blocked":
+                        self._emit(
+                            "status",
+                            {"summary": "run paused: mandatory L2 Todo list could not be established"},
+                        )
+                        break
+                    # Whether the bounded bootstrap retries or is skipped, the
+                    # next iteration is a normal model turn (with the state
+                    # deciding which tool set is visible).
+                    try:
+                        self._persist()
+                    except Exception:
+                        pass
+                    continue
                 if not tool_calls:
+                    if self._single_no_plan_todo_initial_gate_active():
+                        # A level-2 run may not silently finish an orientation
+                        # turn without establishing its mandatory Todo graph.
+                        # Start the bounded writer-only turn now; it is still
+                        # finite and can fall back to the normal recovery path
+                        # after the existing retry limit.
+                        if self._start_single_no_plan_todo_bootstrap():
+                            self._emit(
+                                "status",
+                                {"summary": "L2 produced no observation tool; Todo bootstrap required before execution"},
+                            )
+                            continue
                     with self.lock:
                         self.current_phase = "no-tools"
                         self.current_tool_name = ""
@@ -61981,7 +67676,12 @@ body{padding:18px}
                 hard_break_reason = ""
                 interrupted_in_tools = False
                 single_round_tool_results: list[dict] = []
-                plan_subtask_snapshot = self._current_plan_worker_subtask_snapshot(role=single_role)
+                single_round_has_perception = False
+                single_round_has_mutation = False
+                single_round_has_todo = False
+                bootstrap_todo_success = False
+                bootstrap_todo_failure_reason = ""
+                bootstrap_started = False
                 single_watchdog_before_fp = self._watchdog_state_fingerprint(self._ensure_blackboard())
                 round_tool_fp = self._tool_calls_fingerprint(tool_calls)
                 for tc in tool_calls:
@@ -61989,12 +67689,17 @@ body{padding:18px}
                         interrupted_in_tools = True
                         self._emit("status", {"summary": "run interrupted"})
                         break
+                    plan_subtask_snapshot = self._current_plan_worker_subtask_snapshot(role="")
                     name = tc["function"]["name"]
                     with self.lock:
                         self.current_phase = f"tool:{name}"
                         self.current_tool_name = name
                     round_tool_names.append(name)
-                    todo_rows_before = self.todo.snapshot() if name in {"TodoWrite", "TodoWriteRescue"} else None
+                    todo_rows_before = (
+                        self.todo.snapshot()
+                        if canonicalize_tool_name(name) in {"TodoWrite", "TodoWriteRescue"}
+                        else None
+                    )
                     args = tc["function"]["arguments"]
                     args_error = str(tc.get("args_error", "") or "").strip()
                     raw_args = tc.get("raw_arguments")
@@ -62142,6 +67847,22 @@ body{padding:18px}
                                             f"missing args persisted: {', '.join(missing)}",
                                         )
                                         retry_requested_this_round = True
+                    if not skip_dispatch and self._single_no_plan_todo_mutation_blocked(name, args):
+                        # Defend against providers that emit a stale/hallucinated
+                        # mutation call even though the L2 perception tool bundle
+                        # hides mutation-capable tools.  Do not execute it; move
+                        # directly into the existing bounded Todo bootstrap.
+                        if self._start_single_no_plan_todo_bootstrap():
+                            output = (
+                                "Error: this is an L2 run; mutation was withheld until "
+                                "TodoWrite/TodoWriteRescue creates the required Todo list."
+                            )
+                            skip_dispatch = True
+                            bootstrap_started = True
+                            self._emit(
+                                "status",
+                                {"summary": f"L2 Todo gate withheld mutation tool: {name}"},
+                            )
                     if not skip_dispatch:
                         try:
                             output = self._dispatch_tool(name, args)
@@ -62162,26 +67883,84 @@ body{padding:18px}
                         output,
                         dispatched_name=dispatched_name,
                     )
+                    result_canonical_name = canonicalize_tool_name(
+                        dispatched_name or name
+                    )
+                    if self._single_no_plan_todo_is_perception_result(result_item):
+                        single_round_has_perception = True
+                    if self._single_no_plan_todo_is_mutation_result(result_item):
+                        single_round_has_mutation = True
+                        self.single_no_plan_todo_bootstrap_write_seen = True
+                    if result_canonical_name in {"TodoWrite", "TodoWriteRescue"}:
+                        single_round_has_todo = True
+                    delegate = self._ensure_blackboard().get("last_delegate", {})
+                    delegate = delegate if isinstance(delegate, dict) else {}
+                    if (
+                        str(delegate.get("plan_step_id", "") or "")
+                        == str(plan_subtask_snapshot.get("step_id", "") or "")
+                    ):
+                        bound_subtask_id = trim(str(delegate.get("plan_subtask_id", "") or ""), 100)
+                        bound_subtask_content = trim(str(delegate.get("plan_subtask_content", "") or ""), 500)
+                        if bound_subtask_id:
+                            plan_subtask_snapshot = {
+                                **dict(plan_subtask_snapshot),
+                                "subtask_id": bound_subtask_id,
+                                "subtask_content": bound_subtask_content
+                                or str(plan_subtask_snapshot.get("subtask_content", "") or ""),
+                            }
                     self._bind_tool_result_to_plan_subtask(result_item, plan_subtask_snapshot)
                     tool_key = str(dispatched_name or name).strip() or str(name or "").strip() or "unknown-tool"
-                    if not result_item["ok"]:
+                    is_control_feedback = self._tool_result_is_control_feedback(result_item)
+                    if not result_item["ok"] and not is_control_feedback:
                         round_error_count += 1
                         tool_error_streaks[tool_key] = int(tool_error_streaks.get(tool_key, 0) or 0) + 1
+                    elif is_control_feedback:
+                        tool_error_streaks[tool_key] = 0
+                        self._emit(
+                            "status",
+                            {
+                                "summary": (
+                                    f"plan control feedback handled ({result_item.get('control_outcome', 'continue')}); "
+                                    "current parent step preserved"
+                                )
+                            },
+                        )
                     else:
                         round_ok_count += 1
                         self._clear_tool_retry_count(name)
                         tool_error_streaks[tool_key] = 0
                         recovery_retry_rounds = 0
-                    if dispatched_name in {"TodoWrite", "TodoWriteRescue"}:
+                    dispatched_todo_name = canonicalize_tool_name(dispatched_name or name)
+                    if dispatched_todo_name in {"TodoWrite", "TodoWriteRescue"}:
                         todo_attempted = True
                         todo_rows_after = self.todo.snapshot()
                         state, reason = self._analyze_todo_result(
-                            dispatched_name,
+                            dispatched_todo_name,
                             output,
                             before_rows=todo_rows_before,
                             after_rows=todo_rows_after,
                         )
-                        if state == "ok":
+                        if bootstrap_waiting_for_turn:
+                            if state == "ok" and self._single_no_plan_todo_has_rows():
+                                bootstrap_todo_success = True
+                            else:
+                                bootstrap_todo_failure_reason = trim(
+                                    str(reason or "TodoWrite did not create a usable list"),
+                                    260,
+                                )
+                        if is_control_feedback:
+                            self.todo_write_issue_count = 0
+                            self.todo_last_issue = ""
+                            self._emit(
+                                "status",
+                                {
+                                    "summary": (
+                                        "todo control gate preserved canonical current-step subtasks; "
+                                        "continue the existing in_progress item"
+                                    )
+                                },
+                            )
+                        elif state == "ok":
                             used_todo = True
                             self.todo_write_issue_count = 0
                             self.todo_last_issue = ""
@@ -62245,6 +68024,10 @@ body{padding:18px}
                         self._blackboard_update_from_tool_result("developer", result_item)
                     except Exception:
                         pass
+                    if bootstrap_started:
+                        # Discard the rest of a multi-call mutation batch.  The
+                        # next model turn is restricted to the Todo writers.
+                        break
                     # Failure ledger: record tool call and detect errors (single-agent, unified)
                     if not is_finish_tool:
                         self._ledger_record_tool_call(name, args if isinstance(args, dict) else {})
@@ -62325,6 +68108,40 @@ body{padding:18px}
                     self.current_phase = "post-tools"
                 if interrupted_in_tools:
                     break
+                if bootstrap_waiting_for_turn:
+                    if bootstrap_todo_success:
+                        self._single_no_plan_todo_bootstrap_succeeded()
+                    else:
+                        bootstrap_failure_state = self._single_no_plan_todo_bootstrap_failure(
+                            bootstrap_todo_failure_reason
+                            or "TodoWrite did not create a usable Todo list"
+                        )
+                        if bootstrap_failure_state == "blocked":
+                            self._emit(
+                                "status",
+                                {"summary": "run paused: mandatory L2 Todo list could not be established"},
+                            )
+                            break
+                    try:
+                        self._persist()
+                    except Exception:
+                        pass
+                    continue
+                if (
+                    single_round_has_perception
+                    and not single_round_has_mutation
+                    and not single_round_has_todo
+                    and not interrupted_in_tools
+                    and not stop_due_to_ask_user_single
+                    and not stop_due_to_finish_task
+                    and not stop_due_to_hard_break
+                    and self._single_no_plan_todo_bootstrap_allowed()
+                ):
+                    bootstrap_started = self._start_single_no_plan_todo_bootstrap()
+                if bootstrap_started:
+                    # Do not let ordinary no-tool/plan recovery reinterpret the
+                    # perception round; the next model call is the planning turn.
+                    continue
                 single_watchdog_after_board = self._ensure_blackboard()
                 single_watchdog_after_fp = self._watchdog_state_fingerprint(single_watchdog_after_board)
                 self._watchdog_process_worker_step(
@@ -62337,11 +68154,19 @@ body{padding:18px}
                     state_changed=bool(single_watchdog_after_fp != single_watchdog_before_fp),
                     pinned_selection=pinned_selection,
                 )
+                if self._consume_ask_user_pause():
+                    self._enter_ask_user_paused_state(single_role)
+                    self._emit("status", {"summary": "single run paused only at the current plan step"})
+                    break
                 # Single-agent plan step tracking: sync todos and auto-advance.
                 # A real step transition is a hard execution boundary: retry and
                 # convergence state from the completed step must not constrain the
                 # freshly activated subplan.
                 plan_step_advanced = self._single_agent_plan_step_check(single_round_tool_results)
+                if self._consume_ask_user_pause():
+                    self._enter_ask_user_paused_state(single_role)
+                    self._emit("status", {"summary": "single step recovery requested; parent plan preserved"})
+                    break
                 if plan_step_advanced:
                     force_single_tool_rounds = 0
                     retry_requested_this_round = False
@@ -62557,6 +68382,10 @@ body{padding:18px}
                     recovery_retry_rounds = 0
                     fault_counter = 0
                     last_fault_reason = ""
+                    recovery_progress_fp = (
+                        self._active_plan_recovery_progress_fingerprint()
+                        or recovery_progress_fp
+                    )
                     self._decay_stall_severity(STALL_SEVERITY_DECAY_ON_SUCCESS)
                 if fault_counter >= int(FUSED_FAULT_BREAK_THRESHOLD):
                     _stall_sev = self._bump_stall_severity("fault-threshold", STALL_SEVERITY_WEIGHT_FAULT)
@@ -62585,31 +68414,67 @@ body{padding:18px}
                             },
                         )
                 if recovery_retry_rounds >= HARD_BREAK_RECOVERY_ROUND_THRESHOLD:
-                    _stall_sev = self._bump_stall_severity("recovery-retry-exhausted", STALL_SEVERITY_WEIGHT_RECOVERY_RETRY)
-                    if _stall_sev >= STALL_SEVERITY_ESCALATION_THRESHOLD:
-                        if self._escalate_stall_to_plan_mode(
-                            "recovery-retry-exhausted", fault_counter=fault_counter,
-                            last_fault_reason=last_fault_reason, pinned_selection=pinned_selection,
-                        ):
-                            stop_due_to_hard_break = True
-                            hard_break_reason = "stall escalated to plan mode (recovery-retry-exhausted)"
-                            retry_requested_this_round = False
-                    if not self.stall_escalation_triggered:
-                        stop_due_to_hard_break = True
-                        hard_break_reason = (
-                            "recovery instructions repeated without progress "
-                            f"({recovery_retry_rounds} rounds)"
+                    active_step = self._get_active_plan_step(self._ensure_blackboard())
+                    if isinstance(active_step, dict):
+                        current_progress_fp = self._active_plan_recovery_progress_fingerprint()
+                        progress_changed = bool(
+                            current_progress_fp
+                            and recovery_progress_fp
+                            and current_progress_fp != recovery_progress_fp
                         )
+                        recovery_progress_fp = current_progress_fp or recovery_progress_fp
+                        self._prune_runtime_retry_hints()
+                        activation = self._activate_plan_step_execution(
+                            active_step,
+                            board=self._ensure_blackboard(),
+                            owner=self._current_plan_worker_owner(),
+                            reason="recovery-window-renewed",
+                            sync_todos=True,
+                        )
+                        recovery_retry_rounds = 0
                         retry_requested_this_round = False
+                        force_single_tool_rounds = 0
+                        repeated_tool_rounds = 0
+                        last_tool_fp = ""
                         self._emit(
                             "status",
                             {
                                 "summary": (
-                                    "hard-break triggered: "
-                                    f"{hard_break_reason}; execution paused for manual intervention"
+                                    "recovery window renewed for current plan step; "
+                                    f"parent={active_step.get('id', '')}, progress_changed={str(progress_changed).lower()}, "
+                                    f"subplan_available={str(bool(activation.get('available', False))).lower()}"
                                 )
                             },
                         )
+                    else:
+                        _stall_sev = self._bump_stall_severity(
+                            "recovery-retry-exhausted",
+                            STALL_SEVERITY_WEIGHT_RECOVERY_RETRY,
+                        )
+                        if _stall_sev >= STALL_SEVERITY_ESCALATION_THRESHOLD:
+                            if self._escalate_stall_to_plan_mode(
+                                "recovery-retry-exhausted", fault_counter=fault_counter,
+                                last_fault_reason=last_fault_reason, pinned_selection=pinned_selection,
+                            ):
+                                stop_due_to_hard_break = True
+                                hard_break_reason = "stall escalated to plan mode (recovery-retry-exhausted)"
+                                retry_requested_this_round = False
+                        if not self.stall_escalation_triggered:
+                            stop_due_to_hard_break = True
+                            hard_break_reason = (
+                                "recovery instructions repeated without progress "
+                                f"({recovery_retry_rounds} rounds)"
+                            )
+                            retry_requested_this_round = False
+                            self._emit(
+                                "status",
+                                {
+                                    "summary": (
+                                        "hard-break triggered: "
+                                        f"{hard_break_reason}; execution paused for manual intervention"
+                                    )
+                                },
+                            )
                 if used_todo:
                     self.rounds_without_todo = 0
                     self.todo_reminder_count = 0
@@ -62852,6 +68717,113 @@ body{padding:18px}
                             )
                         },
                     )
+
+    def _ui_todo_task_scope_snapshot(self, board: dict | None = None) -> tuple[list[dict], list[dict], dict]:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        raw_todos = self.todo.snapshot()
+        raw_tasks = self.tasks.list_objects()
+        plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
+        plan_phase = str(plan.get("phase", "") or "").strip().lower()
+        plan_rows = [
+            dict(row)
+            for row in (bb.get("project_todos", []) if isinstance(bb.get("project_todos"), list) else [])
+            if isinstance(row, dict) and str(row.get("category", "") or "") == "plan_step"
+        ]
+        plan_scope_active = bool(
+            plan_phase in {"research", "synthesis", "awaiting_choice", "executing"}
+            or self.runtime_plan_mode_needed
+            or self.runtime_plan_proposal
+            or self.runtime_plan_approved
+        )
+        if not plan_scope_active:
+            return raw_todos, raw_tasks, {"kind": "default"}
+
+        execution_scope = bool(
+            plan_phase == "executing"
+            or (
+                not plan_phase
+                and self.runtime_plan_approved
+                and plan_rows
+            )
+        )
+        if not execution_scope or not plan_rows:
+            return [], [], {
+                "kind": "plan",
+                "phase": plan_phase or "planning",
+                "task_epoch": float(bb.get("task_epoch", 0.0) or 0.0),
+                "plan_epoch": trim(str(plan.get("epoch", "") or ""), 40),
+                "parent_step_id": "",
+                "parent_step_content": "",
+            }
+
+        plan_rows.sort(key=lambda row: int(row.get("plan_step_index", 0) or 0))
+        existing_plan_rows = {
+            str(row.get("key", "") or ""): row
+            for row in raw_todos
+            if isinstance(row, dict) and str(row.get("key", "") or "").startswith("bb:proj:")
+        }
+        roadmap_rows: list[dict] = []
+        for row in plan_rows:
+            step_id = trim(str(row.get("id", "") or ""), 40)
+            if not step_id:
+                continue
+            status = self._normalize_todo_status_value(row.get("status", ""), "pending")
+            content = trim(str(row.get("content", "") or row.get("full_content", "") or ""), 400)
+            key = f"bb:proj:{step_id}"
+            existing = existing_plan_rows.get(key, {})
+            active_form = str(existing.get("activeForm", "") or "").strip()
+            if not active_form:
+                active_form = self.todo._default_active_form(status, content)
+            roadmap_rows.append(
+                {
+                    "key": key,
+                    "content": content,
+                    "status": status,
+                    "activeForm": active_form,
+                    "plan_step_id": step_id,
+                    "plan_step_index": int(row.get("plan_step_index", len(roadmap_rows)) or 0),
+                    "activated_at": row.get("activated_at"),
+                    "completed_at": row.get("completed_at"),
+                    "evidence": row.get("evidence", ""),
+                }
+            )
+
+        active_step = next(
+            (row for row in plan_rows if str(row.get("status", "") or "").strip().lower() == "in_progress"),
+            None,
+        )
+        active_step_id = trim(str((active_step or {}).get("id", "") or ""), 40)
+        subtask_rows: list[dict] = []
+        if active_step_id:
+            for index, row in enumerate(self._active_plan_worker_todo_rows(active_step_id, role="")):
+                status = self._normalize_todo_status_value(row.get("status", ""), "pending")
+                content = trim(str(row.get("content", "") or ""), 500)
+                subtask_rows.append(
+                    {
+                        "id": index + 1,
+                        "subject": content,
+                        "description": trim(str(row.get("activeForm", "") or ""), 500),
+                        "status": status,
+                        "owner": self._sanitize_agent_role(row.get("owner", "")) or None,
+                        "blockedBy": [],
+                        "blocks": [],
+                        "created_at": row.get("created_at"),
+                        "updated_at": row.get("updated_at"),
+                        "completed_at": row.get("completed_at"),
+                        "evidence": row.get("evidence", ""),
+                        "parent_step_id": active_step_id,
+                        "subtask_id": self._stable_plan_worker_subtask_id(active_step_id, row),
+                    }
+                )
+        scope = {
+            "kind": "plan_step",
+            "phase": plan_phase or "executing",
+            "task_epoch": float(bb.get("task_epoch", 0.0) or 0.0),
+            "plan_epoch": trim(str(plan.get("epoch", "") or ""), 40),
+            "parent_step_id": active_step_id,
+            "parent_step_content": trim(str((active_step or {}).get("content", "") or ""), 400),
+        }
+        return roadmap_rows, subtask_rows, scope
 
     def snapshot(self, include_model_catalog: bool = False, lite: bool = False) -> dict:
         with self.lock:
@@ -63205,6 +69177,7 @@ body{padding:18px}
             agent_contexts_view = self._agent_context_budget_metrics_snapshot()
             model_catalog = self.model_catalog() if include_model_catalog else None
             blackboard = self._normalize_blackboard(self.blackboard)
+            todo_view, task_view, todo_task_scope = self._ui_todo_task_scope_snapshot(blackboard)
             if (
                 not bool(self.running)
                 and str(blackboard.get("status", "") or "").strip().upper() == "PLANNING"
@@ -63356,8 +69329,9 @@ body{padding:18px}
                 "messages": visible_messages,
                 "conversation_feed": conversation_feed[-conversation_window:],
                 "uploads": upload_view,
-                "todos": self.todo.snapshot(),
-                "tasks": self.tasks.list_objects(),
+                "todos": todo_view,
+                "tasks": task_view,
+                "todo_task_scope": todo_task_scope,
                 "background": self.bg.list_objects(),
                 "teammates": list(self.teammates.values()),
                 "activity": self.activity[-activity_window:],
@@ -63670,6 +69644,7 @@ class SessionManager:
         max_run_seconds: int = MAX_RUN_SECONDS,
         shell_command_timeout_seconds: int = DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
         auto_task_level_ceiling: int = DEFAULT_AUTO_TASK_LEVEL_CEILING,
+        l2_todo_policy: str | None = None,
         auto_model_switch: bool = False,
         arbiter_enabled: bool = True,
         arbiter_model: str = "",
@@ -63729,6 +69704,10 @@ class SessionManager:
             fallback=DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
         )
         self.auto_task_level_ceiling = normalize_auto_task_level_ceiling(auto_task_level_ceiling)
+        cfg_l2_todo_policy = extract_l2_todo_policy_setting(self.default_llm_config)
+        self.l2_todo_policy = normalize_l2_todo_policy(
+            l2_todo_policy if l2_todo_policy is not None else (cfg_l2_todo_policy or DEFAULT_L2_TODO_POLICY)
+        )
         self.auto_model_switch = bool(auto_model_switch)
         self.arbiter_enabled = bool(arbiter_enabled)
         self.arbiter_model = str(arbiter_model or "").strip()
@@ -63742,6 +69721,11 @@ class SessionManager:
         self.user_memory_setting_locked = bool(user_memory_setting_locked)
         self.telemetry_callback = None
         self.single_advance_prompt_enhance = False
+        cfg_single_todo_enabled, cfg_single_todo_prompt = extract_single_no_plan_todo_settings(
+            self.default_llm_config
+        )
+        self.single_no_plan_todo_enabled = bool(cfg_single_todo_enabled)
+        self.single_no_plan_todo_prompt = str(cfg_single_todo_prompt or "").strip()
         self.read_context_policy = DEFAULT_READ_CONTEXT_POLICY
         self.tool_memory_policy = DEFAULT_TOOL_MEMORY_POLICY
         self.upload_callback = upload_callback
@@ -63881,6 +69865,16 @@ class SessionManager:
             "auto_task_level_ceiling": normalize_auto_task_level_ceiling(
                 getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
             ),
+            "l2_todo_policy": normalize_l2_todo_policy(
+                getattr(self, "l2_todo_policy", DEFAULT_L2_TODO_POLICY)
+            ),
+            "single_no_plan_todo_enabled": bool(
+                getattr(self, "single_no_plan_todo_enabled", False)
+            ),
+            "single_no_plan_todo_prompt": trim(
+                str(getattr(self, "single_no_plan_todo_prompt", "") or ""),
+                6000,
+            ),
             "web_search_enabled": bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED)),
             "user_memory_mode": normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE)),
             "global_llm_config_revision": str(getattr(self, "global_llm_config_revision", "") or ""),
@@ -63950,6 +69944,13 @@ class SessionManager:
                 if raw_auto_task_level_ceiling is not None
                 else getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
             )
+            cfg_l2_todo_policy = extract_l2_todo_policy_setting(raw)
+            if cfg_l2_todo_policy is not None:
+                self.l2_todo_policy = normalize_l2_todo_policy(cfg_l2_todo_policy)
+            if _single_no_plan_todo_setting_present(raw):
+                _single_todo_enabled, _single_todo_prompt = extract_single_no_plan_todo_settings(raw)
+                self.single_no_plan_todo_enabled = bool(_single_todo_enabled)
+                self.single_no_plan_todo_prompt = str(_single_todo_prompt or "").strip()
             if not bool(getattr(self, "web_search_setting_locked", False)) and "web_search_enabled" in raw:
                 self.web_search_enabled = _to_bool_like(
                     raw.get("web_search_enabled"),
@@ -64064,6 +70065,12 @@ class SessionManager:
         )
         sess.execution_mode = normalize_execution_mode(self.execution_mode, default=EXECUTION_MODE_SYNC)
         sess.single_advance_prompt_enhance = bool(self.single_advance_prompt_enhance)
+        sess.single_no_plan_todo_enabled = bool(
+            getattr(self, "single_no_plan_todo_enabled", False)
+        )
+        sess.single_no_plan_todo_prompt = str(
+            getattr(self, "single_no_plan_todo_prompt", "") or ""
+        ).strip()[:6000]
         sess.read_context_policy = normalize_read_context_policy(
             getattr(self, "read_context_policy", DEFAULT_READ_CONTEXT_POLICY)
         )
@@ -64072,6 +70079,9 @@ class SessionManager:
         )
         sess.auto_task_level_ceiling = normalize_auto_task_level_ceiling(
             getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
+        )
+        sess.l2_todo_policy = normalize_l2_todo_policy(
+            getattr(self, "l2_todo_policy", DEFAULT_L2_TODO_POLICY)
         )
         sess.web_search_enabled = bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED))
         sess.user_memory_mode = normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
@@ -64106,6 +70116,13 @@ class SessionManager:
         self._sync_ollama_defaults(active_profile)
         self.thinking = False
         self.user_language = normalize_ui_language(getattr(sess, "ui_language", self.user_language))
+        self.single_no_plan_todo_enabled = bool(
+            getattr(sess, "single_no_plan_todo_enabled", getattr(self, "single_no_plan_todo_enabled", False))
+        )
+        self.single_no_plan_todo_prompt = str(
+            getattr(sess, "single_no_plan_todo_prompt", getattr(self, "single_no_plan_todo_prompt", ""))
+            or ""
+        ).strip()[:6000]
         self.read_context_policy = normalize_read_context_policy(
             getattr(sess, "read_context_policy", getattr(self, "read_context_policy", DEFAULT_READ_CONTEXT_POLICY))
         )
@@ -64122,6 +70139,9 @@ class SessionManager:
                 "auto_task_level_ceiling",
                 getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING),
             )
+        )
+        self.l2_todo_policy = normalize_l2_todo_policy(
+            getattr(sess, "l2_todo_policy", getattr(self, "l2_todo_policy", DEFAULT_L2_TODO_POLICY))
         )
         if bool(getattr(self, "web_search_setting_locked", False)):
             set_web_search_enabled_on_runtime(sess, self.web_search_enabled, persist=True)
@@ -64260,6 +70280,7 @@ class SessionManager:
                 max_run_seconds=self.max_run_seconds,
                 shell_command_timeout_seconds=self.shell_command_timeout_seconds,
                 auto_task_level_ceiling=self.auto_task_level_ceiling,
+                l2_todo_policy=self.l2_todo_policy,
                 auto_model_switch=self.auto_model_switch,
                 arbiter_enabled=self.arbiter_enabled,
                 arbiter_model=self.arbiter_model,
@@ -64367,6 +70388,7 @@ class SessionManager:
                 max_run_seconds=self.max_run_seconds,
                 shell_command_timeout_seconds=self.shell_command_timeout_seconds,
                 auto_task_level_ceiling=self.auto_task_level_ceiling,
+                l2_todo_policy=self.l2_todo_policy,
                 auto_model_switch=self.auto_model_switch,
                 arbiter_enabled=self.arbiter_enabled,
                 arbiter_model=self.arbiter_model,
@@ -64772,6 +70794,10 @@ class SessionManager:
             active_profile = self._active_profile()
             self._sync_ollama_defaults(active_profile)
             self.thinking = False
+            if _single_no_plan_todo_setting_present(cfg):
+                _single_todo_enabled, _single_todo_prompt = extract_single_no_plan_todo_settings(cfg)
+                self.single_no_plan_todo_enabled = bool(_single_todo_enabled)
+                self.single_no_plan_todo_prompt = str(_single_todo_prompt or "").strip()
             cfg_read_context_policy = extract_read_context_policy_setting(cfg)
             if cfg_read_context_policy:
                 self.read_context_policy = cfg_read_context_policy
@@ -64781,6 +70807,9 @@ class SessionManager:
             cfg_auto_task_level_ceiling = extract_auto_task_level_ceiling_setting(cfg)
             if cfg_auto_task_level_ceiling is not None:
                 self.auto_task_level_ceiling = normalize_auto_task_level_ceiling(cfg_auto_task_level_ceiling)
+            cfg_l2_todo_policy = extract_l2_todo_policy_setting(cfg)
+            if cfg_l2_todo_policy is not None:
+                self.l2_todo_policy = normalize_l2_todo_policy(cfg_l2_todo_policy)
             cfg_web_search_enabled = extract_web_search_enabled_setting(cfg)
             if cfg_web_search_enabled is not None and not bool(getattr(self, "web_search_setting_locked", False)):
                 self.web_search_enabled = bool(cfg_web_search_enabled)
@@ -65592,8 +71621,9 @@ h3{font-size:.96rem;margin:10px 0 6px}
 .todo-list,.task-list{display:flex;flex-direction:column;gap:8px;min-width:0}
 .todo-layer{display:flex;flex-direction:column;gap:7px;min-width:0}
 .todo-layer+.todo-layer{margin-top:13px;padding-top:11px;border-top:1px solid #dfe8f3}
-.todo-parent-ref{display:flex;align-items:center;gap:6px;margin:3px 2px 0;color:#607089;font-size:.72rem;font-weight:700;line-height:1.3}
+.todo-parent-ref,.task-scope-label{display:flex;align-items:center;gap:6px;margin:3px 2px 8px;color:#607089;font-size:.72rem;font-weight:700;line-height:1.3;overflow-wrap:anywhere}
 .todo-parent-ref::before{content:"↳";color:#8393a8}
+.task-scope-label::before{content:"↳";color:#8393a8}
 .todo-item,.task-item{border:1px solid #e4ebf4;border-left-width:4px;border-radius:10px;padding:8px 10px;background:#fcfdff;min-width:0}
 .todo-item.st-pending,.task-item.st-pending{border-left-color:#7b8798}
 .todo-item.st-in_progress,.task-item.st-in_progress{border-left-color:#1f6feb;background:#eef5ff}
@@ -65784,7 +71814,7 @@ const I18N={
     upload_drop_release:'Drop to upload',
     sec_todos:'Todos',sec_tasks:'Tasks',sec_activity:'Activity',sec_commands:'Commands',sec_diffs:'File Diffs',sec_files:'Files',sec_catalog:'Catalog',
     stat_sessions:'Sessions',stat_running:'Running',stat_messages:'Messages',stat_global_tasks:'Global Tasks',stat_daily_sessions:'Daily Sessions',stat_model:'Model',
-    no_sessions:'No sessions',no_todos:'No todos',no_tasks:'No tasks',no_activity:'No activity',no_commands:'No commands',no_diffs:'No file diffs',no_files:'No files',no_catalog:'No catalog',no_uploads:'No uploads',
+    no_sessions:'No sessions',no_todos:'No todos',no_tasks:'No tasks',no_current_subtasks:'No subtasks for the current plan step yet',no_activity:'No activity',no_commands:'No commands',no_diffs:'No file diffs',no_files:'No files',no_catalog:'No catalog',no_uploads:'No uploads',
     running:'running',idle:'idle',open:'open',completed:'completed',blocked:'blocked',
     status_pending:'PENDING',status_in_progress:'IN PROGRESS',status_completed:'COMPLETED',status_blocked:'BLOCKED',status_deleted:'DELETED',
     owner_unassigned:'owner=unassigned',
@@ -65823,7 +71853,7 @@ const I18N={
     upload_drop_release:'释放以上传文件',
     sec_todos:'Todos',sec_tasks:'Tasks',sec_activity:'Activity',sec_commands:'Commands',sec_diffs:'File Diffs',sec_files:'文件',sec_catalog:'Catalog',
     stat_sessions:'会话',stat_running:'运行中',stat_messages:'消息',stat_global_tasks:'全局任务',stat_daily_sessions:'每日会话',stat_model:'模型',
-    no_sessions:'暂无会话',no_todos:'暂无 Todos',no_tasks:'暂无 Tasks',no_activity:'暂无活动',no_commands:'暂无命令',no_diffs:'暂无文件差异',no_files:'暂无文件',no_catalog:'暂无目录',no_uploads:'暂无上传',
+    no_sessions:'暂无会话',no_todos:'暂无 Todos',no_tasks:'暂无 Tasks',no_current_subtasks:'当前计划步骤尚未生成子任务',no_activity:'暂无活动',no_commands:'暂无命令',no_diffs:'暂无文件差异',no_files:'暂无文件',no_catalog:'暂无目录',no_uploads:'暂无上传',
     running:'运行中',idle:'空闲',open:'未完成',completed:'已完成',blocked:'阻塞',
     status_pending:'待处理',status_in_progress:'进行中',status_completed:'已完成',status_blocked:'阻塞',status_deleted:'已删除',
     owner_unassigned:'owner=未分配',
@@ -65862,7 +71892,7 @@ const I18N={
     upload_drop_release:'釋放以上傳檔案',
     sec_todos:'Todos',sec_tasks:'Tasks',sec_activity:'Activity',sec_commands:'Commands',sec_diffs:'File Diffs',sec_files:'檔案',sec_catalog:'Catalog',
     stat_sessions:'會話',stat_running:'執行中',stat_messages:'訊息',stat_global_tasks:'全域任務',stat_daily_sessions:'每日會話',stat_model:'模型',
-    no_sessions:'尚無會話',no_todos:'尚無 Todos',no_tasks:'尚無 Tasks',no_activity:'尚無活動',no_commands:'尚無命令',no_diffs:'尚無檔案差異',no_files:'尚無檔案',no_catalog:'尚無目錄',no_uploads:'尚無上傳',
+    no_sessions:'尚無會話',no_todos:'尚無 Todos',no_tasks:'尚無 Tasks',no_current_subtasks:'目前計劃步驟尚未產生子任務',no_activity:'尚無活動',no_commands:'尚無命令',no_diffs:'尚無檔案差異',no_files:'尚無檔案',no_catalog:'尚無目錄',no_uploads:'尚無上傳',
     running:'執行中',idle:'閒置',open:'未完成',completed:'已完成',blocked:'阻塞',
     status_pending:'待處理',status_in_progress:'進行中',status_completed:'已完成',status_blocked:'阻塞',status_deleted:'已刪除',
     owner_unassigned:'owner=未指派',
@@ -65901,7 +71931,7 @@ const I18N={
     upload_drop_release:'ドロップしてアップロード',
     sec_todos:'Todos',sec_tasks:'Tasks',sec_activity:'Activity',sec_commands:'Commands',sec_diffs:'File Diffs',sec_files:'ファイル',sec_catalog:'Catalog',
     stat_sessions:'セッション',stat_running:'実行中',stat_messages:'メッセージ',stat_global_tasks:'タスク',stat_daily_sessions:'日次セッション',stat_model:'モデル',
-    no_sessions:'セッションはありません',no_todos:'Todo はありません',no_tasks:'Task はありません',no_activity:'アクティビティなし',no_commands:'コマンドなし',no_diffs:'差分なし',no_files:'ファイルなし',no_catalog:'カタログなし',no_uploads:'アップロードなし',
+    no_sessions:'セッションはありません',no_todos:'Todo はありません',no_tasks:'Task はありません',no_current_subtasks:'現在の計画ステップにはまだサブタスクがありません',no_activity:'アクティビティなし',no_commands:'コマンドなし',no_diffs:'差分なし',no_files:'ファイルなし',no_catalog:'カタログなし',no_uploads:'アップロードなし',
     running:'実行中',idle:'待機中',open:'未完了',completed:'完了',blocked:'ブロック',
     status_pending:'未着手',status_in_progress:'進行中',status_completed:'完了',status_blocked:'ブロック',status_deleted:'削除済み',
     owner_unassigned:'owner=未割り当て',
@@ -65946,7 +71976,7 @@ Object.assign(I18N['en'],{
   event_truncation_recovery:'Truncation Recovery',event_truncation_state:'Structured truncation recovery state',event_truncation_note:'Model output hit a truncation boundary and entered recovery mode.',
       event_live_model_call_title:'Agent Turn Model Call',event_live_model_call_note:'The active agent is in a model call. This timer updates live while generation is in progress.',
       event_scheduler_queued_title:'Queued Task',event_scheduler_queued_note:'This message is saved and waiting for an execution slot.',event_scheduler_queue_position:'queue position',event_scheduler_reason:'reason',event_scheduler_queued_hint:'queued',
-  event_auto_continue:'Auto Continue',event_arbiter_continue:'Arbiter Continue',event_continuation_briefing:'Continuation Briefing',event_reminder:'Reminder',event_todo_rescue:'Todo Rescue',event_tool_retry:'Tool Retry',event_segmented_retry:'Segmented Retry',event_forced_converge:'Forced Converge',event_no_tool_recovery:'No-Tool Recovery',event_context_recall:'Context Recall',event_failure_recovery:'Failure Recovery',event_truncate_rescue:'Truncation Rescue',event_thinking_recovery:'Thinking Recovery',event_fault_prefill:'Fault Prefill',event_edit_recovery:'Edit Recovery',
+  event_auto_continue:'Auto Continue',event_arbiter_continue:'Arbiter Continue',event_continuation_briefing:'Continuation Briefing',event_reminder:'Reminder',event_todo_rescue:'Todo Rescue',event_tool_retry:'Tool Retry',event_segmented_retry:'Segmented Retry',event_forced_converge:'Forced Converge',event_no_tool_recovery:'No-Tool Recovery',event_context_recall:'Context Recall',event_failure_recovery:'Failure Recovery',event_truncate_rescue:'Truncation Rescue',event_thinking_recovery:'Thinking Recovery',event_fault_prefill:'Fault Prefill',event_edit_recovery:'Edit Recovery',event_todo_bootstrap_title:'Todo Initialization',event_todo_bootstrap_retry_title:'Todo Initialization Retry',event_todo_bootstrap_subtitle:'Planning state after read-only perception',event_todo_bootstrap_note:'The next Todo list is being shaped from observed evidence before execution resumes.',event_todo_bootstrap_retry_note:'The Todo writer did not complete; the bounded retry is being requested.',event_todo_bootstrap_perception:'perception complete',event_todo_bootstrap_item_count:'3-7 items',event_todo_bootstrap_one_active:'exactly 1 active',event_reason:'reason',
   state_on:'on',state_off:'off',
   rt_session:'session',rt_model:'model',rt_thinking:'thinking',rt_thinking_stream:'thinking_stream',rt_response_stream:'response_stream',rt_mode:'mode',rt_active_agent:'active_agent',rt_blackboard:'bb',rt_task:'task',rt_complexity:'complexity',rt_judgement:'judgement',rt_budget:'budget',rt_remaining:'remaining',rt_blackboard_cycles:'bb_cycles',rt_round_limit:'round_limit',rt_round:'round',rt_phase:'phase',rt_queued_inputs:'queued_inputs',rt_run_timeout:'run_timeout',rt_ctx_used:'ctx_used',rt_ctx_limit:'ctx_limit',rt_ctx_mode:'ctx_mode',rt_manual_lock:'manual-lock',rt_adaptive:'adaptive',rt_ctx_left:'ctx_left',rt_ctx_left_for:'{label} left',rt_ctx_live_title:'Remaining context budget by active call',rt_truncation:'truncation',rt_trunc_retry:'trunc_retry',rt_trunc_tokens:'trunc_tokens~',rt_archive:'archive',rt_last_compact:'last_compact',compact_ago:'ago',compact_just_now:'just now',rt_ollama:'ollama',rt_files:'files',rt_ui_mode:'ui_mode',rt_state:'state',rt_awaiting_user:'awaiting user',ask_user_title:'Agent needs your input',ask_user_free_hint:'Pick an option above, or type your answer below and send.',ask_user_pick_hint:'Pick one of the options above to continue.',
   preview_download:'Download',preview_source:'Source',preview_rendered:'Preview',preview_copy_link:'Copy Link',preview_open:'Open in Browser',preview_link_copied:'Link Copied',
@@ -65975,7 +72005,7 @@ Object.assign(I18N['zh-CN'],{
   event_truncation_recovery:'截断恢复',event_truncation_state:'结构化截断恢复状态',event_truncation_note:'模型输出触发了截断边界，已进入恢复流程。',
       event_live_model_call_title:'Agent 轮次模型调用',event_live_model_call_note:'当前活跃 agent 正在进行模型调用。计时器会在生成期间实时更新。',
       event_scheduler_queued_title:'任务已排队',event_scheduler_queued_note:'这条消息已保存，正在等待后台执行名额。',event_scheduler_queue_position:'队列位置',event_scheduler_reason:'原因',event_scheduler_queued_hint:'已排队',
-  event_auto_continue:'自动继续',event_arbiter_continue:'裁决继续',event_continuation_briefing:'续跑简报',event_reminder:'提醒',event_todo_rescue:'待办救援',event_tool_retry:'工具重试',event_segmented_retry:'分段重试',event_forced_converge:'强制收敛',event_no_tool_recovery:'无工具恢复',event_context_recall:'上下文召回',event_failure_recovery:'故障恢复',event_truncate_rescue:'截断救援',event_thinking_recovery:'思考恢复',event_fault_prefill:'故障预填',event_edit_recovery:'编辑恢复',
+  event_auto_continue:'自动继续',event_arbiter_continue:'裁决继续',event_continuation_briefing:'续跑简报',event_reminder:'提醒',event_todo_rescue:'待办救援',event_tool_retry:'工具重试',event_segmented_retry:'分段重试',event_forced_converge:'强制收敛',event_no_tool_recovery:'无工具恢复',event_context_recall:'上下文召回',event_failure_recovery:'故障恢复',event_truncate_rescue:'截断救援',event_thinking_recovery:'思考恢复',event_fault_prefill:'故障预填',event_edit_recovery:'编辑恢复',event_todo_bootstrap_title:'Todo 初始化',event_todo_bootstrap_retry_title:'Todo 初始化重试',event_todo_bootstrap_subtitle:'只读感知后的规划状态',event_todo_bootstrap_note:'系统正在根据已观察证据整理下一组 Todo，然后继续执行。',event_todo_bootstrap_retry_note:'Todo 写入未完成，系统正在进行有限次数的重试。',event_todo_bootstrap_perception:'感知已完成',event_todo_bootstrap_item_count:'3-7 项',event_todo_bootstrap_one_active:'恰好 1 项进行中',event_reason:'原因',
   state_on:'开',state_off:'关',
   rt_session:'会话',rt_model:'模型',rt_thinking:'思考',rt_thinking_stream:'思考流',rt_response_stream:'正文流',rt_mode:'模式',rt_active_agent:'活跃代理',rt_blackboard:'黑板',rt_task:'任务',rt_complexity:'复杂度',rt_judgement:'裁决',rt_budget:'预算',rt_remaining:'剩余',rt_blackboard_cycles:'黑板轮次',rt_round_limit:'轮次上限',rt_round:'轮次',rt_phase:'阶段',rt_queued_inputs:'排队输入',rt_run_timeout:'运行超时',rt_ctx_used:'上下文已用',rt_ctx_limit:'上下文上限',rt_ctx_mode:'上下文模式',rt_manual_lock:'手动锁定',rt_adaptive:'自适应',rt_ctx_left:'上下文剩余',rt_ctx_left_for:'{label}剩余',rt_ctx_live_title:'按真实调用显示上下文剩余',rt_truncation:'截断数',rt_trunc_retry:'截断重试',rt_trunc_tokens:'截断Token~',rt_archive:'归档',rt_last_compact:'最近压缩',compact_ago:'前',compact_just_now:'刚刚',rt_ollama:'Ollama',rt_files:'文件根目录',rt_ui_mode:'界面模式',rt_state:'状态',rt_awaiting_user:'等待用户',ask_user_title:'需要你的输入',ask_user_free_hint:'点击上方选项,或在下方输入答复后发送。',ask_user_pick_hint:'请选择上方其中一个选项以继续。',
   preview_download:'下载',preview_source:'源码',preview_rendered:'预览',preview_copy_link:'复制链接',preview_open:'浏览器打开',preview_link_copied:'已复制链接',
@@ -66007,7 +72037,7 @@ Object.assign(I18N['zh-TW'],{
   event_truncation_recovery:'截斷恢復',event_truncation_state:'結構化截斷恢復狀態',event_truncation_note:'模型輸出觸發截斷邊界，已進入恢復流程。',
       event_live_model_call_title:'Agent 輪次模型呼叫',event_live_model_call_note:'目前活躍 agent 正在進行模型呼叫。計時器會在生成期間即時更新。',
       event_scheduler_queued_title:'任務已排隊',event_scheduler_queued_note:'這則訊息已保存，正在等待背景執行名額。',event_scheduler_queue_position:'佇列位置',event_scheduler_reason:'原因',event_scheduler_queued_hint:'已排隊',
-  event_auto_continue:'自動繼續',event_arbiter_continue:'裁決繼續',event_continuation_briefing:'續跑簡報',event_reminder:'提醒',event_todo_rescue:'待辦救援',event_tool_retry:'工具重試',event_segmented_retry:'分段重試',event_forced_converge:'強制收斂',event_no_tool_recovery:'無工具恢復',event_context_recall:'上下文召回',event_failure_recovery:'故障恢復',event_truncate_rescue:'截斷救援',event_thinking_recovery:'思考恢復',event_fault_prefill:'故障預填',event_edit_recovery:'編輯恢復',
+  event_auto_continue:'自動繼續',event_arbiter_continue:'裁決繼續',event_continuation_briefing:'續跑簡報',event_reminder:'提醒',event_todo_rescue:'待辦救援',event_tool_retry:'工具重試',event_segmented_retry:'分段重試',event_forced_converge:'強制收斂',event_no_tool_recovery:'無工具恢復',event_context_recall:'上下文召回',event_failure_recovery:'故障恢復',event_truncate_rescue:'截斷救援',event_thinking_recovery:'思考恢復',event_fault_prefill:'故障預填',event_edit_recovery:'編輯恢復',event_todo_bootstrap_title:'Todo 初始化',event_todo_bootstrap_retry_title:'Todo 初始化重試',event_todo_bootstrap_subtitle:'唯讀感知後的規劃狀態',event_todo_bootstrap_note:'系統會根據已觀察證據整理下一組 Todo，再繼續執行。',event_todo_bootstrap_retry_note:'Todo 寫入未完成，系統正在進行有限次重試。',event_todo_bootstrap_perception:'感知已完成',event_todo_bootstrap_item_count:'3-7 項',event_todo_bootstrap_one_active:'恰好 1 項進行中',event_reason:'原因',
   state_on:'開',state_off:'關',
   rt_session:'會話',rt_model:'模型',rt_thinking:'思考',rt_thinking_stream:'思考流',rt_response_stream:'正文串流',rt_mode:'模式',rt_active_agent:'活躍代理',rt_blackboard:'黑板',rt_task:'任務',rt_complexity:'複雜度',rt_judgement:'裁決',rt_budget:'預算',rt_remaining:'剩餘',rt_blackboard_cycles:'黑板輪次',rt_round_limit:'輪次上限',rt_round:'輪次',rt_phase:'階段',rt_queued_inputs:'排隊輸入',rt_run_timeout:'執行逾時',rt_ctx_used:'上下文已用',rt_ctx_limit:'上下文上限',rt_ctx_mode:'上下文模式',rt_manual_lock:'手動鎖定',rt_adaptive:'自適應',rt_ctx_left:'上下文剩餘',rt_ctx_left_for:'{label}剩餘',rt_ctx_live_title:'依真實呼叫顯示上下文剩餘',rt_truncation:'截斷數',rt_trunc_retry:'截斷重試',rt_trunc_tokens:'截斷Token~',rt_archive:'封存',rt_last_compact:'最近壓縮',compact_ago:'前',compact_just_now:'剛剛',rt_ollama:'Ollama',rt_files:'檔案根目錄',rt_ui_mode:'介面模式',rt_state:'狀態',rt_awaiting_user:'等待使用者',ask_user_title:'需要你的輸入',ask_user_free_hint:'點擊上方選項,或在下方輸入答覆後送出。',ask_user_pick_hint:'請選擇上方其中一個選項以繼續。',
   preview_download:'下載',preview_source:'原始碼',preview_rendered:'預覽',preview_copy_link:'複製連結',preview_open:'瀏覽器開啟',preview_link_copied:'已複製連結',
@@ -66037,7 +72067,7 @@ Object.assign(I18N['ja'],{
   event_truncation_recovery:'切り詰め復旧',event_truncation_state:'構造化切り詰め復旧状態',event_truncation_note:'モデル出力が切り詰め境界に達したため、復旧フローに入りました。',
       event_live_model_call_title:'Agent ターンモデル呼び出し',event_live_model_call_note:'現在のアクティブ agent はモデル呼び出し中です。生成中はこのタイマーがリアルタイム更新されます。',
       event_scheduler_queued_title:'キュー済みタスク',event_scheduler_queued_note:'このメッセージは保存され、実行枠を待っています。',event_scheduler_queue_position:'キュー位置',event_scheduler_reason:'理由',event_scheduler_queued_hint:'キュー済み',
-  event_auto_continue:'自動継続',event_arbiter_continue:'判定継続',event_continuation_briefing:'継続ブリーフ',event_reminder:'リマインダー',event_todo_rescue:'Todo 救援',event_tool_retry:'ツール再試行',event_segmented_retry:'分割再試行',event_forced_converge:'強制収束',event_no_tool_recovery:'ツールなし復旧',event_context_recall:'コンテキスト再呼び出し',event_failure_recovery:'障害復旧',event_truncate_rescue:'切り詰め救援',event_thinking_recovery:'思考復旧',event_fault_prefill:'障害プリフィル',event_edit_recovery:'編集復旧',
+  event_auto_continue:'自動継続',event_arbiter_continue:'判定継続',event_continuation_briefing:'継続ブリーフ',event_reminder:'リマインダー',event_todo_rescue:'Todo 救援',event_tool_retry:'ツール再試行',event_segmented_retry:'分割再試行',event_forced_converge:'強制収束',event_no_tool_recovery:'ツールなし復旧',event_context_recall:'コンテキスト再呼び出し',event_failure_recovery:'障害復旧',event_truncate_rescue:'切り詰め救援',event_thinking_recovery:'思考復旧',event_fault_prefill:'障害プリフィル',event_edit_recovery:'編集復旧',event_todo_bootstrap_title:'Todo 初期化',event_todo_bootstrap_retry_title:'Todo 初期化の再試行',event_todo_bootstrap_subtitle:'読み取り専用の認識後に行う計画状態',event_todo_bootstrap_note:'観測した証拠から次の Todo を整理してから実行を続けます。',event_todo_bootstrap_retry_note:'Todo の書き込みが完了せず、回数を制限した再試行を行います。',event_todo_bootstrap_perception:'認識完了',event_todo_bootstrap_item_count:'3-7 項目',event_todo_bootstrap_one_active:'進行中は 1 項目のみ',event_reason:'理由',
   state_on:'オン',state_off:'オフ',
   rt_session:'セッション',rt_model:'モデル',rt_thinking:'思考',rt_thinking_stream:'思考ストリーム',rt_response_stream:'レスポンスストリーム',rt_mode:'モード',rt_active_agent:'アクティブAgent',rt_blackboard:'黒板',rt_task:'タスク',rt_complexity:'複雑度',rt_judgement:'判定',rt_budget:'予算',rt_remaining:'残り',rt_blackboard_cycles:'黒板サイクル',rt_round_limit:'ラウンド上限',rt_round:'ラウンド',rt_phase:'フェーズ',rt_queued_inputs:'待機入力',rt_run_timeout:'実行タイムアウト',rt_ctx_used:'コンテキスト使用量',rt_ctx_limit:'コンテキスト上限',rt_ctx_mode:'コンテキストモード',rt_manual_lock:'手動固定',rt_adaptive:'適応',rt_ctx_left:'残りコンテキスト',rt_ctx_left_for:'{label}残り',rt_ctx_live_title:'実際の呼び出し別の残りコンテキスト',rt_truncation:'切り詰め数',rt_trunc_retry:'切り詰め再試行',rt_trunc_tokens:'切り詰めToken~',rt_archive:'アーカイブ',rt_last_compact:'直近 compact',compact_ago:'前',compact_just_now:'たった今',rt_ollama:'Ollama',rt_files:'ファイルルート',rt_ui_mode:'UIモード',rt_state:'状態',rt_awaiting_user:'ユーザー待ち',ask_user_title:'入力が必要です',ask_user_free_hint:'上のオプションを選ぶか、下に回答を入力して送信してください。',ask_user_pick_hint:'続行するには上のオプションを選んでください。',
   preview_download:'ダウンロード',preview_source:'ソース',preview_rendered:'プレビュー',preview_copy_link:'リンクをコピー',preview_open:'ブラウザで開く',preview_link_copied:'リンクをコピーしました',
@@ -66629,7 +72659,7 @@ function _deltaStartWatchdog(){
 function renderSkillsEntryLink(){const link=E('downloadBtn');if(!link)return;const host=location.hostname||'127.0.0.1';const enabled=Boolean(S.config?.skills_ui_enabled);const fromConfig=String(S.config?.skills_ui_url||'').trim();const skillsPort=Number(S.config?.skills_port||0);let href='#';if(enabled){if(fromConfig){href=fromConfig}else if(Number.isFinite(skillsPort)&&skillsPort>0){const currentPort=Number(location.port||0);if(!(currentPort&&skillsPort===currentPort)){href=`${location.protocol}//${host}:${skillsPort}`}}}const offline=(href==='#');link.href=href;link.classList.toggle('disabled',offline);link.textContent=offline?t('skills_offline'):t('open_skills')}
 function tailSig(rows,count,mapper){const arr=Array.isArray(rows)?rows:[];if(!arr.length)return'';return arr.slice(Math.max(0,arr.length-count)).map(mapper).join('|')}
 function feedSignature(snap){const feed=Array.isArray(snap?.conversation_feed)?snap.conversation_feed:(Array.isArray(snap?.messages)?snap.messages:[]);const sig=tailSig(feed,8,row=>`${Number(row?.ts||0)}:${String(row?.role||'')}:${String(row?.agent_role||'')}:${String(row?.type||'')}:${String(row?.text||'').length}:${String(row?.thinking||'').length}:${String(row?.text||'').slice(-12)}:${String(row?.thinking||'').slice(-12)}`);const live=String(snap?.live_thinking||'');const liveResp=String(snap?.live_response_text||'');const liveRespId=String(snap?.live_response_stream_id||'');const liveRespActive=snap?.live_response_active?1:0;const runActive=snap?.live_run_notice_active?1:0;const runLabel=String(snap?.live_run_notice_label||'');const runStart=Number(snap?.live_run_notice_started_at||0);const truncText=String(snap?.live_truncation_text||'');const truncKind=String(snap?.live_truncation_kind||'');const truncTool=String(snap?.live_truncation_tool||'');const truncAttempts=Number(snap?.live_truncation_attempts||0);const truncTokens=Number(snap?.live_truncation_tokens||0);const truncActive=snap?.live_truncation_active?1:0;return `${feed.length}|${sig}|lt=${live.length}:${live.slice(-12)}|lr=${liveRespActive}:${liveRespId}:${liveResp.length}:${liveResp.slice(-12)}|rn=${runActive}:${runStart}:${runLabel.slice(-12)}|tr=${truncActive}:${truncAttempts}:${truncTokens}:${truncKind.slice(-12)}:${truncTool.slice(-12)}:${truncText.length}`}
-function boardsSignature(snap){const agentCtx=(Array.isArray(snap?.agent_contexts)?snap.agent_contexts:[]).map(r=>`${r.role}:${r.left}:${r.left_percent}:${r.tier}:${r.active?1:0}`).join(',');return [snap?.running?1:0,snap?.agent_phase||'',Number(snap?.agent_round_index||0),Number(snap?.queued_user_inputs_count||0),Number(snap?.truncation_count||0),Number(snap?.live_truncation_attempts||0),Number(snap?.live_truncation_tokens||0),snap?.live_truncation_active?1:0,Number(snap?.context_tokens_estimate||0),Number(snap?.context_left_tokens||0),Number(snap?.context_left_percent||0),agentCtx,Number(snap?.render_bridge?.seq||0),String(snap?.plan_mode_preference||'auto'),Number(snap?.user_task_level||0),(snap?.todos||[]).length,(snap?.tasks||[]).length,(snap?.activity||[]).length,(snap?.operations||[]).length,(snap?.uploads||[]).length].join('|')}
+function boardsSignature(snap){const agentCtx=(Array.isArray(snap?.agent_contexts)?snap.agent_contexts:[]).map(r=>`${r.role}:${r.left}:${r.left_percent}:${r.tier}:${r.active?1:0}`).join(',');const scope=snap?.todo_task_scope||{};const todoRows=Array.isArray(snap?.todos)?snap.todos:[];const taskRows=Array.isArray(snap?.tasks)?snap.tasks:[];const todoSig=todoRows.map(row=>`${String(row?.key||row?.plan_step_id||'')}:${String(row?.status||'')}:${String(row?.content||'')}`).join('~');const taskSig=taskRows.map(row=>`${String(row?.subtask_id||row?.id||'')}:${String(row?.status||'')}:${String(row?.subject||'')}`).join('~');return [snap?.running?1:0,snap?.agent_phase||'',Number(snap?.agent_round_index||0),Number(snap?.queued_user_inputs_count||0),Number(snap?.truncation_count||0),Number(snap?.live_truncation_attempts||0),Number(snap?.live_truncation_tokens||0),snap?.live_truncation_active?1:0,Number(snap?.context_tokens_estimate||0),Number(snap?.context_left_tokens||0),Number(snap?.context_left_percent||0),agentCtx,Number(snap?.render_bridge?.seq||0),String(snap?.plan_mode_preference||'auto'),Number(snap?.user_task_level||0),String(scope.kind||'default'),String(scope.task_epoch||''),String(scope.plan_epoch||''),String(scope.parent_step_id||''),todoSig,taskSig,(snap?.activity||[]).length,(snap?.operations||[]).length,(snap?.uploads||[]).length].join('|')}
 function sessionsSignature(list){const rows=Array.isArray(list)?list:[];const sig=tailSig(rows,6,row=>`${String(row?.id||'')}:${row?.running?1:0}:${Number(row?.message_count||0)}:${Number(row?.updated_at||0)}`);const aid=String(S.activeId||'').trim();let activeSig='-';if(aid){const activeRow=rows.find(row=>String(row?.id||'')===aid);if(activeRow){activeSig=`${aid}:${activeRow?.running?1:0}:${Number(activeRow?.message_count||0)}:${Number(activeRow?.updated_at||0)}`}else{activeSig=`missing:${aid}`}}return `${rows.length}|active=${activeSig}|${sig}`}
 function mergeSessionRows(base,incoming){const map=new Map();for(const row of Array.isArray(base)?base:[]){const id=String(row?.id||'').trim();if(id)map.set(id,{...row})}for(const row of Array.isArray(incoming)?incoming:[]){const id=String(row?.id||'').trim();if(id)map.set(id,{...(map.get(id)||{}),...row})}return Array.from(map.values()).sort((a,b)=>Number(b?.updated_at||0)-Number(a?.updated_at||0))}
 function applySessionPage(rowsRaw,opt={}){const payload=(rowsRaw&&typeof rowsRaw==='object'&&!Array.isArray(rowsRaw))?rowsRaw:{};const rows=Array.isArray(rowsRaw)?rowsRaw:(Array.isArray(payload.sessions)?payload.sessions:[]);const append=!!opt.append;const keepExisting=append||Number(S.sessions?.length||0)>rows.length;S.sessions=keepExisting?mergeSessionRows(S.sessions,rows):rows;const total=Number(payload.total);S.sessionTotal=Number.isFinite(total)&&total>=S.sessions.length?total:S.sessions.length;const offset=Number(payload.offset||0);const limit=Number(payload.limit||rows.length||0);const next=Number.isFinite(offset)&&Number.isFinite(limit)?offset+rows.length:S.sessions.length;S.sessionNextOffset=Math.max(Number(S.sessionNextOffset||0),next,S.sessions.length);const payloadHasMore=Object.prototype.hasOwnProperty.call(payload,'has_more')?!!payload.has_more:(S.sessionNextOffset<S.sessionTotal);S.sessionHasMore=!!(payloadHasMore&&S.sessionNextOffset<S.sessionTotal);return{rows,selectedId:'',total:S.sessionTotal,hasMore:S.sessionHasMore}}
@@ -67717,27 +73747,27 @@ function _setPreviewCopyState(tab){
 function _selectedCodePreviewText(body,sel){
   if(!body||!sel||sel.rangeCount<1)return'';
   const range=sel.getRangeAt(0);
-  const inBody=(range.commonAncestorContainer===body)||body.contains(range.commonAncestorContainer);
+  let inBody=false;
+  try{inBody=range.intersectsNode(body)}catch(_){inBody=false}
   if(!inBody)return'';
-  const cells=Array.from(body.querySelectorAll('.code-code:not(.code-code-delete)'));
-  const lines=[];
-  for(const cell of cells){
-    let intersects=false;
-    try{intersects=range.intersectsNode(cell)}catch(_){intersects=false}
-    if(!intersects)continue;
-    const clipped=document.createRange();
-    clipped.selectNodeContents(cell);
-    try{
-      if(range.compareBoundaryPoints(Range.START_TO_START,clipped)>0){
-        clipped.setStart(range.startContainer,range.startOffset);
-      }
-      if(range.compareBoundaryPoints(Range.END_TO_END,clipped)<0){
-        clipped.setEnd(range.endContainer,range.endOffset);
-      }
-    }catch(_){continue}
-    lines.push(String(clipped.toString()||'').replace(/\\r\\n?/g,'\\n'));
+  // Clone only the selected DOM fragment, then remove presentation-only
+  // gutters.  The previous per-cell boundary code could fall back to the
+  // browser's default copy path when a drag began in the gutter, which copied
+  // line numbers/signs along with the source text.
+  let fragment=null;
+  try{fragment=range.cloneContents()}catch(_){fragment=null}
+  if(!fragment)return'';
+  const holder=document.createElement('div');
+  holder.appendChild(fragment);
+  holder.querySelectorAll('.code-gutter,.code-code-delete').forEach(node=>node.remove());
+  const rows=Array.from(holder.querySelectorAll('.code-row'));
+  if(rows.length){
+    return rows.map(row=>{
+      const code=row.querySelector('.code-code');
+      return String(code?code.textContent:row.textContent||'').replace(/\\r\\n?/g,'\\n');
+    }).join('\\n');
   }
-  return lines.join('\\n');
+  return String(holder.textContent||'').replace(/\\r\\n?/g,'\\n');
 }
 async function copyPreviewCode(){
   const tab=activePreviewTab();
@@ -67774,18 +73804,38 @@ async function copyPreviewCode(){
 }
 function _bindPreviewCopyGuard(){
   const body=E('previewBody');
-  if(!body||body._copyGuardBound)return;
-  body._copyGuardBound=true;
-  body.addEventListener('copy',ev=>{
-    const tab=activePreviewTab();
-    if(!tab||tab.kind!=='code')return;
+  if(!body||document._previewCopyGuardBound)return;
+  document._previewCopyGuardBound=true;
+  document.addEventListener('copy',ev=>{
+    if(!body.querySelector('.code-code'))return;
     const sel=(window.getSelection&&typeof window.getSelection==='function')?window.getSelection():null;
     if(!sel||sel.isCollapsed)return;
+    const range=sel.rangeCount?sel.getRangeAt(0):null;
+    let inBody=false;
+    try{inBody=!!range&&range.intersectsNode(body)}catch(_){inBody=false}
+    if(!inBody)return;
     const text=_selectedCodePreviewText(body,sel);
-    if(!ev.clipboardData||typeof ev.clipboardData.setData!=='function')return;
+    if(!text)return;
     ev.preventDefault();
-    ev.clipboardData.setData('text/plain',text);
-  });
+    ev.stopPropagation();
+    if(ev.clipboardData&&typeof ev.clipboardData.setData==='function'){
+      ev.clipboardData.setData('text/plain',text);
+      return;
+    }
+    // Some WebKit/webview versions expose no clipboardData on the copy event;
+    // keep the default path suppressed and synchronously copy sanitized text.
+    try{
+      const ta=document.createElement('textarea');
+      ta.value=text;
+      ta.setAttribute('readonly','readonly');
+      ta.style.position='fixed';
+      ta.style.left='-9999px';
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+    }catch(_){/* clipboard permissions are outside the preview renderer */}
+  },true);
 }
 function _codePreviewHotAnchor(rows,stage){
   const arr=Array.isArray(rows)?rows:[];
@@ -68027,7 +74077,7 @@ function renderActivePreview(forceReload=false){
 function _chatVirtRowKey(row,idx){const r=row||{};const txt=String(r.text||'');const th=String(r.thinking||'');return `${Number(r.ts||0)}:${String(r.role||'')}:${String(r.agent_role||'')}:${String(r.type||'')}:${txt.length}:${th.length}:${txt.slice(-16)}:${th.slice(-16)}:${idx}`}
 function _chatVirtFormatElapsed(seconds){const sec=Math.max(0,Math.floor(Number(seconds)||0));const h=Math.floor(sec/3600);const m=Math.floor((sec%3600)/60);const s=sec%60;if(h>0)return `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;return `${m}:${String(s).padStart(2,'0')}`}
 function _chatVirtLiveRunText(label,elapsed){return `${t('running')} · ${_chatVirtFormatElapsed(elapsed)}`}
-const CHAT_EVENT_CARD_KINDS=new Set(['tool_calls','tool_start','tool_result','file_patch','upload','command','web_search','live_truncation','live_run_notice','skill_loaded','plan_notice','plan_proposal','plan_approved_handoff','step_verified','todo_focus','live_user_adjustment','user_feedback_merge']);
+const CHAT_EVENT_CARD_KINDS=new Set(['tool_calls','tool_start','tool_result','file_patch','upload','command','web_search','live_truncation','live_run_notice','skill_loaded','plan_notice','plan_proposal','plan_approved_handoff','step_verified','todo_focus','live_user_adjustment','user_feedback_merge','runtime_hint']);
 function _chatVirtFormatDurationMs(ms){
   const n=Number(ms||0);
   if(!Number.isFinite(n)||n<=0)return '';
@@ -68656,6 +74706,8 @@ const RUNTIME_HINT_RENDER_META={
   'thinking-empty-recovery':{labelKey:'event_thinking_recovery',tone:'warning'},
   'fault-prefill':{labelKey:'event_fault_prefill',tone:'warning'},
   'edit-recovery':{labelKey:'event_edit_recovery',tone:'warning'},
+  'single-no-plan-todo-bootstrap':{labelKey:'event_todo_bootstrap_title',tone:'notice'},
+  'single-no-plan-todo-bootstrap-retry':{labelKey:'event_todo_bootstrap_retry_title',tone:'warning'},
 };
 function _chatVirtParseRuntimeHint(raw){
   const txt=String(raw||'').trim();
@@ -68678,6 +74730,7 @@ function _chatVirtBuildMessageNode(m){
       const parsedToolEventText=_chatVirtParseToolEventText(rawTextForKind);
       const parsedLiveUserAdjustment=_chatVirtParseLiveUserAdjustment(rawTextForKind);
       const parsedUserFeedbackMerge=_chatVirtParseUserFeedbackMerge(rawTextForKind);
+      const parsedRuntimeHint=(m.role==='user')?_chatVirtParseRuntimeHint(rawTextForKind):null;
       if(m.type==='manager_delegate')kind='manager_delegate';
       else if(m.type==='agent_bus')kind='agent_bus';
       else if(m.type==='tool_calls')kind='tool_calls';
@@ -68699,8 +74752,9 @@ function _chatVirtBuildMessageNode(m){
   else if(m.type==='step_verified'||_chatVirtParseStepVerified(rawTextForKind))kind='step_verified';
   else if(m.type==='todo_focus'||_chatVirtParseTodoFocus(rawTextForKind)||(m.type==='plan_notice'&&(dataKind==='todo_focus'||dataKind==='todo-focus')))kind='todo_focus';
   else if(m.type==='live_user_adjustment'||parsedLiveUserAdjustment)kind='live_user_adjustment';
-  else if(m.type==='user_feedback_merge'||parsedUserFeedbackMerge)kind='user_feedback_merge';
-  else if(m.type==='plan_notice')kind='plan_notice';
+      else if(m.type==='user_feedback_merge'||parsedUserFeedbackMerge)kind='user_feedback_merge';
+      else if(parsedRuntimeHint)kind='runtime_hint';
+      else if(m.type==='plan_notice')kind='plan_notice';
   else if(m.role==='assistant'&&m.thinking)kind='assistant_thinking';
   else kind='plain_text';
   const d=_chatVirtAcquireNode(kind);
@@ -69181,13 +75235,39 @@ function _chatVirtBuildMessageNode(m){
   }
   const textKey=`${m._vk}:text`;
   let finalText=String(m.text||'');
-  const runtimeHint=(m.role==='user')?_chatVirtParseRuntimeHint(finalText):null;
+  const runtimeHint=parsedRuntimeHint;
   finalText=_stripLeadingAgentTitle(finalText,agentRole);
   if(agentRole&&agentRole!=='manager'){
     const cleaned=_stripObjectiveInstructionForWorker(finalText);
     if(cleaned)finalText=cleaned;
   }
   if(runtimeHint){
+    const isTodoBootstrap=runtimeHint.name==='single-no-plan-todo-bootstrap'||runtimeHint.name==='single-no-plan-todo-bootstrap-retry';
+    if(isTodoBootstrap){
+      const retry=runtimeHint.name.endsWith('-retry');
+      const body=String(runtimeHint.body||'').trim();
+      const reasonMatch=retry?body.match(/did not complete:\s*([^.\\n]+)/i):null;
+      const reason=reasonMatch?String(reasonMatch[1]||'').trim():'';
+      const pills=[
+        _chatVirtEventPillHtml(t('event_todo_bootstrap_perception'),'ok'),
+        _chatVirtEventPillHtml(t('event_todo_bootstrap_item_count'),'info'),
+        _chatVirtEventPillHtml(t('event_todo_bootstrap_one_active'),'neutral','mono'),
+      ];
+      const grid=reason?[_chatVirtEventCellHtml(t('event_reason'),reason,{})]:[];
+      const note=t(retry?'event_todo_bootstrap_retry_note':'event_todo_bootstrap_note');
+      const key=`${String(m._vk||'')}:todo-bootstrap`;
+      const bodyHtml=`<div class="msg-event-body"><div class="msg-event-note">${esc(note)}</div></div>`;
+      d.innerHTML=_chatVirtEventCardHtml(
+        t(retry?'event_todo_bootstrap_retry_title':'event_todo_bootstrap_title'),
+        t('event_todo_bootstrap_subtitle'),
+        pills,
+        grid,
+        bodyHtml,
+        'msg-event-card-plan',
+      );
+      d.setAttribute('data-math-request',key);
+      return d;
+    }
     const hintLabel=String(runtimeHint.meta?.label||'Runtime Hint');
     const hintTone=String(runtimeHint.meta?.tone||'notice');
     const bodyKey=`${textKey}:runtime-hint`;
@@ -69734,7 +75814,7 @@ function renderTodoBoard(items){
   }
   return `<div class="board-summary"><span>${esc(open)} ${esc(t('open'))}</span><span>${esc(done)}/${esc(todos.length)} ${esc(t('completed'))}</span></div>${html}`;
 }
-function renderTaskBoard(items){const tasks=Array.isArray(items)?items:[];if(!tasks.length)return `<div class=\"mono\">${esc(t('no_tasks'))}</div>`;const completed=tasks.filter(row=>normalizeStatus(row?.status,'pending')==='completed').length;const blocked=tasks.filter(row=>normalizeStatus(row?.status,'pending')==='blocked').length;const cards=tasks.map(row=>{const status=normalizeStatus(row?.status,'pending');const id=Number(row?.id||0)||'-';const subject=cleanWorkText(row?.subject,status)||'(empty task)';const owner=String(row?.owner||'').trim();const blockedBy=Array.isArray(row?.blockedBy)&&row.blockedBy.length?`blocked_by=${row.blockedBy.map(x=>`#${x}`).join(', ')}`:'';const blocks=Array.isArray(row?.blocks)&&row.blocks.length?`blocks=${row.blocks.map(x=>`#${x}`).join(', ')}`:'';const timeTxt=formatTs(row?.updated_at||row?.created_at);const meta=[owner?`owner=@${owner}`:t('owner_unassigned'),blockedBy,blocks,timeTxt].filter(Boolean).join(' · ');return `<div class=\"task-item ${statusClass(status)}\"><div class=\"task-head\"><span class=\"mono task-id\">#${esc(id)}</span><span class=\"status-badge ${statusClass(status)}\">${esc(statusLabel(status))}</span></div><div class=\"task-subject\">${esc(subject)}</div><div class=\"task-meta\">${esc(meta)}</div></div>`}).join('');return `<div class=\"board-summary\"><span>${esc(tasks.length-completed)} ${esc(t('open'))}</span><span>${esc(completed)} ${esc(t('completed'))} · ${esc(blocked)} ${esc(t('blocked'))}</span></div><div class=\"task-list\">${cards}</div>`}
+function renderTaskBoard(items,scope={}){const tasks=Array.isArray(items)?items:[];const scoped=String(scope?.kind||'')==='plan_step';const parentText=scoped?cleanWorkText(scope?.parent_step_content||''):'';const scopeHtml=parentText?`<div class=\"task-scope-label\">${esc(parentText)}</div>`:'';if(!tasks.length)return scopeHtml+`<div class=\"mono\">${esc(t(scoped?'no_current_subtasks':'no_tasks'))}</div>`;const completed=tasks.filter(row=>normalizeStatus(row?.status,'pending')==='completed').length;const blocked=tasks.filter(row=>normalizeStatus(row?.status,'pending')==='blocked').length;const cards=tasks.map(row=>{const status=normalizeStatus(row?.status,'pending');const id=Number(row?.id||0)||'-';const subject=cleanWorkText(row?.subject,status)||'(empty task)';const owner=String(row?.owner||'').trim();const blockedBy=Array.isArray(row?.blockedBy)&&row.blockedBy.length?`blocked_by=${row.blockedBy.map(x=>`#${x}`).join(', ')}`:'';const blocks=Array.isArray(row?.blocks)&&row.blocks.length?`blocks=${row.blocks.map(x=>`#${x}`).join(', ')}`:'';const timeTxt=formatTs(row?.updated_at||row?.created_at);const meta=[owner?`owner=@${owner}`:t('owner_unassigned'),blockedBy,blocks,timeTxt].filter(Boolean).join(' · ');return `<div class=\"task-item ${statusClass(status)}\"><div class=\"task-head\"><span class=\"mono task-id\">#${esc(id)}</span><span class=\"status-badge ${statusClass(status)}\">${esc(statusLabel(status))}</span></div><div class=\"task-subject\">${esc(subject)}</div><div class=\"task-meta\">${esc(meta)}</div></div>`}).join('');return scopeHtml+`<div class=\"board-summary\"><span>${esc(tasks.length-completed)} ${esc(t('open'))}</span><span>${esc(completed)} ${esc(t('completed'))} · ${esc(blocked)} ${esc(t('blocked'))}</span></div><div class=\"task-list\">${cards}</div>`}
 function ensureFileExplorerState(sessionId){const sid=String(sessionId||S.activeId||'').trim();if(!sid)return null;if(!S.fileExplorerBySession)S.fileExplorerBySession={};if(!S.fileExplorerBySession[sid]||typeof S.fileExplorerBySession[sid]!=='object'){S.fileExplorerBySession[sid]={tree:null,root:'',nodeCount:0,truncated:false,maxNodes:0,fetchedAt:0,lastRequestAt:0,lastErrorAt:0,inflight:false,selected:'',expanded:{'':true}}}const st=S.fileExplorerBySession[sid];if(!st.expanded||typeof st.expanded!=='object')st.expanded={'':true};st.expanded['']=true;if(!Number.isFinite(Number(st.lastRequestAt)))st.lastRequestAt=0;if(!Number.isFinite(Number(st.lastErrorAt)))st.lastErrorAt=0;return st}
 function _fePath(sessionId){const sid=encodeURIComponent(String(sessionId||'').trim());return `/api/sessions/${sid}/files-tree?max_nodes=420&max_depth=5`}
 function _feSize(bytes){const n=Number(bytes||0);if(!Number.isFinite(n)||n<0)return '-';if(n<1024)return `${n}B`;if(n<1024*1024)return `${(n/1024).toFixed(1)}KB`;if(n<1024*1024*1024)return `${(n/(1024*1024)).toFixed(1)}MB`;return `${(n/(1024*1024*1024)).toFixed(1)}GB`}
@@ -69758,7 +75838,7 @@ function answerAskUser(text){const val=String(text||'').trim();if(!val||!S.activ
 function renderAskUserCard(){const card=E('askUserCard');if(!card)return;const pq=S.snap?.pending_user_question;const show=!S.snap?.running&&pq&&String(pq.question||'').trim();if(!show){if(card.style.display!=='none'){card.style.display='none';card.innerHTML='';}return;}const q=String(pq.question||'').trim();const opts=Array.isArray(pq.options)?pq.options.filter(o=>String(o||'').trim()):[];const allowFree=pq.allow_free_text!==false;const role=String(pq.role||'agent');const roleLabel=role&&role!=='agent'?_chatVirtAgentRoleLabel(role):'';let btns='';if(opts.length){btns='<div class="ask-user-options">'+opts.map((o,i)=>`<button type="button" class="ask-user-opt" data-ask-idx="${i}">${esc(String(o))}</button>`).join('')+'</div>';}const hint=allowFree?esc(t('ask_user_free_hint')):esc(t('ask_user_pick_hint'));const html=`<div class="ask-user-head"><span class="ask-user-badge">${esc(t('ask_user_title'))}</span>${roleLabel?`<span class="ask-user-role">${esc(roleLabel)}</span>`:''}</div><div class="ask-user-q">${esc(q)}</div>${btns}<div class="ask-user-hint">${hint}</div>`;if(card.innerHTML!==html){card.innerHTML=html;card.querySelectorAll('.ask-user-opt').forEach(b=>{b.addEventListener('click',()=>{const idx=parseInt(b.getAttribute('data-ask-idx')||'-1',10);if(idx>=0&&idx<opts.length)answerAskUser(opts[idx]);});});}card.style.display='';}
 function renderRuntimeStatus(){const uiState=S.staticMode?(S.frozen?'static':'live'):'live';const boolWord=v=>t(v?'state_on':'state_off');const activeRole=String(S.snap?.agent_active_role||'').trim();const activeRoleLabel=activeRole?_chatVirtAgentRoleLabel(activeRole):'-';const _awaitingUser=!S.snap?.running&&S.snap?.pending_user_question&&String(S.snap?.pending_user_question?.question||'').trim();const _stateVal=_awaitingUser?t('rt_awaiting_user'):(S.snap?.running?t('running'):t('idle'));const _stateTone=_awaitingUser?'state-awaiting':(S.snap?.running?'state-running':'state-idle');const runtimeItems=[{label:t('rt_session'),value:S.snap?.id||'-',mono:true},{label:t('rt_model'),value:S.snap?.model||'-',mono:true},{label:t('rt_thinking'),value:boolWord(S.snap?.thinking)},{label:t('rt_thinking_stream'),value:boolWord(S.snap?.thinking_stream)},{label:t('rt_response_stream'),value:boolWord(S.snap?.response_stream)},{label:t('rt_mode'),value:S.snap?.execution_mode||S.config?.execution_mode||'sync'},{label:t('rt_active_agent'),value:activeRoleLabel},{label:t('rt_blackboard'),value:S.snap?.blackboard?.status||'-'},{label:t('rt_task'),value:S.snap?.blackboard?.task_profile?.task_type||'-'},{label:t('rt_complexity'),value:S.snap?.blackboard?.task_profile?.complexity||'-'},{label:t('rt_judgement'),value:S.snap?.blackboard?.manager_judgement?.progress||'-'},{label:t('rt_budget'),value:S.snap?.blackboard?.task_profile?.round_budget??'-'},{label:t('rt_remaining'),value:S.snap?.blackboard?.manager_judgement?.remaining_rounds??'-'},{label:t('rt_blackboard_cycles'),value:S.snap?.blackboard?.manager_cycles??'-'},{label:t('rt_round_limit'),value:S.snap?.max_agent_rounds||'-'},{label:t('rt_round'),value:S.snap?.agent_round_index??'-'},{label:t('rt_phase'),value:S.snap?.agent_phase||t('idle')},{label:t('rt_queued_inputs'),value:S.snap?.queued_user_inputs_count??0},{label:t('rt_run_timeout'),value:`${S.snap?.max_run_seconds??'-'}s`},{label:t('rt_ctx_used'),value:S.snap?.context_tokens_estimate??'-'},{label:t('rt_ctx_limit'),value:S.snap?.context_effective_token_limit||S.snap?.context_token_upper_bound||'-'},{label:t('rt_ctx_mode'),value:t(S.snap?.context_token_limit_locked?'rt_manual_lock':'rt_adaptive')},{label:t('rt_ctx_left'),value:formatContextLeft(S.snap)},{label:t('rt_truncation'),value:S.snap?.truncation_count||0},{label:t('rt_trunc_retry'),value:S.snap?.live_truncation_attempts||0},{label:t('rt_trunc_tokens'),value:S.snap?.live_truncation_tokens||0},{label:t('rt_archive'),value:S.snap?.compact_segments_count||0},{label:t('rt_last_compact'),value:fmtLastCompact(S.snap)},{label:t('rt_ollama'),value:S.snap?.ollama_base_url||'-',mono:true,wide:true},{label:t('rt_files'),value:S.snap?.session_files_root||'-',mono:true,wide:true},{label:t('rt_ui_mode'),value:uiState},{label:t('rt_state'),value:_stateVal,tone:_stateTone}];setHtmlIfChanged('status',runtimeItems.map(item=>_runtimePillHtml(item.label,item.value,item)).join('')+agentContextChipsHtml(S.snap),'runtimeStatus')}
 function renderPlanLevelControls(){const _pmBtn=E('planModeBtn');if(_pmBtn){const _pm=S.snap?.plan_mode_preference||'auto';setTextIfChanged(_pmBtn,'Plan: '+_pm.charAt(0).toUpperCase()+_pm.slice(1))}updateLevelBtn(S.snap?.user_task_level||0)}
-function renderTodoTaskPanels(){const todoSig=currentLang()+'|'+String(S.snap?.plan_mode_preference||'auto')+'|'+_safeJsonSig(S.snap?.todos||[]);if(S.renderSigs.todosSig!==todoSig){S.renderSigs.todosSig=todoSig;setPanelHtml('todos',renderTodoBoard(S.snap?.todos||[]))}const taskSig=currentLang()+'|'+_safeJsonSig(S.snap?.tasks||[]);if(S.renderSigs.tasksSig!==taskSig){S.renderSigs.tasksSig=taskSig;setPanelHtml('tasks',renderTaskBoard(S.snap?.tasks||[]))}}
+function renderTodoTaskPanels(){const scope=S.snap?.todo_task_scope||{kind:'default'};const scopeSig=_safeJsonSig(scope);const todoSig=currentLang()+'|'+String(S.snap?.plan_mode_preference||'auto')+'|'+scopeSig+'|'+_safeJsonSig(S.snap?.todos||[]);if(S.renderSigs.todosSig!==todoSig){S.renderSigs.todosSig=todoSig;setPanelHtml('todos',renderTodoBoard(S.snap?.todos||[]))}const taskSig=currentLang()+'|'+scopeSig+'|'+_safeJsonSig(S.snap?.tasks||[]);if(S.renderSigs.tasksSig!==taskSig){S.renderSigs.tasksSig=taskSig;setPanelHtml('tasks',renderTaskBoard(S.snap?.tasks||[],scope))}}
 function renderActivityPanel(){const rows=(S.snap?.activity||[]).slice(-80).sort((a,b)=>Number(a.ts||0)-Number(b.ts||0));const sig=currentLang()+'|'+rows.map(a=>`${Number(a.ts||0)}:${String(a.summary||'')}`).join('|');if(S.renderSigs.activitySig===sig)return;S.renderSigs.activitySig=sig;setPanelHtml('activity',rows.map(a=>`<div class=\"mono\">${new Date(a.ts*1000).toLocaleTimeString()} · ${esc(a.summary)}</div>`).join('')||`<div class=\"mono\">${esc(t('no_activity'))}</div>`)}
 function _commandPanelSig(cmds){return currentLang()+'|'+cmds.map(e=>{const d=(e&&typeof e==='object'&&e.data&&typeof e.data==='object')?e.data:{};const page=_cmdCurrentPage(e);const out=String(_cmdPageText(e,page)||'');return `${_cmdStateKey(e)}:${page}:${_cmdPageCount(e)}:${d.exit_code}:${d.ui_truncated?1:0}:${d.model_truncated?1:0}:${out.length}:${out.slice(-24)}`}).join('|')}
 function renderCommandsPanel(ops){const cmds=(Array.isArray(ops)?ops:[]).filter(x=>x.type==='command').slice(-30).reverse();const sig=_commandPanelSig(cmds);if(S.renderSigs.commandsSig===sig)return;S.renderSigs.commandsSig=sig;setPanelHtml('commands',cmds.map(e=>{const d=(e&&typeof e==='object'&&e.data&&typeof e.data==='object')?e.data:{};const page=_cmdCurrentPage(e);const total=_cmdPageCount(e);const totalAll=Math.max(total,Number(d.ui_output_page_total||0)||total);const flags=[d.ui_truncated?`<span class=\"cmd-flag warn\">${esc(t('cmd_ui_preview_truncated'))}</span>`:'',d.model_truncated?`<span class=\"cmd-flag info\">${esc(t('cmd_model_context_truncated'))}</span>`:'',d.temp_output_path?`<span class=\"cmd-flag info\">${esc(t('cmd_temp_read_file_ready'))}</span>`:'',d.buffer_ref?`<span class=\"cmd-flag\">${esc(t('cmd_buffered_copy'))}</span>`:''].filter(Boolean).join('');const pager=total>1?`<div class=\"cmd-pager\"><button data-cmd-key=\"${esc(_cmdStateKey(e))}\" data-cmd-page=\"-1\" data-cmd-total=\"${esc(total)}\" ${page<=1?'disabled':''}>${esc(t('cmd_prev'))}</button><span class=\"cmd-sub\">${esc(t('cmd_preview'))} ${esc(page)}/${esc(total)}${totalAll>total?` · ${esc(t('cmd_of'))} ${esc(totalAll)}`:''}</span><button data-cmd-key=\"${esc(_cmdStateKey(e))}\" data-cmd-page=\"1\" data-cmd-total=\"${esc(total)}\" ${page>=total?'disabled':''}>${esc(t('cmd_next'))}</button></div>`:'';const extra=[d.temp_output_path?`<div class=\"cmd-sub\">${esc(t('cmd_read_file_path'))}: ${esc(d.temp_output_path)}</div>`:'',d.buffer_ref?`<div class=\"cmd-sub\">${esc(t('cmd_buffer_ref'))}: ${esc(d.buffer_ref)} · ${esc(t('cmd_chars'))}=${esc(d.buffer_chars||0)}</div>`:'',Number(d.output_full_chars||0)>0?`<div class=\"cmd-sub\">${esc(t('cmd_full_output'))}: ${esc(d.output_full_chars)} ${esc(t('cmd_chars'))} · ${esc(d.output_full_lines||0)} ${esc(t('cmd_lines'))} · ${esc(t('cmd_strategy'))}=${esc(d.long_output_strategy||'inline')}</div>`:''].filter(Boolean).join('');const output=String(_cmdPageText(e,page)||'').trim();return `<div class=\"cmd-item\"><div class=\"cmd-main\">${esc(d.name||t('cmd_default_name'))} · ${esc(t('cmd_exit'))}=${esc(d.exit_code??'-')}</div><div class=\"cmd-sub\">${esc(d.command||'')}<br>${esc(d.cwd||'')}</div>${flags?`<div class=\"cmd-flags\">${flags}</div>`:''}${extra}${output?`<div class=\"cmd-output\">${esc(output)}</div>`:''}${pager}</div>`}).join('')||`<div class=\"mono\">${esc(t('no_commands'))}</div>`);const cmdHost=E('commands');if(cmdHost){for(const btn of cmdHost.querySelectorAll('[data-cmd-page]')){btn.onclick=(ev)=>{ev.preventDefault();const key=String(btn.getAttribute('data-cmd-key')||'').trim();const step=Number(btn.getAttribute('data-cmd-page')||0);const total=Math.max(1,Number(btn.getAttribute('data-cmd-total')||1));if(!key||!step)return;if(!S.commandPageState||typeof S.commandPageState!=='object')S.commandPageState={};const cur=Number(S.commandPageState[key]||1);S.commandPageState[key]=Math.max(1,Math.min(total,cur+step));S.renderSigs.commandsSig='';renderBoards()}}}}
@@ -86553,6 +92633,9 @@ class AppContext:
         web_search_setting_locked: bool = False,
         user_memory_mode: str = DEFAULT_USER_MEMORY_MODE,
         user_memory_setting_locked: bool = False,
+        single_no_plan_todo_enabled: bool | None = None,
+        single_no_plan_todo_prompt: str = "",
+        l2_todo_policy: str | None = None,
     ):
         self.workspace = Path(workspace).resolve()
         self.workspace_migration = _migrate_legacy_runtime_roots(self.workspace)
@@ -86589,6 +92672,12 @@ class AppContext:
             fallback=DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
         )
         self.auto_task_level_ceiling = normalize_auto_task_level_ceiling(auto_task_level_ceiling)
+        # The AppContext loads its base config below.  Keep an explicit
+        # constructor value authoritative, and resolve the file value only
+        # after ``self.default_llm_config`` exists.
+        self.l2_todo_policy = normalize_l2_todo_policy(
+            l2_todo_policy if l2_todo_policy is not None else DEFAULT_L2_TODO_POLICY
+        )
         self.auto_model_switch = bool(auto_model_switch)
         self.arbiter_enabled = bool(arbiter_enabled)
         self.arbiter_model = str(arbiter_model or "").strip()
@@ -86601,6 +92690,8 @@ class AppContext:
         self.web_search_setting_locked = bool(web_search_setting_locked)
         self.user_memory_mode = normalize_user_memory_mode(user_memory_mode)
         self.user_memory_setting_locked = bool(user_memory_setting_locked)
+        self.single_no_plan_todo_enabled = False
+        self.single_no_plan_todo_prompt = ""
         self.read_context_policy = DEFAULT_READ_CONTEXT_POLICY
         self.tool_memory_policy = DEFAULT_TOOL_MEMORY_POLICY
         self.skills_root = skills_root
@@ -86608,6 +92699,27 @@ class AppContext:
         self.skills_store = SkillStore(self.skills_root)
         self.skills_store_refresh_ts = 0.0
         self.default_llm_config = parse_json_object(try_read_text(self.workspace / "LLM.config.json") or "{}", {})
+        if l2_todo_policy is None:
+            cfg_l2_todo_policy = extract_l2_todo_policy_setting(self.default_llm_config)
+            if cfg_l2_todo_policy is not None:
+                self.l2_todo_policy = normalize_l2_todo_policy(cfg_l2_todo_policy)
+        cfg_single_todo_enabled, cfg_single_todo_prompt = extract_single_no_plan_todo_settings(
+            self.default_llm_config
+        )
+        self.single_no_plan_todo_enabled = bool(cfg_single_todo_enabled)
+        self.single_no_plan_todo_prompt = str(cfg_single_todo_prompt or "").strip()
+        explicit_single_todo_prompt = trim(str(single_no_plan_todo_prompt or "").strip(), 6000)
+        if single_no_plan_todo_enabled is not None or explicit_single_todo_prompt:
+            # A prompt-only programmatic configuration is an opt-in.  An
+            # explicit false still wins, matching the config-file precedence.
+            self.single_no_plan_todo_enabled = (
+                bool(single_no_plan_todo_enabled)
+                if single_no_plan_todo_enabled is not None
+                else bool(explicit_single_todo_prompt)
+            )
+            self.single_no_plan_todo_prompt = explicit_single_todo_prompt
+            if self.single_no_plan_todo_enabled and not self.single_no_plan_todo_prompt:
+                self.single_no_plan_todo_prompt = DEFAULT_SINGLE_NO_PLAN_TODO_PROMPT
         self.global_llm_config_revision = self._llm_config_revision(self.default_llm_config)
         self.global_llm_config_source = ""
         self.force_global_llm_config_for_users = False
@@ -86946,7 +93058,11 @@ class AppContext:
                     })
                 finally:
                     probe.close()
-        argv = _admin_config_to_argv(clean)
+        try:
+            argv = _admin_config_to_argv(clean)
+        except Exception as exc:
+            errors.append({"key": "startup", "error": f"startup arguments cannot be compiled: {exc}"})
+            argv = []
         return {
             "ok": not errors,
             "errors": errors,
@@ -90252,6 +96368,7 @@ class AppContext:
                 self.max_run_seconds,
                 self.shell_command_timeout_seconds,
                 self.auto_task_level_ceiling,
+                self.l2_todo_policy,
                 self.auto_model_switch,
                 self.arbiter_enabled,
                 self.arbiter_model,
@@ -90285,6 +96402,12 @@ class AppContext:
             mgr.auto_task_level_ceiling = normalize_auto_task_level_ceiling(
                 getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
             )
+            mgr.single_no_plan_todo_enabled = bool(
+                getattr(self, "single_no_plan_todo_enabled", False)
+            )
+            mgr.single_no_plan_todo_prompt = str(
+                getattr(self, "single_no_plan_todo_prompt", "") or ""
+            ).strip()[:6000]
             mgr.web_search_enabled = bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED))
             mgr.web_search_setting_locked = bool(getattr(self, "web_search_setting_locked", False))
             mgr.user_memory_mode = normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
@@ -90397,6 +96520,10 @@ class AppContext:
         active = dict(self.global_profiles.get(self.global_active_profile_id, {}))
         self._sync_global_ollama_defaults(active)
         self.thinking = False
+        if _single_no_plan_todo_setting_present(cfg):
+            cfg_single_todo_enabled, cfg_single_todo_prompt = extract_single_no_plan_todo_settings(cfg)
+            self.single_no_plan_todo_enabled = bool(cfg_single_todo_enabled)
+            self.single_no_plan_todo_prompt = str(cfg_single_todo_prompt or "").strip()
         cfg_max_output_tokens = cfg.get("max_output_tokens")
         if cfg_max_output_tokens is not None:
             self.max_output_tokens = max(256, int(cfg_max_output_tokens))
@@ -90411,6 +96538,9 @@ class AppContext:
         cfg_auto_task_level_ceiling = extract_auto_task_level_ceiling_setting(cfg)
         if cfg_auto_task_level_ceiling is not None:
             self.auto_task_level_ceiling = normalize_auto_task_level_ceiling(cfg_auto_task_level_ceiling)
+        cfg_l2_todo_policy = extract_l2_todo_policy_setting(cfg)
+        if cfg_l2_todo_policy is not None:
+            self.l2_todo_policy = normalize_l2_todo_policy(cfg_l2_todo_policy)
         cfg_web_search_enabled = extract_web_search_enabled_setting(cfg)
         if cfg_web_search_enabled is not None and not bool(getattr(self, "web_search_setting_locked", False)):
             self.web_search_enabled = bool(cfg_web_search_enabled)
@@ -90446,6 +96576,12 @@ class AppContext:
                 mgr.global_llm_config_source = source or "global-config"
                 mgr.force_global_defaults_on_load = True
                 mgr.reset_to_llm_config(cfg, source=source or "global-config")
+                mgr.single_no_plan_todo_enabled = bool(
+                    getattr(self, "single_no_plan_todo_enabled", False)
+                )
+                mgr.single_no_plan_todo_prompt = str(
+                    getattr(self, "single_no_plan_todo_prompt", "") or ""
+                ).strip()[:6000]
                 mgr.read_context_policy = normalize_read_context_policy(
                     getattr(self, "read_context_policy", DEFAULT_READ_CONTEXT_POLICY)
                 )
@@ -90455,11 +96591,20 @@ class AppContext:
                 mgr.auto_task_level_ceiling = normalize_auto_task_level_ceiling(
                     getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
                 )
+                mgr.l2_todo_policy = normalize_l2_todo_policy(
+                    getattr(self, "l2_todo_policy", DEFAULT_L2_TODO_POLICY)
+                )
                 mgr.web_search_enabled = bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED))
                 mgr.web_search_setting_locked = bool(getattr(self, "web_search_setting_locked", False))
                 mgr.user_memory_mode = normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
                 mgr.user_memory_setting_locked = bool(getattr(self, "user_memory_setting_locked", False))
                 for sess in mgr.sessions.values():
+                    sess.single_no_plan_todo_enabled = bool(
+                        getattr(self, "single_no_plan_todo_enabled", False)
+                    )
+                    sess.single_no_plan_todo_prompt = str(
+                        getattr(self, "single_no_plan_todo_prompt", "") or ""
+                    ).strip()[:6000]
                     sess.read_context_policy = normalize_read_context_policy(
                         getattr(self, "read_context_policy", DEFAULT_READ_CONTEXT_POLICY)
                     )
@@ -90468,6 +96613,9 @@ class AppContext:
                     )
                     sess.auto_task_level_ceiling = normalize_auto_task_level_ceiling(
                         getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
+                    )
+                    sess.l2_todo_policy = normalize_l2_todo_policy(
+                        getattr(self, "l2_todo_policy", DEFAULT_L2_TODO_POLICY)
                     )
                     sess.web_search_enabled = bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED))
                     sess.user_memory_mode = normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
@@ -95057,7 +101205,8 @@ def main():
         help=(
             "LLM config source (URL or local file path). "
             "Also reads startup keys like show_upload_list, download_js_lib, shell_command_timeout, "
-            "ctx_limit/context_token_limit, tool_memory_policy/read_context_policy, auto_task_level_ceiling and "
+            "ctx_limit/context_token_limit, tool_memory_policy/read_context_policy, auto_task_level_ceiling, "
+            "l2_todo_policy (force|auto|off) and "
             "daily_session_limit (aliases: daily_sessions_per_ip / "
             "max_daily_sessions_per_ip / session_daily_limit; shell aliases: "
             "shell_timeout / bash_timeout / command_timeout)."
@@ -95129,7 +101278,8 @@ def main():
         "--max_auto_task_level",
         "--max-auto-task-level",
         dest="auto_task_level_ceiling",
-        default="",
+        default=None,
+        type=int,
         help=(
             "Limit automatic L1-L5 task classification to this maximum level (1-5); "
             f"0/off means no cap (default {DEFAULT_AUTO_TASK_LEVEL_CEILING}). "
@@ -95139,6 +101289,19 @@ def main():
             "Manual task-level overrides and manual plan-mode preference are not capped. "
             "Also configurable via config keys auto_task_level_ceiling/task_level_ceiling/"
             "max_auto_task_level/complexity_ceiling."
+        ),
+    )
+    parser.add_argument(
+        "--l2-todo-policy",
+        "--l2_todo_policy",
+        "--level2-todo-policy",
+        dest="l2_todo_policy",
+        default=None,
+        choices=list(L2_TODO_POLICY_CHOICES),
+        help=(
+            "Level-2 Todo behavior: force (default, mandatory), auto (let the LLM "
+            "judge from task semantics), or off (explicitly disable the L2 contract). "
+            "Also configurable via config key l2_todo_policy."
         ),
     )
     parser.add_argument(
@@ -95243,6 +101406,25 @@ def main():
         help="Agent execution mode (single|sequential|sync). Empty means read from startup config, then fallback to sync.",
     )
     parser.add_argument(
+        "--single-no-plan-todo",
+        dest="single_no_plan_todo_enabled",
+        action="store_true",
+        default=None,
+        help="Enable the optional single/no-plan Todo bootstrap; L2 behavior is controlled by --l2-todo-policy.",
+    )
+    parser.add_argument(
+        "--no-single-no-plan-todo",
+        dest="single_no_plan_todo_enabled",
+        action="store_false",
+        help="Disable the optional single/no-plan bootstrap; use --l2-todo-policy off to disable the L2 Todo contract.",
+    )
+    parser.add_argument(
+        "--single-no-plan-todo-prompt",
+        dest="single_no_plan_todo_prompt",
+        default=None,
+        help="Custom prompt used for the single/no-plan Todo bootstrap turn.",
+    )
+    parser.add_argument(
         "--max-output-tokens",
         default=AGENT_MAX_OUTPUT_TOKENS,
         type=int,
@@ -95276,6 +101458,8 @@ def main():
         shell_command_timeout=None,
         web_search_enabled=None,
         user_memory_mode=None,
+        single_no_plan_todo_enabled=None,
+        single_no_plan_todo_prompt=None,
     )
     skip_admin_defaults = str(os.environ.pop("CLOUDS_CODER_SKIP_ADMIN_DEFAULTS", "") or "").strip().lower() in {"1", "true", "yes", "on"}
     admin_default_keys: set[str] = set()
@@ -95323,6 +101507,9 @@ def main():
     resolved_read_context_policy = DEFAULT_READ_CONTEXT_POLICY
     resolved_tool_memory_policy = DEFAULT_TOOL_MEMORY_POLICY
     resolved_auto_task_level_ceiling = DEFAULT_AUTO_TASK_LEVEL_CEILING
+    resolved_l2_todo_policy = DEFAULT_L2_TODO_POLICY
+    resolved_single_no_plan_todo_enabled = False
+    resolved_single_no_plan_todo_prompt = ""
     resolved_web_search_enabled = DEFAULT_WEB_SEARCH_ENABLED
     resolved_user_memory_mode = DEFAULT_USER_MEMORY_MODE
     external_config: dict = {}
@@ -95371,6 +101558,14 @@ def main():
             external_auto_task_level_ceiling = extract_auto_task_level_ceiling_setting(external_config)
             if external_auto_task_level_ceiling is not None:
                 resolved_auto_task_level_ceiling = normalize_auto_task_level_ceiling(external_auto_task_level_ceiling)
+            external_l2_todo_policy = extract_l2_todo_policy_setting(external_config)
+            if external_l2_todo_policy is not None:
+                resolved_l2_todo_policy = normalize_l2_todo_policy(external_l2_todo_policy)
+            if _single_no_plan_todo_setting_present(external_config):
+                (
+                    resolved_single_no_plan_todo_enabled,
+                    resolved_single_no_plan_todo_prompt,
+                ) = extract_single_no_plan_todo_settings(external_config)
             external_web_search_enabled = extract_web_search_enabled_setting(external_config)
             if external_web_search_enabled is not None:
                 resolved_web_search_enabled = bool(external_web_search_enabled)
@@ -95408,6 +101603,14 @@ def main():
     web_ui_auto_task_level_ceiling = extract_auto_task_level_ceiling_setting(web_ui_config)
     if web_ui_auto_task_level_ceiling is not None:
         resolved_auto_task_level_ceiling = normalize_auto_task_level_ceiling(web_ui_auto_task_level_ceiling)
+    web_ui_l2_todo_policy = extract_l2_todo_policy_setting(web_ui_config)
+    if web_ui_l2_todo_policy is not None:
+        resolved_l2_todo_policy = normalize_l2_todo_policy(web_ui_l2_todo_policy)
+    if _single_no_plan_todo_setting_present(web_ui_config):
+        (
+            resolved_single_no_plan_todo_enabled,
+            resolved_single_no_plan_todo_prompt,
+        ) = extract_single_no_plan_todo_settings(web_ui_config)
     web_ui_web_search_enabled = extract_web_search_enabled_setting(web_ui_config)
     if web_ui_web_search_enabled is not None:
         resolved_web_search_enabled = bool(web_ui_web_search_enabled)
@@ -95454,6 +101657,59 @@ def main():
             getattr(args, "auto_task_level_ceiling", "")
         )
     resolved_auto_task_level_ceiling = normalize_auto_task_level_ceiling(resolved_auto_task_level_ceiling)
+    cli_l2_todo_policy = str(getattr(args, "l2_todo_policy", "") or "").strip()
+    if cli_l2_todo_policy:
+        resolved_l2_todo_policy = normalize_l2_todo_policy(cli_l2_todo_policy)
+    resolved_l2_todo_policy = normalize_l2_todo_policy(resolved_l2_todo_policy)
+    _l2_todo_cli_explicit = any(
+        str(arg).split("=", 1)[0]
+        in {"--l2-todo-policy", "--l2_todo_policy", "--level2-todo-policy"}
+        for arg in sys.argv[1:]
+    )
+    _l2_todo_admin_explicit = "l2_todo_policy" in admin_default_keys
+    _l2_todo_external_explicit = extract_l2_todo_policy_setting(external_config) is not None
+    _l2_todo_web_explicit = extract_l2_todo_policy_setting(web_ui_config) is not None
+    _single_todo_cli_explicit = any(
+        str(arg).split("=", 1)[0]
+        in {
+            "--single-no-plan-todo",
+            "--no-single-no-plan-todo",
+            "--single-no-plan-todo-prompt",
+        }
+        for arg in sys.argv[1:]
+    )
+    _single_todo_cli_prompt_explicit = any(
+        str(arg).split("=", 1)[0] == "--single-no-plan-todo-prompt"
+        for arg in sys.argv[1:]
+    )
+    _single_todo_cli_disable_explicit = any(
+        str(arg).split("=", 1)[0] == "--no-single-no-plan-todo"
+        for arg in sys.argv[1:]
+    )
+    _single_todo_admin_explicit = bool(
+        {"single_no_plan_todo_enabled", "single_no_plan_todo_prompt"} & admin_default_keys
+    )
+    _single_todo_external_explicit = _single_no_plan_todo_setting_present(external_config)
+    _single_todo_web_explicit = _single_no_plan_todo_setting_present(web_ui_config)
+    if _single_todo_cli_explicit or _single_todo_admin_explicit:
+        _raw_single_todo_enabled = getattr(args, "single_no_plan_todo_enabled", None)
+        if _raw_single_todo_enabled is not None:
+            resolved_single_no_plan_todo_enabled = bool(_raw_single_todo_enabled)
+        _raw_single_todo_prompt = getattr(args, "single_no_plan_todo_prompt", None)
+        if _raw_single_todo_prompt is not None:
+            resolved_single_no_plan_todo_prompt = trim(str(_raw_single_todo_prompt or "").strip(), 6000)
+            if (
+                _single_todo_cli_prompt_explicit
+                and resolved_single_no_plan_todo_prompt
+                and not _single_todo_cli_disable_explicit
+            ):
+                # A non-empty CLI prompt is itself an opt-in unless the user
+                # also supplied the explicit disable switch.
+                resolved_single_no_plan_todo_enabled = True
+        if _single_todo_cli_disable_explicit:
+            resolved_single_no_plan_todo_enabled = False
+        if resolved_single_no_plan_todo_enabled and not resolved_single_no_plan_todo_prompt:
+            resolved_single_no_plan_todo_prompt = DEFAULT_SINGLE_NO_PLAN_TODO_PROMPT
     raw_ui_style = str(getattr(args, "ui_style", "") or "").strip()
     if not raw_ui_style:
         raw_ui_style = str(extract_ui_style_setting(external_config) or "").strip()
@@ -95750,10 +102006,40 @@ def main():
         web_search_setting_locked=web_search_setting_locked,
         user_memory_mode=resolved_user_memory_mode,
         user_memory_setting_locked=user_memory_setting_locked,
+        l2_todo_policy=(
+            resolved_l2_todo_policy
+            if (_l2_todo_cli_explicit or _l2_todo_admin_explicit or _l2_todo_external_explicit or _l2_todo_web_explicit)
+            else None
+        ),
+        # Leave the constructor argument unspecified when no startup source
+        # mentioned this optional policy, so its base LLM.config.json value is
+        # preserved.  Explicit CLI/Admin/external/WebUI values still win.
+        single_no_plan_todo_enabled=(
+            resolved_single_no_plan_todo_enabled
+            if (
+                _single_todo_cli_explicit
+                or _single_todo_admin_explicit
+                or _single_todo_external_explicit
+                or _single_todo_web_explicit
+            )
+            else None
+        ),
+        single_no_plan_todo_prompt=(
+            resolved_single_no_plan_todo_prompt
+            if (
+                _single_todo_cli_explicit
+                or _single_todo_admin_explicit
+                or _single_todo_external_explicit
+                or _single_todo_web_explicit
+            )
+            else ""
+        ),
     )
     app.read_context_policy = resolved_read_context_policy
     app.tool_memory_policy = resolved_tool_memory_policy
     app.auto_task_level_ceiling = resolved_auto_task_level_ceiling
+    if _l2_todo_cli_explicit or _l2_todo_admin_explicit:
+        app.l2_todo_policy = normalize_l2_todo_policy(resolved_l2_todo_policy)
     app.web_search_enabled = bool(resolved_web_search_enabled)
     app.web_search_setting_locked = bool(web_search_setting_locked)
     app.user_memory_mode = normalize_user_memory_mode(resolved_user_memory_mode)
@@ -95770,6 +102056,9 @@ def main():
         except Exception as exc:
             print(f"[web-agent] failed to apply --config: {exc}")
             sys.exit(2)
+    if _single_todo_cli_explicit or _single_todo_admin_explicit:
+        app.single_no_plan_todo_enabled = bool(resolved_single_no_plan_todo_enabled)
+        app.single_no_plan_todo_prompt = str(resolved_single_no_plan_todo_prompt or "").strip()[:6000]
     app.read_context_policy = resolved_read_context_policy
     app.tool_memory_policy = resolved_tool_memory_policy
     app.auto_task_level_ceiling = resolved_auto_task_level_ceiling
@@ -95789,6 +102078,9 @@ def main():
         _mgr.read_context_policy = resolved_read_context_policy
         _mgr.tool_memory_policy = resolved_tool_memory_policy
         _mgr.auto_task_level_ceiling = resolved_auto_task_level_ceiling
+        _mgr.l2_todo_policy = normalize_l2_todo_policy(getattr(app, "l2_todo_policy", resolved_l2_todo_policy))
+        _mgr.single_no_plan_todo_enabled = bool(resolved_single_no_plan_todo_enabled)
+        _mgr.single_no_plan_todo_prompt = str(resolved_single_no_plan_todo_prompt or "").strip()[:6000]
         _mgr.web_search_enabled = bool(getattr(app, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED))
         _mgr.web_search_setting_locked = bool(web_search_setting_locked)
         _mgr.user_memory_mode = normalize_user_memory_mode(getattr(app, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
@@ -95797,6 +102089,9 @@ def main():
             _sess.read_context_policy = resolved_read_context_policy
             _sess.tool_memory_policy = resolved_tool_memory_policy
             _sess.auto_task_level_ceiling = resolved_auto_task_level_ceiling
+            _sess.l2_todo_policy = normalize_l2_todo_policy(getattr(app, "l2_todo_policy", resolved_l2_todo_policy))
+            _sess.single_no_plan_todo_enabled = bool(resolved_single_no_plan_todo_enabled)
+            _sess.single_no_plan_todo_prompt = str(resolved_single_no_plan_todo_prompt or "").strip()[:6000]
             _sess.web_search_enabled = bool(getattr(app, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED))
             _sess.user_memory_mode = normalize_user_memory_mode(getattr(app, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
             _sess.updated_at = now_ts()
@@ -95859,6 +102154,9 @@ def main():
         "tool_memory_policy": str(resolved_tool_memory_policy),
         "user_memory_mode": str(resolved_user_memory_mode),
         "auto_task_level_ceiling": int(resolved_auto_task_level_ceiling),
+        "l2_todo_policy": normalize_l2_todo_policy(getattr(app, "l2_todo_policy", resolved_l2_todo_policy)),
+        "single_no_plan_todo_enabled": bool(resolved_single_no_plan_todo_enabled),
+        "single_no_plan_todo_prompt": str(resolved_single_no_plan_todo_prompt or ""),
         "daily_session_limit_per_ip": int(resolved_daily_session_limit_per_ip),
         "ollama_base_url": str(bootstrap_base_url),
         "model": str(resolved_model),
