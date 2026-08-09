@@ -21859,6 +21859,24 @@ class SessionState:
             or completion.get("state") in {"finalizing", "completed"}
         )
 
+    def _blackboard_is_terminal_completion(self, board: dict | None = None) -> bool:
+        """Return only a durable run terminal state.
+
+        ``approval=True`` and ``status=COMPLETED`` are also used as a
+        provisional approval marker before the finish gate has accepted the
+        request.  The sync loop must continue through that provisional state so
+        it can collect missing review evidence and finalize normally.
+        """
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        raw_status = str(bb.get("status", "") or "").strip().upper()
+        status = self._normalize_blackboard_status(bb.get("status", "INITIALIZING"))
+        completion = self._normalize_completion_state(bb.get("completion", {}))
+        return bool(
+            raw_status == "ABORTED"
+            or status == "ABORTED"
+            or completion.get("state") in {"finalizing", "completed"}
+        )
+
     def _has_resumable_work_state(self, board: dict | None = None) -> bool:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         if self._blackboard_is_finished_or_aborted(bb):
@@ -28682,7 +28700,10 @@ class SessionState:
             return True
         tool = canonicalize_tool_name(record.get("tool", record.get("name", "")))
         command = str(record.get("command", "") or "")
-        summary = str(record.get("summary", record.get("output", "")) or "")
+        summary = str(
+            record.get("summary", record.get("output", record.get("content", "")))
+            or ""
+        )
         if self._is_plan_infrastructure_tool_error(tool, {"command": command}, summary):
             return True
         low = unicodedata.normalize("NFKC", summary).lower()
@@ -36778,6 +36799,11 @@ body{padding:18px}
         )
 
     def _execution_log_entry_is_blocking_error(self, row: dict) -> bool:
+        # Role/tool policy failures are orchestration diagnostics, not product
+        # failures. They must not keep the finish gate in a repair loop after a
+        # valid developer-side validation has already been recorded.
+        if self._is_non_product_acceptance_error_record(row):
+            return False
         if (
             str((row or {}).get("assertion_kind", "") or "") == "negative_search_no_match"
             and bool((row or {}).get("assertion_ok", False))
@@ -36963,10 +36989,13 @@ body{padding:18px}
             }
         if reason_key == "sync-review-missing":
             return {
-                "target": "reviewer",
+                # Reviewer is intentionally read-only in normal Sync mode.
+                # Validation that must execute a command belongs to developer;
+                # reviewer can inspect the resulting evidence afterward.
+                "target": "developer",
                 "instruction": (
-                    "Finish is blocked until reviewer validation passes. Read the current artifacts/logs, "
-                    "run or inspect validation evidence, then write review_feedback with pass/fix and evidence."
+                    "Finish is blocked until current validation evidence is recorded. Run or inspect the required "
+                    "validation as the developer, then write review_feedback with pass/fix and concrete evidence."
                 ),
                 "reason": reason_key,
                 "source": "finish-gate",
@@ -40669,6 +40698,77 @@ body{padding:18px}
     def _plan_control_feedback(outcome: object, message: object) -> str:
         outcome_key = re.sub(r"[^a-z0-9_]+", "_", str(outcome or "continue").strip().lower()).strip("_")
         return f"Control[{outcome_key or 'continue'}]: {str(message or '').strip()}"
+
+    def _capture_todo_write_transaction(
+        self,
+        board: dict | None = None,
+        *,
+        active_step_id: str = "",
+    ) -> dict:
+        """Capture the task/step identity that a TodoWrite may commit against.
+
+        TodoWrite can spend a long time in semantic auditing.  The caller must
+        revalidate this snapshot before committing because the run loop may have
+        advanced the plan, completed the task, or accepted a newer user request
+        while that audit was in flight.
+        """
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        current = self._get_active_plan_step(bb)
+        resolved_step_id = trim(
+            str(active_step_id or (current or {}).get("id", "") or "").strip(),
+            40,
+        )
+        try:
+            task_epoch = float(bb.get("task_epoch", 0.0) or 0.0)
+        except Exception:
+            task_epoch = 0.0
+        return {
+            "task_epoch": task_epoch,
+            "plan_step_id": resolved_step_id,
+            "run_generation": int(getattr(self, "run_generation", 0) or 0),
+            "started_at": float(now_ts()),
+        }
+
+    def _todo_write_transaction_is_current(
+        self,
+        transaction: dict | None,
+        *,
+        board: dict | None = None,
+    ) -> tuple[bool, str]:
+        if not isinstance(transaction, dict):
+            return True, ""
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        if self._blackboard_is_terminal_completion(bb):
+            return False, "run already finished or aborted"
+        try:
+            expected_epoch = float(transaction.get("task_epoch", 0.0) or 0.0)
+            actual_epoch = float(bb.get("task_epoch", 0.0) or 0.0)
+        except Exception:
+            return False, "task epoch is unavailable"
+        if expected_epoch and abs(expected_epoch - actual_epoch) > 1e-6:
+            return False, "task epoch changed"
+        expected_generation = int(transaction.get("run_generation", 0) or 0)
+        actual_generation = int(getattr(self, "run_generation", 0) or 0)
+        if expected_generation and actual_generation and expected_generation != actual_generation:
+            return False, "run generation changed"
+        expected_step_id = trim(str(transaction.get("plan_step_id", "") or "").strip(), 40)
+        if expected_step_id:
+            current = self._get_active_plan_step(bb)
+            actual_step_id = trim(str((current or {}).get("id", "") or "").strip(), 40)
+            if actual_step_id != expected_step_id:
+                return False, "active plan step changed"
+        return True, ""
+
+    def _emit_stale_todo_write_discarded(self, reason: str) -> str:
+        detail = trim(str(reason or "stale task transaction").strip(), 180)
+        self._emit(
+            "status",
+            {"summary": f"discarded stale TodoWrite update ({detail})"},
+        )
+        return self._plan_control_feedback(
+            "stale_todo_transaction",
+            f"The TodoWrite operation was discarded because {detail}. Preserve the current canonical task/step state.",
+        )
 
     def _tool_control_feedback_outcome(self, name: object, output: object) -> str:
         del name
@@ -47135,9 +47235,26 @@ body{padding:18px}
         *,
         rows: list[dict] | None = None,
         board: dict | None = None,
+        transaction: dict | None = None,
     ) -> bool:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        if transaction is not None:
+            valid, stale_reason = self._todo_write_transaction_is_current(
+                transaction,
+                board=bb,
+            )
+            if not valid:
+                self._emit_stale_todo_write_discarded(stale_reason)
+                return False
         self._migrate_plan_worker_todo_partitions(bb)
+        if transaction is not None:
+            valid, stale_reason = self._todo_write_transaction_is_current(
+                transaction,
+                board=self._ensure_blackboard(),
+            )
+            if not valid:
+                self._emit_stale_todo_write_discarded(stale_reason)
+                return False
         mirror = dict(bb.get("plan_worker_todos", {}) if isinstance(bb.get("plan_worker_todos"), dict) else {})
         changed = False
         worker_owners = {"developer", "explorer", "reviewer"}
@@ -47275,6 +47392,14 @@ body{padding:18px}
                 mirror.pop(parent, None)
                 changed = True
         if changed:
+            if transaction is not None:
+                valid, stale_reason = self._todo_write_transaction_is_current(
+                    transaction,
+                    board=self._ensure_blackboard(),
+                )
+                if not valid:
+                    self._emit_stale_todo_write_discarded(stale_reason)
+                    return False
             bb["plan_worker_todos"] = mirror
             bb["updated_at"] = float(now_ts())
             self.blackboard = bb
@@ -48550,17 +48675,40 @@ body{padding:18px}
         revision_reason: str = "",
         revision_evidence: object = None,
         trusted_restore: bool = False,
+        transaction: dict | None = None,
     ) -> str:
         if not isinstance(items, list):
             raise ValueError("items must be array")
+        bb = self._ensure_blackboard()
+        if transaction is not None:
+            valid, stale_reason = self._todo_write_transaction_is_current(
+                transaction,
+                board=bb,
+            )
+            if not valid:
+                return self._emit_stale_todo_write_discarded(stale_reason)
         active_step = self._get_active_plan_step()
         if not isinstance(active_step, dict):
+            if transaction is not None:
+                return self._emit_stale_todo_write_discarded("active plan step no longer exists")
             return self.todo.update(items)
         step_id = trim(str(active_step.get("id", "") or ""), 20)
         if not step_id:
+            if transaction is not None:
+                return self._emit_stale_todo_write_discarded("active plan step no longer exists")
             return self.todo.update(items)
         role_key = self._sanitize_agent_role(role) or self._current_plan_worker_owner()
-        bb = self._ensure_blackboard()
+        if transaction is None:
+            transaction = self._capture_todo_write_transaction(
+                bb,
+                active_step_id=step_id,
+            )
+        valid, stale_reason = self._todo_write_transaction_is_current(
+            transaction,
+            board=bb,
+        )
+        if not valid:
+            return self._emit_stale_todo_write_discarded(stale_reason)
         existing = self.todo.snapshot()
         preserved: list[dict] = []
         target_rows: list[dict] = []
@@ -49060,24 +49208,40 @@ body{padding:18px}
                     _insert_idx = _i + 1
                     break
         final_rows = preserved[:_insert_idx] + current_step_rows + preserved[_insert_idx:]
-        result = self.todo.update(final_rows)
+        state_lock = getattr(self, "lock", None)
+        if state_lock is not None:
+            state_lock.acquire()
         try:
-            self._sync_plan_worker_todos_to_blackboard(step_id)
-            self._update_plan_file_step_status()
-        except Exception:
-            pass
-        # TodoWrite is the requested state transition, not merely a hint.  If
-        # this transaction completed the final acceptance row with deterministic
-        # or semantic evidence, advance now from the same committed graph.  Both
-        # Single and Sync use this path; the next run-loop preflight remains a
-        # harmless recovery backstop if persistence/UI work raises unexpectedly.
-        try:
-            self._advance_completed_acceptance_after_todo_commit(
-                active_step,
-                actor=role_key,
+            valid, stale_reason = self._todo_write_transaction_is_current(
+                transaction,
+                board=self._ensure_blackboard(),
             )
-        except Exception:
-            pass
+            if not valid:
+                return self._emit_stale_todo_write_discarded(stale_reason)
+            result = self.todo.update(final_rows)
+            try:
+                self._sync_plan_worker_todos_to_blackboard(
+                    step_id,
+                    transaction=transaction,
+                )
+                self._update_plan_file_step_status()
+            except Exception:
+                pass
+            # TodoWrite is the requested state transition, not merely a hint.  If
+            # this transaction completed the final acceptance row with deterministic
+            # or semantic evidence, advance now from the same committed graph.  Both
+            # Single and Sync use this path; the next run-loop preflight remains a
+            # harmless recovery backstop if persistence/UI work raises unexpectedly.
+            try:
+                self._advance_completed_acceptance_after_todo_commit(
+                    active_step,
+                    actor=role_key,
+                )
+            except Exception:
+                pass
+        finally:
+            if state_lock is not None:
+                state_lock.release()
         # Read-before-write closure: echo the canonical, renumbered subtask list
         # back as the tool result so the model SEES the reconciled arrangement it
         # just produced (numbering, statuses, the single acceptance gate) rather
@@ -59530,6 +59694,10 @@ body{padding:18px}
         bb = self._ensure_blackboard()
         active_step = self._get_active_plan_step(bb)
         active_step_id = trim(str((active_step or {}).get("id", "") or ""), 40)
+        transaction = self._capture_todo_write_transaction(
+            bb,
+            active_step_id=active_step_id,
+        )
         role_key = self._sanitize_agent_role(role) or self._current_plan_worker_owner(bb)
         items = self._todo_payload_items(
             source,
@@ -59567,6 +59735,7 @@ body{padding:18px}
                 update_mode=mode,
                 revision_reason=reason,
                 revision_evidence=revision_evidence,
+                transaction=transaction,
             )
         if route_kind == "pure_sync":
             return self._merge_owner_scoped_todo_items(normalized_items, role=role_key)
@@ -60805,7 +60974,20 @@ body{padding:18px}
             # a ThreadPoolExecutor boundary.
             # MCP tools also enforce their own per-call timeout inside the
             # MCP client (and may legitimately run long), so don't double-wrap.
-            if name in {"bash", "worktree_run", "check_background"} or self._is_mcp_tool_name(name):
+            if (
+                name in {
+                    "bash",
+                    "worktree_run",
+                    "check_background",
+                    # TodoWrite mutates the canonical Todo/blackboard graph.
+                    # It cannot be safely cancelled once semantic auditing has
+                    # started, so never run it behind a cancellable worker
+                    # thread that can outlive its timeout response.
+                    "TodoWrite",
+                    "TodoWriteRescue",
+                }
+                or self._is_mcp_tool_name(name)
+            ):
                 out = self._dispatch_tool_inner(name, args, role_key)
                 self._maybe_record_tool_memory_after_result(name, args, out, role_key)
                 self._record_tool_telemetry(name, out, telemetry_started)
@@ -62908,6 +63090,12 @@ body{padding:18px}
             "reviewer": 0.0,
         }
         board = self._ensure_blackboard()
+        if self._blackboard_is_terminal_completion(board):
+            self._emit(
+                "status",
+                {"summary": "sync loop skipped: task is already finished or aborted"},
+            )
+            return
         profile = self._ensure_blackboard_task_profile(board)
         budget_val = self._blackboard_round_budget(board)
         # Pure sync no-plan — create internal plan-step todos at the runtime
@@ -62940,6 +63128,15 @@ body{padding:18px}
                         "agent_role": "manager",
                     }
                 )
+        # A bootstrap/reconciliation callback may have completed the task while
+        # the worker was being initialized. Never reopen a completed board.
+        board = self._ensure_blackboard()
+        if self._blackboard_is_terminal_completion(board):
+            self._emit(
+                "status",
+                {"summary": "sync loop stopped during initialization: task is already finished or aborted"},
+            )
+            return
         self._blackboard_set_status("INITIALIZING", "sync collaborative loop started")
         self._emit(
             "status",
@@ -62954,6 +63151,13 @@ body{padding:18px}
         rounds_used = 0
         budget_compact_notified = False
         while rounds_used < self.max_agent_rounds:
+            board = self._ensure_blackboard()
+            if self._blackboard_is_terminal_completion(board):
+                self._emit(
+                    "status",
+                    {"summary": "sync loop stopped: task reached a terminal completion state"},
+                )
+                break
             current_budget = self._blackboard_round_budget()
             compact_mode = bool(current_budget > 0 and rounds_used >= current_budget)
             if compact_mode and (not budget_compact_notified):
