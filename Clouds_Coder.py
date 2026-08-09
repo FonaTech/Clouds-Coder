@@ -28663,6 +28663,37 @@ class SessionState:
             or "illegal absolute path" in low
         )
 
+    def _is_non_product_acceptance_error_record(self, record: dict | None) -> bool:
+        """Return whether a failed observation describes orchestration, not the artifact.
+
+        Sync read-only roles can accidentally request a mutating shell command,
+        and Todo/plan control tools can reject an update.  Those failures are
+        useful coordination feedback, but they are not a newer observation of
+        the product under acceptance and therefore must not invalidate an
+        already decisive PASS.  This classifier is deliberately task-agnostic;
+        it recognizes runtime-owned policy/permission failures, never a
+        particular framework, artifact, or visual assertion.
+        """
+        if not isinstance(record, dict):
+            return False
+        if bool(record.get("control_feedback", False)) or str(
+            record.get("error_kind", "") or ""
+        ).strip().lower() == "plan_control_gate":
+            return True
+        tool = canonicalize_tool_name(record.get("tool", record.get("name", "")))
+        command = str(record.get("command", "") or "")
+        summary = str(record.get("summary", record.get("output", "")) or "")
+        if self._is_plan_infrastructure_tool_error(tool, {"command": command}, summary):
+            return True
+        low = unicodedata.normalize("NFKC", summary).lower()
+        role_policy_markers = (
+            "shell mutation is not allowed for read-only agent role",
+            "is not allowed for agent role",
+            "tool is not allowed for agent role",
+            "read-only agent role",
+        )
+        return any(marker in low for marker in role_policy_markers)
+
     def _code_preview_bucket_dir(self, rel_path: str) -> Path:
         rel = normalize_rel_preview_path(rel_path)
         digest = hashlib.sha1(rel.encode("utf-8", errors="ignore")).hexdigest()[:14]
@@ -41621,7 +41652,20 @@ body{padding:18px}
             "frontend", "front-end", "前端", "页面", "頁面", "dom", "ui", "交互", "互動",
             "可旋转", "可旋轉", "visible", "display", "显示", "顯示", "fps",
         )
-        return any(token in text for token in visual_tokens)
+        for token in visual_tokens:
+            # Short ASCII capability names need lexical boundaries: a raw
+            # substring check made ``ui`` match ordinary words such as
+            # ``build`` and incorrectly converted generic runtime acceptance
+            # into a browser-preferred contract.
+            if token.isascii() and len(token) <= 3:
+                if re.search(
+                    rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])",
+                    text,
+                ):
+                    return True
+            elif token in text:
+                return True
+        return False
 
     @staticmethod
     def _is_browser_runtime_tool_name(tool_name: object) -> bool:
@@ -41812,6 +41856,10 @@ body{padding:18px}
             if isinstance(row, dict)
             and canonicalize_tool_name(row.get("tool", row.get("name", ""))) not in mutation_tools
         ]
+        product_rows = [
+            row for row in rows
+            if not self._is_non_product_acceptance_error_record(row)
+        ]
 
         def negative_assertion_passes(row: dict) -> bool:
             return bool(
@@ -41832,7 +41880,7 @@ body{padding:18px}
             )
 
         passing_rows = [
-            row for row in rows
+            row for row in product_rows
             if (
                 runtime_passes(row)
                 if str(row.get("kind", "") or "") == "runtime"
@@ -41840,9 +41888,19 @@ body{padding:18px}
             ) or negative_assertion_passes(row)
         ]
         if expected == "runtime/test/build/browser execution evidence":
-            runtime_rows = [row for row in rows if str(row.get("kind", "") or "") == "runtime"]
-            if runtime_rows and not (
-                runtime_passes(runtime_rows[-1]) or negative_assertion_passes(runtime_rows[-1])
+            runtime_rows = [
+                row for row in product_rows
+                if str(row.get("kind", "") or "") == "runtime"
+            ]
+            decisive_runtime_rows = [
+                row for row in runtime_rows
+                if runtime_passes(row)
+                or negative_assertion_passes(row)
+                or self._acceptance_failure_is_decisive(row, acceptance_text)
+            ]
+            if decisive_runtime_rows and not (
+                runtime_passes(decisive_runtime_rows[-1])
+                or negative_assertion_passes(decisive_runtime_rows[-1])
             ):
                 return {
                     "passed": False,
@@ -41940,7 +41998,7 @@ body{padding:18px}
                 "missing_terms": assertion_terms,
                 "missing_paths": self._extract_plan_step_referenced_paths(acceptance_text, limit=8),
                 "matched_records": [],
-                "candidate": bool(rows),
+                "candidate": bool(product_rows),
             }
 
         coverage_rows = core_rows if expected == "runtime/test/build/browser execution evidence" else passing_rows
@@ -41972,7 +42030,22 @@ body{padding:18px}
             term for term in assertion_terms
             if not self._acceptance_summary_covers_term(combined, term)
         ]
+        explicit_acceptance_pass = any(
+            bool(re.search(
+                r"(?i)(?:\bacceptance|\baccept|验收|驗收)\s*[:=：_-]*\s*(?:pass|passed|ok|通过|通過)\b",
+                str(row.get("summary", "") or ""),
+            ))
+            and runtime_passes(row)
+            for row in core_rows
+        )
         deterministic_pass = bool(core_rows and not missing_paths and not missing_terms)
+        # A successful, explicit verdict emitted by the acceptance probe is a
+        # decisive aggregate result.  It may satisfy natural-language concepts
+        # whose exact words (e.g. "scene" vs pixel/canvas metrics) are absent
+        # from the compacted output.  Path identity is still required, and a
+        # later decisive failure has already been handled above.
+        if explicit_acceptance_pass and not missing_paths:
+            deterministic_pass = True
         semantic_review_required = bool(browser_observation_missing and core_rows)
         passed = bool(deterministic_pass and not semantic_review_required)
         return {
@@ -41990,7 +42063,7 @@ body{padding:18px}
             "missing_terms": missing_terms,
             "missing_paths": missing_paths,
             "matched_records": coverage_rows[-16:] if passed else [],
-            "candidate": True,
+            "candidate": bool(product_rows),
             "semantic_review_required": semantic_review_required,
             "browser_observation_missing": bool(browser_observation_missing),
         }
@@ -42902,6 +42975,40 @@ body{padding:18px}
         self._replace_plan_worker_rows(step_id, rows)
         return self._step_subtasks_all_completed(plan_step)
 
+    def _advance_completed_acceptance_after_todo_commit(
+        self,
+        plan_step: dict,
+        *,
+        actor: str,
+    ) -> bool:
+        """Advance once after a Todo transaction durably closes acceptance.
+
+        This is intentionally called only after both TodoManager and the
+        blackboard mirror have been updated.  It closes the historical split
+        state where TodoWrite returned success while the run loop kept routing
+        the same acceptance row for another round.
+        """
+        if not isinstance(plan_step, dict):
+            return False
+        bb = self._ensure_blackboard()
+        current = self._get_active_plan_step(bb)
+        step_id = trim(str(plan_step.get("id", "") or ""), 40)
+        if not isinstance(current, dict) or trim(str(current.get("id", "") or ""), 40) != step_id:
+            return False
+        gate = self._plan_step_acceptance_gate_status(current, None, bb)
+        if not self._plan_step_acceptance_ready_for_advance(current, gate, bb):
+            return False
+        record = gate.get("evidence", {}) if isinstance(gate.get("evidence"), dict) else {}
+        evidence = trim(
+            str(record.get("summary", "") or "").strip()
+            or f"{gate.get('source', 'acceptance-gate')}: {gate.get('reason', 'verified')}",
+            200,
+        )
+        return bool(self._advance_plan_step(
+            evidence=evidence,
+            actor=str(actor or "developer"),
+        ))
+
     def _record_trusted_plan_step_acceptance_event(
         self,
         plan_step: dict,
@@ -43022,18 +43129,22 @@ body{padding:18px}
                 row for row in scoped_records
                 if str(row.get("kind", "") or "") == "runtime"
                 and float(row.get("ts", 0.0) or 0.0) > latest_trusted_ts + 1e-6
+                and not self._is_non_product_acceptance_error_record(row)
             ]
-            if later_runtime and not (
-                self._plan_evidence_record_passes(later_runtime[-1])
-                or (
-                    str(later_runtime[-1].get("assertion_kind", "") or "") == "negative_search_no_match"
-                    and bool(later_runtime[-1].get("assertion_ok", False))
-                    and bool(later_runtime[-1].get("assertion_complete", False))
+            later_failures = [
+                row for row in later_runtime
+                if not self._plan_evidence_record_passes(row)
+                and not (
+                    str(row.get("assertion_kind", "") or "") == "negative_search_no_match"
+                    and bool(row.get("assertion_ok", False))
+                    and bool(row.get("assertion_complete", False))
                 )
-            ):
+                and self._acceptance_failure_is_decisive(row, contract_text)
+            ]
+            if later_failures:
                 # A trusted semantic decision describes the evidence available
-                # at its timestamp. A later failing check is newer ground truth
-                # and invalidates that decision until repaired/re-audited.
+                # at its timestamp. A later decisive failure is newer ground
+                # truth and invalidates it; unrelated probes/policy errors do not.
                 return []
         return matches
 
@@ -45698,9 +45809,23 @@ body{padding:18px}
         if alias:
             desired_index = max(0, int(alias.group(1)) - 1)
         else:
-            pt_alias = re.fullmatch(r"pt[\s:_-]*0*(\d+)", raw_parent, flags=re.IGNORECASE)
-            if pt_alias:
-                desired_index = max(0, int(pt_alias.group(1)))
+            # Providers commonly serialize a plan-step ordinal as the bare
+            # value ``"1"`` (or ``"#1"``) instead of echoing the opaque
+            # canonical ``pt:<epoch>:000`` id.  Treat that shape as a 1-based
+            # roadmap ordinal.  Resolution still goes through project_todos,
+            # so an alias for a different step remains a real cross-step row
+            # and is rejected by the caller rather than silently rebound.
+            ordinal_alias = re.fullmatch(
+                r"#?\s*0*(\d+)\s*[.)、．]?",
+                raw_parent,
+                flags=re.IGNORECASE,
+            )
+            if ordinal_alias:
+                desired_index = max(0, int(ordinal_alias.group(1)) - 1)
+            else:
+                pt_alias = re.fullmatch(r"pt[\s:_-]*0*(\d+)", raw_parent, flags=re.IGNORECASE)
+                if pt_alias:
+                    desired_index = max(0, int(pt_alias.group(1)))
 
         if desired_index is None and isinstance(rows, list):
             majors: list[int] = []
@@ -46228,6 +46353,9 @@ body{padding:18px}
         row: dict | None,
         plan_step: dict | None,
         board: dict | None = None,
+        *,
+        allow_acceptance_semantic_review: bool = False,
+        actor: str = "",
     ) -> bool:
         """Return whether a persisted completed worker row is evidence-backed.
 
@@ -46274,12 +46402,25 @@ body{padding:18px}
                 since_ts = self._acceptance_evidence_since_ts(row, plan_step)
             except Exception:
                 since_ts = 0.0
-            return bool(self._trusted_plan_step_acceptance_records(
+            if self._trusted_plan_step_acceptance_records(
                 plan_step,
                 row,
                 board=board,
                 since_ts=since_ts,
-            ))
+            ):
+                return True
+            if not allow_acceptance_semantic_review:
+                return False
+            # A model explicitly requesting completion is the correct point for
+            # the one-shot semantic fallback.  Passive restore/sync paths keep
+            # this disabled, so simply loading a stale completed bit can never
+            # trigger an LLM decision or manufacture progress.
+            return self._semantic_acceptance_completion_has_evidence(
+                plan_step,
+                row,
+                board=board,
+                actor=actor,
+            )
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         bindings = bb.get("plan_subtask_evidence_bindings", {}) if isinstance(bb.get("plan_subtask_evidence_bindings"), dict) else {}
         step_bindings = bindings.get(step_id, {}) if isinstance(bindings.get(step_id), dict) else {}
@@ -46311,6 +46452,117 @@ body{padding:18px}
             subtask_id=subtask_id,
             since_ts=since_ts,
         ))
+
+    def _semantic_acceptance_completion_has_evidence(
+        self,
+        plan_step: dict,
+        acceptance: dict,
+        *,
+        board: dict | None = None,
+        actor: str = "",
+    ) -> bool:
+        """Resolve an ambiguous acceptance completion against real step evidence.
+
+        The existing quality judge is signature-cached.  We invoke it only when
+        the deterministic gate reports semantic ambiguity and has current,
+        step-local product evidence.  PASS is persisted as a contract-bound
+        trusted event; VERIFY and REPAIR stay open and retain their audit for the
+        normal gate/recovery route.
+        """
+        if not isinstance(plan_step, dict) or not isinstance(acceptance, dict):
+            return False
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        step_id = trim(str(plan_step.get("id", "") or ""), 40)
+        if not step_id:
+            return False
+        rows = self._active_plan_worker_todo_rows(step_id, role="")
+        work_rows = [
+            row for row in rows
+            if not self._is_plan_step_acceptance_subtask(row.get("content", ""))
+        ]
+        if not work_rows or any(
+            str(row.get("status", "") or "").strip().lower() != "completed"
+            for row in work_rows
+        ):
+            return False
+        since_ts = self._acceptance_evidence_since_ts(acceptance, plan_step)
+        records = self._plan_step_evidence_records(step_id, board=bb, since_ts=since_ts)
+        records.extend(self._plan_step_acceptance_review_records(
+            plan_step,
+            board=bb,
+            since_ts=since_ts,
+        ))
+        product_records = [
+            row for row in records
+            if isinstance(row, dict)
+            and not self._is_non_product_acceptance_error_record(row)
+        ]
+        passing_candidates = [
+            row for row in product_records
+            if self._plan_evidence_record_passes(row)
+            or (
+                str(row.get("assertion_kind", "") or "") == "negative_search_no_match"
+                and bool(row.get("assertion_ok", False))
+                and bool(row.get("assertion_complete", False))
+            )
+        ]
+        if not passing_candidates:
+            return False
+        contract_text = self._effective_plan_step_acceptance_text(
+            plan_step,
+            acceptance.get("content", ""),
+        )
+        expected = self._acceptance_expected_evidence(contract_text)
+        evaluation = self._evaluate_acceptance_evidence_records(
+            product_records,
+            expected,
+            acceptance_text=contract_text,
+            subject_text=str(
+                plan_step.get("full_content", "")
+                or plan_step.get("content", "")
+                or ""
+            ),
+        )
+        if str(evaluation.get("status", "") or "") == "failed":
+            return False
+        gate = {
+            "ok": False,
+            "reason": "final-acceptance-semantic-coverage-uncertain",
+            "expected": expected,
+            "acceptance": dict(acceptance),
+            "acceptance_contract": contract_text,
+            "candidate_evidence": product_records[-16:],
+            "current_results": [],
+            "evidence_evaluation": evaluation,
+        }
+        review = self._llm_review_plan_step_quality(
+            plan_step,
+            {"tool_results": []},
+            bb,
+            candidate_evidence={"gate": gate, "records": product_records[-16:]},
+        )
+        if not (
+            review.get("available")
+            and review.get("passed")
+            and str(review.get("confidence", "") or "").lower() in {"high", "medium"}
+        ):
+            return False
+        evidence_items = review.get("evidence", []) or []
+        if not isinstance(evidence_items, list):
+            evidence_items = [evidence_items]
+        evidence_text = "; ".join(
+            trim(str(item or ""), 260)
+            for item in evidence_items[:4]
+            if str(item or "").strip()
+        ) or trim(str(review.get("reason", "") or "semantic acceptance pass"), 500)
+        trusted = self._record_trusted_plan_step_acceptance_event(
+            plan_step,
+            acceptance,
+            evidence=trim(f"[semantic-audit] {evidence_text}", 900),
+            actor=str(actor or "reviewer"),
+            source="semantic_audit",
+        )
+        return bool(trusted)
 
     def _plan_subtask_semantic_evidence_signature(
         self,
@@ -46631,7 +46883,13 @@ body{padding:18px}
         if subtask_id:
             candidate["subtask_id"] = subtask_id
         if self._is_plan_step_acceptance_subtask(candidate.get("content", "")):
-            return self._plan_worker_completed_status_has_evidence(candidate, plan_step, board)
+            return self._plan_worker_completed_status_has_evidence(
+                candidate,
+                plan_step,
+                board,
+                allow_acceptance_semantic_review=True,
+                actor=str(candidate.get("completed_by", "") or self._current_plan_worker_owner(board)),
+            )
         if self._plan_subtask_has_accumulated_evidence(
             plan_step,
             candidate.get("content", ""),
@@ -48808,6 +49066,18 @@ body{padding:18px}
             self._update_plan_file_step_status()
         except Exception:
             pass
+        # TodoWrite is the requested state transition, not merely a hint.  If
+        # this transaction completed the final acceptance row with deterministic
+        # or semantic evidence, advance now from the same committed graph.  Both
+        # Single and Sync use this path; the next run-loop preflight remains a
+        # harmless recovery backstop if persistence/UI work raises unexpectedly.
+        try:
+            self._advance_completed_acceptance_after_todo_commit(
+                active_step,
+                actor=role_key,
+            )
+        except Exception:
+            pass
         # Read-before-write closure: echo the canonical, renumbered subtask list
         # back as the tool result so the model SEES the reconciled arrangement it
         # just produced (numbering, statuses, the single acceptance gate) rather
@@ -50291,6 +50561,48 @@ body{padding:18px}
             return False
         return not self._command_output_has_error_shape(str(record.get("summary", "") or ""))
 
+    def _acceptance_failure_is_decisive(
+        self,
+        record: dict | None,
+        acceptance_text: object = "",
+    ) -> bool:
+        """Whether a failed runtime record is a verdict about this contract.
+
+        A non-zero helper/probe command is not automatically acceptance ground
+        truth.  It invalidates an earlier PASS only when it is explicitly an
+        acceptance/validation command, reports a contract assertion, or its
+        output names a concrete term/path from the acceptance contract.  Real
+        later browser/test/build failures therefore still block, while an
+        unrelated diagnostic experiment cannot monopolize the step cursor.
+        """
+        if not isinstance(record, dict) or str(record.get("kind", "") or "") != "runtime":
+            return False
+        if self._is_non_product_acceptance_error_record(record):
+            return False
+        assertion_kind = str(record.get("assertion_kind", "") or "").strip()
+        if assertion_kind or bool(record.get("assertion_complete", False)):
+            return True
+        command = unicodedata.normalize("NFKC", str(record.get("command", "") or "")).lower()
+        summary = unicodedata.normalize("NFKC", str(record.get("summary", "") or "")).lower()
+        explicit_verdict_markers = (
+            "acceptance", "accept=", "accept_", "accept-", "acceptance=",
+            "验收", "驗收", "gate_pass", "gate_fail", "gate closed", "gate_closed",
+            "all_checks", "all checks", "assertion", "assert_",
+        )
+        if any(marker in command or marker in summary for marker in explicit_verdict_markers):
+            return True
+        if self._command_looks_like_validation(command):
+            return True
+        contract = str(acceptance_text or "")
+        identifiers = list(self._acceptance_assertion_terms(contract))
+        identifiers.extend(self._extract_plan_step_referenced_paths(contract, limit=8))
+        haystack = f"{command}\n{summary}"
+        return any(
+            self._acceptance_summary_covers_term(haystack, value)
+            for value in identifiers
+            if str(value or "").strip()
+        )
+
     def _plan_subtask_evidence_identifiers(self, text: object) -> dict:
         source = normalize_work_text(str(text or "")) or str(text or "")
         source = re.sub(r"^\s*\d+\.\d+\s+", "", source).strip()
@@ -50876,7 +51188,14 @@ body{padding:18px}
         )
         if evaluation.get("passed"):
             return list(evaluation.get("matched_records", []) or [])
-        if acceptance_records and str(evaluation.get("status", "") or "") != "failed":
+        # A binding is only a routing hint.  Older/third-party TodoWrite calls
+        # can leave the decisive runtime event step-local but unbound (or bound
+        # to a neighbouring acceptance row after a snapshot rewrite).  Once the
+        # acceptance-only view is inconclusive, reconcile against the complete
+        # current-step ledger whenever it contains evidence.  The explicit
+        # ``failed`` guard is intentional: a decisive failure must never be
+        # hidden by a broader fallback pass.
+        if records and str(evaluation.get("status", "") or "") != "failed":
             aggregate_records = list(records)
             aggregate_records.extend(review_records)
             evaluation = self._evaluate_acceptance_evidence_records(
