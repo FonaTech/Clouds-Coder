@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -u
+set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
@@ -17,5 +17,7 @@ fi
 "$PYTHON_BIN" "$SCRIPT_DIR/run_split.py" "$@"
 STATUS=$?
 echo
-read -r -p "Press Enter to close..."
+if [[ -t 0 ]]; then
+  read -r -p "Press Enter to close..."
+fi
 exit "$STATUS"

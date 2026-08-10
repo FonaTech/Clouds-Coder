@@ -12,17 +12,11 @@
   <a href="https://pypi.org/project/clouds-coder/"><img src="https://img.shields.io/pypi/dm/clouds-coder.svg" alt="PyPI 下载量" /></a>
 </p>
 <p align="center">
-  <a href="./RELEASE_NOTES.md">Release Notes</a> ·
+  <a href="./log/CHANGELOG-2026-08-10.md">2026-08-10 功能更新日志（EN/中文/日本語）</a> ·
   <a href="./log/CHANGELOG-2026-06-22.md">2026-06-22 更新日志（EN/中文/日本語）</a> ·
   <a href="./log/CHANGELOG-2026-06-05.md">2026-06-05 更新日志（EN/中文/日本語）</a> ·
   <a href="./log/CHANGELOG-2026-05-28.md">2026-05-28 更新日志（EN/中文/日本語）</a> ·
   <a href="./log/CHANGELOG-2026-05-02.md">2026-05-02 更新日志（EN/中文/日本語）</a> ·
-  <a href="./log/CHANGELOG-2026-03-31.md">2026-03-31 更新日志（EN/中文/日本語）</a> ·
-  <a href="./log/CHANGELOG-2026-03-25.md">2026-03-25 更新日志（EN/中文/日本語）</a> ·
-  <a href="./log/CHANGELOG-2026-03-20.md">2026-03-20 更新日志（EN/中文/日本語）</a> ·
-  <a href="./log/CHANGELOG-2026-03-16.md">2026-03-16 更新日志</a> ·
-  <a href="./log/CHANGELOG-2026-03-07.md">2026-03-07 更新日志</a> ·
-  <a href="./LICENSE">MIT License</a> ·
   <a href="./LLM.config.json">LLM Config Template</a>
 </p>
 <p align="center">
@@ -33,7 +27,7 @@ Clouds Coder 是一个以“CLI 执行层与 Web 用户层分离”为核心的�
 
 它的首要问题定义是：CLI 编程门槛高、环境分发困难、学习曲线陡。Clouds Coder 通过前后端分离（云端 CLI 执行 + Web 端交互控制）来降低 Vibe Coding 上手成本，同时把超时、截断、上下文预算、空想循环治理作为并列核心能力，保障复杂任务可执行、可收敛、可复盘。
 
-架构更新日志归档：[`CHANGELOG-2026-06-22.md`](./log/CHANGELOG-2026-06-22.md) | [`CHANGELOG-2026-06-05.md`](./log/CHANGELOG-2026-06-05.md) | [`CHANGELOG-2026-05-28.md`](./log/CHANGELOG-2026-05-28.md) | [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md) | [`CHANGELOG-2026-03-31.md`](./log/CHANGELOG-2026-03-31.md) | [`CHANGELOG-2026-03-25.md`](./log/CHANGELOG-2026-03-25.md) | [`CHANGELOG-2026-03-20.md`](./log/CHANGELOG-2026-03-20.md) | [`CHANGELOG-2026-03-16.md`](./log/CHANGELOG-2026-03-16.md) | [`CHANGELOG-2026-03-07.md`](./log/CHANGELOG-2026-03-07.md)
+架构更新日志归档：[`CHANGELOG-2026-08-10.md`](./log/CHANGELOG-2026-08-10.md) | [`CHANGELOG-2026-06-22.md`](./log/CHANGELOG-2026-06-22.md) | [`CHANGELOG-2026-06-05.md`](./log/CHANGELOG-2026-06-05.md) | [`CHANGELOG-2026-05-28.md`](./log/CHANGELOG-2026-05-28.md) | [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md)
 
 ## 1. 项目定位
 
@@ -139,7 +133,11 @@ Clouds Coder 并不是“只做写代码”的 CLI 包装器，而是一个可�
 - SSE 心跳与写入异常处理
 - 预览链路：Markdown/HTML/代码/PDF/CSV/Excel/Word/PPT/媒体/代码阶段预览
 - 前端资源控制：live/static 冻结、快照调度、对话虚拟化
-- 可导入架构拆分工具：`split_coder.py` 通过 `_source_bridge.py` 重新生成可 import 的 `Code_Structure/` 导航包
+- **管理员控制面**：密码/会话认证、Token 换取、类型化启动配置、安全重置与受监管重启回滚
+- **应用商店**：个人应用与管理员审核共享应用、不可变 Skill 快照和资源上限
+- **运行遥测**：低争用 SQLite 模型/工具指标与 `/api/admin/metrics` 隐私聚合
+- **证据绑定的 Plan 可靠性**：`TodoWriteResume`、L2 Todo 策略、过期写拒绝、语义验收复核和原子推进
+- **按架构边界拆分源码**：`split_coder.py` 按运行时自然边界生成真实 `Code_Structure/` 模块；不再通过桥接文件加载单体
 - 科研任务友好：工件优先、阶段可追溯、可复现持久化链路
 
 ## 3. 架构总览
@@ -500,7 +498,7 @@ stateDiagram-v2
 - 新增系统级依赖导入：`deque`、`selectors`、`signal`、`shlex`，用于调度与非阻塞控制路径。
 - 扩展 `RUNTIME_CONTROL_HINT_PREFIXES`：新增 `<arbiter-continue>` 与 `<fault-prefill>`，增强恢复闭环表达力。
 
-完整三语更新日志见：[`CHANGELOG-2026-03-07.md`](./log/CHANGELOG-2026-03-07.md)。
+本节在 README 归档中保留 2026-03-07 更新说明。
 
 ### 3.6 2026-03-16 严重修复：Single 模式 Agent 泄漏 & 终止信号失效
 
@@ -518,7 +516,7 @@ stateDiagram-v2
   - 第 3 层 — Sync 循环拦截：每个 Agent turn 完成后检测结论性回复，满足条件立即 break 并自动 approve。
 - 安全守卫：存在错误日志或待办事项时，结论检测不会触发 finish（避免误杀）。
 
-完整三语详情见：[`CHANGELOG-2026-03-16.md`](./log/CHANGELOG-2026-03-16.md)
+本节在 README 归档中保留 2026-03-16 更新详情。
 
 ### 3.7 2026-03-20 重大更新：Plan Mode 架构 & 内核全面升级
 
@@ -557,7 +555,7 @@ stateDiagram-v2
 - `_run_read()` 检测图片/音频/视频文件，模型支持时作为原生多模态输入注入。
 - Plan mode 下 TodoWrite 创建带 owner 标记的子任务，不覆盖 plan_step。
 
-完整三语详情见：[`CHANGELOG-2026-03-20.md`](./log/CHANGELOG-2026-03-20.md)
+本节在 README 归档中保留 2026-03-20 更新详情。
 
 ### 3.8 2026-03-25 重大更新：Skills 生态系统兼容 & 双库 RAG 架构 & 内核修复
 
@@ -656,7 +654,7 @@ sequenceDiagram
 - 前端 `setTaskLevel()`：在级别更新后添加 `scheduleSnapshot()` — 修复任务级别选择器在下次 SSE 刷新时回弹至 "Auto"。
 - `_sync_todos_from_blackboard`：worker items（`owner ∈ {developer, explorer, reviewer}`)现在单独收集并优先保留 — 修复每次黑板同步都丢失 TodoWrite 条目的问题。
 
-完整三语详情见：[`CHANGELOG-2026-03-25.md`](./log/CHANGELOG-2026-03-25.md)
+本节在 README 归档中保留 2026-03-25 更新详情。
 
 ### 3.9 2026-05-02 重大更新：持久化 Wiki RAG + 工作流记忆 + Provider 韧性 + 可导入拆分架构
 
@@ -675,7 +673,7 @@ sequenceDiagram
 - 正常对话完成后不再额外追加“任务执行完成”的合成 summary 气泡，除非显式设置 `AGENT_RUN_COMPLETION_SUMMARY=true`。
 
 **拆分架构工具**
-- `split_coder.py` 现在通过 `_source_bridge.py` 生成可导入的 `Code_Structure/` 包，避免循环 import，同时保留符号覆盖。
+- 5 月的拆分工具首次建立了可导入的 `Code_Structure/` 包；当前生成器已用真实源码模块与有序初始化取代桥接式布局。
 - self-check 覆盖顶层符号一致性、`py_compile`、陈旧生成文件、package import walk、entry-point help 和生成缓存清理。
 
 完整三语详情见：[`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md)
@@ -792,10 +790,11 @@ flowchart TB
 - `TodoManager` / `TaskManager` / `BackgroundManager`：规划与异步执行
 - `WorktreeManager`：隔离工作目录管理
 - `Handler` / `SkillsHandler`：Agent UI 与 Skills Studio 的 API 入口
+- `AdminAuthStore` / `ApplicationRegistry` / `TelemetryStore`：管理员认证、不可变应用生命周期与隐私保护运行指标
 - `RAGIngestionService`（Data RAG）+ `CodeIngestionService`（Code RAG）：基于 `TFGraphIDFIndex` / `CodeGraphIndex` 的双库知识摄取与检索引擎
 - `WikiStore`：面向知识库和代码库累计综合的持久化 Markdown Wiki 编译器
 - `WorkflowMemoryStore`：面向可复用代码任务模式的评分式编程工作流记忆
-- `split_coder.py` / `Code_Structure`：由 `_source_bridge.py` 支撑的可导入拆分架构导航包
+- `split_coder.py` / `Code_Structure`：包含 53 个真实模块的源码完整可导入包，由 `_runtime.py` 保持初始化顺序（无需桥接文件）
 
 ## 4.1 RAG 知识架构：TF-Graph_IDF 引擎
 
@@ -1136,6 +1135,8 @@ flowchart LR
 - 模型与语言配置：`/api/sessions/{id}/config/model`、`/config/language`
 - 预览与渲染：`/preview-file/*`、`/preview-code/*`、`/preview-code-stages/*`、`/render-state`、`/render-frame`
 - Skills Studio：`/api/skillslab/*`
+- 管理端：`/admin`、`/api/admin/auth/*`、`/api/admin/config`、`/api/admin/config/reset`、`/api/admin/restart`、`/api/admin/metrics`
+- 应用：`/api/apps/personal`、`/api/apps/shared`、`/api/apps/skills`、`/api/apps/`
 
 ## 9. 快速开始
 
@@ -1199,6 +1200,9 @@ python Clouds_Coder.py --host 0.0.0.0 --port 8080
 - `--config <path-or-url>`：加载外部 LLM 配置
 - `--use_external_web_ui` / `--no_external_web_ui`：切换外部 UI
 - `--export_web_ui`：导出内置 UI 资源
+- `--l2-todo-policy {force,auto,off}` / `--level2-todo-policy`：L2 Todo 合约行为
+- `--single-no-plan-todo` / `--no-single-no-plan-todo`：启用或关闭有界 single/no-plan Todo bootstrap
+- `--single-no-plan-todo-prompt <text>`：自定义 bootstrap 感知提示
 
 ## 10. 仓库结构
 
@@ -1207,6 +1211,11 @@ python Clouds_Coder.py --host 0.0.0.0 --port 8080
 ```text
 .
 ├── Clouds_Coder.py   # 核心运行时（后端 + 内嵌前端资源）
+├── Code_Structure/                  # 源码完整的生成导航/导入包
+│   ├── .split_manifest.json         # 874/874 语句覆盖清单
+│   ├── _runtime.py                  # 仅负责原始顺序初始化
+│   └── admin/ app/ agent/ ...        # 53 个真实源码模块
+├── run_split.py / run_split.sh      # 跨平台拆分启动器
 ├── requirements.txt                  # Python 依赖
 ├── .env.example                      # 环境变量模板
 ├── .gitignore                        # 发布时隐藏文件过滤规则
@@ -1429,4 +1438,4 @@ flowchart TD
 
 ## 13. 许可证
 
-本项目采用 MIT License，见 [LICENSE](./LICENSE)。
+本项目采用 MIT License。

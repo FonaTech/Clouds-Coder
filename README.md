@@ -12,17 +12,11 @@
   <a href="https://pypi.org/project/clouds-coder/"><img src="https://img.shields.io/pypi/dm/clouds-coder.svg" alt="PyPI downloads" /></a>
 </p>
 <p align="center">
-  <a href="./RELEASE_NOTES.md">Release Notes</a> ·
+  <a href="./log/CHANGELOG-2026-08-10.md">2026-08-10 Feature Changelog (EN/中文/日本語)</a> ·
   <a href="./log/CHANGELOG-2026-06-22.md">2026-06-22 Changelog (EN/中文/日本語)</a> ·
   <a href="./log/CHANGELOG-2026-06-05.md">2026-06-05 Changelog (EN/中文/日本語)</a> ·
   <a href="./log/CHANGELOG-2026-05-28.md">2026-05-28 Changelog (EN/中文/日本語)</a> ·
   <a href="./log/CHANGELOG-2026-05-02.md">2026-05-02 Changelog (EN/中文/日本語)</a> ·
-  <a href="./log/CHANGELOG-2026-03-31.md">2026-03-31 Changelog (EN/中文/日本語)</a> ·
-  <a href="./log/CHANGELOG-2026-03-25.md">2026-03-25 Changelog (EN/中文/日本語)</a> ·
-  <a href="./log/CHANGELOG-2026-03-20.md">2026-03-20 Changelog</a> ·
-  <a href="./log/CHANGELOG-2026-03-16.md">2026-03-16 Changelog</a> ·
-  <a href="./log/CHANGELOG-2026-03-07.md">2026-03-07 Changelog</a> ·
-  <a href="./LICENSE">MIT License</a> ·
   <a href="./LLM.config.json">LLM Config Template</a>
 </p>
 <p align="center">
@@ -33,7 +27,7 @@ Clouds Coder is a local-first, general-purpose task agent platform centered on s
 
 Its primary problem framing is that CLI coding remains hard to learn and difficult to distribute consistently across users. Clouds Coder addresses this through backend/frontend separation (cloud-side CLI execution + Web-side interaction) to lower Vibe Coding onboarding cost, while timeout/truncation/context/anti-drift controls are treated as co-equal core capabilities that keep complex tasks executable, convergent, and trustworthy.
 
-Architecture changelog archive (trilingual): [`CHANGELOG-2026-06-22.md`](./log/CHANGELOG-2026-06-22.md) | [`CHANGELOG-2026-06-05.md`](./log/CHANGELOG-2026-06-05.md) | [`CHANGELOG-2026-05-28.md`](./log/CHANGELOG-2026-05-28.md) | [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md) | [`CHANGELOG-2026-03-31.md`](./log/CHANGELOG-2026-03-31.md) | [`CHANGELOG-2026-03-25.md`](./log/CHANGELOG-2026-03-25.md) | [`CHANGELOG-2026-03-20.md`](./log/CHANGELOG-2026-03-20.md) | [`CHANGELOG-2026-03-16.md`](./log/CHANGELOG-2026-03-16.md) | [`CHANGELOG-2026-03-07.md`](./log/CHANGELOG-2026-03-07.md)
+Architecture changelog archive (trilingual): [`CHANGELOG-2026-08-10.md`](./log/CHANGELOG-2026-08-10.md) | [`CHANGELOG-2026-06-22.md`](./log/CHANGELOG-2026-06-22.md) | [`CHANGELOG-2026-06-05.md`](./log/CHANGELOG-2026-06-05.md) | [`CHANGELOG-2026-05-28.md`](./log/CHANGELOG-2026-05-28.md) | [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md)
 
 ## 1. Project Positioning
 
@@ -139,7 +133,11 @@ This design reduces "thinking-only" drift by forcing thought to be converted int
 - SSE event stream with heartbeat and write-exception handling
 - Rich preview pipeline: markdown/html/code/PDF/CSV/Excel/Word/PPT/media preview + code stage preview
 - Frontend rendering controls for resource stability (live/static freeze, snapshot strategy, virtualized chat rows)
-- Importable architecture split tooling: `split_coder.py` regenerates `Code_Structure/` as an importable navigation package backed by `_source_bridge.py`
+- **Admin control plane**: password/session authentication, token exchange, typed startup configuration, safe reset, and supervised restart rollback
+- **Application Store**: personal and admin-reviewed shared applications with immutable Skill snapshots and bounded resources
+- **Operational telemetry**: low-contention SQLite model/tool metrics with privacy-preserving aggregation at `/api/admin/metrics`
+- **Evidence-bound plan reliability**: `TodoWriteResume`, L2 Todo policy, stale-write rejection, semantic acceptance review, and atomic step advancement
+- **Architecture-aware source split**: `split_coder.py` regenerates real `Code_Structure/` modules organized by the runtime's natural boundaries; no monolith-loading bridge is required
 - Scientific-work friendly output path: artifact-first steps, traceable stage outputs, and reproducibility-oriented persistence
 
 ## 3. Architecture Overview
@@ -508,7 +506,7 @@ Priority-ordered updates merged into this architecture:
 - Added system-level imports for orchestration and non-blocking control paths: `deque`, `selectors`, `signal`, `shlex`.
 - Expanded `RUNTIME_CONTROL_HINT_PREFIXES` with `<arbiter-continue>` and `<fault-prefill>` for richer recovery loops.
 
-The full trilingual release narrative is in [`CHANGELOG-2026-03-07.md`](./log/CHANGELOG-2026-03-07.md).
+This section preserves the 2026-03-07 release narrative in the README archive.
 
 ### 3.6 2026-03-16 Critical Fix: Single-Mode Agent Leak & Termination Signal
 
@@ -526,7 +524,7 @@ Two interrelated critical bugs were fixed in the multi-agent orchestration layer
   - Layer 3 — Sync-loop interception: post-turn conclusive-reply detection in `_multi_agent_sync_blackboard_worker()` with auto-approval and immediate break.
 - Safety guards: conclusive-reply finish is suppressed when error logs exist or open todo items remain.
 
-Full trilingual details: [`CHANGELOG-2026-03-16.md`](./log/CHANGELOG-2026-03-16.md)
+This section preserves the 2026-03-16 release details in the README archive.
 
 ### 3.7 2026-03-20 Major Update: Plan Mode Architecture & Core Overhaul
 
@@ -567,7 +565,7 @@ The largest architecture update since project inception — 7 modules, 60+ modif
 - `_run_read()` detects image/audio/video files and injects as native multimodal input when model supports it.
 - TodoWrite in plan mode creates sub-items tagged with owner, preventing plan_step overwrite.
 
-Full trilingual details: [`CHANGELOG-2026-03-20.md`](./log/CHANGELOG-2026-03-20.md)
+This section preserves the 2026-03-20 release details in the README archive.
 
 ### 3.8 2026-03-25 Update: Universal Skills Ecosystem + Dual RAG Architecture + Core Fixes
 
@@ -667,7 +665,7 @@ sequenceDiagram
 - Frontend `setTaskLevel()`: added `scheduleSnapshot()` after level update — previously caused the task-level selector to revert to "Auto" on next SSE refresh.
 - `_sync_todos_from_blackboard`: worker items (`owner ∈ {developer, explorer, reviewer}`) now preserved separately across blackboard syncs — previously lost every cycle.
 
-Full trilingual details: [`CHANGELOG-2026-03-25.md`](./log/CHANGELOG-2026-03-25.md)
+This section preserves the 2026-03-25 release details in the README archive.
 
 ### 3.9 2026-05-02 Update: Persistent Wiki RAG + Workflow Memory + Provider Resilience + Importable Split Architecture
 
@@ -686,7 +684,7 @@ Full trilingual details: [`CHANGELOG-2026-03-25.md`](./log/CHANGELOG-2026-03-25.
 - Normal chat completion no longer adds an extra synthetic "task completed" summary bubble unless `AGENT_RUN_COMPLETION_SUMMARY=true`.
 
 **Split Architecture Tooling**
-- `split_coder.py` now emits an importable `Code_Structure/` package using `_source_bridge.py`, avoiding circular imports while preserving symbol coverage.
+- The May split tooling established an importable `Code_Structure/` package; the current generator supersedes that bridge-based layout with real source modules and ordered initialization.
 - The self-check validates top-level symbol coverage, `py_compile`, stale generated files, package import walk, entry-point help, and generated cache cleanup.
 
 Full trilingual details: [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md)
@@ -803,10 +801,11 @@ The practical result is that Web service behavior is not just "chat over HTTP." 
 - `TodoManager` / `TaskManager` / `BackgroundManager`: planning and async execution
 - `WorktreeManager`: isolated work directory coordination for task execution
 - `Handler` / `SkillsHandler`: HTTP API endpoints for Agent UI and Skills Studio
+- `AdminAuthStore` / `ApplicationRegistry` / `TelemetryStore`: authenticated administration, immutable application lifecycle, and privacy-preserving operational metrics
 - `RAGIngestionService` (Data RAG) + `CodeIngestionService` (Code RAG): dual knowledge base ingestion and retrieval engines built on `TFGraphIDFIndex` / `CodeGraphIndex`
 - `WikiStore`: persistent Markdown wiki compiler for accumulated knowledge and code-library synthesis
 - `WorkflowMemoryStore`: scored programming workflow memory for reusable code-task patterns
-- `split_coder.py` / `Code_Structure`: importable split-architecture navigation package backed by `_source_bridge.py`
+- `split_coder.py` / `Code_Structure`: importable package with real modules organized by subsystem; `_runtime.py` preserves legacy initialization order without loading the monolith
 
 ## 4.1 RAG Knowledge Architecture: TF-Graph_IDF Engine
 
@@ -1160,6 +1159,8 @@ Major endpoint groups:
 - Model config: `/api/sessions/{id}/config/model`, `/config/language`
 - Preview/render: `/preview-file/*`, `/preview-code/*`, `/preview-code-stages/*`, `/render-state`, `/render-frame`
 - Skills Studio: `/api/skillslab/*`
+- Administration: `/admin`, `/api/admin/auth/*`, `/api/admin/config`, `/api/admin/config/reset`, `/api/admin/restart`, `/api/admin/metrics`
+- Applications: `/api/apps/personal`, `/api/apps/shared`, `/api/apps/skills`, `/api/apps/`
 
 ## 9. Quick Start
 
@@ -1223,6 +1224,9 @@ Default behavior:
 - `--config <path-or-url>`: load external LLM profile config
 - `--use_external_web_ui` / `--no_external_web_ui`: external UI mode switch
 - `--export_web_ui`: export built-in UI assets to configured web UI dir
+- `--l2-todo-policy {force,auto,off}` / `--level2-todo-policy`: L2 Todo contract behavior
+- `--single-no-plan-todo` / `--no-single-no-plan-todo`: enable or disable bounded single/no-plan Todo bootstrap
+- `--single-no-plan-todo-prompt <text>`: customize the bootstrap perception prompt
 
 ## 10. Repository Structure
 
@@ -1231,6 +1235,11 @@ Release package (static files):
 ```text
 .
 ├── Clouds_Coder.py   # Core runtime (backend + embedded frontend assets)
+├── Code_Structure/                  # Generated source-complete navigation/import package
+│   ├── .split_manifest.json         # 874/874 statement coverage manifest
+│   ├── _runtime.py                  # Ordered initialization only
+│   └── admin/ app/ agent/ ...        # 53 real source modules
+├── run_split.py / run_split.sh      # Cross-platform splitter launchers
 ├── requirements.txt                  # Python dependencies
 ├── .env.example                      # Environment variable template
 ├── .gitignore                        # Release-time hidden-file filter rules
@@ -1267,6 +1276,7 @@ Notes:
 - `skills/` is released by the program itself (`ensure_embedded_skills` + `ensure_runtime_skills`), so it does not need to be manually bundled in this release directory.
 - `js_lib/` is managed at runtime (download/validation/cache), so it can be absent in a clean release package.
 - macOS hidden files (`.DS_Store`, `__MACOSX`, `._*`) are filtered by `.gitignore` and should not be committed into release artifacts.
+- `Code_Structure/` is generated from `Clouds_Coder.py`; rerun `run_split.py` after source changes. It does not load the monolith through a bridge file.
 - The static release package intentionally keeps only runtime-critical files and packaging scripts.
 
 ## 11. Engineering Characteristics
@@ -1453,4 +1463,4 @@ flowchart TD
 
 ## 13. License
 
-This project is released under the MIT License. See [LICENSE](./LICENSE).
+This project is released under the MIT License.

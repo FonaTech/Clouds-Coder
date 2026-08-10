@@ -14,14 +14,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "source",
         nargs="?",
-        default="Clouds_Coder.py",
-        help="Source Python file to split. Defaults to Clouds_Coder.py next to this launcher.",
+        default=None,
+        help="Source Python file to split. Defaults to the nearest Clouds_Coder.py.",
     )
     parser.add_argument(
         "output_dir",
         nargs="?",
-        default="Code_Structure",
-        help="Output directory. Defaults to Code_Structure next to this launcher.",
+        default=None,
+        help="Output directory. Defaults to Code_Structure next to the source file.",
     )
     parser.add_argument(
         "--report-name",
@@ -53,6 +53,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip the split_coder.py --self-check phase.",
     )
+    parser.add_argument(
+        "--dump-layout",
+        action="store_true",
+        help="Print the detected statement-to-module layout.",
+    )
+    parser.add_argument(
+        "--auto-layout",
+        action="store_true",
+        help="Use generic architecture heuristics instead of the Clouds_Coder layout.",
+    )
+    parser.add_argument(
+        "--layout-file",
+        help="Custom JSON module-to-symbol layout file.",
+    )
     return parser
 
 
@@ -65,6 +79,14 @@ def resolve_path(base_dir: Path, raw: str) -> Path:
     return path
 
 
+def discover_project_dir(launcher_dir: Path) -> Path:
+    """Support launchers kept either in the project root or in Split Tools/."""
+    for candidate in (launcher_dir, launcher_dir.parent):
+        if (candidate / "Clouds_Coder.py").is_file():
+            return candidate
+    return launcher_dir
+
+
 def main() -> int:
     parser = build_arg_parser()
     args = parser.parse_args()
@@ -75,8 +97,17 @@ def main() -> int:
         print(f"[run_split] missing split_coder.py: {split_coder}", file=sys.stderr)
         return 2
 
-    source_path = resolve_path(launcher_dir, args.source)
-    output_dir = resolve_path(launcher_dir, args.output_dir)
+    project_dir = discover_project_dir(launcher_dir)
+    source_path = (
+        resolve_path(project_dir, args.source)
+        if args.source
+        else (project_dir / "Clouds_Coder.py").resolve()
+    )
+    output_dir = (
+        resolve_path(project_dir, args.output_dir)
+        if args.output_dir
+        else (source_path.parent / "Code_Structure").resolve()
+    )
     if not source_path.exists():
         print(f"[run_split] source file not found: {source_path}", file=sys.stderr)
         return 2
@@ -98,6 +129,12 @@ def main() -> int:
         cmd.append("--dry-run")
     if args.no_report:
         cmd.append("--no-report")
+    if args.dump_layout:
+        cmd.append("--dump-layout")
+    if args.auto_layout:
+        cmd.append("--auto-layout")
+    if args.layout_file:
+        cmd.extend(["--layout-file", str(resolve_path(project_dir, args.layout_file))])
     if not args.no_self_check and not args.dry_run:
         cmd.append("--self-check")
 
@@ -106,7 +143,7 @@ def main() -> int:
     print("[run_split] output   =", output_dir, flush=True)
     print("[run_split] command  =", " ".join(repr(part) for part in cmd), flush=True)
 
-    completed = subprocess.run(cmd, cwd=str(launcher_dir))
+    completed = subprocess.run(cmd, cwd=str(project_dir))
     return int(completed.returncode)
 
 

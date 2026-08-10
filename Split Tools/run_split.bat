@@ -1,5 +1,6 @@
 @echo off
 setlocal
+chcp 65001 >nul 2>nul
 
 set "SCRIPT_DIR=%~dp0"
 set "PYTHON_BIN="

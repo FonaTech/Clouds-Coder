@@ -12,17 +12,11 @@
   <a href="https://pypi.org/project/clouds-coder/"><img src="https://img.shields.io/pypi/dm/clouds-coder.svg" alt="PyPI ダウンロード数" /></a>
 </p>
 <p align="center">
-  <a href="./RELEASE_NOTES.md">Release Notes</a> ·
+  <a href="./log/CHANGELOG-2026-08-10.md">2026-08-10 機能変更ログ（EN/中文/日本語）</a> ·
   <a href="./log/CHANGELOG-2026-06-22.md">2026-06-22 Changelog (EN/中文/日本語)</a> ·
   <a href="./log/CHANGELOG-2026-06-05.md">2026-06-05 Changelog (EN/中文/日本語)</a> ·
   <a href="./log/CHANGELOG-2026-05-28.md">2026-05-28 Changelog (EN/中文/日本語)</a> ·
   <a href="./log/CHANGELOG-2026-05-02.md">2026-05-02 Changelog (EN/中文/日本語)</a> ·
-  <a href="./log/CHANGELOG-2026-03-31.md">2026-03-31 Changelog (EN/中文/日本語)</a> ·
-  <a href="./log/CHANGELOG-2026-03-25.md">2026-03-25 Changelog (EN/中文/日本語)</a> ·
-  <a href="./log/CHANGELOG-2026-03-20.md">2026-03-20 Changelog (EN/中文/日本語)</a> ·
-  <a href="./log/CHANGELOG-2026-03-16.md">2026-03-16 Changelog</a> ·
-  <a href="./log/CHANGELOG-2026-03-07.md">2026-03-07 Changelog</a> ·
-  <a href="./LICENSE">MIT License</a> ·
   <a href="./LLM.config.json">LLM Config Template</a>
 </p>
 <p align="center">
@@ -33,7 +27,7 @@ Clouds Coder は、CLI 実行面と Web ユーザー面の分離を中核に据�
 
 主要な問題設定は、CLI コーディングが学習コスト高く、利用者ごとの環境配布が難しい点です。Clouds Coder はバックエンド/フロントエンド分離（クラウド側 CLI 実行 + Web 側操作）で Vibe Coding の導入コストを下げると同時に、timeout・切断回復・文脈予算・思考ループ抑制を並列の中核能力として扱い、複雑タスクの実行性・収束性・再検証性を担保します。
 
-アーキテクチャ changelog アーカイブ: [`CHANGELOG-2026-06-22.md`](./log/CHANGELOG-2026-06-22.md) | [`CHANGELOG-2026-06-05.md`](./log/CHANGELOG-2026-06-05.md) | [`CHANGELOG-2026-05-28.md`](./log/CHANGELOG-2026-05-28.md) | [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md) | [`CHANGELOG-2026-03-31.md`](./log/CHANGELOG-2026-03-31.md) | [`CHANGELOG-2026-03-25.md`](./log/CHANGELOG-2026-03-25.md) | [`CHANGELOG-2026-03-20.md`](./log/CHANGELOG-2026-03-20.md) | [`CHANGELOG-2026-03-16.md`](./log/CHANGELOG-2026-03-16.md) | [`CHANGELOG-2026-03-07.md`](./log/CHANGELOG-2026-03-07.md)
+アーキテクチャ changelog アーカイブ: [`CHANGELOG-2026-08-10.md`](./log/CHANGELOG-2026-08-10.md) | [`CHANGELOG-2026-06-22.md`](./log/CHANGELOG-2026-06-22.md) | [`CHANGELOG-2026-06-05.md`](./log/CHANGELOG-2026-06-05.md) | [`CHANGELOG-2026-05-28.md`](./log/CHANGELOG-2026-05-28.md) | [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md)
 
 ## 1. プロジェクトの位置づけ
 
@@ -139,7 +133,11 @@ Clouds Coder は「コードを書くためだけの CLI ラッパー」では�
 - SSE ハートビートと書き込み例外処理
 - Markdown/HTML/コード/PDF/CSV/Excel/Word/PPT/メディア/コード段階プレビュー
 - フロントエンド負荷制御（live/static 凍結、スナップショット制御、仮想リスト）
-- import 可能な分割アーキテクチャツール：`split_coder.py` が `_source_bridge.py` に支えられた `Code_Structure/` ナビゲーションパッケージを再生成
+- **管理プレーン**：パスワード/セッション認証、Token 交換、型付き起動設定、安全な reset と監視付き restart rollback
+- **App Store**：個人アプリ、管理者審査済み共有アプリ、イミュータブルな Skill snapshot、資源上限
+- **運用テレメトリ**：低競合 SQLite のモデル/ツール指標と `/api/admin/metrics` のプライバシー保護集計
+- **証拠バインド実行**：`TodoWriteResume`、L2 Todo ポリシー、古い書き込み破棄、意味的受入審査、原子的ステップ進行
+- **ソース完全な分割アーキテクチャ**：`split_coder.py` が 874 トップレベル文を 53 の実ソース `Code_Structure/` モジュールへ生成し、橋渡し用モノリス読込を使わない
 - 研究ワークロード向け: 成果物中心、段階追跡可能、再現性重視の永続化設計
 
 ## 3. アーキテクチャ概要
@@ -494,7 +492,7 @@ stateDiagram-v2
 - オーケストレーションと非ブロッキング制御のため `deque`、`selectors`、`signal`、`shlex` を導入。
 - `RUNTIME_CONTROL_HINT_PREFIXES` に `<arbiter-continue>` と `<fault-prefill>` を追加し、回復ヒント表現を拡張。
 
-三言語の完全版更新ログ: [`CHANGELOG-2026-03-07.md`](./log/CHANGELOG-2026-03-07.md)
+本節は README アーカイブ内に 2026-03-07 の更新説明を保持します。
 
 ### 3.6 2026-03-16 重大修正：Single モード Agent リーク & 終了シグナル無視
 
@@ -512,7 +510,7 @@ stateDiagram-v2
   - 第 3 層 — Sync ループインターセプト：各 Agent ターン完了後に結論的応答を検出し、条件を満たせば即座に break し自動承認。
 - セーフガード：エラーログまたは未完了タスクが存在する場合、結論検出は finish をトリガーしない（誤終了防止）。
 
-三言語の完全版詳細: [`CHANGELOG-2026-03-16.md`](./log/CHANGELOG-2026-03-16.md)
+本節は README アーカイブ内に 2026-03-16 の更新詳細を保持します。
 
 ### 3.7 2026-03-20 大規模更新：Plan Mode アーキテクチャ & コア全面刷新
 
@@ -551,7 +549,7 @@ stateDiagram-v2
 - `_run_read()` が画像/音声/動画ファイルを検出、モデル対応時にネイティブマルチモーダル入力として注入。
 - Plan mode 下の TodoWrite は owner タグ付きサブタスクを作成、plan_step を上書きしない。
 
-三言語の完全版詳細: [`CHANGELOG-2026-03-20.md`](./log/CHANGELOG-2026-03-20.md)
+本節は README アーカイブ内に 2026-03-20 の更新詳細を保持します。
 
 ### 3.8 2026-03-25 重大アップデート：Skills エコシステム互換 & デュアル RAG アーキテクチャ & コア修正
 
@@ -650,7 +648,7 @@ sequenceDiagram
 - フロントエンド `setTaskLevel()`：レベル更新後に `scheduleSnapshot()` 追加 — 次の SSE 更新でタスクレベルセレクターが "Auto" に戻る問題を修正。
 - `_sync_todos_from_blackboard`：worker items（`owner ∈ {developer, explorer, reviewer}`) をブラックボード同期をまたいで保護 — 毎回のサイクルで TodoWrite アイテムが消失する問題を修正。
 
-三言語の完全版詳細: [`CHANGELOG-2026-03-25.md`](./log/CHANGELOG-2026-03-25.md)
+本節は README アーカイブ内に 2026-03-25 の更新詳細を保持します。
 
 ### 3.9 2026-05-02 重大アップデート：永続 Wiki RAG + ワークフローメモリ + Provider 耐性 + import 可能な分割構造
 
@@ -669,7 +667,7 @@ sequenceDiagram
 - 通常のチャット完了後、`AGENT_RUN_COMPLETION_SUMMARY=true` が明示されない限り、追加の「タスク完了」サマリーバブルは生成されません。
 
 **分割アーキテクチャツール**
-- `split_coder.py` は `_source_bridge.py` を使って import 可能な `Code_Structure/` package を生成し、循環 import を避けつつシンボル網羅性を保持します。
+- 5 月の分割ツールは import 可能な `Code_Structure/` package を導入し、現在のジェネレータはその bridge 方式を実ソースモジュールと順序付き初期化へ置き換えています。
 - self-check はトップレベルシンボル一致、`py_compile`、古い生成ファイル、package import walk、entry-point help、生成キャッシュ削除を検証します。
 
 三言語の完全版詳細: [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md)
@@ -739,10 +737,11 @@ flowchart TD
 - `TodoManager` / `TaskManager` / `BackgroundManager`：計画と非同期処理
 - `WorktreeManager`：分離作業ディレクトリ
 - `Handler` / `SkillsHandler`：Agent UI/Skills Studio API
+- `AdminAuthStore` / `ApplicationRegistry` / `TelemetryStore`：管理認証、不変アプリ lifecycle、プライバシー保護メトリクス
 - `RAGIngestionService`（Data RAG）+ `CodeIngestionService`（Code RAG）：`TFGraphIDFIndex` / `CodeGraphIndex` に基づくデュアル知識取り込み・検索エンジン
 - `WikiStore`：知識ライブラリとコードライブラリの蓄積統合を担う永続 Markdown Wiki コンパイラ
 - `WorkflowMemoryStore`：再利用可能なコードタスクパターンのためのスコアリング型プログラミングワークフローメモリ
-- `split_coder.py` / `Code_Structure`：`_source_bridge.py` に支えられた import 可能な分割アーキテクチャナビゲーションパッケージ
+- `split_coder.py` / `Code_Structure`：53 実モジュールからなるソース完全な import 可能 package。`_runtime.py` が初期化順を維持します。
 
 ## 4.1 RAG 知識アーキテクチャ：TF-Graph_IDF エンジン
 
@@ -1092,6 +1091,8 @@ flowchart LR
 - モデル/言語設定：`/api/sessions/{id}/config/model`、`/config/language`
 - プレビュー/描画：`/preview-file/*`、`/preview-code/*`、`/preview-code-stages/*`、`/render-state`、`/render-frame`
 - Skills Studio：`/api/skillslab/*`
+- 管理：`/admin`、`/api/admin/auth/*`、`/api/admin/config`、`/api/admin/config/reset`、`/api/admin/restart`、`/api/admin/metrics`
+- アプリ：`/api/apps/personal`、`/api/apps/shared`、`/api/apps/skills`、`/api/apps/`
 
 ## 9. クイックスタート
 
@@ -1155,6 +1156,9 @@ python Clouds_Coder.py --host 0.0.0.0 --port 8080
 - `--config <path-or-url>`：外部 LLM 設定
 - `--use_external_web_ui` / `--no_external_web_ui`：外部 UI 切替
 - `--export_web_ui`：内蔵 UI 資産エクスポート
+- `--l2-todo-policy {force,auto,off}` / `--level2-todo-policy`：L2 Todo 契約
+- `--single-no-plan-todo` / `--no-single-no-plan-todo`：single/no-plan Todo bootstrap の切替
+- `--single-no-plan-todo-prompt <text>`：bootstrap プロンプト
 
 ## 10. リポジトリ構成
 
@@ -1163,6 +1167,11 @@ python Clouds_Coder.py --host 0.0.0.0 --port 8080
 ```text
 .
 ├── Clouds_Coder.py   # コアランタイム（バックエンド + 内蔵フロント資産）
+├── Code_Structure/                  # ソース完全な生成ナビゲーション/import package
+│   ├── .split_manifest.json         # 874/874 文カバレッジマニフェスト
+│   ├── _runtime.py                  # 初期化順序のみ
+│   └── admin/ app/ agent/ ...        # 53 実ソースモジュール
+├── run_split.py / run_split.sh      # クロスプラットフォーム分割ランチャー
 ├── requirements.txt                  # Python 依存
 ├── .env.example                      # 環境変数テンプレート
 ├── .gitignore                        # リリース時の隠しファイル除外ルール
@@ -1385,4 +1394,4 @@ flowchart TD
 
 ## 13. ライセンス
 
-本プロジェクトは MIT License で公開されています。詳細は [LICENSE](./LICENSE)。
+本プロジェクトは MIT License で公開されています。
