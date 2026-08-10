@@ -229,7 +229,7 @@ RAG_PARSE_TIMEOUT_SECONDS = max(
     min(240, int(str(os.getenv("AGENT_RAG_PARSE_TIMEOUT", "75") or "75"))),
 )
 
-# split-source: order=792 original-lines=77691-82324 hash=3cf5127aba1f993e
+# split-source: order=792 original-lines=77676-82309 hash=3cf5127aba1f993e
 
 RAG_TERM_GROUPS = (
     # ── Batch 1 / 10 : 检索 · 研究 · CS基础 · 编程语言 ──────────────────────
@@ -4865,7 +4865,7 @@ RAG_TERM_GROUPS = (
     # ── Batch LLL end — 4000 groups reached ────────────────────────────────
 )
 
-# split-source: order=793 original-lines=82325-82346 hash=16c96d4b2d9ea8e8
+# split-source: order=793 original-lines=82310-82331 hash=16c96d4b2d9ea8e8
 RAG_RESEARCH_HINTS = (
     "abstract",
     "introduction",
@@ -4889,7 +4889,7 @@ RAG_RESEARCH_HINTS = (
     "论文",
 )
 
-# split-source: order=794 original-lines=82347-82357 hash=636311fb17640a4e
+# split-source: order=794 original-lines=82332-82342 hash=636311fb17640a4e
 RAG_CODE_HINTS = (
     "def ",
     "class ",
@@ -4902,7 +4902,7 @@ RAG_CODE_HINTS = (
     "public class",
 )
 
-# split-source: order=795 original-lines=82358-82373 hash=4605c77eed589f3f
+# split-source: order=795 original-lines=82343-82358 hash=4605c77eed589f3f
 RAG_SHORT_TOKEN_ALLOWLIST = {
     "2d",
     "3d",
@@ -4920,7 +4920,7 @@ RAG_SHORT_TOKEN_ALLOWLIST = {
     "vr",
 }
 
-# split-source: order=796 original-lines=82374-82446 hash=527026fadb463036
+# split-source: order=796 original-lines=82359-82431 hash=527026fadb463036
 RAG_EN_STOPWORDS = {
     "a",
     "an",
@@ -4995,7 +4995,7 @@ RAG_EN_STOPWORDS = {
     "yours",
 }
 
-# split-source: order=797 original-lines=82447-82483 hash=7523a7a144f1f7c8
+# split-source: order=797 original-lines=82432-82468 hash=7523a7a144f1f7c8
 RAG_ZH_STOPWORDS = {
     "一个",
     "一种",
@@ -5034,7 +5034,7 @@ RAG_ZH_STOPWORDS = {
     "可以",
 }
 
-# split-source: order=798 original-lines=82484-82562 hash=fffc05a6e73ad1f0
+# split-source: order=798 original-lines=82469-82547 hash=fffc05a6e73ad1f0
 RAG_GENERIC_ENTITY_TERMS_EN = {
     "acknowledgment",
     "acknowledgments",
@@ -5115,7 +5115,7 @@ RAG_GENERIC_ENTITY_TERMS_EN = {
     "theorems",
 }
 
-# split-source: order=799 original-lines=82563-82605 hash=cd605de6a86d441a
+# split-source: order=799 original-lines=82548-82590 hash=cd605de6a86d441a
 RAG_GENERIC_ENTITY_TERMS_ZH = {
     "图",
     "图谱",
@@ -5160,7 +5160,7 @@ RAG_GENERIC_ENTITY_TERMS_ZH = {
     "表格",
 }
 
-# split-source: order=800 original-lines=82606-82624 hash=e90fa9ad0c5a4f61
+# split-source: order=800 original-lines=82591-82609 hash=e90fa9ad0c5a4f61
 RAG_STRUCTURAL_ENTITY_PATTERNS = (
     re.compile(
         r"^(?:fig(?:ure)?s?|table|tables|sec(?:tion)?s?|chapter|chapters|appendix|appendices|"
@@ -5181,7 +5181,7 @@ RAG_STRUCTURAL_ENTITY_PATTERNS = (
     ),
 )
 
-# split-source: order=825 original-lines=83369-83378 hash=bca531e8850a5266
+# split-source: order=825 original-lines=83354-83363 hash=bca531e8850a5266
 
 
 
@@ -5193,7 +5193,7 @@ CODE_LIBRARY_IGNORED_DIRS = {
     "__pycache__", ".venv", "venv", "env", ".tox",
 }
 
-# split-source: order=826 original-lines=83379-83435 hash=bc72eba2e2dbde18
+# split-source: order=826 original-lines=83364-83420 hash=bc72eba2e2dbde18
 CODE_LIBRARY_LANGUAGE_BY_EXT = {
     ".py": "python",
     ".pyi": "python",
@@ -5252,7 +5252,7 @@ CODE_LIBRARY_LANGUAGE_BY_EXT = {
     ".md": "markdown",
 }
 
-# split-source: order=827 original-lines=83436-83442 hash=9de27595b7cb2425
+# split-source: order=827 original-lines=83421-83427 hash=9de27595b7cb2425
 CODE_LIBRARY_SPECIAL_FILENAMES = {
     "dockerfile": "docker",
     "makefile": "make",

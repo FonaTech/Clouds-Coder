@@ -26,7 +26,7 @@ import unicodedata
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Optional
 
 
 GENERATOR_VERSION = "3.0"
@@ -49,8 +49,8 @@ class NodeInfo:
     source_end: int
     source_hash: str = ""
     target_module: str = ""
-    bound_names: List[str] = field(default_factory=list)
-    bases: List[str] = field(default_factory=list)
+    bound_names: list[str] = field(default_factory=list)
+    bases: list[str] = field(default_factory=list)
     generated_ast_index: int = -1
 
 
@@ -65,7 +65,7 @@ class ManifestEntry:
     source_end: int
     source_hash: str
     target_module: str
-    bound_names: List[str] = field(default_factory=list)
+    bound_names: list[str] = field(default_factory=list)
     generated_ast_index: int = -1
 
 
@@ -77,7 +77,7 @@ class SplitManifest:
     package_name: str
     generator_version: str = GENERATOR_VERSION
     source_statement_count: int = 0
-    nodes: List[ManifestEntry] = field(default_factory=list)
+    nodes: list[ManifestEntry] = field(default_factory=list)
     layout_config: str = ""
 
     FILENAME = ".split_manifest.json"
@@ -118,12 +118,12 @@ class ImportStatement:
     kind: str
     lineno: int
     end_lineno: int
-    bound_names: Set[str] = field(default_factory=set)
+    bound_names: set[str] = field(default_factory=set)
 
 
 # Exact symbols reflect the current Clouds_Coder architecture.  Regex rules are
 # deliberately ordered from specific subsystems to the general constants bin.
-DEFAULT_LAYOUT: Dict[str, List[str]] = {
+DEFAULT_LAYOUT: dict[str, list[str]] = {
     "__init__.py": [],
     "app/__init__.py": [],
     "app/main.py": ["main", "~^_main_guard_"],
@@ -278,8 +278,8 @@ class _TopLevelBindingCollector(ast.NodeVisitor):
     """Collect names stored by one statement without entering nested scopes."""
 
     def __init__(self) -> None:
-        self.names: List[str] = []
-        self._seen: Set[str] = set()
+        self.names: list[str] = []
+        self._seen: set[str] = set()
 
     def add(self, name: str) -> None:
         if name and name not in self._seen:
@@ -332,7 +332,7 @@ class _TopLevelBindingCollector(ast.NodeVisitor):
             self.visit(child)
 
 
-def top_level_bound_names(node: ast.AST) -> List[str]:
+def top_level_bound_names(node: ast.AST) -> list[str]:
     collector = _TopLevelBindingCollector()
     collector.visit(node)
     return collector.names
@@ -342,12 +342,12 @@ class ArchitectureAnalyzer:
     def __init__(self, source_path: Path) -> None:
         self.source_path = source_path
         self.source_text = ""
-        self.source_lines: List[str] = []
+        self.source_lines: list[str] = []
         self.tree: Optional[ast.Module] = None
-        self.nodes: List[NodeInfo] = []
-        self.import_statements: List[ImportStatement] = []
+        self.nodes: list[NodeInfo] = []
+        self.import_statements: list[ImportStatement] = []
 
-    def analyze(self) -> List[NodeInfo]:
+    def analyze(self) -> list[NodeInfo]:
         self.source_text = self.source_path.read_text(encoding="utf-8")
         self.source_lines = self.source_text.splitlines(keepends=True)
         print(f"  Parsing {len(self.source_lines):,} lines with AST...")
@@ -373,7 +373,7 @@ class ArchitectureAnalyzer:
 
     def _make_info(self, order: int, node: ast.AST, source_start: int, source_end: int) -> NodeInfo:
         bound = top_level_bound_names(node)
-        bases: List[str] = []
+        bases: list[str] = []
         if isinstance(node, ast.ClassDef):
             name, kind = node.name, "class"
             bases = [self._name_of(base) for base in node.bases]
@@ -468,7 +468,7 @@ class ArchitectureAnalyzer:
 class AutoLayoutGenerator:
     """Architecture heuristics used for new symbols not in the explicit map."""
 
-    CLASS_RULES: List[Tuple[re.Pattern[str], str]] = [
+    CLASS_RULES: list[tuple[re.Pattern[str], str]] = [
         (re.compile(r"(?:Handler|HTTPServer)$"), "server/http.py"),
         (re.compile(r"^(?:RAG|Code).*(?:Store|Index)$"), "rag/store.py"),
         (re.compile(r"^(?:RAG|Code).*Ingestion"), "rag/ingestion.py"),
@@ -478,8 +478,8 @@ class AutoLayoutGenerator:
         (re.compile(r"^Skill"), "skills/store.py"),
     ]
 
-    def generate(self, nodes: List[NodeInfo]) -> Dict[str, List[str]]:
-        layout: Dict[str, List[str]] = {key: [] for key in DEFAULT_LAYOUT if key.endswith("__init__.py")}
+    def generate(self, nodes: list[NodeInfo]) -> dict[str, list[str]]:
+        layout: dict[str, list[str]] = {key: [] for key in DEFAULT_LAYOUT if key.endswith("__init__.py")}
         for node in nodes:
             if node.kind == "import":
                 continue
@@ -508,12 +508,12 @@ class AutoLayoutGenerator:
 
 
 class ModuleRouter:
-    def __init__(self, layout: Dict[str, List[str]]) -> None:
+    def __init__(self, layout: dict[str, list[str]]) -> None:
         self.layout = layout
         self.fallback = AutoLayoutGenerator()
-        self.rules: List[Tuple[str, List[Tuple[str, object]]]] = []
+        self.rules: list[tuple[str, list[tuple[str, object]]]] = []
         for module, patterns in layout.items():
-            compiled: List[Tuple[str, object]] = []
+            compiled: list[tuple[str, object]] = []
             for pattern in patterns:
                 if pattern.startswith("~"):
                     compiled.append(("regex", re.compile(pattern[1:])))
@@ -533,7 +533,7 @@ class ModuleRouter:
                     return module
         return self.fallback._classify(node)
 
-    def assign_all(self, nodes: List[NodeInfo]) -> None:
+    def assign_all(self, nodes: list[NodeInfo]) -> None:
         for node in nodes:
             node.target_module = self.route(node)
         for index, node in enumerate(nodes):
@@ -544,8 +544,8 @@ class ModuleRouter:
                 node.target_module = nearby
 
     @staticmethod
-    def _context_module(nodes: List[NodeInfo], index: int) -> str:
-        candidates: List[Tuple[int, int, str]] = []
+    def _context_module(nodes: list[NodeInfo], index: int) -> str:
+        candidates: list[tuple[int, int, str]] = []
         current = nodes[index]
         for direction, bias in ((-1, 0), (1, 1)):
             cursor = index + direction
@@ -568,18 +568,18 @@ class ModuleRouter:
 
 
 class DependencyAnalyzer:
-    def __init__(self, analyzer: ArchitectureAnalyzer, nodes: List[NodeInfo]) -> None:
+    def __init__(self, analyzer: ArchitectureAnalyzer, nodes: list[NodeInfo]) -> None:
         self.analyzer = analyzer
         self.nodes = nodes
-        self.symbol_to_module: Dict[str, str] = {}
+        self.symbol_to_module: dict[str, str] = {}
         for node in nodes:
             if node.kind == "import":
                 continue
             for name in node.bound_names:
                 self.symbol_to_module[name] = node.target_module
 
-    def compute_dependency_map(self, module: str, nodes: List[NodeInfo]) -> Dict[str, Set[str]]:
-        deps: Dict[str, Set[str]] = defaultdict(set)
+    def compute_dependency_map(self, module: str, nodes: list[NodeInfo]) -> dict[str, set[str]]:
+        deps: dict[str, set[str]] = defaultdict(set)
         for node in nodes:
             for name in self._referenced_names(node):
                 owner = self.symbol_to_module.get(name)
@@ -587,17 +587,17 @@ class DependencyAnalyzer:
                     deps[owner].add(name)
         return deps
 
-    def _referenced_names(self, node: NodeInfo) -> Set[str]:
+    def _referenced_names(self, node: NodeInfo) -> set[str]:
         source = self.analyzer.get_node_source(node)
         try:
             table = symtable.symtable(source, str(self.analyzer.source_path), "exec")
         except SyntaxError:
             return set()
-        out: Set[str] = set()
+        out: set[str] = set()
         self._walk_symbols(table, out)
         return out
 
-    def _walk_symbols(self, table: symtable.SymbolTable, out: Set[str]) -> None:
+    def _walk_symbols(self, table: symtable.SymbolTable, out: set[str]) -> None:
         table_type = table.get_type()
         for symbol in table.get_symbols():
             if not symbol.is_referenced() or symbol.is_imported() or symbol.is_parameter():
@@ -616,7 +616,7 @@ class CodeGenerator:
         self.analyzer = analyzer
         self.package_name = package_name
 
-    def generate_source_module(self, module_path: str, nodes: List[NodeInfo]) -> str:
+    def generate_source_module(self, module_path: str, nodes: list[NodeInfo]) -> str:
         parts = [GENERATED_HEADER.rstrip(), "", "from __future__ import annotations", ""]
         for ast_index, node in enumerate(nodes, start=1):
             node.generated_ast_index = ast_index
@@ -659,7 +659,7 @@ class CodeGenerator:
             )
         return source
 
-    def runtime_plan(self, nodes: List[NodeInfo]) -> List[dict]:
+    def runtime_plan(self, nodes: list[NodeInfo]) -> list[dict]:
         return [
             {
                 "order": node.order,
@@ -672,7 +672,7 @@ class CodeGenerator:
             for node in sorted(nodes, key=lambda item: item.order)
         ]
 
-    def generate_runtime(self, nodes: List[NodeInfo]) -> str:
+    def generate_runtime(self, nodes: list[NodeInfo]) -> str:
         plan_repr = repr(self.runtime_plan(nodes))
         source_filename = self.analyzer.source_path.name
         template = r'''__HEADER__
@@ -897,7 +897,7 @@ class FrameworkReportGenerator:
         self,
         source_path: Path,
         output_dir: Path,
-        modules: Dict[str, List[NodeInfo]],
+        modules: dict[str, list[NodeInfo]],
         dependency_analyzer: DependencyAnalyzer,
     ) -> None:
         self.source_path = source_path
@@ -963,15 +963,15 @@ class FrameworkReportGenerator:
             lines.append("")
         return "\n".join(lines).rstrip() + "\n"
 
-    def _tree_lines(self, paths: List[str]) -> List[str]:
-        tree: Dict[str, dict] = {}
+    def _tree_lines(self, paths: list[str]) -> list[str]:
+        tree: dict[str, dict] = {}
         for path in paths:
             cursor = tree
             for part in path.split("/"):
                 cursor = cursor.setdefault(part, {})
         out = [f"{self.output_dir.name}/"]
 
-        def render(branch: Dict[str, dict], prefix: str = "") -> None:
+        def render(branch: dict[str, dict], prefix: str = "") -> None:
             items = sorted(branch.items(), key=lambda row: (not bool(row[1]), row[0]))
             for index, (name, children) in enumerate(items):
                 last = index == len(items) - 1
@@ -987,8 +987,8 @@ class FileWriter:
     def __init__(self, output_dir: Path, dry_run: bool = False) -> None:
         self.output_dir = output_dir
         self.dry_run = dry_run
-        self.written: List[str] = []
-        self.skipped: List[str] = []
+        self.written: list[str] = []
+        self.skipped: list[str] = []
 
     def write(self, relative: str, content: str) -> bool:
         path = self.output_dir / relative
@@ -1014,8 +1014,8 @@ def _generated_file(path: Path) -> bool:
         return False
 
 
-def _remove_stale_generated_files(output_dir: Path, expected: Set[str]) -> List[str]:
-    removed: List[str] = []
+def _remove_stale_generated_files(output_dir: Path, expected: set[str]) -> list[str]:
+    removed: list[str] = []
     if not output_dir.exists():
         return removed
     for path in sorted(output_dir.rglob("*.py"), key=lambda item: len(item.parts), reverse=True):
@@ -1040,8 +1040,8 @@ def _remove_stale_generated_files(output_dir: Path, expected: Set[str]) -> List[
     return sorted(removed)
 
 
-def _clear_pycache(root: Path) -> List[str]:
-    removed: List[str] = []
+def _clear_pycache(root: Path) -> list[str]:
+    removed: list[str] = []
     if not root.exists():
         return removed
     for path in sorted(root.rglob("__pycache__"), key=lambda item: len(item.parts), reverse=True):
@@ -1051,9 +1051,9 @@ def _clear_pycache(root: Path) -> List[str]:
     return removed
 
 
-def _collect_source_defined_names(path: Path) -> Set[str]:
+def _collect_source_defined_names(path: Path) -> set[str]:
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    names: Set[str] = set()
+    names: set[str] = set()
     for node in tree.body:
         if isinstance(node, (ast.Import, ast.ImportFrom)) or (
             isinstance(node, ast.Try) and ArchitectureAnalyzer._is_import_try(node)
@@ -1104,7 +1104,7 @@ def run_self_check(
 
         expected_source_modules = sorted({node.target_module for node in manifest.nodes})
         compile_paths = sorted(output_dir.rglob("*.py"))
-        compile_errors: List[str] = []
+        compile_errors: list[str] = []
         for path in compile_paths:
             if "__pycache__" in path.parts:
                 continue
@@ -1126,7 +1126,7 @@ def run_self_check(
         else:
             print("  [OK] generated package has no monolith-loading source bridge")
 
-        missing_real_source: List[str] = []
+        missing_real_source: list[str] = []
         for relative in expected_source_modules:
             path = output_dir / relative
             text = path.read_text(encoding="utf-8") if path.exists() else ""
@@ -1268,7 +1268,7 @@ class Splitter:
         self,
         source_path: Path,
         output_dir: Path,
-        layout: Dict[str, List[str]],
+        layout: dict[str, list[str]],
         *,
         dry_run: bool = False,
         update_mode: bool = False,
@@ -1306,7 +1306,7 @@ class Splitter:
         print("[3/7] Routing statements by application architecture...")
         router = ModuleRouter(self.layout)
         router.assign_all(nodes)
-        modules: Dict[str, List[NodeInfo]] = defaultdict(list)
+        modules: dict[str, list[NodeInfo]] = defaultdict(list)
         for node in nodes:
             modules[node.target_module].append(node)
         unclassified = modules.get("_unclassified.py", [])
@@ -1326,7 +1326,7 @@ class Splitter:
         writer = FileWriter(self.output_dir, self.dry_run)
 
         print("[5/7] Writing real source modules and ordered runtime...")
-        expected: Set[str] = {"__init__.py", "__main__.py", CodeGenerator.RUNTIME_MODULE}
+        expected: set[str] = {"__init__.py", "__main__.py", CodeGenerator.RUNTIME_MODULE}
         for module, rows in sorted(modules.items()):
             writer.write(module, generator.generate_source_module(module, rows))
             expected.add(module)
@@ -1378,7 +1378,7 @@ class Splitter:
                 for node in nodes
             ],
         )
-        removed: List[str] = []
+        removed: list[str] = []
         if not self.dry_run:
             manifest.save(self.output_dir)
             removed = _remove_stale_generated_files(self.output_dir, expected)
@@ -1435,7 +1435,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def load_layout(args: argparse.Namespace, source_path: Path) -> Dict[str, List[str]]:
+def load_layout(args: argparse.Namespace, source_path: Path) -> dict[str, list[str]]:
     if args.layout_file:
         path = Path(args.layout_file).expanduser().resolve()
         if not path.is_file():

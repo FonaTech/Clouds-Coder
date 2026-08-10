@@ -43054,10 +43054,6 @@ body{padding:18px}
             return False
         now_value = float(now_ts())
         accepted = dict(rows[acceptance_index])
-        contract_text = self._effective_plan_step_acceptance_text(
-            plan_step,
-            accepted.get("content", ""),
-        )
         accepted["status"] = "completed"
         accepted["completed_at"] = now_value
         accepted["updated_at"] = now_value
@@ -45119,7 +45115,6 @@ body{padding:18px}
         validation_ok_current = self._tool_results_have_validation_evidence(current, results)
         validation_ok_blackboard = self._plan_step_has_blackboard_evidence(current, bb)
         validation_ok = validation_ok_current or validation_ok_blackboard
-        verified_tag_current = self._check_step_verified_tag(current, messages=self.agent_messages)
         bb_sig = self._plan_step_blackboard_signals(current, bb)
         phase_evidence = False
         if phase in ("research", "design") and validation_ok:
@@ -45140,15 +45135,6 @@ body{padding:18px}
         _has_subtasks = bool(self._active_plan_worker_todo_rows(
             str(current.get("id", "") or ""), role=""
         ))
-        accumulated_evidence_path = (
-            subtasks_all_done
-            and self._step_has_accumulated_evidence(current, bb)
-        )
-        explicit_verified_path = (
-            subtasks_all_done
-            and verified_tag_current
-            and (validation_ok_blackboard or self._step_has_accumulated_evidence(current, bb))
-        )
         acceptance_gate = self._plan_step_acceptance_gate_status(current, worker_step, bb)
         acceptance_gate_ok = bool(acceptance_gate.get("ok", False))
         has_strong_evidence = self._plan_step_acceptance_ready_for_advance(
@@ -50848,7 +50834,6 @@ body{padding:18px}
             return False
         identifiers = self._plan_subtask_evidence_identifiers(subtask_text)
         paths = identifiers.get("paths", [])
-        commands = identifiers.get("commands", [])
         command_specs = identifiers.get("command_specs", [])
         technical_tokens = identifiers.get("technical_tokens", [])
         observed_paths = [normalize_rel_preview_path(str(record.get("path", "") or "")).lower()]
@@ -74715,14 +74700,14 @@ function _chatVirtParseWebSearchText(raw){
   const head=String(m[1]||'').trim();
   const rest=String(m[2]||'').trim();
   const out={tool:'agent_web_search',phase:'',mode:'',query:'',url:'',summary:'',result_count:0,page_count:0,evidence_records:0};
-  const headParts=head.split(/\s+/).filter(Boolean);
+  const headParts=head.split(/\\s+/).filter(Boolean);
   if(headParts.length){out.phase=headParts.shift()||'';out.mode=headParts.shift()||'';}
   for(const line of rest.split(/\\n/)){
     const s=String(line||'').trim();
     if(!s)continue;
-    let mm=s.match(/^(?:query|url)\s*:\s*(.*)$/i);
+    let mm=s.match(/^(?:query|url)\\s*:\\s*(.*)$/i);
     if(mm){out.query=String(mm[1]||'').trim();continue;}
-    mm=s.match(/results\s*:\s*(\d+)\s+pages\s*:\s*(\d+)\s+evidence\s*:\s*(\d+)/i);
+    mm=s.match(/results\\s*:\\s*(\\d+)\\s+pages\\s*:\\s*(\\d+)\\s+evidence\\s*:\\s*(\\d+)/i);
     if(mm){out.result_count=Number(mm[1]||0);out.page_count=Number(mm[2]||0);out.evidence_records=Number(mm[3]||0);continue;}
     out.summary+=(out.summary?'\\n':'')+s;
   }
@@ -75769,7 +75754,7 @@ function _chatVirtBuildMessageNode(m){
     if(isTodoBootstrap){
       const retry=runtimeHint.name.endsWith('-retry');
       const body=String(runtimeHint.body||'').trim();
-      const reasonMatch=retry?body.match(/did not complete:\s*([^.\\n]+)/i):null;
+      const reasonMatch=retry?body.match(/did not complete:\\s*([^.\\n]+)/i):null;
       const reason=reasonMatch?String(reasonMatch[1]||'').trim():'';
       const pills=[
         _chatVirtEventPillHtml(t('event_todo_bootstrap_perception'),'ok'),

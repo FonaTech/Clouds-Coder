@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-# split-source: order=868 original-lines=100649-100832 hash=168fd81e5ca31b72
+# split-source: order=868 original-lines=100634-100817 hash=168fd81e5ca31b72
 
 class RagAdminHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -189,7 +189,7 @@ class RagAdminHandler(BaseHTTPRequestHandler):
                 return self._send_json({"error": str(exc)}, status=400)
         return self._send_json({"error": "not found"}, status=404)
 
-# split-source: order=869 original-lines=100833-101035 hash=5e3a9bc915382a71
+# split-source: order=869 original-lines=100818-101020 hash=5e3a9bc915382a71
 
 
 class CodeAdminHandler(BaseHTTPRequestHandler):

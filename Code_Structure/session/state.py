@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-# split-source: order=780 original-lines=19182-70148 hash=d69ebe828afc84d4
+# split-source: order=780 original-lines=19182-70133 hash=1285a682e409f36e
 
 # ============================================================================
 # Architecture / 架构 / アーキテクチャ
@@ -23879,10 +23879,6 @@ body{padding:18px}
             return False
         now_value = float(now_ts())
         accepted = dict(rows[acceptance_index])
-        contract_text = self._effective_plan_step_acceptance_text(
-            plan_step,
-            accepted.get("content", ""),
-        )
         accepted["status"] = "completed"
         accepted["completed_at"] = now_value
         accepted["updated_at"] = now_value
@@ -25944,7 +25940,6 @@ body{padding:18px}
         validation_ok_current = self._tool_results_have_validation_evidence(current, results)
         validation_ok_blackboard = self._plan_step_has_blackboard_evidence(current, bb)
         validation_ok = validation_ok_current or validation_ok_blackboard
-        verified_tag_current = self._check_step_verified_tag(current, messages=self.agent_messages)
         bb_sig = self._plan_step_blackboard_signals(current, bb)
         phase_evidence = False
         if phase in ("research", "design") and validation_ok:
@@ -25965,15 +25960,6 @@ body{padding:18px}
         _has_subtasks = bool(self._active_plan_worker_todo_rows(
             str(current.get("id", "") or ""), role=""
         ))
-        accumulated_evidence_path = (
-            subtasks_all_done
-            and self._step_has_accumulated_evidence(current, bb)
-        )
-        explicit_verified_path = (
-            subtasks_all_done
-            and verified_tag_current
-            and (validation_ok_blackboard or self._step_has_accumulated_evidence(current, bb))
-        )
         acceptance_gate = self._plan_step_acceptance_gate_status(current, worker_step, bb)
         acceptance_gate_ok = bool(acceptance_gate.get("ok", False))
         has_strong_evidence = self._plan_step_acceptance_ready_for_advance(
@@ -31673,7 +31659,6 @@ body{padding:18px}
             return False
         identifiers = self._plan_subtask_evidence_identifiers(subtask_text)
         paths = identifiers.get("paths", [])
-        commands = identifiers.get("commands", [])
         command_specs = identifiers.get("command_specs", [])
         technical_tokens = identifiers.get("technical_tokens", [])
         observed_paths = [normalize_rel_preview_path(str(record.get("path", "") or "")).lower()]

@@ -6,11 +6,11 @@ set "SCRIPT_DIR=%~dp0"
 set "PYTHON_BIN="
 
 where py >nul 2>nul
-if %errorlevel%==0 (
+if not errorlevel 1 (
   set "PYTHON_BIN=py -3"
 ) else (
   where python >nul 2>nul
-  if %errorlevel%==0 (
+  if not errorlevel 1 (
     set "PYTHON_BIN=python"
   )
 )

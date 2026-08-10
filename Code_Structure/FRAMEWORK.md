@@ -103,32 +103,32 @@ Code_Structure/
 | `agent/todo.py` | 1 | 1 | `config/constants.py`, `config/settings.py`, `utils/misc.py`, `utils/text.py` | 9235–9595 |
 | `agent/tools.py` | 13 | 17 | `config/constants.py` | 18524–19181 |
 | `agent/worktree.py` | 1 | 1 | `agent/tasks.py`, `config/constants.py`, `utils/crypto.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 15111–15327 |
-| `app/context.py` | 1 | 1 | `admin/auth.py`, `admin/config.py`, `admin/constants.py`, `agent/tools.py`, `app/services.py`, `config/constants.py`, `config/paths.py`, `config/settings.py`, `ide/assets.py`, `llm/client.py`, `llm/constants.py`, `llm/utils.py`, `mcp/driver.py`, `rag/assets.py`, `rag/constants.py`, `rag/ingestion.py`, `rag/parsers.py`, `rag/store.py`, `session/manager.py`, `session/state.py`, `skills/provisioning.py`, `skills/store.py`, `utils/crypto.py`, `utils/files.py`, `utils/json_utils.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py`, `web/assets.py`, `web/skills_assets.py` | 93052–97899 |
-| `app/main.py` | 2 | 1 | `admin/config.py`, `admin/constants.py`, `agent/tools.py`, `app/context.py`, `config/constants.py`, `config/paths.py`, `config/settings.py`, `ide/handler.py`, `llm/constants.py`, `llm/utils.py`, `mcp/constants.py`, `mcp/service.py`, `rag/constants.py`, `server/http.py`, `server/rag_admin.py`, `server/skills.py`, `skills/provisioning.py`, `utils/files.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 101484–103127 |
-| `app/services.py` | 2 | 2 | `admin/constants.py`, `config/settings.py`, `skills/embedded.py`, `skills/store.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 97940–99058 |
+| `app/context.py` | 1 | 1 | `admin/auth.py`, `admin/config.py`, `admin/constants.py`, `agent/tools.py`, `app/services.py`, `config/constants.py`, `config/paths.py`, `config/settings.py`, `ide/assets.py`, `llm/client.py`, `llm/constants.py`, `llm/utils.py`, `mcp/driver.py`, `rag/assets.py`, `rag/constants.py`, `rag/ingestion.py`, `rag/parsers.py`, `rag/store.py`, `session/manager.py`, `session/state.py`, `skills/provisioning.py`, `skills/store.py`, `utils/crypto.py`, `utils/files.py`, `utils/json_utils.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py`, `web/assets.py`, `web/skills_assets.py` | 93037–97884 |
+| `app/main.py` | 2 | 1 | `admin/config.py`, `admin/constants.py`, `agent/tools.py`, `app/context.py`, `config/constants.py`, `config/paths.py`, `config/settings.py`, `ide/handler.py`, `llm/constants.py`, `llm/utils.py`, `mcp/constants.py`, `mcp/service.py`, `rag/constants.py`, `server/http.py`, `server/rag_admin.py`, `server/skills.py`, `skills/provisioning.py`, `utils/files.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 101469–103112 |
+| `app/services.py` | 2 | 2 | `admin/constants.py`, `config/settings.py`, `skills/embedded.py`, `skills/store.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 97925–99043 |
 | `config/constants.py` | 344 | 340 | `rag/constants.py` | 63–9106 |
 | `config/paths.py` | 8 | 8 | `utils/text.py` | 66–3645 |
 | `config/settings.py` | 62 | 62 | `agent/tools.py`, `config/constants.py`, `config/paths.py`, `llm/constants.py`, `llm/utils.py`, `rag/constants.py`, `skills/provisioning.py`, `utils/http.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 1784–8016 |
-| `ide/assets.py` | 3 | 3 | — | 92708–93051 |
-| `ide/handler.py` | 1 | 1 | `admin/auth.py`, `app/context.py`, `config/constants.py`, `session/manager.py`, `utils/http.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py` | 101036–101319 |
+| `ide/assets.py` | 3 | 3 | — | 92693–93036 |
+| `ide/handler.py` | 1 | 1 | `admin/auth.py`, `app/context.py`, `config/constants.py`, `session/manager.py`, `utils/http.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py` | 101021–101304 |
 | `llm/client.py` | 2 | 2 | `agent/tools.py`, `config/constants.py`, `config/settings.py`, `llm/utils.py`, `utils/http.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 16206–18523 |
 | `llm/constants.py` | 17 | 17 | — | 64–6708 |
 | `llm/utils.py` | 22 | 22 | `config/settings.py`, `llm/constants.py`, `utils/http.py`, `utils/json_utils.py`, `utils/text.py` | 6234–6922 |
 | `mcp/constants.py` | 7 | 7 | — | 171–15362 |
 | `mcp/driver.py` | 5 | 5 | `mcp/constants.py`, `utils/files.py`, `utils/json_utils.py`, `utils/text.py` | 15363–16205 |
-| `mcp/service.py` | 1 | 1 | `config/constants.py`, `utils/files.py`, `utils/http.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 101320–101483 |
-| `rag/assets.py` | 6 | 6 | — | 90300–92707 |
-| `rag/constants.py` | 74 | 74 | — | 167–83442 |
-| `rag/index.py` | 5 | 5 | `rag/constants.py`, `rag/ingestion.py`, `rag/parsers.py`, `utils/misc.py`, `utils/text.py` | 83467–89945 |
-| `rag/ingestion.py` | 13 | 13 | `config/constants.py`, `config/settings.py`, `rag/constants.py`, `rag/parsers.py`, `rag/store.py`, `session/state.py`, `utils/files.py`, `utils/json_utils.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py` | 82835–90299 |
-| `rag/parsers.py` | 28 | 28 | `config/constants.py`, `rag/constants.py`, `rag/ingestion.py`, `utils/files.py`, `utils/json_utils.py`, `utils/media.py`, `utils/text.py` | 9076–84575 |
-| `rag/store.py` | 7 | 7 | `config/constants.py`, `config/settings.py`, `rag/constants.py`, `rag/index.py`, `rag/ingestion.py`, `rag/parsers.py`, `skills/provisioning.py`, `utils/files.py`, `utils/json_utils.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py` | 86253–90211 |
+| `mcp/service.py` | 1 | 1 | `config/constants.py`, `utils/files.py`, `utils/http.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 101305–101468 |
+| `rag/assets.py` | 6 | 6 | — | 90285–92692 |
+| `rag/constants.py` | 74 | 74 | — | 167–83427 |
+| `rag/index.py` | 5 | 5 | `rag/constants.py`, `rag/ingestion.py`, `rag/parsers.py`, `utils/misc.py`, `utils/text.py` | 83452–89930 |
+| `rag/ingestion.py` | 13 | 13 | `config/constants.py`, `config/settings.py`, `rag/constants.py`, `rag/parsers.py`, `rag/store.py`, `session/state.py`, `utils/files.py`, `utils/json_utils.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py` | 82820–90284 |
+| `rag/parsers.py` | 28 | 28 | `config/constants.py`, `rag/constants.py`, `rag/ingestion.py`, `utils/files.py`, `utils/json_utils.py`, `utils/media.py`, `utils/text.py` | 9076–84560 |
+| `rag/store.py` | 7 | 7 | `config/constants.py`, `config/settings.py`, `rag/constants.py`, `rag/index.py`, `rag/ingestion.py`, `rag/parsers.py`, `skills/provisioning.py`, `utils/files.py`, `utils/json_utils.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py` | 86238–90196 |
 | `rag/web_search.py` | 15 | 15 | `config/constants.py`, `config/paths.py`, `rag/constants.py`, `utils/http.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 4139–5586 |
-| `server/http.py` | 2 | 2 | `admin/auth.py`, `admin/config.py`, `app/context.py`, `config/constants.py`, `config/paths.py`, `config/settings.py`, `llm/utils.py`, `rag/parsers.py`, `session/manager.py`, `session/state.py`, `utils/files.py`, `utils/http.py`, `utils/json_utils.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py`, `web/admin_assets.py` | 97900–100422 |
-| `server/rag_admin.py` | 2 | 2 | `admin/auth.py`, `app/context.py`, `config/constants.py`, `rag/constants.py`, `utils/http.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py` | 100649–101035 |
-| `server/skills.py` | 1 | 1 | `admin/auth.py`, `app/context.py`, `config/constants.py`, `config/paths.py`, `config/settings.py`, `session/manager.py`, `skills/provisioning.py`, `utils/http.py`, `utils/misc.py`, `utils/text.py` | 100423–100648 |
-| `session/manager.py` | 2 | 2 | `config/constants.py`, `config/paths.py`, `config/settings.py`, `llm/client.py`, `llm/utils.py`, `rag/store.py`, `session/state.py`, `utils/crypto.py`, `utils/files.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 2912–71470 |
-| `session/state.py` | 1 | 1 | `admin/constants.py`, `agent/background.py`, `agent/bus.py`, `agent/errors.py`, `agent/events.py`, `agent/tasks.py`, `agent/todo.py`, `agent/tools.py`, `agent/worktree.py`, `config/constants.py`, `config/paths.py`, `config/settings.py`, `llm/client.py`, `llm/constants.py`, `llm/utils.py`, `mcp/constants.py`, `mcp/driver.py`, `rag/constants.py`, `rag/parsers.py`, `rag/web_search.py`, `skills/provisioning.py`, `skills/store.py`, `utils/compress.py`, `utils/crypto.py`, `utils/errors.py`, `utils/files.py`, `utils/http.py`, `utils/json_utils.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py` | 19182–70148 |
+| `server/http.py` | 2 | 2 | `admin/auth.py`, `admin/config.py`, `app/context.py`, `config/constants.py`, `config/paths.py`, `config/settings.py`, `llm/utils.py`, `rag/parsers.py`, `session/manager.py`, `session/state.py`, `utils/files.py`, `utils/http.py`, `utils/json_utils.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py`, `web/admin_assets.py` | 97885–100407 |
+| `server/rag_admin.py` | 2 | 2 | `admin/auth.py`, `app/context.py`, `config/constants.py`, `rag/constants.py`, `utils/http.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py` | 100634–101020 |
+| `server/skills.py` | 1 | 1 | `admin/auth.py`, `app/context.py`, `config/constants.py`, `config/paths.py`, `config/settings.py`, `session/manager.py`, `skills/provisioning.py`, `utils/http.py`, `utils/misc.py`, `utils/text.py` | 100408–100633 |
+| `session/manager.py` | 2 | 2 | `config/constants.py`, `config/paths.py`, `config/settings.py`, `llm/client.py`, `llm/utils.py`, `rag/store.py`, `session/state.py`, `utils/crypto.py`, `utils/files.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 2912–71455 |
+| `session/state.py` | 1 | 1 | `admin/constants.py`, `agent/background.py`, `agent/bus.py`, `agent/errors.py`, `agent/events.py`, `agent/tasks.py`, `agent/todo.py`, `agent/tools.py`, `agent/worktree.py`, `config/constants.py`, `config/paths.py`, `config/settings.py`, `llm/client.py`, `llm/constants.py`, `llm/utils.py`, `mcp/constants.py`, `mcp/driver.py`, `rag/constants.py`, `rag/parsers.py`, `rag/web_search.py`, `skills/provisioning.py`, `skills/store.py`, `utils/compress.py`, `utils/crypto.py`, `utils/errors.py`, `utils/files.py`, `utils/http.py`, `utils/json_utils.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py` | 19182–70133 |
 | `skills/embedded.py` | 10 | 10 | — | 9596–13395 |
 | `skills/provisioning.py` | 26 | 26 | `config/paths.py`, `skills/embedded.py`, `utils/files.py`, `utils/json_utils.py`, `utils/misc.py` | 9622–13358 |
 | `skills/store.py` | 2 | 2 | `config/constants.py`, `config/settings.py`, `llm/utils.py`, `skills/embedded.py`, `utils/files.py`, `utils/http.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 13396–14812 |
@@ -141,9 +141,9 @@ Code_Structure/
 | `utils/media.py` | 3 | 3 | — | 3260–3293 |
 | `utils/misc.py` | 16 | 16 | `config/constants.py` | 3294–9697 |
 | `utils/text.py` | 29 | 29 | `config/constants.py` | 154–9075 |
-| `web/admin_assets.py` | 3 | 3 | — | 77335–77690 |
-| `web/assets.py` | 4 | 4 | — | 71471–76935 |
-| `web/skills_assets.py` | 3 | 3 | — | 76936–77334 |
+| `web/admin_assets.py` | 3 | 3 | — | 77320–77675 |
+| `web/assets.py` | 4 | 4 | — | 71456–76920 |
+| `web/skills_assets.py` | 3 | 3 | — | 76921–77319 |
 
 ## Source Mapping
 
@@ -282,17 +282,17 @@ Code_Structure/
 
 ### `app/context.py`
 
-- order 862: `AppContext` (class), lines 93052-97899, exports `AppContext`
+- order 862: `AppContext` (class), lines 93037-97884, exports `AppContext`
 
 ### `app/main.py`
 
-- order 872: `main` (function), lines 101484-103124, exports `main`
-- order 873: `_main_guard_103126` (main_guard), lines 103125-103127, exports —
+- order 872: `main` (function), lines 101469-103109, exports `main`
+- order 873: `_main_guard_103111` (main_guard), lines 103110-103112, exports —
 
 ### `app/services.py`
 
-- order 864: `TelemetryStore` (class), lines 97940-98315, exports `TelemetryStore`
-- order 865: `ApplicationRegistry` (class), lines 98316-99058, exports `ApplicationRegistry`
+- order 864: `TelemetryStore` (class), lines 97925-98300, exports `TelemetryStore`
+- order 865: `ApplicationRegistry` (class), lines 98301-99043, exports `ApplicationRegistry`
 
 ### `config/constants.py`
 
@@ -719,13 +719,13 @@ Code_Structure/
 
 ### `ide/assets.py`
 
-- order 859: `IDE_INDEX_HTML` (constant), lines 92708-92788, exports `IDE_INDEX_HTML`
-- order 860: `IDE_CSS` (constant), lines 92789-92856, exports `IDE_CSS`
-- order 861: `IDE_JS` (constant), lines 92857-93051, exports `IDE_JS`
+- order 859: `IDE_INDEX_HTML` (constant), lines 92693-92773, exports `IDE_INDEX_HTML`
+- order 860: `IDE_CSS` (constant), lines 92774-92841, exports `IDE_CSS`
+- order 861: `IDE_JS` (constant), lines 92842-93036, exports `IDE_JS`
 
 ### `ide/handler.py`
 
-- order 870: `IdeHandler` (class), lines 101036-101319, exports `IdeHandler`
+- order 870: `IdeHandler` (class), lines 101021-101304, exports `IdeHandler`
 
 ### `llm/client.py`
 
@@ -797,16 +797,16 @@ Code_Structure/
 
 ### `mcp/service.py`
 
-- order 871: `McpServiceHandler` (class), lines 101320-101483, exports `McpServiceHandler`
+- order 871: `McpServiceHandler` (class), lines 101305-101468, exports `McpServiceHandler`
 
 ### `rag/assets.py`
 
-- order 853: `RAG_ADMIN_INDEX_HTML` (constant), lines 90300-90474, exports `RAG_ADMIN_INDEX_HTML`
-- order 854: `RAG_ADMIN_CSS` (constant), lines 90475-90566, exports `RAG_ADMIN_CSS`
-- order 855: `RAG_ADMIN_JS` (constant), lines 90567-92658, exports `RAG_ADMIN_JS`
-- order 856: `CODE_ADMIN_INDEX_HTML` (constant), lines 92659-92671, exports `CODE_ADMIN_INDEX_HTML`
-- order 857: `CODE_ADMIN_CSS` (constant), lines 92672-92702, exports `CODE_ADMIN_CSS`
-- order 858: `CODE_ADMIN_JS` (constant), lines 92703-92707, exports `CODE_ADMIN_JS`
+- order 853: `RAG_ADMIN_INDEX_HTML` (constant), lines 90285-90459, exports `RAG_ADMIN_INDEX_HTML`
+- order 854: `RAG_ADMIN_CSS` (constant), lines 90460-90551, exports `RAG_ADMIN_CSS`
+- order 855: `RAG_ADMIN_JS` (constant), lines 90552-92643, exports `RAG_ADMIN_JS`
+- order 856: `CODE_ADMIN_INDEX_HTML` (constant), lines 92644-92656, exports `CODE_ADMIN_INDEX_HTML`
+- order 857: `CODE_ADMIN_CSS` (constant), lines 92657-92687, exports `CODE_ADMIN_CSS`
+- order 858: `CODE_ADMIN_JS` (constant), lines 92688-92692, exports `CODE_ADMIN_JS`
 
 ### `rag/constants.py`
 
@@ -872,42 +872,42 @@ Code_Structure/
 - order 170: `RAG_EMBEDDING_MODE_VALUES` (constant), lines 282-282, exports `RAG_EMBEDDING_MODE_VALUES`
 - order 171: `RAG_IMPORT_WORKER_COUNT` (constant), lines 283-286, exports `RAG_IMPORT_WORKER_COUNT`
 - order 173: `RAG_PARSE_TIMEOUT_SECONDS` (constant), lines 291-294, exports `RAG_PARSE_TIMEOUT_SECONDS`
-- order 792: `RAG_TERM_GROUPS` (constant), lines 77691-82324, exports `RAG_TERM_GROUPS`
-- order 793: `RAG_RESEARCH_HINTS` (constant), lines 82325-82346, exports `RAG_RESEARCH_HINTS`
-- order 794: `RAG_CODE_HINTS` (constant), lines 82347-82357, exports `RAG_CODE_HINTS`
-- order 795: `RAG_SHORT_TOKEN_ALLOWLIST` (constant), lines 82358-82373, exports `RAG_SHORT_TOKEN_ALLOWLIST`
-- order 796: `RAG_EN_STOPWORDS` (constant), lines 82374-82446, exports `RAG_EN_STOPWORDS`
-- order 797: `RAG_ZH_STOPWORDS` (constant), lines 82447-82483, exports `RAG_ZH_STOPWORDS`
-- order 798: `RAG_GENERIC_ENTITY_TERMS_EN` (constant), lines 82484-82562, exports `RAG_GENERIC_ENTITY_TERMS_EN`
-- order 799: `RAG_GENERIC_ENTITY_TERMS_ZH` (constant), lines 82563-82605, exports `RAG_GENERIC_ENTITY_TERMS_ZH`
-- order 800: `RAG_STRUCTURAL_ENTITY_PATTERNS` (constant), lines 82606-82624, exports `RAG_STRUCTURAL_ENTITY_PATTERNS`
-- order 825: `CODE_LIBRARY_IGNORED_DIRS` (constant), lines 83369-83378, exports `CODE_LIBRARY_IGNORED_DIRS`
-- order 826: `CODE_LIBRARY_LANGUAGE_BY_EXT` (constant), lines 83379-83435, exports `CODE_LIBRARY_LANGUAGE_BY_EXT`
-- order 827: `CODE_LIBRARY_SPECIAL_FILENAMES` (constant), lines 83436-83442, exports `CODE_LIBRARY_SPECIAL_FILENAMES`
+- order 792: `RAG_TERM_GROUPS` (constant), lines 77676-82309, exports `RAG_TERM_GROUPS`
+- order 793: `RAG_RESEARCH_HINTS` (constant), lines 82310-82331, exports `RAG_RESEARCH_HINTS`
+- order 794: `RAG_CODE_HINTS` (constant), lines 82332-82342, exports `RAG_CODE_HINTS`
+- order 795: `RAG_SHORT_TOKEN_ALLOWLIST` (constant), lines 82343-82358, exports `RAG_SHORT_TOKEN_ALLOWLIST`
+- order 796: `RAG_EN_STOPWORDS` (constant), lines 82359-82431, exports `RAG_EN_STOPWORDS`
+- order 797: `RAG_ZH_STOPWORDS` (constant), lines 82432-82468, exports `RAG_ZH_STOPWORDS`
+- order 798: `RAG_GENERIC_ENTITY_TERMS_EN` (constant), lines 82469-82547, exports `RAG_GENERIC_ENTITY_TERMS_EN`
+- order 799: `RAG_GENERIC_ENTITY_TERMS_ZH` (constant), lines 82548-82590, exports `RAG_GENERIC_ENTITY_TERMS_ZH`
+- order 800: `RAG_STRUCTURAL_ENTITY_PATTERNS` (constant), lines 82591-82609, exports `RAG_STRUCTURAL_ENTITY_PATTERNS`
+- order 825: `CODE_LIBRARY_IGNORED_DIRS` (constant), lines 83354-83363, exports `CODE_LIBRARY_IGNORED_DIRS`
+- order 826: `CODE_LIBRARY_LANGUAGE_BY_EXT` (constant), lines 83364-83420, exports `CODE_LIBRARY_LANGUAGE_BY_EXT`
+- order 827: `CODE_LIBRARY_SPECIAL_FILENAMES` (constant), lines 83421-83427, exports `CODE_LIBRARY_SPECIAL_FILENAMES`
 
 ### `rag/index.py`
 
-- order 830: `_code_module_name` (function), lines 83467-83483, exports `_code_module_name`
-- order 831: `_code_choose_community` (function), lines 83484-83493, exports `_code_choose_community`
-- order 832: `_code_query_terms` (function), lines 83494-83508, exports `_code_query_terms`
-- order 841: `TFGraphIDFIndex` (class), lines 84576-86252, exports `TFGraphIDFIndex`
-- order 850: `CodeGraphIndex` (class), lines 89460-89945, exports `CodeGraphIndex`
+- order 830: `_code_module_name` (function), lines 83452-83468, exports `_code_module_name`
+- order 831: `_code_choose_community` (function), lines 83469-83478, exports `_code_choose_community`
+- order 832: `_code_query_terms` (function), lines 83479-83493, exports `_code_query_terms`
+- order 841: `TFGraphIDFIndex` (class), lines 84561-86237, exports `TFGraphIDFIndex`
+- order 850: `CodeGraphIndex` (class), lines 89445-89930, exports `CodeGraphIndex`
 
 ### `rag/ingestion.py`
 
-- order 810: `_rag_trigram_set` (function), lines 82835-82842, exports `_rag_trigram_set`
-- order 811: `_rag_jaccard_sim` (function), lines 82843-82852, exports `_rag_jaccard_sim`
-- order 812: `_rag_mmr_select` (function), lines 82853-82902, exports `_rag_mmr_select`
-- order 817: `_rag_embed_text` (function), lines 83037-83060, exports `_rag_embed_text`
-- order 818: `_rag_embed_batch` (function), lines 83061-83069, exports `_rag_embed_batch`
-- order 819: `_rag_window_for_query` (function), lines 83070-83084, exports `_rag_window_for_query`
-- order 820: `_rag_focused_excerpt` (function), lines 83085-83127, exports `_rag_focused_excerpt`
-- order 821: `_rag_query_variants` (function), lines 83128-83167, exports `_rag_query_variants`
-- order 822: `_rag_parse_segments` (function), lines 83168-83230, exports `_rag_parse_segments`
-- order 823: `_rag_boundary_split` (function), lines 83231-83288, exports `_rag_boundary_split`
-- order 848: `_rag_parse_file_worker` (function), lines 88561-88577, exports `_rag_parse_file_worker`
-- order 849: `RAGIngestionService` (class), lines 88578-89459, exports `RAGIngestionService`
-- order 852: `CodeIngestionService` (class), lines 90212-90299, exports `CodeIngestionService`
+- order 810: `_rag_trigram_set` (function), lines 82820-82827, exports `_rag_trigram_set`
+- order 811: `_rag_jaccard_sim` (function), lines 82828-82837, exports `_rag_jaccard_sim`
+- order 812: `_rag_mmr_select` (function), lines 82838-82887, exports `_rag_mmr_select`
+- order 817: `_rag_embed_text` (function), lines 83022-83045, exports `_rag_embed_text`
+- order 818: `_rag_embed_batch` (function), lines 83046-83054, exports `_rag_embed_batch`
+- order 819: `_rag_window_for_query` (function), lines 83055-83069, exports `_rag_window_for_query`
+- order 820: `_rag_focused_excerpt` (function), lines 83070-83112, exports `_rag_focused_excerpt`
+- order 821: `_rag_query_variants` (function), lines 83113-83152, exports `_rag_query_variants`
+- order 822: `_rag_parse_segments` (function), lines 83153-83215, exports `_rag_parse_segments`
+- order 823: `_rag_boundary_split` (function), lines 83216-83273, exports `_rag_boundary_split`
+- order 848: `_rag_parse_file_worker` (function), lines 88546-88562, exports `_rag_parse_file_worker`
+- order 849: `RAGIngestionService` (class), lines 88563-89444, exports `RAGIngestionService`
+- order 852: `CodeIngestionService` (class), lines 90197-90284, exports `CodeIngestionService`
 
 ### `rag/parsers.py`
 
@@ -915,40 +915,40 @@ Code_Structure/
 - order 702: `is_code_preview_candidate` (function), lines 9090-9100, exports `is_code_preview_candidate`
 - order 707: `preview_kind_for_path` (function), lines 9107-9138, exports `preview_kind_for_path`
 - order 708: `build_code_preview_rows` (function), lines 9139-9187, exports `build_code_preview_rows`
-- order 801: `_rag_safe_name` (function), lines 82625-82639, exports `_rag_safe_name`
-- order 802: `_rag_detect_language` (function), lines 82640-82656, exports `_rag_detect_language`
-- order 803: `_rag_cjk_ngrams` (function), lines 82657-82671, exports `_rag_cjk_ngrams`
-- order 804: `_rag_is_noise_token` (function), lines 82672-82693, exports `_rag_is_noise_token`
-- order 805: `_rag_entity_allowed` (function), lines 82694-82708, exports `_rag_entity_allowed`
-- order 806: `_rag_filter_entities` (function), lines 82709-82725, exports `_rag_filter_entities`
-- order 807: `_rag_filename_entity_aliases` (function), lines 82726-82761, exports `_rag_filename_entity_aliases`
-- order 808: `_rag_apply_filename_entity_policy` (function), lines 82762-82794, exports `_rag_apply_filename_entity_policy`
-- order 809: `_rag_choose_community` (function), lines 82795-82834, exports `_rag_choose_community`
-- order 813: `_rag_tokenize` (function), lines 82903-82956, exports `_rag_tokenize`
-- order 814: `_rag_expand_tokens` (function), lines 82957-82980, exports `_rag_expand_tokens`
-- order 815: `_rag_extract_entities` (function), lines 82981-82999, exports `_rag_extract_entities`
-- order 816: `_rag_classify_document` (function), lines 83000-83036, exports `_rag_classify_document`
-- order 824: `_rag_chunk_text` (function), lines 83289-83368, exports `_rag_chunk_text`
-- order 828: `_code_language_from_name` (function), lines 83443-83461, exports `_code_language_from_name`
-- order 829: `_code_is_test_path` (function), lines 83462-83466, exports `_code_is_test_path`
-- order 833: `_CallCollector` (class), lines 83509-83523, exports `_CallCollector`
-- order 834: `_ALGO_COMPLEXITY_RE` (assignment), lines 83524-83526, exports `_ALGO_COMPLEXITY_RE`
-- order 835: `_ALGO_STEP_RE` (assignment), lines 83527-83527, exports `_ALGO_STEP_RE`
-- order 836: `_ALGO_MATH_VARS` (assignment), lines 83528-83528, exports `_ALGO_MATH_VARS`
-- order 837: `_ALGO_DOC_KEYWORDS` (assignment), lines 83529-83529, exports `_ALGO_DOC_KEYWORDS`
-- order 838: `_detect_algo_chunk` (function), lines 83530-83555, exports `_detect_algo_chunk`
-- order 839: `CodeContentParser` (class), lines 83556-84065, exports `CodeContentParser`
-- order 840: `RAGContentParser` (class), lines 84066-84575, exports `RAGContentParser`
+- order 801: `_rag_safe_name` (function), lines 82610-82624, exports `_rag_safe_name`
+- order 802: `_rag_detect_language` (function), lines 82625-82641, exports `_rag_detect_language`
+- order 803: `_rag_cjk_ngrams` (function), lines 82642-82656, exports `_rag_cjk_ngrams`
+- order 804: `_rag_is_noise_token` (function), lines 82657-82678, exports `_rag_is_noise_token`
+- order 805: `_rag_entity_allowed` (function), lines 82679-82693, exports `_rag_entity_allowed`
+- order 806: `_rag_filter_entities` (function), lines 82694-82710, exports `_rag_filter_entities`
+- order 807: `_rag_filename_entity_aliases` (function), lines 82711-82746, exports `_rag_filename_entity_aliases`
+- order 808: `_rag_apply_filename_entity_policy` (function), lines 82747-82779, exports `_rag_apply_filename_entity_policy`
+- order 809: `_rag_choose_community` (function), lines 82780-82819, exports `_rag_choose_community`
+- order 813: `_rag_tokenize` (function), lines 82888-82941, exports `_rag_tokenize`
+- order 814: `_rag_expand_tokens` (function), lines 82942-82965, exports `_rag_expand_tokens`
+- order 815: `_rag_extract_entities` (function), lines 82966-82984, exports `_rag_extract_entities`
+- order 816: `_rag_classify_document` (function), lines 82985-83021, exports `_rag_classify_document`
+- order 824: `_rag_chunk_text` (function), lines 83274-83353, exports `_rag_chunk_text`
+- order 828: `_code_language_from_name` (function), lines 83428-83446, exports `_code_language_from_name`
+- order 829: `_code_is_test_path` (function), lines 83447-83451, exports `_code_is_test_path`
+- order 833: `_CallCollector` (class), lines 83494-83508, exports `_CallCollector`
+- order 834: `_ALGO_COMPLEXITY_RE` (assignment), lines 83509-83511, exports `_ALGO_COMPLEXITY_RE`
+- order 835: `_ALGO_STEP_RE` (assignment), lines 83512-83512, exports `_ALGO_STEP_RE`
+- order 836: `_ALGO_MATH_VARS` (assignment), lines 83513-83513, exports `_ALGO_MATH_VARS`
+- order 837: `_ALGO_DOC_KEYWORDS` (assignment), lines 83514-83514, exports `_ALGO_DOC_KEYWORDS`
+- order 838: `_detect_algo_chunk` (function), lines 83515-83540, exports `_detect_algo_chunk`
+- order 839: `CodeContentParser` (class), lines 83541-84050, exports `CodeContentParser`
+- order 840: `RAGContentParser` (class), lines 84051-84560, exports `RAGContentParser`
 
 ### `rag/store.py`
 
-- order 842: `RAGLibraryStore` (class), lines 86253-86838, exports `RAGLibraryStore`
-- order 843: `WikiStore` (class), lines 86839-87370, exports `WikiStore`
-- order 844: `UserMemoryStore` (class), lines 87371-88048, exports `UserMemoryStore`
-- order 845: `UserInteractionOptimizer` (class), lines 88049-88117, exports `UserInteractionOptimizer`
-- order 846: `UserIntentProfiler` (class), lines 88118-88159, exports `UserIntentProfiler`
-- order 847: `WorkflowMemoryStore` (class), lines 88160-88560, exports `WorkflowMemoryStore`
-- order 851: `CodeLibraryStore` (class), lines 89946-90211, exports `CodeLibraryStore`
+- order 842: `RAGLibraryStore` (class), lines 86238-86823, exports `RAGLibraryStore`
+- order 843: `WikiStore` (class), lines 86824-87355, exports `WikiStore`
+- order 844: `UserMemoryStore` (class), lines 87356-88033, exports `UserMemoryStore`
+- order 845: `UserInteractionOptimizer` (class), lines 88034-88102, exports `UserInteractionOptimizer`
+- order 846: `UserIntentProfiler` (class), lines 88103-88144, exports `UserIntentProfiler`
+- order 847: `WorkflowMemoryStore` (class), lines 88145-88545, exports `WorkflowMemoryStore`
+- order 851: `CodeLibraryStore` (class), lines 89931-90196, exports `CodeLibraryStore`
 
 ### `rag/web_search.py`
 
@@ -970,26 +970,26 @@ Code_Structure/
 
 ### `server/http.py`
 
-- order 863: `AgentHTTPServer` (class), lines 97900-97939, exports `AgentHTTPServer`
-- order 866: `Handler` (class), lines 99059-100422, exports `Handler`
+- order 863: `AgentHTTPServer` (class), lines 97885-97924, exports `AgentHTTPServer`
+- order 866: `Handler` (class), lines 99044-100407, exports `Handler`
 
 ### `server/rag_admin.py`
 
-- order 868: `RagAdminHandler` (class), lines 100649-100832, exports `RagAdminHandler`
-- order 869: `CodeAdminHandler` (class), lines 100833-101035, exports `CodeAdminHandler`
+- order 868: `RagAdminHandler` (class), lines 100634-100817, exports `RagAdminHandler`
+- order 869: `CodeAdminHandler` (class), lines 100818-101020, exports `CodeAdminHandler`
 
 ### `server/skills.py`
 
-- order 867: `SkillsHandler` (class), lines 100423-100648, exports `SkillsHandler`
+- order 867: `SkillsHandler` (class), lines 100408-100633, exports `SkillsHandler`
 
 ### `session/manager.py`
 
 - order 515: `SessionCreationLimitExceeded` (class), lines 2912-2917, exports `SessionCreationLimitExceeded`
-- order 781: `SessionManager` (class), lines 70149-71470, exports `SessionManager`
+- order 781: `SessionManager` (class), lines 70134-71455, exports `SessionManager`
 
 ### `session/state.py`
 
-- order 780: `SessionState` (class), lines 19182-70148, exports `SessionState`
+- order 780: `SessionState` (class), lines 19182-70133, exports `SessionState`
 
 ### `skills/embedded.py`
 
@@ -1163,19 +1163,19 @@ Code_Structure/
 
 ### `web/admin_assets.py`
 
-- order 789: `ADMIN_INDEX_HTML` (constant), lines 77335-77497, exports `ADMIN_INDEX_HTML`
-- order 790: `ADMIN_CSS` (constant), lines 77498-77625, exports `ADMIN_CSS`
-- order 791: `ADMIN_JS` (constant), lines 77626-77690, exports `ADMIN_JS`
+- order 789: `ADMIN_INDEX_HTML` (constant), lines 77320-77482, exports `ADMIN_INDEX_HTML`
+- order 790: `ADMIN_CSS` (constant), lines 77483-77610, exports `ADMIN_CSS`
+- order 791: `ADMIN_JS` (constant), lines 77611-77675, exports `ADMIN_JS`
 
 ### `web/assets.py`
 
-- order 782: `INDEX_HTML` (constant), lines 71471-71716, exports `INDEX_HTML`
-- order 783: `APP_CSS` (constant), lines 71717-72252, exports `APP_CSS`
-- order 784: `APP_JS` (constant), lines 72253-76895, exports `APP_JS`
-- order 785: `APP_TS` (constant), lines 76896-76935, exports `APP_TS`
+- order 782: `INDEX_HTML` (constant), lines 71456-71701, exports `INDEX_HTML`
+- order 783: `APP_CSS` (constant), lines 71702-72237, exports `APP_CSS`
+- order 784: `APP_JS` (constant), lines 72238-76880, exports `APP_JS`
+- order 785: `APP_TS` (constant), lines 76881-76920, exports `APP_TS`
 
 ### `web/skills_assets.py`
 
-- order 786: `SKILLS_INDEX_HTML` (constant), lines 76936-77091, exports `SKILLS_INDEX_HTML`
-- order 787: `SKILLS_EXTRA_CSS` (constant), lines 77092-77188, exports `SKILLS_EXTRA_CSS`
-- order 788: `SKILLS_APP_JS` (constant), lines 77189-77334, exports `SKILLS_APP_JS`
+- order 786: `SKILLS_INDEX_HTML` (constant), lines 76921-77076, exports `SKILLS_INDEX_HTML`
+- order 787: `SKILLS_EXTRA_CSS` (constant), lines 77077-77173, exports `SKILLS_EXTRA_CSS`
+- order 788: `SKILLS_APP_JS` (constant), lines 77174-77319, exports `SKILLS_APP_JS`
