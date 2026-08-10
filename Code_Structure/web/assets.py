@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-# split-source: order=782 original-lines=71456-71701 hash=ed643e0e4b807060
+# split-source: order=782 original-lines=71458-71703 hash=ed643e0e4b807060
 
 INDEX_HTML = """<!doctype html>
 <html lang="zh-CN">
@@ -251,7 +251,7 @@ window.MathJax={
 </html>
 """
 
-# split-source: order=783 original-lines=71702-72237 hash=09b536d41c48fad0
+# split-source: order=783 original-lines=71704-72239 hash=09b536d41c48fad0
 
 APP_CSS = """@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Noto+Sans+SC:wght@400;500;700&display=swap');
 :root{--bg:#f3f5f8;--fg:#0f1b2d;--muted:#5e6c84;--card:#ffffffcc;--line:#d9e1ec;--brand:#1f6feb;--brand2:#13b8a6;--warn:#b82b2b}
@@ -789,7 +789,7 @@ h3{font-size:.96rem;margin:10px 0 6px}
 @media (max-width:720px){.application-editor-body{grid-template-columns:1fr}.application-skill-catalog{min-height:240px}.application-dialog{max-height:94vh}}
 """
 
-# split-source: order=784 original-lines=72238-76880 hash=17a4bb3f587c59d5
+# split-source: order=784 original-lines=72240-76882 hash=17a4bb3f587c59d5
 
 APP_JS = """/* clouds-coder-app-store-v1 */
 const S={sessions:[],sessionTotal:0,sessionHasMore:false,sessionNextOffset:0,sessionLoadingMore:false,sessionLoadAllTimer:0,activeId:null,snap:null,es:null,esId:'',skills:[],tools:[],providers:[],protocols:[],config:null,models:[],modelOptions:[],previewBySession:{},fileExplorerBySession:{},commandPageState:{},previewNonce:0,refreshTimer:null,refreshInFlight:false,pendingSnapshot:false,pendingFullSnapshot:false,scheduledFullSnapshot:false,sessionPollTimer:null,renderStateInFlight:false,lastRenderStatePullAt:0,lastFeedSig:'',lastBoardsSig:'',lastSessionsSig:'',lastVisibilityState:document.visibilityState||'visible',staticMode:false,frozen:false,bootRendered:false,panelHtml:{},renderSigs:Object.create(null),deferredHtml:Object.create(null),deferredHtmlTimer:0,openPopup:'',follow:{chat:true,sessionList:false,todos:false,tasks:false,activity:true,commands:true,diffs:true,catalog:true,fileExplorer:false},lastEventSeq:0,lastDeltaTs:0,deltaGapCount:0,deltaWatchdogTimer:null,deltaWatchdogStalls:0,deltaWatchdogSeq:0,deltaRenderRaf:0,deltaRenderChat:false,deltaRenderBoards:false,deltaRenderSessions:false,chatRenderRaf:0,chatRenderPendingReason:'',mathObserver:null,mathRoot:null,mdWorker:null,mdWorkerUrl:'',mdReqSeq:0,mdPending:Object.create(null),diffCenterDisabled:Object.create(null),previewCenterDisabled:Object.create(null),diffCenteredDone:Object.create(null),previewCenteredDone:Object.create(null),deferredFullSnapshotTimer:0,deferredFileExplorerTimer:0,modelCatalogTimer:0,modelCatalogInFlight:false,catalogRefreshInFlight:false,fileExplorerDeferUntil:0};
@@ -5434,7 +5434,7 @@ window.addEventListener('DOMContentLoaded',async()=>{for(const id of ['chat','se
 window.addEventListener('DOMContentLoaded',()=>{bindClick('memoryModeAction',(e)=>{closePopups();toggleUserMemoryMode(e)});bindClick('memoryExportAction',(e)=>{closePopups();exportUserMemory(e)});bindClick('memoryClearAction',(e)=>{closePopups();clearUserMemory(e)});renderMemoryModeAction()});
 """
 
-# split-source: order=785 original-lines=76881-76920 hash=655a539a8a0eacf3
+# split-source: order=785 original-lines=76883-76922 hash=655a539a8a0eacf3
 
 APP_TS = """type SessionSummary={id:string;title:string;running:boolean;updated_at:number;message_count:number};
 type Msg={role:string;text:string;type?:string;data?:Record<string,unknown>;thinking?:string;agent_role?:string;[key:string]:unknown};

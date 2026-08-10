@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-# split-source: order=859 original-lines=92693-92773 hash=8a01d19c2bde4593
+# split-source: order=859 original-lines=92695-92775 hash=8a01d19c2bde4593
 
 IDE_INDEX_HTML = """<!doctype html>
 <html lang="zh-CN">
@@ -86,7 +86,7 @@ IDE_INDEX_HTML = """<!doctype html>
 </html>
 """
 
-# split-source: order=860 original-lines=92774-92841 hash=b03a684c525789a4
+# split-source: order=860 original-lines=92776-92843 hash=b03a684c525789a4
 
 IDE_CSS = """
 :root{
@@ -156,7 +156,7 @@ button.primary{background:#0f5fa8;border-color:#1674c8}
 }
 """
 
-# split-source: order=861 original-lines=92842-93036 hash=e82ae8e23129a0a9
+# split-source: order=861 original-lines=92844-93038 hash=e82ae8e23129a0a9
 
 IDE_JS = """
 const E=id=>document.getElementById(id);

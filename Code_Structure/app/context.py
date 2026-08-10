@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-# split-source: order=862 original-lines=93037-97884 hash=12cbeccaa2141dca
+# split-source: order=862 original-lines=93039-97886 hash=0f0a8897e8cdc13f
 
 # ============================================================================
 # Architecture / 架构 / アーキテクチャ
@@ -2343,7 +2343,7 @@ class AppContext:
                     "wiki_candidate_count": int((wiki_result.get("route_meta", {}) or {}).get("candidate_count", 0) or 0)
                     if isinstance(wiki_result.get("route_meta", {}), dict)
                     else 0,
-                    "raw_candidate_count": sum(len((row.get("results", []) or [])) for row in stage_results if isinstance(row, dict) and str(row.get("route", "") or "") not in {"wiki"}),
+                    "raw_candidate_count": sum(len(row.get("results", []) or []) for row in stage_results if isinstance(row, dict) and str(row.get("route", "") or "") not in {"wiki"}),
                     "raw_route": raw_route,
                     "wiki_first": True,
                     "adaptive_retrieval": True,
@@ -2702,7 +2702,7 @@ class AppContext:
                     "wiki_candidate_count": int((wiki_result.get("route_meta", {}) or {}).get("candidate_count", 0) or 0)
                     if isinstance(wiki_result.get("route_meta", {}), dict)
                     else 0,
-                    "raw_candidate_count": sum(len((row.get("results", []) or [])) for row in stage_results if isinstance(row, dict) and str(row.get("route", "") or "") not in {"wiki", "workflow"}),
+                    "raw_candidate_count": sum(len(row.get("results", []) or []) for row in stage_results if isinstance(row, dict) and str(row.get("route", "") or "") not in {"wiki", "workflow"}),
                     "raw_route": raw_route,
                     "workflow_first": True,
                     "wiki_first": True,

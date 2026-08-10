@@ -1,36 +1,34 @@
 #!/usr/bin/env python3
 from __future__ import annotations
+
 import argparse
 import ast
 import base64
-from collections import Counter, defaultdict, deque
 import concurrent.futures
 import csv
 import difflib
 import errno
-from email.utils import parsedate_to_datetime
-import html
-from html.parser import HTMLParser
 import hashlib
 import hmac
+import html
+import importlib.util
 import io
 import ipaddress
-import importlib.util
 import json
 import locale
 import math
-import multiprocessing
 import mimetypes
+import multiprocessing
 import os
 import queue
 import re
 import selectors
-import signal
-import shutil
 import shlex
-import ssl
+import shutil
+import signal
 import socket
 import sqlite3
+import ssl
 import subprocess
 import sys
 import tarfile
@@ -38,18 +36,22 @@ import threading
 import time
 import traceback
 import unicodedata
+import urllib.robotparser as robotparser
 import uuid
+import xml.etree.ElementTree as ET
 import zipfile
 import zlib
-import xml.etree.ElementTree as ET
+from collections import Counter, defaultdict, deque
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+from html.parser import HTMLParser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse, urlunparse
 from urllib.request import Request, urlopen
-import urllib.robotparser as robotparser
+
 try:
     import certifi as _certifi
 except Exception:
@@ -16601,7 +16603,7 @@ class OllamaClient:
         if "embed_model" in profile:
             self.embed_model = str(profile.get("embed_model") or "").strip()
 
-    def embed(self, *, model: str, input: "str | list") -> dict:
+    def embed(self, *, model: str, input: str | list) -> dict:
         """Get embedding vector(s) from the model.
 
         Returns {"embeddings": [[float, ...]]} regardless of backend.
@@ -16693,7 +16695,7 @@ class OllamaClient:
                 url=url,
                 retry_after=self._parse_retry_after_seconds(hdrs, text),
             ) from exc
-        except (URLError, TimeoutError, socket.timeout, ConnectionResetError, ConnectionAbortedError) as exc:
+        except (URLError, TimeoutError, ConnectionResetError, ConnectionAbortedError) as exc:
             raise OllamaError(f"Connection error: {exc}", url=url) from exc
 
     def _post_json_url_with_retries(
@@ -16799,7 +16801,7 @@ class OllamaClient:
                 url=url,
                 retry_after=self._parse_retry_after_seconds(hdrs, text),
             ) from exc
-        except (URLError, TimeoutError, socket.timeout, ConnectionResetError, ConnectionAbortedError) as exc:
+        except (URLError, TimeoutError, ConnectionResetError, ConnectionAbortedError) as exc:
             raise OllamaError(f"Connection error: {exc}", url=url) from exc
 
     def _iter_response_lines_url_with_retries(
@@ -16893,7 +16895,7 @@ class OllamaClient:
                 url=url,
                 retry_after=self._parse_retry_after_seconds(hdrs, text),
             ) from exc
-        except (URLError, TimeoutError, socket.timeout, ConnectionResetError, ConnectionAbortedError) as exc:
+        except (URLError, TimeoutError, ConnectionResetError, ConnectionAbortedError) as exc:
             raise OllamaError(f"Connection error: {exc}", url=url) from exc
 
     def _download_bytes(self, url: str, timeout: int | None = None) -> tuple[bytes, str]:
@@ -16913,7 +16915,7 @@ class OllamaClient:
                 url=url,
                 retry_after=self._parse_retry_after_seconds(hdrs, text),
             ) from exc
-        except (URLError, TimeoutError, socket.timeout, ConnectionResetError, ConnectionAbortedError) as exc:
+        except (URLError, TimeoutError, ConnectionResetError, ConnectionAbortedError) as exc:
             raise OllamaError(f"Connection error: {exc}", url=url) from exc
 
     def _normalize_tool_calls(self, tool_calls: list) -> list[dict]:
@@ -29554,7 +29556,7 @@ body{padding:18px}
                                 note_tip = ""
                                 if note_maps:
                                     try:
-                                        note_tip = trim(str(((note_maps.get(ref_kind, {}) or {}).get(note_id, "") or "")).strip(), 240)
+                                        note_tip = trim(str((note_maps.get(ref_kind, {}) or {}).get(note_id, "") or "").strip(), 240)
                                     except Exception:
                                         note_tip = ""
                                 title_attr = f' title="{html.escape(note_tip)}"' if note_tip else ""
@@ -29639,8 +29641,8 @@ body{padding:18px}
         try:
             import docx  # type: ignore
             from docx.document import Document as _DocxDocument  # type: ignore
-            from docx.oxml.text.paragraph import CT_P  # type: ignore
             from docx.oxml.table import CT_Tbl  # type: ignore
+            from docx.oxml.text.paragraph import CT_P  # type: ignore
             from docx.table import Table as _DocxTable  # type: ignore
             from docx.text.paragraph import Paragraph as _DocxParagraph  # type: ignore
 
@@ -29767,7 +29769,7 @@ body{padding:18px}
                 for ref_kind, note_id in ordered_note_refs:
                     if ref_kind != kind:
                         continue
-                    note_text = str(((note_maps.get(kind, {}) or {}).get(note_id, "") or "")).strip()
+                    note_text = str((note_maps.get(kind, {}) or {}).get(note_id, "") or "").strip()
                     note_body = html.escape(note_text).replace("\n", "<br>") if note_text else "<em>(note content unavailable)</em>"
                     items.append(
                         "<div class=\"pv-doc-note-item\">"
@@ -30259,7 +30261,7 @@ body{padding:18px}
             else:
                 width = max(4.0, min(100.0, (abs(numeric) / max_abs) * 100.0))
                 metric = str(row.get("text", "") or self._preview_value_text(numeric))
-            fill_color = str((((theme or {}).get("colors", {}) or {}).get(accent_keys[idx % len(accent_keys)]) or "#3b82f6"))
+            fill_color = str(((theme or {}).get("colors", {}) or {}).get(accent_keys[idx % len(accent_keys)]) or "#3b82f6")
             bar_rows.append(
                 "<div class=\"pv-slide-bar-row\">"
                 f"<div>{html.escape(str(row.get('label', '') or ''))}</div>"
@@ -84029,7 +84031,7 @@ class CodeContentParser:
             "path": str(fp),
             "kind": "source_code",
             "mime": str(mime or guess_mime_from_name(fp.name, "text/plain")),
-            "size": int(fp.stat().st_size) if fp.exists() and fp.is_file() else len((raw_bytes or b"")),
+            "size": int(fp.stat().st_size) if fp.exists() and fp.is_file() else len(raw_bytes or b""),
             "sha256": _sha256_file(fp) if fp.exists() and fp.is_file() else _sha256_bytes((raw_text or "").encode("utf-8")),
             "language": language or "text",
             "text": raw_text,
@@ -95373,7 +95375,7 @@ class AppContext:
                     "wiki_candidate_count": int((wiki_result.get("route_meta", {}) or {}).get("candidate_count", 0) or 0)
                     if isinstance(wiki_result.get("route_meta", {}), dict)
                     else 0,
-                    "raw_candidate_count": sum(len((row.get("results", []) or [])) for row in stage_results if isinstance(row, dict) and str(row.get("route", "") or "") not in {"wiki"}),
+                    "raw_candidate_count": sum(len(row.get("results", []) or []) for row in stage_results if isinstance(row, dict) and str(row.get("route", "") or "") not in {"wiki"}),
                     "raw_route": raw_route,
                     "wiki_first": True,
                     "adaptive_retrieval": True,
@@ -95732,7 +95734,7 @@ class AppContext:
                     "wiki_candidate_count": int((wiki_result.get("route_meta", {}) or {}).get("candidate_count", 0) or 0)
                     if isinstance(wiki_result.get("route_meta", {}), dict)
                     else 0,
-                    "raw_candidate_count": sum(len((row.get("results", []) or [])) for row in stage_results if isinstance(row, dict) and str(row.get("route", "") or "") not in {"wiki", "workflow"}),
+                    "raw_candidate_count": sum(len(row.get("results", []) or []) for row in stage_results if isinstance(row, dict) and str(row.get("route", "") or "") not in {"wiki", "workflow"}),
                     "raw_route": raw_route,
                     "workflow_first": True,
                     "wiki_first": True,
@@ -99509,8 +99511,8 @@ class Handler(BaseHTTPRequestHandler):
             if not base_url:
                 return self._send_json({"ok": False, "reachable": False, "models": [], "error": "base_url required"})
             try:
-                import urllib.request
                 import urllib.error
+                import urllib.request
                 normalized_base = extract_base_url(base_url)
                 reachable = False
                 last_error = ""
@@ -101331,7 +101333,7 @@ class McpServiceHandler(BaseHTTPRequestHandler):
             raise
 
     @property
-    def app(self) -> "AppContext":
+    def app(self) -> AppContext:
         return self.server.app  # type: ignore[attr-defined]
 
     def _mgr(self):

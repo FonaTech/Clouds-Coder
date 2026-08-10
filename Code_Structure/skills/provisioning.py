@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-# split-source: order=714 original-lines=9622-9687 hash=893a5c7fc3fc79dc
+# split-source: order=714 original-lines=9624-9689 hash=893a5c7fc3fc79dc
 
 
 def ensure_embedded_skills_at_root(skills_root: Path, workdir: Path = WORKDIR, overwrite_existing: bool = False) -> Path:
@@ -71,13 +71,13 @@ def ensure_embedded_skills_at_root(skills_root: Path, workdir: Path = WORKDIR, o
     state_path.write_text(json.dumps(state_payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return target
 
-# split-source: order=715 original-lines=9688-9691 hash=488e35a795d9caca
+# split-source: order=715 original-lines=9690-9693 hash=488e35a795d9caca
 
 
 def ensure_embedded_skills(workdir: Path) -> Path:
     return ensure_embedded_skills_at_root(workdir / "skills", workdir=workdir, overwrite_existing=False)
 
-# split-source: order=717 original-lines=9698-9714 hash=5f75bbd1af19cd42
+# split-source: order=717 original-lines=9700-9716 hash=5f75bbd1af19cd42
 
 def detect_upload_parser_capabilities() -> dict:
     return {
@@ -96,7 +96,7 @@ def detect_upload_parser_capabilities() -> dict:
         "playwright": _module_exists("playwright"),
     }
 
-# split-source: order=718 original-lines=9715-9730 hash=1b6b77e50dc74a25
+# split-source: order=718 original-lines=9717-9732 hash=1b6b77e50dc74a25
 
 def _render_cap_markdown(caps: dict) -> str:
     rows = [
@@ -114,7 +114,7 @@ def _render_cap_markdown(caps: dict) -> str:
         lines.append(f"- `{ext}`: {'available' if ok else 'partial'} ({parser})")
     return "\n".join(lines)
 
-# split-source: order=719 original-lines=9731-9737 hash=9d5e4bda227c4064
+# split-source: order=719 original-lines=9733-9739 hash=9d5e4bda227c4064
 
 def _write_text_if_changed(path: Path, content: str):
     old = try_read_text(path)
@@ -123,7 +123,7 @@ def _write_text_if_changed(path: Path, content: str):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
 
-# split-source: order=720 original-lines=9738-9827 hash=38b2da828440d41b
+# split-source: order=720 original-lines=9740-9829 hash=38b2da828440d41b
 
 def ensure_generated_document_skills(skills_root: Path):
     caps = detect_upload_parser_capabilities()
@@ -215,7 +215,7 @@ If the model cannot process the image natively (runtime message will say so):
     _write_text_if_changed(generated_root / "upload-image-parser" / "SKILL.md", image_skill)
     _write_text_if_changed(generated_root / "upload-parsers-capabilities.json", cap_json)
 
-# split-source: order=721 original-lines=9828-9928 hash=7f3c2b04dcae2810
+# split-source: order=721 original-lines=9830-9930 hash=7f3c2b04dcae2810
 
 def ensure_generated_image_coding_feedback_skill(skills_root: Path):
     generated_root = skills_root / "generated"
@@ -318,7 +318,7 @@ Severity baseline:
     _write_text_if_changed(root / "references" / "visual-evaluation-notes.md", ref_md)
     _write_text_if_changed(generated_root / "image-coding-feedback-loop-capabilities.json", cap_json)
 
-# split-source: order=722 original-lines=9929-9949 hash=0292dde0352a724f
+# split-source: order=722 original-lines=9931-9951 hash=0292dde0352a724f
 
 def _skill_knowledge_files(workdir: Path) -> list[Path]:
     out: list[Path] = []
@@ -341,7 +341,7 @@ def _skill_knowledge_files(workdir: Path) -> list[Path]:
         dedup.append(p)
     return dedup
 
-# split-source: order=723 original-lines=9950-10005 hash=da1db978dee59a36
+# split-source: order=723 original-lines=9952-10007 hash=da1db978dee59a36
 
 def analyze_skill_building_knowledge(workdir: Path = WORKDIR) -> dict:
     files = _skill_knowledge_files(workdir)
@@ -399,13 +399,13 @@ def analyze_skill_building_knowledge(workdir: Path = WORKDIR) -> dict:
         "sources": sources,
     }
 
-# split-source: order=724 original-lines=10006-10009 hash=380c4fa76ed211cc
+# split-source: order=724 original-lines=10008-10011 hash=380c4fa76ed211cc
 
 def _sanitize_skill_slug(raw: str, fallback: str = "skills-gen") -> str:
     slug = re.sub(r"[^A-Za-z0-9._-]+", "-", str(raw or "").strip()).strip("-")
     return slug or fallback
 
-# split-source: order=725 original-lines=10010-10042 hash=812fe6d2a2b42325
+# split-source: order=725 original-lines=10012-10044 hash=812fe6d2a2b42325
 
 def _build_skills_gen_skill_content(knowledge: dict) -> str:
     rules = [str(x).strip() for x in knowledge.get("rules", []) if str(x).strip()]
@@ -440,7 +440,7 @@ Use this skill when the user wants to design, generate, refine, and publish reus
 - Avoid filler prose; prioritize executable steps and checks.
 """
 
-# split-source: order=726 original-lines=10043-10048 hash=577a94a4aa1e7aad
+# split-source: order=726 original-lines=10045-10050 hash=577a94a4aa1e7aad
 
 def ensure_generated_skills_gen_skill(skills_root: Path, workdir: Path = WORKDIR):
     knowledge = analyze_skill_building_knowledge(workdir)
@@ -448,7 +448,7 @@ def ensure_generated_skills_gen_skill(skills_root: Path, workdir: Path = WORKDIR
     _write_text_if_changed(root / "SKILL.md", _build_skills_gen_skill_content(knowledge))
     _write_text_if_changed(root / "knowledge_snapshot.json", json_dumps(knowledge, indent=2))
 
-# split-source: order=727 original-lines=10049-10133 hash=c5202333eb2bc051
+# split-source: order=727 original-lines=10051-10135 hash=c5202333eb2bc051
 
 def ensure_generated_execution_recovery_skill(skills_root: Path):
     generated_root = skills_root / "generated"
@@ -535,7 +535,7 @@ Never publish internal recovery mechanics such as "triage failure", "recover con
         ),
     )
 
-# split-source: order=728 original-lines=10134-10407 hash=0a52d4a1b3b5c3a3
+# split-source: order=728 original-lines=10136-10409 hash=0a52d4a1b3b5c3a3
 
 def ensure_generated_systematic_debugging_skill(skills_root: Path):
     generated_root = skills_root / "generated"
@@ -811,7 +811,7 @@ The rightward categories are harder to diagnose and their bugs have wider blast 
         }, indent=2),
     )
 
-# split-source: order=729 original-lines=10408-10527 hash=7da06e07ba1dd983
+# split-source: order=729 original-lines=10410-10529 hash=7da06e07ba1dd983
 
 def ensure_generated_code_engineering_mastery_skill(skills_root: Path):
     generated_root = skills_root / "generated"
@@ -933,7 +933,7 @@ Before declaring "done", check:
         }, indent=2),
     )
 
-# split-source: order=730 original-lines=10528-10644 hash=f3df1881ef6ef425
+# split-source: order=730 original-lines=10530-10646 hash=f3df1881ef6ef425
 
 def ensure_generated_smart_file_navigation_skill(skills_root: Path):
     generated_root = skills_root / "generated"
@@ -1052,7 +1052,7 @@ If you can't find what you're looking for:
         }, indent=2),
     )
 
-# split-source: order=731 original-lines=10645-10853 hash=06df9666f952d224
+# split-source: order=731 original-lines=10647-10855 hash=06df9666f952d224
 
 def ensure_generated_html_frontend_report_skills(skills_root: Path):
     generated_root = skills_root / "generated"
@@ -1263,7 +1263,7 @@ Validation:
         ),
     )
 
-# split-source: order=732 original-lines=10854-11123 hash=13cdd728d0c8fe6a
+# split-source: order=732 original-lines=10856-11125 hash=13cdd728d0c8fe6a
 
 def ensure_generated_deep_research_skills(skills_root: Path):
     generated_root = skills_root / "generated"
@@ -1535,7 +1535,7 @@ if __name__ == "__main__":
         ),
     )
 
-# split-source: order=733 original-lines=11124-11761 hash=cf10557a0f2e997a
+# split-source: order=733 original-lines=11126-11763 hash=cf10557a0f2e997a
 
 def ensure_generated_research_scientific_skills(skills_root: Path):
     generated_root = skills_root / "generated"
@@ -2175,7 +2175,7 @@ if __name__ == "__main__":
         ),
     )
 
-# split-source: order=734 original-lines=11762-12063 hash=8e4e177b25bb68fb
+# split-source: order=734 original-lines=11764-12065 hash=8e4e177b25bb68fb
 
 # ---------------------------------------------------------------------------
 # Generated Skills: RAG Retrieval Mastery
@@ -2479,7 +2479,7 @@ query_code_library(
         ),
     )
 
-# split-source: order=735 original-lines=12064-12758 hash=8338acd4de952750
+# split-source: order=735 original-lines=12066-12760 hash=8338acd4de952750
 
 # ---------------------------------------------------------------------------
 # Generated Skills: Multimodal Reading Comprehension
@@ -3176,7 +3176,7 @@ This helps you:
         ),
     )
 
-# split-source: order=736 original-lines=12759-12793 hash=fcb333eb4205c0af
+# split-source: order=736 original-lines=12761-12795 hash=fcb333eb4205c0af
 
 
 def ensure_generated_runtime_skills_manifest(skills_root: Path):
@@ -3213,7 +3213,7 @@ def ensure_generated_runtime_skills_manifest(skills_root: Path):
     }
     _write_text_if_changed(generated_root / "runtime-skills-manifest.json", json_dumps(payload, indent=2))
 
-# split-source: order=737 original-lines=12794-12856 hash=4576a7d5bc863b3e
+# split-source: order=737 original-lines=12796-12858 hash=4576a7d5bc863b3e
 
 
 def ensure_generated_agent_web_search_skill(skills_root: Path):
@@ -3278,7 +3278,7 @@ The tool blocks non-HTTP(S), localhost/private/reserved IPs by default, obeys ro
 """
     _write_text_if_changed(skill_root / "SKILL.md", skill)
 
-# split-source: order=740 original-lines=13106-13152 hash=a1cad2dc59ad1cbb
+# split-source: order=740 original-lines=13108-13154 hash=a1cad2dc59ad1cbb
 
 
 # ============================================================================
@@ -3327,7 +3327,7 @@ def ensure_embedded_clawhub_skills(skills_root: Path):
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(zf.read(info.filename))
 
-# split-source: order=742 original-lines=13328-13339 hash=b2142e5179ee4116
+# split-source: order=742 original-lines=13330-13341 hash=b2142e5179ee4116
 
 def ensure_generated_mcp_builder_skill(skills_root: Path):
     """Materialize the mcp-builder skill to disk on demand.
@@ -3341,7 +3341,7 @@ def ensure_generated_mcp_builder_skill(skills_root: Path):
     root = skills_root / "mcp-builder"
     _write_text_if_changed(root / "SKILL.md", MCP_BUILDER_SKILL_MD)
 
-# split-source: order=743 original-lines=13340-13358 hash=3983f97666e841f0
+# split-source: order=743 original-lines=13342-13360 hash=3983f97666e841f0
 
 def ensure_runtime_skills(skills_root: Path):
     ensure_embedded_skills_at_root(skills_root, workdir=WORKDIR, overwrite_existing=False)

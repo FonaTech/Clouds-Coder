@@ -3,13 +3,13 @@
 
 from __future__ import annotations
 
-# split-source: order=56 original-lines=64-64 hash=1193ac432052a5ff
+# split-source: order=56 original-lines=66-66 hash=1193ac432052a5ff
 DEFAULT_OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 
-# split-source: order=57 original-lines=65-65 hash=e498053827490a72
+# split-source: order=57 original-lines=67-67 hash=e498053827490a72
 DEFAULT_OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:7b")
 
-# split-source: order=646 original-lines=6632-6641 hash=9a445aba4f015d9d
+# split-source: order=646 original-lines=6634-6643 hash=9a445aba4f015d9d
 
 OPENAI_COMPAT_PROVIDER_NAMES = {
     "openai_compat",
@@ -21,11 +21,11 @@ OPENAI_COMPAT_PROVIDER_NAMES = {
     "openrouter",
 }
 
-# split-source: order=647 original-lines=6642-6643 hash=17e3a31f65cff18b
+# split-source: order=647 original-lines=6644-6645 hash=17e3a31f65cff18b
 
 OPENAI_LIKE_PROVIDER_NAMES = OPENAI_COMPAT_PROVIDER_NAMES | {"custom_http"}
 
-# split-source: order=650 original-lines=6650-6661 hash=d6ecf69b7361bfa0
+# split-source: order=650 original-lines=6652-6663 hash=d6ecf69b7361bfa0
 
 # ── Effort / reasoning-budget model ────────────────────────────────────
 # A single provider-neutral "effort" axis that maps onto each provider's
@@ -39,28 +39,28 @@ OPENAI_LIKE_PROVIDER_NAMES = OPENAI_COMPAT_PROVIDER_NAMES | {"custom_http"}
 # on a 400 fallback so non-reasoning models never break.
 EFFORT_OFF = "off"
 
-# split-source: order=651 original-lines=6662-6662 hash=0c5d5bfdf97a19e9
+# split-source: order=651 original-lines=6664-6664 hash=0c5d5bfdf97a19e9
 EFFORT_LOW = "low"
 
-# split-source: order=652 original-lines=6663-6663 hash=b5439b37fab58e00
+# split-source: order=652 original-lines=6665-6665 hash=b5439b37fab58e00
 EFFORT_MEDIUM = "medium"
 
-# split-source: order=653 original-lines=6664-6664 hash=82e662cb132aaefa
+# split-source: order=653 original-lines=6666-6666 hash=82e662cb132aaefa
 EFFORT_HIGH = "high"
 
-# split-source: order=654 original-lines=6665-6665 hash=01bd36c88de4589d
+# split-source: order=654 original-lines=6667-6667 hash=01bd36c88de4589d
 EFFORT_MAX = "max"
 
-# split-source: order=655 original-lines=6666-6666 hash=6460246751e15557
+# split-source: order=655 original-lines=6668-6668 hash=6460246751e15557
 EFFORT_LEVELS = (EFFORT_OFF, EFFORT_LOW, EFFORT_MEDIUM, EFFORT_HIGH, EFFORT_MAX)
 
-# split-source: order=656 original-lines=6667-6667 hash=0938bc0fa1221788
+# split-source: order=656 original-lines=6669-6669 hash=0938bc0fa1221788
 EFFORT_ORDER = {name: idx for idx, name in enumerate(EFFORT_LEVELS)}
 
-# split-source: order=657 original-lines=6668-6668 hash=1559f599104bb115
+# split-source: order=657 original-lines=6670-6670 hash=1559f599104bb115
 EFFORT_DEFAULT = EFFORT_MEDIUM
 
-# split-source: order=658 original-lines=6669-6676 hash=6f464f1a4b2eee46
+# split-source: order=658 original-lines=6671-6678 hash=6f464f1a4b2eee46
 
 # Anthropic extended-thinking token budgets per effort level.
 EFFORT_ANTHROPIC_BUDGET = {
@@ -70,7 +70,7 @@ EFFORT_ANTHROPIC_BUDGET = {
     EFFORT_MAX: 32_000,
 }
 
-# split-source: order=659 original-lines=6677-6683 hash=9639aada761e4a0e
+# split-source: order=659 original-lines=6679-6685 hash=9639aada761e4a0e
 # OpenAI/DeepSeek reasoning_effort enum mapping (their API only has 3 tiers).
 EFFORT_OPENAI_REASONING = {
     EFFORT_LOW: "low",
@@ -79,7 +79,7 @@ EFFORT_OPENAI_REASONING = {
     EFFORT_MAX: "high",
 }
 
-# split-source: order=660 original-lines=6684-6693 hash=af4090d39855aa3c
+# split-source: order=660 original-lines=6686-6695 hash=af4090d39855aa3c
 
 # Task level (L1-L5) -> default effort. L3-L5 are forced to MAX per spec:
 # moderate/complex/expert tiers always run reasoning at full strength.
@@ -91,7 +91,7 @@ TASK_LEVEL_EFFORT = {
     5: EFFORT_MAX,
 }
 
-# split-source: order=661 original-lines=6694-6699 hash=28ad6e40a67252b2
+# split-source: order=661 original-lines=6696-6701 hash=28ad6e40a67252b2
 # Per-role effort floor: managers and reviewers reason at least at HIGH even on
 # lighter tiers, because routing/critique quality dominates outcome quality.
 ROLE_EFFORT_FLOOR = {
@@ -99,7 +99,7 @@ ROLE_EFFORT_FLOOR = {
     "reviewer": EFFORT_HIGH,
 }
 
-# split-source: order=662 original-lines=6700-6708 hash=e45835b7df73ce60
+# split-source: order=662 original-lines=6702-6710 hash=e45835b7df73ce60
 # Coordination effort: the manager's per-round *routing* decision is a mechanical
 # tool-pick (missing facts->explorer, impl->developer, verify->reviewer, done->finish)
 # constrained to a single route_to_next_agent call. It does NOT need HIGH/MAX

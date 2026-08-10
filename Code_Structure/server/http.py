@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-# split-source: order=863 original-lines=97885-97924 hash=72f9d812840a61ba
+# split-source: order=863 original-lines=97887-97926 hash=72f9d812840a61ba
 
 # ============================================================================
 # Architecture / 架构 / アーキテクチャ
@@ -45,7 +45,7 @@ class AgentHTTPServer(ThreadingHTTPServer):
                 return
             raise
 
-# split-source: order=866 original-lines=99044-100407 hash=e2dbd7d163c6d5df
+# split-source: order=866 original-lines=99046-100409 hash=e6300aa87899a222
 
 
 # Request router: serves chat APIs, admin APIs, SSE streams, asset endpoints,
@@ -514,8 +514,8 @@ class Handler(BaseHTTPRequestHandler):
             if not base_url:
                 return self._send_json({"ok": False, "reachable": False, "models": [], "error": "base_url required"})
             try:
-                import urllib.request
                 import urllib.error
+                import urllib.request
                 normalized_base = extract_base_url(base_url)
                 reachable = False
                 last_error = ""

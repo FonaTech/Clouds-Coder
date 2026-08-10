@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-# split-source: order=871 original-lines=101305-101468 hash=2cd448000565b0cf
+# split-source: order=871 original-lines=101307-101470 hash=7d17be908949d88f
 
 class McpServiceHandler(BaseHTTPRequestHandler):
     """HTTP control/health surface for the global MCP manager (ide_port+1).
@@ -33,7 +33,7 @@ class McpServiceHandler(BaseHTTPRequestHandler):
             raise
 
     @property
-    def app(self) -> "AppContext":
+    def app(self) -> AppContext:
         return self.server.app  # type: ignore[attr-defined]
 
     def _mgr(self):

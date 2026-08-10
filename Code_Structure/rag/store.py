@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-# split-source: order=842 original-lines=86238-86823 hash=4bc5e1fae18af394
+# split-source: order=842 original-lines=86240-86825 hash=4bc5e1fae18af394
 
 
 # ============================================================================
@@ -591,7 +591,7 @@ class RAGLibraryStore:
             "chunk_count": len(chunk_ids),
         }
 
-# split-source: order=843 original-lines=86824-87355 hash=bf1eadb7273af0f2
+# split-source: order=843 original-lines=86826-87357 hash=bf1eadb7273af0f2
 
 
 class WikiStore:
@@ -1125,7 +1125,7 @@ class WikiStore:
             "query_entities": sorted(qentities),
         }
 
-# split-source: order=844 original-lines=87356-88033 hash=e22aa0b3692247d3
+# split-source: order=844 original-lines=87358-88035 hash=e22aa0b3692247d3
 
 
 class UserMemoryStore:
@@ -1805,7 +1805,7 @@ class UserMemoryStore:
             self._write_profile_locked(self._empty_profile())
         return {"ok": True, "cleared": True, "user_id": self.user_id}
 
-# split-source: order=845 original-lines=88034-88102 hash=471225095db9809e
+# split-source: order=845 original-lines=88036-88104 hash=471225095db9809e
 
 
 class UserInteractionOptimizer:
@@ -1876,7 +1876,7 @@ class UserInteractionOptimizer:
         }
         return capsule, meta
 
-# split-source: order=846 original-lines=88103-88144 hash=dd27ec5fa754e903
+# split-source: order=846 original-lines=88105-88146 hash=dd27ec5fa754e903
 
 
 class UserIntentProfiler:
@@ -1920,7 +1920,7 @@ class UserIntentProfiler:
             "memory_count": int(meta.get("memory_count", 0) or 0),
         }
 
-# split-source: order=847 original-lines=88145-88545 hash=fcbd83fa2e87370f
+# split-source: order=847 original-lines=88147-88547 hash=fcbd83fa2e87370f
 
 
 class WorkflowMemoryStore:
@@ -2323,7 +2323,7 @@ class WorkflowMemoryStore:
             "route_meta": {"mode": "workflow", "card_count": len(cards), "candidate_count": len(rows), "accepted_only": bool(accepted_only)},
         }
 
-# split-source: order=851 original-lines=89931-90196 hash=f9d7e75f3c65db6f
+# split-source: order=851 original-lines=89933-90198 hash=f9d7e75f3c65db6f
 
 
 class CodeLibraryStore(RAGLibraryStore):

@@ -3,10 +3,10 @@
 
 from __future__ import annotations
 
-# split-source: order=79 original-lines=154-154 hash=30f9634a0d17f4c5
+# split-source: order=79 original-lines=156-156 hash=30f9634a0d17f4c5
 MAX_TOOL_OUTPUT = 50_000
 
-# split-source: order=333 original-lines=663-668 hash=1a4a712f8c348716
+# split-source: order=333 original-lines=665-670 hash=1a4a712f8c348716
 SOCKET_NOISE_LINE_PATTERNS = (
     re.compile(r"\bwinerror\s*10038\b", re.IGNORECASE),
     re.compile(r"\bwsaenotsock\b", re.IGNORECASE),
@@ -14,7 +14,7 @@ SOCKET_NOISE_LINE_PATTERNS = (
     re.compile(r"\bbenign\s+socket\s+error\b", re.IGNORECASE),
 )
 
-# split-source: order=536 original-lines=3301-3315 hash=c783a2f33fc85d5a
+# split-source: order=536 original-lines=3303-3317 hash=c783a2f33fc85d5a
 
 
 def filter_runtime_noise_lines(text: str) -> tuple[str, int]:
@@ -31,17 +31,17 @@ def filter_runtime_noise_lines(text: str) -> tuple[str, int]:
         kept.append(row)
     return "\n".join(kept).strip(), int(dropped)
 
-# split-source: order=549 original-lines=3561-3563 hash=29402fd9e54054b0
+# split-source: order=549 original-lines=3563-3565 hash=29402fd9e54054b0
 
 def safe_utf8_bytes(text: object) -> bytes:
     return str(text).encode("utf-8", errors="backslashreplace")
 
-# split-source: order=550 original-lines=3564-3566 hash=ae25fba610e47229
+# split-source: order=550 original-lines=3566-3568 hash=ae25fba610e47229
 
 def escape_invalid_utf8_text(text: object) -> str:
     return safe_utf8_bytes(text).decode("utf-8")
 
-# split-source: order=551 original-lines=3567-3580 hash=e085c61b8c156c29
+# split-source: order=551 original-lines=3569-3582 hash=e085c61b8c156c29
 
 def sanitize_utf8_surrogates(value: object) -> object:
     if isinstance(value, str):
@@ -57,20 +57,20 @@ def sanitize_utf8_surrogates(value: object) -> object:
         }
     return value
 
-# split-source: order=552 original-lines=3581-3585 hash=3ec483008170e5dd
+# split-source: order=552 original-lines=3583-3587 hash=3ec483008170e5dd
 
 def decode_utf8_replace(data: bytes | bytearray | str) -> str:
     if isinstance(data, str):
         return escape_invalid_utf8_text(data)
     return bytes(data).decode("utf-8", errors="replace")
 
-# split-source: order=582 original-lines=4101-4104 hash=4c2a121eb3eb0659
+# split-source: order=582 original-lines=4103-4106 hash=4c2a121eb3eb0659
 
 def trim(text: object, limit: int = MAX_TOOL_OUTPUT) -> str:
     s = str(text)
     return s if len(s) <= limit else s[:limit] + "\n...(truncated)"
 
-# split-source: order=583 original-lines=4105-4119 hash=f77d7ded0a73419b
+# split-source: order=583 original-lines=4107-4121 hash=f77d7ded0a73419b
 
 def display_clean(text: object, limit: int = 0) -> str:
     """Sanitize a model/context string for USER-FACING output (plan.md, UI).
@@ -87,7 +87,7 @@ def display_clean(text: object, limit: int = 0) -> str:
         s = s[:limit].rstrip() + "…"
     return s
 
-# split-source: order=584 original-lines=4120-4138 hash=7a0ce74d6e335344
+# split-source: order=584 original-lines=4122-4140 hash=7a0ce74d6e335344
 
 def short_title_from(text: object, limit: int = 80) -> str:
     """Derive a concise, clean single-line heading from a longer summary/title.
@@ -108,7 +108,7 @@ def short_title_from(text: object, limit: int = 80) -> str:
         return s[:limit].rstrip() + "…"
     return s
 
-# split-source: order=600 original-lines=5587-5597 hash=7e4c59544e18adca
+# split-source: order=600 original-lines=5589-5599 hash=7e4c59544e18adca
 
 
 def _fmt_export_ts(ts: float | int) -> str:
@@ -121,13 +121,13 @@ def _fmt_export_ts(ts: float | int) -> str:
     except Exception:
         return ""
 
-# split-source: order=601 original-lines=5598-5601 hash=0365ec69adb30227
+# split-source: order=601 original-lines=5600-5603 hash=0365ec69adb30227
 
 
 def _html_esc(text: str) -> str:
     return html.escape(str(text or ""))
 
-# split-source: order=602 original-lines=5602-5750 hash=576b0dfcc7e44d09
+# split-source: order=602 original-lines=5604-5752 hash=576b0dfcc7e44d09
 
 
 def _text_to_minimal_pdf(text: str) -> bytes:
@@ -278,7 +278,7 @@ def _text_to_minimal_pdf(text: str) -> bytes:
     buf += b"%%EOF\n"
     return buf
 
-# split-source: order=605 original-lines=5768-5777 hash=cab7131fea9148ae
+# split-source: order=605 original-lines=5770-5779 hash=cab7131fea9148ae
 
 def normalize_embedded_newlines(text: object) -> str:
     s = str(text or "")
@@ -290,7 +290,7 @@ def normalize_embedded_newlines(text: object) -> str:
         s = s.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n").replace("\\t", "\t")
     return s
 
-# split-source: order=606 original-lines=5778-5816 hash=9a1ecf6be1e22a77
+# split-source: order=606 original-lines=5780-5818 hash=9a1ecf6be1e22a77
 
 
 def _map_todo_status_token(token: str) -> str:
@@ -331,7 +331,7 @@ def _map_todo_status_token(token: str) -> str:
         "blocked": "pending",
     }.get(raw, "")
 
-# split-source: order=607 original-lines=5817-5876 hash=4f2c54bfb1a67f12
+# split-source: order=607 original-lines=5819-5878 hash=4f2c54bfb1a67f12
 
 
 def split_todo_status_text(text: object) -> tuple[str, str]:
@@ -393,7 +393,7 @@ def split_todo_status_text(text: object) -> tuple[str, str]:
             break
     return status, probe.strip()
 
-# split-source: order=608 original-lines=5877-5946 hash=ab0c493573492f66
+# split-source: order=608 original-lines=5879-5948 hash=ab0c493573492f66
 
 
 def extract_todo_rows_from_text(
@@ -465,7 +465,7 @@ def extract_todo_rows_from_text(
             break
     return out
 
-# split-source: order=609 original-lines=5947-5965 hash=7cdc7612bc3472e3
+# split-source: order=609 original-lines=5949-5967 hash=7cdc7612bc3472e3
 
 
 def decode_structured_todo_container(value: object) -> object:
@@ -486,7 +486,7 @@ def decode_structured_todo_container(value: object) -> object:
             return decoded
     return value
 
-# split-source: order=610 original-lines=5966-5974 hash=5d22ec67a0ef3858
+# split-source: order=610 original-lines=5968-5976 hash=5d22ec67a0ef3858
 
 
 def infer_todo_status_from_text(text: object, default: str = "pending") -> str:
@@ -497,7 +497,7 @@ def infer_todo_status_from_text(text: object, default: str = "pending") -> str:
         return status
     return default
 
-# split-source: order=611 original-lines=5975-6030 hash=d1116ba4fe08c4f2
+# split-source: order=611 original-lines=5977-6032 hash=d1116ba4fe08c4f2
 
 
 def split_structured_todo_content(text: object, limit: int = 7) -> list[str]:
@@ -555,7 +555,7 @@ def split_structured_todo_content(text: object, limit: int = 7) -> list[str]:
             break
     return out or [src]
 
-# split-source: order=612 original-lines=6031-6060 hash=4f3eb17b1856f763
+# split-source: order=612 original-lines=6033-6062 hash=4f3eb17b1856f763
 
 
 def normalize_work_text(text: object, status: str = "") -> str:
@@ -587,7 +587,7 @@ def normalize_work_text(text: object, status: str = "") -> str:
     )
     return s.strip(" -")
 
-# split-source: order=693 original-lines=8791-8809 hash=b4fd9c47feae07d0
+# split-source: order=693 original-lines=8793-8811 hash=b4fd9c47feae07d0
 
 def make_unified_diff(path: str, old_text: str, new_text: str, max_lines: int = 400) -> tuple[str, int, int]:
     old_lines = old_text.splitlines()
@@ -608,7 +608,7 @@ def make_unified_diff(path: str, old_text: str, new_text: str, max_lines: int = 
     text = "\n".join(diff) if diff else f"@@ no textual diff for {path}"
     return text, added, deleted
 
-# split-source: order=694 original-lines=8810-8815 hash=fc6e1578f1dfb8e0
+# split-source: order=694 original-lines=8812-8817 hash=fc6e1578f1dfb8e0
 
 def _skip_row(text: str) -> dict:
     msg = str(text or "").strip() or "⋮"
@@ -616,13 +616,13 @@ def _skip_row(text: str) -> dict:
         msg = f"⋮ {msg}"
     return {"kind": "skip", "sign": "⋮", "old_line": None, "new_line": None, "text": msg}
 
-# split-source: order=695 original-lines=8816-8819 hash=f5d9ac4c2c90cef7
+# split-source: order=695 original-lines=8818-8821 hash=f5d9ac4c2c90cef7
 
 
 def _row_is_hot(row: dict) -> bool:
     return str((row or {}).get("kind", "")).strip().lower() in {"add", "delete"}
 
-# split-source: order=696 original-lines=8820-8843 hash=5862d764d6ac180a
+# split-source: order=696 original-lines=8822-8845 hash=5862d764d6ac180a
 
 
 def _hotspot_index(rows: list[dict]) -> int:
@@ -648,7 +648,7 @@ def _hotspot_index(rows: list[dict]) -> int:
             best_score = score
     return best_idx
 
-# split-source: order=697 original-lines=8844-8893 hash=6f30990ffc308229
+# split-source: order=697 original-lines=8846-8895 hash=6f30990ffc308229
 
 
 def _compress_rows_keep_hotspot(
@@ -700,7 +700,7 @@ def _compress_rows_keep_hotspot(
         truncated = True
     return out, truncated
 
-# split-source: order=698 original-lines=8894-9028 hash=220a462e9f681355
+# split-source: order=698 original-lines=8896-9030 hash=220a462e9f681355
 
 
 def _focused_diff_rows_from_opcodes(
@@ -837,7 +837,7 @@ def _focused_diff_rows_from_opcodes(
     out, truncated = _compress_rows_keep_hotspot(rows, max_rows)
     return out, bool(truncated or len(out) < len(rows))
 
-# split-source: order=699 original-lines=9029-9061 hash=a8b71f66e76048d1
+# split-source: order=699 original-lines=9031-9063 hash=a8b71f66e76048d1
 
 
 def make_numbered_diff(old_text: str, new_text: str, max_lines: int = 320) -> list[dict]:
@@ -872,7 +872,7 @@ def make_numbered_diff(old_text: str, new_text: str, max_lines: int = 320) -> li
         out.append(_skip_row(f"⋮ ... ({len(new_lines) - show} lines omitted)"))
     return out
 
-# split-source: order=700 original-lines=9062-9075 hash=effc08a63226e126
+# split-source: order=700 original-lines=9064-9077 hash=effc08a63226e126
 
 def render_numbered_diff_text(entries: list[dict]) -> str:
     out = []

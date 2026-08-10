@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-# split-source: order=786 original-lines=76921-77076 hash=d6b2f4627cd4c34c
+# split-source: order=786 original-lines=76923-77078 hash=d6b2f4627cd4c34c
 
 SKILLS_INDEX_HTML = """<!doctype html>
 <html lang="zh-CN">
@@ -161,7 +161,7 @@ SKILLS_INDEX_HTML = """<!doctype html>
 </html>
 """
 
-# split-source: order=787 original-lines=77077-77173 hash=22d432d0f0a0df36
+# split-source: order=787 original-lines=77079-77175 hash=22d432d0f0a0df36
 
 SKILLS_EXTRA_CSS = """
 .skills-main{display:grid;grid-template-columns:minmax(280px,330px) minmax(560px,1fr) minmax(390px,500px);gap:12px;height:78vh;min-height:680px;max-height:78vh;align-items:stretch}
@@ -260,7 +260,7 @@ SKILLS_EXTRA_CSS = """
 }
 """
 
-# split-source: order=788 original-lines=77174-77319 hash=b9236cd0942f4735
+# split-source: order=788 original-lines=77176-77321 hash=b9236cd0942f4735
 
 SKILLS_APP_JS = """const S={config:null,rules:null,skillScan:{skills_count:0,skills:[],tree:{type:'dir',name:'skills',path:'',children:[]},warnings:[]},flow:{nodes:[],edges:[]},flowZoom:1,selectedNodeId:null,drag:null,linkDrag:null,pan:null,skillMap:{},activeSkillFile:'',uploadReports:[]};
 const ADMIN_TOKEN_KEY='clouds_coder_admin_token';

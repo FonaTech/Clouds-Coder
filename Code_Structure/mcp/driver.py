@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-# split-source: order=760 original-lines=15363-15372 hash=19ebd92811495fa7
+# split-source: order=760 original-lines=15365-15374 hash=19ebd92811495fa7
 
 
 def mcp_normalize_name(name: object) -> str:
@@ -15,7 +15,7 @@ def mcp_normalize_name(name: object) -> str:
     """
     return MCP_NAME_RE.sub("_", str(name or "").strip())
 
-# split-source: order=761 original-lines=15373-15457 hash=4b332b8de0a78786
+# split-source: order=761 original-lines=15375-15459 hash=4b332b8de0a78786
 
 
 def mcp_normalize_server_configs(raw: object) -> dict[str, dict]:
@@ -102,7 +102,7 @@ def mcp_normalize_server_configs(raw: object) -> dict[str, dict]:
         }
     return out
 
-# split-source: order=762 original-lines=15458-15477 hash=74b736e5080b3642
+# split-source: order=762 original-lines=15460-15479 hash=74b736e5080b3642
 
 
 def mcp_extract_server_configs(config: object) -> dict[str, dict]:
@@ -124,7 +124,7 @@ def mcp_extract_server_configs(config: object) -> dict[str, dict]:
                 merged.setdefault(n, rec)
     return merged
 
-# split-source: order=763 original-lines=15478-15813 hash=526bee80ffac2ec6
+# split-source: order=763 original-lines=15480-15815 hash=526bee80ffac2ec6
 
 
 class MCPServerProcess:
@@ -462,7 +462,7 @@ class MCPServerProcess:
             "stderr_tail": list(self._stderr_tail[-5:]),
         }
 
-# split-source: order=764 original-lines=15814-16205 hash=561ade738a49a710
+# split-source: order=764 original-lines=15816-16207 hash=561ade738a49a710
 
 
 class MCPManager:

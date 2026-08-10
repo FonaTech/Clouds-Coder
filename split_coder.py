@@ -26,8 +26,6 @@ import unicodedata
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Optional
-
 
 GENERATOR_VERSION = "3.0"
 GENERATED_HEADER = (
@@ -89,7 +87,7 @@ class SplitManifest:
         )
 
     @classmethod
-    def load(cls, output_dir: Path) -> Optional["SplitManifest"]:
+    def load(cls, output_dir: Path) -> SplitManifest | None:
         path = output_dir / cls.FILENAME
         if not path.exists():
             return None
@@ -106,7 +104,7 @@ class SplitManifest:
 @dataclass(frozen=True)
 class ImportAlias:
     name: str
-    asname: Optional[str] = None
+    asname: str | None = None
 
     @property
     def bound_name(self) -> str:
@@ -343,7 +341,7 @@ class ArchitectureAnalyzer:
         self.source_path = source_path
         self.source_text = ""
         self.source_lines: list[str] = []
-        self.tree: Optional[ast.Module] = None
+        self.tree: ast.Module | None = None
         self.nodes: list[NodeInfo] = []
         self.import_statements: list[ImportStatement] = []
 

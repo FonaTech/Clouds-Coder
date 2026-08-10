@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-# split-source: order=780 original-lines=19182-70133 hash=1285a682e409f36e
+# split-source: order=780 original-lines=19184-70135 hash=3ff1ceae0b5ae238
 
 # ============================================================================
 # Architecture / 架构 / アーキテクチャ
@@ -10379,7 +10379,7 @@ body{padding:18px}
                                 note_tip = ""
                                 if note_maps:
                                     try:
-                                        note_tip = trim(str(((note_maps.get(ref_kind, {}) or {}).get(note_id, "") or "")).strip(), 240)
+                                        note_tip = trim(str((note_maps.get(ref_kind, {}) or {}).get(note_id, "") or "").strip(), 240)
                                     except Exception:
                                         note_tip = ""
                                 title_attr = f' title="{html.escape(note_tip)}"' if note_tip else ""
@@ -10464,8 +10464,8 @@ body{padding:18px}
         try:
             import docx  # type: ignore
             from docx.document import Document as _DocxDocument  # type: ignore
-            from docx.oxml.text.paragraph import CT_P  # type: ignore
             from docx.oxml.table import CT_Tbl  # type: ignore
+            from docx.oxml.text.paragraph import CT_P  # type: ignore
             from docx.table import Table as _DocxTable  # type: ignore
             from docx.text.paragraph import Paragraph as _DocxParagraph  # type: ignore
 
@@ -10592,7 +10592,7 @@ body{padding:18px}
                 for ref_kind, note_id in ordered_note_refs:
                     if ref_kind != kind:
                         continue
-                    note_text = str(((note_maps.get(kind, {}) or {}).get(note_id, "") or "")).strip()
+                    note_text = str((note_maps.get(kind, {}) or {}).get(note_id, "") or "").strip()
                     note_body = html.escape(note_text).replace("\n", "<br>") if note_text else "<em>(note content unavailable)</em>"
                     items.append(
                         "<div class=\"pv-doc-note-item\">"
@@ -11084,7 +11084,7 @@ body{padding:18px}
             else:
                 width = max(4.0, min(100.0, (abs(numeric) / max_abs) * 100.0))
                 metric = str(row.get("text", "") or self._preview_value_text(numeric))
-            fill_color = str((((theme or {}).get("colors", {}) or {}).get(accent_keys[idx % len(accent_keys)]) or "#3b82f6"))
+            fill_color = str(((theme or {}).get("colors", {}) or {}).get(accent_keys[idx % len(accent_keys)]) or "#3b82f6")
             bar_rows.append(
                 "<div class=\"pv-slide-bar-row\">"
                 f"<div>{html.escape(str(row.get('label', '') or ''))}</div>"

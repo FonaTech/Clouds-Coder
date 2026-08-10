@@ -3,13 +3,13 @@
 
 from __future__ import annotations
 
-# split-source: order=53 original-lines=61-61 hash=34fee98dbda2c56a
+# split-source: order=53 original-lines=63-63 hash=34fee98dbda2c56a
 _URL_OPEN_ORIGINAL = urlopen
 
-# split-source: order=54 original-lines=62-62 hash=d0b8577f025ef0b5
+# split-source: order=54 original-lines=64-64 hash=d0b8577f025ef0b5
 _HTTP_SSL_CONTEXT = None
 
-# split-source: order=72 original-lines=80-103 hash=7a1e316af503fc49
+# split-source: order=72 original-lines=82-105 hash=7a1e316af503fc49
 
 # ============================================================================
 # Architecture / 架构 / アーキテクチャ
@@ -35,7 +35,7 @@ def _shared_http_ssl_context():
     _HTTP_SSL_CONTEXT = ctx
     return ctx
 
-# split-source: order=73 original-lines=104-113 hash=4d63800588472a20
+# split-source: order=73 original-lines=106-115 hash=4d63800588472a20
 
 def urlopen(url, *args, **kwargs):
     if "context" not in kwargs:
@@ -47,12 +47,12 @@ def urlopen(url, *args, **kwargs):
                 pass
     return _URL_OPEN_ORIGINAL(url, *args, **kwargs)
 
-# split-source: order=554 original-lines=3590-3592 hash=45f4d1c3ae2bda86
+# split-source: order=554 original-lines=3592-3594 hash=45f4d1c3ae2bda86
 
 def json_response_bytes(obj: object) -> bytes:
     return safe_utf8_bytes(json_dumps(obj))
 
-# split-source: order=555 original-lines=3593-3606 hash=b8e0fcf45e3a740c
+# split-source: order=555 original-lines=3595-3608 hash=b8e0fcf45e3a740c
 
 def read_http_json_body(handler: BaseHTTPRequestHandler) -> dict:
     length = int(handler.headers.get("Content-Length", "0") or "0")
@@ -68,7 +68,7 @@ def read_http_json_body(handler: BaseHTTPRequestHandler) -> dict:
     parsed = sanitize_utf8_surrogates(parsed)
     return parsed if isinstance(parsed, dict) else {}
 
-# split-source: order=556 original-lines=3607-3620 hash=d097208eea9ea225
+# split-source: order=556 original-lines=3609-3622 hash=d097208eea9ea225
 
 def close_if_http_request_body_unread(handler: BaseHTTPRequestHandler) -> bool:
     """Prevent an unread write body from becoming the next keep-alive request line."""

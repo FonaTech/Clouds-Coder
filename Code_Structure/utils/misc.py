@@ -3,20 +3,20 @@
 
 from __future__ import annotations
 
-# split-source: order=533 original-lines=3294-3296 hash=745dbe7e9c6ea772
+# split-source: order=533 original-lines=3296-3298 hash=745dbe7e9c6ea772
 
 def now_ts() -> float:
     return time.time()
 
-# split-source: order=534 original-lines=3297-3299 hash=a8196f2cb960defc
+# split-source: order=534 original-lines=3299-3301 hash=a8196f2cb960defc
 
 
 _benign_socket_log_lock = threading.Lock()
 
-# split-source: order=535 original-lines=3300-3300 hash=aae2eb4df5cce110
+# split-source: order=535 original-lines=3302-3302 hash=aae2eb4df5cce110
 _benign_socket_log_state: dict[str, dict[str, float | int]] = {}
 
-# split-source: order=537 original-lines=3316-3336 hash=90391ee449871b43
+# split-source: order=537 original-lines=3318-3338 hash=90391ee449871b43
 
 
 def is_benign_socket_error(exc: BaseException | None) -> bool:
@@ -39,7 +39,7 @@ def is_benign_socket_error(exc: BaseException | None) -> bool:
     }
     return err in benign_errno
 
-# split-source: order=538 original-lines=3337-3348 hash=172cf9bd7c8ecaf5
+# split-source: order=538 original-lines=3339-3350 hash=172cf9bd7c8ecaf5
 
 
 def _socket_error_code(exc: BaseException | None) -> str:
@@ -53,7 +53,7 @@ def _socket_error_code(exc: BaseException | None) -> str:
         return f"errno:{err}"
     return str(type(exc).__name__ if exc is not None else "OSError")
 
-# split-source: order=539 original-lines=3349-3385 hash=67186d8b6ed904ee
+# split-source: order=539 original-lines=3351-3387 hash=67186d8b6ed904ee
 
 
 def _log_benign_socket_error_limited(exc: BaseException | None, where: str = ""):
@@ -92,7 +92,7 @@ def _log_benign_socket_error_limited(exc: BaseException | None, where: str = "")
             msg = f"{msg} (+{suppressed} suppressed)"
         print(msg, file=sys.stderr)
 
-# split-source: order=540 original-lines=3386-3392 hash=d0ad563a0b5da477
+# split-source: order=540 original-lines=3388-3394 hash=d0ad563a0b5da477
 
 
 def swallow_benign_socket_error(exc: BaseException | None, where: str = "") -> bool:
@@ -101,7 +101,7 @@ def swallow_benign_socket_error(exc: BaseException | None, where: str = "") -> b
     _log_benign_socket_error_limited(exc, where)
     return True
 
-# split-source: order=541 original-lines=3393-3408 hash=1ca16ae8018ba100
+# split-source: order=541 original-lines=3395-3410 hash=1ca16ae8018ba100
 
 
 def normalize_timeout_seconds(
@@ -119,7 +119,7 @@ def normalize_timeout_seconds(
         value = min(value, int(maximum))
     return max(int(minimum), int(value))
 
-# split-source: order=542 original-lines=3409-3420 hash=4e362612a8706766
+# split-source: order=542 original-lines=3411-3422 hash=4e362612a8706766
 
 def detect_local_lan_ip() -> str:
     try:
@@ -133,11 +133,11 @@ def detect_local_lan_ip() -> str:
         pass
     return "127.0.0.1"
 
-# split-source: order=543 original-lines=3421-3422 hash=e4278afeb56c9b4f
+# split-source: order=543 original-lines=3423-3424 hash=e4278afeb56c9b4f
 
 _LOCAL_LAN_IP_CACHE: dict[str, object] = {"ts": 0.0, "ip": ""}
 
-# split-source: order=544 original-lines=3423-3436 hash=ecee909e6f5285b0
+# split-source: order=544 original-lines=3425-3438 hash=ecee909e6f5285b0
 
 def detect_local_lan_ip_cached(max_age_seconds: float = 300.0) -> str:
     now = now_ts()
@@ -153,18 +153,18 @@ def detect_local_lan_ip_cached(max_age_seconds: float = 300.0) -> str:
     _LOCAL_LAN_IP_CACHE["ip"] = ip
     return ip
 
-# split-source: order=557 original-lines=3621-3623 hash=dfed892a107f1c65
+# split-source: order=557 original-lines=3623-3625 hash=dfed892a107f1c65
 
 def make_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:8]}"
 
-# split-source: order=558 original-lines=3624-3627 hash=67513f5713af9d3f
+# split-source: order=558 original-lines=3626-3629 hash=67513f5713af9d3f
 
 def sanitize_profile_id(raw: str) -> str:
     pid = re.sub(r"[^A-Za-z0-9._-]+", "-", (raw or "").strip().lower()).strip("-")
     return pid or "profile"
 
-# split-source: order=674 original-lines=7668-7675 hash=794844d6c7fe3db4
+# split-source: order=674 original-lines=7670-7677 hash=794844d6c7fe3db4
 
 def user_id_from_ip(ip: str) -> str:
     raw = str(ip or "").strip()
@@ -174,7 +174,7 @@ def user_id_from_ip(ip: str) -> str:
     safe_ip = re.sub(r"[^A-Za-z0-9._-]", "_", raw)
     return f"user_{safe_ip}_{token}"
 
-# split-source: order=678 original-lines=8017-8030 hash=80f1c7a9452235b7
+# split-source: order=678 original-lines=8019-8032 hash=80f1c7a9452235b7
 
 
 def _meta_string_list(value: object) -> list[str]:
@@ -190,7 +190,7 @@ def _meta_string_list(value: object) -> list[str]:
             out.append(txt)
     return out
 
-# split-source: order=716 original-lines=9692-9697 hash=f5ed28063e7e4a7a
+# split-source: order=716 original-lines=9694-9699 hash=f5ed28063e7e4a7a
 
 def _module_exists(name: str) -> bool:
     try:

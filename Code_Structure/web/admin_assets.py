@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-# split-source: order=789 original-lines=77320-77482 hash=4329f399c6ba3374
+# split-source: order=789 original-lines=77322-77484 hash=4329f399c6ba3374
 
 ADMIN_INDEX_HTML = """<!doctype html>
 <html lang="zh-CN">
@@ -168,7 +168,7 @@ ADMIN_INDEX_HTML = """<!doctype html>
 </html>
 """
 
-# split-source: order=790 original-lines=77483-77610 hash=77cec36bca5b05e2
+# split-source: order=790 original-lines=77485-77612 hash=77cec36bca5b05e2
 
 ADMIN_CSS = """
 :root{--bg:#f3f6fb;--surface:#fff;--surface2:#f7f9fc;--text:#172033;--muted:#667085;--line:#dce3ee;--brand:#2563eb;--brand2:#0f9f8f;--danger:#b42318;--warn:#b54708;--shadow:0 18px 44px rgba(27,39,71,.09)}
@@ -298,7 +298,7 @@ th{color:var(--muted);font-size:.72rem;text-transform:uppercase;letter-spacing:.
 @media(max-width:720px){.admin-shell{padding:14px}.admin-header,.section-head{flex-direction:column;align-items:stretch}.header-actions{justify-content:flex-start}.metric-grid{grid-template-columns:repeat(2,1fr)}.two-column,.chart-grid{grid-template-columns:1fr}.config-grid{grid-template-columns:1fr}.admin-nav{overflow:auto}.action-bar button{flex:1 1 145px}.user-tracking-head{align-items:stretch}.user-filter{align-items:stretch;flex-direction:column}.user-filter select{min-width:0}.focus-user-summary{grid-template-columns:repeat(2,minmax(0,1fr))}.chart-host{min-height:215px}}
 """
 
-# split-source: order=791 original-lines=77611-77675 hash=97d80ca7e372b708
+# split-source: order=791 original-lines=77613-77677 hash=97d80ca7e372b708
 
 ADMIN_JS = r"""
 const A={token:sessionStorage.getItem('clouds_coder_admin_token')||'',config:null,metrics:null,metricUserHash:'',metricResizeTimer:0,apps:[],skills:[],reviewStatus:'pending',selectedSkills:[],toastTimer:0,serverErrors:[],bootId:'',restartNonce:''};

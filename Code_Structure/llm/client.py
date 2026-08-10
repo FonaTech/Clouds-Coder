@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-# split-source: order=765 original-lines=16206-16228 hash=ec5cc2a0de1c5071
+# split-source: order=765 original-lines=16208-16230 hash=ec5cc2a0de1c5071
 
 
 class OllamaError(RuntimeError):
@@ -28,7 +28,7 @@ class OllamaError(RuntimeError):
         self.retryable = retryable
         self.transient = transient
 
-# split-source: order=766 original-lines=16229-18523 hash=772e7b408d71d5cb
+# split-source: order=766 original-lines=16231-18525 hash=1ceae2b2d77ff3cf
 
 class OllamaClient:
     _probe_cache: dict[str, dict] = {}
@@ -404,7 +404,7 @@ class OllamaClient:
         if "embed_model" in profile:
             self.embed_model = str(profile.get("embed_model") or "").strip()
 
-    def embed(self, *, model: str, input: "str | list") -> dict:
+    def embed(self, *, model: str, input: str | list) -> dict:
         """Get embedding vector(s) from the model.
 
         Returns {"embeddings": [[float, ...]]} regardless of backend.
@@ -496,7 +496,7 @@ class OllamaClient:
                 url=url,
                 retry_after=self._parse_retry_after_seconds(hdrs, text),
             ) from exc
-        except (URLError, TimeoutError, socket.timeout, ConnectionResetError, ConnectionAbortedError) as exc:
+        except (URLError, TimeoutError, ConnectionResetError, ConnectionAbortedError) as exc:
             raise OllamaError(f"Connection error: {exc}", url=url) from exc
 
     def _post_json_url_with_retries(
@@ -602,7 +602,7 @@ class OllamaClient:
                 url=url,
                 retry_after=self._parse_retry_after_seconds(hdrs, text),
             ) from exc
-        except (URLError, TimeoutError, socket.timeout, ConnectionResetError, ConnectionAbortedError) as exc:
+        except (URLError, TimeoutError, ConnectionResetError, ConnectionAbortedError) as exc:
             raise OllamaError(f"Connection error: {exc}", url=url) from exc
 
     def _iter_response_lines_url_with_retries(
@@ -696,7 +696,7 @@ class OllamaClient:
                 url=url,
                 retry_after=self._parse_retry_after_seconds(hdrs, text),
             ) from exc
-        except (URLError, TimeoutError, socket.timeout, ConnectionResetError, ConnectionAbortedError) as exc:
+        except (URLError, TimeoutError, ConnectionResetError, ConnectionAbortedError) as exc:
             raise OllamaError(f"Connection error: {exc}", url=url) from exc
 
     def _download_bytes(self, url: str, timeout: int | None = None) -> tuple[bytes, str]:
@@ -716,7 +716,7 @@ class OllamaClient:
                 url=url,
                 retry_after=self._parse_retry_after_seconds(hdrs, text),
             ) from exc
-        except (URLError, TimeoutError, socket.timeout, ConnectionResetError, ConnectionAbortedError) as exc:
+        except (URLError, TimeoutError, ConnectionResetError, ConnectionAbortedError) as exc:
             raise OllamaError(f"Connection error: {exc}", url=url) from exc
 
     def _normalize_tool_calls(self, tool_calls: list) -> list[dict]:
