@@ -1,36 +1,37 @@
 #!/usr/bin/env python3
 from __future__ import annotations
+
 import argparse
 import ast
 import base64
-from collections import Counter, defaultdict, deque
 import concurrent.futures
 import csv
 import difflib
 import errno
-from email.utils import parsedate_to_datetime
-import html
-from html.parser import HTMLParser
+import fnmatch
 import hashlib
 import hmac
+import html
+import importlib.util
 import io
 import ipaddress
-import importlib.util
 import json
 import locale
 import math
-import multiprocessing
 import mimetypes
+import multiprocessing
 import os
 import queue
 import re
+import select
 import selectors
-import signal
-import shutil
 import shlex
-import ssl
+import shutil
+import signal
 import socket
 import sqlite3
+import ssl
+import struct
 import subprocess
 import sys
 import tarfile
@@ -38,18 +39,31 @@ import threading
 import time
 import traceback
 import unicodedata
+import urllib.robotparser as robotparser
 import uuid
+import xml.etree.ElementTree as ET
 import zipfile
 import zlib
-import xml.etree.ElementTree as ET
+from collections import Counter, defaultdict, deque
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+from html.parser import HTMLParser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse, urlunparse
 from urllib.request import Request, urlopen
-import urllib.robotparser as robotparser
+
+try:
+    import fcntl as _fcntl
+    import pty as _pty
+    import termios as _termios
+except ImportError:
+    _fcntl = None
+    _pty = None
+    _termios = None
+
 try:
     import certifi as _certifi
 except Exception:
@@ -69,6 +83,14 @@ ADMIN_CONFIG_FILENAME = "startup_config.json"
 ADMIN_APPS_FILENAME = "shared_apps.json"
 ADMIN_TELEMETRY_FILENAME = "telemetry.sqlite"
 ADMIN_AUTH_FILENAME = "auth.sqlite"
+IDE_AUTH_FILENAME = "ide_auth.sqlite"
+IDE_AUTH_SESSION_TTL_SECONDS = 24 * 60 * 60
+IDE_AUTH_MAX_ACTIVE_SESSIONS = 12
+IDE_DEVICE_SECRET_MIN_BYTES = 32
+IDE_DEVICE_LABEL_MAX_CHARS = 120
+IDE_DEVICE_PAIRING_TTL_SECONDS = 15 * 60
+IDE_WORKBENCH_STATE_FILENAME = "ide_workbench.json"
+IDE_EXTENSIONS_DIRNAME = "ide_extensions"
 ADMIN_MAX_APP_SKILLS = 8
 ADMIN_MAX_APP_CAPSULE_CHARS = 12_000
 ADMIN_MAX_APP_RESOURCE_FILES = 128
@@ -453,7 +475,9 @@ TOOL_MEMORY_POLICY_CHOICES = READ_CONTEXT_POLICY_CHOICES
 DEFAULT_TOOL_MEMORY_POLICY = DEFAULT_READ_CONTEXT_POLICY
 DEFAULT_AUTO_TASK_LEVEL_CEILING = 2  # Applies only to automatic L1-L5 classification; 0 = no cap.
 HARD_BREAK_TOOL_ERROR_THRESHOLD = 20
-HARD_BREAK_RECOVERY_ROUND_THRESHOLD = 3
+# Normal debugging often needs several corrected tool attempts before any
+# observable state changes. Keep this separate from the fused fault/error caps.
+HARD_BREAK_RECOVERY_ROUND_THRESHOLD = 10
 FUSED_FAULT_BREAK_THRESHOLD = 15
 STALL_SEVERITY_ESCALATION_THRESHOLD = 5
 STALL_SEVERITY_WEIGHT_BASH_READ_LOOP = 2
@@ -579,6 +603,7 @@ PERSIST_ON_EVENT_TYPES = {
     "web_search",
     "tool_start",
     "tool_result",
+    "compact",
     "error",
     "message",
     "skill_loaded",
@@ -1122,6 +1147,48 @@ SUPPORTED_UI_LANGUAGES = [
 ]
 UI_LANGUAGE_LABELS = {x["code"]: x["label"] for x in SUPPORTED_UI_LANGUAGES}
 DEFAULT_UI_LANGUAGE = "zh-CN"
+AGENT_LANGUAGE_PREFERENCES = {
+    "zh-CN": {
+        "id": "zh-cn-concise-milestones",
+        "public_progress_mode": "milestone",
+        "tone": "直接、简洁、结论优先",
+        "reasoning_style": "证据优先；只解释关键判断和阶段变化",
+        "instruction": (
+            "Use concise Simplified Chinese with the outcome first. Explain evidence and trade-offs "
+            "at decision points, but avoid narrating routine tool use."
+        ),
+    },
+    "zh-TW": {
+        "id": "zh-tw-concise-milestones",
+        "public_progress_mode": "milestone",
+        "tone": "直接、精簡、結論優先",
+        "reasoning_style": "證據優先；只說明關鍵判斷與階段變化",
+        "instruction": (
+            "Use concise Traditional Chinese with the outcome first. Explain evidence and trade-offs "
+            "at decision points, but avoid narrating routine tool use."
+        ),
+    },
+    "ja": {
+        "id": "ja-polite-milestones",
+        "public_progress_mode": "milestone",
+        "tone": "簡潔で丁寧、結論優先",
+        "reasoning_style": "根拠を優先し、重要な判断と段階の変化だけを説明する",
+        "instruction": (
+            "Use concise, natural Japanese with the conclusion first and a polite neutral tone. "
+            "Explain evidence at meaningful decisions, but do not narrate routine tool use."
+        ),
+    },
+    "en": {
+        "id": "en-concise-milestones",
+        "public_progress_mode": "milestone",
+        "tone": "concise, direct, outcome first",
+        "reasoning_style": "evidence first; explain only key decisions and phase changes",
+        "instruction": (
+            "Use concise, direct English with the outcome first. Explain evidence and trade-offs at "
+            "decision points, but avoid narrating routine tool use."
+        ),
+    },
+}
 UI_STYLE_CHOICES = ("trad", "neo")
 UI_STYLE_LABELS = {"trad": "Trad", "neo": "Neo"}
 DEFAULT_UI_STYLE = "neo"
@@ -1222,9 +1289,29 @@ IDE_FILE_MAX_BYTES = 12 * 1024 * 1024
 IDE_UPLOAD_MAX_BYTES = 32 * 1024 * 1024
 IDE_UPLOAD_TOTAL_MAX_BYTES = 220 * 1024 * 1024
 IDE_UPLOAD_MAX_ITEMS = 1200
+IDE_TEXT_PREVIEW_MAX_BYTES = 2 * 1024 * 1024
+IDE_MARKDOWN_PREVIEW_MAX_LINES = 4000
+IDE_IMAGE_PREVIEW_MAX_EDGE = 4096
+IDE_IMAGE_PREVIEW_MAX_PIXELS = 24_000_000
+IDE_IMAGE_PREVIEW_SOURCE_MAX_PIXELS = 180_000_000
+IDE_VECTOR_PREVIEW_MAX_BYTES = 16 * 1024 * 1024
+IDE_TABLE_PREVIEW_SOURCE_MAX_BYTES = 4 * 1024 * 1024
+IDE_TABLE_PREVIEW_CELL_MAX_CHARS = 2000
+IDE_TABLE_PREVIEW_TOTAL_CHARS = 2_000_000
+IDE_OFFICE_PREVIEW_MAX_ENTRIES = 20_000
+IDE_OFFICE_PREVIEW_MAX_EXPANDED_BYTES = 256 * 1024 * 1024
+IDE_OFFICE_PREVIEW_MAX_ENTRY_BYTES = 96 * 1024 * 1024
 IDE_COMMAND_TIMEOUT_DEFAULT = 120
 IDE_TREE_DEFAULT_MAX_NODES = 800
 IDE_TREE_MAX_NODES = 5000
+IDE_SEARCH_MAX_RESULTS = 2000
+IDE_SEARCH_MAX_FILE_BYTES = 2 * 1024 * 1024
+IDE_TERMINAL_SCROLLBACK_BYTES = 2 * 1024 * 1024
+IDE_TERMINAL_IDLE_SECONDS = 4 * 60 * 60
+IDE_VSIX_MAX_BYTES = 80 * 1024 * 1024
+IDE_VSIX_MAX_EXPANDED_BYTES = 240 * 1024 * 1024
+IDE_VSIX_MAX_FILES = 8000
+IDE_VSIX_MAX_FILE_BYTES = 40 * 1024 * 1024
 IDE_TREE_SKIP_DIRS = {
     ".git", ".hg", ".svn",
     ".next", ".nuxt", ".svelte-kit", ".angular", ".expo",
@@ -1243,6 +1330,8 @@ RAW_TOOLCALL_TEXT_FILTER_THRESHOLD = 3_500
 ASSISTANT_TEXT_PERSIST_MAX_CHARS = 14_000
 ASSISTANT_MESSAGE_EVENT_MAX_CHARS = 4_000
 CODE_PREVIEW_EXTS = {
+    ".html",
+    ".htm",
     ".py",
     ".pyi",
     ".js",
@@ -1440,6 +1529,66 @@ SAMPLE_VIDEO_MP4_B64 = (
 )
 
 OFFLINE_JS_LIB_CATALOG: list[dict[str, object]] = [
+    {
+        "id": "monaco_editor",
+        "filename": "loader.js",
+        "relative_path": "monaco/min/vs/loader.js",
+        "package_urls": [
+            "https://registry.npmjs.org/monaco-editor/-/monaco-editor-0.56.0.tgz",
+        ],
+        "package_install_dir": "monaco",
+        "package_required_paths": [
+            "package.json",
+            "min/vs/loader.js",
+            "min/vs/editor/editor.main.js",
+            "min/vs/editor/editor.worker.js",
+        ],
+        "match_tokens": ["monaco-editor", "monaco/min/vs/loader.js"],
+    },
+    {
+        "id": "xterm",
+        "filename": "xterm.js",
+        "relative_path": "xterm/lib/xterm.js",
+        "package_urls": [
+            "https://registry.npmjs.org/@xterm/xterm/-/xterm-6.0.0.tgz",
+        ],
+        "package_install_dir": "xterm",
+        "package_required_paths": [
+            "package.json",
+            "lib/xterm.js",
+            "css/xterm.css",
+        ],
+        "match_tokens": ["@xterm/xterm", "xterm.js", "xterm.css"],
+    },
+    {
+        "id": "xterm_fit",
+        "filename": "addon-fit.js",
+        "relative_path": "xterm-addon-fit/lib/addon-fit.js",
+        "package_urls": [
+            "https://registry.npmjs.org/@xterm/addon-fit/-/addon-fit-0.11.0.tgz",
+        ],
+        "package_install_dir": "xterm-addon-fit",
+        "package_required_paths": [
+            "package.json",
+            "lib/addon-fit.js",
+        ],
+        "match_tokens": ["@xterm/addon-fit", "addon-fit.js"],
+    },
+    {
+        "id": "codicons",
+        "filename": "codicon.css",
+        "relative_path": "codicons/dist/codicon.css",
+        "package_urls": [
+            "https://registry.npmjs.org/@vscode/codicons/-/codicons-0.0.36.tgz",
+        ],
+        "package_install_dir": "codicons",
+        "package_required_paths": [
+            "package.json",
+            "dist/codicon.css",
+            "dist/codicon.ttf",
+        ],
+        "match_tokens": ["@vscode/codicons", "codicon.css", "codicon.ttf"],
+    },
     {
         "id": "echarts",
         "filename": "echarts.min.js",
@@ -1830,6 +1979,14 @@ def normalize_ui_style(raw: str | None) -> str:
 
 def supported_ui_languages_payload() -> list[dict]:
     return [dict(x) for x in SUPPORTED_UI_LANGUAGES]
+
+
+def agent_language_preference_payload(language: str | None) -> dict:
+    code = normalize_ui_language(language)
+    row = dict(AGENT_LANGUAGE_PREFERENCES.get(code, AGENT_LANGUAGE_PREFERENCES[DEFAULT_UI_LANGUAGE]))
+    row.pop("instruction", None)
+    row["language"] = code
+    return row
 
 
 def normalize_execution_mode(raw: str | None, default: str = EXECUTION_MODE_SYNC) -> str:
@@ -4102,6 +4259,46 @@ def cache_external_js_url(js_root: Path, url: str) -> tuple[Path | None, str]:
 def trim(text: object, limit: int = MAX_TOOL_OUTPUT) -> str:
     s = str(text)
     return s if len(s) <= limit else s[:limit] + "\n...(truncated)"
+
+def ide_public_operation_data(data: object) -> dict:
+    """Project a runtime event into the safe fields used by IDE history and SSE."""
+    source = data if isinstance(data, dict) else {}
+    public: dict = {}
+    text_limits = {
+        "name": 160, "tool": 160, "summary": 1200, "result": 8000,
+        "path": 1200, "session_rel_path": 1200, "session_root": 2000,
+        "root_id": 160, "action": 40, "command": 8000, "cwd": 2000,
+        "output": 12000, "diff": 12000, "diff_numbered": 12000,
+        "change_type": 80, "agent_role": 80, "mode": 80,
+        "tool_call_id": 240, "query": 2000, "pattern": 2000, "url": 2000,
+        "reason": 240, "archive_segment": 240, "next_call_label": 240,
+        "public_progress": 4000,
+    }
+    for key, limit in text_limits.items():
+        if key in source:
+            public[key] = trim(str(source.get(key, "") or ""), limit)
+    for key in (
+        "added", "deleted", "exit_code", "duration_ms", "start_line", "end_line",
+        "round", "tier", "archived_messages", "context_limit_before",
+        "context_used_before", "context_left_before", "context_left_percent_before",
+        "context_used_after", "context_left_after", "context_left_percent_after",
+        "context_used_reduction",
+    ):
+        if key in source:
+            public[key] = source.get(key)
+    if "effective" in source:
+        public["effective"] = bool(source.get("effective"))
+    for key in ("changed_files", "tools"):
+        if isinstance(source.get(key), list):
+            public[key] = [trim(str(value or ""), 1200) for value in source[key][:80]]
+    if isinstance(source.get("code_stage"), dict):
+        stage = source["code_stage"]
+        public["code_stage"] = {
+            key: stage.get(key)
+            for key in ("id", "path", "created_at", "change_type")
+            if key in stage
+        }
+    return public
 
 def display_clean(text: object, limit: int = 0) -> str:
     """Sanitize a model/context string for USER-FACING output (plan.md, UI).
@@ -8377,6 +8574,685 @@ class AdminAuthStore:
             conn.execute("UPDATE admin_sessions SET revoked_at=? WHERE token_digest=?", (now_ts(), digest))
 
 
+class IDEAuthError(Exception):
+    def __init__(self, code: str, message: str, status: int = 400, *, retry_after: int = 0):
+        super().__init__(message)
+        self.code = str(code or "ide_auth_error")
+        self.status = int(status or 400)
+        self.retry_after = max(0, int(retry_after or 0))
+
+
+class IDEAuthStore:
+    """Account and browser-session store for the programming IDE.
+
+    IDE identities are deliberately independent from source IP addresses. The
+    client address remains a capability signal (local mount/process access), not
+    an authentication credential.
+    """
+
+    _USERNAME_RE = re.compile(r"^[A-Za-z0-9._-]{3,64}$")
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.lock = threading.RLock()
+        self.password_slots = threading.BoundedSemaphore(3)
+        self.login_failures: dict[tuple[str, str], deque[float]] = {}
+        self._initialize()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(str(self.path), timeout=10.0, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=10000")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=FULL")
+        return conn
+
+    def _initialize(self) -> None:
+        with self._connect() as conn:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS ide_accounts (
+                    username_key TEXT PRIMARY KEY,
+                    username TEXT NOT NULL,
+                    user_id TEXT NOT NULL UNIQUE,
+                    role TEXT NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    password_salt TEXT NOT NULL,
+                    password_algorithm TEXT NOT NULL,
+                    password_iterations INTEGER NOT NULL,
+                    auth_version INTEGER NOT NULL DEFAULT 1,
+                    disabled INTEGER NOT NULL DEFAULT 0,
+                    must_change_password INTEGER NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS ide_sessions (
+                    token_digest TEXT PRIMARY KEY,
+                    username_key TEXT NOT NULL,
+                    auth_version INTEGER NOT NULL,
+                    csrf_token TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    expires_at REAL NOT NULL,
+                    revoked_at REAL NOT NULL DEFAULT 0,
+                    last_ip TEXT NOT NULL DEFAULT '',
+                    device_digest TEXT NOT NULL DEFAULT '',
+                    FOREIGN KEY(username_key) REFERENCES ide_accounts(username_key)
+                );
+                CREATE INDEX IF NOT EXISTS ide_sessions_expiry
+                    ON ide_sessions(expires_at, revoked_at);
+                CREATE TABLE IF NOT EXISTS ide_devices (
+                    device_digest TEXT PRIMARY KEY,
+                    pairing_id TEXT NOT NULL UNIQUE,
+                    label TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL DEFAULT '',
+                    source_ip TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    username_key TEXT NOT NULL DEFAULT '',
+                    created_at REAL NOT NULL,
+                    requested_at REAL NOT NULL,
+                    approved_at REAL NOT NULL DEFAULT 0,
+                    approved_by TEXT NOT NULL DEFAULT '',
+                    last_seen_at REAL NOT NULL DEFAULT 0,
+                    revoked_at REAL NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS ide_devices_status
+                    ON ide_devices(status, requested_at);
+                """
+            )
+            columns = {
+                str(row["name"] or "")
+                for row in conn.execute("PRAGMA table_info(ide_sessions)").fetchall()
+            }
+            if "device_digest" not in columns:
+                conn.execute("ALTER TABLE ide_sessions ADD COLUMN device_digest TEXT NOT NULL DEFAULT ''")
+        try:
+            os.chmod(self.path, 0o600)
+        except Exception:
+            pass
+
+    @classmethod
+    def _normalize_username(cls, value: object) -> tuple[str, str]:
+        username = unicodedata.normalize("NFKC", str(value or "")).strip()
+        if not cls._USERNAME_RE.fullmatch(username):
+            raise IDEAuthError(
+                "invalid_username",
+                "Username must contain 3-64 letters, numbers, dots, underscores, or hyphens.",
+            )
+        return username, username.casefold()
+
+    @staticmethod
+    def _validate_password(password: object, username: str) -> str:
+        value = str(password if password is not None else "")
+        size = len(value.encode("utf-8", errors="strict"))
+        if size < 12 or size > 512:
+            raise IDEAuthError("weak_password", "Password must be 12-512 UTF-8 bytes.")
+        if value.casefold() == str(username or "").casefold():
+            raise IDEAuthError("weak_password", "Password cannot equal the username.")
+        classes = sum(
+            bool(re.search(pattern, value))
+            for pattern in (r"[a-z]", r"[A-Z]", r"[0-9]", r"[^A-Za-z0-9]")
+        )
+        if classes < 3:
+            raise IDEAuthError("weak_password", "Password must use at least three character classes.")
+        return value
+
+    @staticmethod
+    def _password_digest(password: str, salt: bytes, iterations: int) -> bytes:
+        return AdminAuthStore._password_digest(password, salt, iterations)
+
+    def configured(self) -> bool:
+        try:
+            with self._connect() as conn:
+                return conn.execute("SELECT 1 FROM ide_accounts WHERE role='admin' LIMIT 1").fetchone() is not None
+        except sqlite3.DatabaseError:
+            return True
+
+    @staticmethod
+    def _public_account(row: sqlite3.Row | dict | None) -> dict:
+        if row is None:
+            return {}
+        return {
+            "username": str(row["username"] or ""),
+            "user_id": str(row["user_id"] or ""),
+            "role": str(row["role"] or "user"),
+            "disabled": bool(row["disabled"]),
+            "must_change_password": bool(row["must_change_password"]),
+            "created_at": float(row["created_at"] or 0.0),
+            "updated_at": float(row["updated_at"] or 0.0),
+        }
+
+    def _insert_account(
+        self,
+        username: object,
+        password: object,
+        *,
+        user_id: str,
+        role: str,
+        must_change_password: bool = False,
+    ) -> dict:
+        clean_username, username_key = self._normalize_username(username)
+        clean_password = self._validate_password(password, clean_username)
+        uid = str(user_id or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9._:-]{8,128}", uid):
+            raise IDEAuthError("invalid_user_id", "Invalid IDE user id.")
+        role_key = "admin" if str(role or "").strip().lower() == "admin" else "user"
+        salt = os.urandom(24)
+        with self.password_slots:
+            digest = self._password_digest(clean_password, salt, ADMIN_AUTH_PASSWORD_ITERATIONS)
+        now = now_ts()
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    """INSERT INTO ide_accounts
+                       (username_key,username,user_id,role,password_hash,password_salt,
+                        password_algorithm,password_iterations,auth_version,disabled,
+                        must_change_password,created_at,updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,1,0,?,?,?)""",
+                    (
+                        username_key,
+                        clean_username,
+                        uid,
+                        role_key,
+                        base64.b64encode(digest).decode("ascii"),
+                        base64.b64encode(salt).decode("ascii"),
+                        "pbkdf2_hmac_sha256",
+                        ADMIN_AUTH_PASSWORD_ITERATIONS,
+                        1 if must_change_password else 0,
+                        now,
+                        now,
+                    ),
+                )
+                row = conn.execute("SELECT * FROM ide_accounts WHERE username_key=?", (username_key,)).fetchone()
+        except sqlite3.IntegrityError as exc:
+            raise IDEAuthError("account_exists", "The username or workspace identity already exists.", 409) from exc
+        return self._public_account(row)
+
+    def setup_admin(self, username: object, password: object, *, legacy_user_id: str) -> dict:
+        with self.lock:
+            if self.configured():
+                raise IDEAuthError("setup_already_completed", "IDE administrator already exists.", 409)
+            account = self._insert_account(
+                username,
+                password,
+                user_id=legacy_user_id,
+                role="admin",
+            )
+        session = self.login(username, password, "127.0.0.1")
+        session["account"] = account
+        return session
+
+    def local_session(self, *, legacy_user_id: str, client_ip: str = "127.0.0.1") -> dict:
+        """Issue the trusted loopback identity without requiring a local password."""
+        with self.lock:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT * FROM ide_accounts WHERE role='admin' AND disabled=0 ORDER BY created_at LIMIT 1"
+                ).fetchone()
+            if row is None:
+                random_password = "Local-7!" + base64.urlsafe_b64encode(os.urandom(36)).decode("ascii")
+                try:
+                    self._insert_account(
+                        "local-admin",
+                        random_password,
+                        user_id=str(legacy_user_id or user_id_from_ip("127.0.0.1")),
+                        role="admin",
+                    )
+                except IDEAuthError as exc:
+                    if exc.code != "account_exists":
+                        raise
+                with self._connect() as conn:
+                    row = conn.execute(
+                        "SELECT * FROM ide_accounts WHERE role='admin' AND disabled=0 ORDER BY created_at LIMIT 1"
+                    ).fetchone()
+            if row is None:
+                raise IDEAuthError("local_identity_unavailable", "The local IDE identity is unavailable.", 503)
+        result = self.issue_session(row, client_ip=client_ip)
+        result["local_auto_login"] = True
+        return result
+
+    def create_user(self, username: object, password: object, *, must_change_password: bool = True) -> dict:
+        _, key = self._normalize_username(username)
+        uid = f"ide_{hashlib.sha256((key + ':' + uuid.uuid4().hex).encode()).hexdigest()[:24]}"
+        return self._insert_account(
+            username,
+            password,
+            user_id=uid,
+            role="user",
+            must_change_password=must_change_password,
+        )
+
+    def list_accounts(self) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM ide_accounts ORDER BY role='admin' DESC, username_key ASC"
+            ).fetchall()
+        return [self._public_account(row) for row in rows]
+
+    def _check_rate_limit(self, client_ip: str, username_key: str) -> None:
+        now = now_ts()
+        targets = ((str(client_ip or "unknown")[:96], username_key), (str(client_ip or "unknown")[:96], "*"))
+        with self.lock:
+            for target, limit in ((targets[0], 8), (targets[1], 24)):
+                rows = self.login_failures.setdefault(target, deque())
+                while rows and now - rows[0] > 900:
+                    rows.popleft()
+                if len(rows) >= limit:
+                    retry = max(1, int(900 - (now - rows[0])))
+                    raise IDEAuthError("rate_limited", "Too many login attempts.", 429, retry_after=retry)
+
+    def _record_failure(self, client_ip: str, username_key: str) -> None:
+        now = now_ts()
+        with self.lock:
+            for target in ((str(client_ip or "unknown")[:96], username_key), (str(client_ip or "unknown")[:96], "*")):
+                self.login_failures.setdefault(target, deque()).append(now)
+
+    def login(self, username: object, password: object, client_ip: str) -> dict:
+        try:
+            _, username_key = self._normalize_username(username)
+        except IDEAuthError:
+            username_key = "invalid-user"
+        self._check_rate_limit(client_ip, username_key)
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM ide_accounts WHERE username_key=?", (username_key,)).fetchone()
+        salt = b"\0" * 24
+        expected = b"\0" * 32
+        iterations = ADMIN_AUTH_PASSWORD_ITERATIONS
+        valid = False
+        if row is not None:
+            try:
+                salt = base64.b64decode(str(row["password_salt"]), validate=True)
+                expected = base64.b64decode(str(row["password_hash"]), validate=True)
+                iterations = int(row["password_iterations"] or ADMIN_AUTH_PASSWORD_ITERATIONS)
+                valid = str(row["password_algorithm"] or "") == "pbkdf2_hmac_sha256" and not bool(row["disabled"])
+            except Exception:
+                valid = False
+        with self.password_slots:
+            actual = self._password_digest(str(password if password is not None else ""), salt, iterations)
+        if not (valid and hmac.compare_digest(actual, expected)):
+            self._record_failure(client_ip, username_key)
+            raise IDEAuthError("invalid_credentials", "Invalid username or password.", 401)
+        with self.lock:
+            self.login_failures.pop((str(client_ip or "unknown")[:96], username_key), None)
+        return self.issue_session(row, client_ip=client_ip)
+
+    def _verify_account_password(self, username: object, password: object) -> sqlite3.Row:
+        try:
+            _, username_key = self._normalize_username(username)
+        except IDEAuthError as exc:
+            raise IDEAuthError("invalid_credentials", "Invalid username or password.", 401) from exc
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM ide_accounts WHERE username_key=?", (username_key,)).fetchone()
+        salt = b"\0" * 24
+        expected = b"\0" * 32
+        iterations = ADMIN_AUTH_PASSWORD_ITERATIONS
+        valid = False
+        if row is not None:
+            try:
+                salt = base64.b64decode(str(row["password_salt"]), validate=True)
+                expected = base64.b64decode(str(row["password_hash"]), validate=True)
+                iterations = int(row["password_iterations"] or ADMIN_AUTH_PASSWORD_ITERATIONS)
+                valid = str(row["password_algorithm"] or "") == "pbkdf2_hmac_sha256" and not bool(row["disabled"])
+            except Exception:
+                valid = False
+        with self.password_slots:
+            actual = self._password_digest(str(password if password is not None else ""), salt, iterations)
+        if not (valid and hmac.compare_digest(actual, expected)):
+            raise IDEAuthError("invalid_credentials", "Invalid username or password.", 401)
+        return row
+
+    @staticmethod
+    def _device_digest(device_key: object) -> str:
+        raw = str(device_key or "").strip()
+        if not re.fullmatch(r"cc_device_[A-Za-z0-9_-]{43,160}", raw):
+            raise IDEAuthError("invalid_device_key", "This browser device key is invalid.", 400)
+        encoded_size = len(raw.removeprefix("cc_device_"))
+        if encoded_size < 43:
+            raise IDEAuthError("invalid_device_key", "This browser device key is too short.", 400)
+        return hashlib.sha256(raw.encode("utf-8", errors="strict")).hexdigest()
+
+    @staticmethod
+    def _public_device(row: sqlite3.Row | dict | None) -> dict:
+        if row is None:
+            return {}
+        return {
+            "pairing_id": str(row["pairing_id"] or ""),
+            "label": str(row["label"] or ""),
+            "fingerprint": str(row["fingerprint"] or ""),
+            "source_ip": str(row["source_ip"] or ""),
+            "status": str(row["status"] or "pending"),
+            "user_id": str(row["user_id"] or ""),
+            "created_at": float(row["created_at"] or 0.0),
+            "requested_at": float(row["requested_at"] or 0.0),
+            "approved_at": float(row["approved_at"] or 0.0),
+            "last_seen_at": float(row["last_seen_at"] or 0.0),
+            "revoked_at": float(row["revoked_at"] or 0.0),
+        }
+
+    def issue_session(self, account: sqlite3.Row, *, client_ip: str, device_digest: str = "") -> dict:
+        raw = "ide_session_" + base64.urlsafe_b64encode(os.urandom(32)).decode("ascii").rstrip("=")
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        csrf = base64.urlsafe_b64encode(os.urandom(24)).decode("ascii").rstrip("=")
+        now = now_ts()
+        expires = now + IDE_AUTH_SESSION_TTL_SECONDS
+        username_key = str(account["username_key"] or "")
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("DELETE FROM ide_sessions WHERE revoked_at>0 OR expires_at<=?", (now,))
+            conn.execute(
+                """INSERT INTO ide_sessions
+                   (token_digest,username_key,auth_version,csrf_token,created_at,expires_at,revoked_at,last_ip,device_digest)
+                   VALUES(?,?,?,?,?,?,0,?,?)""",
+                (
+                    digest,
+                    username_key,
+                    int(account["auth_version"] or 1),
+                    csrf,
+                    now,
+                    expires,
+                    str(client_ip or ""),
+                    str(device_digest or ""),
+                ),
+            )
+            extras = conn.execute(
+                """SELECT token_digest FROM ide_sessions WHERE username_key=? AND revoked_at=0
+                   ORDER BY created_at DESC LIMIT -1 OFFSET ?""",
+                (username_key, IDE_AUTH_MAX_ACTIVE_SESSIONS),
+            ).fetchall()
+            if extras:
+                conn.executemany("UPDATE ide_sessions SET revoked_at=? WHERE token_digest=?", [(now, x[0]) for x in extras])
+            conn.execute("COMMIT")
+        return {
+            "access_token": raw,
+            "csrf_token": csrf,
+            "expires_at": expires,
+            "account": self._public_account(account),
+        }
+
+    def verify_session(self, token: str, client_ip: str = "") -> dict | None:
+        raw = str(token or "")
+        if not raw.startswith("ide_session_") or len(raw) < 48:
+            return None
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        now = now_ts()
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT a.*,s.csrf_token,s.expires_at,s.token_digest,s.last_ip,s.device_digest,
+                          d.status AS device_status,d.source_ip AS device_source_ip
+                   FROM ide_sessions s JOIN ide_accounts a ON a.username_key=s.username_key
+                   LEFT JOIN ide_devices d ON d.device_digest=s.device_digest
+                   WHERE s.token_digest=? AND s.revoked_at=0 AND s.expires_at>?
+                     AND s.auth_version=a.auth_version AND a.disabled=0""",
+                (digest, now),
+            ).fetchone()
+        if row is None:
+            return None
+        device_digest = str(row["device_digest"] or "")
+        if device_digest:
+            request_ip = str(client_ip or "")
+            if (
+                str(row["device_status"] or "") != "approved"
+                or not request_ip
+                or not hmac.compare_digest(str(row["last_ip"] or ""), request_ip)
+                or not hmac.compare_digest(str(row["device_source_ip"] or ""), request_ip)
+            ):
+                return None
+        account = self._public_account(row)
+        account.update({
+            "csrf_token": str(row["csrf_token"] or ""),
+            "expires_at": float(row["expires_at"] or 0.0),
+            "token_digest": str(row["token_digest"] or ""),
+        })
+        return account
+
+    def register_device(
+        self,
+        device_key: object,
+        *,
+        label: object,
+        fingerprint: object,
+        client_ip: str,
+    ) -> dict:
+        digest = self._device_digest(device_key)
+        now = now_ts()
+        clean_label = trim(unicodedata.normalize("NFKC", str(label or "")).strip(), IDE_DEVICE_LABEL_MAX_CHARS)
+        clean_label = clean_label or "Web browser"
+        clean_fingerprint = trim(str(fingerprint or "").strip(), 500)
+        source_ip = trim(str(client_ip or "").strip(), 96)
+        if not source_ip:
+            raise IDEAuthError("device_ip_required", "The device source address is unavailable.", 400)
+        pairing_id = "pair-" + digest[:12]
+        user_id = "ide_device_" + digest[:24]
+        with self.lock:
+            with self._connect() as conn:
+                row = conn.execute("SELECT * FROM ide_devices WHERE device_digest=?", (digest,)).fetchone()
+            if row is not None and str(row["status"] or "") == "revoked":
+                raise IDEAuthError("device_revoked", "This browser device was revoked. Reset its device identity to request access again.", 403)
+            username_key = str(row["username_key"] or "") if row is not None else ""
+            if not username_key:
+                username = "device-" + digest[:12]
+                _, candidate_key = self._normalize_username(username)
+                with self._connect() as conn:
+                    account = conn.execute(
+                        "SELECT * FROM ide_accounts WHERE user_id=? OR username_key=?",
+                        (user_id, candidate_key),
+                    ).fetchone()
+                if account is None:
+                    password = "Device-9!" + base64.urlsafe_b64encode(os.urandom(36)).decode("ascii")
+                    account_payload = self._insert_account(username, password, user_id=user_id, role="user")
+                    _, username_key = self._normalize_username(account_payload["username"])
+                else:
+                    if not hmac.compare_digest(str(account["user_id"] or ""), user_id):
+                        raise IDEAuthError("device_identity_conflict", "The browser device identity conflicts with an existing account.", 409)
+                    username_key = str(account["username_key"] or "")
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute("SELECT * FROM ide_devices WHERE device_digest=?", (digest,)).fetchone()
+                if row is None:
+                    conn.execute(
+                        """INSERT INTO ide_devices
+                           (device_digest,pairing_id,label,fingerprint,source_ip,status,user_id,
+                            username_key,created_at,requested_at,approved_at,approved_by,last_seen_at,revoked_at)
+                           VALUES(?,?,?,?,?,'approved',?,?,?, ?,?,'automatic-device-binding',?,0)""",
+                        (digest, pairing_id, clean_label, clean_fingerprint, source_ip, user_id, username_key, now, now, now, now),
+                    )
+                elif str(row["status"] or "") == "revoked":
+                    conn.execute("ROLLBACK")
+                    raise IDEAuthError("device_revoked", "This browser device was revoked. Reset its device identity to request access again.", 403)
+                elif not hmac.compare_digest(str(row["source_ip"] or ""), source_ip):
+                    conn.execute(
+                        """UPDATE ide_devices SET label=?,fingerprint=?,source_ip=?,status='approved',
+                           username_key=?,requested_at=?,approved_at=?,approved_by='automatic-device-binding',
+                           last_seen_at=?,revoked_at=0 WHERE device_digest=?""",
+                        (clean_label, clean_fingerprint, source_ip, username_key, now, now, now, digest),
+                    )
+                    conn.execute(
+                        "UPDATE ide_sessions SET revoked_at=? WHERE device_digest=? AND revoked_at=0",
+                        (now, digest),
+                    )
+                else:
+                    conn.execute(
+                        """UPDATE ide_devices SET label=?,fingerprint=?,status='approved',username_key=?,
+                           approved_at=CASE WHEN approved_at>0 THEN approved_at ELSE ? END,
+                           approved_by=CASE WHEN approved_by<>'' THEN approved_by ELSE 'automatic-device-binding' END,
+                           last_seen_at=?,revoked_at=0 WHERE device_digest=?""",
+                        (clean_label, clean_fingerprint, username_key, now, now, digest),
+                    )
+                row = conn.execute("SELECT * FROM ide_devices WHERE device_digest=?", (digest,)).fetchone()
+                conn.execute("COMMIT")
+        if row is None:
+            raise IDEAuthError("device_registration_failed", "The device request could not be stored.", 503)
+        username_key = str(row["username_key"] or "")
+        with self._connect() as conn:
+            account = conn.execute(
+                "SELECT * FROM ide_accounts WHERE username_key=? AND disabled=0",
+                (username_key,),
+            ).fetchone()
+        if account is None:
+            raise IDEAuthError("device_identity_unavailable", "The approved device identity is unavailable.", 503)
+        result = self.issue_session(account, client_ip=source_ip, device_digest=digest)
+        result["device"] = self._public_device(row)
+        result["device_authenticated"] = True
+        return result
+
+    def list_devices(self) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM ide_devices ORDER BY status='pending' DESC,requested_at DESC"
+            ).fetchall()
+        return [self._public_device(row) for row in rows]
+
+    def approve_device(self, pairing_id: object, *, approved_by: str) -> dict:
+        pairing = str(pairing_id or "").strip()
+        with self.lock:
+            with self._connect() as conn:
+                row = conn.execute("SELECT * FROM ide_devices WHERE pairing_id=?", (pairing,)).fetchone()
+            if row is None:
+                raise IDEAuthError("device_not_found", "Device pairing request not found.", 404)
+            if str(row["status"] or "") == "revoked":
+                raise IDEAuthError("device_revoked", "A revoked device cannot be approved.", 409)
+            username_key = str(row["username_key"] or "")
+            if not username_key:
+                username = "device-" + str(row["device_digest"] or "")[:12]
+                password = "Device-9!" + base64.urlsafe_b64encode(os.urandom(36)).decode("ascii")
+                account = self._insert_account(
+                    username,
+                    password,
+                    user_id=str(row["user_id"] or ""),
+                    role="user",
+                )
+                _, username_key = self._normalize_username(account["username"])
+            now = now_ts()
+            with self._connect() as conn:
+                conn.execute(
+                    """UPDATE ide_devices SET status='approved',username_key=?,approved_at=?,
+                       approved_by=?,last_seen_at=?,revoked_at=0 WHERE pairing_id=?""",
+                    (username_key, now, trim(approved_by, 64), now, pairing),
+                )
+                row = conn.execute("SELECT * FROM ide_devices WHERE pairing_id=?", (pairing,)).fetchone()
+        return self._public_device(row)
+
+    def revoke_device(self, pairing_id: object) -> dict:
+        pairing = str(pairing_id or "").strip()
+        now = now_ts()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM ide_devices WHERE pairing_id=?", (pairing,)).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                raise IDEAuthError("device_not_found", "Device pairing request not found.", 404)
+            digest = str(row["device_digest"] or "")
+            conn.execute(
+                "UPDATE ide_devices SET status='revoked',revoked_at=?,last_seen_at=? WHERE pairing_id=?",
+                (now, now, pairing),
+            )
+            conn.execute("UPDATE ide_sessions SET revoked_at=? WHERE device_digest=?", (now, digest))
+            row = conn.execute("SELECT * FROM ide_devices WHERE pairing_id=?", (pairing,)).fetchone()
+            conn.execute("COMMIT")
+        return self._public_device(row)
+
+    def revoke_session(self, token: str) -> None:
+        raw = str(token or "")
+        if not raw.startswith("ide_session_"):
+            return
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        with self._connect() as conn:
+            conn.execute("UPDATE ide_sessions SET revoked_at=? WHERE token_digest=?", (now_ts(), digest))
+
+    def set_disabled(self, username: object, disabled: bool) -> dict:
+        _, key = self._normalize_username(username)
+        now = now_ts()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM ide_accounts WHERE username_key=?", (key,)).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                raise IDEAuthError("account_not_found", "IDE account not found.", 404)
+            if str(row["role"] or "") == "admin" and disabled:
+                conn.execute("ROLLBACK")
+                raise IDEAuthError("admin_disable_forbidden", "The IDE administrator cannot be disabled.", 409)
+            conn.execute(
+                "UPDATE ide_accounts SET disabled=?,auth_version=auth_version+1,updated_at=? WHERE username_key=?",
+                (1 if disabled else 0, now, key),
+            )
+            conn.execute("UPDATE ide_sessions SET revoked_at=? WHERE username_key=?", (now, key))
+            row = conn.execute("SELECT * FROM ide_accounts WHERE username_key=?", (key,)).fetchone()
+            conn.execute("COMMIT")
+        return self._public_account(row)
+
+    def change_password(self, account: dict, old_password: object, new_password: object) -> dict:
+        username = str(account.get("username", "") or "")
+        self._verify_account_password(username, old_password)
+        clean_password = self._validate_password(new_password, username)
+        salt = os.urandom(24)
+        with self.password_slots:
+            digest = self._password_digest(clean_password, salt, ADMIN_AUTH_PASSWORD_ITERATIONS)
+        now = now_ts()
+        _, key = self._normalize_username(username)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """UPDATE ide_accounts SET password_hash=?,password_salt=?,password_iterations=?,
+                   auth_version=auth_version+1,must_change_password=0,updated_at=? WHERE username_key=?""",
+                (
+                    base64.b64encode(digest).decode("ascii"),
+                    base64.b64encode(salt).decode("ascii"),
+                    ADMIN_AUTH_PASSWORD_ITERATIONS,
+                    now,
+                    key,
+                ),
+            )
+            conn.execute("UPDATE ide_sessions SET revoked_at=? WHERE username_key=?", (now, key))
+            row = conn.execute("SELECT * FROM ide_accounts WHERE username_key=?", (key,)).fetchone()
+            conn.execute("COMMIT")
+        return self._public_account(row)
+
+    def reset_password(self, username: object, new_password: object) -> dict:
+        clean_username, key = self._normalize_username(username)
+        clean_password = self._validate_password(new_password, clean_username)
+        salt = os.urandom(24)
+        with self.password_slots:
+            digest = self._password_digest(clean_password, salt, ADMIN_AUTH_PASSWORD_ITERATIONS)
+        now = now_ts()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM ide_accounts WHERE username_key=?", (key,)).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                raise IDEAuthError("account_not_found", "IDE account not found.", 404)
+            conn.execute(
+                """UPDATE ide_accounts SET password_hash=?,password_salt=?,password_iterations=?,
+                   auth_version=auth_version+1,must_change_password=0,updated_at=? WHERE username_key=?""",
+                (
+                    base64.b64encode(digest).decode("ascii"),
+                    base64.b64encode(salt).decode("ascii"),
+                    ADMIN_AUTH_PASSWORD_ITERATIONS,
+                    now,
+                    key,
+                ),
+            )
+            conn.execute("UPDATE ide_sessions SET revoked_at=? WHERE username_key=?", (now, key))
+            row = conn.execute("SELECT * FROM ide_accounts WHERE username_key=?", (key,)).fetchone()
+            conn.execute("COMMIT")
+        return self._public_account(row)
+
+
+class IDECapabilityError(Exception):
+    def __init__(self, code: str, message: str, status: int = 403):
+        super().__init__(message)
+        self.code = str(code or "ide_capability_denied")
+        self.status = int(status or 403)
+
+
+class IDEFileConflict(Exception):
+    def __init__(self, current: dict):
+        super().__init__("The file changed on disk after it was opened.")
+        self.code = "file_conflict"
+        self.status = 409
+        self.current = dict(current or {})
+
+
 def _admin_config_schema() -> list[dict]:
     """Canonical startup schema shared by validation, CLI compilation and WebUI."""
     def row(
@@ -8428,7 +9304,8 @@ def _admin_config_schema() -> list[dict]:
         row("skills_ui_enabled", "services", "Skills Studio", "boolean", True, true_flag="", false_flag="--no_skills_ui"),
         row("rag_admin_enabled", "services", "RAG admin", "boolean", True, true_flag="", false_flag="--no_rag_admin"),
         row("code_admin_enabled", "services", "Code library admin", "boolean", True, true_flag="", false_flag="--no_code_admin"),
-        row("ide_enabled", "services", "Programming IDE", "boolean", False, true_flag="--enable_ide", false_flag=""),
+        row("ide_enabled", "services", "Programming IDE", "boolean", True, true_flag="--enable_ide", false_flag="--no_ide"),
+        row("ide_password_login_enabled", "services", "IDE password login", "boolean", False, true_flag="--ide-password-login", false_flag="--no-ide-password-login"),
         row("mcp_service_enabled", "services", "MCP service", "boolean", True, true_flag="", false_flag="--no_mcp_service"),
         row("use_external_web_ui", "webui", "External WebUI mode", "tri_state", "inherit", true_flag="--use_external_web_ui", false_flag="--no_external_web_ui", choices=["inherit", "enabled", "disabled"]),
         row("export_web_ui", "webui", "Export built-in WebUI on start", "boolean", False, true_flag="--export_web_ui", false_flag=""),
@@ -9112,12 +9989,12 @@ def preview_kind_for_path(path_text: str) -> str:
         return ""
     if rel.endswith((".html", ".htm")):
         return "html"
-    if rel.endswith((".md", ".markdown")):
+    if rel.endswith((".md", ".markdown", ".mdx")):
         return "markdown"
     if is_code_preview_candidate(rel):
         return "code"
     if rel.endswith(".txt"):
-        return "markdown"
+        return "text"
     ext = PurePosixPath(rel).suffix.lower()
     if ext in IMAGE_EXTS:
         return "image"
@@ -9136,6 +10013,38 @@ def preview_kind_for_path(path_text: str) -> str:
     if ext in DOCUMENT_PREVIEW_EXTS:
         return "document"
     return ""
+
+
+def workspace_file_revision_map(root: Path, max_files: int = 30_000) -> dict[str, str]:
+    base = Path(root).resolve()
+    out: dict[str, str] = {}
+    if not base.exists() or not base.is_dir():
+        return out
+    for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
+        dirnames[:] = [
+            name for name in dirnames
+            if name not in IDE_TREE_SKIP_DIRS and not (Path(dirpath) / name).is_symlink()
+        ]
+        for filename in filenames:
+            fp = Path(dirpath) / filename
+            try:
+                if fp.is_symlink() or not fp.is_file():
+                    continue
+                st = fp.stat()
+                rel = fp.resolve().relative_to(base).as_posix()
+                out[rel] = f"{int(st.st_size)}:{int(st.st_mtime_ns)}:{int(getattr(st, 'st_ino', 0))}"
+            except Exception:
+                continue
+            if len(out) >= max(100, int(max_files or 30_000)):
+                return out
+    return out
+
+
+def workspace_revision_delta(before: dict[str, str], after: dict[str, str], limit: int = 80) -> list[str]:
+    return [
+        path for path in sorted(set(before) | set(after))
+        if before.get(path) != after.get(path)
+    ][:max(1, int(limit or 80))]
 
 
 def build_code_preview_rows(
@@ -14947,9 +15856,10 @@ class TaskManager:
             return tasks
 
 class BackgroundManager:
-    def __init__(self, workdir: Path, command_wrapper=None):
+    def __init__(self, workdir: Path, command_wrapper=None, env_wrapper=None):
         self.workdir = workdir
         self.command_wrapper = command_wrapper
+        self.env_wrapper = env_wrapper
         self.tasks: dict[str, dict] = {}
         self.notifications: queue.Queue = queue.Queue()
         self.lock = threading.Lock()
@@ -14984,6 +15894,7 @@ class BackgroundManager:
                 capture_output=True,
                 text=True,
                 timeout=timeout,
+                env=(self.env_wrapper() if callable(self.env_wrapper) else None),
             )
             output = trim((r.stdout + r.stderr).strip())
             exit_code = int(r.returncode)
@@ -16601,7 +17512,7 @@ class OllamaClient:
         if "embed_model" in profile:
             self.embed_model = str(profile.get("embed_model") or "").strip()
 
-    def embed(self, *, model: str, input: "str | list") -> dict:
+    def embed(self, *, model: str, input: str | list) -> dict:
         """Get embedding vector(s) from the model.
 
         Returns {"embeddings": [[float, ...]]} regardless of backend.
@@ -16693,7 +17604,7 @@ class OllamaClient:
                 url=url,
                 retry_after=self._parse_retry_after_seconds(hdrs, text),
             ) from exc
-        except (URLError, TimeoutError, socket.timeout, ConnectionResetError, ConnectionAbortedError) as exc:
+        except (URLError, TimeoutError, ConnectionResetError, ConnectionAbortedError) as exc:
             raise OllamaError(f"Connection error: {exc}", url=url) from exc
 
     def _post_json_url_with_retries(
@@ -16799,7 +17710,7 @@ class OllamaClient:
                 url=url,
                 retry_after=self._parse_retry_after_seconds(hdrs, text),
             ) from exc
-        except (URLError, TimeoutError, socket.timeout, ConnectionResetError, ConnectionAbortedError) as exc:
+        except (URLError, TimeoutError, ConnectionResetError, ConnectionAbortedError) as exc:
             raise OllamaError(f"Connection error: {exc}", url=url) from exc
 
     def _iter_response_lines_url_with_retries(
@@ -16893,7 +17804,7 @@ class OllamaClient:
                 url=url,
                 retry_after=self._parse_retry_after_seconds(hdrs, text),
             ) from exc
-        except (URLError, TimeoutError, socket.timeout, ConnectionResetError, ConnectionAbortedError) as exc:
+        except (URLError, TimeoutError, ConnectionResetError, ConnectionAbortedError) as exc:
             raise OllamaError(f"Connection error: {exc}", url=url) from exc
 
     def _download_bytes(self, url: str, timeout: int | None = None) -> tuple[bytes, str]:
@@ -16913,7 +17824,7 @@ class OllamaClient:
                 url=url,
                 retry_after=self._parse_retry_after_seconds(hdrs, text),
             ) from exc
-        except (URLError, TimeoutError, socket.timeout, ConnectionResetError, ConnectionAbortedError) as exc:
+        except (URLError, TimeoutError, ConnectionResetError, ConnectionAbortedError) as exc:
             raise OllamaError(f"Connection error: {exc}", url=url) from exc
 
     def _normalize_tool_calls(self, tool_calls: list) -> list[dict]:
@@ -19298,6 +20209,8 @@ class SessionState:
         self.ollama_env_tags: list[str] = list(env_tags)
         self.thinking = False
         self.ui_language = normalize_ui_language(ui_language)
+        self.last_public_progress_signature = ""
+        self.last_public_progress_ts = 0.0
         self.runtime_region_hint = extract_runtime_region_hint_setting(default_llm_config or {})
         self.runtime_timezone_hint = extract_runtime_timezone_hint_setting(default_llm_config or {})
         self.model_profiles: dict[str, dict] = {}
@@ -19324,7 +20237,11 @@ class SessionState:
         self.skills_last_refresh_ts = 0.0
         self.skills_runtime_prepared = False
         self.tasks = TaskManager(self.root / "tasks", crypto)
-        self.bg = BackgroundManager(self.files_root, command_wrapper=self._hard_snapshot_shell_prefix)
+        self.bg = BackgroundManager(
+            self.files_root,
+            command_wrapper=self._hard_snapshot_shell_prefix,
+            env_wrapper=self._shell_process_env,
+        )
         self.bus = MessageBus(self.root / "team" / "inbox", crypto)
         self.worktrees = WorktreeManager(self.id, self.tasks, self.root, crypto, repo_root)
         # External MCP (Model Context Protocol) tool driver. Prefer the shared
@@ -20941,6 +21858,7 @@ class SessionState:
                 if isinstance(_pq, dict) and trim(str(_pq.get("question", "") or "").strip(), 2000):
                     _pq_opts = _pq.get("options", [])
                     self.pending_user_question = {
+                        "id": trim(str(_pq.get("id", "") or ""), 120) or make_id("ask"),
                         "question": trim(str(_pq.get("question", "") or "").strip(), 2000),
                         "options": [trim(str(o or "").strip(), 400) for o in _pq_opts if str(o or "").strip()][:8] if isinstance(_pq_opts, list) else [],
                         "allow_free_text": bool(_pq.get("allow_free_text", True)),
@@ -22088,10 +23006,7 @@ class SessionState:
         if kind_key not in PERSIST_ON_EVENT_TYPES:
             return False
         if kind_key in {"tool_start", "tool_result"}:
-            tool_name = canonicalize_tool_name(
-                str((payload or {}).get("name", "") or (payload or {}).get("tool", "") or "")
-            )
-            return tool_name in CONVERSATION_VISIBLE_TOOL_EVENTS
+            return True
         if kind_key == "web_search":
             return bool((payload or {}).get("conversation_visible", True))
         return True
@@ -22101,7 +23016,7 @@ class SessionState:
             return
         now_value = now_ts()
         kind_key = str(kind or "").strip().lower()
-        immediate = kind_key in {"message", "file_patch", "upload", "command", "error"}
+        immediate = kind_key in {"message", "file_patch", "upload", "command", "compact", "error"}
         if kind_key == "web_search":
             phase = str((payload or {}).get("phase", "") or "").strip().lower()
             immediate = phase in {"done", "error", "timeout"}
@@ -22119,6 +23034,38 @@ class SessionState:
             self._persist()
         except Exception:
             pass
+
+    def _tool_event_context(self, name: str, args: object, result: dict | None = None) -> dict:
+        """Return only safe, compact tool details suitable for IDE event cards."""
+        values = args if isinstance(args, dict) else {}
+        tool_name = canonicalize_tool_name(name) or str(name or "")
+        public: dict = {}
+        for key in ("path", "file_path", "target_path"):
+            value = str(values.get(key, "") or "").strip()
+            if value:
+                public["path"] = trim(value, 1200)
+                break
+        command = str(values.get("command", "") or "").strip()
+        if command:
+            public["command"] = trim(command, 8000)
+        cwd = str(values.get("cwd", "") or "").strip()
+        if not cwd and tool_name in {"bash", "worktree_run", "check_background"}:
+            cwd = str(self.files_root)
+        if cwd:
+            public["cwd"] = trim(cwd, 2000)
+        for key in ("query", "pattern", "url"):
+            value = str(values.get(key, "") or "").strip()
+            if value:
+                public[key] = trim(value, 2000)
+        details = result if isinstance(result, dict) else self._peek_tool_result_meta()
+        for key in ("exit_code", "duration_ms"):
+            if details.get(key) is not None:
+                public[key] = details.get(key)
+        if isinstance(details.get("changed_files"), list):
+            public["changed_files"] = [
+                trim(str(value or ""), 1200) for value in details["changed_files"][:80]
+            ]
+        return public
 
     def _emit(self, kind: str, data: dict):
         try:
@@ -23454,6 +24401,155 @@ class SessionState:
             "required Todo list is absent."
         )
 
+    def _agent_language_preference(self) -> dict:
+        code = normalize_ui_language(getattr(self, "ui_language", DEFAULT_UI_LANGUAGE))
+        row = dict(AGENT_LANGUAGE_PREFERENCES.get(code, AGENT_LANGUAGE_PREFERENCES[DEFAULT_UI_LANGUAGE]))
+        row["language"] = code
+        return row
+
+    def _public_progress_prompt_instruction(self) -> str:
+        preference = self._agent_language_preference()
+        return (
+            "PUBLIC PROGRESS PREFERENCE: Public progress prose is optional, not required for every "
+            "tool call. Add one brief user-facing sentence only when entering a new phase, reporting "
+            "meaningful evidence, starting a long-running operation, or explaining a consequential "
+            "decision. Routine reads, repeated checks, Todo synchronization, and self-explanatory "
+            "structured file edits may call tools without extra prose. Combine related calls into one "
+            "note and never expose hidden chain-of-thought or private reasoning. "
+            f"Language-specific communication preference: {preference.get('instruction', '')} "
+        )
+
+    def _public_tool_progress_summary(
+        self,
+        tool_calls: object,
+        *,
+        role: str = "",
+        force: bool = False,
+    ) -> str:
+        """Build a token-free milestone fallback for a silent, high-value tool turn."""
+        calls = tool_calls if isinstance(tool_calls, list) else []
+        tool_names: list[str] = []
+        for call in calls[:12]:
+            if not isinstance(call, dict):
+                continue
+            function = call.get("function", {}) if isinstance(call.get("function"), dict) else {}
+            name = canonicalize_tool_name(function.get("name", ""))
+            if name and name not in tool_names:
+                tool_names.append(name)
+
+        focus = ""
+        try:
+            todo_rows = self.todo.snapshot()
+            for status in ("in_progress", "pending"):
+                match = next(
+                    (
+                        row for row in todo_rows
+                        if isinstance(row, dict)
+                        and str(row.get("status", "") or "").strip().lower() == status
+                    ),
+                    None,
+                )
+                if match:
+                    focus = trim(str(match.get("content", "") or "").strip(), 160)
+                    break
+        except Exception:
+            focus = ""
+        if not focus:
+            try:
+                active_step = self._get_active_plan_step(self._ensure_blackboard()) or {}
+                focus = trim(str(active_step.get("content", "") or "").strip(), 160)
+            except Exception:
+                focus = ""
+
+        groups: list[str] = []
+        names = set(tool_names)
+        if names.intersection({"read_file", "list_files", "search_files", "query_code_library", "query_knowledge_library", "tool_memory", "context_recall"}):
+            groups.append("read")
+        if names.intersection({"bash", "worktree_run", "check_background"}):
+            groups.append("run")
+        if names.intersection({"write_file", "edit_file", "apply_patch"}):
+            groups.append("edit")
+        if any(name in {"TodoWrite", "TodoWriteRescue", "TodoWriteResume", "update_todos", "update_plan"} for name in tool_names):
+            groups.append("organize")
+        if names.intersection({"agent_web_search", "web_search"}):
+            groups.append("web")
+        if any("browser" in name or "preview" in name or "screenshot" in name for name in tool_names):
+            groups.append("preview")
+        if not groups:
+            groups.append("act")
+
+        # Structured tool cards already make routine reads, file edits, and Todo
+        # updates observable. Avoid generating a second prose bubble for them.
+        milestone_groups = {"run", "web", "preview"}
+        if not force and not any(group in milestone_groups for group in groups):
+            return ""
+
+        signature = f"{normalize_ui_language(getattr(self, 'ui_language', DEFAULT_UI_LANGUAGE))}|{role}|{','.join(groups[:2])}|{focus}"
+        now = now_ts()
+        last_signature = str(getattr(self, "last_public_progress_signature", "") or "")
+        last_ts = float(getattr(self, "last_public_progress_ts", 0.0) or 0.0)
+        if not force and signature == last_signature and (now - last_ts) < 45.0:
+            return ""
+        self.last_public_progress_signature = signature
+        self.last_public_progress_ts = now
+
+        language = normalize_ui_language(getattr(self, "ui_language", DEFAULT_UI_LANGUAGE))
+        if language == "zh-CN":
+            actions = {
+                "read": "读取并检索相关资料",
+                "run": "运行命令以提取或验证证据",
+                "edit": "更新工作区文件",
+                "organize": "同步当前任务进度",
+                "web": "检索外部资料",
+                "preview": "检查页面或生成物的实际效果",
+                "act": "执行当前所需的工具操作",
+            }
+            action = "，并".join(actions[group] for group in groups[:2])
+            if focus:
+                return f"正在推进「{focus}」；本轮将{action}，结果将用于确定下一步。"
+            return f"本轮将{action}，并根据返回的证据继续推进。"
+        if language == "zh-TW":
+            actions = {
+                "read": "讀取並檢索相關資料",
+                "run": "執行命令以擷取或驗證證據",
+                "edit": "更新工作區檔案",
+                "organize": "同步目前任務進度",
+                "web": "檢索外部資料",
+                "preview": "檢查頁面或產出物的實際效果",
+                "act": "執行目前所需的工具操作",
+            }
+            action = "，並".join(actions[group] for group in groups[:2])
+            if focus:
+                return f"正在推進「{focus}」；本輪將{action}，結果將用於決定下一步。"
+            return f"本輪將{action}，並依據傳回的證據繼續推進。"
+        if language == "ja":
+            actions = {
+                "read": "関連資料を読み込みます",
+                "run": "証拠の抽出または検証コマンドを実行します",
+                "edit": "ワークスペースのファイルを更新します",
+                "organize": "現在のタスク進捗を同期します",
+                "web": "外部資料を調査します",
+                "preview": "ページや成果物の実表示を確認します",
+                "act": "必要なツール操作を実行します",
+            }
+            action = "。続けて".join(actions[group] for group in groups[:2])
+            if focus:
+                return f"「{focus}」を進めています。{action}。結果を次の判断に使います。"
+            return f"{action}。得られた証拠を基に続行します。"
+        actions = {
+            "read": "read and retrieve the relevant evidence",
+            "run": "run commands to extract or verify evidence",
+            "edit": "update workspace files",
+            "organize": "synchronize current task progress",
+            "web": "research external sources",
+            "preview": "inspect the rendered page or artifact",
+            "act": "perform the required tool action",
+        }
+        action = " and ".join(actions[group] for group in groups[:2])
+        if focus:
+            return f"Advancing '{focus}': this round will {action}, then use the evidence to choose the next step."
+        return f"This round will {action}, then continue from the returned evidence."
+
     def _system_prompt(self) -> str:
         try:
             self._ensure_skills_ready(force=False)
@@ -23534,6 +24630,7 @@ class SessionState:
             f"(5% reserved for auto compact; raw upper bound ~{self.context_token_upper_bound}). "
             f"{runtime_env_text}"
             f"{_detect_os_shell_instruction()} "
+                f"{self._public_progress_prompt_instruction()}"
                 "Use tools to inspect, edit, and execute. "
                 "If you say you will create, write, build, copy, modify, or verify an artifact, the same turn must include the concrete tool call that does it; do not stop at a promise to act. "
             "When reading files, choose the shape that matches the question: mode='window' for file:line, mode='symbol' for named code, mode='search' for keywords/errors, mode='overview' for structure, and mode='full' only when exact broad context is required. "
@@ -28612,6 +29709,40 @@ class SessionState:
             return safe_path(rel or ".", self.file_buffer_dir)
         return safe_path(normalized, self.files_root)
 
+    def _remote_agent_file_scope_error(self, path_text: object, action: str = "access") -> str:
+        if not bool(getattr(self, "ide_remote_sandbox_required", False)):
+            return ""
+        raw = str(path_text or "").strip().strip("'\"").replace("\\", "/").lower()
+        if (
+            raw in {"file_buffer", "file_buffer/", "/file_buffer", "/file_buffer/"}
+            or raw.startswith("file_buffer/")
+            or raw.startswith("/file_buffer/")
+            or raw.startswith("file_buffer:")
+            or raw.startswith("[file_buffer:")
+        ):
+            return (
+                f"Error: remote Program Agent {action} is limited to the isolated session workspace. "
+                "Global skills, packaged libraries, and runtime file buffers are outside that workspace."
+            )
+        try:
+            normalized = self._normalize_tool_path_text(path_text)
+        except Exception as exc:
+            return f"Error: {type(exc).__name__}: {exc}"
+        external_virtual_roots = (".__skills__", ".__js_lib__", ".__file_buffer__")
+        if any(normalized == root or normalized.startswith(root + "/") for root in external_virtual_roots):
+            return (
+                f"Error: remote Program Agent {action} is limited to the isolated session workspace. "
+                "Global skills, packaged libraries, and runtime file buffers are outside that workspace."
+            )
+        try:
+            target = safe_path(normalized, self.files_root).resolve()
+            workspace_root = self.files_root.resolve()
+            if target == workspace_root or target.is_relative_to(workspace_root):
+                return ""
+        except Exception as exc:
+            return f"Error: {type(exc).__name__}: {exc}"
+        return f"Error: remote Program Agent {action} is limited to the isolated session workspace."
+
     def _session_rel(self, path: Path) -> str:
         target = path.resolve()
         root = self.files_root.resolve()
@@ -28984,6 +30115,7 @@ class SessionState:
             "rows": rows,
             "row_count": len(rows),
             "truncated": bool(truncated),
+            "before_text": before_text,
             "full_text": after_text,
         }
 
@@ -29136,7 +30268,31 @@ body{padding:18px}
             if value.is_integer():
                 return str(int(value))
             return f"{value:.12g}"
-        return str(value)
+        text = str(value)
+        if len(text) > IDE_TABLE_PREVIEW_CELL_MAX_CHARS:
+            return text[: IDE_TABLE_PREVIEW_CELL_MAX_CHARS - 1] + "…"
+        return text
+
+    def _preview_bounded_rows(self, rows: list[list[str]]) -> tuple[list[list[str]], bool]:
+        remaining = max(1, int(IDE_TABLE_PREVIEW_TOTAL_CHARS))
+        bounded: list[list[str]] = []
+        truncated = False
+        for row in rows:
+            next_row: list[str] = []
+            for value in row:
+                text = self._preview_value_text(value)
+                if len(text) > remaining:
+                    text = text[: max(0, remaining - 1)] + ("…" if remaining > 0 else "")
+                    truncated = True
+                next_row.append(text)
+                remaining -= len(text)
+                if remaining <= 0:
+                    break
+            if next_row:
+                bounded.append(next_row)
+            if remaining <= 0:
+                break
+        return bounded, truncated
 
     def _preview_excel_col_label(self, idx: int) -> str:
         n = max(1, int(idx or 1))
@@ -29147,7 +30303,8 @@ body{padding:18px}
         return "".join(reversed(out)) or "A"
 
     def _preview_table_block_html(self, title: str, rows: list[list[str]], *, truncated: bool = False, subtitle: str = "") -> str:
-        grid_rows = [list(r) for r in (rows or [])]
+        grid_rows, budget_truncated = self._preview_bounded_rows([list(r) for r in (rows or [])])
+        truncated = bool(truncated or budget_truncated)
         col_count = max((len(r) for r in grid_rows), default=0)
         if col_count <= 0:
             subtitle_html = f"<div class=\"pv-block-sub\">{html.escape(subtitle)}</div>" if subtitle else ""
@@ -29179,7 +30336,10 @@ body{padding:18px}
         )
 
     def _preview_csv_rows(self, fp: Path) -> tuple[list[list[str]], bool]:
-        raw = fp.read_bytes()
+        with fp.open("rb") as handle:
+            raw = handle.read(IDE_TABLE_PREVIEW_SOURCE_MAX_BYTES + 1)
+        source_truncated = len(raw) > IDE_TABLE_PREVIEW_SOURCE_MAX_BYTES
+        raw = raw[:IDE_TABLE_PREVIEW_SOURCE_MAX_BYTES]
         text = self._decode_text_bytes(raw)
         if not text:
             return [], False
@@ -29191,7 +30351,7 @@ body{padding:18px}
         except Exception:
             pass
         out: list[list[str]] = []
-        truncated = False
+        truncated = source_truncated
         try:
             reader = csv.reader(io.StringIO(text), dialect)
             for ridx, row in enumerate(reader):
@@ -29218,7 +30378,19 @@ body{padding:18px}
         try:
             import openpyxl  # type: ignore
 
-            wb = openpyxl.load_workbook(str(fp), read_only=True, data_only=True)
+            with zipfile.ZipFile(fp, "r") as archive:
+                infos = archive.infolist()
+                if len(infos) > IDE_OFFICE_PREVIEW_MAX_ENTRIES:
+                    raise ValueError(f"workbook has too many archive entries ({len(infos):,})")
+                expanded = 0
+                for info in infos:
+                    size = max(0, int(info.file_size or 0))
+                    if size > IDE_OFFICE_PREVIEW_MAX_ENTRY_BYTES:
+                        raise ValueError(f"workbook entry is too large ({size:,} bytes)")
+                    expanded += size
+                    if expanded > IDE_OFFICE_PREVIEW_MAX_EXPANDED_BYTES:
+                        raise ValueError(f"workbook expands beyond {IDE_OFFICE_PREVIEW_MAX_EXPANDED_BYTES:,} bytes")
+            wb = openpyxl.load_workbook(str(fp), read_only=True, data_only=True, keep_links=False)
             blocks = []
             for ws in list(wb.worksheets)[:6]:
                 rows: list[list[str]] = []
@@ -29554,7 +30726,7 @@ body{padding:18px}
                                 note_tip = ""
                                 if note_maps:
                                     try:
-                                        note_tip = trim(str(((note_maps.get(ref_kind, {}) or {}).get(note_id, "") or "")).strip(), 240)
+                                        note_tip = trim(str((note_maps.get(ref_kind, {}) or {}).get(note_id, "") or "").strip(), 240)
                                     except Exception:
                                         note_tip = ""
                                 title_attr = f' title="{html.escape(note_tip)}"' if note_tip else ""
@@ -29639,8 +30811,8 @@ body{padding:18px}
         try:
             import docx  # type: ignore
             from docx.document import Document as _DocxDocument  # type: ignore
-            from docx.oxml.text.paragraph import CT_P  # type: ignore
             from docx.oxml.table import CT_Tbl  # type: ignore
+            from docx.oxml.text.paragraph import CT_P  # type: ignore
             from docx.table import Table as _DocxTable  # type: ignore
             from docx.text.paragraph import Paragraph as _DocxParagraph  # type: ignore
 
@@ -29767,7 +30939,7 @@ body{padding:18px}
                 for ref_kind, note_id in ordered_note_refs:
                     if ref_kind != kind:
                         continue
-                    note_text = str(((note_maps.get(kind, {}) or {}).get(note_id, "") or "")).strip()
+                    note_text = str((note_maps.get(kind, {}) or {}).get(note_id, "") or "").strip()
                     note_body = html.escape(note_text).replace("\n", "<br>") if note_text else "<em>(note content unavailable)</em>"
                     items.append(
                         "<div class=\"pv-doc-note-item\">"
@@ -30259,7 +31431,7 @@ body{padding:18px}
             else:
                 width = max(4.0, min(100.0, (abs(numeric) / max_abs) * 100.0))
                 metric = str(row.get("text", "") or self._preview_value_text(numeric))
-            fill_color = str((((theme or {}).get("colors", {}) or {}).get(accent_keys[idx % len(accent_keys)]) or "#3b82f6"))
+            fill_color = str(((theme or {}).get("colors", {}) or {}).get(accent_keys[idx % len(accent_keys)]) or "#3b82f6")
             bar_rows.append(
                 "<div class=\"pv-slide-bar-row\">"
                 f"<div>{html.escape(str(row.get('label', '') or ''))}</div>"
@@ -33835,6 +35007,8 @@ body{padding:18px}
         default_titles = {
             "web session",
             "session",
+            "program",
+            "ide workspace",
             "web 会话",
             "会话",
             "web 會話",
@@ -33845,10 +35019,12 @@ body{padding:18px}
         if low in default_titles or t in default_titles:
             return True
         if re.fullmatch(
-            r"(web[\s_-]*)?(session|会话|會話|セッション)[\s_-]*\d*",
+            r"(?:(?:web|program|ide)[\s_-]*)?(session|workspace|会话|會話|セッション)[\s_-]*\d*",
             low,
             flags=re.IGNORECASE,
         ):
+            return True
+        if re.fullmatch(r"program\s+\d{1,2}:\d{2}(?::\d{2})?", low, flags=re.IGNORECASE):
             return True
         if t == self.id:
             return True
@@ -34854,15 +36030,102 @@ body{padding:18px}
         except Exception:
             return False
 
+    def _remote_runtime_read_roots(self) -> list[Path]:
+        candidates: list[Path] = []
+        for raw in (getattr(sys, "prefix", ""), getattr(sys, "base_prefix", "")):
+            try:
+                if raw:
+                    candidates.append(Path(raw).resolve())
+            except Exception:
+                continue
+        try:
+            node = shutil.which("node")
+            if node:
+                node_path = Path(node).resolve()
+                candidates.append(node_path.parent.parent if node_path.parent.name == "bin" else node_path.parent)
+        except Exception:
+            pass
+        roots: list[Path] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            try:
+                if not candidate.exists() or not candidate.is_dir():
+                    continue
+                key = str(candidate)
+                if key in seen:
+                    continue
+                seen.add(key)
+                roots.append(candidate)
+            except Exception:
+                continue
+        return roots
+
+    def _remote_process_path(self) -> str:
+        workspace_root = self.files_root.resolve()
+        allowed_roots = [workspace_root, *self._remote_runtime_read_roots()]
+        denied_roots = [
+            Path("/Users"), Path("/Volumes"), Path("/private/tmp"),
+            Path("/tmp"), Path("/var/tmp"), Path("/private/var/folders"),
+        ]
+        entries: list[str] = []
+        seen: set[str] = set()
+        for raw in str(os.environ.get("PATH", "") or "").split(os.pathsep):
+            text = str(raw or "").strip()
+            if not text:
+                continue
+            try:
+                resolved = Path(text).resolve()
+                denied = any(resolved == root or resolved.is_relative_to(root) for root in denied_roots)
+                allowed = any(resolved == root or resolved.is_relative_to(root) for root in allowed_roots)
+                if denied and not allowed:
+                    continue
+                normalized = str(resolved)
+            except Exception:
+                continue
+            if normalized not in seen:
+                seen.add(normalized)
+                entries.append(normalized)
+        for fallback in ("/usr/bin", "/bin", "/usr/sbin", "/sbin"):
+            if fallback not in seen:
+                entries.append(fallback)
+                seen.add(fallback)
+        return os.pathsep.join(entries)
+
+    def _workspace_sandbox_shell_prefix(self) -> list[str]:
+        if os.name != "posix" or sys.platform != "darwin":
+            return []
+        sandbox = shutil.which("sandbox-exec")
+        workspace_root = self.files_root.resolve()
+        if not sandbox or not workspace_root.exists():
+            return []
+        # Seatbelt applies deny rules after the broad system allowance. The
+        # workspace exception is more specific, so remote processes can read
+        # and write only their session files while installed runtimes remain usable.
+        runtime_read_rules = " ".join(
+            f"(subpath {json.dumps(str(root))})" for root in self._remote_runtime_read_roots()
+        )
+        policy = (
+            "(version 1) "
+            "(allow default) "
+            "(deny file-write*) "
+            f"(allow file-write* (subpath {json.dumps(str(workspace_root))}) (subpath \"/dev\")) "
+            "(deny file-read* "
+            "(subpath \"/Users\") (subpath \"/Volumes\") "
+            "(subpath \"/private/tmp\") (subpath \"/tmp\") (subpath \"/var/tmp\") "
+            "(subpath \"/private/var/folders\")) "
+            f"(allow file-read* (subpath {json.dumps(str(workspace_root))}) {runtime_read_rules})"
+        )
+        return [sandbox, "-p", policy]
+
     def _hard_snapshot_shell_prefix(self) -> list[str]:
+        if bool(getattr(self, "ide_remote_sandbox_required", False)):
+            return self._workspace_sandbox_shell_prefix()
         if self.skill_mode != "hard" or os.name != "posix" or sys.platform != "darwin":
             return []
         sandbox = shutil.which("sandbox-exec")
         snapshot_root = self._application_snapshot_root()
         if not sandbox or not snapshot_root.exists():
             return []
-        # Seatbelt enforces the boundary at the syscall layer while allowing
-        # frozen scripts to execute and the rest of the session workspace to mutate.
         policy = (
             "(version 1) "
             "(allow default) "
@@ -34872,6 +36135,48 @@ body{padding:18px}
 
     def _hard_snapshot_shell_supported(self) -> bool:
         return bool(self._hard_snapshot_shell_prefix())
+
+    def _shell_process_env(self) -> dict:
+        if not bool(getattr(self, "ide_remote_sandbox_required", False)):
+            env = os.environ.copy()
+            env.update({"PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"})
+            if os.name == "nt":
+                env["PYTHONLEGACYWINDOWSSTDIO"] = "0"
+            elif sys.platform == "darwin":
+                env.update({"LANG": "en_US.UTF-8", "LC_ALL": "en_US.UTF-8", "LC_CTYPE": "UTF-8"})
+            else:
+                env.update({"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "LC_CTYPE": "C.UTF-8"})
+            return env
+        sandbox_tmp = self.files_root / ".clouds_coder" / "tmp"
+        sandbox_tmp.mkdir(parents=True, exist_ok=True)
+        allowed = {
+            "LANG", "LC_ALL", "LC_CTYPE", "TERM", "COLORTERM",
+            "TZ", "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_PATH",
+        }
+        env = {key: value for key, value in os.environ.items() if key in allowed}
+        env.update(
+            {
+                "HOME": str(self.files_root),
+                "PWD": str(self.files_root),
+                "PATH": self._remote_process_path(),
+                "WORKSPACE_ROOT": str(self.files_root),
+                "SESSION_ROOT": str(self.files_root),
+                "SESSION_FILES_ROOT": str(self.files_root),
+                "TMPDIR": str(sandbox_tmp),
+                "TMP": str(sandbox_tmp),
+                "TEMP": str(sandbox_tmp),
+                "CLOUDS_CODER_IDE_SANDBOX": "1",
+                "PYTHONIOENCODING": "utf-8",
+                "PYTHONUTF8": "1",
+            }
+        )
+        if os.name == "nt":
+            env["PYTHONLEGACYWINDOWSSTDIO"] = "0"
+        elif sys.platform == "darwin":
+            env.update({"LANG": "en_US.UTF-8", "LC_ALL": "en_US.UTF-8", "LC_CTYPE": "UTF-8"})
+        else:
+            env.update({"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "LC_CTYPE": "C.UTF-8"})
+        return env
 
     def _restore_application_snapshot_permissions(self) -> None:
         if self.skill_mode != "hard":
@@ -34992,14 +36297,7 @@ body{padding:18px}
         def _merge_output_text() -> str:
             # On Windows, cmd.exe outputs in the system OEM codepage (e.g. cp936/GBK),
             # not UTF-8.  Detect and use the correct encoding for decoding.
-            if os.name == "nt":
-                try:
-                    import locale as _lc
-                    enc = _lc.getpreferredencoding(False) or "utf-8"
-                except Exception:
-                    enc = "utf-8"
-            else:
-                enc = "utf-8"
+            enc = "utf-8"
             out_text = out_buf.decode(enc, errors="replace")
             err_text = err_buf.decode(enc, errors="replace")
             return (out_text + err_text).strip()
@@ -35154,16 +36452,19 @@ body{padding:18px}
                 )
 
         try:
-            proc_env = os.environ.copy()
-            proc_env["WORKSPACE_ROOT"] = str(self.root)
-            proc_env["SESSION_ROOT"] = str(self.files_root)
-            proc_env["SESSION_FILES_ROOT"] = str(self.files_root)
-            proc_env["SKILLS_ROOT"] = str(self.skills.skills_root)
-            proc_env["CLOUDS_CODER_ROOT"] = str(self.root)
-            proc_env["JS_LIB_ROOT"] = str(self.js_lib_root)
+            proc_env = self._shell_process_env()
+            if not bool(getattr(self, "ide_remote_sandbox_required", False)):
+                proc_env["WORKSPACE_ROOT"] = str(self.root)
+                proc_env["SESSION_ROOT"] = str(self.files_root)
+                proc_env["SESSION_FILES_ROOT"] = str(self.files_root)
+                proc_env["SKILLS_ROOT"] = str(self.skills.skills_root)
+                proc_env["CLOUDS_CODER_ROOT"] = str(self.root)
+                proc_env["JS_LIB_ROOT"] = str(self.js_lib_root)
             shell_prefix = self._hard_snapshot_shell_prefix()
             popen_command: object = effective_command
             use_shell = True
+            if os.name == "nt" and not shell_prefix:
+                popen_command = f"chcp 65001>nul & {effective_command}"
             if shell_prefix:
                 popen_command = [*shell_prefix, "/bin/sh", "-c", effective_command]
                 use_shell = False
@@ -43054,10 +44355,6 @@ body{padding:18px}
             return False
         now_value = float(now_ts())
         accepted = dict(rows[acceptance_index])
-        contract_text = self._effective_plan_step_acceptance_text(
-            plan_step,
-            accepted.get("content", ""),
-        )
         accepted["status"] = "completed"
         accepted["completed_at"] = now_value
         accepted["updated_at"] = now_value
@@ -45119,7 +46416,6 @@ body{padding:18px}
         validation_ok_current = self._tool_results_have_validation_evidence(current, results)
         validation_ok_blackboard = self._plan_step_has_blackboard_evidence(current, bb)
         validation_ok = validation_ok_current or validation_ok_blackboard
-        verified_tag_current = self._check_step_verified_tag(current, messages=self.agent_messages)
         bb_sig = self._plan_step_blackboard_signals(current, bb)
         phase_evidence = False
         if phase in ("research", "design") and validation_ok:
@@ -45140,15 +46436,6 @@ body{padding:18px}
         _has_subtasks = bool(self._active_plan_worker_todo_rows(
             str(current.get("id", "") or ""), role=""
         ))
-        accumulated_evidence_path = (
-            subtasks_all_done
-            and self._step_has_accumulated_evidence(current, bb)
-        )
-        explicit_verified_path = (
-            subtasks_all_done
-            and verified_tag_current
-            and (validation_ok_blackboard or self._step_has_accumulated_evidence(current, bb))
-        )
         acceptance_gate = self._plan_step_acceptance_gate_status(current, worker_step, bb)
         acceptance_gate_ok = bool(acceptance_gate.get("ok", False))
         has_strong_evidence = self._plan_step_acceptance_ready_for_advance(
@@ -50848,7 +52135,6 @@ body{padding:18px}
             return False
         identifiers = self._plan_subtask_evidence_identifiers(subtask_text)
         paths = identifiers.get("paths", [])
-        commands = identifiers.get("commands", [])
         command_specs = identifiers.get("command_specs", [])
         technical_tokens = identifiers.get("technical_tokens", [])
         observed_paths = [normalize_rel_preview_path(str(record.get("path", "") or "")).lower()]
@@ -54872,6 +56158,7 @@ body{padding:18px}
         return (
             "You are Manager in a multi-agent coding system. "
             "Read blackboard, delegate one short timeslice via route_to_next_agent. "
+            f"{self._public_progress_prompt_instruction()}"
             "Policy: missing facts->explorer, implementation->developer, verification->reviewer, "
             "all done->finish. Set is_mandatory=true when concrete execution is required. "
             "Role capabilities: "
@@ -56419,14 +57706,14 @@ body{padding:18px}
                 if _bb_state_sig and _bb_state_sig == getattr(self, "_last_mgr_bb_state_sig", ""):
                     prompt = (
                         "Read the blackboard and delegate one next short timeslice. "
-                        "Return only one route_to_next_agent call.\n\n"
+                        "Return one route_to_next_agent call; add public prose only for a meaningful phase change.\n\n"
                         "(blackboard state unchanged since the last delegation snapshot above; "
                         "consult it. If progress has stalled, switch agent or finish.)"
                     )
                 else:
                     prompt = (
                         "Read the blackboard and delegate one next short timeslice. "
-                        "Return only one route_to_next_agent call.\n\n"
+                        "Return one route_to_next_agent call; add public prose only for a meaningful phase change.\n\n"
                         f"{self._blackboard_read_state_markdown(max_items=10)}"
                     )
                     self._last_mgr_bb_state_sig = _bb_state_sig
@@ -56460,6 +57747,8 @@ body{padding:18px}
                 text, text_filter_meta = self._sanitize_assistant_text_for_runtime(text, tool_calls)
                 if bool(text_filter_meta.get("filtered", False)) and str(text_filter_meta.get("reason", "")) == "oversized_raw_toolcall":
                     self._inject_toolcall_overflow_hint("manager")
+                if tool_calls and not text.strip():
+                    text = self._public_tool_progress_summary(tool_calls, role="manager")
                 assistant = {"role": "assistant", "content": text, "ts": now_ts()}
                 if tool_calls:
                     assistant["tool_calls"] = [
@@ -56493,6 +57782,8 @@ body{padding:18px}
                         "ts": assistant["ts"],
                         "agent_role": "manager",
                     }
+                    if route_only_tool_calls:
+                        manager_message["type"] = "approach"
                     if "tool_calls" in assistant and (not route_only_tool_calls):
                         manager_message["tool_calls"] = assistant["tool_calls"]
                     self.messages.append(manager_message)
@@ -58994,6 +60285,7 @@ body{padding:18px}
             "Do not leave '/js_lib/...', '/assets/js_lib/...', or other virtual aliases in final exported HTML. "
             "Use blackboard for shared state, ask_colleague for inter-agent communication. "
             "Keep outputs concise and action-oriented. "
+            f"{self._public_progress_prompt_instruction()}"
             "When reading files, choose the shape that matches the question: mode='window' for file:line, mode='symbol' for named code, mode='search' for keywords/errors, mode='overview' for structure, and mode='full' only when exact broad context is required. "
             "When inspecting collections or memory, use focused modes too: tool_memory/context_recall/read_from_blackboard/task_list/check_background/read_inbox/worktree_events support mode='summary', mode='search', mode='window', and mode='detail' where applicable. Prefer query/status/actor/tool filters over repeatedly listing recent items. "
             "Before repeating the same successful read_file/bash/query over the same target, check the injected tool-memory-registry or call tool_memory with mode='search' or mode='detail'. "
@@ -60942,7 +62234,13 @@ body{padding:18px}
             + text[-tail_chars:].lstrip()
         )
 
-    def _dispatch_tool(self, name: str, args: dict, agent_role: str = "") -> str:
+    def _dispatch_tool(
+        self,
+        name: str,
+        args: dict,
+        agent_role: str = "",
+        tool_call_id: str = "",
+    ) -> str:
         """Top-level tool dispatcher with error isolation and per-tool timeout."""
         telemetry_started = time.monotonic()
         self._clear_tool_result_meta()
@@ -60988,18 +62286,18 @@ body{padding:18px}
                 }
                 or self._is_mcp_tool_name(name)
             ):
-                out = self._dispatch_tool_inner(name, args, role_key)
+                out = self._dispatch_tool_inner(name, args, role_key, tool_call_id)
                 self._maybe_record_tool_memory_after_result(name, args, out, role_key)
                 self._record_tool_telemetry(name, out, telemetry_started)
                 return out
             timeout = _TOOL_TIMEOUT_MAP.get(name, _DEFAULT_TOOL_TIMEOUT)
             if timeout <= 0:
-                out = self._dispatch_tool_inner(name, args, role_key)
+                out = self._dispatch_tool_inner(name, args, role_key, tool_call_id)
                 self._maybe_record_tool_memory_after_result(name, args, out, role_key)
                 self._record_tool_telemetry(name, out, telemetry_started)
                 return out
             pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"tool-{name}")
-            future = pool.submit(self._dispatch_tool_inner, name, args, role_key)
+            future = pool.submit(self._dispatch_tool_inner, name, args, role_key, tool_call_id)
             try:
                 out = future.result(timeout=timeout)
                 self._maybe_record_tool_memory_after_result(name, args, out, role_key)
@@ -61097,6 +62395,7 @@ body{padding:18px}
         if not options and not allow_free_text:
             allow_free_text = True
         self.pending_user_question = {
+            "id": make_id("ask"),
             "question": question,
             "options": options,
             "allow_free_text": bool(allow_free_text),
@@ -61148,8 +62447,26 @@ body{padding:18px}
         except Exception:
             pass
 
-    def _dispatch_tool_inner(self, name: str, args: dict, role_key: str = "") -> str:
+    def _dispatch_tool_inner(
+        self,
+        name: str,
+        args: dict,
+        role_key: str = "",
+        tool_call_id: str = "",
+    ) -> str:
         """Inner tool dispatcher — all tool logic lives here."""
+        if bool(getattr(self, "ide_remote_sandbox_required", False)):
+            blocked_remote_tools = {
+                "load_skill", "list_skills", "read_skill", "write_skill",
+                "query_code_library", "query_knowledge_library", "rag_remember",
+                "worktree_create", "worktree_list", "worktree_status", "worktree_run",
+                "worktree_keep", "worktree_remove",
+            }
+            if self._is_mcp_tool_name(name) or canonicalize_tool_name(name) in blocked_remote_tools:
+                return (
+                    f"Error: tool '{name}' is unavailable to remote Program sessions because it can access "
+                    "resources outside the isolated session workspace."
+                )
         # External MCP tools (mcp__<server>__<tool>): route to the owning
         # subprocess. Handled before any built-in branch so an MCP name can
         # never be shadowed by a builtin, and so every role/mode reaches it.
@@ -61187,6 +62504,7 @@ body{padding:18px}
                 "command",
                 {
                     "name": "bash",
+                    "tool_call_id": trim(str(tool_call_id or ""), 240),
                     "command": meta["command"],
                     "effective_command": meta.get("effective_command", meta["command"]),
                     "cwd": meta["cwd"],
@@ -61220,6 +62538,9 @@ body{padding:18px}
             illegal = self._reject_non_workspace_absolute_tool_path(args.get("path", ""))
             if illegal:
                 return illegal
+            remote_scope_error = self._remote_agent_file_scope_error(args.get("path", ""), "read")
+            if remote_scope_error:
+                return remote_scope_error
             if self.skill_mode == "hard" and self._path_targets_global_skills(args.get("path", "")):
                 return (
                     "Error: hard application mode cannot read the mutable global skills store. "
@@ -61276,6 +62597,9 @@ body{padding:18px}
             illegal = self._reject_non_workspace_absolute_tool_path(args.get("path", ""))
             if illegal:
                 return illegal
+            remote_scope_error = self._remote_agent_file_scope_error(args.get("path", ""), "write")
+            if remote_scope_error:
+                return remote_scope_error
             protected = self._runtime_managed_path_tool_error(args.get("path", ""), "write_file")
             if protected:
                 return protected
@@ -61344,6 +62668,9 @@ body{padding:18px}
             illegal = self._reject_non_workspace_absolute_tool_path(args.get("path", ""))
             if illegal:
                 return illegal
+            remote_scope_error = self._remote_agent_file_scope_error(args.get("path", ""), "edit")
+            if remote_scope_error:
+                return remote_scope_error
             protected = self._runtime_managed_path_tool_error(args.get("path", ""), "edit_file")
             if protected:
                 return protected
@@ -61772,6 +63099,7 @@ body{padding:18px}
                 "command",
                 {
                     "name": "worktree_run",
+                    "tool_call_id": trim(str(tool_call_id or ""), 240),
                     "worktree": args["name"],
                     "command": meta["command"],
                     "effective_command": meta.get("effective_command", meta["command"]),
@@ -62658,6 +63986,8 @@ body{padding:18px}
             reason = str(text_filter_meta.get("reason", "") or "").strip()
             if reason == "oversized_raw_toolcall":
                 self._inject_toolcall_overflow_hint(role_key)
+        if tool_calls and not text.strip():
+            text = self._public_tool_progress_summary(tool_calls, role=role_key)
         assistant = {"role": "assistant", "content": text, "ts": now_ts(), "agent_role": role_key}
         if thinking_text:
             assistant["thinking"] = thinking_text
@@ -62674,7 +64004,7 @@ body{padding:18px}
                 for tc in tool_calls
             ]
         self._append_agent_context_message(role_key, assistant, mirror_to_global=True)
-        if (text.strip() or thinking_text) and not tool_calls:
+        if text.strip() or (thinking_text and not tool_calls):
             emit_text = text if text.strip() else "[thinking-only output]"
             self._emit_agent_message(role_key, emit_text, summary=f"{self._agent_display_name(role_key)} response")
         if not tool_calls:
@@ -62723,7 +64053,9 @@ body{padding:18px}
                 "tool_start",
                 {
                     "name": name,
+                    "tool_call_id": str(tc.get("id", "") or ""),
                     "agent_role": role_key,
+                    **self._tool_event_context(name, args),
                     "conversation_visible": canonicalize_tool_name(name) in CONVERSATION_VISIBLE_TOOL_EVENTS,
                     "summary": f"{self._agent_display_name(role_key)} tool start: {name}",
                 },
@@ -62744,7 +64076,12 @@ body{padding:18px}
                     )
                 else:
                     try:
-                        output = self._dispatch_tool(name, args, agent_role=role_key)
+                        output = self._dispatch_tool(
+                            name,
+                            args,
+                            agent_role=role_key,
+                            tool_call_id=str(tc.get("id", "") or ""),
+                        )
                     except Exception as exc:
                         output = f"Error: {exc}"
             raw_output = str(output or "")
@@ -62768,20 +64105,22 @@ body{padding:18px}
                 },
                 mirror_to_global=False,
             )
-            self._emit(
-                "tool_result",
-                {
-                    "name": name,
-                    "agent_role": role_key,
-                    "result": trim(output, 500),
-                    "conversation_visible": canonicalize_tool_name(name) in CONVERSATION_VISIBLE_TOOL_EVENTS,
-                    "summary": f"{self._agent_display_name(role_key)} tool: {name}",
-                },
-            )
             item = self._build_tool_result_item(
                 name,
                 args if isinstance(args, dict) else {},
                 output,
+            )
+            self._emit(
+                "tool_result",
+                {
+                    "name": name,
+                    "tool_call_id": str(tc.get("id", "") or ""),
+                    "agent_role": role_key,
+                    **self._tool_event_context(name, args, item),
+                    "result": trim(output, 500),
+                    "conversation_visible": canonicalize_tool_name(name) in CONVERSATION_VISIBLE_TOOL_EVENTS,
+                    "summary": f"{self._agent_display_name(role_key)} tool: {name}",
+                },
             )
             delegate = self._ensure_blackboard().get("last_delegate", {})
             delegate = delegate if isinstance(delegate, dict) else {}
@@ -64041,6 +65380,7 @@ body{padding:18px}
             system=(
                 "You are Explorer in plan-mode research. Read-only analysis. "
                 "Do NOT create, write, or edit files. "
+                f"{self._public_progress_prompt_instruction()}"
                 f"Workspace: \"{self.files_root}\" ($SESSION_ROOT). "
                 "When reading files, choose the shape that matches the question: mode='window' for file:line, mode='symbol' for named code, mode='search' for keywords/errors, mode='overview' for structure, and mode='full' only when exact broad context is required. "
                 "When reading blackboard or archived context, use mode='summary' first, then mode='search' or mode='window' for focused evidence. "
@@ -64067,6 +65407,8 @@ body{padding:18px}
         text = text_main
         tool_calls = response.get("tool_calls", [])
         text, _ = self._sanitize_assistant_text_for_runtime(text, tool_calls)
+        if tool_calls and not text.strip():
+            text = self._public_tool_progress_summary(tool_calls, role="planner")
         assistant = {"role": "assistant", "content": text, "ts": now_ts(), "agent_role": "explorer"}
         if thinking_text:
             assistant["thinking"] = thinking_text
@@ -64093,6 +65435,8 @@ body{padding:18px}
             }
             if thinking_text:
                 planner_msg["thinking"] = thinking_text
+            if "tool_calls" in assistant:
+                planner_msg["tool_calls"] = assistant["tool_calls"]
             self.messages.append(planner_msg)
             emit_data = {
                 "role": "assistant",
@@ -64126,7 +65470,9 @@ body{padding:18px}
             fn_args = tc["function"]["arguments"]
             self._emit("tool_start", {
                 "name": fn_name,
+                "tool_call_id": str(tc.get("id", "") or ""),
                 "agent_role": "planner",
+                **self._tool_event_context(fn_name, fn_args),
                 "conversation_visible": canonicalize_tool_name(fn_name) in CONVERSATION_VISIBLE_TOOL_EVENTS,
                 "summary": f"plan-mode research start: {fn_name}",
             })
@@ -64144,7 +65490,12 @@ body{padding:18px}
                     }, mirror_to_global=False)
                     continue
             try:
-                raw_output = self._dispatch_tool(fn_name, fn_args, agent_role="explorer")
+                raw_output = self._dispatch_tool(
+                    fn_name,
+                    fn_args,
+                    agent_role="explorer",
+                    tool_call_id=str(tc.get("id", "") or ""),
+                )
             except Exception as exc:
                 raw_output = f"Error: {exc}"
             result_content = str(raw_output or "")
@@ -64171,7 +65522,9 @@ body{padding:18px}
             # B5: Emit tool result as planner bubble
             self._emit("tool_result", {
                 "name": fn_name,
+                "tool_call_id": str(tc.get("id", "") or ""),
                 "agent_role": "planner",
+                **self._tool_event_context(fn_name, fn_args),
                 "result": trim(result_content, 500),
                 "conversation_visible": canonicalize_tool_name(fn_name) in CONVERSATION_VISIBLE_TOOL_EVENTS,
                 "summary": f"plan-mode research: {fn_name}",
@@ -67578,6 +68931,8 @@ body{padding:18px}
                     )
                     raise CircuitBreakerTriggered(stop_note)
                 consecutive_empty_action_rounds = 0
+                if tool_calls and not text.strip():
+                    text = self._public_tool_progress_summary(tool_calls, role=single_role)
                 assistant = {"role": "assistant", "content": text, "ts": now_ts(), "agent_role": single_role}
                 if thinking_text:
                     assistant["thinking"] = thinking_text
@@ -67592,7 +68947,7 @@ body{padding:18px}
                         for tc in tool_calls
                     ]
                 self.messages.append(assistant)
-                if (text.strip() or thinking_text) and not tool_calls:
+                if text.strip() or (thinking_text and not tool_calls):
                     emit_text = text if text.strip() else "[thinking-only output]"
                     emit_summary = "assistant message" if text.strip() else "assistant thinking-only message"
                     self._emit(
@@ -68230,6 +69585,8 @@ body{padding:18px}
                         "tool_start",
                         {
                             "name": name,
+                            "tool_call_id": str(tc.get("id", "") or ""),
+                            **self._tool_event_context(name, args),
                             "conversation_visible": canonicalize_tool_name(name) in CONVERSATION_VISIBLE_TOOL_EVENTS,
                             "summary": f"tool start: {name}",
                         },
@@ -68388,7 +69745,11 @@ body{padding:18px}
                             )
                     if not skip_dispatch:
                         try:
-                            output = self._dispatch_tool(name, args)
+                            output = self._dispatch_tool(
+                                name,
+                                args,
+                                tool_call_id=str(tc.get("id", "") or ""),
+                            )
                         except Exception as exc:
                             output = f"Error: {exc}"
                     raw_output = str(output or "")
@@ -68576,6 +69937,8 @@ body{padding:18px}
                         "tool_result",
                         {
                             "name": name,
+                            "tool_call_id": str(tc.get("id", "") or ""),
+                            **self._tool_event_context(name, args, result_item),
                             "result": trim(output, 500),
                             "conversation_visible": canonicalize_tool_name(name) in CONVERSATION_VISIBLE_TOOL_EVENTS,
                             "summary": f"tool done: {name}",
@@ -69478,6 +70841,12 @@ body{padding:18px}
                     row["data"] = dict(msg.get("data") or {})
                 elif msg_type == "tool_calls" and tool_names:
                     row["data"] = {"tools": list(tool_names)}
+                    public_progress = str(text or "").strip()
+                    if public_progress and not public_progress.lower().startswith("[tool calls]"):
+                        row["data"]["public_progress"] = trim(
+                            public_progress,
+                            int(ASSISTANT_MESSAGE_EVENT_MAX_CHARS),
+                        )
                 elif isinstance(legacy_delegate_data, dict):
                     row["data"] = dict(legacy_delegate_data)
                 agent_role = raw_agent_role
@@ -69744,6 +71113,7 @@ body{padding:18px}
                 "bound_skill_ids": list(self.bound_skill_ids)[:ADMIN_MAX_APP_SKILLS],
                 "provider": self.ollama.provider,
                 "ui_language": self.ui_language,
+                "agent_language_preference": agent_language_preference_payload(self.ui_language),
                 "ollama_base_url": self.ollama.base_url,
                 "thinking": self.thinking,
                 "thinking_stream": bool(self.ollama.thinking_stream),
@@ -69914,6 +71284,9 @@ body{padding:18px}
             "model": str(getattr(getattr(self, "ollama", None), "model", "") or ""),
             "provider": str(getattr(getattr(self, "ollama", None), "provider", "") or ""),
             "ui_language": normalize_ui_language(getattr(self, "ui_language", DEFAULT_UI_LANGUAGE)),
+            "agent_language_preference": agent_language_preference_payload(
+                getattr(self, "ui_language", DEFAULT_UI_LANGUAGE)
+            ),
             "agent_phase": str(getattr(self, "current_phase", "busy") or "busy"),
             "agent_active_tool": str(getattr(self, "current_tool_name", "") or ""),
             "run_started_at": float(getattr(self, "run_started_at", 0.0) or 0.0),
@@ -71503,6 +72876,7 @@ window.MathJax={
     <select id="modelSelect"></select>
     <button id="applyModelBtn" class="subtle">Apply Model</button>
     <button id="llmConfigBtn" class="subtle">Fill LLM Config</button>
+    <button id="programBtn" class="subtle" type="button">Program</button>
     <input id="configInput" type="file" accept=".json,application/json" tabindex="-1" aria-hidden="true" style="position:absolute;left:-10000px;top:auto;width:1px;height:1px;opacity:0;pointer-events:none">
     <a id="downloadBtn" href="#">Open Skills Studio</a>
   </div>
@@ -73180,6 +74554,7 @@ function _deltaStartWatchdog(){
   S.deltaWatchdogTimer=setTimeout(tick,DELTA_WATCHDOG_INTERVAL_MS);
 }
 function renderSkillsEntryLink(){const link=E('downloadBtn');if(!link)return;const host=location.hostname||'127.0.0.1';const enabled=Boolean(S.config?.skills_ui_enabled);const fromConfig=String(S.config?.skills_ui_url||'').trim();const skillsPort=Number(S.config?.skills_port||0);let href='#';if(enabled){if(fromConfig){href=fromConfig}else if(Number.isFinite(skillsPort)&&skillsPort>0){const currentPort=Number(location.port||0);if(!(currentPort&&skillsPort===currentPort)){href=`${location.protocol}//${host}:${skillsPort}`}}}const offline=(href==='#');link.href=href;link.classList.toggle('disabled',offline);link.textContent=offline?t('skills_offline'):t('open_skills')}
+function openProgram(){const port=Number(S.config?.ide_port||0);if(!S.config?.ide_enabled||!Number.isFinite(port)||port<=0){showError('Program IDE is disabled.');return}location.href=`${location.protocol}//${location.hostname||'127.0.0.1'}:${port}/`}
 function tailSig(rows,count,mapper){const arr=Array.isArray(rows)?rows:[];if(!arr.length)return'';return arr.slice(Math.max(0,arr.length-count)).map(mapper).join('|')}
 function feedSignature(snap){const feed=Array.isArray(snap?.conversation_feed)?snap.conversation_feed:(Array.isArray(snap?.messages)?snap.messages:[]);const sig=tailSig(feed,8,row=>`${Number(row?.ts||0)}:${String(row?.role||'')}:${String(row?.agent_role||'')}:${String(row?.type||'')}:${String(row?.text||'').length}:${String(row?.thinking||'').length}:${String(row?.text||'').slice(-12)}:${String(row?.thinking||'').slice(-12)}`);const live=String(snap?.live_thinking||'');const liveResp=String(snap?.live_response_text||'');const liveRespId=String(snap?.live_response_stream_id||'');const liveRespActive=snap?.live_response_active?1:0;const runActive=snap?.live_run_notice_active?1:0;const runLabel=String(snap?.live_run_notice_label||'');const runStart=Number(snap?.live_run_notice_started_at||0);const truncText=String(snap?.live_truncation_text||'');const truncKind=String(snap?.live_truncation_kind||'');const truncTool=String(snap?.live_truncation_tool||'');const truncAttempts=Number(snap?.live_truncation_attempts||0);const truncTokens=Number(snap?.live_truncation_tokens||0);const truncActive=snap?.live_truncation_active?1:0;return `${feed.length}|${sig}|lt=${live.length}:${live.slice(-12)}|lr=${liveRespActive}:${liveRespId}:${liveResp.length}:${liveResp.slice(-12)}|rn=${runActive}:${runStart}:${runLabel.slice(-12)}|tr=${truncActive}:${truncAttempts}:${truncTokens}:${truncKind.slice(-12)}:${truncTool.slice(-12)}:${truncText.length}`}
 function boardsSignature(snap){const agentCtx=(Array.isArray(snap?.agent_contexts)?snap.agent_contexts:[]).map(r=>`${r.role}:${r.left}:${r.left_percent}:${r.tier}:${r.active?1:0}`).join(',');const scope=snap?.todo_task_scope||{};const todoRows=Array.isArray(snap?.todos)?snap.todos:[];const taskRows=Array.isArray(snap?.tasks)?snap.tasks:[];const todoSig=todoRows.map(row=>`${String(row?.key||row?.plan_step_id||'')}:${String(row?.status||'')}:${String(row?.content||'')}`).join('~');const taskSig=taskRows.map(row=>`${String(row?.subtask_id||row?.id||'')}:${String(row?.status||'')}:${String(row?.subject||'')}`).join('~');return [snap?.running?1:0,snap?.agent_phase||'',Number(snap?.agent_round_index||0),Number(snap?.queued_user_inputs_count||0),Number(snap?.truncation_count||0),Number(snap?.live_truncation_attempts||0),Number(snap?.live_truncation_tokens||0),snap?.live_truncation_active?1:0,Number(snap?.context_tokens_estimate||0),Number(snap?.context_left_tokens||0),Number(snap?.context_left_percent||0),agentCtx,Number(snap?.render_bridge?.seq||0),String(snap?.plan_mode_preference||'auto'),Number(snap?.user_task_level||0),String(scope.kind||'default'),String(scope.task_epoch||''),String(scope.plan_epoch||''),String(scope.parent_step_id||''),todoSig,taskSig,(snap?.activity||[]).length,(snap?.operations||[]).length,(snap?.uploads||[]).length].join('|')}
@@ -74715,14 +76090,14 @@ function _chatVirtParseWebSearchText(raw){
   const head=String(m[1]||'').trim();
   const rest=String(m[2]||'').trim();
   const out={tool:'agent_web_search',phase:'',mode:'',query:'',url:'',summary:'',result_count:0,page_count:0,evidence_records:0};
-  const headParts=head.split(/\s+/).filter(Boolean);
+  const headParts=head.split(/\\s+/).filter(Boolean);
   if(headParts.length){out.phase=headParts.shift()||'';out.mode=headParts.shift()||'';}
   for(const line of rest.split(/\\n/)){
     const s=String(line||'').trim();
     if(!s)continue;
-    let mm=s.match(/^(?:query|url)\s*:\s*(.*)$/i);
+    let mm=s.match(/^(?:query|url)\\s*:\\s*(.*)$/i);
     if(mm){out.query=String(mm[1]||'').trim();continue;}
-    mm=s.match(/results\s*:\s*(\d+)\s+pages\s*:\s*(\d+)\s+evidence\s*:\s*(\d+)/i);
+    mm=s.match(/results\\s*:\\s*(\\d+)\\s+pages\\s*:\\s*(\\d+)\\s+evidence\\s*:\\s*(\\d+)/i);
     if(mm){out.result_count=Number(mm[1]||0);out.page_count=Number(mm[2]||0);out.evidence_records=Number(mm[3]||0);continue;}
     out.summary+=(out.summary?'\\n':'')+s;
   }
@@ -75769,7 +77144,7 @@ function _chatVirtBuildMessageNode(m){
     if(isTodoBootstrap){
       const retry=runtimeHint.name.endsWith('-retry');
       const body=String(runtimeHint.body||'').trim();
-      const reasonMatch=retry?body.match(/did not complete:\s*([^.\\n]+)/i):null;
+      const reasonMatch=retry?body.match(/did not complete:\\s*([^.\\n]+)/i):null;
       const reason=reasonMatch?String(reasonMatch[1]||'').trim():'';
       const pills=[
         _chatVirtEventPillHtml(t('event_todo_bootstrap_perception'),'ok'),
@@ -76890,6 +78265,7 @@ async function refreshAll(forceProbe=false){
   if(S.activeId&&!String(sessState?.selectedId||'').trim())await refreshSnapshot({forceFull:!!forceProbe,allowWhenFrozen:true});
 }
 function bindClick(id,fn){const el=E(id);if(el)el.onclick=fn}
+window.addEventListener('DOMContentLoaded',()=>bindClick('programBtn',openProgram));
 window.addEventListener('DOMContentLoaded',async()=>{for(const id of ['chat','sessionList','todos','tasks','activity','commands','diffs','fileExplorer','catalog']){bindPanelScrollState(id,E(id))}const drop=E('promptComposerShell');const fileInput=E('uploadInput');const promptPick=E('promptFilePick');const promptEl=E('prompt');if(promptPick&&fileInput){promptPick.onclick=(ev)=>{ev.preventDefault();fileInput.click()}}if(drop&&fileInput){let _dragC=0;drop.setAttribute('tabindex','0');drop.addEventListener('click',e=>{if(e.target===drop&&promptEl)promptEl.focus()});fileInput.onchange=()=>uploadFiles(fileInput.files).then(()=>{fileInput.value=''}).catch(err=>showError(err.message));for(const evt of ['dragenter','dragover']){drop.addEventListener(evt,e=>{e.preventDefault();if(evt==='dragenter')_dragC++;drop.classList.add('dragover')})}for(const evt of ['dragleave','dragend']){drop.addEventListener(evt,e=>{e.preventDefault();if(evt==='dragleave')_dragC--;if(_dragC<=0){_dragC=0;drop.classList.remove('dragover')}})}drop.addEventListener('drop',e=>{e.preventDefault();_dragC=0;drop.classList.remove('dragover');const files=e.dataTransfer?.files;if(files&&files.length)uploadFiles(files).catch(err=>showError(err.message))});drop.addEventListener('paste',e=>{const files=clipboardFilesFromEvent(e);if(!files.length)return;e.preventDefault();drop.classList.add('dragover');setTimeout(()=>drop.classList.remove('dragover'),220);uploadFiles(files).catch(err=>showError(err.message||String(err)))})}const configInput=E('configInput');if(configInput){configInput.onchange=()=>uploadLlmConfigFile(configInput.files&&configInput.files[0]).then(()=>{configInput.value=''}).catch(err=>showError(err.message||String(err)))}bindClick('newSessionBtn',createSession);bindClick('renameSessionBtn',renameSession);bindClick('deleteSessionBtn',deleteSession);bindClick('applyModelBtn',applyModel);bindClick('llmConfigBtn',openLlmConfigModal);bindClick('llmModalClose',()=>{E('llmConfigModal').style.display='none'});bindClick('llmConfigConfirm',submitLlmConfig);const llmProv=E('llmProvider');if(llmProv){llmProv.addEventListener('change',()=>renderLlmFields(llmProv.value))}const llmOverlay=E('llmConfigModal');if(llmOverlay){llmOverlay.addEventListener('click',e=>{if(e.target===llmOverlay)llmOverlay.style.display='none'})}bindClick('sendBtn',sendMessage);bindClick('interruptBtn',interruptRun);bindClick('clearStaleTodosBtn',clearStaleTodos);bindClick('planModeBtn',togglePlanMode);bindClick('refreshFilesBtn',()=>refreshFileExplorer(true));bindClick('previewReloadBtn',()=>renderActivePreview(true));bindClick('previewCopyBtn',()=>copyPreviewCode());bindPopupButton('toolsMenuBtn','toolsMenu');bindClick('compactAction',(e)=>{if(e)e.preventDefault();closePopups();compactNow()});bindClick('refreshAction',(e)=>{if(e)e.preventDefault();closePopups();refreshAll(true)});bindPopupButton('levelBtn','levelMenu',(menu)=>{for(const opt of menu.querySelectorAll('.level-option')){opt.addEventListener('click',e=>{e.preventDefault();const lvl=parseInt(opt.getAttribute('data-level')||'0',10);setTaskLevel(lvl);setPopupOpen('levelMenu',false)})}});bindPopupButton('exportMenuBtn','exportMenu',(menu)=>{for(const a of menu.querySelectorAll('.export-item')){a.addEventListener('click',()=>setPopupOpen('exportMenu',false))}});document.addEventListener('click',()=>closePopups());const langSel=E('langSelect');if(langSel){langSel.onchange=()=>setLanguage(langSel.value).then(()=>applyApplicationI18n()).catch(err=>showError(err.message||String(err)))}if(promptEl){promptEl.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter'){e.preventDefault();sendMessage()}})}bindApplicationStore();applyUiStyle();applyStaticUiClass();applyMainI18n();applyApplicationI18n();_bindPreviewCopyGuard();try{await refreshAll(false);if(!S.sessions.length){const bootCreate=()=>createSession({prompt:false}).catch(err=>showError(err.message||String(err)));if(typeof requestAnimationFrame==='function'){requestAnimationFrame(()=>setTimeout(bootCreate,0))}else{setTimeout(bootCreate,0)}}}catch(err){showError(err.message||String(err))}_deltaStartWatchdog();scheduleSessionPoll(false);document.addEventListener('visibilitychange',()=>{const next=document.visibilityState||'visible';if(next===S.lastVisibilityState)return;S.lastVisibilityState=next;if(next==='hidden'){if(S.deltaWatchdogTimer){clearTimeout(S.deltaWatchdogTimer);S.deltaWatchdogTimer=null}if(S.sessionPollTimer){clearTimeout(S.sessionPollTimer);S.sessionPollTimer=null}if(S.staticMode)freezeAutoUpdates();return}if(S.staticMode&&S.frozen)resumeAutoUpdates();_deltaStartWatchdog();scheduleSessionPoll(true);scheduleSnapshot({forceFull:false,delayMs:40,allowWhenFrozen:true})})})
 window.addEventListener('DOMContentLoaded',()=>{bindClick('memoryModeAction',(e)=>{closePopups();toggleUserMemoryMode(e)});bindClick('memoryExportAction',(e)=>{closePopups();exportUserMemory(e)});bindClick('memoryClearAction',(e)=>{closePopups();clearUserMemory(e)});renderMemoryModeAction()});
 """
@@ -84044,7 +85420,7 @@ class CodeContentParser:
             "path": str(fp),
             "kind": "source_code",
             "mime": str(mime or guess_mime_from_name(fp.name, "text/plain")),
-            "size": int(fp.stat().st_size) if fp.exists() and fp.is_file() else len((raw_bytes or b"")),
+            "size": int(fp.stat().st_size) if fp.exists() and fp.is_file() else len(raw_bytes or b""),
             "sha256": _sha256_file(fp) if fp.exists() and fp.is_file() else _sha256_bytes((raw_text or "").encode("utf-8")),
             "language": language or "text",
             "text": raw_text,
@@ -92712,147 +94088,149 @@ IDE_INDEX_HTML = """<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Clouds Coder IDE</title>
+<link rel="stylesheet" href="/assets/js_lib/codicons/dist/codicon.css">
+<link rel="stylesheet" href="/assets/js_lib/xterm/css/xterm.css">
 <link rel="stylesheet" href="/assets/ide.css">
 </head>
 <body>
-<div class="ide-shell">
-  <aside class="activity-bar">
-    <button class="activity-button is-active" data-view="explorer" title="Explorer">EX</button>
-    <button class="activity-button" data-view="tools" title="Tools">TL</button>
-    <button class="activity-button" data-view="agent" title="Agent">AI</button>
-  </aside>
-  <aside class="side-panel">
-    <section class="panel-view is-active" data-panel="explorer">
-      <div class="panel-head">
-        <span>Explorer</span>
-        <div class="panel-actions">
-          <button id="refreshTreeBtn" title="Refresh">R</button>
-          <button id="newFileBtn" title="New file">F</button>
-          <button id="newFolderBtn" title="New folder">D</button>
-        </div>
-      </div>
-      <select id="sessionSelect" class="select"></select>
-      <select id="rootSelect" class="select"></select>
-      <div class="upload-row">
-        <button id="uploadFilesBtn">Files</button>
-        <button id="uploadFolderBtn">Folder</button>
-        <input id="fileInput" type="file" multiple hidden>
-        <input id="folderInput" type="file" multiple webkitdirectory directory hidden>
-      </div>
-      <div id="tree" class="tree"></div>
-    </section>
-    <section class="panel-view" data-panel="tools">
-      <div class="panel-head"><span>Toolchains</span><button id="refreshToolsBtn">R</button></div>
-      <div id="toolchains" class="toolchains"></div>
-      <div class="mount-box">
-        <label>Mount path</label>
-        <input id="mountPathInput" class="input" placeholder="/path/to/project">
-        <button id="mountBtn">Authorize</button>
-        <div id="mounts" class="mounts"></div>
-      </div>
-    </section>
-    <section class="panel-view" data-panel="agent">
-      <div class="panel-head"><span>Agent</span></div>
-      <textarea id="agentPrompt" class="agent-prompt" placeholder="Describe the coding task"></textarea>
-      <button id="sendAgentBtn" class="primary">Run agent task</button>
-      <div id="agentStatus" class="status-line"></div>
-    </section>
-  </aside>
-  <main class="workbench">
-    <header class="topbar">
-      <div class="brand">Clouds Coder IDE</div>
-      <div id="status" class="status-line">loading</div>
-      <button id="createSessionBtn">New session</button>
-    </header>
-    <div id="tabs" class="tabs"></div>
-    <section class="editor-wrap">
-      <div id="emptyState" class="empty-state">Open a file from Explorer</div>
-      <textarea id="editor" spellcheck="false"></textarea>
-    </section>
-    <section class="bottom-panel">
-      <div class="terminal-head">
-        <span>Terminal</span>
-        <input id="cwdInput" class="terminal-cwd" placeholder="cwd">
-      </div>
-      <div class="terminal-run">
-        <input id="commandInput" class="command-input" placeholder="python3 main.py">
-        <button id="runCommandBtn">Run</button>
-      </div>
-      <pre id="terminalOutput" class="terminal-output"></pre>
-    </section>
-  </main>
+<div id="authGate" class="auth-gate">
+  <section class="auth-dialog" aria-labelledby="authTitle">
+    <div class="auth-mark"><span class="codicon codicon-code"></span></div>
+    <h1 id="authTitle">Clouds Coder</h1>
+    <p id="authSubtitle">Sign in to Program</p>
+    <form id="authForm">
+      <label for="authUsername">Username</label>
+      <input id="authUsername" autocomplete="username" required>
+      <label for="authPassword">Password</label>
+      <input id="authPassword" type="password" autocomplete="current-password" required>
+      <label id="authConfirmLabel" for="authConfirm" hidden>Confirm password</label>
+      <input id="authConfirm" type="password" autocomplete="new-password" hidden>
+      <button id="authSubmit" class="button primary" type="submit">Sign in</button>
+    </form>
+    <div id="authMessage" class="auth-message" role="status"></div>
+  </section>
 </div>
+<div id="ideShell" class="ide-shell is-hidden">
+  <header class="title-bar">
+    <button id="mainMenuBtn" class="icon-button" title="Application menu" aria-label="Application menu"><span class="codicon codicon-menu"></span></button>
+    <div class="product-mark"><span class="codicon codicon-code"></span></div>
+    <nav id="menuBar" class="menu-bar" aria-label="Main menu">
+      <button data-menu="file">File</button><button data-menu="edit">Edit</button><button data-menu="selection">Selection</button><button data-menu="view">View</button><button data-menu="go">Go</button><button data-menu="run">Run</button><button data-menu="terminal">Terminal</button><button data-menu="help">Help</button>
+    </nav>
+    <button id="commandCenter" class="command-center"><span class="codicon codicon-search"></span><span id="commandCenterText">Clouds Coder Program</span></button>
+    <div class="layout-controls">
+      <button id="togglePrimaryBtn" class="icon-button" title="Toggle Primary Side Bar" aria-label="Toggle Primary Side Bar"><span class="codicon codicon-layout-sidebar-left"></span></button>
+      <button id="togglePanelBtn" class="icon-button" title="Toggle Panel" aria-label="Toggle Panel"><span class="codicon codicon-layout-panel"></span></button>
+      <button id="toggleSecondaryBtn" class="icon-button" title="Toggle Secondary Side Bar" aria-label="Toggle Secondary Side Bar"><span class="codicon codicon-layout-sidebar-right"></span></button>
+    </div>
+  </header>
+  <div class="workbench-grid">
+    <aside class="activity-bar" aria-label="Activity Bar">
+      <div class="activity-top">
+        <button class="activity-button is-active" data-view="explorer" title="Explorer" aria-label="Explorer"><span class="codicon codicon-files"></span></button>
+        <button class="activity-button" data-view="search" title="Search" aria-label="Search"><span class="codicon codicon-search"></span></button>
+        <button class="activity-button" data-view="scm" title="Source Control" aria-label="Source Control"><span class="codicon codicon-source-control"></span><b id="scmBadge" class="activity-badge"></b></button>
+        <button class="activity-button" data-view="run" title="Run and Debug" aria-label="Run and Debug"><span class="codicon codicon-debug-alt"></span></button>
+        <button class="activity-button" data-view="extensions" title="Extensions" aria-label="Extensions"><span class="codicon codicon-extensions"></span></button>
+        <button id="agentActivityBtn" class="activity-button" title="Clouds Coder Agent" aria-label="Clouds Coder Agent"><span class="codicon codicon-sparkle"></span></button>
+      </div>
+      <div class="activity-bottom">
+        <button id="accountsBtn" class="activity-button" title="Accounts" aria-label="Accounts"><span class="codicon codicon-account"></span></button>
+        <button id="manageBtn" class="activity-button" title="Manage" aria-label="Manage"><span class="codicon codicon-settings-gear"></span></button>
+      </div>
+    </aside>
+    <aside id="primarySidebar" class="primary-sidebar">
+      <section class="side-view is-active" data-side-view="explorer">
+        <header class="side-header"><span>Explorer</span><div class="header-actions">
+          <button id="newFileBtn" class="icon-button" title="New File"><span class="codicon codicon-new-file"></span></button>
+          <button id="newFolderBtn" class="icon-button" title="New Folder"><span class="codicon codicon-new-folder"></span></button>
+          <button id="refreshTreeBtn" class="icon-button" title="Refresh Explorer"><span class="codicon codicon-refresh"></span></button>
+          <button id="explorerMoreBtn" class="icon-button" title="More Actions"><span class="codicon codicon-ellipsis"></span></button>
+        </div></header>
+        <div class="workspace-pickers"><div class="session-picker-row"><select id="sessionSelect" title="Session"></select><button id="renameSessionBtn" class="icon-button" title="Rename Session" aria-label="Rename Session"><span class="codicon codicon-edit"></span></button></div><select id="rootSelect" title="Workspace Folder" aria-label="Workspace Folder"></select></div>
+        <div id="openEditors" class="open-editors"></div>
+        <div class="section-label"><span class="codicon codicon-chevron-down"></span><strong id="workspaceLabel">Workspace</strong></div>
+        <div id="tree" class="tree" role="tree"></div>
+        <input id="fileInput" type="file" multiple hidden><input id="folderInput" type="file" multiple webkitdirectory directory hidden>
+      </section>
+      <section class="side-view" data-side-view="search">
+        <header class="side-header"><span>Search</span><div class="header-actions"><button id="clearSearchBtn" class="icon-button" title="Clear Search Results"><span class="codicon codicon-clear-all"></span></button></div></header>
+        <div class="search-form"><div class="input-with-actions"><input id="searchInput" placeholder="Search"><button id="matchCaseBtn" class="mini-toggle" title="Match Case">Aa</button><button id="regexBtn" class="mini-toggle" title="Use Regular Expression">.*</button></div><input id="includeInput" placeholder="files to include"><input id="excludeInput" placeholder="files to exclude"></div>
+        <div id="searchSummary" class="side-summary"></div><div id="searchResults" class="side-list"></div>
+      </section>
+      <section class="side-view" data-side-view="scm">
+        <header class="side-header"><span>Source Control</span><div class="header-actions"><button id="refreshScmBtn" class="icon-button" title="Refresh"><span class="codicon codicon-refresh"></span></button></div></header>
+        <div id="scmBranch" class="scm-branch"></div><div id="scmChanges" class="side-list"></div>
+      </section>
+      <section class="side-view" data-side-view="run">
+        <header class="side-header"><span>Run and Debug</span><div class="header-actions"><button id="refreshTasksBtn" class="icon-button" title="Refresh Tasks"><span class="codicon codicon-refresh"></span></button></div></header>
+        <button id="runActiveBtn" class="button primary run-button"><span class="codicon codicon-play"></span> Run Active File</button>
+        <button id="debugActiveBtn" class="button run-button"><span class="codicon codicon-debug-alt"></span> Debug Active File</button>
+        <div class="section-label"><span class="codicon codicon-chevron-down"></span><strong>Tasks</strong></div><div id="taskList" class="side-list"></div>
+        <div class="section-label"><span class="codicon codicon-chevron-down"></span><strong>Toolchains</strong></div><div id="toolchains" class="toolchains"></div>
+      </section>
+      <section class="side-view" data-side-view="extensions">
+        <header class="side-header"><span>Extensions</span><div class="header-actions"><button id="refreshExtensionsBtn" class="icon-button" title="Refresh Installed Extensions"><span class="codicon codicon-refresh"></span></button></div></header>
+        <div class="extension-search"><input id="extensionSearchInput" placeholder="Search Open VSX"><button id="installVsixBtn" class="icon-button" title="Install from VSIX"><span class="codicon codicon-cloud-upload"></span></button><input id="vsixInput" type="file" accept=".vsix" hidden></div>
+        <div id="extensionSummary" class="side-summary"></div><div id="extensionList" class="side-list"></div>
+      </section>
+    </aside>
+    <main class="editor-area">
+      <div id="editorGrid" class="editor-grid">
+        <section class="editor-group is-active" data-group="0"><div id="tabs0" class="editor-tabs"></div><div id="breadcrumbs0" class="breadcrumbs"></div><div id="historyToolbar0" class="history-toolbar is-hidden"></div><div class="editor-host"><div id="editor0" class="monaco-host"></div><div id="diffEditor0" class="monaco-host history-diff-host is-hidden"></div><textarea id="fallbackEditor0" class="fallback-editor" spellcheck="false"></textarea><div id="artifactPreview0" class="artifact-preview is-hidden"></div><div id="emptyEditor0" class="empty-editor"><div class="empty-logo"><span class="codicon codicon-code"></span></div><div class="empty-actions"><button data-command="file.open">Open File</button><button data-command="workbench.action.quickOpen">Go to File</button><button data-command="workbench.action.showCommands">Command Palette</button></div></div></div></section>
+        <section class="editor-group" data-group="1"><div id="tabs1" class="editor-tabs"></div><div id="breadcrumbs1" class="breadcrumbs"></div><div id="historyToolbar1" class="history-toolbar is-hidden"></div><div class="editor-host"><div id="editor1" class="monaco-host"></div><div id="diffEditor1" class="monaco-host history-diff-host is-hidden"></div><textarea id="fallbackEditor1" class="fallback-editor" spellcheck="false"></textarea><div id="artifactPreview1" class="artifact-preview is-hidden"></div><div id="emptyEditor1" class="empty-editor">Drop an editor here</div></div></section>
+      </div>
+      <section id="panel" class="bottom-panel">
+        <header class="panel-header"><nav class="panel-tabs"><button data-panel-tab="problems">Problems <b id="problemCount">0</b></button><button data-panel-tab="output">Output</button><button class="is-active" data-panel-tab="terminal">Terminal</button><button data-panel-tab="debug">Debug Console</button></nav><div class="header-actions"><button id="newTerminalBtn" class="icon-button" title="New Terminal"><span class="codicon codicon-add"></span></button><button id="killTerminalBtn" class="icon-button" title="Kill Terminal"><span class="codicon codicon-trash"></span></button><button id="maximizePanelBtn" class="icon-button" title="Maximize Panel"><span class="codicon codicon-chevron-up"></span></button><button id="closePanelBtn" class="icon-button" title="Close Panel"><span class="codicon codicon-close"></span></button></div></header>
+        <div class="panel-body"><div id="problemsPanel" class="panel-content"><div id="problemsList" class="data-table"><div class="panel-empty">No problems detected.</div></div></div><div id="outputPanel" class="panel-content"><pre id="outputLog" data-empty="true">No output.</pre></div><div id="terminalPanel" class="panel-content is-active"><div id="terminalHost" class="terminal-host"></div><div id="terminalEmpty" class="panel-empty">Starting terminal...</div><pre id="terminalFallback" class="terminal-fallback" tabindex="0"></pre></div><div id="debugPanel" class="panel-content"><pre id="debugConsole" data-empty="true">No active debug session.</pre></div></div>
+      </section>
+    </main>
+    <aside id="secondarySidebar" class="secondary-sidebar">
+      <header class="side-header"><span>Clouds Coder</span><div class="header-actions"><button id="newAgentChatBtn" class="icon-button" title="New Task" aria-label="New Task"><span class="codicon codicon-add"></span></button><button id="closeSecondaryBtn" class="icon-button" title="Close"><span class="codicon codicon-close"></span></button></div></header>
+      <div id="agentContext" class="agent-context"></div>
+      <section id="agentTodoPanel" class="agent-todo is-hidden"><button id="agentTodoToggle" class="agent-todo-header" type="button" aria-expanded="true"><span class="codicon codicon-chevron-down"></span><strong>Progress</strong><span id="agentTodoCount" class="agent-todo-count"></span></button><div id="agentTodoBody" class="agent-todo-body"></div></section>
+      <div id="agentMessages" class="agent-messages"></div>
+      <div class="agent-composer"><section id="agentAskUser" class="agent-ask-user is-hidden" aria-live="polite"><div class="agent-ask-user-head"><span class="codicon codicon-question"></span><strong>Input required</strong><span id="agentAskUserRole"></span></div><div id="agentAskUserQuestion" class="agent-ask-user-question"></div><div id="agentAskUserOptions" class="agent-ask-user-options"></div><div id="agentAskUserHint" class="agent-ask-user-hint"></div></section><div id="agentAttachments" class="agent-attachments is-hidden"></div><textarea id="agentPrompt" rows="4" placeholder="Ask Clouds Coder"></textarea><input id="agentAttachmentInput" type="file" multiple hidden><div class="agent-actions"><button id="attachContextBtn" class="icon-button" title="Attach files"><span class="codicon codicon-attach"></span></button><button id="agentModelBtn" class="icon-button agent-model-button" title="Choose model"><span class="codicon codicon-hubot"></span><small id="agentContextPercent"></small></button><span id="agentStatus"></span><button id="sendAgentBtn" class="icon-button primary" title="Send"><span class="codicon codicon-send"></span></button></div></div>
+    </aside>
+  </div>
+  <footer class="status-bar"><div class="status-left"><button id="remoteStatus" title="Local window"><span class="codicon codicon-remote"></span></button><button id="gitStatus"><span class="codicon codicon-git-branch"></span><span id="statusBranch">-</span></button><button id="syncStatus"><span class="codicon codicon-sync"></span></button><button id="errorStatus"><span class="codicon codicon-error"></span><span id="errorCount">0</span><span class="codicon codicon-warning"></span><span id="warningCount">0</span></button></div><div id="statusMessage" class="status-message">Ready</div><div class="status-right"><button id="fileSizeStatus" title="File size">0 B</button><button id="languageStatus">Plain Text</button><button id="encodingStatus">UTF-8</button><button id="eolStatus">LF</button><button id="indentStatus">Spaces: 2</button><button id="accountStatus"><span class="codicon codicon-account"></span><span id="accountName"></span></button><button id="notificationsBtn" title="Notifications"><span class="codicon codicon-bell"></span></button></div></footer>
+</div>
+<div id="paletteOverlay" class="overlay is-hidden"><section class="palette"><div class="palette-input-row"><span class="codicon codicon-chevron-right"></span><input id="paletteInput" autocomplete="off" spellcheck="false"></div><div id="paletteResults" class="palette-results"></div></section></div>
+<div id="modalOverlay" class="overlay is-hidden"><section id="modal" class="modal" role="dialog"><header><h2 id="modalTitle"></h2><button id="modalClose" class="icon-button" title="Close"><span class="codicon codicon-close"></span></button></header><div id="modalBody"></div></section></div>
+<div id="menuPopup" class="menu-popup is-hidden"></div><div id="toastHost" class="toast-host"></div>
+<script src="/assets/js_lib/marked.min.js"></script>
 <script src="/assets/ide.js"></script>
 </body>
 </html>
 """
 
 IDE_CSS = """
-:root{
-  --bg:#111315;
-  --panel:#181b1f;
-  --panel-2:#1f242a;
-  --line:#30363d;
-  --ink:#e7edf3;
-  --muted:#9aa5b1;
-  --accent:#4aa8ff;
-  --accent-2:#55d6a9;
-  --danger:#ff6b6b;
-}
+.artifact-text{justify-self:stretch;align-self:stretch;box-sizing:border-box;margin:0;overflow:auto;padding:18px 22px;background:#1f1f1f;color:#d4d4d4;white-space:pre-wrap;overflow-wrap:anywhere;font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}.artifact-binary small{max-width:min(560px,calc(100% - 30px));overflow-wrap:anywhere}.artifact-loading{display:grid;gap:8px;place-items:center;color:#aaa}.artifact-loading .codicon{font-size:28px}.artifact-preview-error{display:grid;gap:10px;place-items:center;max-width:min(620px,calc(100% - 32px));padding:20px;text-align:center;color:#ccc}.artifact-preview-error .codicon{font-size:42px;color:var(--warning)}
+.session-picker-row{display:grid;grid-template-columns:minmax(0,1fr) 26px;gap:2px}.session-picker-row .icon-button{width:26px;height:25px}.editor-group{grid-template-rows:35px 22px auto minmax(0,1fr)!important}.editor-group>.editor-host{grid-row:4}.history-toolbar{height:30px;display:flex;align-items:center;gap:5px;padding:2px 8px;border-top:1px solid #242424;border-bottom:1px solid var(--line);background:#191919;color:#aaa}.history-toolbar select{height:24px;max-width:180px}.history-toolbar .history-stage{margin-left:auto;max-width:220px}.history-toolbar .button{min-height:24px;height:24px;padding:1px 8px;font-size:11px}.history-modes{display:flex;align-items:center}.history-modes button{height:24px;padding:0 8px;border:1px solid #3b3b3b;border-right:0;background:#252526;color:#aaa;font-size:11px;cursor:pointer}.history-modes button:first-child{border-radius:3px 0 0 3px}.history-modes button:last-child{border-right:1px solid #3b3b3b;border-radius:0 3px 3px 0}.history-modes button.is-active{background:#094771;color:#fff;border-color:#0e639c}.history-stats{color:#858585;font-size:10px;white-space:nowrap}.history-diff-host{z-index:3}.history-added-line{background:rgba(46,160,67,.16)}.history-added-glyph{border-left:3px solid rgba(86,211,100,.78);margin-left:2px}.history-diff-host .inline-deleted-margin-view-zone{box-sizing:border-box;background:transparent!important;border-left:3px solid rgba(248,81,73,.78);margin-left:2px;pointer-events:none!important}.history-diff-host .monaco-editor .line-delete-selectable,.history-diff-host .monaco-editor .line-delete-selectable *{user-select:none!important;-webkit-user-select:none!important;pointer-events:none!important;cursor:default!important}.monaco-diff-editor .line-delete,.monaco-diff-editor .char-delete{background-color:rgba(248,81,73,.14)!important}.monaco-diff-editor .line-insert,.monaco-diff-editor .char-insert{background-color:rgba(46,160,67,.16)!important}
+:root{--title:#181818;--activity:#181818;--sidebar:#181818;--editor:#1f1f1f;--tabs:#181818;--panel:#181818;--status:#007acc;--status-hover:#1f8ad2;--line:#2b2b2b;--line-light:#3a3a3a;--input:#313131;--hover:#2a2d2e;--selection:#04395e;--selection-soft:#37373d;--ink:#cccccc;--bright:#f0f0f0;--muted:#969696;--faint:#6a6a6a;--accent:#0078d4;--focus:#007fd4;--danger:#f14c4c;--warning:#cca700;--success:#89d185;--activity-width:48px;--sidebar-width:288px;--secondary-width:320px;--title-height:35px;--status-height:22px;--panel-height:230px}
 *{box-sizing:border-box}
-html,body{height:100%;margin:0;background:var(--bg);color:var(--ink);font-family:Inter,Segoe UI,Arial,sans-serif;font-size:13px;letter-spacing:0}
-button,input,select,textarea{font:inherit}
-button{border:1px solid var(--line);background:var(--panel-2);color:var(--ink);border-radius:4px;padding:6px 9px;cursor:pointer}
-button:hover{border-color:#52606c;background:#252b32}
-button.primary{background:#0f5fa8;border-color:#1674c8}
-.ide-shell{height:100vh;display:grid;grid-template-columns:44px minmax(230px,320px) 1fr;overflow:hidden}
-.activity-bar{background:#0d0f11;border-right:1px solid var(--line);display:flex;flex-direction:column;align-items:center;padding:8px 4px;gap:8px}
-.activity-button{width:32px;height:32px;padding:0;border-radius:6px;font-size:11px;color:var(--muted)}
-.activity-button.is-active{color:#fff;background:#173a59;border-color:#28679a}
-.side-panel{background:var(--panel);border-right:1px solid var(--line);min-width:0;overflow:hidden}
-.panel-view{height:100%;display:none;grid-template-rows:auto auto auto 1fr;gap:8px;padding:10px;min-width:0}
-.panel-view.is-active{display:grid}
-.panel-head{display:flex;align-items:center;justify-content:space-between;gap:8px;text-transform:uppercase;color:#cbd5df;font-size:12px;font-weight:700}
-.panel-actions{display:flex;gap:5px}
-.select,.input{width:100%;min-width:0;background:#101316;color:var(--ink);border:1px solid var(--line);border-radius:4px;padding:7px}
-.upload-row{display:grid;grid-template-columns:1fr 1fr;gap:6px}
-.tree{overflow:auto;min-height:0;border-top:1px solid var(--line);padding-top:8px}
-.tree-row{display:grid;grid-template-columns:18px 1fr auto;align-items:center;gap:4px;min-height:24px;padding:1px 4px;border-radius:4px;white-space:nowrap}
-.tree-row:hover{background:#242a31}
-.tree-row.is-active{background:#123454}
-.tree-name{overflow:hidden;text-overflow:ellipsis}
-.tree-meta{color:var(--muted);font-size:11px}
-.tree-twist{width:18px;height:18px;padding:0;border:none;background:transparent;color:var(--muted)}
-.toolchains,.mounts{display:flex;flex-direction:column;gap:7px;overflow:auto}
-.tool-row,.mount-row{border:1px solid var(--line);background:#12161a;border-radius:6px;padding:8px}
-.tool-row strong{color:#d8e4ef}
-.tool-row span,.mount-row span{display:block;color:var(--muted);font-size:12px;margin-top:3px;overflow:hidden;text-overflow:ellipsis}
-.mount-box{display:grid;gap:7px;align-content:start}
-.workbench{min-width:0;display:grid;grid-template-rows:42px 34px minmax(0,1fr) minmax(120px,25vh);height:100vh}
-.topbar{display:flex;align-items:center;gap:10px;padding:0 12px;background:#15181c;border-bottom:1px solid var(--line)}
-.brand{font-weight:700;white-space:nowrap}
-.status-line{color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:1}
-.tabs{display:flex;align-items:end;overflow-x:auto;background:#171a1f;border-bottom:1px solid var(--line)}
-.tab{display:flex;align-items:center;gap:8px;max-width:260px;min-width:120px;height:33px;padding:0 9px;border-right:1px solid var(--line);background:#1b2026;color:#b9c4cf}
-.tab.is-active{background:#222832;color:#fff}
-.tab span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.tab button{border:none;background:transparent;padding:0;color:var(--muted)}
-.editor-wrap{position:relative;min-height:0;background:#101316}
-#editor{display:none;width:100%;height:100%;resize:none;border:0;outline:0;background:#101316;color:#dce6f0;padding:14px;font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;tab-size:2}
-#editor.is-visible{display:block}
-.empty-state{position:absolute;inset:0;display:grid;place-items:center;color:#6f7b86}
-.empty-state.is-hidden{display:none}
-.bottom-panel{min-height:0;display:grid;grid-template-rows:32px 36px 1fr;background:#14171b;border-top:1px solid var(--line)}
-.terminal-head,.terminal-run{display:flex;align-items:center;gap:8px;padding:5px 9px;border-bottom:1px solid var(--line)}
-.terminal-cwd{width:220px;background:#0e1114;color:var(--ink);border:1px solid var(--line);border-radius:4px;padding:5px}
-.command-input{flex:1;min-width:0;background:#0e1114;color:var(--ink);border:1px solid var(--line);border-radius:4px;padding:6px}
-.terminal-output{margin:0;padding:10px;overflow:auto;white-space:pre-wrap;color:#d7dee6;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
-.agent-prompt{width:100%;min-height:170px;resize:vertical;background:#101316;color:var(--ink);border:1px solid var(--line);border-radius:6px;padding:8px}
-@media (max-width:860px){
-  .ide-shell{grid-template-columns:40px minmax(190px,42vw) 1fr}
-  .workbench{grid-template-rows:42px 34px minmax(0,1fr) 180px}
-  .terminal-cwd{width:120px}
-}
+html,body{width:100%;height:100%;margin:0;overflow:hidden;background:var(--editor);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:13px;letter-spacing:0}
+button,input,select,textarea{font:inherit;letter-spacing:0}
+button{color:inherit}.is-hidden{display:none!important}
+.icon-button{display:inline-grid;place-items:center;width:28px;height:28px;padding:0;border:0;background:transparent;color:var(--ink);border-radius:4px;cursor:pointer}.icon-button:hover{background:var(--hover);color:var(--bright)}.icon-button.primary{background:var(--accent);color:white}.icon-button:disabled{opacity:.4;cursor:default}
+.button{display:inline-flex;align-items:center;justify-content:center;gap:7px;min-height:28px;padding:4px 12px;border:1px solid transparent;border-radius:2px;background:#3a3d41;color:var(--bright);cursor:pointer}.button:hover{background:#45494e}.button.primary{background:var(--accent);color:#fff}.button.primary:hover{background:#026ec1}.button:disabled{opacity:.45;cursor:not-allowed}
+input,select,textarea{border:1px solid transparent;border-radius:2px;background:var(--input);color:var(--bright);outline:none}input:focus,select:focus,textarea:focus{border-color:var(--focus)}input::placeholder,textarea::placeholder{color:#a0a0a0}select{height:25px;padding:0 6px}
+.auth-gate{position:fixed;inset:0;z-index:1000;display:grid;place-items:center;background:#181818}.auth-dialog{width:min(360px,calc(100vw - 32px));padding:36px 34px 32px;border:1px solid var(--line-light);background:#202020;box-shadow:0 18px 58px rgba(0,0,0,.42)}.auth-mark{display:grid;place-items:center;width:44px;height:44px;margin:0 auto 16px;background:#007acc;color:white}.auth-mark .codicon{font-size:28px}.auth-dialog h1{margin:0;text-align:center;color:var(--bright);font-size:22px;font-weight:500}.auth-dialog p{margin:7px 0 24px;text-align:center;color:var(--muted)}.auth-dialog form{display:grid;gap:7px}.auth-dialog label{margin-top:5px;font-size:12px}.auth-dialog input{height:32px;padding:5px 8px}.auth-dialog .button{margin-top:12px;height:32px}.auth-message{min-height:18px;margin-top:14px;color:var(--danger);font-size:12px;line-height:1.45}
+.ide-shell{height:100vh;display:grid;grid-template-rows:var(--title-height) minmax(0,1fr) var(--status-height);overflow:hidden}.title-bar{display:grid;grid-template-columns:30px 26px auto minmax(220px,560px) 1fr;align-items:center;gap:2px;padding:0 7px;background:var(--title);border-bottom:1px solid #151515;user-select:none}.product-mark{display:grid;place-items:center;color:#23a8f2}.product-mark .codicon{font-size:20px}.menu-bar{display:flex;align-items:center;gap:0;min-width:0}.menu-bar button{height:27px;padding:0 7px;border:0;border-radius:4px;background:transparent;color:var(--ink);cursor:pointer}.menu-bar button:hover{background:var(--hover)}.command-center{justify-self:center;width:min(100%,460px);height:25px;display:flex;align-items:center;justify-content:center;gap:7px;border:1px solid #3c3c3c;border-radius:5px;background:#242424;color:#d4d4d4;cursor:pointer;box-shadow:inset 0 0 0 1px rgba(255,255,255,.02)}.command-center:hover{background:#2a2a2a;border-color:#555}.layout-controls{justify-self:end;display:flex;align-items:center;gap:1px}
+.workbench-grid{min-height:0;display:grid;grid-template-columns:var(--activity-width) var(--sidebar-width) minmax(260px,1fr) var(--secondary-width);background:var(--editor)}.ide-shell.primary-hidden .workbench-grid{grid-template-columns:var(--activity-width) 0 minmax(260px,1fr) var(--secondary-width)}.ide-shell.secondary-hidden .workbench-grid{grid-template-columns:var(--activity-width) var(--sidebar-width) minmax(260px,1fr) 0}.ide-shell.primary-hidden.secondary-hidden .workbench-grid{grid-template-columns:var(--activity-width) 0 minmax(260px,1fr) 0}
+.activity-bar{min-width:0;display:flex;flex-direction:column;justify-content:space-between;background:var(--activity);border-right:1px solid var(--line);user-select:none}.activity-top,.activity-bottom{display:flex;flex-direction:column;align-items:stretch}.activity-button{position:relative;display:grid;place-items:center;width:47px;height:48px;padding:0;border:0;border-left:2px solid transparent;background:transparent;color:#858585;cursor:pointer}.activity-button .codicon{font-size:24px}.activity-button:hover{color:#d7d7d7}.activity-button.is-active{border-left-color:#fff;color:#fff}.activity-badge{position:absolute;right:5px;bottom:4px;min-width:16px;height:16px;padding:0 4px;border-radius:8px;background:#007acc;color:#fff;font:10px/16px sans-serif;text-align:center}.activity-badge:empty{display:none}
+.primary-sidebar,.secondary-sidebar{min-width:0;overflow:hidden;background:var(--sidebar);border-right:1px solid var(--line)}.secondary-sidebar{height:100%;min-height:0;border-right:0;border-left:1px solid var(--line);display:grid;grid-template-areas:"agent-header" "agent-context" "agent-todo" "agent-messages" "agent-composer";grid-template-rows:35px auto auto minmax(0,1fr) auto}.secondary-sidebar>.side-header{grid-area:agent-header}.secondary-sidebar>.agent-context{grid-area:agent-context}.secondary-sidebar>.agent-todo{grid-area:agent-todo}.secondary-sidebar>.agent-messages{grid-area:agent-messages}.secondary-sidebar>.agent-composer{grid-area:agent-composer}.primary-hidden .primary-sidebar,.secondary-hidden .secondary-sidebar{visibility:hidden}.side-view{height:100%;min-height:0;display:none;grid-template-rows:35px auto auto minmax(0,1fr);overflow:hidden}.side-view.is-active{display:grid}.side-view[data-side-view="explorer"]{grid-template-rows:35px auto auto 22px minmax(0,1fr)}.side-view[data-side-view="search"],.side-view[data-side-view="extensions"]{grid-template-rows:35px auto auto minmax(0,1fr)}.side-view[data-side-view="scm"]{grid-template-rows:35px auto minmax(0,1fr)}.side-view[data-side-view="run"]{grid-template-rows:35px auto auto 22px minmax(0,1fr) 22px minmax(0,1fr)}.side-header{height:35px;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:0 8px 0 19px;color:#bbbbbb;text-transform:uppercase;font-size:11px;white-space:nowrap}.header-actions{display:flex;align-items:center;gap:0}.side-header .icon-button{width:24px;height:24px}.workspace-pickers{display:grid;grid-template-columns:minmax(0,1fr);gap:3px;padding:0 8px 7px}.workspace-pickers select{width:100%}.open-editors{max-height:132px;overflow:auto}.section-label{display:flex;align-items:center;gap:3px;height:22px;padding:0 5px;border-top:1px solid var(--line);color:#d4d4d4;text-transform:uppercase;font-size:11px}.section-label strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.section-label .codicon{font-size:14px}
+.tree,.side-list{min-height:0;overflow:auto;padding-bottom:12px}.tree-row,.list-row{height:22px;display:flex;align-items:center;gap:5px;padding-right:6px;white-space:nowrap;cursor:default}.tree-row:hover,.list-row:hover{background:var(--hover)}.tree-row.is-active,.list-row.is-active{background:var(--selection)}.tree-twist{flex:0 0 16px;width:16px;height:20px;padding:0;border:0;background:transparent;color:#c5c5c5}.tree-icon{flex:0 0 16px;width:16px;text-align:center;color:#b9b9b9}.tree-icon.folder{color:#dcb67a}.tree-icon.python{color:#4b8bbe}.tree-icon.javascript{color:#f0db4f}.tree-icon.json{color:#e6ca57}.tree-icon.markdown{color:#519aba}.tree-name,.list-main{min-width:0;overflow:hidden;text-overflow:ellipsis}.tree-meta,.list-meta{margin-left:auto;color:var(--muted);font-size:11px}.open-editor-row{height:22px;display:flex;align-items:center;gap:5px;padding:0 8px 0 20px}.open-editor-row:hover{background:var(--hover)}.open-editor-row.is-active{background:var(--selection)}.open-editor-row span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dirty-mark{color:#fff}
+.search-form{display:grid;gap:5px;padding:0 8px 8px}.search-form>input,.extension-search input{width:100%;height:27px;padding:3px 6px}.input-with-actions{display:grid;grid-template-columns:minmax(0,1fr) 28px 28px;border:1px solid transparent;background:var(--input)}.input-with-actions:focus-within{border-color:var(--focus)}.input-with-actions input{min-width:0;height:27px;padding:3px 6px;border:0;background:transparent}.mini-toggle{height:25px;padding:0 4px;border:0;background:transparent;color:var(--ink);font-size:11px;cursor:pointer}.mini-toggle:hover,.mini-toggle.is-active{background:#4b4b4b;color:white}.side-summary{min-height:22px;padding:3px 12px;color:var(--muted);font-size:11px}.result-group{padding:4px 8px;font-weight:600;color:#d4d4d4}.result-line{min-height:23px;padding:3px 8px 3px 22px;white-space:normal}.result-line code{color:#d7d7d7}.result-location{color:#75beff;font-size:11px}.scm-branch{padding:4px 12px 8px;color:#d4d4d4}.scm-row .scm-code{margin-left:auto;font-weight:600}.scm-code.modified{color:#e2c08d}.scm-code.untracked{color:#73c991}.scm-code.deleted{color:#f48771}.run-button{margin:0 10px 7px}.toolchains{overflow:auto}.tool-row{padding:6px 10px;border-bottom:1px solid #242424}.tool-row strong{font-weight:400;color:#d4d4d4}.tool-row span{display:block;margin-top:2px;color:var(--muted);font-size:11px;white-space:normal}.tool-state{float:right;color:var(--success)}.tool-state.missing{color:var(--faint)}.extension-search{display:grid;grid-template-columns:minmax(0,1fr) 28px;gap:4px;padding:0 8px 8px}.extension-row{min-height:72px;display:grid;grid-template-columns:42px minmax(0,1fr) auto;gap:8px;padding:8px}.extension-icon{display:grid;place-items:center;width:42px;height:42px;background:#292929;color:#75beff}.extension-icon .codicon{font-size:24px}.extension-info{min-width:0}.extension-title{color:#ddd;font-weight:600;overflow:hidden;text-overflow:ellipsis}.extension-description{margin-top:3px;color:#aaa;font-size:11px;line-height:1.35;white-space:normal}.extension-meta{margin-top:4px;color:#858585;font-size:10px}.extension-row .button{align-self:start;min-height:24px;padding:2px 8px;font-size:11px}
+.editor-area{min-width:0;min-height:0;display:grid;grid-template-rows:minmax(120px,1fr) var(--panel-height);overflow:hidden;background:var(--editor)}.panel-hidden .editor-area{grid-template-rows:minmax(120px,1fr) 0}.panel-maximized .editor-area{grid-template-rows:80px minmax(0,1fr)}.editor-grid{min-width:0;min-height:0;display:grid;grid-template-columns:minmax(0,1fr);overflow:hidden}.editor-grid.split{grid-template-columns:minmax(180px,1fr) minmax(180px,1fr)}.editor-group{min-width:0;min-height:0;display:none;grid-template-rows:35px 22px minmax(0,1fr);border-right:1px solid var(--line);background:var(--editor)}.editor-group.is-active,.editor-grid.split .editor-group{display:grid}.editor-tabs{display:flex;min-width:0;overflow-x:auto;overflow-y:hidden;background:var(--tabs);border-bottom:1px solid var(--line)}.editor-tab{position:relative;flex:0 0 auto;min-width:120px;max-width:220px;height:34px;display:flex;align-items:center;gap:7px;padding:0 7px 0 10px;border-right:1px solid var(--line);background:#181818;color:#969696;cursor:default}.editor-tab.is-active{background:var(--editor);color:#fff}.editor-tab.is-active:before{content:"";position:absolute;left:0;right:0;top:0;height:1px;background:#75beff}.editor-tab-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.editor-tab .close-tab{margin-left:auto;flex:0 0 20px;width:20px;height:20px}.editor-tab:not(:hover):not(.is-active) .close-tab{visibility:hidden}.breadcrumbs{height:22px;display:flex;align-items:center;gap:2px;padding:0 9px;color:#aaa;white-space:nowrap;overflow:hidden}.breadcrumb-item{display:flex;align-items:center;gap:3px;min-width:0}.breadcrumb-item span{overflow:hidden;text-overflow:ellipsis}.breadcrumb-action{flex:0 0 22px;width:22px;height:20px;margin-left:auto;border:0;background:transparent;color:#aaa;cursor:pointer}.breadcrumb-action:hover{background:var(--hover);color:#fff}.editor-host{position:relative;min-width:0;min-height:0;overflow:hidden;background:var(--editor)}.monaco-host{position:absolute;inset:0}.fallback-editor{display:none;position:absolute;inset:0;width:100%;height:100%;resize:none;padding:10px 12px;border:0;background:var(--editor);color:#d4d4d4;font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;tab-size:2}.fallback-mode .fallback-editor.is-active{display:block}.empty-editor{position:absolute;inset:0;display:grid;place-content:center;gap:26px;color:#8a8a8a;text-align:center;background:var(--editor)}.empty-editor.is-hidden{display:none}.empty-logo .codicon{font-size:96px;color:#2b2b2b}.empty-actions{display:grid;grid-template-columns:auto auto;gap:9px 28px;text-align:left}.empty-actions button{border:0;background:transparent;color:#75beff;text-align:left;cursor:pointer}.empty-actions button:hover{text-decoration:underline}.artifact-preview{position:absolute;inset:0;z-index:5;display:grid;grid-template-rows:32px minmax(0,1fr);background:#181818}.artifact-toolbar{display:flex;align-items:center;gap:4px;padding:0 7px;border-bottom:1px solid var(--line);background:#1d1d1d}.artifact-toolbar strong{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:400}.artifact-toolbar .artifact-meta{margin-left:4px;color:var(--muted);font-size:11px}.artifact-toolbar .icon-button:first-of-type{margin-left:auto}.artifact-stage{min-width:0;min-height:0;overflow:auto;display:grid;place-items:center;background:#202020}.artifact-stage iframe{width:100%;height:100%;border:0;background:#fff}.artifact-stage img{display:block;width:100%;height:100%;min-width:0;min-height:0;object-fit:contain}.artifact-stage video{width:min(100%,1100px);max-height:100%;background:#000}.artifact-stage audio{width:min(680px,calc(100% - 32px))}.artifact-markdown{justify-self:stretch;align-self:stretch;overflow:auto;padding:28px max(24px,8%);background:#1f1f1f;color:#d4d4d4;font:14px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.artifact-markdown h1,.artifact-markdown h2,.artifact-markdown h3{color:#f0f0f0;font-weight:500}.artifact-markdown pre,.artifact-markdown code{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}.artifact-markdown pre{overflow:auto;padding:12px;background:#181818}.artifact-markdown img{max-width:100%;height:auto}.artifact-markdown a{color:#75beff}.artifact-binary{display:grid;gap:10px;place-items:center;text-align:center;color:#bbb}.artifact-binary .codicon{font-size:56px;color:#777}.artifact-binary small{color:var(--muted)}
+.bottom-panel{min-width:0;min-height:0;display:grid;grid-template-rows:35px minmax(0,1fr);border-top:1px solid var(--line);background:var(--panel);overflow:hidden}.panel-hidden .bottom-panel{visibility:hidden}.panel-header{display:flex;align-items:center;justify-content:space-between;padding:0 7px 0 12px}.panel-tabs{display:flex;align-items:stretch;height:100%;gap:20px}.panel-tabs button{position:relative;padding:0 0;border:0;background:transparent;color:#a7a7a7;text-transform:uppercase;font-size:11px;cursor:pointer}.panel-tabs button:hover{color:#fff}.panel-tabs button.is-active{color:#fff}.panel-tabs button.is-active:after{content:"";position:absolute;left:0;right:0;bottom:4px;height:1px;background:#e7e7e7}.panel-tabs b{font-weight:400;color:#aaa}.panel-body{min-width:0;min-height:0;overflow:hidden}.panel-content{position:relative;display:none;width:100%;height:100%;overflow:auto}.panel-content.is-active{display:block}.panel-content pre{height:100%;margin:0;padding:7px 12px;overflow:auto;color:#ccc;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;white-space:pre-wrap}.panel-content pre[data-empty="true"]{display:grid;place-items:center;color:var(--muted);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.panel-empty{display:grid;min-height:100%;place-items:center;padding:16px;color:var(--muted);text-align:center}.terminal-host{width:100%;height:100%;padding:4px 8px}.terminal-host:not(:empty)+.panel-empty{display:none}.terminal-fallback{display:none!important}.terminal-fallback.is-active{display:block!important}.data-table{height:100%;font-size:12px}.problem-row{min-height:23px;display:grid;grid-template-columns:18px minmax(0,1fr) auto;align-items:center;gap:5px;padding:2px 10px}.problem-row:hover{background:var(--hover)}.problem-row.error .codicon{color:var(--danger)}.problem-row.warning .codicon{color:var(--warning)}
+.agent-context{min-height:30px;max-height:54px;padding:5px 9px;border-bottom:1px solid var(--line);color:#aaa;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.agent-todo{min-width:0;max-height:min(190px,28vh);overflow:hidden;border-bottom:1px solid var(--line);background:#1b1b1b}.agent-todo-header{width:100%;height:28px;display:flex;align-items:center;gap:5px;padding:0 8px;border:0;background:#202020;color:#ccc;cursor:pointer;text-align:left}.agent-todo-header:hover{background:var(--hover)}.agent-todo-header strong{font-size:11px;font-weight:600}.agent-todo-count{margin-left:auto;color:#858585;font-size:10px}.agent-todo.is-collapsed .agent-todo-header .codicon{transform:rotate(-90deg)}.agent-todo.is-collapsed .agent-todo-body{display:none}.agent-todo-body{max-height:min(160px,calc(28vh - 28px));overflow:auto;padding:5px 8px 7px}.agent-progress-row{display:grid;grid-template-columns:14px minmax(0,1fr);gap:4px;padding:2px 0;color:#aaa;font-size:11px;line-height:1.35}.agent-progress-row.done{color:#89d185}.agent-progress-row.active{color:#75beff}.agent-messages{min-height:0;overflow:auto;overscroll-behavior:contain;padding:10px}.agent-message{margin:0 0 14px;line-height:1.5;white-space:pre-wrap}.agent-message.user{padding:8px 9px;background:#282828;border-left:2px solid #3794ff}.agent-message.system{color:#aaa}.agent-message.error{color:#f48771}.agent-composer{min-height:0;max-height:min(420px,52vh);overflow:auto;padding:8px;border-top:1px solid var(--line);background:var(--sidebar)}.agent-composer textarea{display:block;width:100%;height:72px;min-height:58px;max-height:72px;resize:none;padding:7px}.agent-ask-user{margin:0 0 8px;padding:9px;border:1px solid #66501f;border-left:2px solid #d7ba7d;background:#252319;color:#ddd}.agent-ask-user-head{display:flex;align-items:center;gap:6px;margin-bottom:6px;color:#d7ba7d;font-size:11px}.agent-ask-user-head span:last-child{margin-left:auto;color:#aaa}.agent-ask-user-question{font-size:12px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere}.agent-ask-user-options{display:grid;gap:5px;margin-top:8px}.agent-ask-user-option{width:100%;min-height:29px;padding:5px 8px;border:1px solid #555;background:#2d2d2d;color:#ddd;text-align:left;cursor:pointer}.agent-ask-user-option:hover{border-color:#d7ba7d;background:#343126}.agent-ask-user-option:disabled{opacity:.55;cursor:default}.agent-ask-user-hint{margin-top:7px;color:#aaa;font-size:10px}.agent-actions{height:31px;display:flex;align-items:center;gap:4px}.agent-actions #agentStatus{min-width:0;margin-right:auto;color:#aaa;font-size:11px;overflow:hidden;text-overflow:ellipsis}.agent-actions .primary{width:27px;height:27px}.agent-model-button{position:relative}.agent-model-button small{position:absolute;right:-1px;bottom:-2px;min-width:17px;padding:0 2px;border-radius:5px;background:#04395e;color:#9cdcfe;font:8px/10px sans-serif}.agent-model-button small:empty{display:none}.agent-attachments{display:flex;gap:4px;max-height:29px;overflow-x:auto;overflow-y:hidden;padding:0 0 6px}.agent-attachment{flex:0 0 auto;max-width:220px;height:23px;display:flex;align-items:center;gap:4px;padding:0 3px 0 7px;border:1px solid #3a3a3a;background:#252526;color:#ccc;font-size:10px}.agent-attachment span:nth-child(2){max-width:155px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.agent-attachment button{width:18px;height:18px}
+.agent-message.assistant{padding-left:9px;border-left:2px solid #89d185;color:#ddd;white-space:normal}.agent-message.approach{padding:7px 9px;border:1px solid #353535;border-left:2px solid #4ec9b0;background:#202524;color:#d5e8e4;white-space:normal}.agent-approach-head{display:flex;align-items:center;gap:6px;margin-bottom:4px;color:#4ec9b0;font:600 10px/1.3 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;text-transform:uppercase}.agent-approach-body{font:12px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;overflow-wrap:anywhere}.agent-markdown{min-width:0;overflow-wrap:anywhere}.agent-markdown>:first-child{margin-top:0}.agent-markdown>:last-child{margin-bottom:0}.agent-markdown h1,.agent-markdown h2,.agent-markdown h3{margin:10px 0 5px;color:#eee;font-weight:600;letter-spacing:0}.agent-markdown h1{font-size:15px}.agent-markdown h2{font-size:14px}.agent-markdown h3{font-size:13px}.agent-markdown p{margin:5px 0}.agent-markdown ul,.agent-markdown ol{margin:5px 0;padding-left:20px}.agent-markdown li{margin:2px 0}.agent-markdown code{padding:1px 3px;background:#292929;color:#d7ba7d;font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}.agent-markdown pre{max-height:360px;margin:7px 0;padding:8px;overflow:auto;background:#151515;border:1px solid #333}.agent-markdown pre code{padding:0;background:transparent;color:#d4d4d4;white-space:pre}.agent-markdown blockquote{margin:7px 0;padding:2px 8px;border-left:2px solid #4ec9b0;color:#aaa}.agent-markdown a{color:#75beff}.agent-markdown table{display:block;max-width:100%;overflow:auto;border-collapse:collapse}.agent-markdown th,.agent-markdown td{padding:3px 6px;border:1px solid #3b3b3b;text-align:left}.agent-markdown hr{border:0;border-top:1px solid #3a3a3a}.agent-message.tool,.agent-message.file_patch,.agent-message.command,.agent-message.control,.agent-message.compact{padding:0;border:1px solid #353535;border-left:2px solid #cca700;background:#202020;color:#bbb;font:11px/1.5 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;white-space:normal}.agent-message.file_patch{border-left-color:#89d185}.agent-message.command{border-left-color:#75beff}.agent-message.control{border-left-color:#c586c0}.agent-message.compact{border-left-color:#4ec9b0}.agent-message .agent-meta{display:block;margin-bottom:4px;color:#75beff;font:10px/1.3 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;text-transform:uppercase}.agent-message .agent-meta.agent-role-manager{color:#c586c0}.agent-message .agent-meta.agent-role-developer{color:#89d185}.agent-message .agent-meta.agent-role-explorer{color:#75beff}.agent-message .agent-meta.agent-role-planner{color:#dcdcaa}.agent-message .agent-meta.agent-role-reviewer{color:#f0a979}.agent-tool-head{min-height:31px;display:flex;align-items:center;gap:6px;padding:5px 7px;cursor:pointer}.agent-tool-head:hover{background:#292929}.agent-tool-head .codicon{color:#c5c5c5}.agent-tool-title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#ddd;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.agent-tool-state{margin-left:auto;color:#9a9a9a;font:10px/1.3 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;white-space:nowrap}.agent-tool-state.success,.diff-add{color:#89d185}.agent-tool-state.error,.diff-del{color:#f48771}.agent-tool-body{display:none;border-top:1px solid #343434}.agent-message.is-expanded .agent-tool-body{display:block}.agent-tool-output{max-height:320px;margin:0;padding:8px;overflow:auto;color:#bcbcbc;background:#191919;white-space:pre-wrap;overflow-wrap:anywhere}.agent-tool-actions{display:flex;align-items:center;gap:5px;padding:6px 7px;border-top:1px solid #303030}.agent-tool-actions button{min-height:23px;padding:2px 7px;font-size:10px}.agent-diff-stats{display:flex;gap:7px;margin-left:auto}.agent-diff{max-height:360px;overflow:auto;padding:6px 0;background:#181818}.agent-diff-line{display:grid;grid-template-columns:40px 13px minmax(0,1fr);padding:0 7px;white-space:pre-wrap;overflow-wrap:anywhere}.agent-diff-line .line-no{color:#777;text-align:right;user-select:none}.agent-diff-line .line-mark{text-align:center;user-select:none}.agent-diff-line.add{background:rgba(35,134,54,.18);color:#b7e1bf}.agent-diff-line.del{background:rgba(248,81,73,.15);color:#efb0aa}.agent-diff-line.hunk{color:#75beff;background:rgba(56,139,253,.1)}.agent-model-menu{width:min(360px,calc(100vw - 8px));max-height:min(440px,70vh);overflow:auto}.agent-model-menu button span:last-child{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.agent-model-summary{padding:7px 10px;border-bottom:1px solid #454545;color:#aaa;font-size:10px}.agent-model-menu button.is-active{color:#9cdcfe}.pairing-code{margin:10px 0;padding:12px;border:1px solid var(--line-light);background:#181818;color:#75beff;text-align:center;font:600 18px/1.2 ui-monospace,SFMono-Regular,Menlo,monospace}.auth-secondary{margin-top:12px;color:#aaa;text-align:center;font-size:11px}
+.status-bar{display:flex;align-items:center;justify-content:space-between;min-width:0;background:var(--status);color:#fff;font-size:12px;user-select:none}.status-left,.status-right{height:100%;display:flex;align-items:stretch;min-width:0}.status-bar button{height:100%;display:flex;align-items:center;gap:4px;padding:0 6px;border:0;background:transparent;color:#fff;white-space:nowrap;cursor:pointer}.status-bar button:hover{background:var(--status-hover)}.status-message{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:2px 8px;color:#fff}.status-right{justify-content:flex-end}
+.overlay{position:fixed;inset:0;z-index:500;background:rgba(0,0,0,.28)}.palette{width:min(700px,calc(100vw - 28px));margin:44px auto 0;background:#252526;border:1px solid #454545;box-shadow:0 10px 32px rgba(0,0,0,.52)}.palette-input-row{height:40px;display:grid;grid-template-columns:24px minmax(0,1fr);align-items:center;margin:6px;border:1px solid var(--focus);background:var(--input);padding:0 7px}.palette-input-row input{height:100%;border:0;background:transparent;font-size:14px}.palette-results{max-height:min(440px,65vh);overflow:auto;padding-bottom:5px}.palette-row{height:34px;display:flex;align-items:center;gap:8px;padding:0 10px;cursor:default}.palette-row.is-active,.palette-row:hover{background:#04395e}.palette-row .keybinding{margin-left:auto;color:#aaa}.modal{width:min(620px,calc(100vw - 30px));max-height:calc(100vh - 80px);margin:48px auto;background:#252526;border:1px solid #454545;box-shadow:0 12px 40px rgba(0,0,0,.55);overflow:auto}.modal>header{height:42px;display:flex;align-items:center;justify-content:space-between;padding:0 10px 0 16px;border-bottom:1px solid var(--line)}.modal h2{margin:0;color:#ddd;font-size:15px;font-weight:500}.modal-form{display:grid;gap:8px;padding:14px}.modal-form input{height:30px;padding:5px 7px}.modal-actions{display:flex;justify-content:flex-end;gap:7px;margin-top:8px}.account-list{padding:8px}.account-row{min-height:38px;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:8px;padding:4px 7px;border-bottom:1px solid var(--line)}.account-row small{display:block;color:#999}.menu-popup{position:fixed;z-index:700;min-width:210px;padding:4px;background:#252526;border:1px solid #454545;box-shadow:0 8px 22px rgba(0,0,0,.5)}.menu-popup button{width:100%;height:27px;display:flex;align-items:center;gap:8px;padding:0 10px;border:0;background:transparent;color:#ddd;text-align:left;cursor:pointer}.menu-popup button:hover{background:#04395e}.menu-popup .separator{height:1px;margin:4px;background:#454545}.menu-popup .shortcut{margin-left:auto;color:#aaa}.toast-host{position:fixed;z-index:900;right:12px;bottom:34px;width:min(390px,calc(100vw - 24px));display:grid;gap:7px}.toast{display:grid;grid-template-columns:20px minmax(0,1fr) 22px;gap:7px;align-items:start;padding:10px;background:#252526;border:1px solid #454545;box-shadow:0 5px 18px rgba(0,0,0,.42)}.toast.error{border-left:3px solid var(--danger)}.toast.warning{border-left:3px solid var(--warning)}.toast.success{border-left:3px solid var(--success)}.toast button{border:0;background:transparent;color:#aaa;cursor:pointer}
+@media(max-width:1080px){:root{--sidebar-width:250px;--secondary-width:280px}.menu-bar button:nth-child(n+5){display:none}.status-right button:nth-child(-n+3){display:none}}
+@media(max-width:820px){:root{--sidebar-width:min(300px,calc(100vw - 48px));--secondary-width:min(320px,calc(100vw - 48px));--panel-height:190px}.title-bar{grid-template-columns:28px 25px 1fr auto}.menu-bar{display:none}.command-center{width:100%;min-width:0}.workbench-grid{position:relative;grid-template-columns:48px minmax(0,1fr)!important}.primary-sidebar,.secondary-sidebar{position:absolute;z-index:90;top:0;bottom:0;width:var(--sidebar-width);box-shadow:5px 0 18px rgba(0,0,0,.42)}.primary-sidebar{left:48px}.secondary-sidebar{right:0;width:var(--secondary-width);box-shadow:-5px 0 18px rgba(0,0,0,.42)}.primary-hidden .primary-sidebar,.secondary-hidden .secondary-sidebar{display:none}.editor-area{grid-column:2}.editor-grid.split{grid-template-columns:minmax(0,1fr)}.editor-grid.split .editor-group:not(.is-active){display:none}.layout-controls #togglePanelBtn{display:none}.empty-actions{grid-template-columns:auto}.status-right button{display:none!important}.status-right #accountStatus,.status-right #notificationsBtn{display:flex!important}.panel-tabs{gap:12px}.panel-tabs button{font-size:10px}.panel-header .header-actions .icon-button:nth-child(-n+2){display:none}}
+@media(max-width:480px){.title-bar{grid-template-columns:28px 22px minmax(0,1fr) auto;padding:0 3px}.layout-controls button:not(#toggleSecondaryBtn){display:none}.command-center span:last-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.activity-button{width:43px}.workbench-grid{grid-template-columns:44px minmax(0,1fr)!important}.primary-sidebar{left:44px}.status-left #syncStatus,.status-left #errorStatus{display:none}.panel-tabs{gap:9px}.panel-tabs button{max-width:62px;overflow:hidden;text-overflow:ellipsis}.auth-dialog{padding:28px 22px}.extension-row{grid-template-columns:36px minmax(0,1fr)}.extension-icon{width:36px;height:36px}.extension-row .button{grid-column:2;justify-self:start}}
 """
 
 IDE_JS = """
@@ -93050,6 +94428,378 @@ function bind(){
 window.addEventListener('DOMContentLoaded',async()=>{bind();try{await refreshConfig();setStatus('ready')}catch(err){setStatus(err.message,true)}});
 """
 
+IDE_JS = r"""
+const E=id=>document.getElementById(id);
+class ApiError extends Error{constructor(message,status,code,data){super(message);this.status=status;this.code=code||'';this.data=data||{}}}
+const S={
+  csrf:'',config:null,account:null,capabilities:{},sessions:[],roots:[],activeSession:'',activeRoot:'session',
+  treeCache:new Map(),openFiles:new Map(),activeByGroup:['',''],activeGroup:0,monaco:null,editors:[],diffEditors:[],models:new Map(),historyOriginalModels:new Map(),historyDecorations:new Map(),viewStates:new Map(),suppressEditorChange:false,codeHistoryMode:'all',
+  activeView:'explorer',panel:'terminal',primaryVisible:true,secondaryVisible:true,panelVisible:true,panelMaximized:false,
+  diagnostics:[],searchResults:[],scm:null,tasks:[],installedExtensions:[],extensionWorkers:new Map(),
+  terminal:null,terminalStarting:false,terminalPromise:null,terminalWidget:null,terminalFit:null,terminalOffset:0,terminalPoll:null,stateTimer:null,diagnosticTimer:null,paletteItems:[],paletteIndex:0,
+  debug:null,debugSeq:0,debugPoll:null,debugFile:null,
+  agentPoll:null,agentPollDue:0,agentPollBusy:false,agentPollRequested:false,agentState:null,agentRendered:new Set(),agentToolCards:new Map(),agentPlanCards:new Map(),agentOperationSeq:0,agentEventSeq:0,agentWasBusy:false,agentSession:'',agentSubmitting:false,agentTreeTimer:null,agentFileRefresh:new Set(),agentAttachments:[],agentModelCatalog:null,agentTodoCollapsed:false,workspaceRefreshBusy:false,workspaceRefreshSeq:0,sessionSwitchSeq:0,sessionSwitching:false,renderingAgentState:false,devicePoll:null,agentEvents:null,agentEventsConnected:false,agentEventReconnect:null
+};
+const HTML_ESCAPE={'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'};
+const escapeHtml=value=>String(value??'').replace(/[&<>"']/g,ch=>HTML_ESCAPE[ch]);
+const qs=value=>encodeURIComponent(String(value??''));
+const isWrite=method=>!['GET','HEAD','OPTIONS'].includes(String(method||'GET').toUpperCase());
+async function api(path,opts={}){
+  const method=String(opts.method||'GET').toUpperCase();
+  const headers=Object.assign({},opts.headers||{});
+  if(opts.body!=null&&!headers['Content-Type'])headers['Content-Type']='application/json';
+  if(isWrite(method)&&S.csrf)headers['X-CSRF-Token']=S.csrf;
+  const res=await fetch(path,Object.assign({credentials:'same-origin',headers},opts));
+  const text=await res.text();let data={};
+  try{data=text?JSON.parse(text):{}}catch{data={error:text||res.statusText}}
+  if(!res.ok)throw new ApiError(data.error||res.statusText,res.status,data.code,data);
+  return data;
+}
+function setStatus(message,tone=''){E('statusMessage').textContent=String(message||'Ready');E('statusMessage').dataset.tone=tone}
+function toast(message,tone='error',timeout=5000){
+  const row=document.createElement('div');row.className='toast '+tone;
+  const icon=tone==='success'?'pass':tone==='warning'?'warning':'error';
+  row.innerHTML=`<span class="codicon codicon-${icon}"></span><div>${escapeHtml(message)}</div><button aria-label="Close"><span class="codicon codicon-close"></span></button>`;
+  row.querySelector('button').onclick=()=>row.remove();E('toastHost').appendChild(row);if(timeout)setTimeout(()=>row.remove(),timeout);
+}
+function appendPanelLog(id,text){const out=E(id);if(out.dataset.empty==='true'){out.textContent='';out.dataset.empty='false'}out.textContent+=(out.textContent?'\n':'')+String(text||'');out.scrollTop=out.scrollHeight}
+function logOutput(text){appendPanelLog('outputLog',text)}
+function logOutputChunk(text){const out=E('outputLog');if(out.dataset.empty==='true'){out.textContent='';out.dataset.empty='false'}out.textContent+=String(text||'');out.scrollTop=out.scrollHeight}
+function logDebug(text){appendPanelLog('debugConsole',text)}
+function activeFile(group=S.activeGroup){return S.openFiles.get(S.activeByGroup[group])||null}
+function rootQuery(root=S.activeRoot){return `root_id=${qs(root||'session')}`}
+function activeDir(){const file=activeFile();if(!file)return '';const index=file.path.lastIndexOf('/');return index<0?'':file.path.slice(0,index)}
+function fileKey(root,path,session=S.activeSession){return `${session}::${root}::${path}`}
+function formatFileSize(bytes){const value=Math.max(0,Number(bytes||0));if(value<1024)return `${value.toLocaleString()} B`;if(value<1024*1024)return `${(value/1024).toFixed(value<10240?1:0)} KB`;if(value<1024*1024*1024)return `${(value/(1024*1024)).toFixed(1)} MB`;return `${(value/(1024*1024*1024)).toFixed(1)} GB`}
+function languageFor(path){const name=String(path||'').toLowerCase();const ext=name.includes('.')?name.slice(name.lastIndexOf('.')):'';return ({'.py':'python','.pyi':'python','.js':'javascript','.mjs':'javascript','.cjs':'javascript','.jsx':'javascript','.ts':'typescript','.tsx':'typescript','.html':'html','.htm':'html','.css':'css','.scss':'scss','.less':'less','.json':'json','.jsonc':'json','.md':'markdown','.yaml':'yaml','.yml':'yaml','.xml':'xml','.sh':'shell','.zsh':'shell','.bash':'shell','.sql':'sql','.c':'c','.h':'c','.cpp':'cpp','.cc':'cpp','.hpp':'cpp','.java':'java','.go':'go','.rs':'rust','.rb':'ruby','.php':'php','.swift':'swift','.kt':'kotlin','.toml':'toml'}[ext]||'plaintext')}
+function fileIconClass(path,type='file'){if(type==='dir')return 'codicon-folder folder';const lang=languageFor(path);return `codicon-file ${lang}`}
+function stableUri(file){return `clouds://${encodeURIComponent(file.session_id)}/${encodeURIComponent(file.root_id)}/${file.path.split('/').map(encodeURIComponent).join('/')}`}
+function isArtifactFile(file){return !!file&&(file.binary||file.preview===true)}
+function canPreviewFile(file){return !!file&&['image','video','audio','pdf','html','markdown','text','csv','excel','presentation','document'].includes(file.previewKind)}
+function artifactUrl(file,kind='raw'){const base=`/api/ide/sessions/${qs(file.session_id)}/workspace/${kind}?root_id=${qs(file.root_id)}&path=${qs(file.path)}`;return `${base}&revision=${qs(file.revision||Date.now())}`}
+function htmlArtifactUrl(file){return `/api/ide/sessions/${qs(file.session_id)}/workspace/html/${file.path.split('/').map(qs).join('/')}?root_id=${qs(file.root_id)}&revision=${qs(file.revision||Date.now())}`}
+function previewKindForPath(path){const ext=(String(path||'').toLowerCase().match(/\.[^.\/]+$/)||[''])[0];if(['.html','.htm'].includes(ext))return'html';if(['.md','.markdown','.mdx'].includes(ext))return'markdown';if(ext==='.txt')return'text';if(['.png','.jpg','.jpeg','.webp','.gif','.bmp','.tiff','.tif','.svg','.avif','.heic','.heif'].includes(ext))return'image';if(['.mp4','.mov','.avi','.mkv','.webm','.m4v','.mpeg','.mpg','.3gp'].includes(ext))return'video';if(['.mp3','.wav','.m4a','.aac','.flac','.ogg','.oga','.opus'].includes(ext))return'audio';if(ext==='.pdf')return'pdf';if(['.csv','.tsv'].includes(ext))return'csv';if(['.xlsx','.xls','.xlsm'].includes(ext))return'excel';if(['.pptx','.ppt','.pptm'].includes(ext))return'presentation';if(['.docx','.doc','.docm'].includes(ext))return'document';return''}
+function loadScript(src){return new Promise((resolve,reject)=>{if(document.querySelector(`script[data-src="${src}"]`))return resolve();const script=document.createElement('script');script.src=src;script.dataset.src=src;script.onload=resolve;script.onerror=()=>reject(new Error(`Unable to load ${src}`));document.head.appendChild(script)})}
+async function initMonaco(){
+  try{
+    await loadScript('/assets/js_lib/monaco/min/vs/loader.js');
+    if(typeof window.require!=='function')throw new Error('Monaco loader unavailable');
+    window.MonacoEnvironment={getWorker:()=>new Worker('/assets/ide-monaco-worker.js')};
+    window.require.config({paths:{vs:'/assets/js_lib/monaco/min/vs'}});
+    await new Promise((resolve,reject)=>window.require(['vs/editor/editor.main'],resolve,reject));
+    S.monaco=window.monaco;
+    S.monaco.editor.defineTheme('clouds-dark',{base:'vs-dark',inherit:true,rules:[],colors:{'editor.background':'#1f1f1f','editorLineNumber.foreground':'#6e7681','editorLineNumber.activeForeground':'#c6c6c6','editor.selectionBackground':'#264f78','editor.inactiveSelectionBackground':'#3a3d41'}});
+    const commonEditorOptions={theme:'clouds-dark',automaticLayout:true,fontSize:13,fontFamily:'SFMono-Regular, Menlo, Monaco, Consolas, monospace',fontLigatures:false,lineHeight:20,minimap:{enabled:true},scrollBeyondLastLine:false,smoothScrolling:true,renderWhitespace:'selection',bracketPairColorization:{enabled:true},guides:{bracketPairs:true,indentation:true},padding:{top:8},tabSize:2,insertSpaces:true,wordWrap:'off',lineNumbersMinChars:5,lineDecorationsWidth:8};
+    for(let group=0;group<2;group++){
+      const editor=S.monaco.editor.create(E(`editor${group}`),{...commonEditorOptions});
+      const diffEditor=S.monaco.editor.createDiffEditor(E(`diffEditor${group}`),{...commonEditorOptions,renderSideBySide:false,readOnly:false,originalEditable:false,renderIndicators:false,renderGutterMenu:false,renderMarginRevertIcon:false,compactMode:true,diffCodeLens:false,enableSplitViewResizing:false});
+      editor.onDidFocusEditorText(()=>{S.activeGroup=group;document.querySelectorAll('.editor-group').forEach((el,i)=>el.classList.toggle('is-active',i===group||E('editorGrid').classList.contains('split')));updateStatusBar()});
+      editor.onDidChangeModelContent(()=>{if(S.suppressEditorChange)return;const file=activeFile(group);if(file){file.dirty=true;renderTabs();renderOpenEditors();scheduleDiagnostics(file);scheduleStateSave()}});
+      diffEditor.getOriginalEditor().updateOptions({lineNumbers:'off',lineNumbersMinChars:0,glyphMargin:false,folding:false,lineDecorationsWidth:0});
+      diffEditor.getModifiedEditor().updateOptions({lineNumbers:'on',lineNumbersMinChars:5,lineDecorationsWidth:24});
+      protectDeletedReviewZones(E(`diffEditor${group}`));
+      editor.onDidChangeCursorPosition(updateStatusBar);diffEditor.getModifiedEditor().onDidChangeCursorPosition(updateStatusBar);S.editors[group]=editor;S.diffEditors[group]=diffEditor;
+    }
+  }catch(error){document.body.classList.add('fallback-mode');logOutput(`Monaco fallback: ${error.message}`);for(let group=0;group<2;group++){const input=E(`fallbackEditor${group}`);input.addEventListener('focus',()=>{S.activeGroup=group;updateStatusBar()});input.addEventListener('input',()=>{const file=activeFile(group);if(file){file.content=input.value;file.dirty=true;renderTabs();renderOpenEditors();scheduleDiagnostics(file)}})}}
+}
+async function initTerminalLibrary(){
+  try{await loadScript('/assets/js_lib/xterm/lib/xterm.js');await loadScript('/assets/js_lib/xterm-addon-fit/lib/addon-fit.js')}catch(error){logOutput(`Terminal renderer fallback: ${error.message}`)}
+}
+function editorValue(group=S.activeGroup){const file=activeFile(group);if(!file)return '';if(S.monaco){const model=S.models.get(file.key);return model?model.getValue():file.content}return E(`fallbackEditor${group}`).value}
+function isHistoryCandidate(file){return !!file&&!file.binary&&file.root_id==='session'&&!file.preview&&file.previewKind!=='markdown'}
+function protectDeletedReviewZones(host){const deletedNode=node=>{const element=node?.nodeType===Node.ELEMENT_NODE?node:node?.parentElement;return element?.closest?.('.line-delete-selectable,.inline-deleted-margin-view-zone')||null};const block=event=>{if(!deletedNode(event.target))return;event.preventDefault();event.stopImmediatePropagation();const selection=document.getSelection?.();if(selection&&!selection.isCollapsed)selection.removeAllRanges()};['pointerdown','mousedown','touchstart','selectstart','dragstart','contextmenu','copy'].forEach(type=>host.addEventListener(type,block,true))}
+function disposeHistoryOriginal(group){const model=S.historyOriginalModels.get(group);if(model){model.dispose();S.historyOriginalModels.delete(group)}const diff=S.diffEditors[group];if(diff)diff.setModel(null)}
+function clearHistoryDecorations(file){const old=S.historyDecorations.get(file?.key)||[];const model=file&&S.models.get(file.key);if(model&&old.length)S.historyDecorations.set(file.key,model.deltaDecorations(old,[]));else if(file)S.historyDecorations.delete(file.key)}
+function visibleHistoryEditor(group){return E(`diffEditor${group}`).classList.contains('is-hidden')?S.editors[group]:S.diffEditors[group]?.getModifiedEditor()}
+function captureHistoryView(group,file){const source=visibleHistoryEditor(group),targetModel=file&&S.models.get(file.key);if(!source?.getModel()||source.getModel()!==targetModel)return null;const position=source.getPosition(),anchorLine=position?.lineNumber||source.getVisibleRanges()?.[0]?.startLineNumber||1;return{selection:source.getSelection(),position,anchorLine,anchorOffset:source.getTopForLineNumber(anchorLine)-source.getScrollTop(),scrollLeft:source.getScrollLeft()}}
+function restoreHistoryView(group,state){if(!state)return;const target=visibleHistoryEditor(group),model=target?.getModel(),showingDiff=!E(`diffEditor${group}`).classList.contains('is-hidden');if(!target||!model)return;let updateListener=null;const apply=()=>{const current=target.getModel();if(!current)return;const lineCount=current.getLineCount(),anchorLine=Math.max(1,Math.min(lineCount,Number(state.anchorLine||state.position?.lineNumber||1))),immediateScroll=S.monaco.ScrollType?.Immediate??1;if(state.selection)target.setSelection(current.validateRange(state.selection));else if(state.position)target.setPosition(current.validatePosition(state.position));target.setScrollTop(Math.max(0,target.getTopForLineNumber(anchorLine)-Number(state.anchorOffset||0)),immediateScroll);target.setScrollLeft(Number(state.scrollLeft||0),immediateScroll);updateStatusBar()};if(showingDiff){S.diffEditors[group].layout();updateListener=S.diffEditors[group].onDidUpdateDiff(()=>{apply();updateListener?.dispose();updateListener=null})}else target.layout();apply();requestAnimationFrame(()=>{apply();requestAnimationFrame(apply)})}
+async function loadCodeHistory(file,stageId=file.stageId||'latest'){
+  if(!isHistoryCandidate(file)){file.historyStages=[];file.historyPayload=null;return}
+  if(!Array.isArray(file.historyStages)){const list=await api(`/api/ide/v2/sessions/${qs(file.session_id)}/code-history?root_id=${qs(file.root_id)}&path=${qs(file.path)}`);file.historyStages=list.stages||[]}
+  file.stageId=stageId||'latest';const payload=await api(`/api/ide/v2/sessions/${qs(file.session_id)}/code-history/stage?root_id=${qs(file.root_id)}&path=${qs(file.path)}&stage_id=${qs(file.stageId)}`);file.historyPayload=payload;
+  if(file.stageId!=='latest')file.content=payload.full_text||'';
+}
+function historyAddedLines(payload){const lines=[];for(const row of payload?.rows||[])if(row.kind==='add'&&Number(row.new_line)>0)lines.push(Number(row.new_line));return [...new Set(lines)]}
+function renderHistoryToolbar(group,file){const host=E(`historyToolbar${group}`);if(!isHistoryCandidate(file)){host.classList.add('is-hidden');host.innerHTML='';return}host.classList.remove('is-hidden');const stages=Array.isArray(file.historyStages)?file.historyStages:[];const payload=file.historyPayload||{};host.innerHTML=`<div class="history-modes"><button data-history-mode="all" class="${S.codeHistoryMode==='all'?'is-active':''}">All</button><button data-history-mode="changes" class="${S.codeHistoryMode==='changes'?'is-active':''}">Changes</button><button data-history-mode="clean" class="${S.codeHistoryMode==='clean'?'is-active':''}">Clean</button></div><span class="history-stats">${payload.stage?`+${Number(payload.stage.added||0)} / -${Number(payload.stage.deleted||0)}`:'No recorded changes'}</span><select class="history-stage" title="Version"><option value="latest">Latest</option>${stages.map(row=>`<option value="${escapeHtml(row.id)}"${file.stageId===row.id?' selected':''}>${escapeHtml(row.label||`#${row.index}`)}</option>`).join('')}</select>${file.stageId!=='latest'?'<button class="button history-restore" title="Restore this version">Restore</button>':''}`;host.querySelectorAll('[data-history-mode]').forEach(button=>button.onclick=()=>{S.codeHistoryMode=button.dataset.historyMode||'all';for(let index=0;index<2;index++)applyHistoryView(index,activeFile(index));scheduleStateSave()});host.querySelector('.history-stage').onchange=event=>selectHistoryStage(file,event.target.value).catch(showError);const restore=host.querySelector('.history-restore');if(restore)restore.onclick=()=>restoreHistoryStage(file).catch(showError)}
+function applyHistoryView(group,file){const editor=S.editors[group],diff=S.diffEditors[group],diffHost=E(`diffEditor${group}`),editorHost=E(`editor${group}`),viewState=captureHistoryView(group,file);disposeHistoryOriginal(group);if(!file||!S.monaco||!isHistoryCandidate(file)||!file.historyPayload){diffHost.classList.add('is-hidden');editorHost.classList.remove('is-hidden');if(file)clearHistoryDecorations(file);renderHistoryToolbar(group,file);restoreHistoryView(group,viewState);return}const payload=file.historyPayload,model=S.models.get(file.key);if(model&&model.getValue()!==String(payload.full_text||'')){S.suppressEditorChange=true;model.setValue(String(payload.full_text||''));S.suppressEditorChange=false}const historical=file.stageId!=='latest';editor.updateOptions({readOnly:historical});clearHistoryDecorations(file);if((S.codeHistoryMode==='all'||S.codeHistoryMode==='changes')&&model){const decorations=historyAddedLines(payload).map(line=>({range:new S.monaco.Range(line,1,line,1),options:{isWholeLine:true,className:'history-added-line',linesDecorationsClassName:'history-added-glyph'}}));S.historyDecorations.set(file.key,model.deltaDecorations([],decorations))}if(S.codeHistoryMode==='all'&&payload.stage?.added+payload.stage?.deleted>0){const original=S.monaco.editor.createModel(String(payload.before_text||''),languageFor(file.path));S.historyOriginalModels.set(group,original);diff.setModel({original,modified:model});diff.updateOptions({readOnly:historical,originalEditable:false,renderSideBySide:false,renderIndicators:false,renderGutterMenu:false,renderMarginRevertIcon:false,compactMode:true});diff.getOriginalEditor().updateOptions({lineNumbers:'off',lineNumbersMinChars:0,glyphMargin:false,folding:false,lineDecorationsWidth:0});diff.getModifiedEditor().updateOptions({lineNumbers:'on',lineNumbersMinChars:5,lineDecorationsWidth:24});editorHost.classList.add('is-hidden');diffHost.classList.remove('is-hidden')}else{diffHost.classList.add('is-hidden');editorHost.classList.remove('is-hidden')}renderHistoryToolbar(group,file);restoreHistoryView(group,viewState)}
+async function selectHistoryStage(file,stageId){if(file.dirty&&!confirm('Discard unsaved changes and switch version?')){renderHistoryToolbar(file.group,file);return}file.dirty=false;file.stageId=stageId||'latest';await loadCodeHistory(file,file.stageId);if(file.stageId==='latest')await refreshOpenFile(file);applyHistoryView(file.group,file);renderTabs();scheduleStateSave()}
+async function restoreHistoryStage(file){if(file.stageId==='latest'||!confirm(`Restore ${file.name} to the selected version?`))return;const out=await api(`/api/ide/v2/sessions/${qs(file.session_id)}/code-history/restore`,{method:'POST',body:JSON.stringify({root_id:file.root_id,path:file.path,stage_id:file.stageId,expected_revision:file.revision})});file.stageId='latest';file.revision=out.revision||out.file?.revision||'';file.historyStages=null;await refreshOpenFile(file);await loadCodeHistory(file,'latest');applyHistoryView(file.group,file);toast(`Restored ${file.name}.`,'success')}
+function showArtifactPreviewError(stage,file,message){stage.innerHTML='';const error=document.createElement('div');error.className='artifact-preview-error';error.innerHTML=`<span class="codicon codicon-warning"></span><strong>Unable to preview ${escapeHtml(file.name)}</strong><small>${escapeHtml(message||'The preview could not be loaded.')}</small>`;stage.appendChild(error)}
+function renderArtifactPreview(group,file){
+  const host=E(`artifactPreview${group}`);host.innerHTML='';host.classList.toggle('is-hidden',!isArtifactFile(file));if(!isArtifactFile(file))return;
+  const toolbar=document.createElement('div');toolbar.className='artifact-toolbar';toolbar.innerHTML=`<strong>${escapeHtml(file.name)}</strong><span class="artifact-meta">${escapeHtml(file.previewKind||file.mime||'binary')}${file.size?` / ${formatFileSize(file.size)}`:''}</span><button class="icon-button" title="Refresh Preview"><span class="codicon codicon-refresh"></span></button>${file.previewKind==='html'?'<a class="icon-button artifact-open-browser" target="_blank" rel="noopener" title="Open in Browser" aria-label="Open in Browser"><span class="codicon codicon-link-external"></span></a>':''}<a class="icon-button artifact-download" title="Download" aria-label="Download"><span class="codicon codicon-cloud-download"></span></a>`;
+  const stage=document.createElement('div');stage.className='artifact-stage';host.append(toolbar,stage);toolbar.querySelector('button').onclick=()=>refreshOpenFile(file,true).catch(showError);const download=toolbar.querySelector('.artifact-download');download.href=artifactUrl(file,'raw')+'&download=1';download.download=file.name;const browser=toolbar.querySelector('.artifact-open-browser');if(browser)browser.href=htmlArtifactUrl(file);
+  const url=file.previewKind==='html'?htmlArtifactUrl(file):artifactUrl(file,'raw'),kind=file.previewKind;
+  if(kind==='image'){const media=document.createElement('img');media.src=artifactUrl(file,'image-preview');media.alt=file.name;media.decoding='async';media.loading='eager';media.onerror=()=>showArtifactPreviewError(stage,file,'The image is invalid or exceeds the safe preview dimensions.');stage.appendChild(media)}
+  else if(kind==='video'){const media=document.createElement('video');media.src=url;media.controls=true;media.onerror=()=>showArtifactPreviewError(stage,file,'The video format could not be loaded by this browser.');stage.appendChild(media)}
+  else if(kind==='audio'){const media=document.createElement('audio');media.src=url;media.controls=true;media.onerror=()=>showArtifactPreviewError(stage,file,'The audio format could not be loaded by this browser.');stage.appendChild(media)}
+  else if(kind==='pdf'||kind==='html'){const frame=document.createElement('iframe');frame.title=`Preview ${file.name}`;frame.referrerPolicy='no-referrer';frame.sandbox='allow-scripts';frame.src=url;stage.appendChild(frame)}
+  else if(['csv','excel','presentation','document','markdown','text'].includes(kind)){const frame=document.createElement('iframe');frame.title=`Preview ${file.name}`;frame.referrerPolicy='no-referrer';frame.sandbox='allow-scripts';frame.src=artifactUrl(file,'preview');frame.onerror=()=>showArtifactPreviewError(stage,file,'The preview renderer did not return a document.');stage.appendChild(frame)}
+  else{stage.innerHTML=`<div class="artifact-binary"><span class="codicon codicon-file-binary"></span><strong>${escapeHtml(file.name)}</strong><small>Preview is not available for this file type.</small><a class="button" href="${escapeHtml(url+'&download=1')}" download="${escapeHtml(file.name)}">Download</a></div>`}
+}
+function sanitizePreviewHtml(raw){const doc=new DOMParser().parseFromString(String(raw||''),'text/html');doc.querySelectorAll('script,style,iframe,object,embed,form,link,meta').forEach(node=>node.remove());doc.querySelectorAll('*').forEach(node=>{for(const attr of [...node.attributes]){const name=attr.name.toLowerCase(),value=attr.value.trim().toLowerCase();if(name.startsWith('on')||name==='style'||((name==='href'||name==='src')&&(value.startsWith('javascript:')||value.startsWith('data:text/html'))))node.removeAttribute(attr.name)}});return doc.body.innerHTML}
+function setEditorModel(group,file){
+  const editor=S.editors[group];const old=activeFile(group);if(old&&editor)S.viewStates.set(`${group}:${old.key}`,editor.saveViewState());
+  S.activeByGroup[group]=file?file.key:'';S.activeGroup=group;
+  const artifact=isArtifactFile(file);if(file&&!artifact&&S.monaco){let model=S.models.get(file.key);if(!model){model=S.monaco.editor.createModel(file.content,languageFor(file.path),S.monaco.Uri.parse(stableUri(file)));S.models.set(file.key,model)}editor.setModel(model);const state=S.viewStates.get(`${group}:${file.key}`);if(state)editor.restoreViewState(state);editor.focus()}
+  else if(S.monaco){editor.setModel(null)}
+  else{const input=E(`fallbackEditor${group}`);input.value=file&&!artifact?file.content:'';input.classList.toggle('is-active',!!file&&!artifact);if(file&&!artifact)input.focus()}
+  if(artifact){disposeHistoryOriginal(group);E(`diffEditor${group}`).classList.add('is-hidden');E(`editor${group}`).classList.remove('is-hidden')}else applyHistoryView(group,file);renderArtifactPreview(group,file);E(`emptyEditor${group}`).classList.toggle('is-hidden',!!file);renderTabs();renderBreadcrumbs();renderTree();renderOpenEditors();updateStatusBar();scheduleStateSave()
+}
+async function openFile(path,options={}){
+  const session=S.activeSession,switchSeq=S.sessionSwitchSeq,root=options.root_id||S.activeRoot;const group=Number.isInteger(options.group)?options.group:S.activeGroup;const key=fileKey(root,path,session);
+  let file=S.openFiles.get(key);
+  if(!file){
+    setStatus(`Opening ${path}...`);let out;try{out=await api(`/api/ide/sessions/${qs(session)}/workspace/file?${rootQuery(root)}&path=${qs(path)}`)}catch(error){const previewKind=previewKindForPath(path);if(error.status===400&&previewKind)out={encoding:'base64',content:'',revision:String(Date.now()),file:{path,name:path.split('/').pop(),preview_kind:previewKind,mime:'',size:0}};else throw error}
+    if(session!==S.activeSession||switchSeq!==S.sessionSwitchSeq)return null;
+    const index=path.lastIndexOf('/'),binary=out.encoding==='base64',previewKind=out.file?.preview_kind||previewKindForPath(path);file={key,path,name:path.split('/').pop(),dir:index<0?'':path.slice(0,index),root_id:root,session_id:session,content:out.content||'',revision:out.revision||out.file?.revision||'',encoding:out.text_encoding||'utf-8',binary,preview:binary||['image','video','audio','pdf','html','markdown','text','csv','excel','presentation','document'].includes(previewKind),previewKind,mime:out.file?.mime||'',size:Number(out.file?.size||0),dirty:false,group,stageId:options.stage_id||'latest',historyStages:null,historyPayload:null};S.openFiles.set(key,file);try{await loadCodeHistory(file,file.stageId)}catch(error){file.historyStages=[];file.historyPayload=null;if(error.status!==400)logOutput(`History ${path}: ${error.message}`)}
+  }
+  else if(options.stage_id&&options.stage_id!==file.stageId){await selectHistoryStage(file,options.stage_id)}
+  if(session!==S.activeSession||switchSeq!==S.sessionSwitchSeq){if(S.openFiles.get(key)===file)S.openFiles.delete(key);return null}
+  file.group=group;setEditorModel(group,file);
+  if(options.line&&S.monaco&&S.editors[group]){S.editors[group].revealPositionInCenter({lineNumber:Number(options.line),column:Number(options.column||1)});S.editors[group].setPosition({lineNumber:Number(options.line),column:Number(options.column||1)})}
+  setStatus(path)
+}
+async function saveFile(file,force=false){
+  if(!file||file.binary)return;if(file.stageId!=='latest')return toast('Historical versions are read-only. Restore the version or return to Latest.','warning');const group=S.activeByGroup.findIndex(key=>key===file.key);const content=group>=0?editorValue(group):(S.models.get(file.key)?.getValue()??file.content);
+  try{const out=await api(`/api/ide/sessions/${qs(file.session_id)}/workspace/file`,{method:'PUT',body:JSON.stringify({root_id:file.root_id,path:file.path,content,expected_revision:force?'':file.revision})});file.content=content;file.revision=out.revision||out.file?.revision||'';file.size=new TextEncoder().encode(content).length;file.dirty=false;file.historyStages=null;await loadCodeHistory(file,'latest');applyHistoryView(file.group,file);renderTabs();renderOpenEditors();setStatus(`Saved ${file.name}`);scheduleDiagnostics(file);scheduleStateSave()}
+  catch(error){if(error.code==='file_conflict'){showConflict(file,error);return}throw error}
+}
+async function saveActive(){return saveFile(activeFile())}
+async function saveAll(){for(const file of S.openFiles.values())if(file.dirty)await saveFile(file)}
+function showConflict(file,error){openModal('File Changed on Disk',`<div class="modal-form"><p>${escapeHtml(file.path)} changed after it was opened.</p><div class="modal-actions"><button id="conflictReload" class="button">Reload</button><button id="conflictOverwrite" class="button primary">Overwrite</button></div></div>`);E('conflictReload').onclick=async()=>{closeModal();S.openFiles.delete(file.key);const model=S.models.get(file.key);if(model){model.dispose();S.models.delete(file.key)}await openFile(file.path,{root_id:file.root_id,group:file.group})};E('conflictOverwrite').onclick=()=>{closeModal();saveFile(file,true).catch(showError)}}
+function closeFile(key){const file=S.openFiles.get(key);if(!file)return;if(file.dirty&&!confirm(`Save changes to ${file.name}?`)){return}if(file.dirty)saveFile(file).catch(showError);S.openFiles.delete(key);const model=S.models.get(key);if(model){model.dispose();S.models.delete(key)}clearHistoryDecorations(file);for(let group=0;group<2;group++)if(S.activeByGroup[group]===key){disposeHistoryOriginal(group);const next=[...S.openFiles.values()].filter(row=>row.group===group).pop()||null;setEditorModel(group,next)}renderTabs();renderOpenEditors();scheduleStateSave()}
+function syncEditorGroupLayout(){const split=[...S.openFiles.values()].some(file=>file.group===1)||!!S.activeByGroup[1];E('editorGrid').classList.toggle('split',split);if(!split)S.activeGroup=0;document.querySelectorAll('.editor-group').forEach((group,index)=>group.classList.toggle('is-active',split||index===S.activeGroup))}
+function renderTabs(){for(let group=0;group<2;group++){const host=E(`tabs${group}`);host.innerHTML='';for(const file of S.openFiles.values()){if(file.group!==group)continue;const tab=document.createElement('div');tab.className='editor-tab'+(S.activeByGroup[group]===file.key?' is-active':'');tab.innerHTML=`<span class="codicon ${fileIconClass(file.path)}"></span><span class="editor-tab-name">${escapeHtml(file.name)}</span>${file.dirty?'<span class="dirty-mark">●</span>':''}<button class="icon-button close-tab" title="Close"><span class="codicon codicon-close"></span></button>`;tab.onclick=()=>setEditorModel(group,file);tab.querySelector('.close-tab').onclick=event=>{event.stopPropagation();closeFile(file.key)};host.appendChild(tab)}}syncEditorGroupLayout()}
+function renderBreadcrumbs(){for(let group=0;group<2;group++){const host=E(`breadcrumbs${group}`),file=activeFile(group);host.innerHTML=file?file.path.split('/').map((part,index,parts)=>`<span class="breadcrumb-item"><span>${escapeHtml(part)}</span>${index<parts.length-1?'<span class="codicon codicon-chevron-right"></span>':''}</span>`).join(''):'';if(file){const size=document.createElement('span');size.className='tree-meta';size.textContent=formatFileSize(file.size);host.appendChild(size)}if(file&&canPreviewFile(file)&&!file.binary){const button=document.createElement('button');button.className='breadcrumb-action';button.title=file.preview?'Open Text Editor':'Open Preview';button.innerHTML=`<span class="codicon codicon-${file.preview?'code':'preview'}"></span>`;button.onclick=()=>{file.preview=!file.preview;setEditorModel(group,file)};host.appendChild(button)}}}
+function renderOpenEditors(){const host=E('openEditors');host.innerHTML='';for(const file of S.openFiles.values()){const row=document.createElement('div');row.className='open-editor-row'+(activeFile()?.key===file.key?' is-active':'');row.innerHTML=`<span class="codicon ${fileIconClass(file.path)}"></span><span>${escapeHtml(file.name)}</span>${file.dirty?'<span class="dirty-mark">●</span>':''}`;row.onclick=()=>setEditorModel(file.group,file);host.appendChild(row)}}
+function renderSessions(){const select=E('sessionSelect');select.innerHTML='';for(const row of S.sessions){const option=document.createElement('option');option.value=row.id;option.textContent=row.title||row.id;option.selected=row.id===S.activeSession;select.appendChild(option)}}
+function renderRoots(){const select=E('rootSelect');select.innerHTML='';for(const root of S.roots){const option=document.createElement('option');option.value=root.id;option.textContent=root.kind==='session'?'Session Workspace':`Workspace Folder: ${root.label||root.id}`;option.selected=root.id===S.activeRoot;select.appendChild(option)}select.classList.toggle('is-hidden',S.roots.length===1&&S.roots[0]?.kind==='session');const current=S.roots.find(root=>root.id===S.activeRoot);E('workspaceLabel').textContent=current?.kind==='session'?'Session Workspace':current?.label||'Workspace'}
+function sessionRequestCurrent(session,seq=null){return session===S.activeSession&&(seq==null||seq===S.sessionSwitchSeq)}
+async function loadRoots(session=S.activeSession,seq=null){if(!session)return false;const out=await api(`/api/ide/sessions/${qs(session)}/workspace/roots`);if(!sessionRequestCurrent(session,seq))return false;S.roots=Array.isArray(out.roots)?out.roots:[];if(!S.roots.some(root=>root.id===S.activeRoot))S.activeRoot=S.roots[0]?.id||'session';renderRoots();S.treeCache.clear();return loadTree('',{session,root:S.activeRoot,seq})}
+async function loadTree(path='',context={}){const session=context.session||S.activeSession,root=context.root||S.activeRoot,seq=context.seq??null;if(!session)return false;const out=await api(`/api/ide/sessions/${qs(session)}/workspace/tree?root_id=${qs(root)}&path=${qs(path)}`);if(!sessionRequestCurrent(session,seq)||root!==S.activeRoot)return false;S.treeCache.set(path,out.tree?.children||[]);renderTree();setStatus(`${out.node_count||0} items`);return true}
+function renderTree(){const host=E('tree');host.innerHTML='';const draw=(path,depth)=>{for(const row of S.treeCache.get(path)||[]){const div=document.createElement('div');div.className='tree-row'+(activeFile()?.path===row.path&&activeFile()?.root_id===S.activeRoot?' is-active':'');div.style.paddingLeft=`${4+depth*12}px`;const open=row.type==='dir'&&S.treeCache.has(row.path);div.innerHTML=`<button class="tree-twist" tabindex="-1"><span class="codicon codicon-${row.type==='dir'?(open?'chevron-down':'chevron-right'):'blank'}"></span></button><span class="tree-icon codicon ${fileIconClass(row.name,row.type)}"></span><span class="tree-name">${escapeHtml(row.name)}</span>${row.type==='file'?`<span class="tree-meta">${formatFileSize(row.size)}</span>`:''}`;div.onclick=async()=>{try{if(row.type==='dir'){if(row.skipped)return toast('This generated directory is hidden by the explorer performance guard.','warning');if(open)S.treeCache.delete(row.path);else await loadTree(row.path);renderTree()}else await openFile(row.path)}catch(error){showError(error)}};div.oncontextmenu=event=>{event.preventDefault();showExplorerMenu(event.clientX,event.clientY,row)};host.appendChild(div);if(row.type==='dir'&&S.treeCache.has(row.path))draw(row.path,depth+1)}};draw('',0)}
+async function refreshOpenFile(file,forcePreview=false){if(!file||file.dirty||file.stageId!=='latest'||file.session_id!==S.activeSession)return;const out=await api(`/api/ide/sessions/${qs(file.session_id)}/workspace/file?${rootQuery(file.root_id)}&path=${qs(file.path)}`);if(file.session_id!==S.activeSession||S.openFiles.get(file.key)!==file)return;const revision=out.revision||out.file?.revision||'';if(revision===file.revision){if(forcePreview&&activeFile(file.group)?.key===file.key&&isArtifactFile(file))renderArtifactPreview(file.group,file);return}file.content=out.content||'';file.revision=revision;file.binary=out.encoding==='base64';file.previewKind=out.file?.preview_kind||file.previewKind||previewKindForPath(file.path);file.mime=out.file?.mime||file.mime||'';file.size=Number(out.file?.size||0);file.historyStages=null;try{await loadCodeHistory(file,'latest')}catch{}if(file.session_id!==S.activeSession||S.openFiles.get(file.key)!==file)return;const model=S.models.get(file.key);if(model&&model.getValue()!==file.content){S.suppressEditorChange=true;model.setValue(file.content);S.suppressEditorChange=false}if(!S.monaco&&activeFile(file.group)?.key===file.key&&!isArtifactFile(file))E(`fallbackEditor${file.group}`).value=file.content;if(activeFile(file.group)?.key===file.key){if(isArtifactFile(file))renderArtifactPreview(file.group,file);else applyHistoryView(file.group,file)}renderTabs();renderBreadcrumbs();renderOpenEditors()}
+async function refreshWorkspaceSnapshot(){if(S.workspaceRefreshBusy||!S.activeSession)return;const refreshSeq=++S.workspaceRefreshSeq,switchSeq=S.sessionSwitchSeq,session=S.activeSession,root=S.activeRoot;S.workspaceRefreshBusy=true;const expanded=[...S.treeCache.keys()].filter(Boolean).sort((a,b)=>a.split('/').length-b.split('/').length);const current=()=>refreshSeq===S.workspaceRefreshSeq&&switchSeq===S.sessionSwitchSeq&&session===S.activeSession&&root===S.activeRoot;try{const next=new Map();const load=async path=>{try{const out=await api(`/api/ide/sessions/${qs(session)}/workspace/tree?root_id=${qs(root)}&path=${qs(path)}`);if(current())next.set(path,out.tree?.children||[])}catch(error){if(!path&&current())throw error}};await load('');for(const path of expanded){if(!current())return;await load(path)}if(!current())return;S.treeCache=next;renderTree();for(const file of [...S.openFiles.values()]){if(!current())return;if(file.session_id===session)try{await refreshOpenFile(file)}catch(error){if(error.status===404){if(!file.dirty)closeFile(file.key)}else logOutput(`File refresh ${file.path}: ${error.message}`)}}}finally{if(refreshSeq===S.workspaceRefreshSeq)S.workspaceRefreshBusy=false}}
+async function createSession(){const title=`Program ${new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}`;const out=await api('/api/ide/sessions',{method:'POST',body:JSON.stringify({title})});await switchSession(out.id,true);return out}
+async function renameCurrentSession(){const row=S.sessions.find(item=>item.id===S.activeSession);if(!row)return;const title=prompt('Session name',row.title||'');if(!title||title.trim()===row.title)return;const out=await api(`/api/ide/sessions/${qs(S.activeSession)}`,{method:'PATCH',body:JSON.stringify({title:title.trim()})});row.title=out.title;renderSessions();updateAgentContext();await loadRoots();scheduleStateSave()}
+async function switchSession(sessionId,isNew=false){const target=String(sessionId||'');if(!target||target===S.activeSession&&!isNew){renderSessions();return true}const seq=++S.sessionSwitchSeq;if([...S.openFiles.values()].some(file=>file.dirty)&&!confirm('Switch session with unsaved files?')){if(seq===S.sessionSwitchSeq)renderSessions();return false}S.sessionSwitching=true;E('sessionSelect').disabled=true;S.activeSession=target;S.workspaceRefreshSeq++;S.workspaceRefreshBusy=false;closeAgentEvents();clearTimeout(S.agentPoll);S.agentPoll=null;S.agentPollDue=0;clearTimeout(S.agentTreeTimer);try{if(S.terminal)await killTerminal();if(seq!==S.sessionSwitchSeq)return false;if(S.debug)await stopDebug();if(seq!==S.sessionSwitchSeq)return false;S.openFiles.clear();S.models.forEach(model=>model.dispose());S.models.clear();S.historyOriginalModels.forEach(model=>model.dispose());S.historyOriginalModels.clear();S.historyDecorations.clear();S.viewStates.clear();S.activeByGroup=['',''];setEditorModel(1,null);setEditorModel(0,null);syncEditorGroupLayout();resetAgentSessionUI(target);await refreshConfig();if(seq!==S.sessionSwitchSeq||target!==S.activeSession)return false;await loadRoots(target,seq);if(seq!==S.sessionSwitchSeq||target!==S.activeSession)return false;updateAgentContext();connectAgentEvents();S.agentPollRequested=true;scheduleAgentPoll(50);if(isNew){toggleSecondary(true);E('agentPrompt').focus();agentMessage('New task workspace ready.','system')}scheduleStateSave();return true}finally{if(seq===S.sessionSwitchSeq){S.sessionSwitching=false;E('sessionSelect').disabled=false;renderSessions()}}}
+async function newFile(){const rel=prompt('File path',activeDir()?`${activeDir()}/untitled.txt`:'untitled.txt');if(!rel)return;await api(`/api/ide/sessions/${qs(S.activeSession)}/workspace/file`,{method:'PUT',body:JSON.stringify({root_id:S.activeRoot,path:rel,content:''})});await loadTree(activeDir());await openFile(rel)}
+async function newFolder(){const rel=prompt('Folder path',activeDir()?`${activeDir()}/new-folder`:'new-folder');if(!rel)return;await api(`/api/ide/sessions/${qs(S.activeSession)}/workspace/mkdir`,{method:'POST',body:JSON.stringify({root_id:S.activeRoot,path:rel})});await loadTree(activeDir())}
+async function renameEntry(row){const next=prompt('New path',row.path);if(!next||next===row.path)return;await api(`/api/ide/sessions/${qs(S.activeSession)}/workspace/rename`,{method:'PATCH',body:JSON.stringify({root_id:S.activeRoot,old_path:row.path,new_path:next})});const key=fileKey(S.activeRoot,row.path);const file=S.openFiles.get(key);if(file){closeFile(key);await openFile(next)}S.treeCache.clear();await loadTree('')}
+async function deleteEntry(row){if(!confirm(`Delete ${row.path}?`))return;await api(`/api/ide/sessions/${qs(S.activeSession)}/workspace/file`,{method:'DELETE',body:JSON.stringify({root_id:S.activeRoot,path:row.path,recursive:true})});const key=fileKey(S.activeRoot,row.path);if(S.openFiles.has(key))closeFile(key);S.treeCache.clear();await loadTree('')}
+function readFileAsB64(file){return new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(String(reader.result||'').split(',',2)[1]||'');reader.onerror=()=>reject(reader.error||new Error('Read failed'));reader.readAsDataURL(file)})}
+async function uploadFiles(files){const list=[...(files||[])];if(!list.length)return;const items=[];for(let index=0;index<list.length;index++){items.push({path:list[index].webkitRelativePath||list[index].name,content_b64:await readFileAsB64(list[index])});setStatus(`Preparing ${index+1}/${list.length}`)}await api(`/api/ide/sessions/${qs(S.activeSession)}/workspace/upload`,{method:'POST',body:JSON.stringify({root_id:S.activeRoot,dest:activeDir(),items})});S.treeCache.clear();await loadTree('');toast(`Uploaded ${list.length} file(s).`,'success')}
+"""
+
+IDE_JS += r"""
+function scheduleDiagnostics(file){clearTimeout(S.diagnosticTimer);if(file&&languageFor(file.path)==='python')S.diagnosticTimer=setTimeout(()=>runDiagnostics(file).catch(error=>logOutput(error.message)),450)}
+async function runDiagnostics(file){const group=S.activeByGroup.findIndex(key=>key===file.key);const content=group>=0?editorValue(group):(S.models.get(file.key)?.getValue()??file.content);const out=await api(`/api/ide/v2/sessions/${qs(file.session_id)}/diagnostics/python`,{method:'POST',body:JSON.stringify({root_id:file.root_id,path:file.path,content})});S.diagnostics=S.diagnostics.filter(row=>row.key!==file.key);for(const row of out.diagnostics||[])S.diagnostics.push(Object.assign({key:file.key,path:file.path,root_id:file.root_id},row));if(S.monaco){const model=S.models.get(file.key);if(model)S.monaco.editor.setModelMarkers(model,'python',(out.diagnostics||[]).map(row=>({severity:row.severity==='warning'?S.monaco.MarkerSeverity.Warning:S.monaco.MarkerSeverity.Error,message:row.message,startLineNumber:row.line||1,startColumn:row.column||1,endLineNumber:row.line||1,endColumn:(row.column||1)+1,source:row.source||'python'})))}renderProblems();updateStatusBar()}
+function renderProblems(){const host=E('problemsList');host.innerHTML='';for(const row of S.diagnostics){const div=document.createElement('div');div.className=`problem-row ${row.severity||'error'}`;div.innerHTML=`<span class="codicon codicon-${row.severity==='warning'?'warning':'error'}"></span><span>${escapeHtml(row.message)} <small>${escapeHtml(row.path)}</small></span><span>${row.line||1}:${row.column||1}</span>`;div.onclick=()=>openFile(row.path,{root_id:row.root_id,line:row.line,column:row.column}).catch(showError);host.appendChild(div)}E('problemCount').textContent=String(S.diagnostics.length)}
+function renderProblems(){const host=E('problemsList');host.innerHTML='';if(!S.diagnostics.length)host.innerHTML='<div class="panel-empty">No problems detected.</div>';for(const row of S.diagnostics){const div=document.createElement('div');div.className=`problem-row ${row.severity||'error'}`;div.innerHTML=`<span class="codicon codicon-${row.severity==='warning'?'warning':'error'}"></span><span>${escapeHtml(row.message)} <small>${escapeHtml(row.path)}</small></span><span>${row.line||1}:${row.column||1}</span>`;div.onclick=()=>openFile(row.path,{root_id:row.root_id,line:row.line,column:row.column}).catch(showError);host.appendChild(div)}E('problemCount').textContent=String(S.diagnostics.length)}
+function updateStatusBar(){const file=activeFile();E('fileSizeStatus').textContent=file?formatFileSize(file.size):'0 B';E('languageStatus').textContent=file?languageFor(file.path).replace(/^./,char=>char.toUpperCase()):'Plain Text';E('encodingStatus').textContent=file?String(file.encoding||'utf-8').toUpperCase():'UTF-8';E('accountName').textContent=S.account?.username||'';const errors=S.diagnostics.filter(row=>row.severity!=='warning').length;const warnings=S.diagnostics.length-errors;E('errorCount').textContent=errors;E('warningCount').textContent=warnings;E('errorStatus').title=`${errors} Errors, ${warnings} Warnings`;if(S.monaco&&S.editors[S.activeGroup]){const visibleDiff=!E(`diffEditor${S.activeGroup}`).classList.contains('is-hidden');const pos=(visibleDiff?S.diffEditors[S.activeGroup]?.getModifiedEditor():S.editors[S.activeGroup])?.getPosition();if(pos)E('indentStatus').textContent=`Ln ${pos.lineNumber}, Col ${pos.column}`}else E('indentStatus').textContent='Spaces: 2'}
+function showView(view){S.activeView=view;S.primaryVisible=true;E('ideShell').classList.remove('primary-hidden');document.querySelectorAll('.activity-button[data-view]').forEach(button=>button.classList.toggle('is-active',button.dataset.view===view));document.querySelectorAll('.side-view').forEach(section=>section.classList.toggle('is-active',section.dataset.sideView===view));if(view==='scm')refreshScm().catch(showError);if(view==='run')refreshTasks().catch(showError);if(view==='extensions')refreshExtensions().catch(showError);scheduleStateSave()}
+function showPanel(tab='terminal'){S.panel=tab;S.panelVisible=true;E('ideShell').classList.remove('panel-hidden');document.querySelectorAll('[data-panel-tab]').forEach(button=>button.classList.toggle('is-active',button.dataset.panelTab===tab));document.querySelectorAll('.panel-content').forEach(panel=>panel.classList.toggle('is-active',panel.id===`${tab}Panel`));if(tab==='terminal'){if(!S.terminal&&S.capabilities.terminal)newTerminal().catch(showError);else if(S.terminalFit)setTimeout(()=>S.terminalFit.fit(),30)}scheduleStateSave()}
+function togglePrimary(){S.primaryVisible=!S.primaryVisible;E('ideShell').classList.toggle('primary-hidden',!S.primaryVisible);scheduleStateSave()}
+function toggleSecondary(force){S.secondaryVisible=typeof force==='boolean'?force:!S.secondaryVisible;E('ideShell').classList.toggle('secondary-hidden',!S.secondaryVisible);scheduleStateSave()}
+function togglePanel(){S.panelVisible=!S.panelVisible;E('ideShell').classList.toggle('panel-hidden',!S.panelVisible);scheduleStateSave()}
+function scheduleStateSave(){clearTimeout(S.stateTimer);S.stateTimer=setTimeout(saveWorkbenchState,600)}
+async function saveWorkbenchState(){if(!S.csrf||!S.activeSession)return;const state={active_session_id:S.activeSession,active_root_id:S.activeRoot,active_view:S.activeView,panel:S.panel,panel_visible:S.panelVisible,secondary_visible:S.secondaryVisible,agent_todo_collapsed:S.agentTodoCollapsed,code_history_mode:S.codeHistoryMode,open_files:[...S.openFiles.values()].slice(0,40).map(file=>({root_id:file.root_id,path:file.path,stage_id:file.stageId||'latest'}))};try{await api('/api/ide/v2/workbench/state',{method:'POST',body:JSON.stringify({state})})}catch(error){logOutput(`State save failed: ${error.message}`)}}
+async function restoreWorkbenchState(){try{const out=await api('/api/ide/v2/workbench/state');const state=out.state||{};if(state.active_session_id&&S.sessions.some(row=>row.id===state.active_session_id))S.activeSession=state.active_session_id;if(state.active_root_id)S.activeRoot=state.active_root_id;if(state.active_view)S.activeView=state.active_view;S.panel=state.panel||'terminal';S.codeHistoryMode=['all','changes','clean'].includes(state.code_history_mode)?state.code_history_mode:'all';const panelVisible=state.panel_visible!==false;S.secondaryVisible=state.secondary_visible!==false;S.agentTodoCollapsed=state.agent_todo_collapsed===true;showView(S.activeView);showPanel(S.panel);S.panelVisible=panelVisible;E('ideShell').classList.toggle('panel-hidden',!panelVisible);if(!S.secondaryVisible)toggleSecondary(false);await loadRoots();for(const row of state.open_files||[]){try{await openFile(row.path,{root_id:row.root_id||'session',group:0,stage_id:row.stage_id||'latest'})}catch(error){logOutput(`Restore skipped ${row.path}: ${error.message}`)}}}catch(error){logOutput(`State restore failed: ${error.message}`);await loadRoots()}}
+async function runSearch(){const query=E('searchInput').value;if(!query.trim()){S.searchResults=[];renderSearch();return}E('searchSummary').textContent='Searching...';const out=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/search`,{method:'POST',body:JSON.stringify({root_id:S.activeRoot,query,case_sensitive:E('matchCaseBtn').classList.contains('is-active'),regex:E('regexBtn').classList.contains('is-active'),include:E('includeInput').value.trim(),exclude:E('excludeInput').value.trim(),max_results:1000})});S.searchResults=out.results||[];E('searchSummary').textContent=`${out.count||0} results in ${out.files_scanned||0} files${out.truncated?' (limit reached)':''}`;renderSearch()}
+function renderSearch(){const host=E('searchResults');host.innerHTML='';let current='';for(const row of S.searchResults){if(row.path!==current){current=row.path;const group=document.createElement('div');group.className='result-group';group.textContent=row.path;host.appendChild(group)}const line=document.createElement('div');line.className='result-line list-row';line.innerHTML=`<code>${escapeHtml(row.preview)}</code><span class="result-location">${row.line}:${row.column}</span>`;line.onclick=()=>openFile(row.path,{root_id:S.activeRoot,line:row.line,column:row.column}).catch(showError);host.appendChild(line)}}
+async function refreshScm(){E('scmBranch').textContent='Checking repository...';const out=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/scm/status?${rootQuery()}`);S.scm=out;E('scmBranch').innerHTML=out.repository?`<span class="codicon codicon-git-branch"></span> ${escapeHtml(out.branch||'detached')}`:'No source control providers registered.';E('statusBranch').textContent=out.branch||'-';E('scmBadge').textContent=out.changes?.length?String(out.changes.length):'';renderScm()}
+function renderScm(){const host=E('scmChanges');host.innerHTML='';for(const row of S.scm?.changes||[]){const code=row.status.trim()||row.status;const tone=code.includes('?')?'untracked':code.includes('D')?'deleted':'modified';const div=document.createElement('div');div.className='list-row scm-row';div.innerHTML=`<span class="codicon ${fileIconClass(row.path)}"></span><span class="list-main">${escapeHtml(row.path)}</span><span class="scm-code ${tone}">${escapeHtml(code)}</span>`;div.onclick=()=>showScmDiff(row).catch(showError);host.appendChild(div)}}
+async function showScmDiff(row){const out=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/scm/diff`,{method:'POST',body:JSON.stringify({root_id:S.activeRoot,path:row.path})});showPanel('output');logOutput(`\n--- ${row.path} ---\n${out.diff||out.error||'No textual diff.'}`)}
+async function refreshTasks(){const out=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/tasks?${rootQuery()}`);S.tasks=out.tasks||[];const host=E('taskList');host.innerHTML='';if(!S.tasks.length)host.innerHTML='<div class="side-summary">No tasks configured in .vscode/tasks.json.</div>';for(const task of S.tasks){const row=document.createElement('div');row.className='list-row';row.innerHTML=`<span class="codicon codicon-play"></span><span class="list-main">${escapeHtml(task.label)}</span>`;row.onclick=()=>runTask(task).catch(showError);host.appendChild(row)}}
+async function runTask(task){showPanel('output');logOutput(`> Running task: ${task.label}`);const out=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/tasks/run`,{method:'POST',body:JSON.stringify({root_id:S.activeRoot,task_id:task.id})});logOutput(`${out.stdout||''}${out.stderr||''}\nTask exited with code ${out.returncode}`);await refreshWorkspaceSnapshot()}
+function renderTools(){const host=E('toolchains');host.innerHTML='';for(const tool of S.config?.toolchains||[]){const row=document.createElement('div');row.className='tool-row';row.innerHTML=`<span class="tool-state ${tool.available?'':'missing'}">${tool.available?'Available':'Missing'}</span><strong>${escapeHtml(tool.name)}</strong><span>${escapeHtml(tool.available?Object.keys(tool.found||{}).join(', '):tool.install_hint)}</span>`;host.appendChild(row)}}
+function shellQuote(value){const text=String(value);if(/^win/i.test(String(S.config?.platform||'')))return `"${text.replace(/"/g,'\\"')}"`;return `'${text.replace(/'/g,"'\\''")}'`}
+async function newTerminal(){if(S.terminalStarting)return S.terminalPromise;if(!S.capabilities.terminal)throw new Error(S.capabilities.process_denial_reason||'Terminal is unavailable.');S.terminalStarting=true;S.terminalPromise=(async()=>{if(S.terminal)await killTerminal();E('terminalEmpty').textContent='Starting terminal...';const out=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/terminals`,{method:'POST',body:JSON.stringify({root_id:S.activeRoot,cwd:activeDir()||'.',cols:100,rows:28})});S.terminal=out.terminal;S.terminalOffset=0;E('terminalFallback').textContent='';setupTerminalWidget();pollTerminal();if(S.panel!=='terminal'||!S.panelVisible)showPanel('terminal');return S.terminal})().finally(()=>{S.terminalStarting=false;S.terminalPromise=null});return S.terminalPromise}
+function setupTerminalWidget(){E('terminalHost').innerHTML='';E('terminalEmpty').classList.add('is-hidden');if(window.Terminal){S.terminalWidget=new window.Terminal({convertEol:true,cursorBlink:true,fontSize:12,fontFamily:'SFMono-Regular, Menlo, Monaco, Consolas, monospace',theme:{background:'#181818',foreground:'#cccccc',cursor:'#ffffff',selectionBackground:'#264f78'},scrollback:5000});const Fit=window.FitAddon?.FitAddon;if(Fit){S.terminalFit=new Fit();S.terminalWidget.loadAddon(S.terminalFit)}S.terminalWidget.open(E('terminalHost'));if(S.terminalFit)S.terminalFit.fit();S.terminalWidget.onData(data=>terminalInput(data));if(S.terminalWidget.onResize)S.terminalWidget.onResize(size=>terminalResize(size.cols,size.rows));E('terminalFallback').classList.remove('is-active')}else{E('terminalFallback').classList.add('is-active');E('terminalFallback').contentEditable='true';E('terminalFallback').onkeydown=event=>{if(event.key.length===1){event.preventDefault();terminalInput(event.key)}else if(event.key==='Enter'){event.preventDefault();terminalInput('\r')}else if(event.key==='Backspace'){event.preventDefault();terminalInput('\x7f')}}}}
+async function terminalInput(data){if(!S.terminal)return;try{await api(`/api/ide/v2/terminals/${qs(S.terminal.id)}/input`,{method:'POST',body:JSON.stringify({data})})}catch(error){logOutput(error.message)}}
+async function terminalResize(cols,rows){if(!S.terminal)return;try{await api(`/api/ide/v2/terminals/${qs(S.terminal.id)}/resize`,{method:'POST',body:JSON.stringify({cols,rows})})}catch(error){logOutput(error.message)}}
+async function pollTerminal(){clearTimeout(S.terminalPoll);if(!S.terminal)return;try{const out=await api(`/api/ide/v2/terminals/${qs(S.terminal.id)}/output?offset=${S.terminalOffset}`);S.terminalOffset=out.next_offset||S.terminalOffset;if(out.data){logOutputChunk(out.data.replace(/\x1b\[[0-9;?]*[ -\/]*[@-~]/g,''));if(S.terminalWidget)S.terminalWidget.write(out.data);else{const host=E('terminalFallback');host.textContent+=out.data;host.scrollTop=host.scrollHeight}}if(out.closed){setStatus(`Terminal exited with code ${out.returncode}`);logOutput(`Process exited with code ${out.returncode}`);S.terminal=null;await refreshWorkspaceSnapshot();return}}catch(error){logOutput(`Terminal: ${error.message}`);return}S.terminalPoll=setTimeout(pollTerminal,220)}
+async function killTerminal(){if(!S.terminal)return;const current=S.terminal;S.terminal=null;clearTimeout(S.terminalPoll);try{await api(`/api/ide/v2/terminals/${qs(current.id)}`,{method:'DELETE',body:'{}'})}catch(error){logOutput(error.message)}if(S.terminalWidget){S.terminalWidget.dispose();S.terminalWidget=null}E('terminalHost').innerHTML='';E('terminalFallback').classList.remove('is-active');E('terminalEmpty').textContent='No active terminal.';E('terminalEmpty').classList.remove('is-hidden')}
+async function runActiveFile(){const file=activeFile();if(!file)return toast('Open a file to run.','warning');if(file.binary)return toast('This artifact is not executable.','warning');if(file.dirty)await saveFile(file);const lang=languageFor(file.path),python=/^win/i.test(String(S.config?.platform||''))?'python':'python3',command=lang==='python'?`${python} ${shellQuote(file.name)}`:['javascript','typescript'].includes(lang)?`node ${shellQuote(file.name)}`:`${shellQuote(file.name)}`;logOutput(`> ${command}`);if(S.capabilities.terminal){await newTerminal();setTimeout(()=>terminalInput(command+'\r'),300);return}showPanel('output');const out=await api(`/api/ide/sessions/${qs(S.activeSession)}/terminal/run`,{method:'POST',body:JSON.stringify({root_id:file.root_id,cwd:file.dir||'.',command})});if(out.stdout)logOutputChunk(out.stdout);if(out.stderr)logOutputChunk(out.stderr);logOutput(`Process exited with code ${out.returncode}`);await refreshWorkspaceSnapshot()}
+async function debugActiveFile(){const file=activeFile();if(!file||languageFor(file.path)!=='python')return toast('Open a Python file to debug.','warning');if(file.dirty)await saveFile(file);if(S.debug)await stopDebug();showPanel('debug');logDebug(`Starting debugger for ${file.path}...`);const out=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/debug`,{method:'POST',body:JSON.stringify({root_id:file.root_id})});S.debug=out.debug;S.debugFile=file;S.debugSeq=1;await sendDebug({seq:S.debugSeq++,type:'request',command:'initialize',arguments:{clientID:'clouds-coder',clientName:'Clouds Coder Program',adapterID:'python',pathFormat:'path',linesStartAt1:true,columnsStartAt1:true,supportsRunInTerminalRequest:false}});pollDebug()}
+async function sendDebug(message){if(!S.debug)return;await api(`/api/ide/v2/debug/${qs(S.debug.id)}/send`,{method:'POST',body:JSON.stringify({message})})}
+async function pollDebug(){clearTimeout(S.debugPoll);if(!S.debug)return;try{const out=await api(`/api/ide/v2/debug/${qs(S.debug.id)}/messages`);for(const msg of out.messages||[])await handleDebugMessage(msg);if(out.stderr)logDebug(out.stderr);if(out.closed){logDebug('Debug adapter stopped.');S.debug=null;return}}catch(error){logDebug(`Debug error: ${error.message}`);S.debug=null;return}S.debugPoll=setTimeout(pollDebug,180)}
+async function handleDebugMessage(msg){if(msg.type==='response'&&msg.command==='initialize'&&msg.success){logDebug('Debugger initialized.');await sendDebug({seq:S.debugSeq++,type:'request',command:'launch',arguments:{program:S.debugFile.name,cwd:S.debugFile.dir||'.',console:'internalConsole',justMyCode:true,noDebug:false}});return}if(msg.type==='event'&&msg.event==='initialized'){await sendDebug({seq:S.debugSeq++,type:'request',command:'configurationDone',arguments:{}});return}if(msg.type==='event'&&msg.event==='output'){logDebug(msg.body?.output||'');return}if(msg.type==='event'&&msg.event==='stopped'){logDebug(`Paused: ${msg.body?.reason||'breakpoint'}`);return}if(msg.type==='event'&&msg.event==='terminated'){logDebug('Program terminated.');await stopDebug(false);await refreshWorkspaceSnapshot();return}if(msg.type==='response'&&!msg.success)logDebug(`${msg.command}: ${msg.message||'request failed'}`)}
+async function stopDebug(closeRemote=true){clearTimeout(S.debugPoll);const current=S.debug;S.debug=null;if(closeRemote&&current)try{await api(`/api/ide/v2/debug/${qs(current.id)}`,{method:'DELETE',body:'{}'})}catch(error){logDebug(error.message)}}
+"""
+
+IDE_JS += r"""
+async function refreshExtensions(query=''){if(query.trim()){const out=await api(`/api/ide/v2/extensions/search?query=${qs(query)}&size=40`);renderExtensions(out.extensions||[],false);E('extensionSummary').textContent=`${out.totalSize||0} Open VSX results`}else{const out=await api('/api/ide/v2/extensions');S.installedExtensions=out.extensions||[];renderExtensions(S.installedExtensions,true);E('extensionSummary').textContent=`${S.installedExtensions.length} installed`}}
+function renderExtensions(rows,installed){const host=E('extensionList');host.innerHTML='';if(!rows.length)host.innerHTML=`<div class="side-summary">${installed?'No extensions installed.':'No extensions found.'}</div>`;for(const ext of rows){const row=document.createElement('div');row.className='extension-row';row.innerHTML=`<div class="extension-icon"><span class="codicon codicon-extensions"></span></div><div class="extension-info"><div class="extension-title">${escapeHtml(ext.displayName||ext.name||ext.id)}</div><div class="extension-description">${escapeHtml(ext.description||'')}</div><div class="extension-meta">${escapeHtml(ext.id||`${ext.namespace}.${ext.name}`)} ${escapeHtml(ext.version||'')}</div></div><button class="button">${installed?'Uninstall':'Install'}</button>`;row.querySelector('.button').onclick=()=>installed?uninstallExtension(ext.id):installExtension(ext.id||`${ext.namespace}.${ext.name}`);host.appendChild(row)}}
+async function installExtension(id,payload={}){setStatus(`Installing ${id||'VSIX'}...`);const out=await api('/api/ide/v2/extensions/install',{method:'POST',body:JSON.stringify(Object.assign({id},payload))});toast(`Installed ${out.extension?.displayName||out.extension?.id}.`,'success');await refreshExtensions();activateExtensionWorker(out.extension).catch(error=>logOutput(`Extension ${out.extension?.id}: ${error.message}`))}
+async function uninstallExtension(id){if(!confirm(`Uninstall ${id}?`))return;await api('/api/ide/v2/extensions',{method:'DELETE',body:JSON.stringify({id})});const worker=S.extensionWorkers.get(id);if(worker){worker.terminate();S.extensionWorkers.delete(id)}await refreshExtensions();toast(`Uninstalled ${id}.`,'success')}
+async function installVsix(file){if(!file)return;await installExtension('',{content_b64:await readFileAsB64(file)})}
+async function activateExtensionWorker(extension){if(!S.capabilities.executable_extensions||!extension?.worker_supported||!extension.browser||!extension.install_path||S.extensionWorkers.has(extension.id))return;const scriptUrl=`/api/ide/v2/extensions/asset/${qs(extension.install_path)}/${extension.browser.split('/').map(qs).join('/')}`;const extensionSource=await fetch(scriptUrl,{credentials:'same-origin'}).then(response=>{if(!response.ok)throw new Error('Unable to load extension code');return response.text()});const bootstrap=`
+const commands=new Map();
+const vscode={version:'clouds-coder-api-0.1',commands:{registerCommand:(id,fn)=>{commands.set(id,fn);postMessage({type:'registerCommand',id});return{dispose:()=>commands.delete(id)}},executeCommand:(id,...args)=>{postMessage({type:'executeHostCommand',id,args});}},window:{showInformationMessage:message=>postMessage({type:'information',message}),showWarningMessage:message=>postMessage({type:'warning',message}),showErrorMessage:message=>postMessage({type:'error',message})},workspace:{getConfiguration:()=>({get:()=>undefined,has:()=>false}),workspaceFolders:[]},languages:{registerCompletionItemProvider:()=>({dispose(){}})},ExtensionContext:class{}};
+self.fetch=()=>Promise.reject(new Error('Network access is not part of the Clouds Coder extension API subset'));self.XMLHttpRequest=undefined;self.WebSocket=undefined;self.EventSource=undefined;self.Worker=undefined;
+self.vscode=vscode;self.require=id=>{if(id==='vscode')return vscode;throw new Error('Only the documented vscode API subset is available')};
+self.onmessage=async event=>{if(event.data?.type==='command'){const fn=commands.get(event.data.id);if(fn)try{await fn(...(event.data.args||[]))}catch(error){postMessage({type:'error',message:error.message})}}};
+${extensionSource}\n;if(typeof activate==='function')Promise.resolve(activate({subscriptions:[],extensionUri:'clouds-extension://${extension.id}',globalState:{get:()=>undefined,update:async()=>{}},workspaceState:{get:()=>undefined,update:async()=>{}}})).catch(error=>postMessage({type:'error',message:error.message}));`;
+  const worker=new Worker(URL.createObjectURL(new Blob([bootstrap],{type:'application/javascript'})));worker.onmessage=event=>handleExtensionMessage(extension,event.data);worker.onerror=event=>logOutput(`Extension ${extension.id}: ${event.message}`);S.extensionWorkers.set(extension.id,worker)
+}
+function handleExtensionMessage(extension,message){if(!message)return;if(message.type==='information')toast(`${extension.displayName}: ${message.message}`,'success');else if(message.type==='warning')toast(`${extension.displayName}: ${message.message}`,'warning');else if(message.type==='error')toast(`${extension.displayName}: ${message.message}`,'error');else if(message.type==='registerCommand')COMMANDS.set(message.id,{label:`${extension.displayName}: ${message.id}`,run:()=>S.extensionWorkers.get(extension.id)?.postMessage({type:'command',id:message.id,args:[]})});else if(message.type==='executeHostCommand')runCommandById(message.id)}
+async function activateInstalledExtensions(){for(const extension of S.installedExtensions)await activateExtensionWorker(extension)}
+function agentRoleKey(role=''){const key=String(role||'').trim().toLowerCase();return['manager','developer','explorer','planner','reviewer','single'].includes(key)?key:''}
+function agentRoleLabel(role=''){const key=agentRoleKey(role);return key?key[0].toUpperCase()+key.slice(1):String(role||'Agent')}
+function stripAgentRolePrefix(text,role=''){const key=agentRoleKey(role),value=String(text||'').replace(/^\uFEFF/,'').trimStart();if(!key)return value;const labels=[key,agentRoleLabel(key)].map(label=>label.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'));return value.replace(new RegExp(`^(?:${labels.join('|')})\\s*(?:[:：]\\s*|\\n+)`,'i'),'').trimStart()}
+function renderAgentMarkdown(text){const source=String(text||'');if(!window.marked?.parse)return escapeHtml(source).replace(/\n/g,'<br>');const html=window.marked.parse(source,{async:false,gfm:true,breaks:false});return sanitizePreviewHtml(html)}
+function agentMessage(text,type='system',meta=''){const row=document.createElement('div');row.className=`agent-message ${type}`;if(meta){const key=agentRoleKey(meta),label=document.createElement('span');label.className=`agent-meta${key?` agent-role-${key}`:''}`;label.textContent=agentRoleLabel(meta);row.appendChild(label)}const value=stripAgentRolePrefix(text,meta);if(type==='assistant'){const body=document.createElement('div');body.className='agent-markdown';body.innerHTML=renderAgentMarkdown(value);body.dataset.source=value;row.appendChild(body)}else row.appendChild(document.createTextNode(value));E('agentMessages').appendChild(row);E('agentMessages').scrollTop=E('agentMessages').scrollHeight;return row}
+function agentApproach(text,role='Agent'){const value=stripAgentRolePrefix(text,role).trim();if(!value)return null;const row=document.createElement('div');row.className='agent-message approach';row.innerHTML=`<div class="agent-approach-head"><span class="codicon codicon-compass"></span><span>Approach</span><span class="agent-meta${agentRoleKey(role)?` agent-role-${agentRoleKey(role)}`:''}" style="margin:0 0 0 auto">${escapeHtml(agentRoleLabel(role))}</span></div><div class="agent-approach-body">${escapeHtml(value)}</div>`;E('agentMessages').appendChild(row);E('agentMessages').scrollTop=E('agentMessages').scrollHeight;return row}
+function renderAgentPlanCard(tools,role='Agent'){const list=(Array.isArray(tools)?tools:[]).map(value=>String(value||'').trim()).filter(Boolean),signature=`${agentRoleKey(role)||String(role||'agent').toLowerCase()}:${list.join('|')}`,existing=S.agentPlanCards.get(signature);if(existing?.isConnected){const count=Number(existing.dataset.occurrences||1)+1;existing.dataset.occurrences=String(count);const state=existing.querySelector('.agent-tool-state');if(state)state.textContent=`Planned ×${count}`;return existing}const card=agentToolCard({kind:'tool',name:'tool_calls',title:'Tools scheduled',state:'Planned',output:list.join(', ')||'Tool calls scheduled',role});card.dataset.occurrences='1';S.agentPlanCards.set(signature,card);return card}
+function updateAgentContext(){const file=activeFile();E('agentContext').textContent=[S.sessions.find(row=>row.id===S.activeSession)?.title,S.roots.find(row=>row.id===S.activeRoot)?.label,file?.path].filter(Boolean).join('  /  ')||'No active context'}
+function agentEventKey(row){return [Number(row?.ts||0).toFixed(4),row?.role||'',row?.agent_role||'',row?.type||'',String(row?.text||'').slice(0,180)].join('|')}
+function renderAgentProgress(state){const panel=E('agentTodoPanel'),host=E('agentTodoBody');const rows=[...(state.todos||[]),...(state.tasks||[])].slice(0,40);panel.classList.toggle('is-hidden',!rows.length);if(!rows.length){host.innerHTML='';return}const completed=rows.filter(row=>String(row.status||'')==='completed').length;E('agentTodoCount').textContent=`${completed}/${rows.length}`;panel.classList.toggle('is-collapsed',S.agentTodoCollapsed);E('agentTodoToggle').setAttribute('aria-expanded',String(!S.agentTodoCollapsed));host.innerHTML=rows.map(row=>{const status=String(row.status||'pending'),mark=status==='completed'?'✓':status==='in_progress'?'●':'○';return `<div class="agent-progress-row ${status==='completed'?'done':status==='in_progress'?'active':''}"><span>${mark}</span><span>${escapeHtml(row.content||row.subject||row.description||'Task')}</span></div>`}).join('')}
+function renderAgentContextHud(state){const pct=Number(state.context_left_percent),left=Number(state.context_left_tokens),limit=Number(state.context_effective_token_limit);const badge=E('agentContextPercent'),button=E('agentModelBtn');badge.textContent=Number.isFinite(pct)?`${Math.round(Math.max(0,Math.min(100,pct)))}%`:'';const context=Number.isFinite(left)&&left>=0?`${left.toLocaleString()} tokens left${Number.isFinite(limit)&&limit>0?` of ${limit.toLocaleString()}`:''}`:'Context usage unavailable';button.title=`${state.model||'Choose model'}\n${context}${Number.isFinite(pct)?` (${pct.toFixed(1)}%)`:''}`}
+function agentToolIcon(kind,name=''){const key=String(name||kind||'').toLowerCase();if(kind==='file_patch'||key.includes('write')||key.includes('edit'))return'diff';if(kind==='command'||key==='bash'||key.includes('terminal'))return'terminal';if(kind==='compact'||key.includes('compact'))return'archive';if(kind==='control')return'symbol-keyword';if(key.includes('read'))return'file-code';if(key.includes('search')||key.includes('query'))return'search';if(key.includes('todo'))return'checklist';if(key.includes('skill'))return'extensions';return'tools'}
+function agentDiffHtml(diff){return String(diff||'').split('\n').map(line=>{let number='',mark=' ',code=line,tone='';const numbered=line.match(/^\s*(\d+)\s+([+\- ])\s?(.*)$/);if(numbered){number=numbered[1];mark=numbered[2];code=numbered[3]}else if(line.startsWith('@@')){mark='@';code=line}else if((line.startsWith('+')&&!line.startsWith('+++'))||(line.startsWith('-')&&!line.startsWith('---'))){mark=line[0];code=line.slice(1)}if(mark==='+')tone='add';else if(mark==='-')tone='del';else if(mark==='@')tone='hunk';return `<div class="agent-diff-line ${tone}"><span class="line-no">${escapeHtml(number)}</span><span class="line-mark">${escapeHtml(mark)}</span><span>${escapeHtml(code)}</span></div>`}).join('')}
+function agentToolCard({kind='tool',name='Tool',title='',state='',stateTone='',output='',path='',added=null,deleted=null,diff='',role='',expanded=false,actionPath='',actionRoot=''}){const row=document.createElement('div');const cardKind=['file_patch','command','control','compact'].includes(kind)?kind:'tool';row.className=`agent-message ${cardKind}${expanded?' is-expanded':''}`;const stats=kind==='file_patch'?`<span class="agent-diff-stats"><span class="diff-add">+${Number(added||0)}</span><span class="diff-del">-${Number(deleted||0)}</span></span>`:'';const body=diff?`<div class="agent-diff">${agentDiffHtml(diff)}</div>`:output?`<pre class="agent-tool-output">${escapeHtml(output)}</pre>`:'';const actions=actionPath?`<div class="agent-tool-actions"><button class="button" data-agent-open-file="${escapeHtml(actionPath)}"><span class="codicon codicon-go-to-file"></span> Open File</button>${stats}</div>`:stats?`<div class="agent-tool-actions">${stats}</div>`:'';const roleKey=agentRoleKey(role),roleHtml=role?`<span class="agent-meta${roleKey?` agent-role-${roleKey}`:''}" style="padding:6px 8px 0">${escapeHtml(agentRoleLabel(role))}</span>`:'';row.innerHTML=`<div class="agent-tool-head" role="button" tabindex="0"><span class="codicon codicon-${agentToolIcon(kind,name)}"></span><span class="agent-tool-title" title="${escapeHtml(path||title||name)}">${escapeHtml(title||name)}</span><span class="agent-tool-state ${escapeHtml(stateTone)}">${escapeHtml(state)}</span><span class="codicon codicon-chevron-right"></span></div><div class="agent-tool-body">${roleHtml}${body}${actions}</div>`;const toggle=()=>row.classList.toggle('is-expanded');const head=row.querySelector('.agent-tool-head');head.onclick=toggle;head.onkeydown=event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();toggle()}};const open=row.querySelector('[data-agent-open-file]');if(open)open.onclick=event=>{event.stopPropagation();openFile(actionPath,{root_id:actionRoot||S.activeRoot}).catch(showError)};E('agentMessages').appendChild(row);E('agentMessages').scrollTop=E('agentMessages').scrollHeight;return row}
+function renderFilePatchCard(data,role=''){const path=String(data.session_rel_path||data.path||'').replace(/^\.\//,'');const change=String(data.change_type||'').toLowerCase();const label=/create|add|new/.test(change)?'Created':'Modified';return agentToolCard({kind:'file_patch',name:'file_patch',title:`${label} ${path||'workspace file'}`,state:'Applied',stateTone:'success',path,added:data.added,deleted:data.deleted,diff:data.diff_numbered||data.diff||'',role,expanded:true,actionPath:path,actionRoot:S.activeRoot})}
+function renderCommandCard(data,role=''){const code=data.exit_code,failed=code!=null&&Number(code)!==0,command=String(data.command||''),summary=command.split('\n')[0].slice(0,90),changed=Array.isArray(data.changed_files)&&data.changed_files.length?`Changed files:\n${data.changed_files.map(path=>`  ${path}`).join('\n')}`:'';const output=[command?`Command:\n${command}`:'',data.cwd?`Working directory: ${data.cwd}`:'',data.output||data.result||'',changed].filter(Boolean).join('\n\n');const card=agentToolCard({kind:'command',name:data.name||'command',title:`${String(data.name||'Command').replace(/^bash$/i,'Bash')}${summary?` · ${summary}`:''}`,state:code==null?'Running':`Exit ${code}${data.duration_ms!=null?` · ${data.duration_ms}ms`:''}`,stateTone:failed?'error':code==null?'':'success',output,role,expanded:failed});card.dataset.commandComplete=String(code!=null);return card}
+function parseAgentControl(text){const value=String(text||'').trim();let match=value.match(/^<([a-z0-9_-]+)(?:\s+[^>]*)?>([\s\S]*)<\/\1>$/i);if(match)return{tag:match[1],body:match[2].trim(),kind:'runtime instruction'};match=value.match(/^\[([^\]\n]{2,100})\](?:\s*([\s\S]*))?$/);if(match&&/^(skill loaded|tool calls|auto-continue|command|file_patch|system|manager|developer|explorer|planner|reviewer)(?::|$)/i.test(match[1]))return{tag:match[1],body:String(match[2]||'').trim(),kind:'control event'};return null}
+function renderAgentControl(text,role='User'){const parsed=parseAgentControl(text);if(!parsed)return null;const skill=parsed.tag.match(/^skill loaded:\s*(.*)$/i);return agentToolCard({kind:'control',name:skill?'skill':parsed.tag,title:skill?`Skill loaded · ${skill[1]}`:`${parsed.kind} · ${parsed.tag}`,state:'Structured',stateTone:'success',output:parsed.body,role,expanded:!!parsed.body})}
+function renderCompactCard(data){const before=Number(data.context_used_before||0),after=Number(data.context_used_after||0),reduction=Number(data.context_used_reduction||Math.max(0,before-after)),output=[data.reason?`Reason: ${data.reason}`:'',`Context used: ${before.toLocaleString()} → ${after.toLocaleString()}`,`Freed: ${reduction.toLocaleString()} tokens`,data.archived_messages!=null?`Archived messages: ${Number(data.archived_messages).toLocaleString()}`:'',data.archive_segment?`Archive: ${data.archive_segment}`:'',data.next_call_label?`Next: ${data.next_call_label}`:''].filter(Boolean).join('\n');return agentToolCard({kind:'compact',name:'compact',title:'Context compacted',state:data.effective===false?'Limited effect':'Completed',stateTone:data.effective===false?'':'success',output,role:data.agent_role||data.role||'System',expanded:false})}
+function replaceTrackedAgentToolCard(existing,card){if(existing?.isConnected)existing.replaceWith(card);for(const[key,value]of S.agentToolCards)if(value===existing)S.agentToolCards.set(key,card)}
+function clearTrackedAgentToolCard(card){for(const[key,value]of S.agentToolCards)if(value===card)S.agentToolCards.delete(key)}
+function renderAgentToolOperation(op){
+  const data=op.data||{},name=String(data.name||data.tool||'tool'),lower=name.toLowerCase(),role=String(data.agent_role||'Agent'),roleKey=agentRoleKey(role)||role.toLowerCase(),callKey=String(data.tool_call_id||''),activeKey=`active:${roleKey}:${lower}`,resultText=String(data.summary||data.result||'');
+  if(op.type==='file_patch')return renderFilePatchCard(data,role);
+  if(op.type==='compact')return renderCompactCard(data);
+  if(op.type==='command'){
+    const commandName=String(data.name||'command').toLowerCase(),commandActiveKey=`active:${roleKey}:${commandName}`,existing=(callKey&&S.agentToolCards.get(callKey))||S.agentToolCards.get(commandActiveKey),card=renderCommandCard(data,role);
+    if(existing)replaceTrackedAgentToolCard(existing,card);
+    S.agentToolCards.set(commandActiveKey,card);
+    if(callKey)S.agentToolCards.set(callKey,card);
+    return card;
+  }
+  if(lower.includes('todowrite'))return null;
+  const done=op.type==='tool_result',shellTool=lower==='bash'||lower==='worktree_run'||lower==='check_background',key=callKey||activeKey,existing=S.agentToolCards.get(key)||S.agentToolCards.get(activeKey);
+  if(shellTool){
+    if(done&&existing?.dataset.commandComplete==='true'){clearTrackedAgentToolCard(existing);return existing}
+    const card=renderCommandCard(data,role);
+    if(existing)replaceTrackedAgentToolCard(existing,card);
+    if(done)clearTrackedAgentToolCard(card);else{S.agentToolCards.set(key,card);S.agentToolCards.set(activeKey,card)}
+    return card;
+  }
+  const failed=done&&(/error|failed|malformed/i.test(resultText)||data.exit_code!=null&&Number(data.exit_code)!==0),path=String(data.path||''),verb=lower==='write_file'?'Write':lower==='edit_file'||lower==='apply_patch'?'Edit':'';const title=verb&&path?`${verb} ${path}`:lower==='read_file'&&path?`Read ${path}`:lower.includes('search')?`Search${data.query?` · ${data.query}`:''}`:name;const output=[path?`Path: ${path}`:'',data.command?`Command: ${data.command}`:'',data.cwd?`Working directory: ${data.cwd}`:'',data.query?`Query: ${data.query}`:'',data.pattern?`Pattern: ${data.pattern}`:'',data.summary||'',done?data.result||'':''].filter(Boolean).join('\n');const card=agentToolCard({kind:'tool',name,title,state:done?(failed?'Failed':'Completed'):'Running',stateTone:failed?'error':done?'success':'',output,role,expanded:failed,actionPath:path,actionRoot:S.activeRoot});if(existing)replaceTrackedAgentToolCard(existing,card);if(done)clearTrackedAgentToolCard(card);else{S.agentToolCards.set(key,card);S.agentToolCards.set(activeKey,card)}return card
+}
+function renderAgentAttachments(){const host=E('agentAttachments');host.classList.toggle('is-hidden',!S.agentAttachments.length);host.innerHTML=S.agentAttachments.map((item,index)=>`<div class="agent-attachment" title="${escapeHtml(item.path)}"><span class="codicon codicon-file"></span><span>${escapeHtml(item.name||item.path)}</span><button class="icon-button" data-remove-attachment="${index}" title="Remove"><span class="codicon codicon-close"></span></button></div>`).join('');host.querySelectorAll('[data-remove-attachment]').forEach(button=>button.onclick=()=>{S.agentAttachments.splice(Number(button.dataset.removeAttachment),1);renderAgentAttachments()})}
+function resetAgentSessionUI(sessionId=''){S.agentSession=sessionId;S.agentState=null;S.agentRendered.clear();S.agentToolCards.clear();S.agentPlanCards.clear();S.agentOperationSeq=0;S.agentEventSeq=0;S.agentWasBusy=false;S.agentSubmitting=false;S.agentFileRefresh.clear();S.agentAttachments=[];renderAgentAttachments();E('agentMessages').innerHTML='';E('agentTodoPanel').classList.add('is-hidden');E('agentTodoBody').innerHTML='';E('agentTodoCount').textContent='';E('agentContextPercent').textContent='';E('agentStatus').textContent='Loading history...';const ask=E('agentAskUser');ask.classList.add('is-hidden');ask.dataset.questionId='';E('agentAskUserQuestion').textContent='';E('agentAskUserOptions').innerHTML='';E('agentAskUserHint').textContent='';E('agentAskUserRole').textContent='';E('sendAgentBtn').disabled=false;E('sendAgentBtn').title='Send';E('agentPrompt').disabled=false;E('agentPrompt').placeholder='Ask Clouds Coder'}
+async function uploadAgentAttachments(files){const list=[...(files||[])];if(!list.length)return;E('attachContextBtn').disabled=true;try{const items=[];for(let index=0;index<list.length;index++){const file=list[index];items.push({path:file.webkitRelativePath||file.name,content_b64:await readFileAsB64(file)});E('agentStatus').textContent=`Attaching ${index+1}/${list.length}`}const out=await api(`/api/ide/sessions/${qs(S.activeSession)}/workspace/upload`,{method:'POST',body:JSON.stringify({root_id:S.activeRoot,dest:'.clouds_coder/attachments',items})});for(const item of out.written||[])if(!S.agentAttachments.some(row=>row.path===item.path))S.agentAttachments.push({path:item.path,name:item.name,size:item.size});renderAgentAttachments();S.treeCache.clear();await loadTree('');toast(`Attached ${out.count||list.length} file(s).`,'success')}finally{E('attachContextBtn').disabled=false;E('agentStatus').textContent=S.agentState?.running?'Running':'Idle';E('agentAttachmentInput').value=''}}
+async function showAgentModelMenu(anchor){const popup=E('menuPopup');popup.classList.remove('is-hidden');popup.classList.add('agent-model-menu');popup.innerHTML='<div class="agent-model-summary">Loading models...</div>';const rect=anchor.getBoundingClientRect();popup.style.left=`${Math.max(4,Math.min(rect.left,window.innerWidth-364))}px`;popup.style.top='auto';popup.style.bottom=`${Math.max(4,window.innerHeight-rect.top+8)}px`;popup.style.transform='';try{const catalog=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/models`);S.agentModelCatalog=catalog;popup.innerHTML='';const pct=Number(S.agentState?.context_left_percent),left=Number(S.agentState?.context_left_tokens);const summary=document.createElement('div');summary.className='agent-model-summary';summary.textContent=`${S.agentState?.model||'Current model'} · ${Number.isFinite(left)?left.toLocaleString()+' tokens left':'context unavailable'}${Number.isFinite(pct)?` (${pct.toFixed(1)}%)`:''}`;popup.appendChild(summary);for(const option of catalog.options||[]){const button=document.createElement('button');button.classList.toggle('is-active',option.selection===catalog.selected);button.innerHTML=`<span class="codicon codicon-${option.selection===catalog.selected?'check':'hubot'}"></span><span>${escapeHtml(option.label||option.model||option.selection)}</span>`;button.onclick=event=>{event.stopPropagation();applyAgentModel(option.selection,option.label||option.model).catch(showError)};popup.appendChild(button)}if(!(catalog.options||[]).length)popup.insertAdjacentHTML('beforeend','<div class="agent-model-summary">No configured models.</div>')}catch(error){popup.innerHTML=`<div class="agent-model-summary">${escapeHtml(error.message)}</div>`}}
+async function applyAgentModel(selection,label){const popup=E('menuPopup');popup.classList.add('is-hidden');popup.classList.remove('agent-model-menu');popup.style.transform='';popup.style.bottom='auto';const out=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/model`,{method:'POST',body:JSON.stringify({selection})});toast(out.queued?out.note||'Model switch queued.':`Model switched to ${label||selection}.`,out.queued?'warning':'success');scheduleAgentPoll(80)}
+async function refreshAgentEditedFile(path,rootId='session'){const clean=String(path||'').replace(/^\.\//,'');if(!clean)return;for(const file of S.openFiles.values()){if(file.session_id!==S.activeSession||file.root_id!==rootId||file.path!==clean||file.dirty||file.stageId!=='latest')continue;try{await refreshOpenFile(file)}catch(error){logOutput(`Agent file refresh: ${error.message}`)}}}
+function scheduleWorkspaceRefresh(delay=250){if(S.renderingAgentState)return;clearTimeout(S.agentTreeTimer);S.agentTreeTimer=setTimeout(()=>refreshWorkspaceSnapshot().catch(error=>logOutput(`Explorer refresh: ${error.message}`)),delay)}
+function renderAgentOperationOnce(op){const seq=Number(op?.seq||0),key=`operation:${op?.id||seq}`;S.agentOperationSeq=Math.max(S.agentOperationSeq,seq);if(op?.type==='file_patch'){const path=op.data?.session_rel_path||op.data?.path||'';S.agentFileRefresh.add(path)}if(S.agentRendered.has(key))return null;S.agentRendered.add(key);if(['tool_start','tool_result','file_patch','command','compact'].includes(op?.type))return renderAgentToolOperation(op);if(op?.type==='error')return agentMessage(op.data?.summary||op.data?.result||'Tool failed','error',op.data?.agent_role||'Agent');return null}
+function renderAgentAskUser(state){
+  const card=E('agentAskUser'),input=E('agentPrompt'),send=E('sendAgentBtn'),pending=!state?.running&&state?.pending_user_question&&String(state.pending_user_question.question||'').trim()?state.pending_user_question:null;
+  if(!pending){card.classList.add('is-hidden');card.dataset.questionId='';E('agentAskUserQuestion').textContent='';E('agentAskUserOptions').innerHTML='';E('agentAskUserHint').textContent='';E('agentAskUserRole').textContent='';input.placeholder='Ask Clouds Coder';send.title='Send';return false}
+  const questionId=String(pending.id||''),options=Array.isArray(pending.options)?pending.options.map(value=>String(value||'').trim()).filter(Boolean):[],allowFree=pending.allow_free_text!==false,submitting=S.agentSubmitting;
+  card.classList.remove('is-hidden');card.dataset.questionId=questionId;E('agentAskUserQuestion').textContent=String(pending.question||'').trim();E('agentAskUserRole').textContent=agentRoleLabel(pending.role||'Agent');E('agentAskUserHint').textContent=allowFree?(options.length?'Choose an option or type your own answer.':'Type your answer below, then send.'):'Choose one of the available options to continue.';
+  const optionHost=E('agentAskUserOptions');optionHost.innerHTML='';for(const option of options){const button=document.createElement('button');button.type='button';button.className='agent-ask-user-option';button.textContent=option;button.disabled=submitting;button.onclick=()=>answerAgentQuestion(option).catch(showError);optionHost.appendChild(button)}
+  input.placeholder=allowFree?'Answer the agent question':'Choose an option above';input.disabled=submitting||!allowFree;send.disabled=submitting||!allowFree;send.title=allowFree?'Send answer':'Choose an option above';return true
+}
+async function answerAgentQuestion(answer){
+  const pending=!S.agentState?.running&&S.agentState?.pending_user_question?S.agentState.pending_user_question:null,value=String(answer||'').trim();if(!pending||!value||S.agentSubmitting)return;
+  const options=Array.isArray(pending.options)?pending.options.map(item=>String(item||'').trim()).filter(Boolean):[];if(pending.allow_free_text===false&&!options.includes(value))throw new Error('Choose one of the available options.');
+  const questionId=String(pending.id||'');S.agentSubmitting=true;E('agentStatus').textContent='Resuming...';renderAgentAskUser(S.agentState);
+  try{const out=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/ask-user/answer`,{method:'POST',body:JSON.stringify({question_id:questionId,answer:value})});E('agentPrompt').value='';S.agentState=Object.assign({},S.agentState,{pending_user_question:null,running:!!out.running});renderAgentAskUser(S.agentState);E('agentStatus').textContent='Resuming...';S.agentPollRequested=true;scheduleAgentPoll(40)}catch(error){S.agentSubmitting=false;renderAgentAskUser(S.agentState);E('agentStatus').textContent='Awaiting input';S.agentPollRequested=true;scheduleAgentPoll(40);throw error}
+}
+function renderAgentState(state){
+  const running=!!state.running,queued=Number(state.scheduler_queued||0)>0,busy=running||queued,awaiting=!running&&state.pending_user_question&&String(state.pending_user_question.question||'').trim(),eventSeq=Number(state.event_seq||0),workspaceChanged=eventSeq>S.agentEventSeq||S.agentWasBusy&&!busy;
+  if(!busy&&!awaiting&&S.agentSubmitting)S.agentSubmitting=false;
+  S.agentEventSeq=Math.max(S.agentEventSeq,eventSeq);
+  const detail=queued&&!running?`${state.scheduler_queued} queued`:[state.active_role,state.phase,state.active_tool].filter(Boolean).join(' / ');
+  E('agentStatus').textContent=busy?(detail||'Running'):awaiting?'Awaiting input':'Idle';E('sendAgentBtn').disabled=busy||S.agentSubmitting;E('agentPrompt').disabled=busy||S.agentSubmitting;
+  renderAgentProgress(state);renderAgentContextHud(state);renderAgentAskUser(state);const previousLive=E('agentLiveResponse');if(previousLive)previousLive.remove();
+  const timeline=[];
+  for(const row of state.feed||[]){const type=String(row.type||'message');if(['file_patch','command','tool_start','tool_result','compact'].includes(type))continue;timeline.push({source:'feed',ts:Number(row.ts||0),seq:0,row})}
+  for(const op of state.operations||[])timeline.push({source:'operation',ts:Number(op.ts||0),seq:Number(op.seq||0),op});
+  timeline.sort((a,b)=>a.ts-b.ts||a.seq-b.seq);
+  for(const item of timeline){
+    if(item.source==='feed'){
+      const row=item.row,key=agentEventKey(row),type=String(row.type||'message');if(S.agentRendered.has(key))continue;S.agentRendered.add(key);const role=String(row.agent_role||row.role||'agent'),text=String(row.text||row.data?.summary||type);
+      if(type==='tool_calls'){const tools=Array.isArray(row.data?.tools)?row.data.tools:[],progress=String(row.data?.public_progress||(!text.toLowerCase().startsWith('[tool calls]')?text:'')).trim();if(progress)agentApproach(progress,role);renderAgentPlanCard(tools.length?tools:[text||'Tool calls scheduled'],role);continue}
+      if(type==='approach'){agentApproach(text,role);continue}
+      if(type==='web_search'){agentToolCard({kind:'tool',name:'web_search',title:'Web search',state:'Completed',stateTone:'success',output:text,role});continue}
+      if(renderAgentControl(text,role))continue;
+      const tone=row.role==='assistant'?'assistant':row.role==='user'?'user':type==='error'?'error':'system';agentMessage(text,tone,role);continue;
+    }
+    renderAgentOperationOnce(item.op);
+  }
+  if(state.live_response_text&&running){const live=agentMessage('','assistant',state.active_role||'Live response');live.id='agentLiveResponse';live.lastChild.textContent=state.live_response_text}
+  if(S.agentFileRefresh.size){const paths=[...S.agentFileRefresh];S.agentFileRefresh.clear();for(const path of paths)refreshAgentEditedFile(path);scheduleWorkspaceRefresh(180)}else if(workspaceChanged)scheduleWorkspaceRefresh(busy?500:100);
+  S.agentWasBusy=busy;
+}
+const renderAgentStateBase=renderAgentState;
+renderAgentState=function(state){const busy=!!state.running||Number(state.scheduler_queued||0)>0;S.agentEventSeq=Math.max(S.agentEventSeq,Number(state.event_seq||0));S.agentWasBusy=busy;if(state.title){const session=S.sessions.find(row=>row.id===S.activeSession);if(session&&session.title!==state.title){session.title=state.title;renderSessions();updateAgentContext()}}S.renderingAgentState=true;try{renderAgentStateBase(state)}finally{S.renderingAgentState=false}};
+function handleAgentEvent(event){const type=String(event?.type||''),data=event?.data||{},seq=Number(event?.seq||0);S.agentEventSeq=Math.max(S.agentEventSeq,seq);if(['tool_start','tool_result','file_patch','command','compact','error'].includes(type))renderAgentOperationOnce({id:String(event?.id||''),seq,ts:Number(event?.ts||0),type,data});if(type==='file_patch'){const path=data.session_rel_path||data.path||'';S.agentFileRefresh.delete(path);if(path)refreshAgentEditedFile(path,data.root_id||'session');scheduleWorkspaceRefresh(120)}else if(type==='workspace_change'||type==='upload'){for(const path of data.changed_files||[])refreshAgentEditedFile(path,data.root_id||'session');scheduleWorkspaceRefresh(120)}if(type!=='hello'){S.agentPollRequested=true;scheduleAgentPoll(40)}}
+function closeAgentEvents(){clearTimeout(S.agentEventReconnect);if(S.agentEvents){S.agentEvents.close();S.agentEvents=null}S.agentEventsConnected=false}
+function connectAgentEvents(){closeAgentEvents();if(!S.activeSession)return;const sid=S.activeSession,seq=S.sessionSwitchSeq,source=new EventSource(`/api/ide/v2/sessions/${qs(sid)}/events`),current=()=>sid===S.activeSession&&seq===S.sessionSwitchSeq&&S.agentEvents===source;S.agentEvents=source;source.onopen=()=>{if(!current())return source.close();S.agentEventsConnected=true;S.agentPollRequested=true;scheduleAgentPoll(0);E('syncStatus').title='Live file events connected'};source.onmessage=message=>{if(!current())return;try{handleAgentEvent(JSON.parse(message.data||'{}'))}catch(error){logOutput(`IDE event: ${error.message}`)}};source.onerror=()=>{if(!current())return source.close();S.agentEventsConnected=false;E('syncStatus').title='Live events reconnecting';source.close();if(S.agentEvents===source)S.agentEvents=null;clearTimeout(S.agentEventReconnect);S.agentEventReconnect=setTimeout(connectAgentEvents,document.hidden?120000:30000);scheduleAgentPoll(document.hidden?120000:30000)}}
+async function pollAgent(){if(S.agentPoll){clearTimeout(S.agentPoll);S.agentPoll=null}S.agentPollDue=0;if(!S.activeSession)return;if(S.agentPollBusy){S.agentPollRequested=true;return}if(S.agentEventsConnected&&S.agentState&&!S.agentSubmitting&&!S.agentPollRequested)return;S.agentPollRequested=false;S.agentPollBusy=true;const sid=S.activeSession,seq=S.sessionSwitchSeq,current=()=>sid===S.activeSession&&seq===S.sessionSwitchSeq;try{if(S.agentSession!==sid)resetAgentSessionUI(sid);const out=await api(`/api/ide/v2/sessions/${qs(sid)}/agent-state`);if(current()){S.agentState=out;renderAgentState(out)}}catch(error){if(current()&&error.status!==404)logOutput(`Agent state: ${error.message}`)}finally{S.agentPollBusy=false;if(S.agentPollRequested||!current())scheduleAgentPoll(0);else if(!S.agentEventsConnected)scheduleAgentPoll(document.hidden?120000:30000)}}
+function scheduleAgentPoll(delay=900){const wait=Math.max(40,Number(delay)||0),due=Date.now()+wait;if(S.agentPoll&&S.agentPollDue<=due)return;clearTimeout(S.agentPoll);S.agentPollDue=due;S.agentPoll=setTimeout(()=>{S.agentPoll=null;S.agentPollDue=0;pollAgent()},wait)}
+async function sendAgent(){const input=E('agentPrompt'),message=input.value.trim(),pending=!S.agentState?.running&&S.agentState?.pending_user_question;if(pending)return answerAgentQuestion(message);if(!message||S.agentSubmitting||S.agentState?.running||Number(S.agentState?.scheduler_queued||0)>0)return;const file=activeFile(),attachments=S.agentAttachments.map(item=>item.path);S.agentSubmitting=true;E('sendAgentBtn').disabled=true;input.disabled=true;E('agentStatus').textContent='Submitting...';try{const out=await api(`/api/ide/sessions/${qs(S.activeSession)}/agent-task`,{method:'POST',body:JSON.stringify({root_id:S.activeRoot,active_path:file?.path||'',message,attachments})});input.value='';S.agentAttachments=[];renderAgentAttachments();E('agentStatus').textContent=out.queued?'Queued':'Started';scheduleAgentPoll(100)}catch(error){S.agentSubmitting=false;E('agentStatus').textContent='';E('sendAgentBtn').disabled=false;input.disabled=false;agentMessage(error.message,'error');throw error}}
+function openModal(title,html){E('modalTitle').textContent=title;E('modalBody').innerHTML=html;E('modalOverlay').classList.remove('is-hidden')}
+function closeModal(){E('modalOverlay').classList.add('is-hidden');E('modalBody').innerHTML=''}
+async function showAccountModal(){let users=[],devices=[];if(S.capabilities.admin&&S.capabilities.local){try{[users,devices]=await Promise.all([api('/api/ide/v2/admin/users').then(x=>x.accounts||[]),api('/api/ide/v2/admin/devices').then(x=>x.devices||[])])}catch(error){logOutput(error.message)}}const userRows=users.map(row=>`<div class="account-row"><div><strong>${escapeHtml(row.username)}</strong><small>${escapeHtml(row.role)}${row.disabled?' / disabled':''}</small></div>${row.role==='admin'?'':`<button class="button" data-user="${escapeHtml(row.username)}" data-disabled="${row.disabled?'0':'1'}">${row.disabled?'Enable':'Disable'}</button>`}</div>`).join('');const deviceRows=devices.map(row=>`<div class="account-row"><div><strong>${escapeHtml(row.label||row.pairing_id)}</strong><small>${escapeHtml(row.pairing_id)} / ${escapeHtml(row.source_ip)} / ${escapeHtml(row.status)}</small></div><div>${row.status==='pending'?`<button class="button primary" data-device-approve="${escapeHtml(row.pairing_id)}">Approve</button>`:''}${row.status!=='revoked'?` <button class="button" data-device-revoke="${escapeHtml(row.pairing_id)}">Revoke</button>`:''}</div></div>`).join('');const passwordForm=S.config?.password_login_enabled?`<form id="resetPasswordForm" class="modal-form"><h3>Password Login</h3><input id="resetUsername" value="${escapeHtml(S.account.username)}" required><input id="resetPassword" type="password" placeholder="New password" required><div class="modal-actions"><button class="button primary">Set Password</button></div></form>`:'';openModal('Access',`<div class="account-list"><div class="account-row"><div><strong>${escapeHtml(S.account.username)}</strong><small>${escapeHtml(S.account.role)} / current</small></div><button id="logoutBtn" class="button">Sign Out</button></div>${userRows}</div>${S.capabilities.admin&&S.capabilities.local?`<div class="section-label"><strong>Web Devices</strong></div><div class="account-list">${deviceRows||'<div class="side-summary">No Web devices requested access.</div>'}</div>${passwordForm}`:''}`);E('logoutBtn').onclick=logout;document.querySelectorAll('[data-user]').forEach(button=>button.onclick=async()=>{await api('/api/ide/v2/admin/users',{method:'PATCH',body:JSON.stringify({username:button.dataset.user,disabled:button.dataset.disabled==='1'})});showAccountModal()});document.querySelectorAll('[data-device-approve]').forEach(button=>button.onclick=async()=>{await api('/api/ide/v2/admin/devices/approve',{method:'POST',body:JSON.stringify({pairing_id:button.dataset.deviceApprove})});showAccountModal()});document.querySelectorAll('[data-device-revoke]').forEach(button=>button.onclick=async()=>{await api('/api/ide/v2/admin/devices/revoke',{method:'POST',body:JSON.stringify({pairing_id:button.dataset.deviceRevoke})});showAccountModal()});if(E('resetPasswordForm'))E('resetPasswordForm').onsubmit=async event=>{event.preventDefault();await api('/api/ide/v2/admin/password-reset',{method:'POST',body:JSON.stringify({username:E('resetUsername').value,new_password:E('resetPassword').value})});location.reload()}}
+async function logout(){try{await api('/api/ide/v2/auth/logout',{method:'POST',body:'{}'})}finally{location.reload()}}
+function showMountModal(){const mounts=S.config?.mounts||[];openModal('Workspace Folders',`<div class="account-list">${mounts.map(row=>`<div class="account-row"><div><strong>${escapeHtml(row.label)}</strong><small>${escapeHtml(row.path)}</small></div><button class="button" data-mount="${escapeHtml(row.id)}">Remove</button></div>`).join('')||'<div class="side-summary">No external folders mounted.</div>'}</div><form id="mountForm" class="modal-form"><input id="mountPath" placeholder="/absolute/path/to/project" required><div class="modal-actions"><button class="button primary">Add Folder</button></div></form>`);document.querySelectorAll('[data-mount]').forEach(button=>button.onclick=async()=>{await api('/api/ide/mounts',{method:'DELETE',body:JSON.stringify({mount_id:button.dataset.mount})});await refreshConfig();showMountModal()});E('mountForm').onsubmit=async event=>{event.preventDefault();await api('/api/ide/mounts',{method:'POST',body:JSON.stringify({path:E('mountPath').value})});await refreshConfig();closeModal()}}
+const COMMANDS=new Map();
+function addCommand(id,label,shortcut,run){COMMANDS.set(id,{id,label,shortcut:shortcut||'',run})}
+function configureCommands(){
+  addCommand('file.new','File: New File','',newFile);addCommand('file.open','File: Upload Files','',()=>E('fileInput').click());addCommand('file.openFolder','File: Add Folder to Workspace','',()=>S.capabilities.mounts?showMountModal():toast('External folders require a local connection.','warning'));addCommand('file.save','File: Save','Ctrl+S',saveActive);addCommand('file.saveAll','File: Save All','Ctrl+K S',saveAll);
+  addCommand('workbench.action.showCommands','View: Show Command Palette','Ctrl+Shift+P',openPalette);addCommand('workbench.action.quickOpen','Go to File','Ctrl+P',()=>openPalette(''));addCommand('workbench.view.explorer','View: Explorer','Ctrl+Shift+E',()=>showView('explorer'));addCommand('workbench.view.search','View: Search','Ctrl+Shift+F',()=>showView('search'));addCommand('workbench.view.scm','View: Source Control','Ctrl+Shift+G',()=>showView('scm'));addCommand('workbench.view.extensions','View: Extensions','Ctrl+Shift+X',()=>showView('extensions'));addCommand('workbench.action.toggleSidebarVisibility','View: Toggle Primary Side Bar','Ctrl+B',togglePrimary);addCommand('workbench.action.togglePanel','View: Toggle Panel','Ctrl+J',togglePanel);addCommand('workbench.action.toggleAuxiliaryBar','View: Toggle Secondary Side Bar','',toggleSecondary);addCommand('workbench.action.splitEditor','View: Split Editor','Ctrl+\\',()=>{const file=activeFile();if(file)openFile(file.path,{root_id:file.root_id,group:1})});
+  addCommand('terminal.create','Terminal: Create New Terminal','Ctrl+Shift+`',newTerminal);addCommand('terminal.kill','Terminal: Kill Active Terminal','',killTerminal);addCommand('task.run','Tasks: Run Task','',()=>showView('run'));addCommand('run.active','Run: Active File','Ctrl+F5',runActiveFile);addCommand('agent.focus','Clouds Coder: Focus Agent','',()=>toggleSecondary(true));addCommand('accounts.manage','Accounts: Manage IDE Users','',showAccountModal);addCommand('session.new','Clouds Coder: New Program Session','',createSession);addCommand('navigate.chat','Clouds Coder: Return to Chat','',()=>{const port=S.config?.agent_port;if(port)location.href=`${location.protocol}//${location.hostname}:${port}/`});
+}
+function runCommandById(id){const command=COMMANDS.get(id);if(!command)return false;Promise.resolve(command.run()).catch(showError);return true}
+function openPalette(initial='>'){E('paletteOverlay').classList.remove('is-hidden');E('paletteInput').value=initial;filterPalette();requestAnimationFrame(()=>E('paletteInput').focus())}
+function closePalette(){E('paletteOverlay').classList.add('is-hidden')}
+function filterPalette(){const raw=E('paletteInput').value;const query=raw.replace(/^>/,'').trim().toLowerCase();S.paletteItems=[...COMMANDS.values()].filter(row=>!query||row.label.toLowerCase().includes(query)).slice(0,70);S.paletteIndex=0;renderPalette()}
+function renderPalette(){const host=E('paletteResults');host.innerHTML='';S.paletteItems.forEach((row,index)=>{const div=document.createElement('div');div.className='palette-row'+(index===S.paletteIndex?' is-active':'');div.innerHTML=`<span class="codicon codicon-symbol-method"></span><span>${escapeHtml(row.label)}</span><span class="keybinding">${escapeHtml(row.shortcut||'')}</span>`;div.onmouseenter=()=>{S.paletteIndex=index;renderPalette()};div.onclick=()=>{closePalette();runCommandById(row.id)};host.appendChild(div)})}
+function showMenu(anchor,items){const popup=E('menuPopup');popup.classList.remove('agent-model-menu');popup.style.transform='';popup.style.bottom='auto';popup.innerHTML='';for(const item of items){if(item==='-'){const separator=document.createElement('div');separator.className='separator';popup.appendChild(separator);continue}const command=COMMANDS.get(item);if(!command)continue;const button=document.createElement('button');button.innerHTML=`<span>${escapeHtml(command.label.replace(/^[^:]+:\s*/,''))}</span><span class="shortcut">${escapeHtml(command.shortcut)}</span>`;button.onclick=()=>{popup.classList.add('is-hidden');runCommandById(item)};popup.appendChild(button)}const rect=anchor.getBoundingClientRect();popup.style.left=`${Math.min(rect.left,window.innerWidth-220)}px`;popup.style.top=`${rect.bottom}px`;popup.classList.remove('is-hidden')}
+function showExplorerMenu(x,y,row){const popup=E('menuPopup');popup.classList.remove('agent-model-menu');popup.style.transform='';popup.style.bottom='auto';popup.innerHTML='';const items=[['Open',()=>openFile(row.path)],['Open to the Side',()=>openFile(row.path,{group:1})],['Rename',()=>renameEntry(row)],['Delete',()=>deleteEntry(row)]];for(const [label,action] of items){const button=document.createElement('button');button.textContent=label;button.onclick=()=>{popup.classList.add('is-hidden');Promise.resolve(action()).catch(showError)};popup.appendChild(button)}popup.style.left=`${Math.min(x,window.innerWidth-220)}px`;popup.style.top=`${Math.min(y,window.innerHeight-150)}px`;popup.classList.remove('is-hidden')}
+const MENUS={file:['file.new','file.open','file.openFolder','-','file.save','file.saveAll','-','navigate.chat'],edit:['workbench.action.showCommands'],selection:['workbench.action.showCommands'],view:['workbench.view.explorer','workbench.view.search','workbench.view.scm','workbench.view.extensions','-','workbench.action.toggleSidebarVisibility','workbench.action.togglePanel','workbench.action.toggleAuxiliaryBar','workbench.action.splitEditor'],go:['workbench.action.quickOpen'],run:['run.active','task.run'],terminal:['terminal.create','terminal.kill'],help:['navigate.chat']};
+function showError(error){const message=error?.message||String(error);toast(message,error?.status===403?'warning':'error');setStatus(message,'error');logOutput(message)}
+"""
+
+IDE_JS += r"""
+async function refreshConfig(){const out=await api('/api/ide/config');S.config=out;S.account=out.account||S.account;S.capabilities=out.capabilities||S.capabilities;S.csrf=out.csrf_token||S.csrf;S.sessions=Array.isArray(out.sessions)?out.sessions:[];if(!S.activeSession||!S.sessions.some(row=>row.id===S.activeSession))S.activeSession=out.active_session_id||S.sessions[0]?.id||'';renderSessions();renderTools();E('accountName').textContent=S.account?.username||'';E('remoteStatus').title=S.capabilities.local?'Local window':'LAN workspace';E('newTerminalBtn').disabled=!S.capabilities.terminal;E('runActiveBtn').disabled=!S.capabilities.processes;E('debugActiveBtn').disabled=!S.capabilities.debug;updateAgentContext();if(!S.activeSession)await createSession()}
+function showPasswordChangeGate(){E('authTitle').textContent='Change Temporary Password';E('authSubtitle').textContent='A new password is required before Program can open.';E('authUsername').value=S.account?.username||'';E('authUsername').disabled=true;E('authPassword').value='';E('authPassword').placeholder='Temporary password';E('authConfirmLabel').hidden=false;E('authConfirmLabel').textContent='New password';E('authConfirm').hidden=false;E('authConfirm').required=true;E('authConfirm').value='';E('authSubmit').textContent='Change Password';E('authForm').onsubmit=async event=>{event.preventDefault();E('authSubmit').disabled=true;try{await api('/api/ide/v2/auth/password',{method:'POST',body:JSON.stringify({old_password:E('authPassword').value,new_password:E('authConfirm').value})});E('authMessage').textContent='Password changed. Sign in with the new password.';setTimeout(()=>location.reload(),800)}catch(error){E('authMessage').textContent=error.message;E('authSubmit').disabled=false}}}
+function deviceKey(){let key=localStorage.getItem('clouds_coder_device_key')||'';if(!/^cc_device_[A-Za-z0-9_-]{43,}$/.test(key)){const bytes=new Uint8Array(32);crypto.getRandomValues(bytes);key='cc_device_'+btoa(String.fromCharCode(...bytes)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');localStorage.setItem('clouds_coder_device_key',key)}return key}
+function devicePayload(){return{device_key:deviceKey(),label:[navigator.platform||'Web',navigator.userAgentData?.platform||'',navigator.userAgentData?.mobile?'Mobile':'Browser'].filter(Boolean).join(' / '),fingerprint:[navigator.userAgent||'',navigator.language||'',screen.width+'x'+screen.height].join('|')}}
+async function waitForDevicePairing(){clearTimeout(S.devicePoll);E('authTitle').textContent='Clouds Coder';E('authSubtitle').textContent='Connecting this device to its isolated workspace...';E('authForm').hidden=true;E('authMessage').textContent='';try{const out=await api('/api/ide/v2/auth/device',{method:'POST',body:JSON.stringify(devicePayload())});if(out.account){S.account=out.account;S.capabilities=out.capabilities||{};S.csrf=out.csrf_token||'';E('authGate').classList.add('is-hidden');await startWorkbench();return true}const pairing=out.device?.pairing_id||'';E('authTitle').textContent='Device Access Pending';E('authSubtitle').textContent='This older device record still requires local approval.';E('authMessage').innerHTML=`<div class="pairing-code">${escapeHtml(pairing)}</div><div class="auth-secondary">${escapeHtml(out.device?.label||'Web browser')} / ${escapeHtml(out.device?.source_ip||'')}</div>`;S.devicePoll=setTimeout(waitForDevicePairing,2200)}catch(error){E('authMessage').textContent=error.message}}
+async function authenticate(){
+  let status;try{status=await api('/api/ide/v2/auth/status')}catch(error){E('authMessage').textContent=error.message;return false}
+  try{const me=await api('/api/ide/v2/auth/me');S.account=me.account;S.capabilities=me.capabilities||{};S.csrf=me.csrf_token||'';if(S.account?.must_change_password){showPasswordChangeGate();return false}return true}catch(error){if(error.status!==401){E('authMessage').textContent=error.message}}
+  if(status.local_auto_login){try{const out=await api('/api/ide/v2/auth/local',{method:'POST',body:'{}'});S.account=out.account;S.capabilities=out.capabilities||{};S.csrf=out.csrf_token||'';return true}catch(error){E('authMessage').textContent=error.message;return false}}
+  if(!status.password_login_enabled){waitForDevicePairing();return false}
+  const setup=!!status.setup_required;E('authTitle').textContent=setup?'Create IDE Administrator':'Clouds Coder';E('authSubtitle').textContent=setup?'Local setup for Program':'Sign in to Program';E('authSubmit').textContent=setup?'Create Administrator':'Sign in';E('authConfirmLabel').hidden=!setup;E('authConfirm').hidden=!setup;E('authConfirm').required=setup;
+  if(setup&&!status.local_setup_allowed){E('authMessage').textContent='The first IDE administrator must be created from localhost.';E('authSubmit').disabled=true}
+  E('authForm').onsubmit=async event=>{event.preventDefault();const username=E('authUsername').value.trim();const password=E('authPassword').value;if(setup&&password!==E('authConfirm').value){E('authMessage').textContent='Passwords do not match.';return}E('authSubmit').disabled=true;E('authMessage').textContent='';try{const out=await api(setup?'/api/ide/v2/auth/setup':'/api/ide/v2/auth/login',{method:'POST',body:JSON.stringify({username,password})});S.account=out.account;S.capabilities=out.capabilities||{};S.csrf=out.csrf_token||'';if(S.account?.must_change_password){showPasswordChangeGate();E('authSubmit').disabled=false;return}E('authGate').classList.add('is-hidden');await startWorkbench()}catch(error){E('authMessage').textContent=error.message;E('authSubmit').disabled=false}};return false
+}
+function bindUI(){
+  document.querySelectorAll('.activity-button[data-view]').forEach(button=>button.onclick=()=>showView(button.dataset.view));E('agentActivityBtn').onclick=()=>toggleSecondary();E('togglePrimaryBtn').onclick=togglePrimary;E('togglePanelBtn').onclick=togglePanel;E('toggleSecondaryBtn').onclick=()=>toggleSecondary();E('closeSecondaryBtn').onclick=()=>toggleSecondary(false);E('closePanelBtn').onclick=()=>{S.panelVisible=false;E('ideShell').classList.add('panel-hidden');scheduleStateSave()};E('maximizePanelBtn').onclick=()=>{S.panelMaximized=!S.panelMaximized;E('ideShell').classList.toggle('panel-maximized',S.panelMaximized)};document.addEventListener('visibilitychange',()=>{if(!S.agentEventsConnected)scheduleAgentPoll(document.hidden?120000:200)});
+  document.querySelectorAll('[data-panel-tab]').forEach(button=>button.onclick=()=>showPanel(button.dataset.panelTab));E('commandCenter').onclick=()=>openPalette('>');E('mainMenuBtn').onclick=event=>showMenu(event.currentTarget,MENUS.file);document.querySelectorAll('[data-menu]').forEach(button=>button.onclick=event=>showMenu(event.currentTarget,MENUS[button.dataset.menu]||[]));
+  E('newFileBtn').onclick=()=>newFile().catch(showError);E('newFolderBtn').onclick=()=>newFolder().catch(showError);E('refreshTreeBtn').onclick=()=>refreshWorkspaceSnapshot().catch(showError);E('explorerMoreBtn').onclick=event=>showMenu(event.currentTarget,['file.open','file.openFolder','session.new']);E('sessionSelect').onchange=()=>switchSession(E('sessionSelect').value).catch(showError);E('renameSessionBtn').onclick=()=>renameCurrentSession().catch(showError);E('rootSelect').onchange=async()=>{S.activeRoot=E('rootSelect').value;S.treeCache.clear();await loadTree('');updateAgentContext()};
+  E('fileInput').onchange=()=>uploadFiles(E('fileInput').files).catch(showError);E('folderInput').onchange=()=>uploadFiles(E('folderInput').files).catch(showError);E('searchInput').oninput=debounce(()=>runSearch().catch(showError),300);E('includeInput').onchange=()=>runSearch().catch(showError);E('excludeInput').onchange=()=>runSearch().catch(showError);E('matchCaseBtn').onclick=()=>{E('matchCaseBtn').classList.toggle('is-active');runSearch().catch(showError)};E('regexBtn').onclick=()=>{E('regexBtn').classList.toggle('is-active');runSearch().catch(showError)};E('clearSearchBtn').onclick=()=>{E('searchInput').value='';S.searchResults=[];E('searchSummary').textContent='';renderSearch()};
+  E('refreshScmBtn').onclick=()=>refreshScm().catch(showError);E('refreshTasksBtn').onclick=()=>refreshTasks().catch(showError);E('runActiveBtn').onclick=()=>runActiveFile().catch(showError);E('debugActiveBtn').onclick=()=>debugActiveFile().catch(showError);E('newTerminalBtn').onclick=()=>newTerminal().catch(showError);E('killTerminalBtn').onclick=()=>killTerminal().catch(showError);E('refreshExtensionsBtn').onclick=()=>refreshExtensions(E('extensionSearchInput').value).catch(showError);E('extensionSearchInput').oninput=debounce(()=>refreshExtensions(E('extensionSearchInput').value).catch(showError),400);E('installVsixBtn').onclick=()=>E('vsixInput').click();E('vsixInput').onchange=()=>installVsix(E('vsixInput').files?.[0]).catch(showError);
+  E('sendAgentBtn').onclick=()=>sendAgent().catch(showError);E('agentPrompt').onkeydown=event=>{if((event.ctrlKey||event.metaKey)&&event.key==='Enter'){event.preventDefault();sendAgent().catch(showError)}};E('attachContextBtn').onclick=()=>E('agentAttachmentInput').click();E('agentAttachmentInput').onchange=()=>uploadAgentAttachments(E('agentAttachmentInput').files).catch(showError);E('agentModelBtn').onclick=event=>{event.stopPropagation();showAgentModelMenu(event.currentTarget).catch(showError)};E('agentTodoToggle').onclick=()=>{S.agentTodoCollapsed=!S.agentTodoCollapsed;E('agentTodoPanel').classList.toggle('is-collapsed',S.agentTodoCollapsed);E('agentTodoToggle').setAttribute('aria-expanded',String(!S.agentTodoCollapsed));scheduleStateSave()};E('newAgentChatBtn').onclick=()=>createSession().catch(showError);
+  E('accountsBtn').onclick=()=>showAccountModal().catch(showError);E('accountStatus').onclick=()=>showAccountModal().catch(showError);E('manageBtn').onclick=event=>showMenu(event.currentTarget,['accounts.manage','file.openFolder','workbench.action.showCommands']);E('notificationsBtn').onclick=()=>toast('No new notifications.','success',2500);E('gitStatus').onclick=()=>showView('scm');E('errorStatus').onclick=()=>showPanel('problems');
+  E('paletteInput').oninput=filterPalette;E('paletteInput').onkeydown=event=>{if(event.key==='ArrowDown'){event.preventDefault();S.paletteIndex=Math.min(S.paletteItems.length-1,S.paletteIndex+1);renderPalette()}else if(event.key==='ArrowUp'){event.preventDefault();S.paletteIndex=Math.max(0,S.paletteIndex-1);renderPalette()}else if(event.key==='Enter'){event.preventDefault();const row=S.paletteItems[S.paletteIndex];if(row){closePalette();runCommandById(row.id)}}else if(event.key==='Escape')closePalette()};E('paletteOverlay').onclick=event=>{if(event.target===E('paletteOverlay'))closePalette()};E('modalClose').onclick=closeModal;E('modalOverlay').onclick=event=>{if(event.target===E('modalOverlay'))closeModal()};
+  document.addEventListener('click',event=>{if(!event.target.closest('#menuPopup')&&!event.target.closest('[data-menu]')&&!event.target.closest('#mainMenuBtn')&&!event.target.closest('#manageBtn')&&!event.target.closest('#agentModelBtn')){E('menuPopup').classList.add('is-hidden');E('menuPopup').classList.remove('agent-model-menu');E('menuPopup').style.transform='';E('menuPopup').style.bottom='auto'}});
+  window.addEventListener('keydown',event=>{const mod=event.ctrlKey||event.metaKey;const key=event.key.toLowerCase();if(mod&&key==='s'){event.preventDefault();(event.shiftKey?saveAll():saveActive()).catch(showError)}else if(mod&&event.shiftKey&&key==='p'){event.preventDefault();openPalette('>')}else if(mod&&key==='p'){event.preventDefault();openPalette('')}else if(mod&&key==='b'){event.preventDefault();togglePrimary()}else if(mod&&key==='j'){event.preventDefault();togglePanel()}else if(mod&&event.shiftKey&&key==='e'){event.preventDefault();showView('explorer')}else if(mod&&event.shiftKey&&key==='f'){event.preventDefault();showView('search')}else if(mod&&event.shiftKey&&key==='g'){event.preventDefault();showView('scm')}else if(mod&&event.shiftKey&&key==='x'){event.preventDefault();showView('extensions')}else if(mod&&event.key==='\\'){event.preventDefault();runCommandById('workbench.action.splitEditor')}else if(event.key==='F5'&&mod){event.preventDefault();runActiveFile().catch(showError)}else if(event.key==='Escape'){closePalette();E('menuPopup').classList.add('is-hidden')}});window.addEventListener('beforeunload',event=>{if([...S.openFiles.values()].some(file=>file.dirty)){event.preventDefault();event.returnValue=''}});window.addEventListener('resize',()=>{if(S.terminalFit)S.terminalFit.fit()})
+}
+function debounce(fn,delay){let timer;return(...args)=>{clearTimeout(timer);timer=setTimeout(()=>fn(...args),delay)}}
+async function startWorkbench(){E('authGate').classList.add('is-hidden');E('ideShell').classList.remove('is-hidden');if(window.innerWidth<=820){S.primaryVisible=false;S.secondaryVisible=false;E('ideShell').classList.add('primary-hidden','secondary-hidden')}await Promise.all([initMonaco(),initTerminalLibrary()]);configureCommands();bindUI();await refreshConfig();await restoreWorkbenchState();await refreshExtensions();await activateInstalledExtensions();updateStatusBar();updateAgentContext();connectAgentEvents();scheduleAgentPoll(50);if(!S.capabilities.processes)toast(S.capabilities.process_denial_reason||'Process features are disabled for this connection.','warning',8000);setStatus('Ready')}
+window.addEventListener('DOMContentLoaded',async()=>{try{if(await authenticate())await startWorkbench()}catch(error){showError(error)}});
+"""
+
 # ============================================================================
 # Architecture / 架构 / アーキテクチャ
 # Layer 7: Application orchestration, runtime services, and UI integration.
@@ -93159,6 +94909,7 @@ class AppContext:
         single_no_plan_todo_enabled: bool | None = None,
         single_no_plan_todo_prompt: str = "",
         l2_todo_policy: str | None = None,
+        ide_password_login_enabled: bool = False,
     ):
         self.workspace = Path(workspace).resolve()
         self.workspace_migration = _migrate_legacy_runtime_roots(self.workspace)
@@ -93284,8 +95035,14 @@ class AppContext:
         self._builtin_web_ui_assets_cache: dict[str, str] | None = None
         self.show_upload_list = False
         self.ide_mounts_cache: dict[str, list[dict]] = {}
+        self.ide_state_lock = threading.RLock()
+        self.ide_terminal_lock = threading.RLock()
+        self.ide_terminals: dict[str, dict] = {}
+        self.ide_debug_lock = threading.RLock()
+        self.ide_debug_sessions: dict[str, dict] = {}
         self.ide_port = IDE_DEFAULT_PORT
         self.ide_enabled = False
+        self.ide_password_login_enabled = bool(ide_password_login_enabled)
         self.admin_state_root = self.workspace / ADMIN_STATE_DIRNAME
         self.admin_state_root.mkdir(parents=True, exist_ok=True)
         try:
@@ -93295,6 +95052,13 @@ class AppContext:
         self.admin_config_path = self.admin_state_root / ADMIN_CONFIG_FILENAME
         self.admin_token_path = self.admin_state_root / "admin.token"
         self.admin_auth = AdminAuthStore(self.admin_state_root / ADMIN_AUTH_FILENAME)
+        self.ide_auth = IDEAuthStore(self.admin_state_root / IDE_AUTH_FILENAME)
+        self.ide_extensions_root = self.admin_state_root / IDE_EXTENSIONS_DIRNAME
+        self.ide_extensions_root.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(self.ide_extensions_root, 0o700)
+        except Exception:
+            pass
         self.admin_token = self._load_or_create_admin_token(allow_create=not self.admin_auth.configured())
         self.admin_initial_config = _admin_factory_config()
         self.admin_active_config = dict(self.admin_initial_config)
@@ -93353,6 +95117,108 @@ class AppContext:
             daemon=True,
         )
         self._session_watchdog_thread.start()
+
+    @staticmethod
+    def ide_is_loopback_address(value: object) -> bool:
+        raw = str(value or "").strip()
+        if raw.lower().startswith("::ffff:"):
+            raw = raw.split("::ffff:", 1)[1]
+        try:
+            return bool(ipaddress.ip_address(raw).is_loopback)
+        except Exception:
+            return False
+
+    def ide_request_capabilities(self, account: dict, *, client_ip: str, direct_loopback: bool) -> dict:
+        local = bool(direct_loopback and self.ide_is_loopback_address(client_ip))
+        hard_isolation = bool(AppContext._ide_remote_sandbox_supported())
+        terminal_supported = bool(_pty is not None and os.name == "posix")
+        role = str(account.get("role", "user") or "user")
+        return {
+            "local": local,
+            "lan": not local,
+            "admin": role == "admin",
+            "mounts": local,
+            "processes": bool(local or hard_isolation),
+            "terminal": bool(terminal_supported and (local or hard_isolation)),
+            "tasks": bool(local or hard_isolation),
+            "debug": bool(local or hard_isolation),
+            "agent_processes": bool(local or hard_isolation),
+            "executable_extensions": bool(local or hard_isolation),
+            "hard_isolation": hard_isolation,
+            "filesystem_soft_isolation": True,
+            "process_denial_reason": "" if (local or hard_isolation) else "LAN process execution requires a configured hard isolation backend.",
+        }
+
+    @staticmethod
+    def _ide_remote_sandbox_supported() -> bool:
+        return bool(os.name == "posix" and sys.platform == "darwin" and shutil.which("sandbox-exec"))
+
+    def _ide_process_prefix(self, sess: SessionState, *, remote: bool) -> list[str]:
+        if not remote:
+            return []
+        sess.ide_remote_sandbox_required = True
+        prefix = sess._workspace_sandbox_shell_prefix()
+        if not prefix:
+            raise IDECapabilityError(
+                "ide_sandbox_unavailable",
+                "Remote process execution is unavailable because the workspace sandbox could not be initialized.",
+                503,
+            )
+        return prefix
+
+    @staticmethod
+    def ide_require_capability(capabilities: dict, name: str) -> None:
+        if bool((capabilities or {}).get(str(name or ""), False)):
+            return
+        reason = str((capabilities or {}).get("process_denial_reason", "") or "")
+        if name == "mounts":
+            reason = "External workspace mounts are available only through an actual loopback connection."
+        raise IDECapabilityError("ide_capability_denied", reason or f"IDE capability denied: {name}")
+
+    def ide_auth_status(self, *, local_setup_allowed: bool) -> dict:
+        configured = bool(self.ide_auth.configured())
+        setup_required = bool(self.ide_password_login_enabled and not configured)
+        return {
+            "setup_required": setup_required,
+            "password_login_enabled": bool(self.ide_password_login_enabled),
+            "device_pairing_enabled": True,
+            "local_setup_allowed": bool(local_setup_allowed and setup_required),
+            "local_auto_login": bool(local_setup_allowed and not setup_required),
+            "setup_local_only": True,
+            "lan_https_required": False,
+            "session_ttl_seconds": IDE_AUTH_SESSION_TTL_SECONDS,
+        }
+
+    def local_ide_login(self, *, local_allowed: bool, client_ip: str) -> dict:
+        if not local_allowed:
+            raise IDEAuthError("loopback_required", "Local IDE sign-in requires an actual loopback connection.", 403)
+        return self.ide_auth.local_session(
+            legacy_user_id=user_id_from_ip("127.0.0.1"),
+            client_ip=client_ip,
+        )
+
+    def setup_ide_admin(self, username: object, password: object, *, local_setup_allowed: bool) -> dict:
+        if not self.ide_password_login_enabled:
+            raise IDEAuthError("password_login_disabled", "IDE password login is disabled.", 403)
+        if not local_setup_allowed:
+            raise IDEAuthError("setup_local_only", "The first IDE administrator must be created over loopback.", 403)
+        legacy_user_id = user_id_from_ip("127.0.0.1")
+        return self.ide_auth.setup_admin(username, password, legacy_user_id=legacy_user_id)
+
+    def login_ide(self, username: object, password: object, client_ip: str) -> dict:
+        if not self.ide_password_login_enabled:
+            raise IDEAuthError("password_login_disabled", "IDE password login is disabled.", 403)
+        if not self.ide_auth.configured():
+            raise IDEAuthError("setup_required", "Create the first IDE administrator before signing in.", 409)
+        return self.ide_auth.login(username, password, client_ip)
+
+    def register_ide_device(self, payload: dict, *, client_ip: str) -> dict:
+        return self.ide_auth.register_device(
+            payload.get("device_key"),
+            label=payload.get("label", "Web browser"),
+            fingerprint=payload.get("fingerprint", ""),
+            client_ip=client_ip,
+        )
 
     def _load_or_create_admin_token(self, *, allow_create: bool = True) -> str:
         env_token = str(os.getenv("CLOUDS_CODER_ADMIN_TOKEN", "") or "").strip()
@@ -93894,7 +95760,14 @@ class AppContext:
         return CODE_ADMIN_JS
 
     def web_ui_ide_index_html(self) -> str:
-        return IDE_INDEX_HTML
+        revision = hashlib.sha256(
+            safe_utf8_bytes(f"{IDE_CSS}\0{IDE_JS}")
+        ).hexdigest()[:12]
+        return (
+            IDE_INDEX_HTML
+            .replace('href="/assets/ide.css"', f'href="/assets/ide.css?v={revision}"')
+            .replace('src="/assets/ide.js"', f'src="/assets/ide.js?v={revision}"')
+        )
 
     def web_ui_ide_style_css(self) -> str:
         return IDE_CSS
@@ -94051,6 +95924,7 @@ class AppContext:
             "ok": True,
             "app": "clouds-coder-ide",
             "version": APP_VERSION,
+            "platform": sys.platform,
             "workspace": str(self.workspace),
             "user_id": str(user_id or ""),
             "agent_port": int(getattr(self, "agent_port", 0) or 0),
@@ -94061,6 +95935,7 @@ class AppContext:
             "sessions": sessions.get("sessions", []),
             "active_session_id": str(sessions.get("active_session_id", "") or ""),
             "session_creation_limit": sessions.get("session_creation_limit", {}),
+            "password_login_enabled": bool(self.ide_password_login_enabled),
         }
 
     def ide_create_session(self, user_id: str, title: str | None = None, client_ip: str = "") -> dict:
@@ -94073,6 +95948,13 @@ class AppContext:
             "session_creation_limit": quota,
             "roots": self.ide_workspace_roots(user_id, sess.id),
         }
+
+    def ide_rename_session(self, user_id: str, session_id: str, title: str) -> dict:
+        clean = trim(str(title or "").strip(), 120)
+        if not clean:
+            raise ValueError("title required")
+        sess = self.manager_for_user(user_id).rename(str(session_id or "").strip(), clean)
+        return {"ok": True, "id": sess.id, "title": sess.title}
 
     def _ide_session(self, user_id: str, session_id: str) -> SessionState:
         sess = self.manager_for_user(user_id).get(str(session_id or "").strip())
@@ -94140,7 +96022,7 @@ class AppContext:
         except Exception:
             st = None
             rel = ""
-        return {
+        payload = {
             "path": rel,
             "name": fp.name,
             "type": "dir" if fp.is_dir() else "file",
@@ -94149,6 +96031,39 @@ class AppContext:
             "mime": guess_mime_from_name(fp.name, "application/octet-stream") if fp.is_file() else "",
             "preview_kind": preview_kind_for_path(rel) if fp.is_file() else "",
         }
+        if st is not None and fp.is_file():
+            payload["revision"] = self._ide_file_revision(fp, st)
+        return payload
+
+    @staticmethod
+    def _ide_file_revision(fp: Path, stat_result=None) -> str:
+        st = stat_result or fp.stat()
+        marker = f"{int(st.st_size)}:{int(st.st_mtime_ns)}:{int(getattr(st, 'st_ino', 0))}"
+        return hashlib.sha256(marker.encode("ascii", errors="ignore")).hexdigest()[:24]
+
+    def _ide_atomic_write(self, target: Path, data: bytes) -> None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_name(f".{target.name}.{uuid.uuid4().hex}.ide-tmp")
+        try:
+            with tmp.open("wb") as handle:
+                handle.write(data)
+                handle.flush()
+                try:
+                    os.fsync(handle.fileno())
+                except Exception:
+                    pass
+            if target.exists():
+                try:
+                    os.chmod(tmp, target.stat().st_mode & 0o777)
+                except Exception:
+                    pass
+            os.replace(tmp, target)
+        finally:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
 
     def _ide_reject_hard_snapshot_mutation(
         self,
@@ -94279,16 +96194,33 @@ class AppContext:
         if not target.exists() or not target.is_file():
             raise FileNotFoundError("file not found")
         size = int(target.stat().st_size)
-        if size > IDE_FILE_MAX_BYTES:
+        stat_payload = self._ide_file_stat(root, target)
+        preview_kind = str(stat_payload.get("preview_kind", "") or "")
+        streamed_preview = preview_kind in {
+            "image", "video", "audio", "pdf", "excel", "presentation", "document",
+        } or (preview_kind in {"text", "markdown"} and size > IDE_TEXT_PREVIEW_MAX_BYTES)
+        if streamed_preview or size > IDE_FILE_MAX_BYTES:
+            if preview_kind:
+                return {
+                    "ok": True,
+                    "root": meta,
+                    "file": stat_payload,
+                    "readonly": True,
+                    "encoding": "base64",
+                    "content_b64": "",
+                    "content_omitted": True,
+                    "revision": stat_payload.get("revision", ""),
+                }
             raise ValueError(f"file is too large for editor ({size} bytes)")
         data = target.read_bytes()
         is_binary = b"\x00" in data[:4096]
         payload = {
             "ok": True,
             "root": meta,
-            "file": self._ide_file_stat(root, target),
+            "file": stat_payload,
             "readonly": False,
             "encoding": "base64" if is_binary else "text",
+            "revision": self._ide_file_revision(target),
         }
         if is_binary:
             payload["content_b64"] = base64.b64encode(data).decode("ascii")
@@ -94309,6 +96241,249 @@ class AppContext:
             payload["text_encoding"] = used_encoding
         return payload
 
+    @staticmethod
+    def _ide_decode_preview_text(data: bytes) -> tuple[str, str]:
+        if b"\x00" in data[:4096]:
+            raise ValueError("file does not contain previewable text")
+        for encoding in ("utf-8", "utf-8-sig", "gb18030"):
+            try:
+                return data.decode(encoding), encoding
+            except UnicodeDecodeError:
+                candidate = data.decode(encoding, errors="ignore")
+                try:
+                    lost_bytes = len(data) - len(candidate.encode(encoding, errors="ignore"))
+                except Exception:
+                    lost_bytes = len(data)
+                if 0 < lost_bytes <= 4:
+                    return candidate, encoding
+        return data.decode("latin-1", errors="replace"), "latin-1"
+
+    def _ide_text_preview_html(
+        self,
+        user_id: str,
+        session_id: str,
+        target: Path,
+        kind: str,
+        *,
+        root_id: str,
+        rel: str,
+    ) -> str:
+        size = int(target.stat().st_size)
+        cap = max(64 * 1024, int(IDE_TEXT_PREVIEW_MAX_BYTES))
+        with target.open("rb") as handle:
+            raw = handle.read(cap + 1)
+        truncated = len(raw) > cap or size > cap
+        raw = raw[:cap]
+        text, encoding = self._ide_decode_preview_text(raw)
+        if truncated and "\n" in text:
+            text = text.rsplit("\n", 1)[0]
+        if kind == "markdown":
+            lines = text.splitlines()
+            if len(lines) > IDE_MARKDOWN_PREVIEW_MAX_LINES:
+                text = "\n".join(lines[:IDE_MARKDOWN_PREVIEW_MAX_LINES])
+                truncated = True
+        note = f"{size:,} bytes · {encoding.upper()}"
+        if truncated:
+            note += f" · showing the first {len(raw):,} bytes"
+        sess = self._ide_session(user_id, session_id)
+        if kind == "text":
+            body = (
+                "<div class=\"pv-card\">"
+                f"<h1 class=\"pv-title\">{html.escape(target.name)}</h1>"
+                f"<div class=\"pv-note\">{html.escape(note)}</div>"
+                f"<pre class=\"pv-pre\">{html.escape(text)}</pre></div>"
+            )
+            return sess._preview_html_shell(target.name, body)
+        try:
+            import markdown as markdown_module  # type: ignore
+
+            rendered = markdown_module.markdown(
+                text,
+                extensions=["extra", "sane_lists", "tables", "fenced_code"],
+                output_format="html5",
+            )
+            try:
+                import bleach  # type: ignore
+
+                rendered = bleach.clean(
+                    rendered,
+                    tags={
+                        "a", "abbr", "blockquote", "br", "code", "del", "details", "div", "em",
+                        "h1", "h2", "h3", "h4", "h5", "h6", "hr", "img", "kbd", "li", "ol",
+                        "p", "pre", "s", "span", "strong", "sub", "summary", "sup", "table",
+                        "tbody", "td", "th", "thead", "tr", "ul",
+                    },
+                    attributes={
+                        "a": ["href", "title"],
+                        "img": ["src", "alt", "title", "width", "height"],
+                        "code": ["class"],
+                        "div": ["class"],
+                        "span": ["class"],
+                        "th": ["align"],
+                        "td": ["align"],
+                    },
+                    protocols={"http", "https", "mailto", "data"},
+                    strip=True,
+                )
+            except Exception:
+                pass
+        except Exception:
+            rendered = f"<pre>{html.escape(text)}</pre>"
+        base_dir = PurePosixPath(normalize_rel_preview_path(rel)).parent
+
+        def rewrite_reference(match: re.Match) -> str:
+            attr, quote_char, raw_ref = match.group(1), match.group(2), html.unescape(match.group(3).strip())
+            if not raw_ref or raw_ref.startswith(("#", "/", "data:", "mailto:", "tel:", "javascript:", "//")):
+                return match.group(0)
+            parsed = urlparse(raw_ref)
+            if parsed.scheme or parsed.netloc:
+                return match.group(0)
+            parts: list[str] = []
+            for part in (base_dir / unquote(parsed.path)).parts:
+                if part in {"", "."}:
+                    continue
+                if part == "..":
+                    if not parts:
+                        return match.group(0)
+                    parts.pop()
+                    continue
+                parts.append(part)
+            asset_rel = PurePosixPath(*parts).as_posix() if parts else ""
+            if not asset_rel:
+                return match.group(0)
+            asset_url = (
+                f"/api/ide/sessions/{quote(str(session_id or ''))}/workspace/raw?"
+                f"root_id={quote(str(root_id or 'session'))}&path={quote(asset_rel)}"
+            )
+            if parsed.fragment:
+                asset_url += f"#{quote(parsed.fragment)}"
+            return f"{attr}={quote_char}{html.escape(asset_url, quote=True)}{quote_char}"
+
+        rendered = re.sub(r'''(?is)\b(src|href)\s*=\s*(["'])(.*?)\2''', rewrite_reference, rendered)
+        body = (
+            "<article class=\"pv-card pv-markdown\">"
+            f"<div class=\"pv-note\">{html.escape(note)}</div>{rendered}</article>"
+        )
+        extra_css = """
+.pv-markdown{line-height:1.65;overflow-wrap:anywhere}
+.pv-markdown h1,.pv-markdown h2,.pv-markdown h3,.pv-markdown h4{line-height:1.3;margin:1.2em 0 .55em}
+.pv-markdown h1:first-of-type{margin-top:.25em}.pv-markdown pre{overflow:auto;padding:14px;border-radius:10px;background:#f3f6fa}
+.pv-markdown code{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}
+.pv-markdown table{display:block;max-width:100%;overflow:auto;border-collapse:collapse}.pv-markdown th,.pv-markdown td{padding:7px 9px;border:1px solid #dbe5f0}
+.pv-markdown img{display:block;max-width:100%;height:auto;margin:16px auto}.pv-markdown blockquote{margin:1em 0;padding:2px 14px;border-left:3px solid #7aa7d9;color:#52647b}
+"""
+        return sess._preview_html_shell(target.name, body, extra_css)
+
+    def ide_image_preview(self, user_id: str, session_id: str, *, root_id: str = "session", rel: str = "") -> tuple[bytes, str]:
+        _, target, _ = self.ide_resolve_workspace(user_id, session_id, root_id, rel)
+        if not target.exists() or not target.is_file():
+            raise FileNotFoundError("file not found")
+        if preview_kind_for_path(rel) != "image":
+            raise ValueError("image preview requires an image file")
+        if target.suffix.lower() == ".svg":
+            size = int(target.stat().st_size)
+            if size > IDE_VECTOR_PREVIEW_MAX_BYTES:
+                raise ValueError(f"vector image is too large to preview ({size:,} bytes)")
+            return target.read_bytes(), "image/svg+xml; charset=utf-8"
+        try:
+            from PIL import Image, ImageOps  # type: ignore
+
+            with Image.open(target) as source:
+                width, height = int(source.width or 0), int(source.height or 0)
+                pixels = width * height
+                if pixels <= 0:
+                    raise ValueError("image dimensions are unavailable")
+                if pixels <= IDE_IMAGE_PREVIEW_MAX_PIXELS and max(width, height) <= IDE_IMAGE_PREVIEW_MAX_EDGE:
+                    return target.read_bytes(), guess_mime_from_name(target.name, "application/octet-stream")
+                if pixels > IDE_IMAGE_PREVIEW_SOURCE_MAX_PIXELS:
+                    raise ValueError(f"image is too large to preview safely ({width}x{height})")
+                image = ImageOps.exif_transpose(source)
+                resampling = getattr(Image, "Resampling", Image)
+                image.thumbnail((IDE_IMAGE_PREVIEW_MAX_EDGE, IDE_IMAGE_PREVIEW_MAX_EDGE), resampling.LANCZOS)
+                output = io.BytesIO()
+                if image.mode in {"RGBA", "LA"} or (image.mode == "P" and "transparency" in image.info):
+                    if image.mode not in {"RGBA", "LA"}:
+                        image = image.convert("RGBA")
+                    image.save(output, format="PNG", optimize=True)
+                    return output.getvalue(), "image/png"
+                if image.mode != "RGB":
+                    image = image.convert("RGB")
+                image.save(output, format="JPEG", quality=88, optimize=True, progressive=True)
+                return output.getvalue(), "image/jpeg"
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError(f"image preview failed: {trim(str(exc), 240)}") from exc
+
+    def ide_preview_html(self, user_id: str, session_id: str, *, root_id: str = "session", rel: str = "") -> str:
+        _, target, _ = self.ide_resolve_workspace(user_id, session_id, root_id, rel)
+        if not target.exists() or not target.is_file():
+            raise FileNotFoundError("file not found")
+        kind = preview_kind_for_path(rel)
+        ext = target.suffix.lower()
+        sess = self._ide_session(user_id, session_id)
+        if kind in {"text", "markdown"}:
+            return self._ide_text_preview_html(
+                user_id, session_id, target, kind, root_id=root_id, rel=rel
+            )
+        if kind == "csv":
+            return sess._preview_csv_html(target)
+        if kind == "excel":
+            if ext in {".xlsx", ".xlsm"}:
+                return sess._preview_xlsx_html(target)
+            if ext == ".xls":
+                return sess._preview_xls_html(target)
+        if kind == "document":
+            if ext in {".docx", ".docm"}:
+                return sess._preview_docx_html(target)
+            if ext == ".doc":
+                return sess._preview_doc_html(target)
+        if kind == "presentation":
+            if ext in {".pptx", ".pptm"}:
+                return sess._preview_pptx_html(target)
+            if ext == ".ppt":
+                return sess._preview_ppt_html(target)
+        raise ValueError(f"html preview not supported for: {normalize_rel_preview_path(rel)}")
+
+    def ide_code_preview_stages(self, user_id: str, session_id: str, *, root_id: str, rel: str) -> dict:
+        if str(root_id or "session").strip() != "session":
+            return {"path": normalize_rel_preview_path(rel), "latest_id": "", "stages": []}
+        return self._ide_session(user_id, session_id).code_preview_stages(rel)
+
+    def ide_code_preview_payload(
+        self,
+        user_id: str,
+        session_id: str,
+        *,
+        root_id: str,
+        rel: str,
+        stage_id: str = "latest",
+    ) -> dict:
+        if str(root_id or "session").strip() != "session":
+            raise ValueError("code history is available only for the session workspace")
+        return self._ide_session(user_id, session_id).code_preview_payload(rel, stage_id)
+
+    def _ide_emit_workspace_change(
+        self,
+        user_id: str,
+        session_id: str,
+        *,
+        root_id: str,
+        action: str,
+        paths: list[str],
+    ) -> None:
+        clean_paths = [normalize_rel_preview_path(value) for value in paths]
+        clean_paths = [value for value in clean_paths if value][:80]
+        self._ide_session(user_id, session_id)._emit(
+            "workspace_change",
+            {
+                "root_id": str(root_id or "session"),
+                "action": trim(str(action or "changed"), 40),
+                "changed_files": clean_paths,
+                "summary": f"IDE workspace {action or 'changed'}: {', '.join(clean_paths[:4])}",
+            },
+        )
+
     def ide_write_file(self, user_id: str, session_id: str, payload: dict) -> dict:
         root_id = str(payload.get("root_id", payload.get("root", "session")) or "session")
         rel = str(payload.get("path", payload.get("rel", "")) or "")
@@ -94318,15 +96493,91 @@ class AppContext:
         self._ide_reject_hard_snapshot_mutation(user_id, session_id, root_id, target)
         if target.exists() and target.is_dir():
             raise IsADirectoryError("target is a directory")
+        existed = bool(target.exists())
+        before_text = ""
+        if root_id == "session" and existed and target.is_file() and is_code_preview_candidate(rel):
+            before_text = try_read_text(target, max_bytes=CODE_PREVIEW_STAGE_MAX_BYTES) or ""
         if "content_b64" in payload:
             data = base64.b64decode(str(payload.get("content_b64", "") or ""), validate=True)
         else:
             data = str(payload.get("content", "")).encode(str(payload.get("encoding", "utf-8") or "utf-8"))
         if len(data) > IDE_FILE_MAX_BYTES:
             raise ValueError(f"file is too large for editor ({len(data)} bytes)")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(data)
-        return {"ok": True, "root": meta, "file": self._ide_file_stat(root, target)}
+        expected_revision = str(payload.get("expected_revision", payload.get("revision", "")) or "").strip()
+        if expected_revision and target.exists():
+            current_revision = self._ide_file_revision(target)
+            if not hmac.compare_digest(expected_revision, current_revision):
+                raise IDEFileConflict({"revision": current_revision, "file": self._ide_file_stat(root, target)})
+        elif expected_revision and not target.exists():
+            raise IDEFileConflict({"revision": "", "missing": True})
+        self._ide_atomic_write(target, data)
+        stat_payload = self._ide_file_stat(root, target)
+        result = {"ok": True, "root": meta, "file": stat_payload, "revision": stat_payload.get("revision", "")}
+        if root_id == "session" and "content_b64" not in payload and is_code_preview_candidate(rel):
+            after_text = data.decode(str(payload.get("encoding", "utf-8") or "utf-8"), errors="replace")
+            if before_text != after_text:
+                diff, added, deleted = make_unified_diff(normalize_rel_preview_path(rel), before_text, after_text)
+                numbered = make_numbered_diff(before_text, after_text)
+                sess = self._ide_session(user_id, session_id)
+                code_stage = sess._record_code_preview_stage(
+                    rel_path=rel,
+                    before_text=before_text,
+                    after_text=after_text,
+                    change_type="added" if not existed else "modified",
+                    tool_name=str(payload.get("history_tool", "ide_editor") or "ide_editor"),
+                    added=added,
+                    deleted=deleted,
+                )
+                patch_payload = {
+                    "path": normalize_rel_preview_path(rel),
+                    "session_rel_path": normalize_rel_preview_path(rel),
+                    "session_root": str(sess.files_root),
+                    "root_id": root_id,
+                    "change_type": "added" if not existed else "modified",
+                    "added": added,
+                    "deleted": deleted,
+                    "diff": trim(diff, 30_000),
+                    "diff_numbered": trim(render_numbered_diff_text(numbered), 30_000),
+                    "summary": f"IDE file {'added' if not existed else 'modified'}: {normalize_rel_preview_path(rel)} (+{added}/-{deleted})",
+                }
+                if code_stage:
+                    patch_payload["code_stage"] = code_stage
+                    result["code_stage"] = code_stage
+                sess._emit("file_patch", patch_payload)
+        else:
+            self._ide_emit_workspace_change(
+                user_id,
+                session_id,
+                root_id=root_id,
+                action="written",
+                paths=[rel],
+            )
+        return result
+
+    def ide_restore_code_preview(self, user_id: str, session_id: str, payload: dict) -> dict:
+        root_id = str(payload.get("root_id", "session") or "session")
+        rel = normalize_rel_preview_path(str(payload.get("path", "") or ""))
+        stage_id = str(payload.get("stage_id", "") or "").strip()
+        if root_id != "session" or not rel or not stage_id or stage_id == "latest":
+            raise ValueError("a session file and historical stage are required")
+        stage = self.ide_code_preview_payload(
+            user_id,
+            session_id,
+            root_id=root_id,
+            rel=rel,
+            stage_id=stage_id,
+        )
+        return self.ide_write_file(
+            user_id,
+            session_id,
+            {
+                "root_id": root_id,
+                "path": rel,
+                "content": str(stage.get("full_text", "") or ""),
+                "expected_revision": str(payload.get("expected_revision", "") or ""),
+                "history_tool": "ide_restore",
+            },
+        )
 
     def ide_mkdir(self, user_id: str, session_id: str, payload: dict) -> dict:
         root_id = str(payload.get("root_id", payload.get("root", "session")) or "session")
@@ -94336,7 +96587,9 @@ class AppContext:
         root, target, meta = self.ide_resolve_workspace(user_id, session_id, root_id, rel)
         self._ide_reject_hard_snapshot_mutation(user_id, session_id, root_id, target)
         target.mkdir(parents=True, exist_ok=bool(payload.get("exist_ok", True)))
-        return {"ok": True, "root": meta, "file": self._ide_file_stat(root, target)}
+        result = {"ok": True, "root": meta, "file": self._ide_file_stat(root, target)}
+        self._ide_emit_workspace_change(user_id, session_id, root_id=root_id, action="created", paths=[rel])
+        return result
 
     def ide_rename(self, user_id: str, session_id: str, payload: dict) -> dict:
         root_id = str(payload.get("root_id", payload.get("root", "session")) or "session")
@@ -94353,7 +96606,9 @@ class AppContext:
             raise FileExistsError("target already exists")
         new_target.parent.mkdir(parents=True, exist_ok=True)
         old_target.replace(new_target)
-        return {"ok": True, "root": meta, "file": self._ide_file_stat(root, new_target)}
+        result = {"ok": True, "root": meta, "file": self._ide_file_stat(root, new_target)}
+        self._ide_emit_workspace_change(user_id, session_id, root_id=root_id, action="renamed", paths=[old_rel, new_rel])
+        return result
 
     def ide_delete(self, user_id: str, session_id: str, payload: dict) -> dict:
         root_id = str(payload.get("root_id", payload.get("root", "session")) or "session")
@@ -94371,7 +96626,9 @@ class AppContext:
                 shutil.rmtree(target)
         else:
             target.unlink()
-        return {"ok": True, "root": meta, "path": normalize_rel_preview_path(rel)}
+        result = {"ok": True, "root": meta, "path": normalize_rel_preview_path(rel)}
+        self._ide_emit_workspace_change(user_id, session_id, root_id=root_id, action="deleted", paths=[rel])
+        return result
 
     def ide_upload(self, user_id: str, session_id: str, payload: dict) -> dict:
         root_id = str(payload.get("root_id", payload.get("root", "session")) or "session")
@@ -94403,13 +96660,22 @@ class AppContext:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(raw)
             written.append(self._ide_file_stat(root, target))
-        return {
+        result = {
             "ok": True,
             "root": meta,
             "written": written,
             "count": len(written),
             "bytes": total,
         }
+        if written:
+            self._ide_emit_workspace_change(
+                user_id,
+                session_id,
+                root_id=root_id,
+                action="uploaded",
+                paths=[str(row.get("path", "") or "") for row in written],
+            )
+        return result
 
     def ide_toolchains(self) -> list[dict]:
         specs = [
@@ -94440,7 +96706,711 @@ class AppContext:
             )
         return rows
 
-    def ide_run_command(self, user_id: str, session_id: str, payload: dict) -> dict:
+    def _ide_state_path(self, user_id: str) -> Path:
+        return self.user_root(user_id) / IDE_WORKBENCH_STATE_FILENAME
+
+    def ide_get_workbench_state(self, user_id: str) -> dict:
+        raw = _read_json_file(self._ide_state_path(user_id), {})
+        state = raw.get("state", {}) if isinstance(raw, dict) else {}
+        return {"ok": True, "state": state if isinstance(state, dict) else {}}
+
+    def ide_save_workbench_state(self, user_id: str, payload: dict) -> dict:
+        state = payload.get("state", payload)
+        if not isinstance(state, dict):
+            raise ValueError("state must be an object")
+        clean = {
+            "active_session_id": trim(str(state.get("active_session_id", "") or ""), 160),
+            "active_root_id": trim(str(state.get("active_root_id", "session") or "session"), 160),
+            "active_view": trim(str(state.get("active_view", "explorer") or "explorer"), 32),
+            "panel": trim(str(state.get("panel", "terminal") or "terminal"), 32),
+            "panel_visible": bool(state.get("panel_visible", True)),
+            "secondary_visible": bool(state.get("secondary_visible", True)),
+            "agent_todo_collapsed": bool(state.get("agent_todo_collapsed", False)),
+            "code_history_mode": (
+                str(state.get("code_history_mode", "all") or "all")
+                if str(state.get("code_history_mode", "all") or "all") in {"all", "changes", "clean"}
+                else "all"
+            ),
+            "open_files": [],
+        }
+        for row in state.get("open_files", []) if isinstance(state.get("open_files", []), list) else []:
+            if not isinstance(row, dict):
+                continue
+            path = normalize_rel_preview_path(str(row.get("path", "") or ""))
+            root_id = trim(str(row.get("root_id", "session") or "session"), 160)
+            if path:
+                stage_id = trim(str(row.get("stage_id", "latest") or "latest"), 160)
+                clean["open_files"].append({"root_id": root_id, "path": path, "stage_id": stage_id or "latest"})
+            if len(clean["open_files"]) >= 40:
+                break
+        with self.ide_state_lock:
+            _write_json_file(self._ide_state_path(user_id), {"state": clean, "updated_at": now_ts()})
+        return {"ok": True, "state": clean}
+
+    def ide_search_workspace(self, user_id: str, session_id: str, payload: dict) -> dict:
+        query = str(payload.get("query", "") or "")
+        if not query or len(query) > 500:
+            raise ValueError("query must contain 1-500 characters")
+        root_id = str(payload.get("root_id", payload.get("root", "session")) or "session")
+        root, base, meta = self.ide_resolve_workspace(user_id, session_id, root_id, str(payload.get("path", ".") or "."))
+        if not base.exists() or not base.is_dir():
+            raise FileNotFoundError("search root not found")
+        max_results = max(1, min(IDE_SEARCH_MAX_RESULTS, int(payload.get("max_results", 500) or 500)))
+        case_sensitive = bool(payload.get("case_sensitive", False))
+        use_regex = bool(payload.get("regex", False))
+        include = str(payload.get("include", "") or "").strip()
+        exclude = str(payload.get("exclude", "") or "").strip()
+        flags = 0 if case_sensitive else re.IGNORECASE
+        pattern = re.compile(query if use_regex else re.escape(query), flags)
+        results: list[dict] = []
+        files_scanned = 0
+        bytes_scanned = 0
+        truncated = False
+        started = time.perf_counter()
+        for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
+            dirnames[:] = [name for name in dirnames if name not in IDE_TREE_SKIP_DIRS and not (Path(dirpath) / name).is_symlink()]
+            for filename in filenames:
+                fp = Path(dirpath) / filename
+                try:
+                    if fp.is_symlink() or not fp.is_file():
+                        continue
+                    rel = fp.resolve().relative_to(root.resolve()).as_posix()
+                    if include and not fnmatch.fnmatch(rel, include):
+                        continue
+                    if exclude and fnmatch.fnmatch(rel, exclude):
+                        continue
+                    size = int(fp.stat().st_size)
+                    if size > IDE_SEARCH_MAX_FILE_BYTES:
+                        continue
+                    data = fp.read_bytes()
+                    if b"\0" in data[:4096]:
+                        continue
+                    text = data.decode("utf-8", errors="replace")
+                except Exception:
+                    continue
+                files_scanned += 1
+                bytes_scanned += len(data)
+                for line_no, line in enumerate(text.splitlines(), 1):
+                    for match in pattern.finditer(line):
+                        results.append({
+                            "path": rel,
+                            "line": line_no,
+                            "column": match.start() + 1,
+                            "end_column": match.end() + 1,
+                            "preview": trim(line, 500),
+                        })
+                        if len(results) >= max_results:
+                            truncated = True
+                            break
+                    if truncated:
+                        break
+                if truncated:
+                    break
+            if truncated:
+                break
+        return {
+            "ok": True,
+            "root": meta,
+            "query": query,
+            "results": results,
+            "count": len(results),
+            "truncated": truncated,
+            "files_scanned": files_scanned,
+            "bytes_scanned": bytes_scanned,
+            "duration_ms": int((time.perf_counter() - started) * 1000),
+        }
+
+    def ide_scm_status(self, user_id: str, session_id: str, payload: dict | None = None) -> dict:
+        body = payload if isinstance(payload, dict) else {}
+        root_id = str(body.get("root_id", body.get("root", "session")) or "session")
+        root, _, meta = self.ide_resolve_workspace(user_id, session_id, root_id, ".")
+        probe = subprocess.run(["git", "-C", str(root), "rev-parse", "--show-toplevel"], capture_output=True, text=True, timeout=8)
+        if probe.returncode != 0:
+            return {"ok": True, "repository": False, "root": meta, "changes": [], "branch": ""}
+        repo_root = Path(probe.stdout.strip()).resolve()
+        if repo_root != root.resolve() and not repo_root.is_relative_to(root.resolve()):
+            return {"ok": True, "repository": False, "root": meta, "changes": [], "branch": ""}
+        status = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain=v1", "-z", "--branch"],
+            capture_output=True,
+            timeout=12,
+        )
+        raw = status.stdout.decode("utf-8", errors="replace")
+        parts = raw.split("\0")
+        branch = ""
+        changes: list[dict] = []
+        for item in parts:
+            if not item:
+                continue
+            if item.startswith("## "):
+                branch = item[3:].split("...", 1)[0].strip()
+                continue
+            if len(item) < 4:
+                continue
+            xy = item[:2]
+            path = item[3:]
+            changes.append({"path": path, "index": xy[0], "working_tree": xy[1], "status": xy})
+            if len(changes) >= 2000:
+                break
+        return {"ok": True, "repository": True, "root": meta, "repo_root": str(repo_root), "branch": branch, "changes": changes}
+
+    def ide_scm_diff(self, user_id: str, session_id: str, payload: dict) -> dict:
+        root_id = str(payload.get("root_id", payload.get("root", "session")) or "session")
+        root, _, meta = self.ide_resolve_workspace(user_id, session_id, root_id, ".")
+        rel = normalize_rel_preview_path(str(payload.get("path", "") or ""))
+        if rel:
+            self.ide_resolve_workspace(user_id, session_id, root_id, rel)
+        command = ["git", "-C", str(root), "diff", "--no-ext-diff", "--no-color"]
+        if bool(payload.get("staged", False)):
+            command.append("--cached")
+        if rel:
+            command.extend(["--", rel])
+        proc = subprocess.run(command, capture_output=True, text=True, timeout=15)
+        return {"ok": proc.returncode == 0, "root": meta, "path": rel, "diff": trim(proc.stdout, 400_000), "error": trim(proc.stderr, 4000)}
+
+    def _ide_terminal_for_user(self, user_id: str, terminal_id: str) -> dict:
+        tid = str(terminal_id or "").strip()
+        with self.ide_terminal_lock:
+            terminal = self.ide_terminals.get(tid)
+        if not terminal or str(terminal.get("user_id", "")) != str(user_id or ""):
+            raise KeyError("terminal not found")
+        return terminal
+
+    @staticmethod
+    def _ide_terminal_set_size(fd: int, cols: int, rows: int) -> None:
+        if _fcntl is None or _termios is None:
+            return
+        size = struct.pack("HHHH", max(2, rows), max(2, cols), 0, 0)
+        _fcntl.ioctl(fd, _termios.TIOCSWINSZ, size)
+
+    def _ide_terminal_reader(self, terminal_id: str) -> None:
+        while True:
+            with self.ide_terminal_lock:
+                terminal = self.ide_terminals.get(terminal_id)
+            if not terminal:
+                return
+            process = terminal["process"]
+            fd = int(terminal["master_fd"])
+            try:
+                ready, _, _ = select.select([fd], [], [], 0.25)
+                chunk = os.read(fd, 32768) if ready else b""
+            except (OSError, ValueError):
+                chunk = b""
+            with terminal["lock"]:
+                if chunk:
+                    terminal["output"].extend(chunk)
+                    terminal["output_end"] += len(chunk)
+                    overflow = len(terminal["output"]) - IDE_TERMINAL_SCROLLBACK_BYTES
+                    if overflow > 0:
+                        del terminal["output"][:overflow]
+                        terminal["output_start"] += overflow
+                    terminal["last_activity"] = now_ts()
+                returncode = process.poll()
+                if returncode is not None:
+                    terminal["closed"] = True
+                    terminal["returncode"] = int(returncode)
+            if returncode is not None and not chunk:
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
+                return
+
+    def ide_terminal_create(self, user_id: str, session_id: str, payload: dict, *, remote: bool = False) -> dict:
+        if _pty is None:
+            raise IDECapabilityError("pty_unavailable", "PTY terminals are unavailable on this platform.", 501)
+        root_id = str(payload.get("root_id", payload.get("root", "session")) or "session")
+        root, cwd, meta = self.ide_resolve_workspace(user_id, session_id, root_id, str(payload.get("cwd", ".") or "."))
+        if cwd.is_file():
+            cwd = cwd.parent
+        if not cwd.exists() or not cwd.is_dir():
+            raise FileNotFoundError("terminal cwd not found")
+        shell = str(payload.get("shell", "") or os.getenv("SHELL", "") or shutil.which("zsh") or shutil.which("bash") or "/bin/sh")
+        if not Path(shell).is_absolute() or not Path(shell).exists():
+            raise ValueError("terminal shell must be an installed absolute path")
+        cols = max(20, min(500, int(payload.get("cols", 100) or 100)))
+        rows = max(5, min(200, int(payload.get("rows", 30) or 30)))
+        master_fd, slave_fd = _pty.openpty()
+        self._ide_terminal_set_size(slave_fd, cols, rows)
+        sess = self._ide_session(user_id, session_id)
+        prefix = self._ide_process_prefix(sess, remote=remote)
+        env = sess._shell_process_env()
+        env.update({"TERM": "xterm-256color", "COLORTERM": "truecolor", "CLOUDS_CODER_IDE": "1"})
+        process_command = [*prefix, shell, "-f"] if prefix else [shell, "-l"]
+        try:
+            process = subprocess.Popen(
+                process_command,
+                cwd=str(cwd),
+                env=env,
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                start_new_session=True,
+                close_fds=True,
+            )
+        finally:
+            os.close(slave_fd)
+        terminal_id = "term_" + uuid.uuid4().hex[:20]
+        terminal = {
+            "id": terminal_id,
+            "user_id": str(user_id or ""),
+            "session_id": str(session_id or ""),
+            "root_id": root_id,
+            "cwd": cwd.relative_to(root).as_posix() if cwd.is_relative_to(root) else ".",
+            "title": Path(shell).name,
+            "process": process,
+            "master_fd": master_fd,
+            "output": bytearray(),
+            "output_start": 0,
+            "output_end": 0,
+            "closed": False,
+            "returncode": None,
+            "created_at": now_ts(),
+            "last_activity": now_ts(),
+            "lock": threading.RLock(),
+        }
+        with self.ide_terminal_lock:
+            self.ide_terminals[terminal_id] = terminal
+        threading.Thread(target=self._ide_terminal_reader, args=(terminal_id,), name=f"ide-terminal-{terminal_id[-6:]}", daemon=True).start()
+        return {"ok": True, "terminal": {"id": terminal_id, "title": terminal["title"], "cwd": terminal["cwd"], "root": meta, "offset": 0}}
+
+    def ide_terminal_output(self, user_id: str, terminal_id: str, offset: int = 0) -> dict:
+        terminal = self._ide_terminal_for_user(user_id, terminal_id)
+        with terminal["lock"]:
+            start = int(terminal["output_start"])
+            end = int(terminal["output_end"])
+            requested = max(0, int(offset or 0))
+            effective = max(start, min(end, requested))
+            data = bytes(terminal["output"])[effective - start:]
+            terminal["last_activity"] = now_ts()
+            return {
+                "ok": True,
+                "terminal_id": terminal_id,
+                "offset": effective,
+                "next_offset": end,
+                "reset": requested < start,
+                "data": data.decode("utf-8", errors="replace"),
+                "closed": bool(terminal["closed"]),
+                "returncode": terminal["returncode"],
+            }
+
+    def ide_terminal_input(self, user_id: str, terminal_id: str, payload: dict) -> dict:
+        terminal = self._ide_terminal_for_user(user_id, terminal_id)
+        data = str(payload.get("data", "") or "").encode("utf-8", errors="replace")
+        if len(data) > 64_000:
+            raise ValueError("terminal input is too large")
+        with terminal["lock"]:
+            if terminal["closed"]:
+                raise ValueError("terminal is closed")
+            os.write(int(terminal["master_fd"]), data)
+            terminal["last_activity"] = now_ts()
+        return {"ok": True}
+
+    def ide_terminal_resize(self, user_id: str, terminal_id: str, payload: dict) -> dict:
+        terminal = self._ide_terminal_for_user(user_id, terminal_id)
+        cols = max(20, min(500, int(payload.get("cols", 100) or 100)))
+        rows = max(5, min(200, int(payload.get("rows", 30) or 30)))
+        self._ide_terminal_set_size(int(terminal["master_fd"]), cols, rows)
+        return {"ok": True, "cols": cols, "rows": rows}
+
+    def ide_terminal_close(self, user_id: str, terminal_id: str) -> dict:
+        terminal = self._ide_terminal_for_user(user_id, terminal_id)
+        process = terminal["process"]
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+                process.wait(timeout=2)
+            except Exception:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+        with terminal["lock"]:
+            terminal["closed"] = True
+            terminal["returncode"] = process.poll()
+        return {"ok": True, "terminal_id": terminal_id}
+
+    @staticmethod
+    def _ide_parse_jsonc(text: str) -> dict:
+        cleaned = re.sub(r"/\*.*?\*/", "", str(text or ""), flags=re.DOTALL)
+        cleaned = re.sub(r"(^|\s)//.*?$", r"\1", cleaned, flags=re.MULTILINE)
+        cleaned = re.sub(r",\s*([}\]])", r"\1", cleaned)
+        parsed = json.loads(cleaned or "{}")
+        return parsed if isinstance(parsed, dict) else {}
+
+    def ide_tasks(self, user_id: str, session_id: str, root_id: str = "session") -> dict:
+        root, target, meta = self.ide_resolve_workspace(user_id, session_id, root_id, ".vscode/tasks.json")
+        tasks: list[dict] = []
+        if target.exists() and target.is_file() and target.stat().st_size <= 1_000_000:
+            raw = self._ide_parse_jsonc(target.read_text(encoding="utf-8", errors="replace"))
+            for idx, row in enumerate(raw.get("tasks", []) if isinstance(raw.get("tasks", []), list) else []):
+                if not isinstance(row, dict):
+                    continue
+                label = trim(str(row.get("label", row.get("taskName", f"Task {idx + 1}")) or f"Task {idx + 1}"), 160)
+                command = str(row.get("command", "") or "").strip()
+                args = [str(x) for x in row.get("args", [])] if isinstance(row.get("args", []), list) else []
+                if label and command:
+                    tasks.append({"id": hashlib.sha256(label.encode()).hexdigest()[:16], "label": label, "type": str(row.get("type", "shell") or "shell"), "command": command, "args": args, "group": row.get("group", "")})
+        return {"ok": True, "root": meta, "tasks": tasks}
+
+    def ide_run_task(self, user_id: str, session_id: str, payload: dict, *, remote: bool = False) -> dict:
+        root_id = str(payload.get("root_id", "session") or "session")
+        listed = self.ide_tasks(user_id, session_id, root_id)
+        task_id = str(payload.get("task_id", "") or "")
+        task = next((row for row in listed["tasks"] if str(row.get("id", "")) == task_id), None)
+        if not task:
+            raise KeyError("task not found")
+        command = " ".join([shlex.quote(str(task["command"])), *[shlex.quote(str(x)) for x in task.get("args", [])]])
+        return self.ide_run_command(
+            user_id,
+            session_id,
+            {"root_id": root_id, "cwd": ".", "command": command},
+            remote=remote,
+        )
+
+    def ide_python_diagnostics(self, user_id: str, session_id: str, payload: dict) -> dict:
+        root_id = str(payload.get("root_id", "session") or "session")
+        rel = normalize_rel_preview_path(str(payload.get("path", "") or ""))
+        root, target, _ = self.ide_resolve_workspace(user_id, session_id, root_id, rel)
+        source = str(payload.get("content", "") or "") if "content" in payload else target.read_text(encoding="utf-8", errors="replace")
+        diagnostics: list[dict] = []
+        try:
+            ast.parse(source, filename=str(target))
+        except SyntaxError as exc:
+            diagnostics.append({"severity": "error", "message": str(exc.msg or "Syntax error"), "line": int(exc.lineno or 1), "column": int(exc.offset or 1), "source": "python"})
+        if not diagnostics:
+            try:
+                import jedi
+                script = jedi.Script(code=source, path=str(target), project=jedi.Project(str(root)))
+                for name in script.get_names(all_scopes=True, definitions=False, references=True)[:5000]:
+                    if str(name.type or "") == "statement" and str(name.name or "") == "":
+                        continue
+            except Exception:
+                pass
+        return {"ok": True, "path": rel, "diagnostics": diagnostics, "engine": "jedi" if importlib.util.find_spec("jedi") else "ast"}
+
+    def _ide_extension_account_root(self, user_id: str) -> Path:
+        digest = hashlib.sha256(str(user_id or "").encode("utf-8", errors="ignore")).hexdigest()[:24]
+        root = (self.ide_extensions_root / digest).resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    @staticmethod
+    def _ide_extension_public_manifest(manifest: dict, *, installed: bool = False) -> dict:
+        contributes = manifest.get("contributes", {}) if isinstance(manifest.get("contributes", {}), dict) else {}
+        safe_contributes = {}
+        for key in ("commands", "menus", "configuration", "languages", "grammars", "themes", "snippets", "keybindings", "views", "viewsContainers"):
+            value = contributes.get(key)
+            if isinstance(value, (dict, list)):
+                safe_contributes[key] = value
+        publisher = trim(str(manifest.get("publisher", "") or ""), 120)
+        name = trim(str(manifest.get("name", "") or ""), 120)
+        return {
+            "id": f"{publisher}.{name}".strip("."),
+            "publisher": publisher,
+            "name": name,
+            "displayName": trim(str(manifest.get("displayName", name) or name), 200),
+            "description": trim(str(manifest.get("description", "") or ""), 1000),
+            "version": trim(str(manifest.get("version", "") or ""), 80),
+            "browser": trim(str(manifest.get("browser", "") or ""), 300),
+            "main": trim(str(manifest.get("main", "") or ""), 300),
+            "extensionKind": manifest.get("extensionKind", []),
+            "activationEvents": manifest.get("activationEvents", []),
+            "contributes": safe_contributes,
+            "installed": bool(installed),
+            "worker_supported": bool(str(manifest.get("browser", "") or "").strip()),
+        }
+
+    def ide_open_vsx_search(self, query: str, *, size: int = 30, offset: int = 0) -> dict:
+        clean = trim(str(query or "").strip(), 300)
+        if not clean:
+            return {"ok": True, "extensions": [], "totalSize": 0}
+        params = f"query={quote(clean)}&size={max(1, min(50, int(size or 30)))}&offset={max(0, int(offset or 0))}"
+        request = Request(
+            "https://open-vsx.org/api/-/search?" + params,
+            headers={"Accept": "application/json", "User-Agent": f"Clouds-Coder/{APP_VERSION}"},
+        )
+        with urlopen(request, timeout=20) as response:
+            raw = json.loads(response.read().decode("utf-8", errors="replace") or "{}")
+        extensions = []
+        for row in raw.get("extensions", []) if isinstance(raw, dict) else []:
+            if not isinstance(row, dict):
+                continue
+            extensions.append({
+                "id": str(row.get("namespace", "") or "") + "." + str(row.get("name", "") or ""),
+                "namespace": str(row.get("namespace", "") or ""),
+                "name": str(row.get("name", "") or ""),
+                "displayName": str(row.get("displayName", row.get("name", "")) or ""),
+                "description": trim(str(row.get("description", "") or ""), 1000),
+                "version": str(row.get("version", "") or ""),
+                "downloadCount": int(row.get("downloadCount", 0) or 0),
+                "averageRating": float(row.get("averageRating", 0) or 0),
+                "iconUrl": str(row.get("files", {}).get("icon", "") or "") if isinstance(row.get("files", {}), dict) else "",
+            })
+        return {"ok": True, "extensions": extensions, "totalSize": int(raw.get("totalSize", len(extensions)) or len(extensions))}
+
+    def _ide_safe_extract_vsix(self, data: bytes, destination: Path) -> dict:
+        if len(data) > IDE_VSIX_MAX_BYTES:
+            raise ValueError("VSIX archive exceeds the size limit")
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            infos = archive.infolist()
+            if len(infos) > IDE_VSIX_MAX_FILES:
+                raise ValueError("VSIX contains too many files")
+            expanded = 0
+            for info in infos:
+                raw_name = str(info.filename or "")
+                posix_name = raw_name.replace("\\", "/")
+                expected_name = posix_name.rstrip("/") if info.is_dir() else posix_name
+                name = _normalize_js_lib_asset_ref(raw_name)
+                if (
+                    not name
+                    or "\\" in raw_name
+                    or posix_name.startswith("/")
+                    or re.match(r"^[A-Za-z]:", posix_name)
+                    or name != expected_name
+                ):
+                    raise ValueError("VSIX contains an unsafe path")
+                mode = (int(info.external_attr) >> 16) & 0o170000
+                if mode == 0o120000:
+                    raise ValueError("VSIX symbolic links are not allowed")
+                if int(info.file_size) > IDE_VSIX_MAX_FILE_BYTES:
+                    raise ValueError(f"VSIX file is too large: {name}")
+                expanded += int(info.file_size)
+                if expanded > IDE_VSIX_MAX_EXPANDED_BYTES:
+                    raise ValueError("VSIX expanded size exceeds the limit")
+            manifest_name = next((x.filename for x in infos if str(x.filename).replace("\\", "/") == "extension/package.json"), "")
+            if not manifest_name:
+                raise ValueError("VSIX does not contain extension/package.json")
+            manifest = json.loads(archive.read(manifest_name).decode("utf-8", errors="strict"))
+            if not isinstance(manifest, dict):
+                raise ValueError("VSIX package.json must be an object")
+            public = self._ide_extension_public_manifest(manifest, installed=True)
+            if not public["publisher"] or not public["name"] or not public["version"]:
+                raise ValueError("VSIX manifest requires publisher, name, and version")
+            temp = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.install")
+            if temp.exists():
+                shutil.rmtree(temp)
+            temp.mkdir(parents=True, exist_ok=False)
+            try:
+                for info in infos:
+                    rel = _normalize_js_lib_asset_ref(info.filename)
+                    target = (temp / rel).resolve()
+                    if not target.is_relative_to(temp.resolve()):
+                        raise ValueError("VSIX path escapes install directory")
+                    if info.is_dir():
+                        target.mkdir(parents=True, exist_ok=True)
+                    else:
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        with archive.open(info) as src, target.open("wb") as dst:
+                            shutil.copyfileobj(src, dst, length=1024 * 1024)
+                _write_json_file(temp / "install.json", {"manifest": public, "installed_at": now_ts()})
+                if destination.exists():
+                    shutil.rmtree(destination)
+                os.replace(temp, destination)
+            finally:
+                if temp.exists():
+                    shutil.rmtree(temp, ignore_errors=True)
+        return public
+
+    def ide_install_extension(self, user_id: str, payload: dict) -> dict:
+        extension_id = trim(str(payload.get("id", "") or "").strip(), 260)
+        data = b""
+        source = "upload"
+        if payload.get("content_b64"):
+            data = base64.b64decode(str(payload.get("content_b64", "") or ""), validate=True)
+        elif extension_id:
+            if not re.fullmatch(r"[A-Za-z0-9._-]+\.[A-Za-z0-9._-]+", extension_id):
+                raise ValueError("invalid Open VSX extension id")
+            namespace, name = extension_id.split(".", 1)
+            metadata_url = f"https://open-vsx.org/api/{quote(namespace)}/{quote(name)}/latest"
+            with urlopen(Request(metadata_url, headers={"Accept": "application/json", "User-Agent": f"Clouds-Coder/{APP_VERSION}"}), timeout=20) as response:
+                metadata = json.loads(response.read().decode("utf-8", errors="replace") or "{}")
+            files = metadata.get("files", {}) if isinstance(metadata, dict) else {}
+            download_url = str(files.get("download", "") or "") if isinstance(files, dict) else ""
+            if not download_url.startswith("https://open-vsx.org/"):
+                raise ValueError("Open VSX metadata did not provide a trusted download URL")
+            with urlopen(Request(download_url, headers={"User-Agent": f"Clouds-Coder/{APP_VERSION}"}), timeout=60) as response:
+                data = response.read(IDE_VSIX_MAX_BYTES + 1)
+            expected_sha = str(files.get("sha256", "") or "").strip().lower() if isinstance(files, dict) else ""
+            if expected_sha and not hmac.compare_digest(hashlib.sha256(data).hexdigest(), expected_sha):
+                raise ValueError("Open VSX package checksum mismatch")
+            source = "open-vsx"
+        else:
+            raise ValueError("extension id or content_b64 required")
+        account_root = self._ide_extension_account_root(user_id)
+        staging_name = hashlib.sha256(data).hexdigest()[:24]
+        staging = account_root / ("package-" + staging_name)
+        manifest = self._ide_safe_extract_vsix(data, staging)
+        final = account_root / re.sub(r"[^A-Za-z0-9._-]+", "-", f"{manifest['id']}-{manifest['version']}")
+        if final != staging:
+            if final.exists():
+                shutil.rmtree(final)
+            os.replace(staging, final)
+        manifest["install_path"] = final.name
+        _write_json_file(final / "install.json", {"manifest": manifest, "installed_at": now_ts()})
+        return {"ok": True, "extension": manifest, "source": source}
+
+    def ide_list_extensions(self, user_id: str) -> dict:
+        root = self._ide_extension_account_root(user_id)
+        rows: list[dict] = []
+        for fp in sorted(root.glob("*/install.json")):
+            raw = _read_json_file(fp, {})
+            manifest = raw.get("manifest", {}) if isinstance(raw, dict) else {}
+            if isinstance(manifest, dict) and manifest.get("id"):
+                row = dict(manifest)
+                row["install_path"] = fp.parent.name
+                rows.append(row)
+        return {"ok": True, "extensions": rows}
+
+    def ide_uninstall_extension(self, user_id: str, extension_id: str) -> dict:
+        clean = str(extension_id or "").strip()
+        root = self._ide_extension_account_root(user_id)
+        removed = False
+        for fp in list(root.glob("*/install.json")):
+            raw = _read_json_file(fp, {})
+            manifest = raw.get("manifest", {}) if isinstance(raw, dict) else {}
+            if isinstance(manifest, dict) and str(manifest.get("id", "")) == clean:
+                shutil.rmtree(fp.parent)
+                removed = True
+        if not removed:
+            raise KeyError("extension not installed")
+        return {"ok": True, "id": clean}
+
+    def ide_extension_asset(self, user_id: str, install_path: str, asset_path: str) -> Path:
+        root = self._ide_extension_account_root(user_id)
+        install_name = re.sub(r"[^A-Za-z0-9._-]+", "", str(install_path or ""))
+        if not install_name:
+            raise FileNotFoundError("extension asset not found")
+        extension_root = (root / install_name / "extension").resolve()
+        rel = _normalize_js_lib_asset_ref(asset_path)
+        target = (extension_root / rel).resolve()
+        if not rel or not target.is_relative_to(extension_root) or not target.exists() or not target.is_file():
+            raise FileNotFoundError("extension asset not found")
+        if target.stat().st_size > IDE_VSIX_MAX_FILE_BYTES:
+            raise ValueError("extension asset is too large")
+        return target
+
+    def _ide_debug_reader(self, debug_id: str) -> None:
+        with self.ide_debug_lock:
+            debug = self.ide_debug_sessions.get(debug_id)
+        if not debug:
+            return
+        stream = debug["process"].stdout
+        try:
+            while True:
+                headers: dict[str, str] = {}
+                while True:
+                    line = stream.readline()
+                    if not line:
+                        return
+                    if line in {b"\r\n", b"\n"}:
+                        break
+                    key, sep, value = line.decode("ascii", errors="replace").partition(":")
+                    if sep:
+                        headers[key.strip().lower()] = value.strip()
+                length = int(headers.get("content-length", "0") or 0)
+                if length <= 0 or length > 8_000_000:
+                    return
+                body = stream.read(length)
+                if len(body) != length:
+                    return
+                message = json.loads(body.decode("utf-8", errors="replace"))
+                with debug["lock"]:
+                    debug["messages"].append(message)
+                    while len(debug["messages"]) > 2000:
+                        debug["messages"].popleft()
+                    debug["last_activity"] = now_ts()
+        finally:
+            with debug["lock"]:
+                debug["closed"] = True
+
+    def ide_debug_create(self, user_id: str, session_id: str, payload: dict, *, remote: bool = False) -> dict:
+        if importlib.util.find_spec("debugpy") is None:
+            raise IDECapabilityError("debugpy_unavailable", "debugpy is not installed.", 501)
+        root_id = str(payload.get("root_id", "session") or "session")
+        root, _, meta = self.ide_resolve_workspace(user_id, session_id, root_id, ".")
+        sess = self._ide_session(user_id, session_id)
+        prefix = self._ide_process_prefix(sess, remote=remote)
+        process = subprocess.Popen(
+            [*prefix, sys.executable, "-m", "debugpy.adapter"],
+            cwd=str(root),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+            env=sess._shell_process_env(),
+        )
+        debug_id = "debug_" + uuid.uuid4().hex[:20]
+        debug = {
+            "id": debug_id,
+            "user_id": str(user_id or ""),
+            "session_id": str(session_id or ""),
+            "root_id": root_id,
+            "root": root,
+            "process": process,
+            "messages": deque(),
+            "next_index": 0,
+            "closed": False,
+            "created_at": now_ts(),
+            "last_activity": now_ts(),
+            "lock": threading.RLock(),
+        }
+        with self.ide_debug_lock:
+            self.ide_debug_sessions[debug_id] = debug
+        threading.Thread(target=self._ide_debug_reader, args=(debug_id,), name=f"ide-debug-{debug_id[-6:]}", daemon=True).start()
+        return {"ok": True, "debug": {"id": debug_id, "root": meta}}
+
+    def _ide_debug_for_user(self, user_id: str, debug_id: str) -> dict:
+        with self.ide_debug_lock:
+            debug = self.ide_debug_sessions.get(str(debug_id or ""))
+        if not debug or str(debug.get("user_id", "")) != str(user_id or ""):
+            raise KeyError("debug session not found")
+        return debug
+
+    def ide_debug_send(self, user_id: str, debug_id: str, payload: dict) -> dict:
+        debug = self._ide_debug_for_user(user_id, debug_id)
+        message = payload.get("message", payload)
+        if not isinstance(message, dict):
+            raise ValueError("DAP message must be an object")
+        raw = json_dumps(message).encode("utf-8")
+        if len(raw) > 8_000_000:
+            raise ValueError("DAP message is too large")
+        with debug["lock"]:
+            if debug["closed"] or debug["process"].poll() is not None:
+                raise ValueError("debug session is closed")
+            stream = debug["process"].stdin
+            stream.write(f"Content-Length: {len(raw)}\r\n\r\n".encode("ascii") + raw)
+            stream.flush()
+            debug["last_activity"] = now_ts()
+        return {"ok": True}
+
+    def ide_debug_messages(self, user_id: str, debug_id: str) -> dict:
+        debug = self._ide_debug_for_user(user_id, debug_id)
+        with debug["lock"]:
+            messages = list(debug["messages"])
+            debug["messages"].clear()
+            stderr = b""
+            if debug["process"].poll() is not None:
+                try:
+                    stderr = debug["process"].stderr.read(32_000)
+                except Exception:
+                    pass
+            return {"ok": True, "messages": messages, "closed": bool(debug["closed"]), "stderr": stderr.decode("utf-8", errors="replace")}
+
+    def ide_debug_close(self, user_id: str, debug_id: str) -> dict:
+        debug = self._ide_debug_for_user(user_id, debug_id)
+        process = debug["process"]
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        with debug["lock"]:
+            debug["closed"] = True
+        return {"ok": True, "debug_id": debug_id}
+
+    def ide_run_command(self, user_id: str, session_id: str, payload: dict, *, remote: bool = False) -> dict:
         command = str(payload.get("command", "") or "").strip()
         if not command:
             raise ValueError("command required")
@@ -94459,11 +97429,16 @@ class AppContext:
         requested_timeout = int(payload.get("timeout", IDE_COMMAND_TIMEOUT_DEFAULT) or IDE_COMMAND_TIMEOUT_DEFAULT)
         timeout = max(1, min(MAX_SHELL_COMMAND_TIMEOUT_SECONDS, requested_timeout))
         started = now_ts()
+        before_files = workspace_file_revision_map(root)
         try:
             effective_command = sess._rewrite_shell_virtual_paths(command, cwd) if sess.skill_mode == "hard" else command
-            shell_prefix = sess._hard_snapshot_shell_prefix() if sess.skill_mode == "hard" else []
+            shell_prefix = self._ide_process_prefix(sess, remote=remote)
+            if not shell_prefix and sess.skill_mode == "hard":
+                shell_prefix = sess._hard_snapshot_shell_prefix()
             run_command: object = effective_command
             run_shell = True
+            if os.name == "nt" and not shell_prefix:
+                run_command = f"chcp 65001>nul & {effective_command}"
             if shell_prefix:
                 run_command = [*shell_prefix, "/bin/sh", "-c", effective_command]
                 run_shell = False
@@ -94472,10 +97447,13 @@ class AppContext:
                 cwd=str(cwd),
                 shell=run_shell,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 capture_output=True,
                 timeout=timeout,
+                env=sess._shell_process_env(),
             )
-            return {
+            result = {
                 "ok": proc.returncode == 0,
                 "root": meta,
                 "cwd": cwd.relative_to(root).as_posix() if cwd.is_relative_to(root) else str(cwd),
@@ -94486,8 +97464,19 @@ class AppContext:
                 "duration_ms": int((now_ts() - started) * 1000),
                 "timeout": timeout,
             }
+            changed_files = workspace_revision_delta(before_files, workspace_file_revision_map(root))
+            result["changed_files"] = changed_files
+            if changed_files:
+                self._ide_emit_workspace_change(
+                    user_id,
+                    session_id,
+                    root_id=root_id,
+                    action="command",
+                    paths=changed_files,
+                )
+            return result
         except subprocess.TimeoutExpired as exc:
-            return {
+            result = {
                 "ok": False,
                 "root": meta,
                 "cwd": cwd.relative_to(root).as_posix() if cwd.is_relative_to(root) else str(cwd),
@@ -94499,8 +97488,27 @@ class AppContext:
                 "timeout": timeout,
                 "timed_out": True,
             }
+            changed_files = workspace_revision_delta(before_files, workspace_file_revision_map(root))
+            result["changed_files"] = changed_files
+            if changed_files:
+                self._ide_emit_workspace_change(
+                    user_id,
+                    session_id,
+                    root_id=root_id,
+                    action="command",
+                    paths=changed_files,
+                )
+            return result
 
-    def ide_agent_task(self, user_id: str, session_id: str, payload: dict, client_ip: str = "") -> dict:
+    def ide_agent_task(
+        self,
+        user_id: str,
+        session_id: str,
+        payload: dict,
+        client_ip: str = "",
+        *,
+        remote: bool = False,
+    ) -> dict:
         sid = str(session_id or "").strip()
         if not sid:
             created = self.ide_create_session(user_id, "IDE Workspace", client_ip=client_ip)
@@ -94511,6 +97519,23 @@ class AppContext:
         root_id = str(payload.get("root_id", payload.get("root", "session")) or "session")
         active_path = normalize_rel_preview_path(str(payload.get("active_path", "") or ""))
         root, _, meta = self.ide_resolve_workspace(user_id, sid, root_id, ".")
+        attachments: list[str] = []
+        raw_attachments = payload.get("attachments", [])
+        if raw_attachments is not None and not isinstance(raw_attachments, list):
+            raise ValueError("attachments must be a list")
+        for item in (raw_attachments or [])[:20]:
+            raw_path = item.get("path", "") if isinstance(item, dict) else item
+            rel_path = normalize_rel_preview_path(str(raw_path or ""))
+            if not rel_path:
+                continue
+            _, attachment_path, _ = self.ide_resolve_workspace(user_id, sid, root_id, rel_path)
+            if not attachment_path.exists() or not attachment_path.is_file():
+                raise FileNotFoundError(f"attachment not found: {rel_path}")
+            attachments.append(rel_path)
+        sess = self._ide_session(user_id, sid)
+        if remote:
+            self._ide_process_prefix(sess, remote=True)
+            sess.ide_remote_sandbox_required = True
         context_lines = [
             "IDE programming request.",
             f"Workspace root: {meta.get('label', root.name)} ({meta.get('kind', 'workspace')})",
@@ -94518,6 +97543,9 @@ class AppContext:
         ]
         if active_path:
             context_lines.append(f"Active file: {active_path}")
+        if attachments:
+            context_lines.append("Attached workspace files (read as needed):")
+            context_lines.extend(f"- {path}" for path in attachments)
         context_lines.append("")
         context_lines.append(message)
         out = self.submit_user_message(user_id, sid, "\n".join(context_lines))
@@ -94525,8 +97553,192 @@ class AppContext:
         result["session_id"] = sid
         return result
 
+    def ide_answer_agent_question(
+        self,
+        user_id: str,
+        session_id: str,
+        payload: dict,
+    ) -> dict:
+        sess = self._ide_session(user_id, session_id)
+        pending = (
+            dict(sess.pending_user_question)
+            if isinstance(getattr(sess, "pending_user_question", None), dict)
+            else None
+        )
+        if not pending or not trim(str(pending.get("question", "") or "").strip(), 2000):
+            raise ValueError("session is not awaiting an ask_user response")
+        expected_id = str(pending.get("id", "") or "").strip()
+        submitted_id = str(payload.get("question_id", "") or "").strip()
+        if expected_id and (
+            not submitted_id or not hmac.compare_digest(expected_id, submitted_id)
+        ):
+            raise ValueError("ask_user question is stale; reload the current session")
+        answer = trim(str(payload.get("answer", payload.get("message", "")) or "").strip(), 4000)
+        if not answer:
+            raise ValueError("answer required")
+        options = [
+            trim(str(value or "").strip(), 400)
+            for value in (pending.get("options", []) if isinstance(pending.get("options"), list) else [])
+            if str(value or "").strip()
+        ][:8]
+        allow_free_text = bool(pending.get("allow_free_text", True))
+        if options and not allow_free_text and answer not in options:
+            raise ValueError("answer must match one of the available options")
+        out = self.submit_user_message(user_id, session_id, answer)
+        result = dict(out if isinstance(out, dict) else {"ok": True, "result": out})
+        result.update({"session_id": session_id, "question_id": expected_id, "answer": answer})
+        return result
+
+    def ide_agent_state(self, user_id: str, session_id: str) -> dict:
+        sess = self._ide_session(user_id, session_id)
+        snap = sess.snapshot_safe(lite=True, lock_timeout=0.35)
+        raw_operations = list(snap.get("operations", []) or []) if isinstance(snap, dict) else []
+        acquired = False
+        try:
+            acquired = bool(sess.lock.acquire(timeout=0.08))
+            if acquired:
+                raw_operations = list(sess.operations[-500:])
+        except Exception:
+            pass
+        finally:
+            if acquired:
+                sess.lock.release()
+
+        feed: list[dict] = []
+        for raw in snap.get("conversation_feed", []) if isinstance(snap, dict) else []:
+            if not isinstance(raw, dict):
+                continue
+            role = str(raw.get("role", "system") or "system").strip().lower()
+            public_text = str(raw.get("text", "") or "")
+            if role == "user" and public_text.startswith("IDE programming request."):
+                _, _, public_text = public_text.partition("\n\n")
+            row = {
+                "role": role,
+                "type": trim(str(raw.get("type", "message") or "message"), 40),
+                "text": trim(public_text, 6000),
+                "ts": float(raw.get("ts", 0.0) or 0.0),
+                "agent_role": trim(str(raw.get("agent_role", "") or ""), 40),
+            }
+            data = raw.get("data", {}) if isinstance(raw.get("data"), dict) else {}
+            if data:
+                public_data = ide_public_operation_data(data)
+                if public_data:
+                    row["data"] = public_data
+            feed.append(row)
+        operations: list[dict] = []
+        for raw in raw_operations:
+            if not isinstance(raw, dict):
+                continue
+            kind = str(raw.get("type", "") or "").strip()
+            if kind not in {"tool_start", "tool_result", "file_patch", "command", "compact", "status", "error"}:
+                continue
+            data = raw.get("data", {}) if isinstance(raw.get("data"), dict) else {}
+            public_data = ide_public_operation_data(data)
+            operations.append(
+                {
+                    "id": str(raw.get("id", "") or ""),
+                    "seq": int(raw.get("seq", 0) or 0),
+                    "ts": float(raw.get("ts", 0.0) or 0.0),
+                    "type": kind,
+                    "data": public_data,
+                }
+            )
+        pending_question = None
+        raw_question = snap.get("pending_user_question") if isinstance(snap, dict) else None
+        if isinstance(raw_question, dict):
+            question = trim(str(raw_question.get("question", "") or "").strip(), 2000)
+            if question:
+                raw_options = raw_question.get("options", [])
+                pending_question = {
+                    "id": trim(str(raw_question.get("id", "") or ""), 120),
+                    "question": question,
+                    "options": [
+                        trim(str(value or "").strip(), 400)
+                        for value in raw_options
+                        if str(value or "").strip()
+                    ][:8] if isinstance(raw_options, list) else [],
+                    "allow_free_text": bool(raw_question.get("allow_free_text", True)),
+                    "role": trim(str(raw_question.get("role", "") or "agent"), 40),
+                    "ts": float(raw_question.get("ts", 0.0) or 0.0),
+                }
+        return {
+            "ok": True,
+            "session_id": str(session_id or ""),
+            "title": trim(str(getattr(sess, "title", "") or ""), 160),
+            "running": bool(snap.get("running", False)),
+            "phase": str(snap.get("agent_phase", "idle") or "idle"),
+            "active_role": str(snap.get("agent_active_role", "") or ""),
+            "active_tool": str(snap.get("agent_active_tool", "") or ""),
+            "live_response_text": trim(str(snap.get("live_response_text", "") or ""), 8000),
+            "event_seq": int(snap.get("event_seq", 0) or 0),
+            "message_count": int(snap.get("message_count", 0) or 0),
+            "queued_inputs": int(snap.get("queued_user_inputs_count", 0) or 0),
+            "scheduler_queued": int(snap.get("scheduler_queued_inputs_count", 0) or 0),
+            "pending_user_question": pending_question,
+            "model": trim(str(snap.get("model", "") or ""), 240),
+            "provider": trim(str(snap.get("provider", "") or ""), 80),
+            "context_tokens_estimate": int(snap.get("context_tokens_estimate", 0) or 0),
+            "context_left_tokens": int(snap.get("context_left_tokens", 0) or 0),
+            "context_left_percent": float(snap.get("context_left_percent", 0.0) or 0.0),
+            "context_effective_token_limit": int(snap.get("context_effective_token_limit", 0) or 0),
+            "agent_contexts": list(snap.get("agent_contexts", []) or [])[:12],
+            "todos": list(snap.get("todos", []) or [])[:40],
+            "tasks": list(snap.get("tasks", []) or [])[:80],
+            "feed": feed[-180:],
+            "operations": operations[-500:],
+        }
+
+    def ide_agent_models(self, user_id: str, session_id: str, *, refresh: bool = False) -> dict:
+        return self._ide_session(user_id, session_id).model_catalog(force_probe=bool(refresh))
+
+    def ide_set_agent_model(self, user_id: str, session_id: str, selection: str) -> dict:
+        sess = self._ide_session(user_id, session_id)
+        picked = str(selection or "").strip()
+        if not picked:
+            raise ValueError("selection required")
+        if bool(getattr(sess, "running", False)):
+            sess._queue_deferred_runtime_update("model_selection", {"selection": picked, "model_override": ""})
+            queued = sess.model_catalog()
+            queued["queued"] = True
+            queued["note"] = "Model switch queued until the current run finishes."
+            return queued
+        out = sess.set_runtime_selection(picked)
+        self.manager_for_user(user_id)._sync_from_session(sess, apply_to_all=False)
+        return out
+
     def rag_js_lib_asset_path(self, filename: str) -> Path | None:
-        return _resolve_js_lib_asset_path(self.js_lib_root, str(filename or "").strip())
+        asset_ref = str(filename or "").strip()
+        roots: list[Path] = []
+        for candidate in (self.js_lib_root, offline_js_lib_root(SCRIPT_DIR)):
+            root = Path(candidate).resolve()
+            if root not in roots:
+                roots.append(root)
+        for root in roots:
+            asset = _resolve_js_lib_asset_path(root, asset_ref)
+            if asset:
+                return asset
+        return None
+
+    def ide_monaco_worker_path(self) -> Path | None:
+        roots: list[Path] = []
+        for candidate in (self.js_lib_root, offline_js_lib_root(SCRIPT_DIR)):
+            root = Path(candidate).resolve()
+            if root not in roots:
+                roots.append(root)
+        for root in roots:
+            asset_root = (root / "monaco" / "min" / "vs" / "assets").resolve()
+            try:
+                candidates = sorted(
+                    fp.resolve()
+                    for fp in asset_root.glob("editor.worker-*.js")
+                    if fp.is_file() and fp.resolve().is_relative_to(root)
+                )
+            except Exception:
+                candidates = []
+            if candidates:
+                return candidates[0]
+        fallback = self.rag_js_lib_asset_path("monaco/min/vs/editor/editor.worker.js")
+        return fallback if fallback and fallback.is_file() else None
 
     def rag_three_asset_info(self) -> dict:
         picks = [
@@ -95388,7 +98600,7 @@ class AppContext:
                     "wiki_candidate_count": int((wiki_result.get("route_meta", {}) or {}).get("candidate_count", 0) or 0)
                     if isinstance(wiki_result.get("route_meta", {}), dict)
                     else 0,
-                    "raw_candidate_count": sum(len((row.get("results", []) or [])) for row in stage_results if isinstance(row, dict) and str(row.get("route", "") or "") not in {"wiki"}),
+                    "raw_candidate_count": sum(len(row.get("results", []) or []) for row in stage_results if isinstance(row, dict) and str(row.get("route", "") or "") not in {"wiki"}),
                     "raw_route": raw_route,
                     "wiki_first": True,
                     "adaptive_retrieval": True,
@@ -95747,7 +98959,7 @@ class AppContext:
                     "wiki_candidate_count": int((wiki_result.get("route_meta", {}) or {}).get("candidate_count", 0) or 0)
                     if isinstance(wiki_result.get("route_meta", {}), dict)
                     else 0,
-                    "raw_candidate_count": sum(len((row.get("results", []) or [])) for row in stage_results if isinstance(row, dict) and str(row.get("route", "") or "") not in {"wiki", "workflow"}),
+                    "raw_candidate_count": sum(len(row.get("results", []) or []) for row in stage_results if isinstance(row, dict) and str(row.get("route", "") or "") not in {"wiki", "workflow"}),
                     "raw_route": raw_route,
                     "workflow_first": True,
                     "wiki_first": True,
@@ -96256,6 +99468,20 @@ class AppContext:
                 mgr.shutdown()
         except Exception:
             pass
+        with self.ide_terminal_lock:
+            terminals = list(self.ide_terminals.values())
+        for terminal in terminals:
+            try:
+                self.ide_terminal_close(str(terminal.get("user_id", "")), str(terminal.get("id", "")))
+            except Exception:
+                pass
+        with self.ide_debug_lock:
+            debuggers = list(self.ide_debug_sessions.values())
+        for debug in debuggers:
+            try:
+                self.ide_debug_close(str(debug.get("user_id", "")), str(debug.get("id", "")))
+            except Exception:
+                pass
         try:
             self.rag_service.shutdown()
         except Exception:
@@ -96276,6 +99502,49 @@ class AppContext:
             self.workflow_memory.shutdown()
         except Exception:
             pass
+
+    def interrupt_all_sessions_for_shutdown(self) -> dict:
+        """Cancel active agent runs without taking session locks or persisting."""
+        report = {"sessions": 0, "running": 0, "bash_terminated": 0}
+        with self._lock:
+            managers = list(self._session_mgrs.values())
+        for mgr in managers:
+            acquired = False
+            try:
+                acquired = bool(mgr.lock.acquire(timeout=0.05))
+                sessions = list(mgr.sessions.values())
+            except Exception:
+                continue
+            finally:
+                if acquired:
+                    try:
+                        mgr.lock.release()
+                    except Exception:
+                        pass
+            for sess in sessions:
+                report["sessions"] += 1
+                if bool(getattr(sess, "running", False)):
+                    report["running"] += 1
+                try:
+                    sess.cancel_requested = True
+                except Exception:
+                    pass
+                proc = getattr(sess, "_running_bash_proc", None)
+                if proc is None or proc.poll() is not None:
+                    continue
+                try:
+                    if os.name == "posix":
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    else:
+                        proc.kill()
+                    report["bash_terminated"] += 1
+                except Exception:
+                    try:
+                        proc.kill()
+                        report["bash_terminated"] += 1
+                    except Exception:
+                        pass
+        return report
 
     def _daily_session_window_info(self, now_dt: datetime | None = None) -> dict:
         now_local = now_dt.astimezone() if isinstance(now_dt, datetime) else datetime.now().astimezone()
@@ -99434,6 +102703,9 @@ class Handler(BaseHTTPRequestHandler):
                     "thinking": model_cat.get("thinking", mgr.thinking),
                     "response_stream": bool(model_cat.get("response_stream", False)),
                     "language": normalize_ui_language(getattr(mgr, "user_language", DEFAULT_UI_LANGUAGE)),
+                    "agent_language_preference": agent_language_preference_payload(
+                        getattr(mgr, "user_language", DEFAULT_UI_LANGUAGE)
+                    ),
                     "ui_style": normalize_ui_style(getattr(self.app, "ui_style", DEFAULT_UI_STYLE)),
                     "ui_style_label": UI_STYLE_LABELS.get(
                         normalize_ui_style(getattr(self.app, "ui_style", DEFAULT_UI_STYLE)),
@@ -99447,6 +102719,8 @@ class Handler(BaseHTTPRequestHandler):
                     "skills_port": skills_port,
                     "rag_admin_port": int(getattr(self.app, "rag_admin_port", 0) or 0),
                     "code_admin_port": int(getattr(self.app, "code_admin_port", 0) or 0),
+                    "ide_port": int(getattr(self.app, "ide_port", 0) or 0),
+                    "ide_enabled": bool(getattr(self.app, "ide_enabled", False)),
                     "skills_ui_enabled": skills_enabled,
                     "skills_ui_url": skills_url,
                     "show_upload_list": bool(getattr(self.app, "show_upload_list", False)),
@@ -99524,8 +102798,8 @@ class Handler(BaseHTTPRequestHandler):
             if not base_url:
                 return self._send_json({"ok": False, "reachable": False, "models": [], "error": "base_url required"})
             try:
-                import urllib.request
                 import urllib.error
+                import urllib.request
                 normalized_base = extract_base_url(base_url)
                 reachable = False
                 last_error = ""
@@ -100759,6 +104033,14 @@ class RagAdminHandler(BaseHTTPRequestHandler):
             if fp.suffix.lower() in {".js", ".mjs", ".cjs"}:
                 content_type = "application/javascript; charset=utf-8"
             return self._send_inline_bytes(data, content_type)
+        m = re.match(r"^/api/ide/v2/extensions/asset/([^/]+)/(.*)$", path)
+        if m:
+            try:
+                context = self._auth_context(required=True)
+                fp = self.app.ide_extension_asset(str(context["account"].get("user_id", "")), m.group(1), m.group(2))
+                return self._send_inline_bytes(fp.read_bytes(), guess_mime_from_name(fp.name, "application/octet-stream"))
+            except Exception as exc:
+                return self._send_exception(exc)
         if path == "/api/health":
             return self._send_json({"ok": True, "app": "rag-admin", "version": APP_VERSION})
         if path == "/api/rag/config":
@@ -101062,29 +104344,133 @@ class IdeHandler(BaseHTTPRequestHandler):
         return trusted_client_ip(self)
 
     def _user_id(self) -> str:
-        return user_id_from_ip(self._client_ip())
+        context = self._auth_context(required=True)
+        return str(context["account"].get("user_id", "") or "")
+
+    def _direct_loopback(self) -> bool:
+        peer = str(self.client_address[0] if getattr(self, "client_address", None) else "")
+        if not (self.app.ide_is_loopback_address(peer) and self.app.ide_is_loopback_address(self._client_ip())):
+            return False
+        host = str(self.headers.get("Host", "") or "").strip().lower()
+        if host.startswith("["):
+            hostname = host.split("]", 1)[0].lstrip("[")
+        else:
+            hostname = host.rsplit(":", 1)[0] if host.count(":") <= 1 else host
+        return hostname in {"localhost", "127.0.0.1", "::1"}
+
+    def _trusted_https(self) -> bool:
+        if isinstance(getattr(self, "connection", None), ssl.SSLSocket):
+            return True
+        trust_proxy = str(os.getenv("CLOUDS_CODER_TRUST_PROXY", "") or "").strip().lower() in {"1", "true", "yes", "on"}
+        if not trust_proxy:
+            return False
+        peer = str(self.client_address[0] if getattr(self, "client_address", None) else "")
+        ranges = str(os.getenv("CLOUDS_CODER_TRUSTED_PROXIES", "127.0.0.1/32,::1/128") or "")
+        try:
+            peer_addr = ipaddress.ip_address(peer)
+            networks = [ipaddress.ip_network(x.strip(), strict=False) for x in ranges.split(",") if x.strip()]
+            trusted = any(peer_addr in network for network in networks)
+        except Exception:
+            trusted = False
+        return bool(trusted and str(self.headers.get("X-Forwarded-Proto", "") or "").split(",", 1)[0].strip().lower() == "https")
+
+    def _bearer_or_cookie_token(self) -> str:
+        auth = str(self.headers.get("Authorization", "") or "").strip()
+        if auth.lower().startswith("bearer "):
+            return auth[7:].strip()
+        cookies = str(self.headers.get("Cookie", "") or "")
+        for item in cookies.split(";"):
+            key, sep, value = item.strip().partition("=")
+            if sep and key == "clouds_ide_session":
+                return unquote(value.strip())
+        return ""
+
+    def _auth_context(self, *, required: bool = False) -> dict | None:
+        cached = getattr(self, "_ide_auth_context_cache", None)
+        if isinstance(cached, dict):
+            return cached
+        token = self._bearer_or_cookie_token()
+        account = self.app.ide_auth.verify_session(token, self._client_ip()) if token else None
+        if account:
+            request_path = unquote(urlparse(self.path).path)
+            password_routes = {
+                "/api/ide/v2/auth/me",
+                "/api/ide/v2/auth/password",
+                "/api/ide/v2/auth/logout",
+            }
+            if bool(account.get("must_change_password")) and request_path not in password_routes:
+                raise IDEAuthError("password_change_required", "Change the temporary password before using Program.", 403)
+            context = {
+                "token": token,
+                "account": account,
+                "capabilities": self.app.ide_request_capabilities(
+                    account,
+                    client_ip=self._client_ip(),
+                    direct_loopback=self._direct_loopback(),
+                ),
+            }
+            self._ide_auth_context_cache = context
+            return context
+        if required:
+            raise IDEAuthError("authentication_required", "Sign in to Clouds Coder IDE.", 401)
+        return None
+
+    def _require_root_capability(self, context: dict, root_id: object) -> None:
+        if str(root_id or "session").strip() not in {"", "session"}:
+            self.app.ide_require_capability(context.get("capabilities", {}), "mounts")
+
+    @staticmethod
+    def _public_auth_account(account: dict) -> dict:
+        return {
+            key: account.get(key)
+            for key in ("username", "user_id", "role", "disabled", "must_change_password", "created_at", "updated_at")
+        }
 
     def _read_json(self) -> dict:
         return read_http_json_body(self)
 
-    def _require_admin_write(self) -> bool:
-        auth = str(self.headers.get("Authorization", "") or "").strip()
-        token = auth[7:].strip() if auth.lower().startswith("bearer ") else str(self.headers.get("X-Admin-Token", "") or "").strip()
+    def _same_origin_write(self) -> bool:
         origin = str(self.headers.get("Origin", "") or "").strip()
         parsed = urlparse(origin)
-        same_origin = not origin or (parsed.scheme in {"http", "https"} and parsed.netloc == str(self.headers.get("Host", "") or ""))
-        if self.app.verify_admin_token(token) and same_origin:
-            return True
-        self._send_json({"error": "admin authentication and same-origin request required"}, status=401)
-        return False
+        return bool(not origin or (parsed.scheme in {"http", "https"} and parsed.netloc == str(self.headers.get("Host", "") or "")))
 
-    def _send_json(self, obj: object, status: int = 200):
+    def _require_write(self, capability: str = "") -> dict | None:
+        try:
+            context = self._auth_context(required=True)
+            if not self._same_origin_write():
+                raise IDEAuthError("same_origin_required", "IDE writes require a same-origin request.", 403)
+            csrf = str(self.headers.get("X-CSRF-Token", "") or "").strip()
+            expected = str(context["account"].get("csrf_token", "") or "")
+            if not csrf or not hmac.compare_digest(csrf, expected):
+                raise IDEAuthError("csrf_required", "A valid IDE CSRF token is required.", 403)
+            if capability:
+                self.app.ide_require_capability(context["capabilities"], capability)
+            return context
+        except (IDEAuthError, IDECapabilityError) as exc:
+            self._send_exception(exc)
+            return None
+
+    def _require_local_admin(self) -> dict | None:
+        context = self._require_write()
+        if not context:
+            return None
+        if not self._direct_loopback() or str(context["account"].get("role", "")) != "admin":
+            self._send_json({"error": "Local IDE administrator access required.", "code": "local_admin_required"}, status=403)
+            return None
+        return context
+
+    def _send_json(self, obj: object, status: int = 200, *, cookies: list[str] | None = None):
         body = json_response_bytes(obj)
         try:
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            for cookie in cookies or []:
+                self.send_header("Set-Cookie", cookie)
+            retry_after = int(obj.get("retry_after", 0) or 0) if isinstance(obj, dict) else 0
+            if status == 429 and retry_after:
+                self.send_header("Retry-After", str(retry_after))
             if close_if_http_request_body_unread(self):
                 self.send_header("Connection", "close")
             self.end_headers()
@@ -101093,6 +104479,28 @@ class IdeHandler(BaseHTTPRequestHandler):
             if swallow_benign_socket_error(exc, "ide-handler.send_json"):
                 return
             raise
+
+    def _send_auth_session(self, out: dict, *, status: int = 200):
+        secure = "; Secure" if self._trusted_https() else ""
+        cookie = (
+            f"clouds_ide_session={quote(str(out.get('access_token', '') or ''))}; "
+            f"Path=/; HttpOnly; SameSite=Strict; Max-Age={IDE_AUTH_SESSION_TTL_SECONDS}{secure}"
+        )
+        account = out.get("account", {}) if isinstance(out.get("account", {}), dict) else {}
+        payload = {
+            "ok": True,
+            "account": self._public_auth_account(account),
+            "csrf_token": out.get("csrf_token", ""),
+            "expires_at": out.get("expires_at", 0),
+            "capabilities": self.app.ide_request_capabilities(
+                account,
+                client_ip=self._client_ip(),
+                direct_loopback=self._direct_loopback(),
+            ),
+        }
+        if isinstance(out.get("device"), dict):
+            payload["device"] = out["device"]
+        return self._send_json(payload, status=status, cookies=[cookie])
 
     def _send_text(self, text: str, content_type: str = "text/plain; charset=utf-8", status: int = 200):
         body = safe_utf8_bytes(text)
@@ -101124,7 +104532,121 @@ class IdeHandler(BaseHTTPRequestHandler):
                 return
             raise
 
+    def _sse_write(self, payload: bytes) -> bool:
+        try:
+            self.wfile.write(payload)
+            self.wfile.flush()
+            return True
+        except Exception as exc:
+            if swallow_benign_socket_error(exc, "ide-handler.sse_write"):
+                return False
+            raise
+
+    def _stream_ide_events(self, sess: SessionState) -> None:
+        try:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+        except Exception as exc:
+            if swallow_benign_socket_error(exc, "ide-handler.stream_events.headers"):
+                return
+            raise
+        sub = sess.events.subscribe()
+        watch_stop = threading.Event()
+        watch_thread: threading.Thread | None = None
+        try:
+            try:
+                from watchfiles import watch as watch_filesystem
+
+                def _watch_workspace() -> None:
+                    try:
+                        for changes in watch_filesystem(
+                            sess.files_root,
+                            stop_event=watch_stop,
+                            debounce=140,
+                            step=50,
+                            rust_timeout=5000,
+                        ):
+                            paths: list[str] = []
+                            for _, raw_path in changes:
+                                try:
+                                    rel = Path(raw_path).resolve().relative_to(sess.files_root.resolve()).as_posix()
+                                except Exception:
+                                    continue
+                                if rel and rel not in paths:
+                                    paths.append(rel)
+                            if not paths:
+                                continue
+                            try:
+                                sub.put_nowait(
+                                    {
+                                        "type": "workspace_change",
+                                        "seq": 0,
+                                        "data": {
+                                            "root_id": "session",
+                                            "action": "watch",
+                                            "changed_files": paths[:80],
+                                        },
+                                    }
+                                )
+                            except queue.Full:
+                                pass
+                    except Exception:
+                        return
+
+                watch_thread = threading.Thread(
+                    target=_watch_workspace,
+                    name=f"ide-watch-{sess.id[-8:]}",
+                    daemon=True,
+                )
+                watch_thread.start()
+            except Exception:
+                watch_thread = None
+            hello = {"type": "hello", "session_id": sess.id, "seq": int(sess.event_seq or 0)}
+            if not self._sse_write(safe_utf8_bytes(f"data: {json_dumps(hello)}\n\n")):
+                return
+            while True:
+                try:
+                    event = sub.get(timeout=SSE_HEARTBEAT_SECONDS)
+                    raw_data = event.get("data", {}) if isinstance(event, dict) else {}
+                    data = raw_data if isinstance(raw_data, dict) else {}
+                    public = {
+                        "id": str(event.get("id", "") or "") if isinstance(event, dict) else "",
+                        "type": trim(str(event.get("type", "event") if isinstance(event, dict) else "event"), 40),
+                        "session_id": sess.id,
+                        "seq": int(event.get("seq", 0) or 0) if isinstance(event, dict) else 0,
+                        "ts": float(event.get("ts", 0.0) or 0.0) if isinstance(event, dict) else 0.0,
+                        "data": ide_public_operation_data(data),
+                    }
+                    seq = int(public.get("seq", 0) or 0)
+                    prefix = f"id: {seq}\n" if seq > 0 else ""
+                    chunk = safe_utf8_bytes(f"{prefix}data: {json_dumps(public)}\n\n")
+                except queue.Empty:
+                    chunk = safe_utf8_bytes(f": ping {int(now_ts())}\n\n")
+                if chunk and not self._sse_write(chunk):
+                    break
+        except Exception as exc:
+            if not swallow_benign_socket_error(exc, "ide-handler.stream_events.loop"):
+                raise
+        finally:
+            watch_stop.set()
+            if watch_thread is not None:
+                watch_thread.join(timeout=0.3)
+            sess.events.unsubscribe(sub)
+
     def _send_exception(self, exc: Exception):
+        if isinstance(exc, IDEAuthError):
+            payload = {"error": str(exc), "code": exc.code}
+            if exc.retry_after:
+                payload["retry_after"] = exc.retry_after
+            return self._send_json(payload, status=exc.status)
+        if isinstance(exc, IDECapabilityError):
+            return self._send_json({"error": str(exc), "code": exc.code}, status=exc.status)
+        if isinstance(exc, IDEFileConflict):
+            return self._send_json({"error": str(exc), "code": exc.code, "current": exc.current}, status=exc.status)
         if isinstance(exc, KeyError):
             return self._send_json({"error": str(exc).strip("'") or "not found"}, status=404)
         if isinstance(exc, FileNotFoundError):
@@ -101147,6 +104669,11 @@ class IdeHandler(BaseHTTPRequestHandler):
             return self._send_text(self.app.web_ui_ide_style_css(), "text/css; charset=utf-8")
         if path == "/assets/ide.js":
             return self._send_text(self.app.web_ui_ide_js(), "application/javascript; charset=utf-8")
+        if path == "/assets/ide-monaco-worker.js":
+            fp = self.app.ide_monaco_worker_path()
+            if not fp:
+                return self._send_json({"error": "Monaco worker asset not found"}, status=404)
+            return self._send_inline_bytes(fp.read_bytes(), "application/javascript; charset=utf-8")
         if path.startswith("/assets/js_lib/"):
             asset_ref = path[len("/assets/js_lib/"):]
             fp = self.app.rag_js_lib_asset_path(asset_ref)
@@ -101162,9 +104689,66 @@ class IdeHandler(BaseHTTPRequestHandler):
             return self._send_inline_bytes(data, content_type)
         if path == "/api/health":
             return self._send_json({"ok": True, "app": "clouds-coder-ide", "version": APP_VERSION})
+        if path == "/api/ide/v2/auth/status":
+            return self._send_json(self.app.ide_auth_status(local_setup_allowed=self._direct_loopback()))
+        if path == "/api/ide/v2/auth/me":
+            try:
+                context = self._auth_context(required=True)
+                return self._send_json({
+                    "ok": True,
+                    "account": self._public_auth_account(context["account"]),
+                    "csrf_token": context["account"].get("csrf_token", ""),
+                    "capabilities": context["capabilities"],
+                })
+            except Exception as exc:
+                return self._send_exception(exc)
+        if path == "/api/ide/v2/admin/devices":
+            try:
+                context = self._auth_context(required=True)
+                if not self._direct_loopback() or str(context["account"].get("role", "")) != "admin":
+                    raise IDECapabilityError("local_admin_required", "Local IDE administrator access required.")
+                return self._send_json({"ok": True, "devices": self.app.ide_auth.list_devices()})
+            except Exception as exc:
+                return self._send_exception(exc)
+        if path == "/api/ide/v2/admin/users":
+            try:
+                context = self._auth_context(required=True)
+                if not self._direct_loopback() or str(context["account"].get("role", "")) != "admin":
+                    raise IDECapabilityError("local_admin_required", "Local IDE administrator access required.")
+                return self._send_json({"ok": True, "accounts": self.app.ide_auth.list_accounts()})
+            except Exception as exc:
+                return self._send_exception(exc)
+        if path == "/api/ide/v2/workbench/state":
+            try:
+                return self._send_json(self.app.ide_get_workbench_state(self._user_id()))
+            except Exception as exc:
+                return self._send_exception(exc)
+        if path == "/api/ide/v2/extensions":
+            try:
+                return self._send_json(self.app.ide_list_extensions(self._user_id()))
+            except Exception as exc:
+                return self._send_exception(exc)
+        if path == "/api/ide/v2/extensions/search":
+            try:
+                self._auth_context(required=True)
+                return self._send_json(self.app.ide_open_vsx_search(
+                    str((query.get("query", [""]) or [""])[0] or ""),
+                    size=int((query.get("size", ["30"]) or ["30"])[0] or 30),
+                    offset=int((query.get("offset", ["0"]) or ["0"])[0] or 0),
+                ))
+            except Exception as exc:
+                return self._send_exception(exc)
         if path == "/api/ide/config":
             try:
-                return self._send_json(self.app.ide_config(self._user_id(), client_ip=self._client_ip()))
+                context = self._auth_context(required=True)
+                out = self.app.ide_config(str(context["account"].get("user_id", "")), client_ip=self._client_ip())
+                out["account"] = self._public_auth_account(context["account"])
+                out["csrf_token"] = context["account"].get("csrf_token", "")
+                out["capabilities"] = context["capabilities"]
+                if not context["capabilities"].get("mounts"):
+                    out["mounts"] = []
+                    out["workspace"] = ""
+                return self._send_json(out)
             except Exception as exc:
                 return self._send_exception(exc)
         if path == "/api/ide/sessions":
@@ -101172,10 +104756,21 @@ class IdeHandler(BaseHTTPRequestHandler):
                 return self._send_json(self.app.ide_session_payload(self._user_id(), client_ip=self._client_ip()))
             except Exception as exc:
                 return self._send_exception(exc)
+        m = re.match(r"^/api/ide/v2/sessions/([^/]+)/events$", path)
+        if m:
+            try:
+                context = self._auth_context(required=True)
+                sess = self.app._ide_session(str(context["account"].get("user_id", "")), m.group(1))
+                return self._stream_ide_events(sess)
+            except Exception as exc:
+                return self._send_exception(exc)
         m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/roots$", path)
         if m:
             try:
-                roots = self.app.ide_workspace_roots(self._user_id(), m.group(1))
+                context = self._auth_context(required=True)
+                roots = self.app.ide_workspace_roots(str(context["account"].get("user_id", "")), m.group(1))
+                if not context["capabilities"].get("mounts"):
+                    roots = [row for row in roots if str(row.get("kind", "")) == "session"]
                 return self._send_json({"ok": True, "session_id": m.group(1), "roots": roots})
             except Exception as exc:
                 return self._send_exception(exc)
@@ -101188,9 +104783,11 @@ class IdeHandler(BaseHTTPRequestHandler):
             root_id = str((query.get("root_id", query.get("root", ["session"])) or ["session"])[0] or "session")
             rel = str((query.get("path", query.get("rel", [""])) or [""])[0] or "")
             try:
+                context = self._auth_context(required=True)
+                self._require_root_capability(context, root_id)
                 return self._send_json(
                     self.app.ide_tree_payload(
-                        self._user_id(),
+                        str(context["account"].get("user_id", "")),
                         m.group(1),
                         root_id=root_id,
                         rel=rel,
@@ -101204,21 +104801,260 @@ class IdeHandler(BaseHTTPRequestHandler):
             root_id = str((query.get("root_id", query.get("root", ["session"])) or ["session"])[0] or "session")
             rel = str((query.get("path", query.get("rel", [""])) or [""])[0] or "")
             try:
-                return self._send_json(self.app.ide_read_file(self._user_id(), m.group(1), root_id=root_id, rel=rel))
+                context = self._auth_context(required=True)
+                self._require_root_capability(context, root_id)
+                return self._send_json(self.app.ide_read_file(str(context["account"].get("user_id", "")), m.group(1), root_id=root_id, rel=rel))
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/raw$", path)
+        if m:
+            root_id = str((query.get("root_id", query.get("root", ["session"])) or ["session"])[0] or "session")
+            rel = str((query.get("path", query.get("rel", [""])) or [""])[0] or "")
+            try:
+                context = self._auth_context(required=True)
+                self._require_root_capability(context, root_id)
+                _, target, _ = self.app.ide_resolve_workspace(
+                    str(context["account"].get("user_id", "")), m.group(1), root_id, rel
+                )
+                if not target.exists() or not target.is_file():
+                    raise FileNotFoundError("file not found")
+                content_type = guess_mime_from_name(target.name, "application/octet-stream")
+                if content_type.startswith("text/") and "charset=" not in content_type.lower():
+                    content_type = f"{content_type}; charset=utf-8"
+                download = _to_bool_like((query.get("download", ["0"]) or ["0"])[0], default=False)
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Type", content_type)
+                    self.send_header("Content-Length", str(int(target.stat().st_size)))
+                    if download:
+                        self.send_header("Content-Disposition", f'attachment; filename="{quote(target.name)}"')
+                    else:
+                        self.send_header("Content-Disposition", "inline")
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    with target.open("rb") as handle:
+                        shutil.copyfileobj(handle, self.wfile, length=1024 * 1024)
+                except Exception as exc:
+                    if swallow_benign_socket_error(exc, "ide-handler.send_workspace_raw"):
+                        return
+                    raise
+                return
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/image-preview$", path)
+        if m:
+            root_id = str((query.get("root_id", query.get("root", ["session"])) or ["session"])[0] or "session")
+            rel = str((query.get("path", query.get("rel", [""])) or [""])[0] or "")
+            try:
+                context = self._auth_context(required=True)
+                self._require_root_capability(context, root_id)
+                data, content_type = self.app.ide_image_preview(
+                    str(context["account"].get("user_id", "")), m.group(1), root_id=root_id, rel=rel
+                )
+                return self._send_inline_bytes(data, content_type)
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/html/(.*)$", path)
+        if m:
+            root_id = str((query.get("root_id", query.get("root", ["session"])) or ["session"])[0] or "session")
+            rel = str(m.group(2) or "")
+            try:
+                context = self._auth_context(required=True)
+                self._require_root_capability(context, root_id)
+                _, target, _ = self.app.ide_resolve_workspace(
+                    str(context["account"].get("user_id", "")), m.group(1), root_id, rel
+                )
+                if not target.exists() or not target.is_file():
+                    raise FileNotFoundError("file not found")
+                content_type = guess_mime_from_name(target.name, "application/octet-stream")
+                if content_type.startswith("text/") and "charset=" not in content_type.lower():
+                    content_type = f"{content_type}; charset=utf-8"
+                return self._send_inline_bytes(target.read_bytes(), content_type)
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/preview$", path)
+        if m:
+            root_id = str((query.get("root_id", query.get("root", ["session"])) or ["session"])[0] or "session")
+            rel = str((query.get("path", query.get("rel", [""])) or [""])[0] or "")
+            try:
+                context = self._auth_context(required=True)
+                self._require_root_capability(context, root_id)
+                html_text = self.app.ide_preview_html(
+                    str(context["account"].get("user_id", "")), m.group(1), root_id=root_id, rel=rel
+                )
+                return self._send_inline_bytes(str(html_text).encode("utf-8", errors="ignore"), "text/html; charset=utf-8")
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/v2/sessions/([^/]+)/scm/status$", path)
+        if m:
+            root_id = str((query.get("root_id", ["session"]) or ["session"])[0] or "session")
+            try:
+                context = self._auth_context(required=True)
+                self._require_root_capability(context, root_id)
+                return self._send_json(self.app.ide_scm_status(str(context["account"].get("user_id", "")), m.group(1), {"root_id": root_id}))
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/v2/sessions/([^/]+)/tasks$", path)
+        if m:
+            root_id = str((query.get("root_id", ["session"]) or ["session"])[0] or "session")
+            try:
+                context = self._auth_context(required=True)
+                self._require_root_capability(context, root_id)
+                return self._send_json(self.app.ide_tasks(str(context["account"].get("user_id", "")), m.group(1), root_id))
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/v2/sessions/([^/]+)/agent-state$", path)
+        if m:
+            try:
+                return self._send_json(self.app.ide_agent_state(self._user_id(), m.group(1)))
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/v2/sessions/([^/]+)/code-history(?:/stage)?$", path)
+        if m:
+            root_id = str((query.get("root_id", ["session"]) or ["session"])[0] or "session")
+            rel = str((query.get("path", [""]) or [""])[0] or "")
+            stage_id = str((query.get("stage_id", ["latest"]) or ["latest"])[0] or "latest")
+            try:
+                context = self._auth_context(required=True)
+                self._require_root_capability(context, root_id)
+                user_id = str(context["account"].get("user_id", ""))
+                if path.endswith("/stage"):
+                    return self._send_json(self.app.ide_code_preview_payload(user_id, m.group(1), root_id=root_id, rel=rel, stage_id=stage_id))
+                return self._send_json(self.app.ide_code_preview_stages(user_id, m.group(1), root_id=root_id, rel=rel))
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/v2/sessions/([^/]+)/models$", path)
+        if m:
+            try:
+                self._auth_context(required=True)
+                refresh = _to_bool_like((query.get("refresh", ["0"]) or ["0"])[0], default=False)
+                return self._send_json(self.app.ide_agent_models(self._user_id(), m.group(1), refresh=refresh))
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/v2/terminals/([^/]+)/output$", path)
+        if m:
+            try:
+                context = self._auth_context(required=True)
+                self.app.ide_require_capability(context["capabilities"], "terminal")
+                offset = int((query.get("offset", ["0"]) or ["0"])[0] or 0)
+                return self._send_json(self.app.ide_terminal_output(str(context["account"].get("user_id", "")), m.group(1), offset))
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/v2/debug/([^/]+)/messages$", path)
+        if m:
+            try:
+                context = self._auth_context(required=True)
+                self.app.ide_require_capability(context["capabilities"], "debug")
+                return self._send_json(self.app.ide_debug_messages(str(context["account"].get("user_id", "")), m.group(1)))
             except Exception as exc:
                 return self._send_exception(exc)
         return self._send_json({"error": "not found"}, status=404)
 
     def do_POST(self):
         path = unquote(urlparse(self.path).path)
-        if not self._require_admin_write():
+        if path == "/api/ide/v2/auth/local":
+            try:
+                if not self._same_origin_write():
+                    raise IDEAuthError("same_origin_required", "IDE authentication requires a same-origin request.", 403)
+                out = self.app.local_ide_login(local_allowed=self._direct_loopback(), client_ip=self._client_ip())
+                return self._send_auth_session(out, status=200)
+            except Exception as exc:
+                return self._send_exception(exc)
+        if path == "/api/ide/v2/auth/device":
+            try:
+                if not self._same_origin_write():
+                    raise IDEAuthError("same_origin_required", "IDE authentication requires a same-origin request.", 403)
+                if self._direct_loopback():
+                    raise IDEAuthError("remote_device_only", "Device pairing is only used by remote Web clients.", 409)
+                out = self.app.register_ide_device(self._read_json(), client_ip=self._client_ip())
+                if out.get("access_token"):
+                    return self._send_auth_session(out, status=200)
+                return self._send_json(out, status=202)
+            except Exception as exc:
+                return self._send_exception(exc)
+        if path in {"/api/ide/v2/admin/devices/approve", "/api/ide/v2/admin/devices/revoke"}:
+            context = self._require_local_admin()
+            if not context:
+                return
+            try:
+                payload = self._read_json()
+                pairing_id = payload.get("pairing_id")
+                if path.endswith("/approve"):
+                    device = self.app.ide_auth.approve_device(
+                        pairing_id,
+                        approved_by=str(context["account"].get("username", "local-admin") or "local-admin"),
+                    )
+                else:
+                    device = self.app.ide_auth.revoke_device(pairing_id)
+                return self._send_json({"ok": True, "device": device})
+            except Exception as exc:
+                return self._send_exception(exc)
+        if path == "/api/ide/v2/admin/password-reset":
+            context = self._require_local_admin()
+            if not context:
+                return
+            try:
+                payload = self._read_json()
+                account = self.app.ide_auth.reset_password(payload.get("username"), payload.get("new_password"))
+                return self._send_json({"ok": True, "account": account})
+            except Exception as exc:
+                return self._send_exception(exc)
+        if path in {"/api/ide/v2/auth/setup", "/api/ide/v2/auth/login"}:
+            try:
+                if not self._same_origin_write():
+                    raise IDEAuthError("same_origin_required", "IDE authentication requires a same-origin request.", 403)
+                payload = self._read_json()
+                if path.endswith("/setup"):
+                    out = self.app.setup_ide_admin(payload.get("username"), payload.get("password"), local_setup_allowed=self._direct_loopback())
+                else:
+                    out = self.app.login_ide(payload.get("username"), payload.get("password"), self._client_ip())
+                return self._send_auth_session(out, status=201 if path.endswith("/setup") else 200)
+            except Exception as exc:
+                return self._send_exception(exc)
+        if path == "/api/ide/v2/auth/logout":
+            context = self._require_write()
+            if not context:
+                return
+            self.app.ide_auth.revoke_session(str(context.get("token", "") or ""))
+            return self._send_json({"ok": True}, cookies=["clouds_ide_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"])
+        if path == "/api/ide/v2/auth/password":
+            context = self._require_write()
+            if not context:
+                return
+            try:
+                payload = self._read_json()
+                account = self.app.ide_auth.change_password(context["account"], payload.get("old_password"), payload.get("new_password"))
+                return self._send_json({"ok": True, "account": account}, cookies=["clouds_ide_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"])
+            except Exception as exc:
+                return self._send_exception(exc)
+        if path == "/api/ide/v2/admin/users":
+            context = self._require_local_admin()
+            if not context:
+                return
+            try:
+                payload = self._read_json()
+                account = self.app.ide_auth.create_user(payload.get("username"), payload.get("password"), must_change_password=bool(payload.get("must_change_password", True)))
+                return self._send_json({"ok": True, "account": account}, status=201)
+            except Exception as exc:
+                return self._send_exception(exc)
+        if path == "/api/ide/v2/workbench/state":
+            context = self._require_write()
+            if not context:
+                return
+            try:
+                return self._send_json(self.app.ide_save_workbench_state(str(context["account"].get("user_id", "")), self._read_json()))
+            except Exception as exc:
+                return self._send_exception(exc)
+        context = self._require_write()
+        if not context:
             return
+        user_id = str(context["account"].get("user_id", "") or "")
         if path == "/api/ide/sessions":
             payload = self._read_json()
             try:
                 return self._send_json(
                     self.app.ide_create_session(
-                        self._user_id(),
+                        user_id,
                         str(payload.get("title", "") or "").strip() or None,
                         client_ip=self._client_ip(),
                     ),
@@ -101237,8 +105073,9 @@ class IdeHandler(BaseHTTPRequestHandler):
         if path == "/api/ide/mounts":
             payload = self._read_json()
             try:
+                self.app.ide_require_capability(context["capabilities"], "mounts")
                 return self._send_json(
-                    self.app.ide_authorize_mount(self._user_id(), str(payload.get("path", "") or "")),
+                    self.app.ide_authorize_mount(user_id, str(payload.get("path", "") or "")),
                     status=201,
                 )
             except Exception as exc:
@@ -101246,74 +105083,248 @@ class IdeHandler(BaseHTTPRequestHandler):
         m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/mkdir$", path)
         if m:
             try:
-                return self._send_json(self.app.ide_mkdir(self._user_id(), m.group(1), self._read_json()), status=201)
+                payload = self._read_json(); self._require_root_capability(context, payload.get("root_id", "session"))
+                return self._send_json(self.app.ide_mkdir(user_id, m.group(1), payload), status=201)
             except Exception as exc:
                 return self._send_exception(exc)
         m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/upload$", path)
         if m:
             try:
-                return self._send_json(self.app.ide_upload(self._user_id(), m.group(1), self._read_json()), status=201)
+                payload = self._read_json(); self._require_root_capability(context, payload.get("root_id", "session"))
+                return self._send_json(self.app.ide_upload(user_id, m.group(1), payload), status=201)
             except Exception as exc:
                 return self._send_exception(exc)
         m = re.match(r"^/api/ide/sessions/([^/]+)/terminal/run$", path)
         if m:
             try:
-                return self._send_json(self.app.ide_run_command(self._user_id(), m.group(1), self._read_json()))
+                self.app.ide_require_capability(context["capabilities"], "processes")
+                payload = self._read_json(); self._require_root_capability(context, payload.get("root_id", "session"))
+                return self._send_json(
+                    self.app.ide_run_command(
+                        user_id,
+                        m.group(1),
+                        payload,
+                        remote=not bool(context["capabilities"].get("local")),
+                    )
+                )
             except Exception as exc:
                 return self._send_exception(exc)
         m = re.match(r"^/api/ide/sessions/([^/]+)/agent-task$", path)
         if m:
             try:
+                self.app.ide_require_capability(context["capabilities"], "agent_processes")
                 return self._send_json(
                     self.app.ide_agent_task(
-                        self._user_id(),
+                        user_id,
                         m.group(1),
                         self._read_json(),
                         client_ip=self._client_ip(),
+                        remote=not bool(context["capabilities"].get("local")),
                     )
                 )
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/v2/sessions/([^/]+)/ask-user/answer$", path)
+        if m:
+            try:
+                self.app.ide_require_capability(context["capabilities"], "agent_processes")
+                return self._send_json(
+                    self.app.ide_answer_agent_question(user_id, m.group(1), self._read_json())
+                )
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/v2/sessions/([^/]+)/model$", path)
+        if m:
+            try:
+                payload = self._read_json()
+                return self._send_json(
+                    self.app.ide_set_agent_model(
+                        user_id,
+                        m.group(1),
+                        str(payload.get("selection", payload.get("model", "")) or ""),
+                    )
+                )
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/v2/sessions/([^/]+)/code-history/restore$", path)
+        if m:
+            try:
+                payload = self._read_json(); self._require_root_capability(context, payload.get("root_id", "session"))
+                return self._send_json(self.app.ide_restore_code_preview(user_id, m.group(1), payload))
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/v2/sessions/([^/]+)/search$", path)
+        if m:
+            try:
+                payload = self._read_json(); self._require_root_capability(context, payload.get("root_id", "session"))
+                return self._send_json(self.app.ide_search_workspace(user_id, m.group(1), payload))
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/v2/sessions/([^/]+)/scm/diff$", path)
+        if m:
+            try:
+                payload = self._read_json(); self._require_root_capability(context, payload.get("root_id", "session"))
+                return self._send_json(self.app.ide_scm_diff(user_id, m.group(1), payload))
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/v2/sessions/([^/]+)/terminals$", path)
+        if m:
+            try:
+                self.app.ide_require_capability(context["capabilities"], "terminal")
+                payload = self._read_json(); self._require_root_capability(context, payload.get("root_id", "session"))
+                return self._send_json(
+                    self.app.ide_terminal_create(
+                        user_id,
+                        m.group(1),
+                        payload,
+                        remote=not bool(context["capabilities"].get("local")),
+                    ),
+                    status=201,
+                )
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/v2/terminals/([^/]+)/(input|resize)$", path)
+        if m:
+            try:
+                self.app.ide_require_capability(context["capabilities"], "terminal")
+                payload = self._read_json()
+                out = self.app.ide_terminal_input(user_id, m.group(1), payload) if m.group(2) == "input" else self.app.ide_terminal_resize(user_id, m.group(1), payload)
+                return self._send_json(out)
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/v2/sessions/([^/]+)/tasks/run$", path)
+        if m:
+            try:
+                self.app.ide_require_capability(context["capabilities"], "tasks")
+                payload = self._read_json(); self._require_root_capability(context, payload.get("root_id", "session"))
+                return self._send_json(
+                    self.app.ide_run_task(
+                        user_id,
+                        m.group(1),
+                        payload,
+                        remote=not bool(context["capabilities"].get("local")),
+                    )
+                )
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/v2/sessions/([^/]+)/diagnostics/python$", path)
+        if m:
+            try:
+                payload = self._read_json(); self._require_root_capability(context, payload.get("root_id", "session"))
+                return self._send_json(self.app.ide_python_diagnostics(user_id, m.group(1), payload))
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/v2/sessions/([^/]+)/debug$", path)
+        if m:
+            try:
+                self.app.ide_require_capability(context["capabilities"], "debug")
+                payload = self._read_json(); self._require_root_capability(context, payload.get("root_id", "session"))
+                return self._send_json(
+                    self.app.ide_debug_create(
+                        user_id,
+                        m.group(1),
+                        payload,
+                        remote=not bool(context["capabilities"].get("local")),
+                    ),
+                    status=201,
+                )
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/v2/debug/([^/]+)/send$", path)
+        if m:
+            try:
+                self.app.ide_require_capability(context["capabilities"], "debug")
+                return self._send_json(self.app.ide_debug_send(user_id, m.group(1), self._read_json()))
+            except Exception as exc:
+                return self._send_exception(exc)
+        if path == "/api/ide/v2/extensions/install":
+            try:
+                return self._send_json(self.app.ide_install_extension(user_id, self._read_json()), status=201)
             except Exception as exc:
                 return self._send_exception(exc)
         return self._send_json({"error": "not found"}, status=404)
 
     def do_PUT(self):
         path = unquote(urlparse(self.path).path)
-        if not self._require_admin_write():
+        context = self._require_write()
+        if not context:
             return
         m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/file$", path)
         if not m:
             return self._send_json({"error": "not found"}, status=404)
         try:
-            return self._send_json(self.app.ide_write_file(self._user_id(), m.group(1), self._read_json()))
+            payload = self._read_json(); self._require_root_capability(context, payload.get("root_id", "session"))
+            return self._send_json(self.app.ide_write_file(str(context["account"].get("user_id", "")), m.group(1), payload))
         except Exception as exc:
             return self._send_exception(exc)
 
     def do_PATCH(self):
         path = unquote(urlparse(self.path).path)
-        if not self._require_admin_write():
+        context = self._require_write()
+        if not context:
             return
+        if path == "/api/ide/v2/admin/users":
+            if not self._direct_loopback() or str(context["account"].get("role", "")) != "admin":
+                return self._send_json({"error": "Local IDE administrator access required.", "code": "local_admin_required"}, status=403)
+            try:
+                payload = self._read_json()
+                return self._send_json({"ok": True, "account": self.app.ide_auth.set_disabled(payload.get("username"), bool(payload.get("disabled", True)))})
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/sessions/([^/]+)$", path)
+        if m:
+            try:
+                payload = self._read_json()
+                return self._send_json(self.app.ide_rename_session(str(context["account"].get("user_id", "")), m.group(1), payload.get("title", "")))
+            except Exception as exc:
+                return self._send_exception(exc)
         m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/rename$", path)
         if not m:
             return self._send_json({"error": "not found"}, status=404)
         try:
-            return self._send_json(self.app.ide_rename(self._user_id(), m.group(1), self._read_json()))
+            payload = self._read_json(); self._require_root_capability(context, payload.get("root_id", "session"))
+            return self._send_json(self.app.ide_rename(str(context["account"].get("user_id", "")), m.group(1), payload))
         except Exception as exc:
             return self._send_exception(exc)
 
     def do_DELETE(self):
         path = unquote(urlparse(self.path).path)
-        if not self._require_admin_write():
+        context = self._require_write()
+        if not context:
             return
+        user_id = str(context["account"].get("user_id", "") or "")
         if path == "/api/ide/mounts":
             try:
+                self.app.ide_require_capability(context["capabilities"], "mounts")
                 payload = self._read_json()
-                return self._send_json(self.app.ide_remove_mount(self._user_id(), str(payload.get("mount_id", "") or "")))
+                return self._send_json(self.app.ide_remove_mount(user_id, str(payload.get("mount_id", "") or "")))
             except Exception as exc:
                 return self._send_exception(exc)
         m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/file$", path)
         if m:
             try:
-                return self._send_json(self.app.ide_delete(self._user_id(), m.group(1), self._read_json()))
+                payload = self._read_json(); self._require_root_capability(context, payload.get("root_id", "session"))
+                return self._send_json(self.app.ide_delete(user_id, m.group(1), payload))
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/v2/terminals/([^/]+)$", path)
+        if m:
+            try:
+                self.app.ide_require_capability(context["capabilities"], "terminal")
+                return self._send_json(self.app.ide_terminal_close(user_id, m.group(1)))
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/v2/debug/([^/]+)$", path)
+        if m:
+            try:
+                self.app.ide_require_capability(context["capabilities"], "debug")
+                return self._send_json(self.app.ide_debug_close(user_id, m.group(1)))
+            except Exception as exc:
+                return self._send_exception(exc)
+        if path == "/api/ide/v2/extensions":
+            try:
+                payload = self._read_json()
+                return self._send_json(self.app.ide_uninstall_extension(user_id, str(payload.get("id", "") or "")))
             except Exception as exc:
                 return self._send_exception(exc)
         return self._send_json({"error": "not found"}, status=404)
@@ -101346,7 +105357,7 @@ class McpServiceHandler(BaseHTTPRequestHandler):
             raise
 
     @property
-    def app(self) -> "AppContext":
+    def app(self) -> AppContext:
         return self.server.app  # type: ignore[attr-defined]
 
     def _mgr(self):
@@ -101651,7 +105662,8 @@ def main():
         "--enable_IDE",
         dest="enable_ide",
         action="store_true",
-        help="Enable Programming IDE web UI server startup (disabled by default)",
+        default=True,
+        help="Enable Programming IDE web UI server startup (enabled by default)",
     )
     parser.add_argument(
         "--no_ide",
@@ -101659,7 +105671,20 @@ def main():
         "--no_IDE",
         dest="no_ide",
         action="store_true",
-        help="Disable Programming IDE web UI server startup (default)",
+        help="Disable Programming IDE web UI server startup",
+    )
+    parser.add_argument(
+        "--ide-password-login",
+        dest="ide_password_login_enabled",
+        action="store_true",
+        default=False,
+        help="Enable optional username/password login for Program IDE (disabled by default)",
+    )
+    parser.add_argument(
+        "--no-ide-password-login",
+        dest="ide_password_login_enabled",
+        action="store_false",
+        help="Disable Program IDE password login",
     )
     parser.add_argument(
         "--mcp_service_port",
@@ -102557,6 +106582,7 @@ def main():
             )
             else ""
         ),
+        ide_password_login_enabled=bool(getattr(args, "ide_password_login_enabled", False)),
     )
     app.read_context_policy = resolved_read_context_policy
     app.tool_memory_policy = resolved_tool_memory_policy
@@ -102795,8 +106821,6 @@ def main():
         _active_ports_for_ide.add(int(code_admin_port))
     if args.no_ide:
         print("[web-agent] programming IDE disabled by --no_ide")
-    elif not bool(getattr(args, "enable_ide", False)):
-        print("[web-agent] programming IDE disabled by default; use --enable_ide to start it")
     elif int(ide_port) in _active_ports_for_ide:
         print(f"[web-agent] programming IDE disabled: ide_port {ide_port} conflicts with a running server port")
     else:
@@ -103052,7 +107076,17 @@ def main():
             raise
     finally:
         try:
-            persist_report = app.persist_all_sessions(include_running=True, lock_timeout=0.6)
+            interrupt_report = app.interrupt_all_sessions_for_shutdown()
+            print(
+                "[web-agent] shutdown_interrupt="
+                f"sessions={int(interrupt_report.get('sessions', 0) or 0)} "
+                f"running={int(interrupt_report.get('running', 0) or 0)} "
+                f"bash_terminated={int(interrupt_report.get('bash_terminated', 0) or 0)}"
+            )
+        except Exception as exc:
+            print(f"[web-agent] shutdown interrupt failed: {trim(str(exc), 300)}")
+        try:
+            persist_report = app.persist_all_sessions(include_running=True, lock_timeout=0.15)
             print(
                 "[web-agent] persist_all_sessions="
                 f"users={int(persist_report.get('checked_users', 0) or 0)} "
