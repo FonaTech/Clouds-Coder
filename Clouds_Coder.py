@@ -1,36 +1,37 @@
 #!/usr/bin/env python3
 from __future__ import annotations
+
 import argparse
 import ast
 import base64
-from collections import Counter, defaultdict, deque
 import concurrent.futures
 import csv
 import difflib
 import errno
-from email.utils import parsedate_to_datetime
-import html
-from html.parser import HTMLParser
+import fnmatch
 import hashlib
 import hmac
+import html
+import importlib.util
 import io
 import ipaddress
-import importlib.util
 import json
 import locale
 import math
-import multiprocessing
 import mimetypes
+import multiprocessing
 import os
 import queue
 import re
+import select
 import selectors
-import signal
-import shutil
 import shlex
-import ssl
+import shutil
+import signal
 import socket
 import sqlite3
+import ssl
+import struct
 import subprocess
 import sys
 import tarfile
@@ -38,18 +39,31 @@ import threading
 import time
 import traceback
 import unicodedata
+import urllib.robotparser as robotparser
 import uuid
+import xml.etree.ElementTree as ET
 import zipfile
 import zlib
-import xml.etree.ElementTree as ET
+from collections import Counter, defaultdict, deque
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+from html.parser import HTMLParser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse, urlunparse
 from urllib.request import Request, urlopen
-import urllib.robotparser as robotparser
+
+try:
+    import fcntl as _fcntl
+    import pty as _pty
+    import termios as _termios
+except ImportError:
+    _fcntl = None
+    _pty = None
+    _termios = None
+
 try:
     import certifi as _certifi
 except Exception:
@@ -69,6 +83,14 @@ ADMIN_CONFIG_FILENAME = "startup_config.json"
 ADMIN_APPS_FILENAME = "shared_apps.json"
 ADMIN_TELEMETRY_FILENAME = "telemetry.sqlite"
 ADMIN_AUTH_FILENAME = "auth.sqlite"
+IDE_AUTH_FILENAME = "ide_auth.sqlite"
+IDE_AUTH_SESSION_TTL_SECONDS = 24 * 60 * 60
+IDE_AUTH_MAX_ACTIVE_SESSIONS = 12
+IDE_DEVICE_SECRET_MIN_BYTES = 32
+IDE_DEVICE_LABEL_MAX_CHARS = 120
+IDE_DEVICE_PAIRING_TTL_SECONDS = 15 * 60
+IDE_WORKBENCH_STATE_FILENAME = "ide_workbench.json"
+IDE_EXTENSIONS_DIRNAME = "ide_extensions"
 ADMIN_MAX_APP_SKILLS = 8
 ADMIN_MAX_APP_CAPSULE_CHARS = 12_000
 ADMIN_MAX_APP_RESOURCE_FILES = 128
@@ -511,6 +533,20 @@ DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS = max(
         ),
     ),
 )
+# Optional single-agent/no-plan bootstrap for lightweight (L1) sessions.  It is
+# deliberately disabled by default so existing L1 sessions keep their current
+# execution posture.  L2 uses the independent ``l2_todo_policy`` setting,
+# whose default is ``force`` and whose explicit alternatives are ``auto`` and
+# ``off``.
+DEFAULT_SINGLE_NO_PLAN_TODO_PROMPT = (
+    "Use the evidence from the completed read-only perception round to think "
+    "through the actual user goal for one planning turn. Then call TodoWrite "
+    "(or TodoWriteRescue) now and create a compact, realistic list of 3-7 "
+    "next actions. Keep exactly one item in_progress, base items on observed "
+    "evidence, and do not implement or modify files in this turn. Do not "
+    "invent unrelated work or switch to plan mode."
+)
+SINGLE_NO_PLAN_TODO_BOOTSTRAP_MAX_ATTEMPTS = 2
 AUTO_CONTINUE_BUDGET_DEFAULT = 30
 AGENT_MAX_OUTPUT_TOKENS = 16384
 OLLAMA_THINKING_TOOL_BUFFER = 4096
@@ -679,6 +715,8 @@ RUNTIME_CONTROL_HINT_PREFIXES = (
     "<truncate-rescue>",
     "<thinking-empty-recovery>",
     "<fault-prefill>",
+    "<single-no-plan-todo-bootstrap>",
+    "<single-no-plan-todo-bootstrap-retry>",
 )
 RETRY_RUNTIME_HINT_PREFIXES = (
     "<todo-rescue>",
@@ -746,6 +784,12 @@ TASK_PROFILE_TYPES = (
 TASK_LEVEL_CHOICES = (1, 2, 3, 4, 5)
 TASK_SCALE_PREFERENCES = ("fast", "balanced", "thorough")
 SEMANTIC_CONFIDENCE_CHOICES = ("high", "medium", "low")
+# Level-2 Todo behavior is configurable at startup.  ``force`` preserves the
+# default safety contract, ``auto`` lets the semantic classifier decide for the
+# current request, and ``off`` is an explicit escape hatch for callers that do
+# not want Todo scaffolding at this tier.
+L2_TODO_POLICY_CHOICES = ("force", "auto", "off")
+DEFAULT_L2_TODO_POLICY = "force"
 TASK_LEVEL_POLICIES: dict[int, dict] = {
     1: {
         "name": "simple_direct_answer",
@@ -754,6 +798,7 @@ TASK_LEVEL_POLICIES: dict[int, dict] = {
         "assigned_expert": "developer",
         "round_budget": 2,
         "requires_user_confirmation": False,
+        "requires_todos": False,
         "complexity": "simple",
     },
     2: {
@@ -763,6 +808,9 @@ TASK_LEVEL_POLICIES: dict[int, dict] = {
         "assigned_expert": "developer",
         "round_budget": 6,
         "requires_user_confirmation": False,
+        # This remains the default L2 behavior. ``l2_todo_policy`` may
+        # explicitly override it with semantic auto judgment or off.
+        "requires_todos": True,
         "complexity": "simple",
     },
     3: {
@@ -772,6 +820,7 @@ TASK_LEVEL_POLICIES: dict[int, dict] = {
         "assigned_expert": "developer",
         "round_budget": 16,
         "requires_user_confirmation": False,
+        "requires_todos": True,
         "complexity": "moderate",
     },
     4: {
@@ -781,6 +830,7 @@ TASK_LEVEL_POLICIES: dict[int, dict] = {
         "assigned_expert": "developer",
         "round_budget": 24,
         "requires_user_confirmation": False,
+        "requires_todos": True,
         "complexity": "complex",
     },
     5: {
@@ -790,6 +840,7 @@ TASK_LEVEL_POLICIES: dict[int, dict] = {
         "assigned_expert": "explorer",
         "round_budget": 0,  # 0 means unlimited by tier budget (still guarded by global safeguards).
         "requires_user_confirmation": True,
+        "requires_todos": True,
         "complexity": "expert",
     },
 }
@@ -904,12 +955,12 @@ DEVELOPER_EDIT_STALL_THRESHOLD = 3  # consecutive edit_file failures on same fil
 # Acceptance-gate repair loop: once a step fails the heuristic gate this many
 # times, escalate from a plain rework hint to the active diagnose→repair→re-verify
 # driver (semantic judge + reviewer-debug + root-cause repair directives).
-ACCEPTANCE_GATE_STALL_THRESHOLD = 3
+ACCEPTANCE_GATE_STALL_THRESHOLD = 10
 # Deadlock guards: repeated no-progress rounds and an absolute repair-round cap.
 # The absolute cap prevents cosmetic evidence changes from resetting the
 # no-progress signature forever while the same acceptance decision remains stuck.
-ACCEPTANCE_GATE_HARD_CEILING = 6  # consecutive no-progress rounds before escalating to the user
-ACCEPTANCE_GATE_TOTAL_ROUND_CEILING = 6
+ACCEPTANCE_GATE_HARD_CEILING = 10  # consecutive no-progress rounds before escalating to the user
+ACCEPTANCE_GATE_TOTAL_ROUND_CEILING = 10
 PLAN_MODE_MANAGER_SYNTHESIS_MAX_TOKENS = 8192
 PLAN_MODE_MAX_OPTIONS = 3
 PLAN_FILE_RELATIVE_PATH = ".clouds_coder/plan.md"
@@ -1196,6 +1247,14 @@ IDE_UPLOAD_MAX_ITEMS = 1200
 IDE_COMMAND_TIMEOUT_DEFAULT = 120
 IDE_TREE_DEFAULT_MAX_NODES = 800
 IDE_TREE_MAX_NODES = 5000
+IDE_SEARCH_MAX_RESULTS = 2000
+IDE_SEARCH_MAX_FILE_BYTES = 2 * 1024 * 1024
+IDE_TERMINAL_SCROLLBACK_BYTES = 2 * 1024 * 1024
+IDE_TERMINAL_IDLE_SECONDS = 4 * 60 * 60
+IDE_VSIX_MAX_BYTES = 80 * 1024 * 1024
+IDE_VSIX_MAX_EXPANDED_BYTES = 240 * 1024 * 1024
+IDE_VSIX_MAX_FILES = 8000
+IDE_VSIX_MAX_FILE_BYTES = 40 * 1024 * 1024
 IDE_TREE_SKIP_DIRS = {
     ".git", ".hg", ".svn",
     ".next", ".nuxt", ".svelte-kit", ".angular", ".expo",
@@ -1214,6 +1273,8 @@ RAW_TOOLCALL_TEXT_FILTER_THRESHOLD = 3_500
 ASSISTANT_TEXT_PERSIST_MAX_CHARS = 14_000
 ASSISTANT_MESSAGE_EVENT_MAX_CHARS = 4_000
 CODE_PREVIEW_EXTS = {
+    ".html",
+    ".htm",
     ".py",
     ".pyi",
     ".js",
@@ -1411,6 +1472,66 @@ SAMPLE_VIDEO_MP4_B64 = (
 )
 
 OFFLINE_JS_LIB_CATALOG: list[dict[str, object]] = [
+    {
+        "id": "monaco_editor",
+        "filename": "loader.js",
+        "relative_path": "monaco/min/vs/loader.js",
+        "package_urls": [
+            "https://registry.npmjs.org/monaco-editor/-/monaco-editor-0.56.0.tgz",
+        ],
+        "package_install_dir": "monaco",
+        "package_required_paths": [
+            "package.json",
+            "min/vs/loader.js",
+            "min/vs/editor/editor.main.js",
+            "min/vs/editor/editor.worker.js",
+        ],
+        "match_tokens": ["monaco-editor", "monaco/min/vs/loader.js"],
+    },
+    {
+        "id": "xterm",
+        "filename": "xterm.js",
+        "relative_path": "xterm/lib/xterm.js",
+        "package_urls": [
+            "https://registry.npmjs.org/@xterm/xterm/-/xterm-6.0.0.tgz",
+        ],
+        "package_install_dir": "xterm",
+        "package_required_paths": [
+            "package.json",
+            "lib/xterm.js",
+            "css/xterm.css",
+        ],
+        "match_tokens": ["@xterm/xterm", "xterm.js", "xterm.css"],
+    },
+    {
+        "id": "xterm_fit",
+        "filename": "addon-fit.js",
+        "relative_path": "xterm-addon-fit/lib/addon-fit.js",
+        "package_urls": [
+            "https://registry.npmjs.org/@xterm/addon-fit/-/addon-fit-0.11.0.tgz",
+        ],
+        "package_install_dir": "xterm-addon-fit",
+        "package_required_paths": [
+            "package.json",
+            "lib/addon-fit.js",
+        ],
+        "match_tokens": ["@xterm/addon-fit", "addon-fit.js"],
+    },
+    {
+        "id": "codicons",
+        "filename": "codicon.css",
+        "relative_path": "codicons/dist/codicon.css",
+        "package_urls": [
+            "https://registry.npmjs.org/@vscode/codicons/-/codicons-0.0.36.tgz",
+        ],
+        "package_install_dir": "codicons",
+        "package_required_paths": [
+            "package.json",
+            "dist/codicon.css",
+            "dist/codicon.ttf",
+        ],
+        "match_tokens": ["@vscode/codicons", "codicon.css", "codicon.ttf"],
+    },
     {
         "id": "echarts",
         "filename": "echarts.min.js",
@@ -2700,6 +2821,85 @@ def normalize_auto_task_level_ceiling(value: object, default: int = DEFAULT_AUTO
     return 0
 
 
+def normalize_l2_todo_policy(value: object, default: str = DEFAULT_L2_TODO_POLICY) -> str:
+    """Normalize the level-2 Todo contract mode.
+
+    The public values are ``force``, ``auto`` and ``off``.  A few natural
+    aliases are accepted so JSON/config and CLI callers can use terms such as
+    ``required`` or ``disabled`` without silently changing the default.
+    Invalid or empty values intentionally fall back to the safe default.
+    """
+    aliases = {
+        "force": "force",
+        "required": "force",
+        "mandatory": "force",
+        "on": "force",
+        "enabled": "force",
+        "true": "force",
+        "1": "force",
+        "auto": "auto",
+        "automatic": "auto",
+        "semantic": "auto",
+        "llm": "auto",
+        "judge": "auto",
+        "off": "off",
+        "disabled": "off",
+        "disable": "off",
+        "none": "off",
+        "false": "off",
+        "0": "off",
+    }
+    raw = str(value if value is not None else "").strip().lower().replace("_", "-")
+    normalized = aliases.get(raw)
+    if normalized in L2_TODO_POLICY_CHOICES:
+        return normalized
+    fallback = str(default or DEFAULT_L2_TODO_POLICY).strip().lower().replace("_", "-")
+    return aliases.get(fallback, DEFAULT_L2_TODO_POLICY)
+
+
+def extract_l2_todo_policy_setting(raw: object) -> str | None:
+    """Read the optional level-2 Todo policy from a config mapping.
+
+    ``None`` means the setting was absent.  A shallow, explicit section walk
+    mirrors the other startup settings and prevents arbitrary provider payloads
+    from being interpreted as execution policy.
+    """
+    if not isinstance(raw, dict):
+        return None
+    policy_keys = (
+        "l2_todo_policy",
+        "l2TodoPolicy",
+        "level2_todo_policy",
+        "level_2_todo_policy",
+        "todo_policy_l2",
+        "level2_todo_mode",
+        "l2_todo_mode",
+    )
+    bool_keys = ("l2_requires_todos", "level2_requires_todos", "l2_todos_required")
+    sections: list[dict] = [raw]
+    for section_name in (
+        "runtime",
+        "startup",
+        "classification",
+        "task_policy",
+        "todo",
+        "todos",
+        "agent",
+        "execution",
+    ):
+        section = raw.get(section_name)
+        if isinstance(section, dict):
+            sections.append(section)
+    for section in sections:
+        for key in policy_keys:
+            if key in section:
+                return normalize_l2_todo_policy(section.get(key))
+        for key in bool_keys:
+            if key in section:
+                return "force" if _to_bool_like(section.get(key), default=True) else "off"
+    return None
+
+
 def extract_auto_task_level_ceiling_setting(raw: object) -> int | None:
     if not isinstance(raw, dict):
         return None
@@ -2844,6 +3044,106 @@ def extract_web_search_enabled_setting(raw: object) -> bool | None:
         if isinstance(section, dict) and key in section:
             return _to_bool_like(section.get(key), default=DEFAULT_WEB_SEARCH_ENABLED)
     return None
+
+
+def _single_no_plan_todo_setting_sections(raw: dict) -> list[dict]:
+    """Return bounded config sections for the single/no-plan Todo setting."""
+    if not isinstance(raw, dict):
+        return []
+    sections: list[dict] = [raw]
+    # Keep this traversal shallow and explicit: configuration files may contain
+    # arbitrary provider payloads, and those must not accidentally become policy.
+    section_names = (
+        "runtime",
+        "single",
+        "agent",
+        "execution",
+        "startup",
+        "todos",
+        "todo",
+    )
+    for name in section_names:
+        section = raw.get(name)
+        if isinstance(section, dict):
+            sections.append(section)
+            for child_name in ("single", "agent", "execution", "todos", "todo"):
+                child = section.get(child_name)
+                if isinstance(child, dict):
+                    sections.append(child)
+    return sections
+
+
+def _single_no_plan_todo_setting_present(raw: object) -> bool:
+    if not isinstance(raw, dict):
+        return False
+    enabled_keys = {
+        "single_no_plan_todo_enabled",
+        "singleNoPlanTodoEnabled",
+        "todo_bootstrap_enabled",
+        "todoBootstrapEnabled",
+        "single_todo_bootstrap_enabled",
+        "singleTodoBootstrapEnabled",
+    }
+    prompt_keys = {
+        "single_no_plan_todo_prompt",
+        "singleNoPlanTodoPrompt",
+        "todo_bootstrap_prompt",
+        "todoBootstrapPrompt",
+        "single_todo_bootstrap_prompt",
+        "singleTodoBootstrapPrompt",
+    }
+    return any(
+        key in section
+        for section in _single_no_plan_todo_setting_sections(raw)
+        for key in (*enabled_keys, *prompt_keys)
+    )
+
+
+def extract_single_no_plan_todo_settings(raw: object) -> tuple[bool, str]:
+    """Read the optional single/no-plan perception-to-Todo bootstrap policy.
+
+    Explicit ``enabled`` wins over a prompt-only setting.  A non-empty prompt
+    enables the feature when no explicit flag is supplied; an explicitly empty
+    prompt with ``enabled=true`` falls back to the built-in protocol prompt.
+    """
+    if not isinstance(raw, dict):
+        return False, ""
+    enabled_keys = (
+        "single_no_plan_todo_enabled",
+        "singleNoPlanTodoEnabled",
+        "todo_bootstrap_enabled",
+        "todoBootstrapEnabled",
+        "single_todo_bootstrap_enabled",
+        "singleTodoBootstrapEnabled",
+    )
+    prompt_keys = (
+        "single_no_plan_todo_prompt",
+        "singleNoPlanTodoPrompt",
+        "todo_bootstrap_prompt",
+        "todoBootstrapPrompt",
+        "single_todo_bootstrap_prompt",
+        "singleTodoBootstrapPrompt",
+    )
+    explicit_enabled: bool | None = None
+    prompt = ""
+    for section in _single_no_plan_todo_setting_sections(raw):
+        if explicit_enabled is None:
+            for key in enabled_keys:
+                if key in section:
+                    explicit_enabled = _to_bool_like(section.get(key), default=False)
+                    break
+        if not prompt:
+            for key in prompt_keys:
+                if key in section:
+                    prompt = trim(str(section.get(key) or "").strip(), 6000)
+                    break
+        if explicit_enabled is not None and prompt:
+            break
+    if explicit_enabled is False:
+        return False, prompt
+    if explicit_enabled is True or prompt:
+        return True, prompt or DEFAULT_SINGLE_NO_PLAN_TODO_PROMPT
+    return False, ""
 
 
 def normalize_user_memory_mode(value: object, default: str = DEFAULT_USER_MEMORY_MODE) -> str:
@@ -5574,13 +5874,34 @@ def _map_todo_status_token(token: str) -> str:
     raw = re.sub(r"\s+", " ", raw)
     return {
         "pending": "pending",
+        "todo": "pending",
+        "open": "pending",
+        "not started": "pending",
+        "notstarted": "pending",
         "待处理": "pending",
         "待處理": "pending",
         "未着手": "pending",
+        "未开始": "pending",
+        "未開始": "pending",
         "in progress": "in_progress",
+        "inprogress": "in_progress",
+        "doing": "in_progress",
+        "working": "in_progress",
+        "active": "in_progress",
         "进行中": "in_progress",
         "進行中": "in_progress",
+        "处理中": "in_progress",
+        "處理中": "in_progress",
         "completed": "completed",
+        "complete": "completed",
+        "done": "completed",
+        "finish": "completed",
+        "finished": "completed",
+        "success": "completed",
+        "succeeded": "completed",
+        "passed": "completed",
+        "完成": "completed",
+        "完成了": "completed",
         "已完成": "completed",
         "完了": "completed",
         "blocked": "pending",
@@ -5628,8 +5949,10 @@ def split_todo_status_text(text: object) -> tuple[str, str]:
             continue
         m = re.match(
             rf"^(?:{marker_prefix})"
-            rf"(pending|in[_\-\s]?progress|completed|blocked|"
-            rf"待处理|待處理|未着手|进行中|進行中|已完成|完了)"
+            rf"(pending|todo|open|not[_\-\s]?started|doing|working|active|"
+            rf"in[_\-\s]?progress|completed|complete|done|finish(?:ed)?|"
+            rf"success(?:ful)?|succeed(?:ed)?|passed|blocked|"
+            rf"待处理|待處理|未着手|未开始|未開始|进行中|進行中|处理中|處理中|完成|完成了|已完成|完了)"
             rf"\s*[：:\-\]]\s*",
             probe,
             flags=re.IGNORECASE,
@@ -5713,6 +6036,25 @@ def extract_todo_rows_from_text(
         if matched and len(out) >= capped:
             break
     return out
+
+
+def decode_structured_todo_container(value: object) -> object:
+    """Decode JSON or Python-literal Todo containers without executing code."""
+    if not isinstance(value, str):
+        return value
+    text = normalize_embedded_newlines(value).strip()
+    if len(text) < 2 or text[0] not in "[{" or text[-1] not in "]}":
+        return value
+    if len(text) > 200_000:
+        return value
+    for decoder in (json.loads, ast.literal_eval):
+        try:
+            decoded = decoder(text)
+        except Exception:
+            continue
+        if isinstance(decoded, (list, dict)):
+            return decoded
+    return value
 
 
 def infer_todo_status_from_text(text: object, default: str = "pending") -> str:
@@ -8127,6 +8469,662 @@ class AdminAuthStore:
             conn.execute("UPDATE admin_sessions SET revoked_at=? WHERE token_digest=?", (now_ts(), digest))
 
 
+class IDEAuthError(Exception):
+    def __init__(self, code: str, message: str, status: int = 400, *, retry_after: int = 0):
+        super().__init__(message)
+        self.code = str(code or "ide_auth_error")
+        self.status = int(status or 400)
+        self.retry_after = max(0, int(retry_after or 0))
+
+
+class IDEAuthStore:
+    """Account and browser-session store for the programming IDE.
+
+    IDE identities are deliberately independent from source IP addresses. The
+    client address remains a capability signal (local mount/process access), not
+    an authentication credential.
+    """
+
+    _USERNAME_RE = re.compile(r"^[A-Za-z0-9._-]{3,64}$")
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.lock = threading.RLock()
+        self.password_slots = threading.BoundedSemaphore(3)
+        self.login_failures: dict[tuple[str, str], deque[float]] = {}
+        self._initialize()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(str(self.path), timeout=10.0, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=10000")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=FULL")
+        return conn
+
+    def _initialize(self) -> None:
+        with self._connect() as conn:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS ide_accounts (
+                    username_key TEXT PRIMARY KEY,
+                    username TEXT NOT NULL,
+                    user_id TEXT NOT NULL UNIQUE,
+                    role TEXT NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    password_salt TEXT NOT NULL,
+                    password_algorithm TEXT NOT NULL,
+                    password_iterations INTEGER NOT NULL,
+                    auth_version INTEGER NOT NULL DEFAULT 1,
+                    disabled INTEGER NOT NULL DEFAULT 0,
+                    must_change_password INTEGER NOT NULL DEFAULT 0,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS ide_sessions (
+                    token_digest TEXT PRIMARY KEY,
+                    username_key TEXT NOT NULL,
+                    auth_version INTEGER NOT NULL,
+                    csrf_token TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    expires_at REAL NOT NULL,
+                    revoked_at REAL NOT NULL DEFAULT 0,
+                    last_ip TEXT NOT NULL DEFAULT '',
+                    device_digest TEXT NOT NULL DEFAULT '',
+                    FOREIGN KEY(username_key) REFERENCES ide_accounts(username_key)
+                );
+                CREATE INDEX IF NOT EXISTS ide_sessions_expiry
+                    ON ide_sessions(expires_at, revoked_at);
+                CREATE TABLE IF NOT EXISTS ide_devices (
+                    device_digest TEXT PRIMARY KEY,
+                    pairing_id TEXT NOT NULL UNIQUE,
+                    label TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL DEFAULT '',
+                    source_ip TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    username_key TEXT NOT NULL DEFAULT '',
+                    created_at REAL NOT NULL,
+                    requested_at REAL NOT NULL,
+                    approved_at REAL NOT NULL DEFAULT 0,
+                    approved_by TEXT NOT NULL DEFAULT '',
+                    last_seen_at REAL NOT NULL DEFAULT 0,
+                    revoked_at REAL NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS ide_devices_status
+                    ON ide_devices(status, requested_at);
+                """
+            )
+            columns = {
+                str(row["name"] or "")
+                for row in conn.execute("PRAGMA table_info(ide_sessions)").fetchall()
+            }
+            if "device_digest" not in columns:
+                conn.execute("ALTER TABLE ide_sessions ADD COLUMN device_digest TEXT NOT NULL DEFAULT ''")
+        try:
+            os.chmod(self.path, 0o600)
+        except Exception:
+            pass
+
+    @classmethod
+    def _normalize_username(cls, value: object) -> tuple[str, str]:
+        username = unicodedata.normalize("NFKC", str(value or "")).strip()
+        if not cls._USERNAME_RE.fullmatch(username):
+            raise IDEAuthError(
+                "invalid_username",
+                "Username must contain 3-64 letters, numbers, dots, underscores, or hyphens.",
+            )
+        return username, username.casefold()
+
+    @staticmethod
+    def _validate_password(password: object, username: str) -> str:
+        value = str(password if password is not None else "")
+        size = len(value.encode("utf-8", errors="strict"))
+        if size < 12 or size > 512:
+            raise IDEAuthError("weak_password", "Password must be 12-512 UTF-8 bytes.")
+        if value.casefold() == str(username or "").casefold():
+            raise IDEAuthError("weak_password", "Password cannot equal the username.")
+        classes = sum(
+            bool(re.search(pattern, value))
+            for pattern in (r"[a-z]", r"[A-Z]", r"[0-9]", r"[^A-Za-z0-9]")
+        )
+        if classes < 3:
+            raise IDEAuthError("weak_password", "Password must use at least three character classes.")
+        return value
+
+    @staticmethod
+    def _password_digest(password: str, salt: bytes, iterations: int) -> bytes:
+        return AdminAuthStore._password_digest(password, salt, iterations)
+
+    def configured(self) -> bool:
+        try:
+            with self._connect() as conn:
+                return conn.execute("SELECT 1 FROM ide_accounts WHERE role='admin' LIMIT 1").fetchone() is not None
+        except sqlite3.DatabaseError:
+            return True
+
+    @staticmethod
+    def _public_account(row: sqlite3.Row | dict | None) -> dict:
+        if row is None:
+            return {}
+        return {
+            "username": str(row["username"] or ""),
+            "user_id": str(row["user_id"] or ""),
+            "role": str(row["role"] or "user"),
+            "disabled": bool(row["disabled"]),
+            "must_change_password": bool(row["must_change_password"]),
+            "created_at": float(row["created_at"] or 0.0),
+            "updated_at": float(row["updated_at"] or 0.0),
+        }
+
+    def _insert_account(
+        self,
+        username: object,
+        password: object,
+        *,
+        user_id: str,
+        role: str,
+        must_change_password: bool = False,
+    ) -> dict:
+        clean_username, username_key = self._normalize_username(username)
+        clean_password = self._validate_password(password, clean_username)
+        uid = str(user_id or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9._:-]{8,128}", uid):
+            raise IDEAuthError("invalid_user_id", "Invalid IDE user id.")
+        role_key = "admin" if str(role or "").strip().lower() == "admin" else "user"
+        salt = os.urandom(24)
+        with self.password_slots:
+            digest = self._password_digest(clean_password, salt, ADMIN_AUTH_PASSWORD_ITERATIONS)
+        now = now_ts()
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    """INSERT INTO ide_accounts
+                       (username_key,username,user_id,role,password_hash,password_salt,
+                        password_algorithm,password_iterations,auth_version,disabled,
+                        must_change_password,created_at,updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,1,0,?,?,?)""",
+                    (
+                        username_key,
+                        clean_username,
+                        uid,
+                        role_key,
+                        base64.b64encode(digest).decode("ascii"),
+                        base64.b64encode(salt).decode("ascii"),
+                        "pbkdf2_hmac_sha256",
+                        ADMIN_AUTH_PASSWORD_ITERATIONS,
+                        1 if must_change_password else 0,
+                        now,
+                        now,
+                    ),
+                )
+                row = conn.execute("SELECT * FROM ide_accounts WHERE username_key=?", (username_key,)).fetchone()
+        except sqlite3.IntegrityError as exc:
+            raise IDEAuthError("account_exists", "The username or workspace identity already exists.", 409) from exc
+        return self._public_account(row)
+
+    def setup_admin(self, username: object, password: object, *, legacy_user_id: str) -> dict:
+        with self.lock:
+            if self.configured():
+                raise IDEAuthError("setup_already_completed", "IDE administrator already exists.", 409)
+            account = self._insert_account(
+                username,
+                password,
+                user_id=legacy_user_id,
+                role="admin",
+            )
+        session = self.login(username, password, "127.0.0.1")
+        session["account"] = account
+        return session
+
+    def local_session(self, *, legacy_user_id: str, client_ip: str = "127.0.0.1") -> dict:
+        """Issue the trusted loopback identity without requiring a local password."""
+        with self.lock:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT * FROM ide_accounts WHERE role='admin' AND disabled=0 ORDER BY created_at LIMIT 1"
+                ).fetchone()
+            if row is None:
+                random_password = "Local-7!" + base64.urlsafe_b64encode(os.urandom(36)).decode("ascii")
+                try:
+                    self._insert_account(
+                        "local-admin",
+                        random_password,
+                        user_id=str(legacy_user_id or user_id_from_ip("127.0.0.1")),
+                        role="admin",
+                    )
+                except IDEAuthError as exc:
+                    if exc.code != "account_exists":
+                        raise
+                with self._connect() as conn:
+                    row = conn.execute(
+                        "SELECT * FROM ide_accounts WHERE role='admin' AND disabled=0 ORDER BY created_at LIMIT 1"
+                    ).fetchone()
+            if row is None:
+                raise IDEAuthError("local_identity_unavailable", "The local IDE identity is unavailable.", 503)
+        result = self.issue_session(row, client_ip=client_ip)
+        result["local_auto_login"] = True
+        return result
+
+    def create_user(self, username: object, password: object, *, must_change_password: bool = True) -> dict:
+        _, key = self._normalize_username(username)
+        uid = f"ide_{hashlib.sha256((key + ':' + uuid.uuid4().hex).encode()).hexdigest()[:24]}"
+        return self._insert_account(
+            username,
+            password,
+            user_id=uid,
+            role="user",
+            must_change_password=must_change_password,
+        )
+
+    def list_accounts(self) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM ide_accounts ORDER BY role='admin' DESC, username_key ASC"
+            ).fetchall()
+        return [self._public_account(row) for row in rows]
+
+    def _check_rate_limit(self, client_ip: str, username_key: str) -> None:
+        now = now_ts()
+        targets = ((str(client_ip or "unknown")[:96], username_key), (str(client_ip or "unknown")[:96], "*"))
+        with self.lock:
+            for target, limit in ((targets[0], 8), (targets[1], 24)):
+                rows = self.login_failures.setdefault(target, deque())
+                while rows and now - rows[0] > 900:
+                    rows.popleft()
+                if len(rows) >= limit:
+                    retry = max(1, int(900 - (now - rows[0])))
+                    raise IDEAuthError("rate_limited", "Too many login attempts.", 429, retry_after=retry)
+
+    def _record_failure(self, client_ip: str, username_key: str) -> None:
+        now = now_ts()
+        with self.lock:
+            for target in ((str(client_ip or "unknown")[:96], username_key), (str(client_ip or "unknown")[:96], "*")):
+                self.login_failures.setdefault(target, deque()).append(now)
+
+    def login(self, username: object, password: object, client_ip: str) -> dict:
+        try:
+            _, username_key = self._normalize_username(username)
+        except IDEAuthError:
+            username_key = "invalid-user"
+        self._check_rate_limit(client_ip, username_key)
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM ide_accounts WHERE username_key=?", (username_key,)).fetchone()
+        salt = b"\0" * 24
+        expected = b"\0" * 32
+        iterations = ADMIN_AUTH_PASSWORD_ITERATIONS
+        valid = False
+        if row is not None:
+            try:
+                salt = base64.b64decode(str(row["password_salt"]), validate=True)
+                expected = base64.b64decode(str(row["password_hash"]), validate=True)
+                iterations = int(row["password_iterations"] or ADMIN_AUTH_PASSWORD_ITERATIONS)
+                valid = str(row["password_algorithm"] or "") == "pbkdf2_hmac_sha256" and not bool(row["disabled"])
+            except Exception:
+                valid = False
+        with self.password_slots:
+            actual = self._password_digest(str(password if password is not None else ""), salt, iterations)
+        if not (valid and hmac.compare_digest(actual, expected)):
+            self._record_failure(client_ip, username_key)
+            raise IDEAuthError("invalid_credentials", "Invalid username or password.", 401)
+        with self.lock:
+            self.login_failures.pop((str(client_ip or "unknown")[:96], username_key), None)
+        return self.issue_session(row, client_ip=client_ip)
+
+    def _verify_account_password(self, username: object, password: object) -> sqlite3.Row:
+        try:
+            _, username_key = self._normalize_username(username)
+        except IDEAuthError as exc:
+            raise IDEAuthError("invalid_credentials", "Invalid username or password.", 401) from exc
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM ide_accounts WHERE username_key=?", (username_key,)).fetchone()
+        salt = b"\0" * 24
+        expected = b"\0" * 32
+        iterations = ADMIN_AUTH_PASSWORD_ITERATIONS
+        valid = False
+        if row is not None:
+            try:
+                salt = base64.b64decode(str(row["password_salt"]), validate=True)
+                expected = base64.b64decode(str(row["password_hash"]), validate=True)
+                iterations = int(row["password_iterations"] or ADMIN_AUTH_PASSWORD_ITERATIONS)
+                valid = str(row["password_algorithm"] or "") == "pbkdf2_hmac_sha256" and not bool(row["disabled"])
+            except Exception:
+                valid = False
+        with self.password_slots:
+            actual = self._password_digest(str(password if password is not None else ""), salt, iterations)
+        if not (valid and hmac.compare_digest(actual, expected)):
+            raise IDEAuthError("invalid_credentials", "Invalid username or password.", 401)
+        return row
+
+    @staticmethod
+    def _device_digest(device_key: object) -> str:
+        raw = str(device_key or "").strip()
+        if not re.fullmatch(r"cc_device_[A-Za-z0-9_-]{43,160}", raw):
+            raise IDEAuthError("invalid_device_key", "This browser device key is invalid.", 400)
+        encoded_size = len(raw.removeprefix("cc_device_"))
+        if encoded_size < 43:
+            raise IDEAuthError("invalid_device_key", "This browser device key is too short.", 400)
+        return hashlib.sha256(raw.encode("utf-8", errors="strict")).hexdigest()
+
+    @staticmethod
+    def _public_device(row: sqlite3.Row | dict | None) -> dict:
+        if row is None:
+            return {}
+        return {
+            "pairing_id": str(row["pairing_id"] or ""),
+            "label": str(row["label"] or ""),
+            "fingerprint": str(row["fingerprint"] or ""),
+            "source_ip": str(row["source_ip"] or ""),
+            "status": str(row["status"] or "pending"),
+            "user_id": str(row["user_id"] or ""),
+            "created_at": float(row["created_at"] or 0.0),
+            "requested_at": float(row["requested_at"] or 0.0),
+            "approved_at": float(row["approved_at"] or 0.0),
+            "last_seen_at": float(row["last_seen_at"] or 0.0),
+            "revoked_at": float(row["revoked_at"] or 0.0),
+        }
+
+    def issue_session(self, account: sqlite3.Row, *, client_ip: str, device_digest: str = "") -> dict:
+        raw = "ide_session_" + base64.urlsafe_b64encode(os.urandom(32)).decode("ascii").rstrip("=")
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        csrf = base64.urlsafe_b64encode(os.urandom(24)).decode("ascii").rstrip("=")
+        now = now_ts()
+        expires = now + IDE_AUTH_SESSION_TTL_SECONDS
+        username_key = str(account["username_key"] or "")
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("DELETE FROM ide_sessions WHERE revoked_at>0 OR expires_at<=?", (now,))
+            conn.execute(
+                """INSERT INTO ide_sessions
+                   (token_digest,username_key,auth_version,csrf_token,created_at,expires_at,revoked_at,last_ip,device_digest)
+                   VALUES(?,?,?,?,?,?,0,?,?)""",
+                (
+                    digest,
+                    username_key,
+                    int(account["auth_version"] or 1),
+                    csrf,
+                    now,
+                    expires,
+                    str(client_ip or ""),
+                    str(device_digest or ""),
+                ),
+            )
+            extras = conn.execute(
+                """SELECT token_digest FROM ide_sessions WHERE username_key=? AND revoked_at=0
+                   ORDER BY created_at DESC LIMIT -1 OFFSET ?""",
+                (username_key, IDE_AUTH_MAX_ACTIVE_SESSIONS),
+            ).fetchall()
+            if extras:
+                conn.executemany("UPDATE ide_sessions SET revoked_at=? WHERE token_digest=?", [(now, x[0]) for x in extras])
+            conn.execute("COMMIT")
+        return {
+            "access_token": raw,
+            "csrf_token": csrf,
+            "expires_at": expires,
+            "account": self._public_account(account),
+        }
+
+    def verify_session(self, token: str, client_ip: str = "") -> dict | None:
+        raw = str(token or "")
+        if not raw.startswith("ide_session_") or len(raw) < 48:
+            return None
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        now = now_ts()
+        with self._connect() as conn:
+            row = conn.execute(
+                """SELECT a.*,s.csrf_token,s.expires_at,s.token_digest,s.last_ip,s.device_digest,
+                          d.status AS device_status,d.source_ip AS device_source_ip
+                   FROM ide_sessions s JOIN ide_accounts a ON a.username_key=s.username_key
+                   LEFT JOIN ide_devices d ON d.device_digest=s.device_digest
+                   WHERE s.token_digest=? AND s.revoked_at=0 AND s.expires_at>?
+                     AND s.auth_version=a.auth_version AND a.disabled=0""",
+                (digest, now),
+            ).fetchone()
+        if row is None:
+            return None
+        device_digest = str(row["device_digest"] or "")
+        if device_digest:
+            request_ip = str(client_ip or "")
+            if (
+                str(row["device_status"] or "") != "approved"
+                or not request_ip
+                or not hmac.compare_digest(str(row["last_ip"] or ""), request_ip)
+                or not hmac.compare_digest(str(row["device_source_ip"] or ""), request_ip)
+            ):
+                return None
+        account = self._public_account(row)
+        account.update({
+            "csrf_token": str(row["csrf_token"] or ""),
+            "expires_at": float(row["expires_at"] or 0.0),
+            "token_digest": str(row["token_digest"] or ""),
+        })
+        return account
+
+    def register_device(
+        self,
+        device_key: object,
+        *,
+        label: object,
+        fingerprint: object,
+        client_ip: str,
+    ) -> dict:
+        digest = self._device_digest(device_key)
+        now = now_ts()
+        clean_label = trim(unicodedata.normalize("NFKC", str(label or "")).strip(), IDE_DEVICE_LABEL_MAX_CHARS)
+        clean_label = clean_label or "Web browser"
+        clean_fingerprint = trim(str(fingerprint or "").strip(), 500)
+        source_ip = trim(str(client_ip or "").strip(), 96)
+        if not source_ip:
+            raise IDEAuthError("device_ip_required", "The device source address is unavailable.", 400)
+        pairing_id = "pair-" + digest[:12]
+        user_id = "ide_device_" + digest[:24]
+        with self.lock:
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute("SELECT * FROM ide_devices WHERE device_digest=?", (digest,)).fetchone()
+                if row is None:
+                    conn.execute(
+                        """INSERT INTO ide_devices
+                           (device_digest,pairing_id,label,fingerprint,source_ip,status,user_id,
+                            username_key,created_at,requested_at,approved_at,approved_by,last_seen_at,revoked_at)
+                           VALUES(?,?,?,?,?,'pending',?,'',?,?,0,'',?,0)""",
+                        (digest, pairing_id, clean_label, clean_fingerprint, source_ip, user_id, now, now, now),
+                    )
+                elif str(row["status"] or "") == "revoked":
+                    conn.execute("ROLLBACK")
+                    raise IDEAuthError("device_revoked", "This browser device was revoked. Reset its device identity to request access again.", 403)
+                elif str(row["status"] or "") == "approved" and not hmac.compare_digest(str(row["source_ip"] or ""), source_ip):
+                    conn.execute(
+                        """UPDATE ide_devices SET label=?,fingerprint=?,source_ip=?,status='pending',
+                           requested_at=?,approved_at=0,approved_by='',last_seen_at=? WHERE device_digest=?""",
+                        (clean_label, clean_fingerprint, source_ip, now, now, digest),
+                    )
+                    conn.execute(
+                        "UPDATE ide_sessions SET revoked_at=? WHERE device_digest=? AND revoked_at=0",
+                        (now, digest),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE ide_devices SET label=?,fingerprint=?,last_seen_at=? WHERE device_digest=?",
+                        (clean_label, clean_fingerprint, now, digest),
+                    )
+                row = conn.execute("SELECT * FROM ide_devices WHERE device_digest=?", (digest,)).fetchone()
+                conn.execute("COMMIT")
+        if row is None:
+            raise IDEAuthError("device_registration_failed", "The device request could not be stored.", 503)
+        if str(row["status"] or "") != "approved":
+            return {"ok": True, "pending": True, "device": self._public_device(row)}
+        username_key = str(row["username_key"] or "")
+        with self._connect() as conn:
+            account = conn.execute(
+                "SELECT * FROM ide_accounts WHERE username_key=? AND disabled=0",
+                (username_key,),
+            ).fetchone()
+        if account is None:
+            raise IDEAuthError("device_identity_unavailable", "The approved device identity is unavailable.", 503)
+        result = self.issue_session(account, client_ip=source_ip, device_digest=digest)
+        result["device"] = self._public_device(row)
+        result["device_authenticated"] = True
+        return result
+
+    def list_devices(self) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM ide_devices ORDER BY status='pending' DESC,requested_at DESC"
+            ).fetchall()
+        return [self._public_device(row) for row in rows]
+
+    def approve_device(self, pairing_id: object, *, approved_by: str) -> dict:
+        pairing = str(pairing_id or "").strip()
+        with self.lock:
+            with self._connect() as conn:
+                row = conn.execute("SELECT * FROM ide_devices WHERE pairing_id=?", (pairing,)).fetchone()
+            if row is None:
+                raise IDEAuthError("device_not_found", "Device pairing request not found.", 404)
+            if str(row["status"] or "") == "revoked":
+                raise IDEAuthError("device_revoked", "A revoked device cannot be approved.", 409)
+            username_key = str(row["username_key"] or "")
+            if not username_key:
+                username = "device-" + str(row["device_digest"] or "")[:12]
+                password = "Device-9!" + base64.urlsafe_b64encode(os.urandom(36)).decode("ascii")
+                account = self._insert_account(
+                    username,
+                    password,
+                    user_id=str(row["user_id"] or ""),
+                    role="user",
+                )
+                _, username_key = self._normalize_username(account["username"])
+            now = now_ts()
+            with self._connect() as conn:
+                conn.execute(
+                    """UPDATE ide_devices SET status='approved',username_key=?,approved_at=?,
+                       approved_by=?,last_seen_at=?,revoked_at=0 WHERE pairing_id=?""",
+                    (username_key, now, trim(approved_by, 64), now, pairing),
+                )
+                row = conn.execute("SELECT * FROM ide_devices WHERE pairing_id=?", (pairing,)).fetchone()
+        return self._public_device(row)
+
+    def revoke_device(self, pairing_id: object) -> dict:
+        pairing = str(pairing_id or "").strip()
+        now = now_ts()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM ide_devices WHERE pairing_id=?", (pairing,)).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                raise IDEAuthError("device_not_found", "Device pairing request not found.", 404)
+            digest = str(row["device_digest"] or "")
+            conn.execute(
+                "UPDATE ide_devices SET status='revoked',revoked_at=?,last_seen_at=? WHERE pairing_id=?",
+                (now, now, pairing),
+            )
+            conn.execute("UPDATE ide_sessions SET revoked_at=? WHERE device_digest=?", (now, digest))
+            row = conn.execute("SELECT * FROM ide_devices WHERE pairing_id=?", (pairing,)).fetchone()
+            conn.execute("COMMIT")
+        return self._public_device(row)
+
+    def revoke_session(self, token: str) -> None:
+        raw = str(token or "")
+        if not raw.startswith("ide_session_"):
+            return
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+        with self._connect() as conn:
+            conn.execute("UPDATE ide_sessions SET revoked_at=? WHERE token_digest=?", (now_ts(), digest))
+
+    def set_disabled(self, username: object, disabled: bool) -> dict:
+        _, key = self._normalize_username(username)
+        now = now_ts()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM ide_accounts WHERE username_key=?", (key,)).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                raise IDEAuthError("account_not_found", "IDE account not found.", 404)
+            if str(row["role"] or "") == "admin" and disabled:
+                conn.execute("ROLLBACK")
+                raise IDEAuthError("admin_disable_forbidden", "The IDE administrator cannot be disabled.", 409)
+            conn.execute(
+                "UPDATE ide_accounts SET disabled=?,auth_version=auth_version+1,updated_at=? WHERE username_key=?",
+                (1 if disabled else 0, now, key),
+            )
+            conn.execute("UPDATE ide_sessions SET revoked_at=? WHERE username_key=?", (now, key))
+            row = conn.execute("SELECT * FROM ide_accounts WHERE username_key=?", (key,)).fetchone()
+            conn.execute("COMMIT")
+        return self._public_account(row)
+
+    def change_password(self, account: dict, old_password: object, new_password: object) -> dict:
+        username = str(account.get("username", "") or "")
+        self._verify_account_password(username, old_password)
+        clean_password = self._validate_password(new_password, username)
+        salt = os.urandom(24)
+        with self.password_slots:
+            digest = self._password_digest(clean_password, salt, ADMIN_AUTH_PASSWORD_ITERATIONS)
+        now = now_ts()
+        _, key = self._normalize_username(username)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """UPDATE ide_accounts SET password_hash=?,password_salt=?,password_iterations=?,
+                   auth_version=auth_version+1,must_change_password=0,updated_at=? WHERE username_key=?""",
+                (
+                    base64.b64encode(digest).decode("ascii"),
+                    base64.b64encode(salt).decode("ascii"),
+                    ADMIN_AUTH_PASSWORD_ITERATIONS,
+                    now,
+                    key,
+                ),
+            )
+            conn.execute("UPDATE ide_sessions SET revoked_at=? WHERE username_key=?", (now, key))
+            row = conn.execute("SELECT * FROM ide_accounts WHERE username_key=?", (key,)).fetchone()
+            conn.execute("COMMIT")
+        return self._public_account(row)
+
+    def reset_password(self, username: object, new_password: object) -> dict:
+        clean_username, key = self._normalize_username(username)
+        clean_password = self._validate_password(new_password, clean_username)
+        salt = os.urandom(24)
+        with self.password_slots:
+            digest = self._password_digest(clean_password, salt, ADMIN_AUTH_PASSWORD_ITERATIONS)
+        now = now_ts()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM ide_accounts WHERE username_key=?", (key,)).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                raise IDEAuthError("account_not_found", "IDE account not found.", 404)
+            conn.execute(
+                """UPDATE ide_accounts SET password_hash=?,password_salt=?,password_iterations=?,
+                   auth_version=auth_version+1,must_change_password=0,updated_at=? WHERE username_key=?""",
+                (
+                    base64.b64encode(digest).decode("ascii"),
+                    base64.b64encode(salt).decode("ascii"),
+                    ADMIN_AUTH_PASSWORD_ITERATIONS,
+                    now,
+                    key,
+                ),
+            )
+            conn.execute("UPDATE ide_sessions SET revoked_at=? WHERE username_key=?", (now, key))
+            row = conn.execute("SELECT * FROM ide_accounts WHERE username_key=?", (key,)).fetchone()
+            conn.execute("COMMIT")
+        return self._public_account(row)
+
+
+class IDECapabilityError(Exception):
+    def __init__(self, code: str, message: str, status: int = 403):
+        super().__init__(message)
+        self.code = str(code or "ide_capability_denied")
+        self.status = int(status or 403)
+
+
+class IDEFileConflict(Exception):
+    def __init__(self, current: dict):
+        super().__init__("The file changed on disk after it was opened.")
+        self.code = "file_conflict"
+        self.status = 409
+        self.current = dict(current or {})
+
+
 def _admin_config_schema() -> list[dict]:
     """Canonical startup schema shared by validation, CLI compilation and WebUI."""
     def row(
@@ -8178,7 +9176,8 @@ def _admin_config_schema() -> list[dict]:
         row("skills_ui_enabled", "services", "Skills Studio", "boolean", True, true_flag="", false_flag="--no_skills_ui"),
         row("rag_admin_enabled", "services", "RAG admin", "boolean", True, true_flag="", false_flag="--no_rag_admin"),
         row("code_admin_enabled", "services", "Code library admin", "boolean", True, true_flag="", false_flag="--no_code_admin"),
-        row("ide_enabled", "services", "Programming IDE", "boolean", False, true_flag="--enable_ide", false_flag=""),
+        row("ide_enabled", "services", "Programming IDE", "boolean", True, true_flag="--enable_ide", false_flag="--no_ide"),
+        row("ide_password_login_enabled", "services", "IDE password login", "boolean", False, true_flag="--ide-password-login", false_flag="--no-ide-password-login"),
         row("mcp_service_enabled", "services", "MCP service", "boolean", True, true_flag="", false_flag="--no_mcp_service"),
         row("use_external_web_ui", "webui", "External WebUI mode", "tri_state", "inherit", true_flag="--use_external_web_ui", false_flag="--no_external_web_ui", choices=["inherit", "enabled", "disabled"]),
         row("export_web_ui", "webui", "Export built-in WebUI on start", "boolean", False, true_flag="--export_web_ui", false_flag=""),
@@ -8192,6 +9191,15 @@ def _admin_config_schema() -> list[dict]:
         row("web_search_enabled", "runtime", "Web search", "tri_state", "inherit", true_flag="--enable-web-search", false_flag="--disable-web-search", choices=["inherit", "enabled", "disabled"]),
         row("user_memory_mode", "runtime", "User memory mode", "enum", "weak", "--user-memory", choices=["off", "weak", "on"]),
         row("auto_task_level_ceiling", "runtime", "Auto task level ceiling", "integer", DEFAULT_AUTO_TASK_LEVEL_CEILING, "--auto_task_level_ceiling", minimum=0, maximum=5),
+        row(
+            "l2_todo_policy",
+            "runtime",
+            "Level-2 Todo policy",
+            "enum",
+            DEFAULT_L2_TODO_POLICY,
+            "--l2-todo-policy",
+            choices=list(L2_TODO_POLICY_CHOICES),
+        ),
         row("daily_session_limit_per_ip", "limits", "Daily sessions per user", "integer", 0, "--daily_session_limit_per_ip", minimum=0, maximum=1_000_000),
         row("ollama_base_url", "model", "Ollama base URL", "url", DEFAULT_OLLAMA_BASE_URL, "--ollama-base-url"),
         row("model", "model", "Default model", "text", DEFAULT_OLLAMA_MODEL, "--model"),
@@ -8202,6 +9210,23 @@ def _admin_config_schema() -> list[dict]:
         row("arbiter_max_tokens", "arbiter", "Arbiter max tokens", "integer", ARBITER_DEFAULT_MAX_TOKENS, "--arbiter-max-tokens", minimum=24, maximum=256),
         row("arbiter_temperature", "arbiter", "Arbiter temperature", "number", ARBITER_DEFAULT_TEMPERATURE, "--arbiter-temperature", minimum=0, maximum=1, step=0.05),
         row("execution_mode", "runtime", "Agent execution mode", "enum", EXECUTION_MODE_SYNC, "--execution-mode", choices=["single", "sequential", "sync"]),
+        row(
+            "single_no_plan_todo_enabled",
+            "runtime",
+            "Optional single/no-plan Todo bootstrap (L2 follows policy)",
+            "boolean",
+            False,
+            true_flag="--single-no-plan-todo",
+            false_flag="--no-single-no-plan-todo",
+        ),
+        row(
+            "single_no_plan_todo_prompt",
+            "runtime",
+            "Single/no-plan Todo prompt",
+            "text",
+            "",
+            "--single-no-plan-todo-prompt",
+        ),
         row("max_output_tokens", "runtime", "Max output tokens", "integer", AGENT_MAX_OUTPUT_TOKENS, "--max-output-tokens", minimum=256, maximum=1_000_000),
         row("max_user", "limits", "Global concurrent tasks", "integer", 0, "--max_user", minimum=0, maximum=100_000),
         row("max_user_sessions", "limits", "Concurrent tasks per user", "integer", 0, "--max_user_sessions", minimum=0, maximum=100_000),
@@ -8228,6 +9253,12 @@ def _admin_coerce_config(raw: object) -> tuple[dict, list[dict]]:
         if nullable and (value is None or str(value).strip() == ""):
             out[key] = None
             continue
+        if value is None or (isinstance(value, str) and not value.strip()):
+            # Admin forms can submit an empty string after a field is
+            # cleared. Nullable fields intentionally remain None; every
+            # other startup field resets to its schema default so restart
+            # never emits an invalid empty argparse value.
+            value = spec.get("factory_default")
         try:
             if typ == "integer":
                 if isinstance(value, bool):
@@ -8329,11 +9360,20 @@ def _admin_coerce_config(raw: object) -> tuple[dict, list[dict]]:
 
 
 def _admin_config_to_argv(config: dict) -> list[str]:
+    clean, errors = _admin_coerce_config(config)
+    clean.pop("_effective_ports", None)
+    if errors:
+        details = "; ".join(
+            f"{str(row.get('key', '') or 'config')}: {str(row.get('error', '') or 'invalid value')}"
+            for row in errors[:8]
+            if isinstance(row, dict)
+        )
+        raise ValueError(f"invalid Admin startup config: {details or 'validation failed'}")
     schema = _admin_config_schema()
     argv: list[str] = []
     for spec in schema:
         key = str(spec["key"])
-        value = config.get(key, spec.get("factory_default"))
+        value = clean.get(key, spec.get("factory_default"))
         typ = str(spec.get("type", "text"))
         if typ == "boolean":
             flag = str(spec.get("true_flag" if bool(value) else "false_flag", "") or "")
@@ -8350,7 +9390,9 @@ def _admin_config_to_argv(config: dict) -> list[str]:
             continue
         flag = str(spec.get("flag", "") or "")
         if flag:
-            argv.extend([flag, str(value)])
+            value_text = str(value).strip()
+            if value_text:
+                argv.extend([flag, value_text])
     return argv
 
 
@@ -8845,6 +9887,38 @@ def preview_kind_for_path(path_text: str) -> str:
     return ""
 
 
+def workspace_file_revision_map(root: Path, max_files: int = 30_000) -> dict[str, str]:
+    base = Path(root).resolve()
+    out: dict[str, str] = {}
+    if not base.exists() or not base.is_dir():
+        return out
+    for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
+        dirnames[:] = [
+            name for name in dirnames
+            if name not in IDE_TREE_SKIP_DIRS and not (Path(dirpath) / name).is_symlink()
+        ]
+        for filename in filenames:
+            fp = Path(dirpath) / filename
+            try:
+                if fp.is_symlink() or not fp.is_file():
+                    continue
+                st = fp.stat()
+                rel = fp.resolve().relative_to(base).as_posix()
+                out[rel] = f"{int(st.st_size)}:{int(st.st_mtime_ns)}:{int(getattr(st, 'st_ino', 0))}"
+            except Exception:
+                continue
+            if len(out) >= max(100, int(max_files or 30_000)):
+                return out
+    return out
+
+
+def workspace_revision_delta(before: dict[str, str], after: dict[str, str], limit: int = 80) -> list[str]:
+    return [
+        path for path in sorted(set(before) | set(after))
+        if before.get(path) != after.get(path)
+    ][:max(1, int(limit or 80))]
+
+
 def build_code_preview_rows(
     before_text: str,
     after_text: str,
@@ -9010,12 +10084,32 @@ class TodoManager:
                     raw = {"content": str(item).strip(), "status": "pending"}
                 except Exception:
                     continue
-            raw_content = str(raw.get("content", raw.get("text", raw.get("title", "")))).strip()
+            raw_content = str(
+                raw.get(
+                    "content",
+                    raw.get(
+                        "text",
+                        raw.get(
+                            "title",
+                            raw.get(
+                                "task",
+                                raw.get("description", raw.get("label", raw.get("name", ""))),
+                            ),
+                        ),
+                    ),
+                )
+            ).strip()
             split_rows = split_structured_todo_content(raw_content, limit=7)
             if len(split_rows) <= 1:
                 expanded_items.append(raw)
                 continue
-            base_status = str(raw.get("status", raw.get("state", "pending")) or "pending").strip().lower()
+            base_status = raw.get("status", raw.get("state", ""))
+            if base_status in (None, ""):
+                if _to_bool_like(raw.get("completed", raw.get("done", False)), default=False):
+                    base_status = "completed"
+                elif _to_bool_like(raw.get("in_progress", raw.get("active", False)), default=False):
+                    base_status = "in_progress"
+            base_status = str(base_status or "pending").strip().lower()
             for split_idx, split_content in enumerate(split_rows):
                 split_raw = dict(raw)
                 split_raw["content"] = split_content
@@ -9032,15 +10126,35 @@ class TodoManager:
         worker_in_progress_seen_by_owner: set[str] = set()
         status_alias = {
             "todo": "pending",
+            "open": "pending",
+            "not_started": "pending",
+            "notstarted": "pending",
+            "待处理": "pending",
+            "待處理": "pending",
+            "未开始": "pending",
+            "未開始": "pending",
             "[_]": "pending",
             "[]": "pending",
             "[ ]": "pending",
             "doing": "in_progress",
+            "working": "in_progress",
+            "active": "in_progress",
+            "started": "in_progress",
+            "进行中": "in_progress",
+            "進行中": "in_progress",
+            "处理中": "in_progress",
+            "處理中": "in_progress",
             "inprogress": "in_progress",
             "in-progress": "in_progress",
             "[>]": "in_progress",
             ">": "in_progress",
             "done": "completed",
+            "complete": "completed",
+            "success": "completed",
+            "succeeded": "completed",
+            "passed": "completed",
+            "完成": "completed",
+            "已完成": "completed",
             "finish": "completed",
             "finished": "completed",
             "[x]": "completed",
@@ -9048,15 +10162,37 @@ class TodoManager:
         }
         for idx, item in enumerate(expanded_items):
             raw = item if isinstance(item, dict) else {"content": str(item or "").strip(), "status": "pending"}
-            raw_content = str(raw.get("content", raw.get("text", raw.get("title", "")))).strip()
+            raw_content = str(
+                raw.get(
+                    "content",
+                    raw.get(
+                        "text",
+                        raw.get(
+                            "title",
+                            raw.get(
+                                "task",
+                                raw.get("description", raw.get("label", raw.get("name", ""))),
+                            ),
+                        ),
+                    ),
+                )
+            ).strip()
             inferred_status = infer_todo_status_from_text(raw_content, default="")
             content = normalize_work_text(raw_content)
             if not content:
                 content = raw_content
             if not content:
                 continue  # Skip empty items instead of raising
-            raw_status = str(raw.get("status", raw.get("state", "pending"))).strip().lower()
+            raw_status_value = raw.get("status", raw.get("state", ""))
+            if raw_status_value in (None, ""):
+                if _to_bool_like(raw.get("completed", raw.get("done", False)), default=False):
+                    raw_status_value = "completed"
+                elif _to_bool_like(raw.get("in_progress", raw.get("active", False)), default=False):
+                    raw_status_value = "in_progress"
+            raw_status = str(raw_status_value or "pending").strip().lower().replace("-", "_").replace(" ", "_")
             status = status_alias.get(raw_status, raw_status or "pending")
+            if status not in {"pending", "in_progress", "completed"}:
+                status = _map_todo_status_token(raw_status) or status
             if inferred_status and status in {"", "pending", "todo"}:
                 status = inferred_status
             if status not in {"pending", "in_progress", "completed"}:
@@ -9073,6 +10209,7 @@ class TodoManager:
                 owner = ""
             key = trim(str(raw.get("key", "") or "").strip(), 120)
             is_plan_step = key.startswith("bb:proj:")
+            parent_step_id = trim(str(raw.get("parent_step_id", "") or ""), 20)
             if status == "in_progress":
                 if is_plan_step:
                     if plan_in_progress_seen:
@@ -9085,7 +10222,15 @@ class TodoManager:
                         status = "pending"
                     else:
                         worker_in_progress_seen_by_owner.add(owner_bucket)
-            if not active_form:
+            # Worker rows are a canonical state view. Never retain a stale
+            # localized activeForm after reconciliation changed the status.
+            # Rebuild the display form from the normalized status. Keeping an
+            # old activeForm after a status-only update made the UI claim a row
+            # was completed while the canonical status was still pending (and
+            # vice versa), especially after a resume/compaction handoff.
+            if parent_step_id and owner in {"explorer", "developer", "reviewer"}:
+                active_form = self._default_active_form(status, content, owner=owner)
+            else:
                 active_form = self._default_active_form(status, content, owner=owner)
             row = {"content": content, "status": status, "activeForm": active_form}
             if owner:
@@ -9093,12 +10238,12 @@ class TodoManager:
             if key:
                 row["key"] = key
             # Preserve parent_step_id for subtask-to-plan-step linkage
-            parent_step_id = trim(str(raw.get("parent_step_id", "") or ""), 20)
             if parent_step_id:
                 row["parent_step_id"] = parent_step_id
             for meta_key in (
                 "subtask_id", "created_at", "updated_at", "started_at", "completed_at",
-                "completed_by", "evidence", "revision_reason", "revision_evidence",
+                "completed_by", "evidence", "evidence_binding", "evidence_ids",
+                "revision_reason", "revision_evidence", "external_subtask_id",
             ):
                 if meta_key in raw and raw.get(meta_key) not in (None, ""):
                     row[meta_key] = raw.get(meta_key)
@@ -9711,8 +10856,8 @@ Use this skill when the agent shows model degradation symptoms:
 1. If context may be missing, call `context_recall` with `mode="summary"` first, then use `mode="search"` or `mode="window"` for focused evidence.
 2. Inspect the authoritative current task/plan/todo state before touching todos:
    - if an approved plan or canonical todo list already exists, preserve it and repair only the current broken row;
-   - if the task is simple, normally needs no todos, or can continue with one repaired tool call, do not create recovery todos;
-   - create a minimal 3-7 item todo list only when the original user task is genuinely multi-step, still unfinished, has no usable tracking state, and the items describe user work rather than recovery machinery.
+   - preserve/create a Todo graph only when the current runtime policy says `requires_todos=true`; L3+ remains required, while L2 may be force, auto, or off;
+   - when L2 currently requires Todos, create a compact 3-7 item list whenever no usable tracking state exists; when L2 does not require Todos, do not invent a recovery list. For optional L1 tracking, use the original multi-step/uncertainty test. Items must describe user work rather than recovery machinery.
 3. Enter strict execution mode:
    - execute exactly ONE tool call per round,
    - keep tool arguments complete JSON,
@@ -9746,7 +10891,7 @@ Never publish internal recovery mechanics such as "triage failure", "recover con
 # Fast Decision Rules
 
 1. Missing context -> `context_recall mode="summary"`, then `mode="search"` or `mode="window"` for focused evidence.
-2. No todo plan -> continue without todos unless the original user task is genuinely multi-step and needs durable tracking; never create todos solely because recovery was triggered.
+2. No todo plan -> establish/repair a Todo plan only when current runtime `requires_todos=true`; L3+ is required and L2 follows its configured force|auto|off decision. Effective L1 may continue without todos unless optional tracking is enabled. Never create recovery todos solely because recovery was triggered.
 3. Repeated tool failure -> one-tool strict retry with smaller chunk.
 4. Still failing -> explicit blocker, stop loop.
 """
@@ -13051,9 +14196,9 @@ _BUILTIN_SKILLS: dict[str, dict] = {
         "body": (
             "# Task Management Guide\n"
             "- For level 1 tasks: skip todo scaffolding and give the direct response, UNLESS an approved plan step is active.\n"
-            "- For level 2 tasks: decide semantically whether todos will improve execution. Create a compact TodoWrite plan only when the request has enough moving parts, uncertainty, state tracking, or verification burden that todos would reduce mistakes; skip todos when the work can be completed cleanly in one coherent pass. Do not rely on fixed task-type or keyword lists.\n"
+            "- For level 2 tasks: follow the runtime-injected L2 Todo policy and requires_todos decision. When true, maintain a compact TodoWrite/TodoWriteRescue list with exactly one item in_progress; when false, do not create Todo scaffolding solely because the task is L2.\n"
             "- When an approved plan step is active, ALWAYS maintain step-local TodoWrite subtasks scoped to the active parent_step_id. Execute one subtask at a time and update status after each real change.\n"
-            "- For level 3+ tasks: call TodoWrite early with 3-7 concise items, one marked in_progress.\n"
+            "- For level 3+ tasks: the approved Plan is the parent roadmap; TodoWrite contains only the active parent step's rolling subtasks.\n"
             "- Update todos only when plan or status actually changes. Avoid redundant calls.\n"
             "- If TodoWrite fails or repeats unchanged, use TodoWriteRescue with simple string items.\n"
             "- Use task_create/task_update/task_list for multi-step structured work.\n"
@@ -14583,9 +15728,10 @@ class TaskManager:
             return tasks
 
 class BackgroundManager:
-    def __init__(self, workdir: Path, command_wrapper=None):
+    def __init__(self, workdir: Path, command_wrapper=None, env_wrapper=None):
         self.workdir = workdir
         self.command_wrapper = command_wrapper
+        self.env_wrapper = env_wrapper
         self.tasks: dict[str, dict] = {}
         self.notifications: queue.Queue = queue.Queue()
         self.lock = threading.Lock()
@@ -14620,6 +15766,7 @@ class BackgroundManager:
                 capture_output=True,
                 text=True,
                 timeout=timeout,
+                env=(self.env_wrapper() if callable(self.env_wrapper) else None),
             )
             output = trim((r.stdout + r.stderr).strip())
             exit_code = int(r.returncode)
@@ -16237,7 +17384,7 @@ class OllamaClient:
         if "embed_model" in profile:
             self.embed_model = str(profile.get("embed_model") or "").strip()
 
-    def embed(self, *, model: str, input: "str | list") -> dict:
+    def embed(self, *, model: str, input: str | list) -> dict:
         """Get embedding vector(s) from the model.
 
         Returns {"embeddings": [[float, ...]]} regardless of backend.
@@ -16329,7 +17476,7 @@ class OllamaClient:
                 url=url,
                 retry_after=self._parse_retry_after_seconds(hdrs, text),
             ) from exc
-        except (URLError, TimeoutError, socket.timeout, ConnectionResetError, ConnectionAbortedError) as exc:
+        except (URLError, TimeoutError, ConnectionResetError, ConnectionAbortedError) as exc:
             raise OllamaError(f"Connection error: {exc}", url=url) from exc
 
     def _post_json_url_with_retries(
@@ -16435,7 +17582,7 @@ class OllamaClient:
                 url=url,
                 retry_after=self._parse_retry_after_seconds(hdrs, text),
             ) from exc
-        except (URLError, TimeoutError, socket.timeout, ConnectionResetError, ConnectionAbortedError) as exc:
+        except (URLError, TimeoutError, ConnectionResetError, ConnectionAbortedError) as exc:
             raise OllamaError(f"Connection error: {exc}", url=url) from exc
 
     def _iter_response_lines_url_with_retries(
@@ -16529,7 +17676,7 @@ class OllamaClient:
                 url=url,
                 retry_after=self._parse_retry_after_seconds(hdrs, text),
             ) from exc
-        except (URLError, TimeoutError, socket.timeout, ConnectionResetError, ConnectionAbortedError) as exc:
+        except (URLError, TimeoutError, ConnectionResetError, ConnectionAbortedError) as exc:
             raise OllamaError(f"Connection error: {exc}", url=url) from exc
 
     def _download_bytes(self, url: str, timeout: int | None = None) -> tuple[bytes, str]:
@@ -16549,7 +17696,7 @@ class OllamaClient:
                 url=url,
                 retry_after=self._parse_retry_after_seconds(hdrs, text),
             ) from exc
-        except (URLError, TimeoutError, socket.timeout, ConnectionResetError, ConnectionAbortedError) as exc:
+        except (URLError, TimeoutError, ConnectionResetError, ConnectionAbortedError) as exc:
             raise OllamaError(f"Connection error: {exc}", url=url) from exc
 
     def _normalize_tool_calls(self, tool_calls: list) -> list[dict]:
@@ -18216,31 +19363,104 @@ TOOLS = [
         ),
         {
             "items": {"type": "array", "items": {}},
+            # Provider-compatible aliases. Runtime validation intentionally
+            # treats these as equivalent to `items` so a compact/resume model
+            # does not get trapped by the historical required-key spelling.
+            "todos": {"type": "array", "items": {}},
+            "todo_items": {"type": "array", "items": {}},
+            "subtasks": {"type": "array", "items": {}},
+            "rows": {"type": "array", "items": {}},
+            "updates": {"type": "array", "items": {}},
+            "tasks": {"type": "array", "items": {}},
+            "data": {},
+            "content": {"type": "string"},
+            "text": {"type": "string"},
+            "title": {"type": "string"},
+            "task": {"type": "string"},
+            "description": {"type": "string"},
+            "label": {"type": "string"},
+            "resume": {"type": "boolean"},
+            "continue": {"type": "boolean"},
+            "resume_existing": {"type": "boolean"},
+            "in_progress_index": {"type": "integer"},
             "update_mode": {
                 "type": "string",
                 "enum": ["status_update", "revise_open", "rework_completed"],
                 "description": "status_update changes statuses only; revise_open replaces the current open-subtask snapshot after evidence audit; rework_completed requires failure/reviewer evidence.",
             },
             "revision_reason": {"type": "string", "description": "Concrete new finding that justifies a structural rolling-plan revision."},
-            "revision_evidence": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Exact current-step evidence references such as event id, tool+path/command, error excerpt, or reviewer finding.",
-            },
+            "revision_evidence": {},
+            "evidence": {},
         },
-        ["items"],
+        [],
     ),
     tool_def(
         "TodoWriteRescue",
         "Fallback todo writer. Preferred format: objects with content/status/owner/parent_step_id. String fallback should use only '[ ] task', '[>] task', or '[x] task'.",
         {
             "items": {"type": "array", "items": {}},
+            "todos": {"type": "array", "items": {}},
+            "todo_items": {"type": "array", "items": {}},
+            "subtasks": {"type": "array", "items": {}},
+            "rows": {"type": "array", "items": {}},
+            "updates": {"type": "array", "items": {}},
+            "tasks": {"type": "array", "items": {}},
+            "data": {},
+            "content": {"type": "string"},
+            "text": {"type": "string"},
+            "title": {"type": "string"},
+            "task": {"type": "string"},
+            "description": {"type": "string"},
+            "label": {"type": "string"},
+            "resume": {"type": "boolean"},
+            "continue": {"type": "boolean"},
+            "resume_existing": {"type": "boolean"},
             "in_progress_index": {"type": "integer"},
             "update_mode": {"type": "string", "enum": ["status_update", "revise_open", "rework_completed"]},
             "revision_reason": {"type": "string"},
+            "revision_evidence": {},
+            "evidence": {},
+        },
+        [],
+    ),
+    tool_def(
+        "TodoWriteResume",
+        (
+            "Resume and reconcile the existing todo graph after compaction, a handoff, or a partial tool call. "
+            "This is an alias of TodoWrite with elastic item/status recognition; it preserves completed rows and "
+            "updates only the active owner/current plan step. Items may be supplied as items, todos, todo_items, "
+            "subtasks, rows, or a structured text payload."
+        ),
+        {
+            "items": {"type": "array", "items": {}},
+            "todos": {"type": "array", "items": {}},
+            "todo_items": {"type": "array", "items": {}},
+            "subtasks": {"type": "array", "items": {}},
+            "rows": {"type": "array", "items": {}},
+            "updates": {"type": "array", "items": {}},
+            "tasks": {"type": "array", "items": {}},
+            "data": {},
+            "content": {"type": "string"},
+            "text": {"type": "string"},
+            "title": {"type": "string"},
+            "task": {"type": "string"},
+            "description": {"type": "string"},
+            "label": {"type": "string"},
+            "resume": {"type": "boolean"},
+            "continue": {"type": "boolean"},
+            "resume_existing": {"type": "boolean"},
+            "in_progress_index": {"type": "integer"},
+            "update_mode": {"type": "string"},
+            "mode": {"type": "string"},
+            "operation": {"type": "string"},
+            "reason": {"type": "string"},
+            # Keep this unconstrained: providers differ in whether they accept
+            # `oneOf`, while the runtime already normalizes strings and arrays.
+            "evidence": {},
+            "revision_reason": {"type": "string"},
             "revision_evidence": {"type": "array", "items": {"type": "string"}},
         },
-        ["items"],
+        [],
     ),
     tool_def(
         "finish_task",
@@ -18608,22 +19828,51 @@ for _alias, _target in {
     "finishcurrenttask": "finish_current_task",
     "finishtask": "finish_task",
     "markdone": "mark_done",
+    # Todo protocol aliases seen in older providers and compact-resume traces.
+    # They intentionally collapse to the same canonical dispatcher so a resume
+    # call cannot create a second, disconnected todo graph.
+    "todowrite": "TodoWrite",
+    "todowriteresume": "TodoWrite",
+    "todowriteresumeexisting": "TodoWrite",
+    "todoresume": "TodoWrite",
+    "resumetodos": "TodoWrite",
 }.items():
-    if _target in TOOL_SPEC_BY_NAME:
-        TOOL_NAME_FUZZY_MAP[_alias] = _target
+    TOOL_NAME_FUZZY_MAP[_alias] = _target
+
+
+def is_todo_resume_tool_name(raw: object) -> bool:
+    """Return whether a provider tool name carries resume semantics.
+
+    Resume aliases intentionally share TodoWrite's canonical state machine, but
+    the alias itself still conveys an operation when no payload is present.
+    Keeping this tiny bit of provenance avoids losing that meaning during
+    canonicalization.
+    """
+    key = re.sub(r"[^a-z0-9]+", "", str(raw or "").strip().lower())
+    return key in {
+        "todowriteresume",
+        "todowriteresumeexisting",
+        "todoresume",
+        "resumetodos",
+    }
 
 
 def canonicalize_tool_name(raw: object) -> str:
     name = str(raw or "").strip()
     if not name:
         return ""
+    lowered = name.lower()
+    key = re.sub(r"[^a-z0-9]+", "", lowered)
+    # Check aliases before the exact-name path.  ``TodoWriteResume`` is exposed
+    # as a compatibility schema, but must execute through TodoWrite's canonical
+    # reconciliation logic rather than a separate state writer.
+    mapped = TOOL_NAME_FUZZY_MAP.get(key, "") if key else ""
+    if mapped:
+        return mapped
     if name in TOOL_SPEC_BY_NAME:
         return name
-    lowered = name.lower()
     if lowered in TOOL_SPEC_BY_NAME:
         return lowered
-    key = re.sub(r"[^a-z0-9]+", "", lowered)
-    mapped = TOOL_NAME_FUZZY_MAP.get(key, "") if key else ""
     return mapped or name
 
 
@@ -18742,6 +19991,7 @@ class SessionState:
         max_run_seconds: int = MAX_RUN_SECONDS,
         shell_command_timeout_seconds: int = DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
         auto_task_level_ceiling: int = DEFAULT_AUTO_TASK_LEVEL_CEILING,
+        l2_todo_policy: str | None = None,
         auto_model_switch: bool = False,
         arbiter_enabled: bool = True,
         arbiter_model: str = "",
@@ -18843,12 +20093,25 @@ class SessionState:
         # carried alongside it in thread-local state for the orchestrator.
         self._tool_result_local = threading.local()
         self.single_advance_prompt_enhance = False
+        cfg_single_todo_enabled, cfg_single_todo_prompt = extract_single_no_plan_todo_settings(
+            default_llm_config or {}
+        )
+        self.single_no_plan_todo_enabled = bool(cfg_single_todo_enabled)
+        self.single_no_plan_todo_prompt = str(cfg_single_todo_prompt or "").strip()
+        self.single_no_plan_todo_bootstrap_state = "idle"
+        self.single_no_plan_todo_bootstrap_attempts = 0
+        self.single_no_plan_todo_perception_seen = False
+        self.single_no_plan_todo_bootstrap_write_seen = False
         self.skills = SkillStore(skills_root)
         self.skill_load_cache: dict[str, dict] = {}
         self.skills_last_refresh_ts = 0.0
         self.skills_runtime_prepared = False
         self.tasks = TaskManager(self.root / "tasks", crypto)
-        self.bg = BackgroundManager(self.files_root, command_wrapper=self._hard_snapshot_shell_prefix)
+        self.bg = BackgroundManager(
+            self.files_root,
+            command_wrapper=self._hard_snapshot_shell_prefix,
+            env_wrapper=self._shell_process_env,
+        )
         self.bus = MessageBus(self.root / "team" / "inbox", crypto)
         self.worktrees = WorktreeManager(self.id, self.tasks, self.root, crypto, repo_root)
         # External MCP (Model Context Protocol) tool driver. Prefer the shared
@@ -18932,6 +20195,11 @@ class SessionState:
         self.runtime_task_level_floor = 0
         self.runtime_task_level_ceiling = 0  # 0 = no ceiling; set from plan risk on approval
         self.auto_task_level_ceiling = normalize_auto_task_level_ceiling(auto_task_level_ceiling)
+        cfg_l2_todo_policy = extract_l2_todo_policy_setting(default_llm_config or {})
+        self.l2_todo_policy = normalize_l2_todo_policy(
+            l2_todo_policy if l2_todo_policy is not None else (cfg_l2_todo_policy or DEFAULT_L2_TODO_POLICY)
+        )
+        self.runtime_requires_todos: bool | None = None
         self._todowrite_step_counter: dict[str, int] = {}  # Fix 5: track consecutive TodoWrite per step for loop detection
         self.runtime_scale_preference = "balanced"
         self.runtime_direct_objective = ""
@@ -20270,7 +21538,10 @@ class SessionState:
                 active = raw.get("active_profile_id")
                 if isinstance(active, str) and active.strip():
                     self.active_profile_id = self._sanitize_profile_id(active)
-                self.todo.items = raw.get("todos", [])
+                self.todo.items = self._normalize_loaded_todo_rows(
+                    raw.get("todos", []),
+                    self.messages,
+                )
                 self.thinking = False
                 # context_token_upper_bound is a runtime probe, not config — do not restore from disk.
                 # It will be reset to max after load (see below). Only exception: context_limit_locked.
@@ -20308,6 +21579,17 @@ class SessionState:
                         "auto_task_level_ceiling",
                         getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING),
                     )
+                )
+                if "l2_todo_policy" in raw:
+                    self.l2_todo_policy = normalize_l2_todo_policy(
+                        raw.get("l2_todo_policy"),
+                        default=getattr(self, "l2_todo_policy", DEFAULT_L2_TODO_POLICY),
+                    )
+                raw_requires_todos = raw.get("runtime_requires_todos", None)
+                self.runtime_requires_todos = (
+                    _to_bool_like(raw_requires_todos, default=False)
+                    if raw_requires_todos is not None
+                    else None
                 )
                 self.context_last_compact_before = (
                     dict(raw.get("context_last_compact_before", {}) or {})
@@ -20645,6 +21927,34 @@ class SessionState:
                 raw_proposal = raw.get("runtime_plan_proposal", {})
                 self.runtime_plan_proposal = dict(raw_proposal) if isinstance(raw_proposal, dict) else {}
                 self.runtime_plan_choice = str(raw.get("runtime_plan_choice", "") or "")
+                raw_bootstrap_state = str(
+                    raw.get(
+                        "single_no_plan_todo_bootstrap_state",
+                        getattr(self, "single_no_plan_todo_bootstrap_state", "idle"),
+                    )
+                    or "idle"
+                ).strip().lower()
+                self.single_no_plan_todo_bootstrap_state = (
+                    raw_bootstrap_state
+                    if raw_bootstrap_state in {"idle", "waiting", "completed", "skipped", "blocked"}
+                    else "idle"
+                )
+                try:
+                    self.single_no_plan_todo_bootstrap_attempts = max(
+                        0,
+                        min(
+                            SINGLE_NO_PLAN_TODO_BOOTSTRAP_MAX_ATTEMPTS,
+                            int(raw.get("single_no_plan_todo_bootstrap_attempts", 0) or 0),
+                        ),
+                    )
+                except Exception:
+                    self.single_no_plan_todo_bootstrap_attempts = 0
+                self.single_no_plan_todo_perception_seen = bool(
+                    raw.get("single_no_plan_todo_perception_seen", False)
+                )
+                self.single_no_plan_todo_bootstrap_write_seen = bool(
+                    raw.get("single_no_plan_todo_bootstrap_write_seen", False)
+                )
                 self.active_agent_role = str(raw.get("active_agent_role", self.active_agent_role) or "").strip().lower()
                 raw_contexts = raw.get("contexts", {})
                 if isinstance(raw_contexts, dict):
@@ -20876,6 +22186,14 @@ class SessionState:
             "auto_task_level_ceiling": normalize_auto_task_level_ceiling(
                 getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
             ),
+            "l2_todo_policy": normalize_l2_todo_policy(
+                getattr(self, "l2_todo_policy", DEFAULT_L2_TODO_POLICY)
+            ),
+            "runtime_requires_todos": (
+                bool(self.runtime_requires_todos)
+                if isinstance(getattr(self, "runtime_requires_todos", None), bool)
+                else None
+            ),
             "runtime_goal_reset_pending": bool(self.runtime_goal_reset_pending),
             "runtime_goal_reset_ts": float(getattr(self, "runtime_goal_reset_ts", 0.0) or 0.0),
             "runtime_goal_reset_handled_ts": float(getattr(self, "runtime_goal_reset_handled_ts", 0.0) or 0.0),
@@ -20884,6 +22202,25 @@ class SessionState:
             "runtime_plan_approved": bool(self.runtime_plan_approved),
             "runtime_plan_proposal": dict(self.runtime_plan_proposal) if self.runtime_plan_proposal else {},
             "runtime_plan_choice": str(self.runtime_plan_choice or ""),
+            "single_no_plan_todo_enabled": bool(
+                getattr(self, "single_no_plan_todo_enabled", False)
+            ),
+            "single_no_plan_todo_prompt": trim(
+                str(getattr(self, "single_no_plan_todo_prompt", "") or ""),
+                6000,
+            ),
+            "single_no_plan_todo_bootstrap_state": str(
+                getattr(self, "single_no_plan_todo_bootstrap_state", "idle") or "idle"
+            ),
+            "single_no_plan_todo_bootstrap_attempts": int(
+                getattr(self, "single_no_plan_todo_bootstrap_attempts", 0) or 0
+            ),
+            "single_no_plan_todo_perception_seen": bool(
+                getattr(self, "single_no_plan_todo_perception_seen", False)
+            ),
+            "single_no_plan_todo_bootstrap_write_seen": bool(
+                getattr(self, "single_no_plan_todo_bootstrap_write_seen", False)
+            ),
             "active_agent_role": str(self.active_agent_role or ""),
             "contexts": {role: list(self.contexts.get(role, []))[-400:] for role in AGENT_ROLES},
             "manager_context": list(self.manager_context)[-400:],
@@ -21078,6 +22415,7 @@ class SessionState:
         self.runtime_assigned_expert = ""
         self.runtime_participants = []
         self.runtime_round_budget = 0
+        self.runtime_requires_todos = None
         self.runtime_requires_confirmation = False
         self.runtime_confirmation_needed = False
         self.runtime_task_judgement = ""
@@ -21091,6 +22429,10 @@ class SessionState:
         self.runtime_goal_reset_ts = 0.0
         self.runtime_goal_reset_handled_ts = 0.0
         self.runtime_plan_mode_needed = False
+        self.single_no_plan_todo_bootstrap_state = "idle"
+        self.single_no_plan_todo_bootstrap_attempts = 0
+        self.single_no_plan_todo_perception_seen = False
+        self.single_no_plan_todo_bootstrap_write_seen = False
         self.runtime_code_reference_text = ""
         self.runtime_code_reference_meta = {}
         self.runtime_knowledge_reference_text = ""
@@ -21113,10 +22455,6 @@ class SessionState:
             return
         self.runtime_task_level = int(level)
         self._prev_applied_task_level = int(level)
-        self.runtime_execution_mode = normalize_execution_mode(
-            profile.get("execution_mode", judgement.get("execution_mode", self.execution_mode or EXECUTION_MODE_SYNC)),
-            default=EXECUTION_MODE_SYNC,
-        )
         assigned = self._sanitize_agent_role(
             str(
                 profile.get(
@@ -21136,8 +22474,15 @@ class SessionState:
                 role = self._sanitize_agent_role(item)
                 if role and role not in participants:
                     participants.append(role)
-        self.runtime_assigned_expert = assigned
-        self.runtime_participants = participants or [assigned]
+        restored_mode, restored_participants, restored_assigned = self._resolve_level_assignment(
+            level,
+            assigned=assigned,
+            participants=participants,
+            mode=str(profile.get("execution_mode", judgement.get("execution_mode", "")) or ""),
+        )
+        self.runtime_execution_mode = restored_mode
+        self.runtime_assigned_expert = restored_assigned
+        self.runtime_participants = restored_participants
         try:
             round_budget = int(profile.get("round_budget", self.runtime_round_budget or 0) or 0)
         except Exception:
@@ -21149,6 +22494,19 @@ class SessionState:
                 remaining = 0
             round_budget = int(remaining)
         self.runtime_round_budget = int(round_budget)
+        raw_requires_todos = profile.get(
+            "requires_todos",
+            judgement.get("requires_todos", None),
+        )
+        self.runtime_requires_todos = self._resolve_todo_requirement(
+            level,
+            raw_requires_todos,
+            raw_provided=(
+                "requires_todos" in profile or "requires_todos" in judgement
+            ),
+            allow_context=False,
+            fallback=True,
+        )
         self.runtime_requires_confirmation = bool(
             profile.get("requires_user_confirmation", self.runtime_requires_confirmation)
         )
@@ -21288,6 +22646,24 @@ class SessionState:
             or completion.get("state") in {"finalizing", "completed"}
         )
 
+    def _blackboard_is_terminal_completion(self, board: dict | None = None) -> bool:
+        """Return only a durable run terminal state.
+
+        ``approval=True`` and ``status=COMPLETED`` are also used as a
+        provisional approval marker before the finish gate has accepted the
+        request.  The sync loop must continue through that provisional state so
+        it can collect missing review evidence and finalize normally.
+        """
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        raw_status = str(bb.get("status", "") or "").strip().upper()
+        status = self._normalize_blackboard_status(bb.get("status", "INITIALIZING"))
+        completion = self._normalize_completion_state(bb.get("completion", {}))
+        return bool(
+            raw_status == "ABORTED"
+            or status == "ABORTED"
+            or completion.get("state") in {"finalizing", "completed"}
+        )
+
     def _has_resumable_work_state(self, board: dict | None = None) -> bool:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         if self._blackboard_is_finished_or_aborted(bb):
@@ -21370,6 +22746,7 @@ class SessionState:
                 "task_type": str(bb["task_profile"].get("task_type", "general")),
                 "complexity": str(bb["task_profile"].get("complexity", "simple")),
                 "scale_preference": str(bb["task_profile"].get("scale_preference", "balanced") or "balanced"),
+                "requires_todos": bool(bb["task_profile"].get("requires_todos", False)),
                 "progress": "initializing",
                 "remaining_rounds": int(bb["task_profile"].get("round_budget", 1) or 1),
                 "task_level": int(bb["task_profile"].get("task_level", 1) or 1),
@@ -22829,6 +24206,41 @@ class SessionState:
     def _helper_system_prompt(self, system: str = "") -> str:
         return self._inject_runtime_environment_context(system)
 
+    def _todo_contract_prompt_block(self) -> str:
+        """Build the level-driven Todo contract injected into agent prompts."""
+        level = self._runtime_task_level_for_todo_policy()
+        if level != 2 or not self._runtime_level_requires_todos():
+            return ""
+        l2_policy = normalize_l2_todo_policy(
+            getattr(self, "l2_todo_policy", DEFAULT_L2_TODO_POLICY)
+        )
+        contract_label = (
+            "MANDATORY L2 TODO CONTRACT"
+            if l2_policy == "force"
+            else "L2 TODO CONTRACT (semantic classifier decided Todo tracking is required)"
+        )
+        plan_active = bool(
+            getattr(self, "runtime_plan_mode_needed", False)
+            or getattr(self, "runtime_plan_approved", False)
+        )
+        if plan_active:
+            return (
+                f"{contract_label}: this run is level 2, so progress must be "
+                "represented by Todo rows. Because a plan is active, use the existing "
+                "plan/runtime step-local Todo graph and preserve its parent scope; do "
+                "not create a second flat graph. Keep exactly one current item "
+                "in_progress and update it after each real status change."
+            )
+        return (
+            f"{contract_label}: this run is level 2 and must have a compact, "
+            "evidence-based Todo list even when the startup single/no-plan Todo option "
+            "is disabled. First perform a short read-only perception pass, then call "
+            "TodoWrite or TodoWriteRescue before any mutation. Create 3-7 realistic "
+            "next actions with exactly one item in_progress; update the same list after "
+            "each real status change. Do not write files or claim completion while the "
+            "required Todo list is absent."
+        )
+
     def _system_prompt(self) -> str:
         try:
             self._ensure_skills_ready(force=False)
@@ -22887,6 +24299,8 @@ class SessionState:
             plan_steps_block = f"{plan_ctx}\n"
         plan_todo_note = self._plan_todo_discipline_prompt(role="developer")
         plan_todo_block = f"{plan_todo_note}\n" if plan_todo_note else ""
+        todo_contract_note = self._todo_contract_prompt_block()
+        todo_contract_block = f"{todo_contract_note}\n\n" if todo_contract_note else ""
         mm_block = self._multimodal_capability_block()
         mm_hint = f"{mm_block}\n" if mm_block else ""
         runtime_env_text = self._runtime_environment_context_prompt_block() + "\n\n"
@@ -22921,6 +24335,7 @@ class SessionState:
             f"{mm_hint}"
             f"{plan_steps_block}"
             f"{plan_todo_block}"
+            f"{todo_contract_block}"
             f"{html_block}"
             f"{research_block}"
             f"{knowledge_block}"
@@ -25444,18 +26859,40 @@ class SessionState:
             "compiled successfully", "syntax ok", "验收通过", "驗收通過", "验证通过",
             "驗證通過", "审核通过", "審核通過", "全部通过", "全部通過",
         )
-        hard_errors = (
-            "traceback", "syntax error", "fatal error", "build failed",
-            "test failed", "assertionerror", "error:", "failed:", "exception:",
+        explicit_failed_assertion = bool(
+            re.search(
+                r"(?im)^\s*(?:all\s+(?:checks?\s+)?passed|全部通过|全部通過)\s*[:=：]\s*(?:false|no|0)\b",
+                raw,
+            )
+            or re.search(r"(?im)^\s*(?:success|passed|pass|ok)\s*[:=：]\s*false\b", raw)
+            or re.search(r"(?im)^\s*(?:[-*]\s*)?(?:fail|failed)\s*[.!]?\s*$", raw)
+            or re.search(r"(?m)^\s*[❌✗✘]", raw)
+            or re.search(
+                r"(?im)^\s*(?:[-*]\s*)?(?:[\w./@+ -]+\s*[:：]\s*)?"
+                r"(?:missing|not found|absent|不存在|缺失|未找到|未创建|未建立)\s*$",
+                raw,
+            )
         )
+        hard_errors = (
+            "traceback", "syntax error", "syntaxerror:", "fatal error", "build failed",
+            "test failed", "assertionerror", "referenceerror:", "typeerror:",
+            "valueerror:", "runtimeerror:", "modulenotfounderror:", "importerror:",
+            "nameerror:", "filenotfounderror:", "error:", "failed:", "exception:",
+            "command not found", "cannot find module", "no such file or directory",
+        )
+        if explicit_failed_assertion:
+            return True
         if (explicit_zero_exit or any(token in low for token in benign)) and not any(
             token in low
             for token in hard_errors
         ):
             return False
         markers = (
-            "traceback", "exception", "syntax error", "fatal error", "build failed",
-            "test failed", "assertionerror", "error:", "failed:",
+            "traceback", "exception", "syntax error", "syntaxerror:", "fatal error", "build failed",
+            "test failed", "assertionerror", "referenceerror:", "typeerror:", "valueerror:",
+            "runtimeerror:", "modulenotfounderror:", "importerror:", "nameerror:",
+            "filenotfounderror:", "error:", "failed:", "command not found",
+            "cannot find module", "no such file or directory",
         )
         return explicit_nonzero_exit or any(marker in low for marker in markers)
 
@@ -27962,6 +29399,40 @@ class SessionState:
             return safe_path(rel or ".", self.file_buffer_dir)
         return safe_path(normalized, self.files_root)
 
+    def _remote_agent_file_scope_error(self, path_text: object, action: str = "access") -> str:
+        if not bool(getattr(self, "ide_remote_sandbox_required", False)):
+            return ""
+        raw = str(path_text or "").strip().strip("'\"").replace("\\", "/").lower()
+        if (
+            raw in {"file_buffer", "file_buffer/", "/file_buffer", "/file_buffer/"}
+            or raw.startswith("file_buffer/")
+            or raw.startswith("/file_buffer/")
+            or raw.startswith("file_buffer:")
+            or raw.startswith("[file_buffer:")
+        ):
+            return (
+                f"Error: remote Program Agent {action} is limited to the isolated session workspace. "
+                "Global skills, packaged libraries, and runtime file buffers are outside that workspace."
+            )
+        try:
+            normalized = self._normalize_tool_path_text(path_text)
+        except Exception as exc:
+            return f"Error: {type(exc).__name__}: {exc}"
+        external_virtual_roots = (".__skills__", ".__js_lib__", ".__file_buffer__")
+        if any(normalized == root or normalized.startswith(root + "/") for root in external_virtual_roots):
+            return (
+                f"Error: remote Program Agent {action} is limited to the isolated session workspace. "
+                "Global skills, packaged libraries, and runtime file buffers are outside that workspace."
+            )
+        try:
+            target = safe_path(normalized, self.files_root).resolve()
+            workspace_root = self.files_root.resolve()
+            if target == workspace_root or target.is_relative_to(workspace_root):
+                return ""
+        except Exception as exc:
+            return f"Error: {type(exc).__name__}: {exc}"
+        return f"Error: remote Program Agent {action} is limited to the isolated session workspace."
+
     def _session_rel(self, path: Path) -> str:
         target = path.resolve()
         root = self.files_root.resolve()
@@ -28030,6 +29501,40 @@ class SessionState:
             or "runtime-managed file" in low
             or "illegal absolute path" in low
         )
+
+    def _is_non_product_acceptance_error_record(self, record: dict | None) -> bool:
+        """Return whether a failed observation describes orchestration, not the artifact.
+
+        Sync read-only roles can accidentally request a mutating shell command,
+        and Todo/plan control tools can reject an update.  Those failures are
+        useful coordination feedback, but they are not a newer observation of
+        the product under acceptance and therefore must not invalidate an
+        already decisive PASS.  This classifier is deliberately task-agnostic;
+        it recognizes runtime-owned policy/permission failures, never a
+        particular framework, artifact, or visual assertion.
+        """
+        if not isinstance(record, dict):
+            return False
+        if bool(record.get("control_feedback", False)) or str(
+            record.get("error_kind", "") or ""
+        ).strip().lower() == "plan_control_gate":
+            return True
+        tool = canonicalize_tool_name(record.get("tool", record.get("name", "")))
+        command = str(record.get("command", "") or "")
+        summary = str(
+            record.get("summary", record.get("output", record.get("content", "")))
+            or ""
+        )
+        if self._is_plan_infrastructure_tool_error(tool, {"command": command}, summary):
+            return True
+        low = unicodedata.normalize("NFKC", summary).lower()
+        role_policy_markers = (
+            "shell mutation is not allowed for read-only agent role",
+            "is not allowed for agent role",
+            "tool is not allowed for agent role",
+            "read-only agent role",
+        )
+        return any(marker in low for marker in role_policy_markers)
 
     def _code_preview_bucket_dir(self, rel_path: str) -> Path:
         rel = normalize_rel_preview_path(rel_path)
@@ -28300,6 +29805,7 @@ class SessionState:
             "rows": rows,
             "row_count": len(rows),
             "truncated": bool(truncated),
+            "before_text": before_text,
             "full_text": after_text,
         }
 
@@ -28870,7 +30376,7 @@ body{padding:18px}
                                 note_tip = ""
                                 if note_maps:
                                     try:
-                                        note_tip = trim(str(((note_maps.get(ref_kind, {}) or {}).get(note_id, "") or "")).strip(), 240)
+                                        note_tip = trim(str((note_maps.get(ref_kind, {}) or {}).get(note_id, "") or "").strip(), 240)
                                     except Exception:
                                         note_tip = ""
                                 title_attr = f' title="{html.escape(note_tip)}"' if note_tip else ""
@@ -28955,8 +30461,8 @@ body{padding:18px}
         try:
             import docx  # type: ignore
             from docx.document import Document as _DocxDocument  # type: ignore
-            from docx.oxml.text.paragraph import CT_P  # type: ignore
             from docx.oxml.table import CT_Tbl  # type: ignore
+            from docx.oxml.text.paragraph import CT_P  # type: ignore
             from docx.table import Table as _DocxTable  # type: ignore
             from docx.text.paragraph import Paragraph as _DocxParagraph  # type: ignore
 
@@ -29083,7 +30589,7 @@ body{padding:18px}
                 for ref_kind, note_id in ordered_note_refs:
                     if ref_kind != kind:
                         continue
-                    note_text = str(((note_maps.get(kind, {}) or {}).get(note_id, "") or "")).strip()
+                    note_text = str((note_maps.get(kind, {}) or {}).get(note_id, "") or "").strip()
                     note_body = html.escape(note_text).replace("\n", "<br>") if note_text else "<em>(note content unavailable)</em>"
                     items.append(
                         "<div class=\"pv-doc-note-item\">"
@@ -29575,7 +31081,7 @@ body{padding:18px}
             else:
                 width = max(4.0, min(100.0, (abs(numeric) / max_abs) * 100.0))
                 metric = str(row.get("text", "") or self._preview_value_text(numeric))
-            fill_color = str((((theme or {}).get("colors", {}) or {}).get(accent_keys[idx % len(accent_keys)]) or "#3b82f6"))
+            fill_color = str(((theme or {}).get("colors", {}) or {}).get(accent_keys[idx % len(accent_keys)]) or "#3b82f6")
             bar_rows.append(
                 "<div class=\"pv-slide-bar-row\">"
                 f"<div>{html.escape(str(row.get('label', '') or ''))}</div>"
@@ -33151,6 +34657,8 @@ body{padding:18px}
         default_titles = {
             "web session",
             "session",
+            "program",
+            "ide workspace",
             "web 会话",
             "会话",
             "web 會話",
@@ -33161,10 +34669,12 @@ body{padding:18px}
         if low in default_titles or t in default_titles:
             return True
         if re.fullmatch(
-            r"(web[\s_-]*)?(session|会话|會話|セッション)[\s_-]*\d*",
+            r"(?:(?:web|program|ide)[\s_-]*)?(session|workspace|会话|會話|セッション)[\s_-]*\d*",
             low,
             flags=re.IGNORECASE,
         ):
+            return True
+        if re.fullmatch(r"program\s+\d{1,2}:\d{2}(?::\d{2})?", low, flags=re.IGNORECASE):
             return True
         if t == self.id:
             return True
@@ -34170,15 +35680,102 @@ body{padding:18px}
         except Exception:
             return False
 
+    def _remote_runtime_read_roots(self) -> list[Path]:
+        candidates: list[Path] = []
+        for raw in (getattr(sys, "prefix", ""), getattr(sys, "base_prefix", "")):
+            try:
+                if raw:
+                    candidates.append(Path(raw).resolve())
+            except Exception:
+                continue
+        try:
+            node = shutil.which("node")
+            if node:
+                node_path = Path(node).resolve()
+                candidates.append(node_path.parent.parent if node_path.parent.name == "bin" else node_path.parent)
+        except Exception:
+            pass
+        roots: list[Path] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            try:
+                if not candidate.exists() or not candidate.is_dir():
+                    continue
+                key = str(candidate)
+                if key in seen:
+                    continue
+                seen.add(key)
+                roots.append(candidate)
+            except Exception:
+                continue
+        return roots
+
+    def _remote_process_path(self) -> str:
+        workspace_root = self.files_root.resolve()
+        allowed_roots = [workspace_root, *self._remote_runtime_read_roots()]
+        denied_roots = [
+            Path("/Users"), Path("/Volumes"), Path("/private/tmp"),
+            Path("/tmp"), Path("/var/tmp"), Path("/private/var/folders"),
+        ]
+        entries: list[str] = []
+        seen: set[str] = set()
+        for raw in str(os.environ.get("PATH", "") or "").split(os.pathsep):
+            text = str(raw or "").strip()
+            if not text:
+                continue
+            try:
+                resolved = Path(text).resolve()
+                denied = any(resolved == root or resolved.is_relative_to(root) for root in denied_roots)
+                allowed = any(resolved == root or resolved.is_relative_to(root) for root in allowed_roots)
+                if denied and not allowed:
+                    continue
+                normalized = str(resolved)
+            except Exception:
+                continue
+            if normalized not in seen:
+                seen.add(normalized)
+                entries.append(normalized)
+        for fallback in ("/usr/bin", "/bin", "/usr/sbin", "/sbin"):
+            if fallback not in seen:
+                entries.append(fallback)
+                seen.add(fallback)
+        return os.pathsep.join(entries)
+
+    def _workspace_sandbox_shell_prefix(self) -> list[str]:
+        if os.name != "posix" or sys.platform != "darwin":
+            return []
+        sandbox = shutil.which("sandbox-exec")
+        workspace_root = self.files_root.resolve()
+        if not sandbox or not workspace_root.exists():
+            return []
+        # Seatbelt applies deny rules after the broad system allowance. The
+        # workspace exception is more specific, so remote processes can read
+        # and write only their session files while installed runtimes remain usable.
+        runtime_read_rules = " ".join(
+            f"(subpath {json.dumps(str(root))})" for root in self._remote_runtime_read_roots()
+        )
+        policy = (
+            "(version 1) "
+            "(allow default) "
+            "(deny file-write*) "
+            f"(allow file-write* (subpath {json.dumps(str(workspace_root))}) (subpath \"/dev\")) "
+            "(deny file-read* "
+            "(subpath \"/Users\") (subpath \"/Volumes\") "
+            "(subpath \"/private/tmp\") (subpath \"/tmp\") (subpath \"/var/tmp\") "
+            "(subpath \"/private/var/folders\")) "
+            f"(allow file-read* (subpath {json.dumps(str(workspace_root))}) {runtime_read_rules})"
+        )
+        return [sandbox, "-p", policy]
+
     def _hard_snapshot_shell_prefix(self) -> list[str]:
+        if bool(getattr(self, "ide_remote_sandbox_required", False)):
+            return self._workspace_sandbox_shell_prefix()
         if self.skill_mode != "hard" or os.name != "posix" or sys.platform != "darwin":
             return []
         sandbox = shutil.which("sandbox-exec")
         snapshot_root = self._application_snapshot_root()
         if not sandbox or not snapshot_root.exists():
             return []
-        # Seatbelt enforces the boundary at the syscall layer while allowing
-        # frozen scripts to execute and the rest of the session workspace to mutate.
         policy = (
             "(version 1) "
             "(allow default) "
@@ -34188,6 +35785,32 @@ body{padding:18px}
 
     def _hard_snapshot_shell_supported(self) -> bool:
         return bool(self._hard_snapshot_shell_prefix())
+
+    def _shell_process_env(self) -> dict:
+        if not bool(getattr(self, "ide_remote_sandbox_required", False)):
+            return os.environ.copy()
+        sandbox_tmp = self.files_root / ".clouds_coder" / "tmp"
+        sandbox_tmp.mkdir(parents=True, exist_ok=True)
+        allowed = {
+            "LANG", "LC_ALL", "LC_CTYPE", "TERM", "COLORTERM",
+            "TZ", "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_PATH",
+        }
+        env = {key: value for key, value in os.environ.items() if key in allowed}
+        env.update(
+            {
+                "HOME": str(self.files_root),
+                "PWD": str(self.files_root),
+                "PATH": self._remote_process_path(),
+                "WORKSPACE_ROOT": str(self.files_root),
+                "SESSION_ROOT": str(self.files_root),
+                "SESSION_FILES_ROOT": str(self.files_root),
+                "TMPDIR": str(sandbox_tmp),
+                "TMP": str(sandbox_tmp),
+                "TEMP": str(sandbox_tmp),
+                "CLOUDS_CODER_IDE_SANDBOX": "1",
+            }
+        )
+        return env
 
     def _restore_application_snapshot_permissions(self) -> None:
         if self.skill_mode != "hard":
@@ -34470,13 +36093,14 @@ body{padding:18px}
                 )
 
         try:
-            proc_env = os.environ.copy()
-            proc_env["WORKSPACE_ROOT"] = str(self.root)
-            proc_env["SESSION_ROOT"] = str(self.files_root)
-            proc_env["SESSION_FILES_ROOT"] = str(self.files_root)
-            proc_env["SKILLS_ROOT"] = str(self.skills.skills_root)
-            proc_env["CLOUDS_CODER_ROOT"] = str(self.root)
-            proc_env["JS_LIB_ROOT"] = str(self.js_lib_root)
+            proc_env = self._shell_process_env()
+            if not bool(getattr(self, "ide_remote_sandbox_required", False)):
+                proc_env["WORKSPACE_ROOT"] = str(self.root)
+                proc_env["SESSION_ROOT"] = str(self.files_root)
+                proc_env["SESSION_FILES_ROOT"] = str(self.files_root)
+                proc_env["SKILLS_ROOT"] = str(self.skills.skills_root)
+                proc_env["CLOUDS_CODER_ROOT"] = str(self.root)
+                proc_env["JS_LIB_ROOT"] = str(self.js_lib_root)
             shell_prefix = self._hard_snapshot_shell_prefix()
             popen_command: object = effective_command
             use_shell = True
@@ -35512,7 +37136,7 @@ body{padding:18px}
                 args_error = str(tc.get("args_error", "") or "").strip()
                 raw_args = tc.get("raw_arguments")
                 if args_error:
-                    if name in {"TodoWrite", "TodoWriteRescue"}:
+                    if canonicalize_tool_name(name) in {"TodoWrite", "TodoWriteRescue"}:
                         repaired, repaired_out = self._attempt_malformed_tool_repair(name, raw_args)
                         if repaired:
                             msgs.append({"role": "tool", "tool_call_id": tc["id"], "name": name, "content": trim(repaired_out)})
@@ -35871,6 +37495,12 @@ body{padding:18px}
                     role = self._sanitize_agent_role(item)
                     if role and role not in participants:
                         participants.append(role)
+        execution_mode, participants, assigned_expert = self._resolve_level_assignment(
+            task_level,
+            assigned=assigned_expert,
+            participants=participants,
+            mode=execution_mode,
+        )
         if execution_mode == EXECUTION_MODE_SINGLE:
             participants = [assigned_expert]
         else:
@@ -35911,6 +37541,13 @@ body{padding:18px}
             updated_at = float(src.get("updated_at", base.get("updated_at", now_ts())) or now_ts())
         except Exception:
             updated_at = float(now_ts())
+        requires_todos = self._resolve_todo_requirement(
+            task_level,
+            src.get("requires_todos"),
+            raw_provided="requires_todos" in src,
+            allow_context=False,
+            fallback=True,
+        )
         return {
             "task_type": task_type,
             "complexity": complexity,
@@ -35921,6 +37558,7 @@ body{padding:18px}
             "participants": list(participants),
             "assigned_expert": assigned_expert,
             "requires_user_confirmation": bool(requires_user_confirmation),
+            "requires_todos": bool(requires_todos),
             "scale_preference": scale_preference,
             "round_budget": int(round_budget),
             "reason": reason or trim(str(base.get("reason", "")), 400),
@@ -36101,6 +37739,11 @@ body{padding:18px}
         )
 
     def _execution_log_entry_is_blocking_error(self, row: dict) -> bool:
+        # Role/tool policy failures are orchestration diagnostics, not product
+        # failures. They must not keep the finish gate in a repair loop after a
+        # valid developer-side validation has already been recorded.
+        if self._is_non_product_acceptance_error_record(row):
+            return False
         if (
             str((row or {}).get("assertion_kind", "") or "") == "negative_search_no_match"
             and bool((row or {}).get("assertion_ok", False))
@@ -36286,10 +37929,13 @@ body{padding:18px}
             }
         if reason_key == "sync-review-missing":
             return {
-                "target": "reviewer",
+                # Reviewer is intentionally read-only in normal Sync mode.
+                # Validation that must execute a command belongs to developer;
+                # reviewer can inspect the resulting evidence afterward.
+                "target": "developer",
                 "instruction": (
-                    "Finish is blocked until reviewer validation passes. Read the current artifacts/logs, "
-                    "run or inspect validation evidence, then write review_feedback with pass/fix and evidence."
+                    "Finish is blocked until current validation evidence is recorded. Run or inspect the required "
+                    "validation as the developer, then write review_feedback with pass/fix and concrete evidence."
                 ),
                 "reason": reason_key,
                 "source": "finish-gate",
@@ -36732,6 +38378,10 @@ body{padding:18px}
             "focus_epoch": 0.0,
             "plan_step_id": "",
             "plan_step_index": -1,
+            "plan_subtask_id": "",
+            "plan_subtask_content": "",
+            "baseline_todo_signature": [],
+            "baseline_evidence_ids": [],
         }
 
     def _watchdog_normalize_steps(self, rows: object) -> list[dict]:
@@ -36810,6 +38460,22 @@ body{padding:18px}
         out["focus_epoch"] = float(src.get("focus_epoch", 0.0) or 0.0)
         out["plan_step_id"] = trim(str(src.get("plan_step_id", "") or "").strip(), 80)
         out["plan_step_index"] = int(src.get("plan_step_index")) if src.get("plan_step_index") not in (None, "") else -1
+        out["plan_subtask_id"] = trim(str(src.get("plan_subtask_id", "") or "").strip(), 100)
+        out["plan_subtask_content"] = trim(str(src.get("plan_subtask_content", "") or "").strip(), 500)
+        raw_todo_signature = src.get("baseline_todo_signature", [])
+        if isinstance(raw_todo_signature, list):
+            out["baseline_todo_signature"] = [
+                [trim(str(value or ""), 500) for value in row[:4]]
+                for row in raw_todo_signature[:12]
+                if isinstance(row, (list, tuple))
+            ]
+        raw_evidence_ids = src.get("baseline_evidence_ids", [])
+        if isinstance(raw_evidence_ids, list):
+            out["baseline_evidence_ids"] = [
+                trim(str(value or ""), 100)
+                for value in raw_evidence_ids[-40:]
+                if str(value or "").strip()
+            ]
         out["steps"] = self._watchdog_normalize_steps(src.get("steps", []))
         if out["cursor"] >= len(out["steps"]):
             out["active"] = False
@@ -37068,14 +38734,75 @@ body{padding:18px}
         dq = self._normalize_decomposition_queue_state(board.get("decomposition_queue", {}))
         if bool(dq.get("active", False)):
             return False
-        steps, snapshot, raw_text = self._watchdog_decompose_steps(
-            board,
-            reason,
-            pinned_selection=pinned_selection,
-        )
+        active_plan_step = self._get_active_plan_step(board)
+        current_subtask = self._current_plan_worker_subtask_snapshot(
+            board=board,
+            role="",
+        ) if isinstance(active_plan_step, dict) else {}
+        current_subtask_id = trim(str(current_subtask.get("subtask_id", "") or ""), 100)
+        current_subtask_content = trim(str(current_subtask.get("subtask_content", "") or ""), 500)
+        if isinstance(active_plan_step, dict) and not current_subtask_id:
+            try:
+                self._activate_plan_step_execution(
+                    active_plan_step,
+                    board=board,
+                    owner=self._current_plan_worker_owner(board),
+                    reason="watchdog-current-step-bootstrap",
+                    sync_todos=False,
+                )
+                board = self._ensure_blackboard()
+                active_plan_step = self._get_active_plan_step(board)
+                current_subtask = self._current_plan_worker_subtask_snapshot(board=board, role="")
+                current_subtask_id = trim(str(current_subtask.get("subtask_id", "") or ""), 100)
+                current_subtask_content = trim(str(current_subtask.get("subtask_content", "") or ""), 500)
+            except Exception:
+                current_subtask_id = ""
+        if isinstance(active_plan_step, dict):
+            if not current_subtask_id:
+                # Never fall back to decomposing the whole original objective
+                # while a parent plan step is active. Normal routing can repair
+                # the missing child graph without mutating the roadmap.
+                return False
+            # An approved plan already owns decomposition. Recovery must never
+            # split the original project again; it gets one narrow execution
+            # timeslice for the canonical child that is currently in progress.
+            target = self._sanitize_agent_role(role) or self._current_plan_worker_owner(board)
+            action_type = "validate" if self._is_plan_step_acceptance_subtask(current_subtask_content) else "execute"
+            steps = self._watchdog_normalize_steps([{
+                "step": 1,
+                "target": target,
+                "action_type": action_type,
+                "description": (
+                    "Recover ONLY the canonical current subtask below. Do not decompose the original goal, "
+                    "do not create work for later parent steps, and do not replace the current subplan. "
+                    "Use one focused tool call that either advances this Todo or produces evidence directly matching it.\n"
+                    f"CURRENT SUBTASK: {current_subtask_content}"
+                ),
+            }])
+            snapshot = self._watchdog_snapshot_payload(board, reason, role, step)
+            raw_text = "approved-plan-current-subtask-recovery"
+        else:
+            steps, snapshot, raw_text = self._watchdog_decompose_steps(
+                board,
+                reason,
+                pinned_selection=pinned_selection,
+            )
         if not steps:
             return False
         focus_fields = self._route_focus_fields(board)
+        baseline_rows = self._active_plan_worker_todo_rows(
+            str(focus_fields.get("plan_step_id", "") or ""),
+            role="",
+        ) if focus_fields.get("plan_step_id") else []
+        baseline_signature = [list(row) for row in self._todo_progress_signature(baseline_rows)]
+        baseline_evidence_ids = [
+            str(row.get("id", "") or "")
+            for row in self._plan_step_evidence_records(
+                str(focus_fields.get("plan_step_id", "") or ""),
+                board=board,
+            )
+            if str(row.get("id", "") or "")
+        ] if focus_fields.get("plan_step_id") else []
         dq = {
             "active": True,
             "trigger_reason": trim(str(reason or "").strip(), 200),
@@ -37090,6 +38817,10 @@ body{padding:18px}
             "focus_epoch": focus_fields.get("focus_epoch", 0.0),
             "plan_step_id": focus_fields.get("plan_step_id", ""),
             "plan_step_index": focus_fields.get("plan_step_index", -1),
+            "plan_subtask_id": current_subtask_id,
+            "plan_subtask_content": current_subtask_content,
+            "baseline_todo_signature": baseline_signature,
+            "baseline_evidence_ids": baseline_evidence_ids,
         }
         wd = self._normalize_watchdog_state(board.get("watchdog", {}))
         wd["intent_no_tool_streak"] = 0
@@ -37121,17 +38852,33 @@ body{padding:18px}
         return True
 
     def _watchdog_escalate_to_single_developer(self, board: dict, *, reason: str = ""):
-        """Escalate repeated watchdog stalls by forcing Single+Developer mode."""
+        """Escalate a stall without overwriting the configured collaboration mode."""
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
-        self.runtime_execution_mode = EXECUTION_MODE_SINGLE
-        self.runtime_participants = ["developer"]
+        configured_mode = normalize_execution_mode(
+            getattr(self, "execution_mode", ""),
+            default=self._effective_execution_mode(),
+        )
+        preserve_collaboration = configured_mode in {EXECUTION_MODE_SEQUENTIAL, EXECUTION_MODE_SYNC}
+        if preserve_collaboration:
+            self.runtime_execution_mode = configured_mode
+            participants = [
+                self._sanitize_agent_role(item)
+                for item in (self.runtime_participants or [])
+                if self._sanitize_agent_role(item)
+            ]
+            if "developer" not in participants:
+                participants.insert(0, "developer")
+            self.runtime_participants = participants[:3] or ["developer"]
+        else:
+            self.runtime_execution_mode = EXECUTION_MODE_SINGLE
+            self.runtime_participants = ["developer"]
         self.runtime_assigned_expert = "developer"
         dq = self._normalize_decomposition_queue_state(bb.get("decomposition_queue", {}))
         dq["active"] = False
         bb["decomposition_queue"] = dq
         profile = self._ensure_blackboard_task_profile(bb)
-        profile["execution_mode"] = EXECUTION_MODE_SINGLE
-        profile["participants"] = ["developer"]
+        profile["execution_mode"] = self.runtime_execution_mode
+        profile["participants"] = list(self.runtime_participants)
         profile["assigned_expert"] = "developer"
         bb["task_profile"] = profile
         self.blackboard = bb
@@ -37139,7 +38886,11 @@ body{padding:18px}
         self._blackboard_history(
             "manager",
             trim(
-                f"watchdog escalation: forced Single+Developer (trigger_count={int(bb.get('watchdog', {}).get('trigger_count', 0))}, reason={reason})",
+                (
+                    "watchdog escalation: assigned Developer recovery "
+                    f"without changing configured mode={self.runtime_execution_mode} "
+                    f"(trigger_count={int(bb.get('watchdog', {}).get('trigger_count', 0))}, reason={reason})"
+                ),
                 520,
             ),
         )
@@ -37147,8 +38898,8 @@ body{padding:18px}
             "status",
             {
                 "summary": (
-                    "watchdog escalation: multi-agent stall detected, "
-                    "downgrading to Single+Developer mode"
+                    "watchdog escalation: Developer recovery activated; "
+                    f"configured {self.runtime_execution_mode} mode retained"
                 )
             },
         )
@@ -37183,6 +38934,17 @@ body{padding:18px}
             self.blackboard = bb
             self._blackboard_touch()
             return None
+        bound_subtask_id = trim(str(dq.get("plan_subtask_id", "") or ""), 100)
+        if bound_subtask_id:
+            current_subtask = self._current_plan_worker_subtask_snapshot(board=bb, role="")
+            current_subtask_id = trim(str(current_subtask.get("subtask_id", "") or ""), 100)
+            if current_subtask_id != bound_subtask_id:
+                dq["active"] = False
+                dq["last_error"] = "deactivated stale executor queue after canonical subtask changed"
+                bb["decomposition_queue"] = dq
+                self.blackboard = bb
+                self._blackboard_touch()
+                return None
         steps = list(dq.get("steps", []) or [])
         if not steps:
             return None
@@ -37249,6 +39011,8 @@ body{padding:18px}
             "plan_step_index": active_fields.get("plan_step_index", -1),
             "plan_step_total": active_fields.get("plan_step_total", 0),
             "plan_step_epoch": active_fields.get("plan_step_epoch", 0.0),
+            "plan_subtask_id": bound_subtask_id,
+            "plan_subtask_content": trim(str(dq.get("plan_subtask_content", "") or ""), 500),
         }
         bb["decomposition_queue"] = dq
         self.blackboard = bb
@@ -37274,10 +39038,17 @@ body{padding:18px}
         dq_focus = str(dq.get("focus_id", "") or "")
         if dq_focus and dq_focus != str(active_fields.get("focus_id", "") or ""):
             dq["active"] = False
-            dq["last_error"] = "queue focus changed before worker progress accounting"
+            bound_step_id = trim(str(dq.get("plan_step_id", "") or ""), 80)
+            active_step_id = trim(str(active_fields.get("plan_step_id", "") or ""), 80)
+            progressed = bool(bound_step_id and bound_step_id != active_step_id)
+            dq["last_error"] = (
+                "executor queue closed because its plan step advanced"
+                if progressed
+                else "queue focus changed before worker progress accounting"
+            )
             bb["decomposition_queue"] = dq
             self.blackboard = bb
-            return {"queue_active": False, "step_advanced": False}
+            return {"queue_active": False, "step_advanced": progressed}
         rows = list(dq.get("steps", []) or [])
         cursor = max(0, int(dq.get("cursor", 0) or 0))
         if cursor >= len(rows):
@@ -37297,9 +39068,54 @@ body{padding:18px}
         text = trim(strip_thinking_content(str((step or {}).get("text", "") or "").strip()), 1200)
         tool_results = (step or {}).get("tool_results", []) if isinstance((step or {}).get("tool_results"), list) else []
         has_ok_tool = any(isinstance(row, dict) and bool(row.get("ok", False)) for row in tool_results)
-        success = bool(status == "tools" and has_ok_tool)
-        if (not success) and status == "no-tools" and role_key in {"explorer", "reviewer"} and len(text) >= 120:
-            success = True
+        bound_subtask_id = trim(str(dq.get("plan_subtask_id", "") or ""), 100)
+        success = False
+        stale_subtask = False
+        if bound_subtask_id:
+            bound_step_id = trim(str(dq.get("plan_step_id", "") or ""), 80)
+            plan_step = self._get_plan_step_by_id(bound_step_id, bb)
+            rows_for_step = self._active_plan_worker_todo_rows(bound_step_id, role="") if bound_step_id else []
+            bound_row = next(
+                (
+                    row for row in rows_for_step
+                    if self._stable_plan_worker_subtask_id(bound_step_id, row) == bound_subtask_id
+                ),
+                None,
+            )
+            current_subtask = self._current_plan_worker_subtask_snapshot(board=bb, role="")
+            current_subtask_id = trim(str(current_subtask.get("subtask_id", "") or ""), 100)
+            completed = bool(
+                isinstance(bound_row, dict)
+                and str(bound_row.get("status", "") or "").strip().lower() == "completed"
+            )
+            baseline_ids = {
+                str(value or "") for value in (dq.get("baseline_evidence_ids", []) or [])
+                if str(value or "")
+            }
+            new_bound_records = [
+                record for record in self._plan_step_evidence_records(bound_step_id, board=bb)
+                if str(record.get("id", "") or "") not in baseline_ids
+                and str(record.get("subtask_id", "") or "") == bound_subtask_id
+                and self._plan_evidence_record_passes(record)
+            ] if bound_step_id else []
+            evidence_matched = bool(
+                isinstance(plan_step, dict)
+                and isinstance(bound_row, dict)
+                and new_bound_records
+                and self._plan_subtask_has_accumulated_evidence(
+                    plan_step,
+                    bound_row.get("content", ""),
+                    board=bb,
+                    subtask_id=bound_subtask_id,
+                    since_ts=float(bound_row.get("created_at", 0.0) or bound_row.get("started_at", 0.0) or 0.0),
+                )
+            )
+            success = bool(completed or evidence_matched)
+            stale_subtask = bool(current_subtask_id != bound_subtask_id and not completed)
+        else:
+            success = bool(status == "tools" and has_ok_tool)
+            if (not success) and status == "no-tools" and role_key in {"explorer", "reviewer"} and len(text) >= 120:
+                success = True
         attempts = max(0, int(current.get("attempts", 0) or 0)) + 1
         current["attempts"] = attempts
         current["updated_at"] = float(now_ts())
@@ -37308,15 +39124,29 @@ body{padding:18px}
             dq["cursor"] = cursor + 1
             out["step_advanced"] = True
             dq["last_error"] = ""
+        elif stale_subtask:
+            current["status"] = "stale"
+            dq["active"] = False
+            dq["last_error"] = "executor queue invalidated because canonical subtask changed"
+            out["queue_active"] = False
         elif status in {"no-tools", "tools", "skip"}:
             if attempts >= int(WATCHDOG_STEP_MAX_ATTEMPTS):
-                current["status"] = "skipped"
-                dq["cursor"] = cursor + 1
-                out["step_advanced"] = True
-                dq["last_error"] = trim(
-                    f"step {cursor + 1} skipped after {attempts} attempts ({status})",
-                    300,
-                )
+                if bound_subtask_id:
+                    current["status"] = "failed"
+                    dq["active"] = False
+                    out["queue_active"] = False
+                    dq["last_error"] = trim(
+                        f"current-subtask recovery stopped after {attempts} attempts without matching Todo/evidence progress",
+                        300,
+                    )
+                else:
+                    current["status"] = "skipped"
+                    dq["cursor"] = cursor + 1
+                    out["step_advanced"] = True
+                    dq["last_error"] = trim(
+                        f"step {cursor + 1} skipped after {attempts} attempts ({status})",
+                        300,
+                    )
             else:
                 current["status"] = "retry"
                 dq["last_error"] = trim(
@@ -37347,6 +39177,7 @@ body{padding:18px}
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         wd = self._normalize_watchdog_state(bb.get("watchdog", {}))
         dq = self._normalize_decomposition_queue_state(bb.get("decomposition_queue", {}))
+        queue_was_active = bool(dq.get("active", False))
         status = str((step or {}).get("status", "") or "").strip().lower()
         text = trim(strip_thinking_content(str((step or {}).get("text", "") or "").strip()), 1200)
         wd["last_state_fp"] = self._watchdog_state_fingerprint(bb)
@@ -37381,11 +39212,19 @@ body{padding:18px}
         progress_row = self._watchdog_mark_step_progress(bb, role, step)
         bb = self._ensure_blackboard()
         dq = self._normalize_decomposition_queue_state(bb.get("decomposition_queue", {}))
+        if bool(progress_row.get("step_advanced", False)):
+            wd["intent_no_tool_streak"] = 0
+            wd["repeat_no_tool_streak"] = 0
+            wd["state_unchanged_streak"] = 0
+            wd["trigger_count"] = 0
+            wd["last_trigger_reason"] = ""
+            bb["watchdog"] = wd
+            self.blackboard = bb
         trigger_reason = ""
         _is_single = self._effective_execution_mode() == EXECUTION_MODE_SINGLE
         _intent_th = WATCHDOG_INTENT_NO_TOOL_THRESHOLD_SINGLE if _is_single else WATCHDOG_INTENT_NO_TOOL_THRESHOLD
         _repeat_th = WATCHDOG_REPEAT_NO_TOOL_THRESHOLD_SINGLE if _is_single else WATCHDOG_REPEAT_NO_TOOL_THRESHOLD
-        if not bool(dq.get("active", False)):
+        if not bool(dq.get("active", False)) and not queue_was_active:
             if int(wd.get("intent_no_tool_streak", 0) or 0) >= int(_intent_th):
                 trigger_reason = "intent-without-tool-call"
             elif int(wd.get("repeat_no_tool_streak", 0) or 0) >= int(_repeat_th):
@@ -37415,7 +39254,22 @@ body{padding:18px}
                 self._blackboard_touch()
                 # Failure ledger: record stall event
                 self._ledger_record_stall(trigger_reason, "unresolved")
-                if int(wd["trigger_count"]) >= 2:
+                approved_plan_active = isinstance(self._get_active_plan_step(bb), dict) and (
+                    bool(self.runtime_plan_approved)
+                    or str((bb.get("plan", {}) or {}).get("phase", "") or "").strip().lower() == "executing"
+                )
+                if approved_plan_active:
+                    # Repeated watchdog activation inside an approved plan stays
+                    # scoped to the current child. It must not open a new plan,
+                    # request a whole-tree recovery choice, or pause normal work.
+                    triggered = self._watchdog_activate_decomposition(
+                        bb,
+                        reason=trigger_reason,
+                        role=role,
+                        step=step,
+                        pinned_selection=pinned_selection,
+                    )
+                elif int(wd["trigger_count"]) >= 2:
                     _wd_sev = self._bump_stall_severity("watchdog", STALL_SEVERITY_WEIGHT_WATCHDOG)
                     if _wd_sev >= STALL_SEVERITY_ESCALATION_THRESHOLD:
                         if not self._escalate_stall_to_plan_mode(
@@ -37472,6 +39326,7 @@ body{padding:18px}
         )
         safe_step = step if isinstance(step, dict) else {}
         self._blackboard_update_from_worker_step(role, safe_step)
+        plan_step_advanced = self._post_execution_plan_step_check(queue_args, safe_step)
         board_after = self._ensure_blackboard()
         board_after_fp = self._watchdog_state_fingerprint(board_after)
         wd_event = self._watchdog_process_worker_step(
@@ -37499,6 +39354,7 @@ body{padding:18px}
             "role": role,
             "status": status,
             "wd_event": wd_event,
+            "plan_step_advanced": bool(plan_step_advanced),
             "trigger_reason": trim(str(meta.get("trigger_reason", "") or "").strip(), 120),
             "finish_gate_reason": finish_gate_reason,
         }
@@ -37558,6 +39414,10 @@ body{padding:18px}
             "review_feedback": [],
             "conversation_history": [],
             "plan_worker_todos": {},
+            # Durable completion proof for worker rows.  The event ledger is
+            # intentionally bounded, so this compact index survives compaction
+            # and restart without retaining full tool output.
+            "plan_subtask_evidence_bindings": {},
             "plan_step_evidence": {},
             "plan_step_quality_reviews": {},
             "plan_step_recovery": {},
@@ -37596,12 +39456,15 @@ body{padding:18px}
                 "progress_fp": "",
                 "is_mandatory": False,
                 "ts": 0.0,
+                "plan_subtask_id": "",
+                "plan_subtask_content": "",
             },
             "task_profile": profile,
             "manager_judgement": {
                 "task_type": str(profile.get("task_type", "general")),
                 "complexity": str(profile.get("complexity", "simple")),
                 "scale_preference": str(profile.get("scale_preference", "balanced") or "balanced"),
+                "requires_todos": bool(profile.get("requires_todos", False)),
                 "progress": progress,
                 "remaining_rounds": (
                     -1
@@ -37625,6 +39488,14 @@ body{padding:18px}
                 "repeated_delegations": [],
                 "stall_events": [],
                 "tool_call_fingerprints": [],
+            },
+            "failure_recovery": {
+                "reason": "",
+                "count": 0,
+                "ts": 0.0,
+                "focus_kind": "",
+                "focus_id": "",
+                "focus_epoch": 0.0,
             },
             "checkpoints": [],
             "persisted_manager_routes": [],
@@ -37663,6 +39534,8 @@ body{padding:18px}
                 "plan_step_index": int(raw_delegate.get("plan_step_index")) if raw_delegate.get("plan_step_index") not in (None, "") else -1,
                 "plan_step_total": int(raw_delegate.get("plan_step_total", 0) or 0),
                 "plan_step_epoch": float(raw_delegate.get("plan_step_epoch", 0.0) or 0.0),
+                "plan_subtask_id": trim(str(raw_delegate.get("plan_subtask_id", "") or "").strip(), 100),
+                "plan_subtask_content": trim(str(raw_delegate.get("plan_subtask_content", "") or "").strip(), 500),
             }
         raw_approval = src.get("approval", {})
         if isinstance(raw_approval, dict):
@@ -37706,6 +39579,19 @@ body{padding:18px}
                     .strip()
                     .lower()
                 ),
+                "requires_todos": self._resolve_todo_requirement(
+                    board["task_profile"].get("task_level", 0),
+                    raw_judgement.get(
+                        "requires_todos",
+                        board["task_profile"].get("requires_todos"),
+                    ),
+                    raw_provided=(
+                        "requires_todos" in raw_judgement
+                        or "requires_todos" in board["task_profile"]
+                    ),
+                    allow_context=False,
+                    fallback=True,
+                ),
                 "progress": trim(str(raw_judgement.get("progress", "initializing") or "").strip().lower(), 40),
                 "remaining_rounds": max(
                     -1,
@@ -37733,6 +39619,7 @@ body{padding:18px}
                 "task_type": str(board["task_profile"].get("task_type", "")),
                 "complexity": str(board["task_profile"].get("complexity", "")),
                 "scale_preference": str(board["task_profile"].get("scale_preference", "balanced") or "balanced"),
+                "requires_todos": bool(board["task_profile"].get("requires_todos", False)),
                 "progress": "initializing",
                 "remaining_rounds": (
                     -1
@@ -37831,7 +39718,19 @@ body{padding:18px}
                     }
                     subtask_id = trim(str(row.get("subtask_id", "") or ""), 80)
                     if subtask_id:
-                        clean_row["subtask_id"] = subtask_id
+                        if self._is_canonical_plan_worker_subtask_id(subtask_id, step_id):
+                            clean_row["subtask_id"] = subtask_id
+                        else:
+                            clean_row["external_subtask_id"] = subtask_id
+                    external_subtask_id = trim(
+                        str(row.get("external_subtask_id", "") or "").strip(),
+                        120,
+                    )
+                    if external_subtask_id:
+                        clean_row["external_subtask_id"] = external_subtask_id
+                    row_key = trim(str(row.get("key", "") or "").strip(), 120)
+                    if row_key and not row_key.startswith("bb:"):
+                        clean_row["key"] = row_key
                     clean_rows.append(clean_row)
                 plan_step = next(
                     (
@@ -37867,6 +39766,38 @@ body{padding:18px}
                     clean_evidence[step_id] = rows
             if clean_evidence:
                 board["plan_step_evidence"] = clean_evidence
+        raw_bindings = src.get("plan_subtask_evidence_bindings")
+        if isinstance(raw_bindings, dict):
+            clean_bindings: dict[str, dict[str, dict]] = {}
+            for raw_step_id, raw_step_bindings in list(raw_bindings.items())[:80]:
+                step_id = trim(str(raw_step_id or "").strip(), 40)
+                if not step_id or not isinstance(raw_step_bindings, dict):
+                    continue
+                step_out: dict[str, dict] = {}
+                for raw_subtask_id, raw_binding in list(raw_step_bindings.items())[:40]:
+                    subtask_id = trim(str(raw_subtask_id or "").strip(), 100)
+                    if not subtask_id or not isinstance(raw_binding, dict):
+                        continue
+                    evidence_ids = [
+                        trim(str(value or ""), 80)
+                        for value in (raw_binding.get("evidence_ids", []) if isinstance(raw_binding.get("evidence_ids"), list) else [])[:12]
+                        if str(value or "").strip()
+                    ]
+                    if not evidence_ids:
+                        continue
+                    step_out[subtask_id] = {
+                        "subtask_id": trim(str(raw_binding.get("subtask_id", subtask_id) or subtask_id), 100),
+                        "content_core": trim(str(raw_binding.get("content_core", "") or ""), 500),
+                        "source": trim(str(raw_binding.get("source", "direct") or "direct"), 40),
+                        "actor": trim(str(raw_binding.get("actor", "developer") or "developer"), 40),
+                        "evidence_ids": evidence_ids,
+                        "evidence": trim(str(raw_binding.get("evidence", "") or ""), 300),
+                        "ts": float(raw_binding.get("ts", 0.0) or 0.0),
+                    }
+                if step_out:
+                    clean_bindings[step_id] = step_out
+            if clean_bindings:
+                board["plan_subtask_evidence_bindings"] = clean_bindings
         raw_quality_reviews = src.get("plan_step_quality_reviews")
         if isinstance(raw_quality_reviews, dict):
             clean_quality_reviews: dict[str, list[dict]] = {}
@@ -38063,6 +39994,16 @@ body{padding:18px}
             "stall_events": [],
             "tool_call_fingerprints": [],
         }
+        raw_recovery = src.get("failure_recovery")
+        if isinstance(raw_recovery, dict):
+            board["failure_recovery"] = {
+                "reason": trim(str(raw_recovery.get("reason", "") or ""), 240),
+                "count": max(0, int(raw_recovery.get("count", 0) or 0)),
+                "ts": float(raw_recovery.get("ts", 0.0) or 0.0),
+                "focus_kind": trim(str(raw_recovery.get("focus_kind", "") or ""), 40),
+                "focus_id": trim(str(raw_recovery.get("focus_id", "") or ""), 120),
+                "focus_epoch": float(raw_recovery.get("focus_epoch", 0.0) or 0.0),
+            }
         raw_cp = src.get("checkpoints")
         board["checkpoints"] = list(raw_cp)[-CHECKPOINT_MAX_COUNT:] if isinstance(raw_cp, list) else []
         raw_pmr = src.get("persisted_manager_routes")
@@ -39011,10 +40952,13 @@ body{padding:18px}
         preserved_cursor = old_bb.get("plan_step_cursor", None)
         preserved_total = old_bb.get("plan_step_total", None)
         preserved_worker_todos = old_bb.get("plan_worker_todos", {})
+        preserved_subtask_bindings = old_bb.get("plan_subtask_evidence_bindings", {})
         preserved_step_evidence = old_bb.get("plan_step_evidence", {})
         preserved_quality_reviews = old_bb.get("plan_step_quality_reviews", {})
         preserved_todo_revisions = old_bb.get("plan_todo_revisions", [])
         preserved_step_files = old_bb.get("step_files", {})
+        if not preserve_active_state:
+            self.runtime_requires_todos = None
         self.blackboard = self._new_blackboard(goal)
         if (
             isinstance(preserved_skills, dict)
@@ -39046,6 +40990,8 @@ body{padding:18px}
                 self.blackboard["plan_step_total"] = preserved_total
             if isinstance(preserved_worker_todos, dict):
                 self.blackboard["plan_worker_todos"] = preserved_worker_todos
+            if isinstance(preserved_subtask_bindings, dict):
+                self.blackboard["plan_subtask_evidence_bindings"] = preserved_subtask_bindings
             if isinstance(preserved_step_evidence, dict):
                 self.blackboard["plan_step_evidence"] = preserved_step_evidence
             if isinstance(preserved_quality_reviews, dict):
@@ -39693,6 +41639,77 @@ body{padding:18px}
         outcome_key = re.sub(r"[^a-z0-9_]+", "_", str(outcome or "continue").strip().lower()).strip("_")
         return f"Control[{outcome_key or 'continue'}]: {str(message or '').strip()}"
 
+    def _capture_todo_write_transaction(
+        self,
+        board: dict | None = None,
+        *,
+        active_step_id: str = "",
+    ) -> dict:
+        """Capture the task/step identity that a TodoWrite may commit against.
+
+        TodoWrite can spend a long time in semantic auditing.  The caller must
+        revalidate this snapshot before committing because the run loop may have
+        advanced the plan, completed the task, or accepted a newer user request
+        while that audit was in flight.
+        """
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        current = self._get_active_plan_step(bb)
+        resolved_step_id = trim(
+            str(active_step_id or (current or {}).get("id", "") or "").strip(),
+            40,
+        )
+        try:
+            task_epoch = float(bb.get("task_epoch", 0.0) or 0.0)
+        except Exception:
+            task_epoch = 0.0
+        return {
+            "task_epoch": task_epoch,
+            "plan_step_id": resolved_step_id,
+            "run_generation": int(getattr(self, "run_generation", 0) or 0),
+            "started_at": float(now_ts()),
+        }
+
+    def _todo_write_transaction_is_current(
+        self,
+        transaction: dict | None,
+        *,
+        board: dict | None = None,
+    ) -> tuple[bool, str]:
+        if not isinstance(transaction, dict):
+            return True, ""
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        if self._blackboard_is_terminal_completion(bb):
+            return False, "run already finished or aborted"
+        try:
+            expected_epoch = float(transaction.get("task_epoch", 0.0) or 0.0)
+            actual_epoch = float(bb.get("task_epoch", 0.0) or 0.0)
+        except Exception:
+            return False, "task epoch is unavailable"
+        if expected_epoch and abs(expected_epoch - actual_epoch) > 1e-6:
+            return False, "task epoch changed"
+        expected_generation = int(transaction.get("run_generation", 0) or 0)
+        actual_generation = int(getattr(self, "run_generation", 0) or 0)
+        if expected_generation and actual_generation and expected_generation != actual_generation:
+            return False, "run generation changed"
+        expected_step_id = trim(str(transaction.get("plan_step_id", "") or "").strip(), 40)
+        if expected_step_id:
+            current = self._get_active_plan_step(bb)
+            actual_step_id = trim(str((current or {}).get("id", "") or "").strip(), 40)
+            if actual_step_id != expected_step_id:
+                return False, "active plan step changed"
+        return True, ""
+
+    def _emit_stale_todo_write_discarded(self, reason: str) -> str:
+        detail = trim(str(reason or "stale task transaction").strip(), 180)
+        self._emit(
+            "status",
+            {"summary": f"discarded stale TodoWrite update ({detail})"},
+        )
+        return self._plan_control_feedback(
+            "stale_todo_transaction",
+            f"The TodoWrite operation was discarded because {detail}. Preserve the current canonical task/step state.",
+        )
+
     def _tool_control_feedback_outcome(self, name: object, output: object) -> str:
         del name
         match = re.match(
@@ -39875,7 +41892,7 @@ body{padding:18px}
         if exit_code is not None and exit_code != 0:
             return False
         output = str(item.get("output", "") or "")
-        if exit_code is None and self._command_output_has_error_shape(output):
+        if self._command_output_has_error_shape(output):
             return False
         return True
 
@@ -39979,6 +41996,12 @@ body{padding:18px}
         )
         blackboard_read_signal = any(str(r.get("name", "")) == "read_from_blackboard" for r in rows)
         bash_rows = [r for r in rows if str(r.get("name", "")) in {"bash", "worktree_run", "check_background"}]
+        browser_rows = [
+            self._browser_runtime_tool_result_record(r)
+            for r in rows
+            if self._is_browser_runtime_tool_name(r.get("name", ""))
+        ]
+        browser_rows = [row for row in browser_rows if row]
         observed_signal = False
         compile_signal = False
         test_signal = False
@@ -40014,6 +42037,9 @@ body{padding:18px}
                 test_signal = True
             elif execution_passed and low and any(tok in low for tok in test_hints) and not any(neg in low for neg in negative_hints):
                 test_signal = True
+        if any(self._acceptance_record_is_browser_runtime(row) for row in browser_rows):
+            observed_signal = True
+            test_signal = True
         wants_test = phase in ("test", "review") or any(
             tok in step_text for tok in ("test", "pytest", "unit", "integration", "验证", "測試", "测试", "回归", "assert")
         )
@@ -40383,7 +42409,15 @@ body{padding:18px}
             exit_code = None
             evidence_context = f"blackboard_args={trim(json_dumps(args), 700)}\n"
         else:
-            return {}
+            browser_record = self._browser_runtime_tool_result_record(item)
+            if not browser_record:
+                return {}
+            kind = "runtime"
+            command = str(browser_record.get("command", "") or "")
+            path = str(browser_record.get("path", "") or "")
+            ok = bool(browser_record.get("ok", False))
+            exit_code = browser_record.get("exit_code", None)
+            evidence_context = "browser_runtime_observation\n"
         if self._tool_result_is_control_feedback(item):
             return {}
         if kind == "runtime" and not command:
@@ -40466,11 +42500,30 @@ body{padding:18px}
             "检查", "檢查", "通过", "通過", "运行", "執行", "输出", "輸出", "记录", "記錄",
             "confirm", "ensure", "inspect", "open", "contains", "contain", "include", "includes",
             "and", "with", "from", "into", "atom", "atomic", "mode",
+            # Evidence-form words are descriptive metadata, not artifact
+            # assertions. Treating them as required literals made a normal
+            # contract such as "record screenshot/canvas evidence" impossible
+            # to satisfy.
+            "record", "records", "evidence", "key", "keys", "command", "commands",
+            "assertion", "assertions", "content", "browser", "runtime", "visual",
+            "screenshot", "screenshots", "canvas", "page", "pages", "visible",
+            "display", "displays", "render", "rendered", "rendering", "loaded",
+            "http", "url", "urls", "directory", "path", "paths", "entry",
+            "main", "source", "sources", "identity", "status", "statuses",
         }
 
         def is_procedural_check_phrase(value: str) -> bool:
             compact = re.sub(r"[\s\W_]+", "", value, flags=re.UNICODE)
             if not compact:
+                return True
+            if re.fullmatch(
+                r"(?:(?:运行|執行|执行|进行|進行|确认|確認|确保|確保|验证|驗證|检查|檢查|测试|測試))?"
+                r"(?:(?:行为|行為)(?:以及|及其|并且|並且|和|与|與)?)?"
+                r"(?:相关|相關|有关|有關|相应|相應|对应|對應)"
+                r"(?:测试|測試|检查|檢查|验证|驗證|校验|校驗)"
+                r"(?:输出|輸出|结果|結果)?",
+                compact,
+            ):
                 return True
             procedural_prefixes = (
                 "运行", "執行", "执行", "进行", "進行", "确认", "確認", "确保", "確保",
@@ -40480,6 +42533,11 @@ body{padding:18px}
                 "测试", "測試", "检查", "檢查", "验证", "驗證", "校验", "校驗",
                 "构建", "構建", "建置", "编译", "編譯", "通过", "通過", "成功",
                 "无报错", "無報錯", "无错误", "無錯誤",
+            )
+            procedural_fillers = (
+                "相关", "相關", "有关", "有關", "相应", "相應", "对应", "對應",
+                "当前", "目前", "本步骤", "本步驟", "本步", "最终", "最終", "完整",
+                "以及", "及其", "并且", "並且", "或者", "或", "和", "与", "與",
             )
             remainder = compact
             changed = True
@@ -40495,12 +42553,44 @@ body{padding:18px}
                         remainder = remainder[:-len(suffix)]
                         changed = True
                         break
+                for filler in procedural_fillers:
+                    if remainder.startswith(filler):
+                        remainder = remainder[len(filler):]
+                        changed = True
+                        break
+                    if remainder.endswith(filler):
+                        remainder = remainder[:-len(filler)]
+                        changed = True
+                        break
             return not remainder
 
         out: list[str] = []
+        evidence_form_tokens = {
+            "record", "records", "evidence", "key", "keys", "command", "commands",
+            "screenshot", "screenshots", "canvas", "browser", "runtime", "visual",
+            "page", "pages", "visible", "display", "render", "rendered", "loaded",
+        }
         for raw in candidates:
             term = re.sub(r"\s+", " ", str(raw or "").strip(" `\"'.,;:()[]{}"))
-            if len(term) < 3 or term in stop or term.isdigit() or is_procedural_check_phrase(term):
+            compact_parts = [
+                part for part in re.split(r"[/|,+&]", term)
+                if part and part not in {"/", "|", "+", "&"}
+            ]
+            # A phrase such as ``screenshot/canvas evidence`` describes the
+            # shape of proof, not a literal assertion the artifact must contain.
+            # Keep this generic: only discard it when every component is an
+            # evidence-form word; real paths and named artifacts remain intact.
+            evidence_form_only = bool(compact_parts) and all(
+                re.sub(r"\s+", " ", part.strip()) in evidence_form_tokens
+                for part in compact_parts
+            )
+            if (
+                len(term) < 3
+                or term in stop
+                or term.isdigit()
+                or evidence_form_only
+                or is_procedural_check_phrase(term)
+            ):
                 continue
             if term not in out:
                 out.append(term)
@@ -40586,6 +42676,141 @@ body{padding:18px}
                 terms.append(threshold)
         return terms[:12]
 
+    def _acceptance_requires_browser_evidence(self, acceptance_text: object) -> bool:
+        """Return whether browser/runtime observation is the preferred evidence.
+
+        This classifier is shared by single and sync routes.  It must not act as
+        an extra hard gate for visual work: when a browser record is unavailable,
+        the aggregate evidence is handed to the semantic judge instead of being
+        rejected solely because of its tool/provider shape.
+        """
+        text = unicodedata.normalize("NFKC", str(acceptance_text or "")).lower()
+        visual_tokens = (
+            "browser", "浏览器", "瀏覽器", "playwright", "selenium", "cypress", "puppeteer",
+            "screenshot", "截图", "截圖", "canvas", "webgl", "three.js", "threejs",
+            "render", "rendered", "rendering", "渲染", "画面", "畫面", "视觉", "視覺",
+            "frontend", "front-end", "前端", "页面", "頁面", "dom", "ui", "交互", "互動",
+            "可旋转", "可旋轉", "visible", "display", "显示", "顯示", "fps",
+        )
+        for token in visual_tokens:
+            # Short ASCII capability names need lexical boundaries: a raw
+            # substring check made ``ui`` match ordinary words such as
+            # ``build`` and incorrectly converted generic runtime acceptance
+            # into a browser-preferred contract.
+            if token.isascii() and len(token) <= 3:
+                if re.search(
+                    rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])",
+                    text,
+                ):
+                    return True
+            elif token in text:
+                return True
+        return False
+
+    @staticmethod
+    def _is_browser_runtime_tool_name(tool_name: object) -> bool:
+        """Recognize browser-capable tool providers for evidence plumbing only.
+
+        The semantic acceptance judge still decides whether the observation
+        satisfies the task.  This classifier merely prevents successful MCP or
+        browser-driver results from disappearing before they reach that judge.
+        """
+        name = unicodedata.normalize("NFKC", str(tool_name or "")).lower()
+        return any(
+            token in name
+            for token in (
+                "browser", "playwright", "selenium", "cypress", "puppeteer",
+                "chromium", "chrome", "firefox", "webkit", "webdriver",
+                "screenshot", "page_snapshot", "page-snapshot",
+            )
+        )
+
+    def _browser_runtime_tool_result_record(self, item: dict) -> dict:
+        """Normalize one native browser/MCP result into the step evidence shape."""
+        if not isinstance(item, dict):
+            return {}
+        tool = canonicalize_tool_name(item.get("name", ""))
+        if not self._is_browser_runtime_tool_name(tool):
+            return {}
+        args = item.get("args", {}) if isinstance(item.get("args"), dict) else {}
+        output = str(item.get("output", "") or "")
+        command = trim(
+            f"{tool} {json_dumps(args) if args else ''}".strip(),
+            500,
+        )
+        return {
+            "kind": "runtime",
+            "tool": tool,
+            "ok": bool(item.get("ok", False)) and not self._command_output_has_error_shape(output),
+            "command": command,
+            "path": trim(
+                str(
+                    args.get("path", "")
+                    or args.get("url", "")
+                    or args.get("uri", "")
+                    or ""
+                ),
+                300,
+            ),
+            "summary": trim(output or json_dumps(args), 900),
+            "changed_files": [],
+            # Native browser tools expose successful structured results rather
+            # than a process return code.  The browser-runtime validator knows
+            # this distinction and still requires an observable page signal.
+            "exit_code": None,
+            "assertion_kind": trim(str(item.get("assertion_kind", "") or ""), 80),
+            "assertion_ok": bool(item.get("assertion_ok", False)),
+            "assertion_complete": bool(item.get("assertion_complete", False)),
+            "assertion_command": trim(str(item.get("assertion_command", "") or ""), 500),
+        }
+
+    def _acceptance_record_is_browser_runtime(self, record: dict) -> bool:
+        """Check that one runtime record contains an observable browser signal."""
+        if not isinstance(record, dict) or str(record.get("kind", "") or "") != "runtime":
+            return False
+        if not bool(record.get("ok", False)):
+            return False
+        try:
+            exit_code = record.get("exit_code", None)
+            exit_ok = exit_code == 0
+        except Exception:
+            exit_ok = False
+        tool = canonicalize_tool_name(record.get("tool", record.get("name", "")))
+        tool_low = str(tool or "").lower()
+        browser_tool = any(
+            token in tool_low
+            for token in ("browser", "playwright", "selenium", "cypress", "puppeteer", "chromium", "chrome", "firefox")
+        )
+        # Shell/runtime evidence must carry a real terminal exit code. A
+        # browser-native tool can instead expose its own successful tool result.
+        if not exit_ok and not (browser_tool and exit_code is None):
+            return False
+        command = str(record.get("command", "") or "")
+        summary = str(record.get("summary", "") or "")
+        haystack = f"{tool_low}\n{command}\n{summary}".lower()
+        if self._command_output_has_error_shape(summary):
+            return False
+        runner_signal = any(
+            token in haystack
+            for token in (
+                "playwright", "selenium", "cypress", "puppeteer", "chromium", "chrome", "firefox",
+                "browser", "page.", "goto(", "locator", "webdriver", "http://", "https://",
+                "localhost", "127.0.0.1", "static server", "静态服务", "靜態服務",
+            )
+        )
+        observation_signal = any(
+            token in haystack
+            for token in (
+                "screenshot", ".png", ".jpg", ".jpeg", "canvas", "webgl", "dom", "http 200",
+                "status 200", "page loaded", "loaded", "rendered", "visible", "console",
+                "image content", "image/png", "image/jpeg", "accessibility tree", "snapshot",
+                "fps", "runtime_ok", "browser_runtime_ok", "页面正常", "頁面正常", "加载成功", "載入成功",
+            )
+        )
+        # A browser tool's structured result is itself the runner signal, but
+        # it still needs an observed page/canvas/network result.
+        return bool((runner_signal or browser_tool) and observation_signal)
+
     @staticmethod
     def _acceptance_summary_covers_term(summary: object, term: object) -> bool:
         summary_text = unicodedata.normalize("NFKC", str(summary or "")).lower()
@@ -40621,6 +42846,20 @@ body{padding:18px}
             )
         if semantic_key in {"目标声明", "目標聲明", "objectivestatement", "goalstatement"}:
             return any(token in summary_text for token in ("目标声明", "目標聲明", "主目标", "主目標", "子目标", "子目標", "objective", "goal"))
+        if semantic_key in {"javascript", "javascriptfile", "jsfile", "ecmascript"}:
+            if any(token in summary_text for token in ("javascript", "ecmascript")):
+                return True
+            script_paths = re.findall(r"(?<![\w.-])([\w./@+-]+\.(?:js|mjs|cjs))(?![\w.-])", summary_text)
+            product_names = {"three.js", "node.js", "react.js", "vue.js", "next.js", "nuxt.js", "d3.js", "p5.js", "chart.js"}
+            return any(PurePosixPath(path).name.lower() not in product_names for path in script_paths)
+        if semantic_key in {"typescript", "typescriptfile", "tsfile"}:
+            return "typescript" in summary_text or bool(
+                re.search(r"(?<![\w.-])[\w./@+-]+\.(?:ts|tsx)(?![\w.-])", summary_text)
+            )
+        if semantic_key in {"python", "pythonfile", "pyfile"}:
+            return "python" in summary_text or bool(
+                re.search(r"(?<![\w.-])[\w./@+-]+\.py(?![\w.-])", summary_text)
+            )
         threshold = re.fullmatch(r"(>=|<=|==|>|<)\s*(\d+(?:\.\d+)?)", expected)
         if not threshold:
             return bool(expected) and expected in summary_text
@@ -40642,9 +42881,25 @@ body{padding:18px}
         expected: str,
         *,
         acceptance_text: object = "",
+        subject_text: object = "",
     ) -> dict:
         """Actively judge a step's evidence set instead of one record at a time."""
-        rows = [dict(row) for row in (records or []) if isinstance(row, dict)]
+        # Acceptance must be an observation distinct from the mutation under
+        # review. A successful write/edit proves that bytes changed, not that
+        # the result satisfies the acceptance contract. Reads, executions,
+        # retrievals, and reviewer/blackboard verdicts remain eligible and are
+        # still judged against the contract below.
+        mutation_tools = {"write_file", "edit_file"}
+        rows = [
+            dict(row)
+            for row in (records or [])
+            if isinstance(row, dict)
+            and canonicalize_tool_name(row.get("tool", row.get("name", ""))) not in mutation_tools
+        ]
+        product_rows = [
+            row for row in rows
+            if not self._is_non_product_acceptance_error_record(row)
+        ]
 
         def negative_assertion_passes(row: dict) -> bool:
             return bool(
@@ -40661,16 +42916,31 @@ body{padding:18px}
                 str(row.get("kind", "") or "") == "runtime"
                 and bool(row.get("ok", False))
                 and row.get("exit_code") in (None, 0)
+                and not self._command_output_has_error_shape(str(row.get("summary", "") or ""))
             )
 
         passing_rows = [
-            row for row in rows
-            if bool(row.get("ok", False)) or negative_assertion_passes(row)
+            row for row in product_rows
+            if (
+                runtime_passes(row)
+                if str(row.get("kind", "") or "") == "runtime"
+                else bool(row.get("ok", False))
+            ) or negative_assertion_passes(row)
         ]
         if expected == "runtime/test/build/browser execution evidence":
-            runtime_rows = [row for row in rows if str(row.get("kind", "") or "") == "runtime"]
-            if runtime_rows and not (
-                runtime_passes(runtime_rows[-1]) or negative_assertion_passes(runtime_rows[-1])
+            runtime_rows = [
+                row for row in product_rows
+                if str(row.get("kind", "") or "") == "runtime"
+            ]
+            decisive_runtime_rows = [
+                row for row in runtime_rows
+                if runtime_passes(row)
+                or negative_assertion_passes(row)
+                or self._acceptance_failure_is_decisive(row, acceptance_text)
+            ]
+            if decisive_runtime_rows and not (
+                runtime_passes(decisive_runtime_rows[-1])
+                or negative_assertion_passes(decisive_runtime_rows[-1])
             ):
                 return {
                     "passed": False,
@@ -40685,17 +42955,41 @@ body{padding:18px}
                 row for row in runtime_rows
                 if runtime_passes(row) or negative_assertion_completes(row)
             ]
+            prefers_browser = self._acceptance_requires_browser_evidence(
+                "\n".join(
+                    value for value in (
+                        str(acceptance_text or ""),
+                        str(subject_text or ""),
+                    )
+                    if value
+                )
+            )
+            browser_observation_missing = False
+            if prefers_browser:
+                browser_rows = [
+                    row for row in core_rows
+                    if self._acceptance_record_is_browser_runtime(row)
+                ]
+                if browser_rows:
+                    core_rows = browser_rows
+                else:
+                    # Browser evidence is the strongest direct observation, but
+                    # its absence is not a visual-only barrier.  Preserve the
+                    # real runtime candidates and request one semantic audit.
+                    browser_observation_missing = True
             assertion_terms = list(dict.fromkeys(
                 self._acceptance_assertion_terms(acceptance_text)
                 + self._acceptance_file_content_terms(acceptance_text)
             ))
         elif expected == "file/path/directory inspection evidence":
+            browser_observation_missing = False
             core_rows = [
                 row for row in passing_rows
                 if str(row.get("kind", "") or "") == "file" or runtime_passes(row)
             ]
             assertion_terms = self._acceptance_file_content_terms(acceptance_text)
         elif expected == "research/retrieval evidence":
+            browser_observation_missing = False
             core_rows = [
                 row for row in passing_rows
                 if str(row.get("kind", "") or "") in {"research", "file"}
@@ -40706,6 +43000,7 @@ body{padding:18px}
             ]
             assertion_terms = []
         elif expected == "blackboard acceptance record":
+            browser_observation_missing = False
             core_rows = [
                 row for row in passing_rows
                 if str(row.get("kind", "") or "") in {"blackboard", "runtime", "file", "research"}
@@ -40716,6 +43011,7 @@ body{padding:18px}
             ]
             assertion_terms = []
         else:
+            browser_observation_missing = False
             core_rows = [
                 row for row in passing_rows
                 if str(row.get("kind", "") or "") in {"runtime", "file", "research", "blackboard", "generic"}
@@ -40742,9 +43038,10 @@ body{padding:18px}
                 "missing_terms": assertion_terms,
                 "missing_paths": self._extract_plan_step_referenced_paths(acceptance_text, limit=8),
                 "matched_records": [],
-                "candidate": bool(rows),
+                "candidate": bool(product_rows),
             }
 
+        coverage_rows = core_rows if expected == "runtime/test/build/browser execution evidence" else passing_rows
         combined = "\n".join(
             "\n".join(
                 part for part in (
@@ -40759,7 +43056,7 @@ body{padding:18px}
                 )
                 if part
             )
-            for row in passing_rows
+            for row in coverage_rows
         )
         identity_haystack = combined.lower()
         referenced_paths = self._extract_plan_step_referenced_paths(acceptance_text, limit=8)
@@ -40773,15 +43070,42 @@ body{padding:18px}
             term for term in assertion_terms
             if not self._acceptance_summary_covers_term(combined, term)
         ]
-        passed = bool(core_rows and not missing_paths and not missing_terms)
+        explicit_acceptance_pass = any(
+            bool(re.search(
+                r"(?i)(?:\bacceptance|\baccept|验收|驗收)\s*[:=：_-]*\s*(?:pass|passed|ok|通过|通過)\b",
+                str(row.get("summary", "") or ""),
+            ))
+            and runtime_passes(row)
+            for row in core_rows
+        )
+        deterministic_pass = bool(core_rows and not missing_paths and not missing_terms)
+        # A successful, explicit verdict emitted by the acceptance probe is a
+        # decisive aggregate result.  It may satisfy natural-language concepts
+        # whose exact words (e.g. "scene" vs pixel/canvas metrics) are absent
+        # from the compacted output.  Path identity is still required, and a
+        # later decisive failure has already been handled above.
+        if explicit_acceptance_pass and not missing_paths:
+            deterministic_pass = True
+        semantic_review_required = bool(browser_observation_missing and core_rows)
+        passed = bool(deterministic_pass and not semantic_review_required)
         return {
             "passed": passed,
             "status": "passed" if passed else "ambiguous",
-            "reason": "aggregate-evidence-covers-acceptance" if passed else "aggregate-evidence-missing-coverage",
+            "reason": (
+                "aggregate-evidence-covers-acceptance"
+                if passed
+                else (
+                    "visual-runtime-needs-semantic-review"
+                    if semantic_review_required
+                    else "aggregate-evidence-missing-coverage"
+                )
+            ),
             "missing_terms": missing_terms,
             "missing_paths": missing_paths,
-            "matched_records": passing_rows[-16:] if passed else [],
-            "candidate": True,
+            "matched_records": coverage_rows[-16:] if passed else [],
+            "candidate": bool(product_rows),
+            "semantic_review_required": semantic_review_required,
+            "browser_observation_missing": bool(browser_observation_missing),
         }
 
     def _acceptance_evidence_record_matches(
@@ -40935,6 +43259,7 @@ body{padding:18px}
             if tool in {"bash", "worktree_run", "check_background"}:
                 current_evidence_records.append({
                     "kind": "runtime",
+                    "tool": tool,
                     "ok": self._tool_result_is_passing_execution(row),
                     "command": str(args.get("command", "") or ""),
                     "path": "",
@@ -40948,6 +43273,7 @@ body{padding:18px}
             elif tool == "read_file":
                 current_evidence_records.append({
                     "kind": "file",
+                    "tool": tool,
                     "ok": bool(row.get("ok", False)),
                     "command": "",
                     "path": str(args.get("path", "") or ""),
@@ -40957,16 +43283,26 @@ body{padding:18px}
             elif tool == "write_to_blackboard":
                 current_evidence_records.append({
                     "kind": "blackboard",
+                    "tool": tool,
                     "ok": bool(row.get("ok", False)),
                     "command": "",
                     "path": "",
                     "summary": f"{args}\n{row.get('output', '')}",
                     "exit_code": None,
                 })
+            else:
+                browser_record = self._browser_runtime_tool_result_record(row)
+                if browser_record:
+                    current_evidence_records.append(browser_record)
         current_evaluation = self._evaluate_acceptance_evidence_records(
             current_evidence_records,
             expected,
             acceptance_text=text,
+            subject_text=str(
+                plan_step.get("full_content", "")
+                or plan_step.get("content", "")
+                or ""
+            ),
         )
         current_candidate_match = bool(current_evaluation.get("candidate", False) or current_match)
         if current_evaluation.get("passed", False):
@@ -40993,6 +43329,22 @@ body{padding:18px}
                 "source": "plan_step_evidence",
                 "expected": expected,
                 "evidence": durable_matches[-1],
+                "acceptance": acceptance,
+                "acceptance_contract": contract_text,
+            }
+        trusted_acceptance = self._trusted_plan_step_acceptance_records(
+            plan_step,
+            acceptance,
+            board=bb,
+            since_ts=acceptance_started_ts,
+        )
+        if acceptance_completed and trusted_acceptance:
+            return {
+                "ok": True,
+                "reason": "trusted-acceptance-decision-matches-final-acceptance",
+                "source": "plan_step_evidence",
+                "expected": expected,
+                "evidence": trusted_acceptance[-1],
                 "acceptance": acceptance,
                 "acceptance_contract": contract_text,
             }
@@ -41033,11 +43385,43 @@ body{padding:18px}
             candidate_records,
             expected,
             acceptance_text=text,
+            subject_text=str(
+                plan_step.get("full_content", "")
+                or plan_step.get("content", "")
+                or ""
+            ),
         )
+        # Visual/browser wording selects the strongest evidence shape, but it
+        # is not an additional hard restriction.  If deterministic matching
+        # cannot see a native browser observation, let the LLM audit the real
+        # step-local evidence once instead of repeating the same shell check.
+        if bool(aggregate_evaluation.get("semantic_review_required", False)):
+            needs_semantic_audit = True
         has_candidate_evidence = bool(candidate_records or blackboard_match or current_candidate_match)
         exact_candidate_match = bool(
             current_records or durable_matches or aggregate_evaluation.get("passed", False)
         )
+        # A concrete failed check is more actionable than the bookkeeping fact
+        # that the acceptance row was not marked completed. Surface it first so
+        # both single and sync routes seed a repair directive for the actual
+        # failing command instead of asking the worker to repeat TodoWrite.
+        if (
+            has_candidate_evidence
+            and str(aggregate_evaluation.get("status", "") or "") == "failed"
+        ):
+            return {
+                "ok": False,
+                "reason": "final-acceptance-check-failed",
+                "expected": expected,
+                "acceptance": acceptance,
+                "acceptance_contract": contract_text,
+                "candidate_evidence": candidate_records[-8:],
+                "current_results": results[-8:],
+                "semantic_missing": "; ".join(
+                    str(value) for value in (aggregate_evaluation.get("missing_terms", []) or [])[:12]
+                ),
+                "evidence_evaluation": aggregate_evaluation,
+            }
         if not acceptance_completed and not (needs_semantic_audit and has_candidate_evidence):
             return {
                 "ok": False,
@@ -41090,6 +43474,67 @@ body{padding:18px}
     ) -> bool:
         """Hard gate: the final acceptance subtask must be completed with matching tool evidence."""
         return bool(self._plan_step_acceptance_gate_status(plan_step, worker_step, board).get("ok", False))
+
+    def _plan_step_acceptance_ready_for_advance(
+        self,
+        plan_step: dict,
+        gate: dict,
+        board: dict | None = None,
+    ) -> bool:
+        """Close a verified current step without requiring a second evidence heuristic."""
+        if not isinstance(plan_step, dict) or not isinstance(gate, dict) or not gate.get("ok", False):
+            return False
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        active = self._get_active_plan_step(bb)
+        step_id = trim(str(plan_step.get("id", "") or ""), 40)
+        active_id = trim(str((active or {}).get("id", "") or ""), 40) if isinstance(active, dict) else ""
+        if not step_id or step_id != active_id or not self._step_subtasks_all_completed(active):
+            return False
+        acceptance = gate.get("acceptance", {}) if isinstance(gate.get("acceptance"), dict) else {}
+        if str(acceptance.get("status", "") or "").strip().lower() != "completed":
+            return False
+        source = str(gate.get("source", "") or "").strip()
+        reason = str(gate.get("reason", "") or "").strip()
+        if source == "current_tool_results":
+            return reason == "current-aggregate-evidence-matches-final-acceptance"
+        if source == "blackboard":
+            return reason == "blackboard-evidence-matches-final-acceptance"
+        if source != "plan_step_evidence":
+            return False
+        evidence = gate.get("evidence", {}) if isinstance(gate.get("evidence"), dict) else {}
+        evidence_step_id = trim(str(evidence.get("step_id", "") or ""), 40)
+        return bool(
+            evidence
+            and evidence.get("ok", False)
+            and (not evidence_step_id or evidence_step_id == step_id)
+            and reason in {
+                "step-evidence-ledger-matches-final-acceptance",
+                "trusted-acceptance-decision-matches-final-acceptance",
+            }
+        )
+
+    def _try_advance_verified_current_plan_step(self, *, actor: str) -> bool:
+        """Recover the narrow persisted state between acceptance and advancement."""
+        bb = self._ensure_blackboard()
+        current = self._get_active_plan_step(bb)
+        if not isinstance(current, dict):
+            return False
+        try:
+            self._reconcile_plan_worker_progress_from_evidence(actor=str(actor or "developer"))
+            bb = self._ensure_blackboard()
+            current = self._get_active_plan_step(bb) or current
+        except Exception:
+            pass
+        gate = self._plan_step_acceptance_gate_status(current, None, bb)
+        if not self._plan_step_acceptance_ready_for_advance(current, gate, bb):
+            return False
+        record = gate.get("evidence", {}) if isinstance(gate.get("evidence"), dict) else {}
+        evidence = trim(
+            str(record.get("summary", "") or "").strip()
+            or f"{gate.get('source', 'acceptance-gate')}: {gate.get('reason', 'verified')}",
+            200,
+        )
+        return bool(self._advance_plan_step(evidence=evidence, actor=str(actor or "developer")))
 
     def _inject_acceptance_gate_rework_hint(
         self,
@@ -41532,6 +43977,7 @@ body{padding:18px}
         *,
         evidence: str,
         actor: str,
+        decision_source: str = "",
     ) -> bool:
         if not isinstance(plan_step, dict) or not self._step_work_subtasks_completed(plan_step):
             return False
@@ -41554,8 +44000,189 @@ body{padding:18px}
         accepted["completed_by"] = trim(str(actor or "reviewer"), 40)
         accepted["evidence"] = trim(str(evidence or "accepted with bound evidence"), 300)
         rows[acceptance_index] = accepted
+        if decision_source and not self._record_trusted_plan_step_acceptance_event(
+            plan_step,
+            accepted,
+            evidence=evidence,
+            actor=actor,
+            source=decision_source,
+        ):
+            return False
         self._replace_plan_worker_rows(step_id, rows)
         return self._step_subtasks_all_completed(plan_step)
+
+    def _advance_completed_acceptance_after_todo_commit(
+        self,
+        plan_step: dict,
+        *,
+        actor: str,
+    ) -> bool:
+        """Advance once after a Todo transaction durably closes acceptance.
+
+        This is intentionally called only after both TodoManager and the
+        blackboard mirror have been updated.  It closes the historical split
+        state where TodoWrite returned success while the run loop kept routing
+        the same acceptance row for another round.
+        """
+        if not isinstance(plan_step, dict):
+            return False
+        bb = self._ensure_blackboard()
+        current = self._get_active_plan_step(bb)
+        step_id = trim(str(plan_step.get("id", "") or ""), 40)
+        if not isinstance(current, dict) or trim(str(current.get("id", "") or ""), 40) != step_id:
+            return False
+        gate = self._plan_step_acceptance_gate_status(current, None, bb)
+        if not self._plan_step_acceptance_ready_for_advance(current, gate, bb):
+            return False
+        record = gate.get("evidence", {}) if isinstance(gate.get("evidence"), dict) else {}
+        evidence = trim(
+            str(record.get("summary", "") or "").strip()
+            or f"{gate.get('source', 'acceptance-gate')}: {gate.get('reason', 'verified')}",
+            200,
+        )
+        return bool(self._advance_plan_step(
+            evidence=evidence,
+            actor=str(actor or "developer"),
+        ))
+
+    def _record_trusted_plan_step_acceptance_event(
+        self,
+        plan_step: dict,
+        acceptance: dict,
+        *,
+        evidence: str,
+        actor: str,
+        source: str,
+    ) -> dict:
+        """Persist an internally-authorized acceptance decision in the evidence ledger."""
+        trusted_sources = {
+            "semantic_audit",
+            "semantic_reaudit",
+            "semantic_verified",
+            "explicit_user_waiver",
+        }
+        source_key = trim(str(source or "").strip().lower(), 40)
+        if source_key not in trusted_sources or not isinstance(plan_step, dict) or not isinstance(acceptance, dict):
+            return {}
+        step_id = trim(str(plan_step.get("id", "") or ""), 40)
+        if not step_id:
+            return {}
+        contract_text = self._effective_plan_step_acceptance_text(
+            plan_step,
+            acceptance.get("content", ""),
+        )
+        if not contract_text.strip():
+            return {}
+        contract_signature = hashlib.sha1(
+            unicodedata.normalize("NFKC", contract_text).strip().encode("utf-8", "ignore")
+        ).hexdigest()[:20]
+        stamp = float(now_ts())
+        event_id = f"accept:{source_key}:{time.time_ns():x}:{contract_signature}"
+        record = {
+            "id": event_id,
+            "step_id": step_id,
+            "subtask_id": self._stable_plan_worker_subtask_id(step_id, acceptance),
+            "subtask_content": trim(str(acceptance.get("content", "") or ""), 500),
+            "kind": "blackboard",
+            "tool": f"acceptance_{source_key}",
+            "ok": True,
+            "command": "",
+            "path": "",
+            "summary": trim(str(evidence or source_key), 900),
+            "changed_files": [],
+            "exit_code": None,
+            "assertion_kind": "trusted_acceptance_decision",
+            "assertion_ok": True,
+            "assertion_complete": True,
+            "assertion_command": contract_signature,
+            "actor": trim(str(actor or "reviewer"), 40),
+            "ts": stamp,
+        }
+        bb = self._ensure_blackboard()
+        raw_map = dict(bb.get("plan_step_evidence", {}) if isinstance(bb.get("plan_step_evidence"), dict) else {})
+        records = list(raw_map.get(step_id, []) if isinstance(raw_map.get(step_id), list) else [])
+        records.append(record)
+        raw_map[step_id] = records[-40:]
+        bb["plan_step_evidence"] = raw_map
+        self.blackboard = bb
+        return record
+
+    def _trusted_plan_step_acceptance_records(
+        self,
+        plan_step: dict,
+        acceptance: dict,
+        *,
+        board: dict | None = None,
+        since_ts: float = 0.0,
+    ) -> list[dict]:
+        if not isinstance(plan_step, dict) or not isinstance(acceptance, dict):
+            return []
+        step_id = trim(str(plan_step.get("id", "") or ""), 40)
+        contract_text = self._effective_plan_step_acceptance_text(
+            plan_step,
+            acceptance.get("content", ""),
+        )
+        if not step_id or not contract_text.strip():
+            return []
+        contract_signature = hashlib.sha1(
+            unicodedata.normalize("NFKC", contract_text).strip().encode("utf-8", "ignore")
+        ).hexdigest()[:20]
+        expected_subtask_id = self._stable_plan_worker_subtask_id(step_id, acceptance)
+        trusted_tools = {
+            "acceptance_semantic_audit",
+            "acceptance_semantic_reaudit",
+            "acceptance_semantic_verified",
+            "acceptance_explicit_user_waiver",
+        }
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        artifact_revision_ts = self._plan_step_artifact_revision_ts(
+            step_id,
+            board=bb,
+            since_ts=since_ts,
+        )
+        matches: list[dict] = []
+        scoped_records = self._plan_step_evidence_records(step_id, board=bb, since_ts=since_ts)
+        for record in scoped_records:
+            if (
+                str(record.get("kind", "") or "") != "blackboard"
+                or str(record.get("tool", "") or "") not in trusted_tools
+                or str(record.get("assertion_kind", "") or "") != "trusted_acceptance_decision"
+                or not bool(record.get("ok", False))
+                or not bool(record.get("assertion_ok", False))
+                or not bool(record.get("assertion_complete", False))
+                or str(record.get("assertion_command", "") or "") != contract_signature
+                or (
+                    expected_subtask_id
+                    and str(record.get("subtask_id", "") or "") != expected_subtask_id
+                )
+                or float(record.get("ts", 0.0) or 0.0) + 1e-6 < artifact_revision_ts
+            ):
+                continue
+            matches.append(record)
+        if matches:
+            latest_trusted_ts = max(float(row.get("ts", 0.0) or 0.0) for row in matches)
+            later_runtime = [
+                row for row in scoped_records
+                if str(row.get("kind", "") or "") == "runtime"
+                and float(row.get("ts", 0.0) or 0.0) > latest_trusted_ts + 1e-6
+                and not self._is_non_product_acceptance_error_record(row)
+            ]
+            later_failures = [
+                row for row in later_runtime
+                if not self._plan_evidence_record_passes(row)
+                and not (
+                    str(row.get("assertion_kind", "") or "") == "negative_search_no_match"
+                    and bool(row.get("assertion_ok", False))
+                    and bool(row.get("assertion_complete", False))
+                )
+                and self._acceptance_failure_is_decisive(row, contract_text)
+            ]
+            if later_failures:
+                # A trusted semantic decision describes the evidence available
+                # at its timestamp. A later decisive failure is newer ground
+                # truth and invalidates it; unrelated probes/policy errors do not.
+                return []
+        return matches
 
     def _request_active_plan_step_recovery(
         self,
@@ -41698,6 +44325,7 @@ body{padding:18px}
                     step,
                     evidence=f"[scoped re-audit] {evidence or review.get('reason', '')}",
                     actor="reviewer",
+                    decision_source="semantic_reaudit",
                 ):
                     advanced = self._advance_plan_step(
                         evidence=trim(f"[scoped re-audit] {evidence or review.get('reason', '')}", 200),
@@ -41779,6 +44407,7 @@ body{padding:18px}
                 plan_step,
                 evidence=trim(f"[user-waived acceptance] {user_override}", 200),
                 actor="user",
+                decision_source="explicit_user_waiver",
             ):
                 self._emit("status", {"summary": "acceptance waiver retained current step because work subtasks remain open"})
                 return False
@@ -41809,6 +44438,35 @@ body{padding:18px}
         except Exception:
             pass
 
+        # Count acceptance cycles by an unchanged failure/evidence state, not by
+        # raw tool rounds. Creating/fixing an artifact or producing a new check
+        # is real progress and starts a fresh ten-cycle window. Previously the
+        # absolute counter kept increasing during active edits, so a worker could
+        # hit the recovery chooser while it was still constructing the step.
+        sig_attr = f"_acceptance_gate_sig_{step_id}"
+        nopro_attr = f"_acceptance_gate_nopro_n_{step_id}"
+        try:
+            new_sig = self._repair_progress_signature(plan_step, gate, bb)
+        except Exception:
+            new_sig = ""
+        prev_sig = str(getattr(self, sig_attr, "") or "")
+        if new_sig and prev_sig and new_sig != prev_sig:
+            count = 1
+            no_progress = 0
+            try:
+                setattr(self, attr, count)
+            except Exception:
+                pass
+        elif new_sig and new_sig == prev_sig:
+            no_progress = int(getattr(self, nopro_attr, 0) or 0) + 1
+        else:
+            no_progress = 0
+        try:
+            setattr(self, sig_attr, new_sig)
+            setattr(self, nopro_attr, no_progress)
+        except Exception:
+            pass
+
         # Evidence exists but its relationship to named assertions is not
         # mechanically provable. Audit once per evidence signature now instead
         # of spending several repair rounds repeating the same command.
@@ -41832,6 +44490,7 @@ body{padding:18px}
                     plan_step,
                     evidence=trim(f"[semantic-audit] {evidence_text or review.get('reason', '')}", 300),
                     actor=str(actor or "reviewer"),
+                    decision_source="semantic_audit",
                 ):
                     self._emit("status", {"summary": "semantic audit passed acceptance, but current work subtasks remain open"})
                     return False
@@ -41877,6 +44536,7 @@ body{padding:18px}
                 plan_step,
                 evidence=trim(f"[semantic-verified] {verdict.get('evidence', '')}", 300),
                 actor=str(actor or "reviewer"),
+                decision_source="semantic_verified",
             ):
                 self._emit("status", {"summary": "semantic verification retained current step because work subtasks remain open"})
                 return False
@@ -41908,25 +44568,6 @@ body{padding:18px}
                 board=bb,
             )
             self._emit("status", {"summary": "acceptance gate failing — reviewer debug mode enabled to fix the blocker"})
-
-        # Track repair progress: a changing signature means we are still making
-        # headway; an unchanged signature means the loop is deadlocked.
-        sig_attr = f"_acceptance_gate_sig_{step_id}"
-        nopro_attr = f"_acceptance_gate_nopro_n_{step_id}"
-        try:
-            new_sig = self._repair_progress_signature(plan_step, gate, bb)
-        except Exception:
-            new_sig = ""
-        prev_sig = str(getattr(self, sig_attr, "") or "")
-        if new_sig and new_sig == prev_sig:
-            no_progress = int(getattr(self, nopro_attr, 0) or 0) + 1
-        else:
-            no_progress = 0
-        try:
-            setattr(self, sig_attr, new_sig)
-            setattr(self, nopro_attr, no_progress)
-        except Exception:
-            pass
 
         # Step 4 — TRUE DEADLOCK: pause only this parent step. The approved
         # roadmap is immutable unless the user explicitly requests a full replan.
@@ -42020,7 +44661,10 @@ body{padding:18px}
             candidates.append(str(match.group(1) or ""))
         candidates.extend(
             re.findall(
-                r"(?<![\w./-])([A-Za-z0-9_.@+~-]+(?:/[A-Za-z0-9_.@+~ -]+)+)(?![\w./-])",
+                # Keep unquoted path segments tight. A permissive space inside
+                # this expression turns prose such as
+                # "screenshot/canvas evidence" into a fake required path.
+                r"(?<![\w./-])([A-Za-z0-9_.@+~-]+(?:/[A-Za-z0-9_.@+~-]+)+)(?![\w./-])",
                 src,
             )
         )
@@ -42029,6 +44673,18 @@ body{padding:18px}
                 r"(?<![\w./-])([A-Za-z0-9_.@+~-]+\.(?:py|js|ts|tsx|jsx|css|html?|md|txt|csv|json|ya?ml|toml|ini|xml|rst|sql|sh|go|rs|java|c|cc|cpp|h|hpp|f90|glsl))(?![\w./-])",
                 src,
                 flags=re.I,
+            )
+        )
+        # Directory requirements are commonly written as bare names ending
+        # in a slash (``src/、assets/、public/``).  The old extractor only
+        # accepted file suffixes or paths containing a following segment, so
+        # these requirements silently disappeared and a package/build result
+        # could be mistaken for completion.  Keep the slash while parsing and
+        # normalize it to the directory identity used by read_file evidence.
+        candidates.extend(
+            re.findall(
+                r"(?<![\w./-])([A-Za-z0-9_.@+~-]+(?:/[A-Za-z0-9_.@+~-]+)*/)(?![\w./-])",
+                src,
             )
         )
         out: list[str] = []
@@ -42044,6 +44700,16 @@ body{padding:18px}
             "mkdir",
             "touch",
             "ls",
+        }
+        product_names = {
+            "three.js", "node.js", "react.js", "vue.js", "next.js", "nuxt.js",
+            "d3.js", "p5.js", "chart.js", "babylon.js", "anime.js",
+        }
+        prose_path_segments = {
+            "record", "records", "evidence", "key", "keys", "command", "commands",
+            "assertion", "assertions", "content", "output", "outputs", "result", "results",
+            "screenshot", "screenshots", "canvas", "browser", "runtime", "visual", "page", "pages",
+            "file", "files", "path", "paths", "directory", "directories", "status", "statuses",
         }
         for raw in candidates:
             item = str(raw or "").strip().strip("'\"")
@@ -42063,9 +44729,23 @@ body{padding:18px}
                 item = str(suffix_end.group(1) or "").strip()
             if not item or "://" in item:
                 continue
+            # Backtick content may be a concrete path with spaces, but prose
+            # without a file suffix is not an identity to audit.
+            if re.search(r"\s", item) and not re.search(
+                r"\.(?:py|js|ts|tsx|jsx|css|html?|md|txt|csv|json|ya?ml|toml|ini|xml|rst|sql|sh|go|rs|java|c|cc|cpp|h|hpp|f90|glsl)(?:/)?$",
+                item,
+                flags=re.I,
+            ):
+                continue
+            is_directory_hint = item.endswith("/")
+            if "/" not in item and item.lower() in product_names:
+                continue
             if item.split(None, 1)[0].strip().lower() in deny_prefixes:
                 continue
-            if not ("/" in item or re.search(r"\.[A-Za-z0-9]{1,8}$", item)):
+            if not is_directory_hint and not ("/" in item or re.search(r"\.[A-Za-z0-9]{1,8}$", item)):
+                continue
+            segments = [segment.lower() for segment in item.rstrip("/").split("/") if segment]
+            if len(segments) >= 2 and all(segment in prose_path_segments for segment in segments):
                 continue
             rel = normalize_rel_preview_path(item.replace("\\", "/"))
             if not rel or self._is_plan_infrastructure_path(rel):
@@ -42099,6 +44779,8 @@ body{padding:18px}
             return 1.0, "exact"
         exp_path = PurePosixPath(exp)
         act_path = PurePosixPath(act)
+        if exp_path.parent.as_posix() in {"", "."} and exp_path.name == act_path.name:
+            return 0.93, "exact basename match for unqualified expected path"
         exp_key = SessionState._semantic_path_key(exp)
         act_key = SessionState._semantic_path_key(act)
         if exp_key and exp_key == act_key:
@@ -42107,6 +44789,35 @@ body{padding:18px}
         act_stem = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", act_path.stem.lower())
         same_parent = exp_path.parent.as_posix() == act_path.parent.as_posix()
         same_suffix = exp_path.suffix.lower() == act_path.suffix.lower()
+        # Build/distribution variants are the same artifact for acceptance
+        # purposes (for example ``three.min.js`` vs
+        # ``js/three.module.js``). Keep this deliberately narrow: extensions
+        # must match, the base stem must be identical after removing a known
+        # trailing build qualifier, and at least one path must be unqualified
+        # or both directories must already match.
+        def _build_variant_stem(path: PurePosixPath) -> str:
+            stem = path.stem.lower()
+            stripped = re.sub(
+                r"(?:[._-](?:min|module|bundle|umd|esm))+$",
+                "",
+                stem,
+                flags=re.IGNORECASE,
+            )
+            return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", stripped)
+
+        exp_family = _build_variant_stem(exp_path)
+        act_family = _build_variant_stem(act_path)
+        either_unqualified = (
+            exp_path.parent.as_posix() in {"", "."}
+            or act_path.parent.as_posix() in {"", "."}
+        )
+        if (
+            same_suffix
+            and exp_family
+            and exp_family == act_family
+            and (same_parent or either_unqualified)
+        ):
+            return 0.91, "equivalent build-variant filename"
         if exp_stem and act_stem and same_parent and same_suffix:
             if exp_stem == act_stem:
                 return 0.94, "separator-insensitive filename match"
@@ -42120,6 +44831,34 @@ body{padding:18px}
             if same_parent and same_suffix and overlap >= 0.5:
                 return 0.62 + overlap * 0.2, "token-overlap filename match"
         return 0.0, ""
+
+    def _plan_evidence_path_matches(
+        self,
+        expected: object,
+        actual: object,
+        *,
+        threshold: float = 0.72,
+    ) -> bool:
+        """Match evidence paths, including child paths proving a directory."""
+        exp = normalize_rel_preview_path(str(expected or "")).lower()
+        act = normalize_rel_preview_path(str(actual or "")).lower()
+        if not exp or not act:
+            return False
+        if exp == act or self._semantic_path_score(exp, act)[0] >= float(threshold):
+            return True
+        expected_path = PurePosixPath(exp)
+        actual_path = PurePosixPath(act)
+        # Bare/suffixless plan paths commonly denote directories.  Observing a
+        # child is constructive proof that the parent exists.  For an
+        # unqualified directory name, allow that name at any directory segment
+        # (``assets/`` is proved by ``src/assets/texture.png``), but never match
+        # it against an unrelated filename.
+        if not expected_path.suffix:
+            if act.startswith(exp.rstrip("/") + "/"):
+                return True
+            if expected_path.parent.as_posix() in {"", "."}:
+                return expected_path.name in actual_path.parts
+        return False
 
     def _workspace_text_files_for_review(self, *, limit: int = 480) -> list[str]:
         rows: list[str] = []
@@ -43316,7 +46055,6 @@ body{padding:18px}
         validation_ok_current = self._tool_results_have_validation_evidence(current, results)
         validation_ok_blackboard = self._plan_step_has_blackboard_evidence(current, bb)
         validation_ok = validation_ok_current or validation_ok_blackboard
-        verified_tag_current = self._check_step_verified_tag(current, messages=self.agent_messages)
         bb_sig = self._plan_step_blackboard_signals(current, bb)
         phase_evidence = False
         if phase in ("research", "design") and validation_ok:
@@ -43337,23 +46075,12 @@ body{padding:18px}
         _has_subtasks = bool(self._active_plan_worker_todo_rows(
             str(current.get("id", "") or ""), role=""
         ))
-        accumulated_evidence_path = (
-            subtasks_all_done
-            and self._step_has_accumulated_evidence(current, bb)
-        )
-        explicit_verified_path = (
-            subtasks_all_done
-            and verified_tag_current
-            and (validation_ok_blackboard or self._step_has_accumulated_evidence(current, bb))
-        )
         acceptance_gate = self._plan_step_acceptance_gate_status(current, worker_step, bb)
         acceptance_gate_ok = bool(acceptance_gate.get("ok", False))
-        has_strong_evidence = subtasks_all_done and acceptance_gate_ok and (
-            validation_ok
-            or validation_ok_blackboard
-            or phase_evidence
-            or accumulated_evidence_path
-            or explicit_verified_path
+        has_strong_evidence = self._plan_step_acceptance_ready_for_advance(
+            current,
+            acceptance_gate,
+            bb,
         )
         # Parity with single-agent (Fix 1): phase-heuristic escape when the step
         # genuinely has NO step-local subtasks (bootstrap above couldn't decompose
@@ -43426,6 +46153,7 @@ body{padding:18px}
                     str(r.get("name", "")) == "read_file"
                     and not self._is_plan_infrastructure_read_result(r)
                 )
+                or self._is_browser_runtime_tool_name(r.get("name", ""))
             )
             for r in results
             if isinstance(r, dict)
@@ -43479,6 +46207,15 @@ body{padding:18px}
                 relevant.append(r)
             if relevant:
                 worker_items = relevant
+        acceptance_items = [
+            row for row in worker_items
+            if self._is_plan_step_acceptance_subtask(row.get("content", ""))
+        ]
+        if not acceptance_items or any(
+            str(row.get("status", "") or "").lower() != "completed"
+            for row in acceptance_items
+        ):
+            return False
         # Fix 6: Exclude "next-step intent" pending items when all other items are completed.
         # When the worker completes step N and creates step N+1 subtasks in the same TodoWrite call,
         # the new pending items get parent_step_id of step N, blocking its advancement.
@@ -44098,9 +46835,23 @@ body{padding:18px}
         if alias:
             desired_index = max(0, int(alias.group(1)) - 1)
         else:
-            pt_alias = re.fullmatch(r"pt[\s:_-]*0*(\d+)", raw_parent, flags=re.IGNORECASE)
-            if pt_alias:
-                desired_index = max(0, int(pt_alias.group(1)))
+            # Providers commonly serialize a plan-step ordinal as the bare
+            # value ``"1"`` (or ``"#1"``) instead of echoing the opaque
+            # canonical ``pt:<epoch>:000`` id.  Treat that shape as a 1-based
+            # roadmap ordinal.  Resolution still goes through project_todos,
+            # so an alias for a different step remains a real cross-step row
+            # and is rejected by the caller rather than silently rebound.
+            ordinal_alias = re.fullmatch(
+                r"#?\s*0*(\d+)\s*[.)、．]?",
+                raw_parent,
+                flags=re.IGNORECASE,
+            )
+            if ordinal_alias:
+                desired_index = max(0, int(ordinal_alias.group(1)) - 1)
+            else:
+                pt_alias = re.fullmatch(r"pt[\s:_-]*0*(\d+)", raw_parent, flags=re.IGNORECASE)
+                if pt_alias:
+                    desired_index = max(0, int(pt_alias.group(1)))
 
         if desired_index is None and isinstance(rows, list):
             majors: list[int] = []
@@ -44136,26 +46887,192 @@ body{padding:18px}
         raw = re.sub(r"\s+", " ", raw.strip().lower())
         return raw
 
+    def _plan_worker_semantic_core(self, text: object) -> str:
+        """Normalize harmless Todo phrasing differences without changing IDs."""
+        raw = unicodedata.normalize(
+            "NFKC",
+            normalize_work_text(str(text or "")) or str(text or ""),
+        ).strip().lower()
+        _status, parsed = split_todo_status_text(raw)
+        raw = parsed or raw
+        raw = re.sub(
+            r"^\s*(?:(?:step|subtask|task|步骤|步驟|子任务|子任務)\s*)?"
+            r"\d+(?:\.\d+)*\s*[.)、:：-]?\s*",
+            "",
+            raw,
+            flags=re.IGNORECASE,
+        )
+        raw = re.split(
+            r"\s*[;；]\s*(?:evidence|证据|證據|証拠)\s*[:：]",
+            raw,
+            maxsplit=1,
+            flags=re.IGNORECASE,
+        )[0]
+        raw = re.sub(r"[\s\W_]+", " ", raw, flags=re.UNICODE).strip()
+        return raw
+
+    def _plan_worker_todo_match_score(self, incoming: dict | None, existing: dict | None) -> float:
+        """Score two active-step rows; only high, unique scores are canonical matches."""
+        if not isinstance(incoming, dict) or not isinstance(existing, dict):
+            return 0.0
+        incoming_acceptance = self._is_plan_step_acceptance_subtask(incoming.get("content", ""))
+        existing_acceptance = self._is_plan_step_acceptance_subtask(existing.get("content", ""))
+        if incoming_acceptance or existing_acceptance:
+            return 1.0 if incoming_acceptance and existing_acceptance else 0.0
+        incoming_id = trim(str(incoming.get("subtask_id", "") or ""), 80)
+        existing_id = trim(str(existing.get("subtask_id", "") or ""), 80)
+        if incoming_id and existing_id and incoming_id == existing_id:
+            return 1.0
+        incoming_aliases = self._plan_worker_external_identity_values(incoming)
+        existing_aliases = self._plan_worker_external_identity_values(existing)
+        if incoming_aliases and existing_aliases and incoming_aliases.intersection(existing_aliases):
+            return 0.999
+        left = self._plan_worker_semantic_core(incoming.get("content", ""))
+        right = self._plan_worker_semantic_core(existing.get("content", ""))
+        if not left or not right:
+            return 0.0
+        if left == right:
+            return 0.99
+        if min(len(left), len(right)) >= 6 and (left in right or right in left):
+            containment = min(len(left), len(right)) / max(len(left), len(right))
+            if containment >= 0.55:
+                return max(0.80, min(0.94, 0.72 + containment * 0.22))
+        sequence_score = difflib.SequenceMatcher(None, left, right).ratio()
+        left_tokens = self._plan_revision_relation_tokens(left)
+        right_tokens = self._plan_revision_relation_tokens(right)
+        token_score = (
+            len(left_tokens & right_tokens) / max(1, min(len(left_tokens), len(right_tokens)))
+            if left_tokens and right_tokens
+            else 0.0
+        )
+        left_paths = {
+            normalize_rel_preview_path(value).lower()
+            for value in self._extract_plan_step_referenced_paths(left, limit=8)
+            if normalize_rel_preview_path(value)
+        }
+        right_paths = {
+            normalize_rel_preview_path(value).lower()
+            for value in self._extract_plan_step_referenced_paths(right, limit=8)
+            if normalize_rel_preview_path(value)
+        }
+        path_score = 0.0
+        if left_paths and right_paths and left_paths.intersection(right_paths):
+            path_score = 0.90
+        base_score = max(sequence_score, token_score, path_score)
+        left_number = re.match(r"^\s*(\d+\.\d+)\b", str(incoming.get("content", "") or ""))
+        right_number = re.match(r"^\s*(\d+\.\d+)\b", str(existing.get("content", "") or ""))
+        if (
+            left_number
+            and right_number
+            and left_number.group(1) == right_number.group(1)
+            and base_score >= 0.34
+        ):
+            base_score = max(base_score, 0.88)
+        return float(min(1.0, base_score))
+
+    def _plan_worker_rows_equivalent(self, incoming: dict | None, existing: dict | None) -> bool:
+        return self._plan_worker_todo_match_score(incoming, existing) >= 0.64
+
+    @staticmethod
+    def _is_canonical_plan_worker_subtask_id(value: object, step_id: object = "") -> bool:
+        subtask_id = trim(str(value or "").strip(), 100)
+        if not subtask_id.startswith("pst:"):
+            return False
+        step_key = trim(str(step_id or "").strip(), 40)
+        return not step_key or subtask_id.startswith(f"pst:{step_key}:")
+
+    def _plan_worker_external_identity_values(self, row: dict | None) -> set[str]:
+        """Return provider identities without confusing them with canonical IDs."""
+        if not isinstance(row, dict):
+            return set()
+        values: set[str] = set()
+        for field in (
+            "external_subtask_id", "external_id", "todo_id", "task_id",
+            "item_id", "row_id", "id", "key",
+        ):
+            value = trim(str(row.get(field, "") or "").strip(), 120)
+            if value and not value.startswith("bb:"):
+                values.add(value.casefold())
+        supplied = trim(str(row.get("subtask_id", "") or "").strip(), 100)
+        if supplied and not self._is_canonical_plan_worker_subtask_id(supplied):
+            values.add(supplied.casefold())
+        return values
+
+    def _capture_plan_worker_external_identity(self, row: dict, step_id: object) -> dict:
+        """Preserve a legacy/provider subtask id before assigning a pst: id."""
+        if not isinstance(row, dict):
+            return row
+        supplied = trim(str(row.get("subtask_id", "") or "").strip(), 100)
+        if supplied and not self._is_canonical_plan_worker_subtask_id(supplied, step_id):
+            row.setdefault("external_subtask_id", supplied)
+        return row
+
     def _stable_plan_worker_subtask_id(
         self,
         step_id: object,
         row: dict | None,
     ) -> str:
         item = row if isinstance(row, dict) else {}
-        existing = trim(str(item.get("subtask_id", "") or "").strip(), 80)
-        if existing:
-            return existing
         step_key = trim(str(step_id or item.get("parent_step_id", "") or "").strip(), 40)
         if not step_key:
             return ""
         content = str(item.get("content", "") or "")
         if self._is_plan_step_acceptance_subtask(content):
             return f"pst:{step_key}:acceptance"
+        existing = trim(str(item.get("subtask_id", "") or "").strip(), 80)
+        if existing and self._is_canonical_plan_worker_subtask_id(existing, step_key):
+            return existing
         core = self._plan_worker_content_core(content)
         if not core:
             return ""
         digest = hashlib.sha1(f"{step_key}|{core}".encode("utf-8", "ignore")).hexdigest()[:16]
         return f"pst:{step_key}:{digest}"
+
+    def _dedupe_plan_worker_rows(self, rows: list[dict], step_id: object) -> list[dict]:
+        step_key = trim(str(step_id or "").strip(), 40)
+        if not step_key:
+            return [dict(row) for row in (rows or []) if isinstance(row, dict)]
+        status_rank = {"completed": 3, "in_progress": 2, "pending": 1, "blocked": 0}
+        merged: dict[str, dict] = {}
+        order: list[str] = []
+        for index, raw in enumerate(rows or []):
+            if not isinstance(raw, dict):
+                continue
+            row = dict(raw)
+            self._capture_plan_worker_external_identity(row, step_key)
+            identity = self._stable_plan_worker_subtask_id(step_key, row)
+            if not identity:
+                identity = f"anonymous:{index}:{self._plan_worker_content_core(row.get('content', ''))}"
+            row["parent_step_id"] = step_key
+            row["subtask_id"] = identity
+            prior = merged.get(identity)
+            if prior is None:
+                merged[identity] = row
+                order.append(identity)
+                continue
+            prior_status = self._normalize_todo_status_value(prior.get("status", ""), "pending")
+            row_status = self._normalize_todo_status_value(row.get("status", ""), "pending")
+            winner = row if status_rank.get(row_status, 0) > status_rank.get(prior_status, 0) else prior
+            combined = dict(prior)
+            for field in (
+                "status", "completed_at", "completed_by", "evidence", "started_at",
+                "updated_at", "owner", "key", "external_subtask_id",
+            ):
+                if winner.get(field) not in (None, "", 0, 0.0):
+                    combined[field] = winner.get(field)
+            prior_content = str(prior.get("content", "") or "")
+            row_content = str(row.get("content", "") or "")
+            if self._is_plan_step_acceptance_subtask(prior_content or row_content):
+                prior_numbered = bool(re.match(r"^\s*\d+\.\d+\s+", normalize_work_text(prior_content) or prior_content))
+                row_numbered = bool(re.match(r"^\s*\d+\.\d+\s+", normalize_work_text(row_content) or row_content))
+                if row_numbered and not prior_numbered:
+                    combined["content"] = row_content
+            elif not prior_content and row_content:
+                combined["content"] = row_content
+            combined["parent_step_id"] = step_key
+            combined["subtask_id"] = identity
+            merged[identity] = combined
+        return [merged[key] for key in order if key in merged]
 
     def _migrate_plan_worker_todo_partitions(self, board: dict) -> bool:
         """Merge legacy step aliases into canonical parent partitions without losing history."""
@@ -44182,6 +47099,7 @@ body{padding:18px}
                 if trim(str(row.get("parent_step_id", "") or "").strip(), 40) != canonical:
                     changed = True
                 row["parent_step_id"] = canonical
+                self._capture_plan_worker_external_identity(row, canonical)
                 row["subtask_id"] = self._stable_plan_worker_subtask_id(canonical, row)
                 grouped.setdefault(canonical, []).append(row)
 
@@ -44321,11 +47239,10 @@ body{padding:18px}
         if not isinstance(row, dict) or not isinstance(plan_step, dict):
             return False
         content = normalize_embedded_newlines(str(row.get("content", "") or "")).strip()
-        if not content or self._is_plan_step_acceptance_subtask(content):
+        if not content:
             return False
         active_ordinal = self._plan_step_ordinal(plan_step, board)
         head = next((line.strip() for line in content.splitlines() if line.strip()), content)
-        head = re.sub(r"^\s*\d+\.\d+\s+", "", head).strip()
         marker = self._plan_line_marker(head)
         if isinstance(marker, dict):
             marker_kind = str(marker.get("kind", "") or "")
@@ -44334,6 +47251,9 @@ body{padding:18px}
                 return True
             if marker_kind == "sub" and marker_major != active_ordinal:
                 return True
+        if self._is_plan_step_acceptance_subtask(content):
+            return False
+        head = re.sub(r"^\s*\d+\.\d+\s+", "", head).strip()
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         todos = bb.get("project_todos", []) if isinstance(bb.get("project_todos"), list) else []
         row_forms = self._plan_todo_compare_forms(head)
@@ -44402,6 +47322,7 @@ body{padding:18px}
             return self._plan_worker_todo_rows_from_blackboard(step_key, role=role_key)
         plan_step = self._get_plan_step_by_id(step_key)
         all_rows = self._filter_parent_step_duplicate_worker_rows(all_rows, plan_step)
+        all_rows = self._dedupe_plan_worker_rows(all_rows, step_key)
         rows = [r for r in all_rows if str(r.get("owner", "") or "").strip().lower() == role_key] if role_key else list(all_rows)
         if role_key and not rows:
             rows = list(all_rows)
@@ -44421,7 +47342,10 @@ body{padding:18px}
         step_id = trim(str(step.get("id", "") or ""), 40)
         if not step_id:
             return {}
-        rows = self._active_plan_worker_todo_rows(step_id, role=role)
+        # The current subtask is one shared execution cursor. In Sync mode a
+        # role-filtered view can hide another agent's in-progress row and make
+        # the manager delegate a pending sibling or rebuild the subplan.
+        rows = self._active_plan_worker_todo_rows(step_id, role="")
         current = next(
             (
                 row for row in rows
@@ -44437,6 +47361,713 @@ body{padding:18px}
             "subtask_id": subtask_id,
             "subtask_content": trim(str(current.get("content", "") or ""), 500),
         }
+
+    def _plan_subtask_route_fields(
+        self,
+        *,
+        board: dict | None = None,
+        role: str = "",
+    ) -> dict:
+        snapshot = self._current_plan_worker_subtask_snapshot(board=board, role=role)
+        return {
+            "plan_subtask_id": trim(str(snapshot.get("subtask_id", "") or ""), 100),
+            "plan_subtask_content": trim(str(snapshot.get("subtask_content", "") or ""), 500),
+        }
+
+    def _plan_worker_completed_status_has_evidence(
+        self,
+        row: dict | None,
+        plan_step: dict | None,
+        board: dict | None = None,
+        *,
+        allow_acceptance_semantic_review: bool = False,
+        actor: str = "",
+    ) -> bool:
+        """Return whether a persisted completed worker row is evidence-backed.
+
+        TodoManager and the blackboard are intentionally two durable views of
+        the same execution graph.  A stale view can contain ``completed`` even
+        though the tool event that justified it was never recorded (or belongs
+        to another parent step).  Never let that stale bit win a merge.  The
+        check is deliberately step-local and uses the stable subtask identity,
+        so sync handoffs cannot manufacture completion or move the cursor back
+        to an earlier child.
+        """
+        if not isinstance(row, dict) or not isinstance(plan_step, dict):
+            return False
+        status = self._normalize_todo_status_value(row.get("status", ""), "pending")
+        if status != "completed":
+            return True
+        if self._normalize_todo_status_value(plan_step.get("status", ""), "pending") == "completed":
+            return True
+        step_id = trim(str(plan_step.get("id", "") or ""), 40)
+        if not step_id:
+            return False
+        subtask_id = trim(str(row.get("subtask_id", "") or ""), 80)
+        if not subtask_id:
+            subtask_id = self._stable_plan_worker_subtask_id(step_id, row)
+        content = str(row.get("content", "") or "").strip()
+        if not content:
+            return False
+        if self._is_plan_step_acceptance_subtask(content):
+            # Acceptance completion is validated by the dedicated gate. A
+            # non-empty evidence field is only a hint: accept either concrete
+            # tool evidence or an internally-authorized, contract-bound audit
+            # event. Arbitrary Todo text can satisfy neither branch.
+            records = self._matching_acceptance_evidence_records(
+                plan_step,
+                row,
+                board=board,
+                expected=self._acceptance_expected_evidence(
+                    self._effective_plan_step_acceptance_text(plan_step, content)
+                ),
+            )
+            if records:
+                return True
+            try:
+                since_ts = self._acceptance_evidence_since_ts(row, plan_step)
+            except Exception:
+                since_ts = 0.0
+            if self._trusted_plan_step_acceptance_records(
+                plan_step,
+                row,
+                board=board,
+                since_ts=since_ts,
+            ):
+                return True
+            if not allow_acceptance_semantic_review:
+                return False
+            # A model explicitly requesting completion is the correct point for
+            # the one-shot semantic fallback.  Passive restore/sync paths keep
+            # this disabled, so simply loading a stale completed bit can never
+            # trigger an LLM decision or manufacture progress.
+            return self._semantic_acceptance_completion_has_evidence(
+                plan_step,
+                row,
+                board=board,
+                actor=actor,
+            )
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        bindings = bb.get("plan_subtask_evidence_bindings", {}) if isinstance(bb.get("plan_subtask_evidence_bindings"), dict) else {}
+        step_bindings = bindings.get(step_id, {}) if isinstance(bindings.get(step_id), dict) else {}
+        binding = step_bindings.get(subtask_id, {}) if isinstance(step_bindings.get(subtask_id), dict) else {}
+        if (
+            binding
+            and str(binding.get("source", "") or "") in {
+                "direct", "semantic", "status_update", "evidence_reconcile", "trusted_restore",
+            }
+            and bool(binding.get("evidence_ids"))
+        ):
+            return True
+        try:
+            since_ts = float(row.get("created_at", 0.0) or row.get("started_at", 0.0) or 0.0)
+        except Exception:
+            since_ts = 0.0
+        if self._plan_subtask_has_accumulated_evidence(
+            plan_step,
+            content,
+            board=board,
+            subtask_id=subtask_id,
+            since_ts=since_ts,
+        ):
+            return True
+        return bool(self._plan_subtask_semantic_completion_records(
+            plan_step,
+            row,
+            board=board,
+            subtask_id=subtask_id,
+            since_ts=since_ts,
+        ))
+
+    def _semantic_acceptance_completion_has_evidence(
+        self,
+        plan_step: dict,
+        acceptance: dict,
+        *,
+        board: dict | None = None,
+        actor: str = "",
+    ) -> bool:
+        """Resolve an ambiguous acceptance completion against real step evidence.
+
+        The existing quality judge is signature-cached.  We invoke it only when
+        the deterministic gate reports semantic ambiguity and has current,
+        step-local product evidence.  PASS is persisted as a contract-bound
+        trusted event; VERIFY and REPAIR stay open and retain their audit for the
+        normal gate/recovery route.
+        """
+        if not isinstance(plan_step, dict) or not isinstance(acceptance, dict):
+            return False
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        step_id = trim(str(plan_step.get("id", "") or ""), 40)
+        if not step_id:
+            return False
+        rows = self._active_plan_worker_todo_rows(step_id, role="")
+        work_rows = [
+            row for row in rows
+            if not self._is_plan_step_acceptance_subtask(row.get("content", ""))
+        ]
+        if not work_rows or any(
+            str(row.get("status", "") or "").strip().lower() != "completed"
+            for row in work_rows
+        ):
+            return False
+        since_ts = self._acceptance_evidence_since_ts(acceptance, plan_step)
+        records = self._plan_step_evidence_records(step_id, board=bb, since_ts=since_ts)
+        records.extend(self._plan_step_acceptance_review_records(
+            plan_step,
+            board=bb,
+            since_ts=since_ts,
+        ))
+        product_records = [
+            row for row in records
+            if isinstance(row, dict)
+            and not self._is_non_product_acceptance_error_record(row)
+        ]
+        passing_candidates = [
+            row for row in product_records
+            if self._plan_evidence_record_passes(row)
+            or (
+                str(row.get("assertion_kind", "") or "") == "negative_search_no_match"
+                and bool(row.get("assertion_ok", False))
+                and bool(row.get("assertion_complete", False))
+            )
+        ]
+        if not passing_candidates:
+            return False
+        contract_text = self._effective_plan_step_acceptance_text(
+            plan_step,
+            acceptance.get("content", ""),
+        )
+        expected = self._acceptance_expected_evidence(contract_text)
+        evaluation = self._evaluate_acceptance_evidence_records(
+            product_records,
+            expected,
+            acceptance_text=contract_text,
+            subject_text=str(
+                plan_step.get("full_content", "")
+                or plan_step.get("content", "")
+                or ""
+            ),
+        )
+        if str(evaluation.get("status", "") or "") == "failed":
+            return False
+        gate = {
+            "ok": False,
+            "reason": "final-acceptance-semantic-coverage-uncertain",
+            "expected": expected,
+            "acceptance": dict(acceptance),
+            "acceptance_contract": contract_text,
+            "candidate_evidence": product_records[-16:],
+            "current_results": [],
+            "evidence_evaluation": evaluation,
+        }
+        review = self._llm_review_plan_step_quality(
+            plan_step,
+            {"tool_results": []},
+            bb,
+            candidate_evidence={"gate": gate, "records": product_records[-16:]},
+        )
+        if not (
+            review.get("available")
+            and review.get("passed")
+            and str(review.get("confidence", "") or "").lower() in {"high", "medium"}
+        ):
+            return False
+        evidence_items = review.get("evidence", []) or []
+        if not isinstance(evidence_items, list):
+            evidence_items = [evidence_items]
+        evidence_text = "; ".join(
+            trim(str(item or ""), 260)
+            for item in evidence_items[:4]
+            if str(item or "").strip()
+        ) or trim(str(review.get("reason", "") or "semantic acceptance pass"), 500)
+        trusted = self._record_trusted_plan_step_acceptance_event(
+            plan_step,
+            acceptance,
+            evidence=trim(f"[semantic-audit] {evidence_text}", 900),
+            actor=str(actor or "reviewer"),
+            source="semantic_audit",
+        )
+        return bool(trusted)
+
+    def _plan_subtask_semantic_evidence_signature(
+        self,
+        plan_step: dict,
+        row: dict,
+        *,
+        board: dict | None = None,
+        subtask_id: str = "",
+        since_ts: float = 0.0,
+    ) -> tuple[str, list[dict]]:
+        """Return a stable review signature and real current-step candidates."""
+        if not isinstance(plan_step, dict) or not isinstance(row, dict):
+            return "", []
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        step_id = trim(str(plan_step.get("id", "") or ""), 40)
+        stable_id = trim(str(subtask_id or row.get("subtask_id", "") or ""), 80)
+        if not stable_id and step_id:
+            stable_id = self._stable_plan_worker_subtask_id(step_id, row)
+        lower_bound = max(float(since_ts or 0.0), self._plan_step_activation_ts(plan_step))
+        candidates = self._plan_step_evidence_records(
+            step_id,
+            board=bb,
+            since_ts=lower_bound,
+        ) if step_id else []
+        payload = {
+            "step_id": step_id,
+            "subtask_id": stable_id,
+            "subtask": trim(str(row.get("content", "") or ""), 800),
+            "evidence": [
+                (
+                    str(record.get("id", "") or ""),
+                    str(record.get("kind", "") or ""),
+                    str(record.get("tool", "") or ""),
+                    bool(record.get("ok", False)),
+                    record.get("exit_code"),
+                    str(record.get("path", "") or ""),
+                    tuple(str(value or "") for value in (record.get("changed_files", []) or [])),
+                    trim(str(record.get("summary", "") or ""), 500),
+                )
+                for record in candidates[-16:]
+            ],
+        }
+        signature = hashlib.sha1(json_dumps(payload).encode("utf-8", "ignore")).hexdigest()[:20]
+        return signature, candidates[-16:]
+
+    def _cached_plan_subtask_semantic_review(
+        self,
+        plan_step: dict,
+        row: dict,
+        *,
+        board: dict | None = None,
+        subtask_id: str = "",
+        since_ts: float = 0.0,
+    ) -> tuple[dict, list[dict]]:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        step_id = trim(str((plan_step or {}).get("id", "") or ""), 40)
+        stable_id = trim(str(subtask_id or (row or {}).get("subtask_id", "") or ""), 80)
+        if not stable_id and step_id and isinstance(row, dict):
+            stable_id = self._stable_plan_worker_subtask_id(step_id, row)
+        signature, candidates = self._plan_subtask_semantic_evidence_signature(
+            plan_step,
+            row,
+            board=bb,
+            subtask_id=stable_id,
+            since_ts=since_ts,
+        )
+        all_reviews = bb.get("plan_subtask_semantic_reviews", {}) if isinstance(bb.get("plan_subtask_semantic_reviews"), dict) else {}
+        step_reviews = all_reviews.get(step_id, {}) if isinstance(all_reviews.get(step_id), dict) else {}
+        review = step_reviews.get(stable_id, {}) if isinstance(step_reviews.get(stable_id), dict) else {}
+        if not review or str(review.get("evidence_signature", "") or "") != signature:
+            return {}, candidates
+        return dict(review), candidates
+
+    def _record_plan_subtask_semantic_review(
+        self,
+        plan_step: dict,
+        row: dict,
+        review: dict,
+        *,
+        board: dict | None = None,
+        subtask_id: str = "",
+    ) -> None:
+        if not isinstance(plan_step, dict) or not isinstance(row, dict) or not isinstance(review, dict):
+            return
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        step_id = trim(str(plan_step.get("id", "") or ""), 40)
+        stable_id = trim(str(subtask_id or row.get("subtask_id", "") or ""), 80)
+        if not stable_id and step_id:
+            stable_id = self._stable_plan_worker_subtask_id(step_id, row)
+        if not step_id or not stable_id:
+            return
+        all_reviews = dict(bb.get("plan_subtask_semantic_reviews", {}) if isinstance(bb.get("plan_subtask_semantic_reviews"), dict) else {})
+        step_reviews = dict(all_reviews.get(step_id, {}) if isinstance(all_reviews.get(step_id), dict) else {})
+        step_reviews[stable_id] = dict(review)
+        all_reviews[step_id] = step_reviews
+        bb["plan_subtask_semantic_reviews"] = all_reviews
+        bb["updated_at"] = float(now_ts())
+        self.blackboard = bb
+
+    def _llm_review_plan_subtask_completion(
+        self,
+        plan_step: dict,
+        row: dict,
+        *,
+        board: dict | None = None,
+        subtask_id: str = "",
+        since_ts: float = 0.0,
+    ) -> dict:
+        """Use one cached LLM audit when deterministic evidence binding fails.
+
+        The deterministic matcher remains the fast path.  This fallback runs
+        only for an explicit completion request with passing, step-local tool
+        evidence, so action verbs and path wording remain hints rather than a
+        brittle source of permanent Todo deadlocks.
+        """
+        default = {
+            "available": False,
+            "passed": False,
+            "decision": "verify",
+            "confidence": "low",
+            "reason": "semantic subtask review unavailable",
+            "evidence": "",
+            "evidence_ids": [],
+            "source": "subtask-semantic-judge",
+        }
+        if (
+            not isinstance(plan_step, dict)
+            or not isinstance(row, dict)
+            or self._is_plan_step_acceptance_subtask(row.get("content", ""))
+        ):
+            return default
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        stable_id = trim(str(subtask_id or row.get("subtask_id", "") or ""), 80)
+        if not stable_id:
+            stable_id = self._stable_plan_worker_subtask_id(
+                trim(str(plan_step.get("id", "") or ""), 40),
+                row,
+            )
+        cached, candidates = self._cached_plan_subtask_semantic_review(
+            plan_step,
+            row,
+            board=bb,
+            subtask_id=stable_id,
+            since_ts=since_ts,
+        )
+        if cached:
+            return cached
+        signature, candidates = self._plan_subtask_semantic_evidence_signature(
+            plan_step,
+            row,
+            board=bb,
+            subtask_id=stable_id,
+            since_ts=since_ts,
+        )
+        if not candidates:
+            return default
+        evidence_lines = [
+            trim(
+                f"ID={record.get('id', '')} kind={record.get('kind', '')} "
+                f"tool={record.get('tool', '')} ok={record.get('ok')} exit={record.get('exit_code')} "
+                f"path={record.get('path', '')} changed={record.get('changed_files', [])} "
+                f"summary={record.get('summary', '')}",
+                700,
+            )
+            for record in candidates
+        ]
+        review = dict(default)
+        review["evidence_signature"] = signature
+        review["subtask_id"] = stable_id
+        try:
+            prompt = (
+                "A deterministic Todo evidence matcher could not decide whether one current subtask is complete. "
+                "Audit the REAL step-local records semantically; action verbs, numbering, and exact path wording are hints, "
+                "not the verdict. Decide pass only when the records concretely prove this subtask's intended result. "
+                "Equivalent implementation/verification methods are allowed, but evidence for another subtask is not. "
+                "Use verify when proof is insufficient and repair only when a real defect is shown. Never pass a claim without tool evidence.\n\n"
+                f"PARENT STEP:\n{trim(str(plan_step.get('full_content', '') or plan_step.get('content', '') or ''), 1400)}\n\n"
+                f"SUBTASK:\n{trim(str(row.get('content', '') or ''), 800)}\n\n"
+                f"EVIDENCE RECORDS:\n{chr(10).join(evidence_lines)}\n\n"
+                "Reply JSON only: {\"decision\":\"pass|verify|repair\",\"passed\":true|false,"
+                "\"confidence\":\"high|medium|low\",\"reason\":\"...\",\"evidence\":\"...\","
+                "\"evidence_ids\":[\"ID from records\"]}"
+            )
+            resp = self.ollama.chat(
+                [{"role": "user", "content": prompt}],
+                system=self._inject_runtime_environment_context(
+                    "/no_think\nYou are a strict evidence-grounded subtask auditor. Reply only valid JSON."
+                ),
+                max_tokens=360,
+                temperature=0.1,
+                think=False,
+            )
+            raw = str(resp.get("content", "") or resp.get("text", "") or "").strip()
+            payload = extract_json_object_from_text(raw, {})
+            if isinstance(payload, dict) and "passed" in payload:
+                confidence = str(payload.get("confidence", "low") or "low").strip().lower()
+                if confidence not in {"high", "medium", "low"}:
+                    confidence = "low"
+                decision = str(payload.get("decision", "") or "").strip().lower()
+                if decision not in {"pass", "verify", "repair"}:
+                    decision = "pass" if bool(payload.get("passed", False)) else "verify"
+                evidence_text = trim(str(payload.get("evidence", "") or ""), 500)
+                valid_ids = {
+                    str(record.get("id", "") or "")
+                    for record in candidates
+                    if record.get("id") and self._plan_evidence_record_passes(record)
+                }
+                cited_ids = [
+                    trim(str(value or ""), 80)
+                    for value in (payload.get("evidence_ids", []) if isinstance(payload.get("evidence_ids"), list) else [])
+                    if trim(str(value or ""), 80) in valid_ids
+                ]
+                requested_pass = bool(
+                    payload.get("passed", False)
+                    and decision == "pass"
+                    and confidence in {"high", "medium"}
+                    and evidence_text
+                )
+                if requested_pass and not cited_ids:
+                    cited_ids = [
+                        str(record.get("id", "") or "")
+                        for record in candidates
+                        if record.get("id") and self._plan_evidence_record_passes(record)
+                    ]
+                passed = bool(requested_pass and cited_ids)
+                review.update({
+                    "available": True,
+                    "passed": passed,
+                    "decision": decision,
+                    "confidence": confidence,
+                    "reason": trim(str(payload.get("reason", "") or ""), 500),
+                    "evidence": evidence_text,
+                    "evidence_ids": cited_ids[-16:] if passed else [],
+                    "raw": trim(raw, 1200),
+                })
+        except Exception as exc:
+            review["reason"] = trim(f"semantic subtask review unavailable: {exc}", 300)
+        review["ts"] = float(now_ts())
+        self._record_plan_subtask_semantic_review(
+            plan_step,
+            row,
+            review,
+            board=bb,
+            subtask_id=stable_id,
+        )
+        return review
+
+    def _plan_subtask_semantic_completion_records(
+        self,
+        plan_step: dict,
+        row: dict,
+        *,
+        board: dict | None = None,
+        subtask_id: str = "",
+        since_ts: float = 0.0,
+    ) -> list[dict]:
+        review, candidates = self._cached_plan_subtask_semantic_review(
+            plan_step,
+            row,
+            board=board,
+            subtask_id=subtask_id,
+            since_ts=since_ts,
+        )
+        if not (
+            review.get("available")
+            and review.get("passed")
+            and str(review.get("confidence", "") or "").lower() in {"high", "medium"}
+        ):
+            return []
+        evidence_ids = {str(value or "") for value in (review.get("evidence_ids", []) or []) if str(value or "")}
+        return [
+            record for record in candidates
+            if str(record.get("id", "") or "") in evidence_ids
+            and self._plan_evidence_record_passes(record)
+        ]
+
+    def _plan_subtask_completion_audit_warning(
+        self,
+        plan_step: dict,
+        row: dict,
+        *,
+        board: dict | None = None,
+        subtask_id: str = "",
+        since_ts: float = 0.0,
+    ) -> str:
+        label = trim(str((row or {}).get("content", "") or ""), 120)
+        review, _candidates = self._cached_plan_subtask_semantic_review(
+            plan_step,
+            row,
+            board=board,
+            subtask_id=subtask_id,
+            since_ts=since_ts,
+        )
+        if not review.get("available"):
+            return label
+        decision = trim(str(review.get("decision", "verify") or "verify"), 16)
+        reason = trim(str(review.get("reason", "") or ""), 120)
+        return trim(
+            f"{label} [LLM audit={decision}{(': ' + reason) if reason else ''}]",
+            260,
+        )
+
+    def _plan_worker_completion_has_evidence(
+        self,
+        plan_step: dict,
+        row: dict,
+        *,
+        board: dict | None = None,
+        subtask_id: str = "",
+        since_ts: float = 0.0,
+        evidence: object = None,
+    ) -> bool:
+        """Audit a requested completion using the row's own semantic type."""
+        if not isinstance(plan_step, dict) or not isinstance(row, dict):
+            return False
+        candidate = dict(row)
+        candidate["status"] = "completed"
+        if subtask_id:
+            candidate["subtask_id"] = subtask_id
+        if self._is_plan_step_acceptance_subtask(candidate.get("content", "")):
+            return self._plan_worker_completed_status_has_evidence(
+                candidate,
+                plan_step,
+                board,
+                allow_acceptance_semantic_review=True,
+                actor=str(candidate.get("completed_by", "") or self._current_plan_worker_owner(board)),
+            )
+        if self._plan_subtask_has_accumulated_evidence(
+            plan_step,
+            candidate.get("content", ""),
+            board=board,
+            subtask_id=subtask_id,
+            since_ts=since_ts,
+            evidence=evidence,
+        ):
+            return True
+        review = self._llm_review_plan_subtask_completion(
+            plan_step,
+            candidate,
+            board=board,
+            subtask_id=subtask_id,
+            since_ts=since_ts,
+        )
+        return bool(
+            review.get("available")
+            and review.get("passed")
+            and str(review.get("confidence", "") or "").lower() in {"high", "medium"}
+        )
+
+    def _plan_worker_completion_evidence_records(
+        self,
+        plan_step: dict,
+        row: dict,
+        *,
+        board: dict | None = None,
+        subtask_id: str = "",
+        since_ts: float = 0.0,
+        evidence: object = None,
+    ) -> list[dict]:
+        """Return the exact records that justified one accepted completion."""
+        if not isinstance(plan_step, dict) or not isinstance(row, dict):
+            return []
+        if self._is_plan_step_acceptance_subtask(row.get("content", "")):
+            records = self._matching_acceptance_evidence_records(
+                plan_step,
+                row,
+                board=board,
+                expected=self._acceptance_expected_evidence(
+                    self._effective_plan_step_acceptance_text(
+                        plan_step,
+                        row.get("content", ""),
+                    )
+                ),
+            )
+            if records:
+                return records
+            return self._trusted_plan_step_acceptance_records(
+                plan_step,
+                row,
+                board=board,
+                since_ts=since_ts,
+            )
+        records = self._plan_subtask_evidence_records(
+            plan_step,
+            row.get("content", ""),
+            board=board,
+            subtask_id=subtask_id,
+            since_ts=since_ts,
+            evidence=evidence,
+        )
+        if records:
+            return records
+        return self._plan_subtask_semantic_completion_records(
+            plan_step,
+            row,
+            board=board,
+            subtask_id=subtask_id,
+            since_ts=since_ts,
+        )
+
+    def _record_plan_subtask_evidence_binding(
+        self,
+        plan_step: dict,
+        row: dict,
+        records: list[dict],
+        *,
+        source: str,
+        actor: str,
+        board: dict | None = None,
+    ) -> dict:
+        """Persist the runtime's evidence decision beyond the rolling ledger window."""
+        if not isinstance(plan_step, dict) or not isinstance(row, dict):
+            return {}
+        step_id = trim(str(plan_step.get("id", "") or ""), 40)
+        subtask_id = self._stable_plan_worker_subtask_id(step_id, row)
+        passing = [
+            dict(record)
+            for record in (records or [])
+            if isinstance(record, dict)
+            and self._plan_evidence_record_passes(record)
+            and (not record.get("step_id") or str(record.get("step_id", "") or "") == step_id)
+        ]
+        evidence_ids = [trim(str(record.get("id", "") or ""), 80) for record in passing if record.get("id")]
+        if not step_id or not subtask_id or not evidence_ids:
+            return {}
+        latest = passing[-1]
+        binding = {
+            "subtask_id": subtask_id,
+            "content_core": self._plan_worker_content_core(row.get("content", "")),
+            "source": trim(str(source or "direct"), 40),
+            "actor": trim(str(actor or "developer"), 40),
+            "evidence_ids": evidence_ids[-12:],
+            "evidence": trim(
+                f"{latest.get('tool', 'tool')}: {latest.get('summary', '')}",
+                300,
+            ),
+            "ts": float(now_ts()),
+        }
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        all_bindings = dict(
+            bb.get("plan_subtask_evidence_bindings", {})
+            if isinstance(bb.get("plan_subtask_evidence_bindings"), dict)
+            else {}
+        )
+        step_bindings = dict(all_bindings.get(step_id, {}) if isinstance(all_bindings.get(step_id), dict) else {})
+        step_bindings[subtask_id] = binding
+        all_bindings[step_id] = step_bindings
+        bb["plan_subtask_evidence_bindings"] = all_bindings
+        bb["updated_at"] = float(now_ts())
+        self.blackboard = bb
+        return binding
+
+    def _clear_plan_subtask_evidence_binding(
+        self,
+        step_id: object,
+        subtask_id: object,
+        *,
+        board: dict | None = None,
+    ) -> bool:
+        step_key = trim(str(step_id or ""), 40)
+        subtask_key = trim(str(subtask_id or ""), 80)
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        all_bindings = dict(
+            bb.get("plan_subtask_evidence_bindings", {})
+            if isinstance(bb.get("plan_subtask_evidence_bindings"), dict)
+            else {}
+        )
+        step_bindings = dict(all_bindings.get(step_key, {}) if isinstance(all_bindings.get(step_key), dict) else {})
+        if not step_key or not subtask_key or subtask_key not in step_bindings:
+            return False
+        step_bindings.pop(subtask_key, None)
+        if step_bindings:
+            all_bindings[step_key] = step_bindings
+        else:
+            all_bindings.pop(step_key, None)
+        bb["plan_subtask_evidence_bindings"] = all_bindings
+        bb["updated_at"] = float(now_ts())
+        self.blackboard = bb
+        return True
 
     def _bind_tool_result_to_plan_subtask(self, item: dict, snapshot: dict | None) -> dict:
         if not isinstance(item, dict) or not isinstance(snapshot, dict):
@@ -44459,6 +48090,7 @@ body{padding:18px}
         bb = board if isinstance(board, dict) else (self.blackboard if isinstance(getattr(self, "blackboard", None), dict) else {})
         mirror = bb.get("plan_worker_todos", {}) if isinstance(bb.get("plan_worker_todos"), dict) else {}
         raw_rows = mirror.get(step_key, []) if isinstance(mirror.get(step_key), list) else []
+        plan_step = self._get_plan_step_by_id(step_key, bb)
         role_key = self._sanitize_agent_role(role)
         rows: list[dict] = []
         for row in raw_rows:
@@ -44490,10 +48122,34 @@ body{padding:18px}
                 "completed_by": trim(str(row.get("completed_by", "") or ""), 40),
                 "evidence": trim(str(row.get("evidence", "") or ""), 300),
             }
+            external_subtask_id = trim(
+                str(row.get("external_subtask_id", "") or "").strip(),
+                120,
+            )
+            supplied_subtask_id = trim(str(row.get("subtask_id", "") or "").strip(), 100)
+            if supplied_subtask_id and not self._is_canonical_plan_worker_subtask_id(
+                supplied_subtask_id,
+                step_key,
+            ):
+                external_subtask_id = external_subtask_id or supplied_subtask_id
+            if external_subtask_id:
+                item["external_subtask_id"] = external_subtask_id
+            row_key = trim(str(row.get("key", "") or "").strip(), 120)
+            if row_key and not row_key.startswith("bb:"):
+                item["key"] = row_key
             item["subtask_id"] = self._stable_plan_worker_subtask_id(step_key, row)
+            if (
+                item["status"] == "completed"
+                and isinstance(plan_step, dict)
+                and not self._plan_worker_completed_status_has_evidence(item, plan_step, bb)
+            ):
+                item["status"] = "pending"
+                item["completed_at"] = None
+                item["completed_by"] = ""
+                item["evidence"] = ""
             rows.append(item)
-        plan_step = self._get_plan_step_by_id(step_key, bb)
         rows = self._filter_parent_step_duplicate_worker_rows(rows, plan_step, bb)
+        rows = self._dedupe_plan_worker_rows(rows, step_key)
         if role_key and not rows:
             return self._plan_worker_todo_rows_from_blackboard(step_key, role="", board=bb)
         rows.sort(key=self._plan_worker_todo_sort_key)
@@ -44505,9 +48161,26 @@ body{padding:18px}
         *,
         rows: list[dict] | None = None,
         board: dict | None = None,
+        transaction: dict | None = None,
     ) -> bool:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        if transaction is not None:
+            valid, stale_reason = self._todo_write_transaction_is_current(
+                transaction,
+                board=bb,
+            )
+            if not valid:
+                self._emit_stale_todo_write_discarded(stale_reason)
+                return False
         self._migrate_plan_worker_todo_partitions(bb)
+        if transaction is not None:
+            valid, stale_reason = self._todo_write_transaction_is_current(
+                transaction,
+                board=self._ensure_blackboard(),
+            )
+            if not valid:
+                self._emit_stale_todo_write_discarded(stale_reason)
+                return False
         mirror = dict(bb.get("plan_worker_todos", {}) if isinstance(bb.get("plan_worker_todos"), dict) else {})
         changed = False
         worker_owners = {"developer", "explorer", "reviewer"}
@@ -44528,6 +48201,23 @@ body{padding:18px}
                 plan_step_cache[parent_key],
                 bb,
             )
+            protected_existing: list[dict] = []
+            for existing_row in clean_existing:
+                normalized_existing = dict(existing_row)
+                if (
+                    self._normalize_todo_status_value(normalized_existing.get("status", ""), "pending") == "completed"
+                    and not self._plan_worker_completed_status_has_evidence(
+                        normalized_existing,
+                        plan_step_cache[parent_key],
+                        bb,
+                    )
+                ):
+                    normalized_existing["status"] = "pending"
+                    normalized_existing["completed_at"] = None
+                    normalized_existing["completed_by"] = ""
+                    normalized_existing["evidence"] = ""
+                protected_existing.append(normalized_existing)
+            clean_existing = protected_existing
             if clean_existing != existing_rows or parent_key != parent:
                 mirror.pop(parent, None)
                 if clean_existing:
@@ -44575,7 +48265,30 @@ body{padding:18px}
                 "completed_by": trim(str(raw.get("completed_by", "") or ""), 40),
                 "evidence": trim(str(raw.get("evidence", "") or ""), 300),
             }
+            external_subtask_id = trim(
+                str(raw.get("external_subtask_id", "") or "").strip(),
+                120,
+            )
+            supplied_subtask_id = trim(str(raw.get("subtask_id", "") or "").strip(), 100)
+            if supplied_subtask_id and not self._is_canonical_plan_worker_subtask_id(
+                supplied_subtask_id,
+                parent,
+            ):
+                external_subtask_id = external_subtask_id or supplied_subtask_id
+            if external_subtask_id:
+                item["external_subtask_id"] = external_subtask_id
+            row_key = trim(str(raw.get("key", "") or "").strip(), 120)
+            if row_key and not row_key.startswith("bb:"):
+                item["key"] = row_key
             item["subtask_id"] = self._stable_plan_worker_subtask_id(parent, raw)
+            if (
+                item["status"] == "completed"
+                and not self._plan_worker_completed_status_has_evidence(item, plan_step_cache.get(parent), bb)
+            ):
+                item["status"] = "pending"
+                item["completed_at"] = None
+                item["completed_by"] = ""
+                item["evidence"] = ""
             grouped.setdefault(parent, []).append(item)
         target_steps = {step_filter} if step_filter else set(grouped.keys())
         if not step_filter:
@@ -44595,6 +48308,7 @@ body{padding:18px}
                 plan_step_cache.get(parent),
                 bb,
             )
+            clean_rows = self._dedupe_plan_worker_rows(clean_rows, parent)
             clean_rows.sort(key=self._plan_worker_todo_sort_key)
             if clean_rows:
                 if mirror.get(parent) != clean_rows:
@@ -44604,6 +48318,14 @@ body{padding:18px}
                 mirror.pop(parent, None)
                 changed = True
         if changed:
+            if transaction is not None:
+                valid, stale_reason = self._todo_write_transaction_is_current(
+                    transaction,
+                    board=self._ensure_blackboard(),
+                )
+                if not valid:
+                    self._emit_stale_todo_write_discarded(stale_reason)
+                    return False
             bb["plan_worker_todos"] = mirror
             bb["updated_at"] = float(now_ts())
             self.blackboard = bb
@@ -44635,6 +48357,72 @@ body{padding:18px}
             if raw_mirror or memory_rows:
                 return self._sync_plan_worker_todos_to_blackboard(step_key, rows=memory_rows, board=bb)
             return False
+        # Merge the two persistence views before restoring them.  The blackboard
+        # mirror and TodoManager are written by different event paths and one can
+        # legitimately lag the other by a turn.  Restore is monotonic: a completed
+        # row (and its evidence) can never be downgraded by an older pending or
+        # in_progress snapshot.  This keeps sync from visually moving a finished
+        # child back to the first open child after a manager handoff.
+        status_rank = {"pending": 1, "in_progress": 2, "completed": 3}
+        merged_by_id: dict[str, dict] = {}
+        merged_order: list[str] = []
+        for source_row in mirror_rows + memory_rows:
+            row = dict(source_row)
+            identity = self._stable_plan_worker_subtask_id(step_key, row)
+            if not identity:
+                continue
+            row["subtask_id"] = identity
+            row["parent_step_id"] = step_key
+            if (
+                self._normalize_todo_status_value(row.get("status", ""), "pending") == "completed"
+                and not self._plan_worker_completed_status_has_evidence(row, plan_step, bb)
+            ):
+                row["status"] = "pending"
+                row["completed_at"] = None
+                row["completed_by"] = ""
+                row["evidence"] = ""
+            prior = merged_by_id.get(identity)
+            if prior is None:
+                merged_by_id[identity] = row
+                merged_order.append(identity)
+                continue
+            prior_status = self._normalize_todo_status_value(prior.get("status", ""), "pending")
+            incoming_status = self._normalize_todo_status_value(row.get("status", ""), "pending")
+            if status_rank.get(incoming_status, 0) >= status_rank.get(prior_status, 0):
+                winner, loser = row, prior
+            else:
+                winner, loser = prior, row
+            combined = dict(loser)
+            combined.update(winner)
+            # Preserve completion metadata even if the winning copy is an old
+            # serialized row without its optional fields.
+            for field in ("completed_at", "completed_by", "evidence", "created_at", "started_at"):
+                if combined.get(field) in (None, "", 0, 0.0):
+                    value = prior.get(field, row.get(field))
+                    if value not in (None, "", 0, 0.0):
+                        combined[field] = value
+            combined["status"] = "completed" if max(
+                status_rank.get(prior_status, 0), status_rank.get(incoming_status, 0)
+            ) >= status_rank["completed"] else self._normalize_todo_status_value(
+                winner.get("status", ""), "pending"
+            )
+            combined["parent_step_id"] = step_key
+            combined["subtask_id"] = identity
+            if (
+                self._normalize_todo_status_value(combined.get("status", ""), "pending") == "completed"
+                and not self._plan_worker_completed_status_has_evidence(combined, plan_step, bb)
+            ):
+                # A completed bit from one persistence view is not proof by
+                # itself.  Downgrade only the unproven row; keep its identity
+                # and content so the active child remains resumable.
+                combined["status"] = "pending"
+                combined["completed_at"] = None
+                combined["completed_by"] = ""
+                combined["evidence"] = ""
+            merged_by_id[identity] = combined
+        restore_rows = [merged_by_id[key] for key in merged_order if key in merged_by_id]
+        if not restore_rows:
+            return False
         before = [
             (
                 self._plan_worker_todo_identity(row),
@@ -44646,7 +48434,7 @@ body{padding:18px}
         ]
         role_key = self._current_plan_worker_owner(bb)
         self._merge_plan_worker_todo_items(
-            mirror_rows + memory_rows,
+            restore_rows,
             role=role_key,
             trusted_restore=True,
         )
@@ -44951,16 +48739,35 @@ body{padding:18px}
         raw = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
         aliases = {
             "todo": "pending",
+            "open": "pending",
+            "not_started": "pending",
+            "notstarted": "pending",
+            "待处理": "pending",
+            "待處理": "pending",
+            "未开始": "pending",
+            "未開始": "pending",
             "[_]": "pending",
             "[]": "pending",
             "[ ]": "pending",
             "doing": "in_progress",
             "working": "in_progress",
+            "active": "in_progress",
+            "started": "in_progress",
+            "进行中": "in_progress",
+            "進行中": "in_progress",
+            "处理中": "in_progress",
+            "處理中": "in_progress",
             "inprogress": "in_progress",
             "in_progress": "in_progress",
             "[>]": "in_progress",
             ">": "in_progress",
             "done": "completed",
+            "complete": "completed",
+            "success": "completed",
+            "succeeded": "completed",
+            "passed": "completed",
+            "完成": "completed",
+            "已完成": "completed",
             "finish": "completed",
             "finished": "completed",
             "[x]": "completed",
@@ -44980,7 +48787,7 @@ body{padding:18px}
         default_status: str = "pending",
     ) -> dict:
         worker_owners = {"developer", "explorer", "reviewer"}
-        step_key = trim(str(step_id or "").strip(), 20)
+        step_key = trim(str(step_id or "").strip(), 40)
         owner_hint = self._sanitize_agent_role(role_key) or self._current_plan_worker_owner()
         if isinstance(item, str):
             raw: dict = {"content": item}
@@ -44991,13 +48798,43 @@ body{padding:18px}
         key = trim(str(raw.get("key", "") or "").strip(), 120)
         if key.startswith("bb:"):
             return raw
-        raw_content = str(raw.get("content", raw.get("text", raw.get("title", ""))) or "").strip()
+        raw_content = str(
+            raw.get(
+                "content",
+                raw.get(
+                        "text",
+                        raw.get(
+                            "title",
+                            raw.get(
+                                "task",
+                                raw.get("description", raw.get("label", raw.get("name", raw.get("summary", "")))),
+                            ),
+                        ),
+                ),
+            )
+            or ""
+        ).strip()
         parsed_status, parsed_content = split_todo_status_text(raw_content)
         content = normalize_work_text(parsed_content or raw_content) or (parsed_content or raw_content)
         content = trim(str(content or "").strip(), 500)
         if not content:
             return {}
-        raw_status = str(raw.get("status", raw.get("state", "")) or "").strip()
+        # Accept provider-specific aliases without changing the canonical row
+        # identity.  A resume payload often uses ``done``/``finished`` booleans
+        # instead of a status string.
+        raw_status_value = raw.get("status", raw.get("state", raw.get("phase", "")))
+        if raw_status_value in (None, ""):
+            if any(
+                _to_bool_like(raw.get(key, False), default=False)
+                for key in ("completed", "complete", "done", "finished", "passed", "success")
+            ):
+                raw_status_value = "completed"
+            elif any(
+                _to_bool_like(raw.get(key, False), default=False)
+                for key in ("in_progress", "inprogress", "active", "working", "started")
+            ):
+                raw_status_value = "in_progress"
+        raw_status = str(raw_status_value or "").strip()
         raw_status_key = raw_status.lower().replace("-", "_").replace(" ", "_")
         status = self._normalize_todo_status_value(raw_status, parsed_status or default_status)
         if parsed_status and raw_status_key in {"", "todo", "pending"}:
@@ -45015,17 +48852,43 @@ body{padding:18px}
             "status": status,
             "owner": owner,
         }
+        if key:
+            row["key"] = key
         if parent_step_id:
             row["parent_step_id"] = parent_step_id
         active_form = str(raw.get("activeForm", raw.get("active_form", "")) or "").strip()
         if active_form:
             row["activeForm"] = active_form
         for meta_key in (
-            "subtask_id", "created_at", "updated_at", "started_at", "completed_at",
-            "completed_by", "evidence", "revision_reason", "revision_evidence",
+            "created_at", "updated_at", "started_at", "completed_at",
+            "completed_by", "evidence", "evidence_binding", "evidence_ids",
+            "revision_reason", "revision_evidence",
         ):
             if meta_key in raw and raw.get(meta_key) not in (None, ""):
                 row[meta_key] = raw.get(meta_key)
+        for source_key in ("proof", "evidence_ref", "evidence_refs"):
+            if not row.get("evidence") and raw.get(source_key) not in (None, ""):
+                row["evidence"] = raw.get(source_key)
+        supplied_subtask_id = trim(
+            str(raw.get("subtask_id", raw.get("subtaskId", "")) or "").strip(),
+            100,
+        )
+        if supplied_subtask_id:
+            if self._is_canonical_plan_worker_subtask_id(supplied_subtask_id, step_key):
+                row["subtask_id"] = supplied_subtask_id
+            else:
+                row["external_subtask_id"] = supplied_subtask_id
+        for alias_key in (
+            "external_subtask_id", "externalSubtaskId", "external_id", "externalId",
+            "todo_id", "todoId", "task_id", "taskId", "item_id", "itemId",
+            "row_id", "rowId", "id",
+        ):
+            alias = trim(str(raw.get(alias_key, "") or "").strip(), 120)
+            if alias:
+                row.setdefault("external_subtask_id", alias)
+                break
+        if key and not key.startswith("bb:"):
+            row.setdefault("external_subtask_id", key)
         row["subtask_id"] = self._stable_plan_worker_subtask_id(step_key, row)
         return row
 
@@ -45095,7 +48958,16 @@ body{padding:18px}
                     return scoped
             return owner_rows
         if route_kind == "pure_single":
-            return [row for row in snap if self._todo_row_kind(row) == "flat"]
+            # Normal TodoWrite calls are stamped with the active owner so the
+            # UI can show who is working.  Older sessions may still contain
+            # owner-less ``flat`` rows, while newer sessions contain
+            # ``owner_worker`` rows.  A payload-less resume must see both
+            # representations; filtering to only ``flat`` made
+            # TodoWriteResume fail immediately after a normal TodoWrite.
+            return [
+                row for row in snap
+                if self._todo_row_kind(row) in {"flat", "owner_worker"}
+            ]
         return []
 
     def _filter_plan_fragment_todo_rows(self, rows: list[dict]) -> list[dict]:
@@ -45361,6 +49233,128 @@ body{padding:18px}
                 "unsupported_changes": [],
             }
 
+    @staticmethod
+    def _plan_revision_relation_tokens(value: object) -> set[str]:
+        text = unicodedata.normalize("NFKC", str(value or "")).lower()
+        tokens = set(re.findall(r"[a-z0-9][a-z0-9_.+-]{2,}", text))
+        for run in re.findall(r"[\u4e00-\u9fff]{2,}", text):
+            tokens.update(run[index:index + 2] for index in range(max(1, len(run) - 1)))
+        stop = {
+            "the", "and", "with", "from", "this", "that", "error", "failed", "failure",
+            "tool", "result", "output", "step", "task", "运行", "執行", "验证", "驗證",
+            "检查", "檢查", "当前", "當前", "步骤", "步驟", "任务", "任務", "报错", "報錯",
+        }
+        return {token for token in tokens if token not in stop}
+
+    def _plan_revision_texts_related(self, left: object, right: object, minimum: float) -> bool:
+        left_text = normalize_work_text(str(left or "")) or str(left or "")
+        right_text = normalize_work_text(str(right or "")) or str(right or "")
+        left_tokens = self._plan_revision_relation_tokens(left_text)
+        right_tokens = self._plan_revision_relation_tokens(right_text)
+        token_score = (
+            len(left_tokens & right_tokens) / max(1, min(len(left_tokens), len(right_tokens)))
+            if left_tokens and right_tokens
+            else 0.0
+        )
+        sequence_score = difflib.SequenceMatcher(None, left_text.lower(), right_text.lower()).ratio()
+        return max(token_score, sequence_score) >= float(minimum)
+
+    def _bounded_current_subtask_revision_audit(
+        self,
+        plan_step: dict,
+        existing_rows: list[dict],
+        proposed_rows: list[dict],
+        matched_evidence: list[dict],
+        *,
+        reason: str,
+        mode: str,
+        step_id: str,
+    ) -> dict:
+        if mode != "revise_open":
+            return {}
+        existing_open = [
+            row for row in existing_rows
+            if isinstance(row, dict)
+            and str(row.get("status", "pending") or "pending").lower() != "completed"
+            and not self._is_plan_step_acceptance_subtask(row.get("content", ""))
+        ]
+        proposed_open = [
+            row for row in proposed_rows
+            if isinstance(row, dict)
+            and str(row.get("status", "pending") or "pending").lower() != "completed"
+            and not self._is_plan_step_acceptance_subtask(row.get("content", ""))
+        ]
+        if len(existing_open) != len(proposed_open):
+            return {}
+        existing_acceptance = [
+            self._normalize_plan_step_acceptance_subtask_text(row.get("content", ""))
+            for row in existing_rows
+            if isinstance(row, dict) and self._is_plan_step_acceptance_subtask(row.get("content", ""))
+        ]
+        proposed_acceptance = [
+            self._normalize_plan_step_acceptance_subtask_text(row.get("content", ""))
+            for row in proposed_rows
+            if isinstance(row, dict) and self._is_plan_step_acceptance_subtask(row.get("content", ""))
+        ]
+        if existing_acceptance != proposed_acceptance:
+            return {}
+        before_core = [self._plan_worker_content_core(row.get("content", "")) for row in existing_open]
+        after_core = [self._plan_worker_content_core(row.get("content", "")) for row in proposed_open]
+        changed_indexes = [
+            index for index, pair in enumerate(zip(before_core, after_core))
+            if pair[0] != pair[1]
+        ]
+        if len(changed_indexes) != 1:
+            return {}
+        changed_index = changed_indexes[0]
+        prior = existing_open[changed_index]
+        revised = proposed_open[changed_index]
+        if self._normalize_todo_status_value(prior.get("status", ""), "pending") != "in_progress":
+            return {}
+        if self._normalize_todo_status_value(revised.get("status", ""), "pending") != "in_progress":
+            return {}
+        prior_id = self._stable_plan_worker_subtask_id(step_id, prior)
+        directly_bound = [
+            row for row in matched_evidence
+            if prior_id and str(row.get("subtask_id", "") or "").strip() == prior_id
+        ]
+        if not directly_bound:
+            return {}
+        prior_core = self._plan_worker_content_core(prior.get("content", ""))
+        revised_core = self._plan_worker_content_core(revised.get("content", ""))
+        if not prior_core or prior_core not in revised_core:
+            return {}
+        added_detail = revised_core.replace(prior_core, "", 1).strip(" ：:;；,.，。()（）[]【】-")
+        if not added_detail:
+            return {}
+        scope_change_markers = (
+            "remove", "delete", "drop", "skip", "replace", "instead", "without", "no longer",
+            "删除", "刪除", "移除", "跳过", "跳過", "替换", "替換", "取代", "取消",
+            "不再", "无需", "無需", "改为", "改為", "舍弃", "捨棄",
+        )
+        normalized_added_detail = unicodedata.normalize("NFKC", added_detail).lower()
+        if any(marker in normalized_added_detail for marker in scope_change_markers):
+            return {}
+        evidence_text = "\n".join(
+            " ".join(
+                str(row.get(field, "") or "")
+                for field in ("summary", "command", "path", "subtask_content")
+            )
+            for row in directly_bound
+        )
+        if not self._plan_revision_texts_related(added_detail, evidence_text, 0.18):
+            return {}
+        if not self._plan_revision_texts_related(reason, evidence_text, 0.18):
+            return {}
+        return {
+            "ok": True,
+            "structural": True,
+            "reason": "bounded current-subtask revision accepted by direct evidence audit",
+            "before_open": before_core,
+            "after_open": after_core,
+            "evidence_ids": [str(row.get("id", "") or "") for row in directly_bound],
+        }
+
     def _review_plan_worker_revision(
         self,
         plan_step: dict,
@@ -45456,6 +49450,17 @@ body{padding:18px}
                 "after_open": after_open,
                 "evidence_ids": [str(row.get("id", "") or "") for row in matched],
             }
+        bounded_review = self._bounded_current_subtask_revision_audit(
+            plan_step,
+            existing_rows,
+            proposed_rows,
+            matched,
+            reason=reason,
+            mode=mode,
+            step_id=step_id,
+        )
+        if bounded_review:
+            return bounded_review
         semantic_audit = self._semantic_audit_plan_worker_revision(
             plan_step,
             reason=reason,
@@ -45505,6 +49510,13 @@ body{padding:18px}
         key = trim(str(row.get("key", "") or "").strip(), 120)
         if key.startswith("bb:"):
             return f"system:{key}"
+        for field in (
+            "key", "external_subtask_id", "external_id", "todo_id", "task_id",
+            "item_id", "row_id", "id", "subtask_id",
+        ):
+            external_id = trim(str(row.get(field, "") or "").strip(), 120)
+            if external_id and not external_id.startswith("bb:"):
+                return f"external:{external_id.casefold()}"
         content = normalize_work_text(str(row.get("content", "") or "")) or str(row.get("content", "") or "")
         content = re.sub(r"\s+", " ", content.strip().lower())
         if not content:
@@ -45535,59 +49547,42 @@ body{padding:18px}
             if identity not in existing_by_identity:
                 existing_by_identity[identity] = dict(row)
 
-        status_alias = {
-            "todo": "pending",
-            "[_]": "pending",
-            "[]": "pending",
-            "[ ]": "pending",
-            "doing": "in_progress",
-            "inprogress": "in_progress",
-            "in-progress": "in_progress",
-            "[>]": "in_progress",
-            ">": "in_progress",
-            "done": "completed",
-            "finish": "completed",
-            "finished": "completed",
-            "[x]": "completed",
-            "x": "completed",
-        }
         passthrough_rows: list[dict] = []
         merged_rows: list[dict] = []
         seen_identities: set[str] = set()
         for idx, item in enumerate(items):
-            if isinstance(item, str):
-                raw = {"content": item}
-            elif isinstance(item, dict):
-                raw = dict(item)
-            else:
-                raise ValueError(f"item {idx}: invalid type")
+            raw = self._normalize_generic_todo_row(item, owner=role_key)
+            if not raw:
+                continue
             key = trim(str(raw.get("key", "") or "").strip(), 120)
             if key.startswith("bb:"):
                 passthrough_rows.append(raw)
                 continue
-            raw_content = str(raw.get("content", raw.get("text", raw.get("title", "")))).strip()
-            content = normalize_work_text(raw_content) or raw_content
-            if not content:
-                continue
-            normalized: dict[str, object] = {"content": content}
-            raw_status = str(raw.get("status", raw.get("state", "")) or "").strip().lower()
-            if raw_status:
-                normalized["status"] = status_alias.get(raw_status, raw_status)
-            owner = str(raw.get("owner", "") or "").strip().lower()
-            if owner in {"manager", "explorer", "developer", "reviewer"}:
-                normalized["owner"] = owner
-            elif role_key == "manager" and owner == "":
-                normalized["owner"] = role_key
-            active_form = str(raw.get("activeForm", raw.get("active_form", "")) or "").strip()
-            if active_form:
-                normalized["activeForm"] = active_form
+            normalized = dict(raw)
+            normalized["owner"] = role_key if role_key in {"manager", "explorer", "developer", "reviewer"} else str(normalized.get("owner", "") or "")
             identity = self._flat_todo_identity(normalized)
             if not identity:
-                identity = f"ad-hoc:{idx}:{trim(content, 80)}"
-            merged = dict(existing_by_identity.get(identity, {}))
-            if "activeForm" not in normalized:
-                merged.pop("activeForm", None)
+                identity = f"ad-hoc:{idx}:{trim(str(normalized.get('content', '')), 80)}"
+            prior = existing_by_identity.get(identity)
+            if prior is None:
+                candidates = []
+                for candidate_id, candidate in existing_by_identity.items():
+                    if candidate_id in seen_identities:
+                        continue
+                    score = self._plan_worker_todo_match_score(normalized, candidate)
+                    if score >= 0.64:
+                        candidates.append((score, candidate_id, candidate))
+                candidates.sort(key=lambda value: value[0], reverse=True)
+                if candidates and (candidates[0][0] >= 0.86 or len(candidates) == 1 or candidates[0][0] - candidates[1][0] >= 0.08):
+                    _score, identity, prior = candidates[0]
+            merged = dict(prior or {})
+            prior_status = self._normalize_todo_status_value(merged.get("status", ""), "pending")
+            incoming_status = self._normalize_todo_status_value(normalized.get("status", ""), prior_status)
+            if prior_status == "completed" and incoming_status != "completed":
+                incoming_status = "completed"
             merged.update(normalized)
+            merged["status"] = incoming_status
+            merged["owner"] = normalized.get("owner", role_key)
             if identity in seen_identities:
                 continue
             seen_identities.add(identity)
@@ -45606,17 +49601,40 @@ body{padding:18px}
         revision_reason: str = "",
         revision_evidence: object = None,
         trusted_restore: bool = False,
+        transaction: dict | None = None,
     ) -> str:
         if not isinstance(items, list):
             raise ValueError("items must be array")
+        bb = self._ensure_blackboard()
+        if transaction is not None:
+            valid, stale_reason = self._todo_write_transaction_is_current(
+                transaction,
+                board=bb,
+            )
+            if not valid:
+                return self._emit_stale_todo_write_discarded(stale_reason)
         active_step = self._get_active_plan_step()
         if not isinstance(active_step, dict):
+            if transaction is not None:
+                return self._emit_stale_todo_write_discarded("active plan step no longer exists")
             return self.todo.update(items)
         step_id = trim(str(active_step.get("id", "") or ""), 20)
         if not step_id:
+            if transaction is not None:
+                return self._emit_stale_todo_write_discarded("active plan step no longer exists")
             return self.todo.update(items)
         role_key = self._sanitize_agent_role(role) or self._current_plan_worker_owner()
-        bb = self._ensure_blackboard()
+        if transaction is None:
+            transaction = self._capture_todo_write_transaction(
+                bb,
+                active_step_id=step_id,
+            )
+        valid, stale_reason = self._todo_write_transaction_is_current(
+            transaction,
+            board=bb,
+        )
+        if not valid:
+            return self._emit_stale_todo_write_discarded(stale_reason)
         existing = self.todo.snapshot()
         preserved: list[dict] = []
         target_rows: list[dict] = []
@@ -45640,11 +49658,13 @@ body{padding:18px}
             ) or raw_row_step_id
             migrated_row = dict(row)
             migrated_row["parent_step_id"] = row_step_id
+            self._capture_plan_worker_external_identity(migrated_row, row_step_id)
             migrated_row["subtask_id"] = self._stable_plan_worker_subtask_id(row_step_id, migrated_row)
             if owner in worker_owners and row_step_id == step_id:
                 target_rows.append(migrated_row)
             else:
                 preserved.append(migrated_row)
+        target_rows = self._dedupe_plan_worker_rows(target_rows, step_id)
 
         incoming_normalized: list[dict] = []
         for idx, item in enumerate(items):
@@ -45682,6 +49702,15 @@ body{padding:18px}
             parent_step_id = trim(str(raw.get("parent_step_id", "") or ""), 20)
             if not parent_step_id:
                 raw["parent_step_id"] = step_id
+            if self._plan_worker_row_is_foreign_plan_step(raw, active_step, bb):
+                canonical = self._render_plan_worker_todo_canonical(step_id, target_rows)
+                return self._plan_control_feedback(
+                    "preserve_current_subplan",
+                    "TodoWrite rejected a cross-step row in the proposed subplan. "
+                    "Submit only rows whose N.M prefix belongs to the active parent step; "
+                    "the entire current subplan was preserved atomically."
+                    + (f"\n\n{canonical}" if canonical else "")
+                )
             if self._plan_worker_row_duplicates_parent_step(raw, active_step):
                 continue
             incoming_normalized.append(raw)
@@ -45689,9 +49718,19 @@ body{padding:18px}
         incoming_worker_rows = [row for row in incoming_normalized if not str(row.get("key", "") or "").startswith("bb:")]
         if not incoming_worker_rows:
             canonical = self._render_plan_worker_todo_canonical(step_id, target_rows)
+            if target_rows:
+                # A resume/status call may carry only the parent bb: row (or an
+                # empty structural envelope). Preserve the current canonical
+                # children instead of turning a valid handoff into an error.
+                return self._plan_control_feedback(
+                    "preserve_current_subplan",
+                    "No worker rows were supplied; the canonical current-step subtasks were preserved. "
+                    "Continue the existing [>] subtask and send its status/evidence when it changes."
+                    + (f"\n\n{canonical}" if canonical else ""),
+                )
             return self._plan_control_feedback(
                 "preserve_current_subplan",
-                "TodoWrite requires at least one current-step subtask."
+                "No current-step worker rows were supplied; keep the active plan step and create its step-local subtasks before executing."
                 + (f"\n\n{canonical}" if canonical else ""),
             )
 
@@ -45700,6 +49739,21 @@ body{padding:18px}
             mode = "status_update"
         if mode == "status_update" and (str(revision_reason or "").strip() or self._plan_worker_revision_references(revision_evidence)):
             mode = "revise_open"
+
+        completion_audit_warnings: list[str] = []
+
+        def _resolved_row_owner(prior: dict | None, incoming: dict | None = None) -> str:
+            """Keep Sync ownership stable while Single retains one executor."""
+            if self._is_multi_agent_mode():
+                for candidate in (
+                    (prior or {}).get("owner", ""),
+                    (incoming or {}).get("owner", ""),
+                    role_key,
+                ):
+                    owner = self._sanitize_agent_role(candidate)
+                    if owner in worker_owners:
+                        return owner
+            return role_key
 
         def _number_key(row: dict) -> str:
             match = re.match(r"^\s*(\d+\.\d+)\b", normalize_work_text(str(row.get("content", "") or "")) or str(row.get("content", "") or ""))
@@ -45721,44 +49775,129 @@ body{padding:18px}
             if _number_key(row)
         }
 
+        existing_entries = [
+            (key, value)
+            for key, value in existing_by_id.items()
+            if isinstance(value, dict)
+        ]
+        match_cache: dict[int, tuple[str, dict | None]] = {}
+        used_match_ids: set[str] = set()
+
         def _existing_match(row: dict) -> tuple[str, dict | None]:
+            cached = match_cache.get(id(row))
+            if cached is not None:
+                return cached
             subtask_id = trim(str(row.get("subtask_id", "") or ""), 80)
             if subtask_id and subtask_id in existing_by_id:
-                return subtask_id, existing_by_id[subtask_id]
+                result = (subtask_id, existing_by_id[subtask_id])
+                match_cache[id(row)] = result
+                used_match_ids.add(subtask_id)
+                return result
             core = self._plan_worker_content_core(row.get("content", ""))
             core_id = existing_by_core.get(core, "")
-            if core_id:
-                return core_id, existing_by_id.get(core_id)
+            if core_id and core_id not in used_match_ids:
+                result = (core_id, existing_by_id.get(core_id))
+                match_cache[id(row)] = result
+                used_match_ids.add(core_id)
+                return result
             number_id = existing_by_number.get(_number_key(row), "")
-            if number_id:
-                return number_id, existing_by_id.get(number_id)
+            if number_id and number_id not in used_match_ids:
+                result = (number_id, existing_by_id.get(number_id))
+                match_cache[id(row)] = result
+                used_match_ids.add(number_id)
+                return result
+            # Last resort: semantic matching tolerates a changed N.M prefix,
+            # translated wording, and small evidence annotations. Require a
+            # strong/unique score so unrelated open rows are still audited as a
+            # structural revision instead of silently merged.
+            scored: list[tuple[float, str, dict]] = []
+            for candidate_id, candidate in existing_entries:
+                if candidate_id in used_match_ids:
+                    continue
+                score = self._plan_worker_todo_match_score(row, candidate)
+                if score >= 0.64:
+                    scored.append((score, candidate_id, candidate))
+            scored.sort(key=lambda value: value[0], reverse=True)
+            if scored:
+                best = scored[0]
+                second_score = scored[1][0] if len(scored) > 1 else 0.0
+                if best[0] >= 0.86 or best[0] - second_score >= 0.08:
+                    result = (best[1], best[2])
+                    match_cache[id(row)] = result
+                    used_match_ids.add(best[1])
+                    return result
             generated = self._stable_plan_worker_subtask_id(step_id, row)
-            return generated, existing_by_id.get(generated)
+            result = (generated, existing_by_id.get(generated))
+            match_cache[id(row)] = result
+            if generated and generated in existing_by_id:
+                used_match_ids.add(generated)
+            return result
 
         for row in incoming_worker_rows:
             subtask_id, _matched = _existing_match(row)
             row["subtask_id"] = subtask_id or self._stable_plan_worker_subtask_id(step_id, row)
 
-        if not target_rows:
+        if trusted_restore:
+            current_step_rows = [dict(row) for row in incoming_worker_rows]
+        elif not target_rows:
             current_step_rows = [dict(row) for row in incoming_worker_rows]
             for row in current_step_rows:
-                if str(row.get("status", "pending") or "pending").lower() == "completed" and not self._plan_subtask_has_accumulated_evidence(
+                row["owner"] = _resolved_row_owner(None, row)
+                if str(row.get("status", "pending") or "pending").lower() != "completed":
+                    continue
+                since_value = float(row.get("created_at", 0.0) or row.get("started_at", 0.0) or 0.0)
+                subtask_id = str(row.get("subtask_id", "") or "")
+                if not self._plan_worker_completion_has_evidence(
                     active_step,
-                    row.get("content", ""),
+                    row,
                     board=bb,
-                    subtask_id=str(row.get("subtask_id", "") or ""),
-                    since_ts=float(row.get("created_at", 0.0) or row.get("started_at", 0.0) or 0.0),
+                    subtask_id=subtask_id,
+                    since_ts=since_value,
+                    evidence=row.get("evidence", ""),
                 ):
                     row["status"] = "pending"
-        elif trusted_restore:
-            current_step_rows = [dict(row) for row in incoming_worker_rows]
+                    row.pop("completed_at", None)
+                    row.pop("completed_by", None)
+                    completion_audit_warnings.append(
+                        self._plan_subtask_completion_audit_warning(
+                            active_step,
+                            row,
+                            board=bb,
+                            subtask_id=subtask_id,
+                            since_ts=since_value,
+                        )
+                    )
+                else:
+                    records = self._plan_worker_completion_evidence_records(
+                        active_step,
+                        row,
+                        board=bb,
+                        subtask_id=subtask_id,
+                        since_ts=since_value,
+                        evidence=row.get("evidence", ""),
+                    )
+                    binding = self._record_plan_subtask_evidence_binding(
+                        active_step,
+                        row,
+                        records,
+                        source="direct",
+                        actor=role_key,
+                        board=bb,
+                    )
+                    if binding:
+                        row["evidence_ids"] = list(binding.get("evidence_ids", []) or [])
+                        row["evidence_binding"] = binding
         elif mode == "status_update":
-            unknown = [
-                row for row in incoming_worker_rows
-                if _existing_match(row)[1] is None
-                and not self._is_plan_step_acceptance_subtask(row.get("content", ""))
-            ]
-            if unknown:
+            structural_changes: list[dict] = []
+            for row in incoming_worker_rows:
+                _subtask_id, prior = _existing_match(row)
+                if prior is None:
+                    if not self._is_plan_step_acceptance_subtask(row.get("content", "")):
+                        structural_changes.append(row)
+                    continue
+                if not self._plan_worker_rows_equivalent(row, prior):
+                    structural_changes.append(row)
+            if structural_changes:
                 canonical = self._render_plan_worker_todo_canonical(step_id, target_rows)
                 return self._plan_control_feedback(
                     "preserve_current_subplan",
@@ -45777,20 +49916,50 @@ body{padding:18px}
                 if prior_status == "completed" and incoming_status != "completed":
                     incoming_status = "completed"
                 if prior_status != "completed" and incoming_status == "completed":
-                    if not self._plan_subtask_has_accumulated_evidence(
+                    since_value = float(prior.get("created_at", 0.0) or prior.get("started_at", 0.0) or 0.0)
+                    completion_candidate = {**prior, **incoming, "subtask_id": subtask_id}
+                    if not self._plan_worker_completion_has_evidence(
                         active_step,
-                        prior.get("content", incoming.get("content", "")),
+                        completion_candidate,
                         board=bb,
                         subtask_id=subtask_id,
-                        since_ts=float(prior.get("created_at", 0.0) or prior.get("started_at", 0.0) or 0.0),
+                        since_ts=since_value,
+                        evidence=incoming.get("evidence", ""),
                     ):
-                        canonical = self._render_plan_worker_todo_canonical(step_id, target_rows)
-                        return self._plan_control_feedback(
-                            "preserve_current_subplan",
-                            "TodoWrite cannot mark a subtask completed without tool evidence bound to that subtask. "
-                            "Execute the concrete action/check first, then update its status."
-                            + (f"\n\n{canonical}" if canonical else "")
+                        # A normal status update is not a structural transaction.
+                        # Commit the evidence-backed siblings and leave only this
+                        # unsupported completion open, so a missing final browser
+                        # check cannot roll back real implementation progress.
+                        incoming_status = prior_status
+                        completion_audit_warnings.append(
+                            self._plan_subtask_completion_audit_warning(
+                                active_step,
+                                completion_candidate,
+                                board=bb,
+                                subtask_id=subtask_id,
+                                since_ts=since_value,
+                            )
                         )
+                        binding = {}
+                    else:
+                        completion_records = self._plan_worker_completion_evidence_records(
+                            active_step,
+                            completion_candidate,
+                            board=bb,
+                            subtask_id=subtask_id,
+                            since_ts=since_value,
+                            evidence=incoming.get("evidence", ""),
+                        )
+                        binding = self._record_plan_subtask_evidence_binding(
+                            active_step,
+                            completion_candidate,
+                            completion_records,
+                            source="status_update",
+                            actor=role_key,
+                            board=bb,
+                        )
+                else:
+                    binding = {}
                 merged = dict(prior)
                 merged["status"] = incoming_status
                 if incoming_status == "completed":
@@ -45798,8 +49967,11 @@ body{padding:18px}
                     merged["completed_by"] = trim(str(incoming.get("completed_by", "") or role_key), 40)
                     if incoming.get("evidence"):
                         merged["evidence"] = trim(str(incoming.get("evidence", "") or ""), 300)
+                    if binding:
+                        merged["evidence_ids"] = list(binding.get("evidence_ids", []) or [])
+                        merged["evidence_binding"] = binding
                 merged["updated_at"] = float(now_ts())
-                merged["owner"] = role_key
+                merged["owner"] = _resolved_row_owner(prior, incoming)
                 merged["parent_step_id"] = step_id
                 merged["subtask_id"] = subtask_id
                 patched_by_id[subtask_id] = merged
@@ -45854,14 +50026,18 @@ body{padding:18px}
                     if mode != "rework_completed" or incoming_status == "completed":
                         continue
                     completed_by_id.pop(subtask_id, None)
+                    self._clear_plan_subtask_evidence_binding(step_id, subtask_id, board=bb)
                 if incoming_status == "completed":
                     source = prior if isinstance(prior, dict) else incoming
-                    if not self._plan_subtask_has_accumulated_evidence(
+                    source_since = float(source.get("created_at", 0.0) or source.get("started_at", 0.0) or 0.0)
+                    completion_candidate = {**(prior or {}), **incoming, "subtask_id": subtask_id}
+                    if not self._plan_worker_completion_has_evidence(
                         active_step,
-                        source.get("content", incoming.get("content", "")),
+                        completion_candidate,
                         board=bb,
                         subtask_id=subtask_id,
-                        since_ts=float(source.get("created_at", 0.0) or source.get("started_at", 0.0) or 0.0),
+                        since_ts=source_since,
+                        evidence=incoming.get("evidence", ""),
                     ):
                         canonical = self._render_plan_worker_todo_canonical(step_id, target_rows)
                         return self._plan_control_feedback(
@@ -45869,12 +50045,32 @@ body{padding:18px}
                             "Revised subplan attempted to mark work completed without bound evidence."
                             + (f"\n\n{canonical}" if canonical else "")
                         )
+                    completion_records = self._plan_worker_completion_evidence_records(
+                        active_step,
+                        completion_candidate,
+                        board=bb,
+                        subtask_id=subtask_id,
+                        since_ts=source_since,
+                        evidence=incoming.get("evidence", ""),
+                    )
                     completed = dict(prior or incoming)
                     completed.update(incoming)
                     completed["status"] = "completed"
                     completed["subtask_id"] = subtask_id
                     completed["completed_at"] = float(completed.get("completed_at", 0.0) or now_ts())
                     completed["completed_by"] = trim(str(completed.get("completed_by", "") or role_key), 40)
+                    completed["owner"] = _resolved_row_owner(prior, incoming)
+                    binding = self._record_plan_subtask_evidence_binding(
+                        active_step,
+                        {**completed, "subtask_id": subtask_id},
+                        completion_records,
+                        source="status_update" if mode == "status_update" else "semantic",
+                        actor=role_key,
+                        board=bb,
+                    )
+                    if binding:
+                        completed["evidence_ids"] = list(binding.get("evidence_ids", []) or [])
+                        completed["evidence_binding"] = binding
                     completed_by_id[subtask_id] = completed
                     continue
                 revised = dict(prior or {})
@@ -45884,7 +50080,7 @@ body{padding:18px}
                     for field in ("completed_at", "completed_by", "evidence"):
                         revised.pop(field, None)
                     revised["started_at"] = float(now_ts()) if revised["status"] == "in_progress" else 0.0
-                revised["owner"] = role_key
+                revised["owner"] = _resolved_row_owner(prior, incoming)
                 revised["parent_step_id"] = step_id
                 revised["subtask_id"] = subtask_id or self._stable_plan_worker_subtask_id(step_id, revised)
                 revised["updated_at"] = float(now_ts())
@@ -45922,7 +50118,10 @@ body{padding:18px}
         )
         for row in current_step_rows:
             row["parent_step_id"] = step_id
-            row["owner"] = role_key
+            if self._is_multi_agent_mode():
+                row["owner"] = self._sanitize_agent_role(row.get("owner", "")) or role_key
+            else:
+                row["owner"] = role_key
             row["subtask_id"] = self._stable_plan_worker_subtask_id(step_id, row)
 
         # Insert current-step rows right after the active plan step's bb: row in preserved,
@@ -45935,12 +50134,40 @@ body{padding:18px}
                     _insert_idx = _i + 1
                     break
         final_rows = preserved[:_insert_idx] + current_step_rows + preserved[_insert_idx:]
-        result = self.todo.update(final_rows)
+        state_lock = getattr(self, "lock", None)
+        if state_lock is not None:
+            state_lock.acquire()
         try:
-            self._sync_plan_worker_todos_to_blackboard(step_id)
-            self._update_plan_file_step_status()
-        except Exception:
-            pass
+            valid, stale_reason = self._todo_write_transaction_is_current(
+                transaction,
+                board=self._ensure_blackboard(),
+            )
+            if not valid:
+                return self._emit_stale_todo_write_discarded(stale_reason)
+            result = self.todo.update(final_rows)
+            try:
+                self._sync_plan_worker_todos_to_blackboard(
+                    step_id,
+                    transaction=transaction,
+                )
+                self._update_plan_file_step_status()
+            except Exception:
+                pass
+            # TodoWrite is the requested state transition, not merely a hint.  If
+            # this transaction completed the final acceptance row with deterministic
+            # or semantic evidence, advance now from the same committed graph.  Both
+            # Single and Sync use this path; the next run-loop preflight remains a
+            # harmless recovery backstop if persistence/UI work raises unexpectedly.
+            try:
+                self._advance_completed_acceptance_after_todo_commit(
+                    active_step,
+                    actor=role_key,
+                )
+            except Exception:
+                pass
+        finally:
+            if state_lock is not None:
+                state_lock.release()
         # Read-before-write closure: echo the canonical, renumbered subtask list
         # back as the tool result so the model SEES the reconciled arrangement it
         # just produced (numbering, statuses, the single acceptance gate) rather
@@ -45951,7 +50178,15 @@ body{padding:18px}
             revision_note = ""
             if mode in {"revise_open", "rework_completed"} and target_rows:
                 revision_note = "\nROLLING SUBPLAN REVISION: accepted after current-step evidence audit."
-            return f"{result}{revision_note}\n\n{canonical}"
+            audit_note = ""
+            if completion_audit_warnings:
+                unique_open = list(dict.fromkeys(value for value in completion_audit_warnings if value))[:4]
+                audit_note = (
+                    "\nSTATUS EVIDENCE AUDIT: applied every evidence-backed transition and kept "
+                    "only the following requested completion(s) open pending a matching current-step check: "
+                    + "; ".join(unique_open)
+                )
+            return f"{result}{revision_note}{audit_note}\n\n{canonical}"
         return result
 
     def _render_plan_worker_todo_canonical(self, step_id: str, rows: list[dict]) -> str:
@@ -45984,6 +50219,7 @@ body{padding:18px}
             return self.todo.update(items)
         existing = self.todo.snapshot()
         preserved: list[dict] = []
+        existing_owner_rows: list[dict] = []
         for row in existing:
             if not isinstance(row, dict):
                 continue
@@ -45993,22 +50229,68 @@ body{padding:18px}
                 preserved.append(dict(row))
                 continue
             if owner == role_key:
+                existing_owner_rows.append(dict(row))
                 continue
             preserved.append(dict(row))
         normalized: list[dict] = []
         for idx, item in enumerate(items):
-            if isinstance(item, str):
-                row = {"content": item, "status": "pending"}
-            elif isinstance(item, dict):
-                row = dict(item)
-            else:
-                raise ValueError(f"item {idx}: invalid type")
+            row = self._normalize_generic_todo_row(item, owner=role_key)
+            if not row:
+                continue
             if str(row.get("key", "") or "").startswith("bb:"):
                 normalized.append(row)
                 continue
             row["owner"] = role_key
             normalized.append(row)
-        return self.todo.update(preserved + normalized)
+        if not normalized:
+            return self.todo.update(preserved + existing_owner_rows)
+
+        def identity(row: dict) -> str:
+            return self._flat_todo_identity(row)
+
+        existing_by_id = {identity(row): row for row in existing_owner_rows if identity(row)}
+        merged: list[dict] = []
+        used: set[str] = set()
+        for incoming in normalized:
+            incoming_id = identity(incoming)
+            prior_id = incoming_id if incoming_id in existing_by_id else ""
+            prior = existing_by_id.get(prior_id) if prior_id else None
+            if prior is None:
+                scored = []
+                for candidate_id, candidate in existing_by_id.items():
+                    if candidate_id in used:
+                        continue
+                    score = self._plan_worker_todo_match_score(incoming, candidate)
+                    if score >= 0.64:
+                        scored.append((score, candidate_id, candidate))
+                scored.sort(key=lambda value: value[0], reverse=True)
+                if scored and (scored[0][0] >= 0.86 or len(scored) == 1 or scored[0][0] - scored[1][0] >= 0.08):
+                    _score, prior_id, prior = scored[0]
+            if isinstance(prior, dict):
+                used.add(prior_id)
+                merged_row = dict(prior)
+                prior_status = self._normalize_todo_status_value(prior.get("status", ""), "pending")
+                incoming_status = self._normalize_todo_status_value(incoming.get("status", ""), prior_status)
+                if prior_status == "completed" and incoming_status != "completed":
+                    incoming_status = "completed"
+                merged_row.update(incoming)
+                merged_row["status"] = incoming_status
+                merged_row["owner"] = role_key
+                if prior_status == "completed":
+                    for key in ("completed_at", "completed_by", "evidence", "evidence_ids", "evidence_binding"):
+                        if merged_row.get(key) in (None, "", []):
+                            if prior.get(key) not in (None, "", []):
+                                merged_row[key] = prior.get(key)
+                merged.append(merged_row)
+            else:
+                incoming["owner"] = role_key
+                merged.append(incoming)
+        # A worker often sends only the row that changed. Keep untouched rows in
+        # sync mode so a handoff cannot erase another completed/current row.
+        for candidate_id, candidate in existing_by_id.items():
+            if candidate_id not in used:
+                merged.append(dict(candidate))
+        return self.todo.update(preserved + merged)
 
     def _append_instruction_bubble(self, content: str, *, target_roles: tuple[str, ...] = (), summary: str = "") -> bool:
         text = trim(str(content or "").strip(), PLAN_NOTICE_BODY_MAX_CHARS)
@@ -46354,11 +50636,12 @@ body{padding:18px}
         if not raw.strip():
             return ""
         marker = re.compile(
-            r"^\s*(?:[-*•>]\s*)?(?:"
-            r"验收信号|验收标准|验收条件|完成标准|"
-            r"驗收信號|驗收標準|驗收條件|完成標準|"
+            r"^\s*(?:[-*•>]\s*)?(?:\d+(?:\.\d+)*[.)、]?\s*)?(?:"
+            r"(?:最终)?验收(?:信号|标准|条件)?|验证(?:结果|标准|条件)?|完成标准|"
+            r"(?:最終)?驗收(?:信號|標準|條件)?|驗證(?:結果|標準|條件)?|完成標準|"
             r"acceptance(?:\s+(?:signal|criteria|condition))?|pass\s+criteria|"
-            r"受入基準|受入条件|完了条件"
+            r"verification|validation|verify|"
+            r"受入確認|受入基準|受入条件|検証|確認|完了条件"
             r")\s*[:：]\s*(.+?)\s*$",
             flags=re.IGNORECASE,
         )
@@ -46630,7 +50913,7 @@ body{padding:18px}
             ".cpp", ".cc", ".cxx", ".c", ".h", ".hpp", ".cs", ".php", ".rb", ".lua", ".r", ".scala", ".dart",
             ".sh", ".bash", ".zsh", ".ps1", ".sql",
         )
-        if any(ext in low for ext in source_extensions) or any(
+        if any(re.search(re.escape(ext) + r"(?![A-Za-z0-9])", low) for ext in source_extensions) or any(
             token in low
             for token in (
                 "source code", "module", "function", "class", "源码", "源代码", "代码", "模块", "函数", "类",
@@ -46645,6 +50928,13 @@ body{padding:18px}
                 "swift", "c++", "cpp", " c ", "c#", "dotnet", ".net", "php", "ruby", "rails", "lua", "scala",
                 "dart", "flutter", "shell", "bash", "powershell", "sql",
             )
+        ) and not (
+            # Product/library names such as Three.js must not imply that the
+            # active step asks to inspect language source modules. HTML-only
+            # delivery/verification steps otherwise inherit a bogus source-code
+            # acceptance dimension.
+            "three.js" in low
+            and not any(token in low for token in ("javascript", ".js", " js ", "js/", "/js", "脚本", "腳本", "スクリプト"))
         ):
             add("language_code")
         if any(token in low for token in ("three.js", "threejs", "three min", "three.min", "three ")):
@@ -46708,7 +50998,8 @@ body{padding:18px}
             token in low
             for token in (
                 "database", "schema", "migration", "sql", "sqlite", "postgres", "postgresql", "mysql", "redis",
-                "mongodb", "table", "index", "数据库", "表结构", "迁移", "資料庫", "遷移", "テーブル", "データベース",
+                "mongodb", "db table", "database table", "database index", "db index",
+                "数据库", "表结构", "迁移", "資料庫", "遷移", "データベース",
             )
         ):
             add("database_schema")
@@ -47095,8 +51386,28 @@ body{padding:18px}
             # The approved plan already defines the contract. Do not let an LLM
             # broaden it into unrelated API/deploy/test requirements.
             acceptance_item = self._default_plan_step_acceptance_subtask(plan_step, clean_items)
-        elif allow_llm and (not acceptance_item or self._is_generic_plan_step_acceptance_subtask(acceptance_item)):
+        elif acceptance_item and not self._plan_step_acceptance_subtask_is_specific(
+            acceptance_item,
+            plan_step,
+            clean_items,
+        ):
+            # A concrete-looking legacy/LLM row can still contain unrelated
+            # domains (for example database migrations in an HTML-only step).
+            # Rebuild it from the same deterministic context inference shared by
+            # single and sync, rather than preserving a poisoned contract.
+            acceptance_item = ""
+        if (
+            not explicit_contract
+            and allow_llm
+            and (not acceptance_item or self._is_generic_plan_step_acceptance_subtask(acceptance_item))
+        ):
             acceptance_item = self._llm_plan_step_acceptance_subtask(plan_step, clean_items)
+            if not self._plan_step_acceptance_subtask_is_specific(
+                acceptance_item,
+                plan_step,
+                clean_items,
+            ):
+                acceptance_item = ""
         if not acceptance_item:
             acceptance_item = self._default_plan_step_acceptance_subtask(plan_step, clean_items)
         acceptance_item = self._normalize_plan_step_acceptance_subtask_text(acceptance_item)
@@ -47119,8 +51430,6 @@ body{padding:18px}
         owner_key = self._sanitize_agent_role(owner) or self._current_plan_worker_owner()
         work_rows: list[dict] = []
         acceptance_rows: list[dict] = []
-        import re as _re_acc
-        _re_acc_num = _re_acc.compile(r"^\s*\d+\.\d+\s+")
         isolated_rows = self._filter_parent_step_duplicate_worker_rows(rows or [], plan_step)
         isolated_expected_rows = self._filter_parent_step_duplicate_worker_rows(
             [{"content": str(item or "")} for item in (expected or [])],
@@ -47136,22 +51445,17 @@ body{padding:18px}
                 continue
             cloned = dict(row)
             cloned["parent_step_id"] = trim(str(cloned.get("parent_step_id", "") or step_id), 20) or step_id
-            # Single-owner invariant: every step-local worker subtask belongs to ONE
-            # canonical owner (the current plan worker). In multi-agent mode the active
-            # role changes between bootstrap (e.g. explorer) and execution (e.g. developer),
-            # which previously split the same step into two coexisting owner buckets. Force
-            # all rows onto owner_key so both sets collapse into one — matching single-agent
-            # where the owner is always "developer" (this is a no-op there).
-            cloned["owner"] = owner_key
-            # The canonical generated acceptance subtask is ALWAYS unnumbered
-            # ("验收：…；证据：…"). A row that carries an "N.M " numbering prefix but reads
-            # like acceptance (e.g. "1.3 验收：…") is a worker's restatement of plan subtask
-            # N.M, not the step's final acceptance gate. Route it to work_rows so it dedups
-            # against the matching numbered work row instead of competing as a second
-            # acceptance row that never collapses against work rows.
-            _content_str = str(cloned.get("content", "") or "")
-            _has_number_prefix = bool(_re_acc_num.match(normalize_work_text(_content_str) or _content_str))
-            if self._is_plan_step_acceptance_subtask(cloned.get("content", "")) and not _has_number_prefix:
+            # Ownership is execution metadata, not row identity. Single mode has
+            # one executor, while Sync must preserve a valid existing owner across
+            # reviewer/developer handoffs instead of repainting the whole subplan
+            # on every TodoWrite call.
+            existing_owner = self._sanitize_agent_role(cloned.get("owner", ""))
+            cloned["owner"] = (
+                existing_owner
+                if self._is_multi_agent_mode() and existing_owner in {"developer", "explorer", "reviewer"}
+                else owner_key
+            )
+            if self._is_plan_step_acceptance_subtask(cloned.get("content", "")):
                 acceptance_rows.append(cloned)
             else:
                 work_rows.append(cloned)
@@ -47261,6 +51565,7 @@ body{padding:18px}
             (item for item in reversed(expected_items) if self._is_plan_step_acceptance_subtask(item)),
             self._default_plan_step_acceptance_subtask(plan_step, []),
         )
+        explicit_contract = self._explicit_plan_step_acceptance_contract(plan_step)
 
         acceptance_row: dict
         if acceptance_rows:
@@ -47271,11 +51576,17 @@ body{padding:18px}
                 acceptance_row.get("content", "")
             )
             work_texts = [str(row.get("content", "") or "") for row in work_rows]
-            if not self._plan_step_acceptance_subtask_is_specific(existing_acceptance, plan_step, work_texts):
-                if str(acceptance_row.get("status", "pending") or "pending").lower() == "completed":
-                    acceptance_row["content"] = existing_acceptance or expected_acceptance
-                else:
-                    acceptance_row["content"] = expected_acceptance
+            if explicit_contract:
+                acceptance_row["content"] = expected_acceptance
+            elif not self._plan_step_acceptance_subtask_is_specific(existing_acceptance, plan_step, work_texts):
+                acceptance_row["content"] = expected_acceptance
+                # The old completion bit belongs to a different contract. The
+                # evidence ledger can immediately complete the rebuilt row when
+                # current proof covers it; arbitrary legacy Todo text cannot.
+                acceptance_row["status"] = "pending"
+                acceptance_row.pop("completed_at", None)
+                acceptance_row.pop("completed_by", None)
+                acceptance_row.pop("evidence", None)
             else:
                 acceptance_row["content"] = existing_acceptance or expected_acceptance
         else:
@@ -47331,6 +51642,326 @@ body{padding:18px}
                 row["content"] = f"{step_ord}.{j} {stripped_head}" + (sep + tail if sep else "")
         return work_rows + [acceptance_row]
 
+    def _plan_evidence_record_passes(self, record: dict) -> bool:
+        if not isinstance(record, dict) or not bool(record.get("ok", False)):
+            return False
+        if str(record.get("kind", "") or "") != "runtime":
+            return True
+        if record.get("exit_code") not in (None, 0):
+            return False
+        return not self._command_output_has_error_shape(str(record.get("summary", "") or ""))
+
+    def _acceptance_failure_is_decisive(
+        self,
+        record: dict | None,
+        acceptance_text: object = "",
+    ) -> bool:
+        """Whether a failed runtime record is a verdict about this contract.
+
+        A non-zero helper/probe command is not automatically acceptance ground
+        truth.  It invalidates an earlier PASS only when it is explicitly an
+        acceptance/validation command, reports a contract assertion, or its
+        output names a concrete term/path from the acceptance contract.  Real
+        later browser/test/build failures therefore still block, while an
+        unrelated diagnostic experiment cannot monopolize the step cursor.
+        """
+        if not isinstance(record, dict) or str(record.get("kind", "") or "") != "runtime":
+            return False
+        if self._is_non_product_acceptance_error_record(record):
+            return False
+        assertion_kind = str(record.get("assertion_kind", "") or "").strip()
+        if assertion_kind or bool(record.get("assertion_complete", False)):
+            return True
+        command = unicodedata.normalize("NFKC", str(record.get("command", "") or "")).lower()
+        summary = unicodedata.normalize("NFKC", str(record.get("summary", "") or "")).lower()
+        explicit_verdict_markers = (
+            "acceptance", "accept=", "accept_", "accept-", "acceptance=",
+            "验收", "驗收", "gate_pass", "gate_fail", "gate closed", "gate_closed",
+            "all_checks", "all checks", "assertion", "assert_",
+        )
+        if any(marker in command or marker in summary for marker in explicit_verdict_markers):
+            return True
+        if self._command_looks_like_validation(command):
+            return True
+        contract = str(acceptance_text or "")
+        identifiers = list(self._acceptance_assertion_terms(contract))
+        identifiers.extend(self._extract_plan_step_referenced_paths(contract, limit=8))
+        haystack = f"{command}\n{summary}"
+        return any(
+            self._acceptance_summary_covers_term(haystack, value)
+            for value in identifiers
+            if str(value or "").strip()
+        )
+
+    def _plan_subtask_evidence_identifiers(self, text: object) -> dict:
+        source = normalize_work_text(str(text or "")) or str(text or "")
+        source = re.sub(r"^\s*\d+\.\d+\s+", "", source).strip()
+        if not source:
+            return {"paths": [], "commands": [], "command_specs": [], "technical_tokens": []}
+
+        def normalize_phrase(value: object) -> str:
+            return re.sub(r"\s+", " ", str(value or "").strip().lower()).strip(" `\"'")
+
+        paths = [
+            normalize_rel_preview_path(path).lower()
+            for path in self._extract_plan_step_referenced_paths(source, limit=12)
+            if normalize_rel_preview_path(path)
+        ]
+        command_specs: list[dict] = []
+        shell_programs = r"npm|pnpm|yarn|pip3?|python3?|pytest|node|npx|cargo|go|make|uv"
+        command_start = re.compile(rf"(?i)\b({shell_programs})\b")
+        for match in command_start.finditer(source):
+            tail = source[match.start():]
+            tail = re.split(r"(?:&&|\|\||;|\n|[，。；！？]|\s+(?:后|然后|之后|并且|确保|并确认|再))", tail, maxsplit=1)[0]
+            words = re.findall(r"[A-Za-z][A-Za-z0-9_.+/@:-]*|--?[A-Za-z0-9_-]+", tail)
+            if not words:
+                continue
+            program = words[0].lower()
+            subcommand = words[1].lower() if len(words) > 1 else ""
+            script = ""
+            if program in {"npm", "pnpm", "yarn"} and subcommand == "run" and len(words) > 2:
+                script = words[2].lower()
+            elif program in {"npm", "pnpm", "yarn"} and subcommand not in {"init", "install", "i", "add", "build", "test", "run"}:
+                script = subcommand
+            args = [word.lower() for word in words[2 if subcommand == "run" else 2:]]
+            if program in {"npm", "pnpm", "yarn"} and subcommand in {"init", "install", "i", "add", "build", "test", "run"}:
+                kind = {
+                    "init": "init", "install": "install", "i": "install", "add": "install",
+                    "build": "build", "test": "test", "run": "run",
+                }[subcommand]
+            else:
+                kind = "run" if subcommand in {"serve", "start", "dev", "preview"} else "command"
+            canonical_words = words[:3] if kind == "run" and subcommand == "run" else words[:2]
+            command_specs.append({
+                "text": normalize_phrase(" ".join(canonical_words)),
+                "program": program,
+                "subcommand": subcommand,
+                "script": script,
+                "args": args,
+                "kind": kind,
+            })
+
+        technical_tokens: list[str] = []
+        for spec in command_specs:
+            for value in ([spec.get("script", "")] + list(spec.get("args", []) or [])):
+                value = normalize_phrase(value)
+                if not value or value.startswith("-") or len(value) < 3:
+                    continue
+                if re.fullmatch(r"[a-z]+", value) and value in {
+                    "init", "install", "add", "run", "build", "test", "dev", "serve", "start", "preview",
+                }:
+                    continue
+                if value not in technical_tokens:
+                    technical_tokens.append(value)
+        for value in re.findall(r"(?<![A-Za-z0-9])(?:[A-Z][A-Za-z0-9]{2,}|[a-z][a-z0-9_-]{3,}(?:\.js|\.mjs|\.cjs|\.config\.js))(?![A-Za-z0-9])", source):
+            low = value.lower()
+            if low not in technical_tokens and low not in {"current", "step", "project", "scene", "basic"}:
+                technical_tokens.append(low)
+        for path in paths:
+            stem = PurePosixPath(path).name.lower()
+            if stem and stem not in technical_tokens:
+                technical_tokens.append(stem)
+        return {
+            "paths": list(dict.fromkeys(paths))[:12],
+            "commands": [str(spec.get("text", "")) for spec in command_specs if spec.get("text")][:12],
+            "command_specs": command_specs[:12],
+            "technical_tokens": list(dict.fromkeys(technical_tokens))[:24],
+        }
+
+    def _plan_subtask_evidence_semantically_matches(self, subtask_text: object, record: dict) -> bool:
+        """Bind unlabelled evidence only when concrete identifiers agree."""
+        if not isinstance(record, dict) or not self._plan_evidence_record_passes(record):
+            return False
+        identifiers = self._plan_subtask_evidence_identifiers(subtask_text)
+        paths = identifiers.get("paths", [])
+        command_specs = identifiers.get("command_specs", [])
+        technical_tokens = identifiers.get("technical_tokens", [])
+        observed_paths = [normalize_rel_preview_path(str(record.get("path", "") or "")).lower()]
+        observed_paths.extend(
+            normalize_rel_preview_path(str(value or "")).lower()
+            for value in (record.get("changed_files", []) if isinstance(record.get("changed_files"), list) else [])
+            if normalize_rel_preview_path(str(value or ""))
+        )
+        command = re.sub(r"\s+", " ", str(record.get("command", "") or "").strip().lower())
+        summary = re.sub(r"\s+", " ", str(record.get("summary", "") or "").strip().lower())
+        haystack = " ".join(value for value in (command, summary, " ".join(observed_paths)) if value)
+        for expected in paths:
+            for actual in observed_paths:
+                if self._plan_evidence_path_matches(expected, actual, threshold=0.93):
+                    return True
+        for spec in command_specs:
+            kind = str(spec.get("kind", "") or "")
+            program = str(spec.get("program", "") or "")
+            subcommand = str(spec.get("subcommand", "") or "")
+            script = str(spec.get("script", "") or "")
+            args = [str(value or "") for value in (spec.get("args", []) or [])]
+            if kind == "run" or (subcommand == "run" and script):
+                if re.search(rf"\b{re.escape(program)}\s+run\s+{re.escape(script)}\b", command):
+                    return True
+                if script and script in summary and any(marker in summary for marker in ("server", "localhost", "http://", "ready", "listening", "浏览器", "页面")):
+                    return True
+                continue
+            if kind == "install":
+                package_names = [value for value in args if value and not value.startswith("-")]
+                if re.search(rf"\b{re.escape(program)}\s+(?:install|i|add)\b", command) and any(
+                    name in command for name in package_names
+                ):
+                    return True
+                package_context = any(marker in haystack for marker in ("package.json", "node_modules", "dependencies", "installed", "install", "安装"))
+                if package_context and any(name in haystack for name in package_names):
+                    return True
+                continue
+            if kind in {"build", "test"}:
+                if re.search(rf"\b{re.escape(program)}\s+{re.escape(subcommand)}\b", command):
+                    return True
+                continue
+            fragment = str(spec.get("text", "") or "")
+            if fragment and len(fragment) >= 8 and fragment in command:
+                return True
+        # Once a subtask names a concrete path, that path is the binding
+        # contract.  A generic file/technical keyword (for example
+        # ``package.json`` or ``module``) must not be allowed to stand in for
+        # an unrelated required path merely because the record is a successful
+        # file operation.  This was the source of false completions in sync
+        # mode when an install/build command happened before the requested
+        # directory or entry file existed.
+        if not command_specs and not paths:
+            observed_file_context = any(
+                str(record.get("kind", "") or "") == "file"
+                or any(marker in haystack for marker in ("package.json", "node_modules", "config", "module"))
+                for _ in (0,)
+            )
+            matches = [token for token in technical_tokens if len(token) >= 4 and token in haystack]
+            if observed_file_context and matches:
+                return True
+        return False
+
+    def _plan_subtask_evidence_records(
+        self,
+        plan_step: dict,
+        subtask_text: object,
+        *,
+        board: dict | None = None,
+        subtask_id: str = "",
+        since_ts: float = 0.0,
+        evidence: object = None,
+    ) -> list[dict]:
+        if not isinstance(plan_step, dict):
+            return []
+        text = str(subtask_text or "").strip()
+        step_id = trim(str(plan_step.get("id", "") or ""), 20)
+        if not text or not step_id:
+            return []
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        lower_bound = max(float(since_ts or 0.0), self._plan_step_activation_ts(plan_step))
+        records = self._plan_step_evidence_records(step_id, board=bb, since_ts=lower_bound)
+        if not records:
+            return []
+        stable_id = trim(str(subtask_id or "").strip(), 80)
+        if not stable_id:
+            stable_id = self._stable_plan_worker_subtask_id(
+                step_id,
+                {"content": text, "parent_step_id": step_id},
+            )
+        selected: list[dict] = [
+            record for record in records
+            if stable_id and str(record.get("subtask_id", "") or "").strip() == stable_id
+        ]
+        normalized = normalize_work_text(text) or text
+        number_match = re.match(r"^\s*(\d+\.\d+)\b", normalized)
+        number = number_match.group(1) if number_match else ""
+        core = self._plan_worker_content_core(text)
+        expected_paths = self._extract_plan_step_referenced_paths(text, limit=10)
+
+        def target_strength(record: dict) -> int:
+            record_core = self._plan_worker_content_core(record.get("subtask_content", ""))
+            if core and record_core and core == record_core:
+                return 4
+            summary = str(record.get("summary", "") or "")
+            command = str(record.get("command", "") or "")
+            if number:
+                escaped = re.escape(number)
+                marker = rf"(?:子任务|子任務|subtask|task|step)\s*#?\s*{escaped}(?!\d)"
+                line_marker = rf"(?m)^\s*(?:[✅☑✓]\s*)?{escaped}(?!\d)"
+                if re.search(marker, summary, flags=re.I) or re.search(line_marker, summary, flags=re.I):
+                    return 3
+                if re.search(marker, command, flags=re.I):
+                    return 3
+                # Validation output commonly decorates a heading (for example
+                # ``=== 1.3 验证 ===`` or ``1.2+1.3 content assertions``).
+                # The number plus check semantics on the same line is a strong
+                # target signal even when the event was captured under the
+                # previously-active Todo row.
+                validation_heading_terms = (
+                    "验证", "驗證", "校验", "校驗", "检查", "檢查", "断言", "斷言",
+                    "专项", "專項", "verify", "validation", "check", "assert", "all_ok",
+                )
+                for evidence_line in summary.splitlines():
+                    line_low = evidence_line.lower()
+                    if (
+                        re.search(rf"(?<!\d){escaped}(?!\d)", evidence_line)
+                        and any(term in line_low for term in validation_heading_terms)
+                    ):
+                        return 3
+            if expected_paths:
+                observed = [normalize_rel_preview_path(str(record.get("path", "") or ""))]
+                observed.extend(
+                    normalize_rel_preview_path(str(value or ""))
+                    for value in (record.get("changed_files", []) if isinstance(record.get("changed_files"), list) else [])
+                )
+                if str(record.get("kind", "") or "") == "runtime" and self._command_looks_like_validation(command):
+                    observed.extend(self._extract_plan_step_referenced_paths(command, limit=10))
+                observed = [value for value in observed if value]
+                if any(
+                    self._plan_evidence_path_matches(expected, actual, threshold=0.72)
+                    for expected in expected_paths
+                    for actual in observed
+                ):
+                    return 2
+            if self._plan_subtask_evidence_semantically_matches(text, record):
+                return 1
+            # Evidence may have been recorded while a neighbouring row was
+            # active. A compacted/reordered Todo snapshot can still carry the
+            # target row's wording in the result summary; use that as a soft
+            # binding signal rather than requiring the old subtask_id.
+            observed_text = " ".join(
+                str(record.get(field, "") or "")
+                for field in ("subtask_content", "summary", "command", "path")
+            )
+            score = self._plan_worker_todo_match_score(
+                {"content": text},
+                {"content": observed_text},
+            )
+            return 1 if score >= 0.48 else 0
+
+        selected_ids = {str(record.get("id", "") or "") for record in selected}
+        for record in records:
+            record_id = str(record.get("id", "") or "")
+            strength = target_strength(record)
+            if record_id in selected_ids or strength <= 0:
+                continue
+            bound_subtask_id = trim(str(record.get("subtask_id", "") or "").strip(), 80)
+            if bound_subtask_id and stable_id and bound_subtask_id != stable_id:
+                bound_content = str(record.get("subtask_content", "") or "")
+                # A concrete number/path/content match is stronger than the
+                # stale binding captured before the worker's TodoWrite call.
+                if strength < 2 and not self._plan_worker_rows_equivalent(
+                    {"content": text},
+                    {"content": bound_content},
+                ):
+                    continue
+            selected.append(record)
+            selected_ids.add(record_id)
+        if not selected and evidence:
+            refs = self._plan_worker_revision_references(evidence)
+            for record in records:
+                if not self._plan_evidence_record_passes(record):
+                    continue
+                if any(self._plan_worker_revision_reference_matches(ref, record) for ref in refs):
+                    selected.append(record)
+        selected.sort(key=lambda record: float(record.get("ts", 0.0) or 0.0))
+        return selected
+
     def _plan_subtask_has_accumulated_evidence(
         self,
         plan_step: dict,
@@ -47339,6 +51970,7 @@ body{padding:18px}
         board: dict | None = None,
         subtask_id: str = "",
         since_ts: float = 0.0,
+        evidence: object = None,
     ) -> bool:
         if not isinstance(plan_step, dict):
             return False
@@ -47347,27 +51979,42 @@ body{padding:18px}
             return False
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         step_id = trim(str(plan_step.get("id", "") or ""), 20)
-        lower_bound = max(float(since_ts or 0.0), self._plan_step_activation_ts(plan_step))
-        stable_id = trim(str(subtask_id or "").strip(), 80)
-        if not stable_id:
-            probe_row = {"content": text, "parent_step_id": step_id}
-            stable_id = self._stable_plan_worker_subtask_id(step_id, probe_row)
-        all_records = self._plan_step_evidence_records(step_id, board=bb, since_ts=lower_bound)
-        has_bound_records = any(str(record.get("subtask_id", "") or "").strip() for record in all_records)
-        if has_bound_records:
-            records = [
-                record for record in all_records
-                if not stable_id or str(record.get("subtask_id", "") or "").strip() == stable_id
-            ]
-            if not records:
-                return False
-        else:
-            records = list(all_records)
+        records = self._plan_subtask_evidence_records(
+            plan_step,
+            text,
+            board=bb,
+            subtask_id=subtask_id,
+            since_ts=since_ts,
+            evidence=evidence,
+        )
+        # Use the whole current-step ledger for one soft reconciliation pass
+        # when the original event was bound to a neighbouring Todo row. This
+        # is intentionally step-local and still requires a passing observable
+        # record; a natural-language completion claim alone never suffices.
+        if not records:
+            all_records = self._plan_step_evidence_records(step_id, board=bb, since_ts=max(float(since_ts or 0.0), self._plan_step_activation_ts(plan_step)))
+            related: list[dict] = []
+            for record in all_records:
+                if not self._plan_evidence_record_passes(record):
+                    continue
+                observed_text = " ".join(
+                    str(record.get(field, "") or "")
+                    for field in ("subtask_content", "summary", "command", "path")
+                )
+                score = self._plan_worker_todo_match_score(
+                    {"content": text},
+                    {"content": observed_text},
+                )
+                if score >= 0.48:
+                    related.append(record)
+            records = related
+        if not records:
+            return False
         expected_paths = self._extract_plan_step_referenced_paths(text, limit=10)
         if expected_paths:
             known_paths: list[str] = []
             for record in records:
-                if not bool(record.get("ok", False)):
+                if not self._plan_evidence_record_passes(record):
                     continue
                 path = normalize_rel_preview_path(str(record.get("path", "") or ""))
                 if path and not self._is_plan_infrastructure_path(path):
@@ -47376,6 +52023,9 @@ body{padding:18px}
                     rel = normalize_rel_preview_path(str(changed or ""))
                     if rel and not self._is_plan_infrastructure_path(rel):
                         known_paths.append(rel)
+                command = str(record.get("command", "") or "")
+                if str(record.get("kind", "") or "") == "runtime" and self._command_looks_like_validation(command):
+                    known_paths.extend(self._extract_plan_step_referenced_paths(command, limit=10))
             known_paths = list(dict.fromkeys(known_paths))
             if not known_paths:
                 return False
@@ -47384,7 +52034,7 @@ body{padding:18px}
                 if not rel:
                     continue
                 if not any(
-                    rel == actual or self._semantic_path_score(rel, actual)[0] >= 0.72
+                    self._plan_evidence_path_matches(rel, actual, threshold=0.72)
                     for actual in known_paths
                 ):
                     return False
@@ -47418,20 +52068,21 @@ body{padding:18px}
         )
         if any(term in low for term in implementation_terms):
             return any(
-                bool(record.get("ok", False))
+                self._plan_evidence_record_passes(record)
                 and (
                     str(record.get("tool", "") or "") in {"write_file", "edit_file"}
                     or bool(record.get("changed_files"))
+                    or str(record.get("kind", "") or "") in {"runtime", "file"}
                 )
                 for record in records
             )
         if any(term in low for term in research_terms):
             return any(
-                bool(record.get("ok", False))
+                self._plan_evidence_record_passes(record)
                 and str(record.get("kind", "") or "") in {"file", "research", "blackboard"}
                 for record in records
             )
-        return any(bool(record.get("ok", False)) for record in records)
+        return any(self._plan_evidence_record_passes(record) for record in records)
 
     def _initial_plan_worker_row_status_from_evidence(
         self,
@@ -47603,22 +52254,52 @@ body{padding:18px}
             return []
         records = self._plan_step_evidence_records(step_id, board=board, since_ts=since_ts)
         acceptance_subtask_id = self._stable_plan_worker_subtask_id(step_id, acceptance)
-        if any(str(row.get("subtask_id", "") or "").strip() for row in records):
-            records = [
-                row for row in records
-                if str(row.get("subtask_id", "") or "").strip() == acceptance_subtask_id
-            ]
-        records.extend(self._plan_step_acceptance_review_records(
+        acceptance_records = [
+            row for row in records
+            if str(row.get("subtask_id", "") or "").strip() == acceptance_subtask_id
+        ]
+        review_records = self._plan_step_acceptance_review_records(
             plan_step,
             board=board,
             since_ts=since_ts,
-        ))
+        )
+        candidate_records = list(acceptance_records or records)
+        candidate_records.extend(review_records)
         evaluation = self._evaluate_acceptance_evidence_records(
-            records,
+            candidate_records,
             evidence_kind,
             acceptance_text=contract_text,
+            subject_text=str(
+                (plan_step or {}).get("full_content", "")
+                or (plan_step or {}).get("content", "")
+                or ""
+            ),
         )
-        return list(evaluation.get("matched_records", []) or []) if evaluation.get("passed") else []
+        if evaluation.get("passed"):
+            return list(evaluation.get("matched_records", []) or [])
+        # A binding is only a routing hint.  Older/third-party TodoWrite calls
+        # can leave the decisive runtime event step-local but unbound (or bound
+        # to a neighbouring acceptance row after a snapshot rewrite).  Once the
+        # acceptance-only view is inconclusive, reconcile against the complete
+        # current-step ledger whenever it contains evidence.  The explicit
+        # ``failed`` guard is intentional: a decisive failure must never be
+        # hidden by a broader fallback pass.
+        if records and str(evaluation.get("status", "") or "") != "failed":
+            aggregate_records = list(records)
+            aggregate_records.extend(review_records)
+            evaluation = self._evaluate_acceptance_evidence_records(
+                aggregate_records,
+                evidence_kind,
+                acceptance_text=contract_text,
+                subject_text=str(
+                    (plan_step or {}).get("full_content", "")
+                    or (plan_step or {}).get("content", "")
+                    or ""
+                ),
+            )
+            if evaluation.get("passed"):
+                return list(evaluation.get("matched_records", []) or [])
+        return []
 
     def _replace_plan_worker_rows(self, step_id: str, rows: list[dict]) -> None:
         step_key = trim(str(step_id or ""), 40)
@@ -47649,10 +52330,10 @@ body{padding:18px}
     def _reconcile_plan_worker_progress_from_evidence(self, *, actor: str = "developer") -> bool:
         """Fold observable tool evidence into the canonical execution graph.
 
-        This is the compatibility bridge from the old manually-updated Todo
-        protocol to event-driven execution. Work rows may advance when their
-        concrete artifact/check is observed; the final acceptance row completes
-        automatically only on matching passing evidence.
+        Tool evidence is retained for later TodoWrite status audits, but cannot
+        itself change ordinary work-row status. The final acceptance row may
+        complete automatically only after all explicit work statuses are done
+        and a separate matching observation passes.
         """
         bb = self._ensure_blackboard()
         step = self._get_active_plan_step(bb)
@@ -47667,47 +52348,49 @@ body{padding:18px}
             return False
         changed = False
         now_value = float(now_ts())
+        work_texts = [
+            str(row.get("content", "") or "")
+            for row in rows
+            if not self._is_plan_step_acceptance_subtask(row.get("content", ""))
+        ]
+        expected_acceptance = self._default_plan_step_acceptance_subtask(step, work_texts)
+        for row in rows:
+            if not self._is_plan_step_acceptance_subtask(row.get("content", "")):
+                continue
+            existing_acceptance = self._normalize_plan_step_acceptance_subtask_text(row.get("content", ""))
+            if not self._plan_step_acceptance_subtask_is_specific(existing_acceptance, step, work_texts):
+                row["content"] = expected_acceptance
+                row["subtask_id"] = self._stable_plan_worker_subtask_id(step_id, row)
+                row["updated_at"] = now_value
+                changed = True
         acceptance_index = -1
         for idx, row in enumerate(rows):
             if self._is_plan_step_acceptance_subtask(row.get("content", "")):
                 acceptance_index = idx
-                continue
-            if str(row.get("status", "pending") or "pending").lower() != "in_progress":
-                continue
-            if self._plan_subtask_has_accumulated_evidence(
-                step,
-                row.get("content", ""),
-                board=bb,
-                subtask_id=str(row.get("subtask_id", "") or ""),
-                since_ts=float(row.get("created_at", 0.0) or row.get("started_at", 0.0) or 0.0),
-            ):
-                row["status"] = "completed"
-                row["completed_at"] = now_value
-                row["completed_by"] = actor
-                row["updated_at"] = now_value
-                matching = [
-                    record for record in existing_records
-                    if str(record.get("subtask_id", "") or "").strip()
-                    == str(row.get("subtask_id", "") or "").strip()
-                    and bool(record.get("ok", False))
-                ]
-                latest = matching[-1] if matching else {}
-                row["evidence"] = trim(
-                    f"{latest.get('tool', 'tool')}: {latest.get('summary', '')}",
-                    300,
-                )
-                changed = True
-
         work_open = [
             row for row in rows
             if not self._is_plan_step_acceptance_subtask(row.get("content", ""))
             and str(row.get("status", "pending") or "pending").lower() != "completed"
         ]
-        if work_open and not any(str(row.get("status", "") or "").lower() == "in_progress" for row in work_open):
-            work_open[0]["status"] = "in_progress"
-            work_open[0]["started_at"] = now_value
-            work_open[0]["updated_at"] = now_value
-            changed = True
+        if work_open:
+            active = next(
+                (row for row in work_open if str(row.get("status", "") or "").lower() == "in_progress"),
+                work_open[0],
+            )
+            for row in work_open:
+                desired = "in_progress" if row is active else "pending"
+                if str(row.get("status", "pending") or "pending").lower() != desired:
+                    row["status"] = desired
+                    row["updated_at"] = now_value
+                    changed = True
+            if not active.get("started_at"):
+                active["started_at"] = now_value
+                active["updated_at"] = now_value
+                changed = True
+            # Tool events are evidence, not status commands. A pre-call
+            # snapshot identifies the active row but cannot prove it is done.
+            # TodoWrite/Resume requests completion; the merge path then audits
+            # and binds the matching evidence before changing status.
 
         if acceptance_index >= 0:
             acceptance = rows[acceptance_index]
@@ -48585,7 +53268,7 @@ body{padding:18px}
         bb_sig = self._plan_step_blackboard_signals(current, bb)
         todo_progress_signal = any(
             isinstance(r, dict) and r.get("ok", False)
-            and str(r.get("name", "")) in ("TodoWrite", "TodoWriteRescue")
+            and canonicalize_tool_name(r.get("name", "")) in {"TodoWrite", "TodoWriteRescue"}
             for r in tool_results
         )
         # Auto-advance conditions:
@@ -48600,7 +53283,7 @@ body{padding:18px}
             # Once all subtasks are completed, advancement only needs concrete
             # current or accumulated evidence; no external semantic reviewer or
             # extra structured verification tag.
-            if acceptance_gate_ok and (validation_ok or self._step_has_accumulated_evidence(current, bb)):
+            if self._plan_step_acceptance_ready_for_advance(current, acceptance_gate, bb):
                 should_advance = True
             else:
                 _gate_blocked = True  # Evidence missing — disable weaker advancement paths
@@ -48769,9 +53452,19 @@ body{padding:18px}
         non_system_rows = self._filter_plan_fragment_todo_rows(non_system_rows)
         # Smart trim: keep all active (in_progress/pending) system rows,
         # but only recent 3 completed system rows to save capacity for worker subtasks
-        active_system = [r for r in system_rows if r.get("status") != "completed"]
         completed_system = [r for r in system_rows if r.get("status") == "completed"]
-        trimmed_system = active_system + completed_system[-3:]
+        keep_completed_keys = {
+            str(row.get("key", "") or "")
+            for row in completed_system[-3:]
+        }
+        # Preserve roadmap order even when old completed steps are trimmed. The
+        # previous active-first concatenation moved completed parent steps to the
+        # bottom and made their child list appear detached from the plan tree.
+        trimmed_system = [
+            row for row in system_rows
+            if row.get("status") != "completed"
+            or str(row.get("key", "") or "") in keep_completed_keys
+        ]
         # ── Subtask conflict guard ──
         # Remove worker subtasks whose content duplicates a plan step to prevent
         # the UI from showing the same task twice (once as plan step, once as subtask).
@@ -48825,8 +53518,33 @@ body{padding:18px}
                         continue
                 deduped_worker.append(wr)
             worker_rows = deduped_worker
-        remaining_cap = max(0, 40 - len(trimmed_system) - len(worker_rows))
-        merged = list(trimmed_system) + worker_rows + non_system_rows[:remaining_cap]
+        workers_by_parent: dict[str, list[dict]] = {}
+        unbound_workers: list[dict] = []
+        known_parent_ids = {
+            str(row.get("key", "") or "").removeprefix("bb:proj:")
+            for row in trimmed_system
+            if str(row.get("key", "") or "").startswith("bb:proj:")
+        }
+        for row in worker_rows:
+            parent_id = trim(str(row.get("parent_step_id", "") or ""), 40)
+            if parent_id and parent_id in known_parent_ids:
+                workers_by_parent.setdefault(parent_id, []).append(row)
+            else:
+                unbound_workers.append(row)
+
+        merged: list[dict] = []
+        for parent in trimmed_system:
+            merged.append(parent)
+            parent_id = str(parent.get("key", "") or "").removeprefix("bb:proj:")
+            merged.extend(workers_by_parent.pop(parent_id, []))
+        # Unknown/stale parent IDs remain visible as a bounded fallback instead
+        # of silently disappearing; canonical reconciliation will reattach them.
+        for rows in workers_by_parent.values():
+            unbound_workers.extend(rows)
+        merged.extend(unbound_workers)
+        remaining_cap = max(0, 40 - len(merged))
+        merged.extend(non_system_rows[:remaining_cap])
+        merged = merged[:40]
         try:
             todo_out = self.todo.update(merged)
         except Exception:
@@ -48835,6 +53553,11 @@ body{padding:18px}
             self._emit(
                 "status",
                 {"summary": "flat todos attached to current plan step"},
+            )
+        if unbound_workers:
+            self._emit(
+                "status",
+                {"summary": f"{len(unbound_workers)} current-step todo row(s) awaiting parent reconciliation"},
             )
         if todo_out != self.todo.no_changes_text() and reason:
             self._emit(
@@ -49141,6 +53864,13 @@ body{padding:18px}
                     "task_type": {"type": "string"},
                     "complexity": {"type": "string", "enum": list(TASK_COMPLEXITY_LEVELS)},
                     "scale_preference": {"type": "string", "enum": list(TASK_SCALE_PREFERENCES)},
+                    "requires_todos": {
+                        "type": "boolean",
+                        "description": (
+                            "Whether this request needs a Todo graph. L1 must be false and L3-L5 must be true. "
+                            "For L2 follow the configured l2_todo_policy: force=true, off=false, auto=semantic judgment."
+                        ),
+                    },
                     "semantic_confidence": {"type": "string", "enum": list(SEMANTIC_CONFIDENCE_CHOICES)},
                     "low_confidence_reason": {"type": "string"},
                     "inherit_previous_state": {"type": "boolean"},
@@ -49184,6 +53914,7 @@ body{padding:18px}
                     [
                         "level",
                         "judgement",
+                        "requires_todos",
                         "inherit_previous_state",
                         "plan_change_scope",
                         "plan_change_evidence",
@@ -49253,6 +53984,16 @@ body{padding:18px}
             )
         if bool(row.get("requires_user_confirmation", False)):
             merged["requires_user_confirmation"] = True
+        try:
+            merged_level = int(merged.get("level", 0) or 0)
+        except Exception:
+            merged_level = 0
+        merged = self._normalize_todo_requirement_in_decision(
+            merged,
+            level=merged_level,
+            allow_context=False,
+            fallback=True,
+        )
         objective = trim(str(row.get("direct_objective", "") or "").strip(), 800)
         if objective:
             merged["direct_objective"] = objective
@@ -49294,6 +54035,13 @@ body{padding:18px}
         policy = dict(TASK_LEVEL_POLICIES.get(cap, TASK_LEVEL_POLICIES[3]))
         out["level"] = int(cap)
         out["task_level"] = int(cap)
+        out["requires_todos"] = self._resolve_todo_requirement(
+            cap,
+            out.get("requires_todos"),
+            raw_provided="requires_todos" in out,
+            allow_context=False,
+            fallback=True,
+        )
         out["auto_task_level_capped"] = True
         out["auto_task_level_ceiling"] = int(cap)
         capped_complexity = normalize_task_complexity(policy.get("complexity", "simple"), default="simple")
@@ -49432,6 +54180,13 @@ body{padding:18px}
             inherited_requires_confirmation = bool(
                 self.runtime_requires_confirmation or current_profile.get("requires_user_confirmation", False)
             )
+            inherited_requires_todos = self._resolve_todo_requirement(
+                inherited_level,
+                getattr(self, "runtime_requires_todos", None),
+                raw_provided=isinstance(getattr(self, "runtime_requires_todos", None), bool),
+                allow_context=True,
+                fallback=True,
+            )
             return {
                 "level": int(inherited_level),
                 "task_type": inherited_task_type,
@@ -49452,6 +54207,7 @@ body{padding:18px}
                     "participants": list(inherited_participants),
                     "assigned_expert": inherited_assigned,
                     "requires_user_confirmation": bool(inherited_requires_confirmation if inherited_level == 5 else False),
+                    "requires_todos": bool(inherited_requires_todos),
                     "requires_plan": False,
                     "semantic_confidence": "low",
                 "low_confidence_reason": "rule fallback inherited previous runtime state",
@@ -49478,6 +54234,12 @@ body{padding:18px}
         requires_confirmation = bool(policy.get("requires_user_confirmation", False))
         if level == 5 and self._looks_like_positive_confirmation(goal_text):
             requires_confirmation = False
+        requires_todos = self._resolve_todo_requirement(
+            level,
+            raw_provided=False,
+            allow_context=False,
+            fallback=True,
+        )
         return {
             "level": int(level),
             "task_type": task_type,
@@ -49487,10 +54249,14 @@ body{padding:18px}
             "judgement": trim(str(profile.get("reason", "") or "manager fallback classification"), 200),
             "round_budget": int(policy.get("round_budget", profile.get("round_budget", self.max_agent_rounds)) or 0),
             "direct_objective": trim(str(profile.get("direct_objective", "") or ""), 800),
-            "execution_mode": (EXECUTION_MODE_SINGLE if normalize_execution_mode(self.execution_mode, default="") == EXECUTION_MODE_SINGLE else str(policy.get("execution_mode", EXECUTION_MODE_SYNC))),
+            "execution_mode": (
+                normalize_execution_mode(self.execution_mode, default="")
+                or str(policy.get("execution_mode", EXECUTION_MODE_SYNC))
+            ),
                 "participants": participants,
                 "assigned_expert": assigned,
                 "requires_user_confirmation": bool(requires_confirmation),
+                "requires_todos": bool(requires_todos),
                 "requires_plan": False,
                 "semantic_confidence": "low",
             "low_confidence_reason": "rule fallback classification",
@@ -49501,6 +54267,27 @@ body{padding:18px}
         ceiling_prompt = self._auto_task_level_ceiling_prompt()
         user_profile_block = self._user_profile_capsule_prompt_block(stage="intent")
         user_profile_text = f"\n{user_profile_block}\n" if user_profile_block else ""
+        l2_policy = normalize_l2_todo_policy(
+            getattr(self, "l2_todo_policy", DEFAULT_L2_TODO_POLICY)
+        )
+        if l2_policy == "force":
+            l2_todo_rule = (
+                "The configured L2 Todo policy is force: you MUST set requires_todos=true for L2. "
+                "This is the default safety behavior.\n"
+            )
+        elif l2_policy == "off":
+            l2_todo_rule = (
+                "The configured L2 Todo policy is off: you MUST set requires_todos=false for L2. "
+                "Do not add a Todo gate solely because the task is L2. L3-L5 still require Todos.\n"
+            )
+        else:
+            l2_todo_rule = (
+                "The configured L2 Todo policy is auto: judge requires_todos from the actual task semantics. "
+                "Set true for work that benefits from concrete multi-action tracking, file/tool changes, "
+                "verification, or progress across turns; set false for a self-contained answer that can be "
+                "completed in one response. Do not decide from keywords alone. Missing/uncertain output is "
+                "treated conservatively by the runtime.\n"
+            )
         base = (
             "You are Manager. Classify the latest user request by semantic intent, not by keyword templates.\n"
             "Decide whether this latest turn should inherit the previous blackboard/task state.\n"
@@ -49517,9 +54304,13 @@ body{padding:18px}
             "Level 1 — Instant answer: pure Q&A, factual lookup, brief explanation, single-concept clarification. "
             "No file I/O, no tool use, no multi-turn needed. Budget: 2-4 rounds.\n"
             "Level 2 — Multi-turn answer / light task: longer explanation, code snippet review, minor single-file edit, "
-            "short script, quick translation or summary. Single agent, no collaboration needed. Budget: 4-8 rounds.\n"
-            "Level 3 — Coordinated execution: moderately complex coding task, multi-file edits, bug fix requiring investigation, "
-            "API integration, documentation generation, data processing script. Sync mode with 2 participants. Budget: 8-15 rounds.\n"
+            "short script, quick translation or summary. Single agent, no collaboration needed. Budget: 4-8 rounds. "
+            "The Todo requirement for L2 is controlled by the runtime policy below; when requires_todos=true, "
+            "make a compact evidence-based list before mutation, with exactly one item in_progress, and keep it "
+            "updated as work advances.\n"
+            f"{l2_todo_rule}"
+            "Level 3 — Planned single-agent execution: moderately complex coding task, multi-file edits, bug fix requiring investigation, "
+            "API integration, documentation generation, data processing script. Plan-capable single mode with one executor. Budget: 8-15 rounds.\n"
             "Level 4 — Full-stack collaborative: system-level feature implementation, architecture change, "
             "multi-component refactoring, research-and-implement workflow, PPT/report generation from raw materials, "
             "crawler/agent/service development. Sync mode with 3 participants. Budget: 15-25 rounds.\n"
@@ -49535,16 +54326,13 @@ body{padding:18px}
                 "SCALE PREFERENCE: Infer fast|balanced|thorough from user wording. "
                 "User-stated preference overrides your default strategy. "
                 "Budget controls internal depth/compactness, NOT early-stop messaging to user.\n\n"
-                "PLAN MODE DECISION: Task level and plan mode are separate decisions. "
-                "L3/L4/L5, multi-agent routing, or multi-file work does not automatically require plan mode. "
-                "When Plan is Auto, set requires_plan=true only if this latest request needs a user-visible "
-                "proposal/research phase before execution, such as a ground-up rebuild, system-wide inspection, "
-                "architecture redesign, migration with alternatives, or an ambiguous high-risk scope. "
-                "Set requires_plan=false for direct implementation, continuation, concrete bug fixes, reviews, "
-                "bounded feature work, or explanations even if the task remains level 3+.\n\n"
+                "PLAN MODE DECISION: L3/L4/L5 use Plan for a new task; L1/L2 do not. "
+                "For an already approved plan, a continuation, or current-step repair/review, set requires_plan=false "
+                "so execution resumes the existing plan instead of generating a replacement. "
+                "User Plan Off/On remains authoritative in runtime policy.\n\n"
                 "CRITICAL OUTPUT CONTRACT: You MUST output exactly one classify_task_level tool call and no plain-text answer. "
             "A prose-only response is invalid and will be discarded.\n"
-            "The tool call must include concise judgement, inherit_previous_state, "
+            "The tool call must include concise judgement, requires_todos, inherit_previous_state, "
             "and semantic_confidence (high|medium|low). "
             "Use low confidence only when semantic ambiguity is substantial, then set low_confidence_reason briefly.\n"
             f"{ceiling_prompt}"
@@ -49697,12 +54485,9 @@ body{padding:18px}
             f"Current blackboard progress: {progress_state}\n\n"
             f"{user_profile_text}"
             "Use semantic intent only. Do not decide from keywords alone.\n"
-            "Return requires_plan=true only if the user needs a proposal/research/choice phase before action: "
-            "ground-up rebuild or restart, system-wide inspection, architecture redesign, migration with real alternatives, "
-            "ambiguous high-risk scope, or multiple viable implementation strategies that should be selected by the user.\n"
-            "Return requires_plan=false for direct implementation, continuation, bounded feature work, direct bug fixes, "
-            "code review, explanation, concrete incremental changes, or 'continue/implement the plan' style execution, "
-            "even if the task is L3/L4/L5 or multi-agent.\n\n"
+            "For a NEW L3/L4/L5 task, return requires_plan=true so it receives an approved execution roadmap.\n"
+            "Return requires_plan=false only for continuation of an existing approved plan, current-step repair/review, "
+            "or a plan-choice response that should resume execution rather than replace the roadmap.\n\n"
             "Output strict JSON only: {\"requires_plan\": true|false, \"reason\": \"short semantic reason\"}"
         )
         try:
@@ -49831,6 +54616,17 @@ body{padding:18px}
         ):
             level = _auto_level_ceiling
             row = self._apply_auto_task_level_ceiling_to_decision(row, source="runtime-apply")
+        # Resolve the final level after all manual/runtime ceilings.  For a
+        # fresh task, an absent auto-classifier field uses the conservative
+        # fallback; only an explicit continuation may reuse prior context.
+        requires_todos = self._resolve_todo_requirement(
+            level,
+            row.get("requires_todos"),
+            raw_provided="requires_todos" in row,
+            allow_context=bool(inherit_previous_state),
+            fallback=True,
+        )
+        row["requires_todos"] = bool(requires_todos)
         policy = dict(TASK_LEVEL_POLICIES.get(level, TASK_LEVEL_POLICIES[3]))
         policy_mode = str(policy.get("execution_mode", EXECUTION_MODE_SYNC))
         config_mode = normalize_execution_mode(self.execution_mode, default="")
@@ -49967,6 +54763,7 @@ body{padding:18px}
         self.runtime_assigned_expert = assigned
         self.runtime_participants = list(participants)
         self.runtime_round_budget = int(round_budget)
+        self.runtime_requires_todos = bool(requires_todos)
         self.runtime_requires_confirmation = bool(requires_confirmation)
         self.runtime_confirmation_needed = bool(requires_confirmation)
         self.runtime_task_judgement = judgement
@@ -49979,7 +54776,6 @@ body{padding:18px}
         # Decide plan mode with a strict precedence chain:
         # user preference > approved-plan state > semantic plan-needed signal.
         # Task level only gates whether auto-plan is eligible; it never forces plan mode.
-        raw_requires_plan = _to_bool_like(decision.get("requires_plan", False), default=False)
         user_pref = str(self.plan_mode_user_preference or "auto").lower()
         if explicit_full_replan:
             requires_plan = True
@@ -49990,7 +54786,7 @@ body{padding:18px}
         elif bool(getattr(self, "runtime_first_task_in_session", False)) and level in PLAN_MODE_ENABLED_LEVELS:
             requires_plan = True
         elif level in PLAN_MODE_ENABLED_LEVELS:
-            requires_plan = raw_requires_plan
+            requires_plan = not bool(inherit_previous_state)
         else:
             requires_plan = False
         if self.runtime_plan_approved and not explicit_full_replan:
@@ -50015,6 +54811,7 @@ body{padding:18px}
         profile["participants"] = list(participants)
         profile["assigned_expert"] = assigned
         profile["requires_user_confirmation"] = bool(requires_confirmation)
+        profile["requires_todos"] = bool(requires_todos)
         profile["task_type"] = task_type
         profile["complexity"] = complexity
         profile["scale_preference"] = scale_preference
@@ -50038,6 +54835,7 @@ body{padding:18px}
             "execution_mode": mode,
             "participants": list(participants),
             "assigned_expert": assigned,
+            "requires_todos": bool(requires_todos),
             "semantic_confidence": semantic_confidence,
             "low_confidence_reason": low_confidence_reason,
             "updated_at": float(now_ts()),
@@ -50115,6 +54913,9 @@ body{padding:18px}
             f"participants={','.join(self.runtime_participants or []) or '-'}, "
             f"assigned={self.runtime_assigned_expert or '-'}, "
             f"budget={int(self.runtime_round_budget or 0)}.\n\n"
+            f"L2 Todo policy={normalize_l2_todo_policy(getattr(self, 'l2_todo_policy', DEFAULT_L2_TODO_POLICY))}. "
+            "You must emit requires_todos as a boolean: L1=false, L3-L5=true; for L2 obey the configured "
+            "policy (force=true, off=false, auto=semantic judgment).\n\n"
             f"{dims_ctx}"
             f"{skills_ctx}"
             f"Workspace root: \"{self.files_root}\" ($SESSION_ROOT)\n"
@@ -50184,6 +54985,14 @@ body{padding:18px}
             row["inherit_previous_state"] = _to_bool_like(
                 row.get("inherit_previous_state", False),
                 default=False,
+            )
+            # Normalize the classifier's Todo decision before any confidence
+            # merge.  A fresh classification must not inherit a previous
+            # task's boolean when the model omitted the optional field.
+            row = self._normalize_todo_requirement_in_decision(
+                row,
+                allow_context=False,
+                fallback=True,
             )
             row["semantic_confidence"] = self._normalize_semantic_confidence(
                 row.get("semantic_confidence", "medium"),
@@ -50334,7 +55143,13 @@ body{padding:18px}
         if config_mode == EXECUTION_MODE_SINGLE:
             resolved_mode = EXECUTION_MODE_SINGLE
         else:
-            resolved_mode = normalize_execution_mode(mode, default=policy_mode)
+            requested_mode = normalize_execution_mode(mode, default=policy_mode)
+            if policy_mode == EXECUTION_MODE_SINGLE:
+                resolved_mode = EXECUTION_MODE_SINGLE
+            elif requested_mode in {EXECUTION_MODE_SEQUENTIAL, EXECUTION_MODE_SYNC}:
+                resolved_mode = requested_mode
+            else:
+                resolved_mode = policy_mode
         resolved_participants: list[str] = []
         raw_participants = participants if isinstance(participants, list) else []
         for item in raw_participants:
@@ -50438,6 +55253,34 @@ body{padding:18px}
             )
             if current_complexity not in TASK_COMPLEXITY_LEVELS:
                 current_complexity = str(policy.get("complexity", "simple") or "simple")
+            manual_requires_todos = self._resolve_todo_requirement(
+                _utlo,
+                getattr(self, "runtime_requires_todos", None),
+                raw_provided=isinstance(getattr(self, "runtime_requires_todos", None), bool),
+                allow_context=True,
+                fallback=True,
+            )
+            if (
+                _utlo == 2
+                and normalize_l2_todo_policy(
+                    getattr(self, "l2_todo_policy", DEFAULT_L2_TODO_POLICY)
+                ) == "auto"
+                and not self._is_continuation_input(goal)
+            ):
+                # A manual level pins topology only.  In auto Todo mode the
+                # manager still owns the semantic yes/no decision.
+                semantic_row = self._manager_classify_task_level(
+                    goal,
+                    pinned_selection=pinned_selection,
+                    media_inputs_round=media_inputs_round,
+                )
+                manual_requires_todos = self._resolve_todo_requirement(
+                    _utlo,
+                    semantic_row.get("requires_todos"),
+                    raw_provided="requires_todos" in semantic_row,
+                    allow_context=False,
+                    fallback=True,
+                )
             decision = {
                 "level": _utlo,
                 "execution_mode": self._effective_execution_mode(),
@@ -50448,6 +55291,7 @@ body{padding:18px}
                 "scale_preference": "thorough" if _utlo >= 4 else str(self.runtime_scale_preference or "balanced"),
                 "round_budget": int(policy.get("round_budget", self.runtime_round_budget or 0) or 0),
                 "requires_user_confirmation": False,
+                "requires_todos": bool(manual_requires_todos),
                 "inherit_previous_state": True,
                 "judgement": f"user_task_level_override={_utlo} — skipping manager evaluation",
                 "source": "user-override",
@@ -50489,6 +55333,13 @@ body{padding:18px}
                 "scale_preference": str(self.runtime_scale_preference or "balanced"),
                 "round_budget": int(self.runtime_round_budget or 0),
                 "requires_user_confirmation": False,
+                "requires_todos": self._resolve_todo_requirement(
+                    prev_level,
+                    getattr(self, "runtime_requires_todos", None),
+                    raw_provided=isinstance(getattr(self, "runtime_requires_todos", None), bool),
+                    allow_context=True,
+                    fallback=True,
+                ),
                 "inherit_previous_state": True,
                     "judgement": "continuation input detected — inheriting previous complexity",
                     "source": "continuation-inherit",
@@ -50513,6 +55364,7 @@ body{padding:18px}
                 "scale_preference": str(self.runtime_scale_preference or "balanced"),
                 "round_budget": int(self.runtime_round_budget or 0),
                 "requires_user_confirmation": bool(self.runtime_requires_confirmation),
+                "requires_todos": self._runtime_level_requires_todos(),
                 "inherit_previous_state": False,
                 "source": "cached",
             }
@@ -51959,7 +56811,10 @@ body{padding:18px}
             if str(text or "").strip():
                 parsed["reason"] = trim(str(text or "").strip(), 600)
         parsed = self._manager_apply_anti_stall(parsed)
-        return self._manager_apply_task_policy(parsed)
+        parsed = self._manager_apply_task_policy(parsed)
+        if str(parsed.get("target", "") or "") in AGENT_ROLES:
+            parsed = self._align_route_with_current_plan_step(parsed, self._ensure_blackboard())
+        return parsed
 
     def _manager_coordination_context_for_delegate(
         self,
@@ -52137,6 +56992,10 @@ body{padding:18px}
             if focus_kind == "plan_step":
                 focus_text += f" ({plan_step_index + 1}/{max(1, plan_step_total)})"
             lines.append(focus_text)
+        plan_subtask_id = trim(str(row.get("plan_subtask_id", "") or ""), 100)
+        plan_subtask_content = trim(str(row.get("plan_subtask_content", "") or ""), 500)
+        if plan_subtask_content:
+            lines.append(f"canonical subtask: {plan_subtask_content}")
         if instruction:
             lines.append(f"instruction: {instruction}")
         if coordination_context:
@@ -52164,6 +57023,8 @@ body{padding:18px}
             "plan_step_index": plan_step_index,
             "plan_step_total": plan_step_total,
             "plan_step_epoch": float(row.get("plan_step_epoch", 0.0) or 0.0),
+            "plan_subtask_id": plan_subtask_id,
+            "plan_subtask_content": plan_subtask_content,
         }
         return text, data
 
@@ -52225,8 +57086,10 @@ body{padding:18px}
                 return False
             action_tokens = (
                 "start", "begin", "execute", "implement", "create", "write", "continue",
+                "build", "construct", "generate", "draw", "configure", "initialize",
                 "then", "next", "advance", "move to", "进入", "開始", "开始", "执行",
                 "實施", "实现", "創建", "创建", "写", "寫", "继续", "繼續", "然后",
+                "构建", "構建", "搭建", "生成", "绘制", "繪製", "配置", "初始化",
                 "接着", "下一步", "推进", "推進",
             )
             return any(tok in line_low for tok in action_tokens) or any(tok in line for tok in ("进入", "开始", "执行", "创建", "继续", "然后"))
@@ -52326,16 +57189,31 @@ body{padding:18px}
             str(row.get("instruction", "") or "").strip(),
             current_step=current,
         )
+        subtask_snapshot = self._current_plan_worker_subtask_snapshot(board=bb, role="")
+        current_subtask = trim(str(subtask_snapshot.get("subtask_content", "") or ""), 500)
+        subtask_guard = ""
+        if current_subtask:
+            subtask_guard = (
+                "Canonical current subtask (shared Single/Sync cursor): "
+                f"{current_subtask}\n"
+                "Execute or verify this subtask first, then update its canonical Todo status from concrete evidence. "
+                "Treat any conflicting detail below as stale coordination context.\n"
+            )
         preface = (
             f"Execute ONLY the approved current plan step.\n"
             f"Current plan step {step_idx}/{max(1, total)}:\n{full_text}\n"
             "Do not replace it with a different project, destination, domain, or file target. "
             "Do not rewrite the plan or invent a new one.\n"
+            f"{subtask_guard}"
         )
         instruction = trim(f"{preface}{instruction}", MANAGER_INSTRUCTION_MAX_CHARS)
         row["direct_objective"] = canonical_objective
         row["instruction"] = instruction
         row.update(focus_fields)
+        row.update(self._plan_subtask_route_fields(
+            board=bb,
+            role="",
+        ))
         return row
 
     def _manager_delegate_turn(
@@ -52696,6 +57574,10 @@ body{padding:18px}
             "remaining_rounds": int(remaining_rounds),
         }
         route_row.update(self._route_focus_fields(board))
+        route_row.update(self._plan_subtask_route_fields(
+            board=board,
+            role="" if isinstance(self._current_plan_step_row(board), dict) else target,
+        ))
         if target in AGENT_ROLES:
             route_row["coordination_context"] = self._manager_coordination_context_for_delegate(
                 target,
@@ -52913,7 +57795,11 @@ body{padding:18px}
         bb_focus = self._ensure_blackboard()
         delegate_focus_row = bb_focus.get("last_delegate", {}) if isinstance(bb_focus.get("last_delegate"), dict) else {}
         if delegate_focus_row and self._sanitize_agent_role(delegate_focus_row.get("target", "")) == role_key:
-            if not self._route_matches_active_focus(delegate_focus_row, bb_focus):
+            current_subtask = self._current_plan_worker_subtask_snapshot(board=bb_focus, role="")
+            bound_subtask_id = trim(str(delegate_focus_row.get("plan_subtask_id", "") or ""), 100)
+            current_subtask_id = trim(str(current_subtask.get("subtask_id", "") or ""), 100)
+            stale_subtask = bool(bound_subtask_id and bound_subtask_id != current_subtask_id)
+            if not self._route_matches_active_focus(delegate_focus_row, bb_focus) or stale_subtask:
                 repaired = self._align_route_with_current_plan_step(
                     {
                         "target": role_key,
@@ -52924,6 +57810,7 @@ body{padding:18px}
                 )
                 instruction = trim(str(repaired.get("instruction", instruction) or instruction), MANAGER_INSTRUCTION_MAX_CHARS)
                 delegate_focus_row.update(self._route_focus_fields(bb_focus))
+                delegate_focus_row.update(self._plan_subtask_route_fields(board=bb_focus, role=""))
                 delegate_focus_row["instruction"] = instruction
                 delegate_focus_row["source"] = "focus-repair"
                 delegate_focus_row["ts"] = float(now_ts())
@@ -53282,6 +58169,36 @@ body{padding:18px}
                 )
             if role_key in {"reviewer"}:
                 self._blackboard_set_status("TESTING")
+        elif self._is_browser_runtime_tool_name(name):
+            browser_record = self._browser_runtime_tool_result_record(item)
+            line = trim(
+                "\n".join(
+                    part for part in (
+                        f"{name} {json_dumps(args) if args else ''}".strip(),
+                        output,
+                    )
+                    if part
+                ),
+                BLACKBOARD_MAX_TEXT,
+            )
+            self._blackboard_append_section(
+                "execution_logs",
+                role_key,
+                line or f"{name} returned no observable output",
+                metadata={
+                    "evidence_kind": "browser_runtime",
+                    "ok": bool(browser_record.get("ok", False)),
+                    "exit_code": None,
+                },
+            )
+            self._blackboard_append_memory(
+                "validation" if browser_record.get("ok", False) else "command_error",
+                line or f"{name} returned no observable output",
+                actor=role_key,
+                tool=name,
+                tier="long",
+            )
+            self._blackboard_set_status("TESTING")
         elif name == "read_file":
             p = trim(str(args.get("path", "") or "").strip(), 240)
             note = f"read_file: {p}"
@@ -53440,7 +58357,8 @@ body{padding:18px}
                 if self._reviewer_deems_done(text):
                     self._blackboard_mark_approved(text, role_key)
         explicit_todo_write = any(
-            isinstance(item, dict) and str(item.get("name", "") or "") in {"TodoWrite", "TodoWriteRescue"}
+            isinstance(item, dict)
+            and canonicalize_tool_name(item.get("name", "")) in {"TodoWrite", "TodoWriteRescue"}
             for item in tool_results
         )
         if role_key and not explicit_todo_write:
@@ -53809,6 +58727,590 @@ body{padding:18px}
         mode = self._effective_execution_mode()
         return mode in {EXECUTION_MODE_SEQUENTIAL, EXECUTION_MODE_SYNC}
 
+    def _single_no_plan_todo_has_rows(self) -> bool:
+        """Whether a normal (non-plan) Todo graph already exists."""
+        try:
+            rows = self.todo.snapshot()
+        except Exception:
+            rows = []
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict) or not str(row.get("content", "") or "").strip():
+                continue
+            # Plan/system rows belong to a different graph and are handled by
+            # the plan runtime; they should never be mistaken for a bootstrap.
+            try:
+                kind = self._todo_row_kind(row)
+            except Exception:
+                kind = "system" if str(row.get("key", "") or "").startswith("bb:") else "flat"
+            if kind in {"flat", "owner_worker", "plan_worker"}:
+                return True
+        return False
+
+    def _runtime_task_level_for_todo_policy(self) -> int:
+        """Return the effective level used by the Todo contract.
+
+        Runtime classification is normally authoritative, but a restored or
+        partially constructed session can have the level only in its
+        blackboard.  Resolve those sources in the same order as the rest of
+        the runtime policy and apply the automatic ceiling once more as a
+        defensive read.  Manual level selection deliberately bypasses that
+        automatic cap, matching ``_apply_runtime_task_decision``.
+        """
+        candidates: list[object] = []
+        try:
+            override = int(getattr(self, "user_task_level_override", 0) or 0)
+        except Exception:
+            override = 0
+        if override in TASK_LEVEL_CHOICES:
+            candidates.append(override)
+        try:
+            candidates.append(int(getattr(self, "runtime_task_level", 0) or 0))
+        except Exception:
+            pass
+        try:
+            board = getattr(self, "blackboard", {})
+            if isinstance(board, dict):
+                profile = board.get("task_profile", {})
+                judgement = board.get("manager_judgement", {})
+                if isinstance(profile, dict):
+                    candidates.append(int(profile.get("task_level", 0) or 0))
+                if isinstance(judgement, dict):
+                    candidates.append(int(judgement.get("task_level", 0) or 0))
+        except Exception:
+            pass
+        level = next(
+            (value for value in candidates if int(value or 0) in TASK_LEVEL_CHOICES),
+            0,
+        )
+        level = int(level or 0)
+        if override not in TASK_LEVEL_CHOICES:
+            # ``SessionState`` always initializes this field.  A missing field
+            # means a lightweight test/restore object, not an implicit default
+            # cap; avoid silently turning an otherwise explicit L3 into L2.
+            raw_ceiling = getattr(self, "auto_task_level_ceiling", None)
+            if raw_ceiling is None:
+                ceiling = 0
+            else:
+                try:
+                    ceiling = int(self._auto_task_level_ceiling_value())
+                except Exception:
+                    ceiling = normalize_auto_task_level_ceiling(raw_ceiling)
+            if ceiling > 0:
+                level = min(level, ceiling)
+        return level
+
+    def _runtime_level_requires_todos(self) -> bool:
+        """Return the effective Todo requirement for the current run.
+
+        L1 remains direct, L3-L5 retain their existing Todo contract, and L2
+        is resolved by the configured three-state policy.  In ``auto`` mode a
+        boolean emitted by the manager classifier is authoritative; an absent
+        or malformed value falls back conservatively so a classifier/tool
+        formatting failure cannot silently bypass the execution guard.
+        """
+        level = self._runtime_task_level_for_todo_policy()
+        return self._resolve_todo_requirement(level, allow_context=True, fallback=True)
+
+    @staticmethod
+    def _optional_bool_value(value: object) -> bool | None:
+        """Parse a boolean only when the input is an explicit boolean-like value."""
+        if isinstance(value, bool):
+            return bool(value)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            if value in (0, 1):
+                return bool(value)
+            return None
+        text = str(value or "").strip().lower()
+        if text in {"true", "1", "yes", "y", "on", "required", "force", "enabled"}:
+            return True
+        if text in {"false", "0", "no", "n", "off", "disabled", "none"}:
+            return False
+        return None
+
+    def _resolve_todo_requirement(
+        self,
+        level: object,
+        raw: object = None,
+        *,
+        raw_provided: bool = False,
+        allow_context: bool = True,
+        fallback: bool = True,
+    ) -> bool:
+        """Resolve Todo policy without changing plan/step-local Todo state.
+
+        ``raw_provided`` distinguishes an explicit classifier ``false`` from
+        a missing field.  ``allow_context`` is disabled for a fresh classifier
+        or rule fallback so a previous task's decision cannot leak into a new
+        request.
+        """
+        try:
+            level_value = int(level or 0)
+        except Exception:
+            level_value = 0
+        if level_value == 1:
+            return False
+        if level_value in {3, 4, 5}:
+            return True
+        if level_value != 2:
+            return bool(fallback)
+        policy = normalize_l2_todo_policy(
+            getattr(self, "l2_todo_policy", DEFAULT_L2_TODO_POLICY)
+        )
+        if policy == "force":
+            return True
+        if policy == "off":
+            return False
+        if raw_provided:
+            parsed = self._optional_bool_value(raw)
+            if parsed is not None:
+                return bool(parsed)
+        if allow_context:
+            current = getattr(self, "runtime_requires_todos", None)
+            if isinstance(current, bool):
+                return bool(current)
+            try:
+                board = getattr(self, "blackboard", {})
+                if isinstance(board, dict):
+                    for section_name in ("manager_judgement", "task_profile"):
+                        section = board.get(section_name, {})
+                        if not isinstance(section, dict) or "requires_todos" not in section:
+                            continue
+                        parsed = self._optional_bool_value(section.get("requires_todos"))
+                        if parsed is not None:
+                            return bool(parsed)
+            except Exception:
+                pass
+        # Conservative fallback for auto mode: requiring a Todo is safer than
+        # allowing a malformed/missing classifier field to bypass the guard.
+        return bool(fallback)
+
+    def _normalize_todo_requirement_in_decision(
+        self,
+        decision: object,
+        *,
+        level: object = None,
+        allow_context: bool = False,
+        fallback: bool = True,
+    ) -> dict:
+        row = dict(decision) if isinstance(decision, dict) else {}
+        if level is None:
+            level = row.get("level", row.get("task_level", 0))
+        row["requires_todos"] = self._resolve_todo_requirement(
+            level,
+            row.get("requires_todos"),
+            raw_provided="requires_todos" in row,
+            allow_context=allow_context,
+            fallback=fallback,
+        )
+        return row
+
+    def _single_no_plan_todo_policy_enabled(self) -> bool:
+        """Return whether the bounded single/no-plan Todo gate is enabled.
+
+        The startup flag remains an opt-in for L1 and other lightweight
+        sessions.  Effective L2 follows the explicit three-state policy rather
+        than the legacy optional bootstrap switch.
+        """
+        level = self._runtime_task_level_for_todo_policy()
+        if level == 2:
+            # The explicit L2 policy wins over the legacy optional bootstrap
+            # switch.  This is what makes ``--l2-todo-policy off`` effective.
+            return bool(self._runtime_level_requires_todos())
+        return bool(getattr(self, "single_no_plan_todo_enabled", False))
+
+    def _single_no_plan_todo_initial_gate_active(self) -> bool:
+        """Whether an L2 run is still in its pre-Todo orientation window."""
+        return bool(
+            self._runtime_task_level_for_todo_policy() == 2
+            and self._effective_execution_mode() == EXECUTION_MODE_SINGLE
+            and self._single_no_plan_todo_bootstrap_allowed()
+        )
+
+    def _single_no_plan_todo_perception_tools(self) -> list[dict]:
+        """Expose only observation tools until the mandatory L2 Todo exists.
+
+        This is a narrow, one-turn safety boundary.  It prevents a model from
+        bypassing the level contract by emitting ``write_file`` before the
+        normal perception-to-Todo bootstrap has had a chance to run.  MCP and
+        browser tools are admitted only when their names advertise a read-only
+        capability; mutation-prone shell tools stay hidden until the gate
+        closes.
+        """
+        read_names = {
+            "read_file", "list_files", "search_files", "context_recall", "tool_memory",
+            "task_get", "task_list", "read_from_blackboard", "check_background", "read_inbox",
+            "list_teammates", "worktree_list", "worktree_status", "worktree_events",
+            "query_code_library", "query_knowledge_library", "agent_web_search",
+            "list_skills", "list_skill_providers", "list_skill_protocols", "scan_skills", "load_skill",
+        }
+        tools: list[dict] = []
+        for spec in self._available_tools():
+            fn = spec.get("function", {}) if isinstance(spec, dict) else {}
+            name = str(fn.get("name", "") or "").strip()
+            canonical = canonicalize_tool_name(name)
+            if canonical == "TodoWrite" or canonical in read_names:
+                tools.append(spec)
+                continue
+            # Keep this capability check generic for dynamically mounted MCP
+            # and browser tools; it does not encode a task-specific provider.
+            if name.startswith(MCP_TOOL_PREFIX) or self._is_browser_runtime_tool_name(name):
+                if self._single_no_plan_todo_is_perception_result(
+                    {"name": name, "args": {}, "ok": True}
+                ):
+                    tools.append(spec)
+        return tools
+
+    def _single_no_plan_todo_mutation_blocked(self, name: object, args: object = None) -> bool:
+        """Return true when an L2 mutation would bypass the initial Todo gate."""
+        if not self._single_no_plan_todo_initial_gate_active():
+            return False
+        payload = args if isinstance(args, dict) else {}
+        return self._single_no_plan_todo_is_mutation_result(
+            {"name": str(name or ""), "args": payload, "ok": True}
+        )
+
+    def _single_no_plan_todo_bootstrap_allowed(self) -> bool:
+        """Check the semantic boundary before starting a perception bootstrap."""
+        l2_required = self._runtime_task_level_for_todo_policy() == 2
+        if not self._single_no_plan_todo_policy_enabled():
+            return False
+        if self._effective_execution_mode() != EXECUTION_MODE_SINGLE:
+            return False
+        # ``on`` is an explicit plan request.  ``auto`` is allowed only after
+        # classification has established that this particular run needs no plan.
+        preference = str(getattr(self, "plan_mode_user_preference", "auto") or "auto").strip().lower()
+        if preference == "on":
+            return False
+        if bool(getattr(self, "runtime_plan_mode_needed", False)):
+            return False
+        if bool(getattr(self, "runtime_plan_approved", False)):
+            return False
+        try:
+            if self._has_resumable_plan_state():
+                return False
+        except Exception:
+            # A partially constructed/test session has no resumable plan state.
+            pass
+        task_type = str(getattr(self, "runtime_task_type", "") or "").strip().lower()
+        # A manually pinned/semantically classified L2 is still required to
+        # have todos even when its task type happens to be simple_qa.  Preserve
+        # the historical simple-QA exclusion for the optional L1 bootstrap.
+        if task_type == "simple_qa" and not l2_required:
+            return False
+        state = str(getattr(self, "single_no_plan_todo_bootstrap_state", "idle") or "idle").strip().lower()
+        if state != "idle":
+            return False
+        if bool(getattr(self, "single_no_plan_todo_perception_seen", False)):
+            return False
+        if bool(getattr(self, "single_no_plan_todo_bootstrap_write_seen", False)):
+            return False
+        return not self._single_no_plan_todo_has_rows()
+
+    def _single_no_plan_todo_bootstrap_turn_active(self) -> bool:
+        """Check whether a persisted waiting turn may safely resume."""
+        if str(getattr(self, "single_no_plan_todo_bootstrap_state", "idle") or "idle").strip().lower() != "waiting":
+            return False
+        l2_required = self._runtime_task_level_for_todo_policy() == 2
+        if not self._single_no_plan_todo_policy_enabled():
+            return False
+        if self._effective_execution_mode() != EXECUTION_MODE_SINGLE:
+            return False
+        preference = str(getattr(self, "plan_mode_user_preference", "auto") or "auto").strip().lower()
+        if preference == "on" or bool(getattr(self, "runtime_plan_mode_needed", False)):
+            return False
+        if bool(getattr(self, "runtime_plan_approved", False)):
+            return False
+        if (
+            str(getattr(self, "runtime_task_type", "") or "").strip().lower() == "simple_qa"
+            and not l2_required
+        ):
+            return False
+        try:
+            if self._has_resumable_plan_state():
+                return False
+        except Exception:
+            pass
+        return True
+
+    @staticmethod
+    def _single_no_plan_todo_bash_is_read_only(command: object) -> bool:
+        """Conservatively classify a shell command as observation-only."""
+        text = str(command or "").strip()
+        if not text:
+            return False
+        # Command substitution can hide a write behind an otherwise harmless
+        # executable (for example, ``echo $(touch marker)``).
+        if "$(" in text or "`" in text:
+            return False
+        # Redirection and common mutation primitives make the whole command
+        # ineligible, even when an earlier segment is a read.
+        if re.search(r"(?:^|[^\\])(?:>>?|<<?|\|\s*tee\b)", text):
+            return False
+        if re.search(
+            r"\b(?:rm|rmdir|mv|cp|mkdir|mkfile|touch|chmod|chown|ln|install|truncate|dd|sed\s+-i|perl\s+-i|python(?:3)?\s+-c|write|edit)\b",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            return False
+        allowed_commands = {
+            "pwd", "ls", "find", "rg", "grep", "egrep", "fgrep", "cat", "head", "tail",
+            "sed", "awk", "cut", "sort", "uniq", "wc", "file", "stat", "du", "tree",
+            "realpath", "readlink", "env", "which", "type", "echo", "printf", "git",
+        }
+        segments = re.split(r"\s*(?:&&|\|\||[;|])\s*", text)
+        for segment in segments:
+            part = segment.strip()
+            if not part:
+                continue
+            try:
+                tokens = shlex.split(part)
+            except Exception:
+                return False
+            while tokens and tokens[0] in {"env", "command", "builtin", "sudo"}:
+                tokens.pop(0)
+            if not tokens:
+                return False
+            executable = Path(tokens[0]).name.lower()
+            if executable not in allowed_commands:
+                return False
+            if executable == "find" and any(
+                str(token).lower() in {
+                    "-delete", "-exec", "-execdir", "-ok", "-okdir",
+                    "-fprint", "-fprint0", "-fprintf",
+                }
+                for token in tokens[1:]
+            ):
+                return False
+            if executable == "sort" and any(
+                str(token).lower() == "-o"
+                or str(token).lower().startswith("--output")
+                for token in tokens[1:]
+            ):
+                return False
+            if executable == "git":
+                if len(tokens) < 2 or str(tokens[1]).lower() not in {
+                    "status", "diff", "log", "show", "ls-files", "rev-parse",
+                }:
+                    return False
+                if any(
+                    str(token).lower().startswith(("--output", "--ext-diff", "--textconv"))
+                    for token in tokens[2:]
+                ):
+                    return False
+        return True
+
+    @staticmethod
+    def _single_no_plan_todo_browser_is_read_only(name: object, args: object = None) -> bool:
+        """Classify browser/MCP calls by capability, not by provider name."""
+        tool_name = unicodedata.normalize("NFKC", str(name or "")).lower()
+        # These actions can change page/application state or write a local
+        # artifact, so a round containing them must never start the bootstrap.
+        mutation_tokens = (
+            "click", "dblclick", "doubleclick", "type", "fill", "press",
+            "select", "check", "uncheck", "upload", "download", "drag",
+            "drop", "evaluate", "execute", "submit", "setvalue", "set_value",
+            "insert", "scroll", "hover",
+        )
+        if any(token in tool_name for token in mutation_tokens):
+            return False
+        payload = args if isinstance(args, dict) else {}
+        for key in ("action", "operation", "event", "method", "command"):
+            value = unicodedata.normalize("NFKC", str(payload.get(key, "") or "")).lower()
+            if value and any(token in value for token in mutation_tokens):
+                return False
+        return True
+
+    def _single_no_plan_todo_is_perception_result(self, item: dict | None) -> bool:
+        """Return true for a successful, read-only observation result."""
+        if not isinstance(item, dict) or not bool(item.get("ok", False)):
+            return False
+        name = canonicalize_tool_name(item.get("name", ""))
+        args = item.get("args", {}) if isinstance(item.get("args"), dict) else {}
+        if name in {
+            "read_file", "list_files", "search_files", "context_recall", "tool_memory",
+            "task_get", "task_list", "read_from_blackboard", "check_background", "read_inbox",
+            "list_teammates", "worktree_list", "worktree_status", "worktree_events",
+            "query_code_library", "query_knowledge_library", "agent_web_search",
+            "list_skills", "list_skill_providers", "list_skill_protocols",
+            "scan_skills", "load_skill",
+        }:
+            return True
+        if name == "bash" or name == "worktree_run":
+            return self._single_no_plan_todo_bash_is_read_only(args.get("command", ""))
+        if self._is_browser_runtime_tool_name(name):
+            return self._single_no_plan_todo_browser_is_read_only(name, args)
+        # MCP tools are intentionally recognized by capability-shaped names,
+        # not by a task-specific provider list.
+        if name.startswith(MCP_TOOL_PREFIX):
+            low = name.lower()
+            if any(token in low for token in ("write", "edit", "create", "delete", "remove", "execute", "run")):
+                return False
+            return any(token in low for token in ("read", "list", "search", "inspect", "snapshot", "status", "get", "query", "fetch", "observe", "browser", "page"))
+        return False
+
+    def _single_no_plan_todo_is_mutation_result(self, item: dict | None) -> bool:
+        """Return true when a tool result represents a write or other side effect.
+
+        Bootstrap is allowed only after a genuinely observation-only tool round.
+        A model can emit several calls in one response, so checking just
+        ``write_file``/``edit_file`` is insufficient: a mutating shell command,
+        background job, blackboard write, or worktree operation must also block
+        the bootstrap even when a read call appeared earlier in that round.
+        Failed side-effect attempts count as attempts too; otherwise a failed
+        write followed by a read could unexpectedly create a planning turn.
+        """
+        if not isinstance(item, dict):
+            return False
+        name = canonicalize_tool_name(item.get("name", ""))
+        args = item.get("args", {}) if isinstance(item.get("args"), dict) else {}
+        if name in {
+            "write_file", "edit_file", "background_run", "task_create", "task_update",
+            "claim_task", "task", "spawn_teammate", "ask_colleague", "send_message", "broadcast",
+            "shutdown_request", "plan_approval", "write_skill", "write_to_blackboard", "rag_remember",
+            "generate_media", "worktree_create", "worktree_keep", "worktree_remove",
+            "ask_user", "finish_task", "finish_current_task", "mark_done", "compress",
+        }:
+            return True
+        if name in {"bash", "worktree_run"}:
+            return not self._single_no_plan_todo_bash_is_read_only(args.get("command", ""))
+        if self._is_browser_runtime_tool_name(name):
+            return not self._single_no_plan_todo_browser_is_read_only(name, args)
+        if name.startswith(MCP_TOOL_PREFIX):
+            name_tokens = set(re.split(r"[^a-z0-9]+", name.lower()))
+            mutation_tokens = {
+                "write", "edit", "create", "delete", "remove", "execute", "run",
+                "update", "patch", "put", "post", "send", "upload", "commit", "merge",
+            }
+            if name_tokens & mutation_tokens:
+                return True
+            for key in ("action", "operation", "method"):
+                value_tokens = set(
+                    re.split(r"[^a-z0-9]+", str(args.get(key, "") or "").lower())
+                )
+                if value_tokens & mutation_tokens:
+                    return True
+        return False
+
+    def _single_no_plan_todo_bootstrap_tools(self) -> list[dict]:
+        allowed = {"TodoWrite", "TodoWriteRescue"}
+        tools: list[dict] = []
+        for spec in self._available_tools():
+            fn = spec.get("function", {}) if isinstance(spec, dict) else {}
+            # Do not canonicalize here: TodoWriteResume is a compatibility
+            # alias, but this bounded turn intentionally exposes only the two
+            # explicit writers accepted by the bootstrap gate below.
+            name = str(fn.get("name", "") or "").strip()
+            if name in allowed:
+                tools.append(spec)
+        return tools
+
+    def _single_no_plan_todo_remove_bootstrap_hints(self) -> None:
+        if not isinstance(getattr(self, "messages", None), list):
+            return
+        prefixes = ("<single-no-plan-todo-bootstrap>", "<single-no-plan-todo-bootstrap-retry>")
+        self.messages = [
+            row for row in self.messages
+            if not (
+                isinstance(row, dict)
+                and str(row.get("role", "") or "").strip() == "user"
+                and str(row.get("content", "") or "").lstrip().lower().startswith(prefixes)
+            )
+        ][-400:]
+
+    def _start_single_no_plan_todo_bootstrap(self) -> bool:
+        if not self._single_no_plan_todo_bootstrap_allowed():
+            return False
+        prompt = str(
+            getattr(self, "single_no_plan_todo_prompt", "") or DEFAULT_SINGLE_NO_PLAN_TODO_PROMPT
+        ).strip() or DEFAULT_SINGLE_NO_PLAN_TODO_PROMPT
+        self._single_no_plan_todo_remove_bootstrap_hints()
+        self.single_no_plan_todo_bootstrap_state = "waiting"
+        self.single_no_plan_todo_bootstrap_attempts = 0
+        self.single_no_plan_todo_perception_seen = True
+        self.messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "<single-no-plan-todo-bootstrap>\n"
+                    f"{trim(prompt, 6000)}\n\n"
+                    "This is a planning-only turn after real read-only perception. "
+                    "Use the preceding tool result as evidence. Call exactly one "
+                    "TodoWrite or TodoWriteRescue tool now; do not call implementation "
+                    "tools or finish_task.\n"
+                    "</single-no-plan-todo-bootstrap>"
+                ),
+                "ts": now_ts(),
+            }
+        )
+        self._emit(
+            "status",
+            {"summary": "single/no-plan perception complete; Todo bootstrap turn required"},
+        )
+        try:
+            self._persist()
+        except Exception:
+            pass
+        return True
+
+    def _single_no_plan_todo_bootstrap_failure(self, reason: str) -> str:
+        """Record one failed bootstrap turn and return ``retry``, ``skip`` or ``blocked``."""
+        if str(getattr(self, "single_no_plan_todo_bootstrap_state", "") or "").strip().lower() != "waiting":
+            return "skip"
+        attempts = int(getattr(self, "single_no_plan_todo_bootstrap_attempts", 0) or 0) + 1
+        self.single_no_plan_todo_bootstrap_attempts = min(
+            SINGLE_NO_PLAN_TODO_BOOTSTRAP_MAX_ATTEMPTS,
+            attempts,
+        )
+        reason_text = trim(str(reason or "TodoWrite was not emitted"), 260)
+        if attempts < SINGLE_NO_PLAN_TODO_BOOTSTRAP_MAX_ATTEMPTS:
+            self._single_no_plan_todo_remove_bootstrap_hints()
+            self.messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "<single-no-plan-todo-bootstrap-retry>\n"
+                        f"The required Todo bootstrap turn did not complete: {reason_text}. "
+                        "Retry once now. Call exactly one TodoWrite or TodoWriteRescue "
+                        "with 3-7 evidence-based items and exactly one in_progress item; "
+                        "do not use any implementation tool.\n"
+                        "</single-no-plan-todo-bootstrap-retry>"
+                    ),
+                    "ts": now_ts(),
+                }
+            )
+            self._emit(
+                "status",
+                {"summary": f"single/no-plan Todo bootstrap retry ({attempts}/{SINGLE_NO_PLAN_TODO_BOOTSTRAP_MAX_ATTEMPTS})"},
+            )
+            return "retry"
+        # A required L2 Todo contract must not silently restore mutation tools
+        # after bounded writer failures.  L2-off and optional L1 bootstraps keep
+        # the historical finite skip behavior.
+        if (
+            self._runtime_task_level_for_todo_policy() == 2
+            and self._runtime_level_requires_todos()
+        ):
+            self.single_no_plan_todo_bootstrap_state = "blocked"
+            self._emit(
+                "status",
+                {"summary": f"L2 Todo bootstrap blocked after bounded failures: {reason_text}"},
+            )
+            return "blocked"
+        self.single_no_plan_todo_bootstrap_state = "skipped"
+        self._emit(
+            "status",
+            {"summary": f"single/no-plan Todo bootstrap skipped after bounded failures: {reason_text}"},
+        )
+        return "skip"
+
+    def _single_no_plan_todo_bootstrap_succeeded(self) -> None:
+        self.single_no_plan_todo_bootstrap_state = "completed"
+        self.single_no_plan_todo_bootstrap_attempts = 0
+        self._emit(
+            "status",
+            {"summary": "single/no-plan Todo bootstrap completed; normal tools restored"},
+        )
+
     def _mcp_prompt_block(self) -> str:
         """Awareness block about external MCP tools.
 
@@ -53910,7 +59412,8 @@ body{padding:18px}
         allowed = AGENT_TOOL_ALLOWLIST.get(role_key, set())
         if role_key == "reviewer" and bool(self.reviewer_debug_mode):
             allowed = set(allowed) | set(REVIEWER_DEBUG_TOOL_ALLOWLIST)
-        return str(name or "").strip() in allowed
+        raw_name = str(name or "").strip()
+        return raw_name in allowed or canonicalize_tool_name(raw_name) in allowed
 
     def _available_tools(self) -> list[dict]:
         base = filter_tool_specs_for_runtime(
@@ -53941,7 +59444,7 @@ body{padding:18px}
             fn = tool.get("function", {}) if isinstance(tool, dict) else {}
             name = str(fn.get("name", "")).strip()
             # MCP tools bypass the per-role built-in allowlist (every role may use them).
-            if name in allowed or name.startswith(MCP_TOOL_PREFIX):
+            if name in allowed or canonicalize_tool_name(name) in allowed or name.startswith(MCP_TOOL_PREFIX):
                 filtered.append(tool)
         return filtered or base_tools
 
@@ -54393,6 +59896,7 @@ body{padding:18px}
         engineering_note = self._engineering_execution_boost_instruction()
         html_note = self._html_frontend_boost_instruction()
         plan_todo_note = self._plan_todo_discipline_prompt(role=role_key)
+        todo_contract_note = self._todo_contract_prompt_block()
         read_context_note = self._read_context_prompt_block(for_role=role_key)
         web_search_enabled = bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED))
         web_search_context_note = self._web_search_context_prompt_block(for_role=role_key) if web_search_enabled else ""
@@ -54438,6 +59942,8 @@ body{padding:18px}
             base = base + task_memory_note + " "
         if plan_todo_note:
             base = base + plan_todo_note + " "
+        if todo_contract_note:
+            base = base + todo_contract_note + " "
         mcp_note = self._mcp_prompt_block()
         if mcp_note:
             base = base + mcp_note + " "
@@ -54594,80 +60100,571 @@ body{padding:18px}
                 mirror_to_global=False,
             )
 
-    def _todo_write_rescue(self, args: dict) -> str:
-        """Rescue todo writer — accepts both strings and dicts, auto-normalizes.
-        FIXED: Now preserves status from incoming items (especially 'completed')
-        instead of resetting everything to 'pending'."""
-        raw_items = args.get("items", [])
-        if not isinstance(raw_items, list) or not raw_items:
-            raise ValueError("items must be a non-empty array")
-        limited = raw_items[:12]  # Allow more items (was 7) — plans can have 5+ subtasks
-        active_step = self._get_active_plan_step()
-        active_step_id = trim(str((active_step or {}).get("id", "") or ""), 20)
-        owner_hint = self._current_plan_worker_owner()
-        clean_items = []
-        _status_alias = {
-            "todo": "pending", "doing": "in_progress", "inprogress": "in_progress",
-            "in-progress": "in_progress", "done": "completed", "finish": "completed",
-            "finished": "completed", "[_]": "pending", "[]": "pending",
-            "[ ]": "pending", "[>]": "in_progress", ">": "in_progress",
-            "[x]": "completed", "x": "completed",
+    def _todo_payload_items(
+        self,
+        args: object,
+        *,
+        default_parent_step_id: str = "",
+        limit: int = 40,
+    ) -> list[object]:
+        """Normalize provider-specific TodoWrite/Resume payloads into rows."""
+        source = args if isinstance(args, dict) else {}
+        max_items = max(1, min(int(limit or 40), 40))
+
+        def _key_token(value: object) -> str:
+            return re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
+
+        field_aliases = {
+            "content": {"content", "text", "title", "task", "todo", "subtask", "item", "row", "description", "label", "name", "summary", "current", "next"},
+            "status": {"status", "state", "phase"},
+            "completed": {"completed", "complete", "done", "finished", "passed", "success", "iscompleted"},
+            "in_progress": {"inprogress", "active", "working", "started", "isinprogress"},
+            "owner": {"owner", "assignee", "agent", "role"},
+            "key": {"key"},
+            "subtask_id": {"subtaskid"},
+            "external_subtask_id": {"externalsubtaskid", "externalid", "todoid", "taskid", "itemid", "rowid"},
+            "parent_step_id": {"parentstepid", "parentid", "stepid"},
+            "activeForm": {"activeform"},
+            "evidence": {"evidence", "proof", "evidenceref", "evidencerefs"},
         }
-        for idx, item in enumerate(limited):
-            if isinstance(item, dict):
-                content = str(item.get("content", item.get("text", item.get("title", "")))).strip()
-                owner = str(item.get("owner", "") or owner_hint).strip().lower()
-                parent_step_id = trim(str(item.get("parent_step_id", "") or active_step_id), 20)
-                # Preserve status from incoming dict (critical for subtask state tracking)
-                raw_status = str(item.get("status", item.get("state", "pending"))).strip().lower()
-                status = _status_alias.get(raw_status, raw_status)
-                if status not in {"pending", "in_progress", "completed"}:
-                    status = "pending"
-            else:
-                content = str(item).strip()
-                owner = owner_hint
-                parent_step_id = active_step_id
-                parsed_status, parsed_content = split_todo_status_text(content)
-                status = parsed_status or "pending"
-                content = parsed_content or content
-            content = normalize_work_text(content) or content
-            if not content:
-                continue
-            row = {
-                "content": content,
-                "status": status,
-            }
-            if owner in {"developer", "explorer", "reviewer"}:
-                row["owner"] = owner
-            if parent_step_id:
-                row["parent_step_id"] = parent_step_id
-            clean_items.append(row)
-        if not clean_items:
-            raise ValueError("no valid todo item text")
-        # Only apply in_progress_index if NO items already have in_progress status
-        has_in_progress = any(r["status"] == "in_progress" for r in clean_items)
-        if not has_in_progress:
-            in_progress_index = int(args.get("in_progress_index", 0) or 0)
-            if in_progress_index < 0 or in_progress_index >= len(clean_items):
-                in_progress_index = 0
-            # Only set in_progress on a pending item
-            for i, r in enumerate(clean_items):
-                if r["status"] == "pending":
-                    if i >= in_progress_index:
-                        r["status"] = "in_progress"
+        normalized_aliases = {
+            field: {_key_token(alias) for alias in aliases}
+            for field, aliases in field_aliases.items()
+        }
+        plural_containers = {
+            "items", "todos", "todoitems", "subtasks", "rows", "updates",
+            "todolist", "tasks", "planitems", "data",
+        }
+        singular_containers = {"todo", "subtask", "item", "row", "task"}
+        control_tokens = {
+            "resume", "continue", "resumeexisting", "inprogressindex", "activeindex",
+            "currentindex", "nextindex", "updatemode", "mode", "operation", "update",
+            "action", "revisionreason", "reason", "changereason", "why",
+            "revisionevidence", "references", "options", "meta", "control",
+        }
+
+        def _decode_json_container(value: object) -> object:
+            return decode_structured_todo_container(value)
+
+        def _canonicalize_row(value: dict) -> dict:
+            row = dict(value)
+            by_token: dict[str, object] = {}
+            for raw_key, raw_value in value.items():
+                token = _key_token(raw_key)
+                if token and token not in by_token:
+                    by_token[token] = raw_value
+            for field, aliases in normalized_aliases.items():
+                if row.get(field) not in (None, ""):
+                    continue
+                for alias in aliases:
+                    if alias in by_token and by_token[alias] not in (None, ""):
+                        row[field] = by_token[alias]
                         break
-        route_kind = self._todo_route_kind(role=owner_hint)
+            return row
+
+        def _looks_like_row(value: object) -> bool:
+            if not isinstance(value, dict):
+                return False
+            row = _canonicalize_row(value)
+            return any(
+                row.get(key) not in (None, "")
+                for key in (
+                    "content", "status", "completed", "in_progress", "owner", "key",
+                    "subtask_id", "external_subtask_id", "parent_step_id", "activeForm",
+                )
+            )
+
+        def _bind_mapping_identity(row: dict, mapping_key: object) -> dict:
+            external_id = trim(str(mapping_key or "").strip(), 120)
+            if external_id:
+                if not str(row.get("key", "") or "").strip():
+                    row["key"] = external_id
+                if not str(row.get("external_subtask_id", "") or "").strip():
+                    row["external_subtask_id"] = external_id
+            return row
+
+        def _mapping_candidates(value: object) -> list[object]:
+            value = _decode_json_container(value)
+            if isinstance(value, list):
+                return [_canonicalize_row(item) if isinstance(item, dict) else item for item in value]
+            if isinstance(value, str):
+                return [value] if value.strip() else []
+            if not isinstance(value, dict):
+                return []
+
+            # Prefer explicit plural containers over compatibility text fields.
+            # Some providers emit both ``todos=[...]`` and ``content="[...]"``;
+            # treating the outer mapping as a row first collapses the valid array
+            # into one display string.
+            for raw_key, nested in value.items():
+                if _key_token(raw_key) not in plural_containers:
+                    continue
+                nested_rows = _mapping_candidates(nested)
+                if nested_rows:
+                    return nested_rows
+
+            # Singular wrappers may carry row metadata beside the nested row.
+            for raw_key, nested in value.items():
+                if _key_token(raw_key) not in singular_containers or not isinstance(nested, dict):
+                    continue
+                outer = {
+                    key: item
+                    for key, item in value.items()
+                    if key != raw_key and _key_token(key) not in control_tokens
+                }
+                merged = _canonicalize_row({**nested, **outer})
+                if _looks_like_row(merged):
+                    return [merged]
+
+            row = _canonicalize_row(value)
+            content_value = row.get("content")
+            decoded_content = _decode_json_container(content_value)
+            if decoded_content is not content_value and isinstance(decoded_content, (list, dict)):
+                nested_rows = _mapping_candidates(decoded_content)
+                if nested_rows:
+                    return nested_rows
+            if _looks_like_row(row):
+                return [row]
+
+            for raw_key, nested in value.items():
+                if _key_token(raw_key) not in plural_containers | singular_containers:
+                    continue
+                nested_rows = _mapping_candidates(nested)
+                if nested_rows:
+                    return nested_rows
+
+            # ID-keyed maps are common after compaction. Bind the map key to
+            # every recovered row so a later status-only call can find it even
+            # when the display text changed.
+            recovered: list[object] = []
+            for mapping_key, nested in value.items():
+                if _key_token(mapping_key) in control_tokens:
+                    continue
+                nested_rows = _mapping_candidates(nested)
+                for nested_row in nested_rows:
+                    if isinstance(nested_row, dict):
+                        recovered.append(_bind_mapping_identity(_canonicalize_row(nested_row), mapping_key))
+                    elif str(nested_row or "").strip():
+                        recovered.append(
+                            _bind_mapping_identity(
+                                {"content": str(nested_row).strip()},
+                                mapping_key,
+                            )
+                        )
+                    if len(recovered) >= max_items:
+                        return recovered
+            return recovered
+
+        candidates = _mapping_candidates(source)
+        if not candidates:
+            return []
+
+        out: list[object] = []
+        for item in candidates:
+            if len(out) >= max_items:
+                break
+            if isinstance(item, dict):
+                row = _canonicalize_row(item)
+                if default_parent_step_id and not str(row.get("parent_step_id", "") or "").strip():
+                    row["parent_step_id"] = default_parent_step_id
+                raw_content = row.get("content")
+                if isinstance(raw_content, str) and raw_content.strip():
+                    parsed_rows = extract_todo_rows_from_text(
+                        raw_content,
+                        default_parent_step_id=default_parent_step_id,
+                        limit=max_items - len(out),
+                    )
+                    structured_rows = (
+                        split_structured_todo_content(
+                            raw_content,
+                            limit=max_items - len(out),
+                        )
+                        if len(parsed_rows) < 2
+                        else []
+                    )
+                    expanded = parsed_rows if len(parsed_rows) >= 2 else structured_rows
+                    if len(expanded) >= 2:
+                        shared = {
+                            key: value
+                            for key, value in row.items()
+                            if key not in {"content", "status", "state", "phase", "completed", "done", "in_progress", "active"}
+                        }
+                        for expanded_row in expanded[: max_items - len(out)]:
+                            merged_row = dict(shared)
+                            merged_row.update(expanded_row)
+                            out.append(merged_row)
+                        continue
+                out.append(row)
+                continue
+            text = str(item or "").strip()
+            if not text:
+                continue
+            parsed_rows = extract_todo_rows_from_text(
+                text,
+                default_parent_step_id=default_parent_step_id,
+                limit=max_items - len(out),
+            )
+            if len(parsed_rows) >= 2:
+                out.extend(parsed_rows[: max_items - len(out)])
+                continue
+            structured_rows = split_structured_todo_content(
+                text,
+                limit=max_items - len(out),
+            )
+            if len(structured_rows) >= 2:
+                out.extend(structured_rows[: max_items - len(out)])
+                continue
+            out.append(text)
+        return out[:max_items]
+
+    def _normalize_loaded_todo_rows(
+        self,
+        raw_rows: object,
+        messages: object,
+    ) -> list[dict]:
+        """Repair only the legacy one-row stringified Todo payload shape.
+
+        Normal persisted lists are returned byte-for-byte equivalent. When an
+        older run stored a truncated Python representation as the sole Todo, the
+        corresponding structured TodoWrite arguments remain in the conversation
+        and provide a bounded, same-session recovery source.
+        """
+        rows = [dict(row) for row in raw_rows if isinstance(row, dict)] if isinstance(raw_rows, list) else []
+        if len(rows) != 1:
+            return rows
+        content = str(rows[0].get("content", "") or "").strip()
+        if not (content.startswith("[") and "content" in content.casefold()):
+            return rows
+
+        recovered: list[object] = []
+        decoded = decode_structured_todo_container(content)
+        if isinstance(decoded, (list, dict)):
+            recovered = self._todo_payload_items({"items": decoded}, limit=40)
+
+        if len(recovered) < 2 and isinstance(messages, list):
+            for message in reversed(messages[-160:]):
+                if not isinstance(message, dict):
+                    continue
+                calls = message.get("tool_calls", [])
+                if not isinstance(calls, list):
+                    continue
+                for call in reversed(calls):
+                    if not isinstance(call, dict):
+                        continue
+                    function = call.get("function", {}) if isinstance(call.get("function"), dict) else {}
+                    name = canonicalize_tool_name(function.get("name", ""))
+                    if name not in {"TodoWrite", "TodoWriteRescue", "TodoWriteResume"}:
+                        continue
+                    args = decode_structured_todo_container(function.get("arguments", {}))
+                    if not isinstance(args, dict):
+                        continue
+                    candidates = self._todo_payload_items(args, limit=40)
+                    if len(candidates) < 2:
+                        continue
+                    candidate_texts = [
+                        str(row.get("content", "") or "").strip()
+                        for row in candidates
+                        if isinstance(row, dict) and str(row.get("content", "") or "").strip()
+                    ]
+                    overlap = sum(1 for text in candidate_texts if text in content)
+                    if overlap < min(2, len(candidate_texts)):
+                        continue
+                    recovered = candidates
+                    break
+                if len(recovered) >= 2:
+                    break
+
+        if len(recovered) < 2:
+            return rows
+        normalized = TodoManager(getattr(self, "ui_language", DEFAULT_UI_LANGUAGE))
+        try:
+            normalized.update(recovered)
+        except Exception:
+            return rows
+        return normalized.snapshot() or rows
+
+    def _todo_payload_in_progress_index(self, args: object) -> int | None:
+        """Read legacy/current cursor aliases without treating an empty value as 0."""
+        source = args if isinstance(args, dict) else {}
+        for key in (
+            "in_progress_index", "inProgressIndex", "active_index", "activeIndex",
+            "current_index", "currentIndex", "next_index", "nextIndex",
+        ):
+            if key not in source:
+                continue
+            raw = source.get(key)
+            if isinstance(raw, bool) or raw in (None, ""):
+                continue
+            try:
+                value = int(float(str(raw).strip()))
+            except Exception:
+                continue
+            return max(0, value)
+        for key in ("options", "meta", "control"):
+            nested = source.get(key)
+            if isinstance(nested, dict):
+                value = self._todo_payload_in_progress_index(nested)
+                if value is not None:
+                    return value
+        return None
+
+    def _apply_todo_payload_in_progress_index(
+        self,
+        items: list[object],
+        args: object,
+    ) -> list[object]:
+        """Apply a supplied active-row cursor only when no row has explicit progress.
+
+        This preserves the historical TodoWriteRescue contract while allowing
+        normal TodoWrite/Resume payloads to use the same elastic mapping.
+        """
+        index = self._todo_payload_in_progress_index(args)
+        if index is None or not isinstance(items, list) or not items:
+            return items
+
+        normalized: list[object] = []
+        explicit_active = False
+        pending_positions: list[int] = []
+        for item in items:
+            if isinstance(item, dict):
+                row = dict(item)
+                raw_content = str(
+                    row.get(
+                        "content",
+                        row.get(
+                            "text",
+                            row.get(
+                                "title",
+                                row.get("task", row.get("description", row.get("label", row.get("name", "")))),
+                            ),
+                        ),
+                    )
+                    or ""
+                ).strip()
+                parsed_status, _ = split_todo_status_text(raw_content)
+                raw_status = row.get("status", row.get("state", row.get("phase", "")))
+                if raw_status in (None, ""):
+                    if any(
+                        _to_bool_like(row.get(key, False), default=False)
+                        for key in ("in_progress", "inprogress", "active", "working", "started")
+                    ):
+                        raw_status = "in_progress"
+                    elif any(
+                        _to_bool_like(row.get(key, False), default=False)
+                        for key in ("completed", "complete", "done", "finished", "passed", "success")
+                    ):
+                        raw_status = "completed"
+                status = self._normalize_todo_status_value(raw_status, parsed_status or "pending")
+                if parsed_status and str(raw_status or "").strip().lower() in {"", "todo", "pending"}:
+                    status = parsed_status
+                normalized.append(row)
+            else:
+                raw_text = str(item or "").strip()
+                parsed_status, parsed_content = split_todo_status_text(raw_text)
+                status = parsed_status or "pending"
+                normalized.append(
+                    {"content": parsed_content or raw_text, "status": status}
+                )
+            status = self._normalize_todo_status_value(status, "pending")
+            if status == "in_progress":
+                explicit_active = True
+            elif status == "pending":
+                pending_positions.append(len(normalized) - 1)
+        if explicit_active:
+            return normalized
+        if not pending_positions:
+            return normalized
+        target_pos = pending_positions[min(index, len(pending_positions) - 1)]
+        target = normalized[target_pos]
+        if isinstance(target, dict):
+            target["status"] = "in_progress"
+            target.pop("state", None)
+            target.pop("phase", None)
+            target.pop("in_progress", None)
+            target.pop("active", None)
+        return normalized
+
+    def _todo_payload_controls(self, args: object, *, resume: bool = False) -> tuple[str, str, object]:
+        source = args if isinstance(args, dict) else {}
+        mode = ""
+        for key in ("update_mode", "mode", "operation", "update", "action"):
+            value = str(source.get(key, "") or "").strip()
+            if value:
+                mode = value
+                break
+        if not mode:
+            mode = "status_update"
+        reason = ""
+        for key in ("revision_reason", "reason", "change_reason", "why"):
+            value = str(source.get(key, "") or "").strip()
+            if value:
+                reason = value
+                break
+        evidence: object = []
+        for key in ("revision_evidence", "evidence", "evidence_refs", "proof", "references"):
+            if source.get(key) not in (None, ""):
+                evidence = source.get(key)
+                break
+        # Resume is deliberately status-only unless the caller explicitly asks
+        # for an audited structural revision.
+        if resume and not reason and not str(evidence or "").strip():
+            mode = "status_update"
+        return mode, reason, evidence
+
+    def _todo_resume_current_rows(self, role: str = "") -> list[dict]:
+        """Return the existing scoped rows for a payload-less resume call."""
+        bb = self._ensure_blackboard()
+        route_kind = self._todo_route_kind(role=role, board=bb)
+        rows = self._todo_route_rows(route_kind, role=role, board=bb)
+        # After compaction/load the blackboard mirror can be newer than the
+        # in-memory TodoManager. Restore from that canonical mirror instead of
+        # reporting that a payload-less resume has no items.
+        if not rows and route_kind in {"plan_single", "plan_sync"}:
+            step = self._get_active_plan_step(bb)
+            step_id = trim(str((step or {}).get("id", "") or ""), 40)
+            if step_id:
+                rows = self._active_plan_worker_todo_rows(step_id, role="")
+        if not rows and route_kind == "pure_single":
+            rows = [
+                dict(row)
+                for row in self.todo.snapshot()
+                if isinstance(row, dict) and self._todo_row_kind(row) in {"flat", "owner_worker"}
+            ]
+        return [dict(row) for row in rows if isinstance(row, dict)]
+
+    def _normalize_generic_todo_row(self, item: object, *, owner: str = "") -> dict:
+        """Normalize a non-plan todo row before owner/flat reconciliation."""
+        raw = {"content": item} if isinstance(item, str) else dict(item) if isinstance(item, dict) else {"content": str(item or "")}
+        content = str(
+            raw.get(
+                "content",
+                raw.get(
+                    "text",
+                    raw.get(
+                        "title",
+                        raw.get("task", raw.get("description", raw.get("label", raw.get("name", "")))),
+                    ),
+                ),
+            )
+            or ""
+        ).strip()
+        parsed_status, parsed_content = split_todo_status_text(content)
+        content = trim(normalize_work_text(parsed_content or content) or (parsed_content or content), 500)
+        if not content:
+            return {}
+        raw_status_value = raw.get("status", raw.get("state", raw.get("phase", "")))
+        if raw_status_value in (None, ""):
+            if any(_to_bool_like(raw.get(key, False), default=False) for key in ("completed", "complete", "done", "finished", "passed", "success")):
+                raw_status_value = "completed"
+            elif any(_to_bool_like(raw.get(key, False), default=False) for key in ("in_progress", "inprogress", "active", "working", "started")):
+                raw_status_value = "in_progress"
+        status = self._normalize_todo_status_value(raw_status_value, parsed_status or "pending")
+        raw_status_key = str(raw_status_value or "").strip().lower().replace("-", "_").replace(" ", "_")
+        if parsed_status and raw_status_key in {"", "todo", "pending"}:
+            status = parsed_status
+        if status == "blocked":
+            status = "pending"
+        row = {
+            "content": content,
+            "status": status,
+        }
+        role_key = self._sanitize_agent_role(raw.get("owner", "")) or self._sanitize_agent_role(owner)
+        if role_key in {"manager", "explorer", "developer", "reviewer"}:
+            row["owner"] = role_key
+        key = trim(str(raw.get("key", "") or "").strip(), 120)
+        if key:
+            row["key"] = key
+        for alias_key in (
+            "external_subtask_id", "externalSubtaskId", "external_id", "externalId",
+            "todo_id", "todoId", "task_id", "taskId", "item_id", "itemId",
+            "row_id", "rowId", "id",
+        ):
+            alias = trim(str(raw.get(alias_key, "") or "").strip(), 120)
+            if alias:
+                row["external_subtask_id"] = alias
+                break
+        for meta_key in (
+            "activeForm", "active_form", "subtask_id", "created_at", "updated_at", "started_at",
+            "completed_at", "completed_by", "evidence", "evidence_binding", "evidence_ids",
+        ):
+            if raw.get(meta_key) not in (None, ""):
+                row[meta_key] = raw.get(meta_key)
+        for source_key in ("proof", "evidence_ref", "evidence_refs"):
+            if not row.get("evidence") and raw.get(source_key) not in (None, ""):
+                row["evidence"] = raw.get(source_key)
+        return row
+
+    def _todo_write_rescue(self, args: dict, role: str = "") -> str:
+        """Compatibility wrapper over the canonical TodoWrite dispatcher."""
+        source = args if isinstance(args, dict) else {}
+        is_resume = _to_bool_like(
+            source.get("resume", source.get("continue", source.get("resume_existing", False))),
+            default=False,
+        )
+        forwarded = dict(source)
+        # Preserve the historical Rescue convenience: when no row/cursor is
+        # explicitly active, start the first pending row. The canonical cursor
+        # normalizer will leave an explicit in_progress row untouched.
+        if not is_resume and self._todo_payload_in_progress_index(forwarded) is None:
+            forwarded["in_progress_index"] = 0
+        return self._dispatch_todo_update(
+            forwarded,
+            role=role,
+            resume=is_resume,
+        )
+
+    def _dispatch_todo_update(self, args: dict, *, role: str = "", resume: bool = False) -> str:
+        """Canonical dispatcher shared by TodoWrite, Rescue, and Resume aliases."""
+        source = args if isinstance(args, dict) else {}
+        bb = self._ensure_blackboard()
+        active_step = self._get_active_plan_step(bb)
+        active_step_id = trim(str((active_step or {}).get("id", "") or ""), 40)
+        transaction = self._capture_todo_write_transaction(
+            bb,
+            active_step_id=active_step_id,
+        )
+        role_key = self._sanitize_agent_role(role) or self._current_plan_worker_owner(bb)
+        items = self._todo_payload_items(
+            source,
+            default_parent_step_id=active_step_id,
+            limit=40,
+        )
+        is_resume = resume or _to_bool_like(
+            source.get("resume", source.get("continue", source.get("resume_existing", False))),
+            default=False,
+        )
+        if not items and is_resume:
+            items = self._todo_resume_current_rows(role_key)
+        if not items:
+            raise ValueError("no valid todo item text; provide items/todos/subtasks/rows or content")
+        items = self._apply_todo_payload_in_progress_index(items, source)
+        # Apply the active role only when a payload did not explicitly identify a
+        # system row. Plan rows are scoped to the active parent by the merge path.
+        normalized_items: list[object] = []
+        for item in items:
+            if isinstance(item, dict):
+                row = dict(item)
+                if not str(row.get("key", "") or "").startswith("bb:"):
+                    row["owner"] = role_key
+                    if active_step_id and not str(row.get("parent_step_id", "") or "").strip():
+                        row["parent_step_id"] = active_step_id
+                normalized_items.append(row)
+            else:
+                normalized_items.append(item)
+        mode, reason, revision_evidence = self._todo_payload_controls(source, resume=is_resume)
+        route_kind = self._todo_route_kind(role=role_key, board=bb)
         if route_kind in {"plan_single", "plan_sync"}:
             return self._merge_plan_worker_todo_items(
-                clean_items,
-                role=owner_hint,
-                update_mode=str(args.get("update_mode", "status_update") or "status_update"),
-                revision_reason=str(args.get("revision_reason", "") or ""),
-                revision_evidence=args.get("revision_evidence", []),
+                normalized_items,
+                role=role_key,
+                update_mode=mode,
+                revision_reason=reason,
+                revision_evidence=revision_evidence,
+                transaction=transaction,
             )
         if route_kind == "pure_sync":
-            return self._merge_owner_scoped_todo_items(clean_items, role=owner_hint)
-        return self.todo.update(clean_items)
+            return self._merge_owner_scoped_todo_items(normalized_items, role=role_key)
+        return self._merge_flat_todo_items(normalized_items, role=role_key)
 
     def _todo_progress_signature(self, rows: list[dict] | None = None) -> list[tuple[str, str, str, str]]:
         items = rows if isinstance(rows, list) else self.todo.snapshot()
@@ -54696,13 +60693,17 @@ body{padding:18px}
         before_rows: list[dict] | None = None,
         after_rows: list[dict] | None = None,
     ) -> tuple[str, str]:
+        tool_name = canonicalize_tool_name(tool_name)
         txt = str(output or "").strip()
         low = txt.lower()
         has_worker_rows = self._todo_runtime_has_worker_rows()
+        changed = self._todo_progress_changed(before_rows, after_rows) if before_rows is not None else False
         if not txt:
             return ("failed", "empty output")
         if txt.startswith("Error:"):
             return ("failed", txt[6:].strip() or "unknown error")
+        if changed:
+            return ("ok", "todo updated")
         if txt == self.todo.no_changes_text() or "no todo changes" in low:
             if has_worker_rows:
                 return ("ok", "todo already up to date")
@@ -55167,9 +61168,18 @@ body{padding:18px}
         try:
             bb = self._ensure_blackboard()
             recovery = dict(bb.get("failure_recovery", {}) if isinstance(bb.get("failure_recovery"), dict) else {})
+            focus = self._blackboard_focus_identity(bb)
+            if (
+                str(recovery.get("focus_id", "") or "") != str(focus.get("id", "") or "")
+                or abs(float(recovery.get("focus_epoch", 0.0) or 0.0) - float(focus.get("epoch", 0.0) or 0.0)) > 1e-6
+            ):
+                recovery = {}
             recovery["reason"] = note
             recovery["count"] = int(recovery.get("count", 0) or 0) + 1
             recovery["ts"] = float(now_ts())
+            recovery["focus_kind"] = trim(str(focus.get("kind", "") or ""), 40)
+            recovery["focus_id"] = trim(str(focus.get("id", "") or ""), 120)
+            recovery["focus_epoch"] = float(focus.get("epoch", 0.0) or 0.0)
             bb["failure_recovery"] = recovery
             self.blackboard = bb
             self._blackboard_touch()
@@ -55211,12 +61221,25 @@ body{padding:18px}
 
     def _extract_text_items_from_raw_args(self, raw: object) -> list[str]:
         if isinstance(raw, dict):
-            items = raw.get("items")
+            items = None
+            for key in ("items", "todos", "todo_items", "subtasks", "rows", "updates", "tasks"):
+                candidate = raw.get(key)
+                if isinstance(candidate, list) and candidate:
+                    items = candidate
+                    break
             if isinstance(items, list):
                 out = []
                 for item in items:
                     if isinstance(item, dict):
-                        text = str(item.get("content", item.get("text", item.get("title", "")))).strip()
+                        text = str(
+                            item.get(
+                                "content",
+                                item.get(
+                                    "text",
+                                    item.get("title", item.get("task", item.get("description", item.get("label", "")))),
+                                ),
+                            )
+                        ).strip()
                     else:
                         text = str(item).strip()
                     if text and text not in out:
@@ -55231,7 +61254,10 @@ body{padding:18px}
         for m in re.finditer(r'"([^"\\]*(?:\\.[^"\\]*)*)"', text):
             token = m.group(1)
             low = token.strip().lower()
-            if low in {"items", "content", "status", "activeform", "in_progress_index"}:
+            if low in {
+                "items", "todos", "todo_items", "subtasks", "rows", "updates", "content", "status",
+                "state", "activeform", "in_progress_index", "update_mode", "revision_reason",
+            }:
                 continue
             try:
                 token_decoded = bytes(token, "utf-8").decode("unicode_escape")
@@ -55251,7 +61277,10 @@ body{padding:18px}
             s = re.sub(r"^[\-\*\d\.\)\s]+", "", s).strip()
             if not s:
                 continue
-            if s.lower() in {"items", "content", "status", "activeform"}:
+            if s.lower() in {
+                "items", "todos", "todo_items", "subtasks", "rows", "updates", "content", "status",
+                "state", "activeform", "update_mode", "revision_reason",
+            }:
                 continue
             if s not in out:
                 out.append(s)
@@ -55682,13 +61711,18 @@ body{padding:18px}
 
     def _attempt_malformed_tool_repair(self, name: str, raw_args: object) -> tuple[bool, str]:
         # Safe auto-repair only for todo tools; file/code tools require regenerate.
-        if name not in {"TodoWrite", "TodoWriteRescue"}:
+        if canonicalize_tool_name(name) not in {"TodoWrite", "TodoWriteRescue"}:
             return False, ""
-        items = self._extract_text_items_from_raw_args(raw_args)
+        items = self._todo_payload_items(raw_args, limit=40) if isinstance(raw_args, dict) else []
+        if not items:
+            items = self._extract_text_items_from_raw_args(raw_args)
         if not items:
             return False, "no recoverable todo items from malformed arguments"
         try:
-            output = self._dispatch_tool("TodoWriteRescue", {"items": items, "in_progress_index": 0})
+            output = self._dispatch_tool(
+                "TodoWrite",
+                {"items": items, "in_progress_index": 0, "resume": True},
+            )
             return True, output
         except Exception as exc:
             return False, f"rescue failed: {exc}"
@@ -55705,6 +61739,15 @@ body{padding:18px}
                     required = []
         if not required:
             return []
+        # Todo providers use several equivalent payload keys.  Treat a
+        # recoverable alias as satisfying the schema's historical ``items``
+        # requirement; the canonical dispatcher will normalize it.
+        if canon in {"TodoWrite", "TodoWriteRescue"} and isinstance(args, dict):
+            if self._todo_payload_items(args, limit=40) or _to_bool_like(
+                args.get("resume", args.get("continue", args.get("resume_existing", False))),
+                default=False,
+            ):
+                return []
         if not isinstance(args, dict):
             return list(required)
         missing = []
@@ -55828,11 +61871,19 @@ body{padding:18px}
         """Top-level tool dispatcher with error isolation and per-tool timeout."""
         telemetry_started = time.monotonic()
         self._clear_tool_result_meta()
-        name = canonicalize_tool_name(name)
+        raw_name = str(name or "").strip()
+        # Canonicalize Resume aliases without discarding their implicit
+        # operation.  A payload-less TodoWriteResume must reconcile the current
+        # rows, while an ordinary TodoWrite call still requires an explicit
+        # payload.  Copy the dict so callers' tool-call arguments remain intact.
+        resume_alias = is_todo_resume_tool_name(raw_name)
+        name = canonicalize_tool_name(raw_name)
         if not name:
             return "Error: ValueError: tool name is required"
         if not isinstance(args, dict):
             return "Error: TypeError: tool arguments must be a JSON object"
+        if resume_alias and "resume" not in args and "continue" not in args and "resume_existing" not in args:
+            args = {**args, "resume": True}
         if name == "agent_web_search" and not bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED)):
             return "Error: agent_web_search is disabled by startup/config (--enable-web-search to enable)."
         role_key = self._sanitize_agent_role(agent_role)
@@ -55848,7 +61899,20 @@ body{padding:18px}
             # a ThreadPoolExecutor boundary.
             # MCP tools also enforce their own per-call timeout inside the
             # MCP client (and may legitimately run long), so don't double-wrap.
-            if name in {"bash", "worktree_run", "check_background"} or self._is_mcp_tool_name(name):
+            if (
+                name in {
+                    "bash",
+                    "worktree_run",
+                    "check_background",
+                    # TodoWrite mutates the canonical Todo/blackboard graph.
+                    # It cannot be safely cancelled once semantic auditing has
+                    # started, so never run it behind a cancellable worker
+                    # thread that can outlive its timeout response.
+                    "TodoWrite",
+                    "TodoWriteRescue",
+                }
+                or self._is_mcp_tool_name(name)
+            ):
                 out = self._dispatch_tool_inner(name, args, role_key)
                 self._maybe_record_tool_memory_after_result(name, args, out, role_key)
                 self._record_tool_telemetry(name, out, telemetry_started)
@@ -56011,6 +62075,18 @@ body{padding:18px}
 
     def _dispatch_tool_inner(self, name: str, args: dict, role_key: str = "") -> str:
         """Inner tool dispatcher — all tool logic lives here."""
+        if bool(getattr(self, "ide_remote_sandbox_required", False)):
+            blocked_remote_tools = {
+                "load_skill", "list_skills", "read_skill", "write_skill",
+                "query_code_library", "query_knowledge_library", "rag_remember",
+                "worktree_create", "worktree_list", "worktree_status", "worktree_run",
+                "worktree_keep", "worktree_remove",
+            }
+            if self._is_mcp_tool_name(name) or canonicalize_tool_name(name) in blocked_remote_tools:
+                return (
+                    f"Error: tool '{name}' is unavailable to remote Program sessions because it can access "
+                    "resources outside the isolated session workspace."
+                )
         # External MCP tools (mcp__<server>__<tool>): route to the owning
         # subprocess. Handled before any built-in branch so an MCP name can
         # never be shadowed by a builtin, and so every role/mode reaches it.
@@ -56081,6 +62157,9 @@ body{padding:18px}
             illegal = self._reject_non_workspace_absolute_tool_path(args.get("path", ""))
             if illegal:
                 return illegal
+            remote_scope_error = self._remote_agent_file_scope_error(args.get("path", ""), "read")
+            if remote_scope_error:
+                return remote_scope_error
             if self.skill_mode == "hard" and self._path_targets_global_skills(args.get("path", "")):
                 return (
                     "Error: hard application mode cannot read the mutable global skills store. "
@@ -56137,6 +62216,9 @@ body{padding:18px}
             illegal = self._reject_non_workspace_absolute_tool_path(args.get("path", ""))
             if illegal:
                 return illegal
+            remote_scope_error = self._remote_agent_file_scope_error(args.get("path", ""), "write")
+            if remote_scope_error:
+                return remote_scope_error
             protected = self._runtime_managed_path_tool_error(args.get("path", ""), "write_file")
             if protected:
                 return protected
@@ -56205,6 +62287,9 @@ body{padding:18px}
             illegal = self._reject_non_workspace_absolute_tool_path(args.get("path", ""))
             if illegal:
                 return illegal
+            remote_scope_error = self._remote_agent_file_scope_error(args.get("path", ""), "edit")
+            if remote_scope_error:
+                return remote_scope_error
             protected = self._runtime_managed_path_tool_error(args.get("path", ""), "edit_file")
             if protected:
                 return protected
@@ -56259,36 +62344,24 @@ body{padding:18px}
                 )
             return out
         if name == "TodoWrite":
-            bb = self._ensure_blackboard()
-            route_kind = self._todo_route_kind(role=str(role_key or ""), board=bb)
-            if route_kind in {"plan_single", "plan_sync"}:
-                items = args.get("items", [])
-                if isinstance(items, list):
-                    for item in items:
-                        if isinstance(item, dict) and not item.get("key", "").startswith("bb:"):
-                            item["owner"] = str(role_key or "developer")
-                result = self._merge_plan_worker_todo_items(
-                    items,
-                    role=str(role_key or "developer"),
-                    update_mode=str(args.get("update_mode", "status_update") or "status_update"),
-                    revision_reason=str(args.get("revision_reason", "") or ""),
-                    revision_evidence=args.get("revision_evidence", []),
-                )
-            elif route_kind == "pure_sync":
-                items = args.get("items", [])
-                if isinstance(items, list):
-                    for item in items:
-                        if isinstance(item, dict) and not item.get("key", "").startswith("bb:"):
-                            item["owner"] = str(role_key)
-                result = self._merge_owner_scoped_todo_items(items, role=str(role_key))
-            else:
-                result = self.todo.update(args["items"])
+            result = self._dispatch_todo_update(
+                args,
+                role=str(role_key or "developer"),
+                resume=_to_bool_like(
+                    args.get("resume", args.get("continue", args.get("resume_existing", False))),
+                    default=False,
+                ),
+            )
             # Step completion skill recheck: if any item just got marked completed, re-evaluate skills
             # This fires in ALL modes (single/sync/plan) when developer writes todos
             try:
-                new_items = args.get("items", [])
-                if isinstance(new_items, list) and any(
-                    isinstance(it, dict) and str(it.get("status", it.get("state", ""))).lower() in {"completed", "done", "finished", "finish"}
+                new_items = self._todo_payload_items(args, limit=40)
+                if any(
+                    isinstance(it, dict)
+                    and self._normalize_todo_status_value(
+                        it.get("status", it.get("state", "")),
+                        "pending",
+                    ) == "completed"
                     for it in new_items
                 ):
                     self._refresh_loaded_skills_for_execution_focus(trigger="step-completed")  # noqa: E501
@@ -56297,7 +62370,7 @@ body{padding:18px}
                 pass
             return result
         if name == "TodoWriteRescue":
-            result = self._todo_write_rescue(args)
+            result = self._todo_write_rescue(args, role=str(role_key or "developer"))
             # Also recheck skills on rescue write (likely a recovery situation)
             try:
                 pass  # Skills are loaded on-demand by the model via load_skill
@@ -57586,7 +63659,7 @@ body{padding:18px}
         for tc in tool_calls:
             if self.cancel_requested:
                 return {"status": "interrupted", "role": role_key}
-            plan_subtask_snapshot = self._current_plan_worker_subtask_snapshot(role=role_key)
+            plan_subtask_snapshot = self._current_plan_worker_subtask_snapshot(role="")
             name = tc["function"]["name"]
             with self.lock:
                 self.current_phase = f"agent:{role_key}:tool:{name}"
@@ -57656,6 +63729,21 @@ body{padding:18px}
                 args if isinstance(args, dict) else {},
                 output,
             )
+            delegate = self._ensure_blackboard().get("last_delegate", {})
+            delegate = delegate if isinstance(delegate, dict) else {}
+            if (
+                str(delegate.get("plan_step_id", "") or "")
+                == str(plan_subtask_snapshot.get("step_id", "") or "")
+            ):
+                bound_subtask_id = trim(str(delegate.get("plan_subtask_id", "") or ""), 100)
+                bound_subtask_content = trim(str(delegate.get("plan_subtask_content", "") or ""), 500)
+                if bound_subtask_id:
+                    plan_subtask_snapshot = {
+                        **dict(plan_subtask_snapshot),
+                        "subtask_id": bound_subtask_id,
+                        "subtask_content": bound_subtask_content
+                        or str(plan_subtask_snapshot.get("subtask_content", "") or ""),
+                    }
             self._bind_tool_result_to_plan_subtask(item, plan_subtask_snapshot)
             is_finish_tool = name in {"finish_task", "finish_current_task", "mark_done"}
             # Atomic blackboard sync: update shared state immediately after each tool result.
@@ -57907,6 +63995,25 @@ body{padding:18px}
             active_id = str((active_step or {}).get("id", "") or "").strip() if isinstance(active_step, dict) else ""
             if active_id and active_id != bound_step:
                 return False
+        # In plan mode momentum is also bound to the canonical in-progress
+        # subtask.  A parent step can remain in_progress while its child moves
+        # from 1.1 to 1.2 (or to acceptance); reusing the old instruction in
+        # that situation sends the worker back to a completed child and is the
+        # main source of the sync-mode "stuck on first subtask" loop.
+        active_step = self._get_active_plan_step(bb)
+        if isinstance(active_step, dict):
+            bound_subtask = trim(str(route.get("plan_subtask_id", "") or ""), 100)
+            bound_content = self._plan_worker_content_core(route.get("plan_subtask_content", ""))
+            current_subtask = self._current_plan_worker_subtask_snapshot(
+                board=bb,
+                role="",
+            )
+            current_id = trim(str(current_subtask.get("subtask_id", "") or ""), 100)
+            current_content = self._plan_worker_content_core(current_subtask.get("subtask_content", ""))
+            if not bound_subtask or not current_id or bound_subtask != current_id:
+                return False
+            if bound_content and current_content and bound_content != current_content:
+                return False
         # Don't keep hammering a worker that has no remaining subtasks for the step.
         if not self._active_plan_step_has_worker_todos(target):
             return False
@@ -57929,6 +64036,12 @@ body{padding:18px}
             "reviewer": 0.0,
         }
         board = self._ensure_blackboard()
+        if self._blackboard_is_terminal_completion(board):
+            self._emit(
+                "status",
+                {"summary": "sync loop skipped: task is already finished or aborted"},
+            )
+            return
         profile = self._ensure_blackboard_task_profile(board)
         budget_val = self._blackboard_round_budget(board)
         # Pure sync no-plan — create internal plan-step todos at the runtime
@@ -57961,6 +64074,15 @@ body{padding:18px}
                         "agent_role": "manager",
                     }
                 )
+        # A bootstrap/reconciliation callback may have completed the task while
+        # the worker was being initialized. Never reopen a completed board.
+        board = self._ensure_blackboard()
+        if self._blackboard_is_terminal_completion(board):
+            self._emit(
+                "status",
+                {"summary": "sync loop stopped during initialization: task is already finished or aborted"},
+            )
+            return
         self._blackboard_set_status("INITIALIZING", "sync collaborative loop started")
         self._emit(
             "status",
@@ -57975,6 +64097,13 @@ body{padding:18px}
         rounds_used = 0
         budget_compact_notified = False
         while rounds_used < self.max_agent_rounds:
+            board = self._ensure_blackboard()
+            if self._blackboard_is_terminal_completion(board):
+                self._emit(
+                    "status",
+                    {"summary": "sync loop stopped: task reached a terminal completion state"},
+                )
+                break
             current_budget = self._blackboard_round_budget()
             compact_mode = bool(current_budget > 0 and rounds_used >= current_budget)
             if compact_mode and (not budget_compact_notified):
@@ -58001,6 +64130,13 @@ body{padding:18px}
                     pinned_selection=pinned_selection,
                     scope="multi-agent sync",
                 )
+            if self._try_advance_verified_current_plan_step(actor="manager"):
+                idle_counts = {agent_role: 0 for agent_role in AGENT_ROLES}
+                _momentum_route = None
+                _momentum_skips = 0
+                _prev_delegation_hash = ""
+                _repeat_delegation_count = 0
+                continue
             self._apply_auto_compact_if_needed("auto:multi-sync", role="manager")
             # Periodic checkpoint in multi-agent sync loop
             if rounds_used % CHECKPOINT_INTERVAL_ROUNDS == 0:
@@ -58054,6 +64190,27 @@ body{padding:18px}
                 # LLM call to re-decide the obvious continuation. Capped + revalidated.
                 _momentum_skips += 1
                 route = self._align_route_with_current_plan_step(dict(_momentum_route), self._ensure_blackboard())
+                # Refresh the instruction from the canonical child row.  The
+                # parent step may be unchanged while the active child has just
+                # advanced; validation above guarantees this is the same child
+                # that produced the momentum token.
+                _momentum_bb = self._ensure_blackboard()
+                _momentum_subtask = self._current_plan_worker_subtask_snapshot(
+                    board=_momentum_bb,
+                    role="",
+                )
+                _momentum_subtask_text = trim(
+                    str(_momentum_subtask.get("subtask_content", "") or ""),
+                    500,
+                )
+                if _momentum_subtask_text:
+                    route["instruction"] = trim(
+                        f"{route.get('instruction', '')}\n"
+                        "CURRENT CANONICAL SUBTASK (execute this one only):\n"
+                        f"{_momentum_subtask_text}\n"
+                        "Produce one concrete tool result for this subtask, then update its Todo status.",
+                        MANAGER_INSTRUCTION_MAX_CHARS,
+                    )
                 route["source"] = "manager-momentum"
                 self._emit(
                     "status",
@@ -58254,7 +64411,11 @@ body{padding:18px}
             _step_dict = step if isinstance(step, dict) else {}
             _step_results = _step_dict.get("tool_results", []) or []
             _wrote = any(isinstance(r, dict) and r.get("ok") and str(r.get("name", "")) in ("write_file", "edit_file") for r in _step_results)
-            _did_todo = any(isinstance(r, dict) and str(r.get("name", "")) in {"TodoWrite", "TodoWriteRescue"} for r in _step_results)
+            _did_todo = any(
+                isinstance(r, dict)
+                and canonicalize_tool_name(r.get("name", "")) in {"TodoWrite", "TodoWriteRescue"}
+                for r in _step_results
+            )
             if _wrote and not _did_todo:
                 _bb_nudge = self._ensure_blackboard()
                 _cur_step = next(
@@ -58331,6 +64492,22 @@ body{padding:18px}
                 and self._active_plan_step_in_progress(board_after)
             ):
                 _mom_step = self._get_active_plan_step(board_after)
+                _mom_subtask = self._current_plan_worker_subtask_snapshot(
+                    board=board_after,
+                    role="",
+                )
+                _mom_subtask_id = trim(str(_mom_subtask.get("subtask_id", "") or ""), 100)
+                _mom_subtask_content = trim(
+                    str(_mom_subtask.get("subtask_content", "") or ""),
+                    500,
+                )
+                # Do not carry momentum when reconciliation has no current
+                # child (for example, the acceptance row is being activated).
+                # The manager must make a fresh phase-aware decision then.
+                if isinstance(_mom_step, dict) and not _mom_subtask_id:
+                    _momentum_route = None
+                    _momentum_skips = 0
+                    continue
                 _momentum_route = {
                     "target": role,
                     "instruction": instruction,
@@ -58340,6 +64517,8 @@ body{padding:18px}
                     # fresh manager turn so the next step is routed by phase (research->
                     # explorer, review->reviewer) instead of blindly following this owner.
                     "plan_step_id": str((_mom_step or {}).get("id", "") or "") if isinstance(_mom_step, dict) else "",
+                    "plan_subtask_id": _mom_subtask_id,
+                    "plan_subtask_content": _mom_subtask_content,
                 }
             else:
                 _momentum_route = None
@@ -62112,6 +68291,14 @@ body{padding:18px}
                             self._seed_multi_agent_contexts_if_needed(self.runtime_reclassify_goal or "")
                             self._multi_agent_worker(pinned_selection=pinned_selection)
                             return
+                if self._try_advance_verified_current_plan_step(actor="single"):
+                    force_single_tool_rounds = 0
+                    recovery_retry_rounds = 0
+                    fault_counter = 0
+                    last_fault_reason = ""
+                    last_tool_fp = ""
+                    repeated_tool_rounds = 0
+                    continue
                 dq = self._normalize_decomposition_queue_state(
                     self._ensure_blackboard().get("decomposition_queue", {})
                 )
@@ -62166,9 +68353,29 @@ body{padding:18px}
                         )
                 self._clear_live_thinking()
                 self._clear_live_truncation()
+                bootstrap_waiting_for_turn = self._single_no_plan_todo_bootstrap_turn_active()
+                if (
+                    str(getattr(self, "single_no_plan_todo_bootstrap_state", "idle") or "idle").strip().lower()
+                    == "waiting"
+                    and not bootstrap_waiting_for_turn
+                ):
+                    self.single_no_plan_todo_bootstrap_state = "skipped"
+                    self._emit(
+                        "status",
+                        {"summary": "stale single/no-plan Todo bootstrap discarded; normal tools restored"},
+                    )
+                model_tools = (
+                    self._single_no_plan_todo_bootstrap_tools()
+                    if bootstrap_waiting_for_turn
+                    else (
+                        self._single_no_plan_todo_perception_tools()
+                        if self._single_no_plan_todo_initial_gate_active()
+                        else self._available_tools()
+                    )
+                )
                 response = self._chat_with_same_model_retry(
                     self.messages,
-                    tools=self._available_tools(),
+                    tools=model_tools,
                     system=self._system_prompt(),
                     max_tokens=self.max_output_tokens,
                     think=False,
@@ -62192,6 +68399,27 @@ body{padding:18px}
                     with self.lock:
                         thinking_text = str(self.live_thinking_text or "").strip()
                 tool_calls = response.get("tool_calls", [])
+                bootstrap_invalid_tool_call = False
+                if bootstrap_waiting_for_turn:
+                    raw_bootstrap_calls = tool_calls if isinstance(tool_calls, list) else []
+                    valid_bootstrap_calls = []
+                    invalid_bootstrap_calls = []
+                    for call in raw_bootstrap_calls:
+                        fn = call.get("function", {}) if isinstance(call, dict) else {}
+                        call_name = canonicalize_tool_name(fn.get("name", ""))
+                        if call_name in {"TodoWrite", "TodoWriteRescue"}:
+                            valid_bootstrap_calls.append(call)
+                        else:
+                            invalid_bootstrap_calls.append(call_name or "unknown-tool")
+                    if invalid_bootstrap_calls or len(valid_bootstrap_calls) != len(raw_bootstrap_calls):
+                        bootstrap_invalid_tool_call = True
+                        tool_calls = []
+                    else:
+                        # One planning call is enough; duplicate Todo calls in
+                        # the same response only create ambiguous status.
+                        tool_calls = valid_bootstrap_calls[:1]
+                    if not tool_calls and not str(text or "").strip() and not str(thinking_text or "").strip():
+                        text = "Todo bootstrap turn produced no TodoWrite action."
                 if force_single_tool_rounds > 0 and isinstance(tool_calls, list) and len(tool_calls) > 1:
                     original_count = len(tool_calls)
                     tool_calls = list(tool_calls[:1])
@@ -62248,6 +68476,12 @@ body{padding:18px}
                     if self._is_empty_action_turn(text, thinking_text, tool_calls):
                         raise EmptyActionError("assistant returned empty action after stripping thinking")
                 except EmptyActionError:
+                    if self._single_no_plan_todo_initial_gate_active() and self._start_single_no_plan_todo_bootstrap():
+                        self._emit(
+                            "status",
+                            {"summary": "L2 empty action replaced with mandatory Todo bootstrap"},
+                        )
+                        continue
                     consecutive_empty_action_rounds += 1
                     fault_counter += 1
                     last_fault_reason = "empty-action"
@@ -62320,7 +68554,40 @@ body{padding:18px}
                         self._maybe_auto_rename_session_title("task-progress")
                     except Exception:
                         pass
+                if bootstrap_waiting_for_turn and not tool_calls:
+                    bootstrap_reason = (
+                        "model emitted a non-Todo tool call"
+                        if bootstrap_invalid_tool_call
+                        else "model did not call TodoWrite/TodoWriteRescue"
+                    )
+                    bootstrap_failure_state = self._single_no_plan_todo_bootstrap_failure(bootstrap_reason)
+                    if bootstrap_failure_state == "blocked":
+                        self._emit(
+                            "status",
+                            {"summary": "run paused: mandatory L2 Todo list could not be established"},
+                        )
+                        break
+                    # Whether the bounded bootstrap retries or is skipped, the
+                    # next iteration is a normal model turn (with the state
+                    # deciding which tool set is visible).
+                    try:
+                        self._persist()
+                    except Exception:
+                        pass
+                    continue
                 if not tool_calls:
+                    if self._single_no_plan_todo_initial_gate_active():
+                        # A level-2 run may not silently finish an orientation
+                        # turn without establishing its mandatory Todo graph.
+                        # Start the bounded writer-only turn now; it is still
+                        # finite and can fall back to the normal recovery path
+                        # after the existing retry limit.
+                        if self._start_single_no_plan_todo_bootstrap():
+                            self._emit(
+                                "status",
+                                {"summary": "L2 produced no observation tool; Todo bootstrap required before execution"},
+                            )
+                            continue
                     with self.lock:
                         self.current_phase = "no-tools"
                         self.current_tool_name = ""
@@ -62878,6 +69145,12 @@ body{padding:18px}
                 hard_break_reason = ""
                 interrupted_in_tools = False
                 single_round_tool_results: list[dict] = []
+                single_round_has_perception = False
+                single_round_has_mutation = False
+                single_round_has_todo = False
+                bootstrap_todo_success = False
+                bootstrap_todo_failure_reason = ""
+                bootstrap_started = False
                 single_watchdog_before_fp = self._watchdog_state_fingerprint(self._ensure_blackboard())
                 round_tool_fp = self._tool_calls_fingerprint(tool_calls)
                 for tc in tool_calls:
@@ -62885,13 +69158,17 @@ body{padding:18px}
                         interrupted_in_tools = True
                         self._emit("status", {"summary": "run interrupted"})
                         break
-                    plan_subtask_snapshot = self._current_plan_worker_subtask_snapshot(role=single_role)
+                    plan_subtask_snapshot = self._current_plan_worker_subtask_snapshot(role="")
                     name = tc["function"]["name"]
                     with self.lock:
                         self.current_phase = f"tool:{name}"
                         self.current_tool_name = name
                     round_tool_names.append(name)
-                    todo_rows_before = self.todo.snapshot() if name in {"TodoWrite", "TodoWriteRescue"} else None
+                    todo_rows_before = (
+                        self.todo.snapshot()
+                        if canonicalize_tool_name(name) in {"TodoWrite", "TodoWriteRescue"}
+                        else None
+                    )
                     args = tc["function"]["arguments"]
                     args_error = str(tc.get("args_error", "") or "").strip()
                     raw_args = tc.get("raw_arguments")
@@ -63039,6 +69316,22 @@ body{padding:18px}
                                             f"missing args persisted: {', '.join(missing)}",
                                         )
                                         retry_requested_this_round = True
+                    if not skip_dispatch and self._single_no_plan_todo_mutation_blocked(name, args):
+                        # Defend against providers that emit a stale/hallucinated
+                        # mutation call even though the L2 perception tool bundle
+                        # hides mutation-capable tools.  Do not execute it; move
+                        # directly into the existing bounded Todo bootstrap.
+                        if self._start_single_no_plan_todo_bootstrap():
+                            output = (
+                                "Error: this is an L2 run; mutation was withheld until "
+                                "TodoWrite/TodoWriteRescue creates the required Todo list."
+                            )
+                            skip_dispatch = True
+                            bootstrap_started = True
+                            self._emit(
+                                "status",
+                                {"summary": f"L2 Todo gate withheld mutation tool: {name}"},
+                            )
                     if not skip_dispatch:
                         try:
                             output = self._dispatch_tool(name, args)
@@ -63059,6 +69352,31 @@ body{padding:18px}
                         output,
                         dispatched_name=dispatched_name,
                     )
+                    result_canonical_name = canonicalize_tool_name(
+                        dispatched_name or name
+                    )
+                    if self._single_no_plan_todo_is_perception_result(result_item):
+                        single_round_has_perception = True
+                    if self._single_no_plan_todo_is_mutation_result(result_item):
+                        single_round_has_mutation = True
+                        self.single_no_plan_todo_bootstrap_write_seen = True
+                    if result_canonical_name in {"TodoWrite", "TodoWriteRescue"}:
+                        single_round_has_todo = True
+                    delegate = self._ensure_blackboard().get("last_delegate", {})
+                    delegate = delegate if isinstance(delegate, dict) else {}
+                    if (
+                        str(delegate.get("plan_step_id", "") or "")
+                        == str(plan_subtask_snapshot.get("step_id", "") or "")
+                    ):
+                        bound_subtask_id = trim(str(delegate.get("plan_subtask_id", "") or ""), 100)
+                        bound_subtask_content = trim(str(delegate.get("plan_subtask_content", "") or ""), 500)
+                        if bound_subtask_id:
+                            plan_subtask_snapshot = {
+                                **dict(plan_subtask_snapshot),
+                                "subtask_id": bound_subtask_id,
+                                "subtask_content": bound_subtask_content
+                                or str(plan_subtask_snapshot.get("subtask_content", "") or ""),
+                            }
                     self._bind_tool_result_to_plan_subtask(result_item, plan_subtask_snapshot)
                     tool_key = str(dispatched_name or name).strip() or str(name or "").strip() or "unknown-tool"
                     is_control_feedback = self._tool_result_is_control_feedback(result_item)
@@ -63081,15 +69399,24 @@ body{padding:18px}
                         self._clear_tool_retry_count(name)
                         tool_error_streaks[tool_key] = 0
                         recovery_retry_rounds = 0
-                    if dispatched_name in {"TodoWrite", "TodoWriteRescue"}:
+                    dispatched_todo_name = canonicalize_tool_name(dispatched_name or name)
+                    if dispatched_todo_name in {"TodoWrite", "TodoWriteRescue"}:
                         todo_attempted = True
                         todo_rows_after = self.todo.snapshot()
                         state, reason = self._analyze_todo_result(
-                            dispatched_name,
+                            dispatched_todo_name,
                             output,
                             before_rows=todo_rows_before,
                             after_rows=todo_rows_after,
                         )
+                        if bootstrap_waiting_for_turn:
+                            if state == "ok" and self._single_no_plan_todo_has_rows():
+                                bootstrap_todo_success = True
+                            else:
+                                bootstrap_todo_failure_reason = trim(
+                                    str(reason or "TodoWrite did not create a usable list"),
+                                    260,
+                                )
                         if is_control_feedback:
                             self.todo_write_issue_count = 0
                             self.todo_last_issue = ""
@@ -63166,6 +69493,10 @@ body{padding:18px}
                         self._blackboard_update_from_tool_result("developer", result_item)
                     except Exception:
                         pass
+                    if bootstrap_started:
+                        # Discard the rest of a multi-call mutation batch.  The
+                        # next model turn is restricted to the Todo writers.
+                        break
                     # Failure ledger: record tool call and detect errors (single-agent, unified)
                     if not is_finish_tool:
                         self._ledger_record_tool_call(name, args if isinstance(args, dict) else {})
@@ -63246,6 +69577,40 @@ body{padding:18px}
                     self.current_phase = "post-tools"
                 if interrupted_in_tools:
                     break
+                if bootstrap_waiting_for_turn:
+                    if bootstrap_todo_success:
+                        self._single_no_plan_todo_bootstrap_succeeded()
+                    else:
+                        bootstrap_failure_state = self._single_no_plan_todo_bootstrap_failure(
+                            bootstrap_todo_failure_reason
+                            or "TodoWrite did not create a usable Todo list"
+                        )
+                        if bootstrap_failure_state == "blocked":
+                            self._emit(
+                                "status",
+                                {"summary": "run paused: mandatory L2 Todo list could not be established"},
+                            )
+                            break
+                    try:
+                        self._persist()
+                    except Exception:
+                        pass
+                    continue
+                if (
+                    single_round_has_perception
+                    and not single_round_has_mutation
+                    and not single_round_has_todo
+                    and not interrupted_in_tools
+                    and not stop_due_to_ask_user_single
+                    and not stop_due_to_finish_task
+                    and not stop_due_to_hard_break
+                    and self._single_no_plan_todo_bootstrap_allowed()
+                ):
+                    bootstrap_started = self._start_single_no_plan_todo_bootstrap()
+                if bootstrap_started:
+                    # Do not let ordinary no-tool/plan recovery reinterpret the
+                    # perception round; the next model call is the planning turn.
+                    continue
                 single_watchdog_after_board = self._ensure_blackboard()
                 single_watchdog_after_fp = self._watchdog_state_fingerprint(single_watchdog_after_board)
                 self._watchdog_process_worker_step(
@@ -64748,6 +71113,7 @@ class SessionManager:
         max_run_seconds: int = MAX_RUN_SECONDS,
         shell_command_timeout_seconds: int = DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
         auto_task_level_ceiling: int = DEFAULT_AUTO_TASK_LEVEL_CEILING,
+        l2_todo_policy: str | None = None,
         auto_model_switch: bool = False,
         arbiter_enabled: bool = True,
         arbiter_model: str = "",
@@ -64807,6 +71173,10 @@ class SessionManager:
             fallback=DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
         )
         self.auto_task_level_ceiling = normalize_auto_task_level_ceiling(auto_task_level_ceiling)
+        cfg_l2_todo_policy = extract_l2_todo_policy_setting(self.default_llm_config)
+        self.l2_todo_policy = normalize_l2_todo_policy(
+            l2_todo_policy if l2_todo_policy is not None else (cfg_l2_todo_policy or DEFAULT_L2_TODO_POLICY)
+        )
         self.auto_model_switch = bool(auto_model_switch)
         self.arbiter_enabled = bool(arbiter_enabled)
         self.arbiter_model = str(arbiter_model or "").strip()
@@ -64820,6 +71190,11 @@ class SessionManager:
         self.user_memory_setting_locked = bool(user_memory_setting_locked)
         self.telemetry_callback = None
         self.single_advance_prompt_enhance = False
+        cfg_single_todo_enabled, cfg_single_todo_prompt = extract_single_no_plan_todo_settings(
+            self.default_llm_config
+        )
+        self.single_no_plan_todo_enabled = bool(cfg_single_todo_enabled)
+        self.single_no_plan_todo_prompt = str(cfg_single_todo_prompt or "").strip()
         self.read_context_policy = DEFAULT_READ_CONTEXT_POLICY
         self.tool_memory_policy = DEFAULT_TOOL_MEMORY_POLICY
         self.upload_callback = upload_callback
@@ -64959,6 +71334,16 @@ class SessionManager:
             "auto_task_level_ceiling": normalize_auto_task_level_ceiling(
                 getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
             ),
+            "l2_todo_policy": normalize_l2_todo_policy(
+                getattr(self, "l2_todo_policy", DEFAULT_L2_TODO_POLICY)
+            ),
+            "single_no_plan_todo_enabled": bool(
+                getattr(self, "single_no_plan_todo_enabled", False)
+            ),
+            "single_no_plan_todo_prompt": trim(
+                str(getattr(self, "single_no_plan_todo_prompt", "") or ""),
+                6000,
+            ),
             "web_search_enabled": bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED)),
             "user_memory_mode": normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE)),
             "global_llm_config_revision": str(getattr(self, "global_llm_config_revision", "") or ""),
@@ -65028,6 +71413,13 @@ class SessionManager:
                 if raw_auto_task_level_ceiling is not None
                 else getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
             )
+            cfg_l2_todo_policy = extract_l2_todo_policy_setting(raw)
+            if cfg_l2_todo_policy is not None:
+                self.l2_todo_policy = normalize_l2_todo_policy(cfg_l2_todo_policy)
+            if _single_no_plan_todo_setting_present(raw):
+                _single_todo_enabled, _single_todo_prompt = extract_single_no_plan_todo_settings(raw)
+                self.single_no_plan_todo_enabled = bool(_single_todo_enabled)
+                self.single_no_plan_todo_prompt = str(_single_todo_prompt or "").strip()
             if not bool(getattr(self, "web_search_setting_locked", False)) and "web_search_enabled" in raw:
                 self.web_search_enabled = _to_bool_like(
                     raw.get("web_search_enabled"),
@@ -65142,6 +71534,12 @@ class SessionManager:
         )
         sess.execution_mode = normalize_execution_mode(self.execution_mode, default=EXECUTION_MODE_SYNC)
         sess.single_advance_prompt_enhance = bool(self.single_advance_prompt_enhance)
+        sess.single_no_plan_todo_enabled = bool(
+            getattr(self, "single_no_plan_todo_enabled", False)
+        )
+        sess.single_no_plan_todo_prompt = str(
+            getattr(self, "single_no_plan_todo_prompt", "") or ""
+        ).strip()[:6000]
         sess.read_context_policy = normalize_read_context_policy(
             getattr(self, "read_context_policy", DEFAULT_READ_CONTEXT_POLICY)
         )
@@ -65150,6 +71548,9 @@ class SessionManager:
         )
         sess.auto_task_level_ceiling = normalize_auto_task_level_ceiling(
             getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
+        )
+        sess.l2_todo_policy = normalize_l2_todo_policy(
+            getattr(self, "l2_todo_policy", DEFAULT_L2_TODO_POLICY)
         )
         sess.web_search_enabled = bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED))
         sess.user_memory_mode = normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
@@ -65184,6 +71585,13 @@ class SessionManager:
         self._sync_ollama_defaults(active_profile)
         self.thinking = False
         self.user_language = normalize_ui_language(getattr(sess, "ui_language", self.user_language))
+        self.single_no_plan_todo_enabled = bool(
+            getattr(sess, "single_no_plan_todo_enabled", getattr(self, "single_no_plan_todo_enabled", False))
+        )
+        self.single_no_plan_todo_prompt = str(
+            getattr(sess, "single_no_plan_todo_prompt", getattr(self, "single_no_plan_todo_prompt", ""))
+            or ""
+        ).strip()[:6000]
         self.read_context_policy = normalize_read_context_policy(
             getattr(sess, "read_context_policy", getattr(self, "read_context_policy", DEFAULT_READ_CONTEXT_POLICY))
         )
@@ -65200,6 +71608,9 @@ class SessionManager:
                 "auto_task_level_ceiling",
                 getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING),
             )
+        )
+        self.l2_todo_policy = normalize_l2_todo_policy(
+            getattr(sess, "l2_todo_policy", getattr(self, "l2_todo_policy", DEFAULT_L2_TODO_POLICY))
         )
         if bool(getattr(self, "web_search_setting_locked", False)):
             set_web_search_enabled_on_runtime(sess, self.web_search_enabled, persist=True)
@@ -65338,6 +71749,7 @@ class SessionManager:
                 max_run_seconds=self.max_run_seconds,
                 shell_command_timeout_seconds=self.shell_command_timeout_seconds,
                 auto_task_level_ceiling=self.auto_task_level_ceiling,
+                l2_todo_policy=self.l2_todo_policy,
                 auto_model_switch=self.auto_model_switch,
                 arbiter_enabled=self.arbiter_enabled,
                 arbiter_model=self.arbiter_model,
@@ -65445,6 +71857,7 @@ class SessionManager:
                 max_run_seconds=self.max_run_seconds,
                 shell_command_timeout_seconds=self.shell_command_timeout_seconds,
                 auto_task_level_ceiling=self.auto_task_level_ceiling,
+                l2_todo_policy=self.l2_todo_policy,
                 auto_model_switch=self.auto_model_switch,
                 arbiter_enabled=self.arbiter_enabled,
                 arbiter_model=self.arbiter_model,
@@ -65850,6 +72263,10 @@ class SessionManager:
             active_profile = self._active_profile()
             self._sync_ollama_defaults(active_profile)
             self.thinking = False
+            if _single_no_plan_todo_setting_present(cfg):
+                _single_todo_enabled, _single_todo_prompt = extract_single_no_plan_todo_settings(cfg)
+                self.single_no_plan_todo_enabled = bool(_single_todo_enabled)
+                self.single_no_plan_todo_prompt = str(_single_todo_prompt or "").strip()
             cfg_read_context_policy = extract_read_context_policy_setting(cfg)
             if cfg_read_context_policy:
                 self.read_context_policy = cfg_read_context_policy
@@ -65859,6 +72276,9 @@ class SessionManager:
             cfg_auto_task_level_ceiling = extract_auto_task_level_ceiling_setting(cfg)
             if cfg_auto_task_level_ceiling is not None:
                 self.auto_task_level_ceiling = normalize_auto_task_level_ceiling(cfg_auto_task_level_ceiling)
+            cfg_l2_todo_policy = extract_l2_todo_policy_setting(cfg)
+            if cfg_l2_todo_policy is not None:
+                self.l2_todo_policy = normalize_l2_todo_policy(cfg_l2_todo_policy)
             cfg_web_search_enabled = extract_web_search_enabled_setting(cfg)
             if cfg_web_search_enabled is not None and not bool(getattr(self, "web_search_setting_locked", False)):
                 self.web_search_enabled = bool(cfg_web_search_enabled)
@@ -66029,6 +72449,7 @@ window.MathJax={
     <select id="modelSelect"></select>
     <button id="applyModelBtn" class="subtle">Apply Model</button>
     <button id="llmConfigBtn" class="subtle">Fill LLM Config</button>
+    <button id="programBtn" class="subtle" type="button">Program</button>
     <input id="configInput" type="file" accept=".json,application/json" tabindex="-1" aria-hidden="true" style="position:absolute;left:-10000px;top:auto;width:1px;height:1px;opacity:0;pointer-events:none">
     <a id="downloadBtn" href="#">Open Skills Studio</a>
   </div>
@@ -67025,7 +73446,7 @@ Object.assign(I18N['en'],{
   event_truncation_recovery:'Truncation Recovery',event_truncation_state:'Structured truncation recovery state',event_truncation_note:'Model output hit a truncation boundary and entered recovery mode.',
       event_live_model_call_title:'Agent Turn Model Call',event_live_model_call_note:'The active agent is in a model call. This timer updates live while generation is in progress.',
       event_scheduler_queued_title:'Queued Task',event_scheduler_queued_note:'This message is saved and waiting for an execution slot.',event_scheduler_queue_position:'queue position',event_scheduler_reason:'reason',event_scheduler_queued_hint:'queued',
-  event_auto_continue:'Auto Continue',event_arbiter_continue:'Arbiter Continue',event_continuation_briefing:'Continuation Briefing',event_reminder:'Reminder',event_todo_rescue:'Todo Rescue',event_tool_retry:'Tool Retry',event_segmented_retry:'Segmented Retry',event_forced_converge:'Forced Converge',event_no_tool_recovery:'No-Tool Recovery',event_context_recall:'Context Recall',event_failure_recovery:'Failure Recovery',event_truncate_rescue:'Truncation Rescue',event_thinking_recovery:'Thinking Recovery',event_fault_prefill:'Fault Prefill',event_edit_recovery:'Edit Recovery',
+  event_auto_continue:'Auto Continue',event_arbiter_continue:'Arbiter Continue',event_continuation_briefing:'Continuation Briefing',event_reminder:'Reminder',event_todo_rescue:'Todo Rescue',event_tool_retry:'Tool Retry',event_segmented_retry:'Segmented Retry',event_forced_converge:'Forced Converge',event_no_tool_recovery:'No-Tool Recovery',event_context_recall:'Context Recall',event_failure_recovery:'Failure Recovery',event_truncate_rescue:'Truncation Rescue',event_thinking_recovery:'Thinking Recovery',event_fault_prefill:'Fault Prefill',event_edit_recovery:'Edit Recovery',event_todo_bootstrap_title:'Todo Initialization',event_todo_bootstrap_retry_title:'Todo Initialization Retry',event_todo_bootstrap_subtitle:'Planning state after read-only perception',event_todo_bootstrap_note:'The next Todo list is being shaped from observed evidence before execution resumes.',event_todo_bootstrap_retry_note:'The Todo writer did not complete; the bounded retry is being requested.',event_todo_bootstrap_perception:'perception complete',event_todo_bootstrap_item_count:'3-7 items',event_todo_bootstrap_one_active:'exactly 1 active',event_reason:'reason',
   state_on:'on',state_off:'off',
   rt_session:'session',rt_model:'model',rt_thinking:'thinking',rt_thinking_stream:'thinking_stream',rt_response_stream:'response_stream',rt_mode:'mode',rt_active_agent:'active_agent',rt_blackboard:'bb',rt_task:'task',rt_complexity:'complexity',rt_judgement:'judgement',rt_budget:'budget',rt_remaining:'remaining',rt_blackboard_cycles:'bb_cycles',rt_round_limit:'round_limit',rt_round:'round',rt_phase:'phase',rt_queued_inputs:'queued_inputs',rt_run_timeout:'run_timeout',rt_ctx_used:'ctx_used',rt_ctx_limit:'ctx_limit',rt_ctx_mode:'ctx_mode',rt_manual_lock:'manual-lock',rt_adaptive:'adaptive',rt_ctx_left:'ctx_left',rt_ctx_left_for:'{label} left',rt_ctx_live_title:'Remaining context budget by active call',rt_truncation:'truncation',rt_trunc_retry:'trunc_retry',rt_trunc_tokens:'trunc_tokens~',rt_archive:'archive',rt_last_compact:'last_compact',compact_ago:'ago',compact_just_now:'just now',rt_ollama:'ollama',rt_files:'files',rt_ui_mode:'ui_mode',rt_state:'state',rt_awaiting_user:'awaiting user',ask_user_title:'Agent needs your input',ask_user_free_hint:'Pick an option above, or type your answer below and send.',ask_user_pick_hint:'Pick one of the options above to continue.',
   preview_download:'Download',preview_source:'Source',preview_rendered:'Preview',preview_copy_link:'Copy Link',preview_open:'Open in Browser',preview_link_copied:'Link Copied',
@@ -67054,7 +73475,7 @@ Object.assign(I18N['zh-CN'],{
   event_truncation_recovery:'截断恢复',event_truncation_state:'结构化截断恢复状态',event_truncation_note:'模型输出触发了截断边界，已进入恢复流程。',
       event_live_model_call_title:'Agent 轮次模型调用',event_live_model_call_note:'当前活跃 agent 正在进行模型调用。计时器会在生成期间实时更新。',
       event_scheduler_queued_title:'任务已排队',event_scheduler_queued_note:'这条消息已保存，正在等待后台执行名额。',event_scheduler_queue_position:'队列位置',event_scheduler_reason:'原因',event_scheduler_queued_hint:'已排队',
-  event_auto_continue:'自动继续',event_arbiter_continue:'裁决继续',event_continuation_briefing:'续跑简报',event_reminder:'提醒',event_todo_rescue:'待办救援',event_tool_retry:'工具重试',event_segmented_retry:'分段重试',event_forced_converge:'强制收敛',event_no_tool_recovery:'无工具恢复',event_context_recall:'上下文召回',event_failure_recovery:'故障恢复',event_truncate_rescue:'截断救援',event_thinking_recovery:'思考恢复',event_fault_prefill:'故障预填',event_edit_recovery:'编辑恢复',
+  event_auto_continue:'自动继续',event_arbiter_continue:'裁决继续',event_continuation_briefing:'续跑简报',event_reminder:'提醒',event_todo_rescue:'待办救援',event_tool_retry:'工具重试',event_segmented_retry:'分段重试',event_forced_converge:'强制收敛',event_no_tool_recovery:'无工具恢复',event_context_recall:'上下文召回',event_failure_recovery:'故障恢复',event_truncate_rescue:'截断救援',event_thinking_recovery:'思考恢复',event_fault_prefill:'故障预填',event_edit_recovery:'编辑恢复',event_todo_bootstrap_title:'Todo 初始化',event_todo_bootstrap_retry_title:'Todo 初始化重试',event_todo_bootstrap_subtitle:'只读感知后的规划状态',event_todo_bootstrap_note:'系统正在根据已观察证据整理下一组 Todo，然后继续执行。',event_todo_bootstrap_retry_note:'Todo 写入未完成，系统正在进行有限次数的重试。',event_todo_bootstrap_perception:'感知已完成',event_todo_bootstrap_item_count:'3-7 项',event_todo_bootstrap_one_active:'恰好 1 项进行中',event_reason:'原因',
   state_on:'开',state_off:'关',
   rt_session:'会话',rt_model:'模型',rt_thinking:'思考',rt_thinking_stream:'思考流',rt_response_stream:'正文流',rt_mode:'模式',rt_active_agent:'活跃代理',rt_blackboard:'黑板',rt_task:'任务',rt_complexity:'复杂度',rt_judgement:'裁决',rt_budget:'预算',rt_remaining:'剩余',rt_blackboard_cycles:'黑板轮次',rt_round_limit:'轮次上限',rt_round:'轮次',rt_phase:'阶段',rt_queued_inputs:'排队输入',rt_run_timeout:'运行超时',rt_ctx_used:'上下文已用',rt_ctx_limit:'上下文上限',rt_ctx_mode:'上下文模式',rt_manual_lock:'手动锁定',rt_adaptive:'自适应',rt_ctx_left:'上下文剩余',rt_ctx_left_for:'{label}剩余',rt_ctx_live_title:'按真实调用显示上下文剩余',rt_truncation:'截断数',rt_trunc_retry:'截断重试',rt_trunc_tokens:'截断Token~',rt_archive:'归档',rt_last_compact:'最近压缩',compact_ago:'前',compact_just_now:'刚刚',rt_ollama:'Ollama',rt_files:'文件根目录',rt_ui_mode:'界面模式',rt_state:'状态',rt_awaiting_user:'等待用户',ask_user_title:'需要你的输入',ask_user_free_hint:'点击上方选项,或在下方输入答复后发送。',ask_user_pick_hint:'请选择上方其中一个选项以继续。',
   preview_download:'下载',preview_source:'源码',preview_rendered:'预览',preview_copy_link:'复制链接',preview_open:'浏览器打开',preview_link_copied:'已复制链接',
@@ -67086,7 +73507,7 @@ Object.assign(I18N['zh-TW'],{
   event_truncation_recovery:'截斷恢復',event_truncation_state:'結構化截斷恢復狀態',event_truncation_note:'模型輸出觸發截斷邊界，已進入恢復流程。',
       event_live_model_call_title:'Agent 輪次模型呼叫',event_live_model_call_note:'目前活躍 agent 正在進行模型呼叫。計時器會在生成期間即時更新。',
       event_scheduler_queued_title:'任務已排隊',event_scheduler_queued_note:'這則訊息已保存，正在等待背景執行名額。',event_scheduler_queue_position:'佇列位置',event_scheduler_reason:'原因',event_scheduler_queued_hint:'已排隊',
-  event_auto_continue:'自動繼續',event_arbiter_continue:'裁決繼續',event_continuation_briefing:'續跑簡報',event_reminder:'提醒',event_todo_rescue:'待辦救援',event_tool_retry:'工具重試',event_segmented_retry:'分段重試',event_forced_converge:'強制收斂',event_no_tool_recovery:'無工具恢復',event_context_recall:'上下文召回',event_failure_recovery:'故障恢復',event_truncate_rescue:'截斷救援',event_thinking_recovery:'思考恢復',event_fault_prefill:'故障預填',event_edit_recovery:'編輯恢復',
+  event_auto_continue:'自動繼續',event_arbiter_continue:'裁決繼續',event_continuation_briefing:'續跑簡報',event_reminder:'提醒',event_todo_rescue:'待辦救援',event_tool_retry:'工具重試',event_segmented_retry:'分段重試',event_forced_converge:'強制收斂',event_no_tool_recovery:'無工具恢復',event_context_recall:'上下文召回',event_failure_recovery:'故障恢復',event_truncate_rescue:'截斷救援',event_thinking_recovery:'思考恢復',event_fault_prefill:'故障預填',event_edit_recovery:'編輯恢復',event_todo_bootstrap_title:'Todo 初始化',event_todo_bootstrap_retry_title:'Todo 初始化重試',event_todo_bootstrap_subtitle:'唯讀感知後的規劃狀態',event_todo_bootstrap_note:'系統會根據已觀察證據整理下一組 Todo，再繼續執行。',event_todo_bootstrap_retry_note:'Todo 寫入未完成，系統正在進行有限次重試。',event_todo_bootstrap_perception:'感知已完成',event_todo_bootstrap_item_count:'3-7 項',event_todo_bootstrap_one_active:'恰好 1 項進行中',event_reason:'原因',
   state_on:'開',state_off:'關',
   rt_session:'會話',rt_model:'模型',rt_thinking:'思考',rt_thinking_stream:'思考流',rt_response_stream:'正文串流',rt_mode:'模式',rt_active_agent:'活躍代理',rt_blackboard:'黑板',rt_task:'任務',rt_complexity:'複雜度',rt_judgement:'裁決',rt_budget:'預算',rt_remaining:'剩餘',rt_blackboard_cycles:'黑板輪次',rt_round_limit:'輪次上限',rt_round:'輪次',rt_phase:'階段',rt_queued_inputs:'排隊輸入',rt_run_timeout:'執行逾時',rt_ctx_used:'上下文已用',rt_ctx_limit:'上下文上限',rt_ctx_mode:'上下文模式',rt_manual_lock:'手動鎖定',rt_adaptive:'自適應',rt_ctx_left:'上下文剩餘',rt_ctx_left_for:'{label}剩餘',rt_ctx_live_title:'依真實呼叫顯示上下文剩餘',rt_truncation:'截斷數',rt_trunc_retry:'截斷重試',rt_trunc_tokens:'截斷Token~',rt_archive:'封存',rt_last_compact:'最近壓縮',compact_ago:'前',compact_just_now:'剛剛',rt_ollama:'Ollama',rt_files:'檔案根目錄',rt_ui_mode:'介面模式',rt_state:'狀態',rt_awaiting_user:'等待使用者',ask_user_title:'需要你的輸入',ask_user_free_hint:'點擊上方選項,或在下方輸入答覆後送出。',ask_user_pick_hint:'請選擇上方其中一個選項以繼續。',
   preview_download:'下載',preview_source:'原始碼',preview_rendered:'預覽',preview_copy_link:'複製連結',preview_open:'瀏覽器開啟',preview_link_copied:'已複製連結',
@@ -67116,7 +73537,7 @@ Object.assign(I18N['ja'],{
   event_truncation_recovery:'切り詰め復旧',event_truncation_state:'構造化切り詰め復旧状態',event_truncation_note:'モデル出力が切り詰め境界に達したため、復旧フローに入りました。',
       event_live_model_call_title:'Agent ターンモデル呼び出し',event_live_model_call_note:'現在のアクティブ agent はモデル呼び出し中です。生成中はこのタイマーがリアルタイム更新されます。',
       event_scheduler_queued_title:'キュー済みタスク',event_scheduler_queued_note:'このメッセージは保存され、実行枠を待っています。',event_scheduler_queue_position:'キュー位置',event_scheduler_reason:'理由',event_scheduler_queued_hint:'キュー済み',
-  event_auto_continue:'自動継続',event_arbiter_continue:'判定継続',event_continuation_briefing:'継続ブリーフ',event_reminder:'リマインダー',event_todo_rescue:'Todo 救援',event_tool_retry:'ツール再試行',event_segmented_retry:'分割再試行',event_forced_converge:'強制収束',event_no_tool_recovery:'ツールなし復旧',event_context_recall:'コンテキスト再呼び出し',event_failure_recovery:'障害復旧',event_truncate_rescue:'切り詰め救援',event_thinking_recovery:'思考復旧',event_fault_prefill:'障害プリフィル',event_edit_recovery:'編集復旧',
+  event_auto_continue:'自動継続',event_arbiter_continue:'判定継続',event_continuation_briefing:'継続ブリーフ',event_reminder:'リマインダー',event_todo_rescue:'Todo 救援',event_tool_retry:'ツール再試行',event_segmented_retry:'分割再試行',event_forced_converge:'強制収束',event_no_tool_recovery:'ツールなし復旧',event_context_recall:'コンテキスト再呼び出し',event_failure_recovery:'障害復旧',event_truncate_rescue:'切り詰め救援',event_thinking_recovery:'思考復旧',event_fault_prefill:'障害プリフィル',event_edit_recovery:'編集復旧',event_todo_bootstrap_title:'Todo 初期化',event_todo_bootstrap_retry_title:'Todo 初期化の再試行',event_todo_bootstrap_subtitle:'読み取り専用の認識後に行う計画状態',event_todo_bootstrap_note:'観測した証拠から次の Todo を整理してから実行を続けます。',event_todo_bootstrap_retry_note:'Todo の書き込みが完了せず、回数を制限した再試行を行います。',event_todo_bootstrap_perception:'認識完了',event_todo_bootstrap_item_count:'3-7 項目',event_todo_bootstrap_one_active:'進行中は 1 項目のみ',event_reason:'理由',
   state_on:'オン',state_off:'オフ',
   rt_session:'セッション',rt_model:'モデル',rt_thinking:'思考',rt_thinking_stream:'思考ストリーム',rt_response_stream:'レスポンスストリーム',rt_mode:'モード',rt_active_agent:'アクティブAgent',rt_blackboard:'黒板',rt_task:'タスク',rt_complexity:'複雑度',rt_judgement:'判定',rt_budget:'予算',rt_remaining:'残り',rt_blackboard_cycles:'黒板サイクル',rt_round_limit:'ラウンド上限',rt_round:'ラウンド',rt_phase:'フェーズ',rt_queued_inputs:'待機入力',rt_run_timeout:'実行タイムアウト',rt_ctx_used:'コンテキスト使用量',rt_ctx_limit:'コンテキスト上限',rt_ctx_mode:'コンテキストモード',rt_manual_lock:'手動固定',rt_adaptive:'適応',rt_ctx_left:'残りコンテキスト',rt_ctx_left_for:'{label}残り',rt_ctx_live_title:'実際の呼び出し別の残りコンテキスト',rt_truncation:'切り詰め数',rt_trunc_retry:'切り詰め再試行',rt_trunc_tokens:'切り詰めToken~',rt_archive:'アーカイブ',rt_last_compact:'直近 compact',compact_ago:'前',compact_just_now:'たった今',rt_ollama:'Ollama',rt_files:'ファイルルート',rt_ui_mode:'UIモード',rt_state:'状態',rt_awaiting_user:'ユーザー待ち',ask_user_title:'入力が必要です',ask_user_free_hint:'上のオプションを選ぶか、下に回答を入力して送信してください。',ask_user_pick_hint:'続行するには上のオプションを選んでください。',
   preview_download:'ダウンロード',preview_source:'ソース',preview_rendered:'プレビュー',preview_copy_link:'リンクをコピー',preview_open:'ブラウザで開く',preview_link_copied:'リンクをコピーしました',
@@ -67706,6 +74127,7 @@ function _deltaStartWatchdog(){
   S.deltaWatchdogTimer=setTimeout(tick,DELTA_WATCHDOG_INTERVAL_MS);
 }
 function renderSkillsEntryLink(){const link=E('downloadBtn');if(!link)return;const host=location.hostname||'127.0.0.1';const enabled=Boolean(S.config?.skills_ui_enabled);const fromConfig=String(S.config?.skills_ui_url||'').trim();const skillsPort=Number(S.config?.skills_port||0);let href='#';if(enabled){if(fromConfig){href=fromConfig}else if(Number.isFinite(skillsPort)&&skillsPort>0){const currentPort=Number(location.port||0);if(!(currentPort&&skillsPort===currentPort)){href=`${location.protocol}//${host}:${skillsPort}`}}}const offline=(href==='#');link.href=href;link.classList.toggle('disabled',offline);link.textContent=offline?t('skills_offline'):t('open_skills')}
+function openProgram(){const port=Number(S.config?.ide_port||0);if(!S.config?.ide_enabled||!Number.isFinite(port)||port<=0){showError('Program IDE is disabled.');return}location.href=`${location.protocol}//${location.hostname||'127.0.0.1'}:${port}/`}
 function tailSig(rows,count,mapper){const arr=Array.isArray(rows)?rows:[];if(!arr.length)return'';return arr.slice(Math.max(0,arr.length-count)).map(mapper).join('|')}
 function feedSignature(snap){const feed=Array.isArray(snap?.conversation_feed)?snap.conversation_feed:(Array.isArray(snap?.messages)?snap.messages:[]);const sig=tailSig(feed,8,row=>`${Number(row?.ts||0)}:${String(row?.role||'')}:${String(row?.agent_role||'')}:${String(row?.type||'')}:${String(row?.text||'').length}:${String(row?.thinking||'').length}:${String(row?.text||'').slice(-12)}:${String(row?.thinking||'').slice(-12)}`);const live=String(snap?.live_thinking||'');const liveResp=String(snap?.live_response_text||'');const liveRespId=String(snap?.live_response_stream_id||'');const liveRespActive=snap?.live_response_active?1:0;const runActive=snap?.live_run_notice_active?1:0;const runLabel=String(snap?.live_run_notice_label||'');const runStart=Number(snap?.live_run_notice_started_at||0);const truncText=String(snap?.live_truncation_text||'');const truncKind=String(snap?.live_truncation_kind||'');const truncTool=String(snap?.live_truncation_tool||'');const truncAttempts=Number(snap?.live_truncation_attempts||0);const truncTokens=Number(snap?.live_truncation_tokens||0);const truncActive=snap?.live_truncation_active?1:0;return `${feed.length}|${sig}|lt=${live.length}:${live.slice(-12)}|lr=${liveRespActive}:${liveRespId}:${liveResp.length}:${liveResp.slice(-12)}|rn=${runActive}:${runStart}:${runLabel.slice(-12)}|tr=${truncActive}:${truncAttempts}:${truncTokens}:${truncKind.slice(-12)}:${truncTool.slice(-12)}:${truncText.length}`}
 function boardsSignature(snap){const agentCtx=(Array.isArray(snap?.agent_contexts)?snap.agent_contexts:[]).map(r=>`${r.role}:${r.left}:${r.left_percent}:${r.tier}:${r.active?1:0}`).join(',');const scope=snap?.todo_task_scope||{};const todoRows=Array.isArray(snap?.todos)?snap.todos:[];const taskRows=Array.isArray(snap?.tasks)?snap.tasks:[];const todoSig=todoRows.map(row=>`${String(row?.key||row?.plan_step_id||'')}:${String(row?.status||'')}:${String(row?.content||'')}`).join('~');const taskSig=taskRows.map(row=>`${String(row?.subtask_id||row?.id||'')}:${String(row?.status||'')}:${String(row?.subject||'')}`).join('~');return [snap?.running?1:0,snap?.agent_phase||'',Number(snap?.agent_round_index||0),Number(snap?.queued_user_inputs_count||0),Number(snap?.truncation_count||0),Number(snap?.live_truncation_attempts||0),Number(snap?.live_truncation_tokens||0),snap?.live_truncation_active?1:0,Number(snap?.context_tokens_estimate||0),Number(snap?.context_left_tokens||0),Number(snap?.context_left_percent||0),agentCtx,Number(snap?.render_bridge?.seq||0),String(snap?.plan_mode_preference||'auto'),Number(snap?.user_task_level||0),String(scope.kind||'default'),String(scope.task_epoch||''),String(scope.plan_epoch||''),String(scope.parent_step_id||''),todoSig,taskSig,(snap?.activity||[]).length,(snap?.operations||[]).length,(snap?.uploads||[]).length].join('|')}
@@ -68796,27 +75218,27 @@ function _setPreviewCopyState(tab){
 function _selectedCodePreviewText(body,sel){
   if(!body||!sel||sel.rangeCount<1)return'';
   const range=sel.getRangeAt(0);
-  const inBody=(range.commonAncestorContainer===body)||body.contains(range.commonAncestorContainer);
+  let inBody=false;
+  try{inBody=range.intersectsNode(body)}catch(_){inBody=false}
   if(!inBody)return'';
-  const cells=Array.from(body.querySelectorAll('.code-code:not(.code-code-delete)'));
-  const lines=[];
-  for(const cell of cells){
-    let intersects=false;
-    try{intersects=range.intersectsNode(cell)}catch(_){intersects=false}
-    if(!intersects)continue;
-    const clipped=document.createRange();
-    clipped.selectNodeContents(cell);
-    try{
-      if(range.compareBoundaryPoints(Range.START_TO_START,clipped)>0){
-        clipped.setStart(range.startContainer,range.startOffset);
-      }
-      if(range.compareBoundaryPoints(Range.END_TO_END,clipped)<0){
-        clipped.setEnd(range.endContainer,range.endOffset);
-      }
-    }catch(_){continue}
-    lines.push(String(clipped.toString()||'').replace(/\\r\\n?/g,'\\n'));
+  // Clone only the selected DOM fragment, then remove presentation-only
+  // gutters.  The previous per-cell boundary code could fall back to the
+  // browser's default copy path when a drag began in the gutter, which copied
+  // line numbers/signs along with the source text.
+  let fragment=null;
+  try{fragment=range.cloneContents()}catch(_){fragment=null}
+  if(!fragment)return'';
+  const holder=document.createElement('div');
+  holder.appendChild(fragment);
+  holder.querySelectorAll('.code-gutter,.code-code-delete').forEach(node=>node.remove());
+  const rows=Array.from(holder.querySelectorAll('.code-row'));
+  if(rows.length){
+    return rows.map(row=>{
+      const code=row.querySelector('.code-code');
+      return String(code?code.textContent:row.textContent||'').replace(/\\r\\n?/g,'\\n');
+    }).join('\\n');
   }
-  return lines.join('\\n');
+  return String(holder.textContent||'').replace(/\\r\\n?/g,'\\n');
 }
 async function copyPreviewCode(){
   const tab=activePreviewTab();
@@ -68853,18 +75275,38 @@ async function copyPreviewCode(){
 }
 function _bindPreviewCopyGuard(){
   const body=E('previewBody');
-  if(!body||body._copyGuardBound)return;
-  body._copyGuardBound=true;
-  body.addEventListener('copy',ev=>{
-    const tab=activePreviewTab();
-    if(!tab||tab.kind!=='code')return;
+  if(!body||document._previewCopyGuardBound)return;
+  document._previewCopyGuardBound=true;
+  document.addEventListener('copy',ev=>{
+    if(!body.querySelector('.code-code'))return;
     const sel=(window.getSelection&&typeof window.getSelection==='function')?window.getSelection():null;
     if(!sel||sel.isCollapsed)return;
+    const range=sel.rangeCount?sel.getRangeAt(0):null;
+    let inBody=false;
+    try{inBody=!!range&&range.intersectsNode(body)}catch(_){inBody=false}
+    if(!inBody)return;
     const text=_selectedCodePreviewText(body,sel);
-    if(!ev.clipboardData||typeof ev.clipboardData.setData!=='function')return;
+    if(!text)return;
     ev.preventDefault();
-    ev.clipboardData.setData('text/plain',text);
-  });
+    ev.stopPropagation();
+    if(ev.clipboardData&&typeof ev.clipboardData.setData==='function'){
+      ev.clipboardData.setData('text/plain',text);
+      return;
+    }
+    // Some WebKit/webview versions expose no clipboardData on the copy event;
+    // keep the default path suppressed and synchronously copy sanitized text.
+    try{
+      const ta=document.createElement('textarea');
+      ta.value=text;
+      ta.setAttribute('readonly','readonly');
+      ta.style.position='fixed';
+      ta.style.left='-9999px';
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+    }catch(_){/* clipboard permissions are outside the preview renderer */}
+  },true);
 }
 function _codePreviewHotAnchor(rows,stage){
   const arr=Array.isArray(rows)?rows:[];
@@ -69106,7 +75548,7 @@ function renderActivePreview(forceReload=false){
 function _chatVirtRowKey(row,idx){const r=row||{};const txt=String(r.text||'');const th=String(r.thinking||'');return `${Number(r.ts||0)}:${String(r.role||'')}:${String(r.agent_role||'')}:${String(r.type||'')}:${txt.length}:${th.length}:${txt.slice(-16)}:${th.slice(-16)}:${idx}`}
 function _chatVirtFormatElapsed(seconds){const sec=Math.max(0,Math.floor(Number(seconds)||0));const h=Math.floor(sec/3600);const m=Math.floor((sec%3600)/60);const s=sec%60;if(h>0)return `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;return `${m}:${String(s).padStart(2,'0')}`}
 function _chatVirtLiveRunText(label,elapsed){return `${t('running')} · ${_chatVirtFormatElapsed(elapsed)}`}
-const CHAT_EVENT_CARD_KINDS=new Set(['tool_calls','tool_start','tool_result','file_patch','upload','command','web_search','live_truncation','live_run_notice','skill_loaded','plan_notice','plan_proposal','plan_approved_handoff','step_verified','todo_focus','live_user_adjustment','user_feedback_merge']);
+const CHAT_EVENT_CARD_KINDS=new Set(['tool_calls','tool_start','tool_result','file_patch','upload','command','web_search','live_truncation','live_run_notice','skill_loaded','plan_notice','plan_proposal','plan_approved_handoff','step_verified','todo_focus','live_user_adjustment','user_feedback_merge','runtime_hint']);
 function _chatVirtFormatDurationMs(ms){
   const n=Number(ms||0);
   if(!Number.isFinite(n)||n<=0)return '';
@@ -69221,14 +75663,14 @@ function _chatVirtParseWebSearchText(raw){
   const head=String(m[1]||'').trim();
   const rest=String(m[2]||'').trim();
   const out={tool:'agent_web_search',phase:'',mode:'',query:'',url:'',summary:'',result_count:0,page_count:0,evidence_records:0};
-  const headParts=head.split(/\s+/).filter(Boolean);
+  const headParts=head.split(/\\s+/).filter(Boolean);
   if(headParts.length){out.phase=headParts.shift()||'';out.mode=headParts.shift()||'';}
   for(const line of rest.split(/\\n/)){
     const s=String(line||'').trim();
     if(!s)continue;
-    let mm=s.match(/^(?:query|url)\s*:\s*(.*)$/i);
+    let mm=s.match(/^(?:query|url)\\s*:\\s*(.*)$/i);
     if(mm){out.query=String(mm[1]||'').trim();continue;}
-    mm=s.match(/results\s*:\s*(\d+)\s+pages\s*:\s*(\d+)\s+evidence\s*:\s*(\d+)/i);
+    mm=s.match(/results\\s*:\\s*(\\d+)\\s+pages\\s*:\\s*(\\d+)\\s+evidence\\s*:\\s*(\\d+)/i);
     if(mm){out.result_count=Number(mm[1]||0);out.page_count=Number(mm[2]||0);out.evidence_records=Number(mm[3]||0);continue;}
     out.summary+=(out.summary?'\\n':'')+s;
   }
@@ -69735,6 +76177,8 @@ const RUNTIME_HINT_RENDER_META={
   'thinking-empty-recovery':{labelKey:'event_thinking_recovery',tone:'warning'},
   'fault-prefill':{labelKey:'event_fault_prefill',tone:'warning'},
   'edit-recovery':{labelKey:'event_edit_recovery',tone:'warning'},
+  'single-no-plan-todo-bootstrap':{labelKey:'event_todo_bootstrap_title',tone:'notice'},
+  'single-no-plan-todo-bootstrap-retry':{labelKey:'event_todo_bootstrap_retry_title',tone:'warning'},
 };
 function _chatVirtParseRuntimeHint(raw){
   const txt=String(raw||'').trim();
@@ -69757,6 +76201,7 @@ function _chatVirtBuildMessageNode(m){
       const parsedToolEventText=_chatVirtParseToolEventText(rawTextForKind);
       const parsedLiveUserAdjustment=_chatVirtParseLiveUserAdjustment(rawTextForKind);
       const parsedUserFeedbackMerge=_chatVirtParseUserFeedbackMerge(rawTextForKind);
+      const parsedRuntimeHint=(m.role==='user')?_chatVirtParseRuntimeHint(rawTextForKind):null;
       if(m.type==='manager_delegate')kind='manager_delegate';
       else if(m.type==='agent_bus')kind='agent_bus';
       else if(m.type==='tool_calls')kind='tool_calls';
@@ -69778,8 +76223,9 @@ function _chatVirtBuildMessageNode(m){
   else if(m.type==='step_verified'||_chatVirtParseStepVerified(rawTextForKind))kind='step_verified';
   else if(m.type==='todo_focus'||_chatVirtParseTodoFocus(rawTextForKind)||(m.type==='plan_notice'&&(dataKind==='todo_focus'||dataKind==='todo-focus')))kind='todo_focus';
   else if(m.type==='live_user_adjustment'||parsedLiveUserAdjustment)kind='live_user_adjustment';
-  else if(m.type==='user_feedback_merge'||parsedUserFeedbackMerge)kind='user_feedback_merge';
-  else if(m.type==='plan_notice')kind='plan_notice';
+      else if(m.type==='user_feedback_merge'||parsedUserFeedbackMerge)kind='user_feedback_merge';
+      else if(parsedRuntimeHint)kind='runtime_hint';
+      else if(m.type==='plan_notice')kind='plan_notice';
   else if(m.role==='assistant'&&m.thinking)kind='assistant_thinking';
   else kind='plain_text';
   const d=_chatVirtAcquireNode(kind);
@@ -70260,13 +76706,39 @@ function _chatVirtBuildMessageNode(m){
   }
   const textKey=`${m._vk}:text`;
   let finalText=String(m.text||'');
-  const runtimeHint=(m.role==='user')?_chatVirtParseRuntimeHint(finalText):null;
+  const runtimeHint=parsedRuntimeHint;
   finalText=_stripLeadingAgentTitle(finalText,agentRole);
   if(agentRole&&agentRole!=='manager'){
     const cleaned=_stripObjectiveInstructionForWorker(finalText);
     if(cleaned)finalText=cleaned;
   }
   if(runtimeHint){
+    const isTodoBootstrap=runtimeHint.name==='single-no-plan-todo-bootstrap'||runtimeHint.name==='single-no-plan-todo-bootstrap-retry';
+    if(isTodoBootstrap){
+      const retry=runtimeHint.name.endsWith('-retry');
+      const body=String(runtimeHint.body||'').trim();
+      const reasonMatch=retry?body.match(/did not complete:\\s*([^.\\n]+)/i):null;
+      const reason=reasonMatch?String(reasonMatch[1]||'').trim():'';
+      const pills=[
+        _chatVirtEventPillHtml(t('event_todo_bootstrap_perception'),'ok'),
+        _chatVirtEventPillHtml(t('event_todo_bootstrap_item_count'),'info'),
+        _chatVirtEventPillHtml(t('event_todo_bootstrap_one_active'),'neutral','mono'),
+      ];
+      const grid=reason?[_chatVirtEventCellHtml(t('event_reason'),reason,{})]:[];
+      const note=t(retry?'event_todo_bootstrap_retry_note':'event_todo_bootstrap_note');
+      const key=`${String(m._vk||'')}:todo-bootstrap`;
+      const bodyHtml=`<div class="msg-event-body"><div class="msg-event-note">${esc(note)}</div></div>`;
+      d.innerHTML=_chatVirtEventCardHtml(
+        t(retry?'event_todo_bootstrap_retry_title':'event_todo_bootstrap_title'),
+        t('event_todo_bootstrap_subtitle'),
+        pills,
+        grid,
+        bodyHtml,
+        'msg-event-card-plan',
+      );
+      d.setAttribute('data-math-request',key);
+      return d;
+    }
     const hintLabel=String(runtimeHint.meta?.label||'Runtime Hint');
     const hintTone=String(runtimeHint.meta?.tone||'notice');
     const bodyKey=`${textKey}:runtime-hint`;
@@ -71366,6 +77838,7 @@ async function refreshAll(forceProbe=false){
   if(S.activeId&&!String(sessState?.selectedId||'').trim())await refreshSnapshot({forceFull:!!forceProbe,allowWhenFrozen:true});
 }
 function bindClick(id,fn){const el=E(id);if(el)el.onclick=fn}
+window.addEventListener('DOMContentLoaded',()=>bindClick('programBtn',openProgram));
 window.addEventListener('DOMContentLoaded',async()=>{for(const id of ['chat','sessionList','todos','tasks','activity','commands','diffs','fileExplorer','catalog']){bindPanelScrollState(id,E(id))}const drop=E('promptComposerShell');const fileInput=E('uploadInput');const promptPick=E('promptFilePick');const promptEl=E('prompt');if(promptPick&&fileInput){promptPick.onclick=(ev)=>{ev.preventDefault();fileInput.click()}}if(drop&&fileInput){let _dragC=0;drop.setAttribute('tabindex','0');drop.addEventListener('click',e=>{if(e.target===drop&&promptEl)promptEl.focus()});fileInput.onchange=()=>uploadFiles(fileInput.files).then(()=>{fileInput.value=''}).catch(err=>showError(err.message));for(const evt of ['dragenter','dragover']){drop.addEventListener(evt,e=>{e.preventDefault();if(evt==='dragenter')_dragC++;drop.classList.add('dragover')})}for(const evt of ['dragleave','dragend']){drop.addEventListener(evt,e=>{e.preventDefault();if(evt==='dragleave')_dragC--;if(_dragC<=0){_dragC=0;drop.classList.remove('dragover')}})}drop.addEventListener('drop',e=>{e.preventDefault();_dragC=0;drop.classList.remove('dragover');const files=e.dataTransfer?.files;if(files&&files.length)uploadFiles(files).catch(err=>showError(err.message))});drop.addEventListener('paste',e=>{const files=clipboardFilesFromEvent(e);if(!files.length)return;e.preventDefault();drop.classList.add('dragover');setTimeout(()=>drop.classList.remove('dragover'),220);uploadFiles(files).catch(err=>showError(err.message||String(err)))})}const configInput=E('configInput');if(configInput){configInput.onchange=()=>uploadLlmConfigFile(configInput.files&&configInput.files[0]).then(()=>{configInput.value=''}).catch(err=>showError(err.message||String(err)))}bindClick('newSessionBtn',createSession);bindClick('renameSessionBtn',renameSession);bindClick('deleteSessionBtn',deleteSession);bindClick('applyModelBtn',applyModel);bindClick('llmConfigBtn',openLlmConfigModal);bindClick('llmModalClose',()=>{E('llmConfigModal').style.display='none'});bindClick('llmConfigConfirm',submitLlmConfig);const llmProv=E('llmProvider');if(llmProv){llmProv.addEventListener('change',()=>renderLlmFields(llmProv.value))}const llmOverlay=E('llmConfigModal');if(llmOverlay){llmOverlay.addEventListener('click',e=>{if(e.target===llmOverlay)llmOverlay.style.display='none'})}bindClick('sendBtn',sendMessage);bindClick('interruptBtn',interruptRun);bindClick('clearStaleTodosBtn',clearStaleTodos);bindClick('planModeBtn',togglePlanMode);bindClick('refreshFilesBtn',()=>refreshFileExplorer(true));bindClick('previewReloadBtn',()=>renderActivePreview(true));bindClick('previewCopyBtn',()=>copyPreviewCode());bindPopupButton('toolsMenuBtn','toolsMenu');bindClick('compactAction',(e)=>{if(e)e.preventDefault();closePopups();compactNow()});bindClick('refreshAction',(e)=>{if(e)e.preventDefault();closePopups();refreshAll(true)});bindPopupButton('levelBtn','levelMenu',(menu)=>{for(const opt of menu.querySelectorAll('.level-option')){opt.addEventListener('click',e=>{e.preventDefault();const lvl=parseInt(opt.getAttribute('data-level')||'0',10);setTaskLevel(lvl);setPopupOpen('levelMenu',false)})}});bindPopupButton('exportMenuBtn','exportMenu',(menu)=>{for(const a of menu.querySelectorAll('.export-item')){a.addEventListener('click',()=>setPopupOpen('exportMenu',false))}});document.addEventListener('click',()=>closePopups());const langSel=E('langSelect');if(langSel){langSel.onchange=()=>setLanguage(langSel.value).then(()=>applyApplicationI18n()).catch(err=>showError(err.message||String(err)))}if(promptEl){promptEl.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter'){e.preventDefault();sendMessage()}})}bindApplicationStore();applyUiStyle();applyStaticUiClass();applyMainI18n();applyApplicationI18n();_bindPreviewCopyGuard();try{await refreshAll(false);if(!S.sessions.length){const bootCreate=()=>createSession({prompt:false}).catch(err=>showError(err.message||String(err)));if(typeof requestAnimationFrame==='function'){requestAnimationFrame(()=>setTimeout(bootCreate,0))}else{setTimeout(bootCreate,0)}}}catch(err){showError(err.message||String(err))}_deltaStartWatchdog();scheduleSessionPoll(false);document.addEventListener('visibilitychange',()=>{const next=document.visibilityState||'visible';if(next===S.lastVisibilityState)return;S.lastVisibilityState=next;if(next==='hidden'){if(S.deltaWatchdogTimer){clearTimeout(S.deltaWatchdogTimer);S.deltaWatchdogTimer=null}if(S.sessionPollTimer){clearTimeout(S.sessionPollTimer);S.sessionPollTimer=null}if(S.staticMode)freezeAutoUpdates();return}if(S.staticMode&&S.frozen)resumeAutoUpdates();_deltaStartWatchdog();scheduleSessionPoll(true);scheduleSnapshot({forceFull:false,delayMs:40,allowWhenFrozen:true})})})
 window.addEventListener('DOMContentLoaded',()=>{bindClick('memoryModeAction',(e)=>{closePopups();toggleUserMemoryMode(e)});bindClick('memoryExportAction',(e)=>{closePopups();exportUserMemory(e)});bindClick('memoryClearAction',(e)=>{closePopups();clearUserMemory(e)});renderMemoryModeAction()});
 """
@@ -78520,7 +84993,7 @@ class CodeContentParser:
             "path": str(fp),
             "kind": "source_code",
             "mime": str(mime or guess_mime_from_name(fp.name, "text/plain")),
-            "size": int(fp.stat().st_size) if fp.exists() and fp.is_file() else len((raw_bytes or b"")),
+            "size": int(fp.stat().st_size) if fp.exists() and fp.is_file() else len(raw_bytes or b""),
             "sha256": _sha256_file(fp) if fp.exists() and fp.is_file() else _sha256_bytes((raw_text or "").encode("utf-8")),
             "language": language or "text",
             "text": raw_text,
@@ -87188,147 +93661,147 @@ IDE_INDEX_HTML = """<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Clouds Coder IDE</title>
+<link rel="stylesheet" href="/assets/js_lib/codicons/dist/codicon.css">
+<link rel="stylesheet" href="/assets/js_lib/xterm/css/xterm.css">
 <link rel="stylesheet" href="/assets/ide.css">
 </head>
 <body>
-<div class="ide-shell">
-  <aside class="activity-bar">
-    <button class="activity-button is-active" data-view="explorer" title="Explorer">EX</button>
-    <button class="activity-button" data-view="tools" title="Tools">TL</button>
-    <button class="activity-button" data-view="agent" title="Agent">AI</button>
-  </aside>
-  <aside class="side-panel">
-    <section class="panel-view is-active" data-panel="explorer">
-      <div class="panel-head">
-        <span>Explorer</span>
-        <div class="panel-actions">
-          <button id="refreshTreeBtn" title="Refresh">R</button>
-          <button id="newFileBtn" title="New file">F</button>
-          <button id="newFolderBtn" title="New folder">D</button>
-        </div>
-      </div>
-      <select id="sessionSelect" class="select"></select>
-      <select id="rootSelect" class="select"></select>
-      <div class="upload-row">
-        <button id="uploadFilesBtn">Files</button>
-        <button id="uploadFolderBtn">Folder</button>
-        <input id="fileInput" type="file" multiple hidden>
-        <input id="folderInput" type="file" multiple webkitdirectory directory hidden>
-      </div>
-      <div id="tree" class="tree"></div>
-    </section>
-    <section class="panel-view" data-panel="tools">
-      <div class="panel-head"><span>Toolchains</span><button id="refreshToolsBtn">R</button></div>
-      <div id="toolchains" class="toolchains"></div>
-      <div class="mount-box">
-        <label>Mount path</label>
-        <input id="mountPathInput" class="input" placeholder="/path/to/project">
-        <button id="mountBtn">Authorize</button>
-        <div id="mounts" class="mounts"></div>
-      </div>
-    </section>
-    <section class="panel-view" data-panel="agent">
-      <div class="panel-head"><span>Agent</span></div>
-      <textarea id="agentPrompt" class="agent-prompt" placeholder="Describe the coding task"></textarea>
-      <button id="sendAgentBtn" class="primary">Run agent task</button>
-      <div id="agentStatus" class="status-line"></div>
-    </section>
-  </aside>
-  <main class="workbench">
-    <header class="topbar">
-      <div class="brand">Clouds Coder IDE</div>
-      <div id="status" class="status-line">loading</div>
-      <button id="createSessionBtn">New session</button>
-    </header>
-    <div id="tabs" class="tabs"></div>
-    <section class="editor-wrap">
-      <div id="emptyState" class="empty-state">Open a file from Explorer</div>
-      <textarea id="editor" spellcheck="false"></textarea>
-    </section>
-    <section class="bottom-panel">
-      <div class="terminal-head">
-        <span>Terminal</span>
-        <input id="cwdInput" class="terminal-cwd" placeholder="cwd">
-      </div>
-      <div class="terminal-run">
-        <input id="commandInput" class="command-input" placeholder="python3 main.py">
-        <button id="runCommandBtn">Run</button>
-      </div>
-      <pre id="terminalOutput" class="terminal-output"></pre>
-    </section>
-  </main>
+<div id="authGate" class="auth-gate">
+  <section class="auth-dialog" aria-labelledby="authTitle">
+    <div class="auth-mark"><span class="codicon codicon-code"></span></div>
+    <h1 id="authTitle">Clouds Coder</h1>
+    <p id="authSubtitle">Sign in to Program</p>
+    <form id="authForm">
+      <label for="authUsername">Username</label>
+      <input id="authUsername" autocomplete="username" required>
+      <label for="authPassword">Password</label>
+      <input id="authPassword" type="password" autocomplete="current-password" required>
+      <label id="authConfirmLabel" for="authConfirm" hidden>Confirm password</label>
+      <input id="authConfirm" type="password" autocomplete="new-password" hidden>
+      <button id="authSubmit" class="button primary" type="submit">Sign in</button>
+    </form>
+    <div id="authMessage" class="auth-message" role="status"></div>
+  </section>
 </div>
+<div id="ideShell" class="ide-shell is-hidden">
+  <header class="title-bar">
+    <button id="mainMenuBtn" class="icon-button" title="Application menu" aria-label="Application menu"><span class="codicon codicon-menu"></span></button>
+    <div class="product-mark"><span class="codicon codicon-code"></span></div>
+    <nav id="menuBar" class="menu-bar" aria-label="Main menu">
+      <button data-menu="file">File</button><button data-menu="edit">Edit</button><button data-menu="selection">Selection</button><button data-menu="view">View</button><button data-menu="go">Go</button><button data-menu="run">Run</button><button data-menu="terminal">Terminal</button><button data-menu="help">Help</button>
+    </nav>
+    <button id="commandCenter" class="command-center"><span class="codicon codicon-search"></span><span id="commandCenterText">Clouds Coder Program</span></button>
+    <div class="layout-controls">
+      <button id="togglePrimaryBtn" class="icon-button" title="Toggle Primary Side Bar" aria-label="Toggle Primary Side Bar"><span class="codicon codicon-layout-sidebar-left"></span></button>
+      <button id="togglePanelBtn" class="icon-button" title="Toggle Panel" aria-label="Toggle Panel"><span class="codicon codicon-layout-panel"></span></button>
+      <button id="toggleSecondaryBtn" class="icon-button" title="Toggle Secondary Side Bar" aria-label="Toggle Secondary Side Bar"><span class="codicon codicon-layout-sidebar-right"></span></button>
+    </div>
+  </header>
+  <div class="workbench-grid">
+    <aside class="activity-bar" aria-label="Activity Bar">
+      <div class="activity-top">
+        <button class="activity-button is-active" data-view="explorer" title="Explorer" aria-label="Explorer"><span class="codicon codicon-files"></span></button>
+        <button class="activity-button" data-view="search" title="Search" aria-label="Search"><span class="codicon codicon-search"></span></button>
+        <button class="activity-button" data-view="scm" title="Source Control" aria-label="Source Control"><span class="codicon codicon-source-control"></span><b id="scmBadge" class="activity-badge"></b></button>
+        <button class="activity-button" data-view="run" title="Run and Debug" aria-label="Run and Debug"><span class="codicon codicon-debug-alt"></span></button>
+        <button class="activity-button" data-view="extensions" title="Extensions" aria-label="Extensions"><span class="codicon codicon-extensions"></span></button>
+        <button id="agentActivityBtn" class="activity-button" title="Clouds Coder Agent" aria-label="Clouds Coder Agent"><span class="codicon codicon-sparkle"></span></button>
+      </div>
+      <div class="activity-bottom">
+        <button id="accountsBtn" class="activity-button" title="Accounts" aria-label="Accounts"><span class="codicon codicon-account"></span></button>
+        <button id="manageBtn" class="activity-button" title="Manage" aria-label="Manage"><span class="codicon codicon-settings-gear"></span></button>
+      </div>
+    </aside>
+    <aside id="primarySidebar" class="primary-sidebar">
+      <section class="side-view is-active" data-side-view="explorer">
+        <header class="side-header"><span>Explorer</span><div class="header-actions">
+          <button id="newFileBtn" class="icon-button" title="New File"><span class="codicon codicon-new-file"></span></button>
+          <button id="newFolderBtn" class="icon-button" title="New Folder"><span class="codicon codicon-new-folder"></span></button>
+          <button id="refreshTreeBtn" class="icon-button" title="Refresh Explorer"><span class="codicon codicon-refresh"></span></button>
+          <button id="explorerMoreBtn" class="icon-button" title="More Actions"><span class="codicon codicon-ellipsis"></span></button>
+        </div></header>
+        <div class="workspace-pickers"><div class="session-picker-row"><select id="sessionSelect" title="Session"></select><button id="renameSessionBtn" class="icon-button" title="Rename Session" aria-label="Rename Session"><span class="codicon codicon-edit"></span></button></div><select id="rootSelect" title="Workspace Folder" aria-label="Workspace Folder"></select></div>
+        <div id="openEditors" class="open-editors"></div>
+        <div class="section-label"><span class="codicon codicon-chevron-down"></span><strong id="workspaceLabel">Workspace</strong></div>
+        <div id="tree" class="tree" role="tree"></div>
+        <input id="fileInput" type="file" multiple hidden><input id="folderInput" type="file" multiple webkitdirectory directory hidden>
+      </section>
+      <section class="side-view" data-side-view="search">
+        <header class="side-header"><span>Search</span><div class="header-actions"><button id="clearSearchBtn" class="icon-button" title="Clear Search Results"><span class="codicon codicon-clear-all"></span></button></div></header>
+        <div class="search-form"><div class="input-with-actions"><input id="searchInput" placeholder="Search"><button id="matchCaseBtn" class="mini-toggle" title="Match Case">Aa</button><button id="regexBtn" class="mini-toggle" title="Use Regular Expression">.*</button></div><input id="includeInput" placeholder="files to include"><input id="excludeInput" placeholder="files to exclude"></div>
+        <div id="searchSummary" class="side-summary"></div><div id="searchResults" class="side-list"></div>
+      </section>
+      <section class="side-view" data-side-view="scm">
+        <header class="side-header"><span>Source Control</span><div class="header-actions"><button id="refreshScmBtn" class="icon-button" title="Refresh"><span class="codicon codicon-refresh"></span></button></div></header>
+        <div id="scmBranch" class="scm-branch"></div><div id="scmChanges" class="side-list"></div>
+      </section>
+      <section class="side-view" data-side-view="run">
+        <header class="side-header"><span>Run and Debug</span><div class="header-actions"><button id="refreshTasksBtn" class="icon-button" title="Refresh Tasks"><span class="codicon codicon-refresh"></span></button></div></header>
+        <button id="runActiveBtn" class="button primary run-button"><span class="codicon codicon-play"></span> Run Active File</button>
+        <button id="debugActiveBtn" class="button run-button"><span class="codicon codicon-debug-alt"></span> Debug Active File</button>
+        <div class="section-label"><span class="codicon codicon-chevron-down"></span><strong>Tasks</strong></div><div id="taskList" class="side-list"></div>
+        <div class="section-label"><span class="codicon codicon-chevron-down"></span><strong>Toolchains</strong></div><div id="toolchains" class="toolchains"></div>
+      </section>
+      <section class="side-view" data-side-view="extensions">
+        <header class="side-header"><span>Extensions</span><div class="header-actions"><button id="refreshExtensionsBtn" class="icon-button" title="Refresh Installed Extensions"><span class="codicon codicon-refresh"></span></button></div></header>
+        <div class="extension-search"><input id="extensionSearchInput" placeholder="Search Open VSX"><button id="installVsixBtn" class="icon-button" title="Install from VSIX"><span class="codicon codicon-cloud-upload"></span></button><input id="vsixInput" type="file" accept=".vsix" hidden></div>
+        <div id="extensionSummary" class="side-summary"></div><div id="extensionList" class="side-list"></div>
+      </section>
+    </aside>
+    <main class="editor-area">
+      <div id="editorGrid" class="editor-grid">
+        <section class="editor-group is-active" data-group="0"><div id="tabs0" class="editor-tabs"></div><div id="breadcrumbs0" class="breadcrumbs"></div><div id="historyToolbar0" class="history-toolbar is-hidden"></div><div class="editor-host"><div id="editor0" class="monaco-host"></div><div id="diffEditor0" class="monaco-host history-diff-host is-hidden"></div><textarea id="fallbackEditor0" class="fallback-editor" spellcheck="false"></textarea><div id="artifactPreview0" class="artifact-preview is-hidden"></div><div id="emptyEditor0" class="empty-editor"><div class="empty-logo"><span class="codicon codicon-code"></span></div><div class="empty-actions"><button data-command="file.open">Open File</button><button data-command="workbench.action.quickOpen">Go to File</button><button data-command="workbench.action.showCommands">Command Palette</button></div></div></div></section>
+        <section class="editor-group" data-group="1"><div id="tabs1" class="editor-tabs"></div><div id="breadcrumbs1" class="breadcrumbs"></div><div id="historyToolbar1" class="history-toolbar is-hidden"></div><div class="editor-host"><div id="editor1" class="monaco-host"></div><div id="diffEditor1" class="monaco-host history-diff-host is-hidden"></div><textarea id="fallbackEditor1" class="fallback-editor" spellcheck="false"></textarea><div id="artifactPreview1" class="artifact-preview is-hidden"></div><div id="emptyEditor1" class="empty-editor">Drop an editor here</div></div></section>
+      </div>
+      <section id="panel" class="bottom-panel">
+        <header class="panel-header"><nav class="panel-tabs"><button data-panel-tab="problems">Problems <b id="problemCount">0</b></button><button data-panel-tab="output">Output</button><button class="is-active" data-panel-tab="terminal">Terminal</button><button data-panel-tab="debug">Debug Console</button></nav><div class="header-actions"><button id="newTerminalBtn" class="icon-button" title="New Terminal"><span class="codicon codicon-add"></span></button><button id="killTerminalBtn" class="icon-button" title="Kill Terminal"><span class="codicon codicon-trash"></span></button><button id="maximizePanelBtn" class="icon-button" title="Maximize Panel"><span class="codicon codicon-chevron-up"></span></button><button id="closePanelBtn" class="icon-button" title="Close Panel"><span class="codicon codicon-close"></span></button></div></header>
+        <div class="panel-body"><div id="problemsPanel" class="panel-content"><div id="problemsList" class="data-table"><div class="panel-empty">No problems detected.</div></div></div><div id="outputPanel" class="panel-content"><pre id="outputLog" data-empty="true">No output.</pre></div><div id="terminalPanel" class="panel-content is-active"><div id="terminalHost" class="terminal-host"></div><div id="terminalEmpty" class="panel-empty">Starting terminal...</div><pre id="terminalFallback" class="terminal-fallback" tabindex="0"></pre></div><div id="debugPanel" class="panel-content"><pre id="debugConsole" data-empty="true">No active debug session.</pre></div></div>
+      </section>
+    </main>
+    <aside id="secondarySidebar" class="secondary-sidebar">
+      <header class="side-header"><span>Clouds Coder</span><div class="header-actions"><button id="newAgentChatBtn" class="icon-button" title="New Task" aria-label="New Task"><span class="codicon codicon-add"></span></button><button id="closeSecondaryBtn" class="icon-button" title="Close"><span class="codicon codicon-close"></span></button></div></header>
+      <div id="agentContext" class="agent-context"></div>
+      <section id="agentTodoPanel" class="agent-todo is-hidden"><button id="agentTodoToggle" class="agent-todo-header" type="button" aria-expanded="true"><span class="codicon codicon-chevron-down"></span><strong>Progress</strong><span id="agentTodoCount" class="agent-todo-count"></span></button><div id="agentTodoBody" class="agent-todo-body"></div></section>
+      <div id="agentMessages" class="agent-messages"></div>
+      <div class="agent-composer"><div id="agentAttachments" class="agent-attachments is-hidden"></div><textarea id="agentPrompt" rows="4" placeholder="Ask Clouds Coder"></textarea><input id="agentAttachmentInput" type="file" multiple hidden><div class="agent-actions"><button id="attachContextBtn" class="icon-button" title="Attach files"><span class="codicon codicon-attach"></span></button><button id="agentModelBtn" class="icon-button agent-model-button" title="Choose model"><span class="codicon codicon-hubot"></span><small id="agentContextPercent"></small></button><span id="agentStatus"></span><button id="sendAgentBtn" class="icon-button primary" title="Send"><span class="codicon codicon-send"></span></button></div></div>
+    </aside>
+  </div>
+  <footer class="status-bar"><div class="status-left"><button id="remoteStatus" title="Local window"><span class="codicon codicon-remote"></span></button><button id="gitStatus"><span class="codicon codicon-git-branch"></span><span id="statusBranch">-</span></button><button id="syncStatus"><span class="codicon codicon-sync"></span></button><button id="errorStatus"><span class="codicon codicon-error"></span><span id="errorCount">0</span><span class="codicon codicon-warning"></span><span id="warningCount">0</span></button></div><div id="statusMessage" class="status-message">Ready</div><div class="status-right"><button id="fileSizeStatus" title="File size">0 B</button><button id="languageStatus">Plain Text</button><button id="encodingStatus">UTF-8</button><button id="eolStatus">LF</button><button id="indentStatus">Spaces: 2</button><button id="accountStatus"><span class="codicon codicon-account"></span><span id="accountName"></span></button><button id="notificationsBtn" title="Notifications"><span class="codicon codicon-bell"></span></button></div></footer>
+</div>
+<div id="paletteOverlay" class="overlay is-hidden"><section class="palette"><div class="palette-input-row"><span class="codicon codicon-chevron-right"></span><input id="paletteInput" autocomplete="off" spellcheck="false"></div><div id="paletteResults" class="palette-results"></div></section></div>
+<div id="modalOverlay" class="overlay is-hidden"><section id="modal" class="modal" role="dialog"><header><h2 id="modalTitle"></h2><button id="modalClose" class="icon-button" title="Close"><span class="codicon codicon-close"></span></button></header><div id="modalBody"></div></section></div>
+<div id="menuPopup" class="menu-popup is-hidden"></div><div id="toastHost" class="toast-host"></div>
 <script src="/assets/ide.js"></script>
 </body>
 </html>
 """
 
 IDE_CSS = """
-:root{
-  --bg:#111315;
-  --panel:#181b1f;
-  --panel-2:#1f242a;
-  --line:#30363d;
-  --ink:#e7edf3;
-  --muted:#9aa5b1;
-  --accent:#4aa8ff;
-  --accent-2:#55d6a9;
-  --danger:#ff6b6b;
-}
+.session-picker-row{display:grid;grid-template-columns:minmax(0,1fr) 26px;gap:2px}.session-picker-row .icon-button{width:26px;height:25px}.editor-group{grid-template-rows:35px 22px auto minmax(0,1fr)!important}.history-toolbar{height:30px;display:flex;align-items:center;gap:5px;padding:2px 8px;border-top:1px solid #242424;border-bottom:1px solid var(--line);background:#191919;color:#aaa}.history-toolbar select{height:24px;max-width:180px}.history-toolbar .history-stage{margin-left:auto;max-width:220px}.history-toolbar .button{min-height:24px;height:24px;padding:1px 8px;font-size:11px}.history-modes{display:flex;align-items:center}.history-modes button{height:24px;padding:0 8px;border:1px solid #3b3b3b;border-right:0;background:#252526;color:#aaa;font-size:11px;cursor:pointer}.history-modes button:first-child{border-radius:3px 0 0 3px}.history-modes button:last-child{border-right:1px solid #3b3b3b;border-radius:0 3px 3px 0}.history-modes button.is-active{background:#094771;color:#fff;border-color:#0e639c}.history-stats{color:#858585;font-size:10px;white-space:nowrap}.history-diff-host{z-index:3}.history-added-line{background:rgba(46,160,67,.16)}.history-added-glyph{border-left:3px solid rgba(86,211,100,.78);margin-left:2px}.history-diff-host .inline-deleted-margin-view-zone{box-sizing:border-box;background:transparent!important;border-left:3px solid rgba(248,81,73,.78);margin-left:2px;pointer-events:none!important}.history-diff-host .monaco-editor .line-delete-selectable,.history-diff-host .monaco-editor .line-delete-selectable *{user-select:none!important;-webkit-user-select:none!important;pointer-events:none!important;cursor:default!important}.monaco-diff-editor .line-delete,.monaco-diff-editor .char-delete{background-color:rgba(248,81,73,.14)!important}.monaco-diff-editor .line-insert,.monaco-diff-editor .char-insert{background-color:rgba(46,160,67,.16)!important}
+:root{--title:#181818;--activity:#181818;--sidebar:#181818;--editor:#1f1f1f;--tabs:#181818;--panel:#181818;--status:#007acc;--status-hover:#1f8ad2;--line:#2b2b2b;--line-light:#3a3a3a;--input:#313131;--hover:#2a2d2e;--selection:#04395e;--selection-soft:#37373d;--ink:#cccccc;--bright:#f0f0f0;--muted:#969696;--faint:#6a6a6a;--accent:#0078d4;--focus:#007fd4;--danger:#f14c4c;--warning:#cca700;--success:#89d185;--activity-width:48px;--sidebar-width:288px;--secondary-width:320px;--title-height:35px;--status-height:22px;--panel-height:230px}
 *{box-sizing:border-box}
-html,body{height:100%;margin:0;background:var(--bg);color:var(--ink);font-family:Inter,Segoe UI,Arial,sans-serif;font-size:13px;letter-spacing:0}
-button,input,select,textarea{font:inherit}
-button{border:1px solid var(--line);background:var(--panel-2);color:var(--ink);border-radius:4px;padding:6px 9px;cursor:pointer}
-button:hover{border-color:#52606c;background:#252b32}
-button.primary{background:#0f5fa8;border-color:#1674c8}
-.ide-shell{height:100vh;display:grid;grid-template-columns:44px minmax(230px,320px) 1fr;overflow:hidden}
-.activity-bar{background:#0d0f11;border-right:1px solid var(--line);display:flex;flex-direction:column;align-items:center;padding:8px 4px;gap:8px}
-.activity-button{width:32px;height:32px;padding:0;border-radius:6px;font-size:11px;color:var(--muted)}
-.activity-button.is-active{color:#fff;background:#173a59;border-color:#28679a}
-.side-panel{background:var(--panel);border-right:1px solid var(--line);min-width:0;overflow:hidden}
-.panel-view{height:100%;display:none;grid-template-rows:auto auto auto 1fr;gap:8px;padding:10px;min-width:0}
-.panel-view.is-active{display:grid}
-.panel-head{display:flex;align-items:center;justify-content:space-between;gap:8px;text-transform:uppercase;color:#cbd5df;font-size:12px;font-weight:700}
-.panel-actions{display:flex;gap:5px}
-.select,.input{width:100%;min-width:0;background:#101316;color:var(--ink);border:1px solid var(--line);border-radius:4px;padding:7px}
-.upload-row{display:grid;grid-template-columns:1fr 1fr;gap:6px}
-.tree{overflow:auto;min-height:0;border-top:1px solid var(--line);padding-top:8px}
-.tree-row{display:grid;grid-template-columns:18px 1fr auto;align-items:center;gap:4px;min-height:24px;padding:1px 4px;border-radius:4px;white-space:nowrap}
-.tree-row:hover{background:#242a31}
-.tree-row.is-active{background:#123454}
-.tree-name{overflow:hidden;text-overflow:ellipsis}
-.tree-meta{color:var(--muted);font-size:11px}
-.tree-twist{width:18px;height:18px;padding:0;border:none;background:transparent;color:var(--muted)}
-.toolchains,.mounts{display:flex;flex-direction:column;gap:7px;overflow:auto}
-.tool-row,.mount-row{border:1px solid var(--line);background:#12161a;border-radius:6px;padding:8px}
-.tool-row strong{color:#d8e4ef}
-.tool-row span,.mount-row span{display:block;color:var(--muted);font-size:12px;margin-top:3px;overflow:hidden;text-overflow:ellipsis}
-.mount-box{display:grid;gap:7px;align-content:start}
-.workbench{min-width:0;display:grid;grid-template-rows:42px 34px minmax(0,1fr) minmax(120px,25vh);height:100vh}
-.topbar{display:flex;align-items:center;gap:10px;padding:0 12px;background:#15181c;border-bottom:1px solid var(--line)}
-.brand{font-weight:700;white-space:nowrap}
-.status-line{color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:1}
-.tabs{display:flex;align-items:end;overflow-x:auto;background:#171a1f;border-bottom:1px solid var(--line)}
-.tab{display:flex;align-items:center;gap:8px;max-width:260px;min-width:120px;height:33px;padding:0 9px;border-right:1px solid var(--line);background:#1b2026;color:#b9c4cf}
-.tab.is-active{background:#222832;color:#fff}
-.tab span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.tab button{border:none;background:transparent;padding:0;color:var(--muted)}
-.editor-wrap{position:relative;min-height:0;background:#101316}
-#editor{display:none;width:100%;height:100%;resize:none;border:0;outline:0;background:#101316;color:#dce6f0;padding:14px;font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;tab-size:2}
-#editor.is-visible{display:block}
-.empty-state{position:absolute;inset:0;display:grid;place-items:center;color:#6f7b86}
-.empty-state.is-hidden{display:none}
-.bottom-panel{min-height:0;display:grid;grid-template-rows:32px 36px 1fr;background:#14171b;border-top:1px solid var(--line)}
-.terminal-head,.terminal-run{display:flex;align-items:center;gap:8px;padding:5px 9px;border-bottom:1px solid var(--line)}
-.terminal-cwd{width:220px;background:#0e1114;color:var(--ink);border:1px solid var(--line);border-radius:4px;padding:5px}
-.command-input{flex:1;min-width:0;background:#0e1114;color:var(--ink);border:1px solid var(--line);border-radius:4px;padding:6px}
-.terminal-output{margin:0;padding:10px;overflow:auto;white-space:pre-wrap;color:#d7dee6;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
-.agent-prompt{width:100%;min-height:170px;resize:vertical;background:#101316;color:var(--ink);border:1px solid var(--line);border-radius:6px;padding:8px}
-@media (max-width:860px){
-  .ide-shell{grid-template-columns:40px minmax(190px,42vw) 1fr}
-  .workbench{grid-template-rows:42px 34px minmax(0,1fr) 180px}
-  .terminal-cwd{width:120px}
-}
+html,body{width:100%;height:100%;margin:0;overflow:hidden;background:var(--editor);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:13px;letter-spacing:0}
+button,input,select,textarea{font:inherit;letter-spacing:0}
+button{color:inherit}.is-hidden{display:none!important}
+.icon-button{display:inline-grid;place-items:center;width:28px;height:28px;padding:0;border:0;background:transparent;color:var(--ink);border-radius:4px;cursor:pointer}.icon-button:hover{background:var(--hover);color:var(--bright)}.icon-button.primary{background:var(--accent);color:white}.icon-button:disabled{opacity:.4;cursor:default}
+.button{display:inline-flex;align-items:center;justify-content:center;gap:7px;min-height:28px;padding:4px 12px;border:1px solid transparent;border-radius:2px;background:#3a3d41;color:var(--bright);cursor:pointer}.button:hover{background:#45494e}.button.primary{background:var(--accent);color:#fff}.button.primary:hover{background:#026ec1}.button:disabled{opacity:.45;cursor:not-allowed}
+input,select,textarea{border:1px solid transparent;border-radius:2px;background:var(--input);color:var(--bright);outline:none}input:focus,select:focus,textarea:focus{border-color:var(--focus)}input::placeholder,textarea::placeholder{color:#a0a0a0}select{height:25px;padding:0 6px}
+.auth-gate{position:fixed;inset:0;z-index:1000;display:grid;place-items:center;background:#181818}.auth-dialog{width:min(360px,calc(100vw - 32px));padding:36px 34px 32px;border:1px solid var(--line-light);background:#202020;box-shadow:0 18px 58px rgba(0,0,0,.42)}.auth-mark{display:grid;place-items:center;width:44px;height:44px;margin:0 auto 16px;background:#007acc;color:white}.auth-mark .codicon{font-size:28px}.auth-dialog h1{margin:0;text-align:center;color:var(--bright);font-size:22px;font-weight:500}.auth-dialog p{margin:7px 0 24px;text-align:center;color:var(--muted)}.auth-dialog form{display:grid;gap:7px}.auth-dialog label{margin-top:5px;font-size:12px}.auth-dialog input{height:32px;padding:5px 8px}.auth-dialog .button{margin-top:12px;height:32px}.auth-message{min-height:18px;margin-top:14px;color:var(--danger);font-size:12px;line-height:1.45}
+.ide-shell{height:100vh;display:grid;grid-template-rows:var(--title-height) minmax(0,1fr) var(--status-height);overflow:hidden}.title-bar{display:grid;grid-template-columns:30px 26px auto minmax(220px,560px) 1fr;align-items:center;gap:2px;padding:0 7px;background:var(--title);border-bottom:1px solid #151515;user-select:none}.product-mark{display:grid;place-items:center;color:#23a8f2}.product-mark .codicon{font-size:20px}.menu-bar{display:flex;align-items:center;gap:0;min-width:0}.menu-bar button{height:27px;padding:0 7px;border:0;border-radius:4px;background:transparent;color:var(--ink);cursor:pointer}.menu-bar button:hover{background:var(--hover)}.command-center{justify-self:center;width:min(100%,460px);height:25px;display:flex;align-items:center;justify-content:center;gap:7px;border:1px solid #3c3c3c;border-radius:5px;background:#242424;color:#d4d4d4;cursor:pointer;box-shadow:inset 0 0 0 1px rgba(255,255,255,.02)}.command-center:hover{background:#2a2a2a;border-color:#555}.layout-controls{justify-self:end;display:flex;align-items:center;gap:1px}
+.workbench-grid{min-height:0;display:grid;grid-template-columns:var(--activity-width) var(--sidebar-width) minmax(260px,1fr) var(--secondary-width);background:var(--editor)}.ide-shell.primary-hidden .workbench-grid{grid-template-columns:var(--activity-width) 0 minmax(260px,1fr) var(--secondary-width)}.ide-shell.secondary-hidden .workbench-grid{grid-template-columns:var(--activity-width) var(--sidebar-width) minmax(260px,1fr) 0}.ide-shell.primary-hidden.secondary-hidden .workbench-grid{grid-template-columns:var(--activity-width) 0 minmax(260px,1fr) 0}
+.activity-bar{min-width:0;display:flex;flex-direction:column;justify-content:space-between;background:var(--activity);border-right:1px solid var(--line);user-select:none}.activity-top,.activity-bottom{display:flex;flex-direction:column;align-items:stretch}.activity-button{position:relative;display:grid;place-items:center;width:47px;height:48px;padding:0;border:0;border-left:2px solid transparent;background:transparent;color:#858585;cursor:pointer}.activity-button .codicon{font-size:24px}.activity-button:hover{color:#d7d7d7}.activity-button.is-active{border-left-color:#fff;color:#fff}.activity-badge{position:absolute;right:5px;bottom:4px;min-width:16px;height:16px;padding:0 4px;border-radius:8px;background:#007acc;color:#fff;font:10px/16px sans-serif;text-align:center}.activity-badge:empty{display:none}
+.primary-sidebar,.secondary-sidebar{min-width:0;overflow:hidden;background:var(--sidebar);border-right:1px solid var(--line)}.secondary-sidebar{border-right:0;border-left:1px solid var(--line);display:grid;grid-template-rows:35px auto auto minmax(0,1fr) auto}.primary-hidden .primary-sidebar,.secondary-hidden .secondary-sidebar{visibility:hidden}.side-view{height:100%;min-height:0;display:none;grid-template-rows:35px auto auto minmax(0,1fr);overflow:hidden}.side-view.is-active{display:grid}.side-view[data-side-view="explorer"]{grid-template-rows:35px auto auto 22px minmax(0,1fr)}.side-view[data-side-view="search"],.side-view[data-side-view="extensions"]{grid-template-rows:35px auto auto minmax(0,1fr)}.side-view[data-side-view="scm"]{grid-template-rows:35px auto minmax(0,1fr)}.side-view[data-side-view="run"]{grid-template-rows:35px auto auto 22px minmax(0,1fr) 22px minmax(0,1fr)}.side-header{height:35px;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:0 8px 0 19px;color:#bbbbbb;text-transform:uppercase;font-size:11px;white-space:nowrap}.header-actions{display:flex;align-items:center;gap:0}.side-header .icon-button{width:24px;height:24px}.workspace-pickers{display:grid;grid-template-columns:minmax(0,1fr);gap:3px;padding:0 8px 7px}.workspace-pickers select{width:100%}.open-editors{max-height:132px;overflow:auto}.section-label{display:flex;align-items:center;gap:3px;height:22px;padding:0 5px;border-top:1px solid var(--line);color:#d4d4d4;text-transform:uppercase;font-size:11px}.section-label strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.section-label .codicon{font-size:14px}
+.tree,.side-list{min-height:0;overflow:auto;padding-bottom:12px}.tree-row,.list-row{height:22px;display:flex;align-items:center;gap:5px;padding-right:6px;white-space:nowrap;cursor:default}.tree-row:hover,.list-row:hover{background:var(--hover)}.tree-row.is-active,.list-row.is-active{background:var(--selection)}.tree-twist{flex:0 0 16px;width:16px;height:20px;padding:0;border:0;background:transparent;color:#c5c5c5}.tree-icon{flex:0 0 16px;width:16px;text-align:center;color:#b9b9b9}.tree-icon.folder{color:#dcb67a}.tree-icon.python{color:#4b8bbe}.tree-icon.javascript{color:#f0db4f}.tree-icon.json{color:#e6ca57}.tree-icon.markdown{color:#519aba}.tree-name,.list-main{min-width:0;overflow:hidden;text-overflow:ellipsis}.tree-meta,.list-meta{margin-left:auto;color:var(--muted);font-size:11px}.open-editor-row{height:22px;display:flex;align-items:center;gap:5px;padding:0 8px 0 20px}.open-editor-row:hover{background:var(--hover)}.open-editor-row.is-active{background:var(--selection)}.open-editor-row span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dirty-mark{color:#fff}
+.search-form{display:grid;gap:5px;padding:0 8px 8px}.search-form>input,.extension-search input{width:100%;height:27px;padding:3px 6px}.input-with-actions{display:grid;grid-template-columns:minmax(0,1fr) 28px 28px;border:1px solid transparent;background:var(--input)}.input-with-actions:focus-within{border-color:var(--focus)}.input-with-actions input{min-width:0;height:27px;padding:3px 6px;border:0;background:transparent}.mini-toggle{height:25px;padding:0 4px;border:0;background:transparent;color:var(--ink);font-size:11px;cursor:pointer}.mini-toggle:hover,.mini-toggle.is-active{background:#4b4b4b;color:white}.side-summary{min-height:22px;padding:3px 12px;color:var(--muted);font-size:11px}.result-group{padding:4px 8px;font-weight:600;color:#d4d4d4}.result-line{min-height:23px;padding:3px 8px 3px 22px;white-space:normal}.result-line code{color:#d7d7d7}.result-location{color:#75beff;font-size:11px}.scm-branch{padding:4px 12px 8px;color:#d4d4d4}.scm-row .scm-code{margin-left:auto;font-weight:600}.scm-code.modified{color:#e2c08d}.scm-code.untracked{color:#73c991}.scm-code.deleted{color:#f48771}.run-button{margin:0 10px 7px}.toolchains{overflow:auto}.tool-row{padding:6px 10px;border-bottom:1px solid #242424}.tool-row strong{font-weight:400;color:#d4d4d4}.tool-row span{display:block;margin-top:2px;color:var(--muted);font-size:11px;white-space:normal}.tool-state{float:right;color:var(--success)}.tool-state.missing{color:var(--faint)}.extension-search{display:grid;grid-template-columns:minmax(0,1fr) 28px;gap:4px;padding:0 8px 8px}.extension-row{min-height:72px;display:grid;grid-template-columns:42px minmax(0,1fr) auto;gap:8px;padding:8px}.extension-icon{display:grid;place-items:center;width:42px;height:42px;background:#292929;color:#75beff}.extension-icon .codicon{font-size:24px}.extension-info{min-width:0}.extension-title{color:#ddd;font-weight:600;overflow:hidden;text-overflow:ellipsis}.extension-description{margin-top:3px;color:#aaa;font-size:11px;line-height:1.35;white-space:normal}.extension-meta{margin-top:4px;color:#858585;font-size:10px}.extension-row .button{align-self:start;min-height:24px;padding:2px 8px;font-size:11px}
+.editor-area{min-width:0;min-height:0;display:grid;grid-template-rows:minmax(120px,1fr) var(--panel-height);overflow:hidden;background:var(--editor)}.panel-hidden .editor-area{grid-template-rows:minmax(120px,1fr) 0}.panel-maximized .editor-area{grid-template-rows:80px minmax(0,1fr)}.editor-grid{min-width:0;min-height:0;display:grid;grid-template-columns:minmax(0,1fr);overflow:hidden}.editor-grid.split{grid-template-columns:minmax(180px,1fr) minmax(180px,1fr)}.editor-group{min-width:0;min-height:0;display:none;grid-template-rows:35px 22px minmax(0,1fr);border-right:1px solid var(--line);background:var(--editor)}.editor-group.is-active,.editor-grid.split .editor-group{display:grid}.editor-tabs{display:flex;min-width:0;overflow-x:auto;overflow-y:hidden;background:var(--tabs);border-bottom:1px solid var(--line)}.editor-tab{position:relative;flex:0 0 auto;min-width:120px;max-width:220px;height:34px;display:flex;align-items:center;gap:7px;padding:0 7px 0 10px;border-right:1px solid var(--line);background:#181818;color:#969696;cursor:default}.editor-tab.is-active{background:var(--editor);color:#fff}.editor-tab.is-active:before{content:"";position:absolute;left:0;right:0;top:0;height:1px;background:#75beff}.editor-tab-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.editor-tab .close-tab{margin-left:auto;flex:0 0 20px;width:20px;height:20px}.editor-tab:not(:hover):not(.is-active) .close-tab{visibility:hidden}.breadcrumbs{height:22px;display:flex;align-items:center;gap:2px;padding:0 9px;color:#aaa;white-space:nowrap;overflow:hidden}.breadcrumb-item{display:flex;align-items:center;gap:3px;min-width:0}.breadcrumb-item span{overflow:hidden;text-overflow:ellipsis}.breadcrumb-action{flex:0 0 22px;width:22px;height:20px;margin-left:auto;border:0;background:transparent;color:#aaa;cursor:pointer}.breadcrumb-action:hover{background:var(--hover);color:#fff}.editor-host{position:relative;min-width:0;min-height:0;overflow:hidden;background:var(--editor)}.monaco-host{position:absolute;inset:0}.fallback-editor{display:none;position:absolute;inset:0;width:100%;height:100%;resize:none;padding:10px 12px;border:0;background:var(--editor);color:#d4d4d4;font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;tab-size:2}.fallback-mode .fallback-editor.is-active{display:block}.empty-editor{position:absolute;inset:0;display:grid;place-content:center;gap:26px;color:#8a8a8a;text-align:center;background:var(--editor)}.empty-editor.is-hidden{display:none}.empty-logo .codicon{font-size:96px;color:#2b2b2b}.empty-actions{display:grid;grid-template-columns:auto auto;gap:9px 28px;text-align:left}.empty-actions button{border:0;background:transparent;color:#75beff;text-align:left;cursor:pointer}.empty-actions button:hover{text-decoration:underline}.artifact-preview{position:absolute;inset:0;z-index:5;display:grid;grid-template-rows:32px minmax(0,1fr);background:#181818}.artifact-toolbar{display:flex;align-items:center;gap:4px;padding:0 7px;border-bottom:1px solid var(--line);background:#1d1d1d}.artifact-toolbar strong{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:400}.artifact-toolbar .artifact-meta{margin-left:4px;color:var(--muted);font-size:11px}.artifact-toolbar .icon-button:first-of-type{margin-left:auto}.artifact-stage{min-width:0;min-height:0;overflow:auto;display:grid;place-items:center;background:#202020}.artifact-stage iframe{width:100%;height:100%;border:0;background:#fff}.artifact-stage img{display:block;max-width:100%;max-height:100%;object-fit:contain}.artifact-stage video{width:min(100%,1100px);max-height:100%;background:#000}.artifact-stage audio{width:min(680px,calc(100% - 32px))}.artifact-markdown{justify-self:stretch;align-self:stretch;overflow:auto;padding:28px max(24px,8%);background:#1f1f1f;color:#d4d4d4;font:14px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.artifact-markdown h1,.artifact-markdown h2,.artifact-markdown h3{color:#f0f0f0;font-weight:500}.artifact-markdown pre,.artifact-markdown code{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}.artifact-markdown pre{overflow:auto;padding:12px;background:#181818}.artifact-markdown img{max-width:100%;height:auto}.artifact-markdown a{color:#75beff}.artifact-binary{display:grid;gap:10px;place-items:center;text-align:center;color:#bbb}.artifact-binary .codicon{font-size:56px;color:#777}.artifact-binary small{color:var(--muted)}
+.bottom-panel{min-width:0;min-height:0;display:grid;grid-template-rows:35px minmax(0,1fr);border-top:1px solid var(--line);background:var(--panel);overflow:hidden}.panel-hidden .bottom-panel{visibility:hidden}.panel-header{display:flex;align-items:center;justify-content:space-between;padding:0 7px 0 12px}.panel-tabs{display:flex;align-items:stretch;height:100%;gap:20px}.panel-tabs button{position:relative;padding:0 0;border:0;background:transparent;color:#a7a7a7;text-transform:uppercase;font-size:11px;cursor:pointer}.panel-tabs button:hover{color:#fff}.panel-tabs button.is-active{color:#fff}.panel-tabs button.is-active:after{content:"";position:absolute;left:0;right:0;bottom:4px;height:1px;background:#e7e7e7}.panel-tabs b{font-weight:400;color:#aaa}.panel-body{min-width:0;min-height:0;overflow:hidden}.panel-content{position:relative;display:none;width:100%;height:100%;overflow:auto}.panel-content.is-active{display:block}.panel-content pre{height:100%;margin:0;padding:7px 12px;overflow:auto;color:#ccc;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;white-space:pre-wrap}.panel-content pre[data-empty="true"]{display:grid;place-items:center;color:var(--muted);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.panel-empty{display:grid;min-height:100%;place-items:center;padding:16px;color:var(--muted);text-align:center}.terminal-host{width:100%;height:100%;padding:4px 8px}.terminal-host:not(:empty)+.panel-empty{display:none}.terminal-fallback{display:none!important}.terminal-fallback.is-active{display:block!important}.data-table{height:100%;font-size:12px}.problem-row{min-height:23px;display:grid;grid-template-columns:18px minmax(0,1fr) auto;align-items:center;gap:5px;padding:2px 10px}.problem-row:hover{background:var(--hover)}.problem-row.error .codicon{color:var(--danger)}.problem-row.warning .codicon{color:var(--warning)}
+.agent-context{min-height:30px;padding:5px 9px;border-bottom:1px solid var(--line);color:#aaa;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.agent-todo{min-width:0;max-height:190px;border-bottom:1px solid var(--line);background:#1b1b1b}.agent-todo-header{width:100%;height:28px;display:flex;align-items:center;gap:5px;padding:0 8px;border:0;background:#202020;color:#ccc;cursor:pointer;text-align:left}.agent-todo-header:hover{background:var(--hover)}.agent-todo-header strong{font-size:11px;font-weight:600}.agent-todo-count{margin-left:auto;color:#858585;font-size:10px}.agent-todo.is-collapsed .agent-todo-header .codicon{transform:rotate(-90deg)}.agent-todo.is-collapsed .agent-todo-body{display:none}.agent-todo-body{max-height:160px;overflow:auto;padding:5px 8px 7px}.agent-progress-row{display:grid;grid-template-columns:14px minmax(0,1fr);gap:4px;padding:2px 0;color:#aaa;font-size:11px;line-height:1.35}.agent-progress-row.done{color:#89d185}.agent-progress-row.active{color:#75beff}.agent-messages{min-height:0;overflow:auto;padding:10px}.agent-message{margin:0 0 14px;line-height:1.5;white-space:pre-wrap}.agent-message.user{padding:8px 9px;background:#282828;border-left:2px solid #3794ff}.agent-message.system{color:#aaa}.agent-message.error{color:#f48771}.agent-composer{padding:8px;border-top:1px solid var(--line)}.agent-composer textarea{width:100%;min-height:76px;max-height:180px;resize:vertical;padding:7px}.agent-actions{height:31px;display:flex;align-items:center;gap:4px}.agent-actions #agentStatus{min-width:0;margin-right:auto;color:#aaa;font-size:11px;overflow:hidden;text-overflow:ellipsis}.agent-actions .primary{width:27px;height:27px}.agent-model-button{position:relative}.agent-model-button small{position:absolute;right:-1px;bottom:-2px;min-width:17px;padding:0 2px;border-radius:5px;background:#04395e;color:#9cdcfe;font:8px/10px sans-serif}.agent-model-button small:empty{display:none}.agent-attachments{display:flex;gap:4px;overflow-x:auto;padding:0 0 6px}.agent-attachment{flex:0 0 auto;max-width:220px;height:23px;display:flex;align-items:center;gap:4px;padding:0 3px 0 7px;border:1px solid #3a3a3a;background:#252526;color:#ccc;font-size:10px}.agent-attachment span:nth-child(2){max-width:155px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.agent-attachment button{width:18px;height:18px}
+.agent-message.assistant{padding-left:9px;border-left:2px solid #89d185;color:#ddd}.agent-message.tool,.agent-message.file_patch,.agent-message.command{padding:0;border:1px solid #353535;border-left:2px solid #cca700;background:#202020;color:#bbb;font:11px/1.5 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;white-space:normal}.agent-message.file_patch{border-left-color:#89d185}.agent-message.command{border-left-color:#75beff}.agent-message .agent-meta{display:block;margin-bottom:4px;color:#75beff;font:10px/1.3 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;text-transform:uppercase}.agent-tool-head{min-height:31px;display:flex;align-items:center;gap:6px;padding:5px 7px;cursor:pointer}.agent-tool-head:hover{background:#292929}.agent-tool-head .codicon{color:#c5c5c5}.agent-tool-title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#ddd;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.agent-tool-state{margin-left:auto;color:#9a9a9a;font:10px/1.3 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;white-space:nowrap}.agent-tool-state.success,.diff-add{color:#89d185}.agent-tool-state.error,.diff-del{color:#f48771}.agent-tool-body{display:none;border-top:1px solid #343434}.agent-message.is-expanded .agent-tool-body{display:block}.agent-tool-output{max-height:320px;margin:0;padding:8px;overflow:auto;color:#bcbcbc;background:#191919;white-space:pre-wrap;overflow-wrap:anywhere}.agent-tool-actions{display:flex;align-items:center;gap:5px;padding:6px 7px;border-top:1px solid #303030}.agent-tool-actions button{min-height:23px;padding:2px 7px;font-size:10px}.agent-diff-stats{display:flex;gap:7px;margin-left:auto}.agent-diff{max-height:360px;overflow:auto;padding:6px 0;background:#181818}.agent-diff-line{display:grid;grid-template-columns:13px minmax(0,1fr);padding:0 7px;white-space:pre-wrap;overflow-wrap:anywhere}.agent-diff-line.add{background:rgba(35,134,54,.18);color:#b7e1bf}.agent-diff-line.del{background:rgba(248,81,73,.15);color:#efb0aa}.agent-diff-line.hunk{color:#75beff;background:rgba(56,139,253,.1)}.agent-model-menu{width:min(360px,calc(100vw - 8px));max-height:min(440px,70vh);overflow:auto}.agent-model-menu button span:last-child{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.agent-model-summary{padding:7px 10px;border-bottom:1px solid #454545;color:#aaa;font-size:10px}.agent-model-menu button.is-active{color:#9cdcfe}.pairing-code{margin:10px 0;padding:12px;border:1px solid var(--line-light);background:#181818;color:#75beff;text-align:center;font:600 18px/1.2 ui-monospace,SFMono-Regular,Menlo,monospace}.auth-secondary{margin-top:12px;color:#aaa;text-align:center;font-size:11px}
+.status-bar{display:flex;align-items:center;justify-content:space-between;min-width:0;background:var(--status);color:#fff;font-size:12px;user-select:none}.status-left,.status-right{height:100%;display:flex;align-items:stretch;min-width:0}.status-bar button{height:100%;display:flex;align-items:center;gap:4px;padding:0 6px;border:0;background:transparent;color:#fff;white-space:nowrap;cursor:pointer}.status-bar button:hover{background:var(--status-hover)}.status-message{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:2px 8px;color:#fff}.status-right{justify-content:flex-end}
+.overlay{position:fixed;inset:0;z-index:500;background:rgba(0,0,0,.28)}.palette{width:min(700px,calc(100vw - 28px));margin:44px auto 0;background:#252526;border:1px solid #454545;box-shadow:0 10px 32px rgba(0,0,0,.52)}.palette-input-row{height:40px;display:grid;grid-template-columns:24px minmax(0,1fr);align-items:center;margin:6px;border:1px solid var(--focus);background:var(--input);padding:0 7px}.palette-input-row input{height:100%;border:0;background:transparent;font-size:14px}.palette-results{max-height:min(440px,65vh);overflow:auto;padding-bottom:5px}.palette-row{height:34px;display:flex;align-items:center;gap:8px;padding:0 10px;cursor:default}.palette-row.is-active,.palette-row:hover{background:#04395e}.palette-row .keybinding{margin-left:auto;color:#aaa}.modal{width:min(620px,calc(100vw - 30px));max-height:calc(100vh - 80px);margin:48px auto;background:#252526;border:1px solid #454545;box-shadow:0 12px 40px rgba(0,0,0,.55);overflow:auto}.modal>header{height:42px;display:flex;align-items:center;justify-content:space-between;padding:0 10px 0 16px;border-bottom:1px solid var(--line)}.modal h2{margin:0;color:#ddd;font-size:15px;font-weight:500}.modal-form{display:grid;gap:8px;padding:14px}.modal-form input{height:30px;padding:5px 7px}.modal-actions{display:flex;justify-content:flex-end;gap:7px;margin-top:8px}.account-list{padding:8px}.account-row{min-height:38px;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:8px;padding:4px 7px;border-bottom:1px solid var(--line)}.account-row small{display:block;color:#999}.menu-popup{position:fixed;z-index:700;min-width:210px;padding:4px;background:#252526;border:1px solid #454545;box-shadow:0 8px 22px rgba(0,0,0,.5)}.menu-popup button{width:100%;height:27px;display:flex;align-items:center;gap:8px;padding:0 10px;border:0;background:transparent;color:#ddd;text-align:left;cursor:pointer}.menu-popup button:hover{background:#04395e}.menu-popup .separator{height:1px;margin:4px;background:#454545}.menu-popup .shortcut{margin-left:auto;color:#aaa}.toast-host{position:fixed;z-index:900;right:12px;bottom:34px;width:min(390px,calc(100vw - 24px));display:grid;gap:7px}.toast{display:grid;grid-template-columns:20px minmax(0,1fr) 22px;gap:7px;align-items:start;padding:10px;background:#252526;border:1px solid #454545;box-shadow:0 5px 18px rgba(0,0,0,.42)}.toast.error{border-left:3px solid var(--danger)}.toast.warning{border-left:3px solid var(--warning)}.toast.success{border-left:3px solid var(--success)}.toast button{border:0;background:transparent;color:#aaa;cursor:pointer}
+@media(max-width:1080px){:root{--sidebar-width:250px;--secondary-width:280px}.menu-bar button:nth-child(n+5){display:none}.status-right button:nth-child(-n+3){display:none}}
+@media(max-width:820px){:root{--sidebar-width:min(300px,calc(100vw - 48px));--secondary-width:min(320px,calc(100vw - 48px));--panel-height:190px}.title-bar{grid-template-columns:28px 25px 1fr auto}.menu-bar{display:none}.command-center{width:100%;min-width:0}.workbench-grid{position:relative;grid-template-columns:48px minmax(0,1fr)!important}.primary-sidebar,.secondary-sidebar{position:absolute;z-index:90;top:0;bottom:0;width:var(--sidebar-width);box-shadow:5px 0 18px rgba(0,0,0,.42)}.primary-sidebar{left:48px}.secondary-sidebar{right:0;width:var(--secondary-width);box-shadow:-5px 0 18px rgba(0,0,0,.42)}.primary-hidden .primary-sidebar,.secondary-hidden .secondary-sidebar{display:none}.editor-area{grid-column:2}.editor-grid.split{grid-template-columns:minmax(0,1fr)}.editor-grid.split .editor-group:not(.is-active){display:none}.layout-controls #togglePanelBtn{display:none}.empty-actions{grid-template-columns:auto}.status-right button{display:none!important}.status-right #accountStatus,.status-right #notificationsBtn{display:flex!important}.panel-tabs{gap:12px}.panel-tabs button{font-size:10px}.panel-header .header-actions .icon-button:nth-child(-n+2){display:none}}
+@media(max-width:480px){.title-bar{grid-template-columns:28px 22px minmax(0,1fr) auto;padding:0 3px}.layout-controls button:not(#toggleSecondaryBtn){display:none}.command-center span:last-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.activity-button{width:43px}.workbench-grid{grid-template-columns:44px minmax(0,1fr)!important}.primary-sidebar{left:44px}.status-left #syncStatus,.status-left #errorStatus{display:none}.panel-tabs{gap:9px}.panel-tabs button{max-width:62px;overflow:hidden;text-overflow:ellipsis}.auth-dialog{padding:28px 22px}.extension-row{grid-template-columns:36px minmax(0,1fr)}.extension-icon{width:36px;height:36px}.extension-row .button{grid-column:2;justify-self:start}}
 """
 
 IDE_JS = """
@@ -87526,6 +93999,304 @@ function bind(){
 window.addEventListener('DOMContentLoaded',async()=>{bind();try{await refreshConfig();setStatus('ready')}catch(err){setStatus(err.message,true)}});
 """
 
+IDE_JS = r"""
+const E=id=>document.getElementById(id);
+class ApiError extends Error{constructor(message,status,code,data){super(message);this.status=status;this.code=code||'';this.data=data||{}}}
+const S={
+  csrf:'',config:null,account:null,capabilities:{},sessions:[],roots:[],activeSession:'',activeRoot:'session',
+  treeCache:new Map(),openFiles:new Map(),activeByGroup:['',''],activeGroup:0,monaco:null,editors:[],diffEditors:[],models:new Map(),historyOriginalModels:new Map(),historyDecorations:new Map(),viewStates:new Map(),suppressEditorChange:false,codeHistoryMode:'all',
+  activeView:'explorer',panel:'terminal',primaryVisible:true,secondaryVisible:true,panelVisible:true,panelMaximized:false,
+  diagnostics:[],searchResults:[],scm:null,tasks:[],installedExtensions:[],extensionWorkers:new Map(),
+  terminal:null,terminalStarting:false,terminalPromise:null,terminalWidget:null,terminalFit:null,terminalOffset:0,terminalPoll:null,stateTimer:null,diagnosticTimer:null,paletteItems:[],paletteIndex:0,
+  debug:null,debugSeq:0,debugPoll:null,debugFile:null,
+  agentPoll:null,agentPollBusy:false,agentPollRequested:false,agentState:null,agentRendered:new Set(),agentToolCards:new Map(),agentOperationSeq:0,agentEventSeq:0,agentWasBusy:false,agentSession:'',agentSubmitting:false,agentTreeTimer:null,agentFileRefresh:new Set(),agentAttachments:[],agentModelCatalog:null,agentTodoCollapsed:false,workspaceRefreshBusy:false,renderingAgentState:false,devicePoll:null,agentEvents:null,agentEventsConnected:false,agentEventReconnect:null
+};
+const HTML_ESCAPE={'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'};
+const escapeHtml=value=>String(value??'').replace(/[&<>"']/g,ch=>HTML_ESCAPE[ch]);
+const qs=value=>encodeURIComponent(String(value??''));
+const isWrite=method=>!['GET','HEAD','OPTIONS'].includes(String(method||'GET').toUpperCase());
+async function api(path,opts={}){
+  const method=String(opts.method||'GET').toUpperCase();
+  const headers=Object.assign({},opts.headers||{});
+  if(opts.body!=null&&!headers['Content-Type'])headers['Content-Type']='application/json';
+  if(isWrite(method)&&S.csrf)headers['X-CSRF-Token']=S.csrf;
+  const res=await fetch(path,Object.assign({credentials:'same-origin',headers},opts));
+  const text=await res.text();let data={};
+  try{data=text?JSON.parse(text):{}}catch{data={error:text||res.statusText}}
+  if(!res.ok)throw new ApiError(data.error||res.statusText,res.status,data.code,data);
+  return data;
+}
+function setStatus(message,tone=''){E('statusMessage').textContent=String(message||'Ready');E('statusMessage').dataset.tone=tone}
+function toast(message,tone='error',timeout=5000){
+  const row=document.createElement('div');row.className='toast '+tone;
+  const icon=tone==='success'?'pass':tone==='warning'?'warning':'error';
+  row.innerHTML=`<span class="codicon codicon-${icon}"></span><div>${escapeHtml(message)}</div><button aria-label="Close"><span class="codicon codicon-close"></span></button>`;
+  row.querySelector('button').onclick=()=>row.remove();E('toastHost').appendChild(row);if(timeout)setTimeout(()=>row.remove(),timeout);
+}
+function appendPanelLog(id,text){const out=E(id);if(out.dataset.empty==='true'){out.textContent='';out.dataset.empty='false'}out.textContent+=(out.textContent?'\n':'')+String(text||'');out.scrollTop=out.scrollHeight}
+function logOutput(text){appendPanelLog('outputLog',text)}
+function logOutputChunk(text){const out=E('outputLog');if(out.dataset.empty==='true'){out.textContent='';out.dataset.empty='false'}out.textContent+=String(text||'');out.scrollTop=out.scrollHeight}
+function logDebug(text){appendPanelLog('debugConsole',text)}
+function activeFile(group=S.activeGroup){return S.openFiles.get(S.activeByGroup[group])||null}
+function rootQuery(root=S.activeRoot){return `root_id=${qs(root||'session')}`}
+function activeDir(){const file=activeFile();if(!file)return '';const index=file.path.lastIndexOf('/');return index<0?'':file.path.slice(0,index)}
+function fileKey(root,path,session=S.activeSession){return `${session}::${root}::${path}`}
+function formatFileSize(bytes){const value=Math.max(0,Number(bytes||0));if(value<1024)return `${value.toLocaleString()} B`;if(value<1024*1024)return `${(value/1024).toFixed(value<10240?1:0)} KB`;if(value<1024*1024*1024)return `${(value/(1024*1024)).toFixed(1)} MB`;return `${(value/(1024*1024*1024)).toFixed(1)} GB`}
+function languageFor(path){const name=String(path||'').toLowerCase();const ext=name.includes('.')?name.slice(name.lastIndexOf('.')):'';return ({'.py':'python','.pyi':'python','.js':'javascript','.mjs':'javascript','.cjs':'javascript','.jsx':'javascript','.ts':'typescript','.tsx':'typescript','.html':'html','.htm':'html','.css':'css','.scss':'scss','.less':'less','.json':'json','.jsonc':'json','.md':'markdown','.yaml':'yaml','.yml':'yaml','.xml':'xml','.sh':'shell','.zsh':'shell','.bash':'shell','.sql':'sql','.c':'c','.h':'c','.cpp':'cpp','.cc':'cpp','.hpp':'cpp','.java':'java','.go':'go','.rs':'rust','.rb':'ruby','.php':'php','.swift':'swift','.kt':'kotlin','.toml':'toml'}[ext]||'plaintext')}
+function fileIconClass(path,type='file'){if(type==='dir')return 'codicon-folder folder';const lang=languageFor(path);return `codicon-file ${lang}`}
+function stableUri(file){return `clouds://${encodeURIComponent(file.session_id)}/${encodeURIComponent(file.root_id)}/${file.path.split('/').map(encodeURIComponent).join('/')}`}
+function isArtifactFile(file){return !!file&&(file.binary||file.preview===true)}
+function canPreviewFile(file){return !!file&&['image','video','audio','pdf','html','markdown','csv','excel','presentation','document'].includes(file.previewKind)}
+function artifactUrl(file,kind='raw'){const base=`/api/ide/sessions/${qs(file.session_id)}/workspace/${kind}?root_id=${qs(file.root_id)}&path=${qs(file.path)}`;return `${base}&revision=${qs(file.revision||Date.now())}`}
+function htmlArtifactUrl(file){return `/api/ide/sessions/${qs(file.session_id)}/workspace/html/${file.path.split('/').map(qs).join('/')}?root_id=${qs(file.root_id)}&revision=${qs(file.revision||Date.now())}`}
+function previewKindForPath(path){const ext=(String(path||'').toLowerCase().match(/\.[^.\/]+$/)||[''])[0];if(['.png','.jpg','.jpeg','.webp','.gif','.bmp','.tiff','.tif','.svg','.avif','.heic','.heif'].includes(ext))return'image';if(['.mp4','.mov','.avi','.mkv','.webm','.m4v','.mpeg','.mpg','.3gp'].includes(ext))return'video';if(['.mp3','.wav','.m4a','.aac','.flac','.ogg','.oga','.opus'].includes(ext))return'audio';if(ext==='.pdf')return'pdf';if(['.xlsx','.xls','.xlsm'].includes(ext))return'excel';if(['.pptx','.ppt','.pptm'].includes(ext))return'presentation';if(['.docx','.doc','.docm'].includes(ext))return'document';return''}
+function loadScript(src){return new Promise((resolve,reject)=>{if(document.querySelector(`script[data-src="${src}"]`))return resolve();const script=document.createElement('script');script.src=src;script.dataset.src=src;script.onload=resolve;script.onerror=()=>reject(new Error(`Unable to load ${src}`));document.head.appendChild(script)})}
+async function initMonaco(){
+  try{
+    await loadScript('/assets/js_lib/monaco/min/vs/loader.js');
+    if(typeof window.require!=='function')throw new Error('Monaco loader unavailable');
+    window.MonacoEnvironment={getWorker:()=>new Worker('/assets/ide-monaco-worker.js')};
+    window.require.config({paths:{vs:'/assets/js_lib/monaco/min/vs'}});
+    await new Promise((resolve,reject)=>window.require(['vs/editor/editor.main'],resolve,reject));
+    S.monaco=window.monaco;
+    S.monaco.editor.defineTheme('clouds-dark',{base:'vs-dark',inherit:true,rules:[],colors:{'editor.background':'#1f1f1f','editorLineNumber.foreground':'#6e7681','editorLineNumber.activeForeground':'#c6c6c6','editor.selectionBackground':'#264f78','editor.inactiveSelectionBackground':'#3a3d41'}});
+    const commonEditorOptions={theme:'clouds-dark',automaticLayout:true,fontSize:13,fontFamily:'SFMono-Regular, Menlo, Monaco, Consolas, monospace',fontLigatures:false,lineHeight:20,minimap:{enabled:true},scrollBeyondLastLine:false,smoothScrolling:true,renderWhitespace:'selection',bracketPairColorization:{enabled:true},guides:{bracketPairs:true,indentation:true},padding:{top:8},tabSize:2,insertSpaces:true,wordWrap:'off',lineNumbersMinChars:5,lineDecorationsWidth:8};
+    for(let group=0;group<2;group++){
+      const editor=S.monaco.editor.create(E(`editor${group}`),{...commonEditorOptions});
+      const diffEditor=S.monaco.editor.createDiffEditor(E(`diffEditor${group}`),{...commonEditorOptions,renderSideBySide:false,readOnly:false,originalEditable:false,renderIndicators:false,renderGutterMenu:false,renderMarginRevertIcon:false,compactMode:true,diffCodeLens:false,enableSplitViewResizing:false});
+      editor.onDidFocusEditorText(()=>{S.activeGroup=group;document.querySelectorAll('.editor-group').forEach((el,i)=>el.classList.toggle('is-active',i===group||E('editorGrid').classList.contains('split')));updateStatusBar()});
+      editor.onDidChangeModelContent(()=>{if(S.suppressEditorChange)return;const file=activeFile(group);if(file){file.dirty=true;renderTabs();renderOpenEditors();scheduleDiagnostics(file);scheduleStateSave()}});
+      diffEditor.getOriginalEditor().updateOptions({lineNumbers:'off',lineNumbersMinChars:0,glyphMargin:false,folding:false,lineDecorationsWidth:0});
+      diffEditor.getModifiedEditor().updateOptions({lineNumbers:'on',lineNumbersMinChars:5,lineDecorationsWidth:24});
+      protectDeletedReviewZones(E(`diffEditor${group}`));
+      editor.onDidChangeCursorPosition(updateStatusBar);diffEditor.getModifiedEditor().onDidChangeCursorPosition(updateStatusBar);S.editors[group]=editor;S.diffEditors[group]=diffEditor;
+    }
+  }catch(error){document.body.classList.add('fallback-mode');logOutput(`Monaco fallback: ${error.message}`);for(let group=0;group<2;group++){const input=E(`fallbackEditor${group}`);input.addEventListener('focus',()=>{S.activeGroup=group;updateStatusBar()});input.addEventListener('input',()=>{const file=activeFile(group);if(file){file.content=input.value;file.dirty=true;renderTabs();renderOpenEditors();scheduleDiagnostics(file)}})}}
+}
+async function initTerminalLibrary(){
+  try{await loadScript('/assets/js_lib/xterm/lib/xterm.js');await loadScript('/assets/js_lib/xterm-addon-fit/lib/addon-fit.js')}catch(error){logOutput(`Terminal renderer fallback: ${error.message}`)}
+}
+function editorValue(group=S.activeGroup){const file=activeFile(group);if(!file)return '';if(S.monaco){const model=S.models.get(file.key);return model?model.getValue():file.content}return E(`fallbackEditor${group}`).value}
+function isHistoryCandidate(file){return !!file&&!file.binary&&file.root_id==='session'&&!file.preview&&file.previewKind!=='markdown'}
+function protectDeletedReviewZones(host){const deletedNode=node=>{const element=node?.nodeType===Node.ELEMENT_NODE?node:node?.parentElement;return element?.closest?.('.line-delete-selectable,.inline-deleted-margin-view-zone')||null};const block=event=>{if(!deletedNode(event.target))return;event.preventDefault();event.stopImmediatePropagation();const selection=document.getSelection?.();if(selection&&!selection.isCollapsed)selection.removeAllRanges()};['pointerdown','mousedown','touchstart','selectstart','dragstart','contextmenu','copy'].forEach(type=>host.addEventListener(type,block,true))}
+function disposeHistoryOriginal(group){const model=S.historyOriginalModels.get(group);if(model){model.dispose();S.historyOriginalModels.delete(group)}const diff=S.diffEditors[group];if(diff)diff.setModel(null)}
+function clearHistoryDecorations(file){const old=S.historyDecorations.get(file?.key)||[];const model=file&&S.models.get(file.key);if(model&&old.length)S.historyDecorations.set(file.key,model.deltaDecorations(old,[]));else if(file)S.historyDecorations.delete(file.key)}
+function visibleHistoryEditor(group){return E(`diffEditor${group}`).classList.contains('is-hidden')?S.editors[group]:S.diffEditors[group]?.getModifiedEditor()}
+function captureHistoryView(group,file){const source=visibleHistoryEditor(group),targetModel=file&&S.models.get(file.key);if(!source?.getModel()||source.getModel()!==targetModel)return null;const position=source.getPosition(),anchorLine=position?.lineNumber||source.getVisibleRanges()?.[0]?.startLineNumber||1;return{selection:source.getSelection(),position,anchorLine,anchorOffset:source.getTopForLineNumber(anchorLine)-source.getScrollTop(),scrollLeft:source.getScrollLeft()}}
+function restoreHistoryView(group,state){if(!state)return;const target=visibleHistoryEditor(group),model=target?.getModel(),showingDiff=!E(`diffEditor${group}`).classList.contains('is-hidden');if(!target||!model)return;let updateListener=null;const apply=()=>{const current=target.getModel();if(!current)return;const lineCount=current.getLineCount(),anchorLine=Math.max(1,Math.min(lineCount,Number(state.anchorLine||state.position?.lineNumber||1))),immediateScroll=S.monaco.ScrollType?.Immediate??1;if(state.selection)target.setSelection(current.validateRange(state.selection));else if(state.position)target.setPosition(current.validatePosition(state.position));target.setScrollTop(Math.max(0,target.getTopForLineNumber(anchorLine)-Number(state.anchorOffset||0)),immediateScroll);target.setScrollLeft(Number(state.scrollLeft||0),immediateScroll);updateStatusBar()};if(showingDiff){S.diffEditors[group].layout();updateListener=S.diffEditors[group].onDidUpdateDiff(()=>{apply();updateListener?.dispose();updateListener=null})}else target.layout();apply();requestAnimationFrame(()=>{apply();requestAnimationFrame(apply)})}
+async function loadCodeHistory(file,stageId=file.stageId||'latest'){
+  if(!isHistoryCandidate(file)){file.historyStages=[];file.historyPayload=null;return}
+  if(!Array.isArray(file.historyStages)){const list=await api(`/api/ide/v2/sessions/${qs(file.session_id)}/code-history?root_id=${qs(file.root_id)}&path=${qs(file.path)}`);file.historyStages=list.stages||[]}
+  file.stageId=stageId||'latest';const payload=await api(`/api/ide/v2/sessions/${qs(file.session_id)}/code-history/stage?root_id=${qs(file.root_id)}&path=${qs(file.path)}&stage_id=${qs(file.stageId)}`);file.historyPayload=payload;
+  if(file.stageId!=='latest')file.content=payload.full_text||'';
+}
+function historyAddedLines(payload){const lines=[];for(const row of payload?.rows||[])if(row.kind==='add'&&Number(row.new_line)>0)lines.push(Number(row.new_line));return [...new Set(lines)]}
+function renderHistoryToolbar(group,file){const host=E(`historyToolbar${group}`);if(!isHistoryCandidate(file)){host.classList.add('is-hidden');host.innerHTML='';return}host.classList.remove('is-hidden');const stages=Array.isArray(file.historyStages)?file.historyStages:[];const payload=file.historyPayload||{};host.innerHTML=`<div class="history-modes"><button data-history-mode="all" class="${S.codeHistoryMode==='all'?'is-active':''}">All</button><button data-history-mode="changes" class="${S.codeHistoryMode==='changes'?'is-active':''}">Changes</button><button data-history-mode="clean" class="${S.codeHistoryMode==='clean'?'is-active':''}">Clean</button></div><span class="history-stats">${payload.stage?`+${Number(payload.stage.added||0)} / -${Number(payload.stage.deleted||0)}`:'No recorded changes'}</span><select class="history-stage" title="Version"><option value="latest">Latest</option>${stages.map(row=>`<option value="${escapeHtml(row.id)}"${file.stageId===row.id?' selected':''}>${escapeHtml(row.label||`#${row.index}`)}</option>`).join('')}</select>${file.stageId!=='latest'?'<button class="button history-restore" title="Restore this version">Restore</button>':''}`;host.querySelectorAll('[data-history-mode]').forEach(button=>button.onclick=()=>{S.codeHistoryMode=button.dataset.historyMode||'all';for(let index=0;index<2;index++)applyHistoryView(index,activeFile(index));scheduleStateSave()});host.querySelector('.history-stage').onchange=event=>selectHistoryStage(file,event.target.value).catch(showError);const restore=host.querySelector('.history-restore');if(restore)restore.onclick=()=>restoreHistoryStage(file).catch(showError)}
+function applyHistoryView(group,file){const editor=S.editors[group],diff=S.diffEditors[group],diffHost=E(`diffEditor${group}`),editorHost=E(`editor${group}`),viewState=captureHistoryView(group,file);disposeHistoryOriginal(group);if(!file||!S.monaco||!isHistoryCandidate(file)||!file.historyPayload){diffHost.classList.add('is-hidden');editorHost.classList.remove('is-hidden');if(file)clearHistoryDecorations(file);renderHistoryToolbar(group,file);restoreHistoryView(group,viewState);return}const payload=file.historyPayload,model=S.models.get(file.key);if(model&&model.getValue()!==String(payload.full_text||'')){S.suppressEditorChange=true;model.setValue(String(payload.full_text||''));S.suppressEditorChange=false}const historical=file.stageId!=='latest';editor.updateOptions({readOnly:historical});clearHistoryDecorations(file);if((S.codeHistoryMode==='all'||S.codeHistoryMode==='changes')&&model){const decorations=historyAddedLines(payload).map(line=>({range:new S.monaco.Range(line,1,line,1),options:{isWholeLine:true,className:'history-added-line',linesDecorationsClassName:'history-added-glyph'}}));S.historyDecorations.set(file.key,model.deltaDecorations([],decorations))}if(S.codeHistoryMode==='all'&&payload.stage?.added+payload.stage?.deleted>0){const original=S.monaco.editor.createModel(String(payload.before_text||''),languageFor(file.path));S.historyOriginalModels.set(group,original);diff.setModel({original,modified:model});diff.updateOptions({readOnly:historical,originalEditable:false,renderSideBySide:false,renderIndicators:false,renderGutterMenu:false,renderMarginRevertIcon:false,compactMode:true});diff.getOriginalEditor().updateOptions({lineNumbers:'off',lineNumbersMinChars:0,glyphMargin:false,folding:false,lineDecorationsWidth:0});diff.getModifiedEditor().updateOptions({lineNumbers:'on',lineNumbersMinChars:5,lineDecorationsWidth:24});editorHost.classList.add('is-hidden');diffHost.classList.remove('is-hidden')}else{diffHost.classList.add('is-hidden');editorHost.classList.remove('is-hidden')}renderHistoryToolbar(group,file);restoreHistoryView(group,viewState)}
+async function selectHistoryStage(file,stageId){if(file.dirty&&!confirm('Discard unsaved changes and switch version?')){renderHistoryToolbar(file.group,file);return}file.dirty=false;file.stageId=stageId||'latest';await loadCodeHistory(file,file.stageId);if(file.stageId==='latest')await refreshOpenFile(file);applyHistoryView(file.group,file);renderTabs();scheduleStateSave()}
+async function restoreHistoryStage(file){if(file.stageId==='latest'||!confirm(`Restore ${file.name} to the selected version?`))return;const out=await api(`/api/ide/v2/sessions/${qs(file.session_id)}/code-history/restore`,{method:'POST',body:JSON.stringify({root_id:file.root_id,path:file.path,stage_id:file.stageId,expected_revision:file.revision})});file.stageId='latest';file.revision=out.revision||out.file?.revision||'';file.historyStages=null;await refreshOpenFile(file);await loadCodeHistory(file,'latest');applyHistoryView(file.group,file);toast(`Restored ${file.name}.`,'success')}
+function renderArtifactPreview(group,file){
+  const host=E(`artifactPreview${group}`);host.innerHTML='';host.classList.toggle('is-hidden',!isArtifactFile(file));if(!isArtifactFile(file))return;
+  const toolbar=document.createElement('div');toolbar.className='artifact-toolbar';toolbar.innerHTML=`<strong>${escapeHtml(file.name)}</strong><span class="artifact-meta">${escapeHtml(file.previewKind||file.mime||'binary')}${file.size?` / ${formatFileSize(file.size)}`:''}</span><button class="icon-button" title="Refresh Preview"><span class="codicon codicon-refresh"></span></button>${file.previewKind==='html'?'<a class="icon-button artifact-open-browser" target="_blank" rel="noopener" title="Open in Browser" aria-label="Open in Browser"><span class="codicon codicon-link-external"></span></a>':''}<a class="icon-button artifact-download" title="Download" aria-label="Download"><span class="codicon codicon-cloud-download"></span></a>`;
+  const stage=document.createElement('div');stage.className='artifact-stage';host.append(toolbar,stage);toolbar.querySelector('button').onclick=()=>refreshOpenFile(file,true).catch(showError);const download=toolbar.querySelector('.artifact-download');download.href=artifactUrl(file,'raw')+'&download=1';download.download=file.name;const browser=toolbar.querySelector('.artifact-open-browser');if(browser)browser.href=htmlArtifactUrl(file);
+  const url=file.previewKind==='html'?htmlArtifactUrl(file):artifactUrl(file,'raw'),kind=file.previewKind;
+  if(kind==='image'){const media=document.createElement('img');media.src=url;media.alt=file.name;stage.appendChild(media)}
+  else if(kind==='video'){const media=document.createElement('video');media.src=url;media.controls=true;stage.appendChild(media)}
+  else if(kind==='audio'){const media=document.createElement('audio');media.src=url;media.controls=true;stage.appendChild(media)}
+  else if(kind==='pdf'||kind==='html'||['csv','excel','presentation','document'].includes(kind)){const frame=document.createElement('iframe');frame.title=`Preview ${file.name}`;frame.referrerPolicy='no-referrer';frame.sandbox='allow-scripts';frame.src=kind==='html'?url:kind==='pdf'?url:artifactUrl(file,'preview');stage.appendChild(frame)}
+  else if(kind==='markdown'){const article=document.createElement('article');article.className='artifact-markdown';stage.appendChild(article);loadScript('/assets/js_lib/marked.min.js').then(()=>{const html=window.marked?.parse?window.marked.parse(file.content||'',{async:false}):`<pre>${escapeHtml(file.content||'')}</pre>`;article.innerHTML=sanitizePreviewHtml(html)}).catch(()=>{article.innerHTML=`<pre>${escapeHtml(file.content||'')}</pre>`})}
+  else{stage.innerHTML=`<div class="artifact-binary"><span class="codicon codicon-file-binary"></span><strong>${escapeHtml(file.name)}</strong><small>Preview is not available for this file type.</small><a class="button" href="${escapeHtml(url+'&download=1')}" download="${escapeHtml(file.name)}">Download</a></div>`}
+}
+function sanitizePreviewHtml(raw){const doc=new DOMParser().parseFromString(String(raw||''),'text/html');doc.querySelectorAll('script,style,iframe,object,embed,form,link,meta').forEach(node=>node.remove());doc.querySelectorAll('*').forEach(node=>{for(const attr of [...node.attributes]){const name=attr.name.toLowerCase(),value=attr.value.trim().toLowerCase();if(name.startsWith('on')||name==='style'||((name==='href'||name==='src')&&(value.startsWith('javascript:')||value.startsWith('data:text/html'))))node.removeAttribute(attr.name)}});return doc.body.innerHTML}
+function setEditorModel(group,file){
+  const editor=S.editors[group];const old=activeFile(group);if(old&&editor)S.viewStates.set(`${group}:${old.key}`,editor.saveViewState());
+  S.activeByGroup[group]=file?file.key:'';S.activeGroup=group;
+  const artifact=isArtifactFile(file);if(file&&!artifact&&S.monaco){let model=S.models.get(file.key);if(!model){model=S.monaco.editor.createModel(file.content,languageFor(file.path),S.monaco.Uri.parse(stableUri(file)));S.models.set(file.key,model)}editor.setModel(model);const state=S.viewStates.get(`${group}:${file.key}`);if(state)editor.restoreViewState(state);editor.focus()}
+  else if(S.monaco){editor.setModel(null)}
+  else{const input=E(`fallbackEditor${group}`);input.value=file&&!artifact?file.content:'';input.classList.toggle('is-active',!!file&&!artifact);if(file&&!artifact)input.focus()}
+  if(artifact){disposeHistoryOriginal(group);E(`diffEditor${group}`).classList.add('is-hidden');E(`editor${group}`).classList.remove('is-hidden')}else applyHistoryView(group,file);renderArtifactPreview(group,file);E(`emptyEditor${group}`).classList.toggle('is-hidden',!!file);renderTabs();renderBreadcrumbs();renderTree();renderOpenEditors();updateStatusBar();scheduleStateSave()
+}
+async function openFile(path,options={}){
+  const session=S.activeSession,root=options.root_id||S.activeRoot;const group=Number.isInteger(options.group)?options.group:S.activeGroup;const key=fileKey(root,path,session);
+  let file=S.openFiles.get(key);
+  if(!file){
+    setStatus(`Opening ${path}...`);let out;try{out=await api(`/api/ide/sessions/${qs(session)}/workspace/file?${rootQuery(root)}&path=${qs(path)}`)}catch(error){const previewKind=previewKindForPath(path);if(error.status===400&&previewKind)out={encoding:'base64',content:'',revision:String(Date.now()),file:{path,name:path.split('/').pop(),preview_kind:previewKind,mime:'',size:0}};else throw error}
+    if(session!==S.activeSession)return null;
+    const index=path.lastIndexOf('/'),binary=out.encoding==='base64',previewKind=out.file?.preview_kind||'';file={key,path,name:path.split('/').pop(),dir:index<0?'':path.slice(0,index),root_id:root,session_id:session,content:out.content||'',revision:out.revision||out.file?.revision||'',encoding:out.text_encoding||'utf-8',binary,preview:binary||['image','video','audio','pdf','excel','presentation','document'].includes(previewKind),previewKind,mime:out.file?.mime||'',size:Number(out.file?.size||0),dirty:false,group,stageId:options.stage_id||'latest',historyStages:null,historyPayload:null};S.openFiles.set(key,file);try{await loadCodeHistory(file,file.stageId)}catch(error){file.historyStages=[];file.historyPayload=null;if(error.status!==400)logOutput(`History ${path}: ${error.message}`)}
+  }
+  else if(options.stage_id&&options.stage_id!==file.stageId){await selectHistoryStage(file,options.stage_id)}
+  if(session!==S.activeSession){if(S.openFiles.get(key)===file)S.openFiles.delete(key);return null}
+  file.group=group;setEditorModel(group,file);
+  if(options.line&&S.monaco&&S.editors[group]){S.editors[group].revealPositionInCenter({lineNumber:Number(options.line),column:Number(options.column||1)});S.editors[group].setPosition({lineNumber:Number(options.line),column:Number(options.column||1)})}
+  setStatus(path)
+}
+async function saveFile(file,force=false){
+  if(!file||file.binary)return;if(file.stageId!=='latest')return toast('Historical versions are read-only. Restore the version or return to Latest.','warning');const group=S.activeByGroup.findIndex(key=>key===file.key);const content=group>=0?editorValue(group):(S.models.get(file.key)?.getValue()??file.content);
+  try{const out=await api(`/api/ide/sessions/${qs(file.session_id)}/workspace/file`,{method:'PUT',body:JSON.stringify({root_id:file.root_id,path:file.path,content,expected_revision:force?'':file.revision})});file.content=content;file.revision=out.revision||out.file?.revision||'';file.size=new TextEncoder().encode(content).length;file.dirty=false;file.historyStages=null;await loadCodeHistory(file,'latest');applyHistoryView(file.group,file);renderTabs();renderOpenEditors();setStatus(`Saved ${file.name}`);scheduleDiagnostics(file);scheduleStateSave()}
+  catch(error){if(error.code==='file_conflict'){showConflict(file,error);return}throw error}
+}
+async function saveActive(){return saveFile(activeFile())}
+async function saveAll(){for(const file of S.openFiles.values())if(file.dirty)await saveFile(file)}
+function showConflict(file,error){openModal('File Changed on Disk',`<div class="modal-form"><p>${escapeHtml(file.path)} changed after it was opened.</p><div class="modal-actions"><button id="conflictReload" class="button">Reload</button><button id="conflictOverwrite" class="button primary">Overwrite</button></div></div>`);E('conflictReload').onclick=async()=>{closeModal();S.openFiles.delete(file.key);const model=S.models.get(file.key);if(model){model.dispose();S.models.delete(file.key)}await openFile(file.path,{root_id:file.root_id,group:file.group})};E('conflictOverwrite').onclick=()=>{closeModal();saveFile(file,true).catch(showError)}}
+function closeFile(key){const file=S.openFiles.get(key);if(!file)return;if(file.dirty&&!confirm(`Save changes to ${file.name}?`)){return}if(file.dirty)saveFile(file).catch(showError);S.openFiles.delete(key);const model=S.models.get(key);if(model){model.dispose();S.models.delete(key)}clearHistoryDecorations(file);for(let group=0;group<2;group++)if(S.activeByGroup[group]===key){disposeHistoryOriginal(group);const next=[...S.openFiles.values()].filter(row=>row.group===group).pop()||null;setEditorModel(group,next)}renderTabs();renderOpenEditors();scheduleStateSave()}
+function syncEditorGroupLayout(){const split=[...S.openFiles.values()].some(file=>file.group===1)||!!S.activeByGroup[1];E('editorGrid').classList.toggle('split',split);if(!split)S.activeGroup=0;document.querySelectorAll('.editor-group').forEach((group,index)=>group.classList.toggle('is-active',split||index===S.activeGroup))}
+function renderTabs(){for(let group=0;group<2;group++){const host=E(`tabs${group}`);host.innerHTML='';for(const file of S.openFiles.values()){if(file.group!==group)continue;const tab=document.createElement('div');tab.className='editor-tab'+(S.activeByGroup[group]===file.key?' is-active':'');tab.innerHTML=`<span class="codicon ${fileIconClass(file.path)}"></span><span class="editor-tab-name">${escapeHtml(file.name)}</span>${file.dirty?'<span class="dirty-mark">●</span>':''}<button class="icon-button close-tab" title="Close"><span class="codicon codicon-close"></span></button>`;tab.onclick=()=>setEditorModel(group,file);tab.querySelector('.close-tab').onclick=event=>{event.stopPropagation();closeFile(file.key)};host.appendChild(tab)}}syncEditorGroupLayout()}
+function renderBreadcrumbs(){for(let group=0;group<2;group++){const host=E(`breadcrumbs${group}`),file=activeFile(group);host.innerHTML=file?file.path.split('/').map((part,index,parts)=>`<span class="breadcrumb-item"><span>${escapeHtml(part)}</span>${index<parts.length-1?'<span class="codicon codicon-chevron-right"></span>':''}</span>`).join(''):'';if(file){const size=document.createElement('span');size.className='tree-meta';size.textContent=formatFileSize(file.size);host.appendChild(size)}if(file&&canPreviewFile(file)&&!file.binary){const button=document.createElement('button');button.className='breadcrumb-action';button.title=file.preview?'Open Text Editor':'Open Preview';button.innerHTML=`<span class="codicon codicon-${file.preview?'code':'preview'}"></span>`;button.onclick=()=>{file.preview=!file.preview;setEditorModel(group,file)};host.appendChild(button)}}}
+function renderOpenEditors(){const host=E('openEditors');host.innerHTML='';for(const file of S.openFiles.values()){const row=document.createElement('div');row.className='open-editor-row'+(activeFile()?.key===file.key?' is-active':'');row.innerHTML=`<span class="codicon ${fileIconClass(file.path)}"></span><span>${escapeHtml(file.name)}</span>${file.dirty?'<span class="dirty-mark">●</span>':''}`;row.onclick=()=>setEditorModel(file.group,file);host.appendChild(row)}}
+function renderSessions(){const select=E('sessionSelect');select.innerHTML='';for(const row of S.sessions){const option=document.createElement('option');option.value=row.id;option.textContent=row.title||row.id;option.selected=row.id===S.activeSession;select.appendChild(option)}}
+function renderRoots(){const select=E('rootSelect');select.innerHTML='';for(const root of S.roots){const option=document.createElement('option');option.value=root.id;option.textContent=root.kind==='session'?'Session Workspace':`Workspace Folder: ${root.label||root.id}`;option.selected=root.id===S.activeRoot;select.appendChild(option)}select.classList.toggle('is-hidden',S.roots.length===1&&S.roots[0]?.kind==='session');const current=S.roots.find(root=>root.id===S.activeRoot);E('workspaceLabel').textContent=current?.kind==='session'?'Session Workspace':current?.label||'Workspace'}
+async function loadRoots(){if(!S.activeSession)return;const session=S.activeSession,out=await api(`/api/ide/sessions/${qs(session)}/workspace/roots`);if(session!==S.activeSession)return;S.roots=Array.isArray(out.roots)?out.roots:[];if(!S.roots.some(root=>root.id===S.activeRoot))S.activeRoot=S.roots[0]?.id||'session';renderRoots();S.treeCache.clear();await loadTree('')}
+async function loadTree(path=''){if(!S.activeSession)return;const session=S.activeSession,root=S.activeRoot,out=await api(`/api/ide/sessions/${qs(session)}/workspace/tree?root_id=${qs(root)}&path=${qs(path)}`);if(session!==S.activeSession||root!==S.activeRoot)return;S.treeCache.set(path,out.tree?.children||[]);renderTree();setStatus(`${out.node_count||0} items`)}
+function renderTree(){const host=E('tree');host.innerHTML='';const draw=(path,depth)=>{for(const row of S.treeCache.get(path)||[]){const div=document.createElement('div');div.className='tree-row'+(activeFile()?.path===row.path&&activeFile()?.root_id===S.activeRoot?' is-active':'');div.style.paddingLeft=`${4+depth*12}px`;const open=row.type==='dir'&&S.treeCache.has(row.path);div.innerHTML=`<button class="tree-twist" tabindex="-1"><span class="codicon codicon-${row.type==='dir'?(open?'chevron-down':'chevron-right'):'blank'}"></span></button><span class="tree-icon codicon ${fileIconClass(row.name,row.type)}"></span><span class="tree-name">${escapeHtml(row.name)}</span>${row.type==='file'?`<span class="tree-meta">${formatFileSize(row.size)}</span>`:''}`;div.onclick=async()=>{try{if(row.type==='dir'){if(row.skipped)return toast('This generated directory is hidden by the explorer performance guard.','warning');if(open)S.treeCache.delete(row.path);else await loadTree(row.path);renderTree()}else await openFile(row.path)}catch(error){showError(error)}};div.oncontextmenu=event=>{event.preventDefault();showExplorerMenu(event.clientX,event.clientY,row)};host.appendChild(div);if(row.type==='dir'&&S.treeCache.has(row.path))draw(row.path,depth+1)}};draw('',0)}
+async function refreshOpenFile(file,forcePreview=false){if(!file||file.dirty||file.stageId!=='latest')return;const out=await api(`/api/ide/sessions/${qs(file.session_id)}/workspace/file?${rootQuery(file.root_id)}&path=${qs(file.path)}`);const revision=out.revision||out.file?.revision||'';if(revision===file.revision)return;file.content=out.content||'';file.revision=revision;file.binary=out.encoding==='base64';file.previewKind=out.file?.preview_kind||file.previewKind||'';file.mime=out.file?.mime||file.mime||'';file.size=Number(out.file?.size||0);file.historyStages=null;try{await loadCodeHistory(file,'latest')}catch{}const model=S.models.get(file.key);if(model&&model.getValue()!==file.content){S.suppressEditorChange=true;model.setValue(file.content);S.suppressEditorChange=false}if(!S.monaco&&activeFile(file.group)?.key===file.key&&!isArtifactFile(file))E(`fallbackEditor${file.group}`).value=file.content;if(activeFile(file.group)?.key===file.key){if(isArtifactFile(file))renderArtifactPreview(file.group,file);else applyHistoryView(file.group,file)}renderTabs();renderBreadcrumbs();renderOpenEditors()}
+async function refreshWorkspaceSnapshot(){if(S.workspaceRefreshBusy||!S.activeSession)return;S.workspaceRefreshBusy=true;const expanded=[...S.treeCache.keys()].filter(Boolean).sort((a,b)=>a.split('/').length-b.split('/').length);try{const next=new Map();const load=async path=>{try{const out=await api(`/api/ide/sessions/${qs(S.activeSession)}/workspace/tree?${rootQuery()}&path=${qs(path)}`);next.set(path,out.tree?.children||[])}catch(error){if(!path)throw error}};await load('');for(const path of expanded)await load(path);S.treeCache=next;renderTree();for(const file of S.openFiles.values())if(file.session_id===S.activeSession)try{await refreshOpenFile(file)}catch(error){if(error.status===404){if(!file.dirty)closeFile(file.key)}else logOutput(`File refresh ${file.path}: ${error.message}`)}}finally{S.workspaceRefreshBusy=false}}
+async function createSession(){const title=`Program ${new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}`;const out=await api('/api/ide/sessions',{method:'POST',body:JSON.stringify({title})});await switchSession(out.id,true);return out}
+async function renameCurrentSession(){const row=S.sessions.find(item=>item.id===S.activeSession);if(!row)return;const title=prompt('Session name',row.title||'');if(!title||title.trim()===row.title)return;const out=await api(`/api/ide/sessions/${qs(S.activeSession)}`,{method:'PATCH',body:JSON.stringify({title:title.trim()})});row.title=out.title;renderSessions();updateAgentContext();await loadRoots();scheduleStateSave()}
+async function switchSession(sessionId,isNew=false){if([...S.openFiles.values()].some(file=>file.dirty)&&!confirm('Switch session with unsaved files?')){renderSessions();return false}closeAgentEvents();clearTimeout(S.agentPoll);clearTimeout(S.agentTreeTimer);if(S.terminal)await killTerminal();if(S.debug)await stopDebug();S.activeSession=sessionId;S.openFiles.clear();S.models.forEach(model=>model.dispose());S.models.clear();S.historyOriginalModels.forEach(model=>model.dispose());S.historyOriginalModels.clear();S.historyDecorations.clear();S.viewStates.clear();S.activeByGroup=['',''];setEditorModel(1,null);setEditorModel(0,null);syncEditorGroupLayout();resetAgentSessionUI(sessionId);await refreshConfig();await loadRoots();updateAgentContext();connectAgentEvents();S.agentPollRequested=true;scheduleAgentPoll(50);if(isNew){toggleSecondary(true);E('agentPrompt').focus();agentMessage('New task workspace ready.','system')}scheduleStateSave();return true}
+async function newFile(){const rel=prompt('File path',activeDir()?`${activeDir()}/untitled.txt`:'untitled.txt');if(!rel)return;await api(`/api/ide/sessions/${qs(S.activeSession)}/workspace/file`,{method:'PUT',body:JSON.stringify({root_id:S.activeRoot,path:rel,content:''})});await loadTree(activeDir());await openFile(rel)}
+async function newFolder(){const rel=prompt('Folder path',activeDir()?`${activeDir()}/new-folder`:'new-folder');if(!rel)return;await api(`/api/ide/sessions/${qs(S.activeSession)}/workspace/mkdir`,{method:'POST',body:JSON.stringify({root_id:S.activeRoot,path:rel})});await loadTree(activeDir())}
+async function renameEntry(row){const next=prompt('New path',row.path);if(!next||next===row.path)return;await api(`/api/ide/sessions/${qs(S.activeSession)}/workspace/rename`,{method:'PATCH',body:JSON.stringify({root_id:S.activeRoot,old_path:row.path,new_path:next})});const key=fileKey(S.activeRoot,row.path);const file=S.openFiles.get(key);if(file){closeFile(key);await openFile(next)}S.treeCache.clear();await loadTree('')}
+async function deleteEntry(row){if(!confirm(`Delete ${row.path}?`))return;await api(`/api/ide/sessions/${qs(S.activeSession)}/workspace/file`,{method:'DELETE',body:JSON.stringify({root_id:S.activeRoot,path:row.path,recursive:true})});const key=fileKey(S.activeRoot,row.path);if(S.openFiles.has(key))closeFile(key);S.treeCache.clear();await loadTree('')}
+function readFileAsB64(file){return new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(String(reader.result||'').split(',',2)[1]||'');reader.onerror=()=>reject(reader.error||new Error('Read failed'));reader.readAsDataURL(file)})}
+async function uploadFiles(files){const list=[...(files||[])];if(!list.length)return;const items=[];for(let index=0;index<list.length;index++){items.push({path:list[index].webkitRelativePath||list[index].name,content_b64:await readFileAsB64(list[index])});setStatus(`Preparing ${index+1}/${list.length}`)}await api(`/api/ide/sessions/${qs(S.activeSession)}/workspace/upload`,{method:'POST',body:JSON.stringify({root_id:S.activeRoot,dest:activeDir(),items})});S.treeCache.clear();await loadTree('');toast(`Uploaded ${list.length} file(s).`,'success')}
+"""
+
+IDE_JS += r"""
+function scheduleDiagnostics(file){clearTimeout(S.diagnosticTimer);if(file&&languageFor(file.path)==='python')S.diagnosticTimer=setTimeout(()=>runDiagnostics(file).catch(error=>logOutput(error.message)),450)}
+async function runDiagnostics(file){const group=S.activeByGroup.findIndex(key=>key===file.key);const content=group>=0?editorValue(group):(S.models.get(file.key)?.getValue()??file.content);const out=await api(`/api/ide/v2/sessions/${qs(file.session_id)}/diagnostics/python`,{method:'POST',body:JSON.stringify({root_id:file.root_id,path:file.path,content})});S.diagnostics=S.diagnostics.filter(row=>row.key!==file.key);for(const row of out.diagnostics||[])S.diagnostics.push(Object.assign({key:file.key,path:file.path,root_id:file.root_id},row));if(S.monaco){const model=S.models.get(file.key);if(model)S.monaco.editor.setModelMarkers(model,'python',(out.diagnostics||[]).map(row=>({severity:row.severity==='warning'?S.monaco.MarkerSeverity.Warning:S.monaco.MarkerSeverity.Error,message:row.message,startLineNumber:row.line||1,startColumn:row.column||1,endLineNumber:row.line||1,endColumn:(row.column||1)+1,source:row.source||'python'})))}renderProblems();updateStatusBar()}
+function renderProblems(){const host=E('problemsList');host.innerHTML='';for(const row of S.diagnostics){const div=document.createElement('div');div.className=`problem-row ${row.severity||'error'}`;div.innerHTML=`<span class="codicon codicon-${row.severity==='warning'?'warning':'error'}"></span><span>${escapeHtml(row.message)} <small>${escapeHtml(row.path)}</small></span><span>${row.line||1}:${row.column||1}</span>`;div.onclick=()=>openFile(row.path,{root_id:row.root_id,line:row.line,column:row.column}).catch(showError);host.appendChild(div)}E('problemCount').textContent=String(S.diagnostics.length)}
+function renderProblems(){const host=E('problemsList');host.innerHTML='';if(!S.diagnostics.length)host.innerHTML='<div class="panel-empty">No problems detected.</div>';for(const row of S.diagnostics){const div=document.createElement('div');div.className=`problem-row ${row.severity||'error'}`;div.innerHTML=`<span class="codicon codicon-${row.severity==='warning'?'warning':'error'}"></span><span>${escapeHtml(row.message)} <small>${escapeHtml(row.path)}</small></span><span>${row.line||1}:${row.column||1}</span>`;div.onclick=()=>openFile(row.path,{root_id:row.root_id,line:row.line,column:row.column}).catch(showError);host.appendChild(div)}E('problemCount').textContent=String(S.diagnostics.length)}
+function updateStatusBar(){const file=activeFile();E('fileSizeStatus').textContent=file?formatFileSize(file.size):'0 B';E('languageStatus').textContent=file?languageFor(file.path).replace(/^./,char=>char.toUpperCase()):'Plain Text';E('encodingStatus').textContent=file?String(file.encoding||'utf-8').toUpperCase():'UTF-8';E('accountName').textContent=S.account?.username||'';const errors=S.diagnostics.filter(row=>row.severity!=='warning').length;const warnings=S.diagnostics.length-errors;E('errorCount').textContent=errors;E('warningCount').textContent=warnings;E('errorStatus').title=`${errors} Errors, ${warnings} Warnings`;if(S.monaco&&S.editors[S.activeGroup]){const visibleDiff=!E(`diffEditor${S.activeGroup}`).classList.contains('is-hidden');const pos=(visibleDiff?S.diffEditors[S.activeGroup]?.getModifiedEditor():S.editors[S.activeGroup])?.getPosition();if(pos)E('indentStatus').textContent=`Ln ${pos.lineNumber}, Col ${pos.column}`}else E('indentStatus').textContent='Spaces: 2'}
+function showView(view){S.activeView=view;S.primaryVisible=true;E('ideShell').classList.remove('primary-hidden');document.querySelectorAll('.activity-button[data-view]').forEach(button=>button.classList.toggle('is-active',button.dataset.view===view));document.querySelectorAll('.side-view').forEach(section=>section.classList.toggle('is-active',section.dataset.sideView===view));if(view==='scm')refreshScm().catch(showError);if(view==='run')refreshTasks().catch(showError);if(view==='extensions')refreshExtensions().catch(showError);scheduleStateSave()}
+function showPanel(tab='terminal'){S.panel=tab;S.panelVisible=true;E('ideShell').classList.remove('panel-hidden');document.querySelectorAll('[data-panel-tab]').forEach(button=>button.classList.toggle('is-active',button.dataset.panelTab===tab));document.querySelectorAll('.panel-content').forEach(panel=>panel.classList.toggle('is-active',panel.id===`${tab}Panel`));if(tab==='terminal'){if(!S.terminal&&S.capabilities.terminal)newTerminal().catch(showError);else if(S.terminalFit)setTimeout(()=>S.terminalFit.fit(),30)}scheduleStateSave()}
+function togglePrimary(){S.primaryVisible=!S.primaryVisible;E('ideShell').classList.toggle('primary-hidden',!S.primaryVisible);scheduleStateSave()}
+function toggleSecondary(force){S.secondaryVisible=typeof force==='boolean'?force:!S.secondaryVisible;E('ideShell').classList.toggle('secondary-hidden',!S.secondaryVisible);scheduleStateSave()}
+function togglePanel(){S.panelVisible=!S.panelVisible;E('ideShell').classList.toggle('panel-hidden',!S.panelVisible);scheduleStateSave()}
+function scheduleStateSave(){clearTimeout(S.stateTimer);S.stateTimer=setTimeout(saveWorkbenchState,600)}
+async function saveWorkbenchState(){if(!S.csrf||!S.activeSession)return;const state={active_session_id:S.activeSession,active_root_id:S.activeRoot,active_view:S.activeView,panel:S.panel,panel_visible:S.panelVisible,secondary_visible:S.secondaryVisible,agent_todo_collapsed:S.agentTodoCollapsed,code_history_mode:S.codeHistoryMode,open_files:[...S.openFiles.values()].slice(0,40).map(file=>({root_id:file.root_id,path:file.path,stage_id:file.stageId||'latest'}))};try{await api('/api/ide/v2/workbench/state',{method:'POST',body:JSON.stringify({state})})}catch(error){logOutput(`State save failed: ${error.message}`)}}
+async function restoreWorkbenchState(){try{const out=await api('/api/ide/v2/workbench/state');const state=out.state||{};if(state.active_session_id&&S.sessions.some(row=>row.id===state.active_session_id))S.activeSession=state.active_session_id;if(state.active_root_id)S.activeRoot=state.active_root_id;if(state.active_view)S.activeView=state.active_view;S.panel=state.panel||'terminal';S.codeHistoryMode=['all','changes','clean'].includes(state.code_history_mode)?state.code_history_mode:'all';const panelVisible=state.panel_visible!==false;S.secondaryVisible=state.secondary_visible!==false;S.agentTodoCollapsed=state.agent_todo_collapsed===true;showView(S.activeView);showPanel(S.panel);S.panelVisible=panelVisible;E('ideShell').classList.toggle('panel-hidden',!panelVisible);if(!S.secondaryVisible)toggleSecondary(false);await loadRoots();for(const row of state.open_files||[]){try{await openFile(row.path,{root_id:row.root_id||'session',group:0,stage_id:row.stage_id||'latest'})}catch(error){logOutput(`Restore skipped ${row.path}: ${error.message}`)}}}catch(error){logOutput(`State restore failed: ${error.message}`);await loadRoots()}}
+async function runSearch(){const query=E('searchInput').value;if(!query.trim()){S.searchResults=[];renderSearch();return}E('searchSummary').textContent='Searching...';const out=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/search`,{method:'POST',body:JSON.stringify({root_id:S.activeRoot,query,case_sensitive:E('matchCaseBtn').classList.contains('is-active'),regex:E('regexBtn').classList.contains('is-active'),include:E('includeInput').value.trim(),exclude:E('excludeInput').value.trim(),max_results:1000})});S.searchResults=out.results||[];E('searchSummary').textContent=`${out.count||0} results in ${out.files_scanned||0} files${out.truncated?' (limit reached)':''}`;renderSearch()}
+function renderSearch(){const host=E('searchResults');host.innerHTML='';let current='';for(const row of S.searchResults){if(row.path!==current){current=row.path;const group=document.createElement('div');group.className='result-group';group.textContent=row.path;host.appendChild(group)}const line=document.createElement('div');line.className='result-line list-row';line.innerHTML=`<code>${escapeHtml(row.preview)}</code><span class="result-location">${row.line}:${row.column}</span>`;line.onclick=()=>openFile(row.path,{root_id:S.activeRoot,line:row.line,column:row.column}).catch(showError);host.appendChild(line)}}
+async function refreshScm(){E('scmBranch').textContent='Checking repository...';const out=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/scm/status?${rootQuery()}`);S.scm=out;E('scmBranch').innerHTML=out.repository?`<span class="codicon codicon-git-branch"></span> ${escapeHtml(out.branch||'detached')}`:'No source control providers registered.';E('statusBranch').textContent=out.branch||'-';E('scmBadge').textContent=out.changes?.length?String(out.changes.length):'';renderScm()}
+function renderScm(){const host=E('scmChanges');host.innerHTML='';for(const row of S.scm?.changes||[]){const code=row.status.trim()||row.status;const tone=code.includes('?')?'untracked':code.includes('D')?'deleted':'modified';const div=document.createElement('div');div.className='list-row scm-row';div.innerHTML=`<span class="codicon ${fileIconClass(row.path)}"></span><span class="list-main">${escapeHtml(row.path)}</span><span class="scm-code ${tone}">${escapeHtml(code)}</span>`;div.onclick=()=>showScmDiff(row).catch(showError);host.appendChild(div)}}
+async function showScmDiff(row){const out=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/scm/diff`,{method:'POST',body:JSON.stringify({root_id:S.activeRoot,path:row.path})});showPanel('output');logOutput(`\n--- ${row.path} ---\n${out.diff||out.error||'No textual diff.'}`)}
+async function refreshTasks(){const out=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/tasks?${rootQuery()}`);S.tasks=out.tasks||[];const host=E('taskList');host.innerHTML='';if(!S.tasks.length)host.innerHTML='<div class="side-summary">No tasks configured in .vscode/tasks.json.</div>';for(const task of S.tasks){const row=document.createElement('div');row.className='list-row';row.innerHTML=`<span class="codicon codicon-play"></span><span class="list-main">${escapeHtml(task.label)}</span>`;row.onclick=()=>runTask(task).catch(showError);host.appendChild(row)}}
+async function runTask(task){showPanel('output');logOutput(`> Running task: ${task.label}`);const out=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/tasks/run`,{method:'POST',body:JSON.stringify({root_id:S.activeRoot,task_id:task.id})});logOutput(`${out.stdout||''}${out.stderr||''}\nTask exited with code ${out.returncode}`);await refreshWorkspaceSnapshot()}
+function renderTools(){const host=E('toolchains');host.innerHTML='';for(const tool of S.config?.toolchains||[]){const row=document.createElement('div');row.className='tool-row';row.innerHTML=`<span class="tool-state ${tool.available?'':'missing'}">${tool.available?'Available':'Missing'}</span><strong>${escapeHtml(tool.name)}</strong><span>${escapeHtml(tool.available?Object.keys(tool.found||{}).join(', '):tool.install_hint)}</span>`;host.appendChild(row)}}
+function shellQuote(value){return `'${String(value).replace(/'/g,"'\\''")}'`}
+async function newTerminal(){if(S.terminalStarting)return S.terminalPromise;if(!S.capabilities.terminal)throw new Error(S.capabilities.process_denial_reason||'Terminal is unavailable.');S.terminalStarting=true;S.terminalPromise=(async()=>{if(S.terminal)await killTerminal();E('terminalEmpty').textContent='Starting terminal...';const out=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/terminals`,{method:'POST',body:JSON.stringify({root_id:S.activeRoot,cwd:activeDir()||'.',cols:100,rows:28})});S.terminal=out.terminal;S.terminalOffset=0;E('terminalFallback').textContent='';setupTerminalWidget();pollTerminal();if(S.panel!=='terminal'||!S.panelVisible)showPanel('terminal');return S.terminal})().finally(()=>{S.terminalStarting=false;S.terminalPromise=null});return S.terminalPromise}
+function setupTerminalWidget(){E('terminalHost').innerHTML='';E('terminalEmpty').classList.add('is-hidden');if(window.Terminal){S.terminalWidget=new window.Terminal({convertEol:true,cursorBlink:true,fontSize:12,fontFamily:'SFMono-Regular, Menlo, Monaco, Consolas, monospace',theme:{background:'#181818',foreground:'#cccccc',cursor:'#ffffff',selectionBackground:'#264f78'},scrollback:5000});const Fit=window.FitAddon?.FitAddon;if(Fit){S.terminalFit=new Fit();S.terminalWidget.loadAddon(S.terminalFit)}S.terminalWidget.open(E('terminalHost'));if(S.terminalFit)S.terminalFit.fit();S.terminalWidget.onData(data=>terminalInput(data));if(S.terminalWidget.onResize)S.terminalWidget.onResize(size=>terminalResize(size.cols,size.rows));E('terminalFallback').classList.remove('is-active')}else{E('terminalFallback').classList.add('is-active');E('terminalFallback').contentEditable='true';E('terminalFallback').onkeydown=event=>{if(event.key.length===1){event.preventDefault();terminalInput(event.key)}else if(event.key==='Enter'){event.preventDefault();terminalInput('\r')}else if(event.key==='Backspace'){event.preventDefault();terminalInput('\x7f')}}}}
+async function terminalInput(data){if(!S.terminal)return;try{await api(`/api/ide/v2/terminals/${qs(S.terminal.id)}/input`,{method:'POST',body:JSON.stringify({data})})}catch(error){logOutput(error.message)}}
+async function terminalResize(cols,rows){if(!S.terminal)return;try{await api(`/api/ide/v2/terminals/${qs(S.terminal.id)}/resize`,{method:'POST',body:JSON.stringify({cols,rows})})}catch(error){logOutput(error.message)}}
+async function pollTerminal(){clearTimeout(S.terminalPoll);if(!S.terminal)return;try{const out=await api(`/api/ide/v2/terminals/${qs(S.terminal.id)}/output?offset=${S.terminalOffset}`);S.terminalOffset=out.next_offset||S.terminalOffset;if(out.data){logOutputChunk(out.data.replace(/\x1b\[[0-9;?]*[ -\/]*[@-~]/g,''));if(S.terminalWidget)S.terminalWidget.write(out.data);else{const host=E('terminalFallback');host.textContent+=out.data;host.scrollTop=host.scrollHeight}}if(out.closed){setStatus(`Terminal exited with code ${out.returncode}`);logOutput(`Process exited with code ${out.returncode}`);S.terminal=null;await refreshWorkspaceSnapshot();return}}catch(error){logOutput(`Terminal: ${error.message}`);return}S.terminalPoll=setTimeout(pollTerminal,220)}
+async function killTerminal(){if(!S.terminal)return;const current=S.terminal;S.terminal=null;clearTimeout(S.terminalPoll);try{await api(`/api/ide/v2/terminals/${qs(current.id)}`,{method:'DELETE',body:'{}'})}catch(error){logOutput(error.message)}if(S.terminalWidget){S.terminalWidget.dispose();S.terminalWidget=null}E('terminalHost').innerHTML='';E('terminalFallback').classList.remove('is-active');E('terminalEmpty').textContent='No active terminal.';E('terminalEmpty').classList.remove('is-hidden')}
+async function runActiveFile(){const file=activeFile();if(!file)return toast('Open a file to run.','warning');if(file.binary)return toast('This artifact is not executable.','warning');if(file.dirty)await saveFile(file);await newTerminal();const lang=languageFor(file.path);const command=lang==='python'?`python3 ${shellQuote(file.name)}`:['javascript','typescript'].includes(lang)?`node ${shellQuote(file.name)}`:`${shellQuote(file.name)}`;logOutput(`> ${command}`);setTimeout(()=>terminalInput(command+'\r'),300)}
+async function debugActiveFile(){const file=activeFile();if(!file||languageFor(file.path)!=='python')return toast('Open a Python file to debug.','warning');if(file.dirty)await saveFile(file);if(S.debug)await stopDebug();showPanel('debug');logDebug(`Starting debugger for ${file.path}...`);const out=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/debug`,{method:'POST',body:JSON.stringify({root_id:file.root_id})});S.debug=out.debug;S.debugFile=file;S.debugSeq=1;await sendDebug({seq:S.debugSeq++,type:'request',command:'initialize',arguments:{clientID:'clouds-coder',clientName:'Clouds Coder Program',adapterID:'python',pathFormat:'path',linesStartAt1:true,columnsStartAt1:true,supportsRunInTerminalRequest:false}});pollDebug()}
+async function sendDebug(message){if(!S.debug)return;await api(`/api/ide/v2/debug/${qs(S.debug.id)}/send`,{method:'POST',body:JSON.stringify({message})})}
+async function pollDebug(){clearTimeout(S.debugPoll);if(!S.debug)return;try{const out=await api(`/api/ide/v2/debug/${qs(S.debug.id)}/messages`);for(const msg of out.messages||[])await handleDebugMessage(msg);if(out.stderr)logDebug(out.stderr);if(out.closed){logDebug('Debug adapter stopped.');S.debug=null;return}}catch(error){logDebug(`Debug error: ${error.message}`);S.debug=null;return}S.debugPoll=setTimeout(pollDebug,180)}
+async function handleDebugMessage(msg){if(msg.type==='response'&&msg.command==='initialize'&&msg.success){logDebug('Debugger initialized.');await sendDebug({seq:S.debugSeq++,type:'request',command:'launch',arguments:{program:S.debugFile.name,cwd:S.debugFile.dir||'.',console:'internalConsole',justMyCode:true,noDebug:false}});return}if(msg.type==='event'&&msg.event==='initialized'){await sendDebug({seq:S.debugSeq++,type:'request',command:'configurationDone',arguments:{}});return}if(msg.type==='event'&&msg.event==='output'){logDebug(msg.body?.output||'');return}if(msg.type==='event'&&msg.event==='stopped'){logDebug(`Paused: ${msg.body?.reason||'breakpoint'}`);return}if(msg.type==='event'&&msg.event==='terminated'){logDebug('Program terminated.');await stopDebug(false);await refreshWorkspaceSnapshot();return}if(msg.type==='response'&&!msg.success)logDebug(`${msg.command}: ${msg.message||'request failed'}`)}
+async function stopDebug(closeRemote=true){clearTimeout(S.debugPoll);const current=S.debug;S.debug=null;if(closeRemote&&current)try{await api(`/api/ide/v2/debug/${qs(current.id)}`,{method:'DELETE',body:'{}'})}catch(error){logDebug(error.message)}}
+"""
+
+IDE_JS += r"""
+async function refreshExtensions(query=''){if(query.trim()){const out=await api(`/api/ide/v2/extensions/search?query=${qs(query)}&size=40`);renderExtensions(out.extensions||[],false);E('extensionSummary').textContent=`${out.totalSize||0} Open VSX results`}else{const out=await api('/api/ide/v2/extensions');S.installedExtensions=out.extensions||[];renderExtensions(S.installedExtensions,true);E('extensionSummary').textContent=`${S.installedExtensions.length} installed`}}
+function renderExtensions(rows,installed){const host=E('extensionList');host.innerHTML='';if(!rows.length)host.innerHTML=`<div class="side-summary">${installed?'No extensions installed.':'No extensions found.'}</div>`;for(const ext of rows){const row=document.createElement('div');row.className='extension-row';row.innerHTML=`<div class="extension-icon"><span class="codicon codicon-extensions"></span></div><div class="extension-info"><div class="extension-title">${escapeHtml(ext.displayName||ext.name||ext.id)}</div><div class="extension-description">${escapeHtml(ext.description||'')}</div><div class="extension-meta">${escapeHtml(ext.id||`${ext.namespace}.${ext.name}`)} ${escapeHtml(ext.version||'')}</div></div><button class="button">${installed?'Uninstall':'Install'}</button>`;row.querySelector('.button').onclick=()=>installed?uninstallExtension(ext.id):installExtension(ext.id||`${ext.namespace}.${ext.name}`);host.appendChild(row)}}
+async function installExtension(id,payload={}){setStatus(`Installing ${id||'VSIX'}...`);const out=await api('/api/ide/v2/extensions/install',{method:'POST',body:JSON.stringify(Object.assign({id},payload))});toast(`Installed ${out.extension?.displayName||out.extension?.id}.`,'success');await refreshExtensions();activateExtensionWorker(out.extension).catch(error=>logOutput(`Extension ${out.extension?.id}: ${error.message}`))}
+async function uninstallExtension(id){if(!confirm(`Uninstall ${id}?`))return;await api('/api/ide/v2/extensions',{method:'DELETE',body:JSON.stringify({id})});const worker=S.extensionWorkers.get(id);if(worker){worker.terminate();S.extensionWorkers.delete(id)}await refreshExtensions();toast(`Uninstalled ${id}.`,'success')}
+async function installVsix(file){if(!file)return;await installExtension('',{content_b64:await readFileAsB64(file)})}
+async function activateExtensionWorker(extension){if(!S.capabilities.executable_extensions||!extension?.worker_supported||!extension.browser||!extension.install_path||S.extensionWorkers.has(extension.id))return;const scriptUrl=`/api/ide/v2/extensions/asset/${qs(extension.install_path)}/${extension.browser.split('/').map(qs).join('/')}`;const extensionSource=await fetch(scriptUrl,{credentials:'same-origin'}).then(response=>{if(!response.ok)throw new Error('Unable to load extension code');return response.text()});const bootstrap=`
+const commands=new Map();
+const vscode={version:'clouds-coder-api-0.1',commands:{registerCommand:(id,fn)=>{commands.set(id,fn);postMessage({type:'registerCommand',id});return{dispose:()=>commands.delete(id)}},executeCommand:(id,...args)=>{postMessage({type:'executeHostCommand',id,args});}},window:{showInformationMessage:message=>postMessage({type:'information',message}),showWarningMessage:message=>postMessage({type:'warning',message}),showErrorMessage:message=>postMessage({type:'error',message})},workspace:{getConfiguration:()=>({get:()=>undefined,has:()=>false}),workspaceFolders:[]},languages:{registerCompletionItemProvider:()=>({dispose(){}})},ExtensionContext:class{}};
+self.fetch=()=>Promise.reject(new Error('Network access is not part of the Clouds Coder extension API subset'));self.XMLHttpRequest=undefined;self.WebSocket=undefined;self.EventSource=undefined;self.Worker=undefined;
+self.vscode=vscode;self.require=id=>{if(id==='vscode')return vscode;throw new Error('Only the documented vscode API subset is available')};
+self.onmessage=async event=>{if(event.data?.type==='command'){const fn=commands.get(event.data.id);if(fn)try{await fn(...(event.data.args||[]))}catch(error){postMessage({type:'error',message:error.message})}}};
+${extensionSource}\n;if(typeof activate==='function')Promise.resolve(activate({subscriptions:[],extensionUri:'clouds-extension://${extension.id}',globalState:{get:()=>undefined,update:async()=>{}},workspaceState:{get:()=>undefined,update:async()=>{}}})).catch(error=>postMessage({type:'error',message:error.message}));`;
+  const worker=new Worker(URL.createObjectURL(new Blob([bootstrap],{type:'application/javascript'})));worker.onmessage=event=>handleExtensionMessage(extension,event.data);worker.onerror=event=>logOutput(`Extension ${extension.id}: ${event.message}`);S.extensionWorkers.set(extension.id,worker)
+}
+function handleExtensionMessage(extension,message){if(!message)return;if(message.type==='information')toast(`${extension.displayName}: ${message.message}`,'success');else if(message.type==='warning')toast(`${extension.displayName}: ${message.message}`,'warning');else if(message.type==='error')toast(`${extension.displayName}: ${message.message}`,'error');else if(message.type==='registerCommand')COMMANDS.set(message.id,{label:`${extension.displayName}: ${message.id}`,run:()=>S.extensionWorkers.get(extension.id)?.postMessage({type:'command',id:message.id,args:[]})});else if(message.type==='executeHostCommand')runCommandById(message.id)}
+async function activateInstalledExtensions(){for(const extension of S.installedExtensions)await activateExtensionWorker(extension)}
+function agentMessage(text,type='system',meta=''){const row=document.createElement('div');row.className=`agent-message ${type}`;if(meta){const label=document.createElement('span');label.className='agent-meta';label.textContent=meta;row.appendChild(label)}row.appendChild(document.createTextNode(String(text||'')));E('agentMessages').appendChild(row);E('agentMessages').scrollTop=E('agentMessages').scrollHeight;return row}
+function updateAgentContext(){const file=activeFile();E('agentContext').textContent=[S.sessions.find(row=>row.id===S.activeSession)?.title,S.roots.find(row=>row.id===S.activeRoot)?.label,file?.path].filter(Boolean).join('  /  ')||'No active context'}
+function agentEventKey(row){return [Number(row?.ts||0).toFixed(4),row?.role||'',row?.agent_role||'',row?.type||'',String(row?.text||'').slice(0,180)].join('|')}
+function renderAgentProgress(state){const panel=E('agentTodoPanel'),host=E('agentTodoBody');const rows=[...(state.todos||[]),...(state.tasks||[])].slice(0,40);panel.classList.toggle('is-hidden',!rows.length);if(!rows.length){host.innerHTML='';return}const completed=rows.filter(row=>String(row.status||'')==='completed').length;E('agentTodoCount').textContent=`${completed}/${rows.length}`;panel.classList.toggle('is-collapsed',S.agentTodoCollapsed);E('agentTodoToggle').setAttribute('aria-expanded',String(!S.agentTodoCollapsed));host.innerHTML=rows.map(row=>{const status=String(row.status||'pending'),mark=status==='completed'?'✓':status==='in_progress'?'●':'○';return `<div class="agent-progress-row ${status==='completed'?'done':status==='in_progress'?'active':''}"><span>${mark}</span><span>${escapeHtml(row.content||row.subject||row.description||'Task')}</span></div>`}).join('')}
+function renderAgentContextHud(state){const pct=Number(state.context_left_percent),left=Number(state.context_left_tokens),limit=Number(state.context_effective_token_limit);const badge=E('agentContextPercent'),button=E('agentModelBtn');badge.textContent=Number.isFinite(pct)?`${Math.round(Math.max(0,Math.min(100,pct)))}%`:'';const context=Number.isFinite(left)&&left>=0?`${left.toLocaleString()} tokens left${Number.isFinite(limit)&&limit>0?` of ${limit.toLocaleString()}`:''}`:'Context usage unavailable';button.title=`${state.model||'Choose model'}\n${context}${Number.isFinite(pct)?` (${pct.toFixed(1)}%)`:''}`}
+function agentToolIcon(kind,name=''){const key=String(name||kind||'').toLowerCase();if(kind==='file_patch'||key.includes('write')||key.includes('edit'))return'diff';if(kind==='command'||key==='bash'||key.includes('terminal'))return'terminal';if(key.includes('read'))return'file-code';if(key.includes('search')||key.includes('query'))return'search';if(key.includes('todo'))return'checklist';if(key.includes('skill'))return'extensions';return'tools'}
+function agentDiffHtml(diff){return String(diff||'').split('\n').map(line=>{const clean=line.replace(/^\s*\d+\s*[|:]\s?/,'');let tone='';if(clean.startsWith('@@'))tone='hunk';else if(clean.startsWith('+')&&!clean.startsWith('+++'))tone='add';else if(clean.startsWith('-')&&!clean.startsWith('---'))tone='del';const mark=tone==='add'?'+':tone==='del'?'-':tone==='hunk'?'@':' ';return `<div class="agent-diff-line ${tone}"><span>${mark}</span><span>${escapeHtml(line)}</span></div>`}).join('')}
+function agentToolCard({kind='tool',name='Tool',title='',state='',stateTone='',output='',path='',added=null,deleted=null,diff='',role='',expanded=false,actionPath='',actionRoot=''}){const row=document.createElement('div');row.className=`agent-message ${kind==='file_patch'?'file_patch':kind==='command'?'command':'tool'}${expanded?' is-expanded':''}`;const stats=kind==='file_patch'?`<span class="agent-diff-stats"><span class="diff-add">+${Number(added||0)}</span><span class="diff-del">-${Number(deleted||0)}</span></span>`:'';const body=diff?`<div class="agent-diff">${agentDiffHtml(diff)}</div>`:output?`<pre class="agent-tool-output">${escapeHtml(output)}</pre>`:'';const actions=actionPath?`<div class="agent-tool-actions"><button class="button" data-agent-open-file="${escapeHtml(actionPath)}"><span class="codicon codicon-go-to-file"></span> Open File</button>${stats}</div>`:stats?`<div class="agent-tool-actions">${stats}</div>`:'';row.innerHTML=`<div class="agent-tool-head" role="button" tabindex="0"><span class="codicon codicon-${agentToolIcon(kind,name)}"></span><span class="agent-tool-title" title="${escapeHtml(path||title||name)}">${escapeHtml(title||name)}</span><span class="agent-tool-state ${escapeHtml(stateTone)}">${escapeHtml(state)}</span><span class="codicon codicon-chevron-right"></span></div><div class="agent-tool-body">${role?`<span class="agent-meta" style="padding:6px 8px 0">${escapeHtml(role)}</span>`:''}${body}${actions}</div>`;const toggle=()=>row.classList.toggle('is-expanded');const head=row.querySelector('.agent-tool-head');head.onclick=toggle;head.onkeydown=event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();toggle()}};const open=row.querySelector('[data-agent-open-file]');if(open)open.onclick=event=>{event.stopPropagation();openFile(actionPath,{root_id:actionRoot||S.activeRoot}).catch(showError)};E('agentMessages').appendChild(row);E('agentMessages').scrollTop=E('agentMessages').scrollHeight;return row}
+function renderFilePatchCard(data,role=''){const path=String(data.session_rel_path||data.path||'').replace(/^\.\//,'');const change=String(data.change_type||'').toLowerCase();const label=change.includes('create')?'Created':'Modified';return agentToolCard({kind:'file_patch',name:'file_patch',title:`${label} ${path||'workspace file'}`,state:'Applied',stateTone:'success',path,added:data.added,deleted:data.deleted,diff:data.diff_numbered||data.diff||'',role,expanded:true,actionPath:path,actionRoot:S.activeRoot})}
+function renderCommandCard(data,role=''){const code=data.exit_code,failed=code!=null&&Number(code)!==0;const changed=Array.isArray(data.changed_files)&&data.changed_files.length?`\nChanged: ${data.changed_files.join(', ')}`:'';const output=[data.command?`$ ${data.command}`:'',data.cwd?`cwd: ${data.cwd}`:'',data.output||data.result||'',changed].filter(Boolean).join('\n');return agentToolCard({kind:'command',name:data.name||'command',title:data.name||data.command||'Command',state:code==null?'Running':`Exit ${code}${data.duration_ms!=null?` · ${data.duration_ms}ms`:''}`,stateTone:failed?'error':code==null?'':'success',output,role,expanded:failed})}
+function renderAgentToolOperation(op){const data=op.data||{},name=String(data.name||data.tool||'tool'),lower=name.toLowerCase(),role=String(data.agent_role||'Agent tool'),resultText=String(data.summary||data.result||''),fileTool=['write_file','edit_file','apply_patch'].includes(lower);if(lower.includes('todowrite')||(fileTool&&!/error|failed|malformed/i.test(resultText)))return null;if(op.type==='file_patch')return renderFilePatchCard(data,role);if(op.type==='command')return renderCommandCard(data,role);const key=`${role}:${lower}`,done=op.type==='tool_result',failed=done&&(/error|failed|malformed/i.test(resultText)||data.exit_code!=null&&Number(data.exit_code)!==0);const title=lower==='read_file'&&data.path?`Read ${data.path}`:lower.includes('search')?'Search':name;const output=[data.path?`Path: ${data.path}`:'',data.command?`$ ${data.command}`:'',data.summary||'',done?data.result||'':''].filter(Boolean).join('\n');const card=agentToolCard({kind:'tool',name,title,state:done?(failed?'Failed':'Completed'):'Running',stateTone:failed?'error':done?'success':'',output,role,expanded:failed});const existing=S.agentToolCards.get(key);if(done&&existing?.isConnected){existing.replaceWith(card);S.agentToolCards.delete(key)}else if(done){S.agentToolCards.delete(key)}else S.agentToolCards.set(key,card);return card}
+function renderAgentAttachments(){const host=E('agentAttachments');host.classList.toggle('is-hidden',!S.agentAttachments.length);host.innerHTML=S.agentAttachments.map((item,index)=>`<div class="agent-attachment" title="${escapeHtml(item.path)}"><span class="codicon codicon-file"></span><span>${escapeHtml(item.name||item.path)}</span><button class="icon-button" data-remove-attachment="${index}" title="Remove"><span class="codicon codicon-close"></span></button></div>`).join('');host.querySelectorAll('[data-remove-attachment]').forEach(button=>button.onclick=()=>{S.agentAttachments.splice(Number(button.dataset.removeAttachment),1);renderAgentAttachments()})}
+function resetAgentSessionUI(sessionId=''){S.agentSession=sessionId;S.agentState=null;S.agentRendered.clear();S.agentToolCards.clear();S.agentOperationSeq=0;S.agentEventSeq=0;S.agentWasBusy=false;S.agentSubmitting=false;S.agentFileRefresh.clear();S.agentAttachments=[];renderAgentAttachments();E('agentMessages').innerHTML='';E('agentTodoPanel').classList.add('is-hidden');E('agentTodoBody').innerHTML='';E('agentTodoCount').textContent='';E('agentContextPercent').textContent='';E('agentStatus').textContent='Loading history...';E('sendAgentBtn').disabled=false;E('agentPrompt').disabled=false}
+async function uploadAgentAttachments(files){const list=[...(files||[])];if(!list.length)return;E('attachContextBtn').disabled=true;try{const items=[];for(let index=0;index<list.length;index++){const file=list[index];items.push({path:file.webkitRelativePath||file.name,content_b64:await readFileAsB64(file)});E('agentStatus').textContent=`Attaching ${index+1}/${list.length}`}const out=await api(`/api/ide/sessions/${qs(S.activeSession)}/workspace/upload`,{method:'POST',body:JSON.stringify({root_id:S.activeRoot,dest:'.clouds_coder/attachments',items})});for(const item of out.written||[])if(!S.agentAttachments.some(row=>row.path===item.path))S.agentAttachments.push({path:item.path,name:item.name,size:item.size});renderAgentAttachments();S.treeCache.clear();await loadTree('');toast(`Attached ${out.count||list.length} file(s).`,'success')}finally{E('attachContextBtn').disabled=false;E('agentStatus').textContent=S.agentState?.running?'Running':'Idle';E('agentAttachmentInput').value=''}}
+async function showAgentModelMenu(anchor){const popup=E('menuPopup');popup.classList.remove('is-hidden');popup.classList.add('agent-model-menu');popup.innerHTML='<div class="agent-model-summary">Loading models...</div>';const rect=anchor.getBoundingClientRect();popup.style.left=`${Math.max(4,Math.min(rect.left,window.innerWidth-364))}px`;popup.style.top='auto';popup.style.bottom=`${Math.max(4,window.innerHeight-rect.top+8)}px`;popup.style.transform='';try{const catalog=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/models`);S.agentModelCatalog=catalog;popup.innerHTML='';const pct=Number(S.agentState?.context_left_percent),left=Number(S.agentState?.context_left_tokens);const summary=document.createElement('div');summary.className='agent-model-summary';summary.textContent=`${S.agentState?.model||'Current model'} · ${Number.isFinite(left)?left.toLocaleString()+' tokens left':'context unavailable'}${Number.isFinite(pct)?` (${pct.toFixed(1)}%)`:''}`;popup.appendChild(summary);for(const option of catalog.options||[]){const button=document.createElement('button');button.classList.toggle('is-active',option.selection===catalog.selected);button.innerHTML=`<span class="codicon codicon-${option.selection===catalog.selected?'check':'hubot'}"></span><span>${escapeHtml(option.label||option.model||option.selection)}</span>`;button.onclick=event=>{event.stopPropagation();applyAgentModel(option.selection,option.label||option.model).catch(showError)};popup.appendChild(button)}if(!(catalog.options||[]).length)popup.insertAdjacentHTML('beforeend','<div class="agent-model-summary">No configured models.</div>')}catch(error){popup.innerHTML=`<div class="agent-model-summary">${escapeHtml(error.message)}</div>`}}
+async function applyAgentModel(selection,label){const popup=E('menuPopup');popup.classList.add('is-hidden');popup.classList.remove('agent-model-menu');popup.style.transform='';popup.style.bottom='auto';const out=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/model`,{method:'POST',body:JSON.stringify({selection})});toast(out.queued?out.note||'Model switch queued.':`Model switched to ${label||selection}.`,out.queued?'warning':'success');scheduleAgentPoll(80)}
+async function refreshAgentEditedFile(path,rootId='session'){const clean=String(path||'').replace(/^\.\//,'');if(!clean)return;for(const file of S.openFiles.values()){if(file.session_id!==S.activeSession||file.root_id!==rootId||file.path!==clean||file.dirty||file.stageId!=='latest')continue;try{await refreshOpenFile(file)}catch(error){logOutput(`Agent file refresh: ${error.message}`)}}}
+function scheduleWorkspaceRefresh(delay=250){if(S.renderingAgentState)return;clearTimeout(S.agentTreeTimer);S.agentTreeTimer=setTimeout(()=>refreshWorkspaceSnapshot().catch(error=>logOutput(`Explorer refresh: ${error.message}`)),delay)}
+function renderAgentState(state){const running=!!state.running,queued=Number(state.scheduler_queued||0)>0,busy=running||queued,eventSeq=Number(state.event_seq||0),workspaceChanged=eventSeq>S.agentEventSeq||S.agentWasBusy&&!busy;S.agentEventSeq=Math.max(S.agentEventSeq,eventSeq);const detail=queued&&!running?`${state.scheduler_queued} queued`:[state.active_role,state.phase,state.active_tool].filter(Boolean).join(' / ');E('agentStatus').textContent=busy?(detail||'Running'):'Idle';E('sendAgentBtn').disabled=busy||S.agentSubmitting;E('agentPrompt').disabled=busy||S.agentSubmitting;renderAgentProgress(state);renderAgentContextHud(state);const previousLive=E('agentLiveResponse');if(previousLive)previousLive.remove();const timeline=[];for(const row of state.feed||[]){const type=String(row.type||'message');if(['file_patch','command','tool_start','tool_result'].includes(type))continue;timeline.push({source:'feed',ts:Number(row.ts||0),seq:0,row})}for(const op of state.operations||[])timeline.push({source:'operation',ts:Number(op.ts||0),seq:Number(op.seq||0),op});timeline.sort((a,b)=>a.ts-b.ts||a.seq-b.seq);for(const item of timeline){if(item.source==='feed'){const row=item.row,key=agentEventKey(row),type=String(row.type||'message');if(S.agentRendered.has(key))continue;S.agentRendered.add(key);const role=String(row.agent_role||row.role||'agent');if(type==='tool_calls'){const tools=Array.isArray(row.data?.tools)?row.data.tools.join(', '):row.text||'Tool calls scheduled';agentToolCard({kind:'tool',name:'tool_calls',title:'Tools scheduled',state:'Planned',output:tools,role});continue}if(type==='web_search'){agentToolCard({kind:'tool',name:'web_search',title:'Web search',state:'Completed',stateTone:'success',output:row.text||row.data?.summary||'',role});continue}const tone=row.role==='assistant'?'assistant':row.role==='user'?'user':type==='error'?'error':'system';agentMessage(row.text||row.data?.summary||type,tone,role);continue}const op=item.op,seq=Number(op.seq||0),key=`operation:${op.id||seq}`;S.agentOperationSeq=Math.max(S.agentOperationSeq,seq);if(op.type==='file_patch'){const path=op.data?.session_rel_path||op.data?.path||'';S.agentFileRefresh.add(path)}if(S.agentRendered.has(key))continue;S.agentRendered.add(key);if(['tool_start','tool_result','file_patch','command'].includes(op.type))renderAgentToolOperation(op);else if(op.type==='error')agentMessage(op.data?.summary||op.data?.result||'Tool failed','error',op.data?.agent_role||'Agent')}if(state.live_response_text&&running){const live=agentMessage('','assistant','Live response');live.id='agentLiveResponse';live.lastChild.textContent=state.live_response_text}if(S.agentFileRefresh.size){const paths=[...S.agentFileRefresh];S.agentFileRefresh.clear();for(const path of paths)refreshAgentEditedFile(path);scheduleWorkspaceRefresh(180)}else if(workspaceChanged)scheduleWorkspaceRefresh(busy?500:100);if(!busy&&S.agentSubmitting)S.agentSubmitting=false;S.agentWasBusy=busy}
+const renderAgentStateBase=renderAgentState;
+renderAgentState=function(state){const busy=!!state.running||Number(state.scheduler_queued||0)>0,previousOperationSeq=S.agentOperationSeq;S.agentEventSeq=Math.max(S.agentEventSeq,Number(state.event_seq||0));S.agentWasBusy=busy;if(state.title){const session=S.sessions.find(row=>row.id===S.activeSession);if(session&&session.title!==state.title){session.title=state.title;renderSessions();updateAgentContext()}}S.renderingAgentState=true;try{renderAgentStateBase(Object.assign({},state,{operations:(state.operations||[]).filter(op=>Number(op.seq||0)>previousOperationSeq)}))}finally{S.renderingAgentState=false}};
+function handleAgentEvent(event){const type=String(event?.type||''),data=event?.data||{};if(type==='file_patch'){if(data.path)refreshAgentEditedFile(data.path,data.root_id||'session');scheduleWorkspaceRefresh(120)}else if(type==='workspace_change'||type==='upload'){for(const path of data.changed_files||[])refreshAgentEditedFile(path,data.root_id||'session');scheduleWorkspaceRefresh(120)}if(type!=='hello'){S.agentPollRequested=true;scheduleAgentPoll(40)}}
+function closeAgentEvents(){clearTimeout(S.agentEventReconnect);if(S.agentEvents){S.agentEvents.close();S.agentEvents=null}S.agentEventsConnected=false}
+function connectAgentEvents(){closeAgentEvents();if(!S.activeSession)return;const sid=S.activeSession,source=new EventSource(`/api/ide/v2/sessions/${qs(sid)}/events`);S.agentEvents=source;source.onopen=()=>{if(sid!==S.activeSession)return source.close();S.agentEventsConnected=true;S.agentPollRequested=true;scheduleAgentPoll(0);E('syncStatus').title='Live file events connected'};source.onmessage=message=>{if(sid!==S.activeSession)return;try{handleAgentEvent(JSON.parse(message.data||'{}'))}catch(error){logOutput(`IDE event: ${error.message}`)}};source.onerror=()=>{if(sid!==S.activeSession)return;S.agentEventsConnected=false;E('syncStatus').title='Live events reconnecting';source.close();if(S.agentEvents===source)S.agentEvents=null;clearTimeout(S.agentEventReconnect);S.agentEventReconnect=setTimeout(connectAgentEvents,document.hidden?120000:30000);scheduleAgentPoll(document.hidden?120000:30000)}}
+async function pollAgent(){clearTimeout(S.agentPoll);if(!S.activeSession||S.agentPollBusy)return;if(S.agentEventsConnected&&S.agentState&&!S.agentSubmitting&&!S.agentPollRequested)return;S.agentPollRequested=false;S.agentPollBusy=true;const sid=S.activeSession;try{if(S.agentSession!==sid)resetAgentSessionUI(sid);const out=await api(`/api/ide/v2/sessions/${qs(sid)}/agent-state`);if(sid===S.activeSession){S.agentState=out;renderAgentState(out)}}catch(error){if(sid===S.activeSession&&error.status!==404)logOutput(`Agent state: ${error.message}`)}finally{S.agentPollBusy=false;if(S.agentPollRequested)scheduleAgentPoll(0);else if(!S.agentEventsConnected)scheduleAgentPoll(document.hidden?120000:30000)}}
+function scheduleAgentPoll(delay=900){clearTimeout(S.agentPoll);S.agentPoll=setTimeout(pollAgent,Math.max(250,delay))}
+async function sendAgent(){const input=E('agentPrompt');const message=input.value.trim();if(!message||S.agentSubmitting||S.agentState?.running||Number(S.agentState?.scheduler_queued||0)>0)return;const file=activeFile(),attachments=S.agentAttachments.map(item=>item.path);S.agentSubmitting=true;E('sendAgentBtn').disabled=true;input.disabled=true;E('agentStatus').textContent='Submitting...';try{const out=await api(`/api/ide/sessions/${qs(S.activeSession)}/agent-task`,{method:'POST',body:JSON.stringify({root_id:S.activeRoot,active_path:file?.path||'',message,attachments})});input.value='';S.agentAttachments=[];renderAgentAttachments();E('agentStatus').textContent=out.queued?'Queued':'Started';scheduleAgentPoll(100)}catch(error){S.agentSubmitting=false;E('agentStatus').textContent='';E('sendAgentBtn').disabled=false;input.disabled=false;agentMessage(error.message,'error');throw error}}
+function openModal(title,html){E('modalTitle').textContent=title;E('modalBody').innerHTML=html;E('modalOverlay').classList.remove('is-hidden')}
+function closeModal(){E('modalOverlay').classList.add('is-hidden');E('modalBody').innerHTML=''}
+async function showAccountModal(){let users=[],devices=[];if(S.capabilities.admin&&S.capabilities.local){try{[users,devices]=await Promise.all([api('/api/ide/v2/admin/users').then(x=>x.accounts||[]),api('/api/ide/v2/admin/devices').then(x=>x.devices||[])])}catch(error){logOutput(error.message)}}const userRows=users.map(row=>`<div class="account-row"><div><strong>${escapeHtml(row.username)}</strong><small>${escapeHtml(row.role)}${row.disabled?' / disabled':''}</small></div>${row.role==='admin'?'':`<button class="button" data-user="${escapeHtml(row.username)}" data-disabled="${row.disabled?'0':'1'}">${row.disabled?'Enable':'Disable'}</button>`}</div>`).join('');const deviceRows=devices.map(row=>`<div class="account-row"><div><strong>${escapeHtml(row.label||row.pairing_id)}</strong><small>${escapeHtml(row.pairing_id)} / ${escapeHtml(row.source_ip)} / ${escapeHtml(row.status)}</small></div><div>${row.status==='pending'?`<button class="button primary" data-device-approve="${escapeHtml(row.pairing_id)}">Approve</button>`:''}${row.status!=='revoked'?` <button class="button" data-device-revoke="${escapeHtml(row.pairing_id)}">Revoke</button>`:''}</div></div>`).join('');const passwordForm=S.config?.password_login_enabled?`<form id="resetPasswordForm" class="modal-form"><h3>Password Login</h3><input id="resetUsername" value="${escapeHtml(S.account.username)}" required><input id="resetPassword" type="password" placeholder="New password" required><div class="modal-actions"><button class="button primary">Set Password</button></div></form>`:'';openModal('Access',`<div class="account-list"><div class="account-row"><div><strong>${escapeHtml(S.account.username)}</strong><small>${escapeHtml(S.account.role)} / current</small></div><button id="logoutBtn" class="button">Sign Out</button></div>${userRows}</div>${S.capabilities.admin&&S.capabilities.local?`<div class="section-label"><strong>Web Devices</strong></div><div class="account-list">${deviceRows||'<div class="side-summary">No Web devices requested access.</div>'}</div>${passwordForm}`:''}`);E('logoutBtn').onclick=logout;document.querySelectorAll('[data-user]').forEach(button=>button.onclick=async()=>{await api('/api/ide/v2/admin/users',{method:'PATCH',body:JSON.stringify({username:button.dataset.user,disabled:button.dataset.disabled==='1'})});showAccountModal()});document.querySelectorAll('[data-device-approve]').forEach(button=>button.onclick=async()=>{await api('/api/ide/v2/admin/devices/approve',{method:'POST',body:JSON.stringify({pairing_id:button.dataset.deviceApprove})});showAccountModal()});document.querySelectorAll('[data-device-revoke]').forEach(button=>button.onclick=async()=>{await api('/api/ide/v2/admin/devices/revoke',{method:'POST',body:JSON.stringify({pairing_id:button.dataset.deviceRevoke})});showAccountModal()});if(E('resetPasswordForm'))E('resetPasswordForm').onsubmit=async event=>{event.preventDefault();await api('/api/ide/v2/admin/password-reset',{method:'POST',body:JSON.stringify({username:E('resetUsername').value,new_password:E('resetPassword').value})});location.reload()}}
+async function logout(){try{await api('/api/ide/v2/auth/logout',{method:'POST',body:'{}'})}finally{location.reload()}}
+function showMountModal(){const mounts=S.config?.mounts||[];openModal('Workspace Folders',`<div class="account-list">${mounts.map(row=>`<div class="account-row"><div><strong>${escapeHtml(row.label)}</strong><small>${escapeHtml(row.path)}</small></div><button class="button" data-mount="${escapeHtml(row.id)}">Remove</button></div>`).join('')||'<div class="side-summary">No external folders mounted.</div>'}</div><form id="mountForm" class="modal-form"><input id="mountPath" placeholder="/absolute/path/to/project" required><div class="modal-actions"><button class="button primary">Add Folder</button></div></form>`);document.querySelectorAll('[data-mount]').forEach(button=>button.onclick=async()=>{await api('/api/ide/mounts',{method:'DELETE',body:JSON.stringify({mount_id:button.dataset.mount})});await refreshConfig();showMountModal()});E('mountForm').onsubmit=async event=>{event.preventDefault();await api('/api/ide/mounts',{method:'POST',body:JSON.stringify({path:E('mountPath').value})});await refreshConfig();closeModal()}}
+const COMMANDS=new Map();
+function addCommand(id,label,shortcut,run){COMMANDS.set(id,{id,label,shortcut:shortcut||'',run})}
+function configureCommands(){
+  addCommand('file.new','File: New File','',newFile);addCommand('file.open','File: Upload Files','',()=>E('fileInput').click());addCommand('file.openFolder','File: Add Folder to Workspace','',()=>S.capabilities.mounts?showMountModal():toast('External folders require a local connection.','warning'));addCommand('file.save','File: Save','Ctrl+S',saveActive);addCommand('file.saveAll','File: Save All','Ctrl+K S',saveAll);
+  addCommand('workbench.action.showCommands','View: Show Command Palette','Ctrl+Shift+P',openPalette);addCommand('workbench.action.quickOpen','Go to File','Ctrl+P',()=>openPalette(''));addCommand('workbench.view.explorer','View: Explorer','Ctrl+Shift+E',()=>showView('explorer'));addCommand('workbench.view.search','View: Search','Ctrl+Shift+F',()=>showView('search'));addCommand('workbench.view.scm','View: Source Control','Ctrl+Shift+G',()=>showView('scm'));addCommand('workbench.view.extensions','View: Extensions','Ctrl+Shift+X',()=>showView('extensions'));addCommand('workbench.action.toggleSidebarVisibility','View: Toggle Primary Side Bar','Ctrl+B',togglePrimary);addCommand('workbench.action.togglePanel','View: Toggle Panel','Ctrl+J',togglePanel);addCommand('workbench.action.toggleAuxiliaryBar','View: Toggle Secondary Side Bar','',toggleSecondary);addCommand('workbench.action.splitEditor','View: Split Editor','Ctrl+\\',()=>{const file=activeFile();if(file)openFile(file.path,{root_id:file.root_id,group:1})});
+  addCommand('terminal.create','Terminal: Create New Terminal','Ctrl+Shift+`',newTerminal);addCommand('terminal.kill','Terminal: Kill Active Terminal','',killTerminal);addCommand('task.run','Tasks: Run Task','',()=>showView('run'));addCommand('run.active','Run: Active File','Ctrl+F5',runActiveFile);addCommand('agent.focus','Clouds Coder: Focus Agent','',()=>toggleSecondary(true));addCommand('accounts.manage','Accounts: Manage IDE Users','',showAccountModal);addCommand('session.new','Clouds Coder: New Program Session','',createSession);addCommand('navigate.chat','Clouds Coder: Return to Chat','',()=>{const port=S.config?.agent_port;if(port)location.href=`${location.protocol}//${location.hostname}:${port}/`});
+}
+function runCommandById(id){const command=COMMANDS.get(id);if(!command)return false;Promise.resolve(command.run()).catch(showError);return true}
+function openPalette(initial='>'){E('paletteOverlay').classList.remove('is-hidden');E('paletteInput').value=initial;filterPalette();requestAnimationFrame(()=>E('paletteInput').focus())}
+function closePalette(){E('paletteOverlay').classList.add('is-hidden')}
+function filterPalette(){const raw=E('paletteInput').value;const query=raw.replace(/^>/,'').trim().toLowerCase();S.paletteItems=[...COMMANDS.values()].filter(row=>!query||row.label.toLowerCase().includes(query)).slice(0,70);S.paletteIndex=0;renderPalette()}
+function renderPalette(){const host=E('paletteResults');host.innerHTML='';S.paletteItems.forEach((row,index)=>{const div=document.createElement('div');div.className='palette-row'+(index===S.paletteIndex?' is-active':'');div.innerHTML=`<span class="codicon codicon-symbol-method"></span><span>${escapeHtml(row.label)}</span><span class="keybinding">${escapeHtml(row.shortcut||'')}</span>`;div.onmouseenter=()=>{S.paletteIndex=index;renderPalette()};div.onclick=()=>{closePalette();runCommandById(row.id)};host.appendChild(div)})}
+function showMenu(anchor,items){const popup=E('menuPopup');popup.classList.remove('agent-model-menu');popup.style.transform='';popup.style.bottom='auto';popup.innerHTML='';for(const item of items){if(item==='-'){const separator=document.createElement('div');separator.className='separator';popup.appendChild(separator);continue}const command=COMMANDS.get(item);if(!command)continue;const button=document.createElement('button');button.innerHTML=`<span>${escapeHtml(command.label.replace(/^[^:]+:\s*/,''))}</span><span class="shortcut">${escapeHtml(command.shortcut)}</span>`;button.onclick=()=>{popup.classList.add('is-hidden');runCommandById(item)};popup.appendChild(button)}const rect=anchor.getBoundingClientRect();popup.style.left=`${Math.min(rect.left,window.innerWidth-220)}px`;popup.style.top=`${rect.bottom}px`;popup.classList.remove('is-hidden')}
+function showExplorerMenu(x,y,row){const popup=E('menuPopup');popup.classList.remove('agent-model-menu');popup.style.transform='';popup.style.bottom='auto';popup.innerHTML='';const items=[['Open',()=>openFile(row.path)],['Open to the Side',()=>openFile(row.path,{group:1})],['Rename',()=>renameEntry(row)],['Delete',()=>deleteEntry(row)]];for(const [label,action] of items){const button=document.createElement('button');button.textContent=label;button.onclick=()=>{popup.classList.add('is-hidden');Promise.resolve(action()).catch(showError)};popup.appendChild(button)}popup.style.left=`${Math.min(x,window.innerWidth-220)}px`;popup.style.top=`${Math.min(y,window.innerHeight-150)}px`;popup.classList.remove('is-hidden')}
+const MENUS={file:['file.new','file.open','file.openFolder','-','file.save','file.saveAll','-','navigate.chat'],edit:['workbench.action.showCommands'],selection:['workbench.action.showCommands'],view:['workbench.view.explorer','workbench.view.search','workbench.view.scm','workbench.view.extensions','-','workbench.action.toggleSidebarVisibility','workbench.action.togglePanel','workbench.action.toggleAuxiliaryBar','workbench.action.splitEditor'],go:['workbench.action.quickOpen'],run:['run.active','task.run'],terminal:['terminal.create','terminal.kill'],help:['navigate.chat']};
+function showError(error){const message=error?.message||String(error);toast(message,error?.status===403?'warning':'error');setStatus(message,'error');logOutput(message)}
+"""
+
+IDE_JS += r"""
+async function refreshConfig(){const out=await api('/api/ide/config');S.config=out;S.account=out.account||S.account;S.capabilities=out.capabilities||S.capabilities;S.csrf=out.csrf_token||S.csrf;S.sessions=Array.isArray(out.sessions)?out.sessions:[];if(!S.activeSession||!S.sessions.some(row=>row.id===S.activeSession))S.activeSession=out.active_session_id||S.sessions[0]?.id||'';renderSessions();renderTools();E('accountName').textContent=S.account?.username||'';E('remoteStatus').title=S.capabilities.local?'Local window':'LAN workspace';E('newTerminalBtn').disabled=!S.capabilities.terminal;E('runActiveBtn').disabled=!S.capabilities.processes;E('debugActiveBtn').disabled=!S.capabilities.debug;updateAgentContext();if(!S.activeSession)await createSession()}
+function showPasswordChangeGate(){E('authTitle').textContent='Change Temporary Password';E('authSubtitle').textContent='A new password is required before Program can open.';E('authUsername').value=S.account?.username||'';E('authUsername').disabled=true;E('authPassword').value='';E('authPassword').placeholder='Temporary password';E('authConfirmLabel').hidden=false;E('authConfirmLabel').textContent='New password';E('authConfirm').hidden=false;E('authConfirm').required=true;E('authConfirm').value='';E('authSubmit').textContent='Change Password';E('authForm').onsubmit=async event=>{event.preventDefault();E('authSubmit').disabled=true;try{await api('/api/ide/v2/auth/password',{method:'POST',body:JSON.stringify({old_password:E('authPassword').value,new_password:E('authConfirm').value})});E('authMessage').textContent='Password changed. Sign in with the new password.';setTimeout(()=>location.reload(),800)}catch(error){E('authMessage').textContent=error.message;E('authSubmit').disabled=false}}}
+function deviceKey(){let key=localStorage.getItem('clouds_coder_device_key')||'';if(!/^cc_device_[A-Za-z0-9_-]{43,}$/.test(key)){const bytes=new Uint8Array(32);crypto.getRandomValues(bytes);key='cc_device_'+btoa(String.fromCharCode(...bytes)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');localStorage.setItem('clouds_coder_device_key',key)}return key}
+function devicePayload(){return{device_key:deviceKey(),label:[navigator.platform||'Web',navigator.userAgentData?.platform||'',navigator.userAgentData?.mobile?'Mobile':'Browser'].filter(Boolean).join(' / '),fingerprint:[navigator.userAgent||'',navigator.language||'',screen.width+'x'+screen.height].join('|')}}
+async function waitForDevicePairing(){clearTimeout(S.devicePoll);try{const out=await api('/api/ide/v2/auth/device',{method:'POST',body:JSON.stringify(devicePayload())});if(out.account){S.account=out.account;S.capabilities=out.capabilities||{};S.csrf=out.csrf_token||'';E('authGate').classList.add('is-hidden');await startWorkbench();return true}const pairing=out.device?.pairing_id||'';E('authTitle').textContent='Approve This Device';E('authSubtitle').textContent='Open Program locally and approve this Web device.';E('authForm').hidden=true;E('authMessage').innerHTML=`<div class="pairing-code">${escapeHtml(pairing)}</div><div class="auth-secondary">${escapeHtml(out.device?.label||'Web browser')} / ${escapeHtml(out.device?.source_ip||'')}</div>`;S.devicePoll=setTimeout(waitForDevicePairing,2200)}catch(error){E('authMessage').textContent=error.message}}
+async function authenticate(){
+  let status;try{status=await api('/api/ide/v2/auth/status')}catch(error){E('authMessage').textContent=error.message;return false}
+  try{const me=await api('/api/ide/v2/auth/me');S.account=me.account;S.capabilities=me.capabilities||{};S.csrf=me.csrf_token||'';if(S.account?.must_change_password){showPasswordChangeGate();return false}return true}catch(error){if(error.code==='lan_https_required'){E('authMessage').textContent=error.message;E('authSubmit').disabled=true;return false}}
+  if(status.local_auto_login){try{const out=await api('/api/ide/v2/auth/local',{method:'POST',body:'{}'});S.account=out.account;S.capabilities=out.capabilities||{};S.csrf=out.csrf_token||'';return true}catch(error){E('authMessage').textContent=error.message;return false}}
+  if(!status.password_login_enabled){waitForDevicePairing();return false}
+  const setup=!!status.setup_required;E('authTitle').textContent=setup?'Create IDE Administrator':'Clouds Coder';E('authSubtitle').textContent=setup?'Local setup for Program':'Sign in to Program';E('authSubmit').textContent=setup?'Create Administrator':'Sign in';E('authConfirmLabel').hidden=!setup;E('authConfirm').hidden=!setup;E('authConfirm').required=setup;
+  if(setup&&!status.local_setup_allowed){E('authMessage').textContent='The first IDE administrator must be created from localhost.';E('authSubmit').disabled=true}
+  E('authForm').onsubmit=async event=>{event.preventDefault();const username=E('authUsername').value.trim();const password=E('authPassword').value;if(setup&&password!==E('authConfirm').value){E('authMessage').textContent='Passwords do not match.';return}E('authSubmit').disabled=true;E('authMessage').textContent='';try{const out=await api(setup?'/api/ide/v2/auth/setup':'/api/ide/v2/auth/login',{method:'POST',body:JSON.stringify({username,password})});S.account=out.account;S.capabilities=out.capabilities||{};S.csrf=out.csrf_token||'';if(S.account?.must_change_password){showPasswordChangeGate();E('authSubmit').disabled=false;return}E('authGate').classList.add('is-hidden');await startWorkbench()}catch(error){E('authMessage').textContent=error.message;E('authSubmit').disabled=false}};return false
+}
+function bindUI(){
+  document.querySelectorAll('.activity-button[data-view]').forEach(button=>button.onclick=()=>showView(button.dataset.view));E('agentActivityBtn').onclick=()=>toggleSecondary();E('togglePrimaryBtn').onclick=togglePrimary;E('togglePanelBtn').onclick=togglePanel;E('toggleSecondaryBtn').onclick=()=>toggleSecondary();E('closeSecondaryBtn').onclick=()=>toggleSecondary(false);E('closePanelBtn').onclick=()=>{S.panelVisible=false;E('ideShell').classList.add('panel-hidden');scheduleStateSave()};E('maximizePanelBtn').onclick=()=>{S.panelMaximized=!S.panelMaximized;E('ideShell').classList.toggle('panel-maximized',S.panelMaximized)};document.addEventListener('visibilitychange',()=>{if(!S.agentEventsConnected)scheduleAgentPoll(document.hidden?120000:200)});
+  document.querySelectorAll('[data-panel-tab]').forEach(button=>button.onclick=()=>showPanel(button.dataset.panelTab));E('commandCenter').onclick=()=>openPalette('>');E('mainMenuBtn').onclick=event=>showMenu(event.currentTarget,MENUS.file);document.querySelectorAll('[data-menu]').forEach(button=>button.onclick=event=>showMenu(event.currentTarget,MENUS[button.dataset.menu]||[]));
+  E('newFileBtn').onclick=()=>newFile().catch(showError);E('newFolderBtn').onclick=()=>newFolder().catch(showError);E('refreshTreeBtn').onclick=()=>refreshWorkspaceSnapshot().catch(showError);E('explorerMoreBtn').onclick=event=>showMenu(event.currentTarget,['file.open','file.openFolder','session.new']);E('sessionSelect').onchange=()=>switchSession(E('sessionSelect').value).catch(showError);E('renameSessionBtn').onclick=()=>renameCurrentSession().catch(showError);E('rootSelect').onchange=async()=>{S.activeRoot=E('rootSelect').value;S.treeCache.clear();await loadTree('');updateAgentContext()};
+  E('fileInput').onchange=()=>uploadFiles(E('fileInput').files).catch(showError);E('folderInput').onchange=()=>uploadFiles(E('folderInput').files).catch(showError);E('searchInput').oninput=debounce(()=>runSearch().catch(showError),300);E('includeInput').onchange=()=>runSearch().catch(showError);E('excludeInput').onchange=()=>runSearch().catch(showError);E('matchCaseBtn').onclick=()=>{E('matchCaseBtn').classList.toggle('is-active');runSearch().catch(showError)};E('regexBtn').onclick=()=>{E('regexBtn').classList.toggle('is-active');runSearch().catch(showError)};E('clearSearchBtn').onclick=()=>{E('searchInput').value='';S.searchResults=[];E('searchSummary').textContent='';renderSearch()};
+  E('refreshScmBtn').onclick=()=>refreshScm().catch(showError);E('refreshTasksBtn').onclick=()=>refreshTasks().catch(showError);E('runActiveBtn').onclick=()=>runActiveFile().catch(showError);E('debugActiveBtn').onclick=()=>debugActiveFile().catch(showError);E('newTerminalBtn').onclick=()=>newTerminal().catch(showError);E('killTerminalBtn').onclick=()=>killTerminal().catch(showError);E('refreshExtensionsBtn').onclick=()=>refreshExtensions(E('extensionSearchInput').value).catch(showError);E('extensionSearchInput').oninput=debounce(()=>refreshExtensions(E('extensionSearchInput').value).catch(showError),400);E('installVsixBtn').onclick=()=>E('vsixInput').click();E('vsixInput').onchange=()=>installVsix(E('vsixInput').files?.[0]).catch(showError);
+  E('sendAgentBtn').onclick=()=>sendAgent().catch(showError);E('agentPrompt').onkeydown=event=>{if((event.ctrlKey||event.metaKey)&&event.key==='Enter'){event.preventDefault();sendAgent().catch(showError)}};E('attachContextBtn').onclick=()=>E('agentAttachmentInput').click();E('agentAttachmentInput').onchange=()=>uploadAgentAttachments(E('agentAttachmentInput').files).catch(showError);E('agentModelBtn').onclick=event=>{event.stopPropagation();showAgentModelMenu(event.currentTarget).catch(showError)};E('agentTodoToggle').onclick=()=>{S.agentTodoCollapsed=!S.agentTodoCollapsed;E('agentTodoPanel').classList.toggle('is-collapsed',S.agentTodoCollapsed);E('agentTodoToggle').setAttribute('aria-expanded',String(!S.agentTodoCollapsed));scheduleStateSave()};E('newAgentChatBtn').onclick=()=>createSession().catch(showError);
+  E('accountsBtn').onclick=()=>showAccountModal().catch(showError);E('accountStatus').onclick=()=>showAccountModal().catch(showError);E('manageBtn').onclick=event=>showMenu(event.currentTarget,['accounts.manage','file.openFolder','workbench.action.showCommands']);E('notificationsBtn').onclick=()=>toast('No new notifications.','success',2500);E('gitStatus').onclick=()=>showView('scm');E('errorStatus').onclick=()=>showPanel('problems');
+  E('paletteInput').oninput=filterPalette;E('paletteInput').onkeydown=event=>{if(event.key==='ArrowDown'){event.preventDefault();S.paletteIndex=Math.min(S.paletteItems.length-1,S.paletteIndex+1);renderPalette()}else if(event.key==='ArrowUp'){event.preventDefault();S.paletteIndex=Math.max(0,S.paletteIndex-1);renderPalette()}else if(event.key==='Enter'){event.preventDefault();const row=S.paletteItems[S.paletteIndex];if(row){closePalette();runCommandById(row.id)}}else if(event.key==='Escape')closePalette()};E('paletteOverlay').onclick=event=>{if(event.target===E('paletteOverlay'))closePalette()};E('modalClose').onclick=closeModal;E('modalOverlay').onclick=event=>{if(event.target===E('modalOverlay'))closeModal()};
+  document.addEventListener('click',event=>{if(!event.target.closest('#menuPopup')&&!event.target.closest('[data-menu]')&&!event.target.closest('#mainMenuBtn')&&!event.target.closest('#manageBtn')&&!event.target.closest('#agentModelBtn')){E('menuPopup').classList.add('is-hidden');E('menuPopup').classList.remove('agent-model-menu');E('menuPopup').style.transform='';E('menuPopup').style.bottom='auto'}});
+  window.addEventListener('keydown',event=>{const mod=event.ctrlKey||event.metaKey;const key=event.key.toLowerCase();if(mod&&key==='s'){event.preventDefault();(event.shiftKey?saveAll():saveActive()).catch(showError)}else if(mod&&event.shiftKey&&key==='p'){event.preventDefault();openPalette('>')}else if(mod&&key==='p'){event.preventDefault();openPalette('')}else if(mod&&key==='b'){event.preventDefault();togglePrimary()}else if(mod&&key==='j'){event.preventDefault();togglePanel()}else if(mod&&event.shiftKey&&key==='e'){event.preventDefault();showView('explorer')}else if(mod&&event.shiftKey&&key==='f'){event.preventDefault();showView('search')}else if(mod&&event.shiftKey&&key==='g'){event.preventDefault();showView('scm')}else if(mod&&event.shiftKey&&key==='x'){event.preventDefault();showView('extensions')}else if(mod&&event.key==='\\'){event.preventDefault();runCommandById('workbench.action.splitEditor')}else if(event.key==='F5'&&mod){event.preventDefault();runActiveFile().catch(showError)}else if(event.key==='Escape'){closePalette();E('menuPopup').classList.add('is-hidden')}});window.addEventListener('beforeunload',event=>{if([...S.openFiles.values()].some(file=>file.dirty)){event.preventDefault();event.returnValue=''}});window.addEventListener('resize',()=>{if(S.terminalFit)S.terminalFit.fit()})
+}
+function debounce(fn,delay){let timer;return(...args)=>{clearTimeout(timer);timer=setTimeout(()=>fn(...args),delay)}}
+async function startWorkbench(){E('authGate').classList.add('is-hidden');E('ideShell').classList.remove('is-hidden');if(window.innerWidth<=820){S.primaryVisible=false;S.secondaryVisible=false;E('ideShell').classList.add('primary-hidden','secondary-hidden')}await Promise.all([initMonaco(),initTerminalLibrary()]);configureCommands();bindUI();await refreshConfig();await restoreWorkbenchState();await refreshExtensions();await activateInstalledExtensions();updateStatusBar();updateAgentContext();connectAgentEvents();scheduleAgentPoll(50);if(!S.capabilities.processes)toast(S.capabilities.process_denial_reason||'Process features are disabled for this connection.','warning',8000);setStatus('Ready')}
+window.addEventListener('DOMContentLoaded',async()=>{try{if(await authenticate())await startWorkbench()}catch(error){showError(error)}});
+"""
+
 # ============================================================================
 # Architecture / 架构 / アーキテクチャ
 # Layer 7: Application orchestration, runtime services, and UI integration.
@@ -87632,6 +94403,10 @@ class AppContext:
         web_search_setting_locked: bool = False,
         user_memory_mode: str = DEFAULT_USER_MEMORY_MODE,
         user_memory_setting_locked: bool = False,
+        single_no_plan_todo_enabled: bool | None = None,
+        single_no_plan_todo_prompt: str = "",
+        l2_todo_policy: str | None = None,
+        ide_password_login_enabled: bool = False,
     ):
         self.workspace = Path(workspace).resolve()
         self.workspace_migration = _migrate_legacy_runtime_roots(self.workspace)
@@ -87668,6 +94443,12 @@ class AppContext:
             fallback=DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
         )
         self.auto_task_level_ceiling = normalize_auto_task_level_ceiling(auto_task_level_ceiling)
+        # The AppContext loads its base config below.  Keep an explicit
+        # constructor value authoritative, and resolve the file value only
+        # after ``self.default_llm_config`` exists.
+        self.l2_todo_policy = normalize_l2_todo_policy(
+            l2_todo_policy if l2_todo_policy is not None else DEFAULT_L2_TODO_POLICY
+        )
         self.auto_model_switch = bool(auto_model_switch)
         self.arbiter_enabled = bool(arbiter_enabled)
         self.arbiter_model = str(arbiter_model or "").strip()
@@ -87680,6 +94461,8 @@ class AppContext:
         self.web_search_setting_locked = bool(web_search_setting_locked)
         self.user_memory_mode = normalize_user_memory_mode(user_memory_mode)
         self.user_memory_setting_locked = bool(user_memory_setting_locked)
+        self.single_no_plan_todo_enabled = False
+        self.single_no_plan_todo_prompt = ""
         self.read_context_policy = DEFAULT_READ_CONTEXT_POLICY
         self.tool_memory_policy = DEFAULT_TOOL_MEMORY_POLICY
         self.skills_root = skills_root
@@ -87687,6 +94470,27 @@ class AppContext:
         self.skills_store = SkillStore(self.skills_root)
         self.skills_store_refresh_ts = 0.0
         self.default_llm_config = parse_json_object(try_read_text(self.workspace / "LLM.config.json") or "{}", {})
+        if l2_todo_policy is None:
+            cfg_l2_todo_policy = extract_l2_todo_policy_setting(self.default_llm_config)
+            if cfg_l2_todo_policy is not None:
+                self.l2_todo_policy = normalize_l2_todo_policy(cfg_l2_todo_policy)
+        cfg_single_todo_enabled, cfg_single_todo_prompt = extract_single_no_plan_todo_settings(
+            self.default_llm_config
+        )
+        self.single_no_plan_todo_enabled = bool(cfg_single_todo_enabled)
+        self.single_no_plan_todo_prompt = str(cfg_single_todo_prompt or "").strip()
+        explicit_single_todo_prompt = trim(str(single_no_plan_todo_prompt or "").strip(), 6000)
+        if single_no_plan_todo_enabled is not None or explicit_single_todo_prompt:
+            # A prompt-only programmatic configuration is an opt-in.  An
+            # explicit false still wins, matching the config-file precedence.
+            self.single_no_plan_todo_enabled = (
+                bool(single_no_plan_todo_enabled)
+                if single_no_plan_todo_enabled is not None
+                else bool(explicit_single_todo_prompt)
+            )
+            self.single_no_plan_todo_prompt = explicit_single_todo_prompt
+            if self.single_no_plan_todo_enabled and not self.single_no_plan_todo_prompt:
+                self.single_no_plan_todo_prompt = DEFAULT_SINGLE_NO_PLAN_TODO_PROMPT
         self.global_llm_config_revision = self._llm_config_revision(self.default_llm_config)
         self.global_llm_config_source = ""
         self.force_global_llm_config_for_users = False
@@ -87728,8 +94532,14 @@ class AppContext:
         self._builtin_web_ui_assets_cache: dict[str, str] | None = None
         self.show_upload_list = False
         self.ide_mounts_cache: dict[str, list[dict]] = {}
+        self.ide_state_lock = threading.RLock()
+        self.ide_terminal_lock = threading.RLock()
+        self.ide_terminals: dict[str, dict] = {}
+        self.ide_debug_lock = threading.RLock()
+        self.ide_debug_sessions: dict[str, dict] = {}
         self.ide_port = IDE_DEFAULT_PORT
         self.ide_enabled = False
+        self.ide_password_login_enabled = bool(ide_password_login_enabled)
         self.admin_state_root = self.workspace / ADMIN_STATE_DIRNAME
         self.admin_state_root.mkdir(parents=True, exist_ok=True)
         try:
@@ -87739,6 +94549,13 @@ class AppContext:
         self.admin_config_path = self.admin_state_root / ADMIN_CONFIG_FILENAME
         self.admin_token_path = self.admin_state_root / "admin.token"
         self.admin_auth = AdminAuthStore(self.admin_state_root / ADMIN_AUTH_FILENAME)
+        self.ide_auth = IDEAuthStore(self.admin_state_root / IDE_AUTH_FILENAME)
+        self.ide_extensions_root = self.admin_state_root / IDE_EXTENSIONS_DIRNAME
+        self.ide_extensions_root.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(self.ide_extensions_root, 0o700)
+        except Exception:
+            pass
         self.admin_token = self._load_or_create_admin_token(allow_create=not self.admin_auth.configured())
         self.admin_initial_config = _admin_factory_config()
         self.admin_active_config = dict(self.admin_initial_config)
@@ -87797,6 +94614,107 @@ class AppContext:
             daemon=True,
         )
         self._session_watchdog_thread.start()
+
+    @staticmethod
+    def ide_is_loopback_address(value: object) -> bool:
+        raw = str(value or "").strip()
+        if raw.lower().startswith("::ffff:"):
+            raw = raw.split("::ffff:", 1)[1]
+        try:
+            return bool(ipaddress.ip_address(raw).is_loopback)
+        except Exception:
+            return False
+
+    def ide_request_capabilities(self, account: dict, *, client_ip: str, direct_loopback: bool) -> dict:
+        local = bool(direct_loopback and self.ide_is_loopback_address(client_ip))
+        hard_isolation = bool(AppContext._ide_remote_sandbox_supported())
+        role = str(account.get("role", "user") or "user")
+        return {
+            "local": local,
+            "lan": not local,
+            "admin": role == "admin",
+            "mounts": local,
+            "processes": bool(local or hard_isolation),
+            "terminal": bool(local or hard_isolation),
+            "tasks": bool(local or hard_isolation),
+            "debug": bool(local or hard_isolation),
+            "agent_processes": bool(local or hard_isolation),
+            "executable_extensions": bool(local or hard_isolation),
+            "hard_isolation": hard_isolation,
+            "filesystem_soft_isolation": True,
+            "process_denial_reason": "" if (local or hard_isolation) else "LAN process execution requires a configured hard isolation backend.",
+        }
+
+    @staticmethod
+    def _ide_remote_sandbox_supported() -> bool:
+        return bool(os.name == "posix" and sys.platform == "darwin" and shutil.which("sandbox-exec"))
+
+    def _ide_process_prefix(self, sess: SessionState, *, remote: bool) -> list[str]:
+        if not remote:
+            return []
+        sess.ide_remote_sandbox_required = True
+        prefix = sess._workspace_sandbox_shell_prefix()
+        if not prefix:
+            raise IDECapabilityError(
+                "ide_sandbox_unavailable",
+                "Remote process execution is unavailable because the workspace sandbox could not be initialized.",
+                503,
+            )
+        return prefix
+
+    @staticmethod
+    def ide_require_capability(capabilities: dict, name: str) -> None:
+        if bool((capabilities or {}).get(str(name or ""), False)):
+            return
+        reason = str((capabilities or {}).get("process_denial_reason", "") or "")
+        if name == "mounts":
+            reason = "External workspace mounts are available only through an actual loopback connection."
+        raise IDECapabilityError("ide_capability_denied", reason or f"IDE capability denied: {name}")
+
+    def ide_auth_status(self, *, local_setup_allowed: bool) -> dict:
+        configured = bool(self.ide_auth.configured())
+        setup_required = bool(self.ide_password_login_enabled and not configured)
+        return {
+            "setup_required": setup_required,
+            "password_login_enabled": bool(self.ide_password_login_enabled),
+            "device_pairing_enabled": True,
+            "local_setup_allowed": bool(local_setup_allowed and setup_required),
+            "local_auto_login": bool(local_setup_allowed and not setup_required),
+            "setup_local_only": True,
+            "lan_https_required": True,
+            "session_ttl_seconds": IDE_AUTH_SESSION_TTL_SECONDS,
+        }
+
+    def local_ide_login(self, *, local_allowed: bool, client_ip: str) -> dict:
+        if not local_allowed:
+            raise IDEAuthError("loopback_required", "Local IDE sign-in requires an actual loopback connection.", 403)
+        return self.ide_auth.local_session(
+            legacy_user_id=user_id_from_ip("127.0.0.1"),
+            client_ip=client_ip,
+        )
+
+    def setup_ide_admin(self, username: object, password: object, *, local_setup_allowed: bool) -> dict:
+        if not self.ide_password_login_enabled:
+            raise IDEAuthError("password_login_disabled", "IDE password login is disabled.", 403)
+        if not local_setup_allowed:
+            raise IDEAuthError("setup_local_only", "The first IDE administrator must be created over loopback.", 403)
+        legacy_user_id = user_id_from_ip("127.0.0.1")
+        return self.ide_auth.setup_admin(username, password, legacy_user_id=legacy_user_id)
+
+    def login_ide(self, username: object, password: object, client_ip: str) -> dict:
+        if not self.ide_password_login_enabled:
+            raise IDEAuthError("password_login_disabled", "IDE password login is disabled.", 403)
+        if not self.ide_auth.configured():
+            raise IDEAuthError("setup_required", "Create the first IDE administrator before signing in.", 409)
+        return self.ide_auth.login(username, password, client_ip)
+
+    def register_ide_device(self, payload: dict, *, client_ip: str) -> dict:
+        return self.ide_auth.register_device(
+            payload.get("device_key"),
+            label=payload.get("label", "Web browser"),
+            fingerprint=payload.get("fingerprint", ""),
+            client_ip=client_ip,
+        )
 
     def _load_or_create_admin_token(self, *, allow_create: bool = True) -> str:
         env_token = str(os.getenv("CLOUDS_CODER_ADMIN_TOKEN", "") or "").strip()
@@ -88025,7 +94943,11 @@ class AppContext:
                     })
                 finally:
                     probe.close()
-        argv = _admin_config_to_argv(clean)
+        try:
+            argv = _admin_config_to_argv(clean)
+        except Exception as exc:
+            errors.append({"key": "startup", "error": f"startup arguments cannot be compiled: {exc}"})
+            argv = []
         return {
             "ok": not errors,
             "errors": errors,
@@ -88334,7 +95256,14 @@ class AppContext:
         return CODE_ADMIN_JS
 
     def web_ui_ide_index_html(self) -> str:
-        return IDE_INDEX_HTML
+        revision = hashlib.sha256(
+            safe_utf8_bytes(f"{IDE_CSS}\0{IDE_JS}")
+        ).hexdigest()[:12]
+        return (
+            IDE_INDEX_HTML
+            .replace('href="/assets/ide.css"', f'href="/assets/ide.css?v={revision}"')
+            .replace('src="/assets/ide.js"', f'src="/assets/ide.js?v={revision}"')
+        )
 
     def web_ui_ide_style_css(self) -> str:
         return IDE_CSS
@@ -88501,6 +95430,7 @@ class AppContext:
             "sessions": sessions.get("sessions", []),
             "active_session_id": str(sessions.get("active_session_id", "") or ""),
             "session_creation_limit": sessions.get("session_creation_limit", {}),
+            "password_login_enabled": bool(self.ide_password_login_enabled),
         }
 
     def ide_create_session(self, user_id: str, title: str | None = None, client_ip: str = "") -> dict:
@@ -88513,6 +95443,13 @@ class AppContext:
             "session_creation_limit": quota,
             "roots": self.ide_workspace_roots(user_id, sess.id),
         }
+
+    def ide_rename_session(self, user_id: str, session_id: str, title: str) -> dict:
+        clean = trim(str(title or "").strip(), 120)
+        if not clean:
+            raise ValueError("title required")
+        sess = self.manager_for_user(user_id).rename(str(session_id or "").strip(), clean)
+        return {"ok": True, "id": sess.id, "title": sess.title}
 
     def _ide_session(self, user_id: str, session_id: str) -> SessionState:
         sess = self.manager_for_user(user_id).get(str(session_id or "").strip())
@@ -88580,7 +95517,7 @@ class AppContext:
         except Exception:
             st = None
             rel = ""
-        return {
+        payload = {
             "path": rel,
             "name": fp.name,
             "type": "dir" if fp.is_dir() else "file",
@@ -88589,6 +95526,39 @@ class AppContext:
             "mime": guess_mime_from_name(fp.name, "application/octet-stream") if fp.is_file() else "",
             "preview_kind": preview_kind_for_path(rel) if fp.is_file() else "",
         }
+        if st is not None and fp.is_file():
+            payload["revision"] = self._ide_file_revision(fp, st)
+        return payload
+
+    @staticmethod
+    def _ide_file_revision(fp: Path, stat_result=None) -> str:
+        st = stat_result or fp.stat()
+        marker = f"{int(st.st_size)}:{int(st.st_mtime_ns)}:{int(getattr(st, 'st_ino', 0))}"
+        return hashlib.sha256(marker.encode("ascii", errors="ignore")).hexdigest()[:24]
+
+    def _ide_atomic_write(self, target: Path, data: bytes) -> None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_name(f".{target.name}.{uuid.uuid4().hex}.ide-tmp")
+        try:
+            with tmp.open("wb") as handle:
+                handle.write(data)
+                handle.flush()
+                try:
+                    os.fsync(handle.fileno())
+                except Exception:
+                    pass
+            if target.exists():
+                try:
+                    os.chmod(tmp, target.stat().st_mode & 0o777)
+                except Exception:
+                    pass
+            os.replace(tmp, target)
+        finally:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
 
     def _ide_reject_hard_snapshot_mutation(
         self,
@@ -88720,6 +95690,17 @@ class AppContext:
             raise FileNotFoundError("file not found")
         size = int(target.stat().st_size)
         if size > IDE_FILE_MAX_BYTES:
+            stat_payload = self._ide_file_stat(root, target)
+            if stat_payload.get("preview_kind"):
+                return {
+                    "ok": True,
+                    "root": meta,
+                    "file": stat_payload,
+                    "readonly": True,
+                    "encoding": "base64",
+                    "content_b64": "",
+                    "revision": stat_payload.get("revision", ""),
+                }
             raise ValueError(f"file is too large for editor ({size} bytes)")
         data = target.read_bytes()
         is_binary = b"\x00" in data[:4096]
@@ -88729,6 +95710,7 @@ class AppContext:
             "file": self._ide_file_stat(root, target),
             "readonly": False,
             "encoding": "base64" if is_binary else "text",
+            "revision": self._ide_file_revision(target),
         }
         if is_binary:
             payload["content_b64"] = base64.b64encode(data).decode("ascii")
@@ -88749,6 +95731,71 @@ class AppContext:
             payload["text_encoding"] = used_encoding
         return payload
 
+    def ide_preview_html(self, user_id: str, session_id: str, *, root_id: str = "session", rel: str = "") -> str:
+        _, target, _ = self.ide_resolve_workspace(user_id, session_id, root_id, rel)
+        if not target.exists() or not target.is_file():
+            raise FileNotFoundError("file not found")
+        kind = preview_kind_for_path(rel)
+        ext = target.suffix.lower()
+        sess = self._ide_session(user_id, session_id)
+        if kind == "csv":
+            return sess._preview_csv_html(target)
+        if kind == "excel":
+            if ext in {".xlsx", ".xlsm"}:
+                return sess._preview_xlsx_html(target)
+            if ext == ".xls":
+                return sess._preview_xls_html(target)
+        if kind == "document":
+            if ext in {".docx", ".docm"}:
+                return sess._preview_docx_html(target)
+            if ext == ".doc":
+                return sess._preview_doc_html(target)
+        if kind == "presentation":
+            if ext in {".pptx", ".pptm"}:
+                return sess._preview_pptx_html(target)
+            if ext == ".ppt":
+                return sess._preview_ppt_html(target)
+        raise ValueError(f"html preview not supported for: {normalize_rel_preview_path(rel)}")
+
+    def ide_code_preview_stages(self, user_id: str, session_id: str, *, root_id: str, rel: str) -> dict:
+        if str(root_id or "session").strip() != "session":
+            return {"path": normalize_rel_preview_path(rel), "latest_id": "", "stages": []}
+        return self._ide_session(user_id, session_id).code_preview_stages(rel)
+
+    def ide_code_preview_payload(
+        self,
+        user_id: str,
+        session_id: str,
+        *,
+        root_id: str,
+        rel: str,
+        stage_id: str = "latest",
+    ) -> dict:
+        if str(root_id or "session").strip() != "session":
+            raise ValueError("code history is available only for the session workspace")
+        return self._ide_session(user_id, session_id).code_preview_payload(rel, stage_id)
+
+    def _ide_emit_workspace_change(
+        self,
+        user_id: str,
+        session_id: str,
+        *,
+        root_id: str,
+        action: str,
+        paths: list[str],
+    ) -> None:
+        clean_paths = [normalize_rel_preview_path(value) for value in paths]
+        clean_paths = [value for value in clean_paths if value][:80]
+        self._ide_session(user_id, session_id)._emit(
+            "workspace_change",
+            {
+                "root_id": str(root_id or "session"),
+                "action": trim(str(action or "changed"), 40),
+                "changed_files": clean_paths,
+                "summary": f"IDE workspace {action or 'changed'}: {', '.join(clean_paths[:4])}",
+            },
+        )
+
     def ide_write_file(self, user_id: str, session_id: str, payload: dict) -> dict:
         root_id = str(payload.get("root_id", payload.get("root", "session")) or "session")
         rel = str(payload.get("path", payload.get("rel", "")) or "")
@@ -88758,15 +95805,91 @@ class AppContext:
         self._ide_reject_hard_snapshot_mutation(user_id, session_id, root_id, target)
         if target.exists() and target.is_dir():
             raise IsADirectoryError("target is a directory")
+        existed = bool(target.exists())
+        before_text = ""
+        if root_id == "session" and existed and target.is_file() and is_code_preview_candidate(rel):
+            before_text = try_read_text(target, max_bytes=CODE_PREVIEW_STAGE_MAX_BYTES) or ""
         if "content_b64" in payload:
             data = base64.b64decode(str(payload.get("content_b64", "") or ""), validate=True)
         else:
             data = str(payload.get("content", "")).encode(str(payload.get("encoding", "utf-8") or "utf-8"))
         if len(data) > IDE_FILE_MAX_BYTES:
             raise ValueError(f"file is too large for editor ({len(data)} bytes)")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(data)
-        return {"ok": True, "root": meta, "file": self._ide_file_stat(root, target)}
+        expected_revision = str(payload.get("expected_revision", payload.get("revision", "")) or "").strip()
+        if expected_revision and target.exists():
+            current_revision = self._ide_file_revision(target)
+            if not hmac.compare_digest(expected_revision, current_revision):
+                raise IDEFileConflict({"revision": current_revision, "file": self._ide_file_stat(root, target)})
+        elif expected_revision and not target.exists():
+            raise IDEFileConflict({"revision": "", "missing": True})
+        self._ide_atomic_write(target, data)
+        stat_payload = self._ide_file_stat(root, target)
+        result = {"ok": True, "root": meta, "file": stat_payload, "revision": stat_payload.get("revision", "")}
+        if root_id == "session" and "content_b64" not in payload and is_code_preview_candidate(rel):
+            after_text = data.decode(str(payload.get("encoding", "utf-8") or "utf-8"), errors="replace")
+            if before_text != after_text:
+                diff, added, deleted = make_unified_diff(normalize_rel_preview_path(rel), before_text, after_text)
+                numbered = make_numbered_diff(before_text, after_text)
+                sess = self._ide_session(user_id, session_id)
+                code_stage = sess._record_code_preview_stage(
+                    rel_path=rel,
+                    before_text=before_text,
+                    after_text=after_text,
+                    change_type="added" if not existed else "modified",
+                    tool_name=str(payload.get("history_tool", "ide_editor") or "ide_editor"),
+                    added=added,
+                    deleted=deleted,
+                )
+                patch_payload = {
+                    "path": normalize_rel_preview_path(rel),
+                    "session_rel_path": normalize_rel_preview_path(rel),
+                    "session_root": str(sess.files_root),
+                    "root_id": root_id,
+                    "change_type": "added" if not existed else "modified",
+                    "added": added,
+                    "deleted": deleted,
+                    "diff": trim(diff, 30_000),
+                    "diff_numbered": trim(render_numbered_diff_text(numbered), 30_000),
+                    "summary": f"IDE file {'added' if not existed else 'modified'}: {normalize_rel_preview_path(rel)} (+{added}/-{deleted})",
+                }
+                if code_stage:
+                    patch_payload["code_stage"] = code_stage
+                    result["code_stage"] = code_stage
+                sess._emit("file_patch", patch_payload)
+        else:
+            self._ide_emit_workspace_change(
+                user_id,
+                session_id,
+                root_id=root_id,
+                action="written",
+                paths=[rel],
+            )
+        return result
+
+    def ide_restore_code_preview(self, user_id: str, session_id: str, payload: dict) -> dict:
+        root_id = str(payload.get("root_id", "session") or "session")
+        rel = normalize_rel_preview_path(str(payload.get("path", "") or ""))
+        stage_id = str(payload.get("stage_id", "") or "").strip()
+        if root_id != "session" or not rel or not stage_id or stage_id == "latest":
+            raise ValueError("a session file and historical stage are required")
+        stage = self.ide_code_preview_payload(
+            user_id,
+            session_id,
+            root_id=root_id,
+            rel=rel,
+            stage_id=stage_id,
+        )
+        return self.ide_write_file(
+            user_id,
+            session_id,
+            {
+                "root_id": root_id,
+                "path": rel,
+                "content": str(stage.get("full_text", "") or ""),
+                "expected_revision": str(payload.get("expected_revision", "") or ""),
+                "history_tool": "ide_restore",
+            },
+        )
 
     def ide_mkdir(self, user_id: str, session_id: str, payload: dict) -> dict:
         root_id = str(payload.get("root_id", payload.get("root", "session")) or "session")
@@ -88776,7 +95899,9 @@ class AppContext:
         root, target, meta = self.ide_resolve_workspace(user_id, session_id, root_id, rel)
         self._ide_reject_hard_snapshot_mutation(user_id, session_id, root_id, target)
         target.mkdir(parents=True, exist_ok=bool(payload.get("exist_ok", True)))
-        return {"ok": True, "root": meta, "file": self._ide_file_stat(root, target)}
+        result = {"ok": True, "root": meta, "file": self._ide_file_stat(root, target)}
+        self._ide_emit_workspace_change(user_id, session_id, root_id=root_id, action="created", paths=[rel])
+        return result
 
     def ide_rename(self, user_id: str, session_id: str, payload: dict) -> dict:
         root_id = str(payload.get("root_id", payload.get("root", "session")) or "session")
@@ -88793,7 +95918,9 @@ class AppContext:
             raise FileExistsError("target already exists")
         new_target.parent.mkdir(parents=True, exist_ok=True)
         old_target.replace(new_target)
-        return {"ok": True, "root": meta, "file": self._ide_file_stat(root, new_target)}
+        result = {"ok": True, "root": meta, "file": self._ide_file_stat(root, new_target)}
+        self._ide_emit_workspace_change(user_id, session_id, root_id=root_id, action="renamed", paths=[old_rel, new_rel])
+        return result
 
     def ide_delete(self, user_id: str, session_id: str, payload: dict) -> dict:
         root_id = str(payload.get("root_id", payload.get("root", "session")) or "session")
@@ -88811,7 +95938,9 @@ class AppContext:
                 shutil.rmtree(target)
         else:
             target.unlink()
-        return {"ok": True, "root": meta, "path": normalize_rel_preview_path(rel)}
+        result = {"ok": True, "root": meta, "path": normalize_rel_preview_path(rel)}
+        self._ide_emit_workspace_change(user_id, session_id, root_id=root_id, action="deleted", paths=[rel])
+        return result
 
     def ide_upload(self, user_id: str, session_id: str, payload: dict) -> dict:
         root_id = str(payload.get("root_id", payload.get("root", "session")) or "session")
@@ -88843,13 +95972,22 @@ class AppContext:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(raw)
             written.append(self._ide_file_stat(root, target))
-        return {
+        result = {
             "ok": True,
             "root": meta,
             "written": written,
             "count": len(written),
             "bytes": total,
         }
+        if written:
+            self._ide_emit_workspace_change(
+                user_id,
+                session_id,
+                root_id=root_id,
+                action="uploaded",
+                paths=[str(row.get("path", "") or "") for row in written],
+            )
+        return result
 
     def ide_toolchains(self) -> list[dict]:
         specs = [
@@ -88880,7 +96018,711 @@ class AppContext:
             )
         return rows
 
-    def ide_run_command(self, user_id: str, session_id: str, payload: dict) -> dict:
+    def _ide_state_path(self, user_id: str) -> Path:
+        return self.user_root(user_id) / IDE_WORKBENCH_STATE_FILENAME
+
+    def ide_get_workbench_state(self, user_id: str) -> dict:
+        raw = _read_json_file(self._ide_state_path(user_id), {})
+        state = raw.get("state", {}) if isinstance(raw, dict) else {}
+        return {"ok": True, "state": state if isinstance(state, dict) else {}}
+
+    def ide_save_workbench_state(self, user_id: str, payload: dict) -> dict:
+        state = payload.get("state", payload)
+        if not isinstance(state, dict):
+            raise ValueError("state must be an object")
+        clean = {
+            "active_session_id": trim(str(state.get("active_session_id", "") or ""), 160),
+            "active_root_id": trim(str(state.get("active_root_id", "session") or "session"), 160),
+            "active_view": trim(str(state.get("active_view", "explorer") or "explorer"), 32),
+            "panel": trim(str(state.get("panel", "terminal") or "terminal"), 32),
+            "panel_visible": bool(state.get("panel_visible", True)),
+            "secondary_visible": bool(state.get("secondary_visible", True)),
+            "agent_todo_collapsed": bool(state.get("agent_todo_collapsed", False)),
+            "code_history_mode": (
+                str(state.get("code_history_mode", "all") or "all")
+                if str(state.get("code_history_mode", "all") or "all") in {"all", "changes", "clean"}
+                else "all"
+            ),
+            "open_files": [],
+        }
+        for row in state.get("open_files", []) if isinstance(state.get("open_files", []), list) else []:
+            if not isinstance(row, dict):
+                continue
+            path = normalize_rel_preview_path(str(row.get("path", "") or ""))
+            root_id = trim(str(row.get("root_id", "session") or "session"), 160)
+            if path:
+                stage_id = trim(str(row.get("stage_id", "latest") or "latest"), 160)
+                clean["open_files"].append({"root_id": root_id, "path": path, "stage_id": stage_id or "latest"})
+            if len(clean["open_files"]) >= 40:
+                break
+        with self.ide_state_lock:
+            _write_json_file(self._ide_state_path(user_id), {"state": clean, "updated_at": now_ts()})
+        return {"ok": True, "state": clean}
+
+    def ide_search_workspace(self, user_id: str, session_id: str, payload: dict) -> dict:
+        query = str(payload.get("query", "") or "")
+        if not query or len(query) > 500:
+            raise ValueError("query must contain 1-500 characters")
+        root_id = str(payload.get("root_id", payload.get("root", "session")) or "session")
+        root, base, meta = self.ide_resolve_workspace(user_id, session_id, root_id, str(payload.get("path", ".") or "."))
+        if not base.exists() or not base.is_dir():
+            raise FileNotFoundError("search root not found")
+        max_results = max(1, min(IDE_SEARCH_MAX_RESULTS, int(payload.get("max_results", 500) or 500)))
+        case_sensitive = bool(payload.get("case_sensitive", False))
+        use_regex = bool(payload.get("regex", False))
+        include = str(payload.get("include", "") or "").strip()
+        exclude = str(payload.get("exclude", "") or "").strip()
+        flags = 0 if case_sensitive else re.IGNORECASE
+        pattern = re.compile(query if use_regex else re.escape(query), flags)
+        results: list[dict] = []
+        files_scanned = 0
+        bytes_scanned = 0
+        truncated = False
+        started = time.perf_counter()
+        for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
+            dirnames[:] = [name for name in dirnames if name not in IDE_TREE_SKIP_DIRS and not (Path(dirpath) / name).is_symlink()]
+            for filename in filenames:
+                fp = Path(dirpath) / filename
+                try:
+                    if fp.is_symlink() or not fp.is_file():
+                        continue
+                    rel = fp.resolve().relative_to(root.resolve()).as_posix()
+                    if include and not fnmatch.fnmatch(rel, include):
+                        continue
+                    if exclude and fnmatch.fnmatch(rel, exclude):
+                        continue
+                    size = int(fp.stat().st_size)
+                    if size > IDE_SEARCH_MAX_FILE_BYTES:
+                        continue
+                    data = fp.read_bytes()
+                    if b"\0" in data[:4096]:
+                        continue
+                    text = data.decode("utf-8", errors="replace")
+                except Exception:
+                    continue
+                files_scanned += 1
+                bytes_scanned += len(data)
+                for line_no, line in enumerate(text.splitlines(), 1):
+                    for match in pattern.finditer(line):
+                        results.append({
+                            "path": rel,
+                            "line": line_no,
+                            "column": match.start() + 1,
+                            "end_column": match.end() + 1,
+                            "preview": trim(line, 500),
+                        })
+                        if len(results) >= max_results:
+                            truncated = True
+                            break
+                    if truncated:
+                        break
+                if truncated:
+                    break
+            if truncated:
+                break
+        return {
+            "ok": True,
+            "root": meta,
+            "query": query,
+            "results": results,
+            "count": len(results),
+            "truncated": truncated,
+            "files_scanned": files_scanned,
+            "bytes_scanned": bytes_scanned,
+            "duration_ms": int((time.perf_counter() - started) * 1000),
+        }
+
+    def ide_scm_status(self, user_id: str, session_id: str, payload: dict | None = None) -> dict:
+        body = payload if isinstance(payload, dict) else {}
+        root_id = str(body.get("root_id", body.get("root", "session")) or "session")
+        root, _, meta = self.ide_resolve_workspace(user_id, session_id, root_id, ".")
+        probe = subprocess.run(["git", "-C", str(root), "rev-parse", "--show-toplevel"], capture_output=True, text=True, timeout=8)
+        if probe.returncode != 0:
+            return {"ok": True, "repository": False, "root": meta, "changes": [], "branch": ""}
+        repo_root = Path(probe.stdout.strip()).resolve()
+        if repo_root != root.resolve() and not repo_root.is_relative_to(root.resolve()):
+            return {"ok": True, "repository": False, "root": meta, "changes": [], "branch": ""}
+        status = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain=v1", "-z", "--branch"],
+            capture_output=True,
+            timeout=12,
+        )
+        raw = status.stdout.decode("utf-8", errors="replace")
+        parts = raw.split("\0")
+        branch = ""
+        changes: list[dict] = []
+        for item in parts:
+            if not item:
+                continue
+            if item.startswith("## "):
+                branch = item[3:].split("...", 1)[0].strip()
+                continue
+            if len(item) < 4:
+                continue
+            xy = item[:2]
+            path = item[3:]
+            changes.append({"path": path, "index": xy[0], "working_tree": xy[1], "status": xy})
+            if len(changes) >= 2000:
+                break
+        return {"ok": True, "repository": True, "root": meta, "repo_root": str(repo_root), "branch": branch, "changes": changes}
+
+    def ide_scm_diff(self, user_id: str, session_id: str, payload: dict) -> dict:
+        root_id = str(payload.get("root_id", payload.get("root", "session")) or "session")
+        root, _, meta = self.ide_resolve_workspace(user_id, session_id, root_id, ".")
+        rel = normalize_rel_preview_path(str(payload.get("path", "") or ""))
+        if rel:
+            self.ide_resolve_workspace(user_id, session_id, root_id, rel)
+        command = ["git", "-C", str(root), "diff", "--no-ext-diff", "--no-color"]
+        if bool(payload.get("staged", False)):
+            command.append("--cached")
+        if rel:
+            command.extend(["--", rel])
+        proc = subprocess.run(command, capture_output=True, text=True, timeout=15)
+        return {"ok": proc.returncode == 0, "root": meta, "path": rel, "diff": trim(proc.stdout, 400_000), "error": trim(proc.stderr, 4000)}
+
+    def _ide_terminal_for_user(self, user_id: str, terminal_id: str) -> dict:
+        tid = str(terminal_id or "").strip()
+        with self.ide_terminal_lock:
+            terminal = self.ide_terminals.get(tid)
+        if not terminal or str(terminal.get("user_id", "")) != str(user_id or ""):
+            raise KeyError("terminal not found")
+        return terminal
+
+    @staticmethod
+    def _ide_terminal_set_size(fd: int, cols: int, rows: int) -> None:
+        if _fcntl is None or _termios is None:
+            return
+        size = struct.pack("HHHH", max(2, rows), max(2, cols), 0, 0)
+        _fcntl.ioctl(fd, _termios.TIOCSWINSZ, size)
+
+    def _ide_terminal_reader(self, terminal_id: str) -> None:
+        while True:
+            with self.ide_terminal_lock:
+                terminal = self.ide_terminals.get(terminal_id)
+            if not terminal:
+                return
+            process = terminal["process"]
+            fd = int(terminal["master_fd"])
+            try:
+                ready, _, _ = select.select([fd], [], [], 0.25)
+                chunk = os.read(fd, 32768) if ready else b""
+            except (OSError, ValueError):
+                chunk = b""
+            with terminal["lock"]:
+                if chunk:
+                    terminal["output"].extend(chunk)
+                    terminal["output_end"] += len(chunk)
+                    overflow = len(terminal["output"]) - IDE_TERMINAL_SCROLLBACK_BYTES
+                    if overflow > 0:
+                        del terminal["output"][:overflow]
+                        terminal["output_start"] += overflow
+                    terminal["last_activity"] = now_ts()
+                returncode = process.poll()
+                if returncode is not None:
+                    terminal["closed"] = True
+                    terminal["returncode"] = int(returncode)
+            if returncode is not None and not chunk:
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
+                return
+
+    def ide_terminal_create(self, user_id: str, session_id: str, payload: dict, *, remote: bool = False) -> dict:
+        if _pty is None:
+            raise IDECapabilityError("pty_unavailable", "PTY terminals are unavailable on this platform.", 501)
+        root_id = str(payload.get("root_id", payload.get("root", "session")) or "session")
+        root, cwd, meta = self.ide_resolve_workspace(user_id, session_id, root_id, str(payload.get("cwd", ".") or "."))
+        if cwd.is_file():
+            cwd = cwd.parent
+        if not cwd.exists() or not cwd.is_dir():
+            raise FileNotFoundError("terminal cwd not found")
+        shell = str(payload.get("shell", "") or os.getenv("SHELL", "") or shutil.which("zsh") or shutil.which("bash") or "/bin/sh")
+        if not Path(shell).is_absolute() or not Path(shell).exists():
+            raise ValueError("terminal shell must be an installed absolute path")
+        cols = max(20, min(500, int(payload.get("cols", 100) or 100)))
+        rows = max(5, min(200, int(payload.get("rows", 30) or 30)))
+        master_fd, slave_fd = _pty.openpty()
+        self._ide_terminal_set_size(slave_fd, cols, rows)
+        sess = self._ide_session(user_id, session_id)
+        prefix = self._ide_process_prefix(sess, remote=remote)
+        env = sess._shell_process_env()
+        env.update({"TERM": "xterm-256color", "COLORTERM": "truecolor", "CLOUDS_CODER_IDE": "1"})
+        process_command = [*prefix, shell, "-f"] if prefix else [shell, "-l"]
+        try:
+            process = subprocess.Popen(
+                process_command,
+                cwd=str(cwd),
+                env=env,
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                start_new_session=True,
+                close_fds=True,
+            )
+        finally:
+            os.close(slave_fd)
+        terminal_id = "term_" + uuid.uuid4().hex[:20]
+        terminal = {
+            "id": terminal_id,
+            "user_id": str(user_id or ""),
+            "session_id": str(session_id or ""),
+            "root_id": root_id,
+            "cwd": cwd.relative_to(root).as_posix() if cwd.is_relative_to(root) else ".",
+            "title": Path(shell).name,
+            "process": process,
+            "master_fd": master_fd,
+            "output": bytearray(),
+            "output_start": 0,
+            "output_end": 0,
+            "closed": False,
+            "returncode": None,
+            "created_at": now_ts(),
+            "last_activity": now_ts(),
+            "lock": threading.RLock(),
+        }
+        with self.ide_terminal_lock:
+            self.ide_terminals[terminal_id] = terminal
+        threading.Thread(target=self._ide_terminal_reader, args=(terminal_id,), name=f"ide-terminal-{terminal_id[-6:]}", daemon=True).start()
+        return {"ok": True, "terminal": {"id": terminal_id, "title": terminal["title"], "cwd": terminal["cwd"], "root": meta, "offset": 0}}
+
+    def ide_terminal_output(self, user_id: str, terminal_id: str, offset: int = 0) -> dict:
+        terminal = self._ide_terminal_for_user(user_id, terminal_id)
+        with terminal["lock"]:
+            start = int(terminal["output_start"])
+            end = int(terminal["output_end"])
+            requested = max(0, int(offset or 0))
+            effective = max(start, min(end, requested))
+            data = bytes(terminal["output"])[effective - start:]
+            terminal["last_activity"] = now_ts()
+            return {
+                "ok": True,
+                "terminal_id": terminal_id,
+                "offset": effective,
+                "next_offset": end,
+                "reset": requested < start,
+                "data": data.decode("utf-8", errors="replace"),
+                "closed": bool(terminal["closed"]),
+                "returncode": terminal["returncode"],
+            }
+
+    def ide_terminal_input(self, user_id: str, terminal_id: str, payload: dict) -> dict:
+        terminal = self._ide_terminal_for_user(user_id, terminal_id)
+        data = str(payload.get("data", "") or "").encode("utf-8", errors="replace")
+        if len(data) > 64_000:
+            raise ValueError("terminal input is too large")
+        with terminal["lock"]:
+            if terminal["closed"]:
+                raise ValueError("terminal is closed")
+            os.write(int(terminal["master_fd"]), data)
+            terminal["last_activity"] = now_ts()
+        return {"ok": True}
+
+    def ide_terminal_resize(self, user_id: str, terminal_id: str, payload: dict) -> dict:
+        terminal = self._ide_terminal_for_user(user_id, terminal_id)
+        cols = max(20, min(500, int(payload.get("cols", 100) or 100)))
+        rows = max(5, min(200, int(payload.get("rows", 30) or 30)))
+        self._ide_terminal_set_size(int(terminal["master_fd"]), cols, rows)
+        return {"ok": True, "cols": cols, "rows": rows}
+
+    def ide_terminal_close(self, user_id: str, terminal_id: str) -> dict:
+        terminal = self._ide_terminal_for_user(user_id, terminal_id)
+        process = terminal["process"]
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+                process.wait(timeout=2)
+            except Exception:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+        with terminal["lock"]:
+            terminal["closed"] = True
+            terminal["returncode"] = process.poll()
+        return {"ok": True, "terminal_id": terminal_id}
+
+    @staticmethod
+    def _ide_parse_jsonc(text: str) -> dict:
+        cleaned = re.sub(r"/\*.*?\*/", "", str(text or ""), flags=re.DOTALL)
+        cleaned = re.sub(r"(^|\s)//.*?$", r"\1", cleaned, flags=re.MULTILINE)
+        cleaned = re.sub(r",\s*([}\]])", r"\1", cleaned)
+        parsed = json.loads(cleaned or "{}")
+        return parsed if isinstance(parsed, dict) else {}
+
+    def ide_tasks(self, user_id: str, session_id: str, root_id: str = "session") -> dict:
+        root, target, meta = self.ide_resolve_workspace(user_id, session_id, root_id, ".vscode/tasks.json")
+        tasks: list[dict] = []
+        if target.exists() and target.is_file() and target.stat().st_size <= 1_000_000:
+            raw = self._ide_parse_jsonc(target.read_text(encoding="utf-8", errors="replace"))
+            for idx, row in enumerate(raw.get("tasks", []) if isinstance(raw.get("tasks", []), list) else []):
+                if not isinstance(row, dict):
+                    continue
+                label = trim(str(row.get("label", row.get("taskName", f"Task {idx + 1}")) or f"Task {idx + 1}"), 160)
+                command = str(row.get("command", "") or "").strip()
+                args = [str(x) for x in row.get("args", [])] if isinstance(row.get("args", []), list) else []
+                if label and command:
+                    tasks.append({"id": hashlib.sha256(label.encode()).hexdigest()[:16], "label": label, "type": str(row.get("type", "shell") or "shell"), "command": command, "args": args, "group": row.get("group", "")})
+        return {"ok": True, "root": meta, "tasks": tasks}
+
+    def ide_run_task(self, user_id: str, session_id: str, payload: dict, *, remote: bool = False) -> dict:
+        root_id = str(payload.get("root_id", "session") or "session")
+        listed = self.ide_tasks(user_id, session_id, root_id)
+        task_id = str(payload.get("task_id", "") or "")
+        task = next((row for row in listed["tasks"] if str(row.get("id", "")) == task_id), None)
+        if not task:
+            raise KeyError("task not found")
+        command = " ".join([shlex.quote(str(task["command"])), *[shlex.quote(str(x)) for x in task.get("args", [])]])
+        return self.ide_run_command(
+            user_id,
+            session_id,
+            {"root_id": root_id, "cwd": ".", "command": command},
+            remote=remote,
+        )
+
+    def ide_python_diagnostics(self, user_id: str, session_id: str, payload: dict) -> dict:
+        root_id = str(payload.get("root_id", "session") or "session")
+        rel = normalize_rel_preview_path(str(payload.get("path", "") or ""))
+        root, target, _ = self.ide_resolve_workspace(user_id, session_id, root_id, rel)
+        source = str(payload.get("content", "") or "") if "content" in payload else target.read_text(encoding="utf-8", errors="replace")
+        diagnostics: list[dict] = []
+        try:
+            ast.parse(source, filename=str(target))
+        except SyntaxError as exc:
+            diagnostics.append({"severity": "error", "message": str(exc.msg or "Syntax error"), "line": int(exc.lineno or 1), "column": int(exc.offset or 1), "source": "python"})
+        if not diagnostics:
+            try:
+                import jedi
+                script = jedi.Script(code=source, path=str(target), project=jedi.Project(str(root)))
+                for name in script.get_names(all_scopes=True, definitions=False, references=True)[:5000]:
+                    if str(name.type or "") == "statement" and str(name.name or "") == "":
+                        continue
+            except Exception:
+                pass
+        return {"ok": True, "path": rel, "diagnostics": diagnostics, "engine": "jedi" if importlib.util.find_spec("jedi") else "ast"}
+
+    def _ide_extension_account_root(self, user_id: str) -> Path:
+        digest = hashlib.sha256(str(user_id or "").encode("utf-8", errors="ignore")).hexdigest()[:24]
+        root = (self.ide_extensions_root / digest).resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    @staticmethod
+    def _ide_extension_public_manifest(manifest: dict, *, installed: bool = False) -> dict:
+        contributes = manifest.get("contributes", {}) if isinstance(manifest.get("contributes", {}), dict) else {}
+        safe_contributes = {}
+        for key in ("commands", "menus", "configuration", "languages", "grammars", "themes", "snippets", "keybindings", "views", "viewsContainers"):
+            value = contributes.get(key)
+            if isinstance(value, (dict, list)):
+                safe_contributes[key] = value
+        publisher = trim(str(manifest.get("publisher", "") or ""), 120)
+        name = trim(str(manifest.get("name", "") or ""), 120)
+        return {
+            "id": f"{publisher}.{name}".strip("."),
+            "publisher": publisher,
+            "name": name,
+            "displayName": trim(str(manifest.get("displayName", name) or name), 200),
+            "description": trim(str(manifest.get("description", "") or ""), 1000),
+            "version": trim(str(manifest.get("version", "") or ""), 80),
+            "browser": trim(str(manifest.get("browser", "") or ""), 300),
+            "main": trim(str(manifest.get("main", "") or ""), 300),
+            "extensionKind": manifest.get("extensionKind", []),
+            "activationEvents": manifest.get("activationEvents", []),
+            "contributes": safe_contributes,
+            "installed": bool(installed),
+            "worker_supported": bool(str(manifest.get("browser", "") or "").strip()),
+        }
+
+    def ide_open_vsx_search(self, query: str, *, size: int = 30, offset: int = 0) -> dict:
+        clean = trim(str(query or "").strip(), 300)
+        if not clean:
+            return {"ok": True, "extensions": [], "totalSize": 0}
+        params = f"query={quote(clean)}&size={max(1, min(50, int(size or 30)))}&offset={max(0, int(offset or 0))}"
+        request = Request(
+            "https://open-vsx.org/api/-/search?" + params,
+            headers={"Accept": "application/json", "User-Agent": f"Clouds-Coder/{APP_VERSION}"},
+        )
+        with urlopen(request, timeout=20) as response:
+            raw = json.loads(response.read().decode("utf-8", errors="replace") or "{}")
+        extensions = []
+        for row in raw.get("extensions", []) if isinstance(raw, dict) else []:
+            if not isinstance(row, dict):
+                continue
+            extensions.append({
+                "id": str(row.get("namespace", "") or "") + "." + str(row.get("name", "") or ""),
+                "namespace": str(row.get("namespace", "") or ""),
+                "name": str(row.get("name", "") or ""),
+                "displayName": str(row.get("displayName", row.get("name", "")) or ""),
+                "description": trim(str(row.get("description", "") or ""), 1000),
+                "version": str(row.get("version", "") or ""),
+                "downloadCount": int(row.get("downloadCount", 0) or 0),
+                "averageRating": float(row.get("averageRating", 0) or 0),
+                "iconUrl": str(row.get("files", {}).get("icon", "") or "") if isinstance(row.get("files", {}), dict) else "",
+            })
+        return {"ok": True, "extensions": extensions, "totalSize": int(raw.get("totalSize", len(extensions)) or len(extensions))}
+
+    def _ide_safe_extract_vsix(self, data: bytes, destination: Path) -> dict:
+        if len(data) > IDE_VSIX_MAX_BYTES:
+            raise ValueError("VSIX archive exceeds the size limit")
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            infos = archive.infolist()
+            if len(infos) > IDE_VSIX_MAX_FILES:
+                raise ValueError("VSIX contains too many files")
+            expanded = 0
+            for info in infos:
+                raw_name = str(info.filename or "")
+                posix_name = raw_name.replace("\\", "/")
+                expected_name = posix_name.rstrip("/") if info.is_dir() else posix_name
+                name = _normalize_js_lib_asset_ref(raw_name)
+                if (
+                    not name
+                    or "\\" in raw_name
+                    or posix_name.startswith("/")
+                    or re.match(r"^[A-Za-z]:", posix_name)
+                    or name != expected_name
+                ):
+                    raise ValueError("VSIX contains an unsafe path")
+                mode = (int(info.external_attr) >> 16) & 0o170000
+                if mode == 0o120000:
+                    raise ValueError("VSIX symbolic links are not allowed")
+                if int(info.file_size) > IDE_VSIX_MAX_FILE_BYTES:
+                    raise ValueError(f"VSIX file is too large: {name}")
+                expanded += int(info.file_size)
+                if expanded > IDE_VSIX_MAX_EXPANDED_BYTES:
+                    raise ValueError("VSIX expanded size exceeds the limit")
+            manifest_name = next((x.filename for x in infos if str(x.filename).replace("\\", "/") == "extension/package.json"), "")
+            if not manifest_name:
+                raise ValueError("VSIX does not contain extension/package.json")
+            manifest = json.loads(archive.read(manifest_name).decode("utf-8", errors="strict"))
+            if not isinstance(manifest, dict):
+                raise ValueError("VSIX package.json must be an object")
+            public = self._ide_extension_public_manifest(manifest, installed=True)
+            if not public["publisher"] or not public["name"] or not public["version"]:
+                raise ValueError("VSIX manifest requires publisher, name, and version")
+            temp = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.install")
+            if temp.exists():
+                shutil.rmtree(temp)
+            temp.mkdir(parents=True, exist_ok=False)
+            try:
+                for info in infos:
+                    rel = _normalize_js_lib_asset_ref(info.filename)
+                    target = (temp / rel).resolve()
+                    if not target.is_relative_to(temp.resolve()):
+                        raise ValueError("VSIX path escapes install directory")
+                    if info.is_dir():
+                        target.mkdir(parents=True, exist_ok=True)
+                    else:
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        with archive.open(info) as src, target.open("wb") as dst:
+                            shutil.copyfileobj(src, dst, length=1024 * 1024)
+                _write_json_file(temp / "install.json", {"manifest": public, "installed_at": now_ts()})
+                if destination.exists():
+                    shutil.rmtree(destination)
+                os.replace(temp, destination)
+            finally:
+                if temp.exists():
+                    shutil.rmtree(temp, ignore_errors=True)
+        return public
+
+    def ide_install_extension(self, user_id: str, payload: dict) -> dict:
+        extension_id = trim(str(payload.get("id", "") or "").strip(), 260)
+        data = b""
+        source = "upload"
+        if payload.get("content_b64"):
+            data = base64.b64decode(str(payload.get("content_b64", "") or ""), validate=True)
+        elif extension_id:
+            if not re.fullmatch(r"[A-Za-z0-9._-]+\.[A-Za-z0-9._-]+", extension_id):
+                raise ValueError("invalid Open VSX extension id")
+            namespace, name = extension_id.split(".", 1)
+            metadata_url = f"https://open-vsx.org/api/{quote(namespace)}/{quote(name)}/latest"
+            with urlopen(Request(metadata_url, headers={"Accept": "application/json", "User-Agent": f"Clouds-Coder/{APP_VERSION}"}), timeout=20) as response:
+                metadata = json.loads(response.read().decode("utf-8", errors="replace") or "{}")
+            files = metadata.get("files", {}) if isinstance(metadata, dict) else {}
+            download_url = str(files.get("download", "") or "") if isinstance(files, dict) else ""
+            if not download_url.startswith("https://open-vsx.org/"):
+                raise ValueError("Open VSX metadata did not provide a trusted download URL")
+            with urlopen(Request(download_url, headers={"User-Agent": f"Clouds-Coder/{APP_VERSION}"}), timeout=60) as response:
+                data = response.read(IDE_VSIX_MAX_BYTES + 1)
+            expected_sha = str(files.get("sha256", "") or "").strip().lower() if isinstance(files, dict) else ""
+            if expected_sha and not hmac.compare_digest(hashlib.sha256(data).hexdigest(), expected_sha):
+                raise ValueError("Open VSX package checksum mismatch")
+            source = "open-vsx"
+        else:
+            raise ValueError("extension id or content_b64 required")
+        account_root = self._ide_extension_account_root(user_id)
+        staging_name = hashlib.sha256(data).hexdigest()[:24]
+        staging = account_root / ("package-" + staging_name)
+        manifest = self._ide_safe_extract_vsix(data, staging)
+        final = account_root / re.sub(r"[^A-Za-z0-9._-]+", "-", f"{manifest['id']}-{manifest['version']}")
+        if final != staging:
+            if final.exists():
+                shutil.rmtree(final)
+            os.replace(staging, final)
+        manifest["install_path"] = final.name
+        _write_json_file(final / "install.json", {"manifest": manifest, "installed_at": now_ts()})
+        return {"ok": True, "extension": manifest, "source": source}
+
+    def ide_list_extensions(self, user_id: str) -> dict:
+        root = self._ide_extension_account_root(user_id)
+        rows: list[dict] = []
+        for fp in sorted(root.glob("*/install.json")):
+            raw = _read_json_file(fp, {})
+            manifest = raw.get("manifest", {}) if isinstance(raw, dict) else {}
+            if isinstance(manifest, dict) and manifest.get("id"):
+                row = dict(manifest)
+                row["install_path"] = fp.parent.name
+                rows.append(row)
+        return {"ok": True, "extensions": rows}
+
+    def ide_uninstall_extension(self, user_id: str, extension_id: str) -> dict:
+        clean = str(extension_id or "").strip()
+        root = self._ide_extension_account_root(user_id)
+        removed = False
+        for fp in list(root.glob("*/install.json")):
+            raw = _read_json_file(fp, {})
+            manifest = raw.get("manifest", {}) if isinstance(raw, dict) else {}
+            if isinstance(manifest, dict) and str(manifest.get("id", "")) == clean:
+                shutil.rmtree(fp.parent)
+                removed = True
+        if not removed:
+            raise KeyError("extension not installed")
+        return {"ok": True, "id": clean}
+
+    def ide_extension_asset(self, user_id: str, install_path: str, asset_path: str) -> Path:
+        root = self._ide_extension_account_root(user_id)
+        install_name = re.sub(r"[^A-Za-z0-9._-]+", "", str(install_path or ""))
+        if not install_name:
+            raise FileNotFoundError("extension asset not found")
+        extension_root = (root / install_name / "extension").resolve()
+        rel = _normalize_js_lib_asset_ref(asset_path)
+        target = (extension_root / rel).resolve()
+        if not rel or not target.is_relative_to(extension_root) or not target.exists() or not target.is_file():
+            raise FileNotFoundError("extension asset not found")
+        if target.stat().st_size > IDE_VSIX_MAX_FILE_BYTES:
+            raise ValueError("extension asset is too large")
+        return target
+
+    def _ide_debug_reader(self, debug_id: str) -> None:
+        with self.ide_debug_lock:
+            debug = self.ide_debug_sessions.get(debug_id)
+        if not debug:
+            return
+        stream = debug["process"].stdout
+        try:
+            while True:
+                headers: dict[str, str] = {}
+                while True:
+                    line = stream.readline()
+                    if not line:
+                        return
+                    if line in {b"\r\n", b"\n"}:
+                        break
+                    key, sep, value = line.decode("ascii", errors="replace").partition(":")
+                    if sep:
+                        headers[key.strip().lower()] = value.strip()
+                length = int(headers.get("content-length", "0") or 0)
+                if length <= 0 or length > 8_000_000:
+                    return
+                body = stream.read(length)
+                if len(body) != length:
+                    return
+                message = json.loads(body.decode("utf-8", errors="replace"))
+                with debug["lock"]:
+                    debug["messages"].append(message)
+                    while len(debug["messages"]) > 2000:
+                        debug["messages"].popleft()
+                    debug["last_activity"] = now_ts()
+        finally:
+            with debug["lock"]:
+                debug["closed"] = True
+
+    def ide_debug_create(self, user_id: str, session_id: str, payload: dict, *, remote: bool = False) -> dict:
+        if importlib.util.find_spec("debugpy") is None:
+            raise IDECapabilityError("debugpy_unavailable", "debugpy is not installed.", 501)
+        root_id = str(payload.get("root_id", "session") or "session")
+        root, _, meta = self.ide_resolve_workspace(user_id, session_id, root_id, ".")
+        sess = self._ide_session(user_id, session_id)
+        prefix = self._ide_process_prefix(sess, remote=remote)
+        process = subprocess.Popen(
+            [*prefix, sys.executable, "-m", "debugpy.adapter"],
+            cwd=str(root),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+            env=sess._shell_process_env(),
+        )
+        debug_id = "debug_" + uuid.uuid4().hex[:20]
+        debug = {
+            "id": debug_id,
+            "user_id": str(user_id or ""),
+            "session_id": str(session_id or ""),
+            "root_id": root_id,
+            "root": root,
+            "process": process,
+            "messages": deque(),
+            "next_index": 0,
+            "closed": False,
+            "created_at": now_ts(),
+            "last_activity": now_ts(),
+            "lock": threading.RLock(),
+        }
+        with self.ide_debug_lock:
+            self.ide_debug_sessions[debug_id] = debug
+        threading.Thread(target=self._ide_debug_reader, args=(debug_id,), name=f"ide-debug-{debug_id[-6:]}", daemon=True).start()
+        return {"ok": True, "debug": {"id": debug_id, "root": meta}}
+
+    def _ide_debug_for_user(self, user_id: str, debug_id: str) -> dict:
+        with self.ide_debug_lock:
+            debug = self.ide_debug_sessions.get(str(debug_id or ""))
+        if not debug or str(debug.get("user_id", "")) != str(user_id or ""):
+            raise KeyError("debug session not found")
+        return debug
+
+    def ide_debug_send(self, user_id: str, debug_id: str, payload: dict) -> dict:
+        debug = self._ide_debug_for_user(user_id, debug_id)
+        message = payload.get("message", payload)
+        if not isinstance(message, dict):
+            raise ValueError("DAP message must be an object")
+        raw = json_dumps(message).encode("utf-8")
+        if len(raw) > 8_000_000:
+            raise ValueError("DAP message is too large")
+        with debug["lock"]:
+            if debug["closed"] or debug["process"].poll() is not None:
+                raise ValueError("debug session is closed")
+            stream = debug["process"].stdin
+            stream.write(f"Content-Length: {len(raw)}\r\n\r\n".encode("ascii") + raw)
+            stream.flush()
+            debug["last_activity"] = now_ts()
+        return {"ok": True}
+
+    def ide_debug_messages(self, user_id: str, debug_id: str) -> dict:
+        debug = self._ide_debug_for_user(user_id, debug_id)
+        with debug["lock"]:
+            messages = list(debug["messages"])
+            debug["messages"].clear()
+            stderr = b""
+            if debug["process"].poll() is not None:
+                try:
+                    stderr = debug["process"].stderr.read(32_000)
+                except Exception:
+                    pass
+            return {"ok": True, "messages": messages, "closed": bool(debug["closed"]), "stderr": stderr.decode("utf-8", errors="replace")}
+
+    def ide_debug_close(self, user_id: str, debug_id: str) -> dict:
+        debug = self._ide_debug_for_user(user_id, debug_id)
+        process = debug["process"]
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+        with debug["lock"]:
+            debug["closed"] = True
+        return {"ok": True, "debug_id": debug_id}
+
+    def ide_run_command(self, user_id: str, session_id: str, payload: dict, *, remote: bool = False) -> dict:
         command = str(payload.get("command", "") or "").strip()
         if not command:
             raise ValueError("command required")
@@ -88899,9 +96741,12 @@ class AppContext:
         requested_timeout = int(payload.get("timeout", IDE_COMMAND_TIMEOUT_DEFAULT) or IDE_COMMAND_TIMEOUT_DEFAULT)
         timeout = max(1, min(MAX_SHELL_COMMAND_TIMEOUT_SECONDS, requested_timeout))
         started = now_ts()
+        before_files = workspace_file_revision_map(root)
         try:
             effective_command = sess._rewrite_shell_virtual_paths(command, cwd) if sess.skill_mode == "hard" else command
-            shell_prefix = sess._hard_snapshot_shell_prefix() if sess.skill_mode == "hard" else []
+            shell_prefix = self._ide_process_prefix(sess, remote=remote)
+            if not shell_prefix and sess.skill_mode == "hard":
+                shell_prefix = sess._hard_snapshot_shell_prefix()
             run_command: object = effective_command
             run_shell = True
             if shell_prefix:
@@ -88914,8 +96759,9 @@ class AppContext:
                 text=True,
                 capture_output=True,
                 timeout=timeout,
+                env=sess._shell_process_env(),
             )
-            return {
+            result = {
                 "ok": proc.returncode == 0,
                 "root": meta,
                 "cwd": cwd.relative_to(root).as_posix() if cwd.is_relative_to(root) else str(cwd),
@@ -88926,8 +96772,19 @@ class AppContext:
                 "duration_ms": int((now_ts() - started) * 1000),
                 "timeout": timeout,
             }
+            changed_files = workspace_revision_delta(before_files, workspace_file_revision_map(root))
+            result["changed_files"] = changed_files
+            if changed_files:
+                self._ide_emit_workspace_change(
+                    user_id,
+                    session_id,
+                    root_id=root_id,
+                    action="command",
+                    paths=changed_files,
+                )
+            return result
         except subprocess.TimeoutExpired as exc:
-            return {
+            result = {
                 "ok": False,
                 "root": meta,
                 "cwd": cwd.relative_to(root).as_posix() if cwd.is_relative_to(root) else str(cwd),
@@ -88939,8 +96796,27 @@ class AppContext:
                 "timeout": timeout,
                 "timed_out": True,
             }
+            changed_files = workspace_revision_delta(before_files, workspace_file_revision_map(root))
+            result["changed_files"] = changed_files
+            if changed_files:
+                self._ide_emit_workspace_change(
+                    user_id,
+                    session_id,
+                    root_id=root_id,
+                    action="command",
+                    paths=changed_files,
+                )
+            return result
 
-    def ide_agent_task(self, user_id: str, session_id: str, payload: dict, client_ip: str = "") -> dict:
+    def ide_agent_task(
+        self,
+        user_id: str,
+        session_id: str,
+        payload: dict,
+        client_ip: str = "",
+        *,
+        remote: bool = False,
+    ) -> dict:
         sid = str(session_id or "").strip()
         if not sid:
             created = self.ide_create_session(user_id, "IDE Workspace", client_ip=client_ip)
@@ -88951,6 +96827,23 @@ class AppContext:
         root_id = str(payload.get("root_id", payload.get("root", "session")) or "session")
         active_path = normalize_rel_preview_path(str(payload.get("active_path", "") or ""))
         root, _, meta = self.ide_resolve_workspace(user_id, sid, root_id, ".")
+        attachments: list[str] = []
+        raw_attachments = payload.get("attachments", [])
+        if raw_attachments is not None and not isinstance(raw_attachments, list):
+            raise ValueError("attachments must be a list")
+        for item in (raw_attachments or [])[:20]:
+            raw_path = item.get("path", "") if isinstance(item, dict) else item
+            rel_path = normalize_rel_preview_path(str(raw_path or ""))
+            if not rel_path:
+                continue
+            _, attachment_path, _ = self.ide_resolve_workspace(user_id, sid, root_id, rel_path)
+            if not attachment_path.exists() or not attachment_path.is_file():
+                raise FileNotFoundError(f"attachment not found: {rel_path}")
+            attachments.append(rel_path)
+        sess = self._ide_session(user_id, sid)
+        if remote:
+            self._ide_process_prefix(sess, remote=True)
+            sess.ide_remote_sandbox_required = True
         context_lines = [
             "IDE programming request.",
             f"Workspace root: {meta.get('label', root.name)} ({meta.get('kind', 'workspace')})",
@@ -88958,6 +96851,9 @@ class AppContext:
         ]
         if active_path:
             context_lines.append(f"Active file: {active_path}")
+        if attachments:
+            context_lines.append("Attached workspace files (read as needed):")
+            context_lines.extend(f"- {path}" for path in attachments)
         context_lines.append("")
         context_lines.append(message)
         out = self.submit_user_message(user_id, sid, "\n".join(context_lines))
@@ -88965,8 +96861,164 @@ class AppContext:
         result["session_id"] = sid
         return result
 
+    def ide_agent_state(self, user_id: str, session_id: str) -> dict:
+        sess = self._ide_session(user_id, session_id)
+        snap = sess.snapshot_safe(lite=True, lock_timeout=0.35)
+        raw_operations = list(snap.get("operations", []) or []) if isinstance(snap, dict) else []
+        acquired = False
+        try:
+            acquired = bool(sess.lock.acquire(timeout=0.08))
+            if acquired:
+                raw_operations = list(sess.operations[-500:])
+        except Exception:
+            pass
+        finally:
+            if acquired:
+                sess.lock.release()
+
+        def public_operation_data(data: object) -> dict:
+            source = data if isinstance(data, dict) else {}
+            public: dict = {}
+            text_limits = {
+                "name": 160, "tool": 160, "summary": 1200, "result": 8000,
+                "path": 1200, "session_rel_path": 1200, "session_root": 2000,
+                "command": 8000, "cwd": 2000, "output": 12000,
+                "diff": 12000, "diff_numbered": 12000, "change_type": 80,
+                "agent_role": 80, "mode": 80,
+            }
+            for key, limit in text_limits.items():
+                if key in source:
+                    public[key] = trim(str(source.get(key, "") or ""), limit)
+            for key in ("added", "deleted", "exit_code", "duration_ms", "start_line", "end_line"):
+                if key in source:
+                    public[key] = source.get(key)
+            for key in ("changed_files", "tools"):
+                if isinstance(source.get(key), list):
+                    public[key] = [trim(str(value or ""), 1200) for value in source[key][:80]]
+            if isinstance(source.get("code_stage"), dict):
+                stage = source["code_stage"]
+                public["code_stage"] = {
+                    key: stage.get(key)
+                    for key in ("id", "path", "created_at", "change_type")
+                    if key in stage
+                }
+            return public
+        feed: list[dict] = []
+        for raw in snap.get("conversation_feed", []) if isinstance(snap, dict) else []:
+            if not isinstance(raw, dict):
+                continue
+            role = str(raw.get("role", "system") or "system").strip().lower()
+            public_text = str(raw.get("text", "") or "")
+            if role == "user" and public_text.startswith("IDE programming request."):
+                _, _, public_text = public_text.partition("\n\n")
+            row = {
+                "role": role,
+                "type": trim(str(raw.get("type", "message") or "message"), 40),
+                "text": trim(public_text, 6000),
+                "ts": float(raw.get("ts", 0.0) or 0.0),
+                "agent_role": trim(str(raw.get("agent_role", "") or ""), 40),
+            }
+            data = raw.get("data", {}) if isinstance(raw.get("data"), dict) else {}
+            if data:
+                public_data = public_operation_data(data)
+                if public_data:
+                    row["data"] = public_data
+            feed.append(row)
+        operations: list[dict] = []
+        for raw in raw_operations:
+            if not isinstance(raw, dict):
+                continue
+            kind = str(raw.get("type", "") or "").strip()
+            if kind not in {"tool_start", "tool_result", "file_patch", "command", "status", "error"}:
+                continue
+            data = raw.get("data", {}) if isinstance(raw.get("data"), dict) else {}
+            public_data = public_operation_data(data)
+            operations.append(
+                {
+                    "id": str(raw.get("id", "") or ""),
+                    "seq": int(raw.get("seq", 0) or 0),
+                    "ts": float(raw.get("ts", 0.0) or 0.0),
+                    "type": kind,
+                    "data": public_data,
+                }
+            )
+        return {
+            "ok": True,
+            "session_id": str(session_id or ""),
+            "title": trim(str(getattr(sess, "title", "") or ""), 160),
+            "running": bool(snap.get("running", False)),
+            "phase": str(snap.get("agent_phase", "idle") or "idle"),
+            "active_role": str(snap.get("agent_active_role", "") or ""),
+            "active_tool": str(snap.get("agent_active_tool", "") or ""),
+            "live_response_text": trim(str(snap.get("live_response_text", "") or ""), 8000),
+            "event_seq": int(snap.get("event_seq", 0) or 0),
+            "message_count": int(snap.get("message_count", 0) or 0),
+            "queued_inputs": int(snap.get("queued_user_inputs_count", 0) or 0),
+            "scheduler_queued": int(snap.get("scheduler_queued_inputs_count", 0) or 0),
+            "model": trim(str(snap.get("model", "") or ""), 240),
+            "provider": trim(str(snap.get("provider", "") or ""), 80),
+            "context_tokens_estimate": int(snap.get("context_tokens_estimate", 0) or 0),
+            "context_left_tokens": int(snap.get("context_left_tokens", 0) or 0),
+            "context_left_percent": float(snap.get("context_left_percent", 0.0) or 0.0),
+            "context_effective_token_limit": int(snap.get("context_effective_token_limit", 0) or 0),
+            "agent_contexts": list(snap.get("agent_contexts", []) or [])[:12],
+            "todos": list(snap.get("todos", []) or [])[:40],
+            "tasks": list(snap.get("tasks", []) or [])[:80],
+            "feed": feed[-180:],
+            "operations": operations[-500:],
+        }
+
+    def ide_agent_models(self, user_id: str, session_id: str, *, refresh: bool = False) -> dict:
+        return self._ide_session(user_id, session_id).model_catalog(force_probe=bool(refresh))
+
+    def ide_set_agent_model(self, user_id: str, session_id: str, selection: str) -> dict:
+        sess = self._ide_session(user_id, session_id)
+        picked = str(selection or "").strip()
+        if not picked:
+            raise ValueError("selection required")
+        if bool(getattr(sess, "running", False)):
+            sess._queue_deferred_runtime_update("model_selection", {"selection": picked, "model_override": ""})
+            queued = sess.model_catalog()
+            queued["queued"] = True
+            queued["note"] = "Model switch queued until the current run finishes."
+            return queued
+        out = sess.set_runtime_selection(picked)
+        self.manager_for_user(user_id)._sync_from_session(sess, apply_to_all=False)
+        return out
+
     def rag_js_lib_asset_path(self, filename: str) -> Path | None:
-        return _resolve_js_lib_asset_path(self.js_lib_root, str(filename or "").strip())
+        asset_ref = str(filename or "").strip()
+        roots: list[Path] = []
+        for candidate in (self.js_lib_root, offline_js_lib_root(SCRIPT_DIR)):
+            root = Path(candidate).resolve()
+            if root not in roots:
+                roots.append(root)
+        for root in roots:
+            asset = _resolve_js_lib_asset_path(root, asset_ref)
+            if asset:
+                return asset
+        return None
+
+    def ide_monaco_worker_path(self) -> Path | None:
+        roots: list[Path] = []
+        for candidate in (self.js_lib_root, offline_js_lib_root(SCRIPT_DIR)):
+            root = Path(candidate).resolve()
+            if root not in roots:
+                roots.append(root)
+        for root in roots:
+            asset_root = (root / "monaco" / "min" / "vs" / "assets").resolve()
+            try:
+                candidates = sorted(
+                    fp.resolve()
+                    for fp in asset_root.glob("editor.worker-*.js")
+                    if fp.is_file() and fp.resolve().is_relative_to(root)
+                )
+            except Exception:
+                candidates = []
+            if candidates:
+                return candidates[0]
+        fallback = self.rag_js_lib_asset_path("monaco/min/vs/editor/editor.worker.js")
+        return fallback if fallback and fallback.is_file() else None
 
     def rag_three_asset_info(self) -> dict:
         picks = [
@@ -89828,7 +97880,7 @@ class AppContext:
                     "wiki_candidate_count": int((wiki_result.get("route_meta", {}) or {}).get("candidate_count", 0) or 0)
                     if isinstance(wiki_result.get("route_meta", {}), dict)
                     else 0,
-                    "raw_candidate_count": sum(len((row.get("results", []) or [])) for row in stage_results if isinstance(row, dict) and str(row.get("route", "") or "") not in {"wiki"}),
+                    "raw_candidate_count": sum(len(row.get("results", []) or []) for row in stage_results if isinstance(row, dict) and str(row.get("route", "") or "") not in {"wiki"}),
                     "raw_route": raw_route,
                     "wiki_first": True,
                     "adaptive_retrieval": True,
@@ -90187,7 +98239,7 @@ class AppContext:
                     "wiki_candidate_count": int((wiki_result.get("route_meta", {}) or {}).get("candidate_count", 0) or 0)
                     if isinstance(wiki_result.get("route_meta", {}), dict)
                     else 0,
-                    "raw_candidate_count": sum(len((row.get("results", []) or [])) for row in stage_results if isinstance(row, dict) and str(row.get("route", "") or "") not in {"wiki", "workflow"}),
+                    "raw_candidate_count": sum(len(row.get("results", []) or []) for row in stage_results if isinstance(row, dict) and str(row.get("route", "") or "") not in {"wiki", "workflow"}),
                     "raw_route": raw_route,
                     "workflow_first": True,
                     "wiki_first": True,
@@ -90696,6 +98748,20 @@ class AppContext:
                 mgr.shutdown()
         except Exception:
             pass
+        with self.ide_terminal_lock:
+            terminals = list(self.ide_terminals.values())
+        for terminal in terminals:
+            try:
+                self.ide_terminal_close(str(terminal.get("user_id", "")), str(terminal.get("id", "")))
+            except Exception:
+                pass
+        with self.ide_debug_lock:
+            debuggers = list(self.ide_debug_sessions.values())
+        for debug in debuggers:
+            try:
+                self.ide_debug_close(str(debug.get("user_id", "")), str(debug.get("id", "")))
+            except Exception:
+                pass
         try:
             self.rag_service.shutdown()
         except Exception:
@@ -91331,6 +99397,7 @@ class AppContext:
                 self.max_run_seconds,
                 self.shell_command_timeout_seconds,
                 self.auto_task_level_ceiling,
+                self.l2_todo_policy,
                 self.auto_model_switch,
                 self.arbiter_enabled,
                 self.arbiter_model,
@@ -91364,6 +99431,12 @@ class AppContext:
             mgr.auto_task_level_ceiling = normalize_auto_task_level_ceiling(
                 getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
             )
+            mgr.single_no_plan_todo_enabled = bool(
+                getattr(self, "single_no_plan_todo_enabled", False)
+            )
+            mgr.single_no_plan_todo_prompt = str(
+                getattr(self, "single_no_plan_todo_prompt", "") or ""
+            ).strip()[:6000]
             mgr.web_search_enabled = bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED))
             mgr.web_search_setting_locked = bool(getattr(self, "web_search_setting_locked", False))
             mgr.user_memory_mode = normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
@@ -91476,6 +99549,10 @@ class AppContext:
         active = dict(self.global_profiles.get(self.global_active_profile_id, {}))
         self._sync_global_ollama_defaults(active)
         self.thinking = False
+        if _single_no_plan_todo_setting_present(cfg):
+            cfg_single_todo_enabled, cfg_single_todo_prompt = extract_single_no_plan_todo_settings(cfg)
+            self.single_no_plan_todo_enabled = bool(cfg_single_todo_enabled)
+            self.single_no_plan_todo_prompt = str(cfg_single_todo_prompt or "").strip()
         cfg_max_output_tokens = cfg.get("max_output_tokens")
         if cfg_max_output_tokens is not None:
             self.max_output_tokens = max(256, int(cfg_max_output_tokens))
@@ -91490,6 +99567,9 @@ class AppContext:
         cfg_auto_task_level_ceiling = extract_auto_task_level_ceiling_setting(cfg)
         if cfg_auto_task_level_ceiling is not None:
             self.auto_task_level_ceiling = normalize_auto_task_level_ceiling(cfg_auto_task_level_ceiling)
+        cfg_l2_todo_policy = extract_l2_todo_policy_setting(cfg)
+        if cfg_l2_todo_policy is not None:
+            self.l2_todo_policy = normalize_l2_todo_policy(cfg_l2_todo_policy)
         cfg_web_search_enabled = extract_web_search_enabled_setting(cfg)
         if cfg_web_search_enabled is not None and not bool(getattr(self, "web_search_setting_locked", False)):
             self.web_search_enabled = bool(cfg_web_search_enabled)
@@ -91525,6 +99605,12 @@ class AppContext:
                 mgr.global_llm_config_source = source or "global-config"
                 mgr.force_global_defaults_on_load = True
                 mgr.reset_to_llm_config(cfg, source=source or "global-config")
+                mgr.single_no_plan_todo_enabled = bool(
+                    getattr(self, "single_no_plan_todo_enabled", False)
+                )
+                mgr.single_no_plan_todo_prompt = str(
+                    getattr(self, "single_no_plan_todo_prompt", "") or ""
+                ).strip()[:6000]
                 mgr.read_context_policy = normalize_read_context_policy(
                     getattr(self, "read_context_policy", DEFAULT_READ_CONTEXT_POLICY)
                 )
@@ -91534,11 +99620,20 @@ class AppContext:
                 mgr.auto_task_level_ceiling = normalize_auto_task_level_ceiling(
                     getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
                 )
+                mgr.l2_todo_policy = normalize_l2_todo_policy(
+                    getattr(self, "l2_todo_policy", DEFAULT_L2_TODO_POLICY)
+                )
                 mgr.web_search_enabled = bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED))
                 mgr.web_search_setting_locked = bool(getattr(self, "web_search_setting_locked", False))
                 mgr.user_memory_mode = normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
                 mgr.user_memory_setting_locked = bool(getattr(self, "user_memory_setting_locked", False))
                 for sess in mgr.sessions.values():
+                    sess.single_no_plan_todo_enabled = bool(
+                        getattr(self, "single_no_plan_todo_enabled", False)
+                    )
+                    sess.single_no_plan_todo_prompt = str(
+                        getattr(self, "single_no_plan_todo_prompt", "") or ""
+                    ).strip()[:6000]
                     sess.read_context_policy = normalize_read_context_policy(
                         getattr(self, "read_context_policy", DEFAULT_READ_CONTEXT_POLICY)
                     )
@@ -91547,6 +99642,9 @@ class AppContext:
                     )
                     sess.auto_task_level_ceiling = normalize_auto_task_level_ceiling(
                         getattr(self, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
+                    )
+                    sess.l2_todo_policy = normalize_l2_todo_policy(
+                        getattr(self, "l2_todo_policy", DEFAULT_L2_TODO_POLICY)
                     )
                     sess.web_search_enabled = bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED))
                     sess.user_memory_mode = normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
@@ -93855,6 +101953,8 @@ class Handler(BaseHTTPRequestHandler):
                     "skills_port": skills_port,
                     "rag_admin_port": int(getattr(self.app, "rag_admin_port", 0) or 0),
                     "code_admin_port": int(getattr(self.app, "code_admin_port", 0) or 0),
+                    "ide_port": int(getattr(self.app, "ide_port", 0) or 0),
+                    "ide_enabled": bool(getattr(self.app, "ide_enabled", False)),
                     "skills_ui_enabled": skills_enabled,
                     "skills_ui_url": skills_url,
                     "show_upload_list": bool(getattr(self.app, "show_upload_list", False)),
@@ -93932,8 +102032,8 @@ class Handler(BaseHTTPRequestHandler):
             if not base_url:
                 return self._send_json({"ok": False, "reachable": False, "models": [], "error": "base_url required"})
             try:
-                import urllib.request
                 import urllib.error
+                import urllib.request
                 normalized_base = extract_base_url(base_url)
                 reachable = False
                 last_error = ""
@@ -95167,6 +103267,14 @@ class RagAdminHandler(BaseHTTPRequestHandler):
             if fp.suffix.lower() in {".js", ".mjs", ".cjs"}:
                 content_type = "application/javascript; charset=utf-8"
             return self._send_inline_bytes(data, content_type)
+        m = re.match(r"^/api/ide/v2/extensions/asset/([^/]+)/(.*)$", path)
+        if m:
+            try:
+                context = self._auth_context(required=True)
+                fp = self.app.ide_extension_asset(str(context["account"].get("user_id", "")), m.group(1), m.group(2))
+                return self._send_inline_bytes(fp.read_bytes(), guess_mime_from_name(fp.name, "application/octet-stream"))
+            except Exception as exc:
+                return self._send_exception(exc)
         if path == "/api/health":
             return self._send_json({"ok": True, "app": "rag-admin", "version": APP_VERSION})
         if path == "/api/rag/config":
@@ -95470,29 +103578,141 @@ class IdeHandler(BaseHTTPRequestHandler):
         return trusted_client_ip(self)
 
     def _user_id(self) -> str:
-        return user_id_from_ip(self._client_ip())
+        context = self._auth_context(required=True)
+        return str(context["account"].get("user_id", "") or "")
+
+    def _direct_loopback(self) -> bool:
+        peer = str(self.client_address[0] if getattr(self, "client_address", None) else "")
+        if not (self.app.ide_is_loopback_address(peer) and self.app.ide_is_loopback_address(self._client_ip())):
+            return False
+        host = str(self.headers.get("Host", "") or "").strip().lower()
+        if host.startswith("["):
+            hostname = host.split("]", 1)[0].lstrip("[")
+        else:
+            hostname = host.rsplit(":", 1)[0] if host.count(":") <= 1 else host
+        return hostname in {"localhost", "127.0.0.1", "::1"}
+
+    def _trusted_https(self) -> bool:
+        if isinstance(getattr(self, "connection", None), ssl.SSLSocket):
+            return True
+        trust_proxy = str(os.getenv("CLOUDS_CODER_TRUST_PROXY", "") or "").strip().lower() in {"1", "true", "yes", "on"}
+        if not trust_proxy:
+            return False
+        peer = str(self.client_address[0] if getattr(self, "client_address", None) else "")
+        ranges = str(os.getenv("CLOUDS_CODER_TRUSTED_PROXIES", "127.0.0.1/32,::1/128") or "")
+        try:
+            peer_addr = ipaddress.ip_address(peer)
+            networks = [ipaddress.ip_network(x.strip(), strict=False) for x in ranges.split(",") if x.strip()]
+            trusted = any(peer_addr in network for network in networks)
+        except Exception:
+            trusted = False
+        return bool(trusted and str(self.headers.get("X-Forwarded-Proto", "") or "").split(",", 1)[0].strip().lower() == "https")
+
+    def _require_lan_https(self) -> bool:
+        if self._direct_loopback() or self._trusted_https():
+            return True
+        self._send_json({"error": "LAN IDE access requires HTTPS or a trusted HTTPS reverse proxy.", "code": "lan_https_required"}, status=426)
+        return False
+
+    def _bearer_or_cookie_token(self) -> str:
+        auth = str(self.headers.get("Authorization", "") or "").strip()
+        if auth.lower().startswith("bearer "):
+            return auth[7:].strip()
+        cookies = str(self.headers.get("Cookie", "") or "")
+        for item in cookies.split(";"):
+            key, sep, value = item.strip().partition("=")
+            if sep and key == "clouds_ide_session":
+                return unquote(value.strip())
+        return ""
+
+    def _auth_context(self, *, required: bool = False) -> dict | None:
+        cached = getattr(self, "_ide_auth_context_cache", None)
+        if isinstance(cached, dict):
+            return cached
+        token = self._bearer_or_cookie_token()
+        if token and not (self._direct_loopback() or self._trusted_https()):
+            raise IDEAuthError("lan_https_required", "LAN IDE access requires HTTPS or a trusted HTTPS reverse proxy.", 426)
+        account = self.app.ide_auth.verify_session(token, self._client_ip()) if token else None
+        if account:
+            request_path = unquote(urlparse(self.path).path)
+            password_routes = {
+                "/api/ide/v2/auth/me",
+                "/api/ide/v2/auth/password",
+                "/api/ide/v2/auth/logout",
+            }
+            if bool(account.get("must_change_password")) and request_path not in password_routes:
+                raise IDEAuthError("password_change_required", "Change the temporary password before using Program.", 403)
+            context = {
+                "token": token,
+                "account": account,
+                "capabilities": self.app.ide_request_capabilities(
+                    account,
+                    client_ip=self._client_ip(),
+                    direct_loopback=self._direct_loopback(),
+                ),
+            }
+            self._ide_auth_context_cache = context
+            return context
+        if required:
+            raise IDEAuthError("authentication_required", "Sign in to Clouds Coder IDE.", 401)
+        return None
+
+    def _require_root_capability(self, context: dict, root_id: object) -> None:
+        if str(root_id or "session").strip() not in {"", "session"}:
+            self.app.ide_require_capability(context.get("capabilities", {}), "mounts")
+
+    @staticmethod
+    def _public_auth_account(account: dict) -> dict:
+        return {
+            key: account.get(key)
+            for key in ("username", "user_id", "role", "disabled", "must_change_password", "created_at", "updated_at")
+        }
 
     def _read_json(self) -> dict:
         return read_http_json_body(self)
 
-    def _require_admin_write(self) -> bool:
-        auth = str(self.headers.get("Authorization", "") or "").strip()
-        token = auth[7:].strip() if auth.lower().startswith("bearer ") else str(self.headers.get("X-Admin-Token", "") or "").strip()
+    def _same_origin_write(self) -> bool:
         origin = str(self.headers.get("Origin", "") or "").strip()
         parsed = urlparse(origin)
-        same_origin = not origin or (parsed.scheme in {"http", "https"} and parsed.netloc == str(self.headers.get("Host", "") or ""))
-        if self.app.verify_admin_token(token) and same_origin:
-            return True
-        self._send_json({"error": "admin authentication and same-origin request required"}, status=401)
-        return False
+        return bool(not origin or (parsed.scheme in {"http", "https"} and parsed.netloc == str(self.headers.get("Host", "") or "")))
 
-    def _send_json(self, obj: object, status: int = 200):
+    def _require_write(self, capability: str = "") -> dict | None:
+        try:
+            context = self._auth_context(required=True)
+            if not self._same_origin_write():
+                raise IDEAuthError("same_origin_required", "IDE writes require a same-origin request.", 403)
+            csrf = str(self.headers.get("X-CSRF-Token", "") or "").strip()
+            expected = str(context["account"].get("csrf_token", "") or "")
+            if not csrf or not hmac.compare_digest(csrf, expected):
+                raise IDEAuthError("csrf_required", "A valid IDE CSRF token is required.", 403)
+            if capability:
+                self.app.ide_require_capability(context["capabilities"], capability)
+            return context
+        except (IDEAuthError, IDECapabilityError) as exc:
+            self._send_exception(exc)
+            return None
+
+    def _require_local_admin(self) -> dict | None:
+        context = self._require_write()
+        if not context:
+            return None
+        if not self._direct_loopback() or str(context["account"].get("role", "")) != "admin":
+            self._send_json({"error": "Local IDE administrator access required.", "code": "local_admin_required"}, status=403)
+            return None
+        return context
+
+    def _send_json(self, obj: object, status: int = 200, *, cookies: list[str] | None = None):
         body = json_response_bytes(obj)
         try:
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            for cookie in cookies or []:
+                self.send_header("Set-Cookie", cookie)
+            retry_after = int(obj.get("retry_after", 0) or 0) if isinstance(obj, dict) else 0
+            if status == 429 and retry_after:
+                self.send_header("Retry-After", str(retry_after))
             if close_if_http_request_body_unread(self):
                 self.send_header("Connection", "close")
             self.end_headers()
@@ -95501,6 +103721,28 @@ class IdeHandler(BaseHTTPRequestHandler):
             if swallow_benign_socket_error(exc, "ide-handler.send_json"):
                 return
             raise
+
+    def _send_auth_session(self, out: dict, *, status: int = 200):
+        secure = "; Secure" if self._trusted_https() else ""
+        cookie = (
+            f"clouds_ide_session={quote(str(out.get('access_token', '') or ''))}; "
+            f"Path=/; HttpOnly; SameSite=Strict; Max-Age={IDE_AUTH_SESSION_TTL_SECONDS}{secure}"
+        )
+        account = out.get("account", {}) if isinstance(out.get("account", {}), dict) else {}
+        payload = {
+            "ok": True,
+            "account": self._public_auth_account(account),
+            "csrf_token": out.get("csrf_token", ""),
+            "expires_at": out.get("expires_at", 0),
+            "capabilities": self.app.ide_request_capabilities(
+                account,
+                client_ip=self._client_ip(),
+                direct_loopback=self._direct_loopback(),
+            ),
+        }
+        if isinstance(out.get("device"), dict):
+            payload["device"] = out["device"]
+        return self._send_json(payload, status=status, cookies=[cookie])
 
     def _send_text(self, text: str, content_type: str = "text/plain; charset=utf-8", status: int = 200):
         body = safe_utf8_bytes(text)
@@ -95532,7 +103774,127 @@ class IdeHandler(BaseHTTPRequestHandler):
                 return
             raise
 
+    def _sse_write(self, payload: bytes) -> bool:
+        try:
+            self.wfile.write(payload)
+            self.wfile.flush()
+            return True
+        except Exception as exc:
+            if swallow_benign_socket_error(exc, "ide-handler.sse_write"):
+                return False
+            raise
+
+    def _stream_ide_events(self, sess: SessionState) -> None:
+        try:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+        except Exception as exc:
+            if swallow_benign_socket_error(exc, "ide-handler.stream_events.headers"):
+                return
+            raise
+        sub = sess.events.subscribe()
+        watch_stop = threading.Event()
+        watch_thread: threading.Thread | None = None
+        try:
+            try:
+                from watchfiles import watch as watch_filesystem
+
+                def _watch_workspace() -> None:
+                    try:
+                        for changes in watch_filesystem(
+                            sess.files_root,
+                            stop_event=watch_stop,
+                            debounce=140,
+                            step=50,
+                            rust_timeout=5000,
+                        ):
+                            paths: list[str] = []
+                            for _, raw_path in changes:
+                                try:
+                                    rel = Path(raw_path).resolve().relative_to(sess.files_root.resolve()).as_posix()
+                                except Exception:
+                                    continue
+                                if rel and rel not in paths:
+                                    paths.append(rel)
+                            if not paths:
+                                continue
+                            try:
+                                sub.put_nowait(
+                                    {
+                                        "type": "workspace_change",
+                                        "seq": 0,
+                                        "data": {
+                                            "root_id": "session",
+                                            "action": "watch",
+                                            "changed_files": paths[:80],
+                                        },
+                                    }
+                                )
+                            except queue.Full:
+                                pass
+                    except Exception:
+                        return
+
+                watch_thread = threading.Thread(
+                    target=_watch_workspace,
+                    name=f"ide-watch-{sess.id[-8:]}",
+                    daemon=True,
+                )
+                watch_thread.start()
+            except Exception:
+                watch_thread = None
+            hello = {"type": "hello", "session_id": sess.id, "seq": int(sess.event_seq or 0)}
+            if not self._sse_write(safe_utf8_bytes(f"data: {json_dumps(hello)}\n\n")):
+                return
+            while True:
+                try:
+                    event = sub.get(timeout=SSE_HEARTBEAT_SECONDS)
+                    raw_data = event.get("data", {}) if isinstance(event, dict) else {}
+                    data = raw_data if isinstance(raw_data, dict) else {}
+                    public = {
+                        "type": trim(str(event.get("type", "event") if isinstance(event, dict) else "event"), 40),
+                        "session_id": sess.id,
+                        "seq": int(event.get("seq", 0) or 0) if isinstance(event, dict) else 0,
+                        "data": {
+                            "path": trim(str(data.get("session_rel_path", data.get("path", "")) or ""), 1200),
+                            "root_id": trim(str(data.get("root_id", "session") or "session"), 160),
+                            "action": trim(str(data.get("action", "") or ""), 40),
+                            "changed_files": [
+                                trim(str(value or ""), 1200)
+                                for value in (data.get("changed_files", []) if isinstance(data.get("changed_files"), list) else [])[:80]
+                            ],
+                        },
+                    }
+                    seq = int(public.get("seq", 0) or 0)
+                    prefix = f"id: {seq}\n" if seq > 0 else ""
+                    chunk = safe_utf8_bytes(f"{prefix}data: {json_dumps(public)}\n\n")
+                except queue.Empty:
+                    chunk = safe_utf8_bytes(f": ping {int(now_ts())}\n\n")
+                if chunk and not self._sse_write(chunk):
+                    break
+        except Exception as exc:
+            if not swallow_benign_socket_error(exc, "ide-handler.stream_events.loop"):
+                raise
+        finally:
+            watch_stop.set()
+            if watch_thread is not None:
+                watch_thread.join(timeout=0.3)
+            sess.events.unsubscribe(sub)
+
     def _send_exception(self, exc: Exception):
+        if isinstance(exc, IDEAuthError):
+            payload = {"error": str(exc), "code": exc.code}
+            if exc.retry_after:
+                payload["retry_after"] = exc.retry_after
+            return self._send_json(payload, status=exc.status)
+        if isinstance(exc, IDECapabilityError):
+            return self._send_json({"error": str(exc), "code": exc.code}, status=exc.status)
+        if isinstance(exc, IDEFileConflict):
+            return self._send_json({"error": str(exc), "code": exc.code, "current": exc.current}, status=exc.status)
         if isinstance(exc, KeyError):
             return self._send_json({"error": str(exc).strip("'") or "not found"}, status=404)
         if isinstance(exc, FileNotFoundError):
@@ -95555,6 +103917,11 @@ class IdeHandler(BaseHTTPRequestHandler):
             return self._send_text(self.app.web_ui_ide_style_css(), "text/css; charset=utf-8")
         if path == "/assets/ide.js":
             return self._send_text(self.app.web_ui_ide_js(), "application/javascript; charset=utf-8")
+        if path == "/assets/ide-monaco-worker.js":
+            fp = self.app.ide_monaco_worker_path()
+            if not fp:
+                return self._send_json({"error": "Monaco worker asset not found"}, status=404)
+            return self._send_inline_bytes(fp.read_bytes(), "application/javascript; charset=utf-8")
         if path.startswith("/assets/js_lib/"):
             asset_ref = path[len("/assets/js_lib/"):]
             fp = self.app.rag_js_lib_asset_path(asset_ref)
@@ -95570,9 +103937,66 @@ class IdeHandler(BaseHTTPRequestHandler):
             return self._send_inline_bytes(data, content_type)
         if path == "/api/health":
             return self._send_json({"ok": True, "app": "clouds-coder-ide", "version": APP_VERSION})
+        if path == "/api/ide/v2/auth/status":
+            return self._send_json(self.app.ide_auth_status(local_setup_allowed=self._direct_loopback()))
+        if path == "/api/ide/v2/auth/me":
+            try:
+                context = self._auth_context(required=True)
+                return self._send_json({
+                    "ok": True,
+                    "account": self._public_auth_account(context["account"]),
+                    "csrf_token": context["account"].get("csrf_token", ""),
+                    "capabilities": context["capabilities"],
+                })
+            except Exception as exc:
+                return self._send_exception(exc)
+        if path == "/api/ide/v2/admin/devices":
+            try:
+                context = self._auth_context(required=True)
+                if not self._direct_loopback() or str(context["account"].get("role", "")) != "admin":
+                    raise IDECapabilityError("local_admin_required", "Local IDE administrator access required.")
+                return self._send_json({"ok": True, "devices": self.app.ide_auth.list_devices()})
+            except Exception as exc:
+                return self._send_exception(exc)
+        if path == "/api/ide/v2/admin/users":
+            try:
+                context = self._auth_context(required=True)
+                if not self._direct_loopback() or str(context["account"].get("role", "")) != "admin":
+                    raise IDECapabilityError("local_admin_required", "Local IDE administrator access required.")
+                return self._send_json({"ok": True, "accounts": self.app.ide_auth.list_accounts()})
+            except Exception as exc:
+                return self._send_exception(exc)
+        if path == "/api/ide/v2/workbench/state":
+            try:
+                return self._send_json(self.app.ide_get_workbench_state(self._user_id()))
+            except Exception as exc:
+                return self._send_exception(exc)
+        if path == "/api/ide/v2/extensions":
+            try:
+                return self._send_json(self.app.ide_list_extensions(self._user_id()))
+            except Exception as exc:
+                return self._send_exception(exc)
+        if path == "/api/ide/v2/extensions/search":
+            try:
+                self._auth_context(required=True)
+                return self._send_json(self.app.ide_open_vsx_search(
+                    str((query.get("query", [""]) or [""])[0] or ""),
+                    size=int((query.get("size", ["30"]) or ["30"])[0] or 30),
+                    offset=int((query.get("offset", ["0"]) or ["0"])[0] or 0),
+                ))
+            except Exception as exc:
+                return self._send_exception(exc)
         if path == "/api/ide/config":
             try:
-                return self._send_json(self.app.ide_config(self._user_id(), client_ip=self._client_ip()))
+                context = self._auth_context(required=True)
+                out = self.app.ide_config(str(context["account"].get("user_id", "")), client_ip=self._client_ip())
+                out["account"] = self._public_auth_account(context["account"])
+                out["csrf_token"] = context["account"].get("csrf_token", "")
+                out["capabilities"] = context["capabilities"]
+                if not context["capabilities"].get("mounts"):
+                    out["mounts"] = []
+                    out["workspace"] = ""
+                return self._send_json(out)
             except Exception as exc:
                 return self._send_exception(exc)
         if path == "/api/ide/sessions":
@@ -95580,10 +104004,21 @@ class IdeHandler(BaseHTTPRequestHandler):
                 return self._send_json(self.app.ide_session_payload(self._user_id(), client_ip=self._client_ip()))
             except Exception as exc:
                 return self._send_exception(exc)
+        m = re.match(r"^/api/ide/v2/sessions/([^/]+)/events$", path)
+        if m:
+            try:
+                context = self._auth_context(required=True)
+                sess = self.app._ide_session(str(context["account"].get("user_id", "")), m.group(1))
+                return self._stream_ide_events(sess)
+            except Exception as exc:
+                return self._send_exception(exc)
         m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/roots$", path)
         if m:
             try:
-                roots = self.app.ide_workspace_roots(self._user_id(), m.group(1))
+                context = self._auth_context(required=True)
+                roots = self.app.ide_workspace_roots(str(context["account"].get("user_id", "")), m.group(1))
+                if not context["capabilities"].get("mounts"):
+                    roots = [row for row in roots if str(row.get("kind", "")) == "session"]
                 return self._send_json({"ok": True, "session_id": m.group(1), "roots": roots})
             except Exception as exc:
                 return self._send_exception(exc)
@@ -95596,9 +104031,11 @@ class IdeHandler(BaseHTTPRequestHandler):
             root_id = str((query.get("root_id", query.get("root", ["session"])) or ["session"])[0] or "session")
             rel = str((query.get("path", query.get("rel", [""])) or [""])[0] or "")
             try:
+                context = self._auth_context(required=True)
+                self._require_root_capability(context, root_id)
                 return self._send_json(
                     self.app.ide_tree_payload(
-                        self._user_id(),
+                        str(context["account"].get("user_id", "")),
                         m.group(1),
                         root_id=root_id,
                         rel=rel,
@@ -95612,21 +104049,251 @@ class IdeHandler(BaseHTTPRequestHandler):
             root_id = str((query.get("root_id", query.get("root", ["session"])) or ["session"])[0] or "session")
             rel = str((query.get("path", query.get("rel", [""])) or [""])[0] or "")
             try:
-                return self._send_json(self.app.ide_read_file(self._user_id(), m.group(1), root_id=root_id, rel=rel))
+                context = self._auth_context(required=True)
+                self._require_root_capability(context, root_id)
+                return self._send_json(self.app.ide_read_file(str(context["account"].get("user_id", "")), m.group(1), root_id=root_id, rel=rel))
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/raw$", path)
+        if m:
+            root_id = str((query.get("root_id", query.get("root", ["session"])) or ["session"])[0] or "session")
+            rel = str((query.get("path", query.get("rel", [""])) or [""])[0] or "")
+            try:
+                context = self._auth_context(required=True)
+                self._require_root_capability(context, root_id)
+                _, target, _ = self.app.ide_resolve_workspace(
+                    str(context["account"].get("user_id", "")), m.group(1), root_id, rel
+                )
+                if not target.exists() or not target.is_file():
+                    raise FileNotFoundError("file not found")
+                content_type = guess_mime_from_name(target.name, "application/octet-stream")
+                if content_type.startswith("text/") and "charset=" not in content_type.lower():
+                    content_type = f"{content_type}; charset=utf-8"
+                download = _to_bool_like((query.get("download", ["0"]) or ["0"])[0], default=False)
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Type", content_type)
+                    self.send_header("Content-Length", str(int(target.stat().st_size)))
+                    if download:
+                        self.send_header("Content-Disposition", f'attachment; filename="{quote(target.name)}"')
+                    else:
+                        self.send_header("Content-Disposition", "inline")
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    with target.open("rb") as handle:
+                        shutil.copyfileobj(handle, self.wfile, length=1024 * 1024)
+                except Exception as exc:
+                    if swallow_benign_socket_error(exc, "ide-handler.send_workspace_raw"):
+                        return
+                    raise
+                return
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/html/(.*)$", path)
+        if m:
+            root_id = str((query.get("root_id", query.get("root", ["session"])) or ["session"])[0] or "session")
+            rel = str(m.group(2) or "")
+            try:
+                context = self._auth_context(required=True)
+                self._require_root_capability(context, root_id)
+                _, target, _ = self.app.ide_resolve_workspace(
+                    str(context["account"].get("user_id", "")), m.group(1), root_id, rel
+                )
+                if not target.exists() or not target.is_file():
+                    raise FileNotFoundError("file not found")
+                content_type = guess_mime_from_name(target.name, "application/octet-stream")
+                if content_type.startswith("text/") and "charset=" not in content_type.lower():
+                    content_type = f"{content_type}; charset=utf-8"
+                return self._send_inline_bytes(target.read_bytes(), content_type)
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/preview$", path)
+        if m:
+            root_id = str((query.get("root_id", query.get("root", ["session"])) or ["session"])[0] or "session")
+            rel = str((query.get("path", query.get("rel", [""])) or [""])[0] or "")
+            try:
+                context = self._auth_context(required=True)
+                self._require_root_capability(context, root_id)
+                html_text = self.app.ide_preview_html(
+                    str(context["account"].get("user_id", "")), m.group(1), root_id=root_id, rel=rel
+                )
+                return self._send_inline_bytes(str(html_text).encode("utf-8", errors="ignore"), "text/html; charset=utf-8")
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/v2/sessions/([^/]+)/scm/status$", path)
+        if m:
+            root_id = str((query.get("root_id", ["session"]) or ["session"])[0] or "session")
+            try:
+                context = self._auth_context(required=True)
+                self._require_root_capability(context, root_id)
+                return self._send_json(self.app.ide_scm_status(str(context["account"].get("user_id", "")), m.group(1), {"root_id": root_id}))
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/v2/sessions/([^/]+)/tasks$", path)
+        if m:
+            root_id = str((query.get("root_id", ["session"]) or ["session"])[0] or "session")
+            try:
+                context = self._auth_context(required=True)
+                self._require_root_capability(context, root_id)
+                return self._send_json(self.app.ide_tasks(str(context["account"].get("user_id", "")), m.group(1), root_id))
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/v2/sessions/([^/]+)/agent-state$", path)
+        if m:
+            try:
+                return self._send_json(self.app.ide_agent_state(self._user_id(), m.group(1)))
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/v2/sessions/([^/]+)/code-history(?:/stage)?$", path)
+        if m:
+            root_id = str((query.get("root_id", ["session"]) or ["session"])[0] or "session")
+            rel = str((query.get("path", [""]) or [""])[0] or "")
+            stage_id = str((query.get("stage_id", ["latest"]) or ["latest"])[0] or "latest")
+            try:
+                context = self._auth_context(required=True)
+                self._require_root_capability(context, root_id)
+                user_id = str(context["account"].get("user_id", ""))
+                if path.endswith("/stage"):
+                    return self._send_json(self.app.ide_code_preview_payload(user_id, m.group(1), root_id=root_id, rel=rel, stage_id=stage_id))
+                return self._send_json(self.app.ide_code_preview_stages(user_id, m.group(1), root_id=root_id, rel=rel))
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/v2/sessions/([^/]+)/models$", path)
+        if m:
+            try:
+                self._auth_context(required=True)
+                refresh = _to_bool_like((query.get("refresh", ["0"]) or ["0"])[0], default=False)
+                return self._send_json(self.app.ide_agent_models(self._user_id(), m.group(1), refresh=refresh))
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/v2/terminals/([^/]+)/output$", path)
+        if m:
+            try:
+                context = self._auth_context(required=True)
+                self.app.ide_require_capability(context["capabilities"], "terminal")
+                offset = int((query.get("offset", ["0"]) or ["0"])[0] or 0)
+                return self._send_json(self.app.ide_terminal_output(str(context["account"].get("user_id", "")), m.group(1), offset))
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/v2/debug/([^/]+)/messages$", path)
+        if m:
+            try:
+                context = self._auth_context(required=True)
+                self.app.ide_require_capability(context["capabilities"], "debug")
+                return self._send_json(self.app.ide_debug_messages(str(context["account"].get("user_id", "")), m.group(1)))
             except Exception as exc:
                 return self._send_exception(exc)
         return self._send_json({"error": "not found"}, status=404)
 
     def do_POST(self):
         path = unquote(urlparse(self.path).path)
-        if not self._require_admin_write():
+        if path == "/api/ide/v2/auth/local":
+            try:
+                if not self._same_origin_write():
+                    raise IDEAuthError("same_origin_required", "IDE authentication requires a same-origin request.", 403)
+                out = self.app.local_ide_login(local_allowed=self._direct_loopback(), client_ip=self._client_ip())
+                return self._send_auth_session(out, status=200)
+            except Exception as exc:
+                return self._send_exception(exc)
+        if path == "/api/ide/v2/auth/device":
+            try:
+                if not self._same_origin_write():
+                    raise IDEAuthError("same_origin_required", "IDE authentication requires a same-origin request.", 403)
+                if self._direct_loopback():
+                    raise IDEAuthError("remote_device_only", "Device pairing is only used by remote Web clients.", 409)
+                if not self._require_lan_https():
+                    return
+                out = self.app.register_ide_device(self._read_json(), client_ip=self._client_ip())
+                if out.get("access_token"):
+                    return self._send_auth_session(out, status=200)
+                return self._send_json(out, status=202)
+            except Exception as exc:
+                return self._send_exception(exc)
+        if path in {"/api/ide/v2/admin/devices/approve", "/api/ide/v2/admin/devices/revoke"}:
+            context = self._require_local_admin()
+            if not context:
+                return
+            try:
+                payload = self._read_json()
+                pairing_id = payload.get("pairing_id")
+                if path.endswith("/approve"):
+                    device = self.app.ide_auth.approve_device(
+                        pairing_id,
+                        approved_by=str(context["account"].get("username", "local-admin") or "local-admin"),
+                    )
+                else:
+                    device = self.app.ide_auth.revoke_device(pairing_id)
+                return self._send_json({"ok": True, "device": device})
+            except Exception as exc:
+                return self._send_exception(exc)
+        if path == "/api/ide/v2/admin/password-reset":
+            context = self._require_local_admin()
+            if not context:
+                return
+            try:
+                payload = self._read_json()
+                account = self.app.ide_auth.reset_password(payload.get("username"), payload.get("new_password"))
+                return self._send_json({"ok": True, "account": account})
+            except Exception as exc:
+                return self._send_exception(exc)
+        if path in {"/api/ide/v2/auth/setup", "/api/ide/v2/auth/login"}:
+            try:
+                if not self._same_origin_write():
+                    raise IDEAuthError("same_origin_required", "IDE authentication requires a same-origin request.", 403)
+                if path.endswith("/login") and not self._require_lan_https():
+                    return
+                payload = self._read_json()
+                if path.endswith("/setup"):
+                    out = self.app.setup_ide_admin(payload.get("username"), payload.get("password"), local_setup_allowed=self._direct_loopback())
+                else:
+                    out = self.app.login_ide(payload.get("username"), payload.get("password"), self._client_ip())
+                return self._send_auth_session(out, status=201 if path.endswith("/setup") else 200)
+            except Exception as exc:
+                return self._send_exception(exc)
+        if path == "/api/ide/v2/auth/logout":
+            context = self._require_write()
+            if not context:
+                return
+            self.app.ide_auth.revoke_session(str(context.get("token", "") or ""))
+            return self._send_json({"ok": True}, cookies=["clouds_ide_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"])
+        if path == "/api/ide/v2/auth/password":
+            context = self._require_write()
+            if not context:
+                return
+            try:
+                payload = self._read_json()
+                account = self.app.ide_auth.change_password(context["account"], payload.get("old_password"), payload.get("new_password"))
+                return self._send_json({"ok": True, "account": account}, cookies=["clouds_ide_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"])
+            except Exception as exc:
+                return self._send_exception(exc)
+        if path == "/api/ide/v2/admin/users":
+            context = self._require_local_admin()
+            if not context:
+                return
+            try:
+                payload = self._read_json()
+                account = self.app.ide_auth.create_user(payload.get("username"), payload.get("password"), must_change_password=bool(payload.get("must_change_password", True)))
+                return self._send_json({"ok": True, "account": account}, status=201)
+            except Exception as exc:
+                return self._send_exception(exc)
+        if path == "/api/ide/v2/workbench/state":
+            context = self._require_write()
+            if not context:
+                return
+            try:
+                return self._send_json(self.app.ide_save_workbench_state(str(context["account"].get("user_id", "")), self._read_json()))
+            except Exception as exc:
+                return self._send_exception(exc)
+        context = self._require_write()
+        if not context:
             return
+        user_id = str(context["account"].get("user_id", "") or "")
         if path == "/api/ide/sessions":
             payload = self._read_json()
             try:
                 return self._send_json(
                     self.app.ide_create_session(
-                        self._user_id(),
+                        user_id,
                         str(payload.get("title", "") or "").strip() or None,
                         client_ip=self._client_ip(),
                     ),
@@ -95645,8 +104312,9 @@ class IdeHandler(BaseHTTPRequestHandler):
         if path == "/api/ide/mounts":
             payload = self._read_json()
             try:
+                self.app.ide_require_capability(context["capabilities"], "mounts")
                 return self._send_json(
-                    self.app.ide_authorize_mount(self._user_id(), str(payload.get("path", "") or "")),
+                    self.app.ide_authorize_mount(user_id, str(payload.get("path", "") or "")),
                     status=201,
                 )
             except Exception as exc:
@@ -95654,74 +104322,239 @@ class IdeHandler(BaseHTTPRequestHandler):
         m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/mkdir$", path)
         if m:
             try:
-                return self._send_json(self.app.ide_mkdir(self._user_id(), m.group(1), self._read_json()), status=201)
+                payload = self._read_json(); self._require_root_capability(context, payload.get("root_id", "session"))
+                return self._send_json(self.app.ide_mkdir(user_id, m.group(1), payload), status=201)
             except Exception as exc:
                 return self._send_exception(exc)
         m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/upload$", path)
         if m:
             try:
-                return self._send_json(self.app.ide_upload(self._user_id(), m.group(1), self._read_json()), status=201)
+                payload = self._read_json(); self._require_root_capability(context, payload.get("root_id", "session"))
+                return self._send_json(self.app.ide_upload(user_id, m.group(1), payload), status=201)
             except Exception as exc:
                 return self._send_exception(exc)
         m = re.match(r"^/api/ide/sessions/([^/]+)/terminal/run$", path)
         if m:
             try:
-                return self._send_json(self.app.ide_run_command(self._user_id(), m.group(1), self._read_json()))
+                self.app.ide_require_capability(context["capabilities"], "terminal")
+                payload = self._read_json(); self._require_root_capability(context, payload.get("root_id", "session"))
+                return self._send_json(
+                    self.app.ide_run_command(
+                        user_id,
+                        m.group(1),
+                        payload,
+                        remote=not bool(context["capabilities"].get("local")),
+                    )
+                )
             except Exception as exc:
                 return self._send_exception(exc)
         m = re.match(r"^/api/ide/sessions/([^/]+)/agent-task$", path)
         if m:
             try:
+                self.app.ide_require_capability(context["capabilities"], "agent_processes")
                 return self._send_json(
                     self.app.ide_agent_task(
-                        self._user_id(),
+                        user_id,
                         m.group(1),
                         self._read_json(),
                         client_ip=self._client_ip(),
+                        remote=not bool(context["capabilities"].get("local")),
                     )
                 )
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/v2/sessions/([^/]+)/model$", path)
+        if m:
+            try:
+                payload = self._read_json()
+                return self._send_json(
+                    self.app.ide_set_agent_model(
+                        user_id,
+                        m.group(1),
+                        str(payload.get("selection", payload.get("model", "")) or ""),
+                    )
+                )
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/v2/sessions/([^/]+)/code-history/restore$", path)
+        if m:
+            try:
+                payload = self._read_json(); self._require_root_capability(context, payload.get("root_id", "session"))
+                return self._send_json(self.app.ide_restore_code_preview(user_id, m.group(1), payload))
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/v2/sessions/([^/]+)/search$", path)
+        if m:
+            try:
+                payload = self._read_json(); self._require_root_capability(context, payload.get("root_id", "session"))
+                return self._send_json(self.app.ide_search_workspace(user_id, m.group(1), payload))
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/v2/sessions/([^/]+)/scm/diff$", path)
+        if m:
+            try:
+                payload = self._read_json(); self._require_root_capability(context, payload.get("root_id", "session"))
+                return self._send_json(self.app.ide_scm_diff(user_id, m.group(1), payload))
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/v2/sessions/([^/]+)/terminals$", path)
+        if m:
+            try:
+                self.app.ide_require_capability(context["capabilities"], "terminal")
+                payload = self._read_json(); self._require_root_capability(context, payload.get("root_id", "session"))
+                return self._send_json(
+                    self.app.ide_terminal_create(
+                        user_id,
+                        m.group(1),
+                        payload,
+                        remote=not bool(context["capabilities"].get("local")),
+                    ),
+                    status=201,
+                )
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/v2/terminals/([^/]+)/(input|resize)$", path)
+        if m:
+            try:
+                self.app.ide_require_capability(context["capabilities"], "terminal")
+                payload = self._read_json()
+                out = self.app.ide_terminal_input(user_id, m.group(1), payload) if m.group(2) == "input" else self.app.ide_terminal_resize(user_id, m.group(1), payload)
+                return self._send_json(out)
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/v2/sessions/([^/]+)/tasks/run$", path)
+        if m:
+            try:
+                self.app.ide_require_capability(context["capabilities"], "tasks")
+                payload = self._read_json(); self._require_root_capability(context, payload.get("root_id", "session"))
+                return self._send_json(
+                    self.app.ide_run_task(
+                        user_id,
+                        m.group(1),
+                        payload,
+                        remote=not bool(context["capabilities"].get("local")),
+                    )
+                )
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/v2/sessions/([^/]+)/diagnostics/python$", path)
+        if m:
+            try:
+                payload = self._read_json(); self._require_root_capability(context, payload.get("root_id", "session"))
+                return self._send_json(self.app.ide_python_diagnostics(user_id, m.group(1), payload))
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/v2/sessions/([^/]+)/debug$", path)
+        if m:
+            try:
+                self.app.ide_require_capability(context["capabilities"], "debug")
+                payload = self._read_json(); self._require_root_capability(context, payload.get("root_id", "session"))
+                return self._send_json(
+                    self.app.ide_debug_create(
+                        user_id,
+                        m.group(1),
+                        payload,
+                        remote=not bool(context["capabilities"].get("local")),
+                    ),
+                    status=201,
+                )
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/v2/debug/([^/]+)/send$", path)
+        if m:
+            try:
+                self.app.ide_require_capability(context["capabilities"], "debug")
+                return self._send_json(self.app.ide_debug_send(user_id, m.group(1), self._read_json()))
+            except Exception as exc:
+                return self._send_exception(exc)
+        if path == "/api/ide/v2/extensions/install":
+            try:
+                return self._send_json(self.app.ide_install_extension(user_id, self._read_json()), status=201)
             except Exception as exc:
                 return self._send_exception(exc)
         return self._send_json({"error": "not found"}, status=404)
 
     def do_PUT(self):
         path = unquote(urlparse(self.path).path)
-        if not self._require_admin_write():
+        context = self._require_write()
+        if not context:
             return
         m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/file$", path)
         if not m:
             return self._send_json({"error": "not found"}, status=404)
         try:
-            return self._send_json(self.app.ide_write_file(self._user_id(), m.group(1), self._read_json()))
+            payload = self._read_json(); self._require_root_capability(context, payload.get("root_id", "session"))
+            return self._send_json(self.app.ide_write_file(str(context["account"].get("user_id", "")), m.group(1), payload))
         except Exception as exc:
             return self._send_exception(exc)
 
     def do_PATCH(self):
         path = unquote(urlparse(self.path).path)
-        if not self._require_admin_write():
+        context = self._require_write()
+        if not context:
             return
+        if path == "/api/ide/v2/admin/users":
+            if not self._direct_loopback() or str(context["account"].get("role", "")) != "admin":
+                return self._send_json({"error": "Local IDE administrator access required.", "code": "local_admin_required"}, status=403)
+            try:
+                payload = self._read_json()
+                return self._send_json({"ok": True, "account": self.app.ide_auth.set_disabled(payload.get("username"), bool(payload.get("disabled", True)))})
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/sessions/([^/]+)$", path)
+        if m:
+            try:
+                payload = self._read_json()
+                return self._send_json(self.app.ide_rename_session(str(context["account"].get("user_id", "")), m.group(1), payload.get("title", "")))
+            except Exception as exc:
+                return self._send_exception(exc)
         m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/rename$", path)
         if not m:
             return self._send_json({"error": "not found"}, status=404)
         try:
-            return self._send_json(self.app.ide_rename(self._user_id(), m.group(1), self._read_json()))
+            payload = self._read_json(); self._require_root_capability(context, payload.get("root_id", "session"))
+            return self._send_json(self.app.ide_rename(str(context["account"].get("user_id", "")), m.group(1), payload))
         except Exception as exc:
             return self._send_exception(exc)
 
     def do_DELETE(self):
         path = unquote(urlparse(self.path).path)
-        if not self._require_admin_write():
+        context = self._require_write()
+        if not context:
             return
+        user_id = str(context["account"].get("user_id", "") or "")
         if path == "/api/ide/mounts":
             try:
+                self.app.ide_require_capability(context["capabilities"], "mounts")
                 payload = self._read_json()
-                return self._send_json(self.app.ide_remove_mount(self._user_id(), str(payload.get("mount_id", "") or "")))
+                return self._send_json(self.app.ide_remove_mount(user_id, str(payload.get("mount_id", "") or "")))
             except Exception as exc:
                 return self._send_exception(exc)
         m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/file$", path)
         if m:
             try:
-                return self._send_json(self.app.ide_delete(self._user_id(), m.group(1), self._read_json()))
+                payload = self._read_json(); self._require_root_capability(context, payload.get("root_id", "session"))
+                return self._send_json(self.app.ide_delete(user_id, m.group(1), payload))
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/v2/terminals/([^/]+)$", path)
+        if m:
+            try:
+                self.app.ide_require_capability(context["capabilities"], "terminal")
+                return self._send_json(self.app.ide_terminal_close(user_id, m.group(1)))
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/v2/debug/([^/]+)$", path)
+        if m:
+            try:
+                self.app.ide_require_capability(context["capabilities"], "debug")
+                return self._send_json(self.app.ide_debug_close(user_id, m.group(1)))
+            except Exception as exc:
+                return self._send_exception(exc)
+        if path == "/api/ide/v2/extensions":
+            try:
+                payload = self._read_json()
+                return self._send_json(self.app.ide_uninstall_extension(user_id, str(payload.get("id", "") or "")))
             except Exception as exc:
                 return self._send_exception(exc)
         return self._send_json({"error": "not found"}, status=404)
@@ -95754,7 +104587,7 @@ class McpServiceHandler(BaseHTTPRequestHandler):
             raise
 
     @property
-    def app(self) -> "AppContext":
+    def app(self) -> AppContext:
         return self.server.app  # type: ignore[attr-defined]
 
     def _mgr(self):
@@ -96059,7 +104892,8 @@ def main():
         "--enable_IDE",
         dest="enable_ide",
         action="store_true",
-        help="Enable Programming IDE web UI server startup (disabled by default)",
+        default=True,
+        help="Enable Programming IDE web UI server startup (enabled by default)",
     )
     parser.add_argument(
         "--no_ide",
@@ -96067,7 +104901,20 @@ def main():
         "--no_IDE",
         dest="no_ide",
         action="store_true",
-        help="Disable Programming IDE web UI server startup (default)",
+        help="Disable Programming IDE web UI server startup",
+    )
+    parser.add_argument(
+        "--ide-password-login",
+        dest="ide_password_login_enabled",
+        action="store_true",
+        default=False,
+        help="Enable optional username/password login for Program IDE (disabled by default)",
+    )
+    parser.add_argument(
+        "--no-ide-password-login",
+        dest="ide_password_login_enabled",
+        action="store_false",
+        help="Disable Program IDE password login",
     )
     parser.add_argument(
         "--mcp_service_port",
@@ -96136,7 +104983,8 @@ def main():
         help=(
             "LLM config source (URL or local file path). "
             "Also reads startup keys like show_upload_list, download_js_lib, shell_command_timeout, "
-            "ctx_limit/context_token_limit, tool_memory_policy/read_context_policy, auto_task_level_ceiling and "
+            "ctx_limit/context_token_limit, tool_memory_policy/read_context_policy, auto_task_level_ceiling, "
+            "l2_todo_policy (force|auto|off) and "
             "daily_session_limit (aliases: daily_sessions_per_ip / "
             "max_daily_sessions_per_ip / session_daily_limit; shell aliases: "
             "shell_timeout / bash_timeout / command_timeout)."
@@ -96208,7 +105056,8 @@ def main():
         "--max_auto_task_level",
         "--max-auto-task-level",
         dest="auto_task_level_ceiling",
-        default="",
+        default=None,
+        type=int,
         help=(
             "Limit automatic L1-L5 task classification to this maximum level (1-5); "
             f"0/off means no cap (default {DEFAULT_AUTO_TASK_LEVEL_CEILING}). "
@@ -96218,6 +105067,19 @@ def main():
             "Manual task-level overrides and manual plan-mode preference are not capped. "
             "Also configurable via config keys auto_task_level_ceiling/task_level_ceiling/"
             "max_auto_task_level/complexity_ceiling."
+        ),
+    )
+    parser.add_argument(
+        "--l2-todo-policy",
+        "--l2_todo_policy",
+        "--level2-todo-policy",
+        dest="l2_todo_policy",
+        default=None,
+        choices=list(L2_TODO_POLICY_CHOICES),
+        help=(
+            "Level-2 Todo behavior: force (default, mandatory), auto (let the LLM "
+            "judge from task semantics), or off (explicitly disable the L2 contract). "
+            "Also configurable via config key l2_todo_policy."
         ),
     )
     parser.add_argument(
@@ -96322,6 +105184,25 @@ def main():
         help="Agent execution mode (single|sequential|sync). Empty means read from startup config, then fallback to sync.",
     )
     parser.add_argument(
+        "--single-no-plan-todo",
+        dest="single_no_plan_todo_enabled",
+        action="store_true",
+        default=None,
+        help="Enable the optional single/no-plan Todo bootstrap; L2 behavior is controlled by --l2-todo-policy.",
+    )
+    parser.add_argument(
+        "--no-single-no-plan-todo",
+        dest="single_no_plan_todo_enabled",
+        action="store_false",
+        help="Disable the optional single/no-plan bootstrap; use --l2-todo-policy off to disable the L2 Todo contract.",
+    )
+    parser.add_argument(
+        "--single-no-plan-todo-prompt",
+        dest="single_no_plan_todo_prompt",
+        default=None,
+        help="Custom prompt used for the single/no-plan Todo bootstrap turn.",
+    )
+    parser.add_argument(
         "--max-output-tokens",
         default=AGENT_MAX_OUTPUT_TOKENS,
         type=int,
@@ -96355,6 +105236,8 @@ def main():
         shell_command_timeout=None,
         web_search_enabled=None,
         user_memory_mode=None,
+        single_no_plan_todo_enabled=None,
+        single_no_plan_todo_prompt=None,
     )
     skip_admin_defaults = str(os.environ.pop("CLOUDS_CODER_SKIP_ADMIN_DEFAULTS", "") or "").strip().lower() in {"1", "true", "yes", "on"}
     admin_default_keys: set[str] = set()
@@ -96402,6 +105285,9 @@ def main():
     resolved_read_context_policy = DEFAULT_READ_CONTEXT_POLICY
     resolved_tool_memory_policy = DEFAULT_TOOL_MEMORY_POLICY
     resolved_auto_task_level_ceiling = DEFAULT_AUTO_TASK_LEVEL_CEILING
+    resolved_l2_todo_policy = DEFAULT_L2_TODO_POLICY
+    resolved_single_no_plan_todo_enabled = False
+    resolved_single_no_plan_todo_prompt = ""
     resolved_web_search_enabled = DEFAULT_WEB_SEARCH_ENABLED
     resolved_user_memory_mode = DEFAULT_USER_MEMORY_MODE
     external_config: dict = {}
@@ -96450,6 +105336,14 @@ def main():
             external_auto_task_level_ceiling = extract_auto_task_level_ceiling_setting(external_config)
             if external_auto_task_level_ceiling is not None:
                 resolved_auto_task_level_ceiling = normalize_auto_task_level_ceiling(external_auto_task_level_ceiling)
+            external_l2_todo_policy = extract_l2_todo_policy_setting(external_config)
+            if external_l2_todo_policy is not None:
+                resolved_l2_todo_policy = normalize_l2_todo_policy(external_l2_todo_policy)
+            if _single_no_plan_todo_setting_present(external_config):
+                (
+                    resolved_single_no_plan_todo_enabled,
+                    resolved_single_no_plan_todo_prompt,
+                ) = extract_single_no_plan_todo_settings(external_config)
             external_web_search_enabled = extract_web_search_enabled_setting(external_config)
             if external_web_search_enabled is not None:
                 resolved_web_search_enabled = bool(external_web_search_enabled)
@@ -96487,6 +105381,14 @@ def main():
     web_ui_auto_task_level_ceiling = extract_auto_task_level_ceiling_setting(web_ui_config)
     if web_ui_auto_task_level_ceiling is not None:
         resolved_auto_task_level_ceiling = normalize_auto_task_level_ceiling(web_ui_auto_task_level_ceiling)
+    web_ui_l2_todo_policy = extract_l2_todo_policy_setting(web_ui_config)
+    if web_ui_l2_todo_policy is not None:
+        resolved_l2_todo_policy = normalize_l2_todo_policy(web_ui_l2_todo_policy)
+    if _single_no_plan_todo_setting_present(web_ui_config):
+        (
+            resolved_single_no_plan_todo_enabled,
+            resolved_single_no_plan_todo_prompt,
+        ) = extract_single_no_plan_todo_settings(web_ui_config)
     web_ui_web_search_enabled = extract_web_search_enabled_setting(web_ui_config)
     if web_ui_web_search_enabled is not None:
         resolved_web_search_enabled = bool(web_ui_web_search_enabled)
@@ -96533,6 +105435,59 @@ def main():
             getattr(args, "auto_task_level_ceiling", "")
         )
     resolved_auto_task_level_ceiling = normalize_auto_task_level_ceiling(resolved_auto_task_level_ceiling)
+    cli_l2_todo_policy = str(getattr(args, "l2_todo_policy", "") or "").strip()
+    if cli_l2_todo_policy:
+        resolved_l2_todo_policy = normalize_l2_todo_policy(cli_l2_todo_policy)
+    resolved_l2_todo_policy = normalize_l2_todo_policy(resolved_l2_todo_policy)
+    _l2_todo_cli_explicit = any(
+        str(arg).split("=", 1)[0]
+        in {"--l2-todo-policy", "--l2_todo_policy", "--level2-todo-policy"}
+        for arg in sys.argv[1:]
+    )
+    _l2_todo_admin_explicit = "l2_todo_policy" in admin_default_keys
+    _l2_todo_external_explicit = extract_l2_todo_policy_setting(external_config) is not None
+    _l2_todo_web_explicit = extract_l2_todo_policy_setting(web_ui_config) is not None
+    _single_todo_cli_explicit = any(
+        str(arg).split("=", 1)[0]
+        in {
+            "--single-no-plan-todo",
+            "--no-single-no-plan-todo",
+            "--single-no-plan-todo-prompt",
+        }
+        for arg in sys.argv[1:]
+    )
+    _single_todo_cli_prompt_explicit = any(
+        str(arg).split("=", 1)[0] == "--single-no-plan-todo-prompt"
+        for arg in sys.argv[1:]
+    )
+    _single_todo_cli_disable_explicit = any(
+        str(arg).split("=", 1)[0] == "--no-single-no-plan-todo"
+        for arg in sys.argv[1:]
+    )
+    _single_todo_admin_explicit = bool(
+        {"single_no_plan_todo_enabled", "single_no_plan_todo_prompt"} & admin_default_keys
+    )
+    _single_todo_external_explicit = _single_no_plan_todo_setting_present(external_config)
+    _single_todo_web_explicit = _single_no_plan_todo_setting_present(web_ui_config)
+    if _single_todo_cli_explicit or _single_todo_admin_explicit:
+        _raw_single_todo_enabled = getattr(args, "single_no_plan_todo_enabled", None)
+        if _raw_single_todo_enabled is not None:
+            resolved_single_no_plan_todo_enabled = bool(_raw_single_todo_enabled)
+        _raw_single_todo_prompt = getattr(args, "single_no_plan_todo_prompt", None)
+        if _raw_single_todo_prompt is not None:
+            resolved_single_no_plan_todo_prompt = trim(str(_raw_single_todo_prompt or "").strip(), 6000)
+            if (
+                _single_todo_cli_prompt_explicit
+                and resolved_single_no_plan_todo_prompt
+                and not _single_todo_cli_disable_explicit
+            ):
+                # A non-empty CLI prompt is itself an opt-in unless the user
+                # also supplied the explicit disable switch.
+                resolved_single_no_plan_todo_enabled = True
+        if _single_todo_cli_disable_explicit:
+            resolved_single_no_plan_todo_enabled = False
+        if resolved_single_no_plan_todo_enabled and not resolved_single_no_plan_todo_prompt:
+            resolved_single_no_plan_todo_prompt = DEFAULT_SINGLE_NO_PLAN_TODO_PROMPT
     raw_ui_style = str(getattr(args, "ui_style", "") or "").strip()
     if not raw_ui_style:
         raw_ui_style = str(extract_ui_style_setting(external_config) or "").strip()
@@ -96829,10 +105784,41 @@ def main():
         web_search_setting_locked=web_search_setting_locked,
         user_memory_mode=resolved_user_memory_mode,
         user_memory_setting_locked=user_memory_setting_locked,
+        l2_todo_policy=(
+            resolved_l2_todo_policy
+            if (_l2_todo_cli_explicit or _l2_todo_admin_explicit or _l2_todo_external_explicit or _l2_todo_web_explicit)
+            else None
+        ),
+        # Leave the constructor argument unspecified when no startup source
+        # mentioned this optional policy, so its base LLM.config.json value is
+        # preserved.  Explicit CLI/Admin/external/WebUI values still win.
+        single_no_plan_todo_enabled=(
+            resolved_single_no_plan_todo_enabled
+            if (
+                _single_todo_cli_explicit
+                or _single_todo_admin_explicit
+                or _single_todo_external_explicit
+                or _single_todo_web_explicit
+            )
+            else None
+        ),
+        single_no_plan_todo_prompt=(
+            resolved_single_no_plan_todo_prompt
+            if (
+                _single_todo_cli_explicit
+                or _single_todo_admin_explicit
+                or _single_todo_external_explicit
+                or _single_todo_web_explicit
+            )
+            else ""
+        ),
+        ide_password_login_enabled=bool(getattr(args, "ide_password_login_enabled", False)),
     )
     app.read_context_policy = resolved_read_context_policy
     app.tool_memory_policy = resolved_tool_memory_policy
     app.auto_task_level_ceiling = resolved_auto_task_level_ceiling
+    if _l2_todo_cli_explicit or _l2_todo_admin_explicit:
+        app.l2_todo_policy = normalize_l2_todo_policy(resolved_l2_todo_policy)
     app.web_search_enabled = bool(resolved_web_search_enabled)
     app.web_search_setting_locked = bool(web_search_setting_locked)
     app.user_memory_mode = normalize_user_memory_mode(resolved_user_memory_mode)
@@ -96849,6 +105835,9 @@ def main():
         except Exception as exc:
             print(f"[web-agent] failed to apply --config: {exc}")
             sys.exit(2)
+    if _single_todo_cli_explicit or _single_todo_admin_explicit:
+        app.single_no_plan_todo_enabled = bool(resolved_single_no_plan_todo_enabled)
+        app.single_no_plan_todo_prompt = str(resolved_single_no_plan_todo_prompt or "").strip()[:6000]
     app.read_context_policy = resolved_read_context_policy
     app.tool_memory_policy = resolved_tool_memory_policy
     app.auto_task_level_ceiling = resolved_auto_task_level_ceiling
@@ -96868,6 +105857,9 @@ def main():
         _mgr.read_context_policy = resolved_read_context_policy
         _mgr.tool_memory_policy = resolved_tool_memory_policy
         _mgr.auto_task_level_ceiling = resolved_auto_task_level_ceiling
+        _mgr.l2_todo_policy = normalize_l2_todo_policy(getattr(app, "l2_todo_policy", resolved_l2_todo_policy))
+        _mgr.single_no_plan_todo_enabled = bool(resolved_single_no_plan_todo_enabled)
+        _mgr.single_no_plan_todo_prompt = str(resolved_single_no_plan_todo_prompt or "").strip()[:6000]
         _mgr.web_search_enabled = bool(getattr(app, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED))
         _mgr.web_search_setting_locked = bool(web_search_setting_locked)
         _mgr.user_memory_mode = normalize_user_memory_mode(getattr(app, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
@@ -96876,6 +105868,9 @@ def main():
             _sess.read_context_policy = resolved_read_context_policy
             _sess.tool_memory_policy = resolved_tool_memory_policy
             _sess.auto_task_level_ceiling = resolved_auto_task_level_ceiling
+            _sess.l2_todo_policy = normalize_l2_todo_policy(getattr(app, "l2_todo_policy", resolved_l2_todo_policy))
+            _sess.single_no_plan_todo_enabled = bool(resolved_single_no_plan_todo_enabled)
+            _sess.single_no_plan_todo_prompt = str(resolved_single_no_plan_todo_prompt or "").strip()[:6000]
             _sess.web_search_enabled = bool(getattr(app, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED))
             _sess.user_memory_mode = normalize_user_memory_mode(getattr(app, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
             _sess.updated_at = now_ts()
@@ -96938,6 +105933,9 @@ def main():
         "tool_memory_policy": str(resolved_tool_memory_policy),
         "user_memory_mode": str(resolved_user_memory_mode),
         "auto_task_level_ceiling": int(resolved_auto_task_level_ceiling),
+        "l2_todo_policy": normalize_l2_todo_policy(getattr(app, "l2_todo_policy", resolved_l2_todo_policy)),
+        "single_no_plan_todo_enabled": bool(resolved_single_no_plan_todo_enabled),
+        "single_no_plan_todo_prompt": str(resolved_single_no_plan_todo_prompt or ""),
         "daily_session_limit_per_ip": int(resolved_daily_session_limit_per_ip),
         "ollama_base_url": str(bootstrap_base_url),
         "model": str(resolved_model),
@@ -97053,8 +106051,6 @@ def main():
         _active_ports_for_ide.add(int(code_admin_port))
     if args.no_ide:
         print("[web-agent] programming IDE disabled by --no_ide")
-    elif not bool(getattr(args, "enable_ide", False)):
-        print("[web-agent] programming IDE disabled by default; use --enable_ide to start it")
     elif int(ide_port) in _active_ports_for_ide:
         print(f"[web-agent] programming IDE disabled: ide_port {ide_port} conflicts with a running server port")
     else:
