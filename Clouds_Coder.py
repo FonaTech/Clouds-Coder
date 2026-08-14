@@ -5,6 +5,7 @@ import argparse
 import ast
 import base64
 import concurrent.futures
+import ctypes
 import csv
 import difflib
 import errno
@@ -1290,6 +1291,8 @@ IDE_FILE_MAX_BYTES = 12 * 1024 * 1024
 IDE_UPLOAD_MAX_BYTES = 32 * 1024 * 1024
 IDE_UPLOAD_TOTAL_MAX_BYTES = 220 * 1024 * 1024
 IDE_UPLOAD_MAX_ITEMS = 1200
+IDE_UPLOAD_CHUNK_MAX_BYTES = 768 * 1024
+IDE_UPLOAD_STREAM_MAX_BYTES = 4 * 1024 * 1024 * 1024
 IDE_TEXT_PREVIEW_MAX_BYTES = 2 * 1024 * 1024
 IDE_MARKDOWN_PREVIEW_MAX_LINES = 4000
 IDE_IMAGE_PREVIEW_MAX_EDGE = 4096
@@ -16019,18 +16022,29 @@ class BackgroundManager:
             run_command: object = command
             run_shell = True
             wrapper = self.command_wrapper() if callable(self.command_wrapper) else []
-            if wrapper:
+            windows_job = _is_windows_job_sandbox_prefix(wrapper)
+            if wrapper and not windows_job:
                 run_command = [*wrapper, "/bin/sh", "-c", command]
                 run_shell = False
-            r = subprocess.run(
-                run_command,
-                shell=run_shell,
-                cwd=self.workdir,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                env=(self.env_wrapper() if callable(self.env_wrapper) else None),
-            )
+            process_env = self.env_wrapper() if callable(self.env_wrapper) else os.environ.copy()
+            if windows_job:
+                r = _run_windows_sandboxed_command(
+                    command,
+                    workspace_root=self.workdir,
+                    cwd=self.workdir,
+                    env=process_env,
+                    timeout=timeout,
+                )
+            else:
+                r = subprocess.run(
+                    run_command,
+                    shell=run_shell,
+                    cwd=self.workdir,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    env=process_env,
+                )
             output = trim((r.stdout + r.stderr).strip())
             exit_code = int(r.returncode)
             status = "completed" if exit_code == 0 else "error"
@@ -20235,6 +20249,357 @@ AGENT_TOOL_ALLOWLIST: dict[str, set[str]] = {
 
 _IDE_SANDBOX_BACKEND_CACHE: dict[str, object] = {}
 _IDE_SANDBOX_BACKEND_LOCK = threading.RLock()
+WINDOWS_JOB_SANDBOX_MARKER = "__clouds_windows_job__"
+_WINDOWS_LOW_INTEGRITY_ROOTS: set[str] = set()
+_WINDOWS_LOW_INTEGRITY_LOCK = threading.RLock()
+
+def _is_windows_job_sandbox_prefix(prefix: object) -> bool:
+    return bool(
+        isinstance(prefix, (list, tuple))
+        and len(prefix) == 1
+        and str(prefix[0]) == WINDOWS_JOB_SANDBOX_MARKER
+    )
+
+def _windows_builtin_sandbox_probe() -> tuple[bool, str]:
+    if os.name != "nt" or not sys.platform.startswith("win"):
+        return False, "Windows security APIs are unavailable on this platform."
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+        required = (
+            (kernel32, "CreateJobObjectW"),
+            (kernel32, "AssignProcessToJobObject"),
+            (kernel32, "SetInformationJobObject"),
+            (advapi32, "OpenProcessToken"),
+            (advapi32, "SetTokenInformation"),
+            (advapi32, "AddMandatoryAce"),
+            (advapi32, "SetNamedSecurityInfoW"),
+            (ntdll, "NtResumeProcess"),
+        )
+        missing = [name for library, name in required if not hasattr(library, name)]
+        if missing:
+            return False, f"Windows security API missing: {', '.join(missing)}"
+        return True, "Built-in low-integrity token and Job Object isolation."
+    except Exception as exc:
+        return False, f"Windows security API initialization failed: {exc}"
+
+def _windows_last_error(label: str) -> OSError:
+    code = int(ctypes.get_last_error() or 1)
+    try:
+        detail = ctypes.FormatError(code).strip()
+    except Exception:
+        detail = "Windows API error"
+    return OSError(code, f"{label}: {detail}")
+
+def _windows_set_low_integrity_label(path: Path, *, inherit: bool) -> None:
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    sid = ctypes.c_void_p()
+    advapi32.ConvertStringSidToSidW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p)]
+    advapi32.ConvertStringSidToSidW.restype = wintypes.BOOL
+    if not advapi32.ConvertStringSidToSidW("S-1-16-4096", ctypes.byref(sid)):
+        raise _windows_last_error("ConvertStringSidToSidW")
+    try:
+        advapi32.GetLengthSid.argtypes = [ctypes.c_void_p]
+        advapi32.GetLengthSid.restype = wintypes.DWORD
+        sid_length = int(advapi32.GetLengthSid(sid) or 0)
+        acl_size = max(128, sid_length + 64)
+        acl = ctypes.create_string_buffer(acl_size)
+        advapi32.InitializeAcl.argtypes = [ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD]
+        advapi32.InitializeAcl.restype = wintypes.BOOL
+        if not advapi32.InitializeAcl(ctypes.byref(acl), acl_size, 2):
+            raise _windows_last_error("InitializeAcl")
+        advapi32.AddMandatoryAce.argtypes = [
+            ctypes.c_void_p,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+        ]
+        advapi32.AddMandatoryAce.restype = wintypes.BOOL
+        ace_flags = 0x03 if inherit else 0
+        if not advapi32.AddMandatoryAce(ctypes.byref(acl), 2, ace_flags, 0x1, sid):
+            raise _windows_last_error("AddMandatoryAce")
+        advapi32.SetNamedSecurityInfoW.argtypes = [
+            wintypes.LPWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        advapi32.SetNamedSecurityInfoW.restype = wintypes.DWORD
+        status = int(
+            advapi32.SetNamedSecurityInfoW(
+                str(path), 1, 0x10, None, None, None, ctypes.byref(acl)
+            )
+            or 0
+        )
+        if status:
+            raise OSError(status, f"SetNamedSecurityInfoW: {ctypes.FormatError(status).strip()}")
+    finally:
+        kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+        kernel32.LocalFree.restype = ctypes.c_void_p
+        kernel32.LocalFree(sid)
+
+def _windows_prepare_low_integrity_workspace(workspace_root: Path) -> None:
+    canonical = Path(os.path.realpath(workspace_root)).resolve()
+    key = os.path.normcase(str(canonical))
+    with _WINDOWS_LOW_INTEGRITY_LOCK:
+        if key in _WINDOWS_LOW_INTEGRITY_ROOTS:
+            return
+        _windows_set_low_integrity_label(canonical, inherit=True)
+        for dirpath, dirnames, filenames in os.walk(canonical, topdown=True, followlinks=False):
+            current = Path(dirpath)
+            dirnames[:] = [name for name in dirnames if not (current / name).is_symlink()]
+            for name in dirnames:
+                try:
+                    _windows_set_low_integrity_label(current / name, inherit=True)
+                except OSError:
+                    pass
+            for name in filenames:
+                file_path = current / name
+                if file_path.is_symlink():
+                    continue
+                try:
+                    _windows_set_low_integrity_label(file_path, inherit=False)
+                except OSError:
+                    pass
+        _WINDOWS_LOW_INTEGRITY_ROOTS.add(key)
+
+def _windows_job_memory_limit() -> int:
+    raw = str(os.environ.get("CLOUDS_CODER_SANDBOX_MEMORY", "1g") or "1g").strip().lower()
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([kmgt]?)b?", raw)
+    if not match:
+        return 1024 * 1024 * 1024
+    factor = {"": 1, "k": 1024, "m": 1024**2, "g": 1024**3, "t": 1024**4}[match.group(2)]
+    return max(128 * 1024 * 1024, min(16 * 1024**3, int(float(match.group(1)) * factor)))
+
+def _windows_lower_process_integrity(process_handle: object) -> None:
+    from ctypes import wintypes
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    class SID_AND_ATTRIBUTES(ctypes.Structure):
+        _fields_ = [("Sid", ctypes.c_void_p), ("Attributes", wintypes.DWORD)]
+
+    class TOKEN_MANDATORY_LABEL(ctypes.Structure):
+        _fields_ = [("Label", SID_AND_ATTRIBUTES)]
+
+    token = wintypes.HANDLE()
+    advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    advapi32.OpenProcessToken.restype = wintypes.BOOL
+    if not advapi32.OpenProcessToken(process_handle, 0x0080 | 0x0008, ctypes.byref(token)):
+        raise _windows_last_error("OpenProcessToken")
+    sid = ctypes.c_void_p()
+    try:
+        advapi32.ConvertStringSidToSidW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p)]
+        advapi32.ConvertStringSidToSidW.restype = wintypes.BOOL
+        if not advapi32.ConvertStringSidToSidW("S-1-16-4096", ctypes.byref(sid)):
+            raise _windows_last_error("ConvertStringSidToSidW")
+        advapi32.GetLengthSid.argtypes = [ctypes.c_void_p]
+        advapi32.GetLengthSid.restype = wintypes.DWORD
+        sid_length = int(advapi32.GetLengthSid(sid) or 0)
+        label = TOKEN_MANDATORY_LABEL(SID_AND_ATTRIBUTES(sid, 0x20))
+        advapi32.SetTokenInformation.argtypes = [
+            wintypes.HANDLE,
+            ctypes.c_int,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        ]
+        advapi32.SetTokenInformation.restype = wintypes.BOOL
+        if not advapi32.SetTokenInformation(
+            token, 25, ctypes.byref(label), ctypes.sizeof(label) + sid_length
+        ):
+            raise _windows_last_error("SetTokenInformation(TokenIntegrityLevel)")
+    finally:
+        if sid:
+            kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+            kernel32.LocalFree.restype = ctypes.c_void_p
+            kernel32.LocalFree(sid)
+        if token:
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            kernel32.CloseHandle(token)
+
+def _windows_attach_sandbox_job(proc: subprocess.Popen, workspace_root: Path) -> None:
+    from ctypes import wintypes
+
+    class LARGE_INTEGER(ctypes.Union):
+        _fields_ = [("QuadPart", ctypes.c_longlong)]
+
+    class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", LARGE_INTEGER),
+            ("PerJobUserTimeLimit", LARGE_INTEGER),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class IO_COUNTERS(ctypes.Structure):
+        _fields_ = [(name, ctypes.c_ulonglong) for name in (
+            "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+            "ReadTransferCount", "WriteTransferCount", "OtherTransferCount",
+        )]
+
+    class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+            ("IoInfo", IO_COUNTERS),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    class JOBOBJECT_CPU_RATE_CONTROL_INFORMATION(ctypes.Structure):
+        _fields_ = [("ControlFlags", wintypes.DWORD), ("CpuRate", wintypes.DWORD)]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    ntdll = ctypes.WinDLL("ntdll", use_last_error=True)
+    kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        raise _windows_last_error("CreateJobObjectW")
+    try:
+        limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        limits.BasicLimitInformation.LimitFlags = 0x2000 | 0x0008 | 0x0200 | 0x0400
+        limits.BasicLimitInformation.ActiveProcessLimit = 64
+        limits.JobMemoryLimit = _windows_job_memory_limit()
+        kernel32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        kernel32.SetInformationJobObject.restype = wintypes.BOOL
+        if not kernel32.SetInformationJobObject(job, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
+            raise _windows_last_error("SetInformationJobObject")
+        try:
+            cpu_budget = max(
+                0.1,
+                float(os.environ.get("CLOUDS_CODER_SANDBOX_CPUS", "2") or 2),
+            )
+        except Exception:
+            cpu_budget = 2.0
+        cpu_fraction = min(1.0, cpu_budget / max(1, int(os.cpu_count() or 1)))
+        cpu_limit = JOBOBJECT_CPU_RATE_CONTROL_INFORMATION(
+            0x1 | 0x4,
+            max(100, min(10_000, int(cpu_fraction * 10_000))),
+        )
+        # CPU hard caps are available on supported desktop Windows versions.
+        # Memory/process-tree isolation remains active if an older kernel rejects it.
+        kernel32.SetInformationJobObject(
+            job, 15, ctypes.byref(cpu_limit), ctypes.sizeof(cpu_limit)
+        )
+        _windows_lower_process_integrity(proc._handle)
+        kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        if not kernel32.AssignProcessToJobObject(job, proc._handle):
+            raise _windows_last_error("AssignProcessToJobObject")
+        proc._clouds_windows_job_handle = job
+        job = None
+        ntdll.NtResumeProcess.argtypes = [wintypes.HANDLE]
+        ntdll.NtResumeProcess.restype = ctypes.c_long
+        status = int(ntdll.NtResumeProcess(proc._handle) or 0)
+        if status < 0:
+            raise OSError(status, "NtResumeProcess failed")
+    finally:
+        if job:
+            kernel32.CloseHandle(job)
+
+def _windows_close_sandbox_job(proc: subprocess.Popen | None, *, terminate: bool = False) -> None:
+    if proc is None:
+        return
+    job = getattr(proc, "_clouds_windows_job_handle", None)
+    if not job:
+        return
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        if terminate:
+            try:
+                kernel32.TerminateJobObject(job, 1)
+            except Exception:
+                pass
+        kernel32.CloseHandle(job)
+    finally:
+        proc._clouds_windows_job_handle = None
+
+def _popen_windows_sandboxed(
+    command: object,
+    *,
+    workspace_root: Path,
+    cwd: Path,
+    env: dict,
+    **kwargs,
+) -> subprocess.Popen:
+    if os.name != "nt":
+        raise RuntimeError("Windows built-in sandbox requested on a non-Windows platform")
+    _windows_prepare_low_integrity_workspace(workspace_root)
+    flags = int(kwargs.pop("creationflags", 0) or 0)
+    flags |= int(getattr(subprocess, "CREATE_SUSPENDED", 0x00000004) or 0x00000004)
+    flags |= int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200) or 0x00000200)
+    proc = subprocess.Popen(
+        command,
+        cwd=str(cwd),
+        env=env,
+        creationflags=flags,
+        **kwargs,
+    )
+    try:
+        _windows_attach_sandbox_job(proc, workspace_root)
+        return proc
+    except Exception:
+        try:
+            ctypes.WinDLL("kernel32", use_last_error=True).TerminateProcess(proc._handle, 1)
+        except Exception:
+            pass
+        _windows_close_sandbox_job(proc, terminate=True)
+        raise
+
+def _run_windows_sandboxed_command(
+    command: str,
+    *,
+    workspace_root: Path,
+    cwd: Path,
+    env: dict,
+    timeout: int,
+) -> subprocess.CompletedProcess:
+    proc = _popen_windows_sandboxed(
+        f"chcp 65001>nul & {command}",
+        workspace_root=workspace_root,
+        cwd=cwd,
+        env=env,
+        shell=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=False,
+        bufsize=0,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+        return subprocess.CompletedProcess(
+            command,
+            int(proc.returncode or 0),
+            bytes(stdout or b"").decode("utf-8", errors="replace"),
+            bytes(stderr or b"").decode("utf-8", errors="replace"),
+        )
+    except subprocess.TimeoutExpired:
+        _windows_close_sandbox_job(proc, terminate=True)
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+        raise
+    finally:
+        _windows_close_sandbox_job(proc)
 
 def _detect_ide_sandbox_backend(*, force: bool = False) -> dict:
     preference = str(os.environ.get("CLOUDS_CODER_SANDBOX_BACKEND", "auto") or "auto").strip().lower()
@@ -20259,6 +20624,19 @@ def _detect_ide_sandbox_backend(*, force: bool = False) -> dict:
 
     if preference in {"off", "disabled", "none"}:
         detected = result(reason="Hard process isolation is disabled by CLOUDS_CODER_SANDBOX_BACKEND.")
+    elif preference in {"auto", "windows-job", "windows", "builtin"} and os.name == "nt" and sys.platform.startswith("win"):
+        ready, reason = _windows_builtin_sandbox_probe()
+        detected = (
+            result(
+                "windows-job",
+                available=True,
+                terminal=False,
+                debug=False,
+                reason=reason,
+            )
+            if ready
+            else None
+        )
     elif preference in {"auto", "sandbox-exec", "seatbelt"} and os.name == "posix" and sys.platform == "darwin" and shutil.which("sandbox-exec"):
         detected = result("sandbox-exec", available=True, terminal=True, debug=True)
     elif preference in {"auto", "bubblewrap", "bwrap"} and os.name == "posix" and sys.platform.startswith("linux") and shutil.which("bwrap"):
@@ -20318,8 +20696,9 @@ def _detect_ide_sandbox_backend(*, force: bool = False) -> dict:
         if detected is None:
             detected = result(
                 reason=(
-                    "No hard isolation backend is ready. Install sandbox-exec (macOS), Bubblewrap (Linux), "
-                    f"or pre-load container image {image or '<unset>'} for Docker/Podman."
+                    "No hard isolation backend is ready. The built-in Windows Job Object sandbox, "
+                    "sandbox-exec (macOS), Bubblewrap (Linux), or a pre-loaded Docker/Podman "
+                    f"image ({image or '<unset>'}) is required."
                 )
             )
     with _IDE_SANDBOX_BACKEND_LOCK:
@@ -35255,10 +35634,11 @@ body{padding:18px}
         }
 
     def _is_default_session_title(self, title: str) -> bool:
-        t = str(title or "").strip()
+        t = unicodedata.normalize("NFKC", str(title or ""))
+        t = re.sub(r"[\u200e\u200f\u202a-\u202e\u2066-\u2069]", "", t).strip()
         if not t:
             return True
-        low = t.lower()
+        low = t.casefold()
         repeated = [part.strip() for part in re.split(r"\s*/\s*", t) if part.strip()]
         if len(repeated) > 1 and len(set(repeated)) == 1:
             return self._is_default_session_title(repeated[0])
@@ -35287,7 +35667,13 @@ body{padding:18px}
             flags=re.IGNORECASE,
         ):
             return True
-        if re.fullmatch(r"program\s+\d{1,2}[:：]\d{2}(?:[:：]\d{2})?", low, flags=re.IGNORECASE):
+        if re.fullmatch(
+            r"(?:program|ide\s+workspace)\s+(?:(?:am|pm|a\.m\.|p\.m\.|上午|下午|午前|午後)\s*)?"
+            r"\d{1,2}[:.]\d{2}(?:[:.]\d{2})?"
+            r"(?:\s*(?:am|pm|a\.m\.|p\.m\.|上午|下午|午前|午後))?",
+            low,
+            flags=re.IGNORECASE,
+        ):
             return True
         if t == self.id:
             return True
@@ -36556,6 +36942,8 @@ body{padding:18px}
         resolved_cwd, rel = self._sandbox_relative_cwd(cwd)
         if not workspace_root.exists():
             return []
+        if backend_name == "windows-job":
+            return [WINDOWS_JOB_SANDBOX_MARKER]
         if backend_name == "sandbox-exec":
             sandbox = shutil.which("sandbox-exec")
             if not sandbox:
@@ -36805,6 +37193,10 @@ body{padding:18px}
         def _stop_process(p: subprocess.Popen):
             # shell=True may spawn child processes; stop the whole process group on POSIX.
             try:
+                if os.name == "nt" and getattr(p, "_clouds_windows_job_handle", None):
+                    _windows_close_sandbox_job(p, terminate=True)
+                    p.wait(timeout=1.5)
+                    return
                 if os.name == "posix":
                     try:
                         os.killpg(os.getpgid(p.pid), signal.SIGTERM)
@@ -37002,11 +37394,12 @@ body{padding:18px}
                 proc_env["JS_LIB_ROOT"] = str(self.js_lib_root)
             shell_prefix = self._hard_snapshot_shell_prefix(cwd)
             sandboxed_command = self._sandbox_virtualize_command(effective_command, cwd) if shell_prefix else effective_command
+            windows_job = _is_windows_job_sandbox_prefix(shell_prefix)
             popen_command: object = sandboxed_command
             use_shell = True
-            if os.name == "nt" and not shell_prefix:
+            if os.name == "nt" and (not shell_prefix or windows_job):
                 popen_command = f"chcp 65001>nul & {effective_command}"
-            if shell_prefix:
+            if shell_prefix and not windows_job:
                 popen_command = [*shell_prefix, "/bin/sh", "-c", sandboxed_command]
                 use_shell = False
             popen_kwargs = {
@@ -37024,7 +37417,16 @@ body{padding:18px}
                 create_group = int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) or 0)
                 if create_group > 0:
                     popen_kwargs["creationflags"] = create_group
-            proc = subprocess.Popen(popen_command, **popen_kwargs)
+            if windows_job:
+                proc = _popen_windows_sandboxed(
+                    popen_command,
+                    workspace_root=self.files_root,
+                    cwd=cwd,
+                    env=proc_env,
+                    **{key: value for key, value in popen_kwargs.items() if key not in {"cwd", "env"}},
+                )
+            else:
+                proc = subprocess.Popen(popen_command, **popen_kwargs)
             self._running_bash_proc = proc
             if os.name == "nt":
                 # Windows: read PIPE output via blocking reader threads + queue.
@@ -37138,6 +37540,7 @@ body{padding:18px}
                 meta["output"] = meta["error"]
                 meta["exit_code"] = -1
         finally:
+            _windows_close_sandbox_job(proc)
             self._running_bash_proc = None
             self._restore_application_snapshot_permissions()
         meta["duration_ms"] = int((time.time() - start) * 1000)
@@ -94721,7 +95124,7 @@ IDE_INDEX_HTML = """<!doctype html>
         </div></header>
         <div class="workspace-pickers"><div class="session-picker-row"><select id="sessionSelect" title="Session"></select><button id="renameSessionBtn" class="icon-button" title="Rename Session" aria-label="Rename Session"><span class="codicon codicon-edit"></span></button></div><select id="rootSelect" title="Workspace Folder" aria-label="Workspace Folder"></select></div>
         <div id="openEditors" class="open-editors"></div>
-        <div id="workspaceSectionLabel" class="section-label" title="Right-click for workspace actions"><span class="codicon codicon-chevron-down"></span><strong id="workspaceLabel">Workspace</strong></div>
+        <div id="workspaceSectionLabel" class="section-label" title="Right-click for workspace actions"><span class="codicon codicon-chevron-down"></span><strong id="workspaceLabel">Workspace</strong><button id="downloadWorkspaceBtn" class="icon-button section-download" title="Download Workspace as ZIP" aria-label="Download Workspace as ZIP"><span class="codicon codicon-cloud-download"></span></button></div>
         <div id="tree" class="tree" role="tree"></div>
         <input id="fileInput" type="file" multiple hidden><input id="folderInput" type="file" multiple webkitdirectory directory hidden>
       </section>
@@ -94793,7 +95196,7 @@ input,select,textarea{border:1px solid transparent;border-radius:2px;background:
 .ide-shell{height:100vh;display:grid;grid-template-rows:var(--title-height) minmax(0,1fr) var(--status-height);overflow:hidden}.title-bar{display:grid;grid-template-columns:30px 26px auto minmax(220px,560px) 1fr;align-items:center;gap:2px;padding:0 7px;background:var(--title);border-bottom:1px solid #151515;user-select:none}.product-mark{display:grid;place-items:center;color:#23a8f2}.product-mark .codicon{font-size:20px}.menu-bar{display:flex;align-items:center;gap:0;min-width:0}.menu-bar button{height:27px;padding:0 7px;border:0;border-radius:4px;background:transparent;color:var(--ink);cursor:pointer}.menu-bar button:hover{background:var(--hover)}.command-center{justify-self:center;width:min(100%,460px);height:25px;display:flex;align-items:center;justify-content:center;gap:7px;border:1px solid #3c3c3c;border-radius:5px;background:#242424;color:#d4d4d4;cursor:pointer;box-shadow:inset 0 0 0 1px rgba(255,255,255,.02)}.command-center:hover{background:#2a2a2a;border-color:#555}.layout-controls{justify-self:end;display:flex;align-items:center;gap:1px}
 .workbench-grid{min-height:0;display:grid;grid-template-columns:var(--activity-width) var(--sidebar-width) minmax(260px,1fr) var(--secondary-width);background:var(--editor)}.ide-shell.primary-hidden .workbench-grid{grid-template-columns:var(--activity-width) 0 minmax(260px,1fr) var(--secondary-width)}.ide-shell.secondary-hidden .workbench-grid{grid-template-columns:var(--activity-width) var(--sidebar-width) minmax(260px,1fr) 0}.ide-shell.primary-hidden.secondary-hidden .workbench-grid{grid-template-columns:var(--activity-width) 0 minmax(260px,1fr) 0}
 .activity-bar{min-width:0;display:flex;flex-direction:column;justify-content:space-between;background:var(--activity);border-right:1px solid var(--line);user-select:none}.activity-top,.activity-bottom{display:flex;flex-direction:column;align-items:stretch}.activity-button{position:relative;display:grid;place-items:center;width:47px;height:48px;padding:0;border:0;border-left:2px solid transparent;background:transparent;color:#858585;cursor:pointer}.activity-button .codicon{font-size:24px}.activity-button:hover{color:#d7d7d7}.activity-button.is-active{border-left-color:#fff;color:#fff}.activity-badge{position:absolute;right:5px;bottom:4px;min-width:16px;height:16px;padding:0 4px;border-radius:8px;background:#007acc;color:#fff;font:10px/16px sans-serif;text-align:center}.activity-badge:empty{display:none}
-.primary-sidebar,.secondary-sidebar{min-width:0;overflow:hidden;background:var(--sidebar);border-right:1px solid var(--line)}.secondary-sidebar{height:100%;min-height:0;border-right:0;border-left:1px solid var(--line);display:grid;grid-template-areas:"agent-header" "agent-context" "agent-todo" "agent-messages" "agent-composer";grid-template-rows:35px auto auto minmax(0,1fr) auto}.secondary-sidebar>.side-header{grid-area:agent-header}.secondary-sidebar>.agent-context{grid-area:agent-context}.secondary-sidebar>.agent-todo{grid-area:agent-todo}.secondary-sidebar>.agent-messages{grid-area:agent-messages}.secondary-sidebar>.agent-composer{grid-area:agent-composer}.primary-hidden .primary-sidebar,.secondary-hidden .secondary-sidebar{visibility:hidden}.side-view{height:100%;min-height:0;display:none;grid-template-rows:35px auto auto minmax(0,1fr);overflow:hidden}.side-view.is-active{display:grid}.side-view[data-side-view="explorer"]{grid-template-rows:35px auto auto 22px minmax(0,1fr)}.side-view[data-side-view="search"],.side-view[data-side-view="extensions"]{grid-template-rows:35px auto auto minmax(0,1fr)}.side-view[data-side-view="scm"]{grid-template-rows:35px auto minmax(0,1fr)}.side-view[data-side-view="run"]{grid-template-rows:35px auto auto 22px minmax(0,1fr) 22px minmax(0,1fr)}.side-header{height:35px;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:0 8px 0 19px;color:#bbbbbb;text-transform:uppercase;font-size:11px;white-space:nowrap}.header-actions{display:flex;align-items:center;gap:0}.side-header .icon-button{width:24px;height:24px}.workspace-pickers{display:grid;grid-template-columns:minmax(0,1fr);gap:3px;padding:0 8px 7px}.workspace-pickers select{width:100%}.open-editors{max-height:132px;overflow:auto}.section-label{display:flex;align-items:center;gap:3px;height:22px;padding:0 5px;border-top:1px solid var(--line);color:#d4d4d4;text-transform:uppercase;font-size:11px}.section-label strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.section-label .codicon{font-size:14px}
+.primary-sidebar,.secondary-sidebar{min-width:0;overflow:hidden;background:var(--sidebar);border-right:1px solid var(--line)}.secondary-sidebar{height:100%;min-height:0;border-right:0;border-left:1px solid var(--line);display:grid;grid-template-areas:"agent-header" "agent-context" "agent-todo" "agent-messages" "agent-composer";grid-template-rows:35px auto auto minmax(0,1fr) auto}.secondary-sidebar>.side-header{grid-area:agent-header}.secondary-sidebar>.agent-context{grid-area:agent-context}.secondary-sidebar>.agent-todo{grid-area:agent-todo}.secondary-sidebar>.agent-messages{grid-area:agent-messages}.secondary-sidebar>.agent-composer{grid-area:agent-composer}.primary-hidden .primary-sidebar,.secondary-hidden .secondary-sidebar{visibility:hidden}.side-view{height:100%;min-height:0;display:none;grid-template-rows:35px auto auto minmax(0,1fr);overflow:hidden}.side-view.is-active{display:grid}.side-view[data-side-view="explorer"]{grid-template-rows:35px auto auto 22px minmax(0,1fr)}.side-view[data-side-view="search"],.side-view[data-side-view="extensions"]{grid-template-rows:35px auto auto minmax(0,1fr)}.side-view[data-side-view="scm"]{grid-template-rows:35px auto minmax(0,1fr)}.side-view[data-side-view="run"]{grid-template-rows:35px auto auto 22px minmax(0,1fr) 22px minmax(0,1fr)}.side-header{height:35px;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:0 8px 0 19px;color:#bbbbbb;text-transform:uppercase;font-size:11px;white-space:nowrap}.header-actions{display:flex;align-items:center;gap:0}.side-header .icon-button{width:24px;height:24px}.workspace-pickers{display:grid;grid-template-columns:minmax(0,1fr);gap:3px;padding:0 8px 7px}.workspace-pickers select{width:100%}.open-editors{max-height:132px;overflow:auto}.section-label{display:flex;align-items:center;gap:3px;height:22px;padding:0 3px 0 5px;border-top:1px solid var(--line);color:#d4d4d4;text-transform:uppercase;font-size:11px}.section-label strong{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.section-label .codicon{font-size:14px}.section-label .section-download{flex:none;width:20px;height:20px;margin-left:auto}.section-label .section-download .codicon{font-size:13px}
 .tree,.side-list{min-height:0;overflow:auto;padding-bottom:12px}.tree-row,.list-row{height:22px;display:flex;align-items:center;gap:5px;padding-right:6px;white-space:nowrap;cursor:default}.tree-row:hover,.list-row:hover{background:var(--hover)}.tree-row.is-active,.list-row.is-active{background:var(--selection)}.tree-twist{flex:0 0 16px;width:16px;height:20px;padding:0;border:0;background:transparent;color:#c5c5c5}.tree-icon{flex:0 0 16px;width:16px;text-align:center;color:#b9b9b9}.tree-icon.folder{color:#dcb67a}.tree-icon.python{color:#4b8bbe}.tree-icon.javascript{color:#f0db4f}.tree-icon.json{color:#e6ca57}.tree-icon.markdown{color:#519aba}.tree-name,.list-main{min-width:0;overflow:hidden;text-overflow:ellipsis}.tree-meta,.list-meta{margin-left:auto;color:var(--muted);font-size:11px}.open-editor-row{height:22px;display:flex;align-items:center;gap:5px;padding:0 8px 0 20px}.open-editor-row:hover{background:var(--hover)}.open-editor-row.is-active{background:var(--selection)}.open-editor-row span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.dirty-mark{color:#fff}
 .search-form{display:grid;gap:5px;padding:0 8px 8px}.search-form>input,.extension-search input{width:100%;height:27px;padding:3px 6px}.input-with-actions{display:grid;grid-template-columns:minmax(0,1fr) 28px 28px;border:1px solid transparent;background:var(--input)}.input-with-actions:focus-within{border-color:var(--focus)}.input-with-actions input{min-width:0;height:27px;padding:3px 6px;border:0;background:transparent}.mini-toggle{height:25px;padding:0 4px;border:0;background:transparent;color:var(--ink);font-size:11px;cursor:pointer}.mini-toggle:hover,.mini-toggle.is-active{background:#4b4b4b;color:white}.side-summary{min-height:22px;padding:3px 12px;color:var(--muted);font-size:11px}.result-group{padding:4px 8px;font-weight:600;color:#d4d4d4}.result-line{min-height:23px;padding:3px 8px 3px 22px;white-space:normal}.result-line code{color:#d7d7d7}.result-location{color:#75beff;font-size:11px}.scm-branch{padding:4px 12px 8px;color:#d4d4d4}.scm-row .scm-code{margin-left:auto;font-weight:600}.scm-code.modified{color:#e2c08d}.scm-code.untracked{color:#73c991}.scm-code.deleted{color:#f48771}.run-button{margin:0 10px 7px}.toolchains{overflow:auto}.tool-row{padding:6px 10px;border-bottom:1px solid #242424}.tool-row strong{font-weight:400;color:#d4d4d4}.tool-row span{display:block;margin-top:2px;color:var(--muted);font-size:11px;white-space:normal}.tool-state{float:right;color:var(--success)}.tool-state.missing{color:var(--faint)}.extension-search{display:grid;grid-template-columns:minmax(0,1fr) 28px;gap:4px;padding:0 8px 8px}.extension-row{min-height:72px;display:grid;grid-template-columns:42px minmax(0,1fr) auto;gap:8px;padding:8px}.extension-icon{display:grid;place-items:center;width:42px;height:42px;background:#292929;color:#75beff}.extension-icon .codicon{font-size:24px}.extension-info{min-width:0}.extension-title{color:#ddd;font-weight:600;overflow:hidden;text-overflow:ellipsis}.extension-description{margin-top:3px;color:#aaa;font-size:11px;line-height:1.35;white-space:normal}.extension-meta{margin-top:4px;color:#858585;font-size:10px}.extension-row .button{align-self:start;min-height:24px;padding:2px 8px;font-size:11px}
 .editor-area{min-width:0;min-height:0;display:grid;grid-template-rows:minmax(120px,1fr) var(--panel-height);overflow:hidden;background:var(--editor)}.panel-hidden .editor-area{grid-template-rows:minmax(120px,1fr) 0}.panel-maximized .editor-area{grid-template-rows:80px minmax(0,1fr)}.editor-grid{min-width:0;min-height:0;display:grid;grid-template-columns:minmax(0,1fr);overflow:hidden}.editor-grid.split{grid-template-columns:minmax(180px,1fr) minmax(180px,1fr)}.editor-group{min-width:0;min-height:0;display:none;grid-template-rows:35px 22px minmax(0,1fr);border-right:1px solid var(--line);background:var(--editor)}.editor-group.is-active,.editor-grid.split .editor-group{display:grid}.editor-tabs{display:flex;min-width:0;overflow-x:auto;overflow-y:hidden;background:var(--tabs);border-bottom:1px solid var(--line)}.editor-tab{position:relative;flex:0 0 auto;min-width:120px;max-width:220px;height:34px;display:flex;align-items:center;gap:7px;padding:0 7px 0 10px;border-right:1px solid var(--line);background:#181818;color:#969696;cursor:default}.editor-tab.is-active{background:var(--editor);color:#fff}.editor-tab.is-active:before{content:"";position:absolute;left:0;right:0;top:0;height:1px;background:#75beff}.editor-tab-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.editor-tab .close-tab{margin-left:auto;flex:0 0 20px;width:20px;height:20px}.editor-tab:not(:hover):not(.is-active) .close-tab{visibility:hidden}.breadcrumbs{height:22px;display:flex;align-items:center;gap:2px;padding:0 9px;color:#aaa;white-space:nowrap;overflow:hidden}.breadcrumb-item{display:flex;align-items:center;gap:3px;min-width:0}.breadcrumb-item span{overflow:hidden;text-overflow:ellipsis}.breadcrumb-action{flex:0 0 22px;width:22px;height:20px;margin-left:auto;border:0;background:transparent;color:#aaa;cursor:pointer}.breadcrumb-action:hover{background:var(--hover);color:#fff}.editor-host{position:relative;min-width:0;min-height:0;overflow:hidden;background:var(--editor)}.monaco-host{position:absolute;inset:0}.fallback-editor{display:none;position:absolute;inset:0;width:100%;height:100%;resize:none;padding:10px 12px;border:0;background:var(--editor);color:#d4d4d4;font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;tab-size:2}.fallback-mode .fallback-editor.is-active{display:block}.empty-editor{position:absolute;inset:0;display:grid;place-content:center;gap:26px;color:#8a8a8a;text-align:center;background:var(--editor)}.empty-editor.is-hidden{display:none}.empty-logo .codicon{font-size:96px;color:#2b2b2b}.empty-actions{display:grid;grid-template-columns:auto auto;gap:9px 28px;text-align:left}.empty-actions button{border:0;background:transparent;color:#75beff;text-align:left;cursor:pointer}.empty-actions button:hover{text-decoration:underline}.artifact-preview{position:absolute;inset:0;z-index:5;display:grid;grid-template-rows:32px minmax(0,1fr);background:#181818}.artifact-toolbar{display:flex;align-items:center;gap:4px;padding:0 7px;border-bottom:1px solid var(--line);background:#1d1d1d}.artifact-toolbar strong{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:400}.artifact-toolbar .artifact-meta{margin-left:4px;color:var(--muted);font-size:11px}.artifact-toolbar .icon-button:first-of-type{margin-left:auto}.artifact-stage{min-width:0;min-height:0;overflow:auto;display:grid;place-items:center;background:#202020}.artifact-stage iframe{width:100%;height:100%;border:0;background:#fff}.artifact-stage img{display:block;width:100%;height:100%;min-width:0;min-height:0;object-fit:contain}.artifact-stage video{width:min(100%,1100px);max-height:100%;background:#000}.artifact-stage audio{width:min(680px,calc(100% - 32px))}.artifact-markdown{justify-self:stretch;align-self:stretch;overflow:auto;padding:28px max(24px,8%);background:#1f1f1f;color:#d4d4d4;font:14px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.artifact-markdown h1,.artifact-markdown h2,.artifact-markdown h3{color:#f0f0f0;font-weight:500}.artifact-markdown pre,.artifact-markdown code{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}.artifact-markdown pre{overflow:auto;padding:12px;background:#181818}.artifact-markdown img{max-width:100%;height:auto}.artifact-markdown a{color:#75beff}.artifact-binary{display:grid;gap:10px;place-items:center;text-align:center;color:#bbb}.artifact-binary .codicon{font-size:56px;color:#777}.artifact-binary small{color:var(--muted)}
@@ -94801,7 +95204,7 @@ input,select,textarea{border:1px solid transparent;border-radius:2px;background:
 .agent-context{min-height:30px;max-height:54px;padding:5px 9px;border-bottom:1px solid var(--line);color:#aaa;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.agent-todo{min-width:0;max-height:min(190px,28vh);overflow:hidden;border-bottom:1px solid var(--line);background:#1b1b1b}.agent-todo-header{width:100%;height:28px;display:flex;align-items:center;gap:5px;padding:0 8px;border:0;background:#202020;color:#ccc;cursor:pointer;text-align:left}.agent-todo-header:hover{background:var(--hover)}.agent-todo-header strong{font-size:11px;font-weight:600}.agent-todo-count{margin-left:auto;color:#858585;font-size:10px}.agent-todo.is-collapsed .agent-todo-header .codicon{transform:rotate(-90deg)}.agent-todo.is-collapsed .agent-todo-body{display:none}.agent-todo-body{max-height:min(160px,calc(28vh - 28px));overflow:auto;padding:5px 8px 7px}.agent-progress-row{display:grid;grid-template-columns:14px minmax(0,1fr);gap:4px;padding:2px 0;color:#aaa;font-size:11px;line-height:1.35}.agent-progress-row.done{color:#89d185}.agent-progress-row.active{color:#75beff}.agent-messages{min-height:0;overflow:auto;overscroll-behavior:contain;padding:10px}.agent-message{margin:0 0 14px;line-height:1.5;white-space:pre-wrap}.agent-message.user{padding:8px 9px;background:#282828;border-left:2px solid #3794ff}.agent-message.system{color:#aaa}.agent-message.error{color:#f48771}.agent-composer{min-height:0;max-height:min(420px,52vh);overflow:auto;padding:8px;border-top:1px solid var(--line);background:var(--sidebar)}.agent-composer textarea{display:block;width:100%;height:72px;min-height:58px;max-height:72px;resize:none;padding:7px}.agent-ask-user{margin:0 0 8px;padding:9px;border:1px solid #66501f;border-left:2px solid #d7ba7d;background:#252319;color:#ddd}.agent-ask-user-head{display:flex;align-items:center;gap:6px;margin-bottom:6px;color:#d7ba7d;font-size:11px}.agent-ask-user-head span:last-child{margin-left:auto;color:#aaa}.agent-ask-user-question{font-size:12px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere}.agent-ask-user-options{display:grid;gap:5px;margin-top:8px}.agent-ask-user-option{width:100%;min-height:29px;padding:5px 8px;border:1px solid #555;background:#2d2d2d;color:#ddd;text-align:left;cursor:pointer}.agent-ask-user-option:hover{border-color:#d7ba7d;background:#343126}.agent-ask-user-option:disabled{opacity:.55;cursor:default}.agent-ask-user-hint{margin-top:7px;color:#aaa;font-size:10px}.agent-actions{height:31px;display:flex;align-items:center;gap:4px}.agent-actions #agentStatus{min-width:0;margin-right:auto;color:#aaa;font-size:11px;overflow:hidden;text-overflow:ellipsis}.agent-actions .primary{width:27px;height:27px}.agent-model-button{position:relative}.agent-model-button small{position:absolute;right:-1px;bottom:-2px;min-width:17px;padding:0 2px;border-radius:5px;background:#04395e;color:#9cdcfe;font:8px/10px sans-serif}.agent-model-button small:empty{display:none}.agent-attachments{display:flex;gap:4px;max-height:29px;overflow-x:auto;overflow-y:hidden;padding:0 0 6px}.agent-attachment{flex:0 0 auto;max-width:220px;height:23px;display:flex;align-items:center;gap:4px;padding:0 3px 0 7px;border:1px solid #3a3a3a;background:#252526;color:#ccc;font-size:10px}.agent-attachment span:nth-child(2){max-width:155px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.agent-attachment button{width:18px;height:18px}
 .agent-composer{position:relative}.agent-composer textarea:disabled{opacity:.9;color:#d4d4d4;cursor:text}.agent-drop-hint{position:absolute;inset:8px;z-index:4;display:grid;place-items:center;border:1px dashed #75beff;background:rgba(4,57,94,.92);color:#fff;font-size:12px;pointer-events:none}.agent-composer.is-dragover textarea,.agent-composer.is-dragover .agent-actions{opacity:.35}.agent-stop-button{color:#f48771!important}.agent-stop-button:hover{background:rgba(241,76,76,.18)!important}
 .agent-message.assistant{padding-left:9px;border-left:2px solid #89d185;color:#ddd;white-space:normal}.agent-message.approach{padding:7px 9px;border:1px solid #353535;border-left:2px solid #4ec9b0;background:#202524;color:#d5e8e4;white-space:normal}.agent-approach-head{display:flex;align-items:center;gap:6px;margin-bottom:4px;color:#4ec9b0;font:600 10px/1.3 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;text-transform:uppercase}.agent-approach-body{font:12px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;overflow-wrap:anywhere}.agent-markdown{min-width:0;overflow-wrap:anywhere}.agent-markdown>:first-child{margin-top:0}.agent-markdown>:last-child{margin-bottom:0}.agent-markdown h1,.agent-markdown h2,.agent-markdown h3{margin:10px 0 5px;color:#eee;font-weight:600;letter-spacing:0}.agent-markdown h1{font-size:15px}.agent-markdown h2{font-size:14px}.agent-markdown h3{font-size:13px}.agent-markdown p{margin:5px 0}.agent-markdown ul,.agent-markdown ol{margin:5px 0;padding-left:20px}.agent-markdown li{margin:2px 0}.agent-markdown code{padding:1px 3px;background:#292929;color:#d7ba7d;font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}.agent-markdown pre{max-height:360px;margin:7px 0;padding:8px;overflow:auto;background:#151515;border:1px solid #333}.agent-markdown pre code{padding:0;background:transparent;color:#d4d4d4;white-space:pre}.agent-markdown blockquote{margin:7px 0;padding:2px 8px;border-left:2px solid #4ec9b0;color:#aaa}.agent-markdown a{color:#75beff}.agent-markdown table{display:block;max-width:100%;overflow:auto;border-collapse:collapse}.agent-markdown th,.agent-markdown td{padding:3px 6px;border:1px solid #3b3b3b;text-align:left}.agent-markdown hr{border:0;border-top:1px solid #3a3a3a}.agent-message.tool,.agent-message.file_patch,.agent-message.command,.agent-message.control,.agent-message.compact{padding:0;border:1px solid #353535;border-left:2px solid #cca700;background:#202020;color:#bbb;font:11px/1.5 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;white-space:normal}.agent-message.file_patch{border-left-color:#89d185}.agent-message.command{border-left-color:#75beff}.agent-message.control{border-left-color:#c586c0}.agent-message.compact{border-left-color:#4ec9b0}.agent-message .agent-meta{display:block;margin-bottom:4px;color:#75beff;font:10px/1.3 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;text-transform:uppercase}.agent-message .agent-meta.agent-role-manager{color:#c586c0}.agent-message .agent-meta.agent-role-developer{color:#89d185}.agent-message .agent-meta.agent-role-explorer{color:#75beff}.agent-message .agent-meta.agent-role-planner{color:#dcdcaa}.agent-message .agent-meta.agent-role-reviewer{color:#f0a979}.agent-tool-head{min-height:31px;display:flex;align-items:center;gap:6px;padding:5px 7px;cursor:pointer}.agent-tool-head:hover{background:#292929}.agent-tool-head .codicon{color:#c5c5c5}.agent-tool-title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#ddd;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.agent-tool-state{margin-left:auto;color:#9a9a9a;font:10px/1.3 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;white-space:nowrap}.agent-tool-state.success,.diff-add{color:#89d185}.agent-tool-state.error,.diff-del{color:#f48771}.agent-tool-body{display:none;border-top:1px solid #343434}.agent-message.is-expanded .agent-tool-body{display:block}.agent-tool-output{max-height:320px;margin:0;padding:8px;overflow:auto;color:#bcbcbc;background:#191919;white-space:pre-wrap;overflow-wrap:anywhere}.agent-tool-actions{display:flex;align-items:center;gap:5px;padding:6px 7px;border-top:1px solid #303030}.agent-tool-actions button{min-height:23px;padding:2px 7px;font-size:10px}.agent-diff-stats{display:flex;gap:7px;margin-left:auto}.agent-diff{max-height:360px;overflow:auto;padding:6px 0;background:#181818}.agent-diff-line{display:grid;grid-template-columns:40px 13px minmax(0,1fr);padding:0 7px;white-space:pre-wrap;overflow-wrap:anywhere}.agent-diff-line .line-no{color:#777;text-align:right;user-select:none}.agent-diff-line .line-mark{text-align:center;user-select:none}.agent-diff-line.add{background:rgba(35,134,54,.18);color:#b7e1bf}.agent-diff-line.del{background:rgba(248,81,73,.15);color:#efb0aa}.agent-diff-line.hunk{color:#75beff;background:rgba(56,139,253,.1)}.agent-model-menu{width:min(360px,calc(100vw - 8px));max-height:min(440px,70vh);overflow:auto}.agent-model-menu button span:last-child{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.agent-model-summary{padding:7px 10px;border-bottom:1px solid #454545;color:#aaa;font-size:10px}.agent-model-menu button.is-active{color:#9cdcfe}.pairing-code{margin:10px 0;padding:12px;border:1px solid var(--line-light);background:#181818;color:#75beff;text-align:center;font:600 18px/1.2 ui-monospace,SFMono-Regular,Menlo,monospace}.auth-secondary{margin-top:12px;color:#aaa;text-align:center;font-size:11px}
-.agent-model-summary{display:flex;align-items:center;gap:8px}.agent-model-context{min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.agent-model-compact{flex:none;min-height:22px!important;height:22px!important;padding:2px 7px!important;border:1px solid #4f4f4f!important;background:#2a2a2a!important;color:#ccc!important;font-size:10px!important}.agent-model-compact:hover{background:#353535!important;color:#fff!important}.agent-model-compact:disabled{opacity:.45;cursor:default}
+.agent-model-summary{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:start;gap:8px}.agent-model-context{min-width:0;display:flex;flex-direction:column;gap:2px;line-height:1.35;white-space:normal}.agent-model-name{overflow:hidden;color:#ddd;font-weight:600;text-overflow:ellipsis;white-space:nowrap}.agent-model-usage{color:#aaa;overflow-wrap:anywhere}.agent-model-compact{display:inline-flex!important;align-items:center!important;justify-content:center!important;min-width:52px!important;min-height:22px!important;height:22px!important;padding:0 6px!important;border:1px solid #4f4f4f!important;background:#2a2a2a!important;color:#ccc!important;font-size:10px!important}.agent-model-compact:hover{background:#353535!important;color:#fff!important}.agent-model-compact:disabled{opacity:.45;cursor:default}
 .status-bar{display:flex;align-items:center;justify-content:space-between;min-width:0;background:var(--status);color:#fff;font-size:12px;user-select:none}.status-left,.status-right{height:100%;display:flex;align-items:stretch;min-width:0}.status-bar button{height:100%;display:flex;align-items:center;gap:4px;padding:0 6px;border:0;background:transparent;color:#fff;white-space:nowrap;cursor:pointer}.status-bar button:hover{background:var(--status-hover)}.status-message{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:2px 8px;color:#fff}.status-right{justify-content:flex-end}
 .overlay{position:fixed;inset:0;z-index:500;background:rgba(0,0,0,.28)}.palette{width:min(700px,calc(100vw - 28px));margin:44px auto 0;background:#252526;border:1px solid #454545;box-shadow:0 10px 32px rgba(0,0,0,.52)}.palette-input-row{height:40px;display:grid;grid-template-columns:24px minmax(0,1fr);align-items:center;margin:6px;border:1px solid var(--focus);background:var(--input);padding:0 7px}.palette-input-row input{height:100%;border:0;background:transparent;font-size:14px}.palette-results{max-height:min(440px,65vh);overflow:auto;padding-bottom:5px}.palette-row{height:34px;display:flex;align-items:center;gap:8px;padding:0 10px;cursor:default}.palette-row.is-active,.palette-row:hover{background:#04395e}.palette-row .keybinding{margin-left:auto;color:#aaa}.modal{width:min(620px,calc(100vw - 30px));max-height:calc(100vh - 80px);margin:48px auto;background:#252526;border:1px solid #454545;box-shadow:0 12px 40px rgba(0,0,0,.55);overflow:auto}.modal>header{height:42px;display:flex;align-items:center;justify-content:space-between;padding:0 10px 0 16px;border-bottom:1px solid var(--line)}.modal h2{margin:0;color:#ddd;font-size:15px;font-weight:500}.modal-form{display:grid;gap:8px;padding:14px}.modal-form input{height:30px;padding:5px 7px}.modal-actions{display:flex;justify-content:flex-end;gap:7px;margin-top:8px}.account-list{padding:8px}.account-row{min-height:38px;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:8px;padding:4px 7px;border-bottom:1px solid var(--line)}.account-row small{display:block;color:#999}.menu-popup{position:fixed;z-index:700;min-width:210px;padding:4px;background:#252526;border:1px solid #454545;box-shadow:0 8px 22px rgba(0,0,0,.5)}.menu-popup button{width:100%;height:27px;display:flex;align-items:center;gap:8px;padding:0 10px;border:0;background:transparent;color:#ddd;text-align:left;cursor:pointer}.menu-popup button:hover{background:#04395e}.menu-popup .separator{height:1px;margin:4px;background:#454545}.menu-popup .shortcut{margin-left:auto;color:#aaa}.toast-host{position:fixed;z-index:900;right:12px;bottom:34px;width:min(390px,calc(100vw - 24px));display:grid;gap:7px}.toast{display:grid;grid-template-columns:20px minmax(0,1fr) 22px;gap:7px;align-items:start;padding:10px;background:#252526;border:1px solid #454545;box-shadow:0 5px 18px rgba(0,0,0,.42)}.toast.error{border-left:3px solid var(--danger)}.toast.warning{border-left:3px solid var(--warning)}.toast.success{border-left:3px solid var(--success)}.toast button{border:0;background:transparent;color:#aaa;cursor:pointer}
 @media(max-width:1080px){:root{--sidebar-width:250px;--secondary-width:280px}.menu-bar button:nth-child(n+5){display:none}.status-right button:nth-child(-n+3){display:none}}
@@ -94844,8 +95247,7 @@ function renderSessions(){
   }
 }
 async function createSession(){
-  const title='IDE Workspace '+new Date().toLocaleTimeString();
-  const out=await api('/api/ide/sessions',{method:'POST',body:JSON.stringify({title})});
+  const out=await api('/api/ide/sessions',{method:'POST',body:'{}'});
   S.activeSession=out.id;await refreshConfig();
 }
 async function loadRoots(){
@@ -95157,7 +95559,7 @@ async function loadTree(path='',context={}){const session=context.session||S.act
 function renderTree(){const host=E('tree');host.innerHTML='';const draw=(path,depth)=>{for(const row of S.treeCache.get(path)||[]){const div=document.createElement('div');div.className='tree-row'+(activeFile()?.path===row.path&&activeFile()?.root_id===S.activeRoot?' is-active':'');div.style.paddingLeft=`${4+depth*12}px`;const open=row.type==='dir'&&S.treeCache.has(row.path);div.innerHTML=`<button class="tree-twist" tabindex="-1"><span class="codicon codicon-${row.type==='dir'?(open?'chevron-down':'chevron-right'):'blank'}"></span></button><span class="tree-icon codicon ${fileIconClass(row.name,row.type)}"></span><span class="tree-name">${escapeHtml(row.name)}</span>${row.type==='file'?`<span class="tree-meta">${formatFileSize(row.size)}</span>`:''}`;div.onclick=async()=>{try{if(row.type==='dir'){if(row.skipped)return toast('This generated directory is hidden by the explorer performance guard.','warning');if(open)S.treeCache.delete(row.path);else await loadTree(row.path);renderTree()}else await openFile(row.path)}catch(error){showError(error)}};div.oncontextmenu=event=>{event.preventDefault();showExplorerMenu(event.clientX,event.clientY,row)};host.appendChild(div);if(row.type==='dir'&&S.treeCache.has(row.path))draw(row.path,depth+1)}};draw('',0)}
 async function refreshOpenFile(file,forcePreview=false){if(!file||file.dirty||file.stageId!=='latest'||file.session_id!==S.activeSession)return;const out=await api(`/api/ide/sessions/${qs(file.session_id)}/workspace/file?${rootQuery(file.root_id)}&path=${qs(file.path)}`);if(file.session_id!==S.activeSession||S.openFiles.get(file.key)!==file)return;const revision=out.revision||out.file?.revision||'';if(revision===file.revision){if(forcePreview&&activeFile(file.group)?.key===file.key&&isArtifactFile(file))renderArtifactPreview(file.group,file);return}file.content=out.content||'';file.revision=revision;file.binary=out.encoding==='base64';file.previewKind=out.file?.preview_kind||file.previewKind||previewKindForPath(file.path);file.mime=out.file?.mime||file.mime||'';file.size=Number(out.file?.size||0);file.historyStages=null;try{await loadCodeHistory(file,'latest')}catch{}if(file.session_id!==S.activeSession||S.openFiles.get(file.key)!==file)return;const model=S.models.get(file.key);if(model&&model.getValue()!==file.content){S.suppressEditorChange=true;model.setValue(file.content);S.suppressEditorChange=false}if(!S.monaco&&activeFile(file.group)?.key===file.key&&!isArtifactFile(file))E(`fallbackEditor${file.group}`).value=file.content;if(activeFile(file.group)?.key===file.key){if(isArtifactFile(file))renderArtifactPreview(file.group,file);else applyHistoryView(file.group,file)}renderTabs();renderBreadcrumbs();renderOpenEditors()}
 async function refreshWorkspaceSnapshot(){if(S.workspaceRefreshBusy||!S.activeSession)return;const refreshSeq=++S.workspaceRefreshSeq,switchSeq=S.sessionSwitchSeq,session=S.activeSession,root=S.activeRoot;S.workspaceRefreshBusy=true;const expanded=[...S.treeCache.keys()].filter(Boolean).sort((a,b)=>a.split('/').length-b.split('/').length);const current=()=>refreshSeq===S.workspaceRefreshSeq&&switchSeq===S.sessionSwitchSeq&&session===S.activeSession&&root===S.activeRoot;try{const next=new Map();const load=async path=>{try{const out=await api(`/api/ide/sessions/${qs(session)}/workspace/tree?root_id=${qs(root)}&path=${qs(path)}`);if(current())next.set(path,out.tree?.children||[])}catch(error){if(!path&&current())throw error}};await load('');for(const path of expanded){if(!current())return;await load(path)}if(!current())return;S.treeCache=next;renderTree();for(const file of [...S.openFiles.values()]){if(!current())return;if(file.session_id===session)try{await refreshOpenFile(file)}catch(error){if(error.status===404){if(!file.dirty)closeFile(file.key)}else logOutput(`File refresh ${file.path}: ${error.message}`)}}}finally{if(refreshSeq===S.workspaceRefreshSeq)S.workspaceRefreshBusy=false}}
-async function createSession(){const title=`Program ${new Date().toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'})}`;const out=await api('/api/ide/sessions',{method:'POST',body:JSON.stringify({title})});await switchSession(out.id,true);return out}
+async function createSession(){const out=await api('/api/ide/sessions',{method:'POST',body:'{}'});await switchSession(out.id,true);return out}
 async function renameCurrentSession(){const row=S.sessions.find(item=>item.id===S.activeSession);if(!row)return;const title=prompt('Session name',row.title||'');if(!title||title.trim()===row.title)return;const out=await api(`/api/ide/sessions/${qs(S.activeSession)}`,{method:'PATCH',body:JSON.stringify({title:title.trim()})});row.title=out.title;renderSessions();updateAgentContext();await loadRoots();scheduleStateSave()}
 async function switchSession(sessionId,isNew=false){const target=String(sessionId||'');if(!target||target===S.activeSession&&!isNew){renderSessions();return true}const seq=++S.sessionSwitchSeq;if([...S.openFiles.values()].some(file=>file.dirty)&&!confirm('Switch session with unsaved files?')){if(seq===S.sessionSwitchSeq)renderSessions();return false}S.sessionSwitching=true;E('sessionSelect').disabled=true;S.activeSession=target;S.workspaceRefreshSeq++;S.workspaceRefreshBusy=false;closeAgentEvents();clearTimeout(S.agentPoll);S.agentPoll=null;S.agentPollDue=0;clearTimeout(S.agentTreeTimer);try{if(S.terminal)await killTerminal();if(seq!==S.sessionSwitchSeq)return false;if(S.debug)await stopDebug();if(seq!==S.sessionSwitchSeq)return false;S.openFiles.clear();S.models.forEach(model=>model.dispose());S.models.clear();S.historyOriginalModels.forEach(model=>model.dispose());S.historyOriginalModels.clear();S.historyDecorations.clear();S.viewStates.clear();S.activeByGroup=['',''];setEditorModel(1,null);setEditorModel(0,null);syncEditorGroupLayout();resetAgentSessionUI(target);await refreshConfig();if(seq!==S.sessionSwitchSeq||target!==S.activeSession)return false;await loadRoots(target,seq);if(seq!==S.sessionSwitchSeq||target!==S.activeSession)return false;updateAgentContext();connectAgentEvents();S.agentPollRequested=true;scheduleAgentPoll(50);if(isNew){toggleSecondary(true);E('agentPrompt').focus();agentMessage('New task workspace ready.','system')}scheduleStateSave();return true}finally{if(seq===S.sessionSwitchSeq){S.sessionSwitching=false;E('sessionSelect').disabled=false;renderSessions()}}}
 async function newFile(){const rel=prompt('File path',activeDir()?`${activeDir()}/untitled.txt`:'untitled.txt');if(!rel)return;await api(`/api/ide/sessions/${qs(S.activeSession)}/workspace/file`,{method:'PUT',body:JSON.stringify({root_id:S.activeRoot,path:rel,content:''})});await loadTree(activeDir());await openFile(rel)}
@@ -95168,7 +95570,10 @@ function readFileAsB64(file){return new Promise((resolve,reject)=>{const reader=
 function normalizeUploadPath(value){return String(value||'').replace(/\\/g,'/').split('/').filter(part=>part&&part!=='.'&&part!=='..').join('/')}
 function uploadDirectoriesFor(entries,directories=[]){const found=new Set((directories||[]).map(normalizeUploadPath).filter(Boolean));for(const entry of entries||[]){const parts=normalizeUploadPath(entry.path).split('/');parts.pop();let current='';for(const part of parts){current=current?`${current}/${part}`:part;found.add(current)}}return [...found].sort((a,b)=>a.split('/').length-b.split('/').length||a.localeCompare(b))}
 async function postUploadBatch(dest,items=[],directories=[]){return api(`/api/ide/sessions/${qs(S.activeSession)}/workspace/upload`,{method:'POST',body:JSON.stringify({root_id:S.activeRoot,dest:normalizeUploadPath(dest),items,directories})})}
-async function uploadEntries(entries,directories=[],dest=''){const rows=(entries||[]).filter(row=>row?.file&&normalizeUploadPath(row.path));const dirs=uploadDirectoriesFor(rows,directories);let completed=0,batches=0;for(let index=0;index<dirs.length;index+=900){await postUploadBatch(dest,[],dirs.slice(index,index+900));batches++}let batch=[],batchBytes=0;const flush=async()=>{if(!batch.length)return;await postUploadBatch(dest,batch,[]);completed+=batch.length;batches++;setStatus(`Uploading ${completed}/${rows.length}`);batch=[];batchBytes=0};for(const row of rows){const file=row.file,size=Number(file.size||0);if(size>32*1024*1024)throw new Error(`${file.name} exceeds the 32 MiB upload limit.`);if(batch.length&&(batch.length>=80||batchBytes+size>18*1024*1024))await flush();setStatus(`Preparing ${completed+batch.length+1}/${rows.length}`);batch.push({path:normalizeUploadPath(row.path),content_b64:await readFileAsB64(file)});batchBytes+=size}await flush();S.treeCache.clear();await loadTree('');toast(`Uploaded ${rows.length} file(s)${dirs.length?` and ${dirs.length} folder(s)`:''} in ${batches} batch(es).`,'success')}
+function newUploadId(){if(globalThis.crypto?.randomUUID)return `up_${crypto.randomUUID().replace(/-/g,'')}`;const bytes=new Uint8Array(20);if(globalThis.crypto?.getRandomValues)crypto.getRandomValues(bytes);else for(let i=0;i<bytes.length;i++)bytes[i]=Math.floor(Math.random()*256);return `up_${[...bytes].map(value=>value.toString(16).padStart(2,'0')).join('')}`}
+async function postUploadChunk(dest,path,uploadId,size,offset,chunkB64,complete=false,action=''){return api(`/api/ide/sessions/${qs(S.activeSession)}/workspace/upload-chunk`,{method:'POST',body:JSON.stringify({root_id:S.activeRoot,dest:normalizeUploadPath(dest),path:normalizeUploadPath(path),upload_id:uploadId,size,offset,chunk_b64:chunkB64,action:action||(complete?'complete':'append'),complete})})}
+async function uploadFileStream(row,dest,fileIndex,fileCount){const file=row.file,path=normalizeUploadPath(row.path),size=Math.max(0,Number(file.size||0)),uploadId=newUploadId(),chunkSize=512*1024;if(size>4*1024*1024*1024)throw new Error(`${file.name} exceeds the 4 GiB upload limit.`);let offset=0;try{do{const end=Math.min(size,offset+chunkSize),complete=end===size,chunk=await readFileAsB64(file.slice(offset,end));let lastError=null;for(let attempt=1;attempt<=3;attempt++){try{await postUploadChunk(dest,path,uploadId,size,offset,chunk,complete);lastError=null;break}catch(error){lastError=error;if(attempt<3)await new Promise(resolve=>setTimeout(resolve,150*attempt))}}if(lastError)throw lastError;offset=end;const pct=size?Math.round(offset*100/size):100;setStatus(`Uploading ${fileIndex}/${fileCount} · ${path} · ${pct}%`)}while(offset<size)}catch(error){try{await postUploadChunk(dest,path,uploadId,size,offset,'',false,'abort')}catch{}throw new Error(`${path}: ${error.message||error}`)}}
+async function uploadEntries(entries,directories=[],dest=''){const rows=(entries||[]).filter(row=>row?.file&&normalizeUploadPath(row.path));const dirs=uploadDirectoriesFor(rows,directories);let directoryBatches=0;for(let index=0;index<dirs.length;index+=900){await postUploadBatch(dest,[],dirs.slice(index,index+900));directoryBatches++}for(let index=0;index<rows.length;index++)await uploadFileStream(rows[index],dest,index+1,rows.length);S.treeCache.clear();await loadTree('');toast(`Uploaded ${rows.length} file(s)${dirs.length?` and ${dirs.length} folder(s)`:''}${directoryBatches?` · ${directoryBatches} directory batch(es)`:''}.`,'success')}
 async function uploadFiles(files,dest=''){const list=[...(files||[])];if(!list.length)return;const entries=list.map(file=>({file,path:normalizeUploadPath(file.webkitRelativePath||file.name)}));return uploadEntries(entries,[],dest)}
 async function scanDirectoryHandle(handle){const entries=[],directories=[];const walk=async(current,prefix)=>{const path=normalizeUploadPath(prefix?`${prefix}/${current.name}`:current.name);directories.push(path);for await(const child of current.values()){if(child.kind==='directory')await walk(child,path);else if(child.kind==='file')entries.push({file:await child.getFile(),path:normalizeUploadPath(`${path}/${child.name}`)})}};await walk(handle,'');return{entries,directories}}
 function legacyEntryFile(entry){return new Promise((resolve,reject)=>entry.file(resolve,reject))}
@@ -95285,8 +95690,8 @@ function resetAgentSessionUI(sessionId=''){S.agentSession=sessionId;S.agentState
 function namedAgentClipboardFile(file,index=0){if(!(file instanceof File))return null;if(String(file.name||'').trim())return file;const mime=String(file.type||'').toLowerCase(),ext=({'image/png':'png','image/jpeg':'jpg','image/webp':'webp','application/pdf':'pdf','text/plain':'txt','text/markdown':'md'}[mime]||mime.split('/').pop()||'bin').replace(/[^a-z0-9]+/g,'')||'bin';try{return new File([file],`clipboard_${Date.now()}_${index+1}.${ext}`,{type:file.type||'',lastModified:Date.now()})}catch{return file}}
 function agentClipboardFiles(event){const data=event?.clipboardData;if(!data)return[];const files=[],seen=new Set(),push=(raw,index)=>{const file=namedAgentClipboardFile(raw,index);if(!file)return;const key=`${file.name}:${file.type}:${file.size}`;if(seen.has(key))return;seen.add(key);files.push(file)};[...(data.files||[])].forEach(push);[...(data.items||[])].forEach((item,index)=>{if(item?.kind==='file')push(item.getAsFile?.(),index)});return files}
 async function uploadAgentAttachments(files){const list=[...(files||[])].map(namedAgentClipboardFile).filter(Boolean);if(!list.length)return;E('attachContextBtn').disabled=true;try{const items=[];for(let index=0;index<list.length;index++){const file=list[index];items.push({path:file.webkitRelativePath||file.name,content_b64:await readFileAsB64(file)});E('agentStatus').textContent=`Attaching ${index+1}/${list.length}`}const out=await api(`/api/ide/sessions/${qs(S.activeSession)}/workspace/upload`,{method:'POST',body:JSON.stringify({root_id:S.activeRoot,dest:'.clouds_coder/attachments',items})});for(const item of out.written||[])if(!S.agentAttachments.some(row=>row.path===item.path))S.agentAttachments.push({path:item.path,name:item.name,size:item.size});renderAgentAttachments();S.treeCache.clear();await loadTree('');toast(`Attached ${out.count||list.length} file(s).`,'success')}finally{E('attachContextBtn').disabled=false;E('agentStatus').textContent=S.agentState?.running?'Running':'Idle';E('agentAttachmentInput').value=''}}
-async function showAgentModelMenu(anchor){const popup=E('menuPopup');popup.classList.remove('is-hidden');popup.classList.add('agent-model-menu');popup.innerHTML='<div class="agent-model-summary">Loading models...</div>';const rect=anchor.getBoundingClientRect();popup.style.left=`${Math.max(4,Math.min(rect.left,window.innerWidth-364))}px`;popup.style.top='auto';popup.style.bottom=`${Math.max(4,window.innerHeight-rect.top+8)}px`;popup.style.transform='';try{const catalog=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/models`);S.agentModelCatalog=catalog;popup.innerHTML='';const pct=Number(S.agentState?.context_left_percent),left=Number(S.agentState?.context_left_tokens);const summary=document.createElement('div');summary.className='agent-model-summary';const context=document.createElement('span');context.className='agent-model-context';context.textContent=`${S.agentState?.model||'Current model'} · ${Number.isFinite(left)?left.toLocaleString()+' tokens left':'context unavailable'}${Number.isFinite(pct)?` (${pct.toFixed(1)}%)`:''}`;const compact=document.createElement('button');compact.type='button';compact.className='agent-model-compact';compact.textContent='Compact';compact.title='Compact the current session context';compact.disabled=!!S.agentState?.running;compact.onclick=event=>{event.stopPropagation();compactAgentContext(compact).catch(showError)};summary.append(context,compact);popup.appendChild(summary);for(const option of catalog.options||[]){const button=document.createElement('button');button.classList.toggle('is-active',option.selection===catalog.selected);button.innerHTML=`<span class="codicon codicon-${option.selection===catalog.selected?'check':'hubot'}"></span><span>${escapeHtml(option.label||option.model||option.selection)}</span>`;button.onclick=event=>{event.stopPropagation();applyAgentModel(option.selection,option.label||option.model).catch(showError)};popup.appendChild(button)}if(!(catalog.options||[]).length)popup.insertAdjacentHTML('beforeend','<div class="agent-model-summary">No configured models.</div>')}catch(error){popup.innerHTML=`<div class="agent-model-summary">${escapeHtml(error.message)}</div>`}}
-async function compactAgentContext(button){if(S.agentState?.running)return toast('Stop the active run before compacting context.','warning');if(!confirm('Compact this session context now?'))return;button.disabled=true;button.textContent='Compacting...';try{const out=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/compact`,{method:'POST',body:'{}'});S.agentState=Object.assign({},S.agentState||{},out);E('menuPopup').classList.add('is-hidden');renderAgentContextHud(S.agentState);toast('Context compacted.','success');S.agentPollRequested=true;scheduleAgentPoll(80)}finally{button.disabled=false;button.textContent='Compact'}}
+async function showAgentModelMenu(anchor){const popup=E('menuPopup');popup.classList.remove('is-hidden');popup.classList.add('agent-model-menu');popup.innerHTML='<div class="agent-model-summary">Loading models...</div>';const rect=anchor.getBoundingClientRect();popup.style.left=`${Math.max(4,Math.min(rect.left,window.innerWidth-364))}px`;popup.style.top='auto';popup.style.bottom=`${Math.max(4,window.innerHeight-rect.top+8)}px`;popup.style.transform='';try{const catalog=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/models`);S.agentModelCatalog=catalog;popup.innerHTML='';const pct=Number(S.agentState?.context_left_percent),left=Number(S.agentState?.context_left_tokens),limit=Number(S.agentState?.context_effective_token_limit);const summary=document.createElement('div');summary.className='agent-model-summary';const context=document.createElement('span');context.className='agent-model-context';const modelName=document.createElement('strong');modelName.className='agent-model-name';modelName.textContent=S.agentState?.model||'Current model';const usage=document.createElement('span');usage.className='agent-model-usage';usage.textContent=Number.isFinite(left)?`${left.toLocaleString()} tokens left${Number.isFinite(limit)&&limit>0?` / ${limit.toLocaleString()}`:''}${Number.isFinite(pct)?` · ${pct.toFixed(1)}%`:''}`:'Context usage unavailable';context.append(modelName,usage);const compact=document.createElement('button');compact.type='button';compact.className='agent-model-compact';compact.textContent='Compact';compact.title='Compact the current session context';compact.setAttribute('aria-label','Compact context');compact.disabled=!!S.agentState?.running;compact.onclick=event=>{event.stopPropagation();compactAgentContext(compact).catch(showError)};summary.append(context,compact);popup.appendChild(summary);for(const option of catalog.options||[]){const button=document.createElement('button');button.classList.toggle('is-active',option.selection===catalog.selected);button.innerHTML=`<span class="codicon codicon-${option.selection===catalog.selected?'check':'hubot'}"></span><span>${escapeHtml(option.label||option.model||option.selection)}</span>`;button.onclick=event=>{event.stopPropagation();applyAgentModel(option.selection,option.label||option.model).catch(showError)};popup.appendChild(button)}if(!(catalog.options||[]).length)popup.insertAdjacentHTML('beforeend','<div class="agent-model-summary">No configured models.</div>')}catch(error){popup.innerHTML=`<div class="agent-model-summary">${escapeHtml(error.message)}</div>`}}
+async function compactAgentContext(button){if(S.agentState?.running)return toast('Stop the active run before compacting context.','warning');if(!confirm('Compact this session context now?'))return;button.disabled=true;button.textContent='...';try{const out=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/compact`,{method:'POST',body:'{}'});S.agentState=Object.assign({},S.agentState||{},out);E('menuPopup').classList.add('is-hidden');renderAgentContextHud(S.agentState);toast('Context compacted.','success');S.agentPollRequested=true;scheduleAgentPoll(80)}finally{button.disabled=false;button.textContent='Compact'}}
 async function applyAgentModel(selection,label){const popup=E('menuPopup');popup.classList.add('is-hidden');popup.classList.remove('agent-model-menu');popup.style.transform='';popup.style.bottom='auto';const out=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/model`,{method:'POST',body:JSON.stringify({selection})});toast(out.queued?out.note||'Model switch queued.':`Model switched to ${label||selection}.`,out.queued?'warning':'success');scheduleAgentPoll(80)}
 async function refreshAgentEditedFile(path,rootId='session'){const clean=String(path||'').replace(/^\.\//,'');if(!clean)return;for(const file of S.openFiles.values()){if(file.session_id!==S.activeSession||file.root_id!==rootId||file.path!==clean||file.dirty||file.stageId!=='latest')continue;try{await refreshOpenFile(file)}catch(error){logOutput(`Agent file refresh: ${error.message}`)}}}
 function scheduleWorkspaceRefresh(delay=250){if(S.renderingAgentState)return;clearTimeout(S.agentTreeTimer);S.agentTreeTimer=setTimeout(()=>refreshWorkspaceSnapshot().catch(error=>logOutput(`Explorer refresh: ${error.message}`)),delay)}
@@ -95383,7 +95788,7 @@ async function authenticate(){
 function bindUI(){
   document.querySelectorAll('.activity-button[data-view]').forEach(button=>button.onclick=()=>showView(button.dataset.view));E('agentActivityBtn').onclick=()=>toggleSecondary();E('togglePrimaryBtn').onclick=togglePrimary;E('togglePanelBtn').onclick=togglePanel;E('toggleSecondaryBtn').onclick=()=>toggleSecondary();E('closeSecondaryBtn').onclick=()=>toggleSecondary(false);E('closePanelBtn').onclick=()=>{S.panelVisible=false;E('ideShell').classList.add('panel-hidden');scheduleStateSave()};E('maximizePanelBtn').onclick=()=>{S.panelMaximized=!S.panelMaximized;E('ideShell').classList.toggle('panel-maximized',S.panelMaximized)};document.addEventListener('visibilitychange',()=>{if(!S.agentEventsConnected)scheduleAgentPoll(document.hidden?120000:200)});
   document.querySelectorAll('[data-panel-tab]').forEach(button=>button.onclick=()=>showPanel(button.dataset.panelTab));E('commandCenter').onclick=()=>openPalette('>');E('mainMenuBtn').onclick=event=>showMenu(event.currentTarget,MENUS.file);document.querySelectorAll('[data-menu]').forEach(button=>button.onclick=event=>showMenu(event.currentTarget,MENUS[button.dataset.menu]||[]));
-  E('newFileBtn').onclick=()=>newFile().catch(showError);E('newFolderBtn').onclick=()=>newFolder().catch(showError);E('refreshTreeBtn').onclick=()=>refreshWorkspaceSnapshot().catch(showError);E('explorerMoreBtn').onclick=event=>showMenu(event.currentTarget,['file.open','file.uploadFolder','file.downloadWorkspace','file.openFolder','session.new']);E('sessionSelect').onchange=()=>switchSession(E('sessionSelect').value).catch(showError);E('renameSessionBtn').onclick=()=>renameCurrentSession().catch(showError);E('rootSelect').onchange=async()=>{S.activeRoot=E('rootSelect').value;S.treeCache.clear();await loadTree('');updateAgentContext()};E('workspaceSectionLabel').oncontextmenu=event=>{event.preventDefault();showWorkspaceMenu(event.clientX,event.clientY)};
+  E('newFileBtn').onclick=()=>newFile().catch(showError);E('newFolderBtn').onclick=()=>newFolder().catch(showError);E('refreshTreeBtn').onclick=()=>refreshWorkspaceSnapshot().catch(showError);E('explorerMoreBtn').onclick=event=>showMenu(event.currentTarget,['file.open','file.uploadFolder','file.downloadWorkspace','file.openFolder','session.new']);E('sessionSelect').onchange=()=>switchSession(E('sessionSelect').value).catch(showError);E('renameSessionBtn').onclick=()=>renameCurrentSession().catch(showError);E('rootSelect').onchange=async()=>{S.activeRoot=E('rootSelect').value;S.treeCache.clear();await loadTree('');updateAgentContext()};E('workspaceSectionLabel').oncontextmenu=event=>{event.preventDefault();showWorkspaceMenu(event.clientX,event.clientY)};E('downloadWorkspaceBtn').onclick=event=>{event.preventDefault();event.stopPropagation();downloadWorkspacePath('')};
   E('fileInput').onchange=()=>{const input=E('fileInput'),dest=S.pendingUploadDest;S.pendingUploadDest='';uploadFiles(input.files,dest).catch(showError).finally(()=>{input.value=''})};E('folderInput').onchange=()=>{const input=E('folderInput'),dest=S.pendingFolderUploadDest,legacy=[...(input.webkitEntries||[])];S.pendingFolderUploadDest='';const task=legacy.length?scanLegacyDirectoryEntries(legacy).then(scanned=>uploadEntries(scanned.entries,scanned.directories,dest)):uploadFiles(input.files,dest);task.catch(showError).finally(()=>{input.value=''})};E('searchInput').oninput=debounce(()=>runSearch().catch(showError),300);E('includeInput').onchange=()=>runSearch().catch(showError);E('excludeInput').onchange=()=>runSearch().catch(showError);E('matchCaseBtn').onclick=()=>{E('matchCaseBtn').classList.toggle('is-active');runSearch().catch(showError)};E('regexBtn').onclick=()=>{E('regexBtn').classList.toggle('is-active');runSearch().catch(showError)};E('clearSearchBtn').onclick=()=>{E('searchInput').value='';S.searchResults=[];E('searchSummary').textContent='';renderSearch()};
   E('refreshScmBtn').onclick=()=>refreshScm().catch(showError);E('refreshTasksBtn').onclick=()=>refreshTasks().catch(showError);E('runActiveBtn').onclick=()=>runActiveFile().catch(showError);E('debugActiveBtn').onclick=()=>debugActiveFile().catch(showError);E('newTerminalBtn').onclick=()=>newTerminal().catch(showError);E('killTerminalBtn').onclick=()=>killTerminal().catch(showError);E('refreshExtensionsBtn').onclick=()=>refreshExtensions(E('extensionSearchInput').value).catch(showError);E('extensionSearchInput').oninput=debounce(()=>refreshExtensions(E('extensionSearchInput').value).catch(showError),400);E('installVsixBtn').onclick=()=>E('vsixInput').click();E('vsixInput').onchange=()=>installVsix(E('vsixInput').files?.[0]).catch(showError);
   E('sendAgentBtn').onclick=()=>sendAgent().catch(showError);E('stopAgentBtn').onclick=()=>stopAgent().catch(showError);E('agentPrompt').onkeydown=event=>{if((event.ctrlKey||event.metaKey)&&event.key==='Enter'){event.preventDefault();sendAgent().catch(showError)}};E('attachContextBtn').onclick=()=>E('agentAttachmentInput').click();E('agentAttachmentInput').onchange=()=>uploadAgentAttachments(E('agentAttachmentInput').files).catch(showError);const agentComposer=E('agentComposer'),agentPrompt=E('agentPrompt'),dropHint=E('agentDropHint');let agentDragDepth=0;for(const type of ['dragenter','dragover'])agentComposer.addEventListener(type,event=>{event.preventDefault();if(type==='dragenter')agentDragDepth++;agentComposer.classList.add('is-dragover');dropHint.classList.remove('is-hidden')});for(const type of ['dragleave','dragend'])agentComposer.addEventListener(type,event=>{event.preventDefault();if(type==='dragleave')agentDragDepth--;if(agentDragDepth<=0){agentDragDepth=0;agentComposer.classList.remove('is-dragover');dropHint.classList.add('is-hidden')}});agentComposer.addEventListener('drop',event=>{event.preventDefault();agentDragDepth=0;agentComposer.classList.remove('is-dragover');dropHint.classList.add('is-hidden');const files=event.dataTransfer?.files;if(files?.length)uploadAgentAttachments(files).catch(showError)});agentPrompt.addEventListener('paste',event=>{const files=agentClipboardFiles(event);if(!files.length)return;event.preventDefault();uploadAgentAttachments(files).catch(showError)});E('agentModelBtn').onclick=event=>{event.stopPropagation();showAgentModelMenu(event.currentTarget).catch(showError)};E('agentTodoToggle').onclick=()=>{S.agentTodoCollapsed=!S.agentTodoCollapsed;E('agentTodoPanel').classList.toggle('is-collapsed',S.agentTodoCollapsed);E('agentTodoToggle').setAttribute('aria-expanded',String(!S.agentTodoCollapsed));scheduleStateSave()};E('newAgentChatBtn').onclick=()=>createSession().catch(showError);
@@ -97384,6 +97789,137 @@ document.addEventListener('DOMContentLoaded', function(){
             )
         return result
 
+    def ide_upload_chunk(self, user_id: str, session_id: str, payload: dict) -> dict:
+        """Append one validated chunk and atomically publish a completed upload."""
+        root_id = str(payload.get("root_id", payload.get("root", "session")) or "session")
+        dest = normalize_rel_preview_path(str(payload.get("dest", payload.get("dir", "")) or ""))
+        rel_item = normalize_rel_preview_path(
+            str(payload.get("path", payload.get("filename", "")) or "")
+        )
+        if not rel_item:
+            raise ValueError("upload path required")
+        upload_id = str(payload.get("upload_id", "") or "").strip().lower()
+        if not re.fullmatch(r"[a-z0-9_-]{16,80}", upload_id):
+            raise ValueError("invalid upload id")
+        root, target, meta = self.ide_resolve_workspace(
+            user_id,
+            session_id,
+            root_id,
+            normalize_rel_preview_path(f"{dest}/{rel_item}" if dest else rel_item),
+        )
+        self._ide_reject_hard_snapshot_mutation(user_id, session_id, root_id, target)
+        if target.exists() and target.is_dir():
+            raise IsADirectoryError("upload target is a directory")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        canonical_root = Path(os.path.realpath(root))
+        part = (target.parent / f".clouds-upload-{upload_id}.part").resolve()
+        if not part.is_relative_to(canonical_root):
+            raise ValueError("upload staging path escapes workspace")
+        action = str(payload.get("action", "append") or "append").strip().lower()
+        if action == "abort":
+            part.unlink(missing_ok=True)
+            return {"ok": True, "aborted": True, "path": rel_item, "upload_id": upload_id}
+        if action not in {"append", "complete"}:
+            raise ValueError("invalid upload action")
+        try:
+            offset = int(payload.get("offset", 0) or 0)
+            expected_size = int(payload.get("size", 0) or 0)
+        except Exception as exc:
+            raise ValueError("invalid upload offset or size") from exc
+        if offset < 0 or expected_size < 0:
+            raise ValueError("upload offset and size must be non-negative")
+        if expected_size > IDE_UPLOAD_STREAM_MAX_BYTES:
+            raise ValueError(
+                f"upload item too large: {rel_item} (max {IDE_UPLOAD_STREAM_MAX_BYTES} bytes)"
+            )
+        encoded = str(payload.get("chunk_b64", payload.get("content_b64", "")) or "")
+        try:
+            chunk = base64.b64decode(encoded, validate=True)
+        except Exception as exc:
+            raise ValueError("invalid upload chunk encoding") from exc
+        if len(chunk) > IDE_UPLOAD_CHUNK_MAX_BYTES:
+            raise ValueError(f"upload chunk is too large (max {IDE_UPLOAD_CHUNK_MAX_BYTES} bytes)")
+        if offset + len(chunk) > expected_size:
+            raise ValueError("upload chunk exceeds declared file size")
+
+        if not part.exists():
+            if offset != 0:
+                raise IDEFileConflict({"code": "upload_offset_conflict", "received": 0})
+            with part.open("xb"):
+                pass
+        current_size = int(part.stat().st_size)
+        if current_size == offset:
+            if chunk:
+                with part.open("ab") as handle:
+                    handle.write(chunk)
+                    handle.flush()
+                    if action == "complete":
+                        try:
+                            os.fsync(handle.fileno())
+                        except Exception:
+                            pass
+        elif current_size == offset + len(chunk):
+            with part.open("rb") as handle:
+                handle.seek(offset)
+                if handle.read(len(chunk)) != chunk:
+                    raise IDEFileConflict(
+                        {"code": "upload_chunk_conflict", "received": current_size}
+                    )
+        else:
+            raise IDEFileConflict(
+                {"code": "upload_offset_conflict", "received": current_size}
+            )
+
+        received = int(part.stat().st_size)
+        complete = action == "complete" or bool(payload.get("complete", False))
+        if not complete:
+            return {
+                "ok": True,
+                "upload_id": upload_id,
+                "path": rel_item,
+                "received": received,
+                "complete": False,
+            }
+        if received != expected_size:
+            raise IDEFileConflict(
+                {
+                    "code": "upload_size_conflict",
+                    "received": received,
+                    "expected": expected_size,
+                }
+            )
+        expected_sha256 = str(payload.get("sha256", "") or "").strip().lower()
+        if expected_sha256:
+            if not re.fullmatch(r"[a-f0-9]{64}", expected_sha256):
+                raise ValueError("invalid upload sha256")
+            digest = hashlib.sha256()
+            with part.open("rb") as handle:
+                while True:
+                    block = handle.read(1024 * 1024)
+                    if not block:
+                        break
+                    digest.update(block)
+            if not hmac.compare_digest(digest.hexdigest(), expected_sha256):
+                raise IDEFileConflict({"code": "upload_hash_conflict", "received": received})
+        os.replace(part, target)
+        stat_payload = self._ide_file_stat(root, target)
+        self._ide_emit_workspace_change(
+            user_id,
+            session_id,
+            root_id=root_id,
+            action="uploaded",
+            paths=[str(stat_payload.get("path", "") or rel_item)],
+        )
+        return {
+            "ok": True,
+            "root": meta,
+            "upload_id": upload_id,
+            "path": rel_item,
+            "received": received,
+            "complete": True,
+            "file": stat_payload,
+        }
+
     def ide_toolchains(self) -> list[dict]:
         specs = [
             ("python3", ["python3", "python"], "Install Python from https://www.python.org/downloads/ or your OS package manager."),
@@ -98144,24 +98680,35 @@ document.addEventListener('DOMContentLoaded', function(){
                 shell_prefix = sess._hard_snapshot_shell_prefix(cwd)
             if shell_prefix and remote:
                 effective_command = sess._sandbox_virtualize_command(effective_command, cwd)
+            windows_job = _is_windows_job_sandbox_prefix(shell_prefix)
             run_command: object = effective_command
             run_shell = True
-            if os.name == "nt" and not shell_prefix:
+            if os.name == "nt" and (not shell_prefix or windows_job):
                 run_command = f"chcp 65001>nul & {effective_command}"
-            if shell_prefix:
+            if shell_prefix and not windows_job:
                 run_command = [*shell_prefix, "/bin/sh", "-c", effective_command]
                 run_shell = False
-            proc = subprocess.run(
-                run_command,
-                cwd=str(cwd),
-                shell=run_shell,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                capture_output=True,
-                timeout=timeout,
-                env=sess._shell_process_env(),
-            )
+            process_env = sess._shell_process_env()
+            if windows_job:
+                proc = _run_windows_sandboxed_command(
+                    effective_command,
+                    workspace_root=root,
+                    cwd=cwd,
+                    env=process_env,
+                    timeout=timeout,
+                )
+            else:
+                proc = subprocess.run(
+                    run_command,
+                    cwd=str(cwd),
+                    shell=run_shell,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    capture_output=True,
+                    timeout=timeout,
+                    env=process_env,
+                )
             result = {
                 "ok": proc.returncode == 0,
                 "root": meta,
@@ -105904,6 +106451,16 @@ class IdeHandler(BaseHTTPRequestHandler):
             try:
                 payload = self._read_json(); self._require_root_capability(context, payload.get("root_id", "session"))
                 return self._send_json(self.app.ide_upload(user_id, m.group(1), payload), status=201)
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/upload-chunk$", path)
+        if m:
+            try:
+                payload = self._read_json(); self._require_root_capability(context, payload.get("root_id", "session"))
+                return self._send_json(
+                    self.app.ide_upload_chunk(user_id, m.group(1), payload),
+                    status=201,
+                )
             except Exception as exc:
                 return self._send_exception(exc)
         m = re.match(r"^/api/ide/sessions/([^/]+)/terminal/run$", path)
