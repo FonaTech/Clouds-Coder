@@ -710,7 +710,6 @@ MANAGER_MOMENTUM_MAX_SKIPS = 3
 # coding-type task before the anti-stall logic forces a switch to developer.
 # Was a hard-coded 2 (too aggressive — starved genuine research); raise so the
 # explorer can actually do its job. Tune down if exploration loops appear.
-EXPLORER_CODING_CAP = 4
 MODEL_OUTPUT_RETRY_TIMES = 3
 ARBITER_TRIGGER_MIN_CONTENT_CHARS = 50
 ARBITER_VALID_PLANNING_STREAK_LIMIT = 4
@@ -7073,15 +7072,10 @@ ROLE_EFFORT_FLOOR = {
     "manager": EFFORT_HIGH,
     "reviewer": EFFORT_HIGH,
 }
-# Coordination effort: the manager's per-round *routing* decision is a mechanical
-# tool-pick (missing facts->explorer, impl->developer, verify->reviewer, done->finish)
-# constrained to a single route_to_next_agent call. It does NOT need HIGH/MAX
-# reasoning every round — that was the single biggest token sink in multi-agent
-# mode. Routing calls use this low effort and bypass ROLE_EFFORT_FLOOR; manager
-# judgement/classification/planning calls keep the HIGH floor. On Anthropic/OpenAI
-# this is a real 5-8x thinking-token cut per round; on GLM (binary thinking) it is
-# neutral and the savings come from the loop/cache/tool-scope fixes.
-COORDINATION_EFFORT = EFFORT_LOW
+# Per-round routing is a semantic decision over the active objective, evidence,
+# permissions, and collaboration history. Keep enough reasoning budget for the
+# Manager to make that decision itself; the runtime only validates the result.
+COORDINATION_EFFORT = EFFORT_HIGH
 
 
 def clamp_effort(effort: str, *, ceiling: str = EFFORT_MAX, floor: str = EFFORT_OFF) -> str:
@@ -41498,6 +41492,7 @@ body{padding:18px}
                 "source": "",
                 "progress_fp": "",
                 "is_mandatory": False,
+                "fallback_recovery": False,
                 "ts": 0.0,
                 "plan_subtask_id": "",
                 "plan_subtask_content": "",
@@ -41542,6 +41537,7 @@ body{padding:18px}
             },
             "checkpoints": [],
             "persisted_manager_routes": [],
+            "manager_route_diagnostics": [],
         }
 
     def _normalize_blackboard(self, raw: object) -> dict:
@@ -41569,6 +41565,7 @@ body{padding:18px}
                 "source": trim(str(raw_delegate.get("source", "") or "").strip(), 40),
                 "progress_fp": trim(str(raw_delegate.get("progress_fp", "") or "").strip(), 80),
                 "is_mandatory": _to_bool_like(raw_delegate.get("is_mandatory", False), default=False),
+                "fallback_recovery": _to_bool_like(raw_delegate.get("fallback_recovery", False), default=False),
                 "ts": float(raw_delegate.get("ts", 0.0) or 0.0),
                 "focus_kind": trim(str(raw_delegate.get("focus_kind", "") or "").strip(), 40),
                 "focus_id": trim(str(raw_delegate.get("focus_id", "") or "").strip(), 120),
@@ -42051,6 +42048,12 @@ body{padding:18px}
         board["checkpoints"] = list(raw_cp)[-CHECKPOINT_MAX_COUNT:] if isinstance(raw_cp, list) else []
         raw_pmr = src.get("persisted_manager_routes")
         board["persisted_manager_routes"] = list(raw_pmr)[-PERSISTED_ROUTES_MAX:] if isinstance(raw_pmr, list) else []
+        raw_route_diag = src.get("manager_route_diagnostics")
+        board["manager_route_diagnostics"] = (
+            [dict(row) for row in list(raw_route_diag)[-40:] if isinstance(row, dict)]
+            if isinstance(raw_route_diag, list)
+            else []
+        )
         # Preserve loaded_skills across normalization
         raw_loaded_skills = src.get("loaded_skills")
         if isinstance(raw_loaded_skills, dict) and raw_loaded_skills:
@@ -56010,15 +56013,38 @@ body{padding:18px}
         return [
             tool_def(
                 "route_to_next_agent",
-                "Delegate next short timeslice to explorer/developer/reviewer, or finish.",
+                (
+                    "Choose and delegate the next short timeslice after comparing the current objective, "
+                    "canonical subtask, scoped evidence, prior progress, role permissions, and useful handoffs. "
+                    "Do not infer a role from status labels, artifact counts, filenames, or keywords alone."
+                ),
                 {
-                    "target": {"type": "string", "enum": list(MANAGER_ROUTE_TARGETS)},
-                    "instruction": {"type": "string"},
+                    "target": {
+                        "type": "string",
+                        "enum": list(MANAGER_ROUTE_TARGETS),
+                        "description": (
+                            "Your autonomous role decision for this exact timeslice. It must agree with judgement "
+                            "and the action requested in instruction."
+                        ),
+                    },
+                    "instruction": {
+                        "type": "string",
+                        "description": (
+                            "One concrete, scoped action for the selected role. Preserve the active plan/subtask "
+                            "unless evidence proves a handoff or advancement is needed."
+                        ),
+                    },
                     "task_level": {"type": "integer"},
                     "task_type": {"type": "string"},
                     "complexity": {"type": "string", "enum": list(TASK_COMPLEXITY_LEVELS)},
                     "scale_preference": {"type": "string", "enum": list(TASK_SCALE_PREFERENCES)},
-                    "judgement": {"type": "string"},
+                    "judgement": {
+                        "type": "string",
+                        "description": (
+                            "Brief evidence-based reason for the target: identify the unresolved need, why this "
+                            "role can act on it now, and why another role or finish is not preferable."
+                        ),
+                    },
                     "round_budget": {"type": "integer"},
                     "direct_objective": {"type": "string"},
                     "execution_mode": {"type": "string", "enum": [EXECUTION_MODE_SINGLE, EXECUTION_MODE_SYNC]},
@@ -57750,7 +57776,6 @@ body{padding:18px}
             cur = pending[0]
             step_idx = int(cur.get("plan_step_index", 0) or 0) + 1
             total = len(completed) + len(pending)
-            step_content_low = str(cur.get("content", "") or "").lower()
             # Summarize blackboard evidence that may justify step completion.
             research_count = len(bb.get("research_notes", []) or [])
             code_count = len(bb.get("code_artifacts", {}) or {})
@@ -57792,32 +57817,13 @@ body{padding:18px}
                         )
             except Exception:
                 pass
-            # Build an explicit completion hint from blackboard-side evidence.
             bb_evidence_hint = ""
-            is_research_step = any(kw in step_content_low for kw in ("读取", "分析", "研究", "调研", "检索", "搜索", "查找", "查询", "收集", "采集", "提取", "整理", "数据", "排行", "资金流向", "read", "analyze", "extract", "research", "summarize", "search", "collect", "gather", "retrieve", "总结"))
-            is_implement_step = any(kw in step_content_low for kw in ("创建", "写", "生成", "制作", "implement", "create", "write", "generate", "build", "pptx", "ppt"))
-            is_test_step = any(kw in step_content_low for kw in ("测试", "验证", "test", "verify", "compile", "run"))
-            if is_research_step and research_count > 0 and not worker_hint:
+            if not worker_hint:
                 bb_evidence_hint = (
-                    f"Blackboard has {research_count} research_note(s) — "
-                    "if these were written for this step, set advance_plan_step=true. "
-                )
-            elif is_implement_step and code_count > 0 and not worker_hint:
-                bb_evidence_hint = (
-                    f"Blackboard has {code_count} code_artifact(s) — "
-                    "if these were created for this step, set advance_plan_step=true. "
-                )
-            elif is_test_step and exec_count > 0 and not worker_hint:
-                bb_evidence_hint = (
-                    f"Blackboard has {exec_count} execution_log(s) — "
-                    "if these reflect this step's test run, set advance_plan_step=true. "
-                )
-            elif is_test_step and exec_count == 0 and not worker_hint:
-                bb_evidence_hint = (
-                    "⛔ TEST STEP: no bash execution evidence found yet. "
-                    "You MUST actually run the tests (e.g. `python -m pytest`, `npm test`, `bash run_tests.sh`) "
-                    "and confirm exit code before setting advance_plan_step=true. "
-                    "Creating test files is NOT sufficient — execute them. "
+                    "Global evidence inventory (may include earlier steps): "
+                    f"research_notes={research_count}, code_artifacts={code_count}, execution_logs={exec_count}. "
+                    "Inspect scope/provenance and decide relevance yourself; counts alone do not prove this step "
+                    "is complete and do not select an agent role. "
                 )
             return (
                 f"⚠️ PLAN STEP {step_idx}/{total}: {trim(str(cur.get('content', '') or ''), 200)}. "
@@ -57832,12 +57838,10 @@ body{padding:18px}
         if not pending:
             return "All project tasks completed. Route to finish. "
         cur = pending[0]
-        cat = cur.get("category", "")
-        if cat == "compile_test":
-            return "NEXT: compile/syntax check required. Route to Developer for build. "
-        if cat == "min_test":
-            return "NEXT: minimal test required. Route to Developer to run tests. "
-        return f"NEXT: {trim(str(cur.get('content', '') or ''), 120)}. "
+        return (
+            f"NEXT unresolved task: {trim(str(cur.get('content', '') or ''), 120)}. "
+            "Manager chooses the role from live evidence and capabilities. "
+        )
 
     def _manager_system_prompt(self) -> str:
         board = self._ensure_blackboard()
@@ -57846,14 +57850,6 @@ body{padding:18px}
         budget = self._blackboard_round_budget(board)
         level = int(profile.get("task_level", self.runtime_task_level or 0) or 0)
         mode = normalize_execution_mode(profile.get("execution_mode", self._effective_execution_mode()), default=self._effective_execution_mode())
-        task_type = str(profile.get("task_type", "general") or "general").strip().lower()
-        coding_hint = ""
-        if task_type in ("simple_code", "engineering"):
-            coding_hint = (
-                "CODING TASK: skip lengthy exploration/design phases. "
-                "Route to Developer early for implementation. "
-                "Explorer should only be used for specific file/API lookups, not broad analysis. "
-            )
         project_todo_hint = self._project_todo_hint_for_manager()
         plan_context = self._plan_steps_context_for_manager()
         # If no plan steps, give manager autonomous planning ability
@@ -57863,17 +57859,16 @@ body{padding:18px}
                 "and delegate one phase at a time. Track progress via blackboard. "
                 "Each phase should use the most appropriate agent for that phase's work. "
             )
-        # Phase-aware independence hint
-        current_phase = self._infer_current_phase_from_blackboard()
-        phase_hint = ""
-        if current_phase:
-            phase_hint = (
-                f"PHASE INDEPENDENCE: Current phase is '{current_phase}'. "
-                "Each task phase has its own expertise and approach. "
-                "Do NOT force implementation patterns from previous phases onto the current one. "
-                "For research/analysis phases: let the agent think freely and use its domain knowledge. "
-                "For implementation phases: focus on concrete code output. "
-                "For test/review phases: focus on verification, not re-implementation. "
+        current_subtask = self._current_plan_worker_subtask_snapshot(board=board, role="")
+        subtask_content = trim(str(current_subtask.get("subtask_content", "") or ""), 500)
+        prior_owner = self._sanitize_agent_role(current_subtask.get("owner", ""))
+        decision_frame = ""
+        if subtask_content:
+            decision_frame = (
+                "CURRENT DECISION FOCUS:\n"
+                f"canonical_subtask={subtask_content}\n"
+                f"prior_owner={prior_owner or '(none)'} (prior assignment is evidence, not a forced route)\n"
+                "Classify what remains from the objective and scoped evidence, then choose the role yourself. "
             )
         failure_brief = self._failure_aware_brief()
         failure_hint = ""
@@ -57916,8 +57911,11 @@ body{padding:18px}
             "You are Manager in a multi-agent coding system. "
             "Read blackboard, delegate one short timeslice via route_to_next_agent. "
             f"{self._public_progress_prompt_instruction()}"
-            "Policy: missing facts->explorer, implementation->developer, verification->reviewer, "
-            "all done->finish. Set is_mandatory=true when concrete execution is required. "
+            "You own routing and phase classification. Before calling the tool, compare the unresolved objective, "
+            "canonical subtask, scoped evidence, prior attempts, permissions, and available handoffs. "
+            "Do not use a fixed status-to-role, artifact-count-to-role, filename, or keyword mapping. "
+            "Your public rationale, judgement, target, and instruction must describe one consistent decision. "
+            "Set is_mandatory=true when concrete execution is required. "
             "Role capabilities: "
             "Explorer=read-only (bash/read_file/search/blackboard, TodoWrite, NO write_file/edit_file); "
             "Developer=all tools (write_file/edit_file/bash/read_file/TodoWrite/load_skill/etc); "
@@ -57931,11 +57929,10 @@ body{padding:18px}
             "before starting the next subtask. Never assume todo progress unless the worker actually called the todo tool. "
             "For multi-phase tasks (e.g., 'analyze PDF then make PPT'), each phase must be explicitly closed in todos before the next phase begins. "
             "If the task needs skills not yet loaded, instruct the owner to call load_skill before the subtask that needs it. "
-            f"{coding_hint}"
+            f"{decision_frame}"
             f"{project_todo_hint}"
             f"{plan_context}"
             f"{todo_route_note}"
-            f"{phase_hint}"
             f"{failure_hint}"
             f"{html_hint}"
             f"{user_profile_text}"
@@ -58113,329 +58110,82 @@ body{padding:18px}
         }
         return args, meta
 
-    def _manager_fallback_route(self) -> dict:
+    def _manager_autonomous_route_recovery(self) -> dict:
+        """Recover continuity without classifying a phase or selecting by keywords."""
         board = self._ensure_blackboard()
         latest_user_ts = self._latest_user_message_ts()
-        self._invalidate_stale_approval_if_needed(
-            board,
-            latest_user_ts=latest_user_ts,
-            emit_status=False,
-        )
-        board = self._ensure_blackboard()
-        self._reconcile_active_plan_step_before_finish(board, actor="manager", source="manager-fallback")
-        board = self._ensure_blackboard()
-        profile = self._ensure_blackboard_task_profile(board)
-        task_type = str(profile.get("task_type", "general") or "general")
-        complexity = str(profile.get("complexity", "simple") or "simple")
-        progress = self._manager_progress_state(board)
-        status = self._normalize_blackboard_status(board.get("status", "INITIALIZING"))
-        research_count = len(board.get("research_notes", []) or [])
-        code_count = len(board.get("code_artifacts", {}) or {})
-        feedback = board.get("review_feedback", []) if isinstance(board.get("review_feedback"), list) else []
-        approval = board.get("approval", {}) if isinstance(board.get("approval"), dict) else {}
         finish_gate = self._evaluate_finish_gate(board, latest_user_ts=latest_user_ts)
-        can_finish_from_approval = bool(finish_gate.get("ok", False))
-        finish_gate_reason = str(finish_gate.get("reason", "") or "")
-        has_error_log = self._manager_has_error_log(board)
-        feedback_pass = self._manager_feedback_passed_from_blackboard(board)
-        cycles = int(board.get("manager_cycles", 0) or 0)
-        summary_attempts = int(board.get("manager_summary_attempts", 0) or 0)
-        max_budget = max(1, int(getattr(self, "max_agent_rounds", MAX_AGENT_ROUNDS) or MAX_AGENT_ROUNDS))
-        # Hard guard: pending plan steps block finish — redirect to developer instead
-        pending_plan_steps = [
-            t for t in board.get("project_todos", [])
-            if t.get("category") == "plan_step" and t.get("status") != "completed"
-        ]
-        if cycles >= max_budget:
-            if pending_plan_steps:
-                # Budget exhausted but plan steps remain — continue with current step instead of finishing
-                cur = pending_plan_steps[0]
-                self._emit("status", {
-                    "summary": f"Max cycles reached but {len(pending_plan_steps)} plan steps pending; continuing."
-                })
-                return {
-                    "target": "developer",
-                    "instruction": f"Continue with plan step: {trim(str(cur.get('content', '')), 300)}",
-                    "reason": f"budget-exhausted-but-plan-steps-pending:{len(pending_plan_steps)}",
-                    "source": "fallback",
-                    "advance_plan_step": False,
-                }
-            if can_finish_from_approval:
-                return {
-                    "target": "finish",
-                    "instruction": "Maximum cycles reached and completion gates pass. Finish with final summary.",
-                    "reason": "budget-exhausted-finish-gated",
-                    "source": "fallback",
-                }
-            blocked_route = self._finish_gate_route_for_reason(finish_gate_reason, board)
-            blocked_route["reason"] = f"budget-exhausted-finish-blocked:{finish_gate_reason}"
-            blocked_route["source"] = "fallback"
-            self._emit("status", {"summary": f"Max cycles reached but finish blocked: {finish_gate_reason}"})
-            return blocked_route
-        if finish_gate_reason == "reviewer-summary-missing" and summary_attempts >= 2:
-            self._emit("status", {"summary": "Summary generation still missing; routing to synthesis instead of finish."})
-            return {
-                "target": "explorer",
-                "instruction": (
-                    "Final summary is still missing. Read blackboard evidence and write one structured "
-                    "final summary to blackboard. Do not call finish in this step."
-                ),
-                "reason": "summary-generation-timeout-synthesis",
-                "source": "fallback",
-                "is_mandatory": True,
-            }
-        if progress == "done" and can_finish_from_approval:
+        progress = self._manager_progress_state(board)
+        approval = board.get("approval", {}) if isinstance(board.get("approval"), dict) else {}
+        if bool(finish_gate.get("ok", False)) and (
+            progress == "done" or bool(approval.get("approved", False))
+        ):
             return {
                 "target": "finish",
-                "instruction": "Task already looks completed from current blackboard state.",
-                "reason": "progress-done",
-                "source": "fallback",
+                "instruction": "Completion gates pass for the current objective; finish with the evidence-backed summary.",
+                "reason": "continuity-recovery-finish-gated",
+                "source": "continuity-recovery",
+                "fallback_recovery": True,
             }
-        if bool(approval.get("approved", False)) and can_finish_from_approval:
+
+        current = self._current_plan_worker_subtask_snapshot(board=board, role="")
+        current_content = trim(str(current.get("subtask_content", "") or ""), 500)
+        current_owner = self._sanitize_agent_role(current.get("owner", ""))
+        candidates: list[dict] = []
+        last_delegate = board.get("last_delegate", {}) if isinstance(board.get("last_delegate"), dict) else {}
+        if last_delegate:
+            candidates.append(last_delegate)
+        candidates.extend(reversed(list(getattr(self, "manager_routes", []) or [])[-40:]))
+        for previous in candidates:
+            if not isinstance(previous, dict):
+                continue
+            source = str(previous.get("source", "") or "").strip().lower()
+            if source not in {"tool", "manager-momentum", "agentbus-fast", "agentbus-direct"}:
+                continue
+            target = self._sanitize_agent_role(previous.get("target", ""))
+            if target not in AGENT_ROLES:
+                continue
+            try:
+                if not self._route_scope_matches_current_plan(previous, board, require_scoped=True):
+                    continue
+            except Exception:
+                continue
+            instruction = trim(str(previous.get("instruction", "") or ""), MANAGER_INSTRUCTION_MAX_CHARS)
+            if current_content:
+                instruction = trim(
+                    f"{instruction}\nCurrent canonical subtask: {current_content}",
+                    MANAGER_INSTRUCTION_MAX_CHARS,
+                )
             return {
-                "target": "finish",
-                "instruction": "Review approved and no more actions are needed.",
-                "reason": "approval-true",
-                "source": "fallback",
+                "target": target,
+                "instruction": instruction or "Continue the current scoped objective and produce observable progress.",
+                "reason": f"continuity-recovery-last-manager-decision:{source}",
+                "source": "continuity-recovery",
+                "fallback_recovery": True,
             }
-        if bool(approval.get("approved", False)) and (not can_finish_from_approval):
-            if finish_gate_reason == "approval-stale-new-user-input":
-                return {
-                    "target": "developer",
-                    "instruction": "New user instruction arrived after previous approval; continue implementation for updated requirements.",
-                    "reason": "approval-stale-reroute",
-                    "source": "fallback",
-                }
-            if finish_gate_reason == "reviewer-summary-missing":
-                next_attempt = summary_attempts + 1
-                board["manager_summary_attempts"] = next_attempt
-                self.blackboard = board
-                if next_attempt >= 2:
-                    return {
-                        "target": "explorer",
-                        "instruction": (
-                            "Reviewer summary is still missing. Read blackboard sections "
-                            "(code_artifacts, execution_logs, review_feedback, status) and write one structured "
-                            "final summary to blackboard (changes, validation evidence, residual risks/next steps). "
-                            "Do not call finish tool in this step."
-                        ),
-                        "reason": "approval-missing-summary-handoff-explorer",
-                        "source": "fallback",
-                        "is_mandatory": True,
-                    }
-                return {
-                    "target": "reviewer",
-                    "instruction": (
-                        "Review approved but final summary required. First call read_from_blackboard for "
-                        "code_artifacts/execution_logs/review_feedback/status, then call finish_task with summary "
-                        "including changes, validation evidence, and residual risks/next steps."
-                    ),
-                    "reason": "approval-missing-reviewer-summary-request",
-                    "source": "fallback",
-                    "is_mandatory": True,
-                }
-            if finish_gate_reason == "blocking-error-log":
-                return {
-                    "target": "explorer",
-                    "instruction": "Review is present but blocked by runtime errors. Analyze latest execution log and propose concrete fix.",
-                    "reason": "approval-blocked-by-error",
-                    "source": "fallback",
-                }
-            if finish_gate_reason.startswith("project-todo-incomplete:"):
-                missing_cat = finish_gate_reason.split(":", 1)[-1] if ":" in finish_gate_reason else ""
-                if missing_cat == "compile_test":
-                    return {
-                        "target": "developer",
-                        "instruction": "编译/语法检查尚未完成。请编译项目并确认无错误。",
-                        "reason": "project-todo-compile-pending",
-                        "source": "fallback",
-                        "is_mandatory": True,
-                    }
-                if missing_cat == "min_test":
-                    return {
-                        "target": "developer",
-                        "instruction": "最小功能测试尚未完成。请运行基本测试验证核心功能。",
-                        "reason": "project-todo-test-pending",
-                        "source": "fallback",
-                        "is_mandatory": True,
-                    }
-            if (
-                finish_gate_reason.startswith("plan-steps-incomplete:")
-                or finish_gate_reason.startswith("worker-todo-pending:")
-                or finish_gate_reason == "sync-review-missing"
-            ):
-                blocked_route = self._finish_gate_route_for_reason(finish_gate_reason, board)
-                blocked_route["source"] = "fallback"
-                return blocked_route
-        if task_type == "simple_qa":
-            dev_text = self._latest_agent_assistant_text("developer", min_ts=latest_user_ts)
-            if dev_text:
-                done_probe = self._detect_endpoint_intent(dev_text, None)
-                if bool(done_probe.get("matched", False)):
-                    return {
-                        "target": "finish",
-                        "instruction": "Simple question already answered clearly; stop now.",
-                        "reason": "simple-qa-answered",
-                        "source": "fallback",
-                    }
-            return {
-                "target": "developer",
-                "instruction": (
-                    "Answer user question directly with concise final text. "
-                    "Do not create/edit files unless explicitly requested."
-                ),
-                "reason": "simple-qa-direct-answer",
-                "source": "fallback",
-            }
-        # General endpoint detection: non-simple_qa developer conclusions may also finish the run.
-        if task_type != "simple_qa":
-            dev_text = self._latest_agent_assistant_text("developer", min_ts=latest_user_ts)
-            if dev_text:
-                done_probe = self._detect_endpoint_intent(dev_text, None)
-                if bool(done_probe.get("matched", False)) and not has_error_log:
-                    return {
-                        "target": "finish",
-                        "instruction": "Developer has provided a conclusive response; stop now.",
-                        "reason": "general-endpoint-detected",
-                        "source": "fallback",
-                    }
-        # General guard: if the latest agent reply is conclusive and no todos remain, finish immediately.
-        if not has_error_log:
-            for _role in ("developer", "explorer", "reviewer"):
-                _last = self._latest_agent_assistant_text(_role, min_ts=latest_user_ts)
-                if _last and self._looks_like_conclusive_reply(_last) and not self.todo.has_open_items():
-                    return {
-                        "target": "finish",
-                        "instruction": "Agent already provided a conclusive reply with no open tasks; stop now.",
-                        "reason": "conclusive-reply-detected",
-                        "source": "fallback",
-                    }
-        if task_complexity_rank(complexity) <= task_complexity_rank("moderate") and task_type == "simple_code":
-            if has_error_log:
-                return {
-                    "target": "developer",
-                    "instruction": "Fix the latest concrete runtime/tool error and verify once.",
-                    "reason": "simple-code-error-fix",
-                    "source": "fallback",
-                }
-            if code_count <= 0:
-                return {
-                    "target": "developer",
-                    "instruction": "Implement the minimal code change needed for the request.",
-                    "reason": "simple-code-implement",
-                    "source": "fallback",
-                }
-            if feedback_pass and can_finish_from_approval:
-                return {
-                    "target": "finish",
-                    "instruction": "Quick review passed for simple code task; finish now.",
-                    "reason": "simple-code-pass",
-                    "source": "fallback",
-                }
-            if feedback_pass and (not can_finish_from_approval):
-                if finish_gate_reason == "reviewer-summary-missing":
-                    board["manager_summary_attempts"] = summary_attempts + 1
-                    self.blackboard = board
-                    return {
-                        "target": "reviewer",
-                        "instruction": (
-                            "Quick review passed but final summary is missing. Produce concise final summary "
-                            "covering changed files and validation evidence, then finish."
-                        ),
-                        "reason": "simple-code-summary-request",
-                        "source": "fallback",
-                        "is_mandatory": True,
-                    }
-                return {
-                    "target": "reviewer",
-                    "instruction": "Re-check latest implementation against newest user requirements and provide fresh pass/fix verdict.",
-                    "reason": "simple-code-pass-stale-approval",
-                    "source": "fallback",
-                }
-            return {
-                "target": "reviewer",
-                "instruction": "Run one quick validation and output pass/fix verdict with evidence.",
-                "reason": "simple-code-review",
-                "source": "fallback",
-            }
-        if feedback_pass and code_count > 0 and can_finish_from_approval:
-            return {
-                "target": "finish",
-                "instruction": "Reviewer already approved. End this run.",
-                "reason": "feedback-pass",
-                "source": "fallback",
-            }
-        if feedback_pass and code_count > 0 and (not can_finish_from_approval):
-            if finish_gate_reason == "reviewer-summary-missing":
-                board["manager_summary_attempts"] = summary_attempts + 1
-                self.blackboard = board
-                return {
-                    "target": "reviewer",
-                    "instruction": (
-                        "Review passed but final summary is still missing. Produce final summary covering "
-                        "what changed, validation evidence, and residual risks/next steps, then finish."
-                    ),
-                    "reason": "feedback-pass-summary-request",
-                    "source": "fallback",
-                    "is_mandatory": True,
-                }
-            return {
-                "target": "reviewer",
-                "instruction": "Approval evidence is stale for the latest user turn; run a fresh review and give pass/fix with evidence.",
-                "reason": "feedback-pass-stale-approval",
-                "source": "fallback",
-            }
-        if research_count == 0:
-            return {
-                "target": "explorer",
-                "instruction": "Inspect repository and gather required APIs/constraints before coding.",
-                "reason": "missing-research",
-                "source": "fallback",
-            }
-        if has_error_log and status in {"CODING", "TESTING", "REVIEWING"}:
-            return {
-                "target": "explorer",
-                "instruction": "Analyze latest execution error log and provide a concrete fix strategy.",
-                "reason": "execution-error",
-                "source": "fallback",
-            }
-        if code_count == 0:
-            return {
-                "target": "developer",
-                "instruction": "Implement the first executable version based on current research notes.",
-                "reason": "missing-code",
-                "source": "fallback",
-            }
-        if feedback and (not feedback_pass):
-            return {
-                "target": "developer",
-                "instruction": "Address review feedback with concrete code changes and rerun checks.",
-                "reason": "feedback-fix",
-                "source": "fallback",
-            }
-        if status in {"CODING", "TESTING"}:
-            return {
-                "target": "reviewer",
-                "instruction": "Review current implementation, run validation, and report pass/fix with evidence.",
-                "reason": "need-review",
-                "source": "fallback",
-            }
-        if cycles > 10 and (code_count > 0 or research_count > 0) and can_finish_from_approval:
-            return {
-                "target": "finish",
-                "instruction": (
-                    "Task has produced outputs but no explicit completion condition met. "
-                    "Completion gates pass; generate final summary and finish."
-                ),
-                "reason": "fallback-progress-finish-gated",
-                "source": "fallback",
-            }
+
+        profile = self._ensure_blackboard_task_profile(board)
+        target = current_owner or self._sanitize_agent_role(profile.get("assigned_expert", "")) or "developer"
         return {
-            "target": "developer",
-            "instruction": "Continue implementation and produce concrete file/tool changes.",
-            "reason": "default-developer",
-            "source": "fallback",
+            "target": target,
+            "instruction": (
+                "Continue the current canonical subtask and produce observable progress."
+                + (f"\nCurrent canonical subtask: {current_content}" if current_content else "")
+            ),
+            "reason": (
+                "continuity-recovery-explicit-owner"
+                if current_owner
+                else "continuity-recovery-manager-assigned-expert"
+            ),
+            "source": "continuity-recovery",
+            "fallback_recovery": True,
         }
+
+    def _manager_fallback_route(self) -> dict:
+        # Compatibility entrypoint. Recovery preserves prior Manager decisions or
+        # explicit assignments; it never classifies work from status/artifact text.
+        return self._manager_autonomous_route_recovery()
+
 
     def _manager_apply_anti_stall(self, route: dict) -> dict:
         row = dict(route or {})
@@ -58444,7 +58194,6 @@ body{padding:18px}
         if str(row.get("task_type", "") or "").strip().lower() == "simple_qa":
             return row
         target = str(row.get("target", "") or "").strip().lower()
-        task_type_low = str(row.get("task_type", "") or "").strip().lower()
         # 5a: Merge in-memory routes with persisted routes for detection
         bb_for_routes = self._ensure_blackboard()
         current_progress_fp = self._watchdog_state_fingerprint(bb_for_routes)
@@ -58478,90 +58227,25 @@ body{padding:18px}
                     row["reason"] = trim(f"{row.get('reason', '')}|anti-stall-repeated-delegation", 600)
                     row["source"] = "anti-stall"
                     return row
-        if task_type_low in ("simple_code", "engineering") and target == "explorer":
-            board = bb_for_routes
-            progress = self._manager_progress_state(board)
-            if progress in ("initializing", "in_progress"):
-                explorer_count = sum(
-                    1 for x in merged_routes[-8:]
-                    if str(x.get("target", "") or "").strip().lower() == "explorer"
-                )
-                if explorer_count >= EXPLORER_CODING_CAP:
-                    row["target"] = "developer"
-                    row["instruction"] = (
-                        "Coding task: Explorer has been used enough. "
-                        "Start implementation now using write_file/edit_file."
-                    )
-                    row["reason"] = f"{row.get('reason', '')}|coding-fast-track->developer"
-                    row["source"] = "anti-stall"
-                    return row
         if target not in AGENT_ROLES:
             return row
         recent = [str(x.get("target", "") or "").strip().lower() for x in merged_routes[-4:]]
         if no_progress_since_last_delegate and len(recent) >= 3 and recent[-1] == target and recent[-2] == target and recent[-3] == target:
-            board = bb_for_routes
-            low_reason = str(row.get("reason", "") or "").strip().lower()
-            if "summary" in low_reason and len(board.get("code_artifacts", {}) or {}) > 0:
-                row["target"] = "reviewer"
-                row["instruction"] = (
-                    "Summary generation loop detected. Read blackboard evidence and produce one concise "
-                    "structured final summary with changes, validation, and residual risks. "
-                    "Only call finish_task if completion gates are satisfied."
-                )
-                row["reason"] = f"{row.get('reason', '')}|anti-stall-summary-loop-reviewer"
-                row["source"] = "anti-stall"
-                row["is_mandatory"] = True
-                return row
-            if target != "reviewer" and len(board.get("code_artifacts", {}) or {}) > 0:
-                row["target"] = "reviewer"
-                row["instruction"] = "Parallel-check current changes and provide immediate fix/pass guidance."
-                row["reason"] = f"{row.get('reason', '')}|anti-stall->reviewer"
-            elif target != "developer":
-                row["target"] = "developer"
-                row["instruction"] = "Execute one concrete implementation step using tools now."
-                row["reason"] = f"{row.get('reason', '')}|anti-stall->developer"
-            else:
-                # Developer stuck — check if errors/edit failures exist
-                has_edit_fails = bool(self.developer_edit_fail_streaks)
-                has_errors = self._manager_has_error_log(bb_for_routes)
-                if has_errors or has_edit_fails:
-                    error_ctx = self._recent_error_context(400)
-                    if has_edit_fails:
-                        stuck_files = ", ".join(list(self.developer_edit_fail_streaks.keys())[:3])
-                        error_ctx = f"Edit failures on: {stuck_files}. {error_ctx}"
-                    self._activate_reviewer_debug_mode(error_ctx)
-                    row["target"] = "reviewer"
-                    row["instruction"] = (
-                        "Developer stuck with errors. DEBUG MODE: diagnose and fix directly. "
-                        f"Context: {trim(error_ctx, 400)}"
-                    )
-                    row["reason"] = f"{row.get('reason', '')}|anti-stall->reviewer-debug"
-                else:
-                    row["target"] = "developer"
-                    row["instruction"] = (
-                        "You have been working on this for multiple rounds without visible progress. Consider: "
-                        "1) Use ask_colleague to request help from another agent. "
-                        "2) Try a completely different tool or approach. "
-                        "3) If the current subtask is complete, update TodoWrite and continue the current plan step. "
-                        "Do not call finish_current_task unless the overall user task is truly complete."
-                    )
-                    row["reason"] = f"{row.get('reason', '')}|anti-stall->developer-suggest"
+            error_ctx = self._recent_error_context(400) if self._manager_has_error_log(bb_for_routes) else ""
+            row["instruction"] = trim(
+                f"{row.get('instruction', '')}\n"
+                "No observable progress was recorded for this role across repeated turns. "
+                "Reassess the scoped evidence and take a materially different concrete action, or use "
+                "ask_colleague with a precise handoff. The runtime is not changing the Manager-selected role."
+                + (f"\nRecent error evidence: {error_ctx}" if error_ctx else ""),
+                MANAGER_INSTRUCTION_MAX_CHARS,
+            )
+            row["reason"] = f"{row.get('reason', '')}|anti-stall-preserve-manager-role"
             row["source"] = "anti-stall"
             return row
         if no_progress_since_last_delegate and len(recent) == 4 and recent[0] == recent[2] and recent[1] == recent[3] and recent[0] != recent[1]:
-            board = bb_for_routes
-            if len(board.get("code_artifacts", {}) or {}) > 0:
-                finish_gate = self._evaluate_finish_gate(board)
-                if bool(finish_gate.get("ok", False)):
-                    row["target"] = "finish"
-                    row["instruction"] = "Oscillation detected with existing outputs and completion gates pass; finish now."
-                    row["reason"] = f"{row.get('reason', '')}|anti-stall-oscillation-finish"
-                    row["source"] = "anti-stall"
-                else:
-                    blocked = self._finish_gate_route_for_reason(str(finish_gate.get("reason", "") or ""), board)
-                    row.update(blocked)
-                    row["reason"] = f"{row.get('reason', '')}|anti-stall-oscillation-blocked"
-                return row
+            row["reason"] = f"{row.get('reason', '')}|anti-stall-oscillation-observed"
+            row["source"] = "anti-stall"
         if int(self.stall_severity_score or 0) >= STALL_SEVERITY_ESCALATION_THRESHOLD:
             row["stall_plan_escalation"] = True
         return row
@@ -58631,13 +58315,12 @@ body{padding:18px}
         if target not in MANAGER_ROUTE_TARGETS:
             target = assigned_expert if mode == EXECUTION_MODE_SINGLE else "developer"
         if target in AGENT_ROLES and target not in participants:
-            if executor_mode_flag:
-                if len(participants) < 3:
-                    participants.append(target)
-                else:
-                    participants[-1] = target
+            if mode == EXECUTION_MODE_SINGLE:
+                target = assigned_expert
+            elif len(participants) < 3:
+                participants.append(target)
             else:
-                target = participants[0]
+                participants[-1] = target
         # Single-mode hard rule: regardless of executor_mode_flag, only assigned_expert may act.
         if mode == EXECUTION_MODE_SINGLE:
             participants = [assigned_expert]
@@ -58696,6 +58379,11 @@ body{padding:18px}
                     participants.append("reviewer")
                 else:
                     participants[-1] = "reviewer"
+        if mode != EXECUTION_MODE_SINGLE and target in AGENT_ROLES and target not in participants:
+            if len(participants) < 3:
+                participants.append(target)
+            else:
+                participants[-1] = target
         if plan_budget_floor > 0:
             round_budget = max(round_budget, min(max_budget, plan_budget_floor))
         cycles = int(board.get("manager_cycles", 0) or 0)
@@ -58931,20 +58619,43 @@ body{padding:18px}
         )
         return row
 
-    def _manager_route_from_response(self, text: str, tool_calls: list[dict]) -> dict:
-        parsed: dict | None = None
-        for tc in tool_calls or []:
-            fn = tc.get("function", {}) if isinstance(tc, dict) else {}
-            name = str(fn.get("name", "") or "").strip()
+    def _manager_parse_route_tool_calls(self, tool_calls: list[dict] | None) -> tuple[dict | None, dict]:
+        diagnostics: dict = {
+            "tool_call_count": len(tool_calls or []),
+            "route_call_count": 0,
+            "tool_names": [],
+            "errors": [],
+        }
+        for index, tc in enumerate(tool_calls or []):
+            if not isinstance(tc, dict):
+                diagnostics["errors"].append(f"tool[{index}]:not-object")
+                continue
+            fn = tc.get("function", {}) if isinstance(tc.get("function", {}), dict) else {}
+            name = str(fn.get("name", "") or "").strip().lower()
+            if name:
+                diagnostics["tool_names"].append(trim(name, 80))
             if name not in {"route_to_next_agent", "routetonext_agent"}:
                 continue
-            args = fn.get("arguments", {}) if isinstance(fn, dict) else {}
+            diagnostics["route_call_count"] += 1
+            args = fn.get("arguments", {})
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    diagnostics["errors"].append(
+                        f"route[{index}]:invalid-json:{type(exc).__name__}"
+                    )
+                    continue
             if not isinstance(args, dict):
+                diagnostics["errors"].append(f"route[{index}]:arguments-not-object")
                 continue
             target = str(args.get("target", "") or "").strip().lower()
-            instruction = trim(str(args.get("instruction", "") or "").strip(), MANAGER_INSTRUCTION_MAX_CHARS)
             if target not in MANAGER_ROUTE_TARGETS:
+                diagnostics["errors"].append(
+                    f"route[{index}]:invalid-target:{trim(target or '<empty>', 40)}"
+                )
                 continue
+            instruction = trim(str(args.get("instruction", "") or "").strip(), MANAGER_INSTRUCTION_MAX_CHARS)
             parsed = {
                 "target": target,
                 "instruction": instruction
@@ -58963,14 +58674,60 @@ body{padding:18px}
                 "executor_mode": _to_bool_like(args.get("executor_mode", False), default=False),
                 "advance_plan_step": _to_bool_like(args.get("advance_plan_step", False), default=False),
                 "round_budget": args.get("round_budget", 0),
-                "reason": trim(str(text or "").strip(), 600),
+                "reason": "",
                 "source": "tool",
             }
-            break
+            diagnostics["selected_target"] = target
+            diagnostics["valid"] = True
+            return parsed, diagnostics
+        diagnostics["valid"] = False
+        if not diagnostics["errors"]:
+            diagnostics["errors"].append(
+                "missing-route-tool" if not diagnostics["route_call_count"] else "no-valid-route"
+            )
+        return None, diagnostics
+
+    def _manager_route_from_response(self, text: str, tool_calls: list[dict]) -> dict:
+        parsed, diagnostics = self._manager_parse_route_tool_calls(tool_calls)
+        if parsed is not None:
+            parsed["reason"] = trim(str(text or "").strip(), 600)
         if parsed is None:
             parsed = self._manager_fallback_route()
+            parsed["fallback_recovery"] = True
+            parsed["parse_failure"] = trim(";".join(diagnostics.get("errors", [])), 300)
+            parsed["manager_prose"] = trim(str(text or "").strip(), 600)
             if str(text or "").strip():
-                parsed["reason"] = trim(str(text or "").strip(), 600)
+                parsed["reason"] = trim(
+                    f"{parsed.get('reason', '')}|manager-prose:{str(text or '').strip()}",
+                    600,
+                )
+            board = self._ensure_blackboard()
+            history = board.get("manager_route_diagnostics", [])
+            if not isinstance(history, list):
+                history = []
+            history.append({
+                "ts": float(now_ts()),
+                "valid": False,
+                "tool_call_count": int(diagnostics.get("tool_call_count", 0) or 0),
+                "route_call_count": int(diagnostics.get("route_call_count", 0) or 0),
+                "tool_names": list(diagnostics.get("tool_names", []))[:12],
+                "errors": list(diagnostics.get("errors", []))[:12],
+                "manager_prose": trim(str(text or "").strip(), 600),
+                "fallback_target": str(parsed.get("target", "") or ""),
+                "fallback_reason": trim(str(parsed.get("reason", "") or ""), 600),
+            })
+            board["manager_route_diagnostics"] = history[-40:]
+            self.blackboard = board
+            self._emit(
+                "status",
+                {
+                    "summary": (
+                        "manager route recovery used after invalid structured output: "
+                        f"{parsed.get('parse_failure', 'unknown parse failure')}; "
+                        f"fallback={parsed.get('target', '?')}"
+                    )
+                },
+            )
         parsed = self._manager_apply_anti_stall(parsed)
         parsed = self._manager_apply_task_policy(parsed)
         if str(parsed.get("target", "") or "") in AGENT_ROLES:
@@ -59552,6 +59309,67 @@ body{padding:18px}
                 text, text_filter_meta = self._sanitize_assistant_text_for_runtime(text, tool_calls)
                 if bool(text_filter_meta.get("filtered", False)) and str(text_filter_meta.get("reason", "")) == "oversized_raw_toolcall":
                     self._inject_toolcall_overflow_hint("manager")
+                route_probe, route_probe_diag = self._manager_parse_route_tool_calls(tool_calls)
+                if route_probe is None:
+                    parse_failure = trim(
+                        ";".join(route_probe_diag.get("errors", [])) or "missing-route-tool",
+                        300,
+                    )
+                    self._emit(
+                        "status",
+                        {
+                            "summary": (
+                                "manager structured route was invalid; asking the same Manager "
+                                f"to restate its own decision once ({parse_failure})"
+                            )
+                        },
+                    )
+                    repair_prompt = (
+                        "Your preceding routing response was not structurally actionable. "
+                        f"Parser result: {parse_failure}.\n"
+                        "Preserve your own intended next action and role choice; do not invent a new phase. "
+                        "Return exactly one valid route_to_next_agent tool call now.\n"
+                        f"Your preceding public reasoning, if any:\n{trim(text, 600) or '(none)'}"
+                    )
+                    self._append_manager_context({
+                        "role": "user",
+                        "content": repair_prompt,
+                        "ts": now_ts(),
+                    })
+                    with self.lock:
+                        self.current_phase = "manager:route-repair"
+                        self.current_tool_name = ""
+                        self.active_agent_role = "manager"
+                    repair_response = self._chat_with_same_model_retry(
+                        self.manager_context,
+                        tools=self._manager_route_tools(),
+                        system=self._manager_system_prompt(),
+                        max_tokens=600,
+                        think=False,
+                        stream_thinking=False,
+                        on_thinking_chunk=self._append_live_thinking,
+                        pinned_selection=pinned_selection,
+                        context_label="manager route repair",
+                        retries=max(1, int(MODEL_OUTPUT_RETRY_TIMES)),
+                        media_inputs=media_inputs_round,
+                        coordination=True,
+                    )
+                    repair_text = str(repair_response.get("content") or "")
+                    repair_tool_calls = repair_response.get("tool_calls", [])
+                    repair_text, repair_filter_meta = self._sanitize_assistant_text_for_runtime(
+                        repair_text,
+                        repair_tool_calls,
+                    )
+                    if bool(repair_filter_meta.get("filtered", False)) and str(repair_filter_meta.get("reason", "")) == "oversized_raw_toolcall":
+                        self._inject_toolcall_overflow_hint("manager")
+                    repaired_route, _repair_diag = self._manager_parse_route_tool_calls(repair_tool_calls)
+                    if repaired_route is not None:
+                        text = repair_text or text
+                        tool_calls = repair_tool_calls
+                    else:
+                        text = repair_text or text
+                        if repair_tool_calls:
+                            tool_calls = repair_tool_calls
                 if tool_calls and not text.strip():
                     text = self._public_tool_progress_summary(tool_calls, role="manager")
                 assistant = {"role": "assistant", "content": text, "ts": now_ts()}
@@ -59740,6 +59558,8 @@ body{padding:18px}
             "assigned_expert": assigned_expert,
             "is_mandatory": bool(route.get("is_mandatory", False)),
             "executor_mode": bool(route.get("executor_mode", False)),
+            "fallback_recovery": bool(route.get("fallback_recovery", False)),
+            "parse_failure": trim(str(route.get("parse_failure", "") or ""), 300),
             "requires_user_confirmation": bool(route.get("requires_user_confirmation", False)),
             "round_budget": int(round_budget),
             "remaining_rounds": int(remaining_rounds),
@@ -59894,6 +59714,8 @@ body{padding:18px}
             "ts": float(now_ts()),
             "focus_id": str(route_row.get("focus_id", "") or ""),
             "plan_step_id": str(route_row.get("plan_step_id", "") or ""),
+            "source": str(route_row.get("source", "") or ""),
+            "fallback_recovery": bool(route_row.get("fallback_recovery", False)),
         })
         board["persisted_manager_routes"] = persisted_routes[-PERSISTED_ROUTES_MAX:]
         self.blackboard = board
@@ -66284,6 +66106,13 @@ body{padding:18px}
             return False
         return True
 
+    @staticmethod
+    def _manager_route_can_earn_momentum(route: dict | None) -> bool:
+        if not isinstance(route, dict) or bool(route.get("fallback_recovery", False)):
+            return False
+        source = str(route.get("source", "") or "").strip().lower()
+        return source not in {"fallback", "anti-stall"}
+
     def _multi_agent_sync_blackboard_worker(self, *, pinned_selection: str):
         idle_counts = {role: 0 for role in AGENT_ROLES}
         _prev_delegation_hash = ""
@@ -66777,6 +66606,7 @@ body{padding:18px}
                 and role in AGENT_ROLES
                 and not bool(step.get("stop_due_to_finish", False))
                 and self._active_plan_step_in_progress(board_after)
+                and self._manager_route_can_earn_momentum(route)
             ):
                 _mom_step = self._get_active_plan_step(board_after)
                 _mom_subtask = self._current_plan_worker_subtask_snapshot(
