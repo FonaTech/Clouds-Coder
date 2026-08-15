@@ -51,6 +51,7 @@ from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from http import HTTPStatus
+from http.client import IncompleteRead
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
 from urllib.error import HTTPError, URLError
@@ -10191,6 +10192,80 @@ def preview_kind_for_path(path_text: str) -> str:
     return ""
 
 
+def normalize_markdown_preview_text(text: object) -> str:
+    """Normalize files whose entire Markdown body was indented by a transport layer.
+
+    Python-Markdown correctly treats four leading spaces as a code block. A number
+    of upload/extraction paths, however, indent every line in the file, which makes
+    an otherwise normal document render as one giant code block. Remove only a
+    document-wide common indent; indentation that exists on just some lines is
+    preserved for lists and fenced/nested code.
+    """
+    source = str(text or "").replace("\r\n", "\n").replace("\r", "\n").lstrip("\ufeff")
+    lines = source.split("\n")
+    non_empty = [line for line in lines if line.strip()]
+    if not non_empty:
+        return source
+    indents = [len(re.match(r"^[ \t]*", line).group(0).expandtabs(4)) for line in non_empty]
+    common = min(indents) if indents else 0
+    # A uniformly indented Markdown document is almost always a copied body. Keep
+    # the original indentation when only a subset of lines is indented.
+    if common < 2 or not all((not line.strip()) or len(line) - len(line.lstrip(" \t")) >= common for line in lines):
+        return source
+    out: list[str] = []
+    for line in lines:
+        if not line.strip():
+            out.append("")
+            continue
+        consumed = 0
+        index = 0
+        while index < len(line) and consumed < common and line[index] in " \t":
+            consumed += 4 if line[index] == "\t" else 1
+            index += 1
+        out.append(line[index:] if consumed >= common else line.lstrip(" \t"))
+    return "\n".join(out)
+
+
+def _ask_user_option_rows(raw_options: object, *, limit: int = 8) -> list[object]:
+    """Keep ask_user choices structured without breaking legacy string options."""
+    source = raw_options
+    if isinstance(source, str):
+        candidate = source.strip()
+        if candidate.startswith(("[", "{")):
+            try:
+                source = json.loads(candidate)
+            except Exception:
+                source = [source]
+        else:
+            source = [source] if candidate else []
+    if isinstance(source, dict):
+        source = [source]
+    if not isinstance(source, (list, tuple)):
+        return []
+    rows: list[object] = []
+    for item in source:
+        if isinstance(item, dict):
+            label = trim(str(item.get("label", item.get("text", item.get("name", ""))) or "").strip(), 400)
+            value = trim(str(item.get("value", item.get("id", label)) or label).strip(), 400)
+            description = trim(str(item.get("description", item.get("detail", "")) or "").strip(), 800)
+            if not label and not value:
+                continue
+            rows.append({"label": label or value, "value": value or label, **({"description": description} if description else {})})
+        else:
+            value = trim(str(item or "").strip(), 400)
+            if value:
+                rows.append(value)
+        if len(rows) >= max(1, int(limit or 8)):
+            break
+    return rows
+
+
+def _ask_user_option_value(option: object) -> str:
+    if isinstance(option, dict):
+        return trim(str(option.get("value", option.get("id", option.get("label", ""))) or "").strip(), 400)
+    return trim(str(option or "").strip(), 400)
+
+
 def workspace_file_revision_map(root: Path, max_files: int = 30_000) -> dict[str, str]:
     base = Path(root).resolve()
     out: dict[str, str] = {}
@@ -17618,6 +17693,8 @@ class OllamaClient:
         text = str(exc).lower()
         markers = (
             "connection error",
+            "incomplete read",
+            "incomplete http response",
             "timed out",
             "timeout",
             "connection reset",
@@ -17764,7 +17841,7 @@ class OllamaClient:
 
     def _post_json(self, path: str, payload: dict) -> dict:
         url = f"{self.base_url}{path}"
-        return self._post_json_url(url, payload)
+        return self._post_json_url_with_retries(url, payload)
 
     def _post_json_url(self, url: str, payload: dict, headers: dict | None = None) -> dict:
         req_headers = {"Content-Type": "application/json"}
@@ -17791,7 +17868,7 @@ class OllamaClient:
                 url=url,
                 retry_after=self._parse_retry_after_seconds(hdrs, text),
             ) from exc
-        except (URLError, TimeoutError, ConnectionResetError, ConnectionAbortedError) as exc:
+        except (URLError, TimeoutError, ConnectionResetError, ConnectionAbortedError, IncompleteRead) as exc:
             raise OllamaError(f"Connection error: {exc}", url=url) from exc
 
     def _post_json_url_with_retries(
@@ -17884,6 +17961,9 @@ class OllamaClient:
                             pass
                     line = resp.readline()
                     if not line:
+                        remaining = getattr(resp, "length", None)
+                        if isinstance(remaining, int) and remaining > 0:
+                            raise IncompleteRead(b"", remaining)
                         break
                     yield line.decode("utf-8", errors="replace")
         except HTTPError as exc:
@@ -17897,7 +17977,7 @@ class OllamaClient:
                 url=url,
                 retry_after=self._parse_retry_after_seconds(hdrs, text),
             ) from exc
-        except (URLError, TimeoutError, ConnectionResetError, ConnectionAbortedError) as exc:
+        except (URLError, TimeoutError, ConnectionResetError, ConnectionAbortedError, IncompleteRead) as exc:
             raise OllamaError(f"Connection error: {exc}", url=url) from exc
 
     def _iter_response_lines_url_with_retries(
@@ -17944,6 +18024,7 @@ class OllamaClient:
                 retryable = bool((http_retryable or conn_retryable) and not emitted)
                 exc.retryable = retryable
                 exc.transient = bool(transient or conn_retryable)
+                exc.stream_emitted = bool(emitted)
                 if not retryable or attempt >= retry_budget:
                     raise
                 delay = self._http_retry_delay(exc, attempt)
@@ -20289,6 +20370,7 @@ _IDE_SANDBOX_BACKEND_CACHE: dict[str, object] = {}
 _IDE_SANDBOX_BACKEND_LOCK = threading.RLock()
 WINDOWS_JOB_SANDBOX_MARKER = "__clouds_windows_job__"
 _WINDOWS_LOW_INTEGRITY_ROOTS: set[str] = set()
+_WINDOWS_LOW_INTEGRITY_FAILED_ROOTS: set[str] = set()
 _WINDOWS_LOW_INTEGRITY_LOCK = threading.RLock()
 
 def _is_windows_job_sandbox_prefix(prefix: object) -> bool:
@@ -20384,13 +20466,22 @@ def _windows_set_low_integrity_label(path: Path, *, inherit: bool) -> None:
         kernel32.LocalFree.restype = ctypes.c_void_p
         kernel32.LocalFree(sid)
 
-def _windows_prepare_low_integrity_workspace(workspace_root: Path) -> None:
+def _windows_prepare_low_integrity_workspace(workspace_root: Path) -> bool:
     canonical = Path(os.path.realpath(workspace_root)).resolve()
     key = os.path.normcase(str(canonical))
     with _WINDOWS_LOW_INTEGRITY_LOCK:
-        if key in _WINDOWS_LOW_INTEGRITY_ROOTS:
-            return
-        _windows_set_low_integrity_label(canonical, inherit=True)
+        if key in _WINDOWS_LOW_INTEGRITY_ROOTS or key in _WINDOWS_LOW_INTEGRITY_FAILED_ROOTS:
+            return key in _WINDOWS_LOW_INTEGRITY_ROOTS
+        # The low-integrity label is defense-in-depth. Standard Windows users can
+        # lack SeSecurityPrivilege, in which case SetNamedSecurityInfoW returns
+        # ERROR_ACCESS_DENIED even though the Job Object/token sandbox is usable.
+        # Record that capability failure once and continue with the stronger job
+        # isolation instead of failing every Bash invocation.
+        try:
+            _windows_set_low_integrity_label(canonical, inherit=True)
+        except OSError:
+            _WINDOWS_LOW_INTEGRITY_FAILED_ROOTS.add(key)
+            return False
         for dirpath, dirnames, filenames in os.walk(canonical, topdown=True, followlinks=False):
             current = Path(dirpath)
             dirnames[:] = [name for name in dirnames if not (current / name).is_symlink()]
@@ -20408,6 +20499,7 @@ def _windows_prepare_low_integrity_workspace(workspace_root: Path) -> None:
                 except OSError:
                     pass
         _WINDOWS_LOW_INTEGRITY_ROOTS.add(key)
+        return True
 
 def _windows_job_memory_limit() -> int:
     raw = str(os.environ.get("CLOUDS_CODER_SANDBOX_MEMORY", "1g") or "1g").strip().lower()
@@ -20465,7 +20557,12 @@ def _windows_lower_process_integrity(process_handle: object) -> None:
             kernel32.CloseHandle.restype = wintypes.BOOL
             kernel32.CloseHandle(token)
 
-def _windows_attach_sandbox_job(proc: subprocess.Popen, workspace_root: Path) -> None:
+def _windows_attach_sandbox_job(
+    proc: subprocess.Popen,
+    workspace_root: Path,
+    *,
+    lower_integrity: bool = True,
+) -> None:
     from ctypes import wintypes
 
     class LARGE_INTEGER(ctypes.Union):
@@ -20536,7 +20633,8 @@ def _windows_attach_sandbox_job(proc: subprocess.Popen, workspace_root: Path) ->
         kernel32.SetInformationJobObject(
             job, 15, ctypes.byref(cpu_limit), ctypes.sizeof(cpu_limit)
         )
-        _windows_lower_process_integrity(proc._handle)
+        if lower_integrity:
+            _windows_lower_process_integrity(proc._handle)
         kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
         kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
         if not kernel32.AssignProcessToJobObject(job, proc._handle):
@@ -20579,7 +20677,7 @@ def _popen_windows_sandboxed(
 ) -> subprocess.Popen:
     if os.name != "nt":
         raise RuntimeError("Windows built-in sandbox requested on a non-Windows platform")
-    _windows_prepare_low_integrity_workspace(workspace_root)
+    low_integrity_ready = _windows_prepare_low_integrity_workspace(workspace_root)
     flags = int(kwargs.pop("creationflags", 0) or 0)
     flags |= int(getattr(subprocess, "CREATE_SUSPENDED", 0x00000004) or 0x00000004)
     flags |= int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200) or 0x00000200)
@@ -20591,7 +20689,7 @@ def _popen_windows_sandboxed(
         **kwargs,
     )
     try:
-        _windows_attach_sandbox_job(proc, workspace_root)
+        _windows_attach_sandbox_job(proc, workspace_root, lower_integrity=low_integrity_ready)
         return proc
     except Exception:
         try:
@@ -22522,11 +22620,11 @@ class SessionState:
                     self.live_input_seq = max(self.live_input_seq, max_id)
                 _pq = raw.get("pending_user_question", None)
                 if isinstance(_pq, dict) and trim(str(_pq.get("question", "") or "").strip(), 2000):
-                    _pq_opts = _pq.get("options", [])
+                    _pq_opts = _ask_user_option_rows(_pq.get("options", []))
                     self.pending_user_question = {
                         "id": trim(str(_pq.get("id", "") or ""), 120) or make_id("ask"),
                         "question": trim(str(_pq.get("question", "") or "").strip(), 2000),
-                        "options": [trim(str(o or "").strip(), 400) for o in _pq_opts if str(o or "").strip()][:8] if isinstance(_pq_opts, list) else [],
+                        "options": _pq_opts,
                         "allow_free_text": bool(_pq.get("allow_free_text", True)),
                         "role": str(_pq.get("role", "") or "agent"),
                         "ts": float(_pq.get("ts", 0.0) or 0.0),
@@ -25289,7 +25387,12 @@ class SessionState:
         plan_todo_block = f"{plan_todo_note}\n" if plan_todo_note else ""
         todo_contract_note = self._todo_contract_prompt_block()
         todo_contract_block = f"{todo_contract_note}\n\n" if todo_contract_note else ""
-        agent_loop_note = self._agent_loop_progress_prompt_block()
+        # Single-mode tool rounds are attributed to the selected worker role
+        # (normally developer), so consume the same role-scoped telemetry here.
+        agent_loop_role = self._sanitize_agent_role(
+            getattr(self, "runtime_assigned_expert", "")
+        ) or "developer"
+        agent_loop_note = self._agent_loop_progress_prompt_block(for_role=agent_loop_role)
         agent_loop_block = f"{agent_loop_note}\n\n" if agent_loop_note else ""
         mm_block = self._multimodal_capability_block()
         mm_hint = f"{mm_block}\n" if mm_block else ""
@@ -30822,6 +30925,58 @@ class SessionState:
             except Exception:
                 continue
 
+    def _recover_code_preview_index_from_operations(self) -> None:
+        """Recover stage metadata when an older state persisted operations first.
+
+        Early IDE sessions could contain durable ``file_patch`` operations and the
+        stage blobs but no serialized ``code_preview_index``. That made the first
+        open of a repeatedly edited file look history-free until another edit
+        occurred. The operation already carries the stage id and counters, while
+        blob paths are deterministic from the file path and stage id.
+        """
+        if self.code_preview_index:
+            known = {str(row.get("id", "")) for rows in self.code_preview_index.values() for row in rows if isinstance(row, dict)}
+        else:
+            known = set()
+        recovered: dict[str, list[dict]] = {}
+        for op in getattr(self, "operations", []) or []:
+            if not isinstance(op, dict) or str(op.get("type", "") or "") != "file_patch":
+                continue
+            data = op.get("data", {}) if isinstance(op.get("data"), dict) else {}
+            stage_meta = data.get("code_stage", {}) if isinstance(data.get("code_stage"), dict) else {}
+            stage_id = str(stage_meta.get("id", "") or "").strip()
+            rel = normalize_rel_preview_path(data.get("session_rel_path", data.get("path", "")))
+            if not stage_id or not rel or stage_id in known or not is_code_preview_candidate(rel):
+                continue
+            bucket = self._code_preview_bucket_dir(rel)
+            before_fp = bucket / f"{stage_id}.before.txt"
+            after_fp = bucket / f"{stage_id}.after.txt"
+            if not before_fp.exists() and not after_fp.exists():
+                continue
+            before_text = try_read_text(before_fp, max_bytes=CODE_PREVIEW_STAGE_MAX_BYTES) or ""
+            after_text = try_read_text(after_fp, max_bytes=CODE_PREVIEW_STAGE_MAX_BYTES) or ""
+            stage = {
+                "id": stage_id,
+                "ts": float(stage_meta.get("ts", op.get("ts", 0.0)) or 0.0),
+                "path": rel,
+                "tool": str(data.get("tool", "") or "operation-recovery"),
+                "change_type": str(stage_meta.get("change_type", data.get("change_type", "modified")) or "modified"),
+                "added": int(stage_meta.get("added", data.get("added", 0)) or 0),
+                "deleted": int(stage_meta.get("deleted", data.get("deleted", 0)) or 0),
+                "before_blob": before_fp.relative_to(self.root).as_posix(),
+                "after_blob": after_fp.relative_to(self.root).as_posix(),
+                "bytes_after": len(after_text.encode("utf-8", errors="ignore")),
+                "lines_after": after_text.count("\n") + (1 if after_text else 0),
+            }
+            recovered.setdefault(rel, []).append(stage)
+            known.add(stage_id)
+        if recovered:
+            merged = {key: list(value) for key, value in self.code_preview_index.items()}
+            for rel, rows in recovered.items():
+                merged.setdefault(rel, []).extend(rows)
+                merged[rel].sort(key=lambda row: float(row.get("ts", 0.0) or 0.0))
+            self.code_preview_index = merged
+
     def _prune_code_preview_locked(self):
         cleaned: dict[str, list[dict]] = {}
         removed: list[dict] = []
@@ -30947,6 +31102,9 @@ class SessionState:
             raise ValueError("path required")
         with self.lock:
             stages = list(self.code_preview_index.get(rel, []))
+            if not stages:
+                self._recover_code_preview_index_from_operations()
+                stages = list(self.code_preview_index.get(rel, []))
         out = []
         total = len(stages)
         for i, row in enumerate(stages, start=1):
@@ -63640,15 +63798,7 @@ body{padding:18px}
         question = trim(str(args.get("question", "") or "").strip(), 2000)
         if not question:
             return "Error: ask_user requires a non-empty 'question'."
-        raw_options = args.get("options", [])
-        options: list[str] = []
-        if isinstance(raw_options, list):
-            for opt in raw_options:
-                text = trim(str(opt or "").strip(), 400)
-                if text:
-                    options.append(text)
-                if len(options) >= 8:
-                    break
+        options = _ask_user_option_rows(args.get("options", []))
         allow_free_text = args.get("allow_free_text", True)
         if not isinstance(allow_free_text, bool):
             allow_free_text = str(allow_free_text or "").strip().lower() not in {"false", "0", "no", "off"}
@@ -74050,41 +74200,23 @@ class SessionManager:
                 sid = str(getattr(sess, "id", "") or "")
                 if not sid:
                     continue
-                degraded = False
-                try:
-                    acquired = bool(sess.lock.acquire(timeout=0.03))
-                except Exception:
-                    acquired = False
-                if acquired:
-                    try:
-                        message_count = self._session_message_count(sess)
-                        title = str(getattr(sess, "title", "") or sid)
-                        running = bool(getattr(sess, "running", False))
-                    except Exception:
-                        title = str(getattr(sess, "title", "") or sid)
-                        running = bool(getattr(sess, "running", False))
-                        message_count = int((rows_by_id.get(sid) or {}).get("message_count", 0) or 0)
-                        degraded = True
-                    finally:
-                        try:
-                            sess.lock.release()
-                        except Exception:
-                            pass
-                else:
-                    title = str(getattr(sess, "title", "") or sid)
-                    running = bool(getattr(sess, "running", False))
-                    message_count = int((rows_by_id.get(sid) or {}).get("message_count", 0) or 0)
-                    degraded = True
+                # Session summaries are a hot path for both IDE polling and the
+                # traditional session list. Never lock a live session or rescan its
+                # complete message history here. Mutations update the index through
+                # the normal manager APIs; the selected session's live snapshot is
+                # responsible for immediate message-count updates in the UI.
+                cached = rows_by_id.get(sid, {})
                 rows_by_id[sid] = {
+                    **cached,
                     "id": sid,
-                    "title": title,
-                    "running": running,
-                    "degraded": degraded,
-                    "recovered_at": float(getattr(sess, "run_recovered_at", 0.0) or 0.0),
-                    "recovered_reason": str(getattr(sess, "run_recovered_reason", "") or ""),
-                    "ui_language": normalize_ui_language(getattr(sess, "ui_language", self.user_language)),
-                    "updated_at": float(getattr(sess, "updated_at", 0.0) or 0.0),
-                    "message_count": int(message_count),
+                    "title": str(getattr(sess, "title", "") or cached.get("title", sid) or sid),
+                    "running": bool(getattr(sess, "running", cached.get("running", False))),
+                    "degraded": False,
+                    "recovered_at": float(getattr(sess, "run_recovered_at", cached.get("recovered_at", 0.0)) or 0.0),
+                    "recovered_reason": str(getattr(sess, "run_recovered_reason", cached.get("recovered_reason", "")) or ""),
+                    "ui_language": normalize_ui_language(getattr(sess, "ui_language", cached.get("ui_language", self.user_language))),
+                    "updated_at": float(getattr(sess, "updated_at", cached.get("updated_at", 0.0)) or 0.0),
+                    "message_count": int(cached.get("message_count", 0) or 0),
                     "loaded": True,
                 }
         rows: list[dict] = []
@@ -79545,7 +79677,8 @@ async function refreshAll(forceProbe=false){
   if(!applyModelCatalog(mc)){renderModelControls()}
   scheduleModelCatalogLoad(forceProbe,forceProbe?80:650);
   setTimeout(()=>refreshDeferredCatalogs().catch(()=>{}),forceProbe?80:900);
-  scheduleLoadRemainingSessions(forceProbe?180:550);
+  // Historical sessions are loaded on scroll only. Eagerly draining the catalog
+  // kept low-end servers and the browser busy even when the user never opened it.
   if(S.activeId&&!String(sessState?.selectedId||'').trim())await refreshSnapshot({forceFull:!!forceProbe,allowWhenFrozen:true});
 }
 function bindClick(id,fn){const el=E(id);if(el)el.onclick=fn}
@@ -95887,6 +96020,10 @@ async function refreshWorkspaceSnapshot(){if(S.workspaceRefreshBusy||!S.activeSe
 async function createSession(){const out=await api('/api/ide/sessions',{method:'POST',body:'{}'});await switchSession(out.id,true);return out}
 async function renameCurrentSession(){const row=S.sessions.find(item=>item.id===S.activeSession);if(!row)return;const title=prompt('Session name',row.title||'');if(!title||title.trim()===row.title)return;const out=await api(`/api/ide/sessions/${qs(S.activeSession)}`,{method:'PATCH',body:JSON.stringify({title:title.trim()})});row.title=out.title;renderSessions();updateAgentContext();await loadRoots();scheduleStateSave()}
 async function switchSession(sessionId,isNew=false){const target=String(sessionId||'');if(!target||target===S.activeSession&&!isNew){renderSessions();return true}if([...S.openFiles.values()].some(file=>file.dirty)&&!confirm('Switch session with unsaved files?')){renderSessions();return false}const seq=++S.sessionSwitchSeq;S.sessionSwitching=true;E('sessionSelect').disabled=true;closePromptEnhanceReview(false);S.workspaceClipboard=null;S.explorerSelection=null;clearWorkspaceDropState();S.activeSession=target;S.workspaceRefreshSeq++;S.workspaceRefreshBusy=false;closeAgentEvents();clearTimeout(S.agentPoll);S.agentPoll=null;S.agentPollDue=0;clearTimeout(S.agentTreeTimer);try{if(S.terminal)await killTerminal();if(seq!==S.sessionSwitchSeq)return false;if(S.debug)await stopDebug();if(seq!==S.sessionSwitchSeq)return false;S.openFiles.clear();S.models.forEach(model=>model.dispose());S.models.clear();S.historyOriginalModels.forEach(model=>model.dispose());S.historyOriginalModels.clear();S.historyDecorations.clear();S.viewStates.clear();S.activeByGroup=['',''];setEditorModel(1,null);setEditorModel(0,null);syncEditorGroupLayout();resetAgentSessionUI(target);await refreshConfig();if(seq!==S.sessionSwitchSeq||target!==S.activeSession)return false;await loadRoots(target,seq);if(seq!==S.sessionSwitchSeq||target!==S.activeSession)return false;updateAgentContext();connectAgentEvents();S.agentPollRequested=true;scheduleAgentPoll(50);if(isNew){toggleSecondary(true);E('agentPrompt').focus();agentMessage('New task workspace ready.','system')}scheduleStateSave();return true}finally{if(seq===S.sessionSwitchSeq){S.sessionSwitching=false;E('sessionSelect').disabled=false;renderSessions()}}}
+async function refreshSessionCatalog(){const out=await api('/api/ide/sessions?limit=80&offset=0');S.sessions=Array.isArray(out.sessions)?out.sessions:[];renderSessions();return out}
+// Session switching only needs the catalog. Keep toolchains, mounts, and other
+// static IDE config out of the hot path on machines with many old sessions.
+async function switchSession(sessionId,isNew=false){const target=String(sessionId||'');if(!target||target===S.activeSession&&!isNew){renderSessions();return true}if([...S.openFiles.values()].some(file=>file.dirty)&&!confirm('Switch session with unsaved files?')){renderSessions();return false}const seq=++S.sessionSwitchSeq;S.sessionSwitching=true;E('sessionSelect').disabled=true;closePromptEnhanceReview(false);S.workspaceClipboard=null;S.explorerSelection=null;clearWorkspaceDropState();S.activeSession=target;S.workspaceRefreshSeq++;S.workspaceRefreshBusy=false;closeAgentEvents();clearTimeout(S.agentPoll);S.agentPoll=null;S.agentPollDue=0;clearTimeout(S.agentTreeTimer);try{if(S.terminal)await killTerminal();if(seq!==S.sessionSwitchSeq)return false;if(S.debug)await stopDebug();if(seq!==S.sessionSwitchSeq)return false;S.openFiles.clear();S.models.forEach(model=>model.dispose());S.models.clear();S.historyOriginalModels.forEach(model=>model.dispose());S.historyOriginalModels.clear();S.historyDecorations.clear();S.viewStates.clear();S.activeByGroup=['',''];setEditorModel(1,null);setEditorModel(0,null);syncEditorGroupLayout();resetAgentSessionUI(target);await refreshSessionCatalog();if(seq!==S.sessionSwitchSeq||target!==S.activeSession)return false;await loadRoots(target,seq);if(seq!==S.sessionSwitchSeq||target!==S.activeSession)return false;updateAgentContext();connectAgentEvents();S.agentPollRequested=true;scheduleAgentPoll(50);if(isNew){toggleSecondary(true);E('agentPrompt').focus();agentMessage('New task workspace ready.','system')}scheduleStateSave();return true}finally{if(seq===S.sessionSwitchSeq){S.sessionSwitching=false;E('sessionSelect').disabled=false;renderSessions()}}}
 async function newFile(){const rel=prompt('File path',activeDir()?`${activeDir()}/untitled.txt`:'untitled.txt');if(!rel)return;await api(`/api/ide/sessions/${qs(S.activeSession)}/workspace/file`,{method:'PUT',body:JSON.stringify({root_id:S.activeRoot,path:rel,content:''})});await loadTree(activeDir());await openFile(rel)}
 async function newFolder(){const rel=prompt('Folder path',activeDir()?`${activeDir()}/new-folder`:'new-folder');if(!rel)return;await api(`/api/ide/sessions/${qs(S.activeSession)}/workspace/mkdir`,{method:'POST',body:JSON.stringify({root_id:S.activeRoot,path:rel})});await loadTree(activeDir())}
 async function renameEntry(row){const next=normalizeUploadPath(prompt('New path',row.path)||'');if(!next||next===row.path)return;workspaceAssertNoDirtyFiles(row.path,'renaming this entry');await api(`/api/ide/sessions/${qs(S.activeSession)}/workspace/rename`,{method:'PATCH',body:JSON.stringify({root_id:S.activeRoot,old_path:row.path,new_path:next})});await remapWorkspaceOpenFiles(row.path,next);const selected=explorerSelectionRow();if(selected&&(selected.path===row.path||selected.path.startsWith(`${row.path}/`)))S.explorerSelection=Object.assign({},selected,{path:`${next}${selected.path.slice(row.path.length)}`,name:selected.path===row.path?next.split('/').pop():selected.name});const clip=S.workspaceClipboard;if(clip?.session_id===S.activeSession&&clip?.root_id===S.activeRoot&&(clip.path===row.path||clip.path.startsWith(`${row.path}/`)))S.workspaceClipboard=Object.assign({},clip,{path:`${next}${clip.path.slice(row.path.length)}`,name:clip.path===row.path?next.split('/').pop():clip.name});S.treeCache.clear();await loadTree('')}
@@ -96031,14 +96168,14 @@ function renderAgentOperationOnce(op){const seq=Number(op?.seq||0),key=`operatio
 function renderAgentAskUser(state){
   const card=E('agentAskUser'),input=E('agentPrompt'),send=E('sendAgentBtn'),pending=!state?.running&&state?.pending_user_question&&String(state.pending_user_question.question||'').trim()?state.pending_user_question:null;
   if(!pending){card.classList.add('is-hidden');card.dataset.questionId='';E('agentAskUserQuestion').textContent='';E('agentAskUserOptions').innerHTML='';E('agentAskUserHint').textContent='';E('agentAskUserRole').textContent='';input.placeholder='Ask Clouds Coder';input.disabled=false;send.title='Send';return false}
-  const questionId=String(pending.id||''),options=Array.isArray(pending.options)?pending.options.map(value=>String(value||'').trim()).filter(Boolean):[],allowFree=pending.allow_free_text!==false,submitting=S.agentSubmitting;
+  const questionId=String(pending.id||''),options=Array.isArray(pending.options)?pending.options.map(option=>{const row=option&&typeof option==='object'?option:{label:option,value:option};const label=String(row.label??row.text??row.name??row.value??'').trim(),value=String(row.value??row.id??label).trim(),description=String(row.description??row.detail??'').trim();return label&&value?{label,value,description}:null}).filter(Boolean):[],allowFree=pending.allow_free_text!==false,submitting=S.agentSubmitting;
   card.classList.remove('is-hidden');card.dataset.questionId=questionId;E('agentAskUserQuestion').textContent=String(pending.question||'').trim();E('agentAskUserRole').textContent=agentRoleLabel(pending.role||'Agent');E('agentAskUserHint').textContent=allowFree?(options.length?'Choose an option or type your own answer.':'Type your answer below, then send.'):'Choose one of the available options to continue.';
-  const optionHost=E('agentAskUserOptions');optionHost.innerHTML='';for(const option of options){const button=document.createElement('button');button.type='button';button.className='agent-ask-user-option';button.textContent=option;button.disabled=submitting;button.onclick=()=>answerAgentQuestion(option).catch(showError);optionHost.appendChild(button)}
+  const optionHost=E('agentAskUserOptions');optionHost.innerHTML='';for(const option of options){const button=document.createElement('button');button.type='button';button.className='agent-ask-user-option';button.disabled=submitting;button.title=option.description||option.label;button.innerHTML=`<strong>${escapeHtml(option.label)}</strong>${option.description?`<small>${escapeHtml(option.description)}</small>`:''}`;button.onclick=()=>answerAgentQuestion(option.value).catch(showError);optionHost.appendChild(button)}
   input.placeholder=allowFree?'Answer the agent question':'Choose an option above';input.disabled=!allowFree;send.disabled=submitting||!allowFree;send.title=allowFree?'Send answer':'Choose an option above';return true
 }
 async function answerAgentQuestion(answer){
   const pending=!S.agentState?.running&&S.agentState?.pending_user_question?S.agentState.pending_user_question:null,value=String(answer||'').trim();if(!pending||!value||S.agentSubmitting)return;
-  const options=Array.isArray(pending.options)?pending.options.map(item=>String(item||'').trim()).filter(Boolean):[];if(pending.allow_free_text===false&&!options.includes(value))throw new Error('Choose one of the available options.');
+  const options=Array.isArray(pending.options)?pending.options.map(option=>{const row=option&&typeof option==='object'?option:{value:option};return String(row.value??row.id??row.label??'').trim()}).filter(Boolean):[];if(pending.allow_free_text===false&&!options.includes(value))throw new Error('Choose one of the available options.');
   const questionId=String(pending.id||''),input=E('agentPrompt'),restoreText=input.value.trim()||value;S.agentSubmitting=true;input.value='';E('agentStatus').textContent='Resuming...';renderAgentAskUser(S.agentState);
   try{const out=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/ask-user/answer`,{method:'POST',body:JSON.stringify({question_id:questionId,answer:value})});S.agentSubmitting=false;S.agentState=Object.assign({},S.agentState,{pending_user_question:null,running:!!out.running});renderAgentAskUser(S.agentState);E('agentPrompt').disabled=false;E('sendAgentBtn').disabled=false;input.focus();E('agentStatus').textContent='Resuming...';S.agentPollRequested=true;scheduleAgentPoll(40)}catch(error){S.agentSubmitting=false;input.value=input.value.trim()?`${restoreText}\n${input.value}`:restoreText;renderAgentAskUser(S.agentState);input.focus();E('agentStatus').textContent='Awaiting input';S.agentPollRequested=true;scheduleAgentPoll(40);throw error}
 }
@@ -97271,9 +97408,9 @@ class AppContext:
         self._ide_save_mounts(user_id, mounts)
         return {"ok": True, "mounts": mounts}
 
-    def ide_session_payload(self, user_id: str, client_ip: str = "") -> dict:
+    def ide_session_payload(self, user_id: str, client_ip: str = "", *, limit: int = 80, offset: int = 0) -> dict:
         mgr = self.manager_for_user(user_id)
-        sessions = mgr.list(limit=80, offset=0)
+        sessions = mgr.list(limit=max(1, min(200, int(limit or 80))), offset=max(0, int(offset or 0)))
         if isinstance(sessions, dict):
             rows = list(sessions.get("sessions", []))
         else:
@@ -97709,6 +97846,8 @@ class AppContext:
         truncated = len(raw) > cap or size > cap
         raw = raw[:cap]
         text, encoding = self._ide_decode_preview_text(raw)
+        if kind == "markdown":
+            text = normalize_markdown_preview_text(text)
         if truncated and "\n" in text:
             text = text.rsplit("\n", 1)[0]
         if kind == "markdown":
@@ -99890,13 +100029,10 @@ document.addEventListener('DOMContentLoaded', function(){
         answer = trim(str(payload.get("answer", payload.get("message", "")) or "").strip(), 4000)
         if not answer:
             raise ValueError("answer required")
-        options = [
-            trim(str(value or "").strip(), 400)
-            for value in (pending.get("options", []) if isinstance(pending.get("options"), list) else [])
-            if str(value or "").strip()
-        ][:8]
+        options = _ask_user_option_rows(pending.get("options", []))
+        option_values = {_ask_user_option_value(option) for option in options}
         allow_free_text = bool(pending.get("allow_free_text", True))
-        if options and not allow_free_text and answer not in options:
+        if option_values and not allow_free_text and answer not in option_values:
             raise ValueError("answer must match one of the available options")
         out = self.submit_user_message(user_id, session_id, answer)
         result = dict(out if isinstance(out, dict) else {"ok": True, "result": out})
@@ -99962,15 +100098,11 @@ document.addEventListener('DOMContentLoaded', function(){
         if isinstance(raw_question, dict):
             question = trim(str(raw_question.get("question", "") or "").strip(), 2000)
             if question:
-                raw_options = raw_question.get("options", [])
+                raw_options = _ask_user_option_rows(raw_question.get("options", []))
                 pending_question = {
                     "id": trim(str(raw_question.get("id", "") or ""), 120),
                     "question": question,
-                    "options": [
-                        trim(str(value or "").strip(), 400)
-                        for value in raw_options
-                        if str(value or "").strip()
-                    ][:8] if isinstance(raw_options, list) else [],
+                    "options": raw_options,
                     "allow_free_text": bool(raw_question.get("allow_free_text", True)),
                     "role": trim(str(raw_question.get("role", "") or "agent"), 40),
                     "ts": float(raw_question.get("ts", 0.0) or 0.0),
@@ -107077,7 +107209,16 @@ class IdeHandler(BaseHTTPRequestHandler):
                 return self._send_exception(exc)
         if path == "/api/ide/sessions":
             try:
-                return self._send_json(self.app.ide_session_payload(self._user_id(), client_ip=self._client_ip()))
+                requested_limit = int((query.get("limit", ["80"]) or ["80"])[0] or 80)
+                requested_offset = int((query.get("offset", ["0"]) or ["0"])[0] or 0)
+                return self._send_json(
+                    self.app.ide_session_payload(
+                        self._user_id(),
+                        client_ip=self._client_ip(),
+                        limit=requested_limit,
+                        offset=requested_offset,
+                    )
+                )
             except Exception as exc:
                 return self._send_exception(exc)
         m = re.match(r"^/api/ide/v2/sessions/([^/]+)/events$", path)
