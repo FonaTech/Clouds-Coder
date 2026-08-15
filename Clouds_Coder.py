@@ -432,8 +432,8 @@ CHAT_UPLOAD_PROMPT_PER_FILE_CHARS = max(
     min(2000, int(str(os.getenv("AGENT_CHAT_UPLOAD_PROMPT_PER_FILE_CHARS", "700") or "700"))),
 )
 CHAT_UPLOAD_FRONTEND_WAIT_MS = max(
-    1000,
-    min(30_000, int(str(os.getenv("AGENT_CHAT_UPLOAD_FRONTEND_WAIT_MS", "10000") or "10000"))),
+    0,
+    min(5_000, int(str(os.getenv("AGENT_CHAT_UPLOAD_FRONTEND_WAIT_MS", "250") or "250"))),
 )
 CHAT_UPLOAD_AUTO_LIBRARY_INGEST = (
     str(os.getenv("AGENT_CHAT_UPLOAD_AUTO_LIBRARY_INGEST", "false") or "false").strip().lower()
@@ -20918,6 +20918,11 @@ class SessionState:
         # Session methods may emit events while already holding this lock.
         # Use a re-entrant lock to avoid self-deadlock during nested callbacks.
         self.lock = threading.RLock()
+        # Message submission should not wait for a full encrypted state rewrite.
+        # The worker coalesces bursts and snapshots while holding ``self.lock``.
+        self._persist_scheduler_lock = threading.Lock()
+        self._persist_scheduler_pending = False
+        self._persist_scheduler_thread = None
         self.owner_user_id = str(owner_user_id or "")
         self.upload_callback = upload_callback
         self.run_finished_callback = run_finished_callback
@@ -20956,9 +20961,11 @@ class SessionState:
         # injected the capsule for on an execution turn — keeps execution-stage
         # injection to once-per-user-request (turns 2..N pay nothing).
         self._capsule_exec_injected_user_ts: float = 0.0
-        env_ok, env_tags, _ = probe_ollama_environment(ollama_base)
-        self.ollama_env_available = bool(env_ok)
-        self.ollama_env_tags: list[str] = list(env_tags)
+        # Model discovery is deliberately lazy.  A missing local Ollama service
+        # must not hold the first session page for the probe timeout; the model
+        # catalog request performs discovery when the user actually opens it.
+        self.ollama_env_available = False
+        self.ollama_env_tags: list[str] = []
         self.thinking = False
         self.ui_language = normalize_ui_language(ui_language)
         self.last_public_progress_signature = ""
@@ -22968,6 +22975,53 @@ class SessionState:
             self._prune_code_preview_locked()
         self._persist()
 
+    def _schedule_persist(self) -> None:
+        """Queue one consistent session snapshot for background persistence."""
+        gate = getattr(self, "_persist_scheduler_lock", None)
+        if gate is None:
+            # Some focused tests construct SessionState via __new__.
+            gate = threading.Lock()
+            self._persist_scheduler_lock = gate
+            self._persist_scheduler_pending = False
+            self._persist_scheduler_thread = None
+        with gate:
+            self._persist_scheduler_pending = True
+            worker = getattr(self, "_persist_scheduler_thread", None)
+            if worker is not None and worker.is_alive():
+                return
+            worker = threading.Thread(
+                target=self._persist_scheduler_worker,
+                name=f"session-persist-{self.id}",
+                daemon=True,
+            )
+            self._persist_scheduler_thread = worker
+            worker.start()
+
+    def _persist_scheduler_worker(self) -> None:
+        gate = getattr(self, "_persist_scheduler_lock", None)
+        if gate is None:
+            return
+        while True:
+            with gate:
+                if not bool(getattr(self, "_persist_scheduler_pending", False)):
+                    self._persist_scheduler_thread = None
+                    return
+                self._persist_scheduler_pending = False
+            try:
+                # RLock makes this safe if a caller schedules while already
+                # inside a session mutation; the worker waits for that mutation
+                # and then writes a coherent snapshot.
+                with self.lock:
+                    self._persist()
+            except Exception:
+                # A later durable event will retry. Never turn a successful user
+                # submission into an HTTP error solely because persistence failed.
+                with gate:
+                    if not bool(getattr(self, "_persist_scheduler_pending", False)):
+                        self._persist_scheduler_thread = None
+                        return
+                time.sleep(0.05)
+
     def _persist(self):
         self._prune_skill_load_cache()
         self._prune_code_preview_locked()
@@ -23806,6 +23860,10 @@ class SessionState:
         ):
             return
         self.last_event_persist_ts = now_value
+        if kind_key == "message":
+            self.updated_at = now_value
+            self._schedule_persist()
+            return
         try:
             self.updated_at = now_value
             self._persist()
@@ -65205,7 +65263,8 @@ body{padding:18px}
                 self.current_tool_name = ""
                 self.updated_at = now_ts()
                 self._emit("message", {"role": "user", "text": content, "summary": "user message"})
-                self._persist()
+                # _emit(message) performs the immediate durable event persist.
+                # Do not write the same complete encrypted state a second time.
                 start_worker = True
         finally:
             try:
@@ -73063,9 +73122,10 @@ class SessionManager:
         self.code_library_status_callback = code_library_status_callback
         self.knowledge_library_root = knowledge_library_root
         self.knowledge_library_status_callback = knowledge_library_status_callback
-        env_ok, env_tags, _ = probe_ollama_environment(ollama_base)
-        self.ollama_env_available = bool(env_ok)
-        self.ollama_env_tags: list[str] = list(env_tags)
+        # Keep manager creation cheap for the initial page.  Ollama discovery is
+        # performed by model_catalog() when the model picker is actually loaded.
+        self.ollama_env_available = False
+        self.ollama_env_tags: list[str] = []
         self.run_finished_callback = run_finished_callback
         self.lock = threading.Lock()
         self.sessions: dict[str, SessionState] = {}
@@ -73305,11 +73365,11 @@ class SessionManager:
         if not self.user_model_profiles:
             self.user_model_profiles, self.user_active_profile_id = self._profiles_from_config(self.default_llm_config)
         self._ensure_user_ollama_profile()
-        if not loaded and not self._has_non_ollama_user_profiles():
-            self._prefer_ollama_profile_from_tags()
+        # Do not probe Ollama while the initial session page is loading.  The
+        # catalog path still discovers tags on demand and keeps this fallback
+        # profile runnable with the configured model in the meantime.
         if self.user_active_profile_id not in self.user_model_profiles:
             self.user_active_profile_id = next(iter(self.user_model_profiles.keys()))
-        self._preflight_user_ollama_profile()
         self._ensure_user_active_runnable()
         active = self._active_profile()
         self._sync_ollama_defaults(active)
@@ -73500,7 +73560,8 @@ class SessionManager:
             out = self.user_intent_profiler.prepare_session(sess, content, mode)
             sess.user_memory_mode = mode
             sess.updated_at = now_ts()
-            sess._persist()
+            # The immediately following submit path persists the complete
+            # request state. Avoid a second full encrypted state write here.
             return out
         except Exception as exc:
             sess.user_profile_capsule = ""
@@ -75053,6 +75114,7 @@ const SESSION_POLL_VISIBLE_MS=30000;
 const SESSION_POLL_HIDDEN_MS=60000;
 const SESSION_BOOT_LIMIT=80;
 const SESSION_REFRESH_LIMIT=120;
+const CHAT_UPLOAD_HANDOFF_WAIT_MS=250;
 const PANEL_SCROLL_ACTIVE_MS=1100;
 const CHAT_SCROLL_ACTIVE_MS=180;
 const CHAT_SCROLL_LOCK_MS=500;
@@ -79072,7 +79134,7 @@ function renderChat(reason='snapshot'){
 function ab2b64(buf){let bin='';const bytes=new Uint8Array(buf);const chunk=0x8000;for(let i=0;i<bytes.length;i+=chunk){bin+=String.fromCharCode(...bytes.subarray(i,i+chunk))}return btoa(bin)}
 function uiYield(){return new Promise(resolve=>setTimeout(resolve,0))}
 function blobToBase64(blob){return new Promise((resolve,reject)=>{try{const reader=new FileReader();reader.onload=()=>{const raw=String(reader.result||'');const idx=raw.indexOf(',');resolve(idx>=0?raw.slice(idx+1):raw)};reader.onerror=()=>reject(reader.error||new Error('file read failed'));reader.readAsDataURL(blob)}catch(err){reject(err)}})}
-async function waitForPendingUploads(maxMs=10000){const pending=S.uploadQueuePromise;if(!(pending&&typeof pending.then==='function'))return{ok:true,waited:false};let timer=0;let timedOut=false;const timeout=new Promise(resolve=>{timer=setTimeout(()=>{timedOut=true;resolve({ok:false,timeout:true})},Math.max(1000,Number(maxMs)||10000))});try{const out=await Promise.race([pending.then(()=>({ok:true,waited:true})).catch(err=>({ok:false,error:err})),timeout]);if(timer)clearTimeout(timer);if(timedOut)return out;if(out&&out.error)throw out.error;return out||{ok:true,waited:true}}finally{if(timer)clearTimeout(timer)}}
+async function waitForPendingUploads(maxMs=CHAT_UPLOAD_HANDOFF_WAIT_MS){const pending=S.uploadQueuePromise;if(!(pending&&typeof pending.then==='function'))return{ok:true,waited:false};const budget=Math.max(0,Math.min(5000,Number(maxMs)||0));if(budget<=0)return{ok:false,timeout:true,waited:false};let timer=0;let timedOut=false;const timeout=new Promise(resolve=>{timer=setTimeout(()=>{timedOut=true;resolve({ok:false,timeout:true})},budget)});try{const out=await Promise.race([pending.then(()=>({ok:true,waited:true})).catch(err=>({ok:false,error:err})),timeout]);if(timer)clearTimeout(timer);if(timedOut)return out;if(out&&out.error)return out;return out||{ok:true,waited:true}}finally{if(timer)clearTimeout(timer)}}
 function clipboardFileExtFromType(mime){const low=String(mime||'').toLowerCase();const map={'image/png':'png','image/jpeg':'jpg','image/gif':'gif','image/webp':'webp','application/pdf':'pdf','application/vnd.openxmlformats-officedocument.wordprocessingml.document':'docx','application/msword':'doc','application/vnd.openxmlformats-officedocument.presentationml.presentation':'pptx','application/vnd.ms-powerpoint':'ppt','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet':'xlsx','application/vnd.ms-excel':'xls','text/csv':'csv','text/plain':'txt','text/markdown':'md'};if(map[low])return map[low];if(low.includes('/'))return low.split('/').pop().replace(/[^a-z0-9]+/g,'')||'bin';return'bin'}
 function ensureNamedUploadFile(file,index=0,prefix='clipboard'){const src=file instanceof File?file:null;if(!src)return file;const name=String(src.name||'').trim();if(name)return src;const ext=clipboardFileExtFromType(src.type);const stamp=new Date().toISOString().replace(/[-:.TZ]/g,'').slice(0,14);const safe=`${prefix}_${stamp}_${index+1}.${ext}`;try{return new File([src],safe,{type:src.type||'',lastModified:Date.now()})}catch(_){return src}}
 function clipboardFilesFromEvent(ev){const dt=ev&&ev.clipboardData?ev.clipboardData:null;if(!dt)return[];const out=[];const seen=new Set();const pushFile=(raw,idx)=>{const file=ensureNamedUploadFile(raw,idx,'clipboard');if(!(file instanceof File))return;const sig=[String(file.name||''),String(file.type||''),String(file.size||0)].join('::');if(seen.has(sig))return;seen.add(sig);out.push(file)};const files=dt.files?Array.from(dt.files):[];files.forEach((file,idx)=>pushFile(file,idx));const items=dt.items?Array.from(dt.items):[];items.forEach((item,idx)=>{if(!item||item.kind!=='file')return;const file=typeof item.getAsFile==='function'?item.getAsFile():null;if(file)pushFile(file,idx+files.length)});return out}
@@ -79629,7 +79691,7 @@ async function deleteSession(){if(!S.activeId){showError(t('select_session_first
 async function applyModel(){const sel=E('modelSelect');const btn=E('applyModelBtn');const model=sel?.value||'';if(!model){showError(t('no_model_selected'));return}if(S.staticMode&&S.frozen)resumeAutoUpdates();S.config=S.config||{};const prevModel=String(S.config.model||'');const prevSnapModel=String(S.snap?.model||'');const prevSnapCatalog=(S.snap&&typeof S.snap==='object')?S.snap.llm_model_catalog:undefined;try{S.config.model=model;if(S.snap&&typeof S.snap==='object'){S.snap.model=_modelNameFromSelection(model)||S.snap.model;if(!S.snap.llm_model_catalog||typeof S.snap.llm_model_catalog!=='object')S.snap.llm_model_catalog={};S.snap.llm_model_catalog.selected=model}renderModelControls();renderStats();if(S.snap)renderBoards();if(sel)sel.disabled=true;if(btn)btn.disabled=true;const path=S.activeId?('/api/sessions/'+S.activeId+'/config/model'):'/api/config/model';const changed=await api(path,{method:'POST',body:JSON.stringify({selection:model,model})});if(changed?.note)showError(changed.note);else showError('');if(!applyModelCatalog(changed)){const cat=await loadModelCatalog();if(!applyModelCatalog(cat)){S.config.model=String(changed?.selected||model||'').trim();renderModelControls()}}if(S.snap&&typeof S.snap==='object'){const selected=String(S.config?.model||model||'').trim();const modelName=_modelNameFromSelection(selected);if(modelName)S.snap.model=modelName;if(changed&&typeof changed==='object')S.snap.llm_model_catalog=changed;renderBoards()}scheduleSnapshot({forceFull:true,delayMs:40,allowWhenFrozen:true})}catch(err){S.config.model=prevModel;if(S.snap&&typeof S.snap==='object'){if(prevSnapModel)S.snap.model=prevSnapModel;if(prevSnapCatalog!==undefined)S.snap.llm_model_catalog=prevSnapCatalog;renderBoards()}renderModelControls();renderStats();showError(err.message||String(err))}finally{if(sel)sel.disabled=false;if(btn)btn.disabled=false}}
 
 async function uploadLlmConfigFile(file){try{if(!S.activeId){showError(t('select_session_first'));return}if(!file){return}const arr=await file.arrayBuffer();const payload={filename:'LLM.config.json',mime:file.type||'application/json',content_b64:ab2b64(arr)};const out=await api('/api/sessions/'+S.activeId+'/uploads',{method:'POST',body:JSON.stringify(payload)});const note=String(out?.note||out?.model_catalog?.note||'').trim();if(!out?.model_catalog){showError(t('config_uploaded_no_profiles'));}else{showError(note||'');const modal=E('llmConfigModal');if(modal)modal.style.display='none'}const cat=out?.model_catalog||await loadModelCatalog();if(!applyModelCatalog(cat)){renderModelControls()}await refreshSnapshot({forceFull:true,allowWhenFrozen:true})}catch(err){showError(err.message||String(err))}}
-async function sendMessage(){showError('');const promptText=E('prompt').value.trim();if(!promptText||!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();E('prompt').value='';try{const uploadWait=await waitForPendingUploads(10000);if(uploadWait&&!uploadWait.ok&&uploadWait.timeout){showError('上传仍在后台处理；任务会先使用已保存的文件路径继续。')}const out=await api('/api/sessions/'+S.activeId+'/message',{method:'POST',body:JSON.stringify({content:promptText})});S.lastDeltaTs=Date.now();scheduleSnapshot({forceFull:false,delayMs:40,allowWhenFrozen:true});scheduleSessionPoll(true);if(out&&out.queued&&!out.scheduler_started&&!out.live_input){const pos=Number(out.queue_position||0);const size=Number(out.queue_size||0);showError(`${t('event_scheduler_queued_title')}${pos?` · ${t('event_scheduler_queue_position')} ${pos}${size?`/${size}`:''}`:''}`)}}catch(err){showError(err.message)}}
+async function sendMessage(){showError('');const promptText=E('prompt').value.trim();if(!promptText||!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();E('prompt').value='';try{const configuredWait=Number(S.config?.chat_upload_frontend_wait_ms);const handoffWait=Number.isFinite(configuredWait)?Math.max(0,Math.min(5000,configuredWait)):CHAT_UPLOAD_HANDOFF_WAIT_MS;const uploadWait=await waitForPendingUploads(handoffWait);if(uploadWait&&!uploadWait.ok&&(uploadWait.timeout||uploadWait.error)){showError(uploadWait.timeout?'上传仍在后台处理；任务已先提交，文件完成后会出现在工作区。':`上传继续在后台处理：${uploadWait.error.message||uploadWait.error}`)}const out=await api('/api/sessions/'+S.activeId+'/message',{method:'POST',body:JSON.stringify({content:promptText})});S.lastDeltaTs=Date.now();scheduleSnapshot({forceFull:false,delayMs:40,allowWhenFrozen:true});scheduleSessionPoll(true);if(out&&out.queued&&!out.scheduler_started&&!out.live_input){const pos=Number(out.queue_position||0);const size=Number(out.queue_size||0);showError(`${t('event_scheduler_queued_title')}${pos?` · ${t('event_scheduler_queue_position')} ${pos}${size?`/${size}`:''}`:''}`)}}catch(err){showError(err.message)}}
 async function interruptRun(){if(!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/interrupt',{method:'POST'});S.lastDeltaTs=Date.now();if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:140,allowWhenFrozen:true})}}
 async function compactNow(){if(!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/compact',{method:'POST'});S.lastDeltaTs=Date.now();scheduleCompactRefreshBurst(COMPACT_AUTO_REFRESH_COUNT);if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:180,allowWhenFrozen:true})}}
 async function clearStaleTodos(){if(!S.activeId){showError(t('select_session_first'));return}if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/todos/clear-stale',{method:'POST'});S.lastDeltaTs=Date.now();if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:160,allowWhenFrozen:true})}}
@@ -105218,6 +105280,7 @@ class Handler(BaseHTTPRequestHandler):
                     "daily_session_reset_hour": int(getattr(self.app, "daily_session_reset_hour", 8) or 8),
                     "session_creation_limit": session_creation_limit,
                     "download_js_lib_enabled": bool(getattr(self.app, "js_lib_download_enabled", True)),
+                    "chat_upload_frontend_wait_ms": int(CHAT_UPLOAD_FRONTEND_WAIT_MS),
                 }
             )
         if path == "/api/user-memory":
