@@ -51,6 +51,7 @@ from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from http import HTTPStatus
+from http.client import IncompleteRead
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
 from urllib.error import HTTPError, URLError
@@ -431,8 +432,8 @@ CHAT_UPLOAD_PROMPT_PER_FILE_CHARS = max(
     min(2000, int(str(os.getenv("AGENT_CHAT_UPLOAD_PROMPT_PER_FILE_CHARS", "700") or "700"))),
 )
 CHAT_UPLOAD_FRONTEND_WAIT_MS = max(
-    1000,
-    min(30_000, int(str(os.getenv("AGENT_CHAT_UPLOAD_FRONTEND_WAIT_MS", "10000") or "10000"))),
+    0,
+    min(5_000, int(str(os.getenv("AGENT_CHAT_UPLOAD_FRONTEND_WAIT_MS", "250") or "250"))),
 )
 CHAT_UPLOAD_AUTO_LIBRARY_INGEST = (
     str(os.getenv("AGENT_CHAT_UPLOAD_AUTO_LIBRARY_INGEST", "false") or "false").strip().lower()
@@ -10191,6 +10192,270 @@ def preview_kind_for_path(path_text: str) -> str:
     return ""
 
 
+def normalize_markdown_preview_text(text: object) -> str:
+    """Normalize files whose entire Markdown body was indented by a transport layer.
+
+    Python-Markdown correctly treats four leading spaces as a code block. A number
+    of upload/extraction paths, however, indent every line in the file, which makes
+    an otherwise normal document render as one giant code block. Remove only a
+    document-wide common indent; indentation that exists on just some lines is
+    preserved for lists and fenced/nested code.
+    """
+    source = str(text or "").replace("\r\n", "\n").replace("\r", "\n").lstrip("\ufeff")
+    lines = source.split("\n")
+    non_empty = [line for line in lines if line.strip()]
+    if not non_empty:
+        return source
+    indents = [len(re.match(r"^[ \t]*", line).group(0).expandtabs(4)) for line in non_empty]
+    common = min(indents) if indents else 0
+    # A uniformly indented Markdown document is almost always a copied body. Keep
+    # the original indentation when only a subset of lines is indented.
+    if common < 2 or not all((not line.strip()) or len(line) - len(line.lstrip(" \t")) >= common for line in lines):
+        return source
+    out: list[str] = []
+    for line in lines:
+        if not line.strip():
+            out.append("")
+            continue
+        consumed = 0
+        index = 0
+        while index < len(line) and consumed < common and line[index] in " \t":
+            consumed += 4 if line[index] == "\t" else 1
+            index += 1
+        out.append(line[index:] if consumed >= common else line.lstrip(" \t"))
+    return "\n".join(out)
+
+
+def _preview_markdown_value_html(value: object, *, depth: int = 0) -> str:
+    """Render frontmatter and other metadata values without trusting raw HTML."""
+    if depth > 4:
+        return f"<code>{html.escape(trim(str(value or ''), 800))}</code>"
+    if isinstance(value, dict):
+        rows = []
+        for key, item in list(value.items())[:80]:
+            rows.append(
+                "<tr><th>"
+                f"{html.escape(str(key))}</th><td>{_preview_markdown_value_html(item, depth=depth + 1)}</td></tr>"
+            )
+        return "<table class=\"pv-frontmatter-table\"><tbody>" + "".join(rows) + "</tbody></table>"
+    if isinstance(value, (list, tuple)):
+        items = "".join(
+            f"<li>{_preview_markdown_value_html(item, depth=depth + 1)}</li>"
+            for item in list(value)[:80]
+        )
+        return f"<ul>{items}</ul>"
+    return html.escape(str(value if value is not None else ""))
+
+
+def _preview_markdown_frontmatter_html(meta: dict) -> str:
+    if not isinstance(meta, dict) or not meta:
+        return ""
+    rows = []
+    for key, value in list(meta.items())[:80]:
+        rows.append(
+            "<div class=\"pv-frontmatter-row\"><strong>"
+            f"{html.escape(str(key))}</strong><div>{_preview_markdown_value_html(value)}</div></div>"
+        )
+    return (
+        "<details class=\"pv-frontmatter\" open>"
+        "<summary>Document metadata</summary>"
+        f"<div class=\"pv-frontmatter-grid\">{''.join(rows)}</div></details>"
+    )
+
+
+def _preview_markdown_task_lists(rendered: str) -> str:
+    """Add inert checkboxes for GFM task-list markers after Markdown parsing."""
+    def replace_item(match: re.Match) -> str:
+        prefix, marker, rest = match.group(1), match.group(2), match.group(3)
+        checked = " checked" if str(marker).lower() == "x" else ""
+        return (
+            f'{prefix}<input class="pv-task-checkbox" type="checkbox" disabled{checked}>'
+            f" {rest}"
+        )
+
+    return re.sub(r'(<li(?:\s[^>]*)?>)\s*\[([ xX])\]\s+(.*?)(</li>)',
+                  lambda m: replace_item(m) + m.group(4), rendered, flags=re.S)
+
+
+def _preview_markdown_fallback_inline(text: str) -> str:
+    """Small safe inline Markdown renderer used when Python-Markdown is absent."""
+    source = str(text or "")
+    tokens: list[str] = []
+
+    def token(value: str) -> str:
+        idx = len(tokens)
+        tokens.append(value)
+        return f"\x00PV_TOKEN_{idx}\x00"
+
+    source = re.sub(
+        r"`([^`\n]+)`",
+        lambda m: token(f'<code>{html.escape(m.group(1))}</code>'),
+        source,
+    )
+    source = re.sub(
+        r"!\[([^\]]*)\]\(([^)\s]+)(?:\s+\"([^\"]*)\")?\)",
+        lambda m: token(
+            f'<img src="{html.escape(m.group(2), quote=True)}" alt="{html.escape(m.group(1), quote=True)}"'
+            + (f' title="{html.escape(m.group(3), quote=True)}"' if m.group(3) else "")
+            + ">"
+        ),
+        source,
+    )
+    source = re.sub(
+        r"\[([^\]]+)\]\(([^)\s]+)(?:\s+\"([^\"]*)\")?\)",
+        lambda m: token(
+            f'<a href="{html.escape(m.group(2), quote=True)}"'
+            + (f' title="{html.escape(m.group(3), quote=True)}"' if m.group(3) else "")
+            + f' target="_blank" rel="noreferrer">{html.escape(m.group(1))}</a>'
+        ),
+        source,
+    )
+    escaped = html.escape(source)
+    escaped = re.sub(r"\*\*([^*\n]+)\*\*|__([^_\n]+)__", lambda m: f"<strong>{html.escape(m.group(1) or m.group(2))}</strong>", escaped)
+    escaped = re.sub(r"~~([^~\n]+)~~", lambda m: f"<del>{html.escape(m.group(1))}</del>", escaped)
+    escaped = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)|(?<!_)_([^_\n]+)_(?!_)", lambda m: f"<em>{html.escape(m.group(1) or m.group(2))}</em>", escaped)
+    for idx, value in enumerate(tokens):
+        escaped = escaped.replace(f"\x00PV_TOKEN_{idx}\x00", value)
+    return escaped
+
+
+def _preview_markdown_fallback_html(text: str) -> str:
+    """Render common Markdown structures with only the Python standard library."""
+    lines = str(text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    blocks: list[str] = []
+    idx = 0
+
+    def paragraph(items: list[str]) -> str:
+        joined = "\n".join(items).strip()
+        if not joined:
+            return ""
+        rendered = _preview_markdown_fallback_inline(joined)
+        rendered = rendered.replace("  \n", "<br>")
+        rendered = rendered.replace("\n", "\n")
+        return f"<p>{rendered}</p>"
+
+    while idx < len(lines):
+        line = lines[idx]
+        if not line.strip():
+            idx += 1
+            continue
+        fence = re.match(r"^\s*(```+|~~~+)\s*([^ ]*)\s*$", line)
+        if fence:
+            marker, language = fence.group(1), fence.group(2).strip().lower()
+            idx += 1
+            code: list[str] = []
+            while idx < len(lines) and not re.match(rf"^\s*{re.escape(marker[0])}{{{len(marker)},}}\s*$", lines[idx]):
+                code.append(lines[idx])
+                idx += 1
+            if idx < len(lines):
+                idx += 1
+            cls = f' class="language-{html.escape(language, quote=True)}"' if language else ""
+            code_text = "\n".join(code)
+            blocks.append(f"<pre><code{cls}>{html.escape(code_text)}</code></pre>")
+            continue
+        heading = re.match(r"^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$", line)
+        if heading:
+            level = len(heading.group(1))
+            blocks.append(f"<h{level}>{_preview_markdown_fallback_inline(heading.group(2))}</h{level}>")
+            idx += 1
+            continue
+        if re.match(r"^\s{0,3}((\*\s*){3,}|(-\s*){3,}|(_\s*){3,})$", line):
+            blocks.append("<hr>")
+            idx += 1
+            continue
+        if line.lstrip().startswith(">"): 
+            quote: list[str] = []
+            while idx < len(lines) and (lines[idx].lstrip().startswith(">") or not lines[idx].strip()):
+                quote.append(re.sub(r"^\s*>\s?", "", lines[idx]))
+                idx += 1
+            quote_text = "\n".join(quote)
+            blocks.append(f"<blockquote>{_preview_markdown_fallback_html(quote_text)}</blockquote>")
+            continue
+        if idx + 1 < len(lines) and "|" in line and re.match(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$", lines[idx + 1]):
+            def cells(raw: str) -> list[str]:
+                value = raw.strip().strip("|")
+                return [part.strip() for part in value.split("|")]
+            heads = cells(line)
+            idx += 2
+            rows: list[list[str]] = []
+            while idx < len(lines) and "|" in lines[idx] and lines[idx].strip():
+                rows.append(cells(lines[idx]))
+                idx += 1
+            head_html = "".join(f"<th>{_preview_markdown_fallback_inline(value)}</th>" for value in heads)
+            row_html = "".join("<tr>" + "".join(f"<td>{_preview_markdown_fallback_inline(value)}</td>" for value in row) + "</tr>" for row in rows)
+            blocks.append(f"<div class=\"pv-table-wrap\"><table class=\"pv-grid\"><thead><tr>{head_html}</tr></thead><tbody>{row_html}</tbody></table></div>")
+            continue
+        list_match = re.match(r"^\s*([-+*]|\d+[.)])\s+(.*)$", line)
+        if list_match:
+            ordered = bool(re.match(r"\d", list_match.group(1)))
+            tag = "ol" if ordered else "ul"
+            items: list[str] = []
+            while idx < len(lines):
+                current = re.match(r"^\s*([-+*]|\d+[.)])\s+(.*)$", lines[idx])
+                if not current or bool(re.match(r"\d", current.group(1))) != ordered:
+                    break
+                item_text = current.group(2)
+                task = re.match(r"^\[([ xX])\]\s+(.*)$", item_text)
+                if task:
+                    checked = " checked" if task.group(1).lower() == "x" else ""
+                    item_html = f'<input class="pv-task-checkbox" type="checkbox" disabled{checked}> {_preview_markdown_fallback_inline(task.group(2))}'
+                else:
+                    item_html = _preview_markdown_fallback_inline(item_text)
+                items.append(f"<li>{item_html}</li>")
+                idx += 1
+            blocks.append(f"<{tag}>{''.join(items)}</{tag}>")
+            continue
+        paragraph_lines = [line]
+        idx += 1
+        while idx < len(lines) and lines[idx].strip():
+            if re.match(r"^\s*(?:#{1,6}\s|```|~~~|>|[-+*]\s+|\d+[.)]\s+)", lines[idx]):
+                break
+            paragraph_lines.append(lines[idx])
+            idx += 1
+        blocks.append(paragraph(paragraph_lines))
+    return "".join(blocks)
+
+
+def _ask_user_option_rows(raw_options: object, *, limit: int = 8) -> list[object]:
+    """Keep ask_user choices structured without breaking legacy string options."""
+    source = raw_options
+    if isinstance(source, str):
+        candidate = source.strip()
+        if candidate.startswith(("[", "{")):
+            try:
+                source = json.loads(candidate)
+            except Exception:
+                source = [source]
+        else:
+            source = [source] if candidate else []
+    if isinstance(source, dict):
+        source = [source]
+    if not isinstance(source, (list, tuple)):
+        return []
+    rows: list[object] = []
+    for item in source:
+        if isinstance(item, dict):
+            label = trim(str(item.get("label", item.get("text", item.get("name", ""))) or "").strip(), 400)
+            value = trim(str(item.get("value", item.get("id", label)) or label).strip(), 400)
+            description = trim(str(item.get("description", item.get("detail", "")) or "").strip(), 800)
+            if not label and not value:
+                continue
+            rows.append({"label": label or value, "value": value or label, **({"description": description} if description else {})})
+        else:
+            value = trim(str(item or "").strip(), 400)
+            if value:
+                rows.append(value)
+        if len(rows) >= max(1, int(limit or 8)):
+            break
+    return rows
+
+
+def _ask_user_option_value(option: object) -> str:
+    if isinstance(option, dict):
+        return trim(str(option.get("value", option.get("id", option.get("label", ""))) or "").strip(), 400)
+    return trim(str(option or "").strip(), 400)
+
+
 def workspace_file_revision_map(root: Path, max_files: int = 30_000) -> dict[str, str]:
     base = Path(root).resolve()
     out: dict[str, str] = {}
@@ -17618,6 +17883,8 @@ class OllamaClient:
         text = str(exc).lower()
         markers = (
             "connection error",
+            "incomplete read",
+            "incomplete http response",
             "timed out",
             "timeout",
             "connection reset",
@@ -17764,7 +18031,7 @@ class OllamaClient:
 
     def _post_json(self, path: str, payload: dict) -> dict:
         url = f"{self.base_url}{path}"
-        return self._post_json_url(url, payload)
+        return self._post_json_url_with_retries(url, payload)
 
     def _post_json_url(self, url: str, payload: dict, headers: dict | None = None) -> dict:
         req_headers = {"Content-Type": "application/json"}
@@ -17791,7 +18058,7 @@ class OllamaClient:
                 url=url,
                 retry_after=self._parse_retry_after_seconds(hdrs, text),
             ) from exc
-        except (URLError, TimeoutError, ConnectionResetError, ConnectionAbortedError) as exc:
+        except (URLError, TimeoutError, ConnectionResetError, ConnectionAbortedError, IncompleteRead) as exc:
             raise OllamaError(f"Connection error: {exc}", url=url) from exc
 
     def _post_json_url_with_retries(
@@ -17884,6 +18151,9 @@ class OllamaClient:
                             pass
                     line = resp.readline()
                     if not line:
+                        remaining = getattr(resp, "length", None)
+                        if isinstance(remaining, int) and remaining > 0:
+                            raise IncompleteRead(b"", remaining)
                         break
                     yield line.decode("utf-8", errors="replace")
         except HTTPError as exc:
@@ -17897,7 +18167,7 @@ class OllamaClient:
                 url=url,
                 retry_after=self._parse_retry_after_seconds(hdrs, text),
             ) from exc
-        except (URLError, TimeoutError, ConnectionResetError, ConnectionAbortedError) as exc:
+        except (URLError, TimeoutError, ConnectionResetError, ConnectionAbortedError, IncompleteRead) as exc:
             raise OllamaError(f"Connection error: {exc}", url=url) from exc
 
     def _iter_response_lines_url_with_retries(
@@ -17944,6 +18214,7 @@ class OllamaClient:
                 retryable = bool((http_retryable or conn_retryable) and not emitted)
                 exc.retryable = retryable
                 exc.transient = bool(transient or conn_retryable)
+                exc.stream_emitted = bool(emitted)
                 if not retryable or attempt >= retry_budget:
                     raise
                 delay = self._http_retry_delay(exc, attempt)
@@ -20289,6 +20560,7 @@ _IDE_SANDBOX_BACKEND_CACHE: dict[str, object] = {}
 _IDE_SANDBOX_BACKEND_LOCK = threading.RLock()
 WINDOWS_JOB_SANDBOX_MARKER = "__clouds_windows_job__"
 _WINDOWS_LOW_INTEGRITY_ROOTS: set[str] = set()
+_WINDOWS_LOW_INTEGRITY_FAILED_ROOTS: set[str] = set()
 _WINDOWS_LOW_INTEGRITY_LOCK = threading.RLock()
 
 def _is_windows_job_sandbox_prefix(prefix: object) -> bool:
@@ -20384,13 +20656,22 @@ def _windows_set_low_integrity_label(path: Path, *, inherit: bool) -> None:
         kernel32.LocalFree.restype = ctypes.c_void_p
         kernel32.LocalFree(sid)
 
-def _windows_prepare_low_integrity_workspace(workspace_root: Path) -> None:
+def _windows_prepare_low_integrity_workspace(workspace_root: Path) -> bool:
     canonical = Path(os.path.realpath(workspace_root)).resolve()
     key = os.path.normcase(str(canonical))
     with _WINDOWS_LOW_INTEGRITY_LOCK:
-        if key in _WINDOWS_LOW_INTEGRITY_ROOTS:
-            return
-        _windows_set_low_integrity_label(canonical, inherit=True)
+        if key in _WINDOWS_LOW_INTEGRITY_ROOTS or key in _WINDOWS_LOW_INTEGRITY_FAILED_ROOTS:
+            return key in _WINDOWS_LOW_INTEGRITY_ROOTS
+        # The low-integrity label is defense-in-depth. Standard Windows users can
+        # lack SeSecurityPrivilege, in which case SetNamedSecurityInfoW returns
+        # ERROR_ACCESS_DENIED even though the Job Object/token sandbox is usable.
+        # Record that capability failure once and continue with the stronger job
+        # isolation instead of failing every Bash invocation.
+        try:
+            _windows_set_low_integrity_label(canonical, inherit=True)
+        except OSError:
+            _WINDOWS_LOW_INTEGRITY_FAILED_ROOTS.add(key)
+            return False
         for dirpath, dirnames, filenames in os.walk(canonical, topdown=True, followlinks=False):
             current = Path(dirpath)
             dirnames[:] = [name for name in dirnames if not (current / name).is_symlink()]
@@ -20408,6 +20689,7 @@ def _windows_prepare_low_integrity_workspace(workspace_root: Path) -> None:
                 except OSError:
                     pass
         _WINDOWS_LOW_INTEGRITY_ROOTS.add(key)
+        return True
 
 def _windows_job_memory_limit() -> int:
     raw = str(os.environ.get("CLOUDS_CODER_SANDBOX_MEMORY", "1g") or "1g").strip().lower()
@@ -20465,7 +20747,12 @@ def _windows_lower_process_integrity(process_handle: object) -> None:
             kernel32.CloseHandle.restype = wintypes.BOOL
             kernel32.CloseHandle(token)
 
-def _windows_attach_sandbox_job(proc: subprocess.Popen, workspace_root: Path) -> None:
+def _windows_attach_sandbox_job(
+    proc: subprocess.Popen,
+    workspace_root: Path,
+    *,
+    lower_integrity: bool = True,
+) -> None:
     from ctypes import wintypes
 
     class LARGE_INTEGER(ctypes.Union):
@@ -20536,7 +20823,8 @@ def _windows_attach_sandbox_job(proc: subprocess.Popen, workspace_root: Path) ->
         kernel32.SetInformationJobObject(
             job, 15, ctypes.byref(cpu_limit), ctypes.sizeof(cpu_limit)
         )
-        _windows_lower_process_integrity(proc._handle)
+        if lower_integrity:
+            _windows_lower_process_integrity(proc._handle)
         kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
         kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
         if not kernel32.AssignProcessToJobObject(job, proc._handle):
@@ -20579,7 +20867,7 @@ def _popen_windows_sandboxed(
 ) -> subprocess.Popen:
     if os.name != "nt":
         raise RuntimeError("Windows built-in sandbox requested on a non-Windows platform")
-    _windows_prepare_low_integrity_workspace(workspace_root)
+    low_integrity_ready = _windows_prepare_low_integrity_workspace(workspace_root)
     flags = int(kwargs.pop("creationflags", 0) or 0)
     flags |= int(getattr(subprocess, "CREATE_SUSPENDED", 0x00000004) or 0x00000004)
     flags |= int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200) or 0x00000200)
@@ -20591,7 +20879,7 @@ def _popen_windows_sandboxed(
         **kwargs,
     )
     try:
-        _windows_attach_sandbox_job(proc, workspace_root)
+        _windows_attach_sandbox_job(proc, workspace_root, lower_integrity=low_integrity_ready)
         return proc
     except Exception:
         try:
@@ -20820,6 +21108,11 @@ class SessionState:
         # Session methods may emit events while already holding this lock.
         # Use a re-entrant lock to avoid self-deadlock during nested callbacks.
         self.lock = threading.RLock()
+        # Message submission should not wait for a full encrypted state rewrite.
+        # The worker coalesces bursts and snapshots while holding ``self.lock``.
+        self._persist_scheduler_lock = threading.Lock()
+        self._persist_scheduler_pending = False
+        self._persist_scheduler_thread = None
         self.owner_user_id = str(owner_user_id or "")
         self.upload_callback = upload_callback
         self.run_finished_callback = run_finished_callback
@@ -20858,9 +21151,11 @@ class SessionState:
         # injected the capsule for on an execution turn — keeps execution-stage
         # injection to once-per-user-request (turns 2..N pay nothing).
         self._capsule_exec_injected_user_ts: float = 0.0
-        env_ok, env_tags, _ = probe_ollama_environment(ollama_base)
-        self.ollama_env_available = bool(env_ok)
-        self.ollama_env_tags: list[str] = list(env_tags)
+        # Model discovery is deliberately lazy.  A missing local Ollama service
+        # must not hold the first session page for the probe timeout; the model
+        # catalog request performs discovery when the user actually opens it.
+        self.ollama_env_available = False
+        self.ollama_env_tags: list[str] = []
         self.thinking = False
         self.ui_language = normalize_ui_language(ui_language)
         self.last_public_progress_signature = ""
@@ -21019,6 +21314,11 @@ class SessionState:
         self.read_file_loop_count = 0
         self.read_file_loop_last_intervention_ts = 0.0
         self.tool_memory_loop_state: dict[str, dict] = {}
+        # Per-role, per-run progress telemetry. This is deliberately transient:
+        # durable task truth remains in Todo/blackboard/tool memory, while this
+        # state only helps the next model turn distinguish progress from reused
+        # evidence and stay aligned with the current Todo cursor.
+        self.agent_loop_progress_state: dict[str, dict] = {}
         self.read_context_registry: dict[str, dict] = {}
         self.tool_memory_registry: dict[str, dict] = {}
         self.web_search_context_registry: dict[str, dict] = {}
@@ -22517,11 +22817,11 @@ class SessionState:
                     self.live_input_seq = max(self.live_input_seq, max_id)
                 _pq = raw.get("pending_user_question", None)
                 if isinstance(_pq, dict) and trim(str(_pq.get("question", "") or "").strip(), 2000):
-                    _pq_opts = _pq.get("options", [])
+                    _pq_opts = _ask_user_option_rows(_pq.get("options", []))
                     self.pending_user_question = {
                         "id": trim(str(_pq.get("id", "") or ""), 120) or make_id("ask"),
                         "question": trim(str(_pq.get("question", "") or "").strip(), 2000),
-                        "options": [trim(str(o or "").strip(), 400) for o in _pq_opts if str(o or "").strip()][:8] if isinstance(_pq_opts, list) else [],
+                        "options": _pq_opts,
                         "allow_free_text": bool(_pq.get("allow_free_text", True)),
                         "role": str(_pq.get("role", "") or "agent"),
                         "ts": float(_pq.get("ts", 0.0) or 0.0),
@@ -22865,6 +23165,53 @@ class SessionState:
             self._prune_code_preview_locked()
         self._persist()
 
+    def _schedule_persist(self) -> None:
+        """Queue one consistent session snapshot for background persistence."""
+        gate = getattr(self, "_persist_scheduler_lock", None)
+        if gate is None:
+            # Some focused tests construct SessionState via __new__.
+            gate = threading.Lock()
+            self._persist_scheduler_lock = gate
+            self._persist_scheduler_pending = False
+            self._persist_scheduler_thread = None
+        with gate:
+            self._persist_scheduler_pending = True
+            worker = getattr(self, "_persist_scheduler_thread", None)
+            if worker is not None and worker.is_alive():
+                return
+            worker = threading.Thread(
+                target=self._persist_scheduler_worker,
+                name=f"session-persist-{self.id}",
+                daemon=True,
+            )
+            self._persist_scheduler_thread = worker
+            worker.start()
+
+    def _persist_scheduler_worker(self) -> None:
+        gate = getattr(self, "_persist_scheduler_lock", None)
+        if gate is None:
+            return
+        while True:
+            with gate:
+                if not bool(getattr(self, "_persist_scheduler_pending", False)):
+                    self._persist_scheduler_thread = None
+                    return
+                self._persist_scheduler_pending = False
+            try:
+                # RLock makes this safe if a caller schedules while already
+                # inside a session mutation; the worker waits for that mutation
+                # and then writes a coherent snapshot.
+                with self.lock:
+                    self._persist()
+            except Exception:
+                # A later durable event will retry. Never turn a successful user
+                # submission into an HTTP error solely because persistence failed.
+                with gate:
+                    if not bool(getattr(self, "_persist_scheduler_pending", False)):
+                        self._persist_scheduler_thread = None
+                        return
+                time.sleep(0.05)
+
     def _persist(self):
         self._prune_skill_load_cache()
         self._prune_code_preview_locked()
@@ -23187,6 +23534,8 @@ class SessionState:
         self.read_file_loop_state = {}
         self.read_file_loop_count = 0
         self.read_file_loop_last_intervention_ts = 0.0
+        self.tool_memory_loop_state = {}
+        self.agent_loop_progress_state = {}
         self.stall_severity_score = 0
         self.stall_severity_sources = []
         self.stall_escalation_triggered = False
@@ -23701,6 +24050,10 @@ class SessionState:
         ):
             return
         self.last_event_persist_ts = now_value
+        if kind_key == "message":
+            self.updated_at = now_value
+            self._schedule_persist()
+            return
         try:
             self.updated_at = now_value
             self._persist()
@@ -25282,6 +25635,13 @@ class SessionState:
         plan_todo_block = f"{plan_todo_note}\n" if plan_todo_note else ""
         todo_contract_note = self._todo_contract_prompt_block()
         todo_contract_block = f"{todo_contract_note}\n\n" if todo_contract_note else ""
+        # Single-mode tool rounds are attributed to the selected worker role
+        # (normally developer), so consume the same role-scoped telemetry here.
+        agent_loop_role = self._sanitize_agent_role(
+            getattr(self, "runtime_assigned_expert", "")
+        ) or "developer"
+        agent_loop_note = self._agent_loop_progress_prompt_block(for_role=agent_loop_role)
+        agent_loop_block = f"{agent_loop_note}\n\n" if agent_loop_note else ""
         mm_block = self._multimodal_capability_block()
         mm_hint = f"{mm_block}\n" if mm_block else ""
         runtime_env_text = self._runtime_environment_context_prompt_block() + "\n\n"
@@ -25318,6 +25678,7 @@ class SessionState:
             f"{plan_steps_block}"
             f"{plan_todo_block}"
             f"{todo_contract_block}"
+            f"{agent_loop_block}"
             f"{html_block}"
             f"{research_block}"
             f"{knowledge_block}"
@@ -28638,6 +28999,344 @@ class SessionState:
         self.read_file_loop_recent = []
         self.read_file_loop_count = 0
 
+    def _agent_loop_todo_alignment(self, role: str = "") -> dict:
+        """Return the live Todo cursor used by adaptive loop guidance.
+
+        This is a read-only projection. It never advances or rewrites Todo rows;
+        the canonical Todo/blackboard reconciliation remains authoritative.
+        """
+        role_key = self._sanitize_agent_role(role) or "single"
+        try:
+            board = self._ensure_blackboard()
+        except Exception:
+            board = getattr(self, "blackboard", {})
+            if not isinstance(board, dict):
+                board = {}
+        try:
+            step = self._get_active_plan_step(board)
+        except Exception:
+            step = None
+        try:
+            snapshot = [dict(row) for row in self.todo.snapshot() if isinstance(row, dict)]
+        except Exception:
+            snapshot = []
+
+        step_id = trim(str((step or {}).get("id", "") or ""), 40) if isinstance(step, dict) else ""
+        if step_id:
+            try:
+                rows = self._active_plan_worker_todo_rows(step_id, role="")
+            except Exception:
+                rows = [
+                    row for row in snapshot
+                    if trim(str(row.get("parent_step_id", "") or ""), 40) == step_id
+                ]
+        else:
+            rows = [row for row in snapshot if not str(row.get("key", "") or "").startswith("bb:proj:")]
+            owned = [
+                row for row in rows
+                if str(row.get("owner", "") or "").strip().lower() in {"", role_key}
+            ]
+            if owned:
+                rows = owned
+
+        def _status(row: dict) -> str:
+            raw = str(row.get("status", "pending") or "pending").strip().lower()
+            return raw if raw in {"pending", "in_progress", "completed"} else "pending"
+
+        current = next((row for row in rows if _status(row) == "in_progress"), None)
+        if not isinstance(current, dict):
+            current = next((row for row in rows if _status(row) == "pending"), None)
+        current_text = trim(str((current or {}).get("content", "") or ""), 300)
+        step_text = trim(
+            str((step or {}).get("full_content", "") or (step or {}).get("content", "") or ""),
+            1200,
+        ) if isinstance(step, dict) else ""
+        phase = ""
+        try:
+            phase = self._plan_step_phase_hint(step_text or current_text)
+        except Exception:
+            phase = ""
+        try:
+            current_is_acceptance = self._is_plan_step_acceptance_subtask(current_text)
+        except Exception:
+            current_is_acceptance = bool(
+                re.search(r"(?:acceptance|验收|驗收|受入)", current_text, flags=re.I)
+            )
+        if current_is_acceptance:
+            phase = "review"
+        if not phase:
+            runtime_type = str(getattr(self, "runtime_task_type", "") or "").strip().lower()
+            phase = "research" if "research" in runtime_type else "execute"
+
+        counts = {
+            "pending": sum(1 for row in rows if _status(row) == "pending"),
+            "in_progress": sum(1 for row in rows if _status(row) == "in_progress"),
+            "completed": sum(1 for row in rows if _status(row) == "completed"),
+        }
+        todo_payload = [
+            (
+                trim(str(row.get("parent_step_id", "") or ""), 40),
+                trim(str(row.get("subtask_id", "") or row.get("key", "") or ""), 100),
+                _status(row),
+                trim(str(row.get("content", "") or ""), 300),
+            )
+            for row in rows
+        ]
+        todo_fp = hashlib.sha1(
+            json_dumps({"step": step_id, "rows": todo_payload}).encode("utf-8", errors="replace")
+        ).hexdigest()[:16]
+        return {
+            "role": role_key,
+            "step_id": step_id,
+            "step": trim(str((step or {}).get("content", "") or ""), 220) if isinstance(step, dict) else "",
+            "phase": phase,
+            "current_todo": current_text,
+            "current_status": _status(current) if isinstance(current, dict) else "",
+            "current_is_acceptance": bool(current_is_acceptance),
+            "todo_total": len(rows),
+            "todo_pending": counts["pending"],
+            "todo_in_progress": counts["in_progress"],
+            "todo_completed": counts["completed"],
+            "all_todos_completed": bool(rows) and counts["completed"] == len(rows),
+            "todo_fp": todo_fp,
+        }
+
+    def _agent_loop_next_action(self, alignment: dict, state: dict) -> str:
+        phase = str(alignment.get("phase", "") or "execute").strip().lower()
+        if bool(alignment.get("all_todos_completed", False)):
+            if bool(state.get("seen_validation", False)):
+                return "finish"
+            return "verify"
+        if bool(alignment.get("current_is_acceptance", False)) or phase in {"test", "review"}:
+            return "verify"
+        # This is an observation-driven intervention, not a phase classifier:
+        # when the same evidence keeps returning without Todo progress, make
+        # the next turn consolidate what is already known instead of issuing
+        # another broad read.  The model remains free to choose the concrete
+        # synthesis action for the current deliverable.
+        if bool(state.get("guidance_active", False)) and (
+            int(state.get("reused_streak", 0) or 0) >= 2
+            or int(state.get("stagnant_evidence_streak", 0) or 0) >= 3
+        ):
+            return "synthesize"
+        if phase == "research":
+            return "synthesize"
+        if phase == "design":
+            return "record_design"
+        if phase in {"implement", "deploy", "execute"}:
+            return "execute"
+        return "advance"
+
+    def _update_agent_loop_progress_state(self, tool_results: list[dict], role: str = "") -> dict:
+        """Classify one tool round as progress, new evidence, or evidence reuse.
+
+        The classifier is deterministic and local. It does not stop execution or
+        restrict tools; it only updates the adaptive next-turn system prompt.
+        """
+        rows = [row for row in (tool_results or []) if isinstance(row, dict)]
+        role_key = self._sanitize_agent_role(role) or "single"
+        store = getattr(self, "agent_loop_progress_state", {})
+        if not isinstance(store, dict):
+            store = {}
+        previous = dict(store.get(role_key, {})) if isinstance(store.get(role_key), dict) else {}
+        observations = dict(previous.get("observations", {})) if isinstance(previous.get("observations"), dict) else {}
+        alignment = self._agent_loop_todo_alignment(role_key)
+        previous_todo_fp = str(previous.get("todo_fp", "") or "")
+        todo_fp = str(alignment.get("todo_fp", "") or "")
+        todo_changed = bool(previous_todo_fp and todo_fp and previous_todo_fp != todo_fp)
+
+        evidence_tools = {
+            "read_file", "bash", "background_run", "worktree_run", "check_background",
+            "query_code_library", "query_knowledge_library", "agent_web_search",
+            "tool_memory", "context_recall", "read_from_blackboard", "list_files", "search_files",
+        }
+        mutation_tools = {"write_file", "edit_file", "apply_patch"}
+        todo_tools = {"TodoWrite", "TodoWriteRescue", "update_todos", "update_plan"}
+        evidence_total = 0
+        evidence_fresh = 0
+        evidence_reused = 0
+        successful_mutation = False
+        fresh_validation = False
+        any_failure = False
+        names: list[str] = []
+
+        for row in rows:
+            name = canonicalize_tool_name(row.get("name", "")) or str(row.get("name", "") or "")
+            if name:
+                names.append(name)
+            ok = bool(row.get("ok", False))
+            any_failure = any_failure or not ok
+            changed_files = row.get("changed_files", [])
+            if name in mutation_tools and ok:
+                successful_mutation = True
+            if ok and isinstance(changed_files, list) and bool(changed_files):
+                successful_mutation = True
+
+            is_evidence = name in evidence_tools
+            if not is_evidence:
+                continue
+            evidence_total += 1
+            args = row.get("args", {}) if isinstance(row.get("args"), dict) else {}
+            signature = self._tool_memory_signature_from_args(name, args)
+            digest_payload = {
+                "ok": ok,
+                "exit": row.get("exit_code"),
+                "changed": changed_files if isinstance(changed_files, list) else [],
+                "output": trim(str(row.get("output", "") or ""), 3000),
+            }
+            digest = hashlib.sha1(
+                json_dumps(digest_payload).encode("utf-8", errors="replace")
+            ).hexdigest()[:16]
+            reused = bool(signature and observations.get(signature) == digest)
+            if reused:
+                evidence_reused += 1
+            else:
+                evidence_fresh += 1
+            if signature:
+                observations[signature] = digest
+            if len(observations) > 96:
+                observations = dict(list(observations.items())[-96:])
+
+            is_validation = False
+            try:
+                is_validation = self._tool_result_is_passing_execution(row, require_validation=True)
+            except Exception:
+                command = str(args.get("command", "") or "")
+                is_validation = bool(ok and self._command_looks_like_validation(command))
+            if is_validation and not reused:
+                fresh_validation = True
+
+        evidence_only = bool(rows) and evidence_total == len(rows) and not any_failure
+        concrete_progress = bool(successful_mutation or fresh_validation or todo_changed)
+        reused_streak = int(previous.get("reused_streak", 0) or 0)
+        stagnant_evidence_streak = int(previous.get("stagnant_evidence_streak", 0) or 0)
+        if concrete_progress:
+            reused_streak = 0
+            stagnant_evidence_streak = 0
+        elif evidence_only:
+            stagnant_evidence_streak += 1
+            if evidence_total > 0 and evidence_reused == evidence_total:
+                reused_streak += 1
+            else:
+                reused_streak = 0
+        else:
+            reused_streak = 0
+            if any(name in todo_tools for name in names):
+                stagnant_evidence_streak = 0
+
+        phase = str(alignment.get("phase", "") or "execute").strip().lower()
+        stagnant_limit = 4 if phase == "research" else 3
+        guidance_active = bool(
+            reused_streak >= 2
+            or stagnant_evidence_streak >= stagnant_limit
+            or alignment.get("all_todos_completed", False)
+        )
+        if successful_mutation:
+            round_kind = "mutation"
+        elif fresh_validation:
+            round_kind = "validation"
+        elif todo_changed:
+            round_kind = "todo_progress"
+        elif evidence_only and evidence_total and evidence_reused == evidence_total:
+            round_kind = "evidence_reused"
+        elif evidence_only and evidence_fresh:
+            round_kind = "evidence_new"
+        elif any_failure:
+            round_kind = "failure"
+        else:
+            round_kind = "coordination"
+
+        state = {
+            "role": role_key,
+            "todo_fp": todo_fp,
+            "alignment": alignment,
+            "observations": observations,
+            "round_kind": round_kind,
+            "round_tools": list(dict.fromkeys(names))[:10],
+            "evidence_fresh": evidence_fresh,
+            "evidence_reused": evidence_reused,
+            "reused_streak": reused_streak,
+            "stagnant_evidence_streak": stagnant_evidence_streak,
+            "seen_mutation": bool(previous.get("seen_mutation", False) or successful_mutation),
+            "seen_validation": bool(previous.get("seen_validation", False) or fresh_validation),
+            "guidance_active": guidance_active,
+            "guidance_reason": (
+                "completed_todos"
+                if alignment.get("all_todos_completed", False)
+                else ("reused_evidence" if reused_streak >= 2 else ("evidence_without_todo_progress" if guidance_active else ""))
+            ),
+            "updated_at": now_ts(),
+        }
+        state["next_action"] = self._agent_loop_next_action(alignment, state)
+        store[role_key] = state
+        self.agent_loop_progress_state = store
+        return state
+
+    def _mark_agent_loop_strategy_signal(self, role: str, reason: str) -> None:
+        role_key = self._sanitize_agent_role(role) or "single"
+        store = getattr(self, "agent_loop_progress_state", {})
+        if not isinstance(store, dict):
+            store = {}
+        state = dict(store.get(role_key, {})) if isinstance(store.get(role_key), dict) else {}
+        alignment = state.get("alignment") if isinstance(state.get("alignment"), dict) else self._agent_loop_todo_alignment(role_key)
+        state["alignment"] = alignment
+        state["guidance_active"] = True
+        state["guidance_reason"] = trim(str(reason or "strategy_signal"), 120)
+        state["next_action"] = self._agent_loop_next_action(alignment, state)
+        state["updated_at"] = now_ts()
+        store[role_key] = state
+        self.agent_loop_progress_state = store
+
+    def _agent_loop_progress_prompt_block(self, for_role: str = "") -> str:
+        """Render multi-agent next-turn guidance from live progress telemetry.
+
+        Single and plan+single intentionally keep their original autonomous
+        prompt path. Telemetry may still be recorded for diagnostics, but the
+        adaptive loop policy belongs to sequential/sync role coordination.
+        """
+        if not self._is_multi_agent_mode():
+            return ""
+        role_key = self._sanitize_agent_role(for_role) or "single"
+        store = getattr(self, "agent_loop_progress_state", {})
+        state = dict(store.get(role_key, {})) if isinstance(store, dict) and isinstance(store.get(role_key), dict) else {}
+        alignment = state.get("alignment") if isinstance(state.get("alignment"), dict) else self._agent_loop_todo_alignment(role_key)
+        focus = trim(str(alignment.get("current_todo", "") or alignment.get("step", "") or ""), 240)
+        if not focus and not bool(state.get("guidance_active", False)):
+            return ""
+        action = str(state.get("next_action", "") or self._agent_loop_next_action(alignment, state))
+        action_text = {
+            "synthesize": "Synthesize the evidence already collected into the current deliverable or shared task memory, then align the Todo status.",
+            "record_design": "Commit the current design decision to the intended artifact, then align the Todo status.",
+            "execute": "Take one concrete implementation/execution action for the current Todo instead of gathering more broad evidence.",
+            "verify": "Run the smallest acceptance-relevant verification still needed; record the evidence against the current Todo.",
+            "finish": "The tracked Todos are complete and validation evidence exists; finish the overall task unless a concrete unmet acceptance criterion remains.",
+            "advance": "Take the next concrete action that changes the current deliverable or Todo state.",
+        }.get(action, "Continue the current Todo with one concrete action.")
+        rows = [
+            "<dynamic-agent-loop-state>",
+            f"phase_bias={alignment.get('phase', 'execute')} next_action={action} ",
+            f"todo={focus or '(none)'} status={alignment.get('current_status', '') or '(none)'} ",
+            f"todo_progress={int(alignment.get('todo_completed', 0) or 0)}/{int(alignment.get('todo_total', 0) or 0)}",
+        ]
+        if bool(state.get("guidance_active", False)):
+            rows.append(
+                "progress_signal="
+                f"{state.get('round_kind', 'unknown')} fresh={int(state.get('evidence_fresh', 0) or 0)} "
+                f"reused={int(state.get('evidence_reused', 0) or 0)} "
+                f"stagnant_rounds={int(state.get('stagnant_evidence_streak', 0) or 0)}"
+            )
+            rows.append(action_text)
+            rows.append(
+                "Reused evidence is available in tool memory and is not new progress. Read again only for a new exact unanswered question, changed state, or targeted verification."
+            )
+        else:
+            rows.append("Continue this Todo by default; update the canonical Todo only after a real state change.")
+        rows.append(
+            "This is an adaptive next-action bias, not a fixed phase machine: override it when concrete new evidence changes what the task actually needs."
+        )
+        rows.append("</dynamic-agent-loop-state>")
+        return trim("\n".join(rows), 1400)
+
     def _maybe_inject_read_file_strategy_intervention(self, tool_results: list[dict], role: str = "") -> bool:
         rows = [r for r in (tool_results or []) if isinstance(r, dict)]
         if not rows:
@@ -28689,42 +29388,16 @@ class SessionState:
         state["last_intervention_ts"] = now
         self.read_file_loop_state[role_key] = state
         self.read_file_loop_last_intervention_ts = now
-        context_block = self._read_context_prompt_block(for_role=role_key if role_key != "single" else "", max_chars=2600)
-        paths = []
-        for r in read_rows:
-            args = r.get("args", {}) if isinstance(r.get("args", {}), dict) else {}
-            p = trim(str(args.get("path", "") or ""), 180)
-            if p and p not in paths:
-                paths.append(p)
-        payload = (
-            "<read-context-strategy>\n"
-            f"The last {read_only_rounds} tool round(s) for {role_key} only performed successful read_file calls "
-            f"over a small/repeated evidence set (distinct_recent={distinct_recent}, repeat_rounds={repeat_rounds}). "
-            "This is a strategy warning, not a stop. Decide what evidence is already sufficient, then either edit/write/verify, "
-            "or ask one narrower read question using mode='search', 'symbol', or 'window'. "
-            "Avoid reopening the same full files unless their content changed or a new exact question requires it. "
-            "If useful evidence should persist, call compress with keep_tool_memory or keep_read_context; drop obsolete evidence with drop_tool_memory or drop_read_context.\n"
-            f"recent_paths={', '.join(paths[:8])}\n"
-            f"{context_block}\n"
-            "</read-context-strategy>"
-        )
-        if role_key != "single":
-            self._append_agent_context_message(
-                role_key,
-                {"role": "user", "content": payload, "ts": now_ts(), "agent_role": role_key},
-                mirror_to_global=False,
-            )
-        else:
-            self.messages.append({"role": "user", "content": payload, "ts": now_ts()})
+        self._mark_agent_loop_strategy_signal(role_key, "repeated_read_context")
         self._ledger_record_stall(
             f"read-file-loop({role_key}:{read_only_rounds})",
-            "injected read-context strategy intervention",
+            "activated adaptive read-context guidance",
         )
         self._emit(
             "status",
             {
                 "summary": (
-                    f"read_file strategy intervention injected "
+                    f"adaptive read_file guidance activated "
                     f"(role={role_key}, rounds={read_only_rounds}, distinct={distinct_recent})"
                 )
             },
@@ -28853,9 +29526,11 @@ class SessionState:
             )
 
     def _maybe_inject_tool_strategy_intervention(self, tool_results: list[dict], role: str = "") -> bool:
+        rows = [r for r in (tool_results or []) if isinstance(r, dict)]
+        if rows:
+            self._update_agent_loop_progress_state(rows, role=role)
         if self._maybe_inject_read_file_strategy_intervention(tool_results, role=role):
             return True
-        rows = [r for r in (tool_results or []) if isinstance(r, dict)]
         if not rows:
             return False
         web_rows = [
@@ -28879,38 +29554,16 @@ class SessionState:
                 if now - float(state.get("last_web_search_intervention_ts", 0.0) or 0.0) >= 12.0:
                     state["last_web_search_intervention_ts"] = now
                     self.tool_memory_loop_state[role_key] = state
-                    context_block = self._web_search_context_prompt_block(
-                        for_role=role_key if role_key != "single" else "",
-                        max_chars=2600,
-                    )
-                    payload = (
-                        "<web-search-strategy>\n"
-                        f"The current search tree for {role_key} is showing low-yield or dynamic-page symptoms "
-                        f"(thin_streak={int(ctx.get('thin_streak', 0) or 0)}, "
-                        f"dynamic_streak={int(ctx.get('dynamic_streak', 0) or 0)}). "
-                        "This is a strategy warning, not a stop. Do not run another broad search over the same query family. "
-                        "Choose the next concrete action: follow/fetch one exact useful URL, inspect endpoint/script clues for a dynamic table, "
-                        "query tool_memory/index_status for indexed evidence, or write a caveated finding and advance the active plan step.\n"
-                        f"{context_block}\n"
-                        "</web-search-strategy>"
-                    )
-                    if role_key != "single":
-                        self._append_agent_context_message(
-                            role_key,
-                            {"role": "user", "content": payload, "ts": now_ts(), "agent_role": role_key},
-                            mirror_to_global=False,
-                        )
-                    else:
-                        self.messages.append({"role": "user", "content": payload, "ts": now_ts()})
+                    self._mark_agent_loop_strategy_signal(role_key, "low_yield_web_search")
                     self._ledger_record_stall(
                         f"web-search-low-yield({role_key})",
-                        "injected web-search strategy intervention",
+                        "activated adaptive web-search guidance",
                     )
                     self._emit(
                         "status",
                         {
                             "summary": (
-                                f"web_search strategy intervention injected "
+                                f"adaptive web_search guidance activated "
                                 f"(role={role_key}, thin={int(ctx.get('thin_streak', 0) or 0)}, "
                                 f"dynamic={int(ctx.get('dynamic_streak', 0) or 0)})"
                             )
@@ -28965,35 +29618,17 @@ class SessionState:
         state["repeat_rounds"] = 0
         state["evidence_only_rounds"] = 0
         self.tool_memory_loop_state[role_key] = state
-        memory_block = self._tool_memory_prompt_block(for_role=role_key if role_key != "single" else "", max_chars=2600)
         recent_tools = ", ".join(dict.fromkeys(names))
-        payload = (
-            "<tool-memory-strategy>\n"
-            f"The last evidence-gathering rounds for {role_key} repeated a small tool evidence set "
-            f"(tools={recent_tools}, distinct_recent={distinct_recent}, repeat_rounds={repeat_rounds}). "
-            "This is a strategy warning, not a stop. Decide which remembered evidence is sufficient, then take the next concrete action "
-            "(edit/write/verify/summarize), or ask one narrower unanswered tool question. "
-            "Use compress keep_tool_memory/drop_tool_memory to pin useful evidence and shed obsolete evidence.\n"
-            f"{memory_block}\n"
-            "</tool-memory-strategy>"
-        )
-        if role_key != "single":
-            self._append_agent_context_message(
-                role_key,
-                {"role": "user", "content": payload, "ts": now_ts(), "agent_role": role_key},
-                mirror_to_global=False,
-            )
-        else:
-            self.messages.append({"role": "user", "content": payload, "ts": now_ts()})
+        self._mark_agent_loop_strategy_signal(role_key, "repeated_tool_evidence")
         self._ledger_record_stall(
             f"tool-memory-loop({role_key}:{recent_tools})",
-            "injected tool-memory strategy intervention",
+            "activated adaptive tool-memory guidance",
         )
         self._emit(
             "status",
             {
                 "summary": (
-                    f"tool memory strategy intervention injected "
+                    f"adaptive tool-memory guidance activated "
                     f"(role={role_key}, tools={recent_tools}, distinct={distinct_recent})"
                 )
             },
@@ -30555,6 +31190,58 @@ class SessionState:
             except Exception:
                 continue
 
+    def _recover_code_preview_index_from_operations(self) -> None:
+        """Recover stage metadata when an older state persisted operations first.
+
+        Early IDE sessions could contain durable ``file_patch`` operations and the
+        stage blobs but no serialized ``code_preview_index``. That made the first
+        open of a repeatedly edited file look history-free until another edit
+        occurred. The operation already carries the stage id and counters, while
+        blob paths are deterministic from the file path and stage id.
+        """
+        if self.code_preview_index:
+            known = {str(row.get("id", "")) for rows in self.code_preview_index.values() for row in rows if isinstance(row, dict)}
+        else:
+            known = set()
+        recovered: dict[str, list[dict]] = {}
+        for op in getattr(self, "operations", []) or []:
+            if not isinstance(op, dict) or str(op.get("type", "") or "") != "file_patch":
+                continue
+            data = op.get("data", {}) if isinstance(op.get("data"), dict) else {}
+            stage_meta = data.get("code_stage", {}) if isinstance(data.get("code_stage"), dict) else {}
+            stage_id = str(stage_meta.get("id", "") or "").strip()
+            rel = normalize_rel_preview_path(data.get("session_rel_path", data.get("path", "")))
+            if not stage_id or not rel or stage_id in known or not is_code_preview_candidate(rel):
+                continue
+            bucket = self._code_preview_bucket_dir(rel)
+            before_fp = bucket / f"{stage_id}.before.txt"
+            after_fp = bucket / f"{stage_id}.after.txt"
+            if not before_fp.exists() and not after_fp.exists():
+                continue
+            before_text = try_read_text(before_fp, max_bytes=CODE_PREVIEW_STAGE_MAX_BYTES) or ""
+            after_text = try_read_text(after_fp, max_bytes=CODE_PREVIEW_STAGE_MAX_BYTES) or ""
+            stage = {
+                "id": stage_id,
+                "ts": float(stage_meta.get("ts", op.get("ts", 0.0)) or 0.0),
+                "path": rel,
+                "tool": str(data.get("tool", "") or "operation-recovery"),
+                "change_type": str(stage_meta.get("change_type", data.get("change_type", "modified")) or "modified"),
+                "added": int(stage_meta.get("added", data.get("added", 0)) or 0),
+                "deleted": int(stage_meta.get("deleted", data.get("deleted", 0)) or 0),
+                "before_blob": before_fp.relative_to(self.root).as_posix(),
+                "after_blob": after_fp.relative_to(self.root).as_posix(),
+                "bytes_after": len(after_text.encode("utf-8", errors="ignore")),
+                "lines_after": after_text.count("\n") + (1 if after_text else 0),
+            }
+            recovered.setdefault(rel, []).append(stage)
+            known.add(stage_id)
+        if recovered:
+            merged = {key: list(value) for key, value in self.code_preview_index.items()}
+            for rel, rows in recovered.items():
+                merged.setdefault(rel, []).extend(rows)
+                merged[rel].sort(key=lambda row: float(row.get("ts", 0.0) or 0.0))
+            self.code_preview_index = merged
+
     def _prune_code_preview_locked(self):
         cleaned: dict[str, list[dict]] = {}
         removed: list[dict] = []
@@ -30680,6 +31367,9 @@ class SessionState:
             raise ValueError("path required")
         with self.lock:
             stages = list(self.code_preview_index.get(rel, []))
+            if not stages:
+                self._recover_code_preview_index_from_operations()
+                stages = list(self.code_preview_index.get(rel, []))
         out = []
         total = len(stages)
         for i, row in enumerate(stages, start=1):
@@ -39684,6 +40374,34 @@ body{padding:18px}
             return 0
         return max(1, min(max_budget, budget))
 
+    def _sync_tick_manager_cycle(self, board: dict, cycle: int) -> dict:
+        """Publish the single monotonic budget clock used by Sync routes.
+
+        AgentBus and momentum deliberately bypass the Manager model, so their
+        rounds still need to advance the same visible counter.  Keeping this in
+        one small helper also prevents the HUD from retaining a stale finite or
+        unlimited ``remaining_rounds`` value while the worker is progressing.
+        """
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        try:
+            cycle_value = max(0, int(cycle or 0))
+        except Exception:
+            cycle_value = max(0, int(bb.get("manager_cycles", 0) or 0))
+        bb["manager_cycles"] = cycle_value
+        budget = self._blackboard_round_budget(bb)
+        remaining = -1 if budget <= 0 else max(0, int(budget) - cycle_value)
+        judgement = bb.get("manager_judgement", {})
+        if not isinstance(judgement, dict):
+            judgement = {}
+        judgement["remaining_rounds"] = int(remaining)
+        judgement["updated_at"] = float(now_ts())
+        bb["manager_judgement"] = judgement
+        # The caller already has a normalized board.  Avoid a second full
+        # blackboard normalization on every Sync tick; this path is hot on
+        # lower-powered LAN servers.
+        self._save_blackboard(bb)
+        return bb
+
     def _normalize_blackboard_status(self, raw: object) -> str:
         key = str(raw or "").strip().upper()
         return key if key in BLACKBOARD_STATUSES else "INITIALIZING"
@@ -41755,6 +42473,149 @@ body{padding:18px}
         if route_epoch and active_epoch and abs(route_epoch - active_epoch) > 0.001:
             return False
         return True
+
+    def _route_scope_matches_current_plan(
+        self,
+        route: dict | None,
+        board: dict | None = None,
+        *,
+        require_scoped: bool = False,
+    ) -> bool:
+        """Validate a route against the live plan step and child cursor.
+
+        Sync has several route producers (manager, momentum, and AgentBus). A
+        route that was valid one child ago must never be repaired into the new
+        child by `_align_route_with_current_plan_step`; it must be discarded.
+        ``require_scoped`` is used for worker handoffs because messages created
+        before this scope was recorded are historical evidence, not executable
+        work.
+        """
+        if not isinstance(route, dict):
+            return False
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        current = self._get_active_plan_step(bb)
+        try:
+            active_task_epoch = float(bb.get("task_epoch", 0.0) or 0.0)
+            route_task_epoch = float(route.get("task_epoch", 0.0) or 0.0)
+        except Exception:
+            return False
+        if require_scoped:
+            if active_task_epoch <= 0.0 or route_task_epoch <= 0.0:
+                return False
+            if abs(active_task_epoch - route_task_epoch) > 0.001:
+                return False
+        elif active_task_epoch and route_task_epoch and abs(active_task_epoch - route_task_epoch) > 0.001:
+            return False
+        if not isinstance(current, dict):
+            return True
+        active_step_id = trim(str(current.get("id", "") or ""), 40)
+        route_step_id = trim(str(route.get("plan_step_id", "") or ""), 40)
+        if not route_step_id and str(route.get("focus_kind", "") or "") == "plan_step":
+            route_step_id = trim(str(route.get("focus_id", "") or ""), 40)
+        if not route_step_id:
+            return not require_scoped
+        if active_step_id and route_step_id != active_step_id:
+            return False
+        try:
+            active_epoch = float(current.get("activated_at", 0.0) or 0.0)
+            route_epoch = float(
+                route.get("plan_step_epoch", 0.0)
+                or route.get("focus_epoch", 0.0)
+                or 0.0
+            )
+        except Exception:
+            return False
+        if require_scoped:
+            if not active_step_id or not route_step_id or active_epoch <= 0.0 or route_epoch <= 0.0:
+                return False
+            if abs(active_epoch - route_epoch) > 0.001:
+                return False
+        elif active_epoch and route_epoch and abs(active_epoch - route_epoch) > 0.001:
+            return False
+        current_subtask = self._current_plan_worker_subtask_snapshot(board=bb, role="")
+        current_subtask_id = trim(str(current_subtask.get("subtask_id", "") or ""), 100)
+        route_subtask_id = trim(str(route.get("plan_subtask_id", "") or ""), 100)
+        if current_subtask_id:
+            return bool(route_subtask_id and route_subtask_id == current_subtask_id)
+        # A scoped route with a child cannot execute while the canonical child
+        # cursor is empty (usually the acceptance row is being activated).
+        return not route_subtask_id
+
+    def _mark_agentbus_stale(self, envelope: dict, reason: str) -> None:
+        """Mark one handoff stale once so scans cannot redeliver it forever."""
+        if not isinstance(envelope, dict) or envelope.get("_stale_scope"):
+            return
+        envelope["_stale_scope"] = True
+        envelope["_stale_reason"] = trim(str(reason or "stale plan scope"), 180)
+        envelope["_stale_ts"] = float(now_ts())
+        self._emit(
+            "status",
+            {
+                "summary": (
+                    "stale AgentBus handoff discarded: "
+                    f"{trim(str(envelope.get('from', '?')), 30)}->"
+                    f"{trim(str(envelope.get('to', '?')), 30)} "
+                    f"({envelope.get('_stale_reason', 'scope mismatch')})"
+                )
+            },
+        )
+
+    def _sync_plan_route_owner(self, board: dict | None = None) -> str:
+        """Return an explicitly declared owner, if the plan declares one.
+
+        Role selection is model-driven.  This method deliberately does not
+        infer an owner from filenames, natural-language keywords, or a phase
+        table; those heuristics can route an implementation path such as
+        ``tests/`` to the reviewer.
+        """
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        step = self._get_active_plan_step(bb)
+        if not isinstance(step, dict):
+            return ""
+        for key in ("owner", "owner_role"):
+            owner = self._sanitize_agent_role(step.get(key, ""))
+            if owner in AGENT_ROLES:
+                return owner
+        return ""
+
+    def _enforce_sync_plan_route(self, route: dict | None, board: dict | None = None) -> dict:
+        """Apply only explicit plan ownership; let the Manager choose otherwise."""
+        row = dict(route or {})
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        target = self._sanitize_agent_role(row.get("target", ""))
+        if target not in AGENT_ROLES:
+            return row
+        profile = self._ensure_blackboard_task_profile(bb)
+        mode = normalize_execution_mode(
+            profile.get("execution_mode", self._effective_execution_mode()),
+            default=self._effective_execution_mode(),
+        )
+        if mode != EXECUTION_MODE_SYNC or not isinstance(self._get_active_plan_step(bb), dict):
+            return row
+        desired = self._sync_plan_route_owner(bb)
+        if desired and target != desired:
+            old_target = target
+            row["target"] = desired
+            row["is_mandatory"] = True
+            row["executor_mode"] = False
+            row["reason"] = trim(
+                f"{row.get('reason', '')}|sync-explicit-owner:{old_target}->{desired}",
+                600,
+            )
+            row["source"] = "sync-explicit-owner"
+            current = self._current_plan_worker_subtask_snapshot(board=bb, role="")
+            focus = trim(str(current.get("subtask_content", "") or ""), 400)
+            row["instruction"] = trim(
+                (
+                    f"Plan owner is explicitly set to {desired}; route this Sync turn to that owner. "
+                    f"Execute the current canonical subtask first{(': ' + focus) if focus else '.'}"
+                ),
+                MANAGER_INSTRUCTION_MAX_CHARS,
+            )
+        row.update(self._route_focus_fields(bb))
+        row.update(self._plan_subtask_route_fields(board=bb, role=""))
+        row["task_epoch"] = float(bb.get("task_epoch", 0.0) or 0.0)
+        return row
 
     def _normalize_failure_ledger(self, raw: dict) -> dict:
         fl: dict = {
@@ -47051,6 +47912,7 @@ body{padding:18px}
         self.read_file_loop_count = 0
         self.read_file_loop_last_intervention_ts = 0.0
         self.tool_memory_loop_state = {}
+        self.agent_loop_progress_state = {}
         self.rounds_without_todo = 0
         self.last_todo_reminder_ts = 0.0
         self.todo_reminder_count = 0
@@ -47066,9 +47928,15 @@ body{padding:18px}
         self.reviewer_debug_rounds = 0
         self.reviewer_debug_context = ""
         self.active_agent_role = ""
+        # AgentBus envelopes are executable only inside the step/subtask that
+        # created them. Keep the public message history for audit/UI, but do not
+        # carry old handoffs into the next step's dispatcher.
+        self.agent_bus_messages = []
+        self.manager_routes = []
         bb.pop("failure_recovery", None)
         bb["watchdog"] = self._new_watchdog_state()
         bb["decomposition_queue"] = self._new_decomposition_queue_state()
+        bb["persisted_manager_routes"] = []
         bb["active_agent"] = ""
         bb["last_delegate"] = {
             "target": "",
@@ -48110,16 +48978,13 @@ body{padding:18px}
     def _current_plan_worker_owner(self, board: dict | None = None) -> str:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         step = self._get_active_plan_step(bb)
-        phase = self._plan_step_phase_hint(
-            str((step or {}).get("full_content", "") or (step or {}).get("content", "") or "")
-        ) if isinstance(step, dict) else ""
-        preferred = TASK_PHASE_ROUTING.get(phase, "developer")
-        # In single mode the role is only a phase contract: the configured
-        # expert remains the sole executor. In collaborative modes, the phase
-        # owner is canonical so stale active-agent state cannot assign test
-        # subtasks back to the developer who authored the change.
-        if self._is_multi_agent_mode() and preferred in {"developer", "explorer", "reviewer"}:
-            return preferred
+        if isinstance(step, dict):
+            child = self._current_plan_worker_subtask_snapshot(board=bb, role="")
+            for source in (child, step):
+                for key in ("owner", "owner_role", "assigned_expert"):
+                    owner = self._sanitize_agent_role(source.get(key, "")) if isinstance(source, dict) else ""
+                    if owner in AGENT_ROLES:
+                        return owner
         delegate = bb.get("last_delegate", {}) if isinstance(bb.get("last_delegate"), dict) else {}
         candidates = [
             str(self.active_agent_role or "").strip().lower(),
@@ -48134,7 +48999,7 @@ body{padding:18px}
                 "assigned_expert", self.runtime_assigned_expert
             )
         )
-        return assigned or preferred or "developer"
+        return assigned or "developer"
 
     def _get_plan_step_by_id(self, step_id: str, board: dict | None = None) -> dict | None:
         step_key = trim(str(step_id or "").strip(), 40)
@@ -48706,12 +49571,13 @@ body{padding:18px}
             None,
         )
         if not isinstance(current, dict):
-            return {"step_id": step_id, "subtask_id": "", "subtask_content": ""}
+            return {"step_id": step_id, "subtask_id": "", "subtask_content": "", "owner": ""}
         subtask_id = self._stable_plan_worker_subtask_id(step_id, current)
         return {
             "step_id": step_id,
             "subtask_id": subtask_id,
             "subtask_content": trim(str(current.get("content", "") or ""), 500),
+            "owner": self._sanitize_agent_role(current.get("owner", "")),
         }
 
     def _plan_subtask_route_fields(
@@ -49985,21 +50851,16 @@ body{padding:18px}
             return row
         snapshot = self._active_plan_progress_snapshot(bb)
         step_text = trim(str(snapshot.get("step_text", "") or ""), 220)
-        full_text = self._current_plan_step_full_text(bb, max_len=600)
-        phase = self._plan_step_phase_hint(full_text)
         current_subtask = trim(str(snapshot.get("current_subtask", "") or ""), 180)
         next_pending = trim(str(snapshot.get("next_pending_subtask", "") or ""), 180)
         subtasks_done = self._step_subtasks_all_completed(step)
         has_evidence = self._plan_step_has_blackboard_evidence(step, bb)
-        reviewer_available = True
         profile = self._ensure_blackboard_task_profile(bb)
-        participants = profile.get("participants", []) if isinstance(profile.get("participants"), list) else []
-        participants_norm = [self._sanitize_agent_role(x) for x in participants]
-        participants_norm = [x for x in participants_norm if x]
-        if participants_norm:
-            reviewer_available = "reviewer" in participants_norm
-        if subtasks_done and has_evidence and reviewer_available:
-            row["target"] = "reviewer"
+        if subtasks_done and has_evidence:
+            owner = self._sanitize_agent_role(row.get("target", "")) or self._current_plan_worker_owner(bb)
+            if owner not in AGENT_ROLES:
+                owner = self._sanitize_agent_role(profile.get("assigned_expert", "")) or "developer"
+            row["target"] = owner
             row["instruction"] = trim(
                 (
                     "Recovery routing after repeated identical delegation. "
@@ -50013,10 +50874,9 @@ body{padding:18px}
             row["source"] = "loop-recovery"
             row["is_mandatory"] = True
             return row
-        default_owner = "explorer" if phase in {"research", "design"} else "developer"
         owner = self._sanitize_agent_role(row.get("target", "")) or self._current_plan_worker_owner(bb)
-        if owner not in {"developer", "explorer"}:
-            owner = default_owner
+        if owner not in AGENT_ROLES:
+            owner = self._sanitize_agent_role(profile.get("assigned_expert", "")) or "developer"
         if current_subtask:
             action_text = f"Continue ONLY the current in_progress subtask: {current_subtask}."
         elif next_pending:
@@ -56778,87 +57638,32 @@ body{padding:18px}
                 "A skill-linked step is not complete until the agent has concretely entered the skill chain "
                 "by reading an entrypoint or using a skill resource/script. "
             )
-        # Add current phase routing hint
-        current_phase = self._infer_current_phase_from_blackboard()
-        if current_phase:
-            preferred = TASK_PHASE_ROUTING.get(current_phase, "developer")
-            if self._effective_execution_mode() == EXECUTION_MODE_SINGLE:
-                preferred = self._sanitize_agent_role(
-                    profile.get("assigned_expert", self.runtime_assigned_expert)
-                ) or "developer"
-            # Directive (Fix 5), not advisory: each phase has a clear owner, and the
-            # manager runs at low coordination effort now, so a soft "prefer" was too
-            # easily ignored — collapsing everything onto developer. Make the default
-            # explicit while still allowing a justified exception.
-            if preferred == "explorer":
-                lines.append(
-                    f"CURRENT PHASE: {current_phase} → route to EXPLORER for this phase. "
-                    "Research/analysis is the explorer's job: have it investigate and write "
-                    "findings to blackboard BEFORE the developer implements. Only route elsewhere "
-                    "if exploration is already complete in blackboard. "
-                )
-            elif preferred == "reviewer":
-                lines.append(
-                    f"CURRENT PHASE: {current_phase} → route to REVIEWER for this phase. "
-                    "Verification is the reviewer's job: have it run checks and issue a pass/fix "
-                    "decision. Do NOT let the developer self-approve its own work. "
-                )
-            else:
-                lines.append(
-                    f"CURRENT PHASE: {current_phase} → prefer routing to {preferred}. "
-                    f"Each phase has its own expertise — let {preferred} lead this phase independently. "
-                    "Do NOT carry over implementation patterns from previous phases. "
-                )
+        # Role choice is intentionally left to the LLM Manager.  The runtime
+        # exposes the active step, child cursor, evidence, and permissions; it
+        # does not infer an owner from prose or filenames.
+        lines.append(
+            "ROLE SELECTION: choose the best agent for the current step from the "
+            "live evidence and objective. Do not infer a role from a filename or "
+            "keyword. Keep the current child cursor in order and explain any "
+            "handoff in the route instruction. "
+        )
         todo_note = self._plan_todo_discipline_prompt(for_manager=True)
         if todo_note:
             lines.append(todo_note)
         return "\n".join(lines) + "\n"
 
     def _plan_step_phase_hint(self, step_content: str) -> str:
-        """Infer the task phase from a plan step's content."""
-        c = str(step_content or "").lower()
-        # A major plan row is a phase boundary. Classify from its title first so
-        # acceptance/test details embedded in later substeps cannot silently
-        # turn an implementation phase into a review phase (or vice versa).
-        title = next((line.strip() for line in c.splitlines() if line.strip()), c)
-        research_keywords = (
-            "研究", "分析", "调研", "探索", "检索", "搜索", "查找", "查询", "收集", "采集",
-            "整理", "提取", "资料", "数据", "排行", "资金流向", "走势", "来源", "交叉验证",
-            "research", "analyze", "investigate", "explore", "inspect", "search", "collect",
-            "gather", "retrieve", "extract", "summarize", "source", "evidence",
-        )
-        strong_impl_keywords = (
-            "实现", "开发", "编码", "代码", "函数", "组件", "模块", "着色器", "接口实现",
-            "implement", "develop", "code", "component", "module", "function", "shader",
-            "scaffold", "mkdir", ".f90", ".py", ".cpp", ".js", ".ts", ".tsx", ".jsx", ".glsl",
-        )
+        """Return only an explicit structured phase; never classify prose.
 
-        def _classify(text: str) -> str:
-            # Verification/review must win over incidental implementation words
-            # such as a filename or "code review" in a phase title.
-            if any(kw in text for kw in ("独立验收", "独立验证", "验收与审核", "审查", "评审", "review", "audit", "inspect code")):
-                return "review"
-            if any(kw in text for kw in ("测试", "单测", "回归", "验证", "驗證", "test", "pytest", "unit", "integration", "compile", "verification")):
-                return "test"
-            if any(kw in text for kw in ("部署", "发布", "deploy", "release", "publish", "配置")):
-                return "deploy"
-            if any(kw in text for kw in research_keywords):
-                return "research"
-            if any(kw in text for kw in ("设计", "架构", "规划", "design", "architect", "plan", "interface", "接口")):
-                return "design"
-            if any(kw in text for kw in strong_impl_keywords):
-                return "implement"
-            if any(kw in text for kw in ("编写", "创建", "绘制", "生成", "写入", "制作",
-                                          "write", "create", "build", "generate", "draw")):
-                return "implement"
-            return ""
-
-        title_phase = _classify(title)
-        if title_phase:
-            return title_phase
-        full_phase = _classify(c)
-        if full_phase:
-            return full_phase
+        This function remains as a compatibility seam for acceptance guidance
+        and old persisted data.  Natural-language phase inference was removed:
+        a path such as ``tests/`` is content, not a routing decision.  New plan
+        producers may pass a mapping with ``phase``/``phase_hint`` when they
+        intentionally declare one; otherwise the Manager owns the choice.
+        """
+        if isinstance(step_content, dict):
+            value = step_content.get("phase_hint", step_content.get("phase", ""))
+            return trim(str(value or "").strip().lower(), 40)
         return ""
 
     def _plan_step_acceptance_guidance(self, plan_step: dict) -> dict:
@@ -56948,25 +57753,13 @@ body{padding:18px}
         )
 
     def _infer_current_phase_from_blackboard(self) -> str:
-        """Infer the current task phase from blackboard state and active plan step."""
+        """Read an explicit phase only; do not derive it from blackboard counts."""
         bb = self._ensure_blackboard()
         for t in bb.get("project_todos", []):
             if t.get("category") == "plan_step" and t.get("status") == "in_progress":
-                phase = self._plan_step_phase_hint(str(t.get("full_content", "") or t.get("content", "") or ""))
+                phase = self._plan_step_phase_hint(t)
                 if phase:
                     return phase
-        # Fallback: infer from blackboard state
-        code_count = len(bb.get("code_artifacts", {}) or {})
-        research_count = len(bb.get("research_notes", []) or [])
-        feedback = bb.get("review_feedback", []) if isinstance(bb.get("review_feedback"), list) else []
-        if not research_count and not code_count:
-            return "research"
-        if research_count > 0 and not code_count:
-            return "design"
-        if code_count > 0 and not feedback:
-            return "implement"
-        if feedback:
-            return "review"
         return ""
 
     def _project_todo_hint_for_manager(self) -> str:
@@ -57230,6 +58023,14 @@ body{padding:18px}
         for env in list(self.agent_bus_messages)[-72:]:
             if not isinstance(env, dict):
                 continue
+            if env.get("_fast_routed") or env.get("_stale_scope"):
+                continue
+            if not self._route_scope_matches_current_plan(env, bb, require_scoped=True):
+                self._mark_agentbus_stale(
+                    env,
+                    "handoff does not match active plan step/subtask",
+                )
+                continue
             try:
                 ts = float(env.get("ts", 0.0) or 0.0)
             except Exception:
@@ -57273,6 +58074,12 @@ body{padding:18px}
                         "payload": payload,
                         "ts": ts,
                         "needs_inclusion": bool(dst_needs_inclusion),
+                        "plan_step_id": env.get("plan_step_id", ""),
+                        "plan_step_index": env.get("plan_step_index", -1),
+                        "plan_step_total": env.get("plan_step_total", 0),
+                        "plan_step_epoch": env.get("plan_step_epoch", 0.0),
+                        "plan_subtask_id": env.get("plan_subtask_id", ""),
+                        "plan_subtask_content": env.get("plan_subtask_content", ""),
                     },
                 )
             )
@@ -57317,6 +58124,12 @@ body{padding:18px}
             "assigned_expert": assigned_expert,
             "requires_user_confirmation": bool(profile.get("requires_user_confirmation", False)),
             "is_mandatory": bool(best.get("to", "") in {"developer", "explorer"}),
+            "plan_step_id": best.get("plan_step_id", ""),
+            "plan_step_index": best.get("plan_step_index", -1),
+            "plan_step_total": best.get("plan_step_total", 0),
+            "plan_step_epoch": best.get("plan_step_epoch", 0.0),
+            "plan_subtask_id": best.get("plan_subtask_id", ""),
+            "plan_subtask_content": best.get("plan_subtask_content", ""),
         }
         meta = {
             "env_id": best.get("env_id", ""),
@@ -57668,7 +58481,11 @@ body{padding:18px}
         persisted_routes = bb_for_routes.get("persisted_manager_routes", [])
         if not isinstance(persisted_routes, list):
             persisted_routes = []
-        merged_routes = list(persisted_routes) + list(self.manager_routes)
+        merged_routes = [
+            row for row in (list(persisted_routes) + list(self.manager_routes))
+            if isinstance(row, dict)
+            and self._route_scope_matches_current_plan(row, bb_for_routes, require_scoped=True)
+        ]
         # 5b: Delegation repetition detection from failure_ledger
         fl = bb_for_routes.get("failure_ledger", {})
         if isinstance(fl, dict):
@@ -57794,9 +58611,12 @@ body{padding:18px}
         default_complexity = str(profile.get("complexity", "simple") or "simple")
         progress = self._manager_progress_state(board)
         try:
-            task_level = int(row.get("task_level", profile.get("task_level", self.runtime_task_level or 3)) or 3)
+            raw_task_level = row.get("task_level", None)
+            if raw_task_level in (None, "", 0, "0"):
+                raw_task_level = profile.get("task_level", self.runtime_task_level or 3)
+            task_level = int(raw_task_level or 3)
         except Exception:
-            task_level = 3
+            task_level = int(profile.get("task_level", self.runtime_task_level or 3) or 3)
         if task_level not in TASK_LEVEL_CHOICES:
             task_level = int(profile.get("task_level", 3) or 3)
             if task_level not in TASK_LEVEL_CHOICES:
@@ -57875,6 +58695,19 @@ body{padding:18px}
             except Exception:
                 budget_raw = int(level_policy.get("round_budget", profile.get("round_budget", max_budget)) or max_budget)
             round_budget = max(1, min(max_budget, budget_raw))
+        # An approved plan owns its execution budget. A manager model may omit
+        # this field or emit a tiny per-call budget, but that must not silently
+        # downgrade an L4/L5 run and make the HUD alternate between finite and
+        # unlimited values. Scale preferences may still adjust the profile's
+        # budget; they cannot reduce a single route below that durable floor.
+        plan_budget_floor = 0
+        if isinstance(self._get_active_plan_step(board), dict):
+            try:
+                plan_budget_floor = int(profile.get("round_budget", 0) or 0)
+            except Exception:
+                plan_budget_floor = 0
+        if plan_budget_floor > 0:
+            round_budget = max(round_budget, min(max_budget, plan_budget_floor))
         if scale_preference == "fast":
             if int(round_budget) > 0:
                 round_budget = max(1, int(round(round_budget * 0.6)))
@@ -57890,6 +58723,8 @@ body{padding:18px}
                     participants.append("reviewer")
                 else:
                     participants[-1] = "reviewer"
+        if plan_budget_floor > 0:
+            round_budget = max(round_budget, min(max_budget, plan_budget_floor))
         cycles = int(board.get("manager_cycles", 0) or 0)
         remaining = -1 if int(round_budget) <= 0 else max(0, int(round_budget) - cycles)
         finish_gate = self._evaluate_finish_gate(board, latest_user_ts=latest_user_ts)
@@ -58166,7 +59001,9 @@ body{padding:18px}
         parsed = self._manager_apply_anti_stall(parsed)
         parsed = self._manager_apply_task_policy(parsed)
         if str(parsed.get("target", "") or "") in AGENT_ROLES:
-            parsed = self._align_route_with_current_plan_step(parsed, self._ensure_blackboard())
+            board = self._ensure_blackboard()
+            parsed = self._align_route_with_current_plan_step(parsed, board)
+            parsed = self._enforce_sync_plan_route(parsed, board)
         return parsed
 
     def _manager_coordination_context_for_delegate(
@@ -58583,7 +59420,11 @@ body{padding:18px}
             emit_status=True,
         ):
             board = self._ensure_blackboard()
-        board["manager_cycles"] = int(board.get("manager_cycles", 0) or 0) + 1
+        # In Sync the outer worker loop owns the monotonic dispatch counter so
+        # momentum/AgentBus rounds and manager rounds consume the same budget.
+        # Keep the increment here for direct manager calls and legacy paths.
+        if not bool(getattr(self, "_sync_round_tick_active", False)):
+            board["manager_cycles"] = int(board.get("manager_cycles", 0) or 0) + 1
         text = ""
         tool_calls: list[dict] = []
         used_watchdog_executor = False
@@ -58935,6 +59776,7 @@ body{padding:18px}
             board=board,
             role="" if isinstance(self._current_plan_step_row(board), dict) else target,
         ))
+        route_row["task_epoch"] = float(board.get("task_epoch", 0.0) or 0.0)
         if target in AGENT_ROLES:
             route_row["coordination_context"] = self._manager_coordination_context_for_delegate(
                 target,
@@ -61041,6 +61883,11 @@ body{padding:18px}
         dst = self._sanitize_agent_role(to_role)
         if not src or not dst:
             raise ValueError("invalid agent roles for bus envelope")
+        _bb = self._ensure_blackboard()
+        _scope = self._route_focus_fields(_bb)
+        _scope.update(self._plan_subtask_route_fields(board=_bb, role=""))
+        _scope["task_epoch"] = float(_bb.get("task_epoch", 0.0) or 0.0)
+        _scope["plan_step_cursor"] = int(_bb.get("plan_step_cursor", 0) or 0)
         envelope = {
             "id": make_id("agentmsg"),
             "ts": now_ts(),
@@ -61050,6 +61897,7 @@ body{padding:18px}
             "payload": trim(str(payload or "").strip(), 4000),
             "importance": str(importance or "normal").strip().lower() or "normal",
         }
+        envelope.update(_scope)
         self.agent_bus_messages.append(envelope)
         self.agent_bus_messages = self.agent_bus_messages[-240:]
         language_note = self._agent_language_policy_note()
@@ -61059,7 +61907,6 @@ body{padding:18px}
         # instead of relying on the sender copying its work into the payload. This
         # is what turns the per-role split from a liability into the blackboard-bus
         # advantage: small contexts + addressable shared evidence that never gets lost.
-        _bb = self._ensure_blackboard()
         anchor = self._handoff_mainline_anchor(_bb)
         manifest = ""
         try:
@@ -61153,7 +62000,17 @@ body{padding:18px}
             for env in reversed(self.agent_bus_messages[-20:]):
                 if not isinstance(env, dict):
                     continue
-                if env.get("_fast_routed"):
+                if env.get("_fast_routed") or env.get("_stale_scope"):
+                    continue
+                if not self._route_scope_matches_current_plan(
+                    env,
+                    self._ensure_blackboard(),
+                    require_scoped=True,
+                ):
+                    self._mark_agentbus_stale(
+                        env,
+                        "handoff does not match active plan step/subtask",
+                    )
                     continue
                 intent = str(env.get("intent", "") or "").strip().lower() or "message"
                 if require_preferred and intent not in preferred_intents:
@@ -61193,6 +62050,12 @@ body{padding:18px}
             "intent": intent,
             "from": from_role,
             "env_id": env.get("id", ""),
+            "plan_step_id": env.get("plan_step_id", ""),
+            "plan_step_index": env.get("plan_step_index", -1),
+            "plan_step_total": env.get("plan_step_total", 0),
+            "plan_step_epoch": env.get("plan_step_epoch", 0.0),
+            "plan_subtask_id": env.get("plan_subtask_id", ""),
+            "plan_subtask_content": env.get("plan_subtask_content", ""),
         }
 
     def _drain_agentbus_undelivered_backstop(self, *, min_age: float = 180.0, max_age: float = 1800.0) -> dict | None:
@@ -61211,7 +62074,17 @@ body{padding:18px}
         for env in reversed(self.agent_bus_messages[-60:]):
             if not isinstance(env, dict):
                 continue
-            if env.get("_fast_routed"):
+            if env.get("_fast_routed") or env.get("_stale_scope"):
+                continue
+            if not self._route_scope_matches_current_plan(
+                env,
+                self._ensure_blackboard(),
+                require_scoped=True,
+            ):
+                self._mark_agentbus_stale(
+                    env,
+                    "handoff does not match active plan step/subtask",
+                )
                 continue
             to_role = self._sanitize_agent_role(env.get("to", ""))
             if not to_role or to_role not in AGENT_ROLES:
@@ -61243,6 +62116,12 @@ body{padding:18px}
                 "intent": intent,
                 "from": from_role,
                 "env_id": env.get("id", ""),
+                "plan_step_id": env.get("plan_step_id", ""),
+                "plan_step_index": env.get("plan_step_index", -1),
+                "plan_step_total": env.get("plan_step_total", 0),
+                "plan_step_epoch": env.get("plan_step_epoch", 0.0),
+                "plan_subtask_id": env.get("plan_subtask_id", ""),
+                "plan_subtask_content": env.get("plan_subtask_content", ""),
             }
         return None
 
@@ -61254,6 +62133,7 @@ body{padding:18px}
         html_note = self._html_frontend_boost_instruction()
         plan_todo_note = self._plan_todo_discipline_prompt(role=role_key)
         todo_contract_note = self._todo_contract_prompt_block()
+        agent_loop_note = self._agent_loop_progress_prompt_block(for_role=role_key)
         read_context_note = self._read_context_prompt_block(for_role=role_key)
         web_search_enabled = bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED))
         web_search_context_note = self._web_search_context_prompt_block(for_role=role_key) if web_search_enabled else ""
@@ -61302,6 +62182,8 @@ body{padding:18px}
             base = base + plan_todo_note + " "
         if todo_contract_note:
             base = base + todo_contract_note + " "
+        if agent_loop_note:
+            base = base + agent_loop_note + " "
         mcp_note = self._mcp_prompt_block()
         if mcp_note:
             base = base + mcp_note + " "
@@ -61782,6 +62664,7 @@ body{padding:18px}
 
         normalized: list[object] = []
         explicit_active = False
+        explicit_status = False
         pending_positions: list[int] = []
         for item in items:
             if isinstance(item, dict):
@@ -61816,6 +62699,22 @@ body{padding:18px}
                 if parsed_status and str(raw_status or "").strip().lower() in {"", "todo", "pending"}:
                     status = parsed_status
                 normalized.append(row)
+                # A complete row snapshot is authoritative. In particular,
+                # do not let a legacy cursor rewrite an explicitly pending
+                # row when the same payload also marks several siblings
+                # completed. This was the source of apparent jumpy progress
+                # in both Single+Plan and Sync+Plan.
+                explicit_status = explicit_status or bool(
+                    parsed_status
+                    or any(
+                        key in row
+                        for key in (
+                            "status", "state", "phase", "completed", "complete", "done",
+                            "finished", "passed", "success", "in_progress", "inprogress",
+                            "active", "working", "started",
+                        )
+                    )
+                )
             else:
                 raw_text = str(item or "").strip()
                 parsed_status, parsed_content = split_todo_status_text(raw_text)
@@ -61823,12 +62722,13 @@ body{padding:18px}
                 normalized.append(
                     {"content": parsed_content or raw_text, "status": status}
                 )
+                explicit_status = explicit_status or bool(parsed_status)
             status = self._normalize_todo_status_value(status, "pending")
             if status == "in_progress":
                 explicit_active = True
             elif status == "pending":
                 pending_positions.append(len(normalized) - 1)
-        if explicit_active:
+        if explicit_active or explicit_status:
             return normalized
         if not pending_positions:
             return normalized
@@ -63369,15 +64269,7 @@ body{padding:18px}
         question = trim(str(args.get("question", "") or "").strip(), 2000)
         if not question:
             return "Error: ask_user requires a non-empty 'question'."
-        raw_options = args.get("options", [])
-        options: list[str] = []
-        if isinstance(raw_options, list):
-            for opt in raw_options:
-                text = trim(str(opt or "").strip(), 400)
-                if text:
-                    options.append(text)
-                if len(options) >= 8:
-                    break
+        options = _ask_user_option_rows(args.get("options", []))
         allow_free_text = args.get("allow_free_text", True)
         if not isinstance(allow_free_text, bool):
             allow_free_text = str(allow_free_text or "").strip().lower() not in {"false", "0", "no", "off"}
@@ -64784,7 +65676,8 @@ body{padding:18px}
                 self.current_tool_name = ""
                 self.updated_at = now_ts()
                 self._emit("message", {"role": "user", "text": content, "summary": "user message"})
-                self._persist()
+                # _emit(message) performs the immediate durable event persist.
+                # Do not write the same complete encrypted state a second time.
                 start_worker = True
         finally:
             try:
@@ -65482,6 +66375,7 @@ body{padding:18px}
                 {"summary": "sync loop stopped during initialization: task is already finished or aborted"},
             )
             return
+        budget_val = self._blackboard_round_budget(board)
         self._blackboard_set_status("INITIALIZING", "sync collaborative loop started")
         self._emit(
             "status",
@@ -65495,6 +66389,11 @@ body{padding:18px}
         )
         rounds_used = 0
         budget_compact_notified = False
+        # ``manager_cycles`` is the persisted base when this worker starts.
+        # Every outer Sync iteration consumes exactly one additional cycle,
+        # regardless of whether the route came from Manager, momentum, or the
+        # AgentBus fast path.
+        sync_cycle_base = max(0, int(board.get("manager_cycles", 0) or 0))
         while rounds_used < self.max_agent_rounds:
             board = self._ensure_blackboard()
             if self._blackboard_is_terminal_completion(board):
@@ -65517,6 +66416,10 @@ body{padding:18px}
                     },
                 )
             rounds_used += 1
+            board = self._sync_tick_manager_cycle(
+                self._ensure_blackboard(),
+                sync_cycle_base + rounds_used,
+            )
             if self.cancel_requested:
                 self._emit("status", {"summary": "run interrupted"})
                 break
@@ -65621,11 +66524,23 @@ body{padding:18px}
                     },
                 )
             else:
-                route = self._manager_delegate_turn(
-                    pinned_selection=pinned_selection,
-                    media_inputs_round=manager_media_inputs,
-                )
+                # The outer Sync tick already advanced the shared cycle.  The
+                # Manager retains its legacy increment only for direct callers,
+                # so guard it for this one call and always restore the flag.
+                try:
+                    self._sync_round_tick_active = True
+                    route = self._manager_delegate_turn(
+                        pinned_selection=pinned_selection,
+                        media_inputs_round=manager_media_inputs,
+                    )
+                finally:
+                    self._sync_round_tick_active = False
                 _momentum_skips = 0
+            # Every route producer (AgentBus, momentum, and manager) must pass
+            # the same scope/explicit-owner normalization before a worker call.
+            # This is intentionally after source selection so a fast handoff
+            # cannot bypass the active plan cursor.
+            route = self._enforce_sync_plan_route(route, self._ensure_blackboard())
             target = str(route.get("target", "") or "").strip().lower()
             instruction = trim(str(route.get("instruction", "") or "").strip(), MANAGER_INSTRUCTION_MAX_CHARS)
             if compact_mode and target in AGENT_ROLES:
@@ -68178,8 +69093,6 @@ body{padding:18px}
                 minor = int(sub.group(2))
             except Exception:
                 return None
-            if major <= 0 or minor <= 0:
-                return None
             return {
                 "kind": "sub",
                 "major": major,
@@ -68195,8 +69108,6 @@ body{padding:18px}
             try:
                 number = int(major.group(1))
             except Exception:
-                return None
-            if number <= 0:
                 return None
             return {
                 "kind": "major",
@@ -68795,7 +69706,13 @@ body{padding:18px}
                 return False
             try:
                 major_num = int(m.group(1))
+                minor_num = int(m.group(2))
             except Exception:
+                return False
+            # Zero-prefixed numeric ranges such as ``0.1 THz`` are data, not
+            # plan sub-step markers. Keep them attached to the surrounding
+            # step so they cannot create a phantom parent step.
+            if major_num <= 0 or minor_num <= 0:
                 return False
             title = str(line[m.end():] or "").strip()
             if major_num > len(raw_steps) + 2 and SessionState._looks_like_plan_data_fragment_title(title):
@@ -72642,9 +73559,10 @@ class SessionManager:
         self.code_library_status_callback = code_library_status_callback
         self.knowledge_library_root = knowledge_library_root
         self.knowledge_library_status_callback = knowledge_library_status_callback
-        env_ok, env_tags, _ = probe_ollama_environment(ollama_base)
-        self.ollama_env_available = bool(env_ok)
-        self.ollama_env_tags: list[str] = list(env_tags)
+        # Keep manager creation cheap for the initial page.  Ollama discovery is
+        # performed by model_catalog() when the model picker is actually loaded.
+        self.ollama_env_available = False
+        self.ollama_env_tags: list[str] = []
         self.run_finished_callback = run_finished_callback
         self.lock = threading.Lock()
         self.sessions: dict[str, SessionState] = {}
@@ -72884,11 +73802,11 @@ class SessionManager:
         if not self.user_model_profiles:
             self.user_model_profiles, self.user_active_profile_id = self._profiles_from_config(self.default_llm_config)
         self._ensure_user_ollama_profile()
-        if not loaded and not self._has_non_ollama_user_profiles():
-            self._prefer_ollama_profile_from_tags()
+        # Do not probe Ollama while the initial session page is loading.  The
+        # catalog path still discovers tags on demand and keeps this fallback
+        # profile runnable with the configured model in the meantime.
         if self.user_active_profile_id not in self.user_model_profiles:
             self.user_active_profile_id = next(iter(self.user_model_profiles.keys()))
-        self._preflight_user_ollama_profile()
         self._ensure_user_active_runnable()
         active = self._active_profile()
         self._sync_ollama_defaults(active)
@@ -73079,7 +73997,8 @@ class SessionManager:
             out = self.user_intent_profiler.prepare_session(sess, content, mode)
             sess.user_memory_mode = mode
             sess.updated_at = now_ts()
-            sess._persist()
+            # The immediately following submit path persists the complete
+            # request state. Avoid a second full encrypted state write here.
             return out
         except Exception as exc:
             sess.user_profile_capsule = ""
@@ -73779,41 +74698,23 @@ class SessionManager:
                 sid = str(getattr(sess, "id", "") or "")
                 if not sid:
                     continue
-                degraded = False
-                try:
-                    acquired = bool(sess.lock.acquire(timeout=0.03))
-                except Exception:
-                    acquired = False
-                if acquired:
-                    try:
-                        message_count = self._session_message_count(sess)
-                        title = str(getattr(sess, "title", "") or sid)
-                        running = bool(getattr(sess, "running", False))
-                    except Exception:
-                        title = str(getattr(sess, "title", "") or sid)
-                        running = bool(getattr(sess, "running", False))
-                        message_count = int((rows_by_id.get(sid) or {}).get("message_count", 0) or 0)
-                        degraded = True
-                    finally:
-                        try:
-                            sess.lock.release()
-                        except Exception:
-                            pass
-                else:
-                    title = str(getattr(sess, "title", "") or sid)
-                    running = bool(getattr(sess, "running", False))
-                    message_count = int((rows_by_id.get(sid) or {}).get("message_count", 0) or 0)
-                    degraded = True
+                # Session summaries are a hot path for both IDE polling and the
+                # traditional session list. Never lock a live session or rescan its
+                # complete message history here. Mutations update the index through
+                # the normal manager APIs; the selected session's live snapshot is
+                # responsible for immediate message-count updates in the UI.
+                cached = rows_by_id.get(sid, {})
                 rows_by_id[sid] = {
+                    **cached,
                     "id": sid,
-                    "title": title,
-                    "running": running,
-                    "degraded": degraded,
-                    "recovered_at": float(getattr(sess, "run_recovered_at", 0.0) or 0.0),
-                    "recovered_reason": str(getattr(sess, "run_recovered_reason", "") or ""),
-                    "ui_language": normalize_ui_language(getattr(sess, "ui_language", self.user_language)),
-                    "updated_at": float(getattr(sess, "updated_at", 0.0) or 0.0),
-                    "message_count": int(message_count),
+                    "title": str(getattr(sess, "title", "") or cached.get("title", sid) or sid),
+                    "running": bool(getattr(sess, "running", cached.get("running", False))),
+                    "degraded": False,
+                    "recovered_at": float(getattr(sess, "run_recovered_at", cached.get("recovered_at", 0.0)) or 0.0),
+                    "recovered_reason": str(getattr(sess, "run_recovered_reason", cached.get("recovered_reason", "")) or ""),
+                    "ui_language": normalize_ui_language(getattr(sess, "ui_language", cached.get("ui_language", self.user_language))),
+                    "updated_at": float(getattr(sess, "updated_at", cached.get("updated_at", 0.0)) or 0.0),
+                    "message_count": int(cached.get("message_count", 0) or 0),
                     "loaded": True,
                 }
         rows: list[dict] = []
@@ -74650,6 +75551,7 @@ const SESSION_POLL_VISIBLE_MS=30000;
 const SESSION_POLL_HIDDEN_MS=60000;
 const SESSION_BOOT_LIMIT=80;
 const SESSION_REFRESH_LIMIT=120;
+const CHAT_UPLOAD_HANDOFF_WAIT_MS=250;
 const PANEL_SCROLL_ACTIVE_MS=1100;
 const CHAT_SCROLL_ACTIVE_MS=180;
 const CHAT_SCROLL_LOCK_MS=500;
@@ -78669,7 +79571,7 @@ function renderChat(reason='snapshot'){
 function ab2b64(buf){let bin='';const bytes=new Uint8Array(buf);const chunk=0x8000;for(let i=0;i<bytes.length;i+=chunk){bin+=String.fromCharCode(...bytes.subarray(i,i+chunk))}return btoa(bin)}
 function uiYield(){return new Promise(resolve=>setTimeout(resolve,0))}
 function blobToBase64(blob){return new Promise((resolve,reject)=>{try{const reader=new FileReader();reader.onload=()=>{const raw=String(reader.result||'');const idx=raw.indexOf(',');resolve(idx>=0?raw.slice(idx+1):raw)};reader.onerror=()=>reject(reader.error||new Error('file read failed'));reader.readAsDataURL(blob)}catch(err){reject(err)}})}
-async function waitForPendingUploads(maxMs=10000){const pending=S.uploadQueuePromise;if(!(pending&&typeof pending.then==='function'))return{ok:true,waited:false};let timer=0;let timedOut=false;const timeout=new Promise(resolve=>{timer=setTimeout(()=>{timedOut=true;resolve({ok:false,timeout:true})},Math.max(1000,Number(maxMs)||10000))});try{const out=await Promise.race([pending.then(()=>({ok:true,waited:true})).catch(err=>({ok:false,error:err})),timeout]);if(timer)clearTimeout(timer);if(timedOut)return out;if(out&&out.error)throw out.error;return out||{ok:true,waited:true}}finally{if(timer)clearTimeout(timer)}}
+async function waitForPendingUploads(maxMs=CHAT_UPLOAD_HANDOFF_WAIT_MS){const pending=S.uploadQueuePromise;if(!(pending&&typeof pending.then==='function'))return{ok:true,waited:false};const budget=Math.max(0,Math.min(5000,Number(maxMs)||0));if(budget<=0)return{ok:false,timeout:true,waited:false};let timer=0;let timedOut=false;const timeout=new Promise(resolve=>{timer=setTimeout(()=>{timedOut=true;resolve({ok:false,timeout:true})},budget)});try{const out=await Promise.race([pending.then(()=>({ok:true,waited:true})).catch(err=>({ok:false,error:err})),timeout]);if(timer)clearTimeout(timer);if(timedOut)return out;if(out&&out.error)return out;return out||{ok:true,waited:true}}finally{if(timer)clearTimeout(timer)}}
 function clipboardFileExtFromType(mime){const low=String(mime||'').toLowerCase();const map={'image/png':'png','image/jpeg':'jpg','image/gif':'gif','image/webp':'webp','application/pdf':'pdf','application/vnd.openxmlformats-officedocument.wordprocessingml.document':'docx','application/msword':'doc','application/vnd.openxmlformats-officedocument.presentationml.presentation':'pptx','application/vnd.ms-powerpoint':'ppt','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet':'xlsx','application/vnd.ms-excel':'xls','text/csv':'csv','text/plain':'txt','text/markdown':'md'};if(map[low])return map[low];if(low.includes('/'))return low.split('/').pop().replace(/[^a-z0-9]+/g,'')||'bin';return'bin'}
 function ensureNamedUploadFile(file,index=0,prefix='clipboard'){const src=file instanceof File?file:null;if(!src)return file;const name=String(src.name||'').trim();if(name)return src;const ext=clipboardFileExtFromType(src.type);const stamp=new Date().toISOString().replace(/[-:.TZ]/g,'').slice(0,14);const safe=`${prefix}_${stamp}_${index+1}.${ext}`;try{return new File([src],safe,{type:src.type||'',lastModified:Date.now()})}catch(_){return src}}
 function clipboardFilesFromEvent(ev){const dt=ev&&ev.clipboardData?ev.clipboardData:null;if(!dt)return[];const out=[];const seen=new Set();const pushFile=(raw,idx)=>{const file=ensureNamedUploadFile(raw,idx,'clipboard');if(!(file instanceof File))return;const sig=[String(file.name||''),String(file.type||''),String(file.size||0)].join('::');if(seen.has(sig))return;seen.add(sig);out.push(file)};const files=dt.files?Array.from(dt.files):[];files.forEach((file,idx)=>pushFile(file,idx));const items=dt.items?Array.from(dt.items):[];items.forEach((item,idx)=>{if(!item||item.kind!=='file')return;const file=typeof item.getAsFile==='function'?item.getAsFile():null;if(file)pushFile(file,idx+files.length)});return out}
@@ -79226,7 +80128,7 @@ async function deleteSession(){if(!S.activeId){showError(t('select_session_first
 async function applyModel(){const sel=E('modelSelect');const btn=E('applyModelBtn');const model=sel?.value||'';if(!model){showError(t('no_model_selected'));return}if(S.staticMode&&S.frozen)resumeAutoUpdates();S.config=S.config||{};const prevModel=String(S.config.model||'');const prevSnapModel=String(S.snap?.model||'');const prevSnapCatalog=(S.snap&&typeof S.snap==='object')?S.snap.llm_model_catalog:undefined;try{S.config.model=model;if(S.snap&&typeof S.snap==='object'){S.snap.model=_modelNameFromSelection(model)||S.snap.model;if(!S.snap.llm_model_catalog||typeof S.snap.llm_model_catalog!=='object')S.snap.llm_model_catalog={};S.snap.llm_model_catalog.selected=model}renderModelControls();renderStats();if(S.snap)renderBoards();if(sel)sel.disabled=true;if(btn)btn.disabled=true;const path=S.activeId?('/api/sessions/'+S.activeId+'/config/model'):'/api/config/model';const changed=await api(path,{method:'POST',body:JSON.stringify({selection:model,model})});if(changed?.note)showError(changed.note);else showError('');if(!applyModelCatalog(changed)){const cat=await loadModelCatalog();if(!applyModelCatalog(cat)){S.config.model=String(changed?.selected||model||'').trim();renderModelControls()}}if(S.snap&&typeof S.snap==='object'){const selected=String(S.config?.model||model||'').trim();const modelName=_modelNameFromSelection(selected);if(modelName)S.snap.model=modelName;if(changed&&typeof changed==='object')S.snap.llm_model_catalog=changed;renderBoards()}scheduleSnapshot({forceFull:true,delayMs:40,allowWhenFrozen:true})}catch(err){S.config.model=prevModel;if(S.snap&&typeof S.snap==='object'){if(prevSnapModel)S.snap.model=prevSnapModel;if(prevSnapCatalog!==undefined)S.snap.llm_model_catalog=prevSnapCatalog;renderBoards()}renderModelControls();renderStats();showError(err.message||String(err))}finally{if(sel)sel.disabled=false;if(btn)btn.disabled=false}}
 
 async function uploadLlmConfigFile(file){try{if(!S.activeId){showError(t('select_session_first'));return}if(!file){return}const arr=await file.arrayBuffer();const payload={filename:'LLM.config.json',mime:file.type||'application/json',content_b64:ab2b64(arr)};const out=await api('/api/sessions/'+S.activeId+'/uploads',{method:'POST',body:JSON.stringify(payload)});const note=String(out?.note||out?.model_catalog?.note||'').trim();if(!out?.model_catalog){showError(t('config_uploaded_no_profiles'));}else{showError(note||'');const modal=E('llmConfigModal');if(modal)modal.style.display='none'}const cat=out?.model_catalog||await loadModelCatalog();if(!applyModelCatalog(cat)){renderModelControls()}await refreshSnapshot({forceFull:true,allowWhenFrozen:true})}catch(err){showError(err.message||String(err))}}
-async function sendMessage(){showError('');const promptText=E('prompt').value.trim();if(!promptText||!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();E('prompt').value='';try{const uploadWait=await waitForPendingUploads(10000);if(uploadWait&&!uploadWait.ok&&uploadWait.timeout){showError('上传仍在后台处理；任务会先使用已保存的文件路径继续。')}const out=await api('/api/sessions/'+S.activeId+'/message',{method:'POST',body:JSON.stringify({content:promptText})});S.lastDeltaTs=Date.now();scheduleSnapshot({forceFull:false,delayMs:40,allowWhenFrozen:true});scheduleSessionPoll(true);if(out&&out.queued&&!out.scheduler_started&&!out.live_input){const pos=Number(out.queue_position||0);const size=Number(out.queue_size||0);showError(`${t('event_scheduler_queued_title')}${pos?` · ${t('event_scheduler_queue_position')} ${pos}${size?`/${size}`:''}`:''}`)}}catch(err){showError(err.message)}}
+async function sendMessage(){showError('');const promptText=E('prompt').value.trim();if(!promptText||!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();E('prompt').value='';try{const configuredWait=Number(S.config?.chat_upload_frontend_wait_ms);const handoffWait=Number.isFinite(configuredWait)?Math.max(0,Math.min(5000,configuredWait)):CHAT_UPLOAD_HANDOFF_WAIT_MS;const uploadWait=await waitForPendingUploads(handoffWait);if(uploadWait&&!uploadWait.ok&&(uploadWait.timeout||uploadWait.error)){showError(uploadWait.timeout?'上传仍在后台处理；任务已先提交，文件完成后会出现在工作区。':`上传继续在后台处理：${uploadWait.error.message||uploadWait.error}`)}const out=await api('/api/sessions/'+S.activeId+'/message',{method:'POST',body:JSON.stringify({content:promptText})});S.lastDeltaTs=Date.now();scheduleSnapshot({forceFull:false,delayMs:40,allowWhenFrozen:true});scheduleSessionPoll(true);if(out&&out.queued&&!out.scheduler_started&&!out.live_input){const pos=Number(out.queue_position||0);const size=Number(out.queue_size||0);showError(`${t('event_scheduler_queued_title')}${pos?` · ${t('event_scheduler_queue_position')} ${pos}${size?`/${size}`:''}`:''}`)}}catch(err){showError(err.message)}}
 async function interruptRun(){if(!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/interrupt',{method:'POST'});S.lastDeltaTs=Date.now();if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:140,allowWhenFrozen:true})}}
 async function compactNow(){if(!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/compact',{method:'POST'});S.lastDeltaTs=Date.now();scheduleCompactRefreshBurst(COMPACT_AUTO_REFRESH_COUNT);if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:180,allowWhenFrozen:true})}}
 async function clearStaleTodos(){if(!S.activeId){showError(t('select_session_first'));return}if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/todos/clear-stale',{method:'POST'});S.lastDeltaTs=Date.now();if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:160,allowWhenFrozen:true})}}
@@ -79274,7 +80176,8 @@ async function refreshAll(forceProbe=false){
   if(!applyModelCatalog(mc)){renderModelControls()}
   scheduleModelCatalogLoad(forceProbe,forceProbe?80:650);
   setTimeout(()=>refreshDeferredCatalogs().catch(()=>{}),forceProbe?80:900);
-  scheduleLoadRemainingSessions(forceProbe?180:550);
+  // Historical sessions are loaded on scroll only. Eagerly draining the catalog
+  // kept low-end servers and the browser busy even when the user never opened it.
   if(S.activeId&&!String(sessState?.selectedId||'').trim())await refreshSnapshot({forceFull:!!forceProbe,allowWhenFrozen:true});
 }
 function bindClick(id,fn){const el=E(id);if(el)el.onclick=fn}
@@ -95616,6 +96519,10 @@ async function refreshWorkspaceSnapshot(){if(S.workspaceRefreshBusy||!S.activeSe
 async function createSession(){const out=await api('/api/ide/sessions',{method:'POST',body:'{}'});await switchSession(out.id,true);return out}
 async function renameCurrentSession(){const row=S.sessions.find(item=>item.id===S.activeSession);if(!row)return;const title=prompt('Session name',row.title||'');if(!title||title.trim()===row.title)return;const out=await api(`/api/ide/sessions/${qs(S.activeSession)}`,{method:'PATCH',body:JSON.stringify({title:title.trim()})});row.title=out.title;renderSessions();updateAgentContext();await loadRoots();scheduleStateSave()}
 async function switchSession(sessionId,isNew=false){const target=String(sessionId||'');if(!target||target===S.activeSession&&!isNew){renderSessions();return true}if([...S.openFiles.values()].some(file=>file.dirty)&&!confirm('Switch session with unsaved files?')){renderSessions();return false}const seq=++S.sessionSwitchSeq;S.sessionSwitching=true;E('sessionSelect').disabled=true;closePromptEnhanceReview(false);S.workspaceClipboard=null;S.explorerSelection=null;clearWorkspaceDropState();S.activeSession=target;S.workspaceRefreshSeq++;S.workspaceRefreshBusy=false;closeAgentEvents();clearTimeout(S.agentPoll);S.agentPoll=null;S.agentPollDue=0;clearTimeout(S.agentTreeTimer);try{if(S.terminal)await killTerminal();if(seq!==S.sessionSwitchSeq)return false;if(S.debug)await stopDebug();if(seq!==S.sessionSwitchSeq)return false;S.openFiles.clear();S.models.forEach(model=>model.dispose());S.models.clear();S.historyOriginalModels.forEach(model=>model.dispose());S.historyOriginalModels.clear();S.historyDecorations.clear();S.viewStates.clear();S.activeByGroup=['',''];setEditorModel(1,null);setEditorModel(0,null);syncEditorGroupLayout();resetAgentSessionUI(target);await refreshConfig();if(seq!==S.sessionSwitchSeq||target!==S.activeSession)return false;await loadRoots(target,seq);if(seq!==S.sessionSwitchSeq||target!==S.activeSession)return false;updateAgentContext();connectAgentEvents();S.agentPollRequested=true;scheduleAgentPoll(50);if(isNew){toggleSecondary(true);E('agentPrompt').focus();agentMessage('New task workspace ready.','system')}scheduleStateSave();return true}finally{if(seq===S.sessionSwitchSeq){S.sessionSwitching=false;E('sessionSelect').disabled=false;renderSessions()}}}
+async function refreshSessionCatalog(){const out=await api('/api/ide/sessions?limit=80&offset=0');S.sessions=Array.isArray(out.sessions)?out.sessions:[];renderSessions();return out}
+// Session switching only needs the catalog. Keep toolchains, mounts, and other
+// static IDE config out of the hot path on machines with many old sessions.
+async function switchSession(sessionId,isNew=false){const target=String(sessionId||'');if(!target||target===S.activeSession&&!isNew){renderSessions();return true}if([...S.openFiles.values()].some(file=>file.dirty)&&!confirm('Switch session with unsaved files?')){renderSessions();return false}const seq=++S.sessionSwitchSeq;S.sessionSwitching=true;E('sessionSelect').disabled=true;closePromptEnhanceReview(false);S.workspaceClipboard=null;S.explorerSelection=null;clearWorkspaceDropState();S.activeSession=target;S.workspaceRefreshSeq++;S.workspaceRefreshBusy=false;closeAgentEvents();clearTimeout(S.agentPoll);S.agentPoll=null;S.agentPollDue=0;clearTimeout(S.agentTreeTimer);try{if(S.terminal)await killTerminal();if(seq!==S.sessionSwitchSeq)return false;if(S.debug)await stopDebug();if(seq!==S.sessionSwitchSeq)return false;S.openFiles.clear();S.models.forEach(model=>model.dispose());S.models.clear();S.historyOriginalModels.forEach(model=>model.dispose());S.historyOriginalModels.clear();S.historyDecorations.clear();S.viewStates.clear();S.activeByGroup=['',''];setEditorModel(1,null);setEditorModel(0,null);syncEditorGroupLayout();resetAgentSessionUI(target);await refreshSessionCatalog();if(seq!==S.sessionSwitchSeq||target!==S.activeSession)return false;await loadRoots(target,seq);if(seq!==S.sessionSwitchSeq||target!==S.activeSession)return false;updateAgentContext();connectAgentEvents();S.agentPollRequested=true;scheduleAgentPoll(50);if(isNew){toggleSecondary(true);E('agentPrompt').focus();agentMessage('New task workspace ready.','system')}scheduleStateSave();return true}finally{if(seq===S.sessionSwitchSeq){S.sessionSwitching=false;E('sessionSelect').disabled=false;renderSessions()}}}
 async function newFile(){const rel=prompt('File path',activeDir()?`${activeDir()}/untitled.txt`:'untitled.txt');if(!rel)return;await api(`/api/ide/sessions/${qs(S.activeSession)}/workspace/file`,{method:'PUT',body:JSON.stringify({root_id:S.activeRoot,path:rel,content:''})});await loadTree(activeDir());await openFile(rel)}
 async function newFolder(){const rel=prompt('Folder path',activeDir()?`${activeDir()}/new-folder`:'new-folder');if(!rel)return;await api(`/api/ide/sessions/${qs(S.activeSession)}/workspace/mkdir`,{method:'POST',body:JSON.stringify({root_id:S.activeRoot,path:rel})});await loadTree(activeDir())}
 async function renameEntry(row){const next=normalizeUploadPath(prompt('New path',row.path)||'');if(!next||next===row.path)return;workspaceAssertNoDirtyFiles(row.path,'renaming this entry');await api(`/api/ide/sessions/${qs(S.activeSession)}/workspace/rename`,{method:'PATCH',body:JSON.stringify({root_id:S.activeRoot,old_path:row.path,new_path:next})});await remapWorkspaceOpenFiles(row.path,next);const selected=explorerSelectionRow();if(selected&&(selected.path===row.path||selected.path.startsWith(`${row.path}/`)))S.explorerSelection=Object.assign({},selected,{path:`${next}${selected.path.slice(row.path.length)}`,name:selected.path===row.path?next.split('/').pop():selected.name});const clip=S.workspaceClipboard;if(clip?.session_id===S.activeSession&&clip?.root_id===S.activeRoot&&(clip.path===row.path||clip.path.startsWith(`${row.path}/`)))S.workspaceClipboard=Object.assign({},clip,{path:`${next}${clip.path.slice(row.path.length)}`,name:clip.path===row.path?next.split('/').pop():clip.name});S.treeCache.clear();await loadTree('')}
@@ -95760,14 +96667,14 @@ function renderAgentOperationOnce(op){const seq=Number(op?.seq||0),key=`operatio
 function renderAgentAskUser(state){
   const card=E('agentAskUser'),input=E('agentPrompt'),send=E('sendAgentBtn'),pending=!state?.running&&state?.pending_user_question&&String(state.pending_user_question.question||'').trim()?state.pending_user_question:null;
   if(!pending){card.classList.add('is-hidden');card.dataset.questionId='';E('agentAskUserQuestion').textContent='';E('agentAskUserOptions').innerHTML='';E('agentAskUserHint').textContent='';E('agentAskUserRole').textContent='';input.placeholder='Ask Clouds Coder';input.disabled=false;send.title='Send';return false}
-  const questionId=String(pending.id||''),options=Array.isArray(pending.options)?pending.options.map(value=>String(value||'').trim()).filter(Boolean):[],allowFree=pending.allow_free_text!==false,submitting=S.agentSubmitting;
+  const questionId=String(pending.id||''),options=Array.isArray(pending.options)?pending.options.map(option=>{const row=option&&typeof option==='object'?option:{label:option,value:option};const label=String(row.label??row.text??row.name??row.value??'').trim(),value=String(row.value??row.id??label).trim(),description=String(row.description??row.detail??'').trim();return label&&value?{label,value,description}:null}).filter(Boolean):[],allowFree=pending.allow_free_text!==false,submitting=S.agentSubmitting;
   card.classList.remove('is-hidden');card.dataset.questionId=questionId;E('agentAskUserQuestion').textContent=String(pending.question||'').trim();E('agentAskUserRole').textContent=agentRoleLabel(pending.role||'Agent');E('agentAskUserHint').textContent=allowFree?(options.length?'Choose an option or type your own answer.':'Type your answer below, then send.'):'Choose one of the available options to continue.';
-  const optionHost=E('agentAskUserOptions');optionHost.innerHTML='';for(const option of options){const button=document.createElement('button');button.type='button';button.className='agent-ask-user-option';button.textContent=option;button.disabled=submitting;button.onclick=()=>answerAgentQuestion(option).catch(showError);optionHost.appendChild(button)}
+  const optionHost=E('agentAskUserOptions');optionHost.innerHTML='';for(const option of options){const button=document.createElement('button');button.type='button';button.className='agent-ask-user-option';button.disabled=submitting;button.title=option.description||option.label;button.innerHTML=`<strong>${escapeHtml(option.label)}</strong>${option.description?`<small>${escapeHtml(option.description)}</small>`:''}`;button.onclick=()=>answerAgentQuestion(option.value).catch(showError);optionHost.appendChild(button)}
   input.placeholder=allowFree?'Answer the agent question':'Choose an option above';input.disabled=!allowFree;send.disabled=submitting||!allowFree;send.title=allowFree?'Send answer':'Choose an option above';return true
 }
 async function answerAgentQuestion(answer){
   const pending=!S.agentState?.running&&S.agentState?.pending_user_question?S.agentState.pending_user_question:null,value=String(answer||'').trim();if(!pending||!value||S.agentSubmitting)return;
-  const options=Array.isArray(pending.options)?pending.options.map(item=>String(item||'').trim()).filter(Boolean):[];if(pending.allow_free_text===false&&!options.includes(value))throw new Error('Choose one of the available options.');
+  const options=Array.isArray(pending.options)?pending.options.map(option=>{const row=option&&typeof option==='object'?option:{value:option};return String(row.value??row.id??row.label??'').trim()}).filter(Boolean):[];if(pending.allow_free_text===false&&!options.includes(value))throw new Error('Choose one of the available options.');
   const questionId=String(pending.id||''),input=E('agentPrompt'),restoreText=input.value.trim()||value;S.agentSubmitting=true;input.value='';E('agentStatus').textContent='Resuming...';renderAgentAskUser(S.agentState);
   try{const out=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/ask-user/answer`,{method:'POST',body:JSON.stringify({question_id:questionId,answer:value})});S.agentSubmitting=false;S.agentState=Object.assign({},S.agentState,{pending_user_question:null,running:!!out.running});renderAgentAskUser(S.agentState);E('agentPrompt').disabled=false;E('sendAgentBtn').disabled=false;input.focus();E('agentStatus').textContent='Resuming...';S.agentPollRequested=true;scheduleAgentPoll(40)}catch(error){S.agentSubmitting=false;input.value=input.value.trim()?`${restoreText}\n${input.value}`:restoreText;renderAgentAskUser(S.agentState);input.focus();E('agentStatus').textContent='Awaiting input';S.agentPollRequested=true;scheduleAgentPoll(40);throw error}
 }
@@ -97000,9 +97907,9 @@ class AppContext:
         self._ide_save_mounts(user_id, mounts)
         return {"ok": True, "mounts": mounts}
 
-    def ide_session_payload(self, user_id: str, client_ip: str = "") -> dict:
+    def ide_session_payload(self, user_id: str, client_ip: str = "", *, limit: int = 80, offset: int = 0) -> dict:
         mgr = self.manager_for_user(user_id)
-        sessions = mgr.list(limit=80, offset=0)
+        sessions = mgr.list(limit=max(1, min(200, int(limit or 80))), offset=max(0, int(offset or 0)))
         if isinstance(sessions, dict):
             rows = list(sessions.get("sessions", []))
         else:
@@ -97438,6 +98345,11 @@ class AppContext:
         truncated = len(raw) > cap or size > cap
         raw = raw[:cap]
         text, encoding = self._ide_decode_preview_text(raw)
+        frontmatter: dict = {}
+        if kind == "markdown":
+            text = normalize_markdown_preview_text(text)
+            frontmatter, text = parse_front_matter(text)
+            text = normalize_markdown_preview_text(text)
         if truncated and "\n" in text:
             text = text.rsplit("\n", 1)[0]
         if kind == "markdown":
@@ -97457,14 +98369,30 @@ class AppContext:
                 f"<pre class=\"pv-pre\">{html.escape(text)}</pre></div>"
             )
             return sess._preview_html_shell(target.name, body)
+        renderer_name = "fallback"
         try:
             import markdown as markdown_module  # type: ignore
 
-            rendered = markdown_module.markdown(
-                text,
-                extensions=["extra", "sane_lists", "tables", "fenced_code"],
-                output_format="html5",
-            )
+            # ``extra`` covers tables, fenced code, footnotes and attribute
+            # lists in the supported Python-Markdown versions. The second
+            # invocation keeps older installations usable if one optional
+            # extension is unavailable.
+            try:
+                rendered = markdown_module.markdown(
+                    text,
+                    extensions=["extra", "sane_lists", "footnotes", "md_in_html"],
+                    output_format="html5",
+                    tab_length=4,
+                )
+            except Exception:
+                rendered = markdown_module.markdown(
+                    text,
+                    extensions=["extra", "sane_lists"],
+                    output_format="html5",
+                    tab_length=4,
+                )
+            renderer_name = "python-markdown"
+            rendered = _preview_markdown_task_lists(rendered)
             try:
                 import bleach  # type: ignore
 
@@ -97472,7 +98400,7 @@ class AppContext:
                     rendered,
                     tags={
                         "a", "abbr", "blockquote", "br", "code", "del", "details", "div", "em",
-                        "h1", "h2", "h3", "h4", "h5", "h6", "hr", "img", "kbd", "li", "ol",
+                        "h1", "h2", "h3", "h4", "h5", "h6", "hr", "img", "input", "kbd", "li", "ol",
                         "p", "pre", "s", "span", "strong", "sub", "summary", "sup", "table",
                         "tbody", "td", "th", "thead", "tr", "ul",
                     },
@@ -97482,6 +98410,7 @@ class AppContext:
                         "code": ["class"],
                         "div": ["class"],
                         "span": ["class"],
+                        "input": ["class", "type", "checked", "disabled"],
                         "th": ["align"],
                         "td": ["align"],
                     },
@@ -97491,7 +98420,7 @@ class AppContext:
             except Exception:
                 pass
         except Exception:
-            rendered = f"<pre>{html.escape(text)}</pre>"
+            rendered = _preview_markdown_fallback_html(text)
         base_dir = PurePosixPath(normalize_rel_preview_path(rel)).parent
 
         def rewrite_reference(match: re.Match) -> str:
@@ -97523,9 +98452,11 @@ class AppContext:
             return f"{attr}={quote_char}{html.escape(asset_url, quote=True)}{quote_char}"
 
         rendered = re.sub(r'''(?is)\b(src|href)\s*=\s*(["'])(.*?)\2''', rewrite_reference, rendered)
+        frontmatter_html = _preview_markdown_frontmatter_html(frontmatter)
         body = (
             "<article class=\"pv-card pv-markdown\">"
-            f"<div class=\"pv-note\">{html.escape(note)}</div>{rendered}</article>"
+            f"<div class=\"pv-note\">{html.escape(note)}</div>"
+            f"{frontmatter_html}<div data-pv-markdown-body=\"1\">{rendered}</div></article>"
         )
         extra_css = """
 .pv-markdown{line-height:1.65;overflow-wrap:anywhere}
@@ -97534,30 +98465,74 @@ class AppContext:
 .pv-markdown code{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}
 .pv-markdown table{display:block;max-width:100%;overflow:auto;border-collapse:collapse}.pv-markdown th,.pv-markdown td{padding:7px 9px;border:1px solid #dbe5f0}
 .pv-markdown img{display:block;max-width:100%;height:auto;margin:16px auto}.pv-markdown blockquote{margin:1em 0;padding:2px 14px;border-left:3px solid #7aa7d9;color:#52647b}
-"""
+.pv-frontmatter{margin:0 0 18px;border:1px solid #dbe5f0;border-radius:12px;background:#f8fbff;padding:10px 12px}
+.pv-frontmatter summary{cursor:pointer;font-weight:700;color:#52647b}.pv-frontmatter-grid{display:grid;gap:8px;margin-top:10px}
+.pv-frontmatter-row{display:grid;grid-template-columns:minmax(90px,180px) 1fr;gap:12px;align-items:start;font-size:.84rem}
+.pv-frontmatter-row>div{overflow:auto}.pv-frontmatter-table{display:table;margin:0;font-size:.82rem}.pv-frontmatter-table th{text-align:left;background:#eef5ff}
+.pv-task-checkbox{margin:0 .45em 0 0;vertical-align:middle;accent-color:#4f8fcb}
+.pv-mermaid{overflow:auto;margin:14px 0;padding:12px;border:1px solid #dbe5f0;border-radius:12px;background:#fbfdff;text-align:center}
+.pv-mermaid svg{max-width:100%;height:auto}
+        """
         preview_html = sess._preview_html_shell(target.name, body, extra_css)
+        source_json = (
+            json.dumps(text, ensure_ascii=True)
+            .replace("<", "\\u003c")
+            .replace(">", "\\u003e")
+            .replace("&", "\\u0026")
+        )
         katex_head = (
             '<link rel="stylesheet" href="/assets/js_lib/katex/dist/katex.min.css">'
             '<script defer src="/assets/js_lib/katex/dist/katex.min.js"></script>'
             '<script defer src="/assets/js_lib/katex/dist/contrib/auto-render.min.js"></script>'
+            '<script defer src="/assets/js_lib/marked.min.js"></script>'
+            '<script defer src="/assets/js_lib/mermaid.min.js"></script>'
         )
-        katex_boot = """<script>
-document.addEventListener('DOMContentLoaded', function(){
-  if(typeof renderMathInElement!=='function')return;
-  renderMathInElement(document.querySelector('.pv-markdown')||document.body, {
-    delimiters:[
-      {left:'$$',right:'$$',display:true},
-      {left:'\\\\[',right:'\\\\]',display:true},
-      {left:'\\\\(',right:'\\\\)',display:false},
-      {left:'$',right:'$',display:false}
-    ],
-    ignoredTags:['script','noscript','style','textarea','pre','code'],
-    throwOnError:false
-  });
-});
+        markdown_boot = f"""<script id="pv-markdown-source" type="application/json">{source_json}</script><script>
+document.addEventListener('DOMContentLoaded', function(){{
+  var root=document.querySelector('.pv-markdown');
+  if(!root)return;
+  var body=root.querySelector('[data-pv-markdown-body]');
+  var sourceNode=document.getElementById('pv-markdown-source');
+  var source='';
+  try{{source=sourceNode?JSON.parse(sourceNode.textContent||''):'';}}catch(_){{source='';}}
+  function safeMarkedHtml(value){{
+    var tpl=document.createElement('template');tpl.innerHTML=String(value||'');
+    tpl.content.querySelectorAll('script,iframe,object,embed,style,link,form').forEach(function(node){{node.remove();}});
+    tpl.content.querySelectorAll('*').forEach(function(node){{
+      Array.from(node.attributes||[]).forEach(function(attr){{
+        var name=String(attr.name||'').toLowerCase(),val=String(attr.value||'');
+        if(name.indexOf('on')===0||((name==='href'||name==='src')&&/^\\s*(?:javascript|vbscript|data:text\\/html):/i.test(val)))node.removeAttribute(attr.name);
+      }});
+    }});
+    return tpl.innerHTML;
+  }}
+  // Python-Markdown is authoritative when available. Marked is a local-only
+  // progressive fallback for installations without that optional module.
+  if({str(renderer_name == 'fallback').lower()}&&body&&source&&window.marked&&typeof window.marked.parse==='function'){{
+    try{{body.innerHTML=safeMarkedHtml(window.marked.parse(source,{{gfm:true,breaks:false}}));}}catch(_){{}}
+  }}
+  if(typeof renderMathInElement==='function'){{
+    try{{renderMathInElement(root,{{delimiters:[
+      {{left:'$$',right:'$$',display:true}},{{left:'\\\\[',right:'\\\\]',display:true}},
+      {{left:'\\\\(',right:'\\\\)',display:false}},{{left:'$',right:'$',display:false}}
+    ],ignoredTags:['script','noscript','style','textarea','pre','code'],throwOnError:false}});}}catch(_){{}}
+  }}
+  if(window.mermaid&&typeof window.mermaid.initialize==='function'&&typeof window.mermaid.render==='function'){{
+    try{{window.mermaid.initialize({{startOnLoad:false,securityLevel:'strict',theme:'neutral'}});}}catch(_){{}}
+    root.querySelectorAll('pre code.language-mermaid,pre code.lang-mermaid').forEach(function(code,idx){{
+      var pre=code.parentElement,host=document.createElement('div');host.className='pv-mermaid';
+      var diagramSource=String(code.textContent||'').trim();if(!diagramSource)return;
+      pre.replaceWith(host);
+      Promise.resolve(window.mermaid.render('pv-mermaid-'+Date.now()+'-'+idx,diagramSource)).then(function(result){{
+        var svg=(result&&typeof result==='object')?result.svg:result;if(!svg)throw new Error('empty diagram');
+        host.innerHTML=svg;if(result&&typeof result.bindFunctions==='function')result.bindFunctions(host);
+      }}).catch(function(){{host.replaceWith(pre);}});
+    }});
+  }}
+}});
 </script>"""
         return preview_html.replace("</head>", f"{katex_head}</head>").replace(
-            "</body>", f"{katex_boot}</body>"
+            "</body>", f"{markdown_boot}</body>"
         )
 
     def ide_image_preview(self, user_id: str, session_id: str, *, root_id: str = "session", rel: str = "") -> tuple[bytes, str]:
@@ -99619,13 +100594,10 @@ document.addEventListener('DOMContentLoaded', function(){
         answer = trim(str(payload.get("answer", payload.get("message", "")) or "").strip(), 4000)
         if not answer:
             raise ValueError("answer required")
-        options = [
-            trim(str(value or "").strip(), 400)
-            for value in (pending.get("options", []) if isinstance(pending.get("options"), list) else [])
-            if str(value or "").strip()
-        ][:8]
+        options = _ask_user_option_rows(pending.get("options", []))
+        option_values = {_ask_user_option_value(option) for option in options}
         allow_free_text = bool(pending.get("allow_free_text", True))
-        if options and not allow_free_text and answer not in options:
+        if option_values and not allow_free_text and answer not in option_values:
             raise ValueError("answer must match one of the available options")
         out = self.submit_user_message(user_id, session_id, answer)
         result = dict(out if isinstance(out, dict) else {"ok": True, "result": out})
@@ -99691,15 +100663,11 @@ document.addEventListener('DOMContentLoaded', function(){
         if isinstance(raw_question, dict):
             question = trim(str(raw_question.get("question", "") or "").strip(), 2000)
             if question:
-                raw_options = raw_question.get("options", [])
+                raw_options = _ask_user_option_rows(raw_question.get("options", []))
                 pending_question = {
                     "id": trim(str(raw_question.get("id", "") or ""), 120),
                     "question": question,
-                    "options": [
-                        trim(str(value or "").strip(), 400)
-                        for value in raw_options
-                        if str(value or "").strip()
-                    ][:8] if isinstance(raw_options, list) else [],
+                    "options": raw_options,
                     "allow_free_text": bool(raw_question.get("allow_free_text", True)),
                     "role": trim(str(raw_question.get("role", "") or "agent"), 40),
                     "ts": float(raw_question.get("ts", 0.0) or 0.0),
@@ -104815,6 +105783,7 @@ class Handler(BaseHTTPRequestHandler):
                     "daily_session_reset_hour": int(getattr(self.app, "daily_session_reset_hour", 8) or 8),
                     "session_creation_limit": session_creation_limit,
                     "download_js_lib_enabled": bool(getattr(self.app, "js_lib_download_enabled", True)),
+                    "chat_upload_frontend_wait_ms": int(CHAT_UPLOAD_FRONTEND_WAIT_MS),
                 }
             )
         if path == "/api/user-memory":
@@ -106806,7 +107775,16 @@ class IdeHandler(BaseHTTPRequestHandler):
                 return self._send_exception(exc)
         if path == "/api/ide/sessions":
             try:
-                return self._send_json(self.app.ide_session_payload(self._user_id(), client_ip=self._client_ip()))
+                requested_limit = int((query.get("limit", ["80"]) or ["80"])[0] or 80)
+                requested_offset = int((query.get("offset", ["0"]) or ["0"])[0] or 0)
+                return self._send_json(
+                    self.app.ide_session_payload(
+                        self._user_id(),
+                        client_ip=self._client_ip(),
+                        limit=requested_limit,
+                        offset=requested_offset,
+                    )
+                )
             except Exception as exc:
                 return self._send_exception(exc)
         m = re.match(r"^/api/ide/v2/sessions/([^/]+)/events$", path)
