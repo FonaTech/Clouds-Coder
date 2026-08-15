@@ -29101,32 +29101,6 @@ class SessionState:
             "todo_fp": todo_fp,
         }
 
-    def _agent_loop_next_action(self, alignment: dict, state: dict) -> str:
-        phase = str(alignment.get("phase", "") or "execute").strip().lower()
-        if bool(alignment.get("all_todos_completed", False)):
-            if bool(state.get("seen_validation", False)):
-                return "finish"
-            return "verify"
-        if bool(alignment.get("current_is_acceptance", False)) or phase in {"test", "review"}:
-            return "verify"
-        # This is an observation-driven intervention, not a phase classifier:
-        # when the same evidence keeps returning without Todo progress, make
-        # the next turn consolidate what is already known instead of issuing
-        # another broad read.  The model remains free to choose the concrete
-        # synthesis action for the current deliverable.
-        if bool(state.get("guidance_active", False)) and (
-            int(state.get("reused_streak", 0) or 0) >= 2
-            or int(state.get("stagnant_evidence_streak", 0) or 0) >= 3
-        ):
-            return "synthesize"
-        if phase == "research":
-            return "synthesize"
-        if phase == "design":
-            return "record_design"
-        if phase in {"implement", "deploy", "execute"}:
-            return "execute"
-        return "advance"
-
     def _update_agent_loop_progress_state(self, tool_results: list[dict], role: str = "") -> dict:
         """Classify one tool round as progress, new evidence, or evidence reuse.
 
@@ -29267,7 +29241,9 @@ class SessionState:
             ),
             "updated_at": now_ts(),
         }
-        state["next_action"] = self._agent_loop_next_action(alignment, state)
+        # Keep this state observational. The Manager/agent chooses its own
+        # phase and next action from the shared evidence on every turn.
+        state.pop("next_action", None)
         store[role_key] = state
         self.agent_loop_progress_state = store
         return state
@@ -29282,17 +29258,17 @@ class SessionState:
         state["alignment"] = alignment
         state["guidance_active"] = True
         state["guidance_reason"] = trim(str(reason or "strategy_signal"), 120)
-        state["next_action"] = self._agent_loop_next_action(alignment, state)
+        state.pop("next_action", None)
         state["updated_at"] = now_ts()
         store[role_key] = state
         self.agent_loop_progress_state = store
 
     def _agent_loop_progress_prompt_block(self, for_role: str = "") -> str:
-        """Render multi-agent next-turn guidance from live progress telemetry.
+        """Render observation-only multi-agent progress telemetry.
 
         Single and plan+single intentionally keep their original autonomous
-        prompt path. Telemetry may still be recorded for diagnostics, but the
-        adaptive loop policy belongs to sequential/sync role coordination.
+        prompt path. Sequential/sync receive shared facts, never a runtime-
+        selected phase, role, tool, or next action.
         """
         if not self._is_multi_agent_mode():
             return ""
@@ -29303,20 +29279,14 @@ class SessionState:
         focus = trim(str(alignment.get("current_todo", "") or alignment.get("step", "") or ""), 240)
         if not focus and not bool(state.get("guidance_active", False)):
             return ""
-        action = str(state.get("next_action", "") or self._agent_loop_next_action(alignment, state))
-        action_text = {
-            "synthesize": "Synthesize the evidence already collected into the current deliverable or shared task memory, then align the Todo status.",
-            "record_design": "Commit the current design decision to the intended artifact, then align the Todo status.",
-            "execute": "Take one concrete implementation/execution action for the current Todo instead of gathering more broad evidence.",
-            "verify": "Run the smallest acceptance-relevant verification still needed; record the evidence against the current Todo.",
-            "finish": "The tracked Todos are complete and validation evidence exists; finish the overall task unless a concrete unmet acceptance criterion remains.",
-            "advance": "Take the next concrete action that changes the current deliverable or Todo state.",
-        }.get(action, "Continue the current Todo with one concrete action.")
         rows = [
             "<dynamic-agent-loop-state>",
-            f"phase_bias={alignment.get('phase', 'execute')} next_action={action} ",
+            f"mode=observation-only role={role_key}",
             f"todo={focus or '(none)'} status={alignment.get('current_status', '') or '(none)'} ",
-            f"todo_progress={int(alignment.get('todo_completed', 0) or 0)}/{int(alignment.get('todo_total', 0) or 0)}",
+            f"todo_progress={int(alignment.get('todo_completed', 0) or 0)}/{int(alignment.get('todo_total', 0) or 0)} "
+            f"pending={int(alignment.get('todo_pending', 0) or 0)} "
+            f"in_progress={int(alignment.get('todo_in_progress', 0) or 0)} "
+            f"all_completed={str(bool(alignment.get('all_todos_completed', False))).lower()}",
         ]
         if bool(state.get("guidance_active", False)):
             rows.append(
@@ -29325,14 +29295,17 @@ class SessionState:
                 f"reused={int(state.get('evidence_reused', 0) or 0)} "
                 f"stagnant_rounds={int(state.get('stagnant_evidence_streak', 0) or 0)}"
             )
-            rows.append(action_text)
             rows.append(
-                "Reused evidence is available in tool memory and is not new progress. Read again only for a new exact unanswered question, changed state, or targeted verification."
+                f"seen_mutation={str(bool(state.get('seen_mutation', False))).lower()} "
+                f"seen_validation={str(bool(state.get('seen_validation', False))).lower()} "
+                f"reason={trim(str(state.get('guidance_reason', '') or ''), 120)}"
             )
         else:
-            rows.append("Continue this Todo by default; update the canonical Todo only after a real state change.")
+            rows.append("progress_signal=normal")
         rows.append(
-            "This is an adaptive next-action bias, not a fixed phase machine: override it when concrete new evidence changes what the task actually needs."
+            "These are shared observations, not a phase, role, tool, or next-action selection. "
+            "Choose autonomously from the objective, evidence, agent perspectives, and Todo state; "
+            "revise the approach or Todo ordering when the evidence supports it. Reused evidence is not new progress."
         )
         rows.append("</dynamic-agent-loop-state>")
         return trim("\n".join(rows), 1400)
