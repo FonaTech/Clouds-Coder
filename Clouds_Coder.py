@@ -51,6 +51,7 @@ from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from http import HTTPStatus
+from http.client import IncompleteRead
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
 from urllib.error import HTTPError, URLError
@@ -17618,6 +17619,8 @@ class OllamaClient:
         text = str(exc).lower()
         markers = (
             "connection error",
+            "incomplete read",
+            "incomplete http response",
             "timed out",
             "timeout",
             "connection reset",
@@ -17764,7 +17767,7 @@ class OllamaClient:
 
     def _post_json(self, path: str, payload: dict) -> dict:
         url = f"{self.base_url}{path}"
-        return self._post_json_url(url, payload)
+        return self._post_json_url_with_retries(url, payload)
 
     def _post_json_url(self, url: str, payload: dict, headers: dict | None = None) -> dict:
         req_headers = {"Content-Type": "application/json"}
@@ -17791,7 +17794,7 @@ class OllamaClient:
                 url=url,
                 retry_after=self._parse_retry_after_seconds(hdrs, text),
             ) from exc
-        except (URLError, TimeoutError, ConnectionResetError, ConnectionAbortedError) as exc:
+        except (URLError, TimeoutError, ConnectionResetError, ConnectionAbortedError, IncompleteRead) as exc:
             raise OllamaError(f"Connection error: {exc}", url=url) from exc
 
     def _post_json_url_with_retries(
@@ -17884,6 +17887,9 @@ class OllamaClient:
                             pass
                     line = resp.readline()
                     if not line:
+                        remaining = getattr(resp, "length", None)
+                        if isinstance(remaining, int) and remaining > 0:
+                            raise IncompleteRead(b"", remaining)
                         break
                     yield line.decode("utf-8", errors="replace")
         except HTTPError as exc:
@@ -17897,7 +17903,7 @@ class OllamaClient:
                 url=url,
                 retry_after=self._parse_retry_after_seconds(hdrs, text),
             ) from exc
-        except (URLError, TimeoutError, ConnectionResetError, ConnectionAbortedError) as exc:
+        except (URLError, TimeoutError, ConnectionResetError, ConnectionAbortedError, IncompleteRead) as exc:
             raise OllamaError(f"Connection error: {exc}", url=url) from exc
 
     def _iter_response_lines_url_with_retries(
@@ -17944,6 +17950,7 @@ class OllamaClient:
                 retryable = bool((http_retryable or conn_retryable) and not emitted)
                 exc.retryable = retryable
                 exc.transient = bool(transient or conn_retryable)
+                exc.stream_emitted = bool(emitted)
                 if not retryable or attempt >= retry_budget:
                     raise
                 delay = self._http_retry_delay(exc, attempt)
