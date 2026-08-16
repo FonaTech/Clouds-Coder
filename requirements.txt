@@ -1,12 +1,42 @@
-anthropic>=0.25.0
-python-dotenv>=1.0.0
+# Clouds Coder runtime dependencies
+#
+# The application keeps its browser-side libraries in ./js_lib. This file is
+# for Python packages used by the host runtime and its optional local parsers.
 
-# Rich file preview / upload parsing stack
+# HTTPS certificate bundle and YAML/frontmatter parsing
+certifi>=2024.8.30
+PyYAML>=6.0
+
+# Image conversion, safe image preview, compressed web responses, and robust
+# character-set detection. The stdlib/Pillow-free paths remain degraded
+# fallbacks; a normal requirements install should not select them.
+Pillow>=10.0
+brotli>=1.1.0
+charset-normalizer>=3.3.2
+chardet>=5.2.0
+
+# Local document and office-file parsing
 pdfminer.six>=20231228
 PyMuPDF>=1.24.0
-Pillow>=10.4.0
-pandas>=2.2.0
-openpyxl>=3.1.5
+openpyxl>=3.1.2
 xlrd>=2.0.1
-python-docx>=1.1.2
+python-docx>=1.1.0
 python-pptx>=0.6.23
+
+# Markdown rendering and sanitization
+Markdown>=3.5
+bleach>=6.1
+
+# IDE diagnostics/debugging, filesystem events, and enhanced conversation image
+# export. Playwright's browser binary is optional because Pillow provides the
+# self-contained image-export path; install it with
+# `python -m playwright install chromium` for browser-faithful rendering.
+jedi>=0.19.0
+debugpy>=1.8.0
+watchfiles>=0.21.0
+playwright>=1.45.0
+imgkit>=1.2.3
+
+# Numeric acceleration for dense RAG similarity search. The runtime retains a
+# pure-Python fallback for constrained or partially installed environments.
+numpy>=1.26.0

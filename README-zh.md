@@ -12,6 +12,7 @@
   <a href="https://pypi.org/project/clouds-coder/"><img src="https://img.shields.io/pypi/dm/clouds-coder.svg" alt="PyPI 下载量" /></a>
 </p>
 <p align="center">
+  <a href="./log/CHANGELOG-2026-08-16.md">2026-08-16 IDE 与运行时更新日志（EN/中文/日本語）</a> ·
   <a href="./log/CHANGELOG-2026-08-10.md">2026-08-10 功能更新日志（EN/中文/日本語）</a> ·
   <a href="./log/CHANGELOG-2026-06-22.md">2026-06-22 更新日志（EN/中文/日本語）</a> ·
   <a href="./log/CHANGELOG-2026-06-05.md">2026-06-05 更新日志（EN/中文/日本語）</a> ·
@@ -19,15 +20,38 @@
   <a href="./log/CHANGELOG-2026-05-02.md">2026-05-02 更新日志（EN/中文/日本語）</a> ·
   <a href="./LLM.config.json">LLM Config Template</a>
 </p>
-<p align="center">
-  <img src="./Intro.png" alt="Clouds Coder 介绍首页" width="980" />
-</p>
+<table>
+  <tr>
+    <th width="50%">原版 Web 界面</th>
+    <th width="50%">IDE 工作区</th>
+  </tr>
+  <tr>
+    <td><img src="./Intro.png" alt="Clouds Coder 原版 Web 界面" width="100%" /></td>
+    <td><img src="./Images/clouds-coder-ide.png" alt="Clouds Coder 浏览器 IDE：会话工作区、代码编辑、Agent 进度与诊断面板" width="100%" /></td>
+  </tr>
+</table>
+<p align="center"><sub>Clouds Coder 同时提供面向任务的原版 Web 界面，以及集成文件、分阶段代码历史、Agent 进度与诊断的 IDE 工作区。</sub></p>
 
 Clouds Coder 是一个以“CLI 执行层与 Web 用户层分离”为核心的本地优先（local-first）通用任务智能体平台，不局限于编程场景，集成 Web UI、Skills Studio、鲁棒流式回传与复杂任务恢复能力。
 
 它的首要问题定义是：CLI 编程门槛高、环境分发困难、学习曲线陡。Clouds Coder 通过前后端分离（云端 CLI 执行 + Web 端交互控制）来降低 Vibe Coding 上手成本，同时把超时、截断、上下文预算、空想循环治理作为并列核心能力，保障复杂任务可执行、可收敛、可复盘。
 
-架构更新日志归档：[`CHANGELOG-2026-08-10.md`](./log/CHANGELOG-2026-08-10.md) | [`CHANGELOG-2026-06-22.md`](./log/CHANGELOG-2026-06-22.md) | [`CHANGELOG-2026-06-05.md`](./log/CHANGELOG-2026-06-05.md) | [`CHANGELOG-2026-05-28.md`](./log/CHANGELOG-2026-05-28.md) | [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md)
+架构更新日志归档：[`CHANGELOG-2026-08-16.md`](./log/CHANGELOG-2026-08-16.md) | [`CHANGELOG-2026-08-10.md`](./log/CHANGELOG-2026-08-10.md) | [`CHANGELOG-2026-06-22.md`](./log/CHANGELOG-2026-06-22.md) | [`CHANGELOG-2026-06-05.md`](./log/CHANGELOG-2026-06-05.md) | [`CHANGELOG-2026-05-28.md`](./log/CHANGELOG-2026-05-28.md) | [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md)
+
+## IDE 工作区
+
+Clouds Coder 内置面向会话的浏览器 IDE，把编辑器、运行工具、工件预览和 Agent 执行轨迹放在同一个工作台中。默认端口布局下，运行时使用端口 `P`，IDE 使用 `P+5`；例如运行时为 `8080` 时，IDE 地址为 `http://127.0.0.1:8085`。
+
+| 区域 | 能力 |
+| --- | --- |
+| 会话工作区 | 会话隔离文件；拖放文件或文件夹上传；指向目录时直接上传到目标目录；支持复制、剪切、粘贴、重命名和删除。 |
+| 编辑与历史 | Monaco 编辑器及兼容兜底、标签页、面包屑、Go to File、Command Palette、结构化 Markdown/工件预览，以及 `All` / `Changes` / `Clean` 历史视图。 |
+| 运行与调试 | Problems、Output、Terminal 和 Debug Console 面板；安装 `debugpy` 时使用完整 Python 调试适配器，未安装时回退到标准库 `pdb` 工作流。 |
+| Agent 协作 | 会话级 Agent 对话、规范 Todo 进度、结构化工具与文件 Diff 卡片、上下文附件，以及 `ask user` 的可点击结构化选项。 |
+| Prompt Enhancer | 默认仅强化下一次任务，可选择跨任务常驻；提供 `Low` / `Medium` / `High` / `XHigh` 四档；工作区感知始终开启，Skill 感知可选。预算改变的是规划深度、方案广度、备选路径和验证层级，不裁剪原始请求。 |
+| 工作区安全 | 工作区声明的 stdio MCP 命令在管理员批准前保持禁用；批准绑定工作区、完整配置、可执行文件、参数、环境变量键和引用脚本，相关内容变化会自动使批准失效。 |
+
+完整的 IDE、Agent Loop、Prompt Enhancer、连接重试、上下文压缩与 MCP 信任更新见 [2026-08-16 更新日志](./log/CHANGELOG-2026-08-16.md)。
 
 ## 1. 项目定位
 
@@ -101,6 +125,9 @@ Clouds Coder 并不是“只做写代码”的 CLI 包装器，而是一个可�
 
 ## 2. 核心特性
 
+- **集成式浏览器 IDE**：会话工作区、代码历史、丰富预览、终端/调试、Agent 对话、Todo 进度和文件操作集中在一个界面
+- **深度感知 Prompt Enhancer**：意图分析与最终 Prompt 可编辑；支持一次性/常驻模式、完整工作区上下文、可选 Skill 编排和四档质量预算
+- **显式工作区 MCP 信任**：管理员审核前不启动任何工作区控制的 stdio 进程；信任绑定具体内容，并在配置或脚本变化后自动失效
 - 会话隔离的 agent runtime
 - 单会话内通用任务路由（编程 + 分析 + 综合 + 报告）
 - 内置 `LLM -> Coding -> LLM` 三阶段执行模式，适配复杂多步骤工作

@@ -12,6 +12,7 @@
   <a href="https://pypi.org/project/clouds-coder/"><img src="https://img.shields.io/pypi/dm/clouds-coder.svg" alt="PyPI downloads" /></a>
 </p>
 <p align="center">
+  <a href="./log/CHANGELOG-2026-08-16.md">2026-08-16 IDE & Runtime Changelog (EN/中文/日本語)</a> ·
   <a href="./log/CHANGELOG-2026-08-10.md">2026-08-10 Feature Changelog (EN/中文/日本語)</a> ·
   <a href="./log/CHANGELOG-2026-06-22.md">2026-06-22 Changelog (EN/中文/日本語)</a> ·
   <a href="./log/CHANGELOG-2026-06-05.md">2026-06-05 Changelog (EN/中文/日本語)</a> ·
@@ -19,15 +20,38 @@
   <a href="./log/CHANGELOG-2026-05-02.md">2026-05-02 Changelog (EN/中文/日本語)</a> ·
   <a href="./LLM.config.json">LLM Config Template</a>
 </p>
-<p align="center">
-  <img src="./Intro.png" alt="Clouds Coder Introduction" width="980" />
-</p>
+<table>
+  <tr>
+    <th width="50%">Original Web UI</th>
+    <th width="50%">IDE Workspace</th>
+  </tr>
+  <tr>
+    <td><img src="./Intro.png" alt="Original Clouds Coder Web interface" width="100%" /></td>
+    <td><img src="./Images/clouds-coder-ide.png" alt="Clouds Coder browser IDE with session workspace, code editor, Agent progress, and diagnostics" width="100%" /></td>
+  </tr>
+</table>
+<p align="center"><sub>Clouds Coder offers both the original task-focused Web UI and the IDE workspace with files, staged code history, Agent progress, and diagnostics.</sub></p>
 
 Clouds Coder is a local-first, general-purpose task agent platform centered on separating the CLI execution plane from the Web user plane, with Web UI, Skills Studio, resilient streaming, and long-task recovery controls.
 
 Its primary problem framing is that CLI coding remains hard to learn and difficult to distribute consistently across users. Clouds Coder addresses this through backend/frontend separation (cloud-side CLI execution + Web-side interaction) to lower Vibe Coding onboarding cost, while timeout/truncation/context/anti-drift controls are treated as co-equal core capabilities that keep complex tasks executable, convergent, and trustworthy.
 
-Architecture changelog archive (trilingual): [`CHANGELOG-2026-08-10.md`](./log/CHANGELOG-2026-08-10.md) | [`CHANGELOG-2026-06-22.md`](./log/CHANGELOG-2026-06-22.md) | [`CHANGELOG-2026-06-05.md`](./log/CHANGELOG-2026-06-05.md) | [`CHANGELOG-2026-05-28.md`](./log/CHANGELOG-2026-05-28.md) | [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md)
+Architecture changelog archive (trilingual): [`CHANGELOG-2026-08-16.md`](./log/CHANGELOG-2026-08-16.md) | [`CHANGELOG-2026-08-10.md`](./log/CHANGELOG-2026-08-10.md) | [`CHANGELOG-2026-06-22.md`](./log/CHANGELOG-2026-06-22.md) | [`CHANGELOG-2026-06-05.md`](./log/CHANGELOG-2026-06-05.md) | [`CHANGELOG-2026-05-28.md`](./log/CHANGELOG-2026-05-28.md) | [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md)
+
+## IDE Workspace
+
+Clouds Coder includes a session-aware browser IDE that keeps the editor, runtime tools, artifacts, and Agent execution trace in one place. With the default port layout, start the runtime on port `P` and open the IDE on `P+5` (for example, `http://127.0.0.1:8085` when `P=8080`).
+
+| Area | What it provides |
+| --- | --- |
+| Session Workspace | Session-isolated files, drag-and-drop file or folder upload, drop-to-target-directory behavior, and copy/cut/paste/rename/delete operations. |
+| Editor and history | Monaco editing with a compatibility fallback, tabs, breadcrumbs, Go to File, Command Palette, structured Markdown/artifact previews, and `All` / `Changes` / `Clean` history views. |
+| Run and debug | Problems, Output, Terminal, and Debug Console panels. Python uses `debugpy` when installed and falls back to the standard-library `pdb` workflow when it is not. |
+| Agent collaboration | Session-scoped Agent chat, canonical Todo progress, structured tool and file-diff cards, context attachments, and clickable structured answers for `ask user` requests. |
+| Prompt Enhancer | One-shot by default, optional persistent mode, `Low` / `Medium` / `High` / `XHigh` depth budgets, always-on workspace awareness, and optional model-selected Skill orchestration. Budgets change planning depth, breadth, alternatives, and validation rather than clipping the original request. |
+| Workspace security | Workspace-declared stdio MCP commands remain inert until an administrator approves the exact workspace, configuration, executable, arguments, environment keys, and referenced scripts. Any relevant change invalidates the approval. |
+
+See the [2026-08-16 changelog](./log/CHANGELOG-2026-08-16.md) for the complete IDE, Agent-loop, prompt-enhancement, transport-retry, compaction, and MCP trust update.
 
 ## 1. Project Positioning
 
@@ -101,6 +125,9 @@ This design reduces "thinking-only" drift by forcing thought to be converted int
 
 ## 2. Core Features
 
+- **Integrated browser IDE** — session workspace, code history, rich previews, terminal/debug panels, Agent chat, Todo progress, and file operations in one UI
+- **Depth-aware Prompt Enhancer** — editable intent analysis and final prompt, one-shot/persistent modes, full workspace context, optional Skill selection, and four quality budgets
+- **Explicit workspace MCP trust** — no workspace-controlled stdio process starts before administrator review; trust is content-bound and automatically invalidated by changes
 - Agent runtime with session isolation
 - General-purpose task routing (coding + analysis + synthesis + reporting) in one session graph
 - Built-in `LLM -> Coding -> LLM` execution pattern for complex multi-step work

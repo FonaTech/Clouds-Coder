@@ -12,6 +12,7 @@
   <a href="https://pypi.org/project/clouds-coder/"><img src="https://img.shields.io/pypi/dm/clouds-coder.svg" alt="PyPI ダウンロード数" /></a>
 </p>
 <p align="center">
+  <a href="./log/CHANGELOG-2026-08-16.md">2026-08-16 IDE・ランタイム変更ログ（EN/中文/日本語）</a> ·
   <a href="./log/CHANGELOG-2026-08-10.md">2026-08-10 機能変更ログ（EN/中文/日本語）</a> ·
   <a href="./log/CHANGELOG-2026-06-22.md">2026-06-22 Changelog (EN/中文/日本語)</a> ·
   <a href="./log/CHANGELOG-2026-06-05.md">2026-06-05 Changelog (EN/中文/日本語)</a> ·
@@ -19,15 +20,38 @@
   <a href="./log/CHANGELOG-2026-05-02.md">2026-05-02 Changelog (EN/中文/日本語)</a> ·
   <a href="./LLM.config.json">LLM Config Template</a>
 </p>
-<p align="center">
-  <img src="./Intro.png" alt="Clouds Coder 紹介トップ" width="980" />
-</p>
+<table>
+  <tr>
+    <th width="50%">従来の Web UI</th>
+    <th width="50%">IDE ワークスペース</th>
+  </tr>
+  <tr>
+    <td><img src="./Intro.png" alt="従来の Clouds Coder Web インターフェース" width="100%" /></td>
+    <td><img src="./Images/clouds-coder-ide.png" alt="Clouds Coder ブラウザー IDE：セッションワークスペース、コード編集、Agent 進捗、診断" width="100%" /></td>
+  </tr>
+</table>
+<p align="center"><sub>Clouds Coder は、タスク中心の従来 Web UI と、ファイル・段階別コード履歴・Agent 進捗・診断を統合した IDE ワークスペースの両方を提供します。</sub></p>
 
 Clouds Coder は、CLI 実行面と Web ユーザー面の分離を中核に据えたローカルファーストの汎用タスクエージェント基盤で、コーディング専用に限定せず、Web UI・Skills Studio・堅牢なストリーミング・長タスク回復制御を備えます。
 
 主要な問題設定は、CLI コーディングが学習コスト高く、利用者ごとの環境配布が難しい点です。Clouds Coder はバックエンド/フロントエンド分離（クラウド側 CLI 実行 + Web 側操作）で Vibe Coding の導入コストを下げると同時に、timeout・切断回復・文脈予算・思考ループ抑制を並列の中核能力として扱い、複雑タスクの実行性・収束性・再検証性を担保します。
 
-アーキテクチャ changelog アーカイブ: [`CHANGELOG-2026-08-10.md`](./log/CHANGELOG-2026-08-10.md) | [`CHANGELOG-2026-06-22.md`](./log/CHANGELOG-2026-06-22.md) | [`CHANGELOG-2026-06-05.md`](./log/CHANGELOG-2026-06-05.md) | [`CHANGELOG-2026-05-28.md`](./log/CHANGELOG-2026-05-28.md) | [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md)
+アーキテクチャ changelog アーカイブ: [`CHANGELOG-2026-08-16.md`](./log/CHANGELOG-2026-08-16.md) | [`CHANGELOG-2026-08-10.md`](./log/CHANGELOG-2026-08-10.md) | [`CHANGELOG-2026-06-22.md`](./log/CHANGELOG-2026-06-22.md) | [`CHANGELOG-2026-06-05.md`](./log/CHANGELOG-2026-06-05.md) | [`CHANGELOG-2026-05-28.md`](./log/CHANGELOG-2026-05-28.md) | [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md)
+
+## IDE ワークスペース
+
+Clouds Coder は、エディター、実行ツール、成果物プレビュー、Agent の実行履歴を 1 か所にまとめるセッション対応ブラウザー IDE を内蔵しています。既定のポート構成ではランタイムが `P`、IDE が `P+5` です。たとえば `P=8080` の場合は `http://127.0.0.1:8085` を開きます。
+
+| 領域 | 提供機能 |
+| --- | --- |
+| セッションワークスペース | セッション分離ファイル、ファイル/フォルダーのドラッグ＆ドロップ、指定フォルダーへの直接アップロード、コピー/切り取り/貼り付け/名前変更/削除。 |
+| 編集と履歴 | Monaco と互換フォールバック、タブ、パンくず、Go to File、Command Palette、構造化 Markdown/成果物プレビュー、`All` / `Changes` / `Clean` 履歴表示。 |
+| 実行とデバッグ | Problems、Output、Terminal、Debug Console。`debugpy` があれば完全な Python デバッグアダプターを使い、なければ標準ライブラリ `pdb` ワークフローへフォールバック。 |
+| Agent 協調 | セッション単位の Agent チャット、正規 Todo 進捗、構造化ツール/ファイル Diff カード、コンテキスト添付、`ask user` のクリック可能な選択肢。 |
+| Prompt Enhancer | 既定は次の 1 タスクだけに適用し、必要なら常駐化可能。`Low` / `Medium` / `High` / `XHigh`、常時オンのワークスペース認識、任意の Skill 認識を提供。予算は元の依頼を切り詰めず、計画深度、探索幅、代替案、検証レベルを変えます。 |
+| ワークスペース安全性 | ワークスペース定義の stdio MCP コマンドは、管理者がワークスペース、完全な設定、実行ファイル、引数、環境変数キー、参照スクリプトを承認するまで起動しません。関連内容が変わると承認は失効します。 |
+
+IDE、Agent Loop、Prompt Enhancer、接続再試行、コンテキスト圧縮、MCP 信頼制御の詳細は [2026-08-16 変更ログ](./log/CHANGELOG-2026-08-16.md) を参照してください。
 
 ## 1. プロジェクトの位置づけ
 
@@ -101,6 +125,9 @@ Clouds Coder は「コードを書くためだけの CLI ラッパー」では�
 
 ## 2. 主な機能
 
+- **統合ブラウザー IDE** — セッションワークスペース、コード履歴、リッチプレビュー、ターミナル/デバッグ、Agent チャット、Todo 進捗、ファイル操作を 1 画面に統合
+- **深度対応 Prompt Enhancer** — 編集可能な意図分析と最終 Prompt、1 回/常駐モード、完全なワークスペース文脈、任意の Skill 編成、4 段階の品質予算
+- **明示的なワークスペース MCP 信頼** — 管理者レビュー前はワークスペース制御の stdio プロセスを起動せず、設定やスクリプト変更時に信頼を自動失効
 - セッション分離された agent runtime
 - 単一セッションでの汎用タスクルーティング（コーディング + 分析 + 総合 + レポート）
 - 複雑タスク向け `LLM -> Coding -> LLM` 実行パターンを標準搭載
