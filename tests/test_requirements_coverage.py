@@ -9,7 +9,6 @@ from unittest.mock import patch
 
 import Clouds_Coder as cc
 
-
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE_PATH = ROOT / "Clouds_Coder.py"
 REQUIREMENTS_PATH = ROOT / "requirements.txt"
@@ -79,9 +78,12 @@ class RequirementsCoverageTests(unittest.TestCase):
         missing = sorted(
             distribution
             for module, distribution in IMPORT_TO_DISTRIBUTION.items()
-            if module in third_party and canonical_distribution(distribution) not in declared
+            if module in third_party
+            and canonical_distribution(distribution) not in declared
         )
-        self.assertEqual(missing, [], f"Add host dependencies to requirements.txt: {missing}")
+        self.assertEqual(
+            missing, [], f"Add host dependencies to requirements.txt: {missing}"
+        )
 
     def test_debug_adapter_dependency_is_explicit(self):
         source = SOURCE_PATH.read_text(encoding="utf-8")
@@ -97,7 +99,11 @@ class RequirementsCoverageTests(unittest.TestCase):
             "model": "test-model",
             "conversation_feed": [
                 {"role": "user", "ts": 0, "text": "中文与 English 均应可见。"},
-                {"role": "assistant", "ts": 0, "text": "Pillow fallback rendered successfully."},
+                {
+                    "role": "assistant",
+                    "ts": 0,
+                    "text": "Pillow fallback rendered successfully.",
+                },
             ],
         }
         return session
@@ -110,7 +116,9 @@ class RequirementsCoverageTests(unittest.TestCase):
                 raise ImportError(name)
             return real_import(name, *args, **kwargs)
 
-        with patch("builtins.__import__", side_effect=import_without_external_renderers):
+        with patch(
+            "builtins.__import__", side_effect=import_without_external_renderers
+        ):
             data = self.conversation_session().export_conversation_image()
 
         from PIL import Image

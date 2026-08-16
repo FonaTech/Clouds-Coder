@@ -46,7 +46,10 @@ class PlanTodoProgressionTests(unittest.TestCase):
             "ok": True,
             "exit_code": None,
             "command": "open http://127.0.0.1:8123",
-            "summary": "status 200; screenshot page.png; canvas webgl rendered visible; image/png",
+            "summary": (
+                "status 200; screenshot page.png; canvas webgl rendered visible; "
+                "image/png"
+            ),
         }
 
         for mode in ("single", "sync"):
@@ -60,7 +63,9 @@ class PlanTodoProgressionTests(unittest.TestCase):
                 )
 
                 self.assertFalse(missing["passed"])
-                self.assertEqual(missing["reason"], "visual-runtime-needs-semantic-review")
+                self.assertEqual(
+                    missing["reason"], "visual-runtime-needs-semantic-review"
+                )
                 self.assertTrue(missing["semantic_review_required"])
                 self.assertTrue(passed["passed"])
                 self.assertEqual(passed["matched_records"], [browser_record])
@@ -69,38 +74,42 @@ class PlanTodoProgressionTests(unittest.TestCase):
         session = self.bare_session("single")
         step_id = "pt:test:todo-sync"
         session.blackboard = {
-            "project_todos": [{
-                "id": step_id,
-                "key": "bb:proj:" + step_id,
-                "content": "计算石墨烯透过率并绘图",
-                "full_content": "计算石墨烯透过率并绘图",
-                "category": "plan_step",
-                "status": "in_progress",
-                "plan_step_index": 0,
-                "activated_at": 10.0,
-            }],
+            "project_todos": [
+                {
+                    "id": step_id,
+                    "key": "bb:proj:" + step_id,
+                    "content": "计算石墨烯透过率并绘图",
+                    "full_content": "计算石墨烯透过率并绘图",
+                    "category": "plan_step",
+                    "status": "in_progress",
+                    "plan_step_index": 0,
+                    "activated_at": 10.0,
+                }
+            ],
             "plan_step_total": 1,
         }
-        session.todo.update([
-            {
-                "content": "检查 Python/numpy/matplotlib 环境可用性",
-                "status": "completed",
-                "owner": "developer",
-                "parent_step_id": step_id,
-            },
-            {
-                "content": "验证 Kubo 公式与透过率数值",
-                "status": "in_progress",
-                "owner": "developer",
-                "parent_step_id": step_id,
-            },
-            {
-                "content": "编写正式绘图脚本",
-                "status": "pending",
-                "owner": "developer",
-                "parent_step_id": step_id,
-            },
-        ])
+        session.todo.update(
+            [
+                {
+                    "content": "检查 Python/numpy/matplotlib 环境可用性",
+                    "status": "completed",
+                    "owner": "developer",
+                    "parent_step_id": step_id,
+                },
+                {
+                    "content": "验证 Kubo 公式与透过率数值",
+                    "status": "in_progress",
+                    "owner": "developer",
+                    "parent_step_id": step_id,
+                },
+                {
+                    "content": "编写正式绘图脚本",
+                    "status": "pending",
+                    "owner": "developer",
+                    "parent_step_id": step_id,
+                },
+            ]
+        )
 
         prompt = session._plan_todo_discipline_prompt(role="developer")
 
@@ -124,22 +133,25 @@ class PlanTodoProgressionTests(unittest.TestCase):
         target_id = session._stable_plan_worker_subtask_id(step["id"], target_row)
         session.blackboard = {
             "plan_step_evidence": {
-                step["id"]: [{
-                    "id": "ev:cross-row",
-                    "step_id": step["id"],
-                    "subtask_id": old_id,
-                    "subtask_content": old_row["content"],
-                    "kind": "runtime",
-                    "tool": "bash",
-                    "ok": True,
-                    "exit_code": 0,
-                    "ts": 20.0,
-                    "command": "grep index.html",
-                    "summary": (
-                        "=== 1.2+1.3 内容断言 === new THREE.Scene "
-                        "new THREE.PerspectiveCamera new THREE.WebGLRenderer new THREE.Fog OK"
-                    ),
-                }]
+                step["id"]: [
+                    {
+                        "id": "ev:cross-row",
+                        "step_id": step["id"],
+                        "subtask_id": old_id,
+                        "subtask_content": old_row["content"],
+                        "kind": "runtime",
+                        "tool": "bash",
+                        "ok": True,
+                        "exit_code": 0,
+                        "ts": 20.0,
+                        "command": "grep index.html",
+                        "summary": (
+                            "=== 1.2+1.3 内容断言 === new THREE.Scene "
+                            "new THREE.PerspectiveCamera new THREE.WebGLRenderer "
+                            "new THREE.Fog OK"
+                        ),
+                    }
+                ]
             }
         }
 
@@ -177,35 +189,83 @@ class PlanTodoProgressionTests(unittest.TestCase):
                     "plan_step_total": 1,
                     "plan_subtask_evidence_bindings": {},
                 }
-                bind(session, "_sync_plan_worker_todos_to_blackboard", lambda self, *args, **kwargs: None)
-                bind(session, "_update_plan_file_step_status", lambda self, *args, **kwargs: None)
+                bind(
+                    session,
+                    "_sync_plan_worker_todos_to_blackboard",
+                    lambda self, *args, **kwargs: None,
+                )
+                bind(
+                    session,
+                    "_update_plan_file_step_status",
+                    lambda self, *args, **kwargs: None,
+                )
                 bind(
                     session,
                     "_plan_worker_completion_has_evidence",
-                    lambda self, plan_step, row, **kwargs: not self._is_plan_step_acceptance_subtask(
-                        row.get("content", "")
+                    lambda self, plan_step, row, **kwargs: (
+                        not self._is_plan_step_acceptance_subtask(
+                            row.get("content", "")
+                        )
                     ),
                 )
                 bind(
                     session,
                     "_plan_worker_completion_evidence_records",
-                    lambda self, plan_step, row, **kwargs: [{
-                        "id": "ev:" + self._stable_plan_worker_subtask_id(plan_step["id"], row),
-                        "step_id": plan_step["id"],
-                        "kind": "runtime",
-                        "tool": "bash",
-                        "ok": True,
-                        "exit_code": 0,
-                        "summary": "verified",
-                        "ts": 20.0,
-                    }],
+                    lambda self, plan_step, row, **kwargs: [
+                        {
+                            "id": "ev:"
+                            + self._stable_plan_worker_subtask_id(plan_step["id"], row),
+                            "step_id": plan_step["id"],
+                            "kind": "runtime",
+                            "tool": "bash",
+                            "ok": True,
+                            "exit_code": 0,
+                            "summary": "verified",
+                            "ts": 20.0,
+                        }
+                    ],
                 )
                 rows = [
-                    {"key": step["key"], "content": step["content"], "status": "in_progress"},
-                    {"content": "1.1 创建目录", "status": "completed", "owner": "developer", "parent_step_id": step_id, "subtask_id": f"pst:{step_id}:a", "created_at": 10.0},
-                    {"content": "1.2 创建 index.html", "status": "in_progress", "owner": "developer", "parent_step_id": step_id, "subtask_id": f"pst:{step_id}:b", "created_at": 10.0},
-                    {"content": "1.3 初始化 WebGLRenderer", "status": "pending", "owner": "reviewer", "parent_step_id": step_id, "subtask_id": f"pst:{step_id}:c", "created_at": 10.0},
-                    {"content": "验收：在浏览器打开页面，画面可见且控制台无报错；证据：screenshot/canvas runtime evidence", "status": "pending", "owner": "reviewer", "parent_step_id": step_id, "subtask_id": f"pst:{step_id}:acceptance", "created_at": 10.0},
+                    {
+                        "key": step["key"],
+                        "content": step["content"],
+                        "status": "in_progress",
+                    },
+                    {
+                        "content": "1.1 创建目录",
+                        "status": "completed",
+                        "owner": "developer",
+                        "parent_step_id": step_id,
+                        "subtask_id": f"pst:{step_id}:a",
+                        "created_at": 10.0,
+                    },
+                    {
+                        "content": "1.2 创建 index.html",
+                        "status": "in_progress",
+                        "owner": "developer",
+                        "parent_step_id": step_id,
+                        "subtask_id": f"pst:{step_id}:b",
+                        "created_at": 10.0,
+                    },
+                    {
+                        "content": "1.3 初始化 WebGLRenderer",
+                        "status": "pending",
+                        "owner": "reviewer",
+                        "parent_step_id": step_id,
+                        "subtask_id": f"pst:{step_id}:c",
+                        "created_at": 10.0,
+                    },
+                    {
+                        "content": (
+                            "验收：在浏览器打开页面，画面可见且控制台无报错；"
+                            "证据：screenshot/canvas runtime evidence"
+                        ),
+                        "status": "pending",
+                        "owner": "reviewer",
+                        "parent_step_id": step_id,
+                        "subtask_id": f"pst:{step_id}:acceptance",
+                        "created_at": 10.0,
+                    },
                 ]
                 session.todo.update(rows)
                 incoming = [
@@ -229,9 +289,13 @@ class PlanTodoProgressionTests(unittest.TestCase):
                     },
                     role="reviewer",
                 )
-                stored = [row for row in session.todo.snapshot() if row.get("parent_step_id")]
+                stored = [
+                    row for row in session.todo.snapshot() if row.get("parent_step_id")
+                ]
 
-                self.assertEqual([row["status"] for row in stored[:-1]], ["completed"] * 3)
+                self.assertEqual(
+                    [row["status"] for row in stored[:-1]], ["completed"] * 3
+                )
                 self.assertEqual(stored[-1]["status"], "in_progress")
                 if mode == "single":
                     self.assertEqual(stored[1]["owner"], "reviewer")
@@ -304,12 +368,16 @@ class PlanTodoProgressionTests(unittest.TestCase):
             "project_todos": [step_one, step_two],
             "plan_step_total": 2,
         }
-        session.todo.update([{
-            "content": "1.1 当前工作",
-            "status": "in_progress",
-            "owner": "developer",
-            "parent_step_id": step_one["id"],
-        }])
+        session.todo.update(
+            [
+                {
+                    "content": "1.1 当前工作",
+                    "status": "in_progress",
+                    "owner": "developer",
+                    "parent_step_id": step_one["id"],
+                }
+            ]
+        )
         transaction = session._capture_todo_write_transaction(
             session.blackboard,
             active_step_id=step_one["id"],
@@ -322,12 +390,14 @@ class PlanTodoProgressionTests(unittest.TestCase):
 
         before = session.todo.snapshot()
         result = session._merge_plan_worker_todo_items(
-            [{
-                "content": "1.1 当前工作",
-                "status": "completed",
-                "owner": "developer",
-                "parent_step_id": step_one["id"],
-            }],
+            [
+                {
+                    "content": "1.1 当前工作",
+                    "status": "completed",
+                    "owner": "developer",
+                    "parent_step_id": step_one["id"],
+                }
+            ],
             role="developer",
             transaction=transaction,
         )
@@ -366,12 +436,14 @@ class PlanTodoProgressionTests(unittest.TestCase):
         before = session.todo.snapshot()
 
         result = session._merge_plan_worker_todo_items(
-            [{
-                "content": "1.1 工作",
-                "status": "in_progress",
-                "owner": "developer",
-                "parent_step_id": step["id"],
-            }],
+            [
+                {
+                    "content": "1.1 工作",
+                    "status": "in_progress",
+                    "owner": "developer",
+                    "parent_step_id": step["id"],
+                }
+            ],
             role="developer",
             transaction=transaction,
         )
@@ -388,23 +460,35 @@ class PlanTodoProgressionTests(unittest.TestCase):
             "project_todos": [],
         }
         events = []
-        bind(session, "_emit", lambda self, *args, **kwargs: events.append((args, kwargs)))
+        bind(
+            session,
+            "_emit",
+            lambda self, *args, **kwargs: events.append((args, kwargs)),
+        )
 
         session._multi_agent_sync_blackboard_worker(pinned_selection="")
 
-        self.assertFalse(any(args and args[0] == "manager_delegate" for args, _ in events))
-        self.assertTrue(any(
-            "already finished" in str(args[1] if len(args) > 1 else "")
-            for args, _ in events
-        ))
+        self.assertFalse(
+            any(args and args[0] == "manager_delegate" for args, _ in events)
+        )
+        self.assertTrue(
+            any(
+                "already finished" in str(args[1] if len(args) > 1 else "")
+                for args, _ in events
+            )
+        )
 
     def test_provisional_approval_is_not_treated_as_terminal_sync_completion(self):
         session = self.bare_session("sync")
-        self.assertFalse(session._blackboard_is_terminal_completion({
-            "status": "COMPLETED",
-            "approval": {"approved": True},
-            "completion": {"state": "blocked"},
-        }))
+        self.assertFalse(
+            session._blackboard_is_terminal_completion(
+                {
+                    "status": "COMPLETED",
+                    "approval": {"approved": True},
+                    "completion": {"state": "blocked"},
+                }
+            )
+        )
 
     def test_single_finish_gate_counts_developer_owned_todos(self):
         session = self.bare_session("single")
@@ -419,19 +503,25 @@ class PlanTodoProgressionTests(unittest.TestCase):
             },
             "completion": {"state": "working"},
         }
-        session.todo.update([
-            {
-                "content": "阶段8 城市管理与 UI",
-                "status": "in_progress",
-                "owner": "developer",
-            },
-            {
-                "content": "阶段9 存档与读档",
-                "status": "pending",
-                "owner": "developer",
-            },
-        ])
-        bind(session, "_can_auto_finish_from_approval", lambda self, *args, **kwargs: (True, "ok"))
+        session.todo.update(
+            [
+                {
+                    "content": "阶段8 城市管理与 UI",
+                    "status": "in_progress",
+                    "owner": "developer",
+                },
+                {
+                    "content": "阶段9 存档与读档",
+                    "status": "pending",
+                    "owner": "developer",
+                },
+            ]
+        )
+        bind(
+            session,
+            "_can_auto_finish_from_approval",
+            lambda self, *args, **kwargs: (True, "ok"),
+        )
         bind(session, "_manager_has_error_log", lambda self, *args, **kwargs: False)
 
         rows = session._completion_scoped_open_todo_rows(session.blackboard)
@@ -473,33 +563,48 @@ class PlanTodoProgressionTests(unittest.TestCase):
 
     def test_reviewer_role_policy_error_is_not_a_product_blocker(self):
         session = self.bare_session("sync")
-        self.assertFalse(session._execution_log_entry_is_blocking_error({
-            "actor": "reviewer",
-            "tool": "bash",
-            "content": (
-                "tool_error bash: Error: shell mutation is not allowed for read-only agent role 'reviewer'"
-            ),
-        }))
+        self.assertFalse(
+            session._execution_log_entry_is_blocking_error(
+                {
+                    "actor": "reviewer",
+                    "tool": "bash",
+                    "content": (
+                        "tool_error bash: Error: shell mutation is not allowed for "
+                        "read-only agent role 'reviewer'"
+                    ),
+                }
+            )
+        )
 
     def test_blackboard_sync_nests_workers_below_parent_in_roadmap_order(self):
         session = self.bare_session("sync")
         parents = [
             {"key": "bb:proj:pt:000", "content": "1. 已完成", "status": "completed"},
-            {"key": "bb:proj:pt:001", "content": "2. 当前步骤", "status": "in_progress"},
+            {
+                "key": "bb:proj:pt:001",
+                "content": "2. 当前步骤",
+                "status": "in_progress",
+            },
             {"key": "bb:proj:pt:002", "content": "3. 后续步骤", "status": "pending"},
         ]
-        workers = [{
-            "content": "2.1 当前子任务",
-            "status": "in_progress",
-            "owner": "developer",
-            "parent_step_id": "pt:001",
-        }]
+        workers = [
+            {
+                "content": "2.1 当前子任务",
+                "status": "in_progress",
+                "owner": "developer",
+                "parent_step_id": "pt:001",
+            }
+        ]
         session.todo.update(parents + workers)
         session.blackboard = {"plan": {"phase": ""}, "project_todos": []}
         bind(session, "_todo_route_kind", lambda self, board=None: "plan_sync")
         bind(session, "_init_project_todos", lambda self, board: None)
         bind(session, "_update_project_todo_status", lambda self, board: None)
-        bind(session, "_todo_project_rows_from_blackboard", lambda self, board: list(parents))
+        bind(
+            session,
+            "_todo_project_rows_from_blackboard",
+            lambda self, board: list(parents),
+        )
         bind(
             session,
             "_todo_route_rows",
@@ -537,7 +642,10 @@ class PlanTodoProgressionTests(unittest.TestCase):
         bind(
             session,
             "_route_focus_fields",
-            lambda self, board=None: {"focus_kind": "plan_step", "focus_id": step["id"]},
+            lambda self, board=None: {
+                "focus_kind": "plan_step",
+                "focus_id": step["id"],
+            },
         )
         bind(
             session,
@@ -588,30 +696,41 @@ class PlanTodoProgressionTests(unittest.TestCase):
 
         self.assertTrue(trusted)
         self.assertEqual(
-            [row["id"] for row in session._trusted_plan_step_acceptance_records(
-                step, acceptance, board=session.blackboard, since_ts=10.0
-            )],
+            [
+                row["id"]
+                for row in session._trusted_plan_step_acceptance_records(
+                    step, acceptance, board=session.blackboard, since_ts=10.0
+                )
+            ],
             [trusted["id"]],
         )
 
         browser = {
             "id": "ev:browser",
             "step_id": step["id"],
-            "subtask_id": session._stable_plan_worker_subtask_id(step["id"], acceptance),
+            "subtask_id": session._stable_plan_worker_subtask_id(
+                step["id"], acceptance
+            ),
             "subtask_content": acceptance["content"],
             "kind": "runtime",
             "tool": "chrome",
             "ok": True,
             "exit_code": None,
             "command": "open http://127.0.0.1:8123",
-            "summary": "status 200; screenshot page.png; canvas webgl rendered visible; image/png",
+            "summary": (
+                "status 200; screenshot page.png; canvas webgl rendered visible; "
+                "image/png"
+            ),
             "ts": trusted["ts"] + 0.01,
         }
         session.blackboard["plan_step_evidence"][step["id"]].append(browser)
         self.assertEqual(
-            [row["id"] for row in session._trusted_plan_step_acceptance_records(
-                step, acceptance, board=session.blackboard, since_ts=10.0
-            )],
+            [
+                row["id"]
+                for row in session._trusted_plan_step_acceptance_records(
+                    step, acceptance, board=session.blackboard, since_ts=10.0
+                )
+            ],
             [trusted["id"]],
         )
 
@@ -625,7 +744,8 @@ class PlanTodoProgressionTests(unittest.TestCase):
                 return {
                     "content": (
                         '{"decision":"pass","passed":true,"confidence":"high",'
-                        '"reason":"equivalent generated module satisfies the requested entry",'
+                        '"reason":"equivalent generated module satisfies the '
+                        'requested entry",'
                         '"evidence":"ev:equivalent created and syntax checked",'
                         '"evidence_ids":["ev:equivalent"]}'
                     )
@@ -652,52 +772,68 @@ class PlanTodoProgressionTests(unittest.TestCase):
                 subtask_id = session._stable_plan_worker_subtask_id(step_id, row)
                 session.blackboard = {
                     "plan_step_evidence": {
-                        step_id: [{
-                            "id": "ev:equivalent",
-                            "step_id": step_id,
-                            "subtask_id": "pst:old-binding",
-                            "subtask_content": "create an equivalent generated entry",
-                            "kind": "file",
-                            "tool": "write_file",
-                            "ok": True,
-                            "exit_code": None,
-                            "path": "src/generated-entry.js",
-                            "summary": "generated entry module created; syntax check passed",
-                            "ts": 20.0,
-                        }]
+                        step_id: [
+                            {
+                                "id": "ev:equivalent",
+                                "step_id": step_id,
+                                "subtask_id": "pst:old-binding",
+                                "subtask_content": (
+                                    "create an equivalent generated entry"
+                                ),
+                                "kind": "file",
+                                "tool": "write_file",
+                                "ok": True,
+                                "exit_code": None,
+                                "path": "src/generated-entry.js",
+                                "summary": (
+                                    "generated entry module created; "
+                                    "syntax check passed"
+                                ),
+                                "ts": 20.0,
+                            }
+                        ]
                     }
                 }
 
-                self.assertFalse(session._plan_subtask_has_accumulated_evidence(
-                    step,
-                    row["content"],
-                    board=session.blackboard,
-                    subtask_id=subtask_id,
-                    since_ts=10.0,
-                ))
-                self.assertTrue(session._plan_worker_completion_has_evidence(
-                    step,
-                    row,
-                    board=session.blackboard,
-                    subtask_id=subtask_id,
-                    since_ts=10.0,
-                ))
-                self.assertTrue(session._plan_worker_completion_has_evidence(
-                    step,
-                    row,
-                    board=session.blackboard,
-                    subtask_id=subtask_id,
-                    since_ts=10.0,
-                ))
-                self.assertEqual(session.ollama.calls, 1)
-                self.assertEqual(
-                    [record["id"] for record in session._plan_worker_completion_evidence_records(
+                self.assertFalse(
+                    session._plan_subtask_has_accumulated_evidence(
+                        step,
+                        row["content"],
+                        board=session.blackboard,
+                        subtask_id=subtask_id,
+                        since_ts=10.0,
+                    )
+                )
+                self.assertTrue(
+                    session._plan_worker_completion_has_evidence(
                         step,
                         row,
                         board=session.blackboard,
                         subtask_id=subtask_id,
                         since_ts=10.0,
-                    )],
+                    )
+                )
+                self.assertTrue(
+                    session._plan_worker_completion_has_evidence(
+                        step,
+                        row,
+                        board=session.blackboard,
+                        subtask_id=subtask_id,
+                        since_ts=10.0,
+                    )
+                )
+                self.assertEqual(session.ollama.calls, 1)
+                self.assertEqual(
+                    [
+                        record["id"]
+                        for record in session._plan_worker_completion_evidence_records(
+                            step,
+                            row,
+                            board=session.blackboard,
+                            subtask_id=subtask_id,
+                            since_ts=10.0,
+                        )
+                    ],
                     ["ev:equivalent"],
                 )
 
@@ -707,12 +843,14 @@ class PlanTodoProgressionTests(unittest.TestCase):
         row = {"content": "1.1 创建 src/main.js", "created_at": 10.0}
         session.blackboard = {"plan_step_evidence": {step["id"]: []}}
 
-        self.assertFalse(session._plan_worker_completion_has_evidence(
-            step,
-            row,
-            board=session.blackboard,
-            since_ts=10.0,
-        ))
+        self.assertFalse(
+            session._plan_worker_completion_has_evidence(
+                step,
+                row,
+                board=session.blackboard,
+                since_ts=10.0,
+            )
+        )
 
     def test_llm_subtask_audit_cannot_turn_failed_record_into_completion(self):
         class OveroptimisticOllama:
@@ -731,26 +869,30 @@ class PlanTodoProgressionTests(unittest.TestCase):
         row = {"content": "1.1 验证 src/main.js", "created_at": 10.0}
         session.blackboard = {
             "plan_step_evidence": {
-                step["id"]: [{
-                    "id": "ev:failed",
-                    "step_id": step["id"],
-                    "kind": "runtime",
-                    "tool": "bash",
-                    "ok": False,
-                    "exit_code": 1,
-                    "command": "node --check src/main.js",
-                    "summary": "SyntaxError",
-                    "ts": 20.0,
-                }]
+                step["id"]: [
+                    {
+                        "id": "ev:failed",
+                        "step_id": step["id"],
+                        "kind": "runtime",
+                        "tool": "bash",
+                        "ok": False,
+                        "exit_code": 1,
+                        "command": "node --check src/main.js",
+                        "summary": "SyntaxError",
+                        "ts": 20.0,
+                    }
+                ]
             }
         }
 
-        self.assertFalse(session._plan_worker_completion_has_evidence(
-            step,
-            row,
-            board=session.blackboard,
-            since_ts=10.0,
-        ))
+        self.assertFalse(
+            session._plan_worker_completion_has_evidence(
+                step,
+                row,
+                board=session.blackboard,
+                since_ts=10.0,
+            )
+        )
 
     def test_sync_role_policy_failure_does_not_override_decisive_browser_pass(self):
         acceptance = "验收：浏览器打开 index.html 可见 canvas 场景且控制台无报错"
@@ -761,7 +903,10 @@ class PlanTodoProgressionTests(unittest.TestCase):
             "ok": True,
             "exit_code": 0,
             "command": "chrome --headless http://127.0.0.1:8765/index.html",
-            "summary": "CHROME_EXIT=0 canvas width=756 height=469 ERROR_COUNT=0 ACCEPTANCE=PASS",
+            "summary": (
+                "CHROME_EXIT=0 canvas width=756 height=469 ERROR_COUNT=0 "
+                "ACCEPTANCE=PASS"
+            ),
             "ts": 20.0,
         }
         role_policy_failure = {
@@ -772,7 +917,8 @@ class PlanTodoProgressionTests(unittest.TestCase):
             "exit_code": -1,
             "command": "chrome --headless index.html > probe.txt",
             "summary": (
-                "Error: shell mutation is not allowed for read-only agent role 'reviewer'. "
+                "Error: shell mutation is not allowed for read-only agent role "
+                "'reviewer'. "
                 "Use read/search/validation commands only."
             ),
             "ts": 21.0,
@@ -786,7 +932,9 @@ class PlanTodoProgressionTests(unittest.TestCase):
         )
 
         self.assertTrue(result["passed"])
-        self.assertEqual([row["id"] for row in result["matched_records"]], ["ev:browser-pass"])
+        self.assertEqual(
+            [row["id"] for row in result["matched_records"]], ["ev:browser-pass"]
+        )
 
     def test_unrelated_failed_probe_does_not_override_decisive_browser_pass(self):
         acceptance = "验收：浏览器打开 index.html 可见 canvas 场景且控制台无报错"
@@ -866,7 +1014,8 @@ class PlanTodoProgressionTests(unittest.TestCase):
                 return {
                     "content": (
                         '{"decision":"pass","passed":true,"confidence":"high",'
-                        '"reason":"runtime metrics prove the requested state transition",'
+                        '"reason":"runtime metrics prove the requested state '
+                        'transition",'
                         '"missing":[],"next_actions":[],"evidence":'
                         '["STATE_CHANGE_COUNT=11","RUNTIME_ERROR_COUNT=0"]}'
                     )
@@ -901,7 +1050,9 @@ class PlanTodoProgressionTests(unittest.TestCase):
                     "completed_at": 18.0,
                 }
                 acceptance_row = {
-                    "content": "验收：在浏览器中目标组件呈现预期状态变化；运行时编译无错误",
+                    "content": (
+                        "验收：在浏览器中目标组件呈现预期状态变化；运行时编译无错误"
+                    ),
                     "status": "in_progress",
                     "owner": "developer",
                     "parent_step_id": step_id,
@@ -912,30 +1063,50 @@ class PlanTodoProgressionTests(unittest.TestCase):
                     "project_todos": [step],
                     "plan_step_total": 1,
                     "plan_step_evidence": {
-                        step_id: [{
-                            "id": "ev:ink-runtime",
-                            "step_id": step_id,
-                            "kind": "runtime",
-                            "tool": "bash",
-                            "ok": True,
-                            "exit_code": 0,
-                            "command": "python verify_runtime_behavior.py",
-                            "summary": (
-                                "STATE_CHANGE_COUNT=11 RUNTIME_ERROR_COUNT=0"
-                            ),
-                            "ts": 20.0,
-                        }],
+                        step_id: [
+                            {
+                                "id": "ev:ink-runtime",
+                                "step_id": step_id,
+                                "kind": "runtime",
+                                "tool": "bash",
+                                "ok": True,
+                                "exit_code": 0,
+                                "command": "python verify_runtime_behavior.py",
+                                "summary": (
+                                    "STATE_CHANGE_COUNT=11 RUNTIME_ERROR_COUNT=0"
+                                ),
+                                "ts": 20.0,
+                            }
+                        ],
                     },
                     "plan_subtask_evidence_bindings": {},
                 }
-                session.todo.update([
-                    {"key": step["key"], "content": step["content"], "status": "in_progress"},
-                    work,
-                    acceptance_row,
-                ])
-                bind(session, "_sync_plan_worker_todos_to_blackboard", lambda self, *args, **kwargs: None)
-                bind(session, "_update_plan_file_step_status", lambda self, *args, **kwargs: None)
-                bind(session, "_advance_completed_acceptance_after_todo_commit", lambda self, *args, **kwargs: False)
+                session.todo.update(
+                    [
+                        {
+                            "key": step["key"],
+                            "content": step["content"],
+                            "status": "in_progress",
+                        },
+                        work,
+                        acceptance_row,
+                    ]
+                )
+                bind(
+                    session,
+                    "_sync_plan_worker_todos_to_blackboard",
+                    lambda self, *args, **kwargs: None,
+                )
+                bind(
+                    session,
+                    "_update_plan_file_step_status",
+                    lambda self, *args, **kwargs: None,
+                )
+                bind(
+                    session,
+                    "_advance_completed_acceptance_after_todo_commit",
+                    lambda self, *args, **kwargs: False,
+                )
                 incoming = [
                     {**work, "status": "completed"},
                     {**acceptance_row, "status": "completed"},
@@ -947,17 +1118,20 @@ class PlanTodoProgressionTests(unittest.TestCase):
                     update_mode="status_update",
                 )
                 first = [
-                    row for row in session.todo.snapshot()
+                    row
+                    for row in session.todo.snapshot()
                     if row.get("parent_step_id") == step_id
                     and session._is_plan_step_acceptance_subtask(row.get("content", ""))
                 ][-1]
                 self.assertEqual(first["status"], "completed")
-                self.assertTrue(session._trusted_plan_step_acceptance_records(
-                    step,
-                    first,
-                    board=session.blackboard,
-                    since_ts=10.0,
-                ))
+                self.assertTrue(
+                    session._trusted_plan_step_acceptance_records(
+                        step,
+                        first,
+                        board=session.blackboard,
+                        since_ts=10.0,
+                    )
+                )
                 self.assertEqual(session.ollama.calls, 1)
 
                 session._plan_worker_completion_has_evidence(
@@ -975,7 +1149,8 @@ class PlanTodoProgressionTests(unittest.TestCase):
                     "content": (
                         '{"decision":"verify","passed":false,"confidence":"high",'
                         '"reason":"one direct observation is still missing",'
-                        '"missing":["runtime behavior"],"next_actions":["run focused check"],'
+                        '"missing":["runtime behavior"],"next_actions":'
+                        '["run focused check"],'
                         '"evidence":[]}'
                     )
                 }
@@ -988,37 +1163,66 @@ class PlanTodoProgressionTests(unittest.TestCase):
         step = {
             "id": step_id,
             "content": "1. Runtime behavior",
-            "full_content": "1. Runtime behavior\n1.1 build\n验收：runtime behavior is visible",
+            "full_content": (
+                "1. Runtime behavior\n1.1 build\n验收：runtime behavior is visible"
+            ),
             "category": "plan_step",
             "status": "in_progress",
             "plan_step_index": 0,
             "activated_at": 10.0,
         }
-        work = {"content": "1.1 build", "status": "completed", "owner": "developer", "parent_step_id": step_id}
-        acceptance_row = {"content": "验收：在浏览器确认 runtime behavior is visible", "status": "in_progress", "owner": "developer", "parent_step_id": step_id}
-        step["full_content"] = "1. Runtime behavior\n1.1 build\n验收：在浏览器确认 runtime behavior is visible"
+        work = {
+            "content": "1.1 build",
+            "status": "completed",
+            "owner": "developer",
+            "parent_step_id": step_id,
+        }
+        acceptance_row = {
+            "content": "验收：在浏览器确认 runtime behavior is visible",
+            "status": "in_progress",
+            "owner": "developer",
+            "parent_step_id": step_id,
+        }
+        step["full_content"] = (
+            "1. Runtime behavior\n1.1 build\n"
+            "验收：在浏览器确认 runtime behavior is visible"
+        )
         session.todo.update([work, acceptance_row])
         session.blackboard = {
             "project_todos": [step],
-            "plan_step_evidence": {step_id: [{
-                "id": "ev:candidate", "step_id": step_id, "kind": "runtime", "tool": "bash",
-                "ok": True, "exit_code": 0, "command": "node --check main.js",
-                "summary": "syntax ok", "ts": 20.0,
-            }]},
+            "plan_step_evidence": {
+                step_id: [
+                    {
+                        "id": "ev:candidate",
+                        "step_id": step_id,
+                        "kind": "runtime",
+                        "tool": "bash",
+                        "ok": True,
+                        "exit_code": 0,
+                        "command": "node --check main.js",
+                        "summary": "syntax ok",
+                        "ts": 20.0,
+                    }
+                ]
+            },
         }
 
-        self.assertFalse(session._plan_worker_completion_has_evidence(
-            step,
-            acceptance_row,
-            board=session.blackboard,
-            since_ts=10.0,
-        ))
-        self.assertFalse(session._trusted_plan_step_acceptance_records(
-            step,
-            acceptance_row,
-            board=session.blackboard,
-            since_ts=10.0,
-        ))
+        self.assertFalse(
+            session._plan_worker_completion_has_evidence(
+                step,
+                acceptance_row,
+                board=session.blackboard,
+                since_ts=10.0,
+            )
+        )
+        self.assertFalse(
+            session._trusted_plan_step_acceptance_records(
+                step,
+                acceptance_row,
+                board=session.blackboard,
+                since_ts=10.0,
+            )
+        )
 
     def test_acceptance_todo_commit_advances_once_from_committed_gate(self):
         for mode in ("single", "sync"):
@@ -1034,7 +1238,10 @@ class PlanTodoProgressionTests(unittest.TestCase):
                     "id": step_id,
                     "key": "bb:proj:" + step_id,
                     "content": "1. Build runtime",
-                    "full_content": "1. Build runtime\n1.1 build\n验收：运行 acceptance_test.py 返回 ACCEPTANCE=PASS",
+                    "full_content": (
+                        "1. Build runtime\n1.1 build\n"
+                        "验收：运行 acceptance_test.py 返回 ACCEPTANCE=PASS"
+                    ),
                     "category": "plan_step",
                     "status": "in_progress",
                     "plan_step_index": 0,
@@ -1057,31 +1264,51 @@ class PlanTodoProgressionTests(unittest.TestCase):
                 session.blackboard = {
                     "project_todos": [step],
                     "plan_step_total": 1,
-                    "plan_step_evidence": {step_id: [{
-                        "id": "ev:acceptance-pass",
-                        "step_id": step_id,
-                        "kind": "runtime",
-                        "tool": "bash",
-                        "ok": True,
-                        "exit_code": 0,
-                        "command": "python acceptance_test.py",
-                        "summary": "ACCEPTANCE=PASS exit_code=0",
-                        "ts": 20.0,
-                    }]},
+                    "plan_step_evidence": {
+                        step_id: [
+                            {
+                                "id": "ev:acceptance-pass",
+                                "step_id": step_id,
+                                "kind": "runtime",
+                                "tool": "bash",
+                                "ok": True,
+                                "exit_code": 0,
+                                "command": "python acceptance_test.py",
+                                "summary": "ACCEPTANCE=PASS exit_code=0",
+                                "ts": 20.0,
+                            }
+                        ]
+                    },
                     "plan_subtask_evidence_bindings": {},
                 }
-                session.todo.update([
-                    {"key": step["key"], "content": step["content"], "status": "in_progress"},
-                    work,
-                    acceptance_row,
-                ])
-                bind(session, "_sync_plan_worker_todos_to_blackboard", lambda self, *args, **kwargs: None)
-                bind(session, "_update_plan_file_step_status", lambda self, *args, **kwargs: None)
+                session.todo.update(
+                    [
+                        {
+                            "key": step["key"],
+                            "content": step["content"],
+                            "status": "in_progress",
+                        },
+                        work,
+                        acceptance_row,
+                    ]
+                )
+                bind(
+                    session,
+                    "_sync_plan_worker_todos_to_blackboard",
+                    lambda self, *args, **kwargs: None,
+                )
+                bind(
+                    session,
+                    "_update_plan_file_step_status",
+                    lambda self, *args, **kwargs: None,
+                )
                 advances = []
                 bind(
                     session,
                     "_advance_plan_step",
-                    lambda self, evidence="", actor="developer": advances.append((evidence, actor)) or True,
+                    lambda self, evidence="", actor="developer": (
+                        advances.append((evidence, actor)) or True
+                    ),
                 )
 
                 session._merge_plan_worker_todo_items(
@@ -1094,7 +1321,8 @@ class PlanTodoProgressionTests(unittest.TestCase):
                 )
 
                 stored = [
-                    row for row in session.todo.snapshot()
+                    row
+                    for row in session.todo.snapshot()
                     if row.get("parent_step_id") == step_id
                     and session._is_plan_step_acceptance_subtask(row.get("content", ""))
                 ][-1]
@@ -1130,19 +1358,23 @@ class PlanTodoProgressionTests(unittest.TestCase):
                 }
                 session.blackboard = {
                     "project_todos": [step],
-                    "plan_step_evidence": {step_id: [{
-                        "id": "ev:unbound-pass",
-                        "step_id": step_id,
-                        # Older/third-party tools may omit subtask_id while the
-                        # runtime still records the event under this exact step.
-                        "kind": "runtime",
-                        "tool": "bash",
-                        "ok": True,
-                        "exit_code": 0,
-                        "command": "python acceptance_test.py",
-                        "summary": "ACCEPTANCE=PASS exit_code=0",
-                        "ts": 20.0,
-                    }]},
+                    "plan_step_evidence": {
+                        step_id: [
+                            {
+                                "id": "ev:unbound-pass",
+                                "step_id": step_id,
+                                # Older/third-party tools may omit subtask_id while the
+                                # runtime still records the event under this exact step.
+                                "kind": "runtime",
+                                "tool": "bash",
+                                "ok": True,
+                                "exit_code": 0,
+                                "command": "python acceptance_test.py",
+                                "summary": "ACCEPTANCE=PASS exit_code=0",
+                                "ts": 20.0,
+                            }
+                        ]
+                    },
                 }
 
                 records = session._matching_acceptance_evidence_records(
@@ -1151,7 +1383,9 @@ class PlanTodoProgressionTests(unittest.TestCase):
                     board=session.blackboard,
                 )
 
-                self.assertEqual([record["id"] for record in records], ["ev:unbound-pass"])
+                self.assertEqual(
+                    [record["id"] for record in records], ["ev:unbound-pass"]
+                )
 
     def test_unbound_step_local_evidence_completes_incomplete_acceptance_binding(self):
         """A stale/incomplete acceptance binding must not hide a step-local pass."""
@@ -1176,36 +1410,42 @@ class PlanTodoProgressionTests(unittest.TestCase):
                     "parent_step_id": step_id,
                     "created_at": 10.0,
                 }
-                acceptance_id = session._stable_plan_worker_subtask_id(step_id, acceptance)
+                acceptance_id = session._stable_plan_worker_subtask_id(
+                    step_id, acceptance
+                )
                 session.blackboard = {
                     "project_todos": [step],
-                    "plan_step_evidence": {step_id: [
-                        {
-                            "id": "ev:bound-incomplete",
-                            "step_id": step_id,
-                            "subtask_id": acceptance_id,
-                            "kind": "runtime",
-                            "tool": "bash",
-                            "ok": True,
-                            "exit_code": 0,
-                            "command": "node unrelated_probe.js",
-                            "summary": "probe completed; acceptance result not reported",
-                            "ts": 20.0,
-                        },
-                        {
-                            "id": "ev:unbound-pass-fallback",
-                            "step_id": step_id,
-                            # Deliberately omit subtask_id: this is the shape
-                            # emitted by older/third-party tool integrations.
-                            "kind": "runtime",
-                            "tool": "bash",
-                            "ok": True,
-                            "exit_code": 0,
-                            "command": "python acceptance_test.py",
-                            "summary": "ACCEPTANCE=PASS exit_code=0",
-                            "ts": 21.0,
-                        },
-                    ]},
+                    "plan_step_evidence": {
+                        step_id: [
+                            {
+                                "id": "ev:bound-incomplete",
+                                "step_id": step_id,
+                                "subtask_id": acceptance_id,
+                                "kind": "runtime",
+                                "tool": "bash",
+                                "ok": True,
+                                "exit_code": 0,
+                                "command": "node unrelated_probe.js",
+                                "summary": (
+                                    "probe completed; acceptance result not reported"
+                                ),
+                                "ts": 20.0,
+                            },
+                            {
+                                "id": "ev:unbound-pass-fallback",
+                                "step_id": step_id,
+                                # Deliberately omit subtask_id: this is the shape
+                                # emitted by older/third-party tool integrations.
+                                "kind": "runtime",
+                                "tool": "bash",
+                                "ok": True,
+                                "exit_code": 0,
+                                "command": "python acceptance_test.py",
+                                "summary": "ACCEPTANCE=PASS exit_code=0",
+                                "ts": 21.0,
+                            },
+                        ]
+                    },
                 }
 
                 records = session._matching_acceptance_evidence_records(
@@ -1288,39 +1528,72 @@ class PlanTodoProgressionTests(unittest.TestCase):
                     "plan_step_total": 2,
                     "plan_subtask_evidence_bindings": {},
                 }
-                session.todo.update([
-                    {"key": step["key"], "content": step["content"], "status": "in_progress"},
-                    worker,
-                    {"key": next_step["key"], "content": next_step["content"], "status": "pending"},
-                ])
-                bind(session, "_sync_plan_worker_todos_to_blackboard", lambda self, *args, **kwargs: None)
-                bind(session, "_update_plan_file_step_status", lambda self, *args, **kwargs: None)
-                bind(session, "_advance_completed_acceptance_after_todo_commit", lambda self, *args, **kwargs: False)
-                bind(session, "_plan_worker_completion_has_evidence", lambda self, *args, **kwargs: True)
+                session.todo.update(
+                    [
+                        {
+                            "key": step["key"],
+                            "content": step["content"],
+                            "status": "in_progress",
+                        },
+                        worker,
+                        {
+                            "key": next_step["key"],
+                            "content": next_step["content"],
+                            "status": "pending",
+                        },
+                    ]
+                )
+                bind(
+                    session,
+                    "_sync_plan_worker_todos_to_blackboard",
+                    lambda self, *args, **kwargs: None,
+                )
+                bind(
+                    session,
+                    "_update_plan_file_step_status",
+                    lambda self, *args, **kwargs: None,
+                )
+                bind(
+                    session,
+                    "_advance_completed_acceptance_after_todo_commit",
+                    lambda self, *args, **kwargs: False,
+                )
+                bind(
+                    session,
+                    "_plan_worker_completion_has_evidence",
+                    lambda self, *args, **kwargs: True,
+                )
                 bind(
                     session,
                     "_plan_worker_completion_evidence_records",
-                    lambda self, plan_step, row, **kwargs: [{
-                        "id": "ev:entry",
-                        "step_id": plan_step["id"],
-                        "kind": "file",
-                        "tool": "write_file",
-                        "ok": True,
-                        "summary": "entry created",
-                        "ts": 20.0,
-                    }],
+                    lambda self, plan_step, row, **kwargs: [
+                        {
+                            "id": "ev:entry",
+                            "step_id": plan_step["id"],
+                            "kind": "file",
+                            "tool": "write_file",
+                            "ok": True,
+                            "summary": "entry created",
+                            "ts": 20.0,
+                        }
+                    ],
                 )
 
                 accepted = session._dispatch_todo_update(
-                    {"todos": [{
-                        "content": worker["content"],
-                        "status": "completed",
-                        "parent_step_id": "1",
-                    }]},
+                    {
+                        "todos": [
+                            {
+                                "content": worker["content"],
+                                "status": "completed",
+                                "parent_step_id": "1",
+                            }
+                        ]
+                    },
                     role="developer",
                 )
                 stored = [
-                    row for row in session.todo.snapshot()
+                    row
+                    for row in session.todo.snapshot()
                     if row.get("parent_step_id") == step_id
                     and row.get("content") == worker["content"]
                 ]
@@ -1342,18 +1615,21 @@ class PlanTodoProgressionTests(unittest.TestCase):
                 )
                 self.assertEqual(scope["parent_step_id"], step_id)
                 visible_worker = [
-                    row for row in ui_tasks
-                    if row.get("subject") == worker["content"]
+                    row for row in ui_tasks if row.get("subject") == worker["content"]
                 ]
                 self.assertEqual(visible_worker[-1]["status"], "completed")
 
                 before = session.todo.snapshot()
                 rejected = session._dispatch_todo_update(
-                    {"todos": [{
-                        "content": "2.1 future change",
-                        "status": "in_progress",
-                        "parent_step_id": "2",
-                    }]},
+                    {
+                        "todos": [
+                            {
+                                "content": "2.1 future change",
+                                "status": "in_progress",
+                                "parent_step_id": "2",
+                            }
+                        ]
+                    },
                     role="developer",
                 )
                 self.assertIn("rejected a cross-step", rejected)

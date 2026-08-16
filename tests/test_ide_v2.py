@@ -1,15 +1,15 @@
-import sqlite3
-import tempfile
-import unittest
 import base64
-import io
-import inspect
 import http.client
+import inspect
+import io
 import json
 import os
+import sqlite3
+import tempfile
 import threading
 import time
 import types
+import unittest
 import zipfile
 from pathlib import Path
 from unittest import mock
@@ -86,12 +86,21 @@ class OfflineJSAssetTests(unittest.TestCase):
 
     def test_connection_deadline_still_indexes_every_catalog_entry(self):
         catalog = [
-            {"id": "one", "filename": "one.js", "urls": ["https://example.invalid/one.js"]},
-            {"id": "two", "filename": "two.js", "urls": ["https://example.invalid/two.js"]},
+            {
+                "id": "one",
+                "filename": "one.js",
+                "urls": ["https://example.invalid/one.js"],
+            },
+            {
+                "id": "two",
+                "filename": "two.js",
+                "urls": ["https://example.invalid/two.js"],
+            },
         ]
-        with mock.patch.object(cc, "OFFLINE_JS_LIB_CATALOG", catalog), mock.patch.object(
-            cc, "_download_http_bytes"
-        ) as download:
+        with (
+            mock.patch.object(cc, "OFFLINE_JS_LIB_CATALOG", catalog),
+            mock.patch.object(cc, "_download_http_bytes") as download,
+        ):
             summary = cc.ensure_offline_js_libs(
                 Path(self.tmp.name), no_connection_deadline=-1
             )
@@ -119,9 +128,10 @@ class OfflineJSAssetTests(unittest.TestCase):
         app.skills_root.mkdir()
         app.js_lib_root = self.root
         app.js_lib_download_enabled = False
-        with mock.patch.object(cc, "ensure_runtime_skills"), mock.patch.object(
-            cc, "ensure_offline_js_libs"
-        ) as ensure_all:
+        with (
+            mock.patch.object(cc, "ensure_runtime_skills"),
+            mock.patch.object(cc, "ensure_offline_js_libs") as ensure_all,
+        ):
             bundle = app.source_bundle()
         self.assertGreater(len(bundle), 1000)
         ensure_all.assert_not_called()
@@ -130,13 +140,20 @@ class OfflineJSAssetTests(unittest.TestCase):
         self.assertIn("const CHAT_UPLOAD_HANDOFF_WAIT_MS=250;", cc.APP_JS)
         self.assertIn("waitForPendingUploads(handoffWait)", cc.APP_JS)
         self.assertNotIn("waitForPendingUploads(10000)", cc.APP_JS)
-        self.assertIn('"chat_upload_frontend_wait_ms": int(CHAT_UPLOAD_FRONTEND_WAIT_MS)', inspect.getsource(cc.Handler.do_GET))
+        self.assertIn(
+            '"chat_upload_frontend_wait_ms": int(CHAT_UPLOAD_FRONTEND_WAIT_MS)',
+            inspect.getsource(cc.Handler.do_GET),
+        )
 
     def test_session_manager_does_not_probe_ollama_during_construction(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             crypto = cc.CryptoBox(root / "codes")
-            with mock.patch.object(cc, "probe_ollama_environment", side_effect=AssertionError("probe must be lazy")):
+            with mock.patch.object(
+                cc,
+                "probe_ollama_environment",
+                side_effect=AssertionError("probe must be lazy"),
+            ):
                 manager = cc.SessionManager(
                     root / "sessions",
                     "user-a",
@@ -181,9 +198,20 @@ class IDESandboxBackendTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_bubblewrap_prefix_mounts_only_workspace_writable(self):
-        backend = {"available": True, "name": "bubblewrap", "processes": True, "terminal": True, "debug": True}
-        with mock.patch.object(cc, "_detect_ide_sandbox_backend", return_value=backend), mock.patch.object(
-            cc.shutil, "which", side_effect=lambda name: "/usr/bin/bwrap" if name == "bwrap" else None
+        backend = {
+            "available": True,
+            "name": "bubblewrap",
+            "processes": True,
+            "terminal": True,
+            "debug": True,
+        }
+        with (
+            mock.patch.object(cc, "_detect_ide_sandbox_backend", return_value=backend),
+            mock.patch.object(
+                cc.shutil,
+                "which",
+                side_effect=lambda name: "/usr/bin/bwrap" if name == "bwrap" else None,
+            ),
         ):
             prefix = self.session._workspace_sandbox_shell_prefix(self.files / "nested")
             command = self.session._sandbox_virtualize_command(
@@ -204,8 +232,9 @@ class IDESandboxBackendTests(unittest.TestCase):
             "debug": False,
             "image": "clouds-coder-sandbox:latest",
         }
-        with mock.patch.object(cc, "_detect_ide_sandbox_backend", return_value=backend), mock.patch.object(
-            cc.shutil, "which", return_value="/usr/bin/docker"
+        with (
+            mock.patch.object(cc, "_detect_ide_sandbox_backend", return_value=backend),
+            mock.patch.object(cc.shutil, "which", return_value="/usr/bin/docker"),
         ):
             prefix = self.session._workspace_sandbox_shell_prefix(self.files / "nested")
             terminal_prefix = self.session._workspace_sandbox_shell_prefix(
@@ -228,7 +257,9 @@ class IDESandboxBackendTests(unittest.TestCase):
             "image": "local-image",
             "reason": "container limitations",
         }
-        with mock.patch.object(cc.AppContext, "_ide_remote_sandbox_backend", return_value=backend):
+        with mock.patch.object(
+            cc.AppContext, "_ide_remote_sandbox_backend", return_value=backend
+        ):
             capabilities = app.ide_request_capabilities(
                 {"role": "user"}, client_ip="192.168.1.22", direct_loopback=False
             )
@@ -239,25 +270,29 @@ class IDESandboxBackendTests(unittest.TestCase):
 
     def test_linux_and_windows_backend_detection(self):
         ready = types.SimpleNamespace(returncode=0)
-        with mock.patch.dict(os.environ, {"CLOUDS_CODER_SANDBOX_BACKEND": "bwrap"}), mock.patch.object(
-            cc.os, "name", "posix"
-        ), mock.patch.object(cc.sys, "platform", "linux"), mock.patch.object(
-            cc.shutil, "which", return_value="/usr/bin/bwrap"
-        ), mock.patch.object(cc.subprocess, "run", return_value=ready):
+        with (
+            mock.patch.dict(os.environ, {"CLOUDS_CODER_SANDBOX_BACKEND": "bwrap"}),
+            mock.patch.object(cc.os, "name", "posix"),
+            mock.patch.object(cc.sys, "platform", "linux"),
+            mock.patch.object(cc.shutil, "which", return_value="/usr/bin/bwrap"),
+            mock.patch.object(cc.subprocess, "run", return_value=ready),
+        ):
             linux = cc._detect_ide_sandbox_backend(force=True)
         self.assertEqual(linux["name"], "bubblewrap")
         self.assertTrue(linux["terminal"])
 
-        with mock.patch.dict(
-            os.environ,
-            {
-                "CLOUDS_CODER_SANDBOX_BACKEND": "docker",
-                "CLOUDS_CODER_SANDBOX_IMAGE": "local-sandbox:test",
-            },
-        ), mock.patch.object(cc.os, "name", "nt"), mock.patch.object(
-            cc.sys, "platform", "win32"
-        ), mock.patch.object(cc.shutil, "which", return_value="C:/docker.exe"), mock.patch.object(
-            cc.subprocess, "run", return_value=ready
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "CLOUDS_CODER_SANDBOX_BACKEND": "docker",
+                    "CLOUDS_CODER_SANDBOX_IMAGE": "local-sandbox:test",
+                },
+            ),
+            mock.patch.object(cc.os, "name", "nt"),
+            mock.patch.object(cc.sys, "platform", "win32"),
+            mock.patch.object(cc.shutil, "which", return_value="C:/docker.exe"),
+            mock.patch.object(cc.subprocess, "run", return_value=ready),
         ):
             windows = cc._detect_ide_sandbox_backend(force=True)
         self.assertEqual(windows["name"], "docker")
@@ -266,15 +301,17 @@ class IDESandboxBackendTests(unittest.TestCase):
         self.assertFalse(windows["debug"])
 
     def test_windows_auto_uses_builtin_job_sandbox_without_container(self):
-        with mock.patch.dict(
-            os.environ,
-            {"CLOUDS_CODER_SANDBOX_BACKEND": "auto"},
-        ), mock.patch.object(cc.os, "name", "nt"), mock.patch.object(
-            cc.sys, "platform", "win32"
-        ), mock.patch.object(
-            cc, "_windows_builtin_sandbox_probe", return_value=(True, "ready")
-        ), mock.patch.object(
-            cc.shutil, "which", return_value=None
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"CLOUDS_CODER_SANDBOX_BACKEND": "auto"},
+            ),
+            mock.patch.object(cc.os, "name", "nt"),
+            mock.patch.object(cc.sys, "platform", "win32"),
+            mock.patch.object(
+                cc, "_windows_builtin_sandbox_probe", return_value=(True, "ready")
+            ),
+            mock.patch.object(cc.shutil, "which", return_value=None),
         ):
             backend = cc._detect_ide_sandbox_backend(force=True)
         self.assertEqual(backend["name"], "windows-job")
@@ -315,28 +352,42 @@ class IDEAuthStoreTests(unittest.TestCase):
 
     def test_first_admin_binds_legacy_loopback_identity(self):
         legacy = cc.user_id_from_ip("127.0.0.1")
-        result = self.store.setup_admin("local-admin", "Strong-Passphrase-42!", legacy_user_id=legacy)
+        result = self.store.setup_admin(
+            "local-admin", "Strong-Passphrase-42!", legacy_user_id=legacy
+        )
         self.assertEqual(result["account"]["role"], "admin")
         self.assertEqual(result["account"]["user_id"], legacy)
         self.assertTrue(self.store.configured())
         self.assertIsNotNone(self.store.verify_session(result["access_token"]))
         with self.assertRaises(cc.IDEAuthError) as caught:
-            self.store.setup_admin("second-admin", "Another-Passphrase-42!", legacy_user_id="ide_second_admin")
+            self.store.setup_admin(
+                "second-admin",
+                "Another-Passphrase-42!",
+                legacy_user_id="ide_second_admin",
+            )
         self.assertEqual(caught.exception.code, "setup_already_completed")
 
-    def test_change_password_revokes_sessions_without_leaking_verification_session(self):
+    def test_change_password_revokes_sessions_without_leaking_verification_session(
+        self,
+    ):
         setup = self.store.setup_admin(
             "local-admin",
             "Strong-Passphrase-42!",
             legacy_user_id=cc.user_id_from_ip("127.0.0.1"),
         )
         account = setup["account"]
-        self.store.change_password(account, "Strong-Passphrase-42!", "Replacement-Passphrase-73!")
+        self.store.change_password(
+            account, "Strong-Passphrase-42!", "Replacement-Passphrase-73!"
+        )
         self.assertIsNone(self.store.verify_session(setup["access_token"]))
         with sqlite3.connect(str(self.store.path)) as conn:
-            active = conn.execute("SELECT COUNT(*) FROM ide_sessions WHERE revoked_at=0").fetchone()[0]
+            active = conn.execute(
+                "SELECT COUNT(*) FROM ide_sessions WHERE revoked_at=0"
+            ).fetchone()[0]
         self.assertEqual(active, 0)
-        logged_in = self.store.login("local-admin", "Replacement-Passphrase-73!", "127.0.0.1")
+        logged_in = self.store.login(
+            "local-admin", "Replacement-Passphrase-73!", "127.0.0.1"
+        )
         self.assertIsNotNone(self.store.verify_session(logged_in["access_token"]))
 
     def test_user_disable_revokes_session(self):
@@ -346,15 +397,21 @@ class IDEAuthStoreTests(unittest.TestCase):
             legacy_user_id=cc.user_id_from_ip("127.0.0.1"),
         )
         account = self.store.create_user("developer-one", "Developer-Passphrase-93!")
-        session = self.store.login("developer-one", "Developer-Passphrase-93!", "192.168.1.22")
+        session = self.store.login(
+            "developer-one", "Developer-Passphrase-93!", "192.168.1.22"
+        )
         self.assertEqual(session["account"]["user_id"], account["user_id"])
         self.store.set_disabled("developer-one", True)
         self.assertIsNone(self.store.verify_session(session["access_token"]))
 
-    def test_local_session_is_passwordless_and_device_ip_change_rebinds_automatically(self):
+    def test_local_session_is_passwordless_and_device_ip_change_rebinds_automatically(
+        self,
+    ):
         local = self.store.local_session(legacy_user_id=cc.user_id_from_ip("127.0.0.1"))
         self.assertEqual(local["account"]["username"], "local-admin")
-        self.assertIsNotNone(self.store.verify_session(local["access_token"], "127.0.0.1"))
+        self.assertIsNotNone(
+            self.store.verify_session(local["access_token"], "127.0.0.1")
+        )
 
         device_key = "cc_device_" + "A" * 43
         approved = self.store.register_device(
@@ -366,8 +423,12 @@ class IDEAuthStoreTests(unittest.TestCase):
         self.assertFalse(approved.get("pending", False))
         self.assertEqual(approved["device"]["status"], "approved")
         self.assertEqual(approved["account"]["role"], "user")
-        self.assertIsNotNone(self.store.verify_session(approved["access_token"], "192.168.1.22"))
-        self.assertIsNone(self.store.verify_session(approved["access_token"], "192.168.1.23"))
+        self.assertIsNotNone(
+            self.store.verify_session(approved["access_token"], "192.168.1.22")
+        )
+        self.assertIsNone(
+            self.store.verify_session(approved["access_token"], "192.168.1.23")
+        )
         moved = self.store.register_device(
             device_key,
             label="Test browser",
@@ -377,8 +438,12 @@ class IDEAuthStoreTests(unittest.TestCase):
         self.assertFalse(moved.get("pending", False))
         self.assertEqual(moved["device"]["status"], "approved")
         self.assertEqual(moved["account"]["user_id"], approved["account"]["user_id"])
-        self.assertIsNone(self.store.verify_session(approved["access_token"], "192.168.1.22"))
-        self.assertIsNotNone(self.store.verify_session(moved["access_token"], "192.168.1.23"))
+        self.assertIsNone(
+            self.store.verify_session(approved["access_token"], "192.168.1.22")
+        )
+        self.assertIsNotNone(
+            self.store.verify_session(moved["access_token"], "192.168.1.23")
+        )
 
         self.store.revoke_device(moved["device"]["pairing_id"])
         with self.assertRaises(cc.IDEAuthError) as caught:
@@ -395,20 +460,30 @@ class IDEAuthStoreTests(unittest.TestCase):
         self.store.reset_password("local-admin", "Known-Passphrase-73!")
         self.assertIsNone(self.store.verify_session(local["access_token"], "127.0.0.1"))
         logged_in = self.store.login("local-admin", "Known-Passphrase-73!", "127.0.0.1")
-        self.assertIsNotNone(self.store.verify_session(logged_in["access_token"], "127.0.0.1"))
+        self.assertIsNotNone(
+            self.store.verify_session(logged_in["access_token"], "127.0.0.1")
+        )
 
 
 class IDECapabilityTests(unittest.TestCase):
     def test_loopback_mounts_and_remote_process_sandbox_capabilities(self):
         app = cc.AppContext.__new__(cc.AppContext)
-        local = app.ide_request_capabilities({"role": "user"}, client_ip="127.0.0.1", direct_loopback=True)
+        local = app.ide_request_capabilities(
+            {"role": "user"}, client_ip="127.0.0.1", direct_loopback=True
+        )
         self.assertTrue(local["mounts"])
         self.assertTrue(local["processes"])
-        terminal_supported = bool((cc._pty is not None and os.name == "posix") or os.name == "nt")
+        terminal_supported = bool(
+            (cc._pty is not None and os.name == "posix") or os.name == "nt"
+        )
         self.assertEqual(local["terminal"], terminal_supported)
-        lan = app.ide_request_capabilities({"role": "admin"}, client_ip="192.168.1.22", direct_loopback=False)
+        lan = app.ide_request_capabilities(
+            {"role": "admin"}, client_ip="192.168.1.22", direct_loopback=False
+        )
         self.assertFalse(lan["mounts"])
-        self.assertEqual(lan["terminal"], bool(lan["hard_isolation"] and terminal_supported))
+        self.assertEqual(
+            lan["terminal"], bool(lan["hard_isolation"] and terminal_supported)
+        )
         if not lan["hard_isolation"]:
             with self.assertRaises(cc.IDECapabilityError):
                 app.ide_require_capability(lan, "terminal")
@@ -439,7 +514,7 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_terminal_output_base64_preserves_split_utf8_bytes(self):
-        raw = "山海绘卷".encode("utf-8")
+        raw = "山海绘卷".encode()
         split = 2
         terminal = {
             "user_id": "account-a",
@@ -459,9 +534,13 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
             terminal["output_end"] = len(raw)
             terminal["closed"] = True
             terminal["returncode"] = 0
-        second = self.app.ide_terminal_output("account-a", "term-a", first["next_offset"])
+        second = self.app.ide_terminal_output(
+            "account-a", "term-a", first["next_offset"]
+        )
 
-        joined = base64.b64decode(first["data_b64"]) + base64.b64decode(second["data_b64"])
+        joined = base64.b64decode(first["data_b64"]) + base64.b64decode(
+            second["data_b64"]
+        )
         self.assertEqual(joined.decode("utf-8"), "山海绘卷")
         self.assertEqual(second["encoding"], "utf-8")
 
@@ -474,7 +553,11 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
             self.app.ide_write_file(
                 "account-a",
                 "session-a",
-                {"path": "main.py", "content": "value = 3\n", "expected_revision": opened["revision"]},
+                {
+                    "path": "main.py",
+                    "content": "value = 3\n",
+                    "expected_revision": opened["revision"],
+                },
             )
         self.assertEqual(caught.exception.code, "file_conflict")
         self.assertEqual(target.read_text(encoding="utf-8"), "value = 2\n")
@@ -482,9 +565,13 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
     def test_quick_open_file_list_is_recursive_bounded_and_skips_generated_dirs(self):
         (self.files / "src" / "nested").mkdir(parents=True)
         (self.files / "src" / "main.py").write_text("print('ok')\n", encoding="utf-8")
-        (self.files / "src" / "nested" / "页面.html").write_text("<h1>ok</h1>\n", encoding="utf-8")
+        (self.files / "src" / "nested" / "页面.html").write_text(
+            "<h1>ok</h1>\n", encoding="utf-8"
+        )
         (self.files / "node_modules" / "package").mkdir(parents=True)
-        (self.files / "node_modules" / "package" / "ignored.js").write_text("ignored\n", encoding="utf-8")
+        (self.files / "node_modules" / "package" / "ignored.js").write_text(
+            "ignored\n", encoding="utf-8"
+        )
 
         listed = self.app.ide_workspace_files(
             "account-a", "session-a", root_id="session", max_files=10
@@ -536,13 +623,18 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
             def snapshot_safe(self, **_kwargs):
                 return {
                     "conversation_feed": [
-                        {"role": "user", "text": "IDE programming request.\n\nEarlier context"}
+                        {
+                            "role": "user",
+                            "text": "IDE programming request.\n\nEarlier context",
+                        }
                     ]
                 }
 
         session = FakeSession()
         self.app._ide_session = lambda user_id, session_id: session
-        self.app.submit_user_message = mock.Mock(side_effect=AssertionError("must not submit"))
+        self.app.submit_user_message = mock.Mock(
+            side_effect=AssertionError("must not submit")
+        )
         model_payload = {
             "intent_summary": "修复并验证目标功能",
             "deliverables": ["代码修改", "测试证据"],
@@ -578,15 +670,20 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
             ],
             "enhanced_prompt": "## 目标\n修复目标功能并完成验证。",
         }
-        with mock.patch.object(
-            self.app,
-            "_ide_prompt_skill_catalog",
-            side_effect=AssertionError("skills catalog must stay lazy when awareness is off"),
-        ) as skills_catalog, mock.patch.object(
-            cc.OllamaClient,
-            "chat",
-            return_value={"content": json.dumps(model_payload, ensure_ascii=False)},
-        ) as chat:
+        with (
+            mock.patch.object(
+                self.app,
+                "_ide_prompt_skill_catalog",
+                side_effect=AssertionError(
+                    "skills catalog must stay lazy when awareness is off"
+                ),
+            ) as skills_catalog,
+            mock.patch.object(
+                cc.OllamaClient,
+                "chat",
+                return_value={"content": json.dumps(model_payload, ensure_ascii=False)},
+            ) as chat,
+        ):
             out = self.app.ide_enhance_agent_prompt(
                 "account-a",
                 "session-a",
@@ -619,9 +716,13 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
         self.assertIn('"directory_snapshot"', prompt)
         self.assertIn('"skills_awareness"', prompt)
 
-    def test_prompt_enhancement_selects_valid_skills_and_refines_with_full_instructions(self):
+    def test_prompt_enhancement_selects_valid_skills_and_refines_with_full_instructions(
+        self,
+    ):
         (self.files / "src").mkdir()
-        (self.files / "src" / "app.js").write_text("console.log('ok')\n", encoding="utf-8")
+        (self.files / "src" / "app.js").write_text(
+            "console.log('ok')\n", encoding="utf-8"
+        )
 
         class FakeRuntime:
             model = "test-model"
@@ -647,11 +748,18 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
 
         class FakeSkillStore:
             def _resolve_name(self, name):
-                return ("frontend", None) if name in {"frontend", "Frontend"} else (None, "unknown")
+                return (
+                    ("frontend", None)
+                    if name in {"frontend", "Frontend"}
+                    else (None, "unknown")
+                )
 
             def load(self, name):
                 self.loaded = name
-                return "<skill>Inspect existing components, then implement and run browser validation.</skill>"
+                return (
+                    "<skill>Inspect existing components, then implement and run "
+                    "browser validation.</skill>"
+                )
 
         store = FakeSkillStore()
         catalog = [
@@ -672,21 +780,46 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
             "acceptance_criteria": ["Browser flow passes"],
             "clarifications": [],
             "execution_steps": [
-                {"title": "Inspect", "action": "Inspect src/app.js.", "depends_on": [], "completion_check": "Current behavior is known."}
+                {
+                    "title": "Inspect",
+                    "action": "Inspect src/app.js.",
+                    "depends_on": [],
+                    "completion_check": "Current behavior is known.",
+                }
             ],
             "selected_skills": [
-                {"id": "frontend", "rationale": "The task changes a browser interface."},
+                {
+                    "id": "frontend",
+                    "rationale": "The task changes a browser interface.",
+                },
                 {"id": "invented-skill", "rationale": "This id is not real."},
             ],
             "enhanced_prompt": "## Goal\nImplement the interface.",
         }
         refined = {
             "execution_steps": [
-            {"title": "Inspect", "action": "Inspect src/app.js and its tests.", "depends_on": [], "completion_check": "Current behavior is known."},
-            {"title": "Implement", "action": "Implement one bounded UI increment.", "depends_on": ["Inspect"], "completion_check": "The increment works."},
-            {"title": "Verify", "action": "Run browser validation.", "depends_on": ["Implement"], "completion_check": "The browser flow passes."},
+                {
+                    "title": "Inspect",
+                    "action": "Inspect src/app.js and its tests.",
+                    "depends_on": [],
+                    "completion_check": "Current behavior is known.",
+                },
+                {
+                    "title": "Implement",
+                    "action": "Implement one bounded UI increment.",
+                    "depends_on": ["Inspect"],
+                    "completion_check": "The increment works.",
+                },
+                {
+                    "title": "Verify",
+                    "action": "Run browser validation.",
+                    "depends_on": ["Implement"],
+                    "completion_check": "The browser flow passes.",
+                },
             ],
-            "final_prompt": "## Goal\nImplement the interface in three verified stages.",
+            "final_prompt": (
+                "## Goal\nImplement the interface in three verified stages."
+            ),
         }
         self.app._ide_session = lambda user_id, session_id: FakeSession()
         self.app._ide_prompt_skill_catalog = lambda: (store, catalog, False)
@@ -719,7 +852,9 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
         self.assertIn("Build and validate browser interfaces", first_prompt)
         self.assertIn("Inspect existing components", second_prompt)
 
-    def test_prompt_enhancement_uses_budget_aware_template_when_model_is_unavailable(self):
+    def test_prompt_enhancement_uses_budget_aware_template_when_model_is_unavailable(
+        self,
+    ):
         class FakeRuntime:
             model = "offline-model"
             provider = "ollama"
@@ -743,7 +878,9 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
                 return {"conversation_feed": []}
 
         self.app._ide_session = lambda user_id, session_id: FakeSession()
-        with mock.patch.object(cc.OllamaClient, "chat", side_effect=RuntimeError("offline")):
+        with mock.patch.object(
+            cc.OllamaClient, "chat", side_effect=RuntimeError("offline")
+        ):
             out = self.app.ide_enhance_agent_prompt(
                 "account-a",
                 "session-a",
@@ -790,7 +927,12 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
             "acceptance_criteria": [],
             "clarifications": [],
             "execution_steps": [
-                {"title": "执行", "action": "处理完整请求。", "depends_on": [], "completion_check": "请求已完整处理。"}
+                {
+                    "title": "执行",
+                    "action": "处理完整请求。",
+                    "depends_on": [],
+                    "completion_check": "请求已完整处理。",
+                }
             ],
             "selected_skills": [],
             "enhanced_prompt": "## 目标\n处理完整请求。",
@@ -813,14 +955,18 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
         self.assertEqual(len(out["execution_steps"]), 1)
 
     def test_prompt_enhancement_parser_accepts_complete_flexible_formats(self):
-        nested = self.app._ide_parse_prompt_enhancement_response(json.dumps({
-            "result": {
-                "interpreted_intent": "Repair the parser.",
-                "outputs": ["Parser update"],
-                "steps": ["Inspect", "Implement", "Verify"],
-                "final_prompt": "## Goal\nRepair the parser.",
-            }
-        }))
+        nested = self.app._ide_parse_prompt_enhancement_response(
+            json.dumps(
+                {
+                    "result": {
+                        "interpreted_intent": "Repair the parser.",
+                        "outputs": ["Parser update"],
+                        "steps": ["Inspect", "Implement", "Verify"],
+                        "final_prompt": "## Goal\nRepair the parser.",
+                    }
+                }
+            )
+        )
         self.assertEqual(nested["intent_summary"], "Repair the parser.")
         self.assertEqual(nested["deliverables"], ["Parser update"])
         self.assertEqual(nested["execution_steps"], ["Inspect", "Implement", "Verify"])
@@ -834,19 +980,29 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
         )
         self.assertEqual(markdown["_format"], "markdown")
         self.assertEqual(markdown["intent_summary"], "Handle the request safely.")
-        self.assertEqual(markdown["deliverables"], ["Updated parser", "Regression tests"])
-        self.assertEqual(markdown["execution_steps"], ["Inspect formats", "Implement tolerance"])
-        self.assertEqual(markdown["enhanced_prompt"], "Implement and verify the parser update.")
+        self.assertEqual(
+            markdown["deliverables"], ["Updated parser", "Regression tests"]
+        )
+        self.assertEqual(
+            markdown["execution_steps"], ["Inspect formats", "Implement tolerance"]
+        )
+        self.assertEqual(
+            markdown["enhanced_prompt"], "Implement and verify the parser update."
+        )
 
     def test_prompt_enhancement_parser_rejects_incomplete_json(self):
         malformed = '{"intent_summary":"ok","enhanced_prompt":"unterminated"'
-        prefixed = 'Here is the requested JSON:\n' + malformed
+        prefixed = "Here is the requested JSON:\n" + malformed
         fenced = "```json\n" + malformed + "\n```"
-        incomplete_array = 'Here is the requested JSON:\n[{"enhanced_prompt":"complete inner object"}'
+        incomplete_array = (
+            'Here is the requested JSON:\n[{"enhanced_prompt":"complete inner object"}'
+        )
         self.assertEqual(self.app._ide_parse_prompt_enhancement_response(malformed), {})
         self.assertEqual(self.app._ide_parse_prompt_enhancement_response(prefixed), {})
         self.assertEqual(self.app._ide_parse_prompt_enhancement_response(fenced), {})
-        self.assertEqual(self.app._ide_parse_prompt_enhancement_response(incomplete_array), {})
+        self.assertEqual(
+            self.app._ide_parse_prompt_enhancement_response(incomplete_array), {}
+        )
 
     def test_prompt_enhancement_preference_is_persisted(self):
         saved = self.app.ide_save_workbench_state(
@@ -914,19 +1070,43 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
             )
             for budget in ("low", "medium", "high", "xhigh")
         }
-        self.assertLess(len(variants["low"]["enhanced_prompt"]), len(variants["medium"]["enhanced_prompt"]))
-        self.assertLess(len(variants["medium"]["enhanced_prompt"]), len(variants["high"]["enhanced_prompt"]))
-        self.assertLess(len(variants["high"]["enhanced_prompt"]), len(variants["xhigh"]["enhanced_prompt"]))
+        self.assertLess(
+            len(variants["low"]["enhanced_prompt"]),
+            len(variants["medium"]["enhanced_prompt"]),
+        )
+        self.assertLess(
+            len(variants["medium"]["enhanced_prompt"]),
+            len(variants["high"]["enhanced_prompt"]),
+        )
+        self.assertLess(
+            len(variants["high"]["enhanced_prompt"]),
+            len(variants["xhigh"]["enhanced_prompt"]),
+        )
         self.assertEqual(
-            [len(variants[budget]["execution_steps"]) for budget in ("low", "medium", "high", "xhigh")],
+            [
+                len(variants[budget]["execution_steps"])
+                for budget in ("low", "medium", "high", "xhigh")
+            ],
             [3, 3, 3, 3],
         )
-        profiles = [cc.IDE_PROMPT_ENHANCEMENT_BUDGETS[budget] for budget in ("low", "medium", "high", "xhigh")]
-        self.assertEqual([row["max_tokens"] for row in profiles], [1800, 3600, 6000, 8200])
+        profiles = [
+            cc.IDE_PROMPT_ENHANCEMENT_BUDGETS[budget]
+            for budget in ("low", "medium", "high", "xhigh")
+        ]
+        self.assertEqual(
+            [row["max_tokens"] for row in profiles], [1800, 3600, 6000, 8200]
+        )
         self.assertEqual([row["max_skills"] for row in profiles], [1, 3, 5, 8])
-        self.assertTrue(all("complex" in row["step_guidance"].lower() for row in profiles))
-        self.assertIn("materially viable", cc.IDE_PROMPT_ENHANCEMENT_BUDGETS["high"]["solution_diversity"])
-        self.assertIn("rollback", cc.IDE_PROMPT_ENHANCEMENT_BUDGETS["xhigh"]["planning_depth"])
+        self.assertTrue(
+            all("complex" in row["step_guidance"].lower() for row in profiles)
+        )
+        self.assertIn(
+            "materially viable",
+            cc.IDE_PROMPT_ENHANCEMENT_BUDGETS["high"]["solution_diversity"],
+        )
+        self.assertIn(
+            "rollback", cc.IDE_PROMPT_ENHANCEMENT_BUDGETS["xhigh"]["planning_depth"]
+        )
 
     def test_ide_preview_html_reuses_workspace_safe_artifact_renderers(self):
         target = self.files / "results.csv"
@@ -937,7 +1117,9 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
                 return f"<html><body>{fp.name}</body></html>"
 
         self.app._ide_session = lambda user_id, session_id: PreviewSession()
-        rendered = self.app.ide_preview_html("account-a", "session-a", rel="results.csv")
+        rendered = self.app.ide_preview_html(
+            "account-a", "session-a", rel="results.csv"
+        )
         self.assertIn("results.csv", rendered)
         with self.assertRaises(FileNotFoundError):
             self.app.ide_preview_html("account-a", "session-a", rel="missing.csv")
@@ -974,10 +1156,18 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
         original_limit = cc.IDE_TEXT_PREVIEW_MAX_BYTES
         try:
             cc.IDE_TEXT_PREVIEW_MAX_BYTES = 256 * 1024
-            text_opened = self.app.ide_read_file("account-a", "session-a", rel="large.txt")
-            markdown_opened = self.app.ide_read_file("account-a", "session-a", rel="complex.md")
-            text_preview = self.app.ide_preview_html("account-a", "session-a", rel="large.txt")
-            markdown_preview = self.app.ide_preview_html("account-a", "session-a", rel="complex.md")
+            text_opened = self.app.ide_read_file(
+                "account-a", "session-a", rel="large.txt"
+            )
+            markdown_opened = self.app.ide_read_file(
+                "account-a", "session-a", rel="complex.md"
+            )
+            text_preview = self.app.ide_preview_html(
+                "account-a", "session-a", rel="large.txt"
+            )
+            markdown_preview = self.app.ide_preview_html(
+                "account-a", "session-a", rel="complex.md"
+            )
         finally:
             cc.IDE_TEXT_PREVIEW_MAX_BYTES = original_limit
         self.assertTrue(text_opened["readonly"])
@@ -991,7 +1181,9 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
             self.assertNotIn("<script>alert", preview.lower())
             self.assertIn("/assets/js_lib/katex/dist/katex.min.css", preview)
             self.assertIn("/assets/js_lib/katex/dist/katex.min.js", preview)
-            self.assertIn("/assets/js_lib/katex/dist/contrib/auto-render.min.js", preview)
+            self.assertIn(
+                "/assets/js_lib/katex/dist/contrib/auto-render.min.js", preview
+            )
             self.assertIn("renderMathInElement", preview)
             self.assertNotIn("https://", preview)
 
@@ -1018,7 +1210,9 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
             "```\n",
             encoding="utf-8",
         )
-        preview = self.app.ide_preview_html("account-a", "session-a", rel="structured.md")
+        preview = self.app.ide_preview_html(
+            "account-a", "session-a", rel="structured.md"
+        )
         for marker in (
             "Document metadata",
             "pv-task-checkbox",
@@ -1037,13 +1231,13 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
         rendered = cc._preview_markdown_fallback_html(
             "# Heading\n\n- [x] done\n- [ ] todo\n\n"
             "> quote\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\n"
-            "```json\n{\"ok\": true}\n```"
+            '```json\n{"ok": true}\n```'
         )
         self.assertIn("<h1>Heading</h1>", rendered)
         self.assertIn("pv-task-checkbox", rendered)
         self.assertIn("<blockquote>", rendered)
         self.assertIn("<table", rendered)
-        self.assertIn('language-json', rendered)
+        self.assertIn("language-json", rendered)
         self.assertNotIn("<script", rendered.lower())
 
     def test_image_preview_streams_original_or_safe_thumbnail_without_base64_json(self):
@@ -1052,7 +1246,9 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
         target = self.files / "large.png"
         Image.new("RGB", (5000, 3000), (20, 120, 220)).save(target, format="PNG")
         opened = self.app.ide_read_file("account-a", "session-a", rel="large.png")
-        data, content_type = self.app.ide_image_preview("account-a", "session-a", rel="large.png")
+        data, content_type = self.app.ide_image_preview(
+            "account-a", "session-a", rel="large.png"
+        )
         self.assertTrue(opened["readonly"])
         self.assertTrue(opened["content_omitted"])
         self.assertIn(content_type.split(";", 1)[0], {"image/png", "image/jpeg"})
@@ -1080,7 +1276,9 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
 
     def test_workspace_path_escape_and_symlink_escape_are_rejected(self):
         with self.assertRaises(ValueError):
-            self.app.ide_resolve_workspace("account-a", "session-a", "session", "../outside.txt")
+            self.app.ide_resolve_workspace(
+                "account-a", "session-a", "session", "../outside.txt"
+            )
         outside = self.root / "outside.txt"
         outside.write_text("secret", encoding="utf-8")
         link = self.files / "link.txt"
@@ -1089,12 +1287,16 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
         except OSError:
             self.skipTest("symlinks unavailable")
         with self.assertRaises(ValueError):
-            self.app.ide_resolve_workspace("account-a", "session-a", "session", "link.txt")
+            self.app.ide_resolve_workspace(
+                "account-a", "session-a", "session", "link.txt"
+            )
 
     def test_workspace_archive_preserves_tree_and_empty_dirs_but_skips_symlinks(self):
         (self.files / "project" / "empty").mkdir(parents=True)
         (self.files / "project" / "src").mkdir()
-        (self.files / "project" / "src" / "main.py").write_text("print('ok')\n", encoding="utf-8")
+        (self.files / "project" / "src" / "main.py").write_text(
+            "print('ok')\n", encoding="utf-8"
+        )
         outside = self.root / "outside.txt"
         outside.write_text("secret", encoding="utf-8")
         link = self.files / "project" / "outside-link.txt"
@@ -1139,7 +1341,9 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
         self.assertEqual(copied["destination_path"], "project copy")
         self.assertTrue((self.files / "project copy" / "empty").is_dir())
         self.assertEqual(
-            (self.files / "project copy" / "src" / "main.py").read_text(encoding="utf-8"),
+            (self.files / "project copy" / "src" / "main.py").read_text(
+                encoding="utf-8"
+            ),
             "print('ok')\n",
         )
         copied_again = self.app.ide_copy_workspace_entry(
@@ -1219,7 +1423,9 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
                 "items": [
                     {
                         "path": "sample/readme.txt",
-                        "content_b64": cc.base64.b64encode("目录内容".encode()).decode(),
+                        "content_b64": cc.base64.b64encode(
+                            "目录内容".encode()
+                        ).decode(),
                     }
                 ],
             },
@@ -1228,7 +1434,9 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
         self.assertEqual(out["directory_count"], 2)
         self.assertTrue((self.files / "imports" / "sample" / "empty").is_dir())
         self.assertEqual(
-            (self.files / "imports" / "sample" / "readme.txt").read_text(encoding="utf-8"),
+            (self.files / "imports" / "sample" / "readme.txt").read_text(
+                encoding="utf-8"
+            ),
             "目录内容",
         )
         with self.assertRaises(ValueError):
@@ -1243,7 +1451,7 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
         target = self.files / "imports" / "样例" / "子目录" / "数据.txt"
         target.parent.mkdir(parents=True)
         target.write_bytes(b"old-content")
-        raw = "跨平台目录内容".encode("utf-8")
+        raw = "跨平台目录内容".encode()
         first, second = raw[:9], raw[9:]
         base = {
             "root_id": "session",
@@ -1316,7 +1524,9 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
                 },
             )
         self.assertTrue(out["complete"])
-        self.assertEqual((self.files / "跨平台" / "二进制" / "payload.bin").read_bytes(), raw)
+        self.assertEqual(
+            (self.files / "跨平台" / "二进制" / "payload.bin").read_bytes(), raw
+        )
         archive = self.app.ide_workspace_archive(
             "account-a", "session-a", root_id="session", rel="跨平台"
         )
@@ -1337,7 +1547,9 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
             pass
 
         self.app._ide_session = lambda user_id, session_id: FakeSession()
-        self.app.submit_user_message = lambda user_id, session_id, message: submitted.append(message) or {"ok": True}
+        self.app.submit_user_message = lambda user_id, session_id, message: (
+            submitted.append(message) or {"ok": True}
+        )
         out = self.app.ide_agent_task(
             "account-a",
             "session-a",
@@ -1365,27 +1577,37 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
         return output.getvalue()
 
     def test_vsix_zip_slip_is_rejected(self):
-        manifest = json.dumps({"publisher": "sample", "name": "safe", "version": "1.0.0"})
-        data = self._vsix([
-            ("extension/package.json", manifest),
-            ("extension/../../escaped.txt", "bad"),
-        ])
+        manifest = json.dumps(
+            {"publisher": "sample", "name": "safe", "version": "1.0.0"}
+        )
+        data = self._vsix(
+            [
+                ("extension/package.json", manifest),
+                ("extension/../../escaped.txt", "bad"),
+            ]
+        )
         with self.assertRaises(ValueError):
             self.app._ide_safe_extract_vsix(data, self.root / "install")
         self.assertFalse((self.root / "escaped.txt").exists())
 
     def test_declarative_vsix_manifest_is_exposed_without_host_apis(self):
-        manifest = json.dumps({
-            "publisher": "sample",
-            "name": "theme",
-            "version": "1.0.0",
-            "browser": "dist/extension.js",
-            "contributes": {"commands": [{"command": "sample.hello", "title": "Hello"}]},
-        })
-        data = self._vsix([
-            ("extension/package.json", manifest),
-            ("extension/dist/extension.js", "self.onmessage=()=>{}"),
-        ])
+        manifest = json.dumps(
+            {
+                "publisher": "sample",
+                "name": "theme",
+                "version": "1.0.0",
+                "browser": "dist/extension.js",
+                "contributes": {
+                    "commands": [{"command": "sample.hello", "title": "Hello"}]
+                },
+            }
+        )
+        data = self._vsix(
+            [
+                ("extension/package.json", manifest),
+                ("extension/dist/extension.js", "self.onmessage=()=>{}"),
+            ]
+        )
         public = self.app._ide_safe_extract_vsix(data, self.root / "install")
         self.assertEqual(public["id"], "sample.theme")
         self.assertTrue(public["worker_supported"])
@@ -1397,7 +1619,14 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
         packaged_root = self.root / "package"
         packaged_assets = packaged_root / "js_lib"
         loader = packaged_assets / "monaco" / "min" / "vs" / "loader.js"
-        worker = packaged_assets / "monaco" / "min" / "vs" / "assets" / "editor.worker-test.js"
+        worker = (
+            packaged_assets
+            / "monaco"
+            / "min"
+            / "vs"
+            / "assets"
+            / "editor.worker-test.js"
+        )
         loader.parent.mkdir(parents=True)
         worker.parent.mkdir(parents=True)
         loader.write_text("loader", encoding="utf-8")
@@ -1406,10 +1635,15 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
         self.app.js_lib_root = workspace_assets
 
         with mock.patch.object(cc, "SCRIPT_DIR", packaged_root):
-            self.assertEqual(self.app.rag_js_lib_asset_path("monaco/min/vs/loader.js"), loader.resolve())
+            self.assertEqual(
+                self.app.rag_js_lib_asset_path("monaco/min/vs/loader.js"),
+                loader.resolve(),
+            )
             self.assertEqual(self.app.ide_monaco_worker_path(), worker.resolve())
 
-    @unittest.skipUnless(cc.AppContext._ide_remote_sandbox_supported(), "macOS sandbox-exec required")
+    @unittest.skipUnless(
+        cc.AppContext._ide_remote_sandbox_supported(), "macOS sandbox-exec required"
+    )
     def test_remote_workspace_sandbox_blocks_outside_read_and_write(self):
         session = cc.SessionState.__new__(cc.SessionState)
         session.files_root = self.files
@@ -1424,9 +1658,16 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
             text=True,
         )
         self.assertEqual(allowed.returncode, 0)
-        self.assertEqual((self.files / "made.txt").read_text(encoding="utf-8").strip(), "changed")
+        self.assertEqual(
+            (self.files / "made.txt").read_text(encoding="utf-8").strip(), "changed"
+        )
         blocked_read = cc.subprocess.run(
-            [*prefix, "/bin/sh", "-c", f"cat {cc.shlex.quote(str(Path.home() / '.zshrc'))}"],
+            [
+                *prefix,
+                "/bin/sh",
+                "-c",
+                f"cat {cc.shlex.quote(str(Path.home() / '.zshrc'))}",
+            ],
             cwd=self.files,
             capture_output=True,
             text=True,
@@ -1438,7 +1679,12 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
             text=True,
         )
         blocked_write = cc.subprocess.run(
-            [*prefix, "/bin/sh", "-c", "echo escaped > /private/tmp/clouds-coder-sandbox-test"],
+            [
+                *prefix,
+                "/bin/sh",
+                "-c",
+                "echo escaped > /private/tmp/clouds-coder-sandbox-test",
+            ],
             cwd=self.files,
             capture_output=True,
             text=True,
@@ -1454,7 +1700,11 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
         session.ide_remote_sandbox_required = True
         env = session._shell_process_env()
         expected = str(self.files / ".clouds_coder" / "tmp")
-        virtual = cc._detect_ide_sandbox_backend().get("name") in {"bubblewrap", "docker", "podman"}
+        virtual = cc._detect_ide_sandbox_backend().get("name") in {
+            "bubblewrap",
+            "docker",
+            "podman",
+        }
         self.assertEqual(env["HOME"], "/workspace" if virtual else str(self.files))
         self.assertEqual(env["TMPDIR"], "/tmp" if virtual else expected)
         self.assertEqual(env["TMP"], "/tmp" if virtual else expected)
@@ -1464,7 +1714,12 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
         for entry in env["PATH"].split(os.pathsep):
             resolved = Path(entry).resolve()
             if resolved == Path("/Users") or resolved.is_relative_to(Path("/Users")):
-                self.assertTrue(any(resolved == root or resolved.is_relative_to(root) for root in allowed_roots))
+                self.assertTrue(
+                    any(
+                        resolved == root or resolved.is_relative_to(root)
+                        for root in allowed_roots
+                    )
+                )
 
     def test_remote_agent_file_tools_reject_external_virtual_roots(self):
         session = cc.SessionState.__new__(cc.SessionState)
@@ -1479,7 +1734,9 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
             "[file_buffer:long-output]",
         ):
             with self.subTest(path=path):
-                result = session._dispatch_tool_inner("read_file", {"path": path}, "developer")
+                result = session._dispatch_tool_inner(
+                    "read_file", {"path": path}, "developer"
+                )
                 self.assertIn("limited to the isolated session workspace", result)
 
         write_result = session._dispatch_tool_inner(
@@ -1489,7 +1746,11 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
         )
         edit_result = session._dispatch_tool_inner(
             "edit_file",
-            {"path": "file_buffer/long-output.txt", "old_text": "old", "new_text": "new"},
+            {
+                "path": "file_buffer/long-output.txt",
+                "old_text": "old",
+                "new_text": "new",
+            },
             "developer",
         )
         self.assertIn("limited to the isolated session workspace", write_result)
@@ -1500,8 +1761,13 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
         session.files_root = self.files
         session.ide_remote_sandbox_required = True
 
-        self.assertEqual(session._remote_agent_file_scope_error("src/main.py", "read"), "")
-        self.assertEqual(session._remote_agent_file_scope_error("/workspace/src/main.py", "write"), "")
+        self.assertEqual(
+            session._remote_agent_file_scope_error("src/main.py", "read"), ""
+        )
+        self.assertEqual(
+            session._remote_agent_file_scope_error("/workspace/src/main.py", "write"),
+            "",
+        )
         escaped = session._remote_agent_file_scope_error("../outside.txt", "read")
         self.assertIn("path escapes workspace", escaped)
 
@@ -1516,7 +1782,9 @@ class IDEHTTPAuthTests(unittest.TestCase):
         ide_require_capability = staticmethod(cc.AppContext.ide_require_capability)
 
         def ide_request_capabilities(self, account, *, client_ip, direct_loopback):
-            return cc.AppContext.ide_request_capabilities(self, account, client_ip=client_ip, direct_loopback=direct_loopback)
+            return cc.AppContext.ide_request_capabilities(
+                self, account, client_ip=client_ip, direct_loopback=direct_loopback
+            )
 
         def ide_auth_status(self, *, local_setup_allowed):
             return {
@@ -1529,7 +1797,9 @@ class IDEHTTPAuthTests(unittest.TestCase):
         def setup_ide_admin(self, username, password, *, local_setup_allowed):
             if not local_setup_allowed:
                 raise cc.IDEAuthError("setup_local_only", "local only", 403)
-            return self.ide_auth.setup_admin(username, password, legacy_user_id=cc.user_id_from_ip("127.0.0.1"))
+            return self.ide_auth.setup_admin(
+                username, password, legacy_user_id=cc.user_id_from_ip("127.0.0.1")
+            )
 
         def login_ide(self, username, password, client_ip):
             return self.ide_auth.login(username, password, client_ip)
@@ -1588,7 +1858,9 @@ class IDEHTTPAuthTests(unittest.TestCase):
         self.assertEqual(status, 201)
         cookie = headers["Set-Cookie"].split(";", 1)[0]
         csrf = setup["csrf_token"]
-        status, _, me = self.request("GET", "/api/ide/v2/auth/me", headers={"Cookie": cookie})
+        status, _, me = self.request(
+            "GET", "/api/ide/v2/auth/me", headers={"Cookie": cookie}
+        )
         self.assertEqual(status, 200)
         self.assertEqual(me["account"]["username"], "local-admin")
         status, _, error = self.request(
@@ -1603,7 +1875,11 @@ class IDEHTTPAuthTests(unittest.TestCase):
             "POST",
             "/api/ide/v2/workbench/state",
             {"state": {"active_view": "search"}},
-            {"Cookie": cookie, "Origin": f"http://127.0.0.1:{self.port}", "X-CSRF-Token": csrf},
+            {
+                "Cookie": cookie,
+                "Origin": f"http://127.0.0.1:{self.port}",
+                "X-CSRF-Token": csrf,
+            },
         )
         self.assertEqual(status, 200)
         self.assertEqual(saved["state"]["active_view"], "search")
@@ -1617,7 +1893,11 @@ class IDEHTTPAuthTests(unittest.TestCase):
             status, headers, authenticated = self.request(
                 "POST",
                 "/api/ide/v2/auth/device",
-                {"device_key": device_key, "label": "LAN browser", "fingerprint": "test"},
+                {
+                    "device_key": device_key,
+                    "label": "LAN browser",
+                    "fingerprint": "test",
+                },
                 headers={
                     "Host": f"192.168.1.20:{self.port}",
                     "Origin": f"http://192.168.1.20:{self.port}",
@@ -1638,7 +1918,9 @@ class IDEHTTPAuthTests(unittest.TestCase):
                 },
             )
             self.assertEqual(status, 200)
-            self.assertEqual(me["account"]["user_id"], authenticated["account"]["user_id"])
+            self.assertEqual(
+                me["account"]["user_id"], authenticated["account"]["user_id"]
+            )
             status, _, error = self.request(
                 "GET",
                 "/api/ide/v2/auth/me",
@@ -1661,10 +1943,14 @@ class IDEWorkbenchSourceTests(unittest.TestCase):
     def test_bash_read_loop_intervention_allows_ten_identical_reads(self):
         self.assertEqual(cc.BASH_READ_LOOP_THRESHOLD, 10)
 
-    def test_terminal_renderer_has_incremental_utf8_and_dependency_free_ansi_fallback(self):
+    def test_terminal_renderer_has_incremental_utf8_and_dependency_free_ansi_fallback(
+        self,
+    ):
         self.assertIn("data_b64", inspect.getsource(cc.AppContext.ide_terminal_output))
         self.assertIn("new TextDecoder", cc.IDE_JS)
-        self.assertIn("function stripTerminalControlChunk(text,state,final=false)", cc.IDE_JS)
+        self.assertIn(
+            "function stripTerminalControlChunk(text,state,final=false)", cc.IDE_JS
+        )
         self.assertIn("appendTerminalPlainText(E('terminalFallback'),plain)", cc.IDE_JS)
         self.assertNotIn("host.textContent+=out.data", cc.IDE_JS)
 
@@ -1674,12 +1960,16 @@ class IDEWorkbenchSourceTests(unittest.TestCase):
         start = cc.IDE_JS.index("function stripTerminalControlChunk")
         end = cc.IDE_JS.index("\nfunction appendTerminalPlainText", start)
         parser = cc.IDE_JS[start:end]
-        script = parser + r'''
+        script = (
+            parser
+            + r"""
 const state={pending:''};
 const chunks=['\x1b[31','m红\x1b]0;标题','\x07色\x1b[0m'];
-const output=chunks.map((chunk,index)=>stripTerminalControlChunk(chunk,state,index===chunks.length-1)).join('');
+const output=chunks.map((chunk,index)=>stripTerminalControlChunk(
+chunk,state,index===chunks.length-1)).join('');
 process.stdout.write(JSON.stringify({output,pending:state.pending}));
-'''
+"""
+        )
         completed = cc.subprocess.run(
             [node, "-e", script],
             capture_output=True,
@@ -1696,7 +1986,11 @@ process.stdout.write(JSON.stringify({output,pending:state.pending}));
         self.assertIn("python} -m pdb", cc.IDE_JS)
         self.assertIn("Using the built-in Python pdb compatibility debugger", cc.IDE_JS)
         with mock.patch.object(cc.importlib.util, "find_spec", return_value=None):
-            tool = next(row for row in cc.AppContext.__new__(cc.AppContext).ide_toolchains() if row["name"] == "python-debug")
+            tool = next(
+                row
+                for row in cc.AppContext.__new__(cc.AppContext).ide_toolchains()
+                if row["name"] == "python-debug"
+            )
         self.assertFalse(tool["available"])
         self.assertIn("pdb compatibility debugger", tool["install_hint"])
 
@@ -1724,25 +2018,35 @@ process.stdout.write(JSON.stringify({output,pending:state.pending}));
         self.assertIn("/agent-state", cc.IDE_JS)
         self.assertIn("scheduleAgentPoll", cc.IDE_JS)
         self.assertIn("refreshAgentEditedFile", cc.IDE_JS)
-        self.assertNotIn('"live_thinking"', inspect.getsource(cc.AppContext.ide_agent_state))
+        self.assertNotIn(
+            '"live_thinking"', inspect.getsource(cc.AppContext.ide_agent_state)
+        )
 
     def test_public_model_text_is_kept_when_the_same_turn_calls_tools(self):
         source = Path(cc.__file__).read_text(encoding="utf-8")
-        self.assertGreaterEqual(source.count("if text.strip() or (thinking_text and not tool_calls):"), 2)
-        self.assertNotIn("if (text.strip() or thinking_text) and not tool_calls:", source)
+        self.assertGreaterEqual(
+            source.count("if text.strip() or (thinking_text and not tool_calls):"), 2
+        )
+        self.assertNotIn(
+            "if (text.strip() or thinking_text) and not tool_calls:", source
+        )
 
     def test_tool_rounds_keep_real_approach_but_disable_synthetic_progress(self):
         source = Path(cc.__file__).read_text(encoding="utf-8")
         self.assertFalse(cc.PUBLIC_TOOL_PROGRESS_SUMMARY_ENABLED)
-        self.assertGreaterEqual(source.count("_public_tool_progress_summary(tool_calls"), 2)
+        self.assertGreaterEqual(
+            source.count("_public_tool_progress_summary(tool_calls"), 2
+        )
         self.assertIn("function agentApproach(text,role='Agent')", cc.IDE_JS)
         self.assertIn("function renderAgentPlanCard(tools,role='Agent')", cc.IDE_JS)
         self.assertIn("function isSyntheticPublicProgress(text)", cc.IDE_JS)
         self.assertIn("progress&&!isSyntheticPublicProgress(progress)", cc.IDE_JS)
         self.assertIn("S.agentPlanCards.get(signature)", cc.IDE_JS)
         self.assertIn("Planned ×${count}", cc.IDE_JS)
-        self.assertIn("if(type==='approach'){agentApproach(text,role);continue}", cc.IDE_JS)
-        self.assertNotIn('String(S.agentState?.live_thinking', cc.IDE_JS)
+        self.assertIn(
+            "if(type==='approach'){agentApproach(text,role);continue}", cc.IDE_JS
+        )
+        self.assertNotIn("String(S.agentState?.live_thinking", cc.IDE_JS)
 
     def test_public_tool_progress_summary_is_disabled_without_touching_tool_calls(self):
         session = cc.SessionState.__new__(cc.SessionState)
@@ -1750,50 +2054,92 @@ process.stdout.write(JSON.stringify({output,pending:state.pending}));
         session.last_public_progress_signature = ""
         session.last_public_progress_ts = 0.0
         session.todo = cc.TodoManager("zh-CN")
-        session.todo.update([
-            {"content": "提取 PDF 文本并梳理论文结构", "status": "in_progress"},
-            {"content": "编写 HTML 报告", "status": "pending"},
-        ])
-        summary = session._public_tool_progress_summary([
-            {
-                "function": {
-                    "name": "bash",
-                    "arguments": {"command": "pdftotext input.pdf output.txt"},
+        session.todo.update(
+            [
+                {"content": "提取 PDF 文本并梳理论文结构", "status": "in_progress"},
+                {"content": "编写 HTML 报告", "status": "pending"},
+            ]
+        )
+        summary = session._public_tool_progress_summary(
+            [
+                {
+                    "function": {
+                        "name": "bash",
+                        "arguments": {"command": "pdftotext input.pdf output.txt"},
+                    }
                 }
-            }
-        ])
+            ]
+        )
         self.assertEqual(summary, "")
         self.assertEqual(session._public_progress_prompt_instruction(), "")
         self.assertEqual(session.last_public_progress_signature, "")
-        self.assertEqual(session._public_tool_progress_summary([
-            {"function": {"name": "bash", "arguments": {"command": "pdftotext input.pdf output.txt"}}}
-        ]), "")
-        self.assertEqual(session._public_tool_progress_summary([
-            {"function": {"name": "read_file", "arguments": {"path": "input.txt"}}}
-        ]), "")
-        self.assertTrue(cc.is_synthetic_public_progress(
-            "正在推进「提取 PDF 文本」；本轮将运行命令以提取或验证证据，结果将用于确定下一步。"
-        ))
-        self.assertFalse(cc.is_synthetic_public_progress("模型自主输出的真实阶段说明。"))
+        self.assertEqual(
+            session._public_tool_progress_summary(
+                [
+                    {
+                        "function": {
+                            "name": "bash",
+                            "arguments": {"command": "pdftotext input.pdf output.txt"},
+                        }
+                    }
+                ]
+            ),
+            "",
+        )
+        self.assertEqual(
+            session._public_tool_progress_summary(
+                [
+                    {
+                        "function": {
+                            "name": "read_file",
+                            "arguments": {"path": "input.txt"},
+                        }
+                    }
+                ]
+            ),
+            "",
+        )
+        self.assertTrue(
+            cc.is_synthetic_public_progress(
+                "正在推进「提取 PDF 文本」；本轮将运行命令以提取或验证证据，"
+                "结果将用于确定下一步。"
+            )
+        )
+        self.assertFalse(
+            cc.is_synthetic_public_progress("模型自主输出的真实阶段说明。")
+        )
 
         client = cc.OllamaClient("http://127.0.0.1:11434", "test")
-        prepared = client._prepare_request_messages([
-            {
-                "role": "assistant",
-                "content": "正在推进「提取 PDF 文本」；本轮将运行命令以提取或验证证据，结果将用于确定下一步。",
-                "tool_calls": [{
-                    "id": "call-1",
-                    "type": "function",
-                    "function": {"name": "bash", "arguments": {"command": "pwd"}},
-                }],
-            },
-            {"role": "assistant", "content": "模型自主输出的真实阶段说明。"},
-        ], "ollama")
+        prepared = client._prepare_request_messages(
+            [
+                {
+                    "role": "assistant",
+                    "content": (
+                        "正在推进「提取 PDF 文本」；本轮将运行命令以提取或验证证据，"
+                        "结果将用于确定下一步。"
+                    ),
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {
+                                "name": "bash",
+                                "arguments": {"command": "pwd"},
+                            },
+                        }
+                    ],
+                },
+                {"role": "assistant", "content": "模型自主输出的真实阶段说明。"},
+            ],
+            "ollama",
+        )
         self.assertEqual(prepared[0]["content"], "")
         self.assertEqual(prepared[0]["tool_calls"][0]["function"]["name"], "bash")
         self.assertEqual(prepared[1]["content"], "模型自主输出的真实阶段说明。")
 
-    def test_four_languages_keep_independent_preferences_while_progress_fallback_is_off(self):
+    def test_four_languages_keep_independent_preferences_while_progress_fallback_is_off(
+        self,
+    ):
         expected = {
             "zh-CN": "zh-cn-concise-milestones",
             "zh-TW": "zh-tw-concise-milestones",
@@ -1811,35 +2157,59 @@ process.stdout.write(JSON.stringify({output,pending:state.pending}));
                 session.last_public_progress_signature = ""
                 session.last_public_progress_ts = 0.0
                 session.todo = cc.TodoManager(language)
-                summary = session._public_tool_progress_summary([
-                    {"function": {"name": "bash", "arguments": {"command": "run-tests"}}}
-                ])
+                summary = session._public_tool_progress_summary(
+                    [
+                        {
+                            "function": {
+                                "name": "bash",
+                                "arguments": {"command": "run-tests"},
+                            }
+                        }
+                    ]
+                )
                 self.assertEqual(summary, "")
 
     def test_program_ide_layout_panels_previews_and_new_task_are_wired(self):
-        self.assertIn('side-view[data-side-view="explorer"]{grid-template-rows:35px auto auto 22px minmax(0,1fr)}', cc.IDE_CSS)
-        self.assertIn('.editor-group>.editor-host{grid-row:4}', cc.IDE_CSS)
+        self.assertIn(
+            'side-view[data-side-view="explorer"]{grid-template-rows:35px auto '
+            "auto 22px minmax(0,1fr)}",
+            cc.IDE_CSS,
+        )
+        self.assertIn(".editor-group>.editor-host{grid-row:4}", cc.IDE_CSS)
         self.assertIn('id="artifactPreview0"', cc.IDE_INDEX_HTML)
         self.assertIn('title="New Task"', cc.IDE_INDEX_HTML)
         self.assertIn("refreshWorkspaceSnapshot", cc.IDE_JS)
         self.assertIn("function artifactUrl(file,kind='raw')", cc.IDE_JS)
-        self.assertIn('r"^/api/ide/sessions/([^/]+)/workspace/raw$"', inspect.getsource(cc.IdeHandler.do_GET))
-        self.assertIn('r"^/api/ide/sessions/([^/]+)/workspace/preview$"', inspect.getsource(cc.IdeHandler.do_GET))
+        self.assertIn(
+            'r"^/api/ide/sessions/([^/]+)/workspace/raw$"',
+            inspect.getsource(cc.IdeHandler.do_GET),
+        )
+        self.assertIn(
+            'r"^/api/ide/sessions/([^/]+)/workspace/preview$"',
+            inspect.getsource(cc.IdeHandler.do_GET),
+        )
         self.assertIn("E('newAgentChatBtn').onclick=()=>createSession()", cc.IDE_JS)
         self.assertIn("async function debugActiveFile()", cc.IDE_JS)
         self.assertNotIn("Binary files cannot be edited in the text editor.", cc.IDE_JS)
 
     def test_empty_editor_actions_open_files_and_commands(self):
         self.assertIn('data-command="file.open">Open File', cc.IDE_INDEX_HTML)
-        self.assertIn('data-command="workbench.action.quickOpen">Go to File', cc.IDE_INDEX_HTML)
-        self.assertIn('data-command="workbench.action.showCommands">Command Palette', cc.IDE_INDEX_HTML)
+        self.assertIn(
+            'data-command="workbench.action.quickOpen">Go to File', cc.IDE_INDEX_HTML
+        )
+        self.assertIn(
+            'data-command="workbench.action.showCommands">Command Palette',
+            cc.IDE_INDEX_HTML,
+        )
         self.assertIn(".empty-actions [data-command]", cc.IDE_JS)
         self.assertIn("button.dataset.command", cc.IDE_JS)
         self.assertIn("beginFileUpload(activeDir(),true)", cc.IDE_JS)
         self.assertIn("openAfter&&firstPath?openFile(firstPath)", cc.IDE_JS)
         self.assertIn("async function loadQuickFiles()", cc.IDE_JS)
         self.assertIn("workspace/files?root_id=", cc.IDE_JS)
-        self.assertIn("S.paletteMode=value.startsWith('>')?'commands':'files'", cc.IDE_JS)
+        self.assertIn(
+            "S.paletteMode=value.startsWith('>')?'commands':'files'", cc.IDE_JS
+        )
         self.assertIn("if(row.kind==='file')openFile", cc.IDE_JS)
         self.assertIn('/workspace/files$"', inspect.getsource(cc.IdeHandler.do_GET))
 
@@ -1872,16 +2242,30 @@ process.stdout.write(JSON.stringify({output,pending:state.pending}));
         self.assertIn("promptClarificationGroup(result.clarifications)", cc.IDE_JS)
         self.assertIn("new AbortController()", cc.IDE_JS)
         self.assertIn("signal:controller?.signal", cc.IDE_JS)
-        self.assertIn("E('promptEnhanceOverlay').classList.remove('is-hidden')", cc.IDE_JS)
+        self.assertIn(
+            "E('promptEnhanceOverlay').classList.remove('is-hidden')", cc.IDE_JS
+        )
         self.assertIn("promptEnhancePersistent:false", cc.IDE_JS)
         self.assertIn("prompt_enhance_persistent:S.promptEnhancePersistent", cc.IDE_JS)
-        self.assertIn("prompt_enhance_enabled:S.promptEnhancePersistent&&S.promptEnhanceEnabled", cc.IDE_JS)
-        self.assertIn("S.promptEnhancePersistent=state.prompt_enhance_persistent===true", cc.IDE_JS)
-        self.assertIn("S.promptEnhanceEnabled=S.promptEnhancePersistent&&state.prompt_enhance_enabled===true", cc.IDE_JS)
+        self.assertIn(
+            "prompt_enhance_enabled:S.promptEnhancePersistent&&S.promptEnhanceEnabled",
+            cc.IDE_JS,
+        )
+        self.assertIn(
+            "S.promptEnhancePersistent=state.prompt_enhance_persistent===true",
+            cc.IDE_JS,
+        )
+        self.assertIn(
+            "S.promptEnhanceEnabled=S.promptEnhancePersistent&&"
+            "state.prompt_enhance_enabled===true",
+            cc.IDE_JS,
+        )
         self.assertIn("promptEnhanceBudget:'medium'", cc.IDE_JS)
         self.assertIn("prompt_enhance_budget:S.promptEnhanceBudget", cc.IDE_JS)
         self.assertIn("promptEnhanceSkillsAware:false", cc.IDE_JS)
-        self.assertIn("prompt_enhance_skills_awareness:S.promptEnhanceSkillsAware", cc.IDE_JS)
+        self.assertIn(
+            "prompt_enhance_skills_awareness:S.promptEnhanceSkillsAware", cc.IDE_JS
+        )
         self.assertIn("skills_awareness:!!draft.skills_aware", cc.IDE_JS)
         self.assertIn("function setPromptEnhanceSkillsAware(enabled)", cc.IDE_JS)
         self.assertIn("Workspace awareness", cc.IDE_JS)
@@ -1918,11 +2302,15 @@ process.stdout.write(JSON.stringify({output,pending:state.pending}));
         self.assertIn("function sessionRequestCurrent(session,seq=null)", cc.IDE_JS)
         self.assertIn("const seq=++S.sessionSwitchSeq", cc.IDE_JS)
         self.assertIn("if(seq!==S.sessionSwitchSeq)return false", cc.IDE_JS)
-        self.assertIn("const session=S.activeSession,switchSeq=S.sessionSwitchSeq", cc.IDE_JS)
+        self.assertIn(
+            "const session=S.activeSession,switchSeq=S.sessionSwitchSeq", cc.IDE_JS
+        )
         self.assertIn("switchSeq!==S.sessionSwitchSeq", cc.IDE_JS)
         self.assertIn("workspaceRefreshSeq", cc.IDE_JS)
         self.assertIn("const sid=S.activeSession,seq=S.sessionSwitchSeq", cc.IDE_JS)
-        self.assertIn("if(S.agentPollBusy){S.agentPollRequested=true;return}", cc.IDE_JS)
+        self.assertIn(
+            "if(S.agentPollBusy){S.agentPollRequested=true;return}", cc.IDE_JS
+        )
 
     def test_text_markdown_image_and_excel_preview_paths_are_wired(self):
         self.assertEqual(cc.preview_kind_for_path("notes.txt"), "markdown")
@@ -1933,7 +2321,9 @@ process.stdout.write(JSON.stringify({output,pending:state.pending}));
         self.assertIn("'markdown','text'].includes(kind)", cc.IDE_JS)
         self.assertIn("media.onerror=()=>showArtifactPreviewError", cc.IDE_JS)
         self.assertIn("frame.src=artifactUrl(file,'preview')", cc.IDE_JS)
-        self.assertIn(".artifact-stage img{display:block;width:100%;height:100%", cc.IDE_CSS)
+        self.assertIn(
+            ".artifact-stage img{display:block;width:100%;height:100%", cc.IDE_CSS
+        )
         self.assertIn(".artifact-preview-error", cc.IDE_CSS)
 
     def test_program_agent_todo_model_attachment_and_diff_controls_are_wired(self):
@@ -1981,46 +2371,81 @@ process.stdout.write(JSON.stringify({output,pending:state.pending}));
         self.assertIn("Working directory:", cc.IDE_JS)
         self.assertIn("data.diff_numbered||data.diff", cc.IDE_JS)
         self.assertIn("line-mark", cc.IDE_JS)
-        self.assertNotIn("fileTool&&!/error|failed|malformed/i.test(resultText)", cc.IDE_JS)
+        self.assertNotIn(
+            "fileTool&&!/error|failed|malformed/i.test(resultText)", cc.IDE_JS
+        )
 
     def test_agent_tool_events_render_directly_from_sse_and_merge_shell_cards(self):
         self.assertIn("function renderAgentOperationOnce(op)", cc.IDE_JS)
         self.assertIn("renderAgentOperationOnce({id:String(event?.id||'')", cc.IDE_JS)
-        self.assertIn("['tool_start','tool_result','file_patch','command','compact','error'].includes(type)", cc.IDE_JS)
+        self.assertIn(
+            "['tool_start','tool_result','file_patch','command','compact',"
+            "'error'].includes(type)",
+            cc.IDE_JS,
+        )
         self.assertIn("data.tool_call_id", cc.IDE_JS)
         self.assertIn("existing?.dataset.commandComplete==='true'", cc.IDE_JS)
         self.assertIn("S.agentRendered.add(key)", cc.IDE_JS)
-        self.assertNotIn("lower==='bash'||lower==='worktree_run')return null", cc.IDE_JS)
+        self.assertNotIn(
+            "lower==='bash'||lower==='worktree_run')return null", cc.IDE_JS
+        )
 
     def test_agent_poll_deadline_is_not_postponed_by_continuous_sse(self):
         self.assertIn("agentPollDue:0", cc.IDE_JS)
         self.assertIn("if(S.agentPoll&&S.agentPollDue<=due)return", cc.IDE_JS)
         self.assertIn("const wait=Math.max(40,Number(delay)||0)", cc.IDE_JS)
-        self.assertIn("clearTimeout(S.agentPoll);S.agentPoll=null;S.agentPollDue=0", cc.IDE_JS)
+        self.assertIn(
+            "clearTimeout(S.agentPoll);S.agentPoll=null;S.agentPollDue=0", cc.IDE_JS
+        )
 
-    def test_final_agent_text_uses_sanitized_markdown_and_deduplicates_role_prefix(self):
-        self.assertIn('/assets/js_lib/marked.min.js', cc.IDE_INDEX_HTML)
+    def test_final_agent_text_uses_sanitized_markdown_and_deduplicates_role_prefix(
+        self,
+    ):
+        self.assertIn("/assets/js_lib/marked.min.js", cc.IDE_INDEX_HTML)
         self.assertIn("function renderAgentMarkdown(text)", cc.IDE_JS)
         self.assertIn("sanitizePreviewHtml(html)", cc.IDE_JS)
         self.assertIn("function stripAgentRolePrefix(text,role='')", cc.IDE_JS)
         self.assertIn("body.className='agent-markdown'", cc.IDE_JS)
-        self.assertIn(".agent-markdown h1,.agent-markdown h2,.agent-markdown h3", cc.IDE_CSS)
+        self.assertIn(
+            ".agent-markdown h1,.agent-markdown h2,.agent-markdown h3", cc.IDE_CSS
+        )
 
     def test_agent_sidebar_pins_todo_and_composer_around_scrolling_history(self):
         self.assertIn("height:100%;min-height:0;border-right:0", cc.IDE_CSS)
-        self.assertIn('grid-template-areas:"agent-header" "agent-context" "agent-todo" "agent-messages" "agent-composer"', cc.IDE_CSS)
-        self.assertIn(".secondary-sidebar>.agent-messages{grid-area:agent-messages}", cc.IDE_CSS)
-        self.assertIn(".secondary-sidebar>.agent-composer{grid-area:agent-composer}", cc.IDE_CSS)
-        self.assertIn(".agent-messages{min-height:0;overflow:auto;overscroll-behavior:contain", cc.IDE_CSS)
-        self.assertIn(".agent-composer{min-height:0;max-height:min(420px,52vh);overflow:auto", cc.IDE_CSS)
+        self.assertIn(
+            'grid-template-areas:"agent-header" "agent-context" "agent-todo" '
+            '"agent-messages" "agent-composer"',
+            cc.IDE_CSS,
+        )
+        self.assertIn(
+            ".secondary-sidebar>.agent-messages{grid-area:agent-messages}", cc.IDE_CSS
+        )
+        self.assertIn(
+            ".secondary-sidebar>.agent-composer{grid-area:agent-composer}", cc.IDE_CSS
+        )
+        self.assertIn(
+            ".agent-messages{min-height:0;overflow:auto;overscroll-behavior:contain",
+            cc.IDE_CSS,
+        )
+        self.assertIn(
+            ".agent-composer{min-height:0;max-height:min(420px,52vh);overflow:auto",
+            cc.IDE_CSS,
+        )
         self.assertIn("resize:none", cc.IDE_CSS)
 
     def test_run_has_non_pty_fallback_and_utf8_platform_selection(self):
-        self.assertIn("if(S.capabilities.terminal){await newTerminal(file.dir||'.')", cc.IDE_JS)
+        self.assertIn(
+            "if(S.panel==='terminal'&&S.capabilities.terminal){await "
+            "newTerminal(file.dir||'.')",
+            cc.IDE_JS,
+        )
         self.assertIn("/terminal/run", cc.IDE_JS)
         self.assertIn("S.config?.platform", cc.IDE_JS)
         handler_source = inspect.getsource(cc.IdeHandler.do_POST)
-        self.assertIn('ide_require_capability(context["capabilities"], "processes")', handler_source)
+        self.assertIn(
+            'ide_require_capability(context["capabilities"], "processes")',
+            handler_source,
+        )
 
     def test_all_history_mode_only_shows_modified_line_numbers(self):
         self.assertIn("renderIndicators:false", cc.IDE_JS)
@@ -2029,30 +2454,45 @@ process.stdout.write(JSON.stringify({output,pending:state.pending}));
         self.assertIn("renderMarginRevertIcon:false", cc.IDE_JS)
         self.assertIn("compactMode:true", cc.IDE_JS)
         self.assertIn("lineDecorationsWidth:8", cc.IDE_JS)
-        self.assertIn("S.codeHistoryMode==='all'||S.codeHistoryMode==='changes'", cc.IDE_JS)
+        self.assertIn(
+            "S.codeHistoryMode==='all'||S.codeHistoryMode==='changes'", cc.IDE_JS
+        )
         self.assertIn(".history-diff-host .inline-deleted-margin-view-zone", cc.IDE_CSS)
         self.assertIn(
             "diff.getOriginalEditor().updateOptions({lineNumbers:'off'",
             cc.IDE_JS,
         )
         self.assertIn(
-            "diff.getModifiedEditor().updateOptions({lineNumbers:'on',lineNumbersMinChars:5,lineDecorationsWidth:24})",
+            "diff.getModifiedEditor().updateOptions({lineNumbers:'on',"
+            "lineNumbersMinChars:5,lineDecorationsWidth:24})",
             cc.IDE_JS,
         )
         self.assertIn("lineNumbersMinChars:5,lineDecorationsWidth:8", cc.IDE_JS)
         self.assertIn("function protectDeletedReviewZones(host)", cc.IDE_JS)
         self.assertIn("'selectstart','dragstart','contextmenu','copy'", cc.IDE_JS)
         self.assertIn("protectDeletedReviewZones(E(`diffEditor${group}`))", cc.IDE_JS)
-        self.assertIn(".history-diff-host .monaco-editor .line-delete-selectable", cc.IDE_CSS)
+        self.assertIn(
+            ".history-diff-host .monaco-editor .line-delete-selectable", cc.IDE_CSS
+        )
         self.assertIn("user-select:none!important", cc.IDE_CSS)
         self.assertIn("pointer-events:none!important", cc.IDE_CSS)
-        self.assertIn("const model=S.models.get(file.key);return model?model.getValue():file.content", cc.IDE_JS)
+        self.assertIn(
+            "const model=S.models.get(file.key);return model?model.getValue():"
+            "file.content",
+            cc.IDE_JS,
+        )
         self.assertIn("const commonEditorOptions=", cc.IDE_JS)
         self.assertIn("function captureHistoryView(group,file)", cc.IDE_JS)
         self.assertIn("source.getModel()!==targetModel", cc.IDE_JS)
         self.assertIn("function restoreHistoryView(group,state)", cc.IDE_JS)
-        self.assertIn("anchorOffset:source.getTopForLineNumber(anchorLine)-source.getScrollTop()", cc.IDE_JS)
-        self.assertIn("target.getTopForLineNumber(anchorLine)-Number(state.anchorOffset||0)", cc.IDE_JS)
+        self.assertIn(
+            "anchorOffset:source.getTopForLineNumber(anchorLine)-source.getScrollTop()",
+            cc.IDE_JS,
+        )
+        self.assertIn(
+            "target.getTopForLineNumber(anchorLine)-Number(state.anchorOffset||0)",
+            cc.IDE_JS,
+        )
         self.assertIn("onDidUpdateDiff", cc.IDE_JS)
         self.assertIn("S.monaco.ScrollType?.Immediate??1", cc.IDE_JS)
         self.assertNotIn("S.monaco.ScrollType.Immediate", cc.IDE_JS)
@@ -2069,11 +2509,15 @@ process.stdout.write(JSON.stringify({output,pending:state.pending}));
         self.assertIn("function syncEditorGroupLayout()", cc.IDE_JS)
         self.assertIn("if(!split)S.activeGroup=0", cc.IDE_JS)
         self.assertIn("setEditorModel(1,null);setEditorModel(0,null)", cc.IDE_JS)
-        self.assertIn("if(session!==S.activeSession||switchSeq!==S.sessionSwitchSeq)return null", cc.IDE_JS)
+        self.assertIn(
+            "if(session!==S.activeSession||switchSeq!==S.sessionSwitchSeq)return null",
+            cc.IDE_JS,
+        )
 
     def test_sse_connection_loads_selected_session_history_once(self):
         self.assertIn(
-            "S.agentEventsConnected=true;S.agentPollRequested=true;scheduleAgentPoll(0)",
+            "S.agentEventsConnected=true;S.agentPollRequested=true;"
+            "scheduleAgentPoll(0)",
             cc.IDE_JS,
         )
         self.assertIn(
@@ -2188,7 +2632,9 @@ class IDEAutoTitleTests(unittest.TestCase):
         session.title_origin = "manual"
         self.assertFalse(session._maybe_auto_rename_session_title("test"))
         self.assertEqual(session.title, "Program 12:34")
-        session.ollama.chat = mock.Mock(side_effect=AssertionError("model should not be called"))
+        session.ollama.chat = mock.Mock(
+            side_effect=AssertionError("model should not be called")
+        )
         self.assertFalse(session._maybe_auto_rename_session_title("test"))
 
     def test_load_migration_repairs_only_replaceable_legacy_titles(self):
@@ -2224,22 +2670,35 @@ class IDEAutoTitleTests(unittest.TestCase):
 
 
 class IDEAgentStateTests(unittest.TestCase):
-
     def test_interrupt_agent_cancels_only_matching_queued_rows(self):
         app = cc.AppContext.__new__(cc.AppContext)
         app._lock = threading.RLock()
-        app._task_queue = cc.deque([
-            {"id": 11, "user_id": "user-a", "session_id": "session-a", "content": "one"},
-            {"id": 12, "user_id": "user-b", "session_id": "session-b", "content": "two"},
-        ])
+        app._task_queue = cc.deque(
+            [
+                {
+                    "id": 11,
+                    "user_id": "user-a",
+                    "session_id": "session-a",
+                    "content": "one",
+                },
+                {
+                    "id": 12,
+                    "user_id": "user-b",
+                    "session_id": "session-b",
+                    "content": "two",
+                },
+            ]
+        )
         session = types.SimpleNamespace(
             running=True,
             interrupted=0,
             visible=[],
         )
-        session.interrupt = lambda: setattr(session, "interrupted", session.interrupted + 1)
-        session.update_scheduler_visible_message = (
-            lambda queue_id, **state: session.visible.append((queue_id, state))
+        session.interrupt = lambda: setattr(
+            session, "interrupted", session.interrupted + 1
+        )
+        session.update_scheduler_visible_message = lambda queue_id, **state: (
+            session.visible.append((queue_id, state))
         )
         app._ide_session = lambda user_id, session_id: session
         refreshed = []
@@ -2347,7 +2806,9 @@ class IDEAgentStateTests(unittest.TestCase):
         post_source = inspect.getsource(cc.IdeHandler.do_POST)
         self.assertIn('/workspace/copy$"', post_source)
         self.assertIn("ide_copy_workspace_entry", post_source)
-        self.assertIn('id="tree" class="tree" role="tree" tabindex="0"', cc.IDE_INDEX_HTML)
+        self.assertIn(
+            'id="tree" class="tree" role="tree" tabindex="0"', cc.IDE_INDEX_HTML
+        )
         self.assertIn('id="workspaceSectionLabel"', cc.IDE_INDEX_HTML)
         self.assertIn('tabindex="0" role="button"', cc.IDE_INDEX_HTML)
 
@@ -2374,7 +2835,11 @@ class IDEAgentStateTests(unittest.TestCase):
             with self.subTest(marker=marker):
                 self.assertIn(marker, cc.IDE_JS)
 
-        self.assertIn("S.workspaceClipboard=null;S.explorerSelection=null;clearWorkspaceDropState()", cc.IDE_JS)
+        self.assertIn(
+            "S.workspaceClipboard=null;S.explorerSelection=null;"
+            "clearWorkspaceDropState()",
+            cc.IDE_JS,
+        )
         self.assertIn("event.key==='Delete'||event.key==='Backspace'", cc.IDE_JS)
         self.assertIn(".tree-row.is-drop-target", cc.IDE_CSS)
         self.assertIn(".tree-row.is-cut", cc.IDE_CSS)
@@ -2424,7 +2889,9 @@ class IDEAgentStateTests(unittest.TestCase):
             },
         )
 
-    def test_answer_agent_question_submits_raw_answer_and_rejects_stale_or_invalid_answers(self):
+    def test_answer_agent_question_rejects_stale_or_invalid_answers(
+        self,
+    ):
         app = cc.AppContext.__new__(cc.AppContext)
         session = types.SimpleNamespace(
             pending_user_question={
@@ -2436,7 +2903,9 @@ class IDEAgentStateTests(unittest.TestCase):
         )
         app._ide_session = lambda user_id, session_id: session
         submitted = []
-        app.submit_user_message = lambda user_id, session_id, content: submitted.append(content) or {"ok": True}
+        app.submit_user_message = lambda user_id, session_id, content: (
+            submitted.append(content) or {"ok": True}
+        )
 
         out = app.ide_answer_agent_question(
             "user-a", "session-a", {"question_id": "ask-current", "answer": "B"}
@@ -2544,7 +3013,9 @@ class IDEAgentStateTests(unittest.TestCase):
         handler = FakeHandler()
         cc.IdeHandler._stream_ide_events(handler, FakeSession())
         raw = b"".join(handler.payloads).decode("utf-8")
-        event_lines = [line[6:] for line in raw.splitlines() if line.startswith("data: ")]
+        event_lines = [
+            line[6:] for line in raw.splitlines() if line.startswith("data: ")
+        ]
         event = json.loads(event_lines[-1])
         self.assertEqual(event["id"], "evt-command-1")
         self.assertEqual(event["seq"], 17)
@@ -2558,6 +3029,7 @@ class IDEAgentStateTests(unittest.TestCase):
     def test_shell_command_event_keeps_tool_call_id_for_live_card_replacement(self):
         source = inspect.getsource(cc.SessionState._dispatch_tool_inner)
         self.assertIn('"tool_call_id": trim(str(tool_call_id or ""), 240)', source)
+
     def test_agent_state_filters_thinking_and_preserves_public_evidence(self):
         app = cc.AppContext.__new__(cc.AppContext)
 
@@ -2598,10 +3070,16 @@ class IDEAgentStateTests(unittest.TestCase):
                             "role": "assistant",
                             "agent_role": "developer",
                             "type": "tool_calls",
-                            "text": "正在推进「提取 PDF 文本」；本轮将运行命令以提取或验证证据，结果将用于确定下一步。",
+                            "text": (
+                                "正在推进「提取 PDF 文本」；本轮将运行命令"
+                                "以提取或验证证据，结果将用于确定下一步。"
+                            ),
                             "data": {
                                 "tools": ["bash"],
-                                "public_progress": "正在推进「提取 PDF 文本」；本轮将运行命令以提取或验证证据，结果将用于确定下一步。",
+                                "public_progress": (
+                                    "正在推进「提取 PDF 文本」；本轮将运行命令"
+                                    "以提取或验证证据，结果将用于确定下一步。"
+                                ),
                             },
                             "ts": 2.5,
                         },
@@ -2665,7 +3143,9 @@ class IDEAgentStateTests(unittest.TestCase):
         self.assertEqual(state["operations"][0]["data"]["tool_call_id"], "call-1")
         self.assertEqual(state["model"], "coder-model")
         self.assertEqual(state["context_left_tokens"], 6800)
-        self.assertEqual(state["operations"][1]["data"]["diff_numbered"], "@@ -1 +1,2 @@\n-old\n+new")
+        self.assertEqual(
+            state["operations"][1]["data"]["diff_numbered"], "@@ -1 +1,2 @@\n-old\n+new"
+        )
         self.assertNotIn("private", state["operations"][1]["data"]["code_stage"])
         self.assertEqual(state["operations"][2]["type"], "compact")
         self.assertEqual(state["operations"][2]["data"]["context_used_reduction"], 3000)
@@ -2714,16 +3194,23 @@ class IDEAgentStateTests(unittest.TestCase):
         )
         self.assertEqual(completed.stdout.strip(), "山海绘卷")
 
-    def test_shutdown_interrupt_cancels_and_kills_running_bash_without_session_lock(self):
+    def test_shutdown_interrupt_cancels_and_kills_running_bash_without_session_lock(
+        self,
+    ):
         app = cc.AppContext.__new__(cc.AppContext)
         app._lock = threading.RLock()
         process = mock.Mock()
         process.pid = 4242
         process.poll.return_value = None
-        session = types.SimpleNamespace(running=True, cancel_requested=False, _running_bash_proc=process)
+        session = types.SimpleNamespace(
+            running=True, cancel_requested=False, _running_bash_proc=process
+        )
         manager = types.SimpleNamespace(lock=threading.RLock(), sessions={"s": session})
         app._session_mgrs = {"u": manager}
-        with mock.patch.object(cc.os, "killpg") as killpg, mock.patch.object(cc.os, "getpgid", return_value=4242):
+        with (
+            mock.patch.object(cc.os, "killpg") as killpg,
+            mock.patch.object(cc.os, "getpgid", return_value=4242),
+        ):
             report = app.interrupt_all_sessions_for_shutdown()
         self.assertTrue(session.cancel_requested)
         self.assertEqual(report["running"], 1)
@@ -2733,9 +3220,11 @@ class IDEAgentStateTests(unittest.TestCase):
 
 
 class IDERegressionFixTests(unittest.TestCase):
-
     def test_markdown_preview_removes_only_document_wide_indent(self):
-        source = "    # 标题\n\n    正文段落\n    第二行\n\n    ```python\n    print('ok')\n    ```"
+        source = (
+            "    # 标题\n\n    正文段落\n    第二行\n\n    ```python\n    "
+            "print('ok')\n    ```"
+        )
         normalized = cc.normalize_markdown_preview_text(source)
         self.assertTrue(normalized.startswith("# 标题"))
         self.assertIn("\n正文段落\n第二行", normalized)
@@ -2748,7 +3237,10 @@ class IDERegressionFixTests(unittest.TestCase):
         pending = {
             "id": "ask-structured",
             "question": "Choose a renderer",
-            "options": [{"label": "Canvas", "value": "canvas", "description": "2D fallback"}, {"label": "WebGL", "value": "webgl"}],
+            "options": [
+                {"label": "Canvas", "value": "canvas", "description": "2D fallback"},
+                {"label": "WebGL", "value": "webgl"},
+            ],
             "allow_free_text": False,
             "role": "planner",
         }
@@ -2759,26 +3251,47 @@ class IDERegressionFixTests(unittest.TestCase):
             pending_user_question = pending
 
             def snapshot_safe(self, **_kwargs):
-                return {"running": False, "pending_user_question": pending, "conversation_feed": [], "todos": [], "tasks": []}
+                return {
+                    "running": False,
+                    "pending_user_question": pending,
+                    "conversation_feed": [],
+                    "todos": [],
+                    "tasks": [],
+                }
 
         session = FakeSession()
         app._ide_session = lambda _user_id, _session_id: session
         state = app.ide_agent_state("user-a", "session-a")
-        self.assertEqual(state["pending_user_question"]["options"][0]["value"], "canvas")
+        self.assertEqual(
+            state["pending_user_question"]["options"][0]["value"], "canvas"
+        )
         submitted = []
-        app.submit_user_message = lambda _u, _s, content: submitted.append(content) or {"ok": True}
-        out = app.ide_answer_agent_question("user-a", "session-a", {"question_id": "ask-structured", "answer": "webgl"})
+        app.submit_user_message = lambda _u, _s, content: (
+            submitted.append(content) or {"ok": True}
+        )
+        out = app.ide_answer_agent_question(
+            "user-a", "session-a", {"question_id": "ask-structured", "answer": "webgl"}
+        )
         self.assertEqual(submitted, ["webgl"])
         self.assertEqual(out["answer"], "webgl")
         with self.assertRaisesRegex(ValueError, "available options"):
-            app.ide_answer_agent_question("user-a", "session-a", {"question_id": "ask-structured", "answer": "WebGL"})
+            app.ide_answer_agent_question(
+                "user-a",
+                "session-a",
+                {"question_id": "ask-structured", "answer": "WebGL"},
+            )
 
     def test_session_list_does_not_lock_or_rescan_loaded_history(self):
         manager = cc.SessionManager.__new__(cc.SessionManager)
         manager.lock = threading.RLock()
         manager.user_language = "zh-CN"
         manager.session_index = {
-            f"s-{i}": {"id": f"s-{i}", "title": f"Old {i}", "updated_at": float(i), "message_count": i}
+            f"s-{i}": {
+                "id": f"s-{i}",
+                "title": f"Old {i}",
+                "updated_at": float(i),
+                "message_count": i,
+            }
             for i in range(2500)
         }
 
@@ -2786,7 +3299,15 @@ class IDERegressionFixTests(unittest.TestCase):
             def acquire(self, *_args, **_kwargs):
                 raise AssertionError("session list must not lock every loaded session")
 
-        manager.sessions = {"s-2499": types.SimpleNamespace(id="s-2499", title="Current", running=False, updated_at=2500.0, lock=ExplodingLock())}
+        manager.sessions = {
+            "s-2499": types.SimpleNamespace(
+                id="s-2499",
+                title="Current",
+                running=False,
+                updated_at=2500.0,
+                lock=ExplodingLock(),
+            )
+        }
         page = manager.list(limit=20)
         self.assertEqual(len(page["sessions"]), 20)
         self.assertEqual(page["sessions"][0]["id"], "s-2499")
@@ -2800,26 +3321,49 @@ class IDERegressionFixTests(unittest.TestCase):
             session.code_preview_dir = root / "code_preview"
             session.code_preview_dir.mkdir()
             session.code_preview_index = {}
-            session.operations = [{
-                "type": "file_patch",
-                "ts": 12.0,
-                "data": {"path": "main.py", "added": 1, "deleted": 1, "code_stage": {"id": "stage_old", "ts": 12.0, "change_type": "modified"}},
-            }]
+            session.operations = [
+                {
+                    "type": "file_patch",
+                    "ts": 12.0,
+                    "data": {
+                        "path": "main.py",
+                        "added": 1,
+                        "deleted": 1,
+                        "code_stage": {
+                            "id": "stage_old",
+                            "ts": 12.0,
+                            "change_type": "modified",
+                        },
+                    },
+                }
+            ]
             bucket = session._code_preview_bucket_dir("main.py")
-            (bucket / "stage_old.before.txt").write_text("print('old')\n", encoding="utf-8")
-            (bucket / "stage_old.after.txt").write_text("print('new')\n", encoding="utf-8")
+            (bucket / "stage_old.before.txt").write_text(
+                "print('old')\n", encoding="utf-8"
+            )
+            (bucket / "stage_old.after.txt").write_text(
+                "print('new')\n", encoding="utf-8"
+            )
             session._recover_code_preview_index_from_operations()
-            self.assertEqual(session.code_preview_index["main.py"][0]["id"], "stage_old")
+            self.assertEqual(
+                session.code_preview_index["main.py"][0]["id"], "stage_old"
+            )
             self.assertEqual(session.code_preview_index["main.py"][0]["added"], 1)
 
-    def test_windows_low_integrity_access_denied_is_cached_as_optional_degradation(self):
+    def test_windows_low_integrity_access_denied_is_cached_as_optional_degradation(
+        self,
+    ):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             key = os.path.normcase(str(root.resolve()))
             cc._WINDOWS_LOW_INTEGRITY_ROOTS.discard(key)
             cc._WINDOWS_LOW_INTEGRITY_FAILED_ROOTS.discard(key)
             try:
-                with mock.patch.object(cc, "_windows_set_low_integrity_label", side_effect=PermissionError(5, "Access is denied")) as label:
+                with mock.patch.object(
+                    cc,
+                    "_windows_set_low_integrity_label",
+                    side_effect=PermissionError(5, "Access is denied"),
+                ) as label:
                     self.assertFalse(cc._windows_prepare_low_integrity_workspace(root))
                     self.assertFalse(cc._windows_prepare_low_integrity_workspace(root))
                 label.assert_called_once()

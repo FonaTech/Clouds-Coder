@@ -30,16 +30,20 @@ class SyncRoutingScopeTests(unittest.TestCase):
                 "epoch": 10.0,
                 "title": "实现模块",
             },
-            "project_todos": [{
-                "id": "pt:sync:001",
-                "key": "bb:proj:pt:sync:001",
-                "category": "plan_step",
-                "status": "in_progress",
-                "plan_step_index": 0,
-                "activated_at": 10.0,
-                "content": "1. 实现模块",
-                "full_content": "1. 实现模块\n1.1 创建模块文件\n验收：运行检查并记录证据",
-            }],
+            "project_todos": [
+                {
+                    "id": "pt:sync:001",
+                    "key": "bb:proj:pt:sync:001",
+                    "category": "plan_step",
+                    "status": "in_progress",
+                    "plan_step_index": 0,
+                    "activated_at": 10.0,
+                    "content": "1. 实现模块",
+                    "full_content": (
+                        "1. 实现模块\n1.1 创建模块文件\n验收：运行检查并记录证据"
+                    ),
+                }
+            ],
             "plan_step_total": 1,
             "task_profile": {
                 "execution_mode": "sync",
@@ -49,14 +53,20 @@ class SyncRoutingScopeTests(unittest.TestCase):
             },
         }
         row = {
-            "content": "1.1 创建模块文件" if not acceptance else "验收：运行检查并记录证据",
+            "content": "1.1 创建模块文件"
+            if not acceptance
+            else "验收：运行检查并记录证据",
             "status": "in_progress",
             "owner": "developer" if not acceptance else "reviewer",
             "parent_step_id": "pt:sync:001",
         }
         session.todo.update([row])
         bind(session, "_ensure_blackboard", lambda self: self.blackboard)
-        bind(session, "_ensure_blackboard_task_profile", lambda self, board=None: self.blackboard["task_profile"])
+        bind(
+            session,
+            "_ensure_blackboard_task_profile",
+            lambda self, board=None: self.blackboard["task_profile"],
+        )
         bind(session, "_effective_execution_mode", lambda self: "sync")
         bind(session, "_emit", lambda self, *args, **kwargs: None)
         session.agent_bus_messages = []
@@ -65,7 +75,9 @@ class SyncRoutingScopeTests(unittest.TestCase):
 
     def test_old_or_unscoped_handoff_cannot_cross_plan_step(self):
         session = self.session()
-        current = session._current_plan_worker_subtask_snapshot(board=session.blackboard, role="")
+        current = session._current_plan_worker_subtask_snapshot(
+            board=session.blackboard, role=""
+        )
         old = {
             "from": "developer",
             "to": "reviewer",
@@ -75,28 +87,42 @@ class SyncRoutingScopeTests(unittest.TestCase):
         }
         unscoped = {"from": "developer", "to": "reviewer"}
 
-        self.assertFalse(session._route_scope_matches_current_plan(old, session.blackboard, require_scoped=True))
-        self.assertFalse(session._route_scope_matches_current_plan(unscoped, session.blackboard, require_scoped=True))
+        self.assertFalse(
+            session._route_scope_matches_current_plan(
+                old, session.blackboard, require_scoped=True
+            )
+        )
+        self.assertFalse(
+            session._route_scope_matches_current_plan(
+                unscoped, session.blackboard, require_scoped=True
+            )
+        )
 
         session.agent_bus_messages = [old, unscoped]
         self.assertIsNone(session._drain_agentbus_fast_route())
-        self.assertTrue(all(row.get("_stale_scope") for row in session.agent_bus_messages))
+        self.assertTrue(
+            all(row.get("_stale_scope") for row in session.agent_bus_messages)
+        )
 
     def test_current_scoped_handoff_is_deliverable(self):
         session = self.session()
-        current = session._current_plan_worker_subtask_snapshot(board=session.blackboard, role="")
-        session.agent_bus_messages = [{
-            "id": "agentmsg:current",
-            "ts": cc.now_ts(),
-            "from": "developer",
-            "to": "reviewer",
-            "intent": "review_request",
-            "payload": "Review the current implementation.",
-            "task_epoch": 100.0,
-            "plan_step_id": "pt:sync:001",
-            "plan_step_epoch": 10.0,
-            "plan_subtask_id": current["subtask_id"],
-        }]
+        current = session._current_plan_worker_subtask_snapshot(
+            board=session.blackboard, role=""
+        )
+        session.agent_bus_messages = [
+            {
+                "id": "agentmsg:current",
+                "ts": cc.now_ts(),
+                "from": "developer",
+                "to": "reviewer",
+                "intent": "review_request",
+                "payload": "Review the current implementation.",
+                "task_epoch": 100.0,
+                "plan_step_id": "pt:sync:001",
+                "plan_step_epoch": 10.0,
+                "plan_subtask_id": current["subtask_id"],
+            }
+        ]
 
         route = session._drain_agentbus_fast_route()
 
@@ -125,7 +151,9 @@ class SyncRoutingScopeTests(unittest.TestCase):
 
     def test_scoped_route_requires_matching_task_epoch(self):
         session = self.session()
-        current = session._current_plan_worker_subtask_snapshot(board=session.blackboard, role="")
+        current = session._current_plan_worker_subtask_snapshot(
+            board=session.blackboard, role=""
+        )
         route = {
             "from": "developer",
             "to": "reviewer",
@@ -134,9 +162,11 @@ class SyncRoutingScopeTests(unittest.TestCase):
             "plan_step_epoch": 10.0,
             "plan_subtask_id": current["subtask_id"],
         }
-        self.assertFalse(session._route_scope_matches_current_plan(
-            route, session.blackboard, require_scoped=True
-        ))
+        self.assertFalse(
+            session._route_scope_matches_current_plan(
+                route, session.blackboard, require_scoped=True
+            )
+        )
 
     def test_sync_budget_clock_updates_cycles_and_remaining(self):
         session = self.session()
@@ -164,47 +194,74 @@ class SyncRoutingScopeTests(unittest.TestCase):
         session._sync_tick_manager_cycle(session.blackboard, 7)
 
         self.assertEqual(session.blackboard["manager_cycles"], 7)
-        self.assertEqual(session.blackboard["manager_judgement"]["remaining_rounds"], -1)
+        self.assertEqual(
+            session.blackboard["manager_judgement"]["remaining_rounds"], -1
+        )
 
-    def test_recovery_reuses_scoped_manager_decision_without_artifact_classification(self):
+    def test_recovery_reuses_scoped_manager_decision_without_artifact_classification(
+        self,
+    ):
         session = self.session(acceptance=True)
-        session.blackboard.update({
-            "status": "CODING",
-            "research_notes": [{"content": "earlier research"}],
-            "code_artifacts": {"old_step.py": {"content": "pass"}},
-            "review_feedback": [],
-            "approval": {"approved": False},
-            "manager_cycles": 3,
-            "manager_summary_attempts": 0,
-        })
-        session.manager_routes = [{
-            "target": "developer",
-            "instruction": "Continue the scoped implementation decision.",
-            "source": "tool",
-            "task_epoch": 100.0,
-            "plan_step_id": "pt:sync:001",
-        }]
+        session.blackboard.update(
+            {
+                "status": "CODING",
+                "research_notes": [{"content": "earlier research"}],
+                "code_artifacts": {"old_step.py": {"content": "pass"}},
+                "review_feedback": [],
+                "approval": {"approved": False},
+                "manager_cycles": 3,
+                "manager_summary_attempts": 0,
+            }
+        )
+        session.manager_routes = [
+            {
+                "target": "developer",
+                "instruction": "Continue the scoped implementation decision.",
+                "source": "tool",
+                "task_epoch": 100.0,
+                "plan_step_id": "pt:sync:001",
+            }
+        ]
         bind(session, "_latest_user_message_ts", lambda self: 0.0)
         bind(session, "_manager_progress_state", lambda self, board=None: "in_progress")
-        bind(session, "_evaluate_finish_gate", lambda self, *args, **kwargs: {"ok": False, "reason": "not-approved"})
-        bind(session, "_route_scope_matches_current_plan", lambda self, *args, **kwargs: True)
+        bind(
+            session,
+            "_evaluate_finish_gate",
+            lambda self, *args, **kwargs: {"ok": False, "reason": "not-approved"},
+        )
+        bind(
+            session,
+            "_route_scope_matches_current_plan",
+            lambda self, *args, **kwargs: True,
+        )
 
         route = session._manager_fallback_route()
 
         self.assertEqual(route["target"], "developer")
-        self.assertEqual(route["reason"], "continuity-recovery-last-manager-decision:tool")
+        self.assertEqual(
+            route["reason"], "continuity-recovery-last-manager-decision:tool"
+        )
         self.assertTrue(route["fallback_recovery"])
-        self.assertIn("Continue the scoped implementation decision", route["instruction"])
+        self.assertIn(
+            "Continue the scoped implementation decision", route["instruction"]
+        )
         self.assertNotEqual(route["target"], "reviewer")
 
     def test_valid_structured_route_wins_over_conflicting_manager_prose(self):
         session = self.session()
-        parsed, diagnostics = session._manager_parse_route_tool_calls([{
-            "function": {
-                "name": "route_to_next_agent",
-                "arguments": '{"target":"reviewer","instruction":"Verify current output."}',
-            }
-        }])
+        parsed, diagnostics = session._manager_parse_route_tool_calls(
+            [
+                {
+                    "function": {
+                        "name": "route_to_next_agent",
+                        "arguments": (
+                            '{"target":"reviewer","instruction":"Verify current '
+                            'output."}'
+                        ),
+                    }
+                }
+            ]
+        )
 
         self.assertTrue(diagnostics["valid"])
         self.assertEqual(parsed["target"], "reviewer")
@@ -212,21 +269,36 @@ class SyncRoutingScopeTests(unittest.TestCase):
 
     def test_invalid_route_records_reason_and_marks_fallback_recovery(self):
         session = self.session()
-        bind(session, "_manager_fallback_route", lambda self: {
-            "target": "developer",
-            "instruction": "Continue canonical work.",
-            "reason": "continuity-recovery-manager-assigned-expert",
-            "source": "continuity-recovery",
-            "fallback_recovery": True,
-        })
+        bind(
+            session,
+            "_manager_fallback_route",
+            lambda self: {
+                "target": "developer",
+                "instruction": "Continue canonical work.",
+                "reason": "continuity-recovery-manager-assigned-expert",
+                "source": "continuity-recovery",
+                "fallback_recovery": True,
+            },
+        )
         bind(session, "_manager_apply_anti_stall", lambda self, route: route)
         bind(session, "_manager_apply_task_policy", lambda self, route: route)
-        bind(session, "_align_route_with_current_plan_step", lambda self, route, board=None: route)
+        bind(
+            session,
+            "_align_route_with_current_plan_step",
+            lambda self, route, board=None: route,
+        )
         bind(session, "_enforce_sync_plan_route", lambda self, route, board=None: route)
 
         route = session._manager_route_from_response(
             "下一步应由 developer 创建脚本。",
-            [{"function": {"name": "route_to_next_agent", "arguments": {"target": "unknown"}}}],
+            [
+                {
+                    "function": {
+                        "name": "route_to_next_agent",
+                        "arguments": {"target": "unknown"},
+                    }
+                }
+            ],
         )
 
         self.assertEqual(route["target"], "developer")
@@ -239,32 +311,49 @@ class SyncRoutingScopeTests(unittest.TestCase):
     def test_anti_stall_does_not_turn_existing_code_into_implicit_review(self):
         session = self.session()
         session.blackboard["code_artifacts"] = {"module.py": {"content": "pass"}}
-        session.blackboard["last_delegate"] = {"target": "explorer", "progress_fp": "same"}
+        session.blackboard["last_delegate"] = {
+            "target": "explorer",
+            "progress_fp": "same",
+        }
         session.blackboard["persisted_manager_routes"] = []
         session.blackboard["failure_ledger"] = {"repeated_delegations": []}
         session.manager_routes = [{"target": "explorer"}] * 3
         session.stall_severity_score = 0
         bind(session, "_watchdog_state_fingerprint", lambda self, board=None: "same")
-        bind(session, "_route_scope_matches_current_plan", lambda self, *args, **kwargs: True)
+        bind(
+            session,
+            "_route_scope_matches_current_plan",
+            lambda self, *args, **kwargs: True,
+        )
 
-        route = session._manager_apply_anti_stall({
-            "target": "explorer",
-            "instruction": "Inspect the unresolved API.",
-            "task_type": "general",
-            "source": "tool",
-        })
+        route = session._manager_apply_anti_stall(
+            {
+                "target": "explorer",
+                "instruction": "Inspect the unresolved API.",
+                "task_type": "general",
+                "source": "tool",
+            }
+        )
 
         self.assertEqual(route["target"], "explorer")
         self.assertEqual(route["source"], "anti-stall")
         self.assertIn("anti-stall-preserve-manager-role", route["reason"])
 
     def test_fallback_and_anti_stall_routes_cannot_earn_momentum(self):
-        self.assertFalse(cc.SessionState._manager_route_can_earn_momentum({
-            "source": "fallback",
-            "fallback_recovery": True,
-        }))
-        self.assertFalse(cc.SessionState._manager_route_can_earn_momentum({"source": "anti-stall"}))
-        self.assertTrue(cc.SessionState._manager_route_can_earn_momentum({"source": "tool"}))
+        self.assertFalse(
+            cc.SessionState._manager_route_can_earn_momentum(
+                {
+                    "source": "fallback",
+                    "fallback_recovery": True,
+                }
+            )
+        )
+        self.assertFalse(
+            cc.SessionState._manager_route_can_earn_momentum({"source": "anti-stall"})
+        )
+        self.assertTrue(
+            cc.SessionState._manager_route_can_earn_momentum({"source": "tool"})
+        )
 
     def test_manager_coordination_keeps_high_reasoning_budget(self):
         self.assertEqual(cc.COORDINATION_EFFORT, cc.EFFORT_HIGH)
@@ -281,7 +370,9 @@ class SyncRoutingScopeTests(unittest.TestCase):
     def test_sync_policy_keeps_manager_target_outside_stale_participant_list(self):
         policy_source = inspect.getsource(cc.SessionState._manager_apply_task_policy)
         self.assertIn("participants.append(target)", policy_source)
-        self.assertNotIn("else:\n                target = participants[0]", policy_source)
+        self.assertNotIn(
+            "else:\n                target = participants[0]", policy_source
+        )
 
 
 if __name__ == "__main__":

@@ -6,7 +6,15 @@ import Clouds_Coder as cc
 
 
 class FakeHTTPResponse:
-    def __init__(self, *, body=b"", read_error=None, lines=None, length=None, content_type="application/json"):
+    def __init__(
+        self,
+        *,
+        body=b"",
+        read_error=None,
+        lines=None,
+        length=None,
+        content_type="application/json",
+    ):
         self.body = body
         self.read_error = read_error
         self.lines = list(lines or [])
@@ -57,8 +65,12 @@ class IncompleteHTTPReadTests(unittest.TestCase):
         second = FakeHTTPResponse(body=b'{"complete": true}')
         wait_patch, cooldown_patch, remaining_patch = self.retry_patches(client)
 
-        with mock.patch.object(cc, "urlopen", side_effect=[first, second]) as opened, \
-                wait_patch, cooldown_patch, remaining_patch:
+        with (
+            mock.patch.object(cc, "urlopen", side_effect=[first, second]) as opened,
+            wait_patch,
+            cooldown_patch,
+            remaining_patch,
+        ):
             result = client._post_json("/v1/chat/completions", {"messages": []})
 
         self.assertEqual(result, {"complete": True})
@@ -70,27 +82,39 @@ class IncompleteHTTPReadTests(unittest.TestCase):
         second = FakeHTTPResponse(lines=[b'data: {"ok":true}\n', b""], length=None)
         wait_patch, cooldown_patch, remaining_patch = self.retry_patches(client)
 
-        with mock.patch.object(cc, "urlopen", side_effect=[first, second]) as opened, \
-                wait_patch, cooldown_patch, remaining_patch:
-            lines = list(client._iter_response_lines_url_with_retries(
-                "http://model.test/v1/chat/completions",
-                {"stream": True},
-                max_attempts=1,
-            ))
+        with (
+            mock.patch.object(cc, "urlopen", side_effect=[first, second]) as opened,
+            wait_patch,
+            cooldown_patch,
+            remaining_patch,
+        ):
+            lines = list(
+                client._iter_response_lines_url_with_retries(
+                    "http://model.test/v1/chat/completions",
+                    {"stream": True},
+                    max_attempts=1,
+                )
+            )
 
         self.assertEqual(lines, ['data: {"ok":true}\n'])
         self.assertEqual(opened.call_count, 2)
 
     def test_stream_never_retries_after_a_line_has_been_emitted(self):
         client = self.client()
-        response = FakeHTTPResponse(lines=[
-            b'data: {"delta":"first"}\n',
-            IncompleteRead(b"", 20),
-        ])
+        response = FakeHTTPResponse(
+            lines=[
+                b'data: {"delta":"first"}\n',
+                IncompleteRead(b"", 20),
+            ]
+        )
         wait_patch, cooldown_patch, remaining_patch = self.retry_patches(client)
 
-        with mock.patch.object(cc, "urlopen", return_value=response) as opened, \
-                wait_patch, cooldown_patch, remaining_patch:
+        with (
+            mock.patch.object(cc, "urlopen", return_value=response) as opened,
+            wait_patch,
+            cooldown_patch,
+            remaining_patch,
+        ):
             stream = client._iter_response_lines_url_with_retries(
                 "http://model.test/v1/chat/completions",
                 {"stream": True},

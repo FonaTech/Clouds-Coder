@@ -24,7 +24,9 @@ class PlanStructureTests(unittest.TestCase):
         instance = SessionState.__new__(SessionState)
 
         self.assertEqual(
-            instance._plan_step_phase_hint("Create src/tests/physics.py and run pytest"),
+            instance._plan_step_phase_hint(
+                "Create src/tests/physics.py and run pytest"
+            ),
             "",
         )
 

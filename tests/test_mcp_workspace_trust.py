@@ -30,12 +30,19 @@ for line in sys.stdin:
         continue
     method = message.get('method')
     if method == 'initialize':
-        result = {'protocolVersion': '2025-06-18', 'capabilities': {'tools': {}}, 'serverInfo': {'name': 'test', 'version': '1'}}
+        result = {
+            'protocolVersion': '2025-06-18',
+            'capabilities': {'tools': {}},
+            'serverInfo': {'name': 'test', 'version': '1'},
+        }
     elif method == 'tools/list':
         result = {'tools': []}
     else:
         result = {}
-    print(json.dumps({'jsonrpc': '2.0', 'id': message['id'], 'result': result}), flush=True)
+    print(
+        json.dumps({'jsonrpc': '2.0', 'id': message['id'], 'result': result}),
+        flush=True,
+    )
 """,
             encoding="utf-8",
         )
@@ -75,10 +82,14 @@ for line in sys.stdin:
         return self.manager
 
     def test_default_trust_store_never_uses_workspace_controlled_path(self):
-        with patch.dict(os.environ, {"CLOUDS_CODER_PRIVATE_STATE_DIR": str(self.workspace)}):
+        with patch.dict(
+            os.environ, {"CLOUDS_CODER_PRIVATE_STATE_DIR": str(self.workspace)}
+        ):
             path = cc.mcp_default_trust_store_path(self.workspace)
 
-        self.assertFalse(path.resolve(strict=False).is_relative_to(self.workspace.resolve()))
+        self.assertFalse(
+            path.resolve(strict=False).is_relative_to(self.workspace.resolve())
+        )
 
     def test_workspace_mcp_is_inert_until_exact_command_is_approved(self):
         config = self.write_config("marker-a")
@@ -93,9 +104,13 @@ for line in sys.stdin:
         self.assertFalse(status["alive"])
         preview = manager.approval_requests()[0]
         self.assertFalse(preview["approved"])
-        self.assertEqual(preview["resolved_command"], str(Path(sys.executable).resolve()))
+        self.assertEqual(
+            preview["resolved_command"], str(Path(sys.executable).resolve())
+        )
         self.assertEqual(preview["env_keys"], ["MCP_TEST_MODE"])
-        self.assertEqual(preview["referenced_files"][0]["path"], str(self.script_path.resolve()))
+        self.assertEqual(
+            preview["referenced_files"][0]["path"], str(self.script_path.resolve())
+        )
 
         result = manager.approve_server(
             "marker",
@@ -118,7 +133,10 @@ for line in sys.stdin:
                     "command": sys.executable,
                     "args": [
                         "-c",
-                        f"from pathlib import Path; Path({str(marker)!r}).write_text('executed\\n')",
+                        (
+                            "from pathlib import Path; "
+                            f"Path({str(marker)!r}).write_text('executed\\n')"
+                        ),
                     ],
                 }
             },
@@ -136,11 +154,13 @@ for line in sys.stdin:
         config_a = self.write_config("marker-a")
         manager = self.make_manager(config_a)
         preview_a = manager.approval_requests()[0]
-        self.assertTrue(manager.approve_server(
-            "marker",
-            expected_config_digest=preview_a["config_digest"],
-            expected_fingerprint=preview_a["fingerprint"],
-        )["ok"])
+        self.assertTrue(
+            manager.approve_server(
+                "marker",
+                expected_config_digest=preview_a["config_digest"],
+                expected_fingerprint=preview_a["fingerprint"],
+            )["ok"]
+        )
         self.assertTrue((self.workspace / "marker-a").exists())
 
         config_b = self.write_config("marker-b")
@@ -172,16 +192,20 @@ for line in sys.stdin:
         config = self.write_config("config-marker")
         manager = self.make_manager(config)
         preview = manager.approval_requests()[0]
-        self.assertTrue(manager.approve_server(
-            "marker",
-            expected_config_digest=preview["config_digest"],
-            expected_fingerprint=preview["fingerprint"],
-        )["ok"])
+        self.assertTrue(
+            manager.approve_server(
+                "marker",
+                expected_config_digest=preview["config_digest"],
+                expected_fingerprint=preview["fingerprint"],
+            )["ok"]
+        )
         marker = self.workspace / "config-marker"
         self.assertTrue(marker.exists())
         marker.unlink()
 
-        changed = self.write_config("config-marker", unrelated_provider_setting="changed")
+        changed = self.write_config(
+            "config-marker", unrelated_provider_setting="changed"
+        )
         diff = manager.reload_from_config(changed)
 
         self.assertFalse(marker.exists())
@@ -194,17 +218,20 @@ for line in sys.stdin:
         config = self.write_config("restart-marker")
         manager = self.make_manager(config)
         preview = manager.approval_requests()[0]
-        self.assertTrue(manager.approve_server(
-            "marker",
-            expected_config_digest=preview["config_digest"],
-            expected_fingerprint=preview["fingerprint"],
-        )["ok"])
+        self.assertTrue(
+            manager.approve_server(
+                "marker",
+                expected_config_digest=preview["config_digest"],
+                expected_fingerprint=preview["fingerprint"],
+            )["ok"]
+        )
         marker = self.workspace / "restart-marker"
         self.assertTrue(marker.exists())
         marker.unlink()
 
         self.script_path.write_text(
-            self.script_path.read_text(encoding="utf-8") + "\n# changed after approval\n",
+            self.script_path.read_text(encoding="utf-8")
+            + "\n# changed after approval\n",
             encoding="utf-8",
         )
         restarted = manager.restart_server("marker")
@@ -218,11 +245,13 @@ for line in sys.stdin:
         config = self.write_config("revoke-marker")
         manager = self.make_manager(config)
         preview = manager.approval_requests()[0]
-        self.assertTrue(manager.approve_server(
-            "marker",
-            expected_config_digest=preview["config_digest"],
-            expected_fingerprint=preview["fingerprint"],
-        )["ok"])
+        self.assertTrue(
+            manager.approve_server(
+                "marker",
+                expected_config_digest=preview["config_digest"],
+                expected_fingerprint=preview["fingerprint"],
+            )["ok"]
+        )
 
         result = manager.revoke_server_approval("marker")
 

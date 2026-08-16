@@ -31,11 +31,17 @@ class ContextAutoCompactTests(unittest.TestCase):
         session.context_last_compact_used_reduction = 0
         session.events = []
         rows = iter(metric_rows)
-        bind(session, "_active_next_call_context_metrics", lambda self, **kwargs: dict(next(rows)))
+        bind(
+            session,
+            "_active_next_call_context_metrics",
+            lambda self, **kwargs: dict(next(rows)),
+        )
         bind(session, "_microcompact", lambda self, **kwargs: None)
         bind(session, "_compact_agent_contexts", lambda self, tier: None)
         bind(session, "_role_specific_context_is_live_call", lambda self, role: False)
-        bind(session, "_emit", lambda self, kind, data: self.events.append((kind, data)))
+        bind(
+            session, "_emit", lambda self, kind, data: self.events.append((kind, data))
+        )
         session._auto_compact = mock.Mock()
         return session
 
@@ -92,15 +98,24 @@ class ContextAutoCompactTests(unittest.TestCase):
         plan = inspect.getsource(cc.SessionState._plan_mode_explorer_turn)
 
         self.assertIn('_apply_auto_compact_if_needed("auto", role=single_role)', single)
-        self.assertIn('_apply_auto_compact_if_needed("auto:multi-sync", role="manager")', sync)
-        self.assertIn('_apply_auto_compact_if_needed("auto:multi-seq", role=current_role)', sequential)
+        self.assertIn(
+            '_apply_auto_compact_if_needed("auto:multi-sync", role="manager")', sync
+        )
+        self.assertIn(
+            '_apply_auto_compact_if_needed("auto:multi-seq", role=current_role)',
+            sequential,
+        )
         self.assertIn('f"auto:agent:{role_key}"', worker)
-        self.assertIn('_apply_auto_compact_if_needed("auto:plan-explorer", role="explorer")', plan)
+        self.assertIn(
+            '_apply_auto_compact_if_needed("auto:plan-explorer", role="explorer")', plan
+        )
 
     def test_empty_action_recovery_is_evaluated_after_auto_compact(self):
         single = inspect.getsource(cc.SessionState._agent_worker)
 
-        compact_check = single.index('_apply_auto_compact_if_needed("auto", role=single_role)')
+        compact_check = single.index(
+            '_apply_auto_compact_if_needed("auto", role=single_role)'
+        )
         empty_action_check = single.index("consecutive_empty_action_rounds += 1")
 
         self.assertLess(compact_check, empty_action_check)

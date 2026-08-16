@@ -1,6 +1,6 @@
 import json
-import types
 import threading
+import types
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -42,7 +42,11 @@ class SingleNoPlanTodoBootstrapTests(unittest.TestCase):
         session.skill_mode = "soft"
         session.web_search_enabled = False
         bind(session, "_ensure_blackboard", lambda self: self.blackboard)
-        bind(session, "_emit", lambda self, *args, **kwargs: self.events.append((args, kwargs)))
+        bind(
+            session,
+            "_emit",
+            lambda self, *args, **kwargs: self.events.append((args, kwargs)),
+        )
         bind(session, "_persist", lambda self: None)
         return session
 
@@ -57,13 +61,23 @@ class SingleNoPlanTodoBootstrapTests(unittest.TestCase):
         self.assertEqual(prompt, "custom")
 
         enabled, prompt = cc.extract_single_no_plan_todo_settings(
-            {"runtime": {"single": {"todo_bootstrap_enabled": True, "todo_bootstrap_prompt": "nested"}}}
+            {
+                "runtime": {
+                    "single": {
+                        "todo_bootstrap_enabled": True,
+                        "todo_bootstrap_prompt": "nested",
+                    }
+                }
+            }
         )
         self.assertTrue(enabled)
         self.assertEqual(prompt, "nested")
 
         enabled, prompt = cc.extract_single_no_plan_todo_settings(
-            {"single_no_plan_todo_enabled": False, "single_no_plan_todo_prompt": "ignored for enablement"}
+            {
+                "single_no_plan_todo_enabled": False,
+                "single_no_plan_todo_prompt": "ignored for enablement",
+            }
         )
         self.assertFalse(enabled)
         self.assertEqual(prompt, "ignored for enablement")
@@ -92,9 +106,7 @@ class SingleNoPlanTodoBootstrapTests(unittest.TestCase):
             "auto",
         )
         self.assertEqual(
-            cc.extract_l2_todo_policy_setting(
-                {"runtime": {"l2_todo_policy": "off"}}
-            ),
+            cc.extract_l2_todo_policy_setting({"runtime": {"l2_todo_policy": "off"}}),
             "off",
         )
         self.assertEqual(
@@ -108,7 +120,9 @@ class SingleNoPlanTodoBootstrapTests(unittest.TestCase):
     def test_prompt_only_app_context_argument_enables_bootstrap(self):
         with TemporaryDirectory() as root_text:
             root = Path(root_text)
-            with patch.object(cc, "probe_ollama_environment", return_value=(False, [], "")):
+            with patch.object(
+                cc, "probe_ollama_environment", return_value=(False, [], "")
+            ):
                 app = cc.AppContext(
                     root,
                     "http://127.0.0.1:11434",
@@ -124,14 +138,18 @@ class SingleNoPlanTodoBootstrapTests(unittest.TestCase):
         raw = {
             "l2_todo_policy": "auto",
             "single_no_plan_todo_enabled": True,
-            "single_no_plan_todo_prompt": "Use the read evidence and create the next actions.",
+            "single_no_plan_todo_prompt": (
+                "Use the read evidence and create the next actions."
+            ),
             # This reproduces the old Admin form behavior where an optional
             # integer could arrive as an empty string.
             "auto_task_level_ceiling": "",
         }
         clean, errors = cc._admin_coerce_config(raw)
         self.assertFalse(errors)
-        self.assertEqual(clean["auto_task_level_ceiling"], cc.DEFAULT_AUTO_TASK_LEVEL_CEILING)
+        self.assertEqual(
+            clean["auto_task_level_ceiling"], cc.DEFAULT_AUTO_TASK_LEVEL_CEILING
+        )
         self.assertEqual(clean["l2_todo_policy"], "auto")
         argv = cc._admin_config_to_argv(raw)
         policy_pos = argv.index("--l2-todo-policy")
@@ -153,19 +171,31 @@ class SingleNoPlanTodoBootstrapTests(unittest.TestCase):
                 "base_url": "http://127.0.0.1:11434",
             }
         }
-        session.ollama = types.SimpleNamespace(model="demo-model", base_url="http://127.0.0.1:11434")
+        session.ollama = types.SimpleNamespace(
+            model="demo-model", base_url="http://127.0.0.1:11434"
+        )
         session.failed_selections = []
         session.auto_task_level_ceiling = 0
         session.updated_at = 0.0
         session.single_no_plan_todo_enabled = True
         session.single_no_plan_todo_prompt = "keep this setting"
-        bind(session, "_sanitize_profile_id", lambda self, value: str(value or "").strip())
+        bind(
+            session,
+            "_sanitize_profile_id",
+            lambda self, value: str(value or "").strip(),
+        )
         bind(session, "_profile_is_runnable", lambda self, profile: True)
         bind(session, "_apply_active_profile", lambda self: None)
-        bind(session, "_ensure_active_profile_capabilities", lambda self, force_probe=False: None)
+        bind(
+            session,
+            "_ensure_active_profile_capabilities",
+            lambda self, force_probe=False: None,
+        )
         bind(session, "_persist", lambda self: None)
         bind(session, "_emit", lambda self, *args, **kwargs: None)
-        bind(session, "model_catalog", lambda self: {"selected": self.active_profile_id})
+        bind(
+            session, "model_catalog", lambda self: {"selected": self.active_profile_id}
+        )
 
         result = session.set_runtime_selection("ollama::demo-model")
         self.assertEqual(result["selected"], "ollama")
@@ -355,7 +385,9 @@ class SingleNoPlanTodoBootstrapTests(unittest.TestCase):
         self.assertEqual(session._runtime_task_level_for_todo_policy(), 2)
         self.assertTrue(session._runtime_level_requires_todos())
 
-    def test_todo_payload_prefers_structured_plural_fields_over_stringified_content(self):
+    def test_todo_payload_prefers_structured_plural_fields_over_stringified_content(
+        self,
+    ):
         session = self.bare_session()
         rows = [
             {
@@ -375,7 +407,10 @@ class SingleNoPlanTodoBootstrapTests(unittest.TestCase):
         # plural array plus a Python-repr compatibility ``content`` field.
         payload = {"content": repr(rows), "todos": rows}
         parsed = session._todo_payload_items(payload)
-        self.assertEqual([row["content"] for row in parsed], ["Inspect the observed files", "Implement the next change"])
+        self.assertEqual(
+            [row["content"] for row in parsed],
+            ["Inspect the observed files", "Implement the next change"],
+        )
         self.assertEqual([row["status"] for row in parsed], ["in_progress", "pending"])
 
         # The compatibility field also works when it is the only field.
@@ -394,7 +429,9 @@ class SingleNoPlanTodoBootstrapTests(unittest.TestCase):
 
         parsed = session._todo_payload_items({"todos": rows})
         self.assertEqual(len(parsed), 11)
-        self.assertEqual([row["content"] for row in parsed], [row["content"] for row in rows])
+        self.assertEqual(
+            [row["content"] for row in parsed], [row["content"] for row in rows]
+        )
 
         recovered = session._extract_text_items_from_raw_args({"items": rows})
         self.assertEqual(len(recovered), 11)
@@ -410,8 +447,16 @@ class SingleNoPlanTodoBootstrapTests(unittest.TestCase):
     def test_legacy_stringified_loaded_todo_is_recovered_from_same_session_call(self):
         session = self.bare_session()
         rows = [
-            {"content": "First observed item", "status": "completed", "owner": "developer"},
-            {"content": "Second observed item", "status": "in_progress", "owner": "developer"},
+            {
+                "content": "First observed item",
+                "status": "completed",
+                "owner": "developer",
+            },
+            {
+                "content": "Second observed item",
+                "status": "in_progress",
+                "owner": "developer",
+            },
         ]
         bad_content = repr(rows)[:-4] + "...(truncated)"
         messages = [
@@ -431,15 +476,26 @@ class SingleNoPlanTodoBootstrapTests(unittest.TestCase):
             [{"content": bad_content, "status": "completed"}],
             messages,
         )
-        self.assertEqual([row["content"] for row in recovered], ["First observed item", "Second observed item"])
+        self.assertEqual(
+            [row["content"] for row in recovered],
+            ["First observed item", "Second observed item"],
+        )
         self.assertEqual(recovered[1]["status"], "in_progress")
         normal_rows = [{"content": "normal", "status": "pending", "owner": "developer"}]
-        self.assertEqual(session._normalize_loaded_todo_rows(normal_rows, []), normal_rows)
+        self.assertEqual(
+            session._normalize_loaded_todo_rows(normal_rows, []), normal_rows
+        )
 
     def test_frontend_renders_bootstrap_control_as_structured_card(self):
         source = Path(cc.__file__).read_text(encoding="utf-8")
-        self.assertIn("'single-no-plan-todo-bootstrap':{labelKey:'event_todo_bootstrap_title'", source)
-        self.assertIn("const isTodoBootstrap=runtimeHint.name==='single-no-plan-todo-bootstrap'", source)
+        self.assertIn(
+            "'single-no-plan-todo-bootstrap':{labelKey:'event_todo_bootstrap_title'",
+            source,
+        )
+        self.assertIn(
+            "const isTodoBootstrap=runtimeHint.name==='single-no-plan-todo-bootstrap'",
+            source,
+        )
         self.assertIn("event_todo_bootstrap_item_count", source)
         self.assertIn("event_todo_bootstrap_item_count:'1-40 项 · 对齐阶段'", source)
 
@@ -460,12 +516,24 @@ class SingleNoPlanTodoBootstrapTests(unittest.TestCase):
         self.assertNotIn("write_file", names)
         self.assertNotIn("edit_file", names)
         self.assertNotIn("bash", names)
-        self.assertTrue(session._single_no_plan_todo_mutation_blocked("write_file", {"path": "x", "content": "y"}))
-        self.assertTrue(session._single_no_plan_todo_mutation_blocked("bash", {"command": "printf x > x"}))
+        self.assertTrue(
+            session._single_no_plan_todo_mutation_blocked(
+                "write_file", {"path": "x", "content": "y"}
+            )
+        )
+        self.assertTrue(
+            session._single_no_plan_todo_mutation_blocked(
+                "bash", {"command": "printf x > x"}
+            )
+        )
 
         session.todo.update([{"content": "implement change", "status": "in_progress"}])
         self.assertFalse(session._single_no_plan_todo_initial_gate_active())
-        self.assertFalse(session._single_no_plan_todo_mutation_blocked("write_file", {"path": "x", "content": "y"}))
+        self.assertFalse(
+            session._single_no_plan_todo_mutation_blocked(
+                "write_file", {"path": "x", "content": "y"}
+            )
+        )
 
     def test_l2_prompt_states_mandatory_todo_contract(self):
         session = self.bare_session("single")
@@ -499,7 +567,11 @@ class SingleNoPlanTodoBootstrapTests(unittest.TestCase):
         )
         self.assertFalse(
             session._single_no_plan_todo_is_perception_result(
-                {"name": "bash", "args": {"command": "printf x > generated.txt"}, "ok": True}
+                {
+                    "name": "bash",
+                    "args": {"command": "printf x > generated.txt"},
+                    "ok": True,
+                }
             )
         )
         self.assertFalse(
@@ -509,7 +581,11 @@ class SingleNoPlanTodoBootstrapTests(unittest.TestCase):
         )
         self.assertTrue(
             session._single_no_plan_todo_is_perception_result(
-                {"name": "browser_screenshot", "args": {"url": "http://127.0.0.1:8128"}, "ok": True}
+                {
+                    "name": "browser_screenshot",
+                    "args": {"url": "http://127.0.0.1:8128"},
+                    "ok": True,
+                }
             )
         )
         self.assertTrue(
@@ -519,17 +595,29 @@ class SingleNoPlanTodoBootstrapTests(unittest.TestCase):
         )
         self.assertTrue(
             session._single_no_plan_todo_is_mutation_result(
-                {"name": "mcp__filesystem__write_file", "args": {"path": "out.txt"}, "ok": False}
+                {
+                    "name": "mcp__filesystem__write_file",
+                    "args": {"path": "out.txt"},
+                    "ok": False,
+                }
             )
         )
         self.assertTrue(
             session._single_no_plan_todo_is_mutation_result(
-                {"name": "mcp__service__request", "args": {"method": "POST"}, "ok": True}
+                {
+                    "name": "mcp__service__request",
+                    "args": {"method": "POST"},
+                    "ok": True,
+                }
             )
         )
         self.assertFalse(
             session._single_no_plan_todo_is_perception_result(
-                {"name": "bash", "args": {"command": "echo $(touch marker)"}, "ok": True}
+                {
+                    "name": "bash",
+                    "args": {"command": "echo $(touch marker)"},
+                    "ok": True,
+                }
             )
         )
         self.assertFalse(
@@ -544,7 +632,11 @@ class SingleNoPlanTodoBootstrapTests(unittest.TestCase):
         )
         self.assertTrue(
             session._single_no_plan_todo_is_mutation_result(
-                {"name": "bash", "args": {"command": "printf x > generated.txt"}, "ok": False}
+                {
+                    "name": "bash",
+                    "args": {"command": "printf x > generated.txt"},
+                    "ok": False,
+                }
             )
         )
         self.assertTrue(
@@ -577,7 +669,10 @@ class SingleNoPlanTodoBootstrapTests(unittest.TestCase):
         self.assertTrue(session.single_no_plan_todo_perception_seen)
         self.assertIn("Custom bootstrap instruction", session.messages[-1]["content"])
 
-        names = [row["function"]["name"] for row in session._single_no_plan_todo_bootstrap_tools()]
+        names = [
+            row["function"]["name"]
+            for row in session._single_no_plan_todo_bootstrap_tools()
+        ]
         self.assertEqual(names, ["TodoWrite", "TodoWriteRescue"])
 
     def test_bootstrap_success_and_bounded_failure_are_terminal(self):
@@ -590,10 +685,14 @@ class SingleNoPlanTodoBootstrapTests(unittest.TestCase):
         session.single_no_plan_todo_enabled = False
         self.assertFalse(session._single_no_plan_todo_bootstrap_turn_active())
         session.single_no_plan_todo_enabled = True
-        self.assertEqual(session._single_no_plan_todo_bootstrap_failure("no tool"), "retry")
+        self.assertEqual(
+            session._single_no_plan_todo_bootstrap_failure("no tool"), "retry"
+        )
         self.assertEqual(session.single_no_plan_todo_bootstrap_state, "waiting")
         self.assertEqual(session.single_no_plan_todo_bootstrap_attempts, 1)
-        self.assertEqual(session._single_no_plan_todo_bootstrap_failure("still no tool"), "skip")
+        self.assertEqual(
+            session._single_no_plan_todo_bootstrap_failure("still no tool"), "skip"
+        )
         self.assertEqual(session.single_no_plan_todo_bootstrap_state, "skipped")
         self.assertFalse(session._single_no_plan_todo_bootstrap_allowed())
 
@@ -615,8 +714,12 @@ class SingleNoPlanTodoBootstrapTests(unittest.TestCase):
         session.single_no_plan_todo_enabled = False
         session.auto_task_level_ceiling = 2
         session._start_single_no_plan_todo_bootstrap()
-        self.assertEqual(session._single_no_plan_todo_bootstrap_failure("no tool"), "retry")
-        self.assertEqual(session._single_no_plan_todo_bootstrap_failure("still no tool"), "blocked")
+        self.assertEqual(
+            session._single_no_plan_todo_bootstrap_failure("no tool"), "retry"
+        )
+        self.assertEqual(
+            session._single_no_plan_todo_bootstrap_failure("still no tool"), "blocked"
+        )
         self.assertEqual(session.single_no_plan_todo_bootstrap_state, "blocked")
         self.assertFalse(session._single_no_plan_todo_bootstrap_turn_active())
 
