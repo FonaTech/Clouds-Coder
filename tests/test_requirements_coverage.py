@@ -109,6 +109,11 @@ class RequirementsCoverageTests(unittest.TestCase):
         return session
 
     def test_conversation_png_uses_pillow_without_external_browser_binaries(self):
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("Pillow is not installed")
+
         real_import = builtins.__import__
 
         def import_without_external_renderers(name, *args, **kwargs):
@@ -120,8 +125,6 @@ class RequirementsCoverageTests(unittest.TestCase):
             "builtins.__import__", side_effect=import_without_external_renderers
         ):
             data = self.conversation_session().export_conversation_image()
-
-        from PIL import Image
 
         image = Image.open(BytesIO(data))
         self.assertEqual(image.format, "PNG")

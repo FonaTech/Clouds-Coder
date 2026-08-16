@@ -1241,7 +1241,10 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
         self.assertNotIn("<script", rendered.lower())
 
     def test_image_preview_streams_original_or_safe_thumbnail_without_base64_json(self):
-        from PIL import Image
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("Pillow is not installed")
 
         target = self.files / "large.png"
         Image.new("RGB", (5000, 3000), (20, 120, 220)).save(target, format="PNG")
@@ -1255,7 +1258,10 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
         self.assertGreater(len(data), 100)
 
     def test_xlsx_preview_has_archive_and_table_budgets(self):
-        import openpyxl
+        try:
+            import openpyxl
+        except ImportError:
+            self.skipTest("openpyxl is not installed")
 
         preview_session = cc.SessionState.__new__(cc.SessionState)
         self.app._ide_session = lambda user_id, session_id: preview_session
