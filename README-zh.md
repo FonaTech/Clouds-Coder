@@ -17,7 +17,7 @@
   <a href="./log/CHANGELOG-2026-06-22.md">2026-06-22 更新日志（EN/中文/日本語）</a> ·
   <a href="./log/CHANGELOG-2026-06-05.md">2026-06-05 更新日志（EN/中文/日本語）</a> ·
   <a href="./log/CHANGELOG-2026-05-28.md">2026-05-28 更新日志（EN/中文/日本語）</a> ·
-  <a href="./log/CHANGELOG-2026-05-02.md">2026-05-02 更新日志（EN/中文/日本語）</a> ·
+  <a href="./log/CHANGELOG-2026-05-02.md">2026-05-02 更新日志（EN/中文/日本語）</a><br />
   <a href="./LLM.config.json">LLM Config Template</a>
 </p>
 <table>
