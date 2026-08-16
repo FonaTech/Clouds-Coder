@@ -98,6 +98,10 @@ IDE_PROMPT_ENHANCEMENT_BUDGETS = {
         "max_tokens": 1800,
         "recent_messages": 4,
         "context_chars": 500,
+        "workspace_entries": 80,
+        "workspace_chars": 8_000,
+        "max_skills": 1,
+        "skill_context_chars": 12_000,
         "planning_depth": "Use one direct execution path with only immediate prerequisites and 2-4 coarse steps.",
         "solution_diversity": "Do not enumerate alternatives unless the obvious path has a material risk.",
         "scope_breadth": "Cover only the requested behavior and directly touched surface.",
@@ -107,6 +111,10 @@ IDE_PROMPT_ENHANCEMENT_BUDGETS = {
         "max_tokens": 3600,
         "recent_messages": 8,
         "context_chars": 900,
+        "workspace_entries": 160,
+        "workspace_chars": 12_000,
+        "max_skills": 3,
+        "skill_context_chars": 24_000,
         "planning_depth": "Create a 3-6 step implementation sequence with prerequisites, state transitions, and completion evidence.",
         "solution_diversity": "Consider the main approach plus one credible alternative or tradeoff, then select a conservative default.",
         "scope_breadth": "Cover directly affected UI, backend, data, lifecycle, and test surfaces when present.",
@@ -116,6 +124,10 @@ IDE_PROMPT_ENHANCEMENT_BUDGETS = {
         "max_tokens": 6000,
         "recent_messages": 12,
         "context_chars": 1400,
+        "workspace_entries": 240,
+        "workspace_chars": 18_000,
+        "max_skills": 5,
+        "skill_context_chars": 40_000,
         "planning_depth": "Create dependency-aware phases with intermediate invariants, failure recovery, and layered verification.",
         "solution_diversity": "Evaluate 2-3 viable approaches across correctness, complexity, compatibility, and maintenance; choose and justify a default.",
         "scope_breadth": "Trace cross-module, state, API, UX, compatibility, and operational effects relevant to the request.",
@@ -125,6 +137,10 @@ IDE_PROMPT_ENHANCEMENT_BUDGETS = {
         "max_tokens": 8200,
         "recent_messages": 16,
         "context_chars": 2000,
+        "workspace_entries": 360,
+        "workspace_chars": 24_000,
+        "max_skills": 8,
+        "skill_context_chars": 64_000,
         "planning_depth": "Create milestones with dependencies, decision gates, invariants, rollback points, and requirement-to-evidence traceability.",
         "solution_diversity": "Explore at least three materially different viable strategies when available, combine their strengths, and state why the selected default best fits the evidence.",
         "scope_breadth": "Perform an end-to-end impact scan including architecture, UX, data safety, security, performance, accessibility, offline behavior, and cross-platform concerns, retaining only relevant findings.",
@@ -432,8 +448,8 @@ CHAT_UPLOAD_PROMPT_PER_FILE_CHARS = max(
     min(2000, int(str(os.getenv("AGENT_CHAT_UPLOAD_PROMPT_PER_FILE_CHARS", "700") or "700"))),
 )
 CHAT_UPLOAD_FRONTEND_WAIT_MS = max(
-    1000,
-    min(30_000, int(str(os.getenv("AGENT_CHAT_UPLOAD_FRONTEND_WAIT_MS", "10000") or "10000"))),
+    0,
+    min(5_000, int(str(os.getenv("AGENT_CHAT_UPLOAD_FRONTEND_WAIT_MS", "250") or "250"))),
 )
 CHAT_UPLOAD_AUTO_LIBRARY_INGEST = (
     str(os.getenv("AGENT_CHAT_UPLOAD_AUTO_LIBRARY_INGEST", "false") or "false").strip().lower()
@@ -493,7 +509,7 @@ MAX_AGENT_ROUNDS = 200
 MIN_AGENT_ROUNDS = 8
 MAX_AGENT_ROUNDS_CAP = 400
 REPEATED_TOOL_LOOP_THRESHOLD = 2
-BASH_READ_LOOP_THRESHOLD = 3
+BASH_READ_LOOP_THRESHOLD = 10
 READ_FILE_LOOP_THRESHOLD = 6
 READ_FILE_LOOP_DISTINCT_SOFT_LIMIT = 5
 READ_FILE_COMPACT_PIN_DISTINCT = 8
@@ -710,7 +726,6 @@ MANAGER_MOMENTUM_MAX_SKIPS = 3
 # coding-type task before the anti-stall logic forces a switch to developer.
 # Was a hard-coded 2 (too aggressive — starved genuine research); raise so the
 # explorer can actually do its job. Tune down if exploration loops appear.
-EXPLORER_CODING_CAP = 4
 MODEL_OUTPUT_RETRY_TIMES = 3
 ARBITER_TRIGGER_MIN_CONTENT_CHARS = 50
 ARBITER_VALID_PLANNING_STREAK_LIMIT = 4
@@ -7073,15 +7088,10 @@ ROLE_EFFORT_FLOOR = {
     "manager": EFFORT_HIGH,
     "reviewer": EFFORT_HIGH,
 }
-# Coordination effort: the manager's per-round *routing* decision is a mechanical
-# tool-pick (missing facts->explorer, impl->developer, verify->reviewer, done->finish)
-# constrained to a single route_to_next_agent call. It does NOT need HIGH/MAX
-# reasoning every round — that was the single biggest token sink in multi-agent
-# mode. Routing calls use this low effort and bypass ROLE_EFFORT_FLOOR; manager
-# judgement/classification/planning calls keep the HIGH floor. On Anthropic/OpenAI
-# this is a real 5-8x thinking-token cut per round; on GLM (binary thinking) it is
-# neutral and the savings come from the loop/cache/tool-scope fixes.
-COORDINATION_EFFORT = EFFORT_LOW
+# Per-round routing is a semantic decision over the active objective, evidence,
+# permissions, and collaboration history. Keep enough reasoning budget for the
+# Manager to make that decision itself; the runtime only validates the result.
+COORDINATION_EFFORT = EFFORT_HIGH
 
 
 def clamp_effort(effort: str, *, ceiling: str = EFFORT_MAX, floor: str = EFFORT_OFF) -> str:
@@ -10190,6 +10200,270 @@ def preview_kind_for_path(path_text: str) -> str:
     if ext in DOCUMENT_PREVIEW_EXTS:
         return "document"
     return ""
+
+
+def normalize_markdown_preview_text(text: object) -> str:
+    """Normalize files whose entire Markdown body was indented by a transport layer.
+
+    Python-Markdown correctly treats four leading spaces as a code block. A number
+    of upload/extraction paths, however, indent every line in the file, which makes
+    an otherwise normal document render as one giant code block. Remove only a
+    document-wide common indent; indentation that exists on just some lines is
+    preserved for lists and fenced/nested code.
+    """
+    source = str(text or "").replace("\r\n", "\n").replace("\r", "\n").lstrip("\ufeff")
+    lines = source.split("\n")
+    non_empty = [line for line in lines if line.strip()]
+    if not non_empty:
+        return source
+    indents = [len(re.match(r"^[ \t]*", line).group(0).expandtabs(4)) for line in non_empty]
+    common = min(indents) if indents else 0
+    # A uniformly indented Markdown document is almost always a copied body. Keep
+    # the original indentation when only a subset of lines is indented.
+    if common < 2 or not all((not line.strip()) or len(line) - len(line.lstrip(" \t")) >= common for line in lines):
+        return source
+    out: list[str] = []
+    for line in lines:
+        if not line.strip():
+            out.append("")
+            continue
+        consumed = 0
+        index = 0
+        while index < len(line) and consumed < common and line[index] in " \t":
+            consumed += 4 if line[index] == "\t" else 1
+            index += 1
+        out.append(line[index:] if consumed >= common else line.lstrip(" \t"))
+    return "\n".join(out)
+
+
+def _preview_markdown_value_html(value: object, *, depth: int = 0) -> str:
+    """Render frontmatter and other metadata values without trusting raw HTML."""
+    if depth > 4:
+        return f"<code>{html.escape(trim(str(value or ''), 800))}</code>"
+    if isinstance(value, dict):
+        rows = []
+        for key, item in list(value.items())[:80]:
+            rows.append(
+                "<tr><th>"
+                f"{html.escape(str(key))}</th><td>{_preview_markdown_value_html(item, depth=depth + 1)}</td></tr>"
+            )
+        return "<table class=\"pv-frontmatter-table\"><tbody>" + "".join(rows) + "</tbody></table>"
+    if isinstance(value, (list, tuple)):
+        items = "".join(
+            f"<li>{_preview_markdown_value_html(item, depth=depth + 1)}</li>"
+            for item in list(value)[:80]
+        )
+        return f"<ul>{items}</ul>"
+    return html.escape(str(value if value is not None else ""))
+
+
+def _preview_markdown_frontmatter_html(meta: dict) -> str:
+    if not isinstance(meta, dict) or not meta:
+        return ""
+    rows = []
+    for key, value in list(meta.items())[:80]:
+        rows.append(
+            "<div class=\"pv-frontmatter-row\"><strong>"
+            f"{html.escape(str(key))}</strong><div>{_preview_markdown_value_html(value)}</div></div>"
+        )
+    return (
+        "<details class=\"pv-frontmatter\" open>"
+        "<summary>Document metadata</summary>"
+        f"<div class=\"pv-frontmatter-grid\">{''.join(rows)}</div></details>"
+    )
+
+
+def _preview_markdown_task_lists(rendered: str) -> str:
+    """Add inert checkboxes for GFM task-list markers after Markdown parsing."""
+    def replace_item(match: re.Match) -> str:
+        prefix, marker, rest = match.group(1), match.group(2), match.group(3)
+        checked = " checked" if str(marker).lower() == "x" else ""
+        return (
+            f'{prefix}<input class="pv-task-checkbox" type="checkbox" disabled{checked}>'
+            f" {rest}"
+        )
+
+    return re.sub(r'(<li(?:\s[^>]*)?>)\s*\[([ xX])\]\s+(.*?)(</li>)',
+                  lambda m: replace_item(m) + m.group(4), rendered, flags=re.S)
+
+
+def _preview_markdown_fallback_inline(text: str) -> str:
+    """Small safe inline Markdown renderer used when Python-Markdown is absent."""
+    source = str(text or "")
+    tokens: list[str] = []
+
+    def token(value: str) -> str:
+        idx = len(tokens)
+        tokens.append(value)
+        return f"\x00PV_TOKEN_{idx}\x00"
+
+    source = re.sub(
+        r"`([^`\n]+)`",
+        lambda m: token(f'<code>{html.escape(m.group(1))}</code>'),
+        source,
+    )
+    source = re.sub(
+        r"!\[([^\]]*)\]\(([^)\s]+)(?:\s+\"([^\"]*)\")?\)",
+        lambda m: token(
+            f'<img src="{html.escape(m.group(2), quote=True)}" alt="{html.escape(m.group(1), quote=True)}"'
+            + (f' title="{html.escape(m.group(3), quote=True)}"' if m.group(3) else "")
+            + ">"
+        ),
+        source,
+    )
+    source = re.sub(
+        r"\[([^\]]+)\]\(([^)\s]+)(?:\s+\"([^\"]*)\")?\)",
+        lambda m: token(
+            f'<a href="{html.escape(m.group(2), quote=True)}"'
+            + (f' title="{html.escape(m.group(3), quote=True)}"' if m.group(3) else "")
+            + f' target="_blank" rel="noreferrer">{html.escape(m.group(1))}</a>'
+        ),
+        source,
+    )
+    escaped = html.escape(source)
+    escaped = re.sub(r"\*\*([^*\n]+)\*\*|__([^_\n]+)__", lambda m: f"<strong>{html.escape(m.group(1) or m.group(2))}</strong>", escaped)
+    escaped = re.sub(r"~~([^~\n]+)~~", lambda m: f"<del>{html.escape(m.group(1))}</del>", escaped)
+    escaped = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)|(?<!_)_([^_\n]+)_(?!_)", lambda m: f"<em>{html.escape(m.group(1) or m.group(2))}</em>", escaped)
+    for idx, value in enumerate(tokens):
+        escaped = escaped.replace(f"\x00PV_TOKEN_{idx}\x00", value)
+    return escaped
+
+
+def _preview_markdown_fallback_html(text: str) -> str:
+    """Render common Markdown structures with only the Python standard library."""
+    lines = str(text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    blocks: list[str] = []
+    idx = 0
+
+    def paragraph(items: list[str]) -> str:
+        joined = "\n".join(items).strip()
+        if not joined:
+            return ""
+        rendered = _preview_markdown_fallback_inline(joined)
+        rendered = rendered.replace("  \n", "<br>")
+        rendered = rendered.replace("\n", "\n")
+        return f"<p>{rendered}</p>"
+
+    while idx < len(lines):
+        line = lines[idx]
+        if not line.strip():
+            idx += 1
+            continue
+        fence = re.match(r"^\s*(```+|~~~+)\s*([^ ]*)\s*$", line)
+        if fence:
+            marker, language = fence.group(1), fence.group(2).strip().lower()
+            idx += 1
+            code: list[str] = []
+            while idx < len(lines) and not re.match(rf"^\s*{re.escape(marker[0])}{{{len(marker)},}}\s*$", lines[idx]):
+                code.append(lines[idx])
+                idx += 1
+            if idx < len(lines):
+                idx += 1
+            cls = f' class="language-{html.escape(language, quote=True)}"' if language else ""
+            code_text = "\n".join(code)
+            blocks.append(f"<pre><code{cls}>{html.escape(code_text)}</code></pre>")
+            continue
+        heading = re.match(r"^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$", line)
+        if heading:
+            level = len(heading.group(1))
+            blocks.append(f"<h{level}>{_preview_markdown_fallback_inline(heading.group(2))}</h{level}>")
+            idx += 1
+            continue
+        if re.match(r"^\s{0,3}((\*\s*){3,}|(-\s*){3,}|(_\s*){3,})$", line):
+            blocks.append("<hr>")
+            idx += 1
+            continue
+        if line.lstrip().startswith(">"): 
+            quote: list[str] = []
+            while idx < len(lines) and (lines[idx].lstrip().startswith(">") or not lines[idx].strip()):
+                quote.append(re.sub(r"^\s*>\s?", "", lines[idx]))
+                idx += 1
+            quote_text = "\n".join(quote)
+            blocks.append(f"<blockquote>{_preview_markdown_fallback_html(quote_text)}</blockquote>")
+            continue
+        if idx + 1 < len(lines) and "|" in line and re.match(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$", lines[idx + 1]):
+            def cells(raw: str) -> list[str]:
+                value = raw.strip().strip("|")
+                return [part.strip() for part in value.split("|")]
+            heads = cells(line)
+            idx += 2
+            rows: list[list[str]] = []
+            while idx < len(lines) and "|" in lines[idx] and lines[idx].strip():
+                rows.append(cells(lines[idx]))
+                idx += 1
+            head_html = "".join(f"<th>{_preview_markdown_fallback_inline(value)}</th>" for value in heads)
+            row_html = "".join("<tr>" + "".join(f"<td>{_preview_markdown_fallback_inline(value)}</td>" for value in row) + "</tr>" for row in rows)
+            blocks.append(f"<div class=\"pv-table-wrap\"><table class=\"pv-grid\"><thead><tr>{head_html}</tr></thead><tbody>{row_html}</tbody></table></div>")
+            continue
+        list_match = re.match(r"^\s*([-+*]|\d+[.)])\s+(.*)$", line)
+        if list_match:
+            ordered = bool(re.match(r"\d", list_match.group(1)))
+            tag = "ol" if ordered else "ul"
+            items: list[str] = []
+            while idx < len(lines):
+                current = re.match(r"^\s*([-+*]|\d+[.)])\s+(.*)$", lines[idx])
+                if not current or bool(re.match(r"\d", current.group(1))) != ordered:
+                    break
+                item_text = current.group(2)
+                task = re.match(r"^\[([ xX])\]\s+(.*)$", item_text)
+                if task:
+                    checked = " checked" if task.group(1).lower() == "x" else ""
+                    item_html = f'<input class="pv-task-checkbox" type="checkbox" disabled{checked}> {_preview_markdown_fallback_inline(task.group(2))}'
+                else:
+                    item_html = _preview_markdown_fallback_inline(item_text)
+                items.append(f"<li>{item_html}</li>")
+                idx += 1
+            blocks.append(f"<{tag}>{''.join(items)}</{tag}>")
+            continue
+        paragraph_lines = [line]
+        idx += 1
+        while idx < len(lines) and lines[idx].strip():
+            if re.match(r"^\s*(?:#{1,6}\s|```|~~~|>|[-+*]\s+|\d+[.)]\s+)", lines[idx]):
+                break
+            paragraph_lines.append(lines[idx])
+            idx += 1
+        blocks.append(paragraph(paragraph_lines))
+    return "".join(blocks)
+
+
+def _ask_user_option_rows(raw_options: object, *, limit: int = 8) -> list[object]:
+    """Keep ask_user choices structured without breaking legacy string options."""
+    source = raw_options
+    if isinstance(source, str):
+        candidate = source.strip()
+        if candidate.startswith(("[", "{")):
+            try:
+                source = json.loads(candidate)
+            except Exception:
+                source = [source]
+        else:
+            source = [source] if candidate else []
+    if isinstance(source, dict):
+        source = [source]
+    if not isinstance(source, (list, tuple)):
+        return []
+    rows: list[object] = []
+    for item in source:
+        if isinstance(item, dict):
+            label = trim(str(item.get("label", item.get("text", item.get("name", ""))) or "").strip(), 400)
+            value = trim(str(item.get("value", item.get("id", label)) or label).strip(), 400)
+            description = trim(str(item.get("description", item.get("detail", "")) or "").strip(), 800)
+            if not label and not value:
+                continue
+            rows.append({"label": label or value, "value": value or label, **({"description": description} if description else {})})
+        else:
+            value = trim(str(item or "").strip(), 400)
+            if value:
+                rows.append(value)
+        if len(rows) >= max(1, int(limit or 8)):
+            break
+    return rows
+
+
+def _ask_user_option_value(option: object) -> str:
+    if isinstance(option, dict):
+        return trim(str(option.get("value", option.get("id", option.get("label", ""))) or "").strip(), 400)
+    return trim(str(option or "").strip(), 400)
 
 
 def workspace_file_revision_map(root: Path, max_files: int = 30_000) -> dict[str, str]:
@@ -20296,6 +20570,7 @@ _IDE_SANDBOX_BACKEND_CACHE: dict[str, object] = {}
 _IDE_SANDBOX_BACKEND_LOCK = threading.RLock()
 WINDOWS_JOB_SANDBOX_MARKER = "__clouds_windows_job__"
 _WINDOWS_LOW_INTEGRITY_ROOTS: set[str] = set()
+_WINDOWS_LOW_INTEGRITY_FAILED_ROOTS: set[str] = set()
 _WINDOWS_LOW_INTEGRITY_LOCK = threading.RLock()
 
 def _is_windows_job_sandbox_prefix(prefix: object) -> bool:
@@ -20391,13 +20666,22 @@ def _windows_set_low_integrity_label(path: Path, *, inherit: bool) -> None:
         kernel32.LocalFree.restype = ctypes.c_void_p
         kernel32.LocalFree(sid)
 
-def _windows_prepare_low_integrity_workspace(workspace_root: Path) -> None:
+def _windows_prepare_low_integrity_workspace(workspace_root: Path) -> bool:
     canonical = Path(os.path.realpath(workspace_root)).resolve()
     key = os.path.normcase(str(canonical))
     with _WINDOWS_LOW_INTEGRITY_LOCK:
-        if key in _WINDOWS_LOW_INTEGRITY_ROOTS:
-            return
-        _windows_set_low_integrity_label(canonical, inherit=True)
+        if key in _WINDOWS_LOW_INTEGRITY_ROOTS or key in _WINDOWS_LOW_INTEGRITY_FAILED_ROOTS:
+            return key in _WINDOWS_LOW_INTEGRITY_ROOTS
+        # The low-integrity label is defense-in-depth. Standard Windows users can
+        # lack SeSecurityPrivilege, in which case SetNamedSecurityInfoW returns
+        # ERROR_ACCESS_DENIED even though the Job Object/token sandbox is usable.
+        # Record that capability failure once and continue with the stronger job
+        # isolation instead of failing every Bash invocation.
+        try:
+            _windows_set_low_integrity_label(canonical, inherit=True)
+        except OSError:
+            _WINDOWS_LOW_INTEGRITY_FAILED_ROOTS.add(key)
+            return False
         for dirpath, dirnames, filenames in os.walk(canonical, topdown=True, followlinks=False):
             current = Path(dirpath)
             dirnames[:] = [name for name in dirnames if not (current / name).is_symlink()]
@@ -20415,6 +20699,7 @@ def _windows_prepare_low_integrity_workspace(workspace_root: Path) -> None:
                 except OSError:
                     pass
         _WINDOWS_LOW_INTEGRITY_ROOTS.add(key)
+        return True
 
 def _windows_job_memory_limit() -> int:
     raw = str(os.environ.get("CLOUDS_CODER_SANDBOX_MEMORY", "1g") or "1g").strip().lower()
@@ -20472,7 +20757,12 @@ def _windows_lower_process_integrity(process_handle: object) -> None:
             kernel32.CloseHandle.restype = wintypes.BOOL
             kernel32.CloseHandle(token)
 
-def _windows_attach_sandbox_job(proc: subprocess.Popen, workspace_root: Path) -> None:
+def _windows_attach_sandbox_job(
+    proc: subprocess.Popen,
+    workspace_root: Path,
+    *,
+    lower_integrity: bool = True,
+) -> None:
     from ctypes import wintypes
 
     class LARGE_INTEGER(ctypes.Union):
@@ -20543,7 +20833,8 @@ def _windows_attach_sandbox_job(proc: subprocess.Popen, workspace_root: Path) ->
         kernel32.SetInformationJobObject(
             job, 15, ctypes.byref(cpu_limit), ctypes.sizeof(cpu_limit)
         )
-        _windows_lower_process_integrity(proc._handle)
+        if lower_integrity:
+            _windows_lower_process_integrity(proc._handle)
         kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
         kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
         if not kernel32.AssignProcessToJobObject(job, proc._handle):
@@ -20586,7 +20877,7 @@ def _popen_windows_sandboxed(
 ) -> subprocess.Popen:
     if os.name != "nt":
         raise RuntimeError("Windows built-in sandbox requested on a non-Windows platform")
-    _windows_prepare_low_integrity_workspace(workspace_root)
+    low_integrity_ready = _windows_prepare_low_integrity_workspace(workspace_root)
     flags = int(kwargs.pop("creationflags", 0) or 0)
     flags |= int(getattr(subprocess, "CREATE_SUSPENDED", 0x00000004) or 0x00000004)
     flags |= int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200) or 0x00000200)
@@ -20598,7 +20889,7 @@ def _popen_windows_sandboxed(
         **kwargs,
     )
     try:
-        _windows_attach_sandbox_job(proc, workspace_root)
+        _windows_attach_sandbox_job(proc, workspace_root, lower_integrity=low_integrity_ready)
         return proc
     except Exception:
         try:
@@ -20675,8 +20966,8 @@ def _detect_ide_sandbox_backend(*, force: bool = False) -> dict:
             result(
                 "windows-job",
                 available=True,
-                terminal=False,
-                debug=False,
+                terminal=True,
+                debug=True,
                 reason=reason,
             )
             if ready
@@ -20827,6 +21118,11 @@ class SessionState:
         # Session methods may emit events while already holding this lock.
         # Use a re-entrant lock to avoid self-deadlock during nested callbacks.
         self.lock = threading.RLock()
+        # Message submission should not wait for a full encrypted state rewrite.
+        # The worker coalesces bursts and snapshots while holding ``self.lock``.
+        self._persist_scheduler_lock = threading.Lock()
+        self._persist_scheduler_pending = False
+        self._persist_scheduler_thread = None
         self.owner_user_id = str(owner_user_id or "")
         self.upload_callback = upload_callback
         self.run_finished_callback = run_finished_callback
@@ -20865,9 +21161,11 @@ class SessionState:
         # injected the capsule for on an execution turn — keeps execution-stage
         # injection to once-per-user-request (turns 2..N pay nothing).
         self._capsule_exec_injected_user_ts: float = 0.0
-        env_ok, env_tags, _ = probe_ollama_environment(ollama_base)
-        self.ollama_env_available = bool(env_ok)
-        self.ollama_env_tags: list[str] = list(env_tags)
+        # Model discovery is deliberately lazy.  A missing local Ollama service
+        # must not hold the first session page for the probe timeout; the model
+        # catalog request performs discovery when the user actually opens it.
+        self.ollama_env_available = False
+        self.ollama_env_tags: list[str] = []
         self.thinking = False
         self.ui_language = normalize_ui_language(ui_language)
         self.last_public_progress_signature = ""
@@ -22529,11 +22827,11 @@ class SessionState:
                     self.live_input_seq = max(self.live_input_seq, max_id)
                 _pq = raw.get("pending_user_question", None)
                 if isinstance(_pq, dict) and trim(str(_pq.get("question", "") or "").strip(), 2000):
-                    _pq_opts = _pq.get("options", [])
+                    _pq_opts = _ask_user_option_rows(_pq.get("options", []))
                     self.pending_user_question = {
                         "id": trim(str(_pq.get("id", "") or ""), 120) or make_id("ask"),
                         "question": trim(str(_pq.get("question", "") or "").strip(), 2000),
-                        "options": [trim(str(o or "").strip(), 400) for o in _pq_opts if str(o or "").strip()][:8] if isinstance(_pq_opts, list) else [],
+                        "options": _pq_opts,
                         "allow_free_text": bool(_pq.get("allow_free_text", True)),
                         "role": str(_pq.get("role", "") or "agent"),
                         "ts": float(_pq.get("ts", 0.0) or 0.0),
@@ -22876,6 +23174,53 @@ class SessionState:
         with self.lock:
             self._prune_code_preview_locked()
         self._persist()
+
+    def _schedule_persist(self) -> None:
+        """Queue one consistent session snapshot for background persistence."""
+        gate = getattr(self, "_persist_scheduler_lock", None)
+        if gate is None:
+            # Some focused tests construct SessionState via __new__.
+            gate = threading.Lock()
+            self._persist_scheduler_lock = gate
+            self._persist_scheduler_pending = False
+            self._persist_scheduler_thread = None
+        with gate:
+            self._persist_scheduler_pending = True
+            worker = getattr(self, "_persist_scheduler_thread", None)
+            if worker is not None and worker.is_alive():
+                return
+            worker = threading.Thread(
+                target=self._persist_scheduler_worker,
+                name=f"session-persist-{self.id}",
+                daemon=True,
+            )
+            self._persist_scheduler_thread = worker
+            worker.start()
+
+    def _persist_scheduler_worker(self) -> None:
+        gate = getattr(self, "_persist_scheduler_lock", None)
+        if gate is None:
+            return
+        while True:
+            with gate:
+                if not bool(getattr(self, "_persist_scheduler_pending", False)):
+                    self._persist_scheduler_thread = None
+                    return
+                self._persist_scheduler_pending = False
+            try:
+                # RLock makes this safe if a caller schedules while already
+                # inside a session mutation; the worker waits for that mutation
+                # and then writes a coherent snapshot.
+                with self.lock:
+                    self._persist()
+            except Exception:
+                # A later durable event will retry. Never turn a successful user
+                # submission into an HTTP error solely because persistence failed.
+                with gate:
+                    if not bool(getattr(self, "_persist_scheduler_pending", False)):
+                        self._persist_scheduler_thread = None
+                        return
+                time.sleep(0.05)
 
     def _persist(self):
         self._prune_skill_load_cache()
@@ -23715,6 +24060,10 @@ class SessionState:
         ):
             return
         self.last_event_persist_ts = now_value
+        if kind_key == "message":
+            self.updated_at = now_value
+            self._schedule_persist()
+            return
         try:
             self.updated_at = now_value
             self._persist()
@@ -25303,6 +25652,12 @@ class SessionState:
         ) or "developer"
         agent_loop_note = self._agent_loop_progress_prompt_block(for_role=agent_loop_role)
         agent_loop_block = f"{agent_loop_note}\n\n" if agent_loop_note else ""
+        single_todo_alignment_note = self._single_agent_todo_alignment_prompt_block(
+            for_role=agent_loop_role
+        )
+        single_todo_alignment_block = (
+            f"{single_todo_alignment_note}\n\n" if single_todo_alignment_note else ""
+        )
         mm_block = self._multimodal_capability_block()
         mm_hint = f"{mm_block}\n" if mm_block else ""
         runtime_env_text = self._runtime_environment_context_prompt_block() + "\n\n"
@@ -25339,6 +25694,7 @@ class SessionState:
             f"{plan_steps_block}"
             f"{plan_todo_block}"
             f"{todo_contract_block}"
+            f"{single_todo_alignment_block}"
             f"{agent_loop_block}"
             f"{html_block}"
             f"{research_block}"
@@ -28762,22 +29118,6 @@ class SessionState:
             "todo_fp": todo_fp,
         }
 
-    def _agent_loop_next_action(self, alignment: dict, state: dict) -> str:
-        phase = str(alignment.get("phase", "") or "execute").strip().lower()
-        if bool(alignment.get("all_todos_completed", False)):
-            if bool(state.get("seen_validation", False)):
-                return "finish"
-            return "verify"
-        if bool(alignment.get("current_is_acceptance", False)) or phase in {"test", "review"}:
-            return "verify"
-        if phase == "research":
-            return "synthesize"
-        if phase == "design":
-            return "record_design"
-        if phase in {"implement", "deploy", "execute"}:
-            return "execute"
-        return "advance"
-
     def _update_agent_loop_progress_state(self, tool_results: list[dict], role: str = "") -> dict:
         """Classify one tool round as progress, new evidence, or evidence reuse.
 
@@ -28918,7 +29258,9 @@ class SessionState:
             ),
             "updated_at": now_ts(),
         }
-        state["next_action"] = self._agent_loop_next_action(alignment, state)
+        # Keep this state observational. The Manager/agent chooses its own
+        # phase and next action from the shared evidence on every turn.
+        state.pop("next_action", None)
         store[role_key] = state
         self.agent_loop_progress_state = store
         return state
@@ -28933,13 +29275,20 @@ class SessionState:
         state["alignment"] = alignment
         state["guidance_active"] = True
         state["guidance_reason"] = trim(str(reason or "strategy_signal"), 120)
-        state["next_action"] = self._agent_loop_next_action(alignment, state)
+        state.pop("next_action", None)
         state["updated_at"] = now_ts()
         store[role_key] = state
         self.agent_loop_progress_state = store
 
     def _agent_loop_progress_prompt_block(self, for_role: str = "") -> str:
-        """Render a compact, private next-turn bias from live progress telemetry."""
+        """Render observation-only multi-agent progress telemetry.
+
+        Single and plan+single intentionally keep their original autonomous
+        prompt path. Sequential/sync receive shared facts, never a runtime-
+        selected phase, role, tool, or next action.
+        """
+        if not self._is_multi_agent_mode():
+            return ""
         role_key = self._sanitize_agent_role(for_role) or "single"
         store = getattr(self, "agent_loop_progress_state", {})
         state = dict(store.get(role_key, {})) if isinstance(store, dict) and isinstance(store.get(role_key), dict) else {}
@@ -28947,20 +29296,14 @@ class SessionState:
         focus = trim(str(alignment.get("current_todo", "") or alignment.get("step", "") or ""), 240)
         if not focus and not bool(state.get("guidance_active", False)):
             return ""
-        action = str(state.get("next_action", "") or self._agent_loop_next_action(alignment, state))
-        action_text = {
-            "synthesize": "Synthesize the evidence already collected into the current deliverable or shared task memory, then align the Todo status.",
-            "record_design": "Commit the current design decision to the intended artifact, then align the Todo status.",
-            "execute": "Take one concrete implementation/execution action for the current Todo instead of gathering more broad evidence.",
-            "verify": "Run the smallest acceptance-relevant verification still needed; record the evidence against the current Todo.",
-            "finish": "The tracked Todos are complete and validation evidence exists; finish the overall task unless a concrete unmet acceptance criterion remains.",
-            "advance": "Take the next concrete action that changes the current deliverable or Todo state.",
-        }.get(action, "Continue the current Todo with one concrete action.")
         rows = [
             "<dynamic-agent-loop-state>",
-            f"phase_bias={alignment.get('phase', 'execute')} next_action={action} ",
+            f"mode=observation-only role={role_key}",
             f"todo={focus or '(none)'} status={alignment.get('current_status', '') or '(none)'} ",
-            f"todo_progress={int(alignment.get('todo_completed', 0) or 0)}/{int(alignment.get('todo_total', 0) or 0)}",
+            f"todo_progress={int(alignment.get('todo_completed', 0) or 0)}/{int(alignment.get('todo_total', 0) or 0)} "
+            f"pending={int(alignment.get('todo_pending', 0) or 0)} "
+            f"in_progress={int(alignment.get('todo_in_progress', 0) or 0)} "
+            f"all_completed={str(bool(alignment.get('all_todos_completed', False))).lower()}",
         ]
         if bool(state.get("guidance_active", False)):
             rows.append(
@@ -28969,17 +29312,57 @@ class SessionState:
                 f"reused={int(state.get('evidence_reused', 0) or 0)} "
                 f"stagnant_rounds={int(state.get('stagnant_evidence_streak', 0) or 0)}"
             )
-            rows.append(action_text)
             rows.append(
-                "Reused evidence is available in tool memory and is not new progress. Read again only for a new exact unanswered question, changed state, or targeted verification."
+                f"seen_mutation={str(bool(state.get('seen_mutation', False))).lower()} "
+                f"seen_validation={str(bool(state.get('seen_validation', False))).lower()} "
+                f"reason={trim(str(state.get('guidance_reason', '') or ''), 120)}"
             )
         else:
-            rows.append("Continue this Todo by default; update the canonical Todo only after a real state change.")
+            rows.append("progress_signal=normal")
         rows.append(
-            "This is an adaptive next-action bias, not a fixed phase machine: override it when concrete new evidence changes what the task actually needs."
+            "These are shared observations, not a phase, role, tool, or next-action selection. "
+            "Choose autonomously from the objective, evidence, agent perspectives, and Todo state; "
+            "revise the approach or Todo ordering when the evidence supports it. Reused evidence is not new progress."
         )
         rows.append("</dynamic-agent-loop-state>")
         return trim("\n".join(rows), 1400)
+
+    def _single_agent_todo_alignment_prompt_block(self, for_role: str = "") -> str:
+        """Expose canonical Todo facts without selecting the model's next action.
+
+        Single and plan+single do not consume adaptive Agent Loop strategy
+        guidance. They still need an explicit status-commit contract, otherwise
+        removing the old phase/next-action block also removes the only reminder
+        that observable progress must be written back to TodoWrite.
+        """
+        if self._is_multi_agent_mode():
+            return ""
+        role_key = self._sanitize_agent_role(for_role) or "single"
+        alignment = self._agent_loop_todo_alignment(role_key)
+        total = int(alignment.get("todo_total", 0) or 0)
+        if total <= 0:
+            return ""
+        current = trim(str(alignment.get("current_todo", "") or ""), 260)
+        completed = int(alignment.get("todo_completed", 0) or 0)
+        pending = int(alignment.get("todo_pending", 0) or 0)
+        in_progress = int(alignment.get("todo_in_progress", 0) or 0)
+        all_completed = bool(alignment.get("all_todos_completed", False))
+        return trim(
+            "\n".join(
+                [
+                    "<single-todo-alignment-state>",
+                    f"mode=observation-only role={role_key}",
+                    f"current={current or '(none)'} status={alignment.get('current_status', '') or '(none)'}",
+                    f"todo_progress={completed}/{total} pending={pending} in_progress={in_progress} "
+                    f"all_completed={str(all_completed).lower()}",
+                    "This block reports canonical Todo facts only. It does not choose a phase, tool, role, or next action; reason autonomously from the objective and evidence.",
+                    "When tool results have actually completed one or more Todo rows, call TodoWrite or TodoWriteRescue with update_mode='status_update' before doing work that belongs to another row. One call may mark every evidence-backed completed row and set exactly one remaining open row to in_progress; do not force one bookkeeping call per row. If every row is complete, leave none in_progress and proceed to objective-level acceptance or finish.",
+                    "Do not advance Todo status from approach prose, intention, or an unverified claim alone.",
+                    "</single-todo-alignment-state>",
+                ]
+            ),
+            1500,
+        )
 
     def _maybe_inject_read_file_strategy_intervention(self, tool_results: list[dict], role: str = "") -> bool:
         rows = [r for r in (tool_results or []) if isinstance(r, dict)]
@@ -30834,6 +31217,58 @@ class SessionState:
             except Exception:
                 continue
 
+    def _recover_code_preview_index_from_operations(self) -> None:
+        """Recover stage metadata when an older state persisted operations first.
+
+        Early IDE sessions could contain durable ``file_patch`` operations and the
+        stage blobs but no serialized ``code_preview_index``. That made the first
+        open of a repeatedly edited file look history-free until another edit
+        occurred. The operation already carries the stage id and counters, while
+        blob paths are deterministic from the file path and stage id.
+        """
+        if self.code_preview_index:
+            known = {str(row.get("id", "")) for rows in self.code_preview_index.values() for row in rows if isinstance(row, dict)}
+        else:
+            known = set()
+        recovered: dict[str, list[dict]] = {}
+        for op in getattr(self, "operations", []) or []:
+            if not isinstance(op, dict) or str(op.get("type", "") or "") != "file_patch":
+                continue
+            data = op.get("data", {}) if isinstance(op.get("data"), dict) else {}
+            stage_meta = data.get("code_stage", {}) if isinstance(data.get("code_stage"), dict) else {}
+            stage_id = str(stage_meta.get("id", "") or "").strip()
+            rel = normalize_rel_preview_path(data.get("session_rel_path", data.get("path", "")))
+            if not stage_id or not rel or stage_id in known or not is_code_preview_candidate(rel):
+                continue
+            bucket = self._code_preview_bucket_dir(rel)
+            before_fp = bucket / f"{stage_id}.before.txt"
+            after_fp = bucket / f"{stage_id}.after.txt"
+            if not before_fp.exists() and not after_fp.exists():
+                continue
+            before_text = try_read_text(before_fp, max_bytes=CODE_PREVIEW_STAGE_MAX_BYTES) or ""
+            after_text = try_read_text(after_fp, max_bytes=CODE_PREVIEW_STAGE_MAX_BYTES) or ""
+            stage = {
+                "id": stage_id,
+                "ts": float(stage_meta.get("ts", op.get("ts", 0.0)) or 0.0),
+                "path": rel,
+                "tool": str(data.get("tool", "") or "operation-recovery"),
+                "change_type": str(stage_meta.get("change_type", data.get("change_type", "modified")) or "modified"),
+                "added": int(stage_meta.get("added", data.get("added", 0)) or 0),
+                "deleted": int(stage_meta.get("deleted", data.get("deleted", 0)) or 0),
+                "before_blob": before_fp.relative_to(self.root).as_posix(),
+                "after_blob": after_fp.relative_to(self.root).as_posix(),
+                "bytes_after": len(after_text.encode("utf-8", errors="ignore")),
+                "lines_after": after_text.count("\n") + (1 if after_text else 0),
+            }
+            recovered.setdefault(rel, []).append(stage)
+            known.add(stage_id)
+        if recovered:
+            merged = {key: list(value) for key, value in self.code_preview_index.items()}
+            for rel, rows in recovered.items():
+                merged.setdefault(rel, []).extend(rows)
+                merged[rel].sort(key=lambda row: float(row.get("ts", 0.0) or 0.0))
+            self.code_preview_index = merged
+
     def _prune_code_preview_locked(self):
         cleaned: dict[str, list[dict]] = {}
         removed: list[dict] = []
@@ -30959,6 +31394,9 @@ class SessionState:
             raise ValueError("path required")
         with self.lock:
             stages = list(self.code_preview_index.get(rel, []))
+            if not stages:
+                self._recover_code_preview_index_from_operations()
+                stages = list(self.code_preview_index.get(rel, []))
         out = []
         total = len(stages)
         for i, row in enumerate(stages, start=1):
@@ -39963,6 +40401,34 @@ body{padding:18px}
             return 0
         return max(1, min(max_budget, budget))
 
+    def _sync_tick_manager_cycle(self, board: dict, cycle: int) -> dict:
+        """Publish the single monotonic budget clock used by Sync routes.
+
+        AgentBus and momentum deliberately bypass the Manager model, so their
+        rounds still need to advance the same visible counter.  Keeping this in
+        one small helper also prevents the HUD from retaining a stale finite or
+        unlimited ``remaining_rounds`` value while the worker is progressing.
+        """
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        try:
+            cycle_value = max(0, int(cycle or 0))
+        except Exception:
+            cycle_value = max(0, int(bb.get("manager_cycles", 0) or 0))
+        bb["manager_cycles"] = cycle_value
+        budget = self._blackboard_round_budget(bb)
+        remaining = -1 if budget <= 0 else max(0, int(budget) - cycle_value)
+        judgement = bb.get("manager_judgement", {})
+        if not isinstance(judgement, dict):
+            judgement = {}
+        judgement["remaining_rounds"] = int(remaining)
+        judgement["updated_at"] = float(now_ts())
+        bb["manager_judgement"] = judgement
+        # The caller already has a normalized board.  Avoid a second full
+        # blackboard normalization on every Sync tick; this path is hot on
+        # lower-powered LAN servers.
+        self._save_blackboard(bb)
+        return bb
+
     def _normalize_blackboard_status(self, raw: object) -> str:
         key = str(raw or "").strip().upper()
         return key if key in BLACKBOARD_STATUSES else "INITIALIZING"
@@ -41086,6 +41552,7 @@ body{padding:18px}
                 "source": "",
                 "progress_fp": "",
                 "is_mandatory": False,
+                "fallback_recovery": False,
                 "ts": 0.0,
                 "plan_subtask_id": "",
                 "plan_subtask_content": "",
@@ -41130,6 +41597,7 @@ body{padding:18px}
             },
             "checkpoints": [],
             "persisted_manager_routes": [],
+            "manager_route_diagnostics": [],
         }
 
     def _normalize_blackboard(self, raw: object) -> dict:
@@ -41157,6 +41625,7 @@ body{padding:18px}
                 "source": trim(str(raw_delegate.get("source", "") or "").strip(), 40),
                 "progress_fp": trim(str(raw_delegate.get("progress_fp", "") or "").strip(), 80),
                 "is_mandatory": _to_bool_like(raw_delegate.get("is_mandatory", False), default=False),
+                "fallback_recovery": _to_bool_like(raw_delegate.get("fallback_recovery", False), default=False),
                 "ts": float(raw_delegate.get("ts", 0.0) or 0.0),
                 "focus_kind": trim(str(raw_delegate.get("focus_kind", "") or "").strip(), 40),
                 "focus_id": trim(str(raw_delegate.get("focus_id", "") or "").strip(), 120),
@@ -41639,6 +42108,12 @@ body{padding:18px}
         board["checkpoints"] = list(raw_cp)[-CHECKPOINT_MAX_COUNT:] if isinstance(raw_cp, list) else []
         raw_pmr = src.get("persisted_manager_routes")
         board["persisted_manager_routes"] = list(raw_pmr)[-PERSISTED_ROUTES_MAX:] if isinstance(raw_pmr, list) else []
+        raw_route_diag = src.get("manager_route_diagnostics")
+        board["manager_route_diagnostics"] = (
+            [dict(row) for row in list(raw_route_diag)[-40:] if isinstance(row, dict)]
+            if isinstance(raw_route_diag, list)
+            else []
+        )
         # Preserve loaded_skills across normalization
         raw_loaded_skills = src.get("loaded_skills")
         if isinstance(raw_loaded_skills, dict) and raw_loaded_skills:
@@ -42034,6 +42509,149 @@ body{padding:18px}
         if route_epoch and active_epoch and abs(route_epoch - active_epoch) > 0.001:
             return False
         return True
+
+    def _route_scope_matches_current_plan(
+        self,
+        route: dict | None,
+        board: dict | None = None,
+        *,
+        require_scoped: bool = False,
+    ) -> bool:
+        """Validate a route against the live plan step and child cursor.
+
+        Sync has several route producers (manager, momentum, and AgentBus). A
+        route that was valid one child ago must never be repaired into the new
+        child by `_align_route_with_current_plan_step`; it must be discarded.
+        ``require_scoped`` is used for worker handoffs because messages created
+        before this scope was recorded are historical evidence, not executable
+        work.
+        """
+        if not isinstance(route, dict):
+            return False
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        current = self._get_active_plan_step(bb)
+        try:
+            active_task_epoch = float(bb.get("task_epoch", 0.0) or 0.0)
+            route_task_epoch = float(route.get("task_epoch", 0.0) or 0.0)
+        except Exception:
+            return False
+        if require_scoped:
+            if active_task_epoch <= 0.0 or route_task_epoch <= 0.0:
+                return False
+            if abs(active_task_epoch - route_task_epoch) > 0.001:
+                return False
+        elif active_task_epoch and route_task_epoch and abs(active_task_epoch - route_task_epoch) > 0.001:
+            return False
+        if not isinstance(current, dict):
+            return True
+        active_step_id = trim(str(current.get("id", "") or ""), 40)
+        route_step_id = trim(str(route.get("plan_step_id", "") or ""), 40)
+        if not route_step_id and str(route.get("focus_kind", "") or "") == "plan_step":
+            route_step_id = trim(str(route.get("focus_id", "") or ""), 40)
+        if not route_step_id:
+            return not require_scoped
+        if active_step_id and route_step_id != active_step_id:
+            return False
+        try:
+            active_epoch = float(current.get("activated_at", 0.0) or 0.0)
+            route_epoch = float(
+                route.get("plan_step_epoch", 0.0)
+                or route.get("focus_epoch", 0.0)
+                or 0.0
+            )
+        except Exception:
+            return False
+        if require_scoped:
+            if not active_step_id or not route_step_id or active_epoch <= 0.0 or route_epoch <= 0.0:
+                return False
+            if abs(active_epoch - route_epoch) > 0.001:
+                return False
+        elif active_epoch and route_epoch and abs(active_epoch - route_epoch) > 0.001:
+            return False
+        current_subtask = self._current_plan_worker_subtask_snapshot(board=bb, role="")
+        current_subtask_id = trim(str(current_subtask.get("subtask_id", "") or ""), 100)
+        route_subtask_id = trim(str(route.get("plan_subtask_id", "") or ""), 100)
+        if current_subtask_id:
+            return bool(route_subtask_id and route_subtask_id == current_subtask_id)
+        # A scoped route with a child cannot execute while the canonical child
+        # cursor is empty (usually the acceptance row is being activated).
+        return not route_subtask_id
+
+    def _mark_agentbus_stale(self, envelope: dict, reason: str) -> None:
+        """Mark one handoff stale once so scans cannot redeliver it forever."""
+        if not isinstance(envelope, dict) or envelope.get("_stale_scope"):
+            return
+        envelope["_stale_scope"] = True
+        envelope["_stale_reason"] = trim(str(reason or "stale plan scope"), 180)
+        envelope["_stale_ts"] = float(now_ts())
+        self._emit(
+            "status",
+            {
+                "summary": (
+                    "stale AgentBus handoff discarded: "
+                    f"{trim(str(envelope.get('from', '?')), 30)}->"
+                    f"{trim(str(envelope.get('to', '?')), 30)} "
+                    f"({envelope.get('_stale_reason', 'scope mismatch')})"
+                )
+            },
+        )
+
+    def _sync_plan_route_owner(self, board: dict | None = None) -> str:
+        """Return an explicitly declared owner, if the plan declares one.
+
+        Role selection is model-driven.  This method deliberately does not
+        infer an owner from filenames, natural-language keywords, or a phase
+        table; those heuristics can route an implementation path such as
+        ``tests/`` to the reviewer.
+        """
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        step = self._get_active_plan_step(bb)
+        if not isinstance(step, dict):
+            return ""
+        for key in ("owner", "owner_role"):
+            owner = self._sanitize_agent_role(step.get(key, ""))
+            if owner in AGENT_ROLES:
+                return owner
+        return ""
+
+    def _enforce_sync_plan_route(self, route: dict | None, board: dict | None = None) -> dict:
+        """Apply only explicit plan ownership; let the Manager choose otherwise."""
+        row = dict(route or {})
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        target = self._sanitize_agent_role(row.get("target", ""))
+        if target not in AGENT_ROLES:
+            return row
+        profile = self._ensure_blackboard_task_profile(bb)
+        mode = normalize_execution_mode(
+            profile.get("execution_mode", self._effective_execution_mode()),
+            default=self._effective_execution_mode(),
+        )
+        if mode != EXECUTION_MODE_SYNC or not isinstance(self._get_active_plan_step(bb), dict):
+            return row
+        desired = self._sync_plan_route_owner(bb)
+        if desired and target != desired:
+            old_target = target
+            row["target"] = desired
+            row["is_mandatory"] = True
+            row["executor_mode"] = False
+            row["reason"] = trim(
+                f"{row.get('reason', '')}|sync-explicit-owner:{old_target}->{desired}",
+                600,
+            )
+            row["source"] = "sync-explicit-owner"
+            current = self._current_plan_worker_subtask_snapshot(board=bb, role="")
+            focus = trim(str(current.get("subtask_content", "") or ""), 400)
+            row["instruction"] = trim(
+                (
+                    f"Plan owner is explicitly set to {desired}; route this Sync turn to that owner. "
+                    f"Execute the current canonical subtask first{(': ' + focus) if focus else '.'}"
+                ),
+                MANAGER_INSTRUCTION_MAX_CHARS,
+            )
+        row.update(self._route_focus_fields(bb))
+        row.update(self._plan_subtask_route_fields(board=bb, role=""))
+        row["task_epoch"] = float(bb.get("task_epoch", 0.0) or 0.0)
+        return row
 
     def _normalize_failure_ledger(self, raw: dict) -> dict:
         fl: dict = {
@@ -47346,9 +47964,15 @@ body{padding:18px}
         self.reviewer_debug_rounds = 0
         self.reviewer_debug_context = ""
         self.active_agent_role = ""
+        # AgentBus envelopes are executable only inside the step/subtask that
+        # created them. Keep the public message history for audit/UI, but do not
+        # carry old handoffs into the next step's dispatcher.
+        self.agent_bus_messages = []
+        self.manager_routes = []
         bb.pop("failure_recovery", None)
         bb["watchdog"] = self._new_watchdog_state()
         bb["decomposition_queue"] = self._new_decomposition_queue_state()
+        bb["persisted_manager_routes"] = []
         bb["active_agent"] = ""
         bb["last_delegate"] = {
             "target": "",
@@ -48390,16 +49014,13 @@ body{padding:18px}
     def _current_plan_worker_owner(self, board: dict | None = None) -> str:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         step = self._get_active_plan_step(bb)
-        phase = self._plan_step_phase_hint(
-            str((step or {}).get("full_content", "") or (step or {}).get("content", "") or "")
-        ) if isinstance(step, dict) else ""
-        preferred = TASK_PHASE_ROUTING.get(phase, "developer")
-        # In single mode the role is only a phase contract: the configured
-        # expert remains the sole executor. In collaborative modes, the phase
-        # owner is canonical so stale active-agent state cannot assign test
-        # subtasks back to the developer who authored the change.
-        if self._is_multi_agent_mode() and preferred in {"developer", "explorer", "reviewer"}:
-            return preferred
+        if isinstance(step, dict):
+            child = self._current_plan_worker_subtask_snapshot(board=bb, role="")
+            for source in (child, step):
+                for key in ("owner", "owner_role", "assigned_expert"):
+                    owner = self._sanitize_agent_role(source.get(key, "")) if isinstance(source, dict) else ""
+                    if owner in AGENT_ROLES:
+                        return owner
         delegate = bb.get("last_delegate", {}) if isinstance(bb.get("last_delegate"), dict) else {}
         candidates = [
             str(self.active_agent_role or "").strip().lower(),
@@ -48414,7 +49035,7 @@ body{padding:18px}
                 "assigned_expert", self.runtime_assigned_expert
             )
         )
-        return assigned or preferred or "developer"
+        return assigned or "developer"
 
     def _get_plan_step_by_id(self, step_id: str, board: dict | None = None) -> dict | None:
         step_key = trim(str(step_id or "").strip(), 40)
@@ -48986,12 +49607,13 @@ body{padding:18px}
             None,
         )
         if not isinstance(current, dict):
-            return {"step_id": step_id, "subtask_id": "", "subtask_content": ""}
+            return {"step_id": step_id, "subtask_id": "", "subtask_content": "", "owner": ""}
         subtask_id = self._stable_plan_worker_subtask_id(step_id, current)
         return {
             "step_id": step_id,
             "subtask_id": subtask_id,
             "subtask_content": trim(str(current.get("content", "") or ""), 500),
+            "owner": self._sanitize_agent_role(current.get("owner", "")),
         }
 
     def _plan_subtask_route_fields(
@@ -50265,21 +50887,16 @@ body{padding:18px}
             return row
         snapshot = self._active_plan_progress_snapshot(bb)
         step_text = trim(str(snapshot.get("step_text", "") or ""), 220)
-        full_text = self._current_plan_step_full_text(bb, max_len=600)
-        phase = self._plan_step_phase_hint(full_text)
         current_subtask = trim(str(snapshot.get("current_subtask", "") or ""), 180)
         next_pending = trim(str(snapshot.get("next_pending_subtask", "") or ""), 180)
         subtasks_done = self._step_subtasks_all_completed(step)
         has_evidence = self._plan_step_has_blackboard_evidence(step, bb)
-        reviewer_available = True
         profile = self._ensure_blackboard_task_profile(bb)
-        participants = profile.get("participants", []) if isinstance(profile.get("participants"), list) else []
-        participants_norm = [self._sanitize_agent_role(x) for x in participants]
-        participants_norm = [x for x in participants_norm if x]
-        if participants_norm:
-            reviewer_available = "reviewer" in participants_norm
-        if subtasks_done and has_evidence and reviewer_available:
-            row["target"] = "reviewer"
+        if subtasks_done and has_evidence:
+            owner = self._sanitize_agent_role(row.get("target", "")) or self._current_plan_worker_owner(bb)
+            if owner not in AGENT_ROLES:
+                owner = self._sanitize_agent_role(profile.get("assigned_expert", "")) or "developer"
+            row["target"] = owner
             row["instruction"] = trim(
                 (
                     "Recovery routing after repeated identical delegation. "
@@ -50293,10 +50910,9 @@ body{padding:18px}
             row["source"] = "loop-recovery"
             row["is_mandatory"] = True
             return row
-        default_owner = "explorer" if phase in {"research", "design"} else "developer"
         owner = self._sanitize_agent_role(row.get("target", "")) or self._current_plan_worker_owner(bb)
-        if owner not in {"developer", "explorer"}:
-            owner = default_owner
+        if owner not in AGENT_ROLES:
+            owner = self._sanitize_agent_role(profile.get("assigned_expert", "")) or "developer"
         if current_subtask:
             action_text = f"Continue ONLY the current in_progress subtask: {current_subtask}."
         elif next_pending:
@@ -50309,7 +50925,7 @@ body{padding:18px}
                 " Blackboard already contains partial evidence for this step; build on that work instead of restarting."
             )
         progress_instruction = (
-            "Observable tool evidence is reconciled into the canonical subtask graph automatically; use TodoWrite only to correct structural state."
+            "Tool results are evidence, not ordinary work-status commands. After a real subtask boundary, use TodoWrite update_mode='status_update' before starting work from another row; one call may update every evidence-backed completed row and select exactly one remaining row as in_progress."
             if not self._is_multi_agent_mode()
             else "After the subtask is finished, immediately call TodoWrite to mark it completed and move the next subtask to in_progress."
         )
@@ -52171,7 +52787,7 @@ body{padding:18px}
                 "Do not route to finish_current_task while the approved plan still has unfinished steps."
             )
         tracking_rule = (
-            "Observable tool results are the authoritative progress events. The runtime records matching file/read/test evidence and may close the current subtask or acceptance gate atomically. "
+            "Observable tool results provide completion evidence but do not close ordinary work rows by themselves. After each real subtask boundary, use TodoWrite/TodoWriteRescue update_mode='status_update' before starting work from another row. If one tool round proves several rows complete, update them together in one call and keep exactly one remaining open row in_progress. The runtime may close the final acceptance row atomically only after all ordinary work rows are explicitly completed and matching acceptance evidence passes. "
             if auto_progress
             else "After EACH completed subtask, use TodoWrite/TodoWriteRescue update_mode='status_update' before starting the next one. "
         )
@@ -55457,15 +56073,38 @@ body{padding:18px}
         return [
             tool_def(
                 "route_to_next_agent",
-                "Delegate next short timeslice to explorer/developer/reviewer, or finish.",
+                (
+                    "Choose and delegate the next short timeslice after comparing the current objective, "
+                    "canonical subtask, scoped evidence, prior progress, role permissions, and useful handoffs. "
+                    "Do not infer a role from status labels, artifact counts, filenames, or keywords alone."
+                ),
                 {
-                    "target": {"type": "string", "enum": list(MANAGER_ROUTE_TARGETS)},
-                    "instruction": {"type": "string"},
+                    "target": {
+                        "type": "string",
+                        "enum": list(MANAGER_ROUTE_TARGETS),
+                        "description": (
+                            "Your autonomous role decision for this exact timeslice. It must agree with judgement "
+                            "and the action requested in instruction."
+                        ),
+                    },
+                    "instruction": {
+                        "type": "string",
+                        "description": (
+                            "One concrete, scoped action for the selected role. Preserve the active plan/subtask "
+                            "unless evidence proves a handoff or advancement is needed."
+                        ),
+                    },
                     "task_level": {"type": "integer"},
                     "task_type": {"type": "string"},
                     "complexity": {"type": "string", "enum": list(TASK_COMPLEXITY_LEVELS)},
                     "scale_preference": {"type": "string", "enum": list(TASK_SCALE_PREFERENCES)},
-                    "judgement": {"type": "string"},
+                    "judgement": {
+                        "type": "string",
+                        "description": (
+                            "Brief evidence-based reason for the target: identify the unresolved need, why this "
+                            "role can act on it now, and why another role or finish is not preferable."
+                        ),
+                    },
                     "round_budget": {"type": "integer"},
                     "direct_objective": {"type": "string"},
                     "execution_mode": {"type": "string", "enum": [EXECUTION_MODE_SINGLE, EXECUTION_MODE_SYNC]},
@@ -57058,87 +57697,32 @@ body{padding:18px}
                 "A skill-linked step is not complete until the agent has concretely entered the skill chain "
                 "by reading an entrypoint or using a skill resource/script. "
             )
-        # Add current phase routing hint
-        current_phase = self._infer_current_phase_from_blackboard()
-        if current_phase:
-            preferred = TASK_PHASE_ROUTING.get(current_phase, "developer")
-            if self._effective_execution_mode() == EXECUTION_MODE_SINGLE:
-                preferred = self._sanitize_agent_role(
-                    profile.get("assigned_expert", self.runtime_assigned_expert)
-                ) or "developer"
-            # Directive (Fix 5), not advisory: each phase has a clear owner, and the
-            # manager runs at low coordination effort now, so a soft "prefer" was too
-            # easily ignored — collapsing everything onto developer. Make the default
-            # explicit while still allowing a justified exception.
-            if preferred == "explorer":
-                lines.append(
-                    f"CURRENT PHASE: {current_phase} → route to EXPLORER for this phase. "
-                    "Research/analysis is the explorer's job: have it investigate and write "
-                    "findings to blackboard BEFORE the developer implements. Only route elsewhere "
-                    "if exploration is already complete in blackboard. "
-                )
-            elif preferred == "reviewer":
-                lines.append(
-                    f"CURRENT PHASE: {current_phase} → route to REVIEWER for this phase. "
-                    "Verification is the reviewer's job: have it run checks and issue a pass/fix "
-                    "decision. Do NOT let the developer self-approve its own work. "
-                )
-            else:
-                lines.append(
-                    f"CURRENT PHASE: {current_phase} → prefer routing to {preferred}. "
-                    f"Each phase has its own expertise — let {preferred} lead this phase independently. "
-                    "Do NOT carry over implementation patterns from previous phases. "
-                )
+        # Role choice is intentionally left to the LLM Manager.  The runtime
+        # exposes the active step, child cursor, evidence, and permissions; it
+        # does not infer an owner from prose or filenames.
+        lines.append(
+            "ROLE SELECTION: choose the best agent for the current step from the "
+            "live evidence and objective. Do not infer a role from a filename or "
+            "keyword. Keep the current child cursor in order and explain any "
+            "handoff in the route instruction. "
+        )
         todo_note = self._plan_todo_discipline_prompt(for_manager=True)
         if todo_note:
             lines.append(todo_note)
         return "\n".join(lines) + "\n"
 
     def _plan_step_phase_hint(self, step_content: str) -> str:
-        """Infer the task phase from a plan step's content."""
-        c = str(step_content or "").lower()
-        # A major plan row is a phase boundary. Classify from its title first so
-        # acceptance/test details embedded in later substeps cannot silently
-        # turn an implementation phase into a review phase (or vice versa).
-        title = next((line.strip() for line in c.splitlines() if line.strip()), c)
-        research_keywords = (
-            "研究", "分析", "调研", "探索", "检索", "搜索", "查找", "查询", "收集", "采集",
-            "整理", "提取", "资料", "数据", "排行", "资金流向", "走势", "来源", "交叉验证",
-            "research", "analyze", "investigate", "explore", "inspect", "search", "collect",
-            "gather", "retrieve", "extract", "summarize", "source", "evidence",
-        )
-        strong_impl_keywords = (
-            "实现", "开发", "编码", "代码", "函数", "组件", "模块", "着色器", "接口实现",
-            "implement", "develop", "code", "component", "module", "function", "shader",
-            "scaffold", "mkdir", ".f90", ".py", ".cpp", ".js", ".ts", ".tsx", ".jsx", ".glsl",
-        )
+        """Return only an explicit structured phase; never classify prose.
 
-        def _classify(text: str) -> str:
-            # Verification/review must win over incidental implementation words
-            # such as a filename or "code review" in a phase title.
-            if any(kw in text for kw in ("独立验收", "独立验证", "验收与审核", "审查", "评审", "review", "audit", "inspect code")):
-                return "review"
-            if any(kw in text for kw in ("测试", "单测", "回归", "验证", "驗證", "test", "pytest", "unit", "integration", "compile", "verification")):
-                return "test"
-            if any(kw in text for kw in ("部署", "发布", "deploy", "release", "publish", "配置")):
-                return "deploy"
-            if any(kw in text for kw in research_keywords):
-                return "research"
-            if any(kw in text for kw in ("设计", "架构", "规划", "design", "architect", "plan", "interface", "接口")):
-                return "design"
-            if any(kw in text for kw in strong_impl_keywords):
-                return "implement"
-            if any(kw in text for kw in ("编写", "创建", "绘制", "生成", "写入", "制作",
-                                          "write", "create", "build", "generate", "draw")):
-                return "implement"
-            return ""
-
-        title_phase = _classify(title)
-        if title_phase:
-            return title_phase
-        full_phase = _classify(c)
-        if full_phase:
-            return full_phase
+        This function remains as a compatibility seam for acceptance guidance
+        and old persisted data.  Natural-language phase inference was removed:
+        a path such as ``tests/`` is content, not a routing decision.  New plan
+        producers may pass a mapping with ``phase``/``phase_hint`` when they
+        intentionally declare one; otherwise the Manager owns the choice.
+        """
+        if isinstance(step_content, dict):
+            value = step_content.get("phase_hint", step_content.get("phase", ""))
+            return trim(str(value or "").strip().lower(), 40)
         return ""
 
     def _plan_step_acceptance_guidance(self, plan_step: dict) -> dict:
@@ -57228,25 +57812,13 @@ body{padding:18px}
         )
 
     def _infer_current_phase_from_blackboard(self) -> str:
-        """Infer the current task phase from blackboard state and active plan step."""
+        """Read an explicit phase only; do not derive it from blackboard counts."""
         bb = self._ensure_blackboard()
         for t in bb.get("project_todos", []):
             if t.get("category") == "plan_step" and t.get("status") == "in_progress":
-                phase = self._plan_step_phase_hint(str(t.get("full_content", "") or t.get("content", "") or ""))
+                phase = self._plan_step_phase_hint(t)
                 if phase:
                     return phase
-        # Fallback: infer from blackboard state
-        code_count = len(bb.get("code_artifacts", {}) or {})
-        research_count = len(bb.get("research_notes", []) or [])
-        feedback = bb.get("review_feedback", []) if isinstance(bb.get("review_feedback"), list) else []
-        if not research_count and not code_count:
-            return "research"
-        if research_count > 0 and not code_count:
-            return "design"
-        if code_count > 0 and not feedback:
-            return "implement"
-        if feedback:
-            return "review"
         return ""
 
     def _project_todo_hint_for_manager(self) -> str:
@@ -57264,7 +57836,6 @@ body{padding:18px}
             cur = pending[0]
             step_idx = int(cur.get("plan_step_index", 0) or 0) + 1
             total = len(completed) + len(pending)
-            step_content_low = str(cur.get("content", "") or "").lower()
             # Summarize blackboard evidence that may justify step completion.
             research_count = len(bb.get("research_notes", []) or [])
             code_count = len(bb.get("code_artifacts", {}) or {})
@@ -57306,32 +57877,13 @@ body{padding:18px}
                         )
             except Exception:
                 pass
-            # Build an explicit completion hint from blackboard-side evidence.
             bb_evidence_hint = ""
-            is_research_step = any(kw in step_content_low for kw in ("读取", "分析", "研究", "调研", "检索", "搜索", "查找", "查询", "收集", "采集", "提取", "整理", "数据", "排行", "资金流向", "read", "analyze", "extract", "research", "summarize", "search", "collect", "gather", "retrieve", "总结"))
-            is_implement_step = any(kw in step_content_low for kw in ("创建", "写", "生成", "制作", "implement", "create", "write", "generate", "build", "pptx", "ppt"))
-            is_test_step = any(kw in step_content_low for kw in ("测试", "验证", "test", "verify", "compile", "run"))
-            if is_research_step and research_count > 0 and not worker_hint:
+            if not worker_hint:
                 bb_evidence_hint = (
-                    f"Blackboard has {research_count} research_note(s) — "
-                    "if these were written for this step, set advance_plan_step=true. "
-                )
-            elif is_implement_step and code_count > 0 and not worker_hint:
-                bb_evidence_hint = (
-                    f"Blackboard has {code_count} code_artifact(s) — "
-                    "if these were created for this step, set advance_plan_step=true. "
-                )
-            elif is_test_step and exec_count > 0 and not worker_hint:
-                bb_evidence_hint = (
-                    f"Blackboard has {exec_count} execution_log(s) — "
-                    "if these reflect this step's test run, set advance_plan_step=true. "
-                )
-            elif is_test_step and exec_count == 0 and not worker_hint:
-                bb_evidence_hint = (
-                    "⛔ TEST STEP: no bash execution evidence found yet. "
-                    "You MUST actually run the tests (e.g. `python -m pytest`, `npm test`, `bash run_tests.sh`) "
-                    "and confirm exit code before setting advance_plan_step=true. "
-                    "Creating test files is NOT sufficient — execute them. "
+                    "Global evidence inventory (may include earlier steps): "
+                    f"research_notes={research_count}, code_artifacts={code_count}, execution_logs={exec_count}. "
+                    "Inspect scope/provenance and decide relevance yourself; counts alone do not prove this step "
+                    "is complete and do not select an agent role. "
                 )
             return (
                 f"⚠️ PLAN STEP {step_idx}/{total}: {trim(str(cur.get('content', '') or ''), 200)}. "
@@ -57346,12 +57898,10 @@ body{padding:18px}
         if not pending:
             return "All project tasks completed. Route to finish. "
         cur = pending[0]
-        cat = cur.get("category", "")
-        if cat == "compile_test":
-            return "NEXT: compile/syntax check required. Route to Developer for build. "
-        if cat == "min_test":
-            return "NEXT: minimal test required. Route to Developer to run tests. "
-        return f"NEXT: {trim(str(cur.get('content', '') or ''), 120)}. "
+        return (
+            f"NEXT unresolved task: {trim(str(cur.get('content', '') or ''), 120)}. "
+            "Manager chooses the role from live evidence and capabilities. "
+        )
 
     def _manager_system_prompt(self) -> str:
         board = self._ensure_blackboard()
@@ -57360,14 +57910,6 @@ body{padding:18px}
         budget = self._blackboard_round_budget(board)
         level = int(profile.get("task_level", self.runtime_task_level or 0) or 0)
         mode = normalize_execution_mode(profile.get("execution_mode", self._effective_execution_mode()), default=self._effective_execution_mode())
-        task_type = str(profile.get("task_type", "general") or "general").strip().lower()
-        coding_hint = ""
-        if task_type in ("simple_code", "engineering"):
-            coding_hint = (
-                "CODING TASK: skip lengthy exploration/design phases. "
-                "Route to Developer early for implementation. "
-                "Explorer should only be used for specific file/API lookups, not broad analysis. "
-            )
         project_todo_hint = self._project_todo_hint_for_manager()
         plan_context = self._plan_steps_context_for_manager()
         # If no plan steps, give manager autonomous planning ability
@@ -57377,17 +57919,16 @@ body{padding:18px}
                 "and delegate one phase at a time. Track progress via blackboard. "
                 "Each phase should use the most appropriate agent for that phase's work. "
             )
-        # Phase-aware independence hint
-        current_phase = self._infer_current_phase_from_blackboard()
-        phase_hint = ""
-        if current_phase:
-            phase_hint = (
-                f"PHASE INDEPENDENCE: Current phase is '{current_phase}'. "
-                "Each task phase has its own expertise and approach. "
-                "Do NOT force implementation patterns from previous phases onto the current one. "
-                "For research/analysis phases: let the agent think freely and use its domain knowledge. "
-                "For implementation phases: focus on concrete code output. "
-                "For test/review phases: focus on verification, not re-implementation. "
+        current_subtask = self._current_plan_worker_subtask_snapshot(board=board, role="")
+        subtask_content = trim(str(current_subtask.get("subtask_content", "") or ""), 500)
+        prior_owner = self._sanitize_agent_role(current_subtask.get("owner", ""))
+        decision_frame = ""
+        if subtask_content:
+            decision_frame = (
+                "CURRENT DECISION FOCUS:\n"
+                f"canonical_subtask={subtask_content}\n"
+                f"prior_owner={prior_owner or '(none)'} (prior assignment is evidence, not a forced route)\n"
+                "Classify what remains from the objective and scoped evidence, then choose the role yourself. "
             )
         failure_brief = self._failure_aware_brief()
         failure_hint = ""
@@ -57430,8 +57971,11 @@ body{padding:18px}
             "You are Manager in a multi-agent coding system. "
             "Read blackboard, delegate one short timeslice via route_to_next_agent. "
             f"{self._public_progress_prompt_instruction()}"
-            "Policy: missing facts->explorer, implementation->developer, verification->reviewer, "
-            "all done->finish. Set is_mandatory=true when concrete execution is required. "
+            "You own routing and phase classification. Before calling the tool, compare the unresolved objective, "
+            "canonical subtask, scoped evidence, prior attempts, permissions, and available handoffs. "
+            "Do not use a fixed status-to-role, artifact-count-to-role, filename, or keyword mapping. "
+            "Your public rationale, judgement, target, and instruction must describe one consistent decision. "
+            "Set is_mandatory=true when concrete execution is required. "
             "Role capabilities: "
             "Explorer=read-only (bash/read_file/search/blackboard, TodoWrite, NO write_file/edit_file); "
             "Developer=all tools (write_file/edit_file/bash/read_file/TodoWrite/load_skill/etc); "
@@ -57445,11 +57989,10 @@ body{padding:18px}
             "before starting the next subtask. Never assume todo progress unless the worker actually called the todo tool. "
             "For multi-phase tasks (e.g., 'analyze PDF then make PPT'), each phase must be explicitly closed in todos before the next phase begins. "
             "If the task needs skills not yet loaded, instruct the owner to call load_skill before the subtask that needs it. "
-            f"{coding_hint}"
+            f"{decision_frame}"
             f"{project_todo_hint}"
             f"{plan_context}"
             f"{todo_route_note}"
-            f"{phase_hint}"
             f"{failure_hint}"
             f"{html_hint}"
             f"{user_profile_text}"
@@ -57510,6 +58053,14 @@ body{padding:18px}
         for env in list(self.agent_bus_messages)[-72:]:
             if not isinstance(env, dict):
                 continue
+            if env.get("_fast_routed") or env.get("_stale_scope"):
+                continue
+            if not self._route_scope_matches_current_plan(env, bb, require_scoped=True):
+                self._mark_agentbus_stale(
+                    env,
+                    "handoff does not match active plan step/subtask",
+                )
+                continue
             try:
                 ts = float(env.get("ts", 0.0) or 0.0)
             except Exception:
@@ -57553,6 +58104,12 @@ body{padding:18px}
                         "payload": payload,
                         "ts": ts,
                         "needs_inclusion": bool(dst_needs_inclusion),
+                        "plan_step_id": env.get("plan_step_id", ""),
+                        "plan_step_index": env.get("plan_step_index", -1),
+                        "plan_step_total": env.get("plan_step_total", 0),
+                        "plan_step_epoch": env.get("plan_step_epoch", 0.0),
+                        "plan_subtask_id": env.get("plan_subtask_id", ""),
+                        "plan_subtask_content": env.get("plan_subtask_content", ""),
                     },
                 )
             )
@@ -57597,6 +58154,12 @@ body{padding:18px}
             "assigned_expert": assigned_expert,
             "requires_user_confirmation": bool(profile.get("requires_user_confirmation", False)),
             "is_mandatory": bool(best.get("to", "") in {"developer", "explorer"}),
+            "plan_step_id": best.get("plan_step_id", ""),
+            "plan_step_index": best.get("plan_step_index", -1),
+            "plan_step_total": best.get("plan_step_total", 0),
+            "plan_step_epoch": best.get("plan_step_epoch", 0.0),
+            "plan_subtask_id": best.get("plan_subtask_id", ""),
+            "plan_subtask_content": best.get("plan_subtask_content", ""),
         }
         meta = {
             "env_id": best.get("env_id", ""),
@@ -57607,329 +58170,82 @@ body{padding:18px}
         }
         return args, meta
 
-    def _manager_fallback_route(self) -> dict:
+    def _manager_autonomous_route_recovery(self) -> dict:
+        """Recover continuity without classifying a phase or selecting by keywords."""
         board = self._ensure_blackboard()
         latest_user_ts = self._latest_user_message_ts()
-        self._invalidate_stale_approval_if_needed(
-            board,
-            latest_user_ts=latest_user_ts,
-            emit_status=False,
-        )
-        board = self._ensure_blackboard()
-        self._reconcile_active_plan_step_before_finish(board, actor="manager", source="manager-fallback")
-        board = self._ensure_blackboard()
-        profile = self._ensure_blackboard_task_profile(board)
-        task_type = str(profile.get("task_type", "general") or "general")
-        complexity = str(profile.get("complexity", "simple") or "simple")
-        progress = self._manager_progress_state(board)
-        status = self._normalize_blackboard_status(board.get("status", "INITIALIZING"))
-        research_count = len(board.get("research_notes", []) or [])
-        code_count = len(board.get("code_artifacts", {}) or {})
-        feedback = board.get("review_feedback", []) if isinstance(board.get("review_feedback"), list) else []
-        approval = board.get("approval", {}) if isinstance(board.get("approval"), dict) else {}
         finish_gate = self._evaluate_finish_gate(board, latest_user_ts=latest_user_ts)
-        can_finish_from_approval = bool(finish_gate.get("ok", False))
-        finish_gate_reason = str(finish_gate.get("reason", "") or "")
-        has_error_log = self._manager_has_error_log(board)
-        feedback_pass = self._manager_feedback_passed_from_blackboard(board)
-        cycles = int(board.get("manager_cycles", 0) or 0)
-        summary_attempts = int(board.get("manager_summary_attempts", 0) or 0)
-        max_budget = max(1, int(getattr(self, "max_agent_rounds", MAX_AGENT_ROUNDS) or MAX_AGENT_ROUNDS))
-        # Hard guard: pending plan steps block finish — redirect to developer instead
-        pending_plan_steps = [
-            t for t in board.get("project_todos", [])
-            if t.get("category") == "plan_step" and t.get("status") != "completed"
-        ]
-        if cycles >= max_budget:
-            if pending_plan_steps:
-                # Budget exhausted but plan steps remain — continue with current step instead of finishing
-                cur = pending_plan_steps[0]
-                self._emit("status", {
-                    "summary": f"Max cycles reached but {len(pending_plan_steps)} plan steps pending; continuing."
-                })
-                return {
-                    "target": "developer",
-                    "instruction": f"Continue with plan step: {trim(str(cur.get('content', '')), 300)}",
-                    "reason": f"budget-exhausted-but-plan-steps-pending:{len(pending_plan_steps)}",
-                    "source": "fallback",
-                    "advance_plan_step": False,
-                }
-            if can_finish_from_approval:
-                return {
-                    "target": "finish",
-                    "instruction": "Maximum cycles reached and completion gates pass. Finish with final summary.",
-                    "reason": "budget-exhausted-finish-gated",
-                    "source": "fallback",
-                }
-            blocked_route = self._finish_gate_route_for_reason(finish_gate_reason, board)
-            blocked_route["reason"] = f"budget-exhausted-finish-blocked:{finish_gate_reason}"
-            blocked_route["source"] = "fallback"
-            self._emit("status", {"summary": f"Max cycles reached but finish blocked: {finish_gate_reason}"})
-            return blocked_route
-        if finish_gate_reason == "reviewer-summary-missing" and summary_attempts >= 2:
-            self._emit("status", {"summary": "Summary generation still missing; routing to synthesis instead of finish."})
-            return {
-                "target": "explorer",
-                "instruction": (
-                    "Final summary is still missing. Read blackboard evidence and write one structured "
-                    "final summary to blackboard. Do not call finish in this step."
-                ),
-                "reason": "summary-generation-timeout-synthesis",
-                "source": "fallback",
-                "is_mandatory": True,
-            }
-        if progress == "done" and can_finish_from_approval:
+        progress = self._manager_progress_state(board)
+        approval = board.get("approval", {}) if isinstance(board.get("approval"), dict) else {}
+        if bool(finish_gate.get("ok", False)) and (
+            progress == "done" or bool(approval.get("approved", False))
+        ):
             return {
                 "target": "finish",
-                "instruction": "Task already looks completed from current blackboard state.",
-                "reason": "progress-done",
-                "source": "fallback",
+                "instruction": "Completion gates pass for the current objective; finish with the evidence-backed summary.",
+                "reason": "continuity-recovery-finish-gated",
+                "source": "continuity-recovery",
+                "fallback_recovery": True,
             }
-        if bool(approval.get("approved", False)) and can_finish_from_approval:
+
+        current = self._current_plan_worker_subtask_snapshot(board=board, role="")
+        current_content = trim(str(current.get("subtask_content", "") or ""), 500)
+        current_owner = self._sanitize_agent_role(current.get("owner", ""))
+        candidates: list[dict] = []
+        last_delegate = board.get("last_delegate", {}) if isinstance(board.get("last_delegate"), dict) else {}
+        if last_delegate:
+            candidates.append(last_delegate)
+        candidates.extend(reversed(list(getattr(self, "manager_routes", []) or [])[-40:]))
+        for previous in candidates:
+            if not isinstance(previous, dict):
+                continue
+            source = str(previous.get("source", "") or "").strip().lower()
+            if source not in {"tool", "manager-momentum", "agentbus-fast", "agentbus-direct"}:
+                continue
+            target = self._sanitize_agent_role(previous.get("target", ""))
+            if target not in AGENT_ROLES:
+                continue
+            try:
+                if not self._route_scope_matches_current_plan(previous, board, require_scoped=True):
+                    continue
+            except Exception:
+                continue
+            instruction = trim(str(previous.get("instruction", "") or ""), MANAGER_INSTRUCTION_MAX_CHARS)
+            if current_content:
+                instruction = trim(
+                    f"{instruction}\nCurrent canonical subtask: {current_content}",
+                    MANAGER_INSTRUCTION_MAX_CHARS,
+                )
             return {
-                "target": "finish",
-                "instruction": "Review approved and no more actions are needed.",
-                "reason": "approval-true",
-                "source": "fallback",
+                "target": target,
+                "instruction": instruction or "Continue the current scoped objective and produce observable progress.",
+                "reason": f"continuity-recovery-last-manager-decision:{source}",
+                "source": "continuity-recovery",
+                "fallback_recovery": True,
             }
-        if bool(approval.get("approved", False)) and (not can_finish_from_approval):
-            if finish_gate_reason == "approval-stale-new-user-input":
-                return {
-                    "target": "developer",
-                    "instruction": "New user instruction arrived after previous approval; continue implementation for updated requirements.",
-                    "reason": "approval-stale-reroute",
-                    "source": "fallback",
-                }
-            if finish_gate_reason == "reviewer-summary-missing":
-                next_attempt = summary_attempts + 1
-                board["manager_summary_attempts"] = next_attempt
-                self.blackboard = board
-                if next_attempt >= 2:
-                    return {
-                        "target": "explorer",
-                        "instruction": (
-                            "Reviewer summary is still missing. Read blackboard sections "
-                            "(code_artifacts, execution_logs, review_feedback, status) and write one structured "
-                            "final summary to blackboard (changes, validation evidence, residual risks/next steps). "
-                            "Do not call finish tool in this step."
-                        ),
-                        "reason": "approval-missing-summary-handoff-explorer",
-                        "source": "fallback",
-                        "is_mandatory": True,
-                    }
-                return {
-                    "target": "reviewer",
-                    "instruction": (
-                        "Review approved but final summary required. First call read_from_blackboard for "
-                        "code_artifacts/execution_logs/review_feedback/status, then call finish_task with summary "
-                        "including changes, validation evidence, and residual risks/next steps."
-                    ),
-                    "reason": "approval-missing-reviewer-summary-request",
-                    "source": "fallback",
-                    "is_mandatory": True,
-                }
-            if finish_gate_reason == "blocking-error-log":
-                return {
-                    "target": "explorer",
-                    "instruction": "Review is present but blocked by runtime errors. Analyze latest execution log and propose concrete fix.",
-                    "reason": "approval-blocked-by-error",
-                    "source": "fallback",
-                }
-            if finish_gate_reason.startswith("project-todo-incomplete:"):
-                missing_cat = finish_gate_reason.split(":", 1)[-1] if ":" in finish_gate_reason else ""
-                if missing_cat == "compile_test":
-                    return {
-                        "target": "developer",
-                        "instruction": "编译/语法检查尚未完成。请编译项目并确认无错误。",
-                        "reason": "project-todo-compile-pending",
-                        "source": "fallback",
-                        "is_mandatory": True,
-                    }
-                if missing_cat == "min_test":
-                    return {
-                        "target": "developer",
-                        "instruction": "最小功能测试尚未完成。请运行基本测试验证核心功能。",
-                        "reason": "project-todo-test-pending",
-                        "source": "fallback",
-                        "is_mandatory": True,
-                    }
-            if (
-                finish_gate_reason.startswith("plan-steps-incomplete:")
-                or finish_gate_reason.startswith("worker-todo-pending:")
-                or finish_gate_reason == "sync-review-missing"
-            ):
-                blocked_route = self._finish_gate_route_for_reason(finish_gate_reason, board)
-                blocked_route["source"] = "fallback"
-                return blocked_route
-        if task_type == "simple_qa":
-            dev_text = self._latest_agent_assistant_text("developer", min_ts=latest_user_ts)
-            if dev_text:
-                done_probe = self._detect_endpoint_intent(dev_text, None)
-                if bool(done_probe.get("matched", False)):
-                    return {
-                        "target": "finish",
-                        "instruction": "Simple question already answered clearly; stop now.",
-                        "reason": "simple-qa-answered",
-                        "source": "fallback",
-                    }
-            return {
-                "target": "developer",
-                "instruction": (
-                    "Answer user question directly with concise final text. "
-                    "Do not create/edit files unless explicitly requested."
-                ),
-                "reason": "simple-qa-direct-answer",
-                "source": "fallback",
-            }
-        # General endpoint detection: non-simple_qa developer conclusions may also finish the run.
-        if task_type != "simple_qa":
-            dev_text = self._latest_agent_assistant_text("developer", min_ts=latest_user_ts)
-            if dev_text:
-                done_probe = self._detect_endpoint_intent(dev_text, None)
-                if bool(done_probe.get("matched", False)) and not has_error_log:
-                    return {
-                        "target": "finish",
-                        "instruction": "Developer has provided a conclusive response; stop now.",
-                        "reason": "general-endpoint-detected",
-                        "source": "fallback",
-                    }
-        # General guard: if the latest agent reply is conclusive and no todos remain, finish immediately.
-        if not has_error_log:
-            for _role in ("developer", "explorer", "reviewer"):
-                _last = self._latest_agent_assistant_text(_role, min_ts=latest_user_ts)
-                if _last and self._looks_like_conclusive_reply(_last) and not self.todo.has_open_items():
-                    return {
-                        "target": "finish",
-                        "instruction": "Agent already provided a conclusive reply with no open tasks; stop now.",
-                        "reason": "conclusive-reply-detected",
-                        "source": "fallback",
-                    }
-        if task_complexity_rank(complexity) <= task_complexity_rank("moderate") and task_type == "simple_code":
-            if has_error_log:
-                return {
-                    "target": "developer",
-                    "instruction": "Fix the latest concrete runtime/tool error and verify once.",
-                    "reason": "simple-code-error-fix",
-                    "source": "fallback",
-                }
-            if code_count <= 0:
-                return {
-                    "target": "developer",
-                    "instruction": "Implement the minimal code change needed for the request.",
-                    "reason": "simple-code-implement",
-                    "source": "fallback",
-                }
-            if feedback_pass and can_finish_from_approval:
-                return {
-                    "target": "finish",
-                    "instruction": "Quick review passed for simple code task; finish now.",
-                    "reason": "simple-code-pass",
-                    "source": "fallback",
-                }
-            if feedback_pass and (not can_finish_from_approval):
-                if finish_gate_reason == "reviewer-summary-missing":
-                    board["manager_summary_attempts"] = summary_attempts + 1
-                    self.blackboard = board
-                    return {
-                        "target": "reviewer",
-                        "instruction": (
-                            "Quick review passed but final summary is missing. Produce concise final summary "
-                            "covering changed files and validation evidence, then finish."
-                        ),
-                        "reason": "simple-code-summary-request",
-                        "source": "fallback",
-                        "is_mandatory": True,
-                    }
-                return {
-                    "target": "reviewer",
-                    "instruction": "Re-check latest implementation against newest user requirements and provide fresh pass/fix verdict.",
-                    "reason": "simple-code-pass-stale-approval",
-                    "source": "fallback",
-                }
-            return {
-                "target": "reviewer",
-                "instruction": "Run one quick validation and output pass/fix verdict with evidence.",
-                "reason": "simple-code-review",
-                "source": "fallback",
-            }
-        if feedback_pass and code_count > 0 and can_finish_from_approval:
-            return {
-                "target": "finish",
-                "instruction": "Reviewer already approved. End this run.",
-                "reason": "feedback-pass",
-                "source": "fallback",
-            }
-        if feedback_pass and code_count > 0 and (not can_finish_from_approval):
-            if finish_gate_reason == "reviewer-summary-missing":
-                board["manager_summary_attempts"] = summary_attempts + 1
-                self.blackboard = board
-                return {
-                    "target": "reviewer",
-                    "instruction": (
-                        "Review passed but final summary is still missing. Produce final summary covering "
-                        "what changed, validation evidence, and residual risks/next steps, then finish."
-                    ),
-                    "reason": "feedback-pass-summary-request",
-                    "source": "fallback",
-                    "is_mandatory": True,
-                }
-            return {
-                "target": "reviewer",
-                "instruction": "Approval evidence is stale for the latest user turn; run a fresh review and give pass/fix with evidence.",
-                "reason": "feedback-pass-stale-approval",
-                "source": "fallback",
-            }
-        if research_count == 0:
-            return {
-                "target": "explorer",
-                "instruction": "Inspect repository and gather required APIs/constraints before coding.",
-                "reason": "missing-research",
-                "source": "fallback",
-            }
-        if has_error_log and status in {"CODING", "TESTING", "REVIEWING"}:
-            return {
-                "target": "explorer",
-                "instruction": "Analyze latest execution error log and provide a concrete fix strategy.",
-                "reason": "execution-error",
-                "source": "fallback",
-            }
-        if code_count == 0:
-            return {
-                "target": "developer",
-                "instruction": "Implement the first executable version based on current research notes.",
-                "reason": "missing-code",
-                "source": "fallback",
-            }
-        if feedback and (not feedback_pass):
-            return {
-                "target": "developer",
-                "instruction": "Address review feedback with concrete code changes and rerun checks.",
-                "reason": "feedback-fix",
-                "source": "fallback",
-            }
-        if status in {"CODING", "TESTING"}:
-            return {
-                "target": "reviewer",
-                "instruction": "Review current implementation, run validation, and report pass/fix with evidence.",
-                "reason": "need-review",
-                "source": "fallback",
-            }
-        if cycles > 10 and (code_count > 0 or research_count > 0) and can_finish_from_approval:
-            return {
-                "target": "finish",
-                "instruction": (
-                    "Task has produced outputs but no explicit completion condition met. "
-                    "Completion gates pass; generate final summary and finish."
-                ),
-                "reason": "fallback-progress-finish-gated",
-                "source": "fallback",
-            }
+
+        profile = self._ensure_blackboard_task_profile(board)
+        target = current_owner or self._sanitize_agent_role(profile.get("assigned_expert", "")) or "developer"
         return {
-            "target": "developer",
-            "instruction": "Continue implementation and produce concrete file/tool changes.",
-            "reason": "default-developer",
-            "source": "fallback",
+            "target": target,
+            "instruction": (
+                "Continue the current canonical subtask and produce observable progress."
+                + (f"\nCurrent canonical subtask: {current_content}" if current_content else "")
+            ),
+            "reason": (
+                "continuity-recovery-explicit-owner"
+                if current_owner
+                else "continuity-recovery-manager-assigned-expert"
+            ),
+            "source": "continuity-recovery",
+            "fallback_recovery": True,
         }
+
+    def _manager_fallback_route(self) -> dict:
+        # Compatibility entrypoint. Recovery preserves prior Manager decisions or
+        # explicit assignments; it never classifies work from status/artifact text.
+        return self._manager_autonomous_route_recovery()
+
 
     def _manager_apply_anti_stall(self, route: dict) -> dict:
         row = dict(route or {})
@@ -57938,7 +58254,6 @@ body{padding:18px}
         if str(row.get("task_type", "") or "").strip().lower() == "simple_qa":
             return row
         target = str(row.get("target", "") or "").strip().lower()
-        task_type_low = str(row.get("task_type", "") or "").strip().lower()
         # 5a: Merge in-memory routes with persisted routes for detection
         bb_for_routes = self._ensure_blackboard()
         current_progress_fp = self._watchdog_state_fingerprint(bb_for_routes)
@@ -57948,7 +58263,11 @@ body{padding:18px}
         persisted_routes = bb_for_routes.get("persisted_manager_routes", [])
         if not isinstance(persisted_routes, list):
             persisted_routes = []
-        merged_routes = list(persisted_routes) + list(self.manager_routes)
+        merged_routes = [
+            row for row in (list(persisted_routes) + list(self.manager_routes))
+            if isinstance(row, dict)
+            and self._route_scope_matches_current_plan(row, bb_for_routes, require_scoped=True)
+        ]
         # 5b: Delegation repetition detection from failure_ledger
         fl = bb_for_routes.get("failure_ledger", {})
         if isinstance(fl, dict):
@@ -57968,90 +58287,25 @@ body{padding:18px}
                     row["reason"] = trim(f"{row.get('reason', '')}|anti-stall-repeated-delegation", 600)
                     row["source"] = "anti-stall"
                     return row
-        if task_type_low in ("simple_code", "engineering") and target == "explorer":
-            board = bb_for_routes
-            progress = self._manager_progress_state(board)
-            if progress in ("initializing", "in_progress"):
-                explorer_count = sum(
-                    1 for x in merged_routes[-8:]
-                    if str(x.get("target", "") or "").strip().lower() == "explorer"
-                )
-                if explorer_count >= EXPLORER_CODING_CAP:
-                    row["target"] = "developer"
-                    row["instruction"] = (
-                        "Coding task: Explorer has been used enough. "
-                        "Start implementation now using write_file/edit_file."
-                    )
-                    row["reason"] = f"{row.get('reason', '')}|coding-fast-track->developer"
-                    row["source"] = "anti-stall"
-                    return row
         if target not in AGENT_ROLES:
             return row
         recent = [str(x.get("target", "") or "").strip().lower() for x in merged_routes[-4:]]
         if no_progress_since_last_delegate and len(recent) >= 3 and recent[-1] == target and recent[-2] == target and recent[-3] == target:
-            board = bb_for_routes
-            low_reason = str(row.get("reason", "") or "").strip().lower()
-            if "summary" in low_reason and len(board.get("code_artifacts", {}) or {}) > 0:
-                row["target"] = "reviewer"
-                row["instruction"] = (
-                    "Summary generation loop detected. Read blackboard evidence and produce one concise "
-                    "structured final summary with changes, validation, and residual risks. "
-                    "Only call finish_task if completion gates are satisfied."
-                )
-                row["reason"] = f"{row.get('reason', '')}|anti-stall-summary-loop-reviewer"
-                row["source"] = "anti-stall"
-                row["is_mandatory"] = True
-                return row
-            if target != "reviewer" and len(board.get("code_artifacts", {}) or {}) > 0:
-                row["target"] = "reviewer"
-                row["instruction"] = "Parallel-check current changes and provide immediate fix/pass guidance."
-                row["reason"] = f"{row.get('reason', '')}|anti-stall->reviewer"
-            elif target != "developer":
-                row["target"] = "developer"
-                row["instruction"] = "Execute one concrete implementation step using tools now."
-                row["reason"] = f"{row.get('reason', '')}|anti-stall->developer"
-            else:
-                # Developer stuck — check if errors/edit failures exist
-                has_edit_fails = bool(self.developer_edit_fail_streaks)
-                has_errors = self._manager_has_error_log(bb_for_routes)
-                if has_errors or has_edit_fails:
-                    error_ctx = self._recent_error_context(400)
-                    if has_edit_fails:
-                        stuck_files = ", ".join(list(self.developer_edit_fail_streaks.keys())[:3])
-                        error_ctx = f"Edit failures on: {stuck_files}. {error_ctx}"
-                    self._activate_reviewer_debug_mode(error_ctx)
-                    row["target"] = "reviewer"
-                    row["instruction"] = (
-                        "Developer stuck with errors. DEBUG MODE: diagnose and fix directly. "
-                        f"Context: {trim(error_ctx, 400)}"
-                    )
-                    row["reason"] = f"{row.get('reason', '')}|anti-stall->reviewer-debug"
-                else:
-                    row["target"] = "developer"
-                    row["instruction"] = (
-                        "You have been working on this for multiple rounds without visible progress. Consider: "
-                        "1) Use ask_colleague to request help from another agent. "
-                        "2) Try a completely different tool or approach. "
-                        "3) If the current subtask is complete, update TodoWrite and continue the current plan step. "
-                        "Do not call finish_current_task unless the overall user task is truly complete."
-                    )
-                    row["reason"] = f"{row.get('reason', '')}|anti-stall->developer-suggest"
+            error_ctx = self._recent_error_context(400) if self._manager_has_error_log(bb_for_routes) else ""
+            row["instruction"] = trim(
+                f"{row.get('instruction', '')}\n"
+                "No observable progress was recorded for this role across repeated turns. "
+                "Reassess the scoped evidence and take a materially different concrete action, or use "
+                "ask_colleague with a precise handoff. The runtime is not changing the Manager-selected role."
+                + (f"\nRecent error evidence: {error_ctx}" if error_ctx else ""),
+                MANAGER_INSTRUCTION_MAX_CHARS,
+            )
+            row["reason"] = f"{row.get('reason', '')}|anti-stall-preserve-manager-role"
             row["source"] = "anti-stall"
             return row
         if no_progress_since_last_delegate and len(recent) == 4 and recent[0] == recent[2] and recent[1] == recent[3] and recent[0] != recent[1]:
-            board = bb_for_routes
-            if len(board.get("code_artifacts", {}) or {}) > 0:
-                finish_gate = self._evaluate_finish_gate(board)
-                if bool(finish_gate.get("ok", False)):
-                    row["target"] = "finish"
-                    row["instruction"] = "Oscillation detected with existing outputs and completion gates pass; finish now."
-                    row["reason"] = f"{row.get('reason', '')}|anti-stall-oscillation-finish"
-                    row["source"] = "anti-stall"
-                else:
-                    blocked = self._finish_gate_route_for_reason(str(finish_gate.get("reason", "") or ""), board)
-                    row.update(blocked)
-                    row["reason"] = f"{row.get('reason', '')}|anti-stall-oscillation-blocked"
-                return row
+            row["reason"] = f"{row.get('reason', '')}|anti-stall-oscillation-observed"
+            row["source"] = "anti-stall"
         if int(self.stall_severity_score or 0) >= STALL_SEVERITY_ESCALATION_THRESHOLD:
             row["stall_plan_escalation"] = True
         return row
@@ -58074,9 +58328,12 @@ body{padding:18px}
         default_complexity = str(profile.get("complexity", "simple") or "simple")
         progress = self._manager_progress_state(board)
         try:
-            task_level = int(row.get("task_level", profile.get("task_level", self.runtime_task_level or 3)) or 3)
+            raw_task_level = row.get("task_level", None)
+            if raw_task_level in (None, "", 0, "0"):
+                raw_task_level = profile.get("task_level", self.runtime_task_level or 3)
+            task_level = int(raw_task_level or 3)
         except Exception:
-            task_level = 3
+            task_level = int(profile.get("task_level", self.runtime_task_level or 3) or 3)
         if task_level not in TASK_LEVEL_CHOICES:
             task_level = int(profile.get("task_level", 3) or 3)
             if task_level not in TASK_LEVEL_CHOICES:
@@ -58118,13 +58375,12 @@ body{padding:18px}
         if target not in MANAGER_ROUTE_TARGETS:
             target = assigned_expert if mode == EXECUTION_MODE_SINGLE else "developer"
         if target in AGENT_ROLES and target not in participants:
-            if executor_mode_flag:
-                if len(participants) < 3:
-                    participants.append(target)
-                else:
-                    participants[-1] = target
+            if mode == EXECUTION_MODE_SINGLE:
+                target = assigned_expert
+            elif len(participants) < 3:
+                participants.append(target)
             else:
-                target = participants[0]
+                participants[-1] = target
         # Single-mode hard rule: regardless of executor_mode_flag, only assigned_expert may act.
         if mode == EXECUTION_MODE_SINGLE:
             participants = [assigned_expert]
@@ -58155,6 +58411,19 @@ body{padding:18px}
             except Exception:
                 budget_raw = int(level_policy.get("round_budget", profile.get("round_budget", max_budget)) or max_budget)
             round_budget = max(1, min(max_budget, budget_raw))
+        # An approved plan owns its execution budget. A manager model may omit
+        # this field or emit a tiny per-call budget, but that must not silently
+        # downgrade an L4/L5 run and make the HUD alternate between finite and
+        # unlimited values. Scale preferences may still adjust the profile's
+        # budget; they cannot reduce a single route below that durable floor.
+        plan_budget_floor = 0
+        if isinstance(self._get_active_plan_step(board), dict):
+            try:
+                plan_budget_floor = int(profile.get("round_budget", 0) or 0)
+            except Exception:
+                plan_budget_floor = 0
+        if plan_budget_floor > 0:
+            round_budget = max(round_budget, min(max_budget, plan_budget_floor))
         if scale_preference == "fast":
             if int(round_budget) > 0:
                 round_budget = max(1, int(round(round_budget * 0.6)))
@@ -58170,6 +58439,13 @@ body{padding:18px}
                     participants.append("reviewer")
                 else:
                     participants[-1] = "reviewer"
+        if mode != EXECUTION_MODE_SINGLE and target in AGENT_ROLES and target not in participants:
+            if len(participants) < 3:
+                participants.append(target)
+            else:
+                participants[-1] = target
+        if plan_budget_floor > 0:
+            round_budget = max(round_budget, min(max_budget, plan_budget_floor))
         cycles = int(board.get("manager_cycles", 0) or 0)
         remaining = -1 if int(round_budget) <= 0 else max(0, int(round_budget) - cycles)
         finish_gate = self._evaluate_finish_gate(board, latest_user_ts=latest_user_ts)
@@ -58403,20 +58679,43 @@ body{padding:18px}
         )
         return row
 
-    def _manager_route_from_response(self, text: str, tool_calls: list[dict]) -> dict:
-        parsed: dict | None = None
-        for tc in tool_calls or []:
-            fn = tc.get("function", {}) if isinstance(tc, dict) else {}
-            name = str(fn.get("name", "") or "").strip()
+    def _manager_parse_route_tool_calls(self, tool_calls: list[dict] | None) -> tuple[dict | None, dict]:
+        diagnostics: dict = {
+            "tool_call_count": len(tool_calls or []),
+            "route_call_count": 0,
+            "tool_names": [],
+            "errors": [],
+        }
+        for index, tc in enumerate(tool_calls or []):
+            if not isinstance(tc, dict):
+                diagnostics["errors"].append(f"tool[{index}]:not-object")
+                continue
+            fn = tc.get("function", {}) if isinstance(tc.get("function", {}), dict) else {}
+            name = str(fn.get("name", "") or "").strip().lower()
+            if name:
+                diagnostics["tool_names"].append(trim(name, 80))
             if name not in {"route_to_next_agent", "routetonext_agent"}:
                 continue
-            args = fn.get("arguments", {}) if isinstance(fn, dict) else {}
+            diagnostics["route_call_count"] += 1
+            args = fn.get("arguments", {})
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    diagnostics["errors"].append(
+                        f"route[{index}]:invalid-json:{type(exc).__name__}"
+                    )
+                    continue
             if not isinstance(args, dict):
+                diagnostics["errors"].append(f"route[{index}]:arguments-not-object")
                 continue
             target = str(args.get("target", "") or "").strip().lower()
-            instruction = trim(str(args.get("instruction", "") or "").strip(), MANAGER_INSTRUCTION_MAX_CHARS)
             if target not in MANAGER_ROUTE_TARGETS:
+                diagnostics["errors"].append(
+                    f"route[{index}]:invalid-target:{trim(target or '<empty>', 40)}"
+                )
                 continue
+            instruction = trim(str(args.get("instruction", "") or "").strip(), MANAGER_INSTRUCTION_MAX_CHARS)
             parsed = {
                 "target": target,
                 "instruction": instruction
@@ -58435,18 +58734,66 @@ body{padding:18px}
                 "executor_mode": _to_bool_like(args.get("executor_mode", False), default=False),
                 "advance_plan_step": _to_bool_like(args.get("advance_plan_step", False), default=False),
                 "round_budget": args.get("round_budget", 0),
-                "reason": trim(str(text or "").strip(), 600),
+                "reason": "",
                 "source": "tool",
             }
-            break
+            diagnostics["selected_target"] = target
+            diagnostics["valid"] = True
+            return parsed, diagnostics
+        diagnostics["valid"] = False
+        if not diagnostics["errors"]:
+            diagnostics["errors"].append(
+                "missing-route-tool" if not diagnostics["route_call_count"] else "no-valid-route"
+            )
+        return None, diagnostics
+
+    def _manager_route_from_response(self, text: str, tool_calls: list[dict]) -> dict:
+        parsed, diagnostics = self._manager_parse_route_tool_calls(tool_calls)
+        if parsed is not None:
+            parsed["reason"] = trim(str(text or "").strip(), 600)
         if parsed is None:
             parsed = self._manager_fallback_route()
+            parsed["fallback_recovery"] = True
+            parsed["parse_failure"] = trim(";".join(diagnostics.get("errors", [])), 300)
+            parsed["manager_prose"] = trim(str(text or "").strip(), 600)
             if str(text or "").strip():
-                parsed["reason"] = trim(str(text or "").strip(), 600)
+                parsed["reason"] = trim(
+                    f"{parsed.get('reason', '')}|manager-prose:{str(text or '').strip()}",
+                    600,
+                )
+            board = self._ensure_blackboard()
+            history = board.get("manager_route_diagnostics", [])
+            if not isinstance(history, list):
+                history = []
+            history.append({
+                "ts": float(now_ts()),
+                "valid": False,
+                "tool_call_count": int(diagnostics.get("tool_call_count", 0) or 0),
+                "route_call_count": int(diagnostics.get("route_call_count", 0) or 0),
+                "tool_names": list(diagnostics.get("tool_names", []))[:12],
+                "errors": list(diagnostics.get("errors", []))[:12],
+                "manager_prose": trim(str(text or "").strip(), 600),
+                "fallback_target": str(parsed.get("target", "") or ""),
+                "fallback_reason": trim(str(parsed.get("reason", "") or ""), 600),
+            })
+            board["manager_route_diagnostics"] = history[-40:]
+            self.blackboard = board
+            self._emit(
+                "status",
+                {
+                    "summary": (
+                        "manager route recovery used after invalid structured output: "
+                        f"{parsed.get('parse_failure', 'unknown parse failure')}; "
+                        f"fallback={parsed.get('target', '?')}"
+                    )
+                },
+            )
         parsed = self._manager_apply_anti_stall(parsed)
         parsed = self._manager_apply_task_policy(parsed)
         if str(parsed.get("target", "") or "") in AGENT_ROLES:
-            parsed = self._align_route_with_current_plan_step(parsed, self._ensure_blackboard())
+            board = self._ensure_blackboard()
+            parsed = self._align_route_with_current_plan_step(parsed, board)
+            parsed = self._enforce_sync_plan_route(parsed, board)
         return parsed
 
     def _manager_coordination_context_for_delegate(
@@ -58863,7 +59210,11 @@ body{padding:18px}
             emit_status=True,
         ):
             board = self._ensure_blackboard()
-        board["manager_cycles"] = int(board.get("manager_cycles", 0) or 0) + 1
+        # In Sync the outer worker loop owns the monotonic dispatch counter so
+        # momentum/AgentBus rounds and manager rounds consume the same budget.
+        # Keep the increment here for direct manager calls and legacy paths.
+        if not bool(getattr(self, "_sync_round_tick_active", False)):
+            board["manager_cycles"] = int(board.get("manager_cycles", 0) or 0) + 1
         text = ""
         tool_calls: list[dict] = []
         used_watchdog_executor = False
@@ -59018,6 +59369,67 @@ body{padding:18px}
                 text, text_filter_meta = self._sanitize_assistant_text_for_runtime(text, tool_calls)
                 if bool(text_filter_meta.get("filtered", False)) and str(text_filter_meta.get("reason", "")) == "oversized_raw_toolcall":
                     self._inject_toolcall_overflow_hint("manager")
+                route_probe, route_probe_diag = self._manager_parse_route_tool_calls(tool_calls)
+                if route_probe is None:
+                    parse_failure = trim(
+                        ";".join(route_probe_diag.get("errors", [])) or "missing-route-tool",
+                        300,
+                    )
+                    self._emit(
+                        "status",
+                        {
+                            "summary": (
+                                "manager structured route was invalid; asking the same Manager "
+                                f"to restate its own decision once ({parse_failure})"
+                            )
+                        },
+                    )
+                    repair_prompt = (
+                        "Your preceding routing response was not structurally actionable. "
+                        f"Parser result: {parse_failure}.\n"
+                        "Preserve your own intended next action and role choice; do not invent a new phase. "
+                        "Return exactly one valid route_to_next_agent tool call now.\n"
+                        f"Your preceding public reasoning, if any:\n{trim(text, 600) or '(none)'}"
+                    )
+                    self._append_manager_context({
+                        "role": "user",
+                        "content": repair_prompt,
+                        "ts": now_ts(),
+                    })
+                    with self.lock:
+                        self.current_phase = "manager:route-repair"
+                        self.current_tool_name = ""
+                        self.active_agent_role = "manager"
+                    repair_response = self._chat_with_same_model_retry(
+                        self.manager_context,
+                        tools=self._manager_route_tools(),
+                        system=self._manager_system_prompt(),
+                        max_tokens=600,
+                        think=False,
+                        stream_thinking=False,
+                        on_thinking_chunk=self._append_live_thinking,
+                        pinned_selection=pinned_selection,
+                        context_label="manager route repair",
+                        retries=max(1, int(MODEL_OUTPUT_RETRY_TIMES)),
+                        media_inputs=media_inputs_round,
+                        coordination=True,
+                    )
+                    repair_text = str(repair_response.get("content") or "")
+                    repair_tool_calls = repair_response.get("tool_calls", [])
+                    repair_text, repair_filter_meta = self._sanitize_assistant_text_for_runtime(
+                        repair_text,
+                        repair_tool_calls,
+                    )
+                    if bool(repair_filter_meta.get("filtered", False)) and str(repair_filter_meta.get("reason", "")) == "oversized_raw_toolcall":
+                        self._inject_toolcall_overflow_hint("manager")
+                    repaired_route, _repair_diag = self._manager_parse_route_tool_calls(repair_tool_calls)
+                    if repaired_route is not None:
+                        text = repair_text or text
+                        tool_calls = repair_tool_calls
+                    else:
+                        text = repair_text or text
+                        if repair_tool_calls:
+                            tool_calls = repair_tool_calls
                 if tool_calls and not text.strip():
                     text = self._public_tool_progress_summary(tool_calls, role="manager")
                 assistant = {"role": "assistant", "content": text, "ts": now_ts()}
@@ -59206,6 +59618,8 @@ body{padding:18px}
             "assigned_expert": assigned_expert,
             "is_mandatory": bool(route.get("is_mandatory", False)),
             "executor_mode": bool(route.get("executor_mode", False)),
+            "fallback_recovery": bool(route.get("fallback_recovery", False)),
+            "parse_failure": trim(str(route.get("parse_failure", "") or ""), 300),
             "requires_user_confirmation": bool(route.get("requires_user_confirmation", False)),
             "round_budget": int(round_budget),
             "remaining_rounds": int(remaining_rounds),
@@ -59215,6 +59629,7 @@ body{padding:18px}
             board=board,
             role="" if isinstance(self._current_plan_step_row(board), dict) else target,
         ))
+        route_row["task_epoch"] = float(board.get("task_epoch", 0.0) or 0.0)
         if target in AGENT_ROLES:
             route_row["coordination_context"] = self._manager_coordination_context_for_delegate(
                 target,
@@ -59359,6 +59774,8 @@ body{padding:18px}
             "ts": float(now_ts()),
             "focus_id": str(route_row.get("focus_id", "") or ""),
             "plan_step_id": str(route_row.get("plan_step_id", "") or ""),
+            "source": str(route_row.get("source", "") or ""),
+            "fallback_recovery": bool(route_row.get("fallback_recovery", False)),
         })
         board["persisted_manager_routes"] = persisted_routes[-PERSISTED_ROUTES_MAX:]
         self.blackboard = board
@@ -61321,6 +61738,11 @@ body{padding:18px}
         dst = self._sanitize_agent_role(to_role)
         if not src or not dst:
             raise ValueError("invalid agent roles for bus envelope")
+        _bb = self._ensure_blackboard()
+        _scope = self._route_focus_fields(_bb)
+        _scope.update(self._plan_subtask_route_fields(board=_bb, role=""))
+        _scope["task_epoch"] = float(_bb.get("task_epoch", 0.0) or 0.0)
+        _scope["plan_step_cursor"] = int(_bb.get("plan_step_cursor", 0) or 0)
         envelope = {
             "id": make_id("agentmsg"),
             "ts": now_ts(),
@@ -61330,6 +61752,7 @@ body{padding:18px}
             "payload": trim(str(payload or "").strip(), 4000),
             "importance": str(importance or "normal").strip().lower() or "normal",
         }
+        envelope.update(_scope)
         self.agent_bus_messages.append(envelope)
         self.agent_bus_messages = self.agent_bus_messages[-240:]
         language_note = self._agent_language_policy_note()
@@ -61339,7 +61762,6 @@ body{padding:18px}
         # instead of relying on the sender copying its work into the payload. This
         # is what turns the per-role split from a liability into the blackboard-bus
         # advantage: small contexts + addressable shared evidence that never gets lost.
-        _bb = self._ensure_blackboard()
         anchor = self._handoff_mainline_anchor(_bb)
         manifest = ""
         try:
@@ -61433,7 +61855,17 @@ body{padding:18px}
             for env in reversed(self.agent_bus_messages[-20:]):
                 if not isinstance(env, dict):
                     continue
-                if env.get("_fast_routed"):
+                if env.get("_fast_routed") or env.get("_stale_scope"):
+                    continue
+                if not self._route_scope_matches_current_plan(
+                    env,
+                    self._ensure_blackboard(),
+                    require_scoped=True,
+                ):
+                    self._mark_agentbus_stale(
+                        env,
+                        "handoff does not match active plan step/subtask",
+                    )
                     continue
                 intent = str(env.get("intent", "") or "").strip().lower() or "message"
                 if require_preferred and intent not in preferred_intents:
@@ -61473,6 +61905,12 @@ body{padding:18px}
             "intent": intent,
             "from": from_role,
             "env_id": env.get("id", ""),
+            "plan_step_id": env.get("plan_step_id", ""),
+            "plan_step_index": env.get("plan_step_index", -1),
+            "plan_step_total": env.get("plan_step_total", 0),
+            "plan_step_epoch": env.get("plan_step_epoch", 0.0),
+            "plan_subtask_id": env.get("plan_subtask_id", ""),
+            "plan_subtask_content": env.get("plan_subtask_content", ""),
         }
 
     def _drain_agentbus_undelivered_backstop(self, *, min_age: float = 180.0, max_age: float = 1800.0) -> dict | None:
@@ -61491,7 +61929,17 @@ body{padding:18px}
         for env in reversed(self.agent_bus_messages[-60:]):
             if not isinstance(env, dict):
                 continue
-            if env.get("_fast_routed"):
+            if env.get("_fast_routed") or env.get("_stale_scope"):
+                continue
+            if not self._route_scope_matches_current_plan(
+                env,
+                self._ensure_blackboard(),
+                require_scoped=True,
+            ):
+                self._mark_agentbus_stale(
+                    env,
+                    "handoff does not match active plan step/subtask",
+                )
                 continue
             to_role = self._sanitize_agent_role(env.get("to", ""))
             if not to_role or to_role not in AGENT_ROLES:
@@ -61523,6 +61971,12 @@ body{padding:18px}
                 "intent": intent,
                 "from": from_role,
                 "env_id": env.get("id", ""),
+                "plan_step_id": env.get("plan_step_id", ""),
+                "plan_step_index": env.get("plan_step_index", -1),
+                "plan_step_total": env.get("plan_step_total", 0),
+                "plan_step_epoch": env.get("plan_step_epoch", 0.0),
+                "plan_subtask_id": env.get("plan_subtask_id", ""),
+                "plan_subtask_content": env.get("plan_subtask_content", ""),
             }
         return None
 
@@ -62065,6 +62519,7 @@ body{padding:18px}
 
         normalized: list[object] = []
         explicit_active = False
+        explicit_status = False
         pending_positions: list[int] = []
         for item in items:
             if isinstance(item, dict):
@@ -62099,6 +62554,22 @@ body{padding:18px}
                 if parsed_status and str(raw_status or "").strip().lower() in {"", "todo", "pending"}:
                     status = parsed_status
                 normalized.append(row)
+                # A complete row snapshot is authoritative. In particular,
+                # do not let a legacy cursor rewrite an explicitly pending
+                # row when the same payload also marks several siblings
+                # completed. This was the source of apparent jumpy progress
+                # in both Single+Plan and Sync+Plan.
+                explicit_status = explicit_status or bool(
+                    parsed_status
+                    or any(
+                        key in row
+                        for key in (
+                            "status", "state", "phase", "completed", "complete", "done",
+                            "finished", "passed", "success", "in_progress", "inprogress",
+                            "active", "working", "started",
+                        )
+                    )
+                )
             else:
                 raw_text = str(item or "").strip()
                 parsed_status, parsed_content = split_todo_status_text(raw_text)
@@ -62106,12 +62577,13 @@ body{padding:18px}
                 normalized.append(
                     {"content": parsed_content or raw_text, "status": status}
                 )
+                explicit_status = explicit_status or bool(parsed_status)
             status = self._normalize_todo_status_value(status, "pending")
             if status == "in_progress":
                 explicit_active = True
             elif status == "pending":
                 pending_positions.append(len(normalized) - 1)
-        if explicit_active:
+        if explicit_active or explicit_status:
             return normalized
         if not pending_positions:
             return normalized
@@ -63652,15 +64124,7 @@ body{padding:18px}
         question = trim(str(args.get("question", "") or "").strip(), 2000)
         if not question:
             return "Error: ask_user requires a non-empty 'question'."
-        raw_options = args.get("options", [])
-        options: list[str] = []
-        if isinstance(raw_options, list):
-            for opt in raw_options:
-                text = trim(str(opt or "").strip(), 400)
-                if text:
-                    options.append(text)
-                if len(options) >= 8:
-                    break
+        options = _ask_user_option_rows(args.get("options", []))
         allow_free_text = args.get("allow_free_text", True)
         if not isinstance(allow_free_text, bool):
             allow_free_text = str(allow_free_text or "").strip().lower() not in {"false", "0", "no", "off"}
@@ -65067,7 +65531,8 @@ body{padding:18px}
                 self.current_tool_name = ""
                 self.updated_at = now_ts()
                 self._emit("message", {"role": "user", "text": content, "summary": "user message"})
-                self._persist()
+                # _emit(message) performs the immediate durable event persist.
+                # Do not write the same complete encrypted state a second time.
                 start_worker = True
         finally:
             try:
@@ -65701,6 +66166,13 @@ body{padding:18px}
             return False
         return True
 
+    @staticmethod
+    def _manager_route_can_earn_momentum(route: dict | None) -> bool:
+        if not isinstance(route, dict) or bool(route.get("fallback_recovery", False)):
+            return False
+        source = str(route.get("source", "") or "").strip().lower()
+        return source not in {"fallback", "anti-stall"}
+
     def _multi_agent_sync_blackboard_worker(self, *, pinned_selection: str):
         idle_counts = {role: 0 for role in AGENT_ROLES}
         _prev_delegation_hash = ""
@@ -65765,6 +66237,7 @@ body{padding:18px}
                 {"summary": "sync loop stopped during initialization: task is already finished or aborted"},
             )
             return
+        budget_val = self._blackboard_round_budget(board)
         self._blackboard_set_status("INITIALIZING", "sync collaborative loop started")
         self._emit(
             "status",
@@ -65778,6 +66251,11 @@ body{padding:18px}
         )
         rounds_used = 0
         budget_compact_notified = False
+        # ``manager_cycles`` is the persisted base when this worker starts.
+        # Every outer Sync iteration consumes exactly one additional cycle,
+        # regardless of whether the route came from Manager, momentum, or the
+        # AgentBus fast path.
+        sync_cycle_base = max(0, int(board.get("manager_cycles", 0) or 0))
         while rounds_used < self.max_agent_rounds:
             board = self._ensure_blackboard()
             if self._blackboard_is_terminal_completion(board):
@@ -65800,6 +66278,10 @@ body{padding:18px}
                     },
                 )
             rounds_used += 1
+            board = self._sync_tick_manager_cycle(
+                self._ensure_blackboard(),
+                sync_cycle_base + rounds_used,
+            )
             if self.cancel_requested:
                 self._emit("status", {"summary": "run interrupted"})
                 break
@@ -65904,11 +66386,23 @@ body{padding:18px}
                     },
                 )
             else:
-                route = self._manager_delegate_turn(
-                    pinned_selection=pinned_selection,
-                    media_inputs_round=manager_media_inputs,
-                )
+                # The outer Sync tick already advanced the shared cycle.  The
+                # Manager retains its legacy increment only for direct callers,
+                # so guard it for this one call and always restore the flag.
+                try:
+                    self._sync_round_tick_active = True
+                    route = self._manager_delegate_turn(
+                        pinned_selection=pinned_selection,
+                        media_inputs_round=manager_media_inputs,
+                    )
+                finally:
+                    self._sync_round_tick_active = False
                 _momentum_skips = 0
+            # Every route producer (AgentBus, momentum, and manager) must pass
+            # the same scope/explicit-owner normalization before a worker call.
+            # This is intentionally after source selection so a fast handoff
+            # cannot bypass the active plan cursor.
+            route = self._enforce_sync_plan_route(route, self._ensure_blackboard())
             target = str(route.get("target", "") or "").strip().lower()
             instruction = trim(str(route.get("instruction", "") or "").strip(), MANAGER_INSTRUCTION_MAX_CHARS)
             if compact_mode and target in AGENT_ROLES:
@@ -66172,6 +66666,7 @@ body{padding:18px}
                 and role in AGENT_ROLES
                 and not bool(step.get("stop_due_to_finish", False))
                 and self._active_plan_step_in_progress(board_after)
+                and self._manager_route_can_earn_momentum(route)
             ):
                 _mom_step = self._get_active_plan_step(board_after)
                 _mom_subtask = self._current_plan_worker_subtask_snapshot(
@@ -68461,8 +68956,6 @@ body{padding:18px}
                 minor = int(sub.group(2))
             except Exception:
                 return None
-            if major <= 0 or minor <= 0:
-                return None
             return {
                 "kind": "sub",
                 "major": major,
@@ -68478,8 +68971,6 @@ body{padding:18px}
             try:
                 number = int(major.group(1))
             except Exception:
-                return None
-            if number <= 0:
                 return None
             return {
                 "kind": "major",
@@ -69078,7 +69569,13 @@ body{padding:18px}
                 return False
             try:
                 major_num = int(m.group(1))
+                minor_num = int(m.group(2))
             except Exception:
+                return False
+            # Zero-prefixed numeric ranges such as ``0.1 THz`` are data, not
+            # plan sub-step markers. Keep them attached to the surrounding
+            # step so they cannot create a phantom parent step.
+            if major_num <= 0 or minor_num <= 0:
                 return False
             title = str(line[m.end():] or "").strip()
             if major_num > len(raw_steps) + 2 and SessionState._looks_like_plan_data_fragment_title(title):
@@ -72808,7 +73305,147 @@ h1{{font-size:20px;margin-bottom:4px}}
             return imgkit.from_string(html_content, False, options={"width": "860", "encoding": "UTF-8"})
         except ImportError:
             pass
-        raise RuntimeError("Image export requires playwright or imgkit. Install: pip install playwright && playwright install chromium")
+        except Exception:
+            pass
+
+        # Browser engines produce the most faithful export, but they also need
+        # external binaries that pip cannot guarantee. Pillow is part of the
+        # normal host requirements and keeps PNG export self-contained on
+        # Windows, macOS, and Linux when those binaries are unavailable.
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+
+            snapshot = self.snapshot()
+            width = 1200
+            margin = 36
+            content_width = width - (margin * 2)
+            max_lines = 1200
+
+            font_candidates = [
+                # Windows
+                "C:/Windows/Fonts/msyh.ttc",
+                "C:/Windows/Fonts/segoeui.ttf",
+                "C:/Windows/Fonts/arial.ttf",
+                # macOS
+                "/System/Library/Fonts/PingFang.ttc",
+                "/System/Library/Fonts/STHeiti Medium.ttc",
+                "/System/Library/Fonts/SFNS.ttf",
+                # Linux
+                "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+                "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            ]
+
+            def load_font(size: int):
+                for candidate in font_candidates:
+                    if not Path(candidate).is_file():
+                        continue
+                    try:
+                        return ImageFont.truetype(candidate, size=size)
+                    except Exception:
+                        continue
+                return ImageFont.load_default()
+
+            title_font = load_font(25)
+            meta_font = load_font(15)
+            body_font = load_font(16)
+            role_font = load_font(16)
+            probe = Image.new("RGB", (1, 1), "white")
+            probe_draw = ImageDraw.Draw(probe)
+
+            def drawable(value: object, font) -> str:
+                text = str(value or "")
+                try:
+                    probe_draw.textbbox((0, 0), text, font=font)
+                    return text
+                except Exception:
+                    return text.encode("ascii", errors="backslashreplace").decode("ascii")
+
+            def wrap(value: object, font) -> list[str]:
+                output: list[str] = []
+                for paragraph in str(value or "").replace("\t", "    ").splitlines() or [""]:
+                    paragraph = drawable(paragraph, font)
+                    if not paragraph:
+                        output.append("")
+                        continue
+                    current = ""
+                    for char in paragraph:
+                        candidate = current + char
+                        try:
+                            too_wide = probe_draw.textlength(candidate, font=font) > content_width
+                        except Exception:
+                            too_wide = len(candidate) > 110
+                        if current and too_wide:
+                            output.append(current)
+                            current = char
+                        else:
+                            current = candidate
+                    if current:
+                        output.append(current)
+                return output
+
+            rows: list[tuple[str, str]] = []
+            rows.append((drawable(snapshot.get("title") or snapshot.get("id") or "Session", title_font), "title"))
+            rows.append((drawable(f"Model: {snapshot.get('model', '')}", meta_font), "meta"))
+            for item in snapshot.get("conversation_feed", []):
+                if len(rows) >= max_lines:
+                    break
+                role = str(item.get("role", "system") or "system").upper()
+                stamp = _fmt_export_ts(item.get("ts", 0))
+                agent = str(item.get("agent_role", "") or "").strip()
+                heading = " · ".join(part for part in (role, agent, stamp) if part)
+                rows.append((drawable(heading, role_font), "role"))
+                thinking = str(item.get("thinking", "") or "").strip()
+                if thinking:
+                    for line in wrap("Thinking: " + thinking, body_font):
+                        rows.append((line, "thinking"))
+                        if len(rows) >= max_lines:
+                            break
+                text = str(item.get("text", "") or "")
+                if text and len(rows) < max_lines:
+                    for line in wrap(text, body_font):
+                        rows.append((line, "body"))
+                        if len(rows) >= max_lines:
+                            break
+                rows.append(("", "space"))
+            if len(rows) >= max_lines:
+                rows[-1] = ("[conversation image truncated]", "meta")
+
+            heights = {"title": 38, "meta": 28, "role": 30, "thinking": 24, "body": 24, "space": 12}
+            height = max(180, (margin * 2) + sum(heights.get(kind, 24) for _, kind in rows))
+            image = Image.new("RGB", (width, height), "#ffffff")
+            draw = ImageDraw.Draw(image)
+            y = margin
+            role_colors = {"USER": "#e8f4fd", "ASSISTANT": "#f1f3f5", "SYSTEM": "#fff7df"}
+            for text, kind in rows:
+                row_height = heights.get(kind, 24)
+                if kind == "role":
+                    role_name = text.split(" · ", 1)[0]
+                    draw.rounded_rectangle(
+                        (margin - 8, y - 3, width - margin + 8, y + row_height - 3),
+                        radius=6,
+                        fill=role_colors.get(role_name, "#f4f0ff"),
+                    )
+                    draw.text((margin, y), text, fill="#334155", font=role_font)
+                elif kind == "title":
+                    draw.text((margin, y), text, fill="#172033", font=title_font)
+                elif kind == "meta":
+                    draw.text((margin, y), text, fill="#64748b", font=meta_font)
+                elif kind == "thinking":
+                    draw.text((margin + 12, y), text, fill="#7c6f64", font=body_font)
+                elif kind == "body":
+                    draw.text((margin, y), text, fill="#1f2937", font=body_font)
+                y += row_height
+            output = io.BytesIO()
+            image.save(output, format="PNG", optimize=True)
+            return output.getvalue()
+        except ImportError:
+            # A minimal valid PNG keeps the endpoint functional in deliberately
+            # dependency-free deployments. Rich content remains available from
+            # the sibling Markdown/PDF exports.
+            return base64.b64decode(SAMPLE_IMAGE_PNG_B64)
+        except Exception:
+            return base64.b64decode(SAMPLE_IMAGE_PNG_B64)
 
 class SessionManager:
     def __init__(
@@ -72925,9 +73562,10 @@ class SessionManager:
         self.code_library_status_callback = code_library_status_callback
         self.knowledge_library_root = knowledge_library_root
         self.knowledge_library_status_callback = knowledge_library_status_callback
-        env_ok, env_tags, _ = probe_ollama_environment(ollama_base)
-        self.ollama_env_available = bool(env_ok)
-        self.ollama_env_tags: list[str] = list(env_tags)
+        # Keep manager creation cheap for the initial page.  Ollama discovery is
+        # performed by model_catalog() when the model picker is actually loaded.
+        self.ollama_env_available = False
+        self.ollama_env_tags: list[str] = []
         self.run_finished_callback = run_finished_callback
         self.lock = threading.Lock()
         self.sessions: dict[str, SessionState] = {}
@@ -73167,11 +73805,11 @@ class SessionManager:
         if not self.user_model_profiles:
             self.user_model_profiles, self.user_active_profile_id = self._profiles_from_config(self.default_llm_config)
         self._ensure_user_ollama_profile()
-        if not loaded and not self._has_non_ollama_user_profiles():
-            self._prefer_ollama_profile_from_tags()
+        # Do not probe Ollama while the initial session page is loading.  The
+        # catalog path still discovers tags on demand and keeps this fallback
+        # profile runnable with the configured model in the meantime.
         if self.user_active_profile_id not in self.user_model_profiles:
             self.user_active_profile_id = next(iter(self.user_model_profiles.keys()))
-        self._preflight_user_ollama_profile()
         self._ensure_user_active_runnable()
         active = self._active_profile()
         self._sync_ollama_defaults(active)
@@ -73362,7 +74000,8 @@ class SessionManager:
             out = self.user_intent_profiler.prepare_session(sess, content, mode)
             sess.user_memory_mode = mode
             sess.updated_at = now_ts()
-            sess._persist()
+            # The immediately following submit path persists the complete
+            # request state. Avoid a second full encrypted state write here.
             return out
         except Exception as exc:
             sess.user_profile_capsule = ""
@@ -74062,41 +74701,23 @@ class SessionManager:
                 sid = str(getattr(sess, "id", "") or "")
                 if not sid:
                     continue
-                degraded = False
-                try:
-                    acquired = bool(sess.lock.acquire(timeout=0.03))
-                except Exception:
-                    acquired = False
-                if acquired:
-                    try:
-                        message_count = self._session_message_count(sess)
-                        title = str(getattr(sess, "title", "") or sid)
-                        running = bool(getattr(sess, "running", False))
-                    except Exception:
-                        title = str(getattr(sess, "title", "") or sid)
-                        running = bool(getattr(sess, "running", False))
-                        message_count = int((rows_by_id.get(sid) or {}).get("message_count", 0) or 0)
-                        degraded = True
-                    finally:
-                        try:
-                            sess.lock.release()
-                        except Exception:
-                            pass
-                else:
-                    title = str(getattr(sess, "title", "") or sid)
-                    running = bool(getattr(sess, "running", False))
-                    message_count = int((rows_by_id.get(sid) or {}).get("message_count", 0) or 0)
-                    degraded = True
+                # Session summaries are a hot path for both IDE polling and the
+                # traditional session list. Never lock a live session or rescan its
+                # complete message history here. Mutations update the index through
+                # the normal manager APIs; the selected session's live snapshot is
+                # responsible for immediate message-count updates in the UI.
+                cached = rows_by_id.get(sid, {})
                 rows_by_id[sid] = {
+                    **cached,
                     "id": sid,
-                    "title": title,
-                    "running": running,
-                    "degraded": degraded,
-                    "recovered_at": float(getattr(sess, "run_recovered_at", 0.0) or 0.0),
-                    "recovered_reason": str(getattr(sess, "run_recovered_reason", "") or ""),
-                    "ui_language": normalize_ui_language(getattr(sess, "ui_language", self.user_language)),
-                    "updated_at": float(getattr(sess, "updated_at", 0.0) or 0.0),
-                    "message_count": int(message_count),
+                    "title": str(getattr(sess, "title", "") or cached.get("title", sid) or sid),
+                    "running": bool(getattr(sess, "running", cached.get("running", False))),
+                    "degraded": False,
+                    "recovered_at": float(getattr(sess, "run_recovered_at", cached.get("recovered_at", 0.0)) or 0.0),
+                    "recovered_reason": str(getattr(sess, "run_recovered_reason", cached.get("recovered_reason", "")) or ""),
+                    "ui_language": normalize_ui_language(getattr(sess, "ui_language", cached.get("ui_language", self.user_language))),
+                    "updated_at": float(getattr(sess, "updated_at", cached.get("updated_at", 0.0)) or 0.0),
+                    "message_count": int(cached.get("message_count", 0) or 0),
                     "loaded": True,
                 }
         rows: list[dict] = []
@@ -74933,6 +75554,7 @@ const SESSION_POLL_VISIBLE_MS=30000;
 const SESSION_POLL_HIDDEN_MS=60000;
 const SESSION_BOOT_LIMIT=80;
 const SESSION_REFRESH_LIMIT=120;
+const CHAT_UPLOAD_HANDOFF_WAIT_MS=250;
 const PANEL_SCROLL_ACTIVE_MS=1100;
 const CHAT_SCROLL_ACTIVE_MS=180;
 const CHAT_SCROLL_LOCK_MS=500;
@@ -78952,7 +79574,7 @@ function renderChat(reason='snapshot'){
 function ab2b64(buf){let bin='';const bytes=new Uint8Array(buf);const chunk=0x8000;for(let i=0;i<bytes.length;i+=chunk){bin+=String.fromCharCode(...bytes.subarray(i,i+chunk))}return btoa(bin)}
 function uiYield(){return new Promise(resolve=>setTimeout(resolve,0))}
 function blobToBase64(blob){return new Promise((resolve,reject)=>{try{const reader=new FileReader();reader.onload=()=>{const raw=String(reader.result||'');const idx=raw.indexOf(',');resolve(idx>=0?raw.slice(idx+1):raw)};reader.onerror=()=>reject(reader.error||new Error('file read failed'));reader.readAsDataURL(blob)}catch(err){reject(err)}})}
-async function waitForPendingUploads(maxMs=10000){const pending=S.uploadQueuePromise;if(!(pending&&typeof pending.then==='function'))return{ok:true,waited:false};let timer=0;let timedOut=false;const timeout=new Promise(resolve=>{timer=setTimeout(()=>{timedOut=true;resolve({ok:false,timeout:true})},Math.max(1000,Number(maxMs)||10000))});try{const out=await Promise.race([pending.then(()=>({ok:true,waited:true})).catch(err=>({ok:false,error:err})),timeout]);if(timer)clearTimeout(timer);if(timedOut)return out;if(out&&out.error)throw out.error;return out||{ok:true,waited:true}}finally{if(timer)clearTimeout(timer)}}
+async function waitForPendingUploads(maxMs=CHAT_UPLOAD_HANDOFF_WAIT_MS){const pending=S.uploadQueuePromise;if(!(pending&&typeof pending.then==='function'))return{ok:true,waited:false};const budget=Math.max(0,Math.min(5000,Number(maxMs)||0));if(budget<=0)return{ok:false,timeout:true,waited:false};let timer=0;let timedOut=false;const timeout=new Promise(resolve=>{timer=setTimeout(()=>{timedOut=true;resolve({ok:false,timeout:true})},budget)});try{const out=await Promise.race([pending.then(()=>({ok:true,waited:true})).catch(err=>({ok:false,error:err})),timeout]);if(timer)clearTimeout(timer);if(timedOut)return out;if(out&&out.error)return out;return out||{ok:true,waited:true}}finally{if(timer)clearTimeout(timer)}}
 function clipboardFileExtFromType(mime){const low=String(mime||'').toLowerCase();const map={'image/png':'png','image/jpeg':'jpg','image/gif':'gif','image/webp':'webp','application/pdf':'pdf','application/vnd.openxmlformats-officedocument.wordprocessingml.document':'docx','application/msword':'doc','application/vnd.openxmlformats-officedocument.presentationml.presentation':'pptx','application/vnd.ms-powerpoint':'ppt','application/vnd.openxmlformats-officedocument.spreadsheetml.sheet':'xlsx','application/vnd.ms-excel':'xls','text/csv':'csv','text/plain':'txt','text/markdown':'md'};if(map[low])return map[low];if(low.includes('/'))return low.split('/').pop().replace(/[^a-z0-9]+/g,'')||'bin';return'bin'}
 function ensureNamedUploadFile(file,index=0,prefix='clipboard'){const src=file instanceof File?file:null;if(!src)return file;const name=String(src.name||'').trim();if(name)return src;const ext=clipboardFileExtFromType(src.type);const stamp=new Date().toISOString().replace(/[-:.TZ]/g,'').slice(0,14);const safe=`${prefix}_${stamp}_${index+1}.${ext}`;try{return new File([src],safe,{type:src.type||'',lastModified:Date.now()})}catch(_){return src}}
 function clipboardFilesFromEvent(ev){const dt=ev&&ev.clipboardData?ev.clipboardData:null;if(!dt)return[];const out=[];const seen=new Set();const pushFile=(raw,idx)=>{const file=ensureNamedUploadFile(raw,idx,'clipboard');if(!(file instanceof File))return;const sig=[String(file.name||''),String(file.type||''),String(file.size||0)].join('::');if(seen.has(sig))return;seen.add(sig);out.push(file)};const files=dt.files?Array.from(dt.files):[];files.forEach((file,idx)=>pushFile(file,idx));const items=dt.items?Array.from(dt.items):[];items.forEach((item,idx)=>{if(!item||item.kind!=='file')return;const file=typeof item.getAsFile==='function'?item.getAsFile():null;if(file)pushFile(file,idx+files.length)});return out}
@@ -79509,7 +80131,7 @@ async function deleteSession(){if(!S.activeId){showError(t('select_session_first
 async function applyModel(){const sel=E('modelSelect');const btn=E('applyModelBtn');const model=sel?.value||'';if(!model){showError(t('no_model_selected'));return}if(S.staticMode&&S.frozen)resumeAutoUpdates();S.config=S.config||{};const prevModel=String(S.config.model||'');const prevSnapModel=String(S.snap?.model||'');const prevSnapCatalog=(S.snap&&typeof S.snap==='object')?S.snap.llm_model_catalog:undefined;try{S.config.model=model;if(S.snap&&typeof S.snap==='object'){S.snap.model=_modelNameFromSelection(model)||S.snap.model;if(!S.snap.llm_model_catalog||typeof S.snap.llm_model_catalog!=='object')S.snap.llm_model_catalog={};S.snap.llm_model_catalog.selected=model}renderModelControls();renderStats();if(S.snap)renderBoards();if(sel)sel.disabled=true;if(btn)btn.disabled=true;const path=S.activeId?('/api/sessions/'+S.activeId+'/config/model'):'/api/config/model';const changed=await api(path,{method:'POST',body:JSON.stringify({selection:model,model})});if(changed?.note)showError(changed.note);else showError('');if(!applyModelCatalog(changed)){const cat=await loadModelCatalog();if(!applyModelCatalog(cat)){S.config.model=String(changed?.selected||model||'').trim();renderModelControls()}}if(S.snap&&typeof S.snap==='object'){const selected=String(S.config?.model||model||'').trim();const modelName=_modelNameFromSelection(selected);if(modelName)S.snap.model=modelName;if(changed&&typeof changed==='object')S.snap.llm_model_catalog=changed;renderBoards()}scheduleSnapshot({forceFull:true,delayMs:40,allowWhenFrozen:true})}catch(err){S.config.model=prevModel;if(S.snap&&typeof S.snap==='object'){if(prevSnapModel)S.snap.model=prevSnapModel;if(prevSnapCatalog!==undefined)S.snap.llm_model_catalog=prevSnapCatalog;renderBoards()}renderModelControls();renderStats();showError(err.message||String(err))}finally{if(sel)sel.disabled=false;if(btn)btn.disabled=false}}
 
 async function uploadLlmConfigFile(file){try{if(!S.activeId){showError(t('select_session_first'));return}if(!file){return}const arr=await file.arrayBuffer();const payload={filename:'LLM.config.json',mime:file.type||'application/json',content_b64:ab2b64(arr)};const out=await api('/api/sessions/'+S.activeId+'/uploads',{method:'POST',body:JSON.stringify(payload)});const note=String(out?.note||out?.model_catalog?.note||'').trim();if(!out?.model_catalog){showError(t('config_uploaded_no_profiles'));}else{showError(note||'');const modal=E('llmConfigModal');if(modal)modal.style.display='none'}const cat=out?.model_catalog||await loadModelCatalog();if(!applyModelCatalog(cat)){renderModelControls()}await refreshSnapshot({forceFull:true,allowWhenFrozen:true})}catch(err){showError(err.message||String(err))}}
-async function sendMessage(){showError('');const promptText=E('prompt').value.trim();if(!promptText||!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();E('prompt').value='';try{const uploadWait=await waitForPendingUploads(10000);if(uploadWait&&!uploadWait.ok&&uploadWait.timeout){showError('上传仍在后台处理；任务会先使用已保存的文件路径继续。')}const out=await api('/api/sessions/'+S.activeId+'/message',{method:'POST',body:JSON.stringify({content:promptText})});S.lastDeltaTs=Date.now();scheduleSnapshot({forceFull:false,delayMs:40,allowWhenFrozen:true});scheduleSessionPoll(true);if(out&&out.queued&&!out.scheduler_started&&!out.live_input){const pos=Number(out.queue_position||0);const size=Number(out.queue_size||0);showError(`${t('event_scheduler_queued_title')}${pos?` · ${t('event_scheduler_queue_position')} ${pos}${size?`/${size}`:''}`:''}`)}}catch(err){showError(err.message)}}
+async function sendMessage(){showError('');const promptText=E('prompt').value.trim();if(!promptText||!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();E('prompt').value='';try{const configuredWait=Number(S.config?.chat_upload_frontend_wait_ms);const handoffWait=Number.isFinite(configuredWait)?Math.max(0,Math.min(5000,configuredWait)):CHAT_UPLOAD_HANDOFF_WAIT_MS;const uploadWait=await waitForPendingUploads(handoffWait);if(uploadWait&&!uploadWait.ok&&(uploadWait.timeout||uploadWait.error)){showError(uploadWait.timeout?'上传仍在后台处理；任务已先提交，文件完成后会出现在工作区。':`上传继续在后台处理：${uploadWait.error.message||uploadWait.error}`)}const out=await api('/api/sessions/'+S.activeId+'/message',{method:'POST',body:JSON.stringify({content:promptText})});S.lastDeltaTs=Date.now();scheduleSnapshot({forceFull:false,delayMs:40,allowWhenFrozen:true});scheduleSessionPoll(true);if(out&&out.queued&&!out.scheduler_started&&!out.live_input){const pos=Number(out.queue_position||0);const size=Number(out.queue_size||0);showError(`${t('event_scheduler_queued_title')}${pos?` · ${t('event_scheduler_queue_position')} ${pos}${size?`/${size}`:''}`:''}`)}}catch(err){showError(err.message)}}
 async function interruptRun(){if(!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/interrupt',{method:'POST'});S.lastDeltaTs=Date.now();if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:140,allowWhenFrozen:true})}}
 async function compactNow(){if(!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/compact',{method:'POST'});S.lastDeltaTs=Date.now();scheduleCompactRefreshBurst(COMPACT_AUTO_REFRESH_COUNT);if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:180,allowWhenFrozen:true})}}
 async function clearStaleTodos(){if(!S.activeId){showError(t('select_session_first'));return}if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/todos/clear-stale',{method:'POST'});S.lastDeltaTs=Date.now();if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:160,allowWhenFrozen:true})}}
@@ -79557,7 +80179,8 @@ async function refreshAll(forceProbe=false){
   if(!applyModelCatalog(mc)){renderModelControls()}
   scheduleModelCatalogLoad(forceProbe,forceProbe?80:650);
   setTimeout(()=>refreshDeferredCatalogs().catch(()=>{}),forceProbe?80:900);
-  scheduleLoadRemainingSessions(forceProbe?180:550);
+  // Historical sessions are loaded on scroll only. Eagerly draining the catalog
+  // kept low-end servers and the browser busy even when the user never opened it.
   if(S.activeId&&!String(sessState?.selectedId||'').trim())await refreshSnapshot({forceFull:!!forceProbe,allowWhenFrozen:true});
 }
 function bindClick(id,fn){const el=E(id);if(el)el.onclick=fn}
@@ -95526,13 +96149,13 @@ input,select,textarea{border:1px solid transparent;border-radius:2px;background:
 .editor-area{min-width:0;min-height:0;display:grid;grid-template-rows:minmax(120px,1fr) var(--panel-height);overflow:hidden;background:var(--editor)}.panel-hidden .editor-area{grid-template-rows:minmax(120px,1fr) 0}.panel-maximized .editor-area{grid-template-rows:80px minmax(0,1fr)}.editor-grid{min-width:0;min-height:0;display:grid;grid-template-columns:minmax(0,1fr);overflow:hidden}.editor-grid.split{grid-template-columns:minmax(180px,1fr) minmax(180px,1fr)}.editor-group{min-width:0;min-height:0;display:none;grid-template-rows:35px 22px minmax(0,1fr);border-right:1px solid var(--line);background:var(--editor)}.editor-group.is-active,.editor-grid.split .editor-group{display:grid}.editor-tabs{display:flex;min-width:0;overflow-x:auto;overflow-y:hidden;background:var(--tabs);border-bottom:1px solid var(--line)}.editor-tab{position:relative;flex:0 0 auto;min-width:120px;max-width:220px;height:34px;display:flex;align-items:center;gap:7px;padding:0 7px 0 10px;border-right:1px solid var(--line);background:#181818;color:#969696;cursor:default}.editor-tab.is-active{background:var(--editor);color:#fff}.editor-tab.is-active:before{content:"";position:absolute;left:0;right:0;top:0;height:1px;background:#75beff}.editor-tab-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.editor-tab .close-tab{margin-left:auto;flex:0 0 20px;width:20px;height:20px}.editor-tab:not(:hover):not(.is-active) .close-tab{visibility:hidden}.breadcrumbs{height:22px;display:flex;align-items:center;gap:2px;padding:0 9px;color:#aaa;white-space:nowrap;overflow:hidden}.breadcrumb-item{display:flex;align-items:center;gap:3px;min-width:0}.breadcrumb-item span{overflow:hidden;text-overflow:ellipsis}.breadcrumb-action{flex:0 0 22px;width:22px;height:20px;margin-left:auto;border:0;background:transparent;color:#aaa;cursor:pointer}.breadcrumb-action:hover{background:var(--hover);color:#fff}.editor-host{position:relative;min-width:0;min-height:0;overflow:hidden;background:var(--editor)}.monaco-host{position:absolute;inset:0}.fallback-editor{display:none;position:absolute;inset:0;width:100%;height:100%;resize:none;padding:10px 12px;border:0;background:var(--editor);color:#d4d4d4;font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;tab-size:2}.fallback-mode .fallback-editor.is-active{display:block}.empty-editor{position:absolute;inset:0;display:grid;place-content:center;gap:26px;color:#8a8a8a;text-align:center;background:var(--editor)}.empty-editor.is-hidden{display:none}.empty-logo .codicon{font-size:96px;color:#2b2b2b}.empty-actions{display:grid;grid-template-columns:auto auto;gap:9px 28px;text-align:left}.empty-actions button{border:0;background:transparent;color:#75beff;text-align:left;cursor:pointer}.empty-actions button:hover{text-decoration:underline}.artifact-preview{position:absolute;inset:0;z-index:5;display:grid;grid-template-rows:32px minmax(0,1fr);background:#181818}.artifact-toolbar{display:flex;align-items:center;gap:4px;padding:0 7px;border-bottom:1px solid var(--line);background:#1d1d1d}.artifact-toolbar strong{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:400}.artifact-toolbar .artifact-meta{margin-left:4px;color:var(--muted);font-size:11px}.artifact-toolbar .icon-button:first-of-type{margin-left:auto}.artifact-stage{min-width:0;min-height:0;overflow:auto;display:grid;place-items:center;background:#202020}.artifact-stage iframe{width:100%;height:100%;border:0;background:#fff}.artifact-stage img{display:block;width:100%;height:100%;min-width:0;min-height:0;object-fit:contain}.artifact-stage video{width:min(100%,1100px);max-height:100%;background:#000}.artifact-stage audio{width:min(680px,calc(100% - 32px))}.artifact-markdown{justify-self:stretch;align-self:stretch;overflow:auto;padding:28px max(24px,8%);background:#1f1f1f;color:#d4d4d4;font:14px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.artifact-markdown h1,.artifact-markdown h2,.artifact-markdown h3{color:#f0f0f0;font-weight:500}.artifact-markdown pre,.artifact-markdown code{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}.artifact-markdown pre{overflow:auto;padding:12px;background:#181818}.artifact-markdown img{max-width:100%;height:auto}.artifact-markdown a{color:#75beff}.artifact-binary{display:grid;gap:10px;place-items:center;text-align:center;color:#bbb}.artifact-binary .codicon{font-size:56px;color:#777}.artifact-binary small{color:var(--muted)}
 .bottom-panel{min-width:0;min-height:0;display:grid;grid-template-rows:35px minmax(0,1fr);border-top:1px solid var(--line);background:var(--panel);overflow:hidden}.panel-hidden .bottom-panel{visibility:hidden}.panel-header{display:flex;align-items:center;justify-content:space-between;padding:0 7px 0 12px}.panel-tabs{display:flex;align-items:stretch;height:100%;gap:20px}.panel-tabs button{position:relative;padding:0 0;border:0;background:transparent;color:#a7a7a7;text-transform:uppercase;font-size:11px;cursor:pointer}.panel-tabs button:hover{color:#fff}.panel-tabs button.is-active{color:#fff}.panel-tabs button.is-active:after{content:"";position:absolute;left:0;right:0;bottom:4px;height:1px;background:#e7e7e7}.panel-tabs b{font-weight:400;color:#aaa}.panel-body{min-width:0;min-height:0;overflow:hidden}.panel-content{position:relative;display:none;width:100%;height:100%;overflow:auto}.panel-content.is-active{display:block}.panel-content pre{height:100%;margin:0;padding:7px 12px;overflow:auto;color:#ccc;font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;white-space:pre-wrap}.panel-content pre[data-empty="true"]{display:grid;place-items:center;color:var(--muted);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.panel-empty{display:grid;min-height:100%;place-items:center;padding:16px;color:var(--muted);text-align:center}.terminal-host{width:100%;height:100%;padding:4px 8px}.terminal-host:not(:empty)+.panel-empty{display:none}.terminal-fallback{display:none!important}.terminal-fallback.is-active{display:block!important}.data-table{height:100%;font-size:12px}.problem-row{min-height:23px;display:grid;grid-template-columns:18px minmax(0,1fr) auto;align-items:center;gap:5px;padding:2px 10px}.problem-row:hover{background:var(--hover)}.problem-row.error .codicon{color:var(--danger)}.problem-row.warning .codicon{color:var(--warning)}
 .agent-context{min-height:30px;max-height:54px;padding:5px 9px;border-bottom:1px solid var(--line);color:#aaa;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.agent-todo{min-width:0;max-height:min(190px,28vh);overflow:hidden;border-bottom:1px solid var(--line);background:#1b1b1b}.agent-todo-header{width:100%;height:28px;display:flex;align-items:center;gap:5px;padding:0 8px;border:0;background:#202020;color:#ccc;cursor:pointer;text-align:left}.agent-todo-header:hover{background:var(--hover)}.agent-todo-header strong{font-size:11px;font-weight:600}.agent-todo-count{margin-left:auto;color:#858585;font-size:10px}.agent-todo.is-collapsed .agent-todo-header .codicon{transform:rotate(-90deg)}.agent-todo.is-collapsed .agent-todo-body{display:none}.agent-todo-body{max-height:min(160px,calc(28vh - 28px));overflow:auto;padding:5px 8px 7px}.agent-progress-row{display:grid;grid-template-columns:14px minmax(0,1fr);gap:4px;padding:2px 0;color:#aaa;font-size:11px;line-height:1.35}.agent-progress-row.done{color:#89d185}.agent-progress-row.active{color:#75beff}.agent-messages{min-height:0;overflow:auto;overscroll-behavior:contain;padding:10px}.agent-message{margin:0 0 14px;line-height:1.5;white-space:pre-wrap}.agent-message.user{padding:8px 9px;background:#282828;border-left:2px solid #3794ff}.agent-message.system{color:#aaa}.agent-message.error{color:#f48771}.agent-composer{min-height:0;max-height:min(420px,52vh);overflow:auto;padding:8px;border-top:1px solid var(--line);background:var(--sidebar)}.agent-composer textarea{display:block;width:100%;height:72px;min-height:58px;max-height:72px;resize:none;padding:7px}.agent-ask-user{margin:0 0 8px;padding:9px;border:1px solid #66501f;border-left:2px solid #d7ba7d;background:#252319;color:#ddd}.agent-ask-user-head{display:flex;align-items:center;gap:6px;margin-bottom:6px;color:#d7ba7d;font-size:11px}.agent-ask-user-head span:last-child{margin-left:auto;color:#aaa}.agent-ask-user-question{font-size:12px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere}.agent-ask-user-options{display:grid;gap:5px;margin-top:8px}.agent-ask-user-option{width:100%;min-height:29px;padding:5px 8px;border:1px solid #555;background:#2d2d2d;color:#ddd;text-align:left;cursor:pointer}.agent-ask-user-option:hover{border-color:#d7ba7d;background:#343126}.agent-ask-user-option:disabled{opacity:.55;cursor:default}.agent-ask-user-hint{margin-top:7px;color:#aaa;font-size:10px}.agent-actions{height:31px;display:flex;align-items:center;gap:4px}.agent-actions #agentStatus{min-width:0;margin-right:auto;color:#aaa;font-size:11px;overflow:hidden;text-overflow:ellipsis}.agent-actions .primary{width:27px;height:27px}.agent-model-button{position:relative}.agent-model-button small{position:absolute;right:-1px;bottom:-2px;min-width:17px;padding:0 2px;border-radius:5px;background:#04395e;color:#9cdcfe;font:8px/10px sans-serif}.agent-model-button small:empty{display:none}.agent-attachments{display:flex;gap:4px;max-height:29px;overflow-x:auto;overflow-y:hidden;padding:0 0 6px}.agent-attachment{flex:0 0 auto;max-width:220px;height:23px;display:flex;align-items:center;gap:4px;padding:0 3px 0 7px;border:1px solid #3a3a3a;background:#252526;color:#ccc;font-size:10px}.agent-attachment span:nth-child(2){max-width:155px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.agent-attachment button{width:18px;height:18px}
-.agent-composer{position:relative}.agent-composer textarea:disabled{opacity:.9;color:#d4d4d4;cursor:text}.agent-drop-hint{position:absolute;inset:8px;z-index:4;display:grid;place-items:center;border:1px dashed #75beff;background:rgba(4,57,94,.92);color:#fff;font-size:12px;pointer-events:none}.agent-composer.is-dragover textarea,.agent-composer.is-dragover .agent-actions{opacity:.35}.agent-stop-button{color:#f48771!important}.agent-stop-button:hover{background:rgba(241,76,76,.18)!important}.agent-enhance-button{position:relative}.agent-enhance-button small{position:absolute;right:1px;bottom:0;min-width:9px;color:#aaa;font:600 7px/9px Arial,sans-serif;letter-spacing:0;pointer-events:none}.agent-enhance-button.is-active{color:#e5c365!important;background:rgba(229,195,101,.12)!important;box-shadow:inset 0 0 0 1px rgba(229,195,101,.32)}.agent-enhance-button.is-active small{color:#e5c365}.agent-enhance-button.is-busy .codicon{animation:prompt-pulse 1s ease-in-out infinite}.prompt-budget-menu{min-width:230px}.prompt-budget-menu button{height:auto;min-height:38px;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;padding:5px 10px}.prompt-budget-menu button>span:first-child{display:grid;gap:1px}.prompt-budget-menu button strong{font-size:12px}.prompt-budget-menu button small{color:#999;font-size:10px}.prompt-budget-menu button.is-active{background:#04395e}.prompt-budget-menu .codicon{color:#e5c365}.prompt-budget-persistent{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:10px;min-height:43px;padding:5px 10px 7px;border-bottom:1px solid #454545}.prompt-budget-persistent>span{display:grid;gap:1px}.prompt-budget-persistent strong{color:#ddd;font-size:11px;font-weight:600}.prompt-budget-persistent small{color:#929292;font-size:9px;line-height:1.3}.prompt-persistent-switch{position:relative;width:28px;height:16px;cursor:pointer}.prompt-persistent-switch input{position:absolute;opacity:0;pointer-events:none}.prompt-persistent-switch span{position:absolute;inset:0;border-radius:8px;background:#4a4a4a;box-shadow:inset 0 0 0 1px #606060;transition:background .12s}.prompt-persistent-switch span:after{content:"";position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:50%;background:#d0d0d0;transition:transform .12s}.prompt-persistent-switch input:checked+span{background:#0e639c;box-shadow:inset 0 0 0 1px #1681c4}.prompt-persistent-switch input:checked+span:after{transform:translateX(12px);background:#fff}.prompt-persistent-switch input:focus-visible+span{outline:1px solid var(--focus);outline-offset:2px}@keyframes prompt-pulse{0%,100%{opacity:.45}50%{opacity:1}}
+.agent-composer{position:relative}.agent-composer textarea:disabled{opacity:.9;color:#d4d4d4;cursor:text}.agent-drop-hint{position:absolute;inset:8px;z-index:4;display:grid;place-items:center;border:1px dashed #75beff;background:rgba(4,57,94,.92);color:#fff;font-size:12px;pointer-events:none}.agent-composer.is-dragover textarea,.agent-composer.is-dragover .agent-actions{opacity:.35}.agent-stop-button{color:#f48771!important}.agent-stop-button:hover{background:rgba(241,76,76,.18)!important}.agent-enhance-button{position:relative}.agent-enhance-button small{position:absolute;right:1px;bottom:0;min-width:9px;color:#aaa;font:600 7px/9px Arial,sans-serif;letter-spacing:0;pointer-events:none}.agent-enhance-button.is-active{color:#e5c365!important;background:rgba(229,195,101,.12)!important;box-shadow:inset 0 0 0 1px rgba(229,195,101,.32)}.agent-enhance-button.is-active small{color:#e5c365}.agent-enhance-button.is-busy .codicon{animation:prompt-pulse 1s ease-in-out infinite}.prompt-budget-menu{min-width:244px}.prompt-budget-menu button{height:auto;min-height:38px;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;padding:5px 10px}.prompt-budget-menu button>span:first-child{display:grid;gap:1px}.prompt-budget-menu button strong{font-size:12px}.prompt-budget-menu button small{color:#999;font-size:10px}.prompt-budget-menu button.is-active{background:#04395e}.prompt-budget-menu .codicon{color:#e5c365}.prompt-budget-persistent{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:10px;min-height:43px;padding:5px 10px 7px;border-bottom:1px solid #454545}.prompt-budget-persistent>span{display:grid;gap:1px}.prompt-budget-persistent strong,.prompt-budget-context strong{color:#ddd;font-size:11px;font-weight:600}.prompt-budget-persistent small,.prompt-budget-context small{color:#929292;font-size:9px;line-height:1.3}.prompt-budget-context{display:grid;grid-template-columns:18px minmax(0,1fr);align-items:center;gap:6px;min-height:38px;padding:5px 10px;border-bottom:1px solid #454545}.prompt-budget-context>span:last-child{display:grid;gap:1px}.prompt-budget-context .codicon{color:#75beff}.prompt-persistent-switch{position:relative;width:28px;height:16px;cursor:pointer}.prompt-persistent-switch input{position:absolute;opacity:0;pointer-events:none}.prompt-persistent-switch span{position:absolute;inset:0;border-radius:8px;background:#4a4a4a;box-shadow:inset 0 0 0 1px #606060;transition:background .12s}.prompt-persistent-switch span:after{content:"";position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:50%;background:#d0d0d0;transition:transform .12s}.prompt-persistent-switch input:checked+span{background:#0e639c;box-shadow:inset 0 0 0 1px #1681c4}.prompt-persistent-switch input:checked+span:after{transform:translateX(12px);background:#fff}.prompt-persistent-switch input:focus-visible+span{outline:1px solid var(--focus);outline-offset:2px}@keyframes prompt-pulse{0%,100%{opacity:.45}50%{opacity:1}}
 .agent-message.assistant{padding-left:9px;border-left:2px solid #89d185;color:#ddd;white-space:normal}.agent-message.approach{padding:7px 9px;border:1px solid #353535;border-left:2px solid #4ec9b0;background:#202524;color:#d5e8e4;white-space:normal}.agent-approach-head{display:flex;align-items:center;gap:6px;margin-bottom:4px;color:#4ec9b0;font:600 10px/1.3 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;text-transform:uppercase}.agent-approach-body{font:12px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;overflow-wrap:anywhere}.agent-markdown{min-width:0;overflow-wrap:anywhere}.agent-markdown>:first-child{margin-top:0}.agent-markdown>:last-child{margin-bottom:0}.agent-markdown h1,.agent-markdown h2,.agent-markdown h3{margin:10px 0 5px;color:#eee;font-weight:600;letter-spacing:0}.agent-markdown h1{font-size:15px}.agent-markdown h2{font-size:14px}.agent-markdown h3{font-size:13px}.agent-markdown p{margin:5px 0}.agent-markdown ul,.agent-markdown ol{margin:5px 0;padding-left:20px}.agent-markdown li{margin:2px 0}.agent-markdown code{padding:1px 3px;background:#292929;color:#d7ba7d;font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}.agent-markdown pre{max-height:360px;margin:7px 0;padding:8px;overflow:auto;background:#151515;border:1px solid #333}.agent-markdown pre code{padding:0;background:transparent;color:#d4d4d4;white-space:pre}.agent-markdown blockquote{margin:7px 0;padding:2px 8px;border-left:2px solid #4ec9b0;color:#aaa}.agent-markdown a{color:#75beff}.agent-markdown table{display:block;max-width:100%;overflow:auto;border-collapse:collapse}.agent-markdown th,.agent-markdown td{padding:3px 6px;border:1px solid #3b3b3b;text-align:left}.agent-markdown hr{border:0;border-top:1px solid #3a3a3a}.agent-message.tool,.agent-message.file_patch,.agent-message.command,.agent-message.control,.agent-message.compact{padding:0;border:1px solid #353535;border-left:2px solid #cca700;background:#202020;color:#bbb;font:11px/1.5 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;white-space:normal}.agent-message.file_patch{border-left-color:#89d185}.agent-message.command{border-left-color:#75beff}.agent-message.control{border-left-color:#c586c0}.agent-message.compact{border-left-color:#4ec9b0}.agent-message .agent-meta{display:block;margin-bottom:4px;color:#75beff;font:10px/1.3 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;text-transform:uppercase}.agent-message .agent-meta.agent-role-manager{color:#c586c0}.agent-message .agent-meta.agent-role-developer{color:#89d185}.agent-message .agent-meta.agent-role-explorer{color:#75beff}.agent-message .agent-meta.agent-role-planner{color:#dcdcaa}.agent-message .agent-meta.agent-role-reviewer{color:#f0a979}.agent-tool-head{min-height:31px;display:flex;align-items:center;gap:6px;padding:5px 7px;cursor:pointer}.agent-tool-head:hover{background:#292929}.agent-tool-head .codicon{color:#c5c5c5}.agent-tool-title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#ddd;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.agent-tool-state{margin-left:auto;color:#9a9a9a;font:10px/1.3 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;white-space:nowrap}.agent-tool-state.success,.diff-add{color:#89d185}.agent-tool-state.error,.diff-del{color:#f48771}.agent-tool-body{display:none;border-top:1px solid #343434}.agent-message.is-expanded .agent-tool-body{display:block}.agent-tool-output{max-height:320px;margin:0;padding:8px;overflow:auto;color:#bcbcbc;background:#191919;white-space:pre-wrap;overflow-wrap:anywhere}.agent-tool-actions{display:flex;align-items:center;gap:5px;padding:6px 7px;border-top:1px solid #303030}.agent-tool-actions button{min-height:23px;padding:2px 7px;font-size:10px}.agent-diff-stats{display:flex;gap:7px;margin-left:auto}.agent-diff{max-height:360px;overflow:auto;padding:6px 0;background:#181818}.agent-diff-line{display:grid;grid-template-columns:40px 13px minmax(0,1fr);padding:0 7px;white-space:pre-wrap;overflow-wrap:anywhere}.agent-diff-line .line-no{color:#777;text-align:right;user-select:none}.agent-diff-line .line-mark{text-align:center;user-select:none}.agent-diff-line.add{background:rgba(35,134,54,.18);color:#b7e1bf}.agent-diff-line.del{background:rgba(248,81,73,.15);color:#efb0aa}.agent-diff-line.hunk{color:#75beff;background:rgba(56,139,253,.1)}.agent-model-menu{width:min(360px,calc(100vw - 8px));max-height:min(440px,70vh);overflow:auto}.agent-model-menu button span:last-child{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.agent-model-summary{padding:7px 10px;border-bottom:1px solid #454545;color:#aaa;font-size:10px}.agent-model-menu button.is-active{color:#9cdcfe}.pairing-code{margin:10px 0;padding:12px;border:1px solid var(--line-light);background:#181818;color:#75beff;text-align:center;font:600 18px/1.2 ui-monospace,SFMono-Regular,Menlo,monospace}.auth-secondary{margin-top:12px;color:#aaa;text-align:center;font-size:11px}
 .agent-model-summary{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:start;gap:8px}.agent-model-context{min-width:0;display:flex;flex-direction:column;gap:2px;line-height:1.35;white-space:normal}.agent-model-name{overflow:hidden;color:#ddd;font-weight:600;text-overflow:ellipsis;white-space:nowrap}.agent-model-usage{color:#aaa;overflow-wrap:anywhere}.agent-model-compact{display:inline-flex!important;align-items:center!important;justify-content:center!important;min-width:52px!important;min-height:22px!important;height:22px!important;padding:0 6px!important;border:1px solid #4f4f4f!important;background:#2a2a2a!important;color:#ccc!important;font-size:10px!important}.agent-model-compact:hover{background:#353535!important;color:#fff!important}.agent-model-compact:disabled{opacity:.45;cursor:default}
 .status-bar{display:flex;align-items:center;justify-content:space-between;min-width:0;background:var(--status);color:#fff;font-size:12px;user-select:none}.status-left,.status-right{height:100%;display:flex;align-items:stretch;min-width:0}.status-bar button{height:100%;display:flex;align-items:center;gap:4px;padding:0 6px;border:0;background:transparent;color:#fff;white-space:nowrap;cursor:pointer}.status-bar button:hover{background:var(--status-hover)}.status-message{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:2px 8px;color:#fff}.status-right{justify-content:flex-end}
 .overlay{position:fixed;inset:0;z-index:500;background:rgba(0,0,0,.28)}.palette{width:min(700px,calc(100vw - 28px));margin:44px auto 0;background:#252526;border:1px solid #454545;box-shadow:0 10px 32px rgba(0,0,0,.52)}.palette-input-row{height:40px;display:grid;grid-template-columns:24px minmax(0,1fr);align-items:center;margin:6px;border:1px solid var(--focus);background:var(--input);padding:0 7px}.palette-input-row input{height:100%;border:0;background:transparent;font-size:14px}.palette-results{max-height:min(440px,65vh);overflow:auto;padding-bottom:5px}.palette-row{height:34px;display:flex;align-items:center;gap:8px;padding:0 10px;cursor:default}.palette-row.is-active,.palette-row:hover{background:#04395e}.palette-row .palette-label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.palette-row .keybinding{margin-left:auto;flex:none;color:#aaa}.palette-empty{padding:12px 14px;color:#999}.modal{width:min(620px,calc(100vw - 30px));max-height:calc(100vh - 80px);margin:48px auto;background:#252526;border:1px solid #454545;box-shadow:0 12px 40px rgba(0,0,0,.55);overflow:auto}.modal>header{height:42px;display:flex;align-items:center;justify-content:space-between;padding:0 10px 0 16px;border-bottom:1px solid var(--line)}.modal h2{margin:0;color:#ddd;font-size:15px;font-weight:500}.modal-form{display:grid;gap:8px;padding:14px}.modal-form input{height:30px;padding:5px 7px}.modal-actions{display:flex;justify-content:flex-end;gap:7px;margin-top:8px}.account-list{padding:8px}.account-row{min-height:38px;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:8px;padding:4px 7px;border-bottom:1px solid var(--line)}.account-row small{display:block;color:#999}.prompt-enhance-dialog{display:grid;grid-template-rows:auto minmax(0,1fr) auto;width:min(820px,calc(100vw - 28px));height:min(720px,calc(100vh - 48px));margin:24px auto;background:#252526;border:1px solid #4b4b4b;box-shadow:0 14px 44px rgba(0,0,0,.58)}.prompt-enhance-dialog>header{min-height:48px;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:7px 10px 7px 16px;border-bottom:1px solid var(--line)}.prompt-enhance-dialog h2{margin:0;color:#e5e5e5;font-size:15px;font-weight:500}.prompt-enhance-dialog header small{display:block;margin-top:2px;color:#8f8f8f}.prompt-enhance-body{min-height:0;overflow:auto;padding:14px 16px}.prompt-enhance-loading{display:none;height:100%;min-height:260px;place-content:center;justify-items:center;gap:9px;text-align:center;color:#bbb}.prompt-enhance-loading .codicon{font-size:34px;color:#e5c365;animation:prompt-pulse 1s ease-in-out infinite}.prompt-enhance-loading strong{color:#e5e5e5;font-size:14px}.prompt-enhance-loading p{max-width:520px;margin:0;line-height:1.5}.prompt-enhance-loading small{color:#8f8f8f}.prompt-editor-label{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin:0 0 7px;color:#ddd}.prompt-editor-label strong{font-size:12px}.prompt-editor-label small{color:#8f8f8f}.prompt-enhance-body textarea{box-sizing:border-box;width:100%;height:calc(100% - 48px);min-height:320px;resize:vertical;padding:10px 12px;background:#1e1e1e;color:#d4d4d4;border:1px solid #444;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}.prompt-enhance-body textarea:focus{border-color:var(--focus);outline:0}.prompt-enhance-note{min-height:18px;margin-top:6px;color:#999;font-size:11px}.prompt-enhance-dialog>footer{min-height:48px;display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;align-items:center;gap:7px;padding:7px 12px;border-top:1px solid var(--line)}.prompt-enhance-dialog>footer .button{min-height:29px}.prompt-enhance-dialog.is-busy .prompt-enhance-loading{display:grid}.prompt-enhance-dialog.is-busy .prompt-editor-label,.prompt-enhance-dialog.is-busy .prompt-enhance-body textarea,.prompt-enhance-dialog.is-busy .prompt-enhance-note{display:none}.prompt-enhance-dialog.is-busy>footer button{pointer-events:none;opacity:.62}@media(max-width:640px){.prompt-enhance-dialog{height:calc(100vh - 16px);margin:8px auto}.prompt-editor-label{display:block}.prompt-editor-label small{display:block;margin-top:2px}.prompt-enhance-dialog>footer{grid-template-columns:1fr 1fr}.prompt-enhance-dialog>footer>span{display:none}.prompt-enhance-dialog>footer .button{width:100%}}
 .prompt-enhance-dialog{width:min(880px,calc(100vw - 28px));height:min(760px,calc(100vh - 48px))}.prompt-enhance-body{display:flex;flex-direction:column;gap:10px}.prompt-enhance-analysis{flex:none;padding:10px 12px;background:#202020;border:1px solid #3c3c3c}.prompt-analysis-heading{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:6px;color:#ddd}.prompt-analysis-heading strong{font-size:12px}.prompt-analysis-heading small{color:#858585}.prompt-intent{margin:0 0 8px;color:#ddd;line-height:1.5}.prompt-enhance-details{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}.prompt-detail-group{min-width:0;padding:7px 8px;background:#262626;border-left:2px solid #4b86b4}.prompt-detail-group>strong{display:block;margin-bottom:4px;color:#bbb;font-size:11px;text-transform:uppercase}.prompt-detail-group ul{margin:0;padding-left:17px;color:#c8c8c8}.prompt-detail-group li{margin:2px 0;line-height:1.45}.prompt-detail-group.clarifications{grid-column:1/-1;border-left-color:#d7ba7d}.prompt-clarification{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:8px;padding:5px 0;border-top:1px solid #383838}.prompt-clarification:first-of-type{border-top:0}.prompt-clarification span{overflow-wrap:anywhere}.prompt-clarification .default-answer{color:#dcdcaa}.prompt-enhance-body textarea{flex:1 0 250px;height:auto;min-height:250px}.prompt-enhance-dialog.is-busy .prompt-enhance-analysis,.prompt-enhance-dialog.is-busy .prompt-editor-label,.prompt-enhance-dialog.is-busy .prompt-enhance-body textarea,.prompt-enhance-dialog.is-busy .prompt-enhance-note{display:none}@media(max-width:640px){.prompt-enhance-details{grid-template-columns:1fr}.prompt-clarification{grid-template-columns:1fr}.prompt-enhance-analysis{padding:8px}.prompt-enhance-body textarea{min-height:220px}}
-.menu-popup{position:fixed;z-index:700;min-width:210px;padding:4px;background:#252526;border:1px solid #454545;box-shadow:0 8px 22px rgba(0,0,0,.5)}.menu-popup button{width:100%;height:27px;display:flex;align-items:center;gap:8px;padding:0 10px;border:0;background:transparent;color:#ddd;text-align:left;cursor:pointer}.menu-popup button:hover{background:#04395e}.menu-popup .separator{height:1px;margin:4px;background:#454545}.menu-popup .shortcut{margin-left:auto;color:#aaa}.toast-host{position:fixed;z-index:900;right:12px;bottom:34px;width:min(390px,calc(100vw - 24px));display:grid;gap:7px}.toast{display:grid;grid-template-columns:20px minmax(0,1fr) 22px;gap:7px;align-items:start;padding:10px;background:#252526;border:1px solid #454545;box-shadow:0 5px 18px rgba(0,0,0,.42)}.toast.error{border-left:3px solid var(--danger)}.toast.warning{border-left:3px solid var(--warning)}.toast.success{border-left:3px solid var(--success)}.toast button{border:0;background:transparent;color:#aaa;cursor:pointer}
+.prompt-detail-group.execution{grid-column:1/-1;border-left-color:#4ec9b0}.prompt-detail-group.skills{grid-column:1/-1;border-left-color:#c586c0}.prompt-step,.prompt-skill{display:grid;grid-template-columns:22px minmax(0,1fr);gap:7px;padding:5px 0;border-top:1px solid #383838}.prompt-step:first-of-type,.prompt-skill:first-of-type{border-top:0}.prompt-step-index{display:grid;place-items:center;width:19px;height:19px;border-radius:50%;background:#164f45;color:#d7fff8;font-size:10px}.prompt-step-content,.prompt-skill-content{display:grid;gap:2px;min-width:0}.prompt-step-content span,.prompt-skill-content span{color:#c8c8c8;line-height:1.4;overflow-wrap:anywhere}.prompt-step-content small,.prompt-skill-content small{color:#929292;line-height:1.35}.menu-popup{position:fixed;z-index:700;min-width:210px;padding:4px;background:#252526;border:1px solid #454545;box-shadow:0 8px 22px rgba(0,0,0,.5)}.menu-popup button{width:100%;height:27px;display:flex;align-items:center;gap:8px;padding:0 10px;border:0;background:transparent;color:#ddd;text-align:left;cursor:pointer}.menu-popup button:hover{background:#04395e}.menu-popup .separator{height:1px;margin:4px;background:#454545}.menu-popup .shortcut{margin-left:auto;color:#aaa}.toast-host{position:fixed;z-index:900;right:12px;bottom:34px;width:min(390px,calc(100vw - 24px));display:grid;gap:7px}.toast{display:grid;grid-template-columns:20px minmax(0,1fr) 22px;gap:7px;align-items:start;padding:10px;background:#252526;border:1px solid #454545;box-shadow:0 5px 18px rgba(0,0,0,.42)}.toast.error{border-left:3px solid var(--danger)}.toast.warning{border-left:3px solid var(--warning)}.toast.success{border-left:3px solid var(--success)}.toast button{border:0;background:transparent;color:#aaa;cursor:pointer}
 @media(max-width:1080px){:root{--sidebar-width:250px;--secondary-width:280px}.menu-bar button:nth-child(n+5){display:none}.status-right button:nth-child(-n+3){display:none}}
 @media(max-width:820px){:root{--sidebar-width:min(300px,calc(100vw - 48px));--secondary-width:min(320px,calc(100vw - 48px));--panel-height:190px}.title-bar{grid-template-columns:28px 25px 1fr auto}.menu-bar{display:none}.command-center{width:100%;min-width:0}.workbench-grid{position:relative;grid-template-columns:48px minmax(0,1fr)!important}.primary-sidebar,.secondary-sidebar{position:absolute;z-index:90;top:0;bottom:0;width:var(--sidebar-width);box-shadow:5px 0 18px rgba(0,0,0,.42)}.primary-sidebar{left:48px}.secondary-sidebar{right:0;width:var(--secondary-width);box-shadow:-5px 0 18px rgba(0,0,0,.42)}.primary-hidden .primary-sidebar,.secondary-hidden .secondary-sidebar{display:none}.editor-area{grid-column:2}.editor-grid.split{grid-template-columns:minmax(0,1fr)}.editor-grid.split .editor-group:not(.is-active){display:none}.layout-controls #togglePanelBtn{display:none}.empty-actions{grid-template-columns:auto}.status-right button{display:none!important}.status-right #accountStatus,.status-right #notificationsBtn{display:flex!important}.panel-tabs{gap:12px}.panel-tabs button{font-size:10px}.panel-header .header-actions .icon-button:nth-child(-n+2){display:none}}
 @media(max-width:480px){.title-bar{grid-template-columns:28px 22px minmax(0,1fr) auto;padding:0 3px}.layout-controls button:not(#toggleSecondaryBtn){display:none}.command-center span:last-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.activity-button{width:43px}.workbench-grid{grid-template-columns:44px minmax(0,1fr)!important}.primary-sidebar{left:44px}.status-left #syncStatus,.status-left #errorStatus{display:none}.panel-tabs{gap:9px}.panel-tabs button{max-width:62px;overflow:hidden;text-overflow:ellipsis}.auth-dialog{padding:28px 22px}.extension-row{grid-template-columns:36px minmax(0,1fr)}.extension-icon{width:36px;height:36px}.extension-row .button{grid-column:2;justify-self:start}}
@@ -95740,9 +96363,9 @@ const S={
   treeCache:new Map(),openFiles:new Map(),activeByGroup:['',''],activeGroup:0,monaco:null,editors:[],diffEditors:[],models:new Map(),historyOriginalModels:new Map(),historyDecorations:new Map(),viewStates:new Map(),suppressEditorChange:false,codeHistoryMode:'all',
   activeView:'explorer',panel:'terminal',primaryVisible:true,secondaryVisible:true,panelVisible:true,panelMaximized:false,
   diagnostics:[],searchResults:[],scm:null,tasks:[],installedExtensions:[],extensionWorkers:new Map(),
-  terminal:null,terminalStarting:false,terminalPromise:null,terminalWidget:null,terminalFit:null,terminalOffset:0,terminalPoll:null,stateTimer:null,diagnosticTimer:null,paletteItems:[],paletteIndex:0,paletteMode:'commands',quickFiles:[],quickFilesLoading:false,quickFilesKey:'',quickFilesTruncated:false,
+  terminal:null,terminalStarting:false,terminalPromise:null,terminalWidget:null,terminalFit:null,terminalOffset:0,terminalPoll:null,terminalDecoder:null,terminalAnsiState:null,terminalPlainState:null,stateTimer:null,diagnosticTimer:null,paletteItems:[],paletteIndex:0,paletteMode:'commands',quickFiles:[],quickFilesLoading:false,quickFilesKey:'',quickFilesTruncated:false,
   debug:null,debugSeq:0,debugPoll:null,debugFile:null,
-  agentPoll:null,agentPollDue:0,agentPollBusy:false,agentPollRequested:false,agentState:null,agentRendered:new Set(),agentToolCards:new Map(),agentPlanCards:new Map(),agentOperationSeq:0,agentEventSeq:0,agentWasBusy:false,agentSession:'',agentSubmitting:false,agentInterrupting:false,agentTreeTimer:null,agentFileRefresh:new Set(),agentAttachments:[],agentModelCatalog:null,agentTodoCollapsed:false,promptEnhanceEnabled:false,promptEnhancePersistent:false,promptEnhanceBudget:'medium',promptEnhancing:false,promptEnhanceDraft:null,promptEnhanceAbort:null,workspaceRefreshBusy:false,workspaceRefreshSeq:0,workspaceClipboard:null,explorerSelection:null,sessionSwitchSeq:0,sessionSwitching:false,renderingAgentState:false,devicePoll:null,agentEvents:null,agentEventsConnected:false,agentEventReconnect:null,pendingUploadDest:'',pendingOpenUpload:false,pendingFolderUploadDest:''
+  agentPoll:null,agentPollDue:0,agentPollBusy:false,agentPollRequested:false,agentState:null,agentRendered:new Set(),agentToolCards:new Map(),agentPlanCards:new Map(),agentOperationSeq:0,agentEventSeq:0,agentWasBusy:false,agentSession:'',agentSubmitting:false,agentInterrupting:false,agentTreeTimer:null,agentFileRefresh:new Set(),agentAttachments:[],agentModelCatalog:null,agentTodoCollapsed:false,promptEnhanceEnabled:false,promptEnhancePersistent:false,promptEnhanceSkillsAware:false,promptEnhanceBudget:'medium',promptEnhancing:false,promptEnhanceDraft:null,promptEnhanceAbort:null,workspaceRefreshBusy:false,workspaceRefreshSeq:0,workspaceClipboard:null,explorerSelection:null,sessionSwitchSeq:0,sessionSwitching:false,renderingAgentState:false,devicePoll:null,agentEvents:null,agentEventsConnected:false,agentEventReconnect:null,pendingUploadDest:'',pendingOpenUpload:false,pendingFolderUploadDest:''
 };
 const HTML_ESCAPE={'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'};
 const escapeHtml=value=>String(value??'').replace(/[&<>"']/g,ch=>HTML_ESCAPE[ch]);
@@ -95899,6 +96522,10 @@ async function refreshWorkspaceSnapshot(){if(S.workspaceRefreshBusy||!S.activeSe
 async function createSession(){const out=await api('/api/ide/sessions',{method:'POST',body:'{}'});await switchSession(out.id,true);return out}
 async function renameCurrentSession(){const row=S.sessions.find(item=>item.id===S.activeSession);if(!row)return;const title=prompt('Session name',row.title||'');if(!title||title.trim()===row.title)return;const out=await api(`/api/ide/sessions/${qs(S.activeSession)}`,{method:'PATCH',body:JSON.stringify({title:title.trim()})});row.title=out.title;renderSessions();updateAgentContext();await loadRoots();scheduleStateSave()}
 async function switchSession(sessionId,isNew=false){const target=String(sessionId||'');if(!target||target===S.activeSession&&!isNew){renderSessions();return true}if([...S.openFiles.values()].some(file=>file.dirty)&&!confirm('Switch session with unsaved files?')){renderSessions();return false}const seq=++S.sessionSwitchSeq;S.sessionSwitching=true;E('sessionSelect').disabled=true;closePromptEnhanceReview(false);S.workspaceClipboard=null;S.explorerSelection=null;clearWorkspaceDropState();S.activeSession=target;S.workspaceRefreshSeq++;S.workspaceRefreshBusy=false;closeAgentEvents();clearTimeout(S.agentPoll);S.agentPoll=null;S.agentPollDue=0;clearTimeout(S.agentTreeTimer);try{if(S.terminal)await killTerminal();if(seq!==S.sessionSwitchSeq)return false;if(S.debug)await stopDebug();if(seq!==S.sessionSwitchSeq)return false;S.openFiles.clear();S.models.forEach(model=>model.dispose());S.models.clear();S.historyOriginalModels.forEach(model=>model.dispose());S.historyOriginalModels.clear();S.historyDecorations.clear();S.viewStates.clear();S.activeByGroup=['',''];setEditorModel(1,null);setEditorModel(0,null);syncEditorGroupLayout();resetAgentSessionUI(target);await refreshConfig();if(seq!==S.sessionSwitchSeq||target!==S.activeSession)return false;await loadRoots(target,seq);if(seq!==S.sessionSwitchSeq||target!==S.activeSession)return false;updateAgentContext();connectAgentEvents();S.agentPollRequested=true;scheduleAgentPoll(50);if(isNew){toggleSecondary(true);E('agentPrompt').focus();agentMessage('New task workspace ready.','system')}scheduleStateSave();return true}finally{if(seq===S.sessionSwitchSeq){S.sessionSwitching=false;E('sessionSelect').disabled=false;renderSessions()}}}
+async function refreshSessionCatalog(){const out=await api('/api/ide/sessions?limit=80&offset=0');S.sessions=Array.isArray(out.sessions)?out.sessions:[];renderSessions();return out}
+// Session switching only needs the catalog. Keep toolchains, mounts, and other
+// static IDE config out of the hot path on machines with many old sessions.
+async function switchSession(sessionId,isNew=false){const target=String(sessionId||'');if(!target||target===S.activeSession&&!isNew){renderSessions();return true}if([...S.openFiles.values()].some(file=>file.dirty)&&!confirm('Switch session with unsaved files?')){renderSessions();return false}const seq=++S.sessionSwitchSeq;S.sessionSwitching=true;E('sessionSelect').disabled=true;closePromptEnhanceReview(false);S.workspaceClipboard=null;S.explorerSelection=null;clearWorkspaceDropState();S.activeSession=target;S.workspaceRefreshSeq++;S.workspaceRefreshBusy=false;closeAgentEvents();clearTimeout(S.agentPoll);S.agentPoll=null;S.agentPollDue=0;clearTimeout(S.agentTreeTimer);try{if(S.terminal)await killTerminal();if(seq!==S.sessionSwitchSeq)return false;if(S.debug)await stopDebug();if(seq!==S.sessionSwitchSeq)return false;S.openFiles.clear();S.models.forEach(model=>model.dispose());S.models.clear();S.historyOriginalModels.forEach(model=>model.dispose());S.historyOriginalModels.clear();S.historyDecorations.clear();S.viewStates.clear();S.activeByGroup=['',''];setEditorModel(1,null);setEditorModel(0,null);syncEditorGroupLayout();resetAgentSessionUI(target);await refreshSessionCatalog();if(seq!==S.sessionSwitchSeq||target!==S.activeSession)return false;await loadRoots(target,seq);if(seq!==S.sessionSwitchSeq||target!==S.activeSession)return false;updateAgentContext();connectAgentEvents();S.agentPollRequested=true;scheduleAgentPoll(50);if(isNew){toggleSecondary(true);E('agentPrompt').focus();agentMessage('New task workspace ready.','system')}scheduleStateSave();return true}finally{if(seq===S.sessionSwitchSeq){S.sessionSwitching=false;E('sessionSelect').disabled=false;renderSessions()}}}
 async function newFile(){const rel=prompt('File path',activeDir()?`${activeDir()}/untitled.txt`:'untitled.txt');if(!rel)return;await api(`/api/ide/sessions/${qs(S.activeSession)}/workspace/file`,{method:'PUT',body:JSON.stringify({root_id:S.activeRoot,path:rel,content:''})});await loadTree(activeDir());await openFile(rel)}
 async function newFolder(){const rel=prompt('Folder path',activeDir()?`${activeDir()}/new-folder`:'new-folder');if(!rel)return;await api(`/api/ide/sessions/${qs(S.activeSession)}/workspace/mkdir`,{method:'POST',body:JSON.stringify({root_id:S.activeRoot,path:rel})});await loadTree(activeDir())}
 async function renameEntry(row){const next=normalizeUploadPath(prompt('New path',row.path)||'');if(!next||next===row.path)return;workspaceAssertNoDirtyFiles(row.path,'renaming this entry');await api(`/api/ide/sessions/${qs(S.activeSession)}/workspace/rename`,{method:'PATCH',body:JSON.stringify({root_id:S.activeRoot,old_path:row.path,new_path:next})});await remapWorkspaceOpenFiles(row.path,next);const selected=explorerSelectionRow();if(selected&&(selected.path===row.path||selected.path.startsWith(`${row.path}/`)))S.explorerSelection=Object.assign({},selected,{path:`${next}${selected.path.slice(row.path.length)}`,name:selected.path===row.path?next.split('/').pop():selected.name});const clip=S.workspaceClipboard;if(clip?.session_id===S.activeSession&&clip?.root_id===S.activeRoot&&(clip.path===row.path||clip.path.startsWith(`${row.path}/`)))S.workspaceClipboard=Object.assign({},clip,{path:`${next}${clip.path.slice(row.path.length)}`,name:clip.path===row.path?next.split('/').pop():clip.name});S.treeCache.clear();await loadTree('')}
@@ -95944,8 +96571,8 @@ function togglePrimary(){S.primaryVisible=!S.primaryVisible;E('ideShell').classL
 function toggleSecondary(force){S.secondaryVisible=typeof force==='boolean'?force:!S.secondaryVisible;E('ideShell').classList.toggle('secondary-hidden',!S.secondaryVisible);scheduleStateSave()}
 function togglePanel(){S.panelVisible=!S.panelVisible;E('ideShell').classList.toggle('panel-hidden',!S.panelVisible);scheduleStateSave()}
 function scheduleStateSave(){clearTimeout(S.stateTimer);S.stateTimer=setTimeout(saveWorkbenchState,600)}
-async function saveWorkbenchState(){if(!S.csrf||!S.activeSession)return;const state={active_session_id:S.activeSession,active_root_id:S.activeRoot,active_view:S.activeView,panel:S.panel,panel_visible:S.panelVisible,secondary_visible:S.secondaryVisible,agent_todo_collapsed:S.agentTodoCollapsed,prompt_enhance_persistent:S.promptEnhancePersistent,prompt_enhance_enabled:S.promptEnhancePersistent&&S.promptEnhanceEnabled,prompt_enhance_budget:S.promptEnhanceBudget,code_history_mode:S.codeHistoryMode,open_files:[...S.openFiles.values()].slice(0,40).map(file=>({root_id:file.root_id,path:file.path,stage_id:file.stageId||'latest'}))};try{await api('/api/ide/v2/workbench/state',{method:'POST',body:JSON.stringify({state})})}catch(error){logOutput(`State save failed: ${error.message}`)}}
-async function restoreWorkbenchState(){try{const out=await api('/api/ide/v2/workbench/state');const state=out.state||{};if(state.active_session_id&&S.sessions.some(row=>row.id===state.active_session_id))S.activeSession=state.active_session_id;if(state.active_root_id)S.activeRoot=state.active_root_id;if(state.active_view)S.activeView=state.active_view;S.panel=state.panel||'terminal';S.codeHistoryMode=['all','changes','clean'].includes(state.code_history_mode)?state.code_history_mode:'all';const panelVisible=state.panel_visible!==false;S.secondaryVisible=state.secondary_visible!==false;S.agentTodoCollapsed=state.agent_todo_collapsed===true;S.promptEnhancePersistent=state.prompt_enhance_persistent===true;S.promptEnhanceEnabled=S.promptEnhancePersistent&&state.prompt_enhance_enabled===true;S.promptEnhanceBudget=['low','medium','high','xhigh'].includes(state.prompt_enhance_budget)?state.prompt_enhance_budget:'medium';renderPromptEnhanceToggle();showView(S.activeView);showPanel(S.panel);S.panelVisible=panelVisible;E('ideShell').classList.toggle('panel-hidden',!panelVisible);if(!S.secondaryVisible)toggleSecondary(false);await loadRoots();for(const row of state.open_files||[]){try{await openFile(row.path,{root_id:row.root_id||'session',group:0,stage_id:row.stage_id||'latest'})}catch(error){logOutput(`Restore skipped ${row.path}: ${error.message}`)}}}catch(error){logOutput(`State restore failed: ${error.message}`);renderPromptEnhanceToggle();await loadRoots()}}
+async function saveWorkbenchState(){if(!S.csrf||!S.activeSession)return;const state={active_session_id:S.activeSession,active_root_id:S.activeRoot,active_view:S.activeView,panel:S.panel,panel_visible:S.panelVisible,secondary_visible:S.secondaryVisible,agent_todo_collapsed:S.agentTodoCollapsed,prompt_enhance_persistent:S.promptEnhancePersistent,prompt_enhance_enabled:S.promptEnhancePersistent&&S.promptEnhanceEnabled,prompt_enhance_skills_awareness:S.promptEnhanceSkillsAware,prompt_enhance_budget:S.promptEnhanceBudget,code_history_mode:S.codeHistoryMode,open_files:[...S.openFiles.values()].slice(0,40).map(file=>({root_id:file.root_id,path:file.path,stage_id:file.stageId||'latest'}))};try{await api('/api/ide/v2/workbench/state',{method:'POST',body:JSON.stringify({state})})}catch(error){logOutput(`State save failed: ${error.message}`)}}
+async function restoreWorkbenchState(){try{const out=await api('/api/ide/v2/workbench/state');const state=out.state||{};if(state.active_session_id&&S.sessions.some(row=>row.id===state.active_session_id))S.activeSession=state.active_session_id;if(state.active_root_id)S.activeRoot=state.active_root_id;if(state.active_view)S.activeView=state.active_view;S.panel=state.panel||'terminal';S.codeHistoryMode=['all','changes','clean'].includes(state.code_history_mode)?state.code_history_mode:'all';const panelVisible=state.panel_visible!==false;S.secondaryVisible=state.secondary_visible!==false;S.agentTodoCollapsed=state.agent_todo_collapsed===true;S.promptEnhancePersistent=state.prompt_enhance_persistent===true;S.promptEnhanceEnabled=S.promptEnhancePersistent&&state.prompt_enhance_enabled===true;S.promptEnhanceSkillsAware=state.prompt_enhance_skills_awareness===true;S.promptEnhanceBudget=['low','medium','high','xhigh'].includes(state.prompt_enhance_budget)?state.prompt_enhance_budget:'medium';renderPromptEnhanceToggle();showView(S.activeView);showPanel(S.panel);S.panelVisible=panelVisible;E('ideShell').classList.toggle('panel-hidden',!panelVisible);if(!S.secondaryVisible)toggleSecondary(false);await loadRoots();for(const row of state.open_files||[]){try{await openFile(row.path,{root_id:row.root_id||'session',group:0,stage_id:row.stage_id||'latest'})}catch(error){logOutput(`Restore skipped ${row.path}: ${error.message}`)}}}catch(error){logOutput(`State restore failed: ${error.message}`);renderPromptEnhanceToggle();await loadRoots()}}
 async function runSearch(){const query=E('searchInput').value;if(!query.trim()){S.searchResults=[];renderSearch();return}E('searchSummary').textContent='Searching...';const out=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/search`,{method:'POST',body:JSON.stringify({root_id:S.activeRoot,query,case_sensitive:E('matchCaseBtn').classList.contains('is-active'),regex:E('regexBtn').classList.contains('is-active'),include:E('includeInput').value.trim(),exclude:E('excludeInput').value.trim(),max_results:1000})});S.searchResults=out.results||[];E('searchSummary').textContent=`${out.count||0} results in ${out.files_scanned||0} files${out.truncated?' (limit reached)':''}`;renderSearch()}
 function renderSearch(){const host=E('searchResults');host.innerHTML='';let current='';for(const row of S.searchResults){if(row.path!==current){current=row.path;const group=document.createElement('div');group.className='result-group';group.textContent=row.path;host.appendChild(group)}const line=document.createElement('div');line.className='result-line list-row';line.innerHTML=`<code>${escapeHtml(row.preview)}</code><span class="result-location">${row.line}:${row.column}</span>`;line.onclick=()=>openFile(row.path,{root_id:S.activeRoot,line:row.line,column:row.column}).catch(showError);host.appendChild(line)}}
 async function refreshScm(){E('scmBranch').textContent='Checking repository...';const out=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/scm/status?${rootQuery()}`);S.scm=out;E('scmBranch').innerHTML=out.repository?`<span class="codicon codicon-git-branch"></span> ${escapeHtml(out.branch||'detached')}`:'No source control providers registered.';E('statusBranch').textContent=out.branch||'-';E('scmBadge').textContent=out.changes?.length?String(out.changes.length):'';renderScm()}
@@ -95955,14 +96582,41 @@ async function refreshTasks(){const out=await api(`/api/ide/v2/sessions/${qs(S.a
 async function runTask(task){showPanel('output');logOutput(`> Running task: ${task.label}`);const out=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/tasks/run`,{method:'POST',body:JSON.stringify({root_id:S.activeRoot,task_id:task.id})});logOutput(`${out.stdout||''}${out.stderr||''}\nTask exited with code ${out.returncode}`);await refreshWorkspaceSnapshot()}
 function renderTools(){const host=E('toolchains');host.innerHTML='';for(const tool of S.config?.toolchains||[]){const row=document.createElement('div');row.className='tool-row';row.innerHTML=`<span class="tool-state ${tool.available?'':'missing'}">${tool.available?'Available':'Missing'}</span><strong>${escapeHtml(tool.name)}</strong><span>${escapeHtml(tool.available?Object.keys(tool.found||{}).join(', '):tool.install_hint)}</span>`;host.appendChild(row)}}
 function shellQuote(value){const text=String(value);if(/^win/i.test(String(S.config?.platform||'')))return `"${text.replace(/"/g,'\\"')}"`;return `'${text.replace(/'/g,"'\\''")}'`}
-async function newTerminal(){if(S.terminalStarting)return S.terminalPromise;if(!S.capabilities.terminal)throw new Error(S.capabilities.process_denial_reason||'Terminal is unavailable.');S.terminalStarting=true;S.terminalPromise=(async()=>{if(S.terminal)await killTerminal();E('terminalEmpty').textContent='Starting terminal...';const out=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/terminals`,{method:'POST',body:JSON.stringify({root_id:S.activeRoot,cwd:activeDir()||'.',cols:100,rows:28})});S.terminal=out.terminal;S.terminalOffset=0;E('terminalFallback').textContent='';setupTerminalWidget();pollTerminal();if(S.panel!=='terminal'||!S.panelVisible)showPanel('terminal');return S.terminal})().finally(()=>{S.terminalStarting=false;S.terminalPromise=null});return S.terminalPromise}
-function setupTerminalWidget(){E('terminalHost').innerHTML='';E('terminalEmpty').classList.add('is-hidden');if(window.Terminal){S.terminalWidget=new window.Terminal({convertEol:true,cursorBlink:true,fontSize:12,fontFamily:'SFMono-Regular, Menlo, Monaco, Consolas, monospace',theme:{background:'#181818',foreground:'#cccccc',cursor:'#ffffff',selectionBackground:'#264f78'},scrollback:5000});const Fit=window.FitAddon?.FitAddon;if(Fit){S.terminalFit=new Fit();S.terminalWidget.loadAddon(S.terminalFit)}S.terminalWidget.open(E('terminalHost'));if(S.terminalFit)S.terminalFit.fit();S.terminalWidget.onData(data=>terminalInput(data));if(S.terminalWidget.onResize)S.terminalWidget.onResize(size=>terminalResize(size.cols,size.rows));E('terminalFallback').classList.remove('is-active')}else{E('terminalFallback').classList.add('is-active');E('terminalFallback').contentEditable='true';E('terminalFallback').onkeydown=event=>{if(event.key.length===1){event.preventDefault();terminalInput(event.key)}else if(event.key==='Enter'){event.preventDefault();terminalInput('\r')}else if(event.key==='Backspace'){event.preventDefault();terminalInput('\x7f')}}}}
+function createTerminalTextState(){return{pending:'',lines:[''],row:0,column:0}}
+function decodeTerminalPayload(out){
+  if(out.reset||!S.terminalDecoder)S.terminalDecoder=typeof TextDecoder==='function'?new TextDecoder(String(out.encoding||'utf-8'),{fatal:false}):null;
+  if(typeof out.data_b64!=='string'||!S.terminalDecoder)return String(out.data||'');
+  const raw=atob(out.data_b64),bytes=new Uint8Array(raw.length);for(let i=0;i<raw.length;i++)bytes[i]=raw.charCodeAt(i);
+  return S.terminalDecoder.decode(bytes,{stream:!out.closed});
+}
+function stripTerminalControlChunk(text,state,final=false){
+  state=state||{pending:''};const source=String(state.pending||'')+String(text||'');state.pending='';let visible='',i=0;
+  while(i<source.length){const code=source.charCodeAt(i);
+    if(code===0x1b){if(i+1>=source.length){if(!final)state.pending=source.slice(i);break}const kind=source[i+1];
+      if(kind==='['){let j=i+2;while(j<source.length){const value=source.charCodeAt(j);if(value>=0x40&&value<=0x7e)break;j++}if(j>=source.length){if(!final)state.pending=source.slice(i);break}i=j+1;continue}
+      if(kind===']'||kind==='P'||kind==='X'||kind==='^'||kind==='_'){let j=i+2,done=false;while(j<source.length){if(kind===']'&&source.charCodeAt(j)===0x07){j++;done=true;break}if(source.charCodeAt(j)===0x1b&&source[j+1]==='\\'){j+=2;done=true;break}j++}if(!done){if(!final)state.pending=source.slice(i);break}i=j;continue}
+      i+=2;continue}
+    if(code===0x9b){let j=i+1;while(j<source.length){const value=source.charCodeAt(j);if(value>=0x40&&value<=0x7e)break;j++}if(j>=source.length){if(!final)state.pending=source.slice(i);break}i=j+1;continue}
+    if((code<0x20&&!['\n','\r','\t','\b'].includes(source[i]))||(code>=0x7f&&code<=0x9f)){i++;continue}
+    visible+=source[i++];
+  }
+  return visible;
+}
+function appendTerminalPlainText(host,text){
+  const state=S.terminalPlainState||(S.terminalPlainState=createTerminalTextState());
+  for(const char of String(text||'')){if(char==='\r'){state.column=0;continue}if(char==='\n'){state.row++;state.column=0;if(!state.lines[state.row])state.lines[state.row]='';continue}if(char==='\b'){state.column=Math.max(0,state.column-1);continue}const chars=[...(state.lines[state.row]||'')];if(char==='\t'){const count=8-(state.column%8);for(let n=0;n<count;n++){chars[state.column++]=' '}}else{while(chars.length<state.column)chars.push(' ');chars[state.column]=char;state.column++}state.lines[state.row]=chars.join('')}
+  if(state.lines.length>5000){const remove=state.lines.length-5000;state.lines.splice(0,remove);state.row=Math.max(0,state.row-remove)}
+  host.textContent=state.lines.join('\n');host.scrollTop=host.scrollHeight;
+}
+async function newTerminal(cwd=''){if(S.terminalStarting)return S.terminalPromise;if(!S.capabilities.terminal)throw new Error(S.capabilities.process_denial_reason||'Terminal is unavailable.');S.terminalStarting=true;S.terminalPromise=(async()=>{if(S.terminal)await killTerminal();E('terminalEmpty').textContent='Starting terminal...';const terminalCwd=typeof cwd==='string'&&cwd?cwd:(activeDir()||'.');const out=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/terminals`,{method:'POST',body:JSON.stringify({root_id:S.activeRoot,cwd:terminalCwd,cols:100,rows:28})});S.terminal=out.terminal;S.terminalOffset=0;S.terminalDecoder=typeof TextDecoder==='function'?new TextDecoder('utf-8',{fatal:false}):null;S.terminalAnsiState={pending:''};S.terminalPlainState=createTerminalTextState();E('terminalFallback').textContent='';setupTerminalWidget();pollTerminal();if(S.panel!=='terminal'||!S.panelVisible)showPanel('terminal');return S.terminal})().finally(()=>{S.terminalStarting=false;S.terminalPromise=null});return S.terminalPromise}
+function setupTerminalWidget(){E('terminalHost').innerHTML='';E('terminalEmpty').classList.add('is-hidden');if(window.Terminal){S.terminalWidget=new window.Terminal({convertEol:true,cursorBlink:true,fontSize:12,fontFamily:'SFMono-Regular, Menlo, Monaco, Consolas, monospace',theme:{background:'#181818',foreground:'#cccccc',cursor:'#ffffff',selectionBackground:'#264f78'},scrollback:5000});const Fit=window.FitAddon?.FitAddon;if(Fit){S.terminalFit=new Fit();S.terminalWidget.loadAddon(S.terminalFit)}S.terminalWidget.open(E('terminalHost'));if(S.terminalFit)S.terminalFit.fit();S.terminalWidget.onData(data=>terminalInput(data));if(S.terminalWidget.onResize)S.terminalWidget.onResize(size=>terminalResize(size.cols,size.rows));E('terminalFallback').classList.remove('is-active')}else{const fallback=E('terminalFallback');fallback.classList.add('is-active');fallback.contentEditable='true';fallback.setAttribute('role','textbox');fallback.setAttribute('aria-label','Terminal compatibility renderer');fallback.onkeydown=event=>{if(event.key.length===1){event.preventDefault();terminalInput(event.key)}else if(event.key==='Enter'){event.preventDefault();terminalInput('\r')}else if(event.key==='Backspace'){event.preventDefault();terminalInput('\x7f')}}}}
 async function terminalInput(data){if(!S.terminal)return;try{await api(`/api/ide/v2/terminals/${qs(S.terminal.id)}/input`,{method:'POST',body:JSON.stringify({data})})}catch(error){logOutput(error.message)}}
 async function terminalResize(cols,rows){if(!S.terminal)return;try{await api(`/api/ide/v2/terminals/${qs(S.terminal.id)}/resize`,{method:'POST',body:JSON.stringify({cols,rows})})}catch(error){logOutput(error.message)}}
-async function pollTerminal(){clearTimeout(S.terminalPoll);if(!S.terminal)return;try{const out=await api(`/api/ide/v2/terminals/${qs(S.terminal.id)}/output?offset=${S.terminalOffset}`);S.terminalOffset=out.next_offset||S.terminalOffset;if(out.data){logOutputChunk(out.data.replace(/\x1b\[[0-9;?]*[ -\/]*[@-~]/g,''));if(S.terminalWidget)S.terminalWidget.write(out.data);else{const host=E('terminalFallback');host.textContent+=out.data;host.scrollTop=host.scrollHeight}}if(out.closed){setStatus(`Terminal exited with code ${out.returncode}`);logOutput(`Process exited with code ${out.returncode}`);S.terminal=null;await refreshWorkspaceSnapshot();return}}catch(error){logOutput(`Terminal: ${error.message}`);return}S.terminalPoll=setTimeout(pollTerminal,220)}
-async function killTerminal(){if(!S.terminal)return;const current=S.terminal;S.terminal=null;clearTimeout(S.terminalPoll);try{await api(`/api/ide/v2/terminals/${qs(current.id)}`,{method:'DELETE',body:'{}'})}catch(error){logOutput(error.message)}if(S.terminalWidget){S.terminalWidget.dispose();S.terminalWidget=null}E('terminalHost').innerHTML='';E('terminalFallback').classList.remove('is-active');E('terminalEmpty').textContent='No active terminal.';E('terminalEmpty').classList.remove('is-hidden')}
-async function runActiveFile(){const file=activeFile();if(!file)return toast('Open a file to run.','warning');if(file.binary)return toast('This artifact is not executable.','warning');if(file.dirty)await saveFile(file);const lang=languageFor(file.path),python=/^win/i.test(String(S.config?.platform||''))?'python':'python3',command=lang==='python'?`${python} ${shellQuote(file.name)}`:['javascript','typescript'].includes(lang)?`node ${shellQuote(file.name)}`:`${shellQuote(file.name)}`;logOutput(`> ${command}`);if(S.capabilities.terminal){await newTerminal();setTimeout(()=>terminalInput(command+'\r'),300);return}showPanel('output');const out=await api(`/api/ide/sessions/${qs(S.activeSession)}/terminal/run`,{method:'POST',body:JSON.stringify({root_id:file.root_id,cwd:file.dir||'.',command})});if(out.stdout)logOutputChunk(out.stdout);if(out.stderr)logOutputChunk(out.stderr);logOutput(`Process exited with code ${out.returncode}`);await refreshWorkspaceSnapshot()}
-async function debugActiveFile(){const file=activeFile();if(!file||languageFor(file.path)!=='python')return toast('Open a Python file to debug.','warning');if(file.dirty)await saveFile(file);if(S.debug)await stopDebug();showPanel('debug');logDebug(`Starting debugger for ${file.path}...`);const out=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/debug`,{method:'POST',body:JSON.stringify({root_id:file.root_id})});S.debug=out.debug;S.debugFile=file;S.debugSeq=1;await sendDebug({seq:S.debugSeq++,type:'request',command:'initialize',arguments:{clientID:'clouds-coder',clientName:'Clouds Coder Program',adapterID:'python',pathFormat:'path',linesStartAt1:true,columnsStartAt1:true,supportsRunInTerminalRequest:false}});pollDebug()}
+async function pollTerminal(){clearTimeout(S.terminalPoll);if(!S.terminal)return;try{const out=await api(`/api/ide/v2/terminals/${qs(S.terminal.id)}/output?offset=${S.terminalOffset}`);S.terminalOffset=out.next_offset??S.terminalOffset;if(out.reset){S.terminalAnsiState={pending:''};S.terminalPlainState=createTerminalTextState();if(S.terminalWidget)S.terminalWidget.reset()}const data=decodeTerminalPayload(out);if(data){const plain=stripTerminalControlChunk(data,S.terminalAnsiState,false);if(plain)logOutputChunk(plain.replace(/\r(?!\n)/g,'\n').replace(/\x08/g,''));if(S.terminalWidget)S.terminalWidget.write(data);else appendTerminalPlainText(E('terminalFallback'),plain)}if(out.closed){const tail=stripTerminalControlChunk('',S.terminalAnsiState,true);if(tail&&!S.terminalWidget)appendTerminalPlainText(E('terminalFallback'),tail);setStatus(`Terminal exited with code ${out.returncode}`);logOutput(`Process exited with code ${out.returncode}`);S.terminal=null;await refreshWorkspaceSnapshot();return}}catch(error){logOutput(`Terminal: ${error.message}`);return}S.terminalPoll=setTimeout(pollTerminal,220)}
+async function killTerminal(){if(!S.terminal)return;const current=S.terminal;S.terminal=null;clearTimeout(S.terminalPoll);try{await api(`/api/ide/v2/terminals/${qs(current.id)}`,{method:'DELETE',body:'{}'})}catch(error){logOutput(error.message)}if(S.terminalWidget){S.terminalWidget.dispose();S.terminalWidget=null}S.terminalDecoder=null;S.terminalAnsiState=null;S.terminalPlainState=null;E('terminalHost').innerHTML='';E('terminalFallback').classList.remove('is-active');E('terminalEmpty').textContent='No active terminal.';E('terminalEmpty').classList.remove('is-hidden')}
+async function runActiveFile(){const file=activeFile();if(!file)return toast('Open a file to run.','warning');if(file.binary)return toast('This artifact is not executable.','warning');if(file.dirty)await saveFile(file);const lang=languageFor(file.path),python=/^win/i.test(String(S.config?.platform||''))?'python':'python3',command=lang==='python'?`${python} ${shellQuote(file.name)}`:['javascript','typescript'].includes(lang)?`node ${shellQuote(file.name)}`:`${shellQuote(file.name)}`;logOutput(`> ${command}`);if(S.capabilities.terminal){await newTerminal(file.dir||'.');setTimeout(()=>terminalInput(command+'\r'),300);return}showPanel('output');const out=await api(`/api/ide/sessions/${qs(S.activeSession)}/terminal/run`,{method:'POST',body:JSON.stringify({root_id:file.root_id,cwd:file.dir||'.',command})});if(out.stdout)logOutputChunk(out.stdout);if(out.stderr)logOutputChunk(out.stderr);logOutput(`Process exited with code ${out.returncode}`);await refreshWorkspaceSnapshot()}
+async function startStandardLibraryDebugger(file){if(!S.capabilities.terminal)throw new Error('Python standard-library debugging requires the interactive terminal capability.');const python=/^win/i.test(String(S.config?.platform||''))?'python':'python3',command=`${python} -m pdb ${shellQuote(file.name)}`;logDebug('debugpy is unavailable. Using the built-in Python pdb compatibility debugger in Terminal.');await newTerminal(file.dir||'.');setTimeout(()=>terminalInput(command+'\r'),300);toast('Using Python pdb compatibility debugger. Install debugpy for full IDE debug-adapter support.','warning',8000)}
+async function debugActiveFile(){const file=activeFile();if(!file||languageFor(file.path)!=='python')return toast('Open a Python file to debug.','warning');if(file.dirty)await saveFile(file);if(S.debug)await stopDebug();showPanel('debug');logDebug(`Starting debugger for ${file.path}...`);let out;try{out=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/debug`,{method:'POST',body:JSON.stringify({root_id:file.root_id})})}catch(error){if(error.code==='debugpy_unavailable'){await startStandardLibraryDebugger(file);return}throw error}S.debug=out.debug;S.debugFile=file;S.debugSeq=1;await sendDebug({seq:S.debugSeq++,type:'request',command:'initialize',arguments:{clientID:'clouds-coder',clientName:'Clouds Coder Program',adapterID:'python',pathFormat:'path',linesStartAt1:true,columnsStartAt1:true,supportsRunInTerminalRequest:false}});pollDebug()}
 async function sendDebug(message){if(!S.debug)return;await api(`/api/ide/v2/debug/${qs(S.debug.id)}/send`,{method:'POST',body:JSON.stringify({message})})}
 async function pollDebug(){clearTimeout(S.debugPoll);if(!S.debug)return;try{const out=await api(`/api/ide/v2/debug/${qs(S.debug.id)}/messages`);for(const msg of out.messages||[])await handleDebugMessage(msg);if(out.stderr)logDebug(out.stderr);if(out.closed){logDebug('Debug adapter stopped.');S.debug=null;return}}catch(error){logDebug(`Debug error: ${error.message}`);S.debug=null;return}S.debugPoll=setTimeout(pollDebug,180)}
 async function handleDebugMessage(msg){if(msg.type==='response'&&msg.command==='initialize'&&msg.success){logDebug('Debugger initialized.');await sendDebug({seq:S.debugSeq++,type:'request',command:'launch',arguments:{program:S.debugFile.name,cwd:S.debugFile.dir||'.',console:'internalConsole',justMyCode:true,noDebug:false}});return}if(msg.type==='event'&&msg.event==='initialized'){await sendDebug({seq:S.debugSeq++,type:'request',command:'configurationDone',arguments:{}});return}if(msg.type==='event'&&msg.event==='output'){logDebug(msg.body?.output||'');return}if(msg.type==='event'&&msg.event==='stopped'){logDebug(`Paused: ${msg.body?.reason||'breakpoint'}`);return}if(msg.type==='event'&&msg.event==='terminated'){logDebug('Program terminated.');await stopDebug(false);await refreshWorkspaceSnapshot();return}if(msg.type==='response'&&!msg.success)logDebug(`${msg.command}: ${msg.message||'request failed'}`)}
@@ -96043,14 +96697,14 @@ function renderAgentOperationOnce(op){const seq=Number(op?.seq||0),key=`operatio
 function renderAgentAskUser(state){
   const card=E('agentAskUser'),input=E('agentPrompt'),send=E('sendAgentBtn'),pending=!state?.running&&state?.pending_user_question&&String(state.pending_user_question.question||'').trim()?state.pending_user_question:null;
   if(!pending){card.classList.add('is-hidden');card.dataset.questionId='';E('agentAskUserQuestion').textContent='';E('agentAskUserOptions').innerHTML='';E('agentAskUserHint').textContent='';E('agentAskUserRole').textContent='';input.placeholder='Ask Clouds Coder';input.disabled=false;send.title='Send';return false}
-  const questionId=String(pending.id||''),options=Array.isArray(pending.options)?pending.options.map(value=>String(value||'').trim()).filter(Boolean):[],allowFree=pending.allow_free_text!==false,submitting=S.agentSubmitting;
+  const questionId=String(pending.id||''),options=Array.isArray(pending.options)?pending.options.map(option=>{const row=option&&typeof option==='object'?option:{label:option,value:option};const label=String(row.label??row.text??row.name??row.value??'').trim(),value=String(row.value??row.id??label).trim(),description=String(row.description??row.detail??'').trim();return label&&value?{label,value,description}:null}).filter(Boolean):[],allowFree=pending.allow_free_text!==false,submitting=S.agentSubmitting;
   card.classList.remove('is-hidden');card.dataset.questionId=questionId;E('agentAskUserQuestion').textContent=String(pending.question||'').trim();E('agentAskUserRole').textContent=agentRoleLabel(pending.role||'Agent');E('agentAskUserHint').textContent=allowFree?(options.length?'Choose an option or type your own answer.':'Type your answer below, then send.'):'Choose one of the available options to continue.';
-  const optionHost=E('agentAskUserOptions');optionHost.innerHTML='';for(const option of options){const button=document.createElement('button');button.type='button';button.className='agent-ask-user-option';button.textContent=option;button.disabled=submitting;button.onclick=()=>answerAgentQuestion(option).catch(showError);optionHost.appendChild(button)}
+  const optionHost=E('agentAskUserOptions');optionHost.innerHTML='';for(const option of options){const button=document.createElement('button');button.type='button';button.className='agent-ask-user-option';button.disabled=submitting;button.title=option.description||option.label;button.innerHTML=`<strong>${escapeHtml(option.label)}</strong>${option.description?`<small>${escapeHtml(option.description)}</small>`:''}`;button.onclick=()=>answerAgentQuestion(option.value).catch(showError);optionHost.appendChild(button)}
   input.placeholder=allowFree?'Answer the agent question':'Choose an option above';input.disabled=!allowFree;send.disabled=submitting||!allowFree;send.title=allowFree?'Send answer':'Choose an option above';return true
 }
 async function answerAgentQuestion(answer){
   const pending=!S.agentState?.running&&S.agentState?.pending_user_question?S.agentState.pending_user_question:null,value=String(answer||'').trim();if(!pending||!value||S.agentSubmitting)return;
-  const options=Array.isArray(pending.options)?pending.options.map(item=>String(item||'').trim()).filter(Boolean):[];if(pending.allow_free_text===false&&!options.includes(value))throw new Error('Choose one of the available options.');
+  const options=Array.isArray(pending.options)?pending.options.map(option=>{const row=option&&typeof option==='object'?option:{value:option};return String(row.value??row.id??row.label??'').trim()}).filter(Boolean):[];if(pending.allow_free_text===false&&!options.includes(value))throw new Error('Choose one of the available options.');
   const questionId=String(pending.id||''),input=E('agentPrompt'),restoreText=input.value.trim()||value;S.agentSubmitting=true;input.value='';E('agentStatus').textContent='Resuming...';renderAgentAskUser(S.agentState);
   try{const out=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/ask-user/answer`,{method:'POST',body:JSON.stringify({question_id:questionId,answer:value})});S.agentSubmitting=false;S.agentState=Object.assign({},S.agentState,{pending_user_question:null,running:!!out.running});renderAgentAskUser(S.agentState);E('agentPrompt').disabled=false;E('sendAgentBtn').disabled=false;input.focus();E('agentStatus').textContent='Resuming...';S.agentPollRequested=true;scheduleAgentPoll(40)}catch(error){S.agentSubmitting=false;input.value=input.value.trim()?`${restoreText}\n${input.value}`:restoreText;renderAgentAskUser(S.agentState);input.focus();E('agentStatus').textContent='Awaiting input';S.agentPollRequested=true;scheduleAgentPoll(40);throw error}
 }
@@ -96090,22 +96744,26 @@ function scheduleAgentPoll(delay=900){const wait=Math.max(40,Number(delay)||0),d
 async function stopAgent(){if(!S.activeSession||S.agentInterrupting)return;S.agentInterrupting=true;E('stopAgentBtn').disabled=true;E('agentStatus').textContent='Stopping...';try{await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/agent/interrupt`,{method:'POST',body:'{}'});S.agentPollRequested=true;scheduleAgentPoll(40)}catch(error){S.agentInterrupting=false;E('stopAgentBtn').disabled=false;throw error}}
 const PROMPT_ENHANCE_BUDGETS=[{id:'low',label:'Low',short:'L',meta:'2-4 steps · direct scope'},{id:'medium',label:'Medium',short:'M',meta:'3-6 steps · tradeoff aware'},{id:'high',label:'High',short:'H',meta:'phased · 2-3 approaches · cross-surface'},{id:'xhigh',label:'XHigh',short:'X',meta:'milestones · alternatives · end-to-end'}];
 function promptEnhanceBudgetProfile(){return PROMPT_ENHANCE_BUDGETS.find(row=>row.id===S.promptEnhanceBudget)||PROMPT_ENHANCE_BUDGETS[1]}
-function renderPromptEnhanceToggle(){const button=E('promptEnhanceBtn');if(!button)return;const profile=promptEnhanceBudgetProfile(),mode=S.promptEnhancePersistent?'Persistent':'Next task only';button.classList.toggle('is-active',S.promptEnhanceEnabled);button.classList.toggle('is-busy',S.promptEnhancing);button.setAttribute('aria-pressed',String(S.promptEnhanceEnabled));button.title=`Enhance prompt: ${S.promptEnhanceEnabled?'On':'Off'} · ${profile.label} · ${mode}. Long press or right-click for strength.`;button.disabled=S.promptEnhancing;E('promptEnhanceBudget').textContent=profile.short}
+function renderPromptEnhanceToggle(){const button=E('promptEnhanceBtn');if(!button)return;const profile=promptEnhanceBudgetProfile(),mode=S.promptEnhancePersistent?'Persistent':'Next task only',skills=S.promptEnhanceSkillsAware?'Skills on':'Skills off';button.classList.toggle('is-active',S.promptEnhanceEnabled);button.classList.toggle('is-busy',S.promptEnhancing);button.setAttribute('aria-pressed',String(S.promptEnhanceEnabled));button.title=`Enhance prompt: ${S.promptEnhanceEnabled?'On':'Off'} · ${profile.label} · ${mode} · Workspace tree always on · ${skills}. Long press or right-click for settings.`;button.disabled=S.promptEnhancing;E('promptEnhanceBudget').textContent=profile.short}
 function togglePromptEnhancement(){if(S.promptEnhancing)return;S.promptEnhanceEnabled=!S.promptEnhanceEnabled;renderPromptEnhanceToggle();scheduleStateSave();const mode=S.promptEnhancePersistent?'Persistent mode.':'Applies to the next submitted task only.';toast(`Prompt enhancement ${S.promptEnhanceEnabled?'enabled':'disabled'}. ${S.promptEnhanceEnabled?mode:''}`,S.promptEnhanceEnabled?'success':'warning',2400)}
 function setPromptEnhancePersistent(enabled){if(S.promptEnhancing)return;S.promptEnhancePersistent=!!enabled;if(S.promptEnhancePersistent)S.promptEnhanceEnabled=true;renderPromptEnhanceToggle();scheduleStateSave();const note=S.promptEnhancePersistent?'Prompt enhancement will stay enabled across tasks and reloads.':S.promptEnhanceEnabled?'Persistent mode off. Enhancement remains armed for the next task.':'Persistent mode off. Click the lightbulb to enhance one task.';toast(note,'success',3000)}
+function setPromptEnhanceSkillsAware(enabled){if(S.promptEnhancing)return;S.promptEnhanceSkillsAware=!!enabled;renderPromptEnhanceToggle();scheduleStateSave();toast(S.promptEnhanceSkillsAware?'Skills awareness enabled. Relevant skills will be selected and sequenced.':'Skills awareness disabled. Workspace directory awareness remains enabled.','success',3000)}
 function setPromptEnhanceBudget(budget){const profile=PROMPT_ENHANCE_BUDGETS.find(row=>row.id===budget);if(!profile||S.promptEnhancing)return;S.promptEnhanceBudget=profile.id;renderPromptEnhanceToggle();scheduleStateSave();E('menuPopup').classList.add('is-hidden');toast(`Prompt enhancement strength: ${profile.label}.`,'success',2400)}
-function showPromptEnhanceBudgetMenu(anchor){if(S.promptEnhancing)return;const popup=E('menuPopup');popup.classList.remove('agent-model-menu');popup.classList.add('prompt-budget-menu');popup.style.transform='';popup.innerHTML='';const keep=document.createElement('div');keep.className='prompt-budget-persistent';keep.innerHTML=`<span><strong>Keep enabled</strong><small>Remember across tasks and reloads</small></span><label class="prompt-persistent-switch" title="Keep prompt enhancement enabled"><input type="checkbox" ${S.promptEnhancePersistent?'checked':''} aria-label="Keep prompt enhancement enabled"><span></span></label>`;const keepInput=keep.querySelector('input');keepInput.onchange=event=>{event.stopPropagation();setPromptEnhancePersistent(keepInput.checked)};keep.onclick=event=>event.stopPropagation();popup.appendChild(keep);for(const row of PROMPT_ENHANCE_BUDGETS){const button=document.createElement('button');button.classList.toggle('is-active',row.id===S.promptEnhanceBudget);button.innerHTML=`<span><strong>${escapeHtml(row.label)}</strong><small>${escapeHtml(row.meta)}</small></span>${row.id===S.promptEnhanceBudget?'<span class="codicon codicon-check"></span>':'<span></span>'}`;button.onclick=event=>{event.stopPropagation();setPromptEnhanceBudget(row.id)};popup.appendChild(button)}const rect=anchor.getBoundingClientRect();popup.style.left=`${Math.max(4,Math.min(rect.left,window.innerWidth-238))}px`;popup.style.top='auto';popup.style.bottom=`${Math.max(4,window.innerHeight-rect.top+4)}px`;popup.classList.remove('is-hidden')}
+function showPromptEnhanceBudgetMenu(anchor){if(S.promptEnhancing)return;const popup=E('menuPopup');popup.classList.remove('agent-model-menu');popup.classList.add('prompt-budget-menu');popup.style.transform='';popup.innerHTML='';const addSwitch=(title,note,checked,label,onchange)=>{const row=document.createElement('div');row.className='prompt-budget-persistent';row.innerHTML=`<span><strong>${escapeHtml(title)}</strong><small>${escapeHtml(note)}</small></span><label class="prompt-persistent-switch" title="${escapeHtml(title)}"><input type="checkbox" ${checked?'checked':''} aria-label="${escapeHtml(label)}"><span></span></label>`;const input=row.querySelector('input');input.onchange=event=>{event.stopPropagation();onchange(input.checked)};row.onclick=event=>event.stopPropagation();popup.appendChild(row)};addSwitch('Keep enabled','Remember across tasks and reloads',S.promptEnhancePersistent,'Keep prompt enhancement enabled',setPromptEnhancePersistent);addSwitch('Skills awareness','Select and sequence relevant skills',S.promptEnhanceSkillsAware,'Use skills during prompt enhancement',setPromptEnhanceSkillsAware);const workspace=document.createElement('div');workspace.className='prompt-budget-context';workspace.innerHTML='<span class="codicon codicon-folder-library"></span><span><strong>Workspace awareness</strong><small>Directory structure is always included</small></span>';popup.appendChild(workspace);for(const row of PROMPT_ENHANCE_BUDGETS){const button=document.createElement('button');button.classList.toggle('is-active',row.id===S.promptEnhanceBudget);button.innerHTML=`<span><strong>${escapeHtml(row.label)}</strong><small>${escapeHtml(row.meta)}</small></span>${row.id===S.promptEnhanceBudget?'<span class="codicon codicon-check"></span>':'<span></span>'}`;button.onclick=event=>{event.stopPropagation();setPromptEnhanceBudget(row.id)};popup.appendChild(button)}const rect=anchor.getBoundingClientRect();popup.style.left=`${Math.max(4,Math.min(rect.left,window.innerWidth-252))}px`;popup.style.top='auto';popup.style.bottom=`${Math.max(4,window.innerHeight-rect.top+4)}px`;popup.classList.remove('is-hidden')}
 function bindPromptEnhanceButton(){const button=E('promptEnhanceBtn');let holdTimer=0,suppressClick=false;const clear=()=>{if(holdTimer){clearTimeout(holdTimer);holdTimer=0}};button.addEventListener('pointerdown',event=>{if(event.button!==0||S.promptEnhancing)return;clear();suppressClick=false;holdTimer=setTimeout(()=>{holdTimer=0;suppressClick=true;showPromptEnhanceBudgetMenu(button)},560)});for(const type of ['pointerup','pointercancel','pointerleave'])button.addEventListener(type,clear);button.onclick=event=>{event.stopPropagation();clear();if(suppressClick){suppressClick=false;return}togglePromptEnhancement()};button.oncontextmenu=event=>{event.preventDefault();event.stopPropagation();clear();suppressClick=true;showPromptEnhanceBudgetMenu(button)}}
 function closePromptEnhanceReview(focus=true){const pending=S.promptEnhanceAbort;S.promptEnhanceAbort=null;if(pending?.controller)pending.controller.abort();setPromptEnhanceBusy(false);E('promptEnhanceOverlay').classList.add('is-hidden');S.promptEnhanceDraft=null;if(focus)E('agentPrompt').focus()}
 function setPromptEnhanceBusy(busy,label=''){S.promptEnhancing=!!busy;renderPromptEnhanceToggle();E('sendAgentBtn').disabled=!!busy||S.agentSubmitting;E('promptEnhanceLoadingTitle').textContent=label||'Preparing enhanced prompt...';E('promptEnhanceOverlay').querySelector('.prompt-enhance-dialog').classList.toggle('is-busy',!!busy);for(const id of ['promptUseOriginal','promptRegenerate','promptUseEnhanced'])E(id).disabled=!!busy;E('promptEnhanceClose').disabled=false}
 function promptDetailGroup(label,rows){const values=(rows||[]).filter(Boolean);return values.length?`<div class="prompt-detail-group"><strong>${escapeHtml(label)}</strong><ul>${values.map(value=>`<li>${escapeHtml(value)}</li>`).join('')}</ul></div>`:''}
 function promptClarificationGroup(rows){const values=(rows||[]).filter(row=>row&&row.question&&row.default_answer);return values.length?`<div class="prompt-detail-group clarifications"><strong>Questions and Agent defaults</strong>${values.map(row=>`<div class="prompt-clarification"><span>${escapeHtml(row.question)}</span><span class="default-answer"><b>Default:</b> ${escapeHtml(row.default_answer)}</span></div>`).join('')}</div>`:''}
-function renderPromptEnhancement(result){const draft=S.promptEnhanceDraft;if(!draft)return;E('promptEnhanceIntent').textContent=result.intent_summary||'The request was converted into an actionable Agent instruction.';E('promptEnhanceDetails').innerHTML=promptDetailGroup('Deliverables',result.deliverables)+promptDetailGroup('Constraints',result.constraints)+promptDetailGroup('Assumptions',result.assumptions)+promptDetailGroup('Acceptance criteria',result.acceptance_criteria)+promptClarificationGroup(result.clarifications);const editor=E('promptEnhanceEditor');editor.value=result.enhanced_prompt||draft.original;editor.readOnly=false;E('promptUseEnhanced').textContent='Save & Use';const model=[result.provider,result.model].filter(Boolean).join(' / '),budget=PROMPT_ENHANCE_BUDGETS.find(row=>row.id===(result.budget||draft.budget))?.label||'Medium',fallback=result.source==='fallback';E('promptEnhanceModel').textContent=fallback?`Local template · ${budget}`:(model?`Generated by ${model}`:'Generated for this Agent session')+` · ${budget}`;E('promptEnhanceNote').textContent=fallback?`The model was unavailable, so this prompt was generated from the local ${budget} template.${result.warning?` ${result.warning}`:''}`:'The intent analysis explains the rewrite. Only the editable Final Agent Prompt is sent when you choose Save & Use.';E('promptEnhanceOverlay').classList.remove('is-hidden');requestAnimationFrame(()=>editor.focus())}
+function promptExecutionGroup(rows){const values=(rows||[]).filter(row=>row&&row.action);return values.length?`<div class="prompt-detail-group execution"><strong>Staged execution</strong>${values.map((row,index)=>{const deps=(row.depends_on||[]).filter(Boolean),meta=[deps.length?`After: ${deps.join(', ')}`:'',row.completion_check?`Done when: ${row.completion_check}`:''].filter(Boolean).join(' · ');return `<div class="prompt-step"><span class="prompt-step-index">${index+1}</span><span class="prompt-step-content"><b>${escapeHtml(row.title||`Step ${index+1}`)}</b><span>${escapeHtml(row.action)}</span>${meta?`<small>${escapeHtml(meta)}</small>`:''}</span></div>`}).join('')}</div>`:''}
+function promptSkillGroup(rows){const values=(rows||[]).filter(row=>row&&row.id);return values.length?`<div class="prompt-detail-group skills"><strong>Selected skills</strong>${values.map((row,index)=>`<div class="prompt-skill"><span class="prompt-step-index">${index+1}</span><span class="prompt-skill-content"><b>${escapeHtml(row.name||row.id)}</b><span>${escapeHtml(row.id)}</span>${row.rationale?`<small>${escapeHtml(row.rationale)}</small>`:''}</span></div>`).join('')}</div>`:''}
+function promptWorkspaceGroup(context){if(!context)return'';const summary=`${Number(context.entry_count||0).toLocaleString()} directory entries inspected${context.truncated?' (bounded snapshot)':''}${context.skipped_directories?` · ${context.skipped_directories} generated/heavy directories skipped`:''}`;return promptDetailGroup('Workspace awareness',[summary])}
+function renderPromptEnhancement(result){const draft=S.promptEnhanceDraft;if(!draft)return;E('promptEnhanceIntent').textContent=result.intent_summary||'The request was converted into an actionable Agent instruction.';E('promptEnhanceDetails').innerHTML=promptWorkspaceGroup(result.workspace_context)+promptSkillGroup(result.selected_skills)+promptExecutionGroup(result.execution_steps)+promptDetailGroup('Deliverables',result.deliverables)+promptDetailGroup('Constraints',result.constraints)+promptDetailGroup('Assumptions',result.assumptions)+promptDetailGroup('Acceptance criteria',result.acceptance_criteria)+promptClarificationGroup(result.clarifications);const editor=E('promptEnhanceEditor');editor.value=result.enhanced_prompt||draft.original;editor.readOnly=false;E('promptUseEnhanced').textContent='Save & Use';const model=[result.provider,result.model].filter(Boolean).join(' / '),budget=PROMPT_ENHANCE_BUDGETS.find(row=>row.id===(result.budget||draft.budget))?.label||'Medium',fallback=result.source==='fallback';E('promptEnhanceModel').textContent=fallback?`Local template · ${budget}`:(model?`Generated by ${model}`:'Generated for this Agent session')+` · ${budget}`;const baseNote=fallback?`The model was unavailable, so this prompt was generated from the local ${budget} template.`:'The intent analysis explains the rewrite. Only the editable Final Agent Prompt is sent when you choose Save & Use.';E('promptEnhanceNote').textContent=baseNote+(result.warning?` ${result.warning}`:'');E('promptEnhanceOverlay').classList.remove('is-hidden');requestAnimationFrame(()=>editor.focus())}
 async function submitAgentDraft(draft,message){const input=E('agentPrompt'),submittedPaths=new Set(draft.attachments||[]),cleared=input.value.trim()===draft.original.trim();if(!message||S.agentSubmitting)return;S.agentSubmitting=true;E('sendAgentBtn').disabled=true;if(cleared)input.value='';E('agentStatus').textContent=S.agentState?.running?'Queuing input...':'Submitting...';try{const out=await api(`/api/ide/sessions/${qs(draft.session_id)}/agent-task`,{method:'POST',body:JSON.stringify({root_id:draft.root_id,active_path:draft.active_path,message,attachments:draft.attachments||[]})});S.agentAttachments=S.agentAttachments.filter(item=>!submittedPaths.has(item.path));renderAgentAttachments();if(draft.enhance_requested&&!S.promptEnhancePersistent){S.promptEnhanceEnabled=false;renderPromptEnhanceToggle();scheduleStateSave()}S.agentSubmitting=false;E('sendAgentBtn').disabled=false;input.focus();E('agentStatus').textContent=out.queued?'Queued':'Started';S.agentPollRequested=true;scheduleAgentPoll(100)}catch(error){S.agentSubmitting=false;E('agentStatus').textContent='';E('sendAgentBtn').disabled=false;if(cleared&&!input.value.trim())input.value=draft.original;input.focus();agentMessage(error.message,'error');throw error}}
-async function requestPromptEnhancement(draft,{regenerate=false}={}){if(S.promptEnhancing)return;const previous=regenerate?(E('promptEnhanceEditor').value.trim()||draft.result?.enhanced_prompt||''):'';const generation=regenerate?Number(draft.regeneration||0)+1:0,controller=typeof AbortController==='function'?new AbortController():null,pending={controller},budget=draft.budget||S.promptEnhanceBudget;S.promptEnhanceDraft=draft;S.promptEnhanceAbort=pending;E('promptEnhanceOverlay').classList.remove('is-hidden');if(!regenerate){E('promptEnhanceModel').textContent='';E('promptEnhanceIntent').textContent='';E('promptEnhanceDetails').innerHTML='';E('promptEnhanceEditor').value='';E('promptEnhanceNote').textContent=''}const budgetLabel=PROMPT_ENHANCE_BUDGETS.find(row=>row.id===budget)?.label||'Medium';setPromptEnhanceBusy(true,regenerate?`Regenerating ${budgetLabel} prompt...`:`Preparing ${budgetLabel} prompt...`);try{const result=await api(`/api/ide/v2/sessions/${qs(draft.session_id)}/prompt-enhance`,{method:'POST',body:JSON.stringify({root_id:draft.root_id,active_path:draft.active_path,message:draft.original,attachments:draft.attachments||[],previous_prompt:previous,regeneration:generation,budget}),signal:controller?.signal});if(S.promptEnhanceAbort!==pending||draft.session_id!==S.activeSession||draft.session_seq!==S.sessionSwitchSeq)return;S.promptEnhanceDraft=Object.assign({},draft,{result,regeneration:generation,budget});renderPromptEnhancement(result)}catch(error){if(error?.name==='AbortError')return;if(draft.session_id===S.activeSession&&draft.session_seq===S.sessionSwitchSeq){if(regenerate&&draft.result){S.promptEnhanceDraft=draft;E('promptEnhanceNote').textContent=`Regeneration failed: ${error.message}`}else{S.promptEnhanceDraft=Object.assign({},draft,{budget});E('promptEnhanceModel').textContent=`${budgetLabel} enhancement failed`;E('promptEnhanceIntent').textContent='No enhanced prompt was accepted. The original request is unchanged.';E('promptEnhanceDetails').innerHTML='';E('promptEnhanceEditor').value='';E('promptEnhanceNote').textContent=`Model error: ${error.message}. Choose Regenerate or Use Original & Start.`}E('promptEnhanceOverlay').classList.remove('is-hidden');toast(error.message,'error',8000)}}finally{if(S.promptEnhanceAbort===pending){S.promptEnhanceAbort=null;if(draft.session_id===S.activeSession&&draft.session_seq===S.sessionSwitchSeq)setPromptEnhanceBusy(false)}}}
+async function requestPromptEnhancement(draft,{regenerate=false}={}){if(S.promptEnhancing)return;const previous=regenerate?(E('promptEnhanceEditor').value.trim()||draft.result?.enhanced_prompt||''):'';const generation=regenerate?Number(draft.regeneration||0)+1:0,controller=typeof AbortController==='function'?new AbortController():null,pending={controller},budget=draft.budget||S.promptEnhanceBudget;S.promptEnhanceDraft=draft;S.promptEnhanceAbort=pending;E('promptEnhanceOverlay').classList.remove('is-hidden');if(!regenerate){E('promptEnhanceModel').textContent='';E('promptEnhanceIntent').textContent='';E('promptEnhanceDetails').innerHTML='';E('promptEnhanceEditor').value='';E('promptEnhanceNote').textContent=''}const budgetLabel=PROMPT_ENHANCE_BUDGETS.find(row=>row.id===budget)?.label||'Medium';setPromptEnhanceBusy(true,regenerate?`Regenerating ${budgetLabel} prompt...`:`Preparing ${budgetLabel} prompt with workspace${draft.skills_aware?' and skills':''} awareness...`);try{const result=await api(`/api/ide/v2/sessions/${qs(draft.session_id)}/prompt-enhance`,{method:'POST',body:JSON.stringify({root_id:draft.root_id,active_path:draft.active_path,message:draft.original,attachments:draft.attachments||[],previous_prompt:previous,regeneration:generation,budget,skills_awareness:!!draft.skills_aware}),signal:controller?.signal});if(S.promptEnhanceAbort!==pending||draft.session_id!==S.activeSession||draft.session_seq!==S.sessionSwitchSeq)return;S.promptEnhanceDraft=Object.assign({},draft,{result,regeneration:generation,budget});renderPromptEnhancement(result)}catch(error){if(error?.name==='AbortError')return;if(draft.session_id===S.activeSession&&draft.session_seq===S.sessionSwitchSeq){if(regenerate&&draft.result){S.promptEnhanceDraft=draft;E('promptEnhanceNote').textContent=`Regeneration failed: ${error.message}`}else{S.promptEnhanceDraft=Object.assign({},draft,{budget});E('promptEnhanceModel').textContent=`${budgetLabel} enhancement failed`;E('promptEnhanceIntent').textContent='No enhanced prompt was accepted. The original request is unchanged.';E('promptEnhanceDetails').innerHTML='';E('promptEnhanceEditor').value='';E('promptEnhanceNote').textContent=`Model error: ${error.message}. Choose Regenerate or Use Original & Start.`}E('promptEnhanceOverlay').classList.remove('is-hidden');toast(error.message,'error',8000)}}finally{if(S.promptEnhanceAbort===pending){S.promptEnhanceAbort=null;if(draft.session_id===S.activeSession&&draft.session_seq===S.sessionSwitchSeq)setPromptEnhanceBusy(false)}}}
 async function usePromptReview(original=false){const draft=S.promptEnhanceDraft;if(!draft)return;const message=original?draft.original:E('promptEnhanceEditor').value.trim();if(!message)return toast('Enhanced prompt is empty.','warning');S.promptEnhanceAbort=null;setPromptEnhanceBusy(false);E('promptEnhanceOverlay').classList.add('is-hidden');S.promptEnhanceDraft=null;await submitAgentDraft(draft,message)}
 async function regeneratePromptReview(){const draft=S.promptEnhanceDraft;if(!draft)return;await requestPromptEnhancement(draft,{regenerate:true})}
-async function sendAgent(){const input=E('agentPrompt'),message=input.value.trim(),pending=!S.agentState?.running&&S.agentState?.pending_user_question;if(pending)return answerAgentQuestion(message);if(!message||S.agentSubmitting||S.promptEnhancing)return;const file=activeFile(),draft={session_id:S.activeSession,session_seq:S.sessionSwitchSeq,root_id:S.activeRoot,active_path:file?.path||'',original:message,attachments:S.agentAttachments.map(item=>item.path),regeneration:0,result:null,budget:S.promptEnhanceBudget,enhance_requested:S.promptEnhanceEnabled};if(S.promptEnhanceEnabled)return requestPromptEnhancement(draft);return submitAgentDraft(draft,message)}
+async function sendAgent(){const input=E('agentPrompt'),message=input.value.trim(),pending=!S.agentState?.running&&S.agentState?.pending_user_question;if(pending)return answerAgentQuestion(message);if(!message||S.agentSubmitting||S.promptEnhancing)return;const file=activeFile(),draft={session_id:S.activeSession,session_seq:S.sessionSwitchSeq,root_id:S.activeRoot,active_path:file?.path||'',original:message,attachments:S.agentAttachments.map(item=>item.path),regeneration:0,result:null,budget:S.promptEnhanceBudget,skills_aware:S.promptEnhanceSkillsAware,enhance_requested:S.promptEnhanceEnabled};if(S.promptEnhanceEnabled)return requestPromptEnhancement(draft);return submitAgentDraft(draft,message)}
 function openModal(title,html){E('modalTitle').textContent=title;E('modalBody').innerHTML=html;E('modalOverlay').classList.remove('is-hidden')}
 function closeModal(){E('modalOverlay').classList.add('is-hidden');E('modalBody').innerHTML=''}
 async function showAccountModal(){let users=[],devices=[];if(S.capabilities.admin&&S.capabilities.local){try{[users,devices]=await Promise.all([api('/api/ide/v2/admin/users').then(x=>x.accounts||[]),api('/api/ide/v2/admin/devices').then(x=>x.devices||[])])}catch(error){logOutput(error.message)}}const userRows=users.map(row=>`<div class="account-row"><div><strong>${escapeHtml(row.username)}</strong><small>${escapeHtml(row.role)}${row.disabled?' / disabled':''}</small></div>${row.role==='admin'?'':`<button class="button" data-user="${escapeHtml(row.username)}" data-disabled="${row.disabled?'0':'1'}">${row.disabled?'Enable':'Disable'}</button>`}</div>`).join('');const deviceRows=devices.map(row=>`<div class="account-row"><div><strong>${escapeHtml(row.label||row.pairing_id)}</strong><small>${escapeHtml(row.pairing_id)} / ${escapeHtml(row.source_ip)} / ${escapeHtml(row.status)}</small></div><div>${row.status==='pending'?`<button class="button primary" data-device-approve="${escapeHtml(row.pairing_id)}">Approve</button>`:''}${row.status!=='revoked'?` <button class="button" data-device-revoke="${escapeHtml(row.pairing_id)}">Revoke</button>`:''}</div></div>`).join('');const passwordForm=S.config?.password_login_enabled?`<form id="resetPasswordForm" class="modal-form"><h3>Password Login</h3><input id="resetUsername" value="${escapeHtml(S.account.username)}" required><input id="resetPassword" type="password" placeholder="New password" required><div class="modal-actions"><button class="button primary">Set Password</button></div></form>`:'';openModal('Access',`<div class="account-list"><div class="account-row"><div><strong>${escapeHtml(S.account.username)}</strong><small>${escapeHtml(S.account.role)} / current</small></div><button id="logoutBtn" class="button">Sign Out</button></div>${userRows}</div>${S.capabilities.admin&&S.capabilities.local?`<div class="section-label"><strong>Web Devices</strong></div><div class="account-list">${deviceRows||'<div class="side-summary">No Web devices requested access.</div>'}</div>${passwordForm}`:''}`);E('logoutBtn').onclick=logout;document.querySelectorAll('[data-user]').forEach(button=>button.onclick=async()=>{await api('/api/ide/v2/admin/users',{method:'PATCH',body:JSON.stringify({username:button.dataset.user,disabled:button.dataset.disabled==='1'})});showAccountModal()});document.querySelectorAll('[data-device-approve]').forEach(button=>button.onclick=async()=>{await api('/api/ide/v2/admin/devices/approve',{method:'POST',body:JSON.stringify({pairing_id:button.dataset.deviceApprove})});showAccountModal()});document.querySelectorAll('[data-device-revoke]').forEach(button=>button.onclick=async()=>{await api('/api/ide/v2/admin/devices/revoke',{method:'POST',body:JSON.stringify({pairing_id:button.dataset.deviceRevoke})});showAccountModal()});if(E('resetPasswordForm'))E('resetPasswordForm').onsubmit=async event=>{event.preventDefault();await api('/api/ide/v2/admin/password-reset',{method:'POST',body:JSON.stringify({username:E('resetUsername').value,new_password:E('resetPassword').value})});location.reload()}}
@@ -96501,7 +97159,7 @@ class AppContext:
         local = bool(direct_loopback and self.ide_is_loopback_address(client_ip))
         backend = AppContext._ide_remote_sandbox_backend()
         hard_isolation = bool(backend.get("available", False))
-        terminal_supported = bool(_pty is not None and os.name == "posix")
+        terminal_supported = bool((_pty is not None and os.name == "posix") or os.name == "nt")
         role = str(account.get("role", "user") or "user")
         return {
             "local": local,
@@ -97283,9 +97941,9 @@ class AppContext:
         self._ide_save_mounts(user_id, mounts)
         return {"ok": True, "mounts": mounts}
 
-    def ide_session_payload(self, user_id: str, client_ip: str = "") -> dict:
+    def ide_session_payload(self, user_id: str, client_ip: str = "", *, limit: int = 80, offset: int = 0) -> dict:
         mgr = self.manager_for_user(user_id)
-        sessions = mgr.list(limit=80, offset=0)
+        sessions = mgr.list(limit=max(1, min(200, int(limit or 80))), offset=max(0, int(offset or 0)))
         if isinstance(sessions, dict):
             rows = list(sessions.get("sessions", []))
         else:
@@ -97721,6 +98379,11 @@ class AppContext:
         truncated = len(raw) > cap or size > cap
         raw = raw[:cap]
         text, encoding = self._ide_decode_preview_text(raw)
+        frontmatter: dict = {}
+        if kind == "markdown":
+            text = normalize_markdown_preview_text(text)
+            frontmatter, text = parse_front_matter(text)
+            text = normalize_markdown_preview_text(text)
         if truncated and "\n" in text:
             text = text.rsplit("\n", 1)[0]
         if kind == "markdown":
@@ -97740,14 +98403,30 @@ class AppContext:
                 f"<pre class=\"pv-pre\">{html.escape(text)}</pre></div>"
             )
             return sess._preview_html_shell(target.name, body)
+        renderer_name = "fallback"
         try:
             import markdown as markdown_module  # type: ignore
 
-            rendered = markdown_module.markdown(
-                text,
-                extensions=["extra", "sane_lists", "tables", "fenced_code"],
-                output_format="html5",
-            )
+            # ``extra`` covers tables, fenced code, footnotes and attribute
+            # lists in the supported Python-Markdown versions. The second
+            # invocation keeps older installations usable if one optional
+            # extension is unavailable.
+            try:
+                rendered = markdown_module.markdown(
+                    text,
+                    extensions=["extra", "sane_lists", "footnotes", "md_in_html"],
+                    output_format="html5",
+                    tab_length=4,
+                )
+            except Exception:
+                rendered = markdown_module.markdown(
+                    text,
+                    extensions=["extra", "sane_lists"],
+                    output_format="html5",
+                    tab_length=4,
+                )
+            renderer_name = "python-markdown"
+            rendered = _preview_markdown_task_lists(rendered)
             try:
                 import bleach  # type: ignore
 
@@ -97755,7 +98434,7 @@ class AppContext:
                     rendered,
                     tags={
                         "a", "abbr", "blockquote", "br", "code", "del", "details", "div", "em",
-                        "h1", "h2", "h3", "h4", "h5", "h6", "hr", "img", "kbd", "li", "ol",
+                        "h1", "h2", "h3", "h4", "h5", "h6", "hr", "img", "input", "kbd", "li", "ol",
                         "p", "pre", "s", "span", "strong", "sub", "summary", "sup", "table",
                         "tbody", "td", "th", "thead", "tr", "ul",
                     },
@@ -97765,6 +98444,7 @@ class AppContext:
                         "code": ["class"],
                         "div": ["class"],
                         "span": ["class"],
+                        "input": ["class", "type", "checked", "disabled"],
                         "th": ["align"],
                         "td": ["align"],
                     },
@@ -97774,7 +98454,7 @@ class AppContext:
             except Exception:
                 pass
         except Exception:
-            rendered = f"<pre>{html.escape(text)}</pre>"
+            rendered = _preview_markdown_fallback_html(text)
         base_dir = PurePosixPath(normalize_rel_preview_path(rel)).parent
 
         def rewrite_reference(match: re.Match) -> str:
@@ -97806,9 +98486,11 @@ class AppContext:
             return f"{attr}={quote_char}{html.escape(asset_url, quote=True)}{quote_char}"
 
         rendered = re.sub(r'''(?is)\b(src|href)\s*=\s*(["'])(.*?)\2''', rewrite_reference, rendered)
+        frontmatter_html = _preview_markdown_frontmatter_html(frontmatter)
         body = (
             "<article class=\"pv-card pv-markdown\">"
-            f"<div class=\"pv-note\">{html.escape(note)}</div>{rendered}</article>"
+            f"<div class=\"pv-note\">{html.escape(note)}</div>"
+            f"{frontmatter_html}<div data-pv-markdown-body=\"1\">{rendered}</div></article>"
         )
         extra_css = """
 .pv-markdown{line-height:1.65;overflow-wrap:anywhere}
@@ -97817,30 +98499,74 @@ class AppContext:
 .pv-markdown code{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}
 .pv-markdown table{display:block;max-width:100%;overflow:auto;border-collapse:collapse}.pv-markdown th,.pv-markdown td{padding:7px 9px;border:1px solid #dbe5f0}
 .pv-markdown img{display:block;max-width:100%;height:auto;margin:16px auto}.pv-markdown blockquote{margin:1em 0;padding:2px 14px;border-left:3px solid #7aa7d9;color:#52647b}
-"""
+.pv-frontmatter{margin:0 0 18px;border:1px solid #dbe5f0;border-radius:12px;background:#f8fbff;padding:10px 12px}
+.pv-frontmatter summary{cursor:pointer;font-weight:700;color:#52647b}.pv-frontmatter-grid{display:grid;gap:8px;margin-top:10px}
+.pv-frontmatter-row{display:grid;grid-template-columns:minmax(90px,180px) 1fr;gap:12px;align-items:start;font-size:.84rem}
+.pv-frontmatter-row>div{overflow:auto}.pv-frontmatter-table{display:table;margin:0;font-size:.82rem}.pv-frontmatter-table th{text-align:left;background:#eef5ff}
+.pv-task-checkbox{margin:0 .45em 0 0;vertical-align:middle;accent-color:#4f8fcb}
+.pv-mermaid{overflow:auto;margin:14px 0;padding:12px;border:1px solid #dbe5f0;border-radius:12px;background:#fbfdff;text-align:center}
+.pv-mermaid svg{max-width:100%;height:auto}
+        """
         preview_html = sess._preview_html_shell(target.name, body, extra_css)
+        source_json = (
+            json.dumps(text, ensure_ascii=True)
+            .replace("<", "\\u003c")
+            .replace(">", "\\u003e")
+            .replace("&", "\\u0026")
+        )
         katex_head = (
             '<link rel="stylesheet" href="/assets/js_lib/katex/dist/katex.min.css">'
             '<script defer src="/assets/js_lib/katex/dist/katex.min.js"></script>'
             '<script defer src="/assets/js_lib/katex/dist/contrib/auto-render.min.js"></script>'
+            '<script defer src="/assets/js_lib/marked.min.js"></script>'
+            '<script defer src="/assets/js_lib/mermaid.min.js"></script>'
         )
-        katex_boot = """<script>
-document.addEventListener('DOMContentLoaded', function(){
-  if(typeof renderMathInElement!=='function')return;
-  renderMathInElement(document.querySelector('.pv-markdown')||document.body, {
-    delimiters:[
-      {left:'$$',right:'$$',display:true},
-      {left:'\\\\[',right:'\\\\]',display:true},
-      {left:'\\\\(',right:'\\\\)',display:false},
-      {left:'$',right:'$',display:false}
-    ],
-    ignoredTags:['script','noscript','style','textarea','pre','code'],
-    throwOnError:false
-  });
-});
+        markdown_boot = f"""<script id="pv-markdown-source" type="application/json">{source_json}</script><script>
+document.addEventListener('DOMContentLoaded', function(){{
+  var root=document.querySelector('.pv-markdown');
+  if(!root)return;
+  var body=root.querySelector('[data-pv-markdown-body]');
+  var sourceNode=document.getElementById('pv-markdown-source');
+  var source='';
+  try{{source=sourceNode?JSON.parse(sourceNode.textContent||''):'';}}catch(_){{source='';}}
+  function safeMarkedHtml(value){{
+    var tpl=document.createElement('template');tpl.innerHTML=String(value||'');
+    tpl.content.querySelectorAll('script,iframe,object,embed,style,link,form').forEach(function(node){{node.remove();}});
+    tpl.content.querySelectorAll('*').forEach(function(node){{
+      Array.from(node.attributes||[]).forEach(function(attr){{
+        var name=String(attr.name||'').toLowerCase(),val=String(attr.value||'');
+        if(name.indexOf('on')===0||((name==='href'||name==='src')&&/^\\s*(?:javascript|vbscript|data:text\\/html):/i.test(val)))node.removeAttribute(attr.name);
+      }});
+    }});
+    return tpl.innerHTML;
+  }}
+  // Python-Markdown is authoritative when available. Marked is a local-only
+  // progressive fallback for installations without that optional module.
+  if({str(renderer_name == 'fallback').lower()}&&body&&source&&window.marked&&typeof window.marked.parse==='function'){{
+    try{{body.innerHTML=safeMarkedHtml(window.marked.parse(source,{{gfm:true,breaks:false}}));}}catch(_){{}}
+  }}
+  if(typeof renderMathInElement==='function'){{
+    try{{renderMathInElement(root,{{delimiters:[
+      {{left:'$$',right:'$$',display:true}},{{left:'\\\\[',right:'\\\\]',display:true}},
+      {{left:'\\\\(',right:'\\\\)',display:false}},{{left:'$',right:'$',display:false}}
+    ],ignoredTags:['script','noscript','style','textarea','pre','code'],throwOnError:false}});}}catch(_){{}}
+  }}
+  if(window.mermaid&&typeof window.mermaid.initialize==='function'&&typeof window.mermaid.render==='function'){{
+    try{{window.mermaid.initialize({{startOnLoad:false,securityLevel:'strict',theme:'neutral'}});}}catch(_){{}}
+    root.querySelectorAll('pre code.language-mermaid,pre code.lang-mermaid').forEach(function(code,idx){{
+      var pre=code.parentElement,host=document.createElement('div');host.className='pv-mermaid';
+      var diagramSource=String(code.textContent||'').trim();if(!diagramSource)return;
+      pre.replaceWith(host);
+      Promise.resolve(window.mermaid.render('pv-mermaid-'+Date.now()+'-'+idx,diagramSource)).then(function(result){{
+        var svg=(result&&typeof result==='object')?result.svg:result;if(!svg)throw new Error('empty diagram');
+        host.innerHTML=svg;if(result&&typeof result.bindFunctions==='function')result.bindFunctions(host);
+      }}).catch(function(){{host.replaceWith(pre);}});
+    }});
+  }}
+}});
 </script>"""
         return preview_html.replace("</head>", f"{katex_head}</head>").replace(
-            "</body>", f"{katex_boot}</body>"
+            "</body>", f"{markdown_boot}</body>"
         )
 
     def ide_image_preview(self, user_id: str, session_id: str, *, root_id: str = "session", rel: str = "") -> tuple[bytes, str]:
@@ -98496,6 +99222,16 @@ document.addEventListener('DOMContentLoaded', function(){
                     "install_hint": "" if found else hint,
                 }
             )
+        debugpy_spec = importlib.util.find_spec("debugpy")
+        rows.append(
+            {
+                "name": "python-debug",
+                "available": debugpy_spec is not None,
+                "required_commands": [],
+                "found": {"debugpy": str(getattr(debugpy_spec, "origin", "") or "installed")} if debugpy_spec else {},
+                "install_hint": "Optional: install debugpy for full IDE adapter support. The built-in pdb compatibility debugger remains available without it.",
+            }
+        )
         return rows
 
     def _ide_state_path(self, user_id: str) -> Path:
@@ -98522,6 +99258,9 @@ document.addEventListener('DOMContentLoaded', function(){
             "prompt_enhance_persistent": prompt_enhance_persistent,
             "prompt_enhance_enabled": bool(
                 prompt_enhance_persistent and state.get("prompt_enhance_enabled", False)
+            ),
+            "prompt_enhance_skills_awareness": bool(
+                state.get("prompt_enhance_skills_awareness", False)
             ),
             "prompt_enhance_budget": (
                 str(state.get("prompt_enhance_budget", "medium") or "medium").lower()
@@ -98693,10 +99432,15 @@ document.addEventListener('DOMContentLoaded', function(){
             if not terminal:
                 return
             process = terminal["process"]
-            fd = int(terminal["master_fd"])
+            mode = str(terminal.get("mode", "pty") or "pty")
+            fd = terminal.get("master_fd")
             try:
-                ready, _, _ = select.select([fd], [], [], 0.25)
-                chunk = os.read(fd, 32768) if ready else b""
+                if mode == "pipe":
+                    stream = process.stdout
+                    chunk = os.read(stream.fileno(), 32768) if stream is not None else b""
+                else:
+                    ready, _, _ = select.select([int(fd)], [], [], 0.25)
+                    chunk = os.read(int(fd), 32768) if ready else b""
             except (OSError, ValueError):
                 chunk = b""
             with terminal["lock"]:
@@ -98713,46 +99457,90 @@ document.addEventListener('DOMContentLoaded', function(){
                     terminal["closed"] = True
                     terminal["returncode"] = int(returncode)
             if returncode is not None and not chunk:
-                try:
-                    os.close(fd)
-                except Exception:
-                    pass
+                if mode == "pty" and fd is not None:
+                    try:
+                        os.close(int(fd))
+                    except Exception:
+                        pass
+                _windows_close_sandbox_job(process)
                 return
 
     def ide_terminal_create(self, user_id: str, session_id: str, payload: dict, *, remote: bool = False) -> dict:
-        if _pty is None:
-            raise IDECapabilityError("pty_unavailable", "PTY terminals are unavailable on this platform.", 501)
+        posix_pty = bool(_pty is not None and os.name == "posix")
+        windows_pipe = bool(os.name == "nt")
+        if not posix_pty and not windows_pipe:
+            raise IDECapabilityError("pty_unavailable", "Interactive terminals are unavailable on this platform.", 501)
         root_id = str(payload.get("root_id", payload.get("root", "session")) or "session")
         root, cwd, meta = self.ide_resolve_workspace(user_id, session_id, root_id, str(payload.get("cwd", ".") or "."))
         if cwd.is_file():
             cwd = cwd.parent
         if not cwd.exists() or not cwd.is_dir():
             raise FileNotFoundError("terminal cwd not found")
-        shell = str(payload.get("shell", "") or os.getenv("SHELL", "") or shutil.which("zsh") or shutil.which("bash") or "/bin/sh")
+        if windows_pipe:
+            shell = str(
+                payload.get("shell", "")
+                or os.getenv("COMSPEC", "")
+                or shutil.which("cmd.exe")
+                or shutil.which("powershell.exe")
+                or ""
+            )
+        else:
+            shell = str(payload.get("shell", "") or os.getenv("SHELL", "") or shutil.which("zsh") or shutil.which("bash") or "/bin/sh")
         if not Path(shell).is_absolute() or not Path(shell).exists():
             raise ValueError("terminal shell must be an installed absolute path")
         cols = max(20, min(500, int(payload.get("cols", 100) or 100)))
         rows = max(5, min(200, int(payload.get("rows", 30) or 30)))
         sess = self._ide_session(user_id, session_id)
         prefix = self._ide_process_prefix(sess, remote=remote, cwd=cwd, feature="terminal")
-        master_fd, slave_fd = _pty.openpty()
-        self._ide_terminal_set_size(slave_fd, cols, rows)
         env = sess._shell_process_env()
         env.update({"TERM": "xterm-256color", "COLORTERM": "truecolor", "CLOUDS_CODER_IDE": "1"})
-        process_command = [*prefix, shell, "-f"] if prefix else [shell, "-l"]
-        try:
-            process = subprocess.Popen(
-                process_command,
-                cwd=str(cwd),
-                env=env,
-                stdin=slave_fd,
-                stdout=slave_fd,
-                stderr=slave_fd,
-                start_new_session=True,
-                close_fds=True,
-            )
-        finally:
-            os.close(slave_fd)
+        master_fd: int | None = None
+        mode = "pipe" if windows_pipe else "pty"
+        if mode == "pipe":
+            shell_name = Path(shell).name.lower()
+            if shell_name in {"powershell", "powershell.exe", "pwsh", "pwsh.exe"}:
+                process_command: object = [shell, "-NoLogo", "-NoProfile", "-NoExit", "-Command", "[Console]::InputEncoding=[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false)"]
+            else:
+                process_command = [shell, "/Q", "/K", "chcp 65001>nul"]
+            popen_kwargs = {
+                "stdin": subprocess.PIPE,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.STDOUT,
+                "bufsize": 0,
+            }
+            if _is_windows_job_sandbox_prefix(prefix):
+                process = _popen_windows_sandboxed(
+                    process_command,
+                    workspace_root=root,
+                    cwd=cwd,
+                    env=env,
+                    **popen_kwargs,
+                )
+            else:
+                process = subprocess.Popen(
+                    process_command,
+                    cwd=str(cwd),
+                    env=env,
+                    creationflags=int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) or 0),
+                    **popen_kwargs,
+                )
+        else:
+            master_fd, slave_fd = _pty.openpty()
+            self._ide_terminal_set_size(slave_fd, cols, rows)
+            process_command = [*prefix, shell, "-f"] if prefix else [shell, "-l"]
+            try:
+                process = subprocess.Popen(
+                    process_command,
+                    cwd=str(cwd),
+                    env=env,
+                    stdin=slave_fd,
+                    stdout=slave_fd,
+                    stderr=slave_fd,
+                    start_new_session=True,
+                    close_fds=True,
+                )
+            finally:
+                os.close(slave_fd)
         terminal_id = "term_" + uuid.uuid4().hex[:20]
         terminal = {
             "id": terminal_id,
@@ -98763,6 +99551,7 @@ document.addEventListener('DOMContentLoaded', function(){
             "title": Path(shell).name,
             "process": process,
             "master_fd": master_fd,
+            "mode": mode,
             "output": bytearray(),
             "output_start": 0,
             "output_end": 0,
@@ -98793,19 +99582,31 @@ document.addEventListener('DOMContentLoaded', function(){
                 "next_offset": end,
                 "reset": requested < start,
                 "data": data.decode("utf-8", errors="replace"),
+                "data_b64": base64.b64encode(data).decode("ascii"),
+                "encoding": "utf-8",
                 "closed": bool(terminal["closed"]),
                 "returncode": terminal["returncode"],
             }
 
     def ide_terminal_input(self, user_id: str, terminal_id: str, payload: dict) -> dict:
         terminal = self._ide_terminal_for_user(user_id, terminal_id)
-        data = str(payload.get("data", "") or "").encode("utf-8", errors="replace")
+        text = str(payload.get("data", "") or "")
+        if str(terminal.get("mode", "pty")) == "pipe":
+            text = text.replace("\r\n", "\n").replace("\r", "\n")
+        data = text.encode("utf-8", errors="replace")
         if len(data) > 64_000:
             raise ValueError("terminal input is too large")
         with terminal["lock"]:
             if terminal["closed"]:
                 raise ValueError("terminal is closed")
-            os.write(int(terminal["master_fd"]), data)
+            if str(terminal.get("mode", "pty")) == "pipe":
+                stream = terminal["process"].stdin
+                if stream is None:
+                    raise ValueError("terminal input stream is unavailable")
+                stream.write(data)
+                stream.flush()
+            else:
+                os.write(int(terminal["master_fd"]), data)
             terminal["last_activity"] = now_ts()
         return {"ok": True}
 
@@ -98813,7 +99614,8 @@ document.addEventListener('DOMContentLoaded', function(){
         terminal = self._ide_terminal_for_user(user_id, terminal_id)
         cols = max(20, min(500, int(payload.get("cols", 100) or 100)))
         rows = max(5, min(200, int(payload.get("rows", 30) or 30)))
-        self._ide_terminal_set_size(int(terminal["master_fd"]), cols, rows)
+        if str(terminal.get("mode", "pty")) == "pty" and terminal.get("master_fd") is not None:
+            self._ide_terminal_set_size(int(terminal["master_fd"]), cols, rows)
         return {"ok": True, "cols": cols, "rows": rows}
 
     def ide_terminal_close(self, user_id: str, terminal_id: str) -> dict:
@@ -98821,13 +99623,19 @@ document.addEventListener('DOMContentLoaded', function(){
         process = terminal["process"]
         if process.poll() is None:
             try:
-                os.killpg(process.pid, signal.SIGTERM)
+                if str(terminal.get("mode", "pty")) == "pipe" and os.name == "nt":
+                    _windows_close_sandbox_job(process, terminate=True)
+                    if process.poll() is None:
+                        process.terminate()
+                else:
+                    os.killpg(process.pid, signal.SIGTERM)
                 process.wait(timeout=2)
             except Exception:
                 try:
                     process.kill()
                 except Exception:
                     pass
+        _windows_close_sandbox_job(process)
         with terminal["lock"]:
             terminal["closed"] = True
             terminal["returncode"] = process.poll()
@@ -99134,15 +99942,29 @@ document.addEventListener('DOMContentLoaded', function(){
         root, _, meta = self.ide_resolve_workspace(user_id, session_id, root_id, ".")
         sess = self._ide_session(user_id, session_id)
         prefix = self._ide_process_prefix(sess, remote=remote, cwd=root, feature="debug")
-        process = subprocess.Popen(
-            [*prefix, sys.executable, "-m", "debugpy.adapter"],
-            cwd=str(root),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=0,
-            env=sess._shell_process_env(),
-        )
+        process_command = [sys.executable, "-m", "debugpy.adapter"]
+        process_kwargs = {
+            "stdin": subprocess.PIPE,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "bufsize": 0,
+        }
+        process_env = sess._shell_process_env()
+        if _is_windows_job_sandbox_prefix(prefix):
+            process = _popen_windows_sandboxed(
+                process_command,
+                workspace_root=root,
+                cwd=root,
+                env=process_env,
+                **process_kwargs,
+            )
+        else:
+            process = subprocess.Popen(
+                [*prefix, *process_command],
+                cwd=str(root),
+                env=process_env,
+                **process_kwargs,
+            )
         debug_id = "debug_" + uuid.uuid4().hex[:20]
         debug = {
             "id": debug_id,
@@ -99370,6 +100192,226 @@ document.addEventListener('DOMContentLoaded', function(){
         return result
 
     @staticmethod
+    def _ide_prompt_workspace_snapshot(
+        root: Path,
+        *,
+        max_entries: int = 160,
+        max_chars: int = 12_000,
+        max_depth: int = 6,
+    ) -> dict:
+        """Return a bounded metadata-only workspace tree for prompt enhancement."""
+        max_entries = max(20, min(500, int(max_entries or 160)))
+        max_chars = max(2_000, min(32_000, int(max_chars or 12_000)))
+        max_depth = max(1, min(10, int(max_depth or 6)))
+        entries: list[dict] = []
+        pending: deque[tuple[Path, str, int]] = deque([(root.resolve(), "", 0)])
+        skipped_directories = 0
+        scanned_directories = 0
+        used_chars = 0
+        truncated = False
+        skip_names = {str(name).lower() for name in IDE_TREE_SKIP_DIRS}
+        while pending and len(entries) < max_entries and used_chars < max_chars:
+            directory, rel_dir, depth = pending.popleft()
+            scanned_directories += 1
+            try:
+                with os.scandir(directory) as iterator:
+                    children = sorted(iterator, key=lambda item: str(item.name).lower())
+            except Exception:
+                continue
+            for entry in children:
+                if len(entries) >= max_entries:
+                    truncated = True
+                    break
+                try:
+                    if entry.is_symlink():
+                        continue
+                    name = str(entry.name or "")
+                    if not name:
+                        continue
+                    rel_path = normalize_rel_preview_path(
+                        f"{rel_dir}/{name}" if rel_dir else name
+                    )
+                    if entry.is_dir(follow_symlinks=False):
+                        skipped = name.lower() in skip_names
+                        row = {"type": "dir", "path": rel_path, "skipped": skipped}
+                        if skipped:
+                            skipped_directories += 1
+                        elif depth < max_depth:
+                            pending.append((Path(entry.path), rel_path, depth + 1))
+                        else:
+                            row["depth_limited"] = True
+                            truncated = True
+                    elif entry.is_file(follow_symlinks=False):
+                        row = {
+                            "type": "file",
+                            "path": rel_path,
+                            "size": int(entry.stat(follow_symlinks=False).st_size),
+                        }
+                    else:
+                        continue
+                except Exception:
+                    continue
+                row_chars = len(str(row.get("path", ""))) + 64
+                if entries and used_chars + row_chars > max_chars:
+                    truncated = True
+                    pending.clear()
+                    break
+                entries.append(row)
+                used_chars += row_chars
+        if pending:
+            truncated = True
+        return {
+            "awareness": "always_on",
+            "entries": entries,
+            "entry_count": len(entries),
+            "scanned_directories": scanned_directories,
+            "skipped_directories": skipped_directories,
+            "truncated": bool(truncated),
+            "limits": {
+                "max_entries": max_entries,
+                "max_chars": max_chars,
+                "max_depth": max_depth,
+            },
+        }
+
+    def _ide_prompt_skill_catalog(self, *, max_items: int = 180, max_chars: int = 36_000) -> tuple[SkillStore, list[dict], bool]:
+        store = self._ensure_skills_store(force=False)
+        rows: list[dict] = []
+        used_chars = 0
+        truncated = False
+        for item in store.list_metadata():
+            if not isinstance(item, dict) or str(item.get("id", "") or "") == "_warnings":
+                continue
+            row = {
+                "id": trim(str(item.get("id", "") or ""), 180),
+                "name": trim(str(item.get("name", "") or ""), 120),
+                "description": trim(str(item.get("description", "") or ""), 520),
+                "provider": trim(str(item.get("provider_id", "") or ""), 80),
+                "triggers": [trim(str(value), 100) for value in list(item.get("triggers", []) or [])[:8]],
+                "entrypoints": [trim(str(value), 160) for value in list(item.get("entrypoints", []) or [])[:6]],
+            }
+            if not row["id"]:
+                continue
+            row_chars = len(json_dumps(row))
+            if len(rows) >= max_items or (rows and used_chars + row_chars > max_chars):
+                truncated = True
+                break
+            rows.append(row)
+            used_chars += row_chars
+        return store, rows, truncated
+
+    @staticmethod
+    def _ide_validate_selected_skills(
+        raw: object,
+        catalog: list[dict],
+        store: SkillStore,
+        *,
+        max_skills: int,
+    ) -> list[dict]:
+        if not isinstance(raw, list):
+            return []
+        catalog_by_id = {
+            str(row.get("id", "") or ""): row
+            for row in catalog
+            if isinstance(row, dict) and str(row.get("id", "") or "")
+        }
+        selected: list[dict] = []
+        seen: set[str] = set()
+        for index, item in enumerate(raw):
+            if len(selected) >= max(1, int(max_skills or 1)):
+                break
+            if isinstance(item, str):
+                requested = item.strip()
+                rationale = ""
+            elif isinstance(item, dict):
+                requested = str(
+                    item.get("id", item.get("qualified_name", item.get("name", ""))) or ""
+                ).strip()
+                rationale = trim(str(item.get("rationale", item.get("reason", "")) or "").strip(), 600)
+            else:
+                continue
+            canonical = requested if requested in catalog_by_id else ""
+            if not canonical and requested:
+                try:
+                    resolved, error = store._resolve_name(requested)
+                except Exception:
+                    resolved, error = None, "unavailable"
+                if not error and resolved in catalog_by_id:
+                    canonical = str(resolved)
+            if not canonical or canonical in seen:
+                continue
+            seen.add(canonical)
+            meta = catalog_by_id[canonical]
+            selected.append(
+                {
+                    "id": canonical,
+                    "name": str(meta.get("name", canonical) or canonical),
+                    "description": str(meta.get("description", "") or ""),
+                    "rationale": rationale,
+                    "order": len(selected) + 1,
+                }
+            )
+        return selected
+
+    @staticmethod
+    def _ide_normalize_execution_steps(raw: object, *, limit: int = 12) -> list[dict]:
+        if not isinstance(raw, list):
+            return []
+        steps: list[dict] = []
+        for item in raw[: max(1, int(limit or 12))]:
+            if isinstance(item, str):
+                action = trim(item.strip(), 900)
+                row = {"title": action, "action": action, "depends_on": [], "completion_check": ""}
+            elif isinstance(item, dict):
+                action = trim(str(item.get("action", item.get("description", "")) or "").strip(), 1_200)
+                title = trim(str(item.get("title", "") or "").strip(), 240) or action
+                dependencies = item.get("depends_on", [])
+                if isinstance(dependencies, str):
+                    dependencies = [dependencies]
+                row = {
+                    "title": title,
+                    "action": action or title,
+                    "depends_on": [trim(str(value), 120) for value in dependencies if str(value).strip()][:6]
+                    if isinstance(dependencies, list)
+                    else [],
+                    "completion_check": trim(
+                        str(item.get("completion_check", item.get("done_when", "")) or "").strip(),
+                        900,
+                    ),
+                }
+            else:
+                continue
+            if row["action"]:
+                row["order"] = len(steps) + 1
+                steps.append(row)
+        return steps
+
+    @staticmethod
+    def _ide_append_skill_orchestration(enhanced: str, selected: list[dict], language: str) -> str:
+        if not selected:
+            return enhanced
+        heading = {
+            "zh-CN": "Skills 编排",
+            "zh-TW": "Skills 編排",
+            "ja": "Skills の実行順序",
+        }.get(language, "Skill Orchestration")
+        if f"## {heading}" in enhanced and all(
+            f"`{row.get('id', '')}`" in enhanced for row in selected
+        ):
+            return enhanced
+        intro = {
+            "zh-CN": "按以下顺序使用已验证的技能。执行任务时先通过 load_skill 读取完整说明，再遵循该技能流程；原始请求始终具有最高优先级。",
+            "zh-TW": "依下列順序使用已驗證的技能。執行任務時先透過 load_skill 讀取完整說明，再遵循該技能流程；原始請求始終具有最高優先級。",
+            "ja": "検証済みスキルを次の順序で使用する。実行時は load_skill で完全な指示を読み、その手順に従う。元の依頼を常に最優先する。",
+        }.get(language, "Use the validated skills in this order. At execution time, load each full instruction with load_skill before following its workflow. The original request remains authoritative.")
+        lines = [f"## {heading}", intro]
+        for row in selected:
+            reason = str(row.get("rationale", "") or row.get("description", "") or "").strip()
+            suffix = f" - {reason}" if reason else ""
+            lines.append(f"{int(row.get('order', len(lines) - 1) or 1)}. `{row.get('id', '')}`{suffix}")
+        return f"{enhanced.rstrip()}\n\n" + "\n".join(lines)
+
+    @staticmethod
     def _ide_prompt_enhancement_fallback(
         original: str,
         *,
@@ -99377,6 +100419,8 @@ document.addEventListener('DOMContentLoaded', function(){
         budget: str = "medium",
         active_path: str = "",
         attachments: list[str] | None = None,
+        workspace_snapshot: dict | None = None,
+        selected_skills: list[dict] | None = None,
     ) -> dict:
         code = normalize_ui_language(language)
         budget = str(budget or "medium").lower()
@@ -99562,8 +100606,51 @@ document.addEventListener('DOMContentLoaded', function(){
             context_rows.append(f"- {labels['active_file']}: {active_path}")
         for path in list(attachments or [])[:20]:
             context_rows.append(f"- {labels['attached_file']}: {path}")
+        workspace_snapshot = workspace_snapshot if isinstance(workspace_snapshot, dict) else {}
+        workspace_entries = list(workspace_snapshot.get("entries", []) or [])
+        workspace_heading = {
+            "zh-CN": "工作区目录（始终感知）",
+            "zh-TW": "工作區目錄（始終感知）",
+            "ja": "ワークスペース構成（常時参照）",
+        }.get(code, "Workspace directory (always available)")
+        context_rows.append(
+            f"- {workspace_heading}: {int(workspace_snapshot.get('entry_count', len(workspace_entries)) or 0)} entries"
+            f"; truncated={str(bool(workspace_snapshot.get('truncated', False))).lower()}"
+        )
+        for row in workspace_entries[:80]:
+            if not isinstance(row, dict):
+                continue
+            marker = "dir" if row.get("type") == "dir" else f"file, {int(row.get('size', 0) or 0)} bytes"
+            context_rows.append(f"  - {row.get('path', '')} ({marker})")
         if not context_rows:
             context_rows.append(str(labels["context_default"]))
+        execution_steps = {
+            "zh-CN": [
+                {"title": "检查现状", "action": "检查目录快照、相关文件与现有行为，明确受影响范围。", "depends_on": [], "completion_check": "已获得足以定位修改点的证据。"},
+                {"title": "分步实现", "action": "按依赖关系逐项实现需求，每完成一个可验证增量再进入下一项。", "depends_on": ["检查现状"], "completion_check": "每项修改均对应明确需求且没有无关扩展。"},
+                {"title": "验证交付", "action": "运行与风险相匹配的测试，并按验收标准核对结果。", "depends_on": ["分步实现"], "completion_check": "测试证据、修改摘要和剩余限制均已报告。"},
+            ],
+            "zh-TW": [
+                {"title": "檢查現況", "action": "檢查目錄快照、相關檔案與既有行為，明確受影響範圍。", "depends_on": [], "completion_check": "已取得足以定位修改點的證據。"},
+                {"title": "分步實作", "action": "依相依關係逐項實作需求，每完成一個可驗證增量再進入下一項。", "depends_on": ["檢查現況"], "completion_check": "每項修改均對應明確需求且沒有無關擴展。"},
+                {"title": "驗證交付", "action": "執行與風險相符的測試，並依驗收標準核對結果。", "depends_on": ["分步實作"], "completion_check": "測試證據、修改摘要與剩餘限制均已報告。"},
+            ],
+            "ja": [
+                {"title": "現状確認", "action": "ディレクトリ構成、関連ファイル、既存動作を確認し、影響範囲を特定する。", "depends_on": [], "completion_check": "変更箇所を特定する十分な根拠が得られている。"},
+                {"title": "段階的な実装", "action": "依存関係に沿って要件を一つずつ実装し、検証可能な増分ごとに次へ進む。", "depends_on": ["現状確認"], "completion_check": "各変更が明示された要件に対応し、無関係な拡張がない。"},
+                {"title": "検証と引き渡し", "action": "リスクに応じたテストを実行し、受け入れ基準と照合する。", "depends_on": ["段階的な実装"], "completion_check": "テスト根拠、変更概要、残る制約が報告されている。"},
+            ],
+        }.get(code, [
+            {"title": "Inspect current state", "action": "Inspect the directory snapshot, relevant files, and current behavior to identify the affected surface.", "depends_on": [], "completion_check": "There is enough evidence to locate the required changes."},
+            {"title": "Implement incrementally", "action": "Implement requirements in dependency order, completing one verifiable increment before moving to the next.", "depends_on": ["Inspect current state"], "completion_check": "Each change maps to an explicit requirement without unrelated expansion."},
+            {"title": "Verify and deliver", "action": "Run risk-appropriate tests and check the result against the acceptance criteria.", "depends_on": ["Implement incrementally"], "completion_check": "Test evidence, the change summary, and remaining limitations are reported."},
+        ])
+        steps_heading = {"zh-CN": "执行步骤", "zh-TW": "執行步驟", "ja": "実行手順"}.get(code, "Execution Steps")
+        completion_label = {"zh-CN": "完成检查", "zh-TW": "完成檢查", "ja": "完了条件"}.get(code, "Done when")
+        steps_text = "\n".join(
+            f"{index}. {row['title']}: {row['action']} {completion_label}: {row['completion_check']}"
+            for index, row in enumerate(execution_steps, 1)
+        )
         requirements = "\n".join(
             f"- {item}" for item in [*labels["requirements_list"], *extra_requirements]
         )
@@ -99572,10 +100659,13 @@ document.addEventListener('DOMContentLoaded', function(){
             f"## {labels['context']}\n" + "\n".join(context_rows) + "\n\n"
             f"## {labels['requirements']}\n"
             f"{requirements}\n\n"
+            f"## {steps_heading}\n{steps_text}\n\n"
             f"## {labels['acceptance']}\n"
             f"- {labels['acceptance_item']}\n\n"
             f"## {labels['original']}\n{original}"
         )
+        selected_skills = list(selected_skills or [])
+        enhanced = AppContext._ide_append_skill_orchestration(enhanced, selected_skills, code)
         return {
             "enhanced_prompt": trim(enhanced, 48_000),
             "intent_summary": labels["intent"],
@@ -99585,6 +100675,8 @@ document.addEventListener('DOMContentLoaded', function(){
             "acceptance_criteria": [
                 str(labels["acceptance_item"])
             ],
+            "execution_steps": execution_steps,
+            "selected_skills": selected_skills,
             "open_questions": [],
             "clarifications": [],
             "budget": budget,
@@ -99603,7 +100695,7 @@ document.addEventListener('DOMContentLoaded', function(){
             raise ValueError("message exceeds the 48000 character enhancement limit")
         root_id = str(payload.get("root_id", payload.get("root", "session")) or "session")
         active_path = normalize_rel_preview_path(str(payload.get("active_path", "") or ""))
-        _, _, root_meta = self.ide_resolve_workspace(user_id, session_id, root_id, ".")
+        root, _, root_meta = self.ide_resolve_workspace(user_id, session_id, root_id, ".")
         attachments: list[str] = []
         raw_attachments = payload.get("attachments", [])
         if raw_attachments is not None and not isinstance(raw_attachments, list):
@@ -99623,6 +100715,21 @@ document.addEventListener('DOMContentLoaded', function(){
         if budget not in IDE_PROMPT_ENHANCEMENT_BUDGETS:
             budget = "medium"
         budget_spec = IDE_PROMPT_ENHANCEMENT_BUDGETS[budget]
+        workspace_snapshot = self._ide_prompt_workspace_snapshot(
+            root,
+            max_entries=int(budget_spec["workspace_entries"]),
+            max_chars=int(budget_spec["workspace_chars"]),
+        )
+        skills_aware = bool(payload.get("skills_awareness", False))
+        skill_store: SkillStore | None = None
+        skill_catalog: list[dict] = []
+        skill_catalog_truncated = False
+        skill_catalog_warning = ""
+        if skills_aware:
+            try:
+                skill_store, skill_catalog, skill_catalog_truncated = self._ide_prompt_skill_catalog()
+            except Exception as exc:
+                skill_catalog_warning = trim(str(exc), 500)
         sess = self._ide_session(user_id, session_id)
         language = normalize_ui_language(getattr(sess, "ui_language", DEFAULT_UI_LANGUAGE))
         fallback = self._ide_prompt_enhancement_fallback(
@@ -99631,6 +100738,7 @@ document.addEventListener('DOMContentLoaded', function(){
             budget=budget,
             active_path=active_path,
             attachments=attachments,
+            workspace_snapshot=workspace_snapshot,
         )
         recent_rows: list[str] = []
         try:
@@ -99665,6 +100773,14 @@ document.addEventListener('DOMContentLoaded', function(){
                 "kind": str(root_meta.get("kind", "workspace") or "workspace"),
                 "active_file": active_path,
                 "attachments": attachments,
+                "directory_snapshot": workspace_snapshot,
+            },
+            "skills_awareness": {
+                "enabled": skills_aware,
+                "selection_limit": int(budget_spec["max_skills"]),
+                "catalog": skill_catalog if skills_aware else [],
+                "catalog_truncated": bool(skill_catalog_truncated),
+                "catalog_warning": skill_catalog_warning,
             },
             "recent_public_context": recent_rows,
             "enhancement_budget": budget,
@@ -99672,6 +100788,13 @@ document.addEventListener('DOMContentLoaded', function(){
             "regeneration": regeneration,
             "previous_candidate": previous_prompt,
         }
+        skill_selection_instruction = (
+            f"Skills awareness is enabled. Select between 1 and {int(budget_spec['max_skills'])} materially relevant skills from skills_awareness.catalog. "
+            "Use only exact catalog ids. Return them in selected_skills in intended execution order with a concise task-specific rationale. "
+            "Do not select redundant skills merely to reach the limit. The server will validate ids and provide full instructions for a refinement pass. "
+            if skills_aware and skill_catalog
+            else "Skills awareness is disabled or no skill catalog is available. Return selected_skills as an empty array. "
+        )
         system = (
             "You are Prompt_Enhancer, a preflight compiler for a software engineering Agent. "
             "Rewrite the user's draft into a precise, executable instruction. Do not perform the task. "
@@ -99682,6 +100805,11 @@ document.addEventListener('DOMContentLoaded', function(){
             "The enhanced_prompt must be self-contained and organized with short sections for goal, context, deliverables, constraints, execution guidance, acceptance criteria, and unresolved ambiguity when applicable. "
             "For every ambiguity that could otherwise require user confirmation, provide a concrete conservative default_answer. The downstream Agent must use that default unless the user edits it. Never leave a question without a default. "
             "Write every clarification and its default answer into enhanced_prompt so it is directly executable without another preflight question. "
+            "Always produce execution_steps as an ordered array of independently actionable stages. Each step must have title, action, depends_on, and completion_check. "
+            "For implementation tasks, use at least three dependency-aware steps: evidence gathering, bounded implementation increments, and verification. Do not collapse a complex task into one large implementation step. "
+            "Each step must be small enough for the downstream Agent to finish, verify, and update its todos before advancing. Include the same staged sequence in enhanced_prompt. "
+            "Use workspace.directory_snapshot to ground affected paths and architecture, while treating it as metadata only and never inventing file contents. "
+            + skill_selection_instruction +
             "For low-capability downstream agents, use direct imperative wording and observable acceptance checks. "
             f"The selected enhancement budget is {budget.upper()}. {budget_spec['detail_guidance']} "
             f"Planning depth: {budget_spec['planning_depth']} "
@@ -99689,7 +100817,7 @@ document.addEventListener('DOMContentLoaded', function(){
             f"Scope breadth: {budget_spec['scope_breadth']} "
             "Use the available budget for task-specific precision, not repetition or generic advice. Omit dimensions that are genuinely irrelevant. "
             "Return JSON only, without markdown fences, using exactly these keys: "
-            "intent_summary (string), deliverables (array of strings), constraints (array of strings), assumptions (array of strings), acceptance_criteria (array of strings), clarifications (array of objects with question and default_answer strings), enhanced_prompt (string). "
+            "intent_summary (string), deliverables (array of strings), constraints (array of strings), assumptions (array of strings), acceptance_criteria (array of strings), clarifications (array of objects with question and default_answer strings), execution_steps (array of objects with title, action, depends_on, completion_check), selected_skills (array of objects with id and rationale), enhanced_prompt (string). "
             + model_language_instruction(language)
         )
         user_prompt = (
@@ -99701,6 +100829,7 @@ document.addEventListener('DOMContentLoaded', function(){
         raw_text = ""
         source = "model"
         warning = ""
+        client: OllamaClient | None = None
         try:
             if not profile:
                 raise ValueError("active model profile unavailable")
@@ -99745,6 +100874,104 @@ document.addEventListener('DOMContentLoaded', function(){
             warning = "Prompt enhancement model returned invalid structured JSON"
             parsed = dict(fallback)
             source = "fallback"
+        selected_skills: list[dict] = []
+        if source == "model" and skills_aware and skill_store is not None and skill_catalog:
+            selected_skills = self._ide_validate_selected_skills(
+                parsed.get("selected_skills", []),
+                skill_catalog,
+                skill_store,
+                max_skills=int(budget_spec["max_skills"]),
+            )
+            if not selected_skills and client is not None:
+                selection_system = (
+                    "Select the most materially useful skills for the downstream Agent task. "
+                    f"Choose 1 to {int(budget_spec['max_skills'])} entries using only exact ids from SKILL_CATALOG. "
+                    "Prefer a small complementary set over redundant coverage. Do not perform the task. "
+                    "Return JSON only as {\"selected_skills\":[{\"id\":\"exact-id\",\"rationale\":\"task-specific reason\"}]}. "
+                    + model_language_instruction(language)
+                )
+                selection_input = {
+                    "original_request": original,
+                    "workspace": prompt_input["workspace"],
+                    "selection_limit": int(budget_spec["max_skills"]),
+                    "skill_catalog": skill_catalog,
+                }
+                try:
+                    selection_response = client.chat(
+                        [{"role": "user", "content": "Select skills from SKILL_CATALOG.\n\n" + json_dumps(selection_input, indent=2)}],
+                        system=selection_system,
+                        max_tokens=min(1200, int(budget_spec["max_tokens"])),
+                        temperature=0.05,
+                        think=False,
+                        stream_thinking=False,
+                        response_stream=False,
+                    )
+                    selection_payload = extract_json_object_from_text(
+                        trim(str(selection_response.get("content", "") or ""), 16_000),
+                        {},
+                    )
+                    selected_skills = self._ide_validate_selected_skills(
+                        selection_payload.get("selected_skills", []) if isinstance(selection_payload, dict) else [],
+                        skill_catalog,
+                        skill_store,
+                        max_skills=int(budget_spec["max_skills"]),
+                    )
+                    if not selected_skills:
+                        warning = "Skills awareness was enabled, but the model did not return a valid catalog skill"
+                except Exception as exc:
+                    warning = "Skill selection retry failed: " + trim(str(exc), 400)
+            if selected_skills and client is not None:
+                skill_documents: list[dict] = []
+                remaining_chars = int(budget_spec["skill_context_chars"])
+                for row in selected_skills:
+                    if remaining_chars <= 0:
+                        break
+                    try:
+                        loaded = str(skill_store.load(str(row["id"])))
+                    except Exception as exc:
+                        loaded = f"Skill load failed: {exc}"
+                    body = trim(loaded, remaining_chars)
+                    skill_documents.append({"id": row["id"], "instructions": body})
+                    remaining_chars -= len(body)
+                refinement_input = {
+                    "original_request": original,
+                    "workspace": prompt_input["workspace"],
+                    "validated_selected_skills": selected_skills,
+                    "selected_skill_instructions": skill_documents,
+                    "candidate": parsed,
+                    "enhancement_budget": budget,
+                }
+                refinement_system = (
+                    "You are the second pass of Prompt_Enhancer. Refine the candidate into a deeper, staged Agent instruction using the actual validated skill instructions. "
+                    "Do not perform the task and do not expose hidden reasoning. Keep the original request authoritative. "
+                    "The selected skill ids and order are fixed; understand their instructions, assign each skill to the steps where it materially helps, and avoid redundant skill use. "
+                    "Make execution_steps dependency-aware and granular enough that the downstream Agent can complete and verify one bounded stage before advancing. "
+                    "Do not combine all implementation into one step. Preserve concrete workspace paths only when supported by the directory snapshot. "
+                    "Return JSON only with the same keys as the candidate, including execution_steps, selected_skills, and enhanced_prompt. "
+                    + model_language_instruction(language)
+                )
+                try:
+                    refined_response = client.chat(
+                        [{"role": "user", "content": "Refine this candidate using VALIDATED_INPUT.\n\nVALIDATED_INPUT:\n" + json_dumps(refinement_input, indent=2)}],
+                        system=refinement_system,
+                        max_tokens=int(budget_spec["max_tokens"]),
+                        temperature=0.1,
+                        think=False,
+                        stream_thinking=False,
+                        response_stream=False,
+                    )
+                    refined_text = trim(str(refined_response.get("content", "") or "").strip(), 64_000)
+                    refined = extract_json_object_from_text(refined_text, {})
+                    if (
+                        isinstance(refined, dict)
+                        and str(refined.get("intent_summary", "") or "").strip()
+                        and str(refined.get("enhanced_prompt", "") or "").strip()
+                    ):
+                        parsed = refined
+                    else:
+                        warning = "Skill-aware refinement returned invalid structured JSON; using the validated first-pass result"
+                except Exception as exc:
+                    warning = "Skill-aware refinement failed; using the validated first-pass result: " + trim(str(exc), 400)
         intent_summary = trim(str(parsed.get("intent_summary", "") or "").strip(), 1200)
         enhanced = str(parsed.get("enhanced_prompt", "") or "").strip()
         if not intent_summary or not enhanced:
@@ -99809,6 +101036,39 @@ document.addEventListener('DOMContentLoaded', function(){
                     for row in missing_rows
                 )
                 enhanced = f"{enhanced.rstrip()}\n\n## {heading}\n{decisions}"
+        execution_steps = self._ide_normalize_execution_steps(parsed.get("execution_steps", []))
+        fallback_steps = self._ide_normalize_execution_steps(fallback.get("execution_steps", []))
+        if not execution_steps:
+            execution_steps = fallback_steps
+        elif len(execution_steps) == 1 and len(fallback_steps) >= 3:
+            execution_steps = [fallback_steps[0], execution_steps[0], fallback_steps[-1]]
+        elif len(execution_steps) == 2 and fallback_steps:
+            execution_steps = [*execution_steps, fallback_steps[-1]]
+        for index, row in enumerate(execution_steps, 1):
+            row["order"] = index
+            if index > 1 and not row.get("depends_on"):
+                row["depends_on"] = [execution_steps[index - 2]["title"]]
+        if execution_steps and not all(row["action"] in enhanced for row in execution_steps):
+            steps_heading = {
+                "zh-CN": "分步执行计划",
+                "zh-TW": "分步執行計畫",
+                "ja": "段階的な実行計画",
+            }.get(language, "Staged Execution Plan")
+            completion_label = {
+                "zh-CN": "完成检查",
+                "zh-TW": "完成檢查",
+                "ja": "完了条件",
+            }.get(language, "Done when")
+            step_lines: list[str] = []
+            for row in execution_steps:
+                dependencies = ", ".join(row.get("depends_on", []))
+                dependency_text = f" [depends on: {dependencies}]" if dependencies else ""
+                check = f" {completion_label}: {row['completion_check']}" if row.get("completion_check") else ""
+                step_lines.append(
+                    f"{row['order']}. {row['title']}{dependency_text}: {row['action']}{check}"
+                )
+            enhanced = f"{enhanced.rstrip()}\n\n## {steps_heading}\n" + "\n".join(step_lines)
+        enhanced = self._ide_append_skill_orchestration(enhanced, selected_skills, language)
         enhanced = trim(enhanced, 48_000)
 
         return {
@@ -99821,14 +101081,23 @@ document.addEventListener('DOMContentLoaded', function(){
             "constraints": _string_list("constraints"),
             "assumptions": _string_list("assumptions"),
             "acceptance_criteria": _string_list("acceptance_criteria"),
+            "execution_steps": execution_steps,
+            "selected_skills": selected_skills,
             "open_questions": [row["question"] for row in clarifications],
             "clarifications": clarifications,
             "source": source,
-            "warning": warning if source == "fallback" else "",
+            "warning": warning,
             "provider": provider_name,
             "model": model_name,
             "regeneration": regeneration,
             "budget": budget,
+            "skills_awareness": skills_aware,
+            "workspace_context": {
+                "awareness": "always_on",
+                "entry_count": int(workspace_snapshot.get("entry_count", 0) or 0),
+                "truncated": bool(workspace_snapshot.get("truncated", False)),
+                "skipped_directories": int(workspace_snapshot.get("skipped_directories", 0) or 0),
+            },
         }
 
     def ide_interrupt_agent(self, user_id: str, session_id: str) -> dict:
@@ -99902,13 +101171,10 @@ document.addEventListener('DOMContentLoaded', function(){
         answer = trim(str(payload.get("answer", payload.get("message", "")) or "").strip(), 4000)
         if not answer:
             raise ValueError("answer required")
-        options = [
-            trim(str(value or "").strip(), 400)
-            for value in (pending.get("options", []) if isinstance(pending.get("options"), list) else [])
-            if str(value or "").strip()
-        ][:8]
+        options = _ask_user_option_rows(pending.get("options", []))
+        option_values = {_ask_user_option_value(option) for option in options}
         allow_free_text = bool(pending.get("allow_free_text", True))
-        if options and not allow_free_text and answer not in options:
+        if option_values and not allow_free_text and answer not in option_values:
             raise ValueError("answer must match one of the available options")
         out = self.submit_user_message(user_id, session_id, answer)
         result = dict(out if isinstance(out, dict) else {"ok": True, "result": out})
@@ -99974,15 +101240,11 @@ document.addEventListener('DOMContentLoaded', function(){
         if isinstance(raw_question, dict):
             question = trim(str(raw_question.get("question", "") or "").strip(), 2000)
             if question:
-                raw_options = raw_question.get("options", [])
+                raw_options = _ask_user_option_rows(raw_question.get("options", []))
                 pending_question = {
                     "id": trim(str(raw_question.get("id", "") or ""), 120),
                     "question": question,
-                    "options": [
-                        trim(str(value or "").strip(), 400)
-                        for value in raw_options
-                        if str(value or "").strip()
-                    ][:8] if isinstance(raw_options, list) else [],
+                    "options": raw_options,
                     "allow_free_text": bool(raw_question.get("allow_free_text", True)),
                     "role": trim(str(raw_question.get("role", "") or "agent"), 40),
                     "ts": float(raw_question.get("ts", 0.0) or 0.0),
@@ -105098,6 +106360,7 @@ class Handler(BaseHTTPRequestHandler):
                     "daily_session_reset_hour": int(getattr(self.app, "daily_session_reset_hour", 8) or 8),
                     "session_creation_limit": session_creation_limit,
                     "download_js_lib_enabled": bool(getattr(self.app, "js_lib_download_enabled", True)),
+                    "chat_upload_frontend_wait_ms": int(CHAT_UPLOAD_FRONTEND_WAIT_MS),
                 }
             )
         if path == "/api/user-memory":
@@ -107089,7 +108352,16 @@ class IdeHandler(BaseHTTPRequestHandler):
                 return self._send_exception(exc)
         if path == "/api/ide/sessions":
             try:
-                return self._send_json(self.app.ide_session_payload(self._user_id(), client_ip=self._client_ip()))
+                requested_limit = int((query.get("limit", ["80"]) or ["80"])[0] or 80)
+                requested_offset = int((query.get("offset", ["0"]) or ["0"])[0] or 0)
+                return self._send_json(
+                    self.app.ide_session_payload(
+                        self._user_id(),
+                        client_ip=self._client_ip(),
+                        limit=requested_limit,
+                        offset=requested_offset,
+                    )
+                )
             except Exception as exc:
                 return self._send_exception(exc)
         m = re.match(r"^/api/ide/v2/sessions/([^/]+)/events$", path)
