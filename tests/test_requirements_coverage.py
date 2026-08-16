@@ -1,7 +1,9 @@
 import ast
 import builtins
+import pkgutil
 import re
 import sys
+import sysconfig
 import unittest
 from io import BytesIO
 from pathlib import Path
@@ -43,6 +45,19 @@ IMPORT_TO_DISTRIBUTION = {
 DYNAMIC_RUNTIME_MODULES = {"debugpy"}
 
 
+def stdlib_module_names() -> set[str]:
+    """Return stdlib top-level names on old and new supported Pythons."""
+    current = getattr(sys, "stdlib_module_names", None)
+    if current is not None:
+        return set(current)
+
+    names = set(sys.builtin_module_names)
+    stdlib_path = sysconfig.get_paths().get("stdlib")
+    if stdlib_path:
+        names.update(module.name for module in pkgutil.iter_modules([stdlib_path]))
+    return names
+
+
 def canonical_distribution(value: str) -> str:
     return re.sub(r"[-_.]+", "-", str(value or "").strip()).lower()
 
@@ -70,7 +85,7 @@ class RequirementsCoverageTests(unittest.TestCase):
             elif isinstance(node, ast.ImportFrom) and node.module:
                 imported.add(node.module.split(".", 1)[0])
 
-        third_party = imported - set(sys.stdlib_module_names) - {"__future__"}
+        third_party = imported - stdlib_module_names() - {"__future__"}
         unmapped = sorted(third_party - set(IMPORT_TO_DISTRIBUTION))
         self.assertEqual(unmapped, [], f"Map new third-party imports: {unmapped}")
 
