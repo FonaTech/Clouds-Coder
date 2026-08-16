@@ -35839,6 +35839,11 @@ body{padding:18px}
         if self.cancel_requested:
             return
         bb = self._ensure_blackboard()
+        completion = self._normalize_completion_state(bb.get("completion", {}))
+        if completion.get("state") != "completed":
+            # This hook also runs for pauses, exhausted budgets and recoverable
+            # failures. Those are run boundaries, not task completion.
+            return
         plan = bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {}
         plan_phase = str(plan.get("phase", "") or "").strip().lower()
         proposal_waiting = bool(self.runtime_plan_proposal) and not bool(self.runtime_plan_approved)
@@ -40144,7 +40149,13 @@ body{padding:18px}
         if route_kind == "pure_sync":
             return [row for row in open_rows if self._todo_row_kind(row) == "owner_worker"]
         if route_kind == "pure_single":
-            return [row for row in open_rows if self._todo_row_kind(row) == "flat"]
+            # Single-mode TodoWrite stamps rows with the active owner for UI
+            # attribution. Include those rows as well as legacy owner-less
+            # rows, or budget exhaustion can finalize with open work.
+            return [
+                row for row in open_rows
+                if self._todo_row_kind(row) in {"flat", "owner_worker"}
+            ]
         return open_rows
 
     def _finish_gate_route_for_reason(self, reason: str, board: dict | None = None) -> dict:
