@@ -96,55 +96,39 @@ IDE_WORKBENCH_STATE_FILENAME = "ide_workbench.json"
 IDE_PROMPT_ENHANCEMENT_BUDGETS = {
     "low": {
         "max_tokens": 1800,
-        "recent_messages": 4,
-        "context_chars": 500,
-        "workspace_entries": 80,
-        "workspace_chars": 8_000,
         "max_skills": 1,
-        "skill_context_chars": 12_000,
-        "planning_depth": "Use one direct execution path with only immediate prerequisites and 2-4 coarse steps.",
+        "step_guidance": "Match the number of stages to the task's actual complexity. Keep one direct path with coarse, bounded stages and do not split a simple task merely to create a longer plan.",
+        "planning_depth": "Use the obvious execution path and include only immediate prerequisites, essential implementation work, and proportionate verification.",
         "solution_diversity": "Do not enumerate alternatives unless the obvious path has a material risk.",
         "scope_breadth": "Cover only the requested behavior and directly touched surface.",
-        "detail_guidance": "Keep the result compact: use 4-6 short sections and only essential execution details.",
+        "detail_guidance": "Keep the result compact and include only details needed to execute and verify this specific request.",
     },
     "medium": {
         "max_tokens": 3600,
-        "recent_messages": 8,
-        "context_chars": 900,
-        "workspace_entries": 160,
-        "workspace_chars": 12_000,
         "max_skills": 3,
-        "skill_context_chars": 24_000,
-        "planning_depth": "Create a 3-6 step implementation sequence with prerequisites, state transitions, and completion evidence.",
-        "solution_diversity": "Consider the main approach plus one credible alternative or tradeoff, then select a conservative default.",
+        "step_guidance": "Match stage count to task complexity and split work at natural evidence, affected-surface, implementation, and verification boundaries only when those boundaries are materially distinct.",
+        "planning_depth": "Build a task-specific implementation sequence with relevant prerequisites, state transitions, tradeoffs, and completion evidence.",
+        "solution_diversity": "When a material tradeoff exists, consider the main approach and a credible alternative, then select a conservative default. Keep an obvious change direct.",
         "scope_breadth": "Cover directly affected UI, backend, data, lifecycle, and test surfaces when present.",
-        "detail_guidance": "Produce a detailed implementation brief with 7-10 concrete, task-specific decisions across scope, execution, defaults, and observable acceptance checks.",
+        "detail_guidance": "Produce a detailed implementation brief with task-specific decisions across scope, execution, defaults, and observable acceptance checks, without adding irrelevant ceremony.",
     },
     "high": {
         "max_tokens": 6000,
-        "recent_messages": 12,
-        "context_chars": 1400,
-        "workspace_entries": 240,
-        "workspace_chars": 18_000,
         "max_skills": 5,
-        "skill_context_chars": 40_000,
+        "step_guidance": "Scale stage count with actual complexity. For complex work, expose dependency boundaries, decision points, edge cases, integration work, and layered verification; for simple work, keep the natural short path.",
         "planning_depth": "Create dependency-aware phases with intermediate invariants, failure recovery, and layered verification.",
-        "solution_diversity": "Evaluate 2-3 viable approaches across correctness, complexity, compatibility, and maintenance; choose and justify a default.",
+        "solution_diversity": "When the design choice is non-obvious, evaluate materially viable approaches across correctness, complexity, compatibility, and maintenance, then justify a default. Do not manufacture alternatives for an obvious change.",
         "scope_breadth": "Trace cross-module, state, API, UX, compatibility, and operational effects relevant to the request.",
-        "detail_guidance": "Produce a thorough engineering brief with 10-16 concrete details, including affected surfaces, edge cases, compatibility, failure handling, and layered verification when relevant.",
+        "detail_guidance": "Produce a thorough engineering brief including affected surfaces, edge cases, compatibility, failure handling, and layered verification wherever they are relevant to the actual task.",
     },
     "xhigh": {
         "max_tokens": 8200,
-        "recent_messages": 16,
-        "context_chars": 2000,
-        "workspace_entries": 360,
-        "workspace_chars": 24_000,
         "max_skills": 8,
-        "skill_context_chars": 64_000,
+        "step_guidance": "Use as many milestone-quality stages as the task genuinely requires. Complex work should expose architecture, viable alternatives, risk gates, incremental delivery, recovery, and requirement-to-evidence traceability; simple work must remain concise.",
         "planning_depth": "Create milestones with dependencies, decision gates, invariants, rollback points, and requirement-to-evidence traceability.",
-        "solution_diversity": "Explore at least three materially different viable strategies when available, combine their strengths, and state why the selected default best fits the evidence.",
+        "solution_diversity": "Explore materially different viable strategies when the evidence supports a real choice, combine useful strengths, and explain why the selected default fits best. Never invent alternatives to inflate a straightforward task.",
         "scope_breadth": "Perform an end-to-end impact scan including architecture, UX, data safety, security, performance, accessibility, offline behavior, and cross-platform concerns, retaining only relevant findings.",
-        "detail_guidance": "Produce an exhaustive but relevant execution specification with 14-24 concrete details, staged delivery, requirement-to-test traceability, risks, rollback, and applicable security, performance, accessibility, and cross-platform checks.",
+        "detail_guidance": "Produce an exhaustive but relevant execution specification with staged delivery, requirement-to-test traceability, risks, rollback, and applicable security, performance, accessibility, and cross-platform checks. Depth must come from relevance, not length alone.",
     },
 }
 IDE_EXTENSIONS_DIRNAME = "ide_extensions"
@@ -600,8 +584,10 @@ DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS = max(
 DEFAULT_SINGLE_NO_PLAN_TODO_PROMPT = (
     "Use the evidence from the completed read-only perception round to think "
     "through the actual user goal for one planning turn. Then call TodoWrite "
-    "(or TodoWriteRescue) now and create a compact, realistic list of 3-7 "
-    "next actions. Keep exactly one item in_progress, base items on observed "
+    "(or TodoWriteRescue) now and create a realistic list of 1-40 next actions. "
+    "When the request contains explicit ordered stages, preserve them one-for-one "
+    "in the same order instead of merging them to fit a smaller list. Keep exactly "
+    "one item in_progress, base items on observed "
     "evidence, and do not implement or modify files in this turn. Do not "
     "invent unrelated work or switch to plan mode."
 )
@@ -1203,6 +1189,9 @@ SUPPORTED_UI_LANGUAGES = [
 ]
 UI_LANGUAGE_LABELS = {x["code"]: x["label"] for x in SUPPORTED_UI_LANGUAGES}
 DEFAULT_UI_LANGUAGE = "zh-CN"
+# Temporarily disabled: structured tool cards already expose tool activity, while
+# synthesized progress prose can anchor the next model turn to stale Todo text.
+PUBLIC_TOOL_PROGRESS_SUMMARY_ENABLED = False
 AGENT_LANGUAGE_PREFERENCES = {
     "zh-CN": {
         "id": "zh-cn-concise-milestones",
@@ -2052,6 +2041,8 @@ def agent_language_preference_payload(language: str | None) -> dict:
     row = dict(AGENT_LANGUAGE_PREFERENCES.get(code, AGENT_LANGUAGE_PREFERENCES[DEFAULT_UI_LANGUAGE]))
     row.pop("instruction", None)
     row["language"] = code
+    if not PUBLIC_TOOL_PROGRESS_SUMMARY_ENABLED:
+        row["public_progress_mode"] = "off"
     return row
 
 
@@ -4454,6 +4445,26 @@ def trim(text: object, limit: int = MAX_TOOL_OUTPUT) -> str:
     s = str(text)
     return s if len(s) <= limit else s[:limit] + "\n...(truncated)"
 
+def is_synthetic_public_progress(text: object) -> bool:
+    """Recognize progress prose generated by the disabled tool-summary fallback."""
+    value = str(text or "").strip()
+    if not value:
+        return False
+    boundary_pairs = (
+        ("正在推进「", "结果将用于确定下一步。"),
+        ("本轮将", "并根据返回的证据继续推进。"),
+        ("正在推進「", "結果將用於決定下一步。"),
+        ("本輪將", "並依據傳回的證據繼續推進。"),
+        ("「", "結果を次の判断に使います。"),
+        ("", "得られた証拠を基に続行します。"),
+        ("Advancing '", "then use the evidence to choose the next step."),
+        ("This round will ", "then continue from the returned evidence."),
+    )
+    return any(
+        (not prefix or value.startswith(prefix)) and value.endswith(suffix)
+        for prefix, suffix in boundary_pairs
+    )
+
 def ide_public_operation_data(data: object) -> dict:
     """Project a runtime event into the safe fields used by IDE history and SSE."""
     source = data if isinstance(data, dict) else {}
@@ -4470,7 +4481,14 @@ def ide_public_operation_data(data: object) -> dict:
     }
     for key, limit in text_limits.items():
         if key in source:
-            public[key] = trim(str(source.get(key, "") or ""), limit)
+            value = str(source.get(key, "") or "")
+            if (
+                key == "public_progress"
+                and not PUBLIC_TOOL_PROGRESS_SUMMARY_ENABLED
+                and is_synthetic_public_progress(value)
+            ):
+                continue
+            public[key] = trim(value, limit)
     for key in (
         "added", "deleted", "exit_code", "duration_ms", "start_line", "end_line",
         "round", "tier", "archived_messages", "context_limit_before",
@@ -6365,7 +6383,7 @@ def infer_todo_status_from_text(text: object, default: str = "pending") -> str:
     return default
 
 
-def split_structured_todo_content(text: object, limit: int = 7) -> list[str]:
+def split_structured_todo_content(text: object, limit: int = 40) -> list[str]:
     src = normalize_embedded_newlines(text).strip()
     if not src:
         return []
@@ -6404,7 +6422,7 @@ def split_structured_todo_content(text: object, limit: int = 7) -> list[str]:
             m_sub = sub_re.match(line)
             if m_sub:
                 picked.append(f"{m_sub.group(1)}.{m_sub.group(2)} {trim(str(m_sub.group(3) or '').strip(), 420)}".strip())
-                if len(picked) >= max(1, int(limit or 7)):
+                if len(picked) >= max(1, int(limit or 40)):
                     break
     if not picked:
         return [src]
@@ -6416,7 +6434,7 @@ def split_structured_todo_content(text: object, limit: int = 7) -> list[str]:
             continue
         seen.add(key)
         out.append(line)
-        if len(out) >= max(1, int(limit or 7)):
+        if len(out) >= max(1, int(limit or 40)):
             break
     return out or [src]
 
@@ -10678,7 +10696,7 @@ class TodoManager:
                     ),
                 )
             ).strip()
-            split_rows = split_structured_todo_content(raw_content, limit=7)
+            split_rows = split_structured_todo_content(raw_content, limit=40)
             if len(split_rows) <= 1:
                 expanded_items.append(raw)
                 continue
@@ -11436,7 +11454,7 @@ Use this skill when the agent shows model degradation symptoms:
 2. Inspect the authoritative current task/plan/todo state before touching todos:
    - if an approved plan or canonical todo list already exists, preserve it and repair only the current broken row;
    - preserve/create a Todo graph only when the current runtime policy says `requires_todos=true`; L3+ remains required, while L2 may be force, auto, or off;
-   - when L2 currently requires Todos, create a compact 3-7 item list whenever no usable tracking state exists; when L2 does not require Todos, do not invent a recovery list. For optional L1 tracking, use the original multi-step/uncertainty test. Items must describe user work rather than recovery machinery.
+   - when L2 currently requires Todos, create a complexity-proportionate 1-40 item list whenever no usable tracking state exists; preserve explicit ordered user stages one-for-one instead of merging them to fit a smaller list. When L2 does not require Todos, do not invent a recovery list. For optional L1 tracking, use the original multi-step/uncertainty test. Items must describe user work rather than recovery machinery.
 3. Enter strict execution mode:
    - execute exactly ONE tool call per round,
    - keep tool arguments complete JSON,
@@ -12240,7 +12258,7 @@ Classify the task into one mode before execution:
 
 ## Mandatory Workflow
 1. Clarify research question, scope, constraints, and output depth.
-2. Build a compact Todo plan (3-7 items).
+2. Build a complexity-proportionate Todo plan (1-40 items), preserving explicit ordered stages one-for-one.
 3. Execute evidence collection:
    - text-only: parse and segment source text, then deep-analyze claims.
    - retrieval-online: run query decomposition + multi-source collection + source grading.
@@ -18382,7 +18400,13 @@ class OllamaClient:
                 continue
             row: dict = {"role": role}
             if "content" in msg:
-                row["content"] = msg.get("content", "")
+                content = msg.get("content", "")
+                if (
+                    not PUBLIC_TOOL_PROGRESS_SUMMARY_ENABLED
+                    and is_synthetic_public_progress(content)
+                ):
+                    content = ""
+                row["content"] = content
             if "name" in msg:
                 row["name"] = msg.get("name")
             if "tool_call_id" in msg:
@@ -18416,6 +18440,14 @@ class OllamaClient:
                     )
                 if tcs:
                     row["tool_calls"] = tcs
+            if (
+                not PUBLIC_TOOL_PROGRESS_SUMMARY_ENABLED
+                and role == "assistant"
+                and not str(row.get("content", "") or "").strip()
+                and not row.get("tool_calls")
+                and is_synthetic_public_progress(msg.get("content", ""))
+            ):
+                continue
             out.append(row)
         media_rows = [m for m in (media_inputs or []) if isinstance(m, dict)]
         if not media_rows:
@@ -25430,8 +25462,9 @@ class SessionState:
             f"{contract_label}: this run is level 2 and must have a compact, "
             "evidence-based Todo list even when the startup single/no-plan Todo option "
             "is disabled. First perform a short read-only perception pass, then call "
-            "TodoWrite or TodoWriteRescue before any mutation. Create 3-7 realistic "
-            "next actions with exactly one item in_progress; update the same list after "
+            "TodoWrite or TodoWriteRescue before any mutation. Create 1-40 realistic "
+            "next actions with exactly one item in_progress. If the request defines ordered "
+            "stages, preserve every stage one-for-one and in order; update the same list after "
             "each real status change. Do not write files or claim completion while the "
             "required Todo list is absent."
         )
@@ -25440,9 +25473,13 @@ class SessionState:
         code = normalize_ui_language(getattr(self, "ui_language", DEFAULT_UI_LANGUAGE))
         row = dict(AGENT_LANGUAGE_PREFERENCES.get(code, AGENT_LANGUAGE_PREFERENCES[DEFAULT_UI_LANGUAGE]))
         row["language"] = code
+        if not PUBLIC_TOOL_PROGRESS_SUMMARY_ENABLED:
+            row["public_progress_mode"] = "off"
         return row
 
     def _public_progress_prompt_instruction(self) -> str:
+        if not PUBLIC_TOOL_PROGRESS_SUMMARY_ENABLED:
+            return ""
         preference = self._agent_language_preference()
         return (
             "PUBLIC PROGRESS PREFERENCE: Public progress prose is optional, not required for every "
@@ -25462,6 +25499,8 @@ class SessionState:
         force: bool = False,
     ) -> str:
         """Build a token-free milestone fallback for a silent, high-value tool turn."""
+        if not PUBLIC_TOOL_PROGRESS_SUMMARY_ENABLED:
+            return ""
         calls = tool_calls if isinstance(tool_calls, list) else []
         tool_names: list[str] = []
         for call in calls[:12]:
@@ -27268,7 +27307,7 @@ class SessionState:
                     f"Estimated output tokens: {output_tokens}. "
                     f"Current context upper bound: {self.context_token_upper_bound}. "
                     f"Subtasks: {ids_txt}. "
-                    "Before retrying failed tool calls, first create/update a compact TodoWrite plan (3-7 items) "
+                    "Before retrying failed tool calls, first create/update a complexity-proportionate TodoWrite plan (1-40 items) "
                     "that splits work into chunks. "
                     "Execute one subtask at a time, keep tool arguments complete JSON and concise. "
                     "After each subtask, update task/todo status before moving on."
@@ -61325,7 +61364,7 @@ body{padding:18px}
                         "<single-no-plan-todo-bootstrap-retry>\n"
                         f"The required Todo bootstrap turn did not complete: {reason_text}. "
                         "Retry once now. Call exactly one TodoWrite or TodoWriteRescue "
-                        "with 3-7 evidence-based items and exactly one in_progress item; "
+                        "with 1-40 evidence-based items, preserving explicit ordered stages one-for-one, and exactly one in_progress item; "
                         "do not use any implementation tool.\n"
                         "</single-no-plan-todo-bootstrap-retry>"
                     ),
@@ -62838,7 +62877,7 @@ body{padding:18px}
                 "content": (
                     "<todo-rescue>"
                     f"TodoWrite issue detected: {trim(reason, 220)}. "
-                    "Call TodoWriteRescue now with 3-7 concise items (array of strings) "
+                    "Call TodoWriteRescue now with 1-40 concise items (array of strings); preserve all explicit ordered stages "
                     "and set in_progress_index=0. "
                     f"Goal reference: {goal}"
                     "</todo-rescue>"
@@ -63358,7 +63397,7 @@ body{padding:18px}
                     if text and text not in out:
                         out.append(text)
                 if out:
-                    return out[:7]
+                    return out[:40]
         text = str(raw or "")
         if not text.strip():
             return []
@@ -63377,12 +63416,12 @@ body{padding:18px}
             except Exception:
                 token_decoded = token
             token_decoded = token_decoded.strip()
-            for piece in split_structured_todo_content(token_decoded, limit=7):
+            for piece in split_structured_todo_content(token_decoded, limit=40):
                 piece_text = str(piece or "").strip()
                 if piece_text and piece_text not in out:
                     out.append(piece_text)
         if out:
-            return out[:7]
+            return out[:40]
         # Fallback: parse non-empty lines / bullets
         normalized_text = normalize_embedded_newlines(text)
         for line in normalized_text.splitlines():
@@ -63397,7 +63436,7 @@ body{padding:18px}
                 continue
             if s not in out:
                 out.append(s)
-        return out[:7]
+        return out[:40]
 
     def _resolve_context_archive_segment(self, segment_id: str) -> dict | None:
         sid = str(segment_id or "").strip()
@@ -72573,6 +72612,11 @@ body{padding:18px}
                 # For skill-loaded messages: model sees full content, UI sees compact card
                 if isinstance(msg, dict) and msg.get("_skill_notify") and msg.get("_ui_text"):
                     text = str(msg.get("_ui_text", ""))
+                if (
+                    not PUBLIC_TOOL_PROGRESS_SUMMARY_ENABLED
+                    and is_synthetic_public_progress(text)
+                ):
+                    text = ""
                 if re.match(r"^\[SKILL EXECUTION GUIDE:\s*[^\]]+\]", str(text or "").strip(), flags=re.IGNORECASE):
                     continue
                 if (not str(text or "").strip()) and manager_route_tool_only:
@@ -72624,7 +72668,14 @@ body{padding:18px}
                 ts = float(msg.get("ts", 0.0)) if isinstance(msg, dict) else 0.0
                 row = {"role": role, "text": str(text), "ts": ts, "type": msg_type}
                 if isinstance(msg, dict) and isinstance(msg.get("data"), dict):
-                    row["data"] = dict(msg.get("data") or {})
+                    public_data = dict(msg.get("data") or {})
+                    if (
+                        not PUBLIC_TOOL_PROGRESS_SUMMARY_ENABLED
+                        and is_synthetic_public_progress(public_data.get("public_progress", ""))
+                    ):
+                        public_data.pop("public_progress", None)
+                    if public_data:
+                        row["data"] = public_data
                 elif msg_type == "tool_calls" and tool_names:
                     row["data"] = {"tools": list(tool_names)}
                     public_progress = str(text or "").strip()
@@ -75791,7 +75842,7 @@ Object.assign(I18N['en'],{
   event_truncation_recovery:'Truncation Recovery',event_truncation_state:'Structured truncation recovery state',event_truncation_note:'Model output hit a truncation boundary and entered recovery mode.',
       event_live_model_call_title:'Agent Turn Model Call',event_live_model_call_note:'The active agent is in a model call. This timer updates live while generation is in progress.',
       event_scheduler_queued_title:'Queued Task',event_scheduler_queued_note:'This message is saved and waiting for an execution slot.',event_scheduler_queue_position:'queue position',event_scheduler_reason:'reason',event_scheduler_queued_hint:'queued',
-  event_auto_continue:'Auto Continue',event_arbiter_continue:'Arbiter Continue',event_continuation_briefing:'Continuation Briefing',event_reminder:'Reminder',event_todo_rescue:'Todo Rescue',event_tool_retry:'Tool Retry',event_segmented_retry:'Segmented Retry',event_forced_converge:'Forced Converge',event_no_tool_recovery:'No-Tool Recovery',event_context_recall:'Context Recall',event_failure_recovery:'Failure Recovery',event_truncate_rescue:'Truncation Rescue',event_thinking_recovery:'Thinking Recovery',event_fault_prefill:'Fault Prefill',event_edit_recovery:'Edit Recovery',event_todo_bootstrap_title:'Todo Initialization',event_todo_bootstrap_retry_title:'Todo Initialization Retry',event_todo_bootstrap_subtitle:'Planning state after read-only perception',event_todo_bootstrap_note:'The next Todo list is being shaped from observed evidence before execution resumes.',event_todo_bootstrap_retry_note:'The Todo writer did not complete; the bounded retry is being requested.',event_todo_bootstrap_perception:'perception complete',event_todo_bootstrap_item_count:'3-7 items',event_todo_bootstrap_one_active:'exactly 1 active',event_reason:'reason',
+  event_auto_continue:'Auto Continue',event_arbiter_continue:'Arbiter Continue',event_continuation_briefing:'Continuation Briefing',event_reminder:'Reminder',event_todo_rescue:'Todo Rescue',event_tool_retry:'Tool Retry',event_segmented_retry:'Segmented Retry',event_forced_converge:'Forced Converge',event_no_tool_recovery:'No-Tool Recovery',event_context_recall:'Context Recall',event_failure_recovery:'Failure Recovery',event_truncate_rescue:'Truncation Rescue',event_thinking_recovery:'Thinking Recovery',event_fault_prefill:'Fault Prefill',event_edit_recovery:'Edit Recovery',event_todo_bootstrap_title:'Todo Initialization',event_todo_bootstrap_retry_title:'Todo Initialization Retry',event_todo_bootstrap_subtitle:'Planning state after read-only perception',event_todo_bootstrap_note:'The next Todo list is being shaped from observed evidence before execution resumes.',event_todo_bootstrap_retry_note:'The Todo writer did not complete; the bounded retry is being requested.',event_todo_bootstrap_perception:'perception complete',event_todo_bootstrap_item_count:'1-40 items · stage-aligned',event_todo_bootstrap_one_active:'exactly 1 active',event_reason:'reason',
   state_on:'on',state_off:'off',
   rt_session:'session',rt_model:'model',rt_thinking:'thinking',rt_thinking_stream:'thinking_stream',rt_response_stream:'response_stream',rt_mode:'mode',rt_active_agent:'active_agent',rt_blackboard:'bb',rt_task:'task',rt_complexity:'complexity',rt_judgement:'judgement',rt_budget:'budget',rt_remaining:'remaining',rt_blackboard_cycles:'bb_cycles',rt_round_limit:'round_limit',rt_round:'round',rt_phase:'phase',rt_queued_inputs:'queued_inputs',rt_run_timeout:'run_timeout',rt_ctx_used:'ctx_used',rt_ctx_limit:'ctx_limit',rt_ctx_mode:'ctx_mode',rt_manual_lock:'manual-lock',rt_adaptive:'adaptive',rt_ctx_left:'ctx_left',rt_ctx_left_for:'{label} left',rt_ctx_live_title:'Remaining context budget by active call',rt_truncation:'truncation',rt_trunc_retry:'trunc_retry',rt_trunc_tokens:'trunc_tokens~',rt_archive:'archive',rt_last_compact:'last_compact',compact_ago:'ago',compact_just_now:'just now',rt_ollama:'ollama',rt_files:'files',rt_ui_mode:'ui_mode',rt_state:'state',rt_awaiting_user:'awaiting user',ask_user_title:'Agent needs your input',ask_user_free_hint:'Pick an option above, or type your answer below and send.',ask_user_pick_hint:'Pick one of the options above to continue.',
   preview_download:'Download',preview_source:'Source',preview_rendered:'Preview',preview_copy_link:'Copy Link',preview_open:'Open in Browser',preview_link_copied:'Link Copied',
@@ -75820,7 +75871,7 @@ Object.assign(I18N['zh-CN'],{
   event_truncation_recovery:'截断恢复',event_truncation_state:'结构化截断恢复状态',event_truncation_note:'模型输出触发了截断边界，已进入恢复流程。',
       event_live_model_call_title:'Agent 轮次模型调用',event_live_model_call_note:'当前活跃 agent 正在进行模型调用。计时器会在生成期间实时更新。',
       event_scheduler_queued_title:'任务已排队',event_scheduler_queued_note:'这条消息已保存，正在等待后台执行名额。',event_scheduler_queue_position:'队列位置',event_scheduler_reason:'原因',event_scheduler_queued_hint:'已排队',
-  event_auto_continue:'自动继续',event_arbiter_continue:'裁决继续',event_continuation_briefing:'续跑简报',event_reminder:'提醒',event_todo_rescue:'待办救援',event_tool_retry:'工具重试',event_segmented_retry:'分段重试',event_forced_converge:'强制收敛',event_no_tool_recovery:'无工具恢复',event_context_recall:'上下文召回',event_failure_recovery:'故障恢复',event_truncate_rescue:'截断救援',event_thinking_recovery:'思考恢复',event_fault_prefill:'故障预填',event_edit_recovery:'编辑恢复',event_todo_bootstrap_title:'Todo 初始化',event_todo_bootstrap_retry_title:'Todo 初始化重试',event_todo_bootstrap_subtitle:'只读感知后的规划状态',event_todo_bootstrap_note:'系统正在根据已观察证据整理下一组 Todo，然后继续执行。',event_todo_bootstrap_retry_note:'Todo 写入未完成，系统正在进行有限次数的重试。',event_todo_bootstrap_perception:'感知已完成',event_todo_bootstrap_item_count:'3-7 项',event_todo_bootstrap_one_active:'恰好 1 项进行中',event_reason:'原因',
+  event_auto_continue:'自动继续',event_arbiter_continue:'裁决继续',event_continuation_briefing:'续跑简报',event_reminder:'提醒',event_todo_rescue:'待办救援',event_tool_retry:'工具重试',event_segmented_retry:'分段重试',event_forced_converge:'强制收敛',event_no_tool_recovery:'无工具恢复',event_context_recall:'上下文召回',event_failure_recovery:'故障恢复',event_truncate_rescue:'截断救援',event_thinking_recovery:'思考恢复',event_fault_prefill:'故障预填',event_edit_recovery:'编辑恢复',event_todo_bootstrap_title:'Todo 初始化',event_todo_bootstrap_retry_title:'Todo 初始化重试',event_todo_bootstrap_subtitle:'只读感知后的规划状态',event_todo_bootstrap_note:'系统正在根据已观察证据整理下一组 Todo，然后继续执行。',event_todo_bootstrap_retry_note:'Todo 写入未完成，系统正在进行有限次数的重试。',event_todo_bootstrap_perception:'感知已完成',event_todo_bootstrap_item_count:'1-40 项 · 对齐阶段',event_todo_bootstrap_one_active:'恰好 1 项进行中',event_reason:'原因',
   state_on:'开',state_off:'关',
   rt_session:'会话',rt_model:'模型',rt_thinking:'思考',rt_thinking_stream:'思考流',rt_response_stream:'正文流',rt_mode:'模式',rt_active_agent:'活跃代理',rt_blackboard:'黑板',rt_task:'任务',rt_complexity:'复杂度',rt_judgement:'裁决',rt_budget:'预算',rt_remaining:'剩余',rt_blackboard_cycles:'黑板轮次',rt_round_limit:'轮次上限',rt_round:'轮次',rt_phase:'阶段',rt_queued_inputs:'排队输入',rt_run_timeout:'运行超时',rt_ctx_used:'上下文已用',rt_ctx_limit:'上下文上限',rt_ctx_mode:'上下文模式',rt_manual_lock:'手动锁定',rt_adaptive:'自适应',rt_ctx_left:'上下文剩余',rt_ctx_left_for:'{label}剩余',rt_ctx_live_title:'按真实调用显示上下文剩余',rt_truncation:'截断数',rt_trunc_retry:'截断重试',rt_trunc_tokens:'截断Token~',rt_archive:'归档',rt_last_compact:'最近压缩',compact_ago:'前',compact_just_now:'刚刚',rt_ollama:'Ollama',rt_files:'文件根目录',rt_ui_mode:'界面模式',rt_state:'状态',rt_awaiting_user:'等待用户',ask_user_title:'需要你的输入',ask_user_free_hint:'点击上方选项,或在下方输入答复后发送。',ask_user_pick_hint:'请选择上方其中一个选项以继续。',
   preview_download:'下载',preview_source:'源码',preview_rendered:'预览',preview_copy_link:'复制链接',preview_open:'浏览器打开',preview_link_copied:'已复制链接',
@@ -75852,7 +75903,7 @@ Object.assign(I18N['zh-TW'],{
   event_truncation_recovery:'截斷恢復',event_truncation_state:'結構化截斷恢復狀態',event_truncation_note:'模型輸出觸發截斷邊界，已進入恢復流程。',
       event_live_model_call_title:'Agent 輪次模型呼叫',event_live_model_call_note:'目前活躍 agent 正在進行模型呼叫。計時器會在生成期間即時更新。',
       event_scheduler_queued_title:'任務已排隊',event_scheduler_queued_note:'這則訊息已保存，正在等待背景執行名額。',event_scheduler_queue_position:'佇列位置',event_scheduler_reason:'原因',event_scheduler_queued_hint:'已排隊',
-  event_auto_continue:'自動繼續',event_arbiter_continue:'裁決繼續',event_continuation_briefing:'續跑簡報',event_reminder:'提醒',event_todo_rescue:'待辦救援',event_tool_retry:'工具重試',event_segmented_retry:'分段重試',event_forced_converge:'強制收斂',event_no_tool_recovery:'無工具恢復',event_context_recall:'上下文召回',event_failure_recovery:'故障恢復',event_truncate_rescue:'截斷救援',event_thinking_recovery:'思考恢復',event_fault_prefill:'故障預填',event_edit_recovery:'編輯恢復',event_todo_bootstrap_title:'Todo 初始化',event_todo_bootstrap_retry_title:'Todo 初始化重試',event_todo_bootstrap_subtitle:'唯讀感知後的規劃狀態',event_todo_bootstrap_note:'系統會根據已觀察證據整理下一組 Todo，再繼續執行。',event_todo_bootstrap_retry_note:'Todo 寫入未完成，系統正在進行有限次重試。',event_todo_bootstrap_perception:'感知已完成',event_todo_bootstrap_item_count:'3-7 項',event_todo_bootstrap_one_active:'恰好 1 項進行中',event_reason:'原因',
+  event_auto_continue:'自動繼續',event_arbiter_continue:'裁決繼續',event_continuation_briefing:'續跑簡報',event_reminder:'提醒',event_todo_rescue:'待辦救援',event_tool_retry:'工具重試',event_segmented_retry:'分段重試',event_forced_converge:'強制收斂',event_no_tool_recovery:'無工具恢復',event_context_recall:'上下文召回',event_failure_recovery:'故障恢復',event_truncate_rescue:'截斷救援',event_thinking_recovery:'思考恢復',event_fault_prefill:'故障預填',event_edit_recovery:'編輯恢復',event_todo_bootstrap_title:'Todo 初始化',event_todo_bootstrap_retry_title:'Todo 初始化重試',event_todo_bootstrap_subtitle:'唯讀感知後的規劃狀態',event_todo_bootstrap_note:'系統會根據已觀察證據整理下一組 Todo，再繼續執行。',event_todo_bootstrap_retry_note:'Todo 寫入未完成，系統正在進行有限次重試。',event_todo_bootstrap_perception:'感知已完成',event_todo_bootstrap_item_count:'1-40 項 · 對齊階段',event_todo_bootstrap_one_active:'恰好 1 項進行中',event_reason:'原因',
   state_on:'開',state_off:'關',
   rt_session:'會話',rt_model:'模型',rt_thinking:'思考',rt_thinking_stream:'思考流',rt_response_stream:'正文串流',rt_mode:'模式',rt_active_agent:'活躍代理',rt_blackboard:'黑板',rt_task:'任務',rt_complexity:'複雜度',rt_judgement:'裁決',rt_budget:'預算',rt_remaining:'剩餘',rt_blackboard_cycles:'黑板輪次',rt_round_limit:'輪次上限',rt_round:'輪次',rt_phase:'階段',rt_queued_inputs:'排隊輸入',rt_run_timeout:'執行逾時',rt_ctx_used:'上下文已用',rt_ctx_limit:'上下文上限',rt_ctx_mode:'上下文模式',rt_manual_lock:'手動鎖定',rt_adaptive:'自適應',rt_ctx_left:'上下文剩餘',rt_ctx_left_for:'{label}剩餘',rt_ctx_live_title:'依真實呼叫顯示上下文剩餘',rt_truncation:'截斷數',rt_trunc_retry:'截斷重試',rt_trunc_tokens:'截斷Token~',rt_archive:'封存',rt_last_compact:'最近壓縮',compact_ago:'前',compact_just_now:'剛剛',rt_ollama:'Ollama',rt_files:'檔案根目錄',rt_ui_mode:'介面模式',rt_state:'狀態',rt_awaiting_user:'等待使用者',ask_user_title:'需要你的輸入',ask_user_free_hint:'點擊上方選項,或在下方輸入答覆後送出。',ask_user_pick_hint:'請選擇上方其中一個選項以繼續。',
   preview_download:'下載',preview_source:'原始碼',preview_rendered:'預覽',preview_copy_link:'複製連結',preview_open:'瀏覽器開啟',preview_link_copied:'已複製連結',
@@ -75882,7 +75933,7 @@ Object.assign(I18N['ja'],{
   event_truncation_recovery:'切り詰め復旧',event_truncation_state:'構造化切り詰め復旧状態',event_truncation_note:'モデル出力が切り詰め境界に達したため、復旧フローに入りました。',
       event_live_model_call_title:'Agent ターンモデル呼び出し',event_live_model_call_note:'現在のアクティブ agent はモデル呼び出し中です。生成中はこのタイマーがリアルタイム更新されます。',
       event_scheduler_queued_title:'キュー済みタスク',event_scheduler_queued_note:'このメッセージは保存され、実行枠を待っています。',event_scheduler_queue_position:'キュー位置',event_scheduler_reason:'理由',event_scheduler_queued_hint:'キュー済み',
-  event_auto_continue:'自動継続',event_arbiter_continue:'判定継続',event_continuation_briefing:'継続ブリーフ',event_reminder:'リマインダー',event_todo_rescue:'Todo 救援',event_tool_retry:'ツール再試行',event_segmented_retry:'分割再試行',event_forced_converge:'強制収束',event_no_tool_recovery:'ツールなし復旧',event_context_recall:'コンテキスト再呼び出し',event_failure_recovery:'障害復旧',event_truncate_rescue:'切り詰め救援',event_thinking_recovery:'思考復旧',event_fault_prefill:'障害プリフィル',event_edit_recovery:'編集復旧',event_todo_bootstrap_title:'Todo 初期化',event_todo_bootstrap_retry_title:'Todo 初期化の再試行',event_todo_bootstrap_subtitle:'読み取り専用の認識後に行う計画状態',event_todo_bootstrap_note:'観測した証拠から次の Todo を整理してから実行を続けます。',event_todo_bootstrap_retry_note:'Todo の書き込みが完了せず、回数を制限した再試行を行います。',event_todo_bootstrap_perception:'認識完了',event_todo_bootstrap_item_count:'3-7 項目',event_todo_bootstrap_one_active:'進行中は 1 項目のみ',event_reason:'理由',
+  event_auto_continue:'自動継続',event_arbiter_continue:'判定継続',event_continuation_briefing:'継続ブリーフ',event_reminder:'リマインダー',event_todo_rescue:'Todo 救援',event_tool_retry:'ツール再試行',event_segmented_retry:'分割再試行',event_forced_converge:'強制収束',event_no_tool_recovery:'ツールなし復旧',event_context_recall:'コンテキスト再呼び出し',event_failure_recovery:'障害復旧',event_truncate_rescue:'切り詰め救援',event_thinking_recovery:'思考復旧',event_fault_prefill:'障害プリフィル',event_edit_recovery:'編集復旧',event_todo_bootstrap_title:'Todo 初期化',event_todo_bootstrap_retry_title:'Todo 初期化の再試行',event_todo_bootstrap_subtitle:'読み取り専用の認識後に行う計画状態',event_todo_bootstrap_note:'観測した証拠から次の Todo を整理してから実行を続けます。',event_todo_bootstrap_retry_note:'Todo の書き込みが完了せず、回数を制限した再試行を行います。',event_todo_bootstrap_perception:'認識完了',event_todo_bootstrap_item_count:'1-40 項目 · 段階整合',event_todo_bootstrap_one_active:'進行中は 1 項目のみ',event_reason:'理由',
   state_on:'オン',state_off:'オフ',
   rt_session:'セッション',rt_model:'モデル',rt_thinking:'思考',rt_thinking_stream:'思考ストリーム',rt_response_stream:'レスポンスストリーム',rt_mode:'モード',rt_active_agent:'アクティブAgent',rt_blackboard:'黒板',rt_task:'タスク',rt_complexity:'複雑度',rt_judgement:'判定',rt_budget:'予算',rt_remaining:'残り',rt_blackboard_cycles:'黒板サイクル',rt_round_limit:'ラウンド上限',rt_round:'ラウンド',rt_phase:'フェーズ',rt_queued_inputs:'待機入力',rt_run_timeout:'実行タイムアウト',rt_ctx_used:'コンテキスト使用量',rt_ctx_limit:'コンテキスト上限',rt_ctx_mode:'コンテキストモード',rt_manual_lock:'手動固定',rt_adaptive:'適応',rt_ctx_left:'残りコンテキスト',rt_ctx_left_for:'{label}残り',rt_ctx_live_title:'実際の呼び出し別の残りコンテキスト',rt_truncation:'切り詰め数',rt_trunc_retry:'切り詰め再試行',rt_trunc_tokens:'切り詰めToken~',rt_archive:'アーカイブ',rt_last_compact:'直近 compact',compact_ago:'前',compact_just_now:'たった今',rt_ollama:'Ollama',rt_files:'ファイルルート',rt_ui_mode:'UIモード',rt_state:'状態',rt_awaiting_user:'ユーザー待ち',ask_user_title:'入力が必要です',ask_user_free_hint:'上のオプションを選ぶか、下に回答を入力して送信してください。',ask_user_pick_hint:'続行するには上のオプションを選んでください。',
   preview_download:'ダウンロード',preview_source:'ソース',preview_rendered:'プレビュー',preview_copy_link:'リンクをコピー',preview_open:'ブラウザで開く',preview_link_copied:'リンクをコピーしました',
@@ -78296,6 +78347,7 @@ function _chatVirtTickRunNotice(chatEl){
   }
 }
 function _chatVirtSyncRunTicker(chatEl){if(!chatEl)return;const hasRun=!!chatEl.querySelector('.msg[data-run-live=\"1\"]');if(!hasRun){_chatVirtStopRunTicker(chatEl);return}_chatVirtTickRunNotice(chatEl);if(!chatEl._virtRunTicker){chatEl._virtRunTicker=setInterval(()=>_chatVirtTickRunNotice(chatEl),1000)}}
+function isSyntheticPublicProgress(text){const value=String(text||'').trim();if(!value)return false;const pairs=[['正在推进「','结果将用于确定下一步。'],['本轮将','并根据返回的证据继续推进。'],['正在推進「','結果將用於決定下一步。'],['本輪將','並依據傳回的證據繼續推進。'],['「','結果を次の判断に使います。'],['','得られた証拠を基に続行します。'],["Advancing '",'then use the evidence to choose the next step.'],['This round will ','then continue from the returned evidence.']];return pairs.some(([prefix,suffix])=>(!prefix||value.startsWith(prefix))&&value.endsWith(suffix))}
 function _chatVirtCollectRows(){
   const feed=Array.isArray(S.snap?.conversation_feed)?S.snap.conversation_feed:(Array.isArray(S.snap?.messages)?S.snap.messages:[]);
   const rows=[];
@@ -78303,7 +78355,12 @@ function _chatVirtCollectRows(){
     const r=feed[i]||{};
     const txt=String(r.text||'').trim();
     if(/^\\[SKILL EXECUTION GUIDE:\\s*[^\\]]+\\]/i.test(txt))continue;
-    rows.push({...r,_vk:_chatVirtRowKey(r,i)});
+    const syntheticText=isSyntheticPublicProgress(txt),syntheticData=isSyntheticPublicProgress(r.data?.public_progress);
+    if((syntheticText||syntheticData)&&String(r.type||'message')!=='tool_calls')continue;
+    const clean={...r,_vk:_chatVirtRowKey(r,i)};
+    if(syntheticText)clean.text='';
+    if(syntheticData){clean.data={...(r.data||{})};delete clean.data.public_progress}
+    rows.push(clean);
   }
   const activeAgentRole=_chatVirtAgentRoleKey(S.snap?.agent_active_role);
   const liveThinking=String(S.snap?.live_thinking||'').trim();
@@ -96365,7 +96422,7 @@ const S={
   diagnostics:[],searchResults:[],scm:null,tasks:[],installedExtensions:[],extensionWorkers:new Map(),
   terminal:null,terminalStarting:false,terminalPromise:null,terminalWidget:null,terminalFit:null,terminalOffset:0,terminalPoll:null,terminalDecoder:null,terminalAnsiState:null,terminalPlainState:null,stateTimer:null,diagnosticTimer:null,paletteItems:[],paletteIndex:0,paletteMode:'commands',quickFiles:[],quickFilesLoading:false,quickFilesKey:'',quickFilesTruncated:false,
   debug:null,debugSeq:0,debugPoll:null,debugFile:null,
-  agentPoll:null,agentPollDue:0,agentPollBusy:false,agentPollRequested:false,agentState:null,agentRendered:new Set(),agentToolCards:new Map(),agentPlanCards:new Map(),agentOperationSeq:0,agentEventSeq:0,agentWasBusy:false,agentSession:'',agentSubmitting:false,agentInterrupting:false,agentTreeTimer:null,agentFileRefresh:new Set(),agentAttachments:[],agentModelCatalog:null,agentTodoCollapsed:false,promptEnhanceEnabled:false,promptEnhancePersistent:false,promptEnhanceSkillsAware:false,promptEnhanceBudget:'medium',promptEnhancing:false,promptEnhanceDraft:null,promptEnhanceAbort:null,workspaceRefreshBusy:false,workspaceRefreshSeq:0,workspaceClipboard:null,explorerSelection:null,sessionSwitchSeq:0,sessionSwitching:false,renderingAgentState:false,devicePoll:null,agentEvents:null,agentEventsConnected:false,agentEventReconnect:null,pendingUploadDest:'',pendingOpenUpload:false,pendingFolderUploadDest:''
+  agentPoll:null,agentPollDue:0,agentPollBusy:false,agentPollRequested:false,agentState:null,agentRendered:new Set(),agentToolCards:new Map(),agentPlanCards:new Map(),agentOperationSeq:0,agentEventSeq:0,agentWasBusy:false,agentSession:'',agentSubmitting:false,agentInterrupting:false,agentTreeTimer:null,agentFileRefresh:new Set(),agentAttachments:[],agentModelCatalog:null,agentTodoCollapsed:false,promptEnhanceEnabled:false,promptEnhancePersistent:false,promptEnhanceSkillsAware:false,promptEnhanceBudget:'medium',promptEnhancing:false,promptEnhanceDraft:null,promptEnhanceAbort:null,promptEnhanceStartedAt:0,promptEnhanceElapsedTimer:null,promptEnhanceLoadingLabel:'',workspaceRefreshBusy:false,workspaceRefreshSeq:0,workspaceClipboard:null,explorerSelection:null,sessionSwitchSeq:0,sessionSwitching:false,renderingAgentState:false,devicePoll:null,agentEvents:null,agentEventsConnected:false,agentEventReconnect:null,pendingUploadDest:'',pendingOpenUpload:false,pendingFolderUploadDest:''
 };
 const HTML_ESCAPE={'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'};
 const escapeHtml=value=>String(value??'').replace(/[&<>"']/g,ch=>HTML_ESCAPE[ch]);
@@ -96646,6 +96703,7 @@ function stripAgentRolePrefix(text,role=''){const key=agentRoleKey(role),value=S
 function renderAgentMarkdown(text){const source=String(text||'');if(!window.marked?.parse)return escapeHtml(source).replace(/\n/g,'<br>');const html=window.marked.parse(source,{async:false,gfm:true,breaks:false});return sanitizePreviewHtml(html)}
 function agentMessage(text,type='system',meta=''){const row=document.createElement('div');row.className=`agent-message ${type}`;if(meta){const key=agentRoleKey(meta),label=document.createElement('span');label.className=`agent-meta${key?` agent-role-${key}`:''}`;label.textContent=agentRoleLabel(meta);row.appendChild(label)}const value=stripAgentRolePrefix(text,meta);if(type==='assistant'){const body=document.createElement('div');body.className='agent-markdown';body.innerHTML=renderAgentMarkdown(value);body.dataset.source=value;row.appendChild(body)}else row.appendChild(document.createTextNode(value));E('agentMessages').appendChild(row);E('agentMessages').scrollTop=E('agentMessages').scrollHeight;return row}
 function agentApproach(text,role='Agent'){const value=stripAgentRolePrefix(text,role).trim();if(!value)return null;const row=document.createElement('div');row.className='agent-message approach';row.innerHTML=`<div class="agent-approach-head"><span class="codicon codicon-compass"></span><span>Approach</span><span class="agent-meta${agentRoleKey(role)?` agent-role-${agentRoleKey(role)}`:''}" style="margin:0 0 0 auto">${escapeHtml(agentRoleLabel(role))}</span></div><div class="agent-approach-body">${escapeHtml(value)}</div>`;E('agentMessages').appendChild(row);E('agentMessages').scrollTop=E('agentMessages').scrollHeight;return row}
+function isSyntheticPublicProgress(text){const value=String(text||'').trim();if(!value)return false;const pairs=[['正在推进「','结果将用于确定下一步。'],['本轮将','并根据返回的证据继续推进。'],['正在推進「','結果將用於決定下一步。'],['本輪將','並依據傳回的證據繼續推進。'],['「','結果を次の判断に使います。'],['','得られた証拠を基に続行します。'],["Advancing '",'then use the evidence to choose the next step.'],['This round will ','then continue from the returned evidence.']];return pairs.some(([prefix,suffix])=>(!prefix||value.startsWith(prefix))&&value.endsWith(suffix))}
 function renderAgentPlanCard(tools,role='Agent'){const list=(Array.isArray(tools)?tools:[]).map(value=>String(value||'').trim()).filter(Boolean),signature=`${agentRoleKey(role)||String(role||'agent').toLowerCase()}:${list.join('|')}`,existing=S.agentPlanCards.get(signature);if(existing?.isConnected){const count=Number(existing.dataset.occurrences||1)+1;existing.dataset.occurrences=String(count);const state=existing.querySelector('.agent-tool-state');if(state)state.textContent=`Planned ×${count}`;return existing}const card=agentToolCard({kind:'tool',name:'tool_calls',title:'Tools scheduled',state:'Planned',output:list.join(', ')||'Tool calls scheduled',role});card.dataset.occurrences='1';S.agentPlanCards.set(signature,card);return card}
 function updateAgentContext(){const file=activeFile();E('agentContext').textContent=[S.sessions.find(row=>row.id===S.activeSession)?.title,S.roots.find(row=>row.id===S.activeRoot)?.label,file?.path].filter(Boolean).join('  /  ')||'No active context'}
 function agentEventKey(row){return [Number(row?.ts||0).toFixed(4),row?.role||'',row?.agent_role||'',row?.type||'',String(row?.text||'').slice(0,180)].join('|')}
@@ -96722,7 +96780,7 @@ function renderAgentState(state){
   for(const item of timeline){
     if(item.source==='feed'){
       const row=item.row,key=agentEventKey(row),type=String(row.type||'message');if(S.agentRendered.has(key))continue;S.agentRendered.add(key);const role=String(row.agent_role||row.role||'agent'),text=String(row.text||row.data?.summary||type);
-      if(type==='tool_calls'){const tools=Array.isArray(row.data?.tools)?row.data.tools:[],progress=String(row.data?.public_progress||(!text.toLowerCase().startsWith('[tool calls]')?text:'')).trim();if(progress)agentApproach(progress,role);renderAgentPlanCard(tools.length?tools:[text||'Tool calls scheduled'],role);continue}
+      if(type==='tool_calls'){const tools=Array.isArray(row.data?.tools)?row.data.tools:[],progress=String(row.data?.public_progress||(!text.toLowerCase().startsWith('[tool calls]')?text:'')).trim();if(progress&&!isSyntheticPublicProgress(progress))agentApproach(progress,role);renderAgentPlanCard(tools.length?tools:[text||'Tool calls scheduled'],role);continue}
       if(type==='approach'){agentApproach(text,role);continue}
       if(type==='web_search'){agentToolCard({kind:'tool',name:'web_search',title:'Web search',state:'Completed',stateTone:'success',output:text,role});continue}
       if(renderAgentControl(text,role))continue;
@@ -96742,7 +96800,7 @@ function connectAgentEvents(){closeAgentEvents();if(!S.activeSession)return;cons
 async function pollAgent(){if(S.agentPoll){clearTimeout(S.agentPoll);S.agentPoll=null}S.agentPollDue=0;if(!S.activeSession)return;if(S.agentPollBusy){S.agentPollRequested=true;return}if(S.agentEventsConnected&&S.agentState&&!S.agentSubmitting&&!S.agentPollRequested)return;S.agentPollRequested=false;S.agentPollBusy=true;const sid=S.activeSession,seq=S.sessionSwitchSeq,current=()=>sid===S.activeSession&&seq===S.sessionSwitchSeq;try{if(S.agentSession!==sid)resetAgentSessionUI(sid);const out=await api(`/api/ide/v2/sessions/${qs(sid)}/agent-state`);if(current()){S.agentState=out;renderAgentState(out)}}catch(error){if(current()&&error.status!==404)logOutput(`Agent state: ${error.message}`)}finally{S.agentPollBusy=false;if(S.agentPollRequested||!current())scheduleAgentPoll(0);else if(!S.agentEventsConnected)scheduleAgentPoll(document.hidden?120000:30000)}}
 function scheduleAgentPoll(delay=900){const wait=Math.max(40,Number(delay)||0),due=Date.now()+wait;if(S.agentPoll&&S.agentPollDue<=due)return;clearTimeout(S.agentPoll);S.agentPollDue=due;S.agentPoll=setTimeout(()=>{S.agentPoll=null;S.agentPollDue=0;pollAgent()},wait)}
 async function stopAgent(){if(!S.activeSession||S.agentInterrupting)return;S.agentInterrupting=true;E('stopAgentBtn').disabled=true;E('agentStatus').textContent='Stopping...';try{await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/agent/interrupt`,{method:'POST',body:'{}'});S.agentPollRequested=true;scheduleAgentPoll(40)}catch(error){S.agentInterrupting=false;E('stopAgentBtn').disabled=false;throw error}}
-const PROMPT_ENHANCE_BUDGETS=[{id:'low',label:'Low',short:'L',meta:'2-4 steps · direct scope'},{id:'medium',label:'Medium',short:'M',meta:'3-6 steps · tradeoff aware'},{id:'high',label:'High',short:'H',meta:'phased · 2-3 approaches · cross-surface'},{id:'xhigh',label:'XHigh',short:'X',meta:'milestones · alternatives · end-to-end'}];
+const PROMPT_ENHANCE_BUDGETS=[{id:'low',label:'Low',short:'L',meta:'direct · essential detail'},{id:'medium',label:'Medium',short:'M',meta:'tradeoffs · affected surfaces'},{id:'high',label:'High',short:'H',meta:'dependencies · risks · layered checks'},{id:'xhigh',label:'XHigh',short:'X',meta:'architecture · alternatives · traceability'}];
 function promptEnhanceBudgetProfile(){return PROMPT_ENHANCE_BUDGETS.find(row=>row.id===S.promptEnhanceBudget)||PROMPT_ENHANCE_BUDGETS[1]}
 function renderPromptEnhanceToggle(){const button=E('promptEnhanceBtn');if(!button)return;const profile=promptEnhanceBudgetProfile(),mode=S.promptEnhancePersistent?'Persistent':'Next task only',skills=S.promptEnhanceSkillsAware?'Skills on':'Skills off';button.classList.toggle('is-active',S.promptEnhanceEnabled);button.classList.toggle('is-busy',S.promptEnhancing);button.setAttribute('aria-pressed',String(S.promptEnhanceEnabled));button.title=`Enhance prompt: ${S.promptEnhanceEnabled?'On':'Off'} · ${profile.label} · ${mode} · Workspace tree always on · ${skills}. Long press or right-click for settings.`;button.disabled=S.promptEnhancing;E('promptEnhanceBudget').textContent=profile.short}
 function togglePromptEnhancement(){if(S.promptEnhancing)return;S.promptEnhanceEnabled=!S.promptEnhanceEnabled;renderPromptEnhanceToggle();scheduleStateSave();const mode=S.promptEnhancePersistent?'Persistent mode.':'Applies to the next submitted task only.';toast(`Prompt enhancement ${S.promptEnhanceEnabled?'enabled':'disabled'}. ${S.promptEnhanceEnabled?mode:''}`,S.promptEnhanceEnabled?'success':'warning',2400)}
@@ -96752,13 +96810,15 @@ function setPromptEnhanceBudget(budget){const profile=PROMPT_ENHANCE_BUDGETS.fin
 function showPromptEnhanceBudgetMenu(anchor){if(S.promptEnhancing)return;const popup=E('menuPopup');popup.classList.remove('agent-model-menu');popup.classList.add('prompt-budget-menu');popup.style.transform='';popup.innerHTML='';const addSwitch=(title,note,checked,label,onchange)=>{const row=document.createElement('div');row.className='prompt-budget-persistent';row.innerHTML=`<span><strong>${escapeHtml(title)}</strong><small>${escapeHtml(note)}</small></span><label class="prompt-persistent-switch" title="${escapeHtml(title)}"><input type="checkbox" ${checked?'checked':''} aria-label="${escapeHtml(label)}"><span></span></label>`;const input=row.querySelector('input');input.onchange=event=>{event.stopPropagation();onchange(input.checked)};row.onclick=event=>event.stopPropagation();popup.appendChild(row)};addSwitch('Keep enabled','Remember across tasks and reloads',S.promptEnhancePersistent,'Keep prompt enhancement enabled',setPromptEnhancePersistent);addSwitch('Skills awareness','Select and sequence relevant skills',S.promptEnhanceSkillsAware,'Use skills during prompt enhancement',setPromptEnhanceSkillsAware);const workspace=document.createElement('div');workspace.className='prompt-budget-context';workspace.innerHTML='<span class="codicon codicon-folder-library"></span><span><strong>Workspace awareness</strong><small>Directory structure is always included</small></span>';popup.appendChild(workspace);for(const row of PROMPT_ENHANCE_BUDGETS){const button=document.createElement('button');button.classList.toggle('is-active',row.id===S.promptEnhanceBudget);button.innerHTML=`<span><strong>${escapeHtml(row.label)}</strong><small>${escapeHtml(row.meta)}</small></span>${row.id===S.promptEnhanceBudget?'<span class="codicon codicon-check"></span>':'<span></span>'}`;button.onclick=event=>{event.stopPropagation();setPromptEnhanceBudget(row.id)};popup.appendChild(button)}const rect=anchor.getBoundingClientRect();popup.style.left=`${Math.max(4,Math.min(rect.left,window.innerWidth-252))}px`;popup.style.top='auto';popup.style.bottom=`${Math.max(4,window.innerHeight-rect.top+4)}px`;popup.classList.remove('is-hidden')}
 function bindPromptEnhanceButton(){const button=E('promptEnhanceBtn');let holdTimer=0,suppressClick=false;const clear=()=>{if(holdTimer){clearTimeout(holdTimer);holdTimer=0}};button.addEventListener('pointerdown',event=>{if(event.button!==0||S.promptEnhancing)return;clear();suppressClick=false;holdTimer=setTimeout(()=>{holdTimer=0;suppressClick=true;showPromptEnhanceBudgetMenu(button)},560)});for(const type of ['pointerup','pointercancel','pointerleave'])button.addEventListener(type,clear);button.onclick=event=>{event.stopPropagation();clear();if(suppressClick){suppressClick=false;return}togglePromptEnhancement()};button.oncontextmenu=event=>{event.preventDefault();event.stopPropagation();clear();suppressClick=true;showPromptEnhanceBudgetMenu(button)}}
 function closePromptEnhanceReview(focus=true){const pending=S.promptEnhanceAbort;S.promptEnhanceAbort=null;if(pending?.controller)pending.controller.abort();setPromptEnhanceBusy(false);E('promptEnhanceOverlay').classList.add('is-hidden');S.promptEnhanceDraft=null;if(focus)E('agentPrompt').focus()}
-function setPromptEnhanceBusy(busy,label=''){S.promptEnhancing=!!busy;renderPromptEnhanceToggle();E('sendAgentBtn').disabled=!!busy||S.agentSubmitting;E('promptEnhanceLoadingTitle').textContent=label||'Preparing enhanced prompt...';E('promptEnhanceOverlay').querySelector('.prompt-enhance-dialog').classList.toggle('is-busy',!!busy);for(const id of ['promptUseOriginal','promptRegenerate','promptUseEnhanced'])E(id).disabled=!!busy;E('promptEnhanceClose').disabled=false}
+function promptEnhanceElapsedLabel(ms){const seconds=Math.max(0,Math.floor(Number(ms||0)/1000));if(seconds<60)return`${seconds}s`;const minutes=Math.floor(seconds/60),rest=seconds%60;return`${minutes}m ${String(rest).padStart(2,'0')}s`}
+function updatePromptEnhanceElapsed(){if(!S.promptEnhancing||!S.promptEnhanceStartedAt)return;E('promptEnhanceLoadingTitle').textContent=`${S.promptEnhanceLoadingLabel||'Preparing enhanced prompt...'} · ${promptEnhanceElapsedLabel(Date.now()-S.promptEnhanceStartedAt)}`}
+function setPromptEnhanceBusy(busy,label=''){S.promptEnhancing=!!busy;clearInterval(S.promptEnhanceElapsedTimer);S.promptEnhanceElapsedTimer=null;if(busy){S.promptEnhanceStartedAt=Date.now();S.promptEnhanceLoadingLabel=label||'Preparing enhanced prompt...';updatePromptEnhanceElapsed();S.promptEnhanceElapsedTimer=setInterval(updatePromptEnhanceElapsed,1000)}else{S.promptEnhanceStartedAt=0;S.promptEnhanceLoadingLabel='';E('promptEnhanceLoadingTitle').textContent=label||'Preparing enhanced prompt...'}renderPromptEnhanceToggle();E('sendAgentBtn').disabled=!!busy||S.agentSubmitting;E('promptEnhanceOverlay').querySelector('.prompt-enhance-dialog').classList.toggle('is-busy',!!busy);for(const id of ['promptUseOriginal','promptRegenerate','promptUseEnhanced'])E(id).disabled=!!busy;E('promptEnhanceClose').disabled=false}
 function promptDetailGroup(label,rows){const values=(rows||[]).filter(Boolean);return values.length?`<div class="prompt-detail-group"><strong>${escapeHtml(label)}</strong><ul>${values.map(value=>`<li>${escapeHtml(value)}</li>`).join('')}</ul></div>`:''}
 function promptClarificationGroup(rows){const values=(rows||[]).filter(row=>row&&row.question&&row.default_answer);return values.length?`<div class="prompt-detail-group clarifications"><strong>Questions and Agent defaults</strong>${values.map(row=>`<div class="prompt-clarification"><span>${escapeHtml(row.question)}</span><span class="default-answer"><b>Default:</b> ${escapeHtml(row.default_answer)}</span></div>`).join('')}</div>`:''}
 function promptExecutionGroup(rows){const values=(rows||[]).filter(row=>row&&row.action);return values.length?`<div class="prompt-detail-group execution"><strong>Staged execution</strong>${values.map((row,index)=>{const deps=(row.depends_on||[]).filter(Boolean),meta=[deps.length?`After: ${deps.join(', ')}`:'',row.completion_check?`Done when: ${row.completion_check}`:''].filter(Boolean).join(' · ');return `<div class="prompt-step"><span class="prompt-step-index">${index+1}</span><span class="prompt-step-content"><b>${escapeHtml(row.title||`Step ${index+1}`)}</b><span>${escapeHtml(row.action)}</span>${meta?`<small>${escapeHtml(meta)}</small>`:''}</span></div>`}).join('')}</div>`:''}
 function promptSkillGroup(rows){const values=(rows||[]).filter(row=>row&&row.id);return values.length?`<div class="prompt-detail-group skills"><strong>Selected skills</strong>${values.map((row,index)=>`<div class="prompt-skill"><span class="prompt-step-index">${index+1}</span><span class="prompt-skill-content"><b>${escapeHtml(row.name||row.id)}</b><span>${escapeHtml(row.id)}</span>${row.rationale?`<small>${escapeHtml(row.rationale)}</small>`:''}</span></div>`).join('')}</div>`:''}
 function promptWorkspaceGroup(context){if(!context)return'';const summary=`${Number(context.entry_count||0).toLocaleString()} directory entries inspected${context.truncated?' (bounded snapshot)':''}${context.skipped_directories?` · ${context.skipped_directories} generated/heavy directories skipped`:''}`;return promptDetailGroup('Workspace awareness',[summary])}
-function renderPromptEnhancement(result){const draft=S.promptEnhanceDraft;if(!draft)return;E('promptEnhanceIntent').textContent=result.intent_summary||'The request was converted into an actionable Agent instruction.';E('promptEnhanceDetails').innerHTML=promptWorkspaceGroup(result.workspace_context)+promptSkillGroup(result.selected_skills)+promptExecutionGroup(result.execution_steps)+promptDetailGroup('Deliverables',result.deliverables)+promptDetailGroup('Constraints',result.constraints)+promptDetailGroup('Assumptions',result.assumptions)+promptDetailGroup('Acceptance criteria',result.acceptance_criteria)+promptClarificationGroup(result.clarifications);const editor=E('promptEnhanceEditor');editor.value=result.enhanced_prompt||draft.original;editor.readOnly=false;E('promptUseEnhanced').textContent='Save & Use';const model=[result.provider,result.model].filter(Boolean).join(' / '),budget=PROMPT_ENHANCE_BUDGETS.find(row=>row.id===(result.budget||draft.budget))?.label||'Medium',fallback=result.source==='fallback';E('promptEnhanceModel').textContent=fallback?`Local template · ${budget}`:(model?`Generated by ${model}`:'Generated for this Agent session')+` · ${budget}`;const baseNote=fallback?`The model was unavailable, so this prompt was generated from the local ${budget} template.`:'The intent analysis explains the rewrite. Only the editable Final Agent Prompt is sent when you choose Save & Use.';E('promptEnhanceNote').textContent=baseNote+(result.warning?` ${result.warning}`:'');E('promptEnhanceOverlay').classList.remove('is-hidden');requestAnimationFrame(()=>editor.focus())}
+function renderPromptEnhancement(result){const draft=S.promptEnhanceDraft;if(!draft)return;E('promptEnhanceIntent').textContent=result.intent_summary||'The request was converted into an actionable Agent instruction.';E('promptEnhanceDetails').innerHTML=promptWorkspaceGroup(result.workspace_context)+promptSkillGroup(result.selected_skills)+promptExecutionGroup(result.execution_steps)+promptDetailGroup('Deliverables',result.deliverables)+promptDetailGroup('Constraints',result.constraints)+promptDetailGroup('Assumptions',result.assumptions)+promptDetailGroup('Acceptance criteria',result.acceptance_criteria)+promptClarificationGroup(result.clarifications);const editor=E('promptEnhanceEditor');editor.value=result.enhanced_prompt||draft.original;editor.readOnly=false;E('promptUseEnhanced').textContent='Save & Use';const model=[result.provider,result.model].filter(Boolean).join(' / '),budget=PROMPT_ENHANCE_BUDGETS.find(row=>row.id===(result.budget||draft.budget))?.label||'Medium',fallback=result.source==='fallback',hybrid=result.source==='hybrid';E('promptEnhanceModel').textContent=fallback?`Local template · ${budget}`:(model?`Generated by ${model}`:'Generated for this Agent session')+` · ${budget}`;let baseNote;if(fallback&&result.fallback_reason==='model_error')baseNote=`The model request failed, so this prompt was generated from the local ${budget} template.`;else if(fallback)baseNote=`The model returned unusable structured output, so this prompt was generated from the local ${budget} template.`;else if(hybrid)baseNote='The model response was partially structured; local defaults filled only missing analysis fields.';else baseNote='The intent analysis explains the rewrite. Only the editable Final Agent Prompt is sent when you choose Save & Use.';const elapsed=Number(result.duration_ms)>=0?` Completed in ${promptEnhanceElapsedLabel(result.duration_ms)}.`:'';const timeout=result.timeout_policy==='unlimited'?' No fixed server timeout was applied.':'';E('promptEnhanceNote').textContent=baseNote+elapsed+timeout+(result.warning?` ${result.warning}`:'');E('promptEnhanceOverlay').classList.remove('is-hidden');requestAnimationFrame(()=>editor.focus())}
 async function submitAgentDraft(draft,message){const input=E('agentPrompt'),submittedPaths=new Set(draft.attachments||[]),cleared=input.value.trim()===draft.original.trim();if(!message||S.agentSubmitting)return;S.agentSubmitting=true;E('sendAgentBtn').disabled=true;if(cleared)input.value='';E('agentStatus').textContent=S.agentState?.running?'Queuing input...':'Submitting...';try{const out=await api(`/api/ide/sessions/${qs(draft.session_id)}/agent-task`,{method:'POST',body:JSON.stringify({root_id:draft.root_id,active_path:draft.active_path,message,attachments:draft.attachments||[]})});S.agentAttachments=S.agentAttachments.filter(item=>!submittedPaths.has(item.path));renderAgentAttachments();if(draft.enhance_requested&&!S.promptEnhancePersistent){S.promptEnhanceEnabled=false;renderPromptEnhanceToggle();scheduleStateSave()}S.agentSubmitting=false;E('sendAgentBtn').disabled=false;input.focus();E('agentStatus').textContent=out.queued?'Queued':'Started';S.agentPollRequested=true;scheduleAgentPoll(100)}catch(error){S.agentSubmitting=false;E('agentStatus').textContent='';E('sendAgentBtn').disabled=false;if(cleared&&!input.value.trim())input.value=draft.original;input.focus();agentMessage(error.message,'error');throw error}}
 async function requestPromptEnhancement(draft,{regenerate=false}={}){if(S.promptEnhancing)return;const previous=regenerate?(E('promptEnhanceEditor').value.trim()||draft.result?.enhanced_prompt||''):'';const generation=regenerate?Number(draft.regeneration||0)+1:0,controller=typeof AbortController==='function'?new AbortController():null,pending={controller},budget=draft.budget||S.promptEnhanceBudget;S.promptEnhanceDraft=draft;S.promptEnhanceAbort=pending;E('promptEnhanceOverlay').classList.remove('is-hidden');if(!regenerate){E('promptEnhanceModel').textContent='';E('promptEnhanceIntent').textContent='';E('promptEnhanceDetails').innerHTML='';E('promptEnhanceEditor').value='';E('promptEnhanceNote').textContent=''}const budgetLabel=PROMPT_ENHANCE_BUDGETS.find(row=>row.id===budget)?.label||'Medium';setPromptEnhanceBusy(true,regenerate?`Regenerating ${budgetLabel} prompt...`:`Preparing ${budgetLabel} prompt with workspace${draft.skills_aware?' and skills':''} awareness...`);try{const result=await api(`/api/ide/v2/sessions/${qs(draft.session_id)}/prompt-enhance`,{method:'POST',body:JSON.stringify({root_id:draft.root_id,active_path:draft.active_path,message:draft.original,attachments:draft.attachments||[],previous_prompt:previous,regeneration:generation,budget,skills_awareness:!!draft.skills_aware}),signal:controller?.signal});if(S.promptEnhanceAbort!==pending||draft.session_id!==S.activeSession||draft.session_seq!==S.sessionSwitchSeq)return;S.promptEnhanceDraft=Object.assign({},draft,{result,regeneration:generation,budget});renderPromptEnhancement(result)}catch(error){if(error?.name==='AbortError')return;if(draft.session_id===S.activeSession&&draft.session_seq===S.sessionSwitchSeq){if(regenerate&&draft.result){S.promptEnhanceDraft=draft;E('promptEnhanceNote').textContent=`Regeneration failed: ${error.message}`}else{S.promptEnhanceDraft=Object.assign({},draft,{budget});E('promptEnhanceModel').textContent=`${budgetLabel} enhancement failed`;E('promptEnhanceIntent').textContent='No enhanced prompt was accepted. The original request is unchanged.';E('promptEnhanceDetails').innerHTML='';E('promptEnhanceEditor').value='';E('promptEnhanceNote').textContent=`Model error: ${error.message}. Choose Regenerate or Use Original & Start.`}E('promptEnhanceOverlay').classList.remove('is-hidden');toast(error.message,'error',8000)}}finally{if(S.promptEnhanceAbort===pending){S.promptEnhanceAbort=null;if(draft.session_id===S.activeSession&&draft.session_seq===S.sessionSwitchSeq)setPromptEnhanceBusy(false)}}}
 async function usePromptReview(original=false){const draft=S.promptEnhanceDraft;if(!draft)return;const message=original?draft.original:E('promptEnhanceEditor').value.trim();if(!message)return toast('Enhanced prompt is empty.','warning');S.promptEnhanceAbort=null;setPromptEnhanceBusy(false);E('promptEnhanceOverlay').classList.add('is-hidden');S.promptEnhanceDraft=null;await submitAgentDraft(draft,message)}
@@ -100195,14 +100255,14 @@ document.addEventListener('DOMContentLoaded', function(){{
     def _ide_prompt_workspace_snapshot(
         root: Path,
         *,
-        max_entries: int = 160,
-        max_chars: int = 12_000,
-        max_depth: int = 6,
+        max_entries: int | None = None,
+        max_chars: int | None = None,
+        max_depth: int | None = None,
     ) -> dict:
-        """Return a bounded metadata-only workspace tree for prompt enhancement."""
-        max_entries = max(20, min(500, int(max_entries or 160)))
-        max_chars = max(2_000, min(32_000, int(max_chars or 12_000)))
-        max_depth = max(1, min(10, int(max_depth or 6)))
+        """Return a metadata-only workspace tree without silently clipping prompt input."""
+        entry_limit = int(max_entries) if max_entries is not None and int(max_entries) > 0 else None
+        char_limit = int(max_chars) if max_chars is not None and int(max_chars) > 0 else None
+        depth_limit = int(max_depth) if max_depth is not None and int(max_depth) >= 0 else None
         entries: list[dict] = []
         pending: deque[tuple[Path, str, int]] = deque([(root.resolve(), "", 0)])
         skipped_directories = 0
@@ -100210,7 +100270,7 @@ document.addEventListener('DOMContentLoaded', function(){{
         used_chars = 0
         truncated = False
         skip_names = {str(name).lower() for name in IDE_TREE_SKIP_DIRS}
-        while pending and len(entries) < max_entries and used_chars < max_chars:
+        while pending:
             directory, rel_dir, depth = pending.popleft()
             scanned_directories += 1
             try:
@@ -100219,7 +100279,7 @@ document.addEventListener('DOMContentLoaded', function(){{
             except Exception:
                 continue
             for entry in children:
-                if len(entries) >= max_entries:
+                if entry_limit is not None and len(entries) >= entry_limit:
                     truncated = True
                     break
                 try:
@@ -100236,7 +100296,7 @@ document.addEventListener('DOMContentLoaded', function(){{
                         row = {"type": "dir", "path": rel_path, "skipped": skipped}
                         if skipped:
                             skipped_directories += 1
-                        elif depth < max_depth:
+                        elif depth_limit is None or depth < depth_limit:
                             pending.append((Path(entry.path), rel_path, depth + 1))
                         else:
                             row["depth_limited"] = True
@@ -100252,7 +100312,7 @@ document.addEventListener('DOMContentLoaded', function(){{
                 except Exception:
                     continue
                 row_chars = len(str(row.get("path", ""))) + 64
-                if entries and used_chars + row_chars > max_chars:
+                if entries and char_limit is not None and used_chars + row_chars > char_limit:
                     truncated = True
                     pending.clear()
                     break
@@ -100268,37 +100328,30 @@ document.addEventListener('DOMContentLoaded', function(){{
             "skipped_directories": skipped_directories,
             "truncated": bool(truncated),
             "limits": {
-                "max_entries": max_entries,
-                "max_chars": max_chars,
-                "max_depth": max_depth,
+                "max_entries": entry_limit,
+                "max_chars": char_limit,
+                "max_depth": depth_limit,
             },
         }
 
-    def _ide_prompt_skill_catalog(self, *, max_items: int = 180, max_chars: int = 36_000) -> tuple[SkillStore, list[dict], bool]:
+    def _ide_prompt_skill_catalog(self) -> tuple[SkillStore, list[dict], bool]:
         store = self._ensure_skills_store(force=False)
         rows: list[dict] = []
-        used_chars = 0
-        truncated = False
         for item in store.list_metadata():
             if not isinstance(item, dict) or str(item.get("id", "") or "") == "_warnings":
                 continue
             row = {
-                "id": trim(str(item.get("id", "") or ""), 180),
-                "name": trim(str(item.get("name", "") or ""), 120),
-                "description": trim(str(item.get("description", "") or ""), 520),
-                "provider": trim(str(item.get("provider_id", "") or ""), 80),
-                "triggers": [trim(str(value), 100) for value in list(item.get("triggers", []) or [])[:8]],
-                "entrypoints": [trim(str(value), 160) for value in list(item.get("entrypoints", []) or [])[:6]],
+                "id": str(item.get("id", "") or ""),
+                "name": str(item.get("name", "") or ""),
+                "description": str(item.get("description", "") or ""),
+                "provider": str(item.get("provider_id", "") or ""),
+                "triggers": [str(value) for value in list(item.get("triggers", []) or [])],
+                "entrypoints": [str(value) for value in list(item.get("entrypoints", []) or [])],
             }
             if not row["id"]:
                 continue
-            row_chars = len(json_dumps(row))
-            if len(rows) >= max_items or (rows and used_chars + row_chars > max_chars):
-                truncated = True
-                break
             rows.append(row)
-            used_chars += row_chars
-        return store, rows, truncated
+        return store, rows, False
 
     @staticmethod
     def _ide_validate_selected_skills(
@@ -100327,7 +100380,7 @@ document.addEventListener('DOMContentLoaded', function(){{
                 requested = str(
                     item.get("id", item.get("qualified_name", item.get("name", ""))) or ""
                 ).strip()
-                rationale = trim(str(item.get("rationale", item.get("reason", "")) or "").strip(), 600)
+                rationale = str(item.get("rationale", item.get("reason", "")) or "").strip()
             else:
                 continue
             canonical = requested if requested in catalog_by_id else ""
@@ -100354,30 +100407,29 @@ document.addEventListener('DOMContentLoaded', function(){{
         return selected
 
     @staticmethod
-    def _ide_normalize_execution_steps(raw: object, *, limit: int = 12) -> list[dict]:
+    def _ide_normalize_execution_steps(raw: object) -> list[dict]:
         if not isinstance(raw, list):
             return []
         steps: list[dict] = []
-        for item in raw[: max(1, int(limit or 12))]:
+        for item in raw:
             if isinstance(item, str):
-                action = trim(item.strip(), 900)
+                action = item.strip()
                 row = {"title": action, "action": action, "depends_on": [], "completion_check": ""}
             elif isinstance(item, dict):
-                action = trim(str(item.get("action", item.get("description", "")) or "").strip(), 1_200)
-                title = trim(str(item.get("title", "") or "").strip(), 240) or action
+                action = str(item.get("action", item.get("description", "")) or "").strip()
+                title = str(item.get("title", "") or "").strip() or action
                 dependencies = item.get("depends_on", [])
                 if isinstance(dependencies, str):
                     dependencies = [dependencies]
                 row = {
                     "title": title,
                     "action": action or title,
-                    "depends_on": [trim(str(value), 120) for value in dependencies if str(value).strip()][:6]
+                    "depends_on": [str(value).strip() for value in dependencies if str(value).strip()]
                     if isinstance(dependencies, list)
                     else [],
-                    "completion_check": trim(
-                        str(item.get("completion_check", item.get("done_when", "")) or "").strip(),
-                        900,
-                    ),
+                    "completion_check": str(
+                        item.get("completion_check", item.get("done_when", "")) or ""
+                    ).strip(),
                 }
             else:
                 continue
@@ -100385,6 +100437,138 @@ document.addEventListener('DOMContentLoaded', function(){{
                 row["order"] = len(steps) + 1
                 steps.append(row)
         return steps
+
+    @staticmethod
+    def _ide_parse_prompt_enhancement_response(raw: object) -> dict:
+        """Accept common complete model formats without repairing partial JSON."""
+        text = str(raw or "").strip()
+        if not text:
+            return {}
+
+        def _json_object(candidate: str) -> dict:
+            try:
+                value = json.loads(candidate)
+            except Exception:
+                return {}
+            if isinstance(value, dict):
+                return value
+            if isinstance(value, list) and len(value) == 1 and isinstance(value[0], dict):
+                return value[0]
+            return {}
+
+        parsed = _json_object(text)
+        if not parsed:
+            json_fence = re.search(r"```json\s*\n([\s\S]*?)\n?```", text, re.IGNORECASE)
+            if json_fence:
+                parsed = _json_object(json_fence.group(1).strip())
+                if not parsed:
+                    return {}
+            elif text.lstrip().startswith(("{", "[")):
+                # A JSON-looking response that cannot be decoded as one complete
+                # value may be transport-truncated. Never salvage an inner object.
+                return {}
+            else:
+                object_start = text.find("{")
+                array_start = text.find("[")
+                structural_starts = [index for index in (object_start, array_start) if index >= 0]
+                structural_start = min(structural_starts) if structural_starts else -1
+                if structural_start >= 0:
+                    object_text = text[structural_start:]
+                    try:
+                        candidate, _ = json.JSONDecoder().raw_decode(object_text)
+                    except Exception:
+                        candidate = None
+                    if isinstance(candidate, dict):
+                        parsed = candidate
+                    elif isinstance(candidate, list) and len(candidate) == 1 and isinstance(candidate[0], dict):
+                        parsed = candidate[0]
+                    elif re.match(r"(?:\{\s*\"|\[\s*\{)", object_text):
+                        # Prose followed by an unterminated JSON object is still
+                        # incomplete structured output, not a usable plain prompt.
+                        return {}
+        if isinstance(parsed, dict) and parsed:
+            for container_key in ("result", "data", "response", "output"):
+                nested = parsed.get(container_key)
+                if isinstance(nested, dict) and nested:
+                    parsed = {**parsed, **nested}
+                    break
+            aliases = {
+                "enhanced_prompt": ("final_prompt", "agent_prompt", "prompt"),
+                "intent_summary": ("interpreted_intent", "intent", "summary"),
+                "execution_steps": ("steps", "plan"),
+                "selected_skills": ("skills", "recommended_skills"),
+                "acceptance_criteria": ("acceptance", "success_criteria"),
+                "deliverables": ("outputs", "artifacts"),
+                "assumptions": ("defaults",),
+                "clarifications": ("questions",),
+            }
+            for canonical, alternatives in aliases.items():
+                if parsed.get(canonical) not in (None, "", []):
+                    continue
+                for alias in alternatives:
+                    value = parsed.get(alias)
+                    if value not in (None, "", []):
+                        parsed[canonical] = value
+                        break
+            output_value = parsed.get("output")
+            if not parsed.get("enhanced_prompt") and isinstance(output_value, str):
+                parsed["enhanced_prompt"] = output_value
+            parsed["_format"] = "json"
+            return parsed
+
+        unfenced = text
+        fence = re.fullmatch(r"```(?:markdown|md|text)?\s*\n([\s\S]*?)\n```", text, re.IGNORECASE)
+        if fence:
+            unfenced = fence.group(1).strip()
+        # A malformed JSON object may be transport-truncated. Never submit it
+        # as prose; retain the previous complete candidate or local template.
+        if unfenced.lstrip().startswith(("{", "[")):
+            return {}
+
+        heading_aliases = {
+            "intent_summary": {"interpreted intent", "intent", "intent analysis", "意图分析", "意圖分析", "意図分析"},
+            "deliverables": {"deliverables", "outputs", "artifacts", "交付物", "成果物"},
+            "constraints": {"constraints", "requirements", "约束", "約束", "制約"},
+            "assumptions": {"assumptions", "defaults", "假设", "假設", "前提"},
+            "acceptance_criteria": {"acceptance criteria", "success criteria", "验收标准", "驗收標準", "受け入れ基準"},
+            "execution_steps": {"execution steps", "staged execution", "plan", "steps", "执行步骤", "執行步驟", "実行手順"},
+            "enhanced_prompt": {"final agent prompt", "final prompt", "enhanced prompt", "最终 prompt", "最終 prompt", "最终提示词", "最終プロンプト"},
+        }
+        sections: dict[str, str] = {}
+        matches = list(re.finditer(r"(?m)^\s{0,3}#{1,6}\s+(.+?)\s*$", unfenced))
+        for index, match in enumerate(matches):
+            heading = re.sub(r"[：:]+$", "", match.group(1)).strip().lower()
+            canonical = next(
+                (key for key, names in heading_aliases.items() if heading in names),
+                "",
+            )
+            if not canonical:
+                continue
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(unfenced)
+            value = unfenced[match.end():end].strip()
+            if value:
+                sections[canonical] = value
+
+        def _markdown_items(value: str) -> list[str]:
+            rows: list[str] = []
+            for line in str(value or "").splitlines():
+                item = re.sub(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)", "", line).strip()
+                if item:
+                    rows.append(item)
+            return rows
+
+        result: dict = {
+            "enhanced_prompt": sections.get("enhanced_prompt", unfenced),
+            "_format": "markdown" if matches else "plain_text",
+        }
+        if sections.get("intent_summary"):
+            result["intent_summary"] = sections["intent_summary"]
+        for key in ("deliverables", "constraints", "assumptions", "acceptance_criteria"):
+            if sections.get(key):
+                result[key] = _markdown_items(sections[key])
+        if sections.get("execution_steps"):
+            result["execution_steps"] = _markdown_items(sections["execution_steps"])
+        return result
 
     @staticmethod
     def _ide_append_skill_orchestration(enhanced: str, selected: list[dict], language: str) -> str:
@@ -100604,7 +100788,7 @@ document.addEventListener('DOMContentLoaded', function(){{
         context_rows: list[str] = []
         if active_path:
             context_rows.append(f"- {labels['active_file']}: {active_path}")
-        for path in list(attachments or [])[:20]:
+        for path in list(attachments or []):
             context_rows.append(f"- {labels['attached_file']}: {path}")
         workspace_snapshot = workspace_snapshot if isinstance(workspace_snapshot, dict) else {}
         workspace_entries = list(workspace_snapshot.get("entries", []) or [])
@@ -100617,7 +100801,7 @@ document.addEventListener('DOMContentLoaded', function(){{
             f"- {workspace_heading}: {int(workspace_snapshot.get('entry_count', len(workspace_entries)) or 0)} entries"
             f"; truncated={str(bool(workspace_snapshot.get('truncated', False))).lower()}"
         )
-        for row in workspace_entries[:80]:
+        for row in workspace_entries:
             if not isinstance(row, dict):
                 continue
             marker = "dir" if row.get("type") == "dir" else f"file, {int(row.get('size', 0) or 0)} bytes"
@@ -100645,6 +100829,8 @@ document.addEventListener('DOMContentLoaded', function(){{
             {"title": "Implement incrementally", "action": "Implement requirements in dependency order, completing one verifiable increment before moving to the next.", "depends_on": ["Inspect current state"], "completion_check": "Each change maps to an explicit requirement without unrelated expansion."},
             {"title": "Verify and deliver", "action": "Run risk-appropriate tests and check the result against the acceptance criteria.", "depends_on": ["Implement incrementally"], "completion_check": "Test evidence, the change summary, and remaining limitations are reported."},
         ])
+        for index, row in enumerate(execution_steps):
+            row["depends_on"] = [execution_steps[index - 1]["title"]] if index else []
         steps_heading = {"zh-CN": "执行步骤", "zh-TW": "執行步驟", "ja": "実行手順"}.get(code, "Execution Steps")
         completion_label = {"zh-CN": "完成检查", "zh-TW": "完成檢查", "ja": "完了条件"}.get(code, "Done when")
         steps_text = "\n".join(
@@ -100667,7 +100853,7 @@ document.addEventListener('DOMContentLoaded', function(){{
         selected_skills = list(selected_skills or [])
         enhanced = AppContext._ide_append_skill_orchestration(enhanced, selected_skills, code)
         return {
-            "enhanced_prompt": trim(enhanced, 48_000),
+            "enhanced_prompt": enhanced,
             "intent_summary": labels["intent"],
             "deliverables": [],
             "constraints": [],
@@ -100691,8 +100877,6 @@ document.addEventListener('DOMContentLoaded', function(){{
         original = str(payload.get("message", payload.get("content", "")) or "").strip()
         if not original:
             raise ValueError("message required")
-        if len(original) > 48_000:
-            raise ValueError("message exceeds the 48000 character enhancement limit")
         root_id = str(payload.get("root_id", payload.get("root", "session")) or "session")
         active_path = normalize_rel_preview_path(str(payload.get("active_path", "") or ""))
         root, _, root_meta = self.ide_resolve_workspace(user_id, session_id, root_id, ".")
@@ -100700,7 +100884,7 @@ document.addEventListener('DOMContentLoaded', function(){{
         raw_attachments = payload.get("attachments", [])
         if raw_attachments is not None and not isinstance(raw_attachments, list):
             raise ValueError("attachments must be a list")
-        for item in (raw_attachments or [])[:20]:
+        for item in (raw_attachments or []):
             raw_path = item.get("path", "") if isinstance(item, dict) else item
             rel_path = normalize_rel_preview_path(str(raw_path or ""))
             if not rel_path:
@@ -100709,17 +100893,13 @@ document.addEventListener('DOMContentLoaded', function(){{
             if not attachment_path.exists() or not attachment_path.is_file():
                 raise FileNotFoundError(f"attachment not found: {rel_path}")
             attachments.append(rel_path)
-        previous_prompt = trim(str(payload.get("previous_prompt", "") or "").strip(), 24_000)
-        regeneration = max(0, min(12, int(payload.get("regeneration", 0) or 0)))
+        previous_prompt = str(payload.get("previous_prompt", "") or "").strip()
+        regeneration = max(0, int(payload.get("regeneration", 0) or 0))
         budget = str(payload.get("budget", "medium") or "medium").strip().lower()
         if budget not in IDE_PROMPT_ENHANCEMENT_BUDGETS:
             budget = "medium"
         budget_spec = IDE_PROMPT_ENHANCEMENT_BUDGETS[budget]
-        workspace_snapshot = self._ide_prompt_workspace_snapshot(
-            root,
-            max_entries=int(budget_spec["workspace_entries"]),
-            max_chars=int(budget_spec["workspace_chars"]),
-        )
+        workspace_snapshot = self._ide_prompt_workspace_snapshot(root)
         skills_aware = bool(payload.get("skills_awareness", False))
         skill_store: SkillStore | None = None
         skill_catalog: list[dict] = []
@@ -100744,7 +100924,7 @@ document.addEventListener('DOMContentLoaded', function(){{
         try:
             snapshot = sess.snapshot_safe(lite=True, lock_timeout=0.25)
             feed = list(snapshot.get("conversation_feed", []) or []) if isinstance(snapshot, dict) else []
-            for row in feed[-int(budget_spec["recent_messages"]):]:
+            for row in feed:
                 if not isinstance(row, dict):
                     continue
                 role = str(row.get("role", "") or "").strip().lower()
@@ -100754,7 +100934,7 @@ document.addEventListener('DOMContentLoaded', function(){{
                 if role == "user" and text.startswith("IDE programming request."):
                     _, _, text = text.partition("\n\n")
                 if text:
-                    recent_rows.append(f"{role}: {trim(text, int(budget_spec['context_chars']))}")
+                    recent_rows.append(f"{role}: {text}")
         except Exception:
             recent_rows = []
 
@@ -100806,16 +100986,17 @@ document.addEventListener('DOMContentLoaded', function(){{
             "For every ambiguity that could otherwise require user confirmation, provide a concrete conservative default_answer. The downstream Agent must use that default unless the user edits it. Never leave a question without a default. "
             "Write every clarification and its default answer into enhanced_prompt so it is directly executable without another preflight question. "
             "Always produce execution_steps as an ordered array of independently actionable stages. Each step must have title, action, depends_on, and completion_check. "
-            "For implementation tasks, use at least three dependency-aware steps: evidence gathering, bounded implementation increments, and verification. Do not collapse a complex task into one large implementation step. "
-            "Each step must be small enough for the downstream Agent to finish, verify, and update its todos before advancing. Include the same staged sequence in enhanced_prompt. "
+            "Infer stage count from the task's real complexity: preserve a short natural path for simple work, but do not collapse genuinely complex work into one large implementation step. Never add stages merely to consume a larger budget. "
+            "Each stage must be coherent enough to deliver meaningful progress and bounded enough for the downstream Agent to finish, verify, and update its todos before advancing. Include the same staged sequence in enhanced_prompt. "
             "Use workspace.directory_snapshot to ground affected paths and architecture, while treating it as metadata only and never inventing file contents. "
             + skill_selection_instruction +
             "For low-capability downstream agents, use direct imperative wording and observable acceptance checks. "
             f"The selected enhancement budget is {budget.upper()}. {budget_spec['detail_guidance']} "
             f"Planning depth: {budget_spec['planning_depth']} "
+            f"Step decomposition: {budget_spec['step_guidance']} "
             f"Solution diversity: {budget_spec['solution_diversity']} "
             f"Scope breadth: {budget_spec['scope_breadth']} "
-            "Use the available budget for task-specific precision, not repetition or generic advice. Omit dimensions that are genuinely irrelevant. "
+            "Use the available budget for task-specific precision, reasoning depth, solution breadth, and validation quality, not repetition, artificial stage counts, or generic advice. Omit dimensions that are genuinely irrelevant. "
             "Return JSON only, without markdown fences, using exactly these keys: "
             "intent_summary (string), deliverables (array of strings), constraints (array of strings), assumptions (array of strings), acceptance_criteria (array of strings), clarifications (array of objects with question and default_answer strings), execution_steps (array of objects with title, action, depends_on, completion_check), selected_skills (array of objects with id and rationale), enhanced_prompt (string). "
             + model_language_instruction(language)
@@ -100829,7 +101010,11 @@ document.addEventListener('DOMContentLoaded', function(){{
         raw_text = ""
         source = "model"
         warning = ""
+        fallback_reason = ""
+        enhancement_started = time.monotonic()
+        stage_status: list[dict] = []
         client: OllamaClient | None = None
+        first_stage_started = time.monotonic()
         try:
             if not profile:
                 raise ValueError("active model profile unavailable")
@@ -100863,26 +101048,63 @@ document.addEventListener('DOMContentLoaded', function(){{
                 stream_thinking=False,
                 response_stream=False,
             )
-            raw_text = trim(str(response.get("content", "") or "").strip(), 64_000)
-            parsed = extract_json_object_from_text(raw_text, {})
+            raw_text = str(response.get("content", "") or "").strip()
+            parsed = self._ide_parse_prompt_enhancement_response(raw_text)
+            stage_status.append({
+                "stage": "intent_analysis",
+                "status": "completed",
+                "duration_ms": int((time.monotonic() - first_stage_started) * 1000),
+            })
         except Exception as exc:
             warning = trim(str(exc), 500)
             parsed = dict(fallback)
             source = "fallback"
+            fallback_reason = "model_error"
+            stage_status.append({
+                "stage": "intent_analysis",
+                "status": "failed",
+                "duration_ms": int((time.monotonic() - first_stage_started) * 1000),
+            })
 
         if not isinstance(parsed, dict) or not parsed:
-            warning = "Prompt enhancement model returned invalid structured JSON"
+            if stage_status and stage_status[-1].get("stage") == "intent_analysis":
+                stage_status[-1]["status"] = "invalid_output"
+            warning = "Prompt enhancement model returned no complete usable output"
             parsed = dict(fallback)
             source = "fallback"
+            fallback_reason = "invalid_output"
+        elif source == "model" and not str(parsed.get("enhanced_prompt", "") or "").strip():
+            if stage_status and stage_status[-1].get("stage") == "intent_analysis":
+                stage_status[-1]["status"] = "incomplete_output"
+            warning = "Prompt enhancement model omitted the final enhanced prompt"
+            parsed = dict(fallback)
+            source = "fallback"
+            fallback_reason = "incomplete_output"
+        elif source == "model" and not str(parsed.get("intent_summary", "") or "").strip():
+            if stage_status and stage_status[-1].get("stage") == "intent_analysis":
+                stage_status[-1]["status"] = "partial"
+            merged = dict(fallback)
+            merged.update(parsed)
+            parsed = merged
+            source = "hybrid"
+            warning = "The model omitted part of the intent analysis; local defaults filled only the missing fields"
         selected_skills: list[dict] = []
-        if source == "model" and skills_aware and skill_store is not None and skill_catalog:
+        if source in {"model", "hybrid"} and skills_aware and skill_store is not None and skill_catalog:
             selected_skills = self._ide_validate_selected_skills(
                 parsed.get("selected_skills", []),
                 skill_catalog,
                 skill_store,
                 max_skills=int(budget_spec["max_skills"]),
             )
+            if selected_skills:
+                stage_status.append({
+                    "stage": "skill_selection",
+                    "status": "completed",
+                    "duration_ms": 0,
+                    "source": "intent_analysis",
+                })
             if not selected_skills and client is not None:
+                selection_started = time.monotonic()
                 selection_system = (
                     "Select the most materially useful skills for the downstream Agent task. "
                     f"Choose 1 to {int(budget_spec['max_skills'])} entries using only exact ids from SKILL_CATALOG. "
@@ -100906,10 +101128,18 @@ document.addEventListener('DOMContentLoaded', function(){{
                         stream_thinking=False,
                         response_stream=False,
                     )
-                    selection_payload = extract_json_object_from_text(
-                        trim(str(selection_response.get("content", "") or ""), 16_000),
-                        {},
-                    )
+                    selection_text = str(selection_response.get("content", "") or "")
+                    selection_payload = self._ide_parse_prompt_enhancement_response(selection_text)
+                    if not isinstance(selection_payload.get("selected_skills"), list):
+                        mentioned = [
+                            row for row in skill_catalog
+                            if str(row.get("id", "") or "")
+                            and str(row.get("id", "") or "") in selection_text
+                        ]
+                        selection_payload["selected_skills"] = [
+                            {"id": row["id"], "rationale": "Selected by the model."}
+                            for row in mentioned
+                        ]
                     selected_skills = self._ide_validate_selected_skills(
                         selection_payload.get("selected_skills", []) if isinstance(selection_payload, dict) else [],
                         skill_catalog,
@@ -100918,21 +101148,29 @@ document.addEventListener('DOMContentLoaded', function(){{
                     )
                     if not selected_skills:
                         warning = "Skills awareness was enabled, but the model did not return a valid catalog skill"
+                    stage_status.append({
+                        "stage": "skill_selection",
+                        "status": "completed" if selected_skills else "invalid_output",
+                        "duration_ms": int((time.monotonic() - selection_started) * 1000),
+                    })
                 except Exception as exc:
                     warning = "Skill selection retry failed: " + trim(str(exc), 400)
+                    stage_status.append({
+                        "stage": "skill_selection",
+                        "status": "failed",
+                        "duration_ms": int((time.monotonic() - selection_started) * 1000),
+                    })
             if selected_skills and client is not None:
                 skill_documents: list[dict] = []
-                remaining_chars = int(budget_spec["skill_context_chars"])
                 for row in selected_skills:
-                    if remaining_chars <= 0:
-                        break
                     try:
-                        loaded = str(skill_store.load(str(row["id"])))
+                        skill_record = getattr(skill_store, "skills", {}).get(str(row["id"]), {})
+                        loaded = str(skill_record.get("body", "") or "") if isinstance(skill_record, dict) else ""
+                        if not loaded:
+                            loaded = str(skill_store.load(str(row["id"])))
                     except Exception as exc:
                         loaded = f"Skill load failed: {exc}"
-                    body = trim(loaded, remaining_chars)
-                    skill_documents.append({"id": row["id"], "instructions": body})
-                    remaining_chars -= len(body)
+                    skill_documents.append({"id": row["id"], "instructions": loaded})
                 refinement_input = {
                     "original_request": original,
                     "workspace": prompt_input["workspace"],
@@ -100945,11 +101183,14 @@ document.addEventListener('DOMContentLoaded', function(){{
                     "You are the second pass of Prompt_Enhancer. Refine the candidate into a deeper, staged Agent instruction using the actual validated skill instructions. "
                     "Do not perform the task and do not expose hidden reasoning. Keep the original request authoritative. "
                     "The selected skill ids and order are fixed; understand their instructions, assign each skill to the steps where it materially helps, and avoid redundant skill use. "
-                    "Make execution_steps dependency-aware and granular enough that the downstream Agent can complete and verify one bounded stage before advancing. "
-                    "Do not combine all implementation into one step. Preserve concrete workspace paths only when supported by the directory snapshot. "
-                    "Return JSON only with the same keys as the candidate, including execution_steps, selected_skills, and enhanced_prompt. "
+                    "Make execution_steps dependency-aware and granular enough that the downstream Agent can complete and verify each meaningful stage before advancing. "
+                    "Infer stage count from actual task complexity: do not collapse complex work, and do not inflate simple work. Preserve concrete workspace paths only when supported by the directory snapshot. "
+                    f"Apply this budget-specific decomposition policy: {budget_spec['step_guidance']} "
+                    "Return compact JSON only with exactly two keys: enhanced_prompt (string) and execution_steps (array of objects with title, action, depends_on, completion_check). "
+                    "Do not repeat intent analysis, deliverables, constraints, assumptions, clarifications, selected_skills, or acceptance criteria outside enhanced_prompt; the server preserves them from the first pass. "
                     + model_language_instruction(language)
                 )
+                refinement_started = time.monotonic()
                 try:
                     refined_response = client.chat(
                         [{"role": "user", "content": "Refine this candidate using VALIDATED_INPUT.\n\nVALIDATED_INPUT:\n" + json_dumps(refinement_input, indent=2)}],
@@ -100960,25 +101201,44 @@ document.addEventListener('DOMContentLoaded', function(){{
                         stream_thinking=False,
                         response_stream=False,
                     )
-                    refined_text = trim(str(refined_response.get("content", "") or "").strip(), 64_000)
-                    refined = extract_json_object_from_text(refined_text, {})
+                    refined_text = str(refined_response.get("content", "") or "").strip()
+                    refined = self._ide_parse_prompt_enhancement_response(refined_text)
                     if (
                         isinstance(refined, dict)
-                        and str(refined.get("intent_summary", "") or "").strip()
                         and str(refined.get("enhanced_prompt", "") or "").strip()
                     ):
-                        parsed = refined
+                        merged = dict(parsed)
+                        merged["enhanced_prompt"] = str(refined["enhanced_prompt"])
+                        if isinstance(refined.get("execution_steps"), list):
+                            merged["execution_steps"] = refined["execution_steps"]
+                        parsed = merged
+                        stage_status.append({
+                            "stage": "skill_refinement",
+                            "status": "completed",
+                            "duration_ms": int((time.monotonic() - refinement_started) * 1000),
+                        })
                     else:
-                        warning = "Skill-aware refinement returned invalid structured JSON; using the validated first-pass result"
+                        warning = "Skill-aware refinement returned no complete usable prompt; using the validated first-pass result"
+                        stage_status.append({
+                            "stage": "skill_refinement",
+                            "status": "invalid_output",
+                            "duration_ms": int((time.monotonic() - refinement_started) * 1000),
+                        })
                 except Exception as exc:
                     warning = "Skill-aware refinement failed; using the validated first-pass result: " + trim(str(exc), 400)
-        intent_summary = trim(str(parsed.get("intent_summary", "") or "").strip(), 1200)
+                    stage_status.append({
+                        "stage": "skill_refinement",
+                        "status": "failed",
+                        "duration_ms": int((time.monotonic() - refinement_started) * 1000),
+                    })
+        intent_summary = str(parsed.get("intent_summary", "") or "").strip()
         enhanced = str(parsed.get("enhanced_prompt", "") or "").strip()
         if not intent_summary or not enhanced:
             warning = warning or "Prompt enhancement model returned an incomplete structured response"
             parsed = dict(fallback)
             source = "fallback"
-            intent_summary = trim(str(parsed.get("intent_summary", "") or "").strip(), 1200)
+            fallback_reason = fallback_reason or "incomplete_output"
+            intent_summary = str(parsed.get("intent_summary", "") or "").strip()
             enhanced = str(parsed.get("enhanced_prompt", "") or "").strip()
         authority_heading = {
             "zh-CN": "原始请求（最终权威）",
@@ -100988,13 +101248,13 @@ document.addEventListener('DOMContentLoaded', function(){{
         if original not in enhanced:
             enhanced = f"{enhanced.rstrip()}\n\n## {authority_heading}\n{original}"
 
-        def _string_list(key: str, limit: int = 12) -> list[str]:
+        def _string_list(key: str) -> list[str]:
             raw = parsed.get(key, []) if isinstance(parsed, dict) else []
             if isinstance(raw, str):
                 raw = [raw]
             if not isinstance(raw, list):
                 return []
-            return [trim(str(item or "").strip(), 600) for item in raw if str(item or "").strip()][:limit]
+            return [str(item or "").strip() for item in raw if str(item or "").strip()]
 
         default_text = {
             "zh-CN": "默认采用与原始请求及当前工作区证据一致的最保守方案。",
@@ -101006,11 +101266,11 @@ document.addEventListener('DOMContentLoaded', function(){{
         if isinstance(raw_clarifications, dict):
             raw_clarifications = [raw_clarifications]
         if isinstance(raw_clarifications, list):
-            for item in raw_clarifications[:12]:
+            for item in raw_clarifications:
                 if not isinstance(item, dict):
                     continue
-                question = trim(str(item.get("question", "") or "").strip(), 600)
-                default_answer = trim(str(item.get("default_answer", item.get("answer", "")) or "").strip(), 900)
+                question = str(item.get("question", "") or "").strip()
+                default_answer = str(item.get("default_answer", item.get("answer", "")) or "").strip()
                 if question:
                     clarifications.append({"question": question, "default_answer": default_answer or default_text})
         legacy_questions = _string_list("open_questions")
@@ -101040,10 +101300,6 @@ document.addEventListener('DOMContentLoaded', function(){{
         fallback_steps = self._ide_normalize_execution_steps(fallback.get("execution_steps", []))
         if not execution_steps:
             execution_steps = fallback_steps
-        elif len(execution_steps) == 1 and len(fallback_steps) >= 3:
-            execution_steps = [fallback_steps[0], execution_steps[0], fallback_steps[-1]]
-        elif len(execution_steps) == 2 and fallback_steps:
-            execution_steps = [*execution_steps, fallback_steps[-1]]
         for index, row in enumerate(execution_steps, 1):
             row["order"] = index
             if index > 1 and not row.get("depends_on"):
@@ -101069,7 +101325,6 @@ document.addEventListener('DOMContentLoaded', function(){{
                 )
             enhanced = f"{enhanced.rstrip()}\n\n## {steps_heading}\n" + "\n".join(step_lines)
         enhanced = self._ide_append_skill_orchestration(enhanced, selected_skills, language)
-        enhanced = trim(enhanced, 48_000)
 
         return {
             "ok": True,
@@ -101086,6 +101341,7 @@ document.addEventListener('DOMContentLoaded', function(){{
             "open_questions": [row["question"] for row in clarifications],
             "clarifications": clarifications,
             "source": source,
+            "fallback_reason": fallback_reason,
             "warning": warning,
             "provider": provider_name,
             "model": model_name,
@@ -101098,6 +101354,9 @@ document.addEventListener('DOMContentLoaded', function(){{
                 "truncated": bool(workspace_snapshot.get("truncated", False)),
                 "skipped_directories": int(workspace_snapshot.get("skipped_directories", 0) or 0),
             },
+            "duration_ms": int((time.monotonic() - enhancement_started) * 1000),
+            "stages": stage_status,
+            "timeout_policy": "unlimited",
         }
 
     def ide_interrupt_agent(self, user_id: str, session_id: str) -> dict:
@@ -101204,6 +101463,11 @@ document.addEventListener('DOMContentLoaded', function(){{
             public_text = str(raw.get("text", "") or "")
             if role == "user" and public_text.startswith("IDE programming request."):
                 _, _, public_text = public_text.partition("\n\n")
+            if (
+                not PUBLIC_TOOL_PROGRESS_SUMMARY_ENABLED
+                and is_synthetic_public_progress(public_text)
+            ):
+                public_text = ""
             row = {
                 "role": role,
                 "type": trim(str(raw.get("type", "message") or "message"), 40),
