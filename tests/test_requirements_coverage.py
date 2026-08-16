@@ -52,9 +52,16 @@ def stdlib_module_names() -> set[str]:
         return set(current)
 
     names = set(sys.builtin_module_names)
-    stdlib_path = sysconfig.get_paths().get("stdlib")
-    if stdlib_path:
-        names.update(module.name for module in pkgutil.iter_modules([stdlib_path]))
+    search_paths = {
+        path
+        for path in (
+            sysconfig.get_paths().get("stdlib"),
+            sysconfig.get_paths().get("platstdlib"),
+            sysconfig.get_config_var("DESTSHARED"),
+        )
+        if path
+    }
+    names.update(module.name for module in pkgutil.iter_modules(sorted(search_paths)))
     return names
 
 
