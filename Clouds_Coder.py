@@ -52852,7 +52852,17 @@ body{padding:18px}
             matched.append((incoming, identity, prior, prior_index))
 
         if not existing_scope:
-            result = self.todo.update(preserved_rows + passthrough + normalized)
+            state_lock = getattr(self, "lock", None)
+            if state_lock is not None:
+                state_lock.acquire()
+            try:
+                valid, stale_reason = self._todo_write_transaction_is_current(transaction, board=self._ensure_blackboard())
+                if not valid:
+                    return self._emit_stale_todo_write_discarded(stale_reason)
+                result = self.todo.update(preserved_rows + passthrough + normalized)
+            finally:
+                if state_lock is not None:
+                    state_lock.release()
             self._ensure_root_todo_baseline(normalized, board=bb)
             return result
 
@@ -63253,9 +63263,9 @@ body{padding:18px}
                 "TODO TRACKING: "
                 "When a plan step is active, treat its current todo list as a rolling, evidence-governed subplan instead of inventing a parallel path. "
                 "After completing ONE subtask, call TodoWrite when possible to mark that subtask as 'completed' and move the next one to 'in_progress'. "
-                "For ordinary status progress use update_mode='status_update'. If fresh current-step tool evidence or reviewer findings show that OPEN subtasks are missing, obsolete, wrongly ordered, or poorly split, "
+                "For ordinary status progress use update_mode='status_update'; it is merge-only, so omitted unfinished objectives remain in the canonical tree. If fresh current-step tool evidence or reviewer findings show that OPEN subtasks are missing, obsolete, wrongly ordered, or poorly split, "
                 "first inspect the canonical list and evidence, then submit the complete revised open snapshot with update_mode='revise_open', a concrete revision_reason, and exact revision_evidence references. "
-                "Do not revise from preference or speculation; the runtime audits structural changes and preserves completed history. Use update_mode='rework_completed' only with cited failure/reviewer evidence. "
+                "Do not revise from preference or speculation; an independent LLM reviews semantic requirement coverage and explains its decision, while the runtime preserves completed history and commits atomically. Use update_mode='rework_completed' only with cited failure/reviewer evidence. "
                 "If TodoWrite fails, repeats unchanged, or is unavailable, do not loop on it; continue one concrete action or report the blocker with exact evidence. "
                 "Prefer TodoWrite items as objects with explicit fields: "
             "{content, status, owner?, parent_step_id?}. "
