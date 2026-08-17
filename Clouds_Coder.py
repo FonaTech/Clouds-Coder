@@ -8848,6 +8848,7 @@ class IDEAuthStore:
                     revoked_at REAL NOT NULL DEFAULT 0,
                     last_ip TEXT NOT NULL DEFAULT '',
                     device_digest TEXT NOT NULL DEFAULT '',
+                    session_kind TEXT NOT NULL DEFAULT '',
                     FOREIGN KEY(username_key) REFERENCES ide_accounts(username_key)
                 );
                 CREATE INDEX IF NOT EXISTS ide_sessions_expiry
@@ -8878,6 +8879,15 @@ class IDEAuthStore:
             }
             if "device_digest" not in columns:
                 conn.execute("ALTER TABLE ide_sessions ADD COLUMN device_digest TEXT NOT NULL DEFAULT ''")
+            if "session_kind" not in columns:
+                conn.execute("ALTER TABLE ide_sessions ADD COLUMN session_kind TEXT NOT NULL DEFAULT ''")
+            # Empty session kinds are legacy cookies and cannot be classified
+            # as password, device, or the vulnerable shared local-admin form.
+            # Revoke them so no ambiguous identity crosses the new boundary.
+            conn.execute(
+                "UPDATE ide_sessions SET revoked_at=? WHERE revoked_at=0 AND session_kind=''",
+                (now_ts(),),
+            )
         try:
             os.chmod(self.path, 0o600)
         except Exception:
@@ -8995,31 +9005,42 @@ class IDEAuthStore:
         return session
 
     def local_session(self, *, legacy_user_id: str, client_ip: str = "127.0.0.1") -> dict:
-        """Issue the trusted loopback identity without requiring a local password."""
+        """Issue the caller's automatic identity without sharing an admin account."""
+        user_id = str(legacy_user_id or user_id_from_ip(client_ip)).strip()
+        if not re.fullmatch(r"[A-Za-z0-9._:-]{8,128}", user_id):
+            raise IDEAuthError("invalid_user_id", "Invalid IDE local user id.")
         with self.lock:
             with self._connect() as conn:
                 row = conn.execute(
-                    "SELECT * FROM ide_accounts WHERE role='admin' AND disabled=0 ORDER BY created_at LIMIT 1"
+                    "SELECT * FROM ide_accounts WHERE user_id=?",
+                    (user_id,),
                 ).fetchone()
             if row is None:
                 random_password = "Local-7!" + base64.urlsafe_b64encode(os.urandom(36)).decode("ascii")
+                identity = user_id[5:] if user_id.startswith("user_") else user_id
+                safe_identity = re.sub(r"[^A-Za-z0-9._-]", "_", identity)
+                username = f"local-user_{safe_identity}"
+                if len(username) > 64:
+                    digest = hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:24]
+                    username = f"local-user_{digest}"
                 try:
                     self._insert_account(
-                        "local-admin",
+                        username,
                         random_password,
-                        user_id=str(legacy_user_id or user_id_from_ip("127.0.0.1")),
-                        role="admin",
+                        user_id=user_id,
+                        role="user",
                     )
                 except IDEAuthError as exc:
                     if exc.code != "account_exists":
                         raise
                 with self._connect() as conn:
                     row = conn.execute(
-                        "SELECT * FROM ide_accounts WHERE role='admin' AND disabled=0 ORDER BY created_at LIMIT 1"
+                        "SELECT * FROM ide_accounts WHERE user_id=?",
+                        (user_id,),
                     ).fetchone()
-            if row is None:
+            if row is None or bool(row["disabled"]):
                 raise IDEAuthError("local_identity_unavailable", "The local IDE identity is unavailable.", 503)
-        result = self.issue_session(row, client_ip=client_ip)
+        result = self.issue_session(row, client_ip=client_ip, session_kind="local_auto")
         result["local_auto_login"] = True
         return result
 
@@ -9141,7 +9162,14 @@ class IDEAuthStore:
             "revoked_at": float(row["revoked_at"] or 0.0),
         }
 
-    def issue_session(self, account: sqlite3.Row, *, client_ip: str, device_digest: str = "") -> dict:
+    def issue_session(
+        self,
+        account: sqlite3.Row,
+        *,
+        client_ip: str,
+        device_digest: str = "",
+        session_kind: str = "password",
+    ) -> dict:
         raw = "ide_session_" + base64.urlsafe_b64encode(os.urandom(32)).decode("ascii").rstrip("=")
         digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
         csrf = base64.urlsafe_b64encode(os.urandom(24)).decode("ascii").rstrip("=")
@@ -9153,8 +9181,9 @@ class IDEAuthStore:
             conn.execute("DELETE FROM ide_sessions WHERE revoked_at>0 OR expires_at<=?", (now,))
             conn.execute(
                 """INSERT INTO ide_sessions
-                   (token_digest,username_key,auth_version,csrf_token,created_at,expires_at,revoked_at,last_ip,device_digest)
-                   VALUES(?,?,?,?,?,?,0,?,?)""",
+                   (token_digest,username_key,auth_version,csrf_token,created_at,expires_at,
+                    revoked_at,last_ip,device_digest,session_kind)
+                   VALUES(?,?,?,?,?,?,0,?,?,?)""",
                 (
                     digest,
                     username_key,
@@ -9164,6 +9193,7 @@ class IDEAuthStore:
                     expires,
                     str(client_ip or ""),
                     str(device_digest or ""),
+                    str(session_kind or "password"),
                 ),
             )
             extras = conn.execute(
@@ -9190,6 +9220,7 @@ class IDEAuthStore:
         with self._connect() as conn:
             row = conn.execute(
                 """SELECT a.*,s.csrf_token,s.expires_at,s.token_digest,s.last_ip,s.device_digest,
+                          s.session_kind,
                           d.status AS device_status,d.source_ip AS device_source_ip
                    FROM ide_sessions s JOIN ide_accounts a ON a.username_key=s.username_key
                    LEFT JOIN ide_devices d ON d.device_digest=s.device_digest
@@ -9199,9 +9230,17 @@ class IDEAuthStore:
             ).fetchone()
         if row is None:
             return None
+        request_ip = str(client_ip or "")
+        if str(row["session_kind"] or "") == "local_auto":
+            expected_user_id = user_id_from_ip(request_ip)
+            if (
+                not request_ip
+                or not hmac.compare_digest(str(row["last_ip"] or ""), request_ip)
+                or not hmac.compare_digest(str(row["user_id"] or ""), expected_user_id)
+            ):
+                return None
         device_digest = str(row["device_digest"] or "")
         if device_digest:
-            request_ip = str(client_ip or "")
             if (
                 str(row["device_status"] or "") != "approved"
                 or not request_ip
@@ -9214,6 +9253,7 @@ class IDEAuthStore:
             "csrf_token": str(row["csrf_token"] or ""),
             "expires_at": float(row["expires_at"] or 0.0),
             "token_digest": str(row["token_digest"] or ""),
+            "session_kind": str(row["session_kind"] or ""),
         })
         return account
 
@@ -9302,7 +9342,12 @@ class IDEAuthStore:
             ).fetchone()
         if account is None:
             raise IDEAuthError("device_identity_unavailable", "The approved device identity is unavailable.", 503)
-        result = self.issue_session(account, client_ip=source_ip, device_digest=digest)
+        result = self.issue_session(
+            account,
+            client_ip=source_ip,
+            device_digest=digest,
+            session_kind="device",
+        )
         result["device"] = self._public_device(row)
         result["device_authenticated"] = True
         return result
@@ -97588,7 +97633,7 @@ IDE_JS = r"""
 const E=id=>document.getElementById(id);
 class ApiError extends Error{constructor(message,status,code,data){super(message);this.status=status;this.code=code||'';this.data=data||{}}}
 const S={
-  csrf:'',config:null,account:null,capabilities:{},sessions:[],roots:[],activeSession:'',activeRoot:'session',autoLogin:false,authRefreshPromise:null,
+  csrf:'',config:null,account:null,capabilities:{},sessions:[],roots:[],activeSession:'',activeRoot:'session',autoLogin:false,authRefreshPromise:null,csrfRefreshPromise:null,
   treeCache:new Map(),openFiles:new Map(),activeByGroup:['',''],activeGroup:0,monaco:null,editors:[],diffEditors:[],models:new Map(),historyOriginalModels:new Map(),historyDecorations:new Map(),viewStates:new Map(),suppressEditorChange:false,codeHistoryMode:'all',
   activeView:'explorer',panel:'terminal',primaryVisible:true,secondaryVisible:true,panelVisible:true,panelMaximized:false,
   diagnostics:[],searchResults:[],scm:null,tasks:[],installedExtensions:[],extensionWorkers:new Map(),
@@ -97611,6 +97656,16 @@ async function refreshAutomaticAuth(){
   })().finally(()=>{S.authRefreshPromise=null});
   return S.authRefreshPromise;
 }
+async function refreshCsrfToken(){
+  if(S.csrfRefreshPromise)return S.csrfRefreshPromise;
+  S.csrfRefreshPromise=(async()=>{
+    const out=await api('/api/ide/v2/auth/me',{method:'GET'},false);
+    S.account=out.account||S.account;S.capabilities=out.capabilities||S.capabilities;S.csrf=out.csrf_token||'';
+    if(!S.csrf)throw new ApiError('The IDE session did not return a CSRF token.',403,'csrf_required',{});
+    return out;
+  })().finally(()=>{S.csrfRefreshPromise=null});
+  return S.csrfRefreshPromise;
+}
 async function api(path,opts={},allowAuthRetry=true){
   const method=String(opts.method||'GET').toUpperCase();
   const headers=Object.assign({},opts.headers||{});
@@ -97622,6 +97677,10 @@ async function api(path,opts={},allowAuthRetry=true){
   if(!res.ok){
     if(res.status===401&&allowAuthRetry&&S.autoLogin&&!isIDEAuthPath(path)){
       await refreshAutomaticAuth();
+      return api(path,opts,false);
+    }
+    if(res.status===403&&data.code==='csrf_required'&&allowAuthRetry&&isWrite(method)&&!isIDEAuthPath(path)){
+      await refreshCsrfToken();
       return api(path,opts,false);
     }
     throw new ApiError(data.error||res.statusText,res.status,data.code,data);
@@ -98495,7 +98554,7 @@ class AppContext:
         if not local_allowed and self.ide_password_login_enabled:
             raise IDEAuthError("loopback_required", "Local IDE sign-in requires an actual loopback connection.", 403)
         return self.ide_auth.local_session(
-            legacy_user_id=user_id_from_ip("127.0.0.1"),
+            legacy_user_id=user_id_from_ip(client_ip),
             client_ip=client_ip,
         )
 
@@ -109577,6 +109636,11 @@ class IdeHandler(BaseHTTPRequestHandler):
             return cached
         token = self._bearer_or_cookie_token()
         account = self.app.ide_auth.verify_session(token, self._client_ip()) if token else None
+        if account and not bool(getattr(self.app, "ide_password_login_enabled", True)):
+            # Automatic mode must not continue a legacy/password session that
+            # was created before local identities were bound to the caller.
+            if str(account.get("session_kind", "") or "") != "local_auto":
+                account = None
         if account:
             request_path = unquote(urlparse(self.path).path)
             password_routes = {

@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=815 original-lines=16330-16439 hash=8ca288a9a3b391d7
+# split-source: order=815 original-lines=16375-16484 hash=8ca288a9a3b391d7
 
 class BackgroundManager:
     def __init__(self, workdir: Path, command_wrapper=None, env_wrapper=None):

@@ -192,7 +192,7 @@ def _meta_string_list(value: object) -> list[str]:
             out.append(txt)
     return out
 
-# split-source: order=780 original-lines=11074-11079 hash=f5ed28063e7e4a7a
+# split-source: order=780 original-lines=11119-11124 hash=f5ed28063e7e4a7a
 
 def _module_exists(name: str) -> bool:
     try:

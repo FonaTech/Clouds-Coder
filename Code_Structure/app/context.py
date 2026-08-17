@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=957 original-lines=98078-106353 hash=3e1ef007a15a3466
+# split-source: order=957 original-lines=98137-106412 hash=73354b4fe6bf6101
 
 # ============================================================================
 # Architecture / 架构 / アーキテクチャ
@@ -426,7 +426,7 @@ class AppContext:
         if not local_allowed and self.ide_password_login_enabled:
             raise IDEAuthError("loopback_required", "Local IDE sign-in requires an actual loopback connection.", 403)
         return self.ide_auth.local_session(
-            legacy_user_id=user_id_from_ip("127.0.0.1"),
+            legacy_user_id=user_id_from_ip(client_ip),
             client_ip=client_ip,
         )
 

@@ -2866,16 +2866,16 @@ BACKEND_I18N["ja"].update(
     }
 )
 
-# split-source: order=757 original-lines=10189-10191 hash=fe64e14cf82a6abb
+# split-source: order=757 original-lines=10234-10236 hash=fe64e14cf82a6abb
 
 
 TABULAR_PREVIEW_EXTS = {".csv", ".tsv"}
 
-# split-source: order=758 original-lines=10192-10192 hash=43ed1e050832d382
+# split-source: order=758 original-lines=10237-10237 hash=43ed1e050832d382
 EXCEL_PREVIEW_EXTS = {".xlsx", ".xls", ".xlsm"}
 
-# split-source: order=759 original-lines=10193-10193 hash=41505360f13ba6a7
+# split-source: order=759 original-lines=10238-10238 hash=41505360f13ba6a7
 PRESENTATION_PREVIEW_EXTS = {".pptx", ".ppt", ".pptm"}
 
-# split-source: order=760 original-lines=10194-10194 hash=8d36725f2e52a335
+# split-source: order=760 original-lines=10239-10239 hash=8d36725f2e52a335
 DOCUMENT_PREVIEW_EXTS = {".docx", ".doc", ".docm"}

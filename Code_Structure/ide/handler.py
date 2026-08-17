@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=965 original-lines=109504-110654 hash=62cadb8b57bfad49
+# split-source: order=965 original-lines=109563-110718 hash=8a17d9ee021a07d2
 
 
 class IdeHandler(BaseHTTPRequestHandler):
@@ -82,6 +82,11 @@ class IdeHandler(BaseHTTPRequestHandler):
             return cached
         token = self._bearer_or_cookie_token()
         account = self.app.ide_auth.verify_session(token, self._client_ip()) if token else None
+        if account and not bool(getattr(self.app, "ide_password_login_enabled", True)):
+            # Automatic mode must not continue a legacy/password session that
+            # was created before local identities were bound to the caller.
+            if str(account.get("session_kind", "") or "") != "local_auto":
+                account = None
         if account:
             request_path = unquote(urlparse(self.path).path)
             password_routes = {
