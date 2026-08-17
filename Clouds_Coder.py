@@ -1357,6 +1357,8 @@ IDE_SEARCH_MAX_RESULTS = 2000
 IDE_SEARCH_MAX_FILE_BYTES = 2 * 1024 * 1024
 IDE_TERMINAL_SCROLLBACK_BYTES = 2 * 1024 * 1024
 IDE_TERMINAL_IDLE_SECONDS = 4 * 60 * 60
+IDE_DEBUG_ADAPTER_START_ATTEMPTS = 3
+IDE_DEBUG_ADAPTER_START_TIMEOUT_SECONDS = 5.0
 IDE_VSIX_MAX_BYTES = 80 * 1024 * 1024
 IDE_VSIX_MAX_EXPANDED_BYTES = 240 * 1024 * 1024
 IDE_VSIX_MAX_FILES = 8000
@@ -16753,6 +16755,7 @@ MCP_TOOL_PREFIX = "mcp__"
 _MCP_DEFAULT_HANDSHAKE_TIMEOUT = 20.0
 _MCP_DEFAULT_CALL_TIMEOUT = 60.0
 _MCP_MAX_RESULT_CHARS = 24000
+_MCP_TRUST_STORE_VERSION = 1
 
 
 def mcp_normalize_name(name: object) -> str:
@@ -16870,6 +16873,262 @@ def mcp_extract_server_configs(config: object) -> dict[str, dict]:
     return merged
 
 
+def _mcp_sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while True:
+            chunk = stream.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _mcp_file_identity(path: object) -> dict:
+    try:
+        resolved = Path(path).resolve(strict=True)
+        if not resolved.is_file():
+            return {}
+        stat = resolved.stat()
+        return {
+            "path": str(resolved),
+            "sha256": _mcp_sha256_file(resolved),
+            "size": int(stat.st_size),
+            "mtime_ns": int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))),
+            "device": int(getattr(stat, "st_dev", 0) or 0),
+            "inode": int(getattr(stat, "st_ino", 0) or 0),
+        }
+    except Exception:
+        return {}
+
+
+def mcp_workspace_identity(workspace: object) -> dict:
+    try:
+        resolved = Path(workspace).resolve(strict=False)
+    except Exception:
+        resolved = Path(str(workspace or "")).absolute()
+    device = 0
+    inode = 0
+    try:
+        stat = resolved.stat()
+        device = int(getattr(stat, "st_dev", 0) or 0)
+        inode = int(getattr(stat, "st_ino", 0) or 0)
+    except Exception:
+        pass
+    payload = {"path": str(resolved), "device": device, "inode": inode}
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    payload["id"] = hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()
+    return payload
+
+
+def mcp_config_file_digest(config_path: object) -> str:
+    try:
+        path = Path(config_path).resolve(strict=True)
+        return _mcp_sha256_file(path) if path.is_file() else ""
+    except Exception:
+        return ""
+
+
+def mcp_default_trust_store_path(workspace: object) -> Path:
+    workspace_path = Path(workspace).resolve(strict=False)
+    roots: list[Path] = []
+    override = str(os.getenv("CLOUDS_CODER_PRIVATE_STATE_DIR", "") or "").strip()
+    if override:
+        roots.append(Path(override).expanduser())
+    if os.name == "nt":
+        local_app_data = str(os.getenv("LOCALAPPDATA", "") or "").strip()
+        if local_app_data:
+            roots.append(Path(local_app_data) / "CloudsCoder")
+    else:
+        xdg_state = str(os.getenv("XDG_STATE_HOME", "") or "").strip()
+        if xdg_state:
+            roots.append(Path(xdg_state).expanduser() / "clouds-coder")
+        roots.append(Path.home() / ".clouds_coder")
+    workspace_id = str(mcp_workspace_identity(workspace_path).get("id", "workspace"))
+    for root in roots:
+        try:
+            resolved = root.resolve(strict=False)
+            if resolved == workspace_path or resolved.is_relative_to(workspace_path):
+                continue
+            return resolved / "mcp_trust" / f"{workspace_id}.json"
+        except Exception:
+            continue
+    # Fail closed without making application startup fail. This private random
+    # directory is intentionally non-persistent; the operator can set
+    # CLOUDS_CODER_PRIVATE_STATE_DIR to retain approvals across restarts.
+    fallback = Path(tempfile.mkdtemp(prefix="clouds-coder-mcp-trust-"))
+    try:
+        os.chmod(fallback, 0o700)
+    except Exception:
+        pass
+    return fallback / f"{workspace_id}.json"
+
+
+def mcp_record_definition_fingerprint(record: dict) -> str:
+    rec = record if isinstance(record, dict) else {}
+    payload = {
+        "command": str(rec.get("command", "") or ""),
+        "args": [str(value) for value in (rec.get("args", []) or [])],
+        "env": sorted((str(key), str(value)) for key, value in (rec.get("env", {}) or {}).items()),
+        "cwd": str(rec.get("cwd", "") or ""),
+        "transport": str(rec.get("transport", "stdio") or "stdio"),
+        "url": str(rec.get("url", "") or ""),
+        "enabled": bool(rec.get("enabled", True)),
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def _mcp_effective_spawn(record: dict, workspace: object = None) -> tuple[dict, list[str], dict, str | None]:
+    rec = record if isinstance(record, dict) else {}
+    workspace_path = Path(workspace).resolve(strict=False) if workspace else Path.cwd().resolve(strict=False)
+    raw_cwd = str(rec.get("cwd", "") or "").strip()
+    if raw_cwd:
+        cwd_path = Path(raw_cwd)
+        if not cwd_path.is_absolute():
+            cwd_path = workspace_path / cwd_path
+        cwd_path = cwd_path.resolve(strict=False)
+    else:
+        cwd_path = workspace_path
+    env_overrides = {str(key): str(value) for key, value in (rec.get("env", {}) or {}).items()}
+    env = dict(os.environ)
+    env.update(env_overrides)
+    command = str(rec.get("command", "") or "").strip()
+    args = [str(value) for value in (rec.get("args", []) or [])]
+    resolved_command = ""
+    if command:
+        command_path = Path(command)
+        if command_path.is_absolute() or "/" in command or "\\" in command:
+            candidate = command_path if command_path.is_absolute() else cwd_path / command_path
+            try:
+                resolved_command = str(candidate.resolve(strict=True))
+            except Exception:
+                resolved_command = str(candidate.resolve(strict=False))
+        else:
+            resolved_command = str(shutil.which(command, path=env.get("PATH")) or "")
+    executable_identity = _mcp_file_identity(resolved_command) if resolved_command else {}
+    referenced_files: list[dict] = []
+    seen_paths: set[str] = set()
+    script_suffixes = {
+        ".py", ".pyw", ".js", ".mjs", ".cjs", ".ts", ".sh", ".bash",
+        ".zsh", ".fish", ".ps1", ".rb", ".pl", ".php", ".lua", ".jar",
+        ".exe", ".cmd", ".bat", ".com",
+    }
+    interpreter_names = {
+        "python", "python3", "node", "nodejs", "deno", "bun", "bash", "sh",
+        "zsh", "fish", "pwsh", "powershell", "ruby", "perl", "php", "lua", "java",
+    }
+    executable_name = Path(resolved_command or command).name.lower()
+    is_interpreter = executable_name in interpreter_names or any(
+        executable_name.startswith(prefix) for prefix in ("python", "node")
+    )
+    candidate_indexes: set[int] = set()
+    if is_interpreter and not any(value in {"-c", "-m", "--eval", "-e"} for value in args):
+        for index, value in enumerate(args):
+            if value and not value.startswith("-"):
+                candidate_indexes.add(index)
+                break
+    for index, value in enumerate(args):
+        if Path(value).suffix.lower() in script_suffixes:
+            candidate_indexes.add(index)
+    for index in sorted(candidate_indexes):
+        value = args[index]
+        candidate = Path(value)
+        if not candidate.is_absolute():
+            candidate = cwd_path / candidate
+        identity = _mcp_file_identity(candidate)
+        identity_path = str(identity.get("path", "") or "")
+        if identity_path and identity_path not in seen_paths:
+            seen_paths.add(identity_path)
+            referenced_files.append(identity)
+    binding = {
+        "record_fingerprint": mcp_record_definition_fingerprint(rec),
+        "configured_command": command,
+        "resolved_command": resolved_command,
+        "args": args,
+        "cwd": str(cwd_path),
+        "env": sorted(env_overrides.items()),
+        "executable": executable_identity,
+        "referenced_files": referenced_files,
+    }
+    raw = json.dumps(binding, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    descriptor = {
+        "fingerprint": hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest(),
+        "record_fingerprint": binding["record_fingerprint"],
+        "configured_command": command,
+        "resolved_command": resolved_command,
+        "args": args,
+        "cwd": str(cwd_path),
+        "env_keys": sorted(env_overrides.keys()),
+        "executable": executable_identity,
+        "referenced_files": referenced_files,
+    }
+    argv = [resolved_command or command] + args
+    return descriptor, argv, env, str(cwd_path) if raw_cwd else None
+
+
+class MCPWorkspaceTrustStore:
+    """User-private approval receipts for command-bearing workspace MCP config."""
+
+    def __init__(self, path: object):
+        self.path = Path(path).expanduser().resolve(strict=False)
+        self._lock = threading.RLock()
+
+    def _read_unlocked(self) -> dict:
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except Exception:
+            payload = {}
+        if not isinstance(payload, dict) or int(payload.get("version", 0) or 0) != _MCP_TRUST_STORE_VERSION:
+            return {"version": _MCP_TRUST_STORE_VERSION, "receipts": {}}
+        receipts = payload.get("receipts", {})
+        payload["receipts"] = receipts if isinstance(receipts, dict) else {}
+        return payload
+
+    def _write_unlocked(self, payload: dict) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(self.path.parent, 0o700)
+        except Exception:
+            pass
+        tmp = self.path.with_name(f".{self.path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+            try:
+                os.chmod(tmp, 0o600)
+            except Exception:
+                pass
+            os.replace(tmp, self.path)
+        finally:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
+
+    def receipt(self, server: str) -> dict:
+        with self._lock:
+            payload = self._read_unlocked()
+            row = payload.get("receipts", {}).get(str(server or ""), {})
+            return dict(row) if isinstance(row, dict) else {}
+
+    def approve(self, server: str, receipt: dict) -> dict:
+        with self._lock:
+            payload = self._read_unlocked()
+            payload.setdefault("receipts", {})[str(server)] = dict(receipt or {})
+            self._write_unlocked(payload)
+            return dict(payload["receipts"][str(server)])
+
+    def revoke(self, server: str) -> bool:
+        with self._lock:
+            payload = self._read_unlocked()
+            existed = str(server) in payload.get("receipts", {})
+            payload.get("receipts", {}).pop(str(server), None)
+            if existed:
+                self._write_unlocked(payload)
+            return existed
+
+
 class MCPServerProcess:
     """One MCP server subprocess speaking JSON-RPC 2.0 over stdio.
 
@@ -16881,10 +17140,13 @@ class MCPServerProcess:
     safe.
     """
 
-    def __init__(self, name: str, record: dict, *, logger=None):
+    def __init__(self, name: str, record: dict, *, logger=None, workspace: object = None, spawn_authorizer=None):
         self.name = name
         self.record = dict(record or {})
         self._logger = logger
+        self._workspace = workspace
+        self._spawn_authorizer = spawn_authorizer
+        self.authorization: dict = {}
         self.proc: subprocess.Popen | None = None
         self.tools: list[dict] = []          # raw MCP tool descriptors (inputSchema camelCase)
         self.server_info: dict = {}
@@ -16927,10 +17189,18 @@ class MCPServerProcess:
             self.state = "error"
             self.error = "no command configured"
             return False
-        argv = [command] + [str(a) for a in self.record.get("args", [])]
-        env = dict(os.environ)
-        env.update({str(k): str(v) for k, v in (self.record.get("env") or {}).items()})
-        cwd = str(self.record.get("cwd", "") or "") or None
+        descriptor, argv, env, cwd = _mcp_effective_spawn(self.record, self._workspace)
+        if callable(self._spawn_authorizer):
+            try:
+                decision = self._spawn_authorizer(self.name, dict(self.record), dict(descriptor))
+            except Exception as exc:
+                decision = {"approved": False, "reason": f"authorization check failed: {exc}"}
+            self.authorization = dict(decision) if isinstance(decision, dict) else {}
+            if not bool(self.authorization.get("approved", False)):
+                self.state = "approval_required"
+                self.error = str(self.authorization.get("reason", "workspace MCP approval required") or "workspace MCP approval required")
+                self._log(self.error)
+                return False
         self.state = "starting"
         try:
             self.proc = subprocess.Popen(
@@ -17194,6 +17464,14 @@ class MCPServerProcess:
             return False
 
     def status_dict(self) -> dict:
+        authorization = {
+            key: self.authorization.get(key)
+            for key in (
+                "approved", "approval_required", "reason", "config_digest",
+                "fingerprint", "approved_at",
+            )
+            if key in self.authorization
+        }
         return {
             "name": self.name,
             "state": self.state,
@@ -17203,6 +17481,7 @@ class MCPServerProcess:
             "command": self.record.get("command", ""),
             "tools": [t.get("name", "") for t in self.tools],
             "stderr_tail": list(self._stderr_tail[-5:]),
+            "authorization": authorization,
         }
 
 
@@ -17227,7 +17506,15 @@ class MCPManager:
     Thread-safety: every mutation of servers/specs/route is lock-guarded.
     """
 
-    def __init__(self, server_records: dict[str, dict] | None = None, *, logger=None, config_path: object = None):
+    def __init__(
+        self,
+        server_records: dict[str, dict] | None = None,
+        *,
+        logger=None,
+        config_path: object = None,
+        workspace: object = None,
+        trust_store: MCPWorkspaceTrustStore | None = None,
+    ):
         self._logger = logger
         self.servers: dict[str, MCPServerProcess] = {}
         self._records: dict[str, dict] = {}
@@ -17239,6 +17526,9 @@ class MCPManager:
         self._connected_once = False
         # Health monitor / hot-swap state.
         self._config_path = str(config_path) if config_path else ""
+        self._workspace = Path(workspace).resolve(strict=False) if workspace else None
+        self._trust_store = trust_store
+        self._approval_gate_enabled = bool(self._config_path and self._workspace is not None and trust_store is not None)
         self._config_mtime = 0.0
         self._monitor_thread: threading.Thread | None = None
         self._monitor_stop = threading.Event()
@@ -17258,6 +17548,191 @@ class MCPManager:
 
     def has_servers(self) -> bool:
         return any(r.get("enabled", True) for r in self._records.values())
+
+    # -- workspace command trust --------------------------------------------
+    def _current_trust_config(self) -> tuple[dict, str, str]:
+        if not self._config_path:
+            return {}, "", "config path is unavailable"
+        path = Path(self._config_path)
+        try:
+            raw = path.read_bytes()
+        except Exception as exc:
+            return {}, "", f"cannot read MCP config: {exc}"
+        digest = hashlib.sha256(raw).hexdigest()
+        try:
+            text = raw.decode("utf-8-sig")
+            config = json.loads(text)
+        except Exception as exc:
+            return {}, digest, f"invalid MCP config JSON: {exc}"
+        if not isinstance(config, dict):
+            return {}, digest, "MCP config root must be an object"
+        return config, digest, ""
+
+    def _approval_snapshot(
+        self,
+        name: str,
+        record: dict | None = None,
+        descriptor: dict | None = None,
+    ) -> dict:
+        sname = str(name or "").strip()
+        if not self._approval_gate_enabled:
+            return {
+                "server": sname,
+                "approved": True,
+                "reason": "host-managed MCP config",
+                "approval_required": False,
+            }
+        config, config_digest, config_error = self._current_trust_config()
+        workspace_identity = mcp_workspace_identity(self._workspace)
+        public = {
+            "server": sname,
+            "approved": False,
+            "approval_required": True,
+            "reason": config_error or "workspace MCP approval required",
+            "workspace": workspace_identity,
+            "config_path": str(Path(self._config_path).resolve(strict=False)),
+            "config_digest": config_digest,
+        }
+        if config_error:
+            return public
+        current_records = mcp_extract_server_configs(config)
+        current = current_records.get(sname)
+        if not isinstance(current, dict) or not current.get("enabled", True):
+            public["reason"] = "server is missing or disabled in the current workspace config"
+            return public
+        current_descriptor, _argv, _env, _cwd = _mcp_effective_spawn(current, self._workspace)
+        public.update({
+            "command": current_descriptor.get("configured_command", ""),
+            "resolved_command": current_descriptor.get("resolved_command", ""),
+            "args": list(current_descriptor.get("args", []) or []),
+            "cwd": current_descriptor.get("cwd", ""),
+            "env_keys": list(current_descriptor.get("env_keys", []) or []),
+            "executable": dict(current_descriptor.get("executable", {}) or {}),
+            "referenced_files": list(current_descriptor.get("referenced_files", []) or []),
+            "fingerprint": current_descriptor.get("fingerprint", ""),
+            "record_fingerprint": current_descriptor.get("record_fingerprint", ""),
+        })
+        public["_config"] = config
+        public["_record"] = current
+        if isinstance(record, dict) and mcp_record_definition_fingerprint(record) != current_descriptor.get("record_fingerprint"):
+            public["reason"] = "workspace MCP declaration changed before spawn"
+            return public
+        if isinstance(descriptor, dict) and str(descriptor.get("fingerprint", "")) != str(current_descriptor.get("fingerprint", "")):
+            public["reason"] = "effective MCP command or referenced file changed before spawn"
+            return public
+        receipt = self._trust_store.receipt(sname) if self._trust_store is not None else {}
+        public["approved_at"] = float(receipt.get("approved_at", 0.0) or 0.0) if receipt else 0.0
+        checks = (
+            str(receipt.get("workspace_id", "")) == str(workspace_identity.get("id", "")),
+            str(receipt.get("config_digest", "")) == str(config_digest),
+            str(receipt.get("record_fingerprint", "")) == str(current_descriptor.get("record_fingerprint", "")),
+            str(receipt.get("fingerprint", "")) == str(current_descriptor.get("fingerprint", "")),
+        )
+        if receipt and all(checks):
+            public["approved"] = True
+            public["approval_required"] = False
+            public["reason"] = "approved for this workspace config and effective command"
+        elif receipt:
+            if str(receipt.get("config_digest", "")) != str(config_digest):
+                public["reason"] = "previous approval is stale because workspace config content changed"
+            elif str(receipt.get("record_fingerprint", "")) != str(current_descriptor.get("record_fingerprint", "")):
+                public["reason"] = "previous approval is stale because the MCP declaration changed"
+            elif receipt.get("executable", {}) != current_descriptor.get("executable", {}):
+                public["reason"] = "previous approval is stale because the resolved executable changed"
+            elif receipt.get("referenced_files", []) != current_descriptor.get("referenced_files", []):
+                public["reason"] = "previous approval is stale because a referenced file changed"
+            else:
+                public["reason"] = "previous approval is stale because the effective MCP command changed"
+        return public
+
+    @staticmethod
+    def _public_approval_snapshot(row: dict) -> dict:
+        return {
+            key: value for key, value in (row or {}).items()
+            if not str(key).startswith("_")
+        }
+
+    def approval_requests(self) -> list[dict]:
+        with self._lock:
+            records = dict(self._records)
+        return [
+            self._public_approval_snapshot(self._approval_snapshot(name, record))
+            for name, record in sorted(records.items())
+            if record.get("enabled", True) and record.get("transport", "stdio") == "stdio"
+        ]
+
+    def _authorize_spawn(self, name: str, record: dict, descriptor: dict) -> dict:
+        return self._public_approval_snapshot(self._approval_snapshot(name, record, descriptor))
+
+    def approve_server(self, name: str, *, expected_config_digest: str = "", expected_fingerprint: str = "") -> dict:
+        sname = str(name or "").strip()
+        with self._lock:
+            record = dict(self._records.get(sname, {}))
+        snapshot = self._approval_snapshot(sname, record)
+        if not record or not snapshot.get("fingerprint"):
+            return {"ok": False, "error": snapshot.get("reason", "server is not configured"), **self._public_approval_snapshot(snapshot)}
+        if expected_config_digest and expected_config_digest != snapshot.get("config_digest"):
+            return {"ok": False, "error": "approval request is stale; reload details and confirm again", **self._public_approval_snapshot(snapshot)}
+        if expected_fingerprint and expected_fingerprint != snapshot.get("fingerprint"):
+            return {"ok": False, "error": "effective command changed; reload details and confirm again", **self._public_approval_snapshot(snapshot)}
+        receipt = {
+            "server": sname,
+            "workspace_id": str((snapshot.get("workspace") or {}).get("id", "")),
+            "workspace_path": str((snapshot.get("workspace") or {}).get("path", "")),
+            "config_path": str(snapshot.get("config_path", "")),
+            "config_digest": str(snapshot.get("config_digest", "")),
+            "record_fingerprint": str(snapshot.get("record_fingerprint", "")),
+            "fingerprint": str(snapshot.get("fingerprint", "")),
+            "executable": dict(snapshot.get("executable", {}) or {}),
+            "referenced_files": list(snapshot.get("referenced_files", []) or []),
+            "approved_at": float(now_ts()),
+        }
+        try:
+            self._trust_store.approve(sname, receipt)
+        except Exception as exc:
+            return {"ok": False, "error": f"failed to persist private MCP approval: {exc}"}
+        diff = self.reload_from_config(snapshot.get("_config", {}))
+        current_private = self._approval_snapshot(sname)
+        current = self._public_approval_snapshot(current_private)
+        if not current.get("approved", False):
+            try:
+                self._trust_store.revoke(sname)
+            except Exception:
+                pass
+            latest_config = current_private.get("_config", {})
+            if isinstance(latest_config, dict):
+                self.reload_from_config(latest_config)
+            return {
+                "ok": False,
+                "error": "workspace MCP content changed during approval; review the new command and confirm again",
+                "server": sname,
+                "approval": self._public_approval_snapshot(self._approval_snapshot(sname)),
+            }
+        return {"ok": True, "server": sname, "approval": current, "reload": diff}
+
+    def revoke_server_approval(self, name: str) -> dict:
+        sname = str(name or "").strip()
+        try:
+            revoked = bool(self._trust_store.revoke(sname)) if self._trust_store is not None else False
+        except Exception as exc:
+            return {"ok": False, "error": f"failed to revoke MCP approval: {exc}", "server": sname}
+        with self._lock:
+            proc = self.servers.pop(sname, None)
+            record = dict(self._records.get(sname, {}))
+        if proc is not None:
+            try:
+                proc.stop()
+            except Exception:
+                pass
+        if record.get("enabled", True) and record.get("transport", "stdio") == "stdio":
+            self._start_one(sname, record)
+        self._rebuild_specs()
+        return {
+            "ok": True,
+            "server": sname,
+            "revoked": revoked,
+            "approval": self._public_approval_snapshot(self._approval_snapshot(sname, record)),
+        }
 
     # -- connection ----------------------------------------------------------
     def start_async(self):
@@ -17285,7 +17760,13 @@ class MCPManager:
             if record.get("transport") != "stdio":
                 self._log(f"[mcp] skip '{name}': transport '{record.get('transport')}' not supported (stdio only)")
                 continue
-            proc = MCPServerProcess(name, record, logger=self._logger)
+            proc = MCPServerProcess(
+                name,
+                record,
+                logger=self._logger,
+                workspace=self._workspace,
+                spawn_authorizer=self._authorize_spawn if self._approval_gate_enabled else None,
+            )
             ok = False
             try:
                 ok = proc.start()
@@ -17421,8 +17902,8 @@ class MCPManager:
         """Hot-swap: diff new on-disk config vs running set; stop removed, start
         added, leave unchanged servers running. Returns the applied diff.
 
-        Only trusted on-disk config is accepted (caller reads the file); no inline
-        server specs, so this adds no new process-spawning surface.
+        Workspace config remains inert until its exact command-bearing revision
+        has a matching user-private approval receipt.
         """
         try:
             new_records = mcp_extract_server_configs(config)
@@ -17441,7 +17922,7 @@ class MCPManager:
         with self._lock:
             old_records = dict(self._records)
             running = dict(self.servers)
-        added, removed, kept = [], [], []
+        added, removed, kept, approval_required = [], [], [], []
         # Removed or changed-enabled-off → stop.
         for name, old in old_records.items():
             new = new_records.get(name)
@@ -17456,8 +17937,12 @@ class MCPManager:
                         self.servers.pop(name, None)
                 if name in old_records:
                     removed.append(name)
-            elif _sig(old) != _sig(new):
-                # Definition changed → restart with new record.
+            else:
+                authorized = bool(self._approval_snapshot(name, new).get("approved", False))
+                if _sig(old) == _sig(new) and authorized:
+                    continue
+                # Definition, config digest, executable, or referenced script
+                # identity changed. Stop before attempting a freshly gated start.
                 proc = running.get(name)
                 if proc is not None:
                     try:
@@ -17466,31 +17951,52 @@ class MCPManager:
                         pass
                     with self._lock:
                         self.servers.pop(name, None)
-                removed.append(name)  # will be re-added below
+                removed.append(name)  # may be re-added below after approval
         # Added or (re)started.
         for name, new in new_records.items():
             if not new.get("enabled", True) or new.get("transport") != "stdio":
                 continue
             with self._lock:
                 already = name in self.servers and self.servers[name].state == "ready"
-            if already and _sig(old_records.get(name, {})) == _sig(new):
+            authorized = bool(self._approval_snapshot(name, new).get("approved", False))
+            if already and authorized and _sig(old_records.get(name, {})) == _sig(new):
                 kept.append(name)
                 continue
             self._start_one(name, new)
-            added.append(name)
+            with self._lock:
+                state = str(getattr(self.servers.get(name), "state", "") or "")
+            if state == "approval_required":
+                approval_required.append(name)
+            else:
+                added.append(name)
         with self._lock:
             self._records = new_records
         self._rebuild_specs()
         self._connected_once = True
-        diff = {"ok": True, "added": sorted(set(added)), "removed": sorted(set(removed) - set(added)), "kept": sorted(set(kept))}
-        if diff["added"] or diff["removed"]:
-            self._log(f"[mcp] hot-swap: +{diff['added']} -{diff['removed']} ={diff['kept']}")
+        diff = {
+            "ok": True,
+            "added": sorted(set(added)),
+            "removed": sorted(set(removed) - set(added)),
+            "kept": sorted(set(kept)),
+            "approval_required": sorted(set(approval_required)),
+        }
+        if diff["added"] or diff["removed"] or diff["approval_required"]:
+            self._log(
+                f"[mcp] hot-swap: +{diff['added']} -{diff['removed']} "
+                f"={diff['kept']} approval_required={diff['approval_required']}"
+            )
         return diff
 
     def _start_one(self, name: str, record: dict) -> bool:
         if record.get("transport") != "stdio":
             return False
-        proc = MCPServerProcess(name, record, logger=self._logger)
+        proc = MCPServerProcess(
+            name,
+            record,
+            logger=self._logger,
+            workspace=self._workspace,
+            spawn_authorizer=self._authorize_spawn if self._approval_gate_enabled else None,
+        )
         ok = False
         try:
             ok = proc.start()
@@ -19985,9 +20491,11 @@ TOOLS = [
     tool_def(
         "TodoWrite",
         (
-            "Update current todos. In approved plan mode, use update_mode='status_update' for status-only progress. "
+            "Update current todos. update_mode='status_update' is merge-only: omitted unfinished rows are preserved, "
+            "so a partial progress payload can never shorten the task tree. In approved plan mode, use it for status-only progress. "
             "When new current-step tool evidence or reviewer findings prove the open subplan is no longer suitable, "
-            "use update_mode='revise_open' with a concrete revision_reason and revision_evidence references; the runtime audits the revision atomically. "
+            "use update_mode='revise_open' with a concrete revision_reason and revision_evidence references; the runtime performs an atomic LLM audit "
+            "against the authoritative goal, original Todo baseline, completed evidence, and remaining requirement coverage before replacing open rows. "
             "Use 'rework_completed' only when failure/reviewer evidence requires reopening completed work. "
             "Preferred items are objects with content/status/owner/parent_step_id/subtask_id."
         ),
@@ -20016,7 +20524,7 @@ TOOLS = [
             "update_mode": {
                 "type": "string",
                 "enum": ["status_update", "revise_open", "rework_completed"],
-                "description": "status_update changes statuses only; revise_open replaces the current open-subtask snapshot after evidence audit; rework_completed requires failure/reviewer evidence.",
+                "description": "status_update merges statuses and preserves omitted rows; revise_open proposes a complete open snapshot and requires an LLM coverage/risk audit; rework_completed additionally proposes reopening completed work.",
             },
             "revision_reason": {"type": "string", "description": "Concrete new finding that justifies a structural rolling-plan revision."},
             "revision_evidence": {},
@@ -20026,7 +20534,7 @@ TOOLS = [
     ),
     tool_def(
         "TodoWriteRescue",
-        "Fallback todo writer. Preferred format: objects with content/status/owner/parent_step_id. String fallback should use only '[ ] task', '[>] task', or '[x] task'.",
+        "Fallback todo writer using the same protected merge/replan transaction as TodoWrite. Omitted rows are preserved unless an explicit revise_open passes LLM review. Preferred format: objects with content/status/owner/parent_step_id. String fallback should use only '[ ] task', '[>] task', or '[x] task'.",
         {
             "items": {"type": "array", "items": {}},
             "todos": {"type": "array", "items": {}},
@@ -37931,6 +38439,13 @@ body{padding:18px}
             "LANG", "LC_ALL", "LC_CTYPE", "TERM", "COLORTERM",
             "TZ", "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_PATH",
         }
+        if os.name == "nt":
+            allowed.update({
+                "COMSPEC", "ComSpec", "OS", "PATHEXT", "PROCESSOR_ARCHITECTURE",
+                "PROCESSOR_IDENTIFIER", "PROCESSOR_LEVEL", "PROCESSOR_REVISION",
+                "SYSTEMDRIVE", "SYSTEMROOT", "SystemDrive", "SystemRoot", "WINDIR",
+                "NUMBER_OF_PROCESSORS",
+            })
         env = {key: value for key, value in os.environ.items() if key in allowed}
         env.update(
             {
@@ -41741,6 +42256,12 @@ body{padding:18px}
             "plan_step_quality_reviews": {},
             "plan_step_recovery": {},
             "plan_todo_revisions": [],
+            # Root TodoWrite plans (single and sync without an approved Plan)
+            # need the same durable revision protection as plan-step subtasks.
+            # The baseline never changes inside a task epoch; accepted/rejected
+            # structural proposals are kept in a bounded audit ledger.
+            "todo_tree_baseline": [],
+            "todo_tree_revisions": [],
             "status": "INITIALIZING",
             "task_epoch": float(now_ts()),
             "focus": {
@@ -42282,6 +42803,73 @@ body{padding:18px}
                     "ts": float(raw_revision.get("ts", 0.0) or 0.0),
                 })
             board["plan_todo_revisions"] = revisions
+        raw_tree_baseline = src.get("todo_tree_baseline", [])
+        if isinstance(raw_tree_baseline, list):
+            baseline: list[dict] = []
+            for raw_row in raw_tree_baseline[:40]:
+                if not isinstance(raw_row, dict):
+                    continue
+                content = trim(str(raw_row.get("content", "") or "").strip(), 500)
+                if not content:
+                    continue
+                baseline.append({
+                    "identity": trim(str(raw_row.get("identity", "") or "").strip(), 160),
+                    "content": content,
+                    "owner": self._sanitize_agent_role(raw_row.get("owner", "")),
+                    "status": self._normalize_todo_status_value(raw_row.get("status", ""), "pending"),
+                    "created_at": float(raw_row.get("created_at", 0.0) or 0.0),
+                })
+            board["todo_tree_baseline"] = baseline
+        raw_tree_revisions = src.get("todo_tree_revisions", [])
+        if isinstance(raw_tree_revisions, list):
+            tree_revisions: list[dict] = []
+            for raw_revision in raw_tree_revisions[-40:]:
+                if not isinstance(raw_revision, dict):
+                    continue
+                mapping = raw_revision.get("replacement_mapping", [])
+                clean_mapping: list[dict] = []
+                if isinstance(mapping, dict):
+                    mapping = [
+                        {"removed": key, "replacement": value, "reason": ""}
+                        for key, value in mapping.items()
+                    ]
+                if isinstance(mapping, list):
+                    for raw_map in mapping[:40]:
+                        if not isinstance(raw_map, dict):
+                            continue
+                        clean_mapping.append({
+                            "removed": trim(str(raw_map.get("removed", "") or ""), 500),
+                            "replacement": trim(str(raw_map.get("replacement", "") or ""), 500),
+                            "reason": trim(str(raw_map.get("reason", "") or ""), 500),
+                        })
+                tree_revisions.append({
+                    "actor": trim(str(raw_revision.get("actor", "") or ""), 40),
+                    "status": trim(str(raw_revision.get("status", "") or ""), 24),
+                    "mode": trim(str(raw_revision.get("mode", "") or ""), 32),
+                    "reason": trim(str(raw_revision.get("reason", "") or ""), 1200),
+                    "review_reason": trim(str(raw_revision.get("review_reason", "") or ""), 1200),
+                    "completion_risk": trim(str(raw_revision.get("completion_risk", "") or ""), 24),
+                    "removed_objectives": [
+                        trim(str(value or ""), 500)
+                        for value in (raw_revision.get("removed_objectives", []) if isinstance(raw_revision.get("removed_objectives"), list) else [])[:40]
+                        if str(value or "").strip()
+                    ],
+                    "replacement_mapping": clean_mapping,
+                    "requirement_coverage": [
+                        trim(str(value or ""), 700)
+                        for value in (raw_revision.get("requirement_coverage", []) if isinstance(raw_revision.get("requirement_coverage"), list) else [])[:40]
+                        if str(value or "").strip()
+                    ],
+                    "evidence": [
+                        trim(str(value or ""), 700)
+                        for value in (raw_revision.get("evidence", []) if isinstance(raw_revision.get("evidence"), list) else [])[:20]
+                        if str(value or "").strip()
+                    ],
+                    "before_open": [trim(str(value or ""), 500) for value in (raw_revision.get("before_open", []) or [])[:40]],
+                    "after_open": [trim(str(value or ""), 500) for value in (raw_revision.get("after_open", []) or [])[:40]],
+                    "ts": float(raw_revision.get("ts", 0.0) or 0.0),
+                })
+            board["todo_tree_revisions"] = tree_revisions
         board["watchdog"] = self._normalize_watchdog_state(src.get("watchdog", {}))
         board["decomposition_queue"] = self._normalize_decomposition_queue_state(
             src.get("decomposition_queue", {})
@@ -43427,6 +44015,8 @@ body{padding:18px}
         preserved_step_evidence = old_bb.get("plan_step_evidence", {})
         preserved_quality_reviews = old_bb.get("plan_step_quality_reviews", {})
         preserved_todo_revisions = old_bb.get("plan_todo_revisions", [])
+        preserved_tree_baseline = old_bb.get("todo_tree_baseline", [])
+        preserved_tree_revisions = old_bb.get("todo_tree_revisions", [])
         preserved_step_files = old_bb.get("step_files", {})
         if not preserve_active_state:
             self.runtime_requires_todos = None
@@ -43469,6 +44059,10 @@ body{padding:18px}
                 self.blackboard["plan_step_quality_reviews"] = preserved_quality_reviews
             if isinstance(preserved_todo_revisions, list):
                 self.blackboard["plan_todo_revisions"] = preserved_todo_revisions
+            if isinstance(preserved_tree_baseline, list):
+                self.blackboard["todo_tree_baseline"] = preserved_tree_baseline
+            if isinstance(preserved_tree_revisions, list):
+                self.blackboard["todo_tree_revisions"] = preserved_tree_revisions
             if isinstance(preserved_step_files, dict):
                 self.blackboard["step_files"] = preserved_step_files
         self.manager_context = []
@@ -44133,10 +44727,22 @@ body{padding:18px}
             task_epoch = float(bb.get("task_epoch", 0.0) or 0.0)
         except Exception:
             task_epoch = 0.0
+        todo_signature = ""
+        try:
+            todo_signature = hashlib.sha256(
+                json.dumps(
+                    self._todo_progress_signature(self.todo.snapshot()),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8", "ignore")
+            ).hexdigest()
+        except Exception:
+            todo_signature = ""
         return {
             "task_epoch": task_epoch,
             "plan_step_id": resolved_step_id,
             "run_generation": int(getattr(self, "run_generation", 0) or 0),
+            "todo_signature": todo_signature,
             "started_at": float(now_ts()),
         }
 
@@ -44162,6 +44768,20 @@ body{padding:18px}
         actual_generation = int(getattr(self, "run_generation", 0) or 0)
         if expected_generation and actual_generation and expected_generation != actual_generation:
             return False, "run generation changed"
+        expected_todo_signature = str(transaction.get("todo_signature", "") or "").strip()
+        if expected_todo_signature:
+            try:
+                actual_todo_signature = hashlib.sha256(
+                    json.dumps(
+                        self._todo_progress_signature(self.todo.snapshot()),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8", "ignore")
+                ).hexdigest()
+            except Exception:
+                return False, "Todo tree revision is unavailable"
+            if actual_todo_signature != expected_todo_signature:
+                return False, "Todo tree changed during review"
         expected_step_id = trim(str(transaction.get("plan_step_id", "") or "").strip(), 40)
         if expected_step_id:
             current = self._get_active_plan_step(bb)
@@ -51682,7 +52302,7 @@ body{padding:18px}
             if not isinstance(payload, dict):
                 return {"available": False, "approved": False, "reason": "semantic audit returned invalid JSON"}
             confidence = str(payload.get("confidence", "low") or "low").strip().lower()
-            approved = bool(payload.get("approved", False)) and confidence in {"high", "medium"}
+            approved = bool(payload.get("approved", False))
             return {
                 "available": True,
                 "approved": approved,
@@ -51728,102 +52348,6 @@ body{padding:18px}
         )
         sequence_score = difflib.SequenceMatcher(None, left_text.lower(), right_text.lower()).ratio()
         return max(token_score, sequence_score) >= float(minimum)
-
-    def _bounded_current_subtask_revision_audit(
-        self,
-        plan_step: dict,
-        existing_rows: list[dict],
-        proposed_rows: list[dict],
-        matched_evidence: list[dict],
-        *,
-        reason: str,
-        mode: str,
-        step_id: str,
-    ) -> dict:
-        if mode != "revise_open":
-            return {}
-        existing_open = [
-            row for row in existing_rows
-            if isinstance(row, dict)
-            and str(row.get("status", "pending") or "pending").lower() != "completed"
-            and not self._is_plan_step_acceptance_subtask(row.get("content", ""))
-        ]
-        proposed_open = [
-            row for row in proposed_rows
-            if isinstance(row, dict)
-            and str(row.get("status", "pending") or "pending").lower() != "completed"
-            and not self._is_plan_step_acceptance_subtask(row.get("content", ""))
-        ]
-        if len(existing_open) != len(proposed_open):
-            return {}
-        existing_acceptance = [
-            self._normalize_plan_step_acceptance_subtask_text(row.get("content", ""))
-            for row in existing_rows
-            if isinstance(row, dict) and self._is_plan_step_acceptance_subtask(row.get("content", ""))
-        ]
-        proposed_acceptance = [
-            self._normalize_plan_step_acceptance_subtask_text(row.get("content", ""))
-            for row in proposed_rows
-            if isinstance(row, dict) and self._is_plan_step_acceptance_subtask(row.get("content", ""))
-        ]
-        if existing_acceptance != proposed_acceptance:
-            return {}
-        before_core = [self._plan_worker_content_core(row.get("content", "")) for row in existing_open]
-        after_core = [self._plan_worker_content_core(row.get("content", "")) for row in proposed_open]
-        changed_indexes = [
-            index for index, pair in enumerate(zip(before_core, after_core))
-            if pair[0] != pair[1]
-        ]
-        if len(changed_indexes) != 1:
-            return {}
-        changed_index = changed_indexes[0]
-        prior = existing_open[changed_index]
-        revised = proposed_open[changed_index]
-        if self._normalize_todo_status_value(prior.get("status", ""), "pending") != "in_progress":
-            return {}
-        if self._normalize_todo_status_value(revised.get("status", ""), "pending") != "in_progress":
-            return {}
-        prior_id = self._stable_plan_worker_subtask_id(step_id, prior)
-        directly_bound = [
-            row for row in matched_evidence
-            if prior_id and str(row.get("subtask_id", "") or "").strip() == prior_id
-        ]
-        if not directly_bound:
-            return {}
-        prior_core = self._plan_worker_content_core(prior.get("content", ""))
-        revised_core = self._plan_worker_content_core(revised.get("content", ""))
-        if not prior_core or prior_core not in revised_core:
-            return {}
-        added_detail = revised_core.replace(prior_core, "", 1).strip(" ：:;；,.，。()（）[]【】-")
-        if not added_detail:
-            return {}
-        scope_change_markers = (
-            "remove", "delete", "drop", "skip", "replace", "instead", "without", "no longer",
-            "删除", "刪除", "移除", "跳过", "跳過", "替换", "替換", "取代", "取消",
-            "不再", "无需", "無需", "改为", "改為", "舍弃", "捨棄",
-        )
-        normalized_added_detail = unicodedata.normalize("NFKC", added_detail).lower()
-        if any(marker in normalized_added_detail for marker in scope_change_markers):
-            return {}
-        evidence_text = "\n".join(
-            " ".join(
-                str(row.get(field, "") or "")
-                for field in ("summary", "command", "path", "subtask_content")
-            )
-            for row in directly_bound
-        )
-        if not self._plan_revision_texts_related(added_detail, evidence_text, 0.18):
-            return {}
-        if not self._plan_revision_texts_related(reason, evidence_text, 0.18):
-            return {}
-        return {
-            "ok": True,
-            "structural": True,
-            "reason": "bounded current-subtask revision accepted by direct evidence audit",
-            "before_open": before_core,
-            "after_open": after_core,
-            "evidence_ids": [str(row.get("id", "") or "") for row in directly_bound],
-        }
 
     def _review_plan_worker_revision(
         self,
@@ -51920,17 +52444,6 @@ body{padding:18px}
                 "after_open": after_open,
                 "evidence_ids": [str(row.get("id", "") or "") for row in matched],
             }
-        bounded_review = self._bounded_current_subtask_revision_audit(
-            plan_step,
-            existing_rows,
-            proposed_rows,
-            matched,
-            reason=reason,
-            mode=mode,
-            step_id=step_id,
-        )
-        if bounded_review:
-            return bounded_review
         semantic_audit = self._semantic_audit_plan_worker_revision(
             plan_step,
             reason=reason,
@@ -51996,68 +52509,491 @@ body{padding:18px}
             return f"substep:{match.group(1)}"
         return f"text:{content}"
 
-    def _merge_flat_todo_items(self, items: list[dict], role: str = "") -> str:
+    def _stable_root_todo_id(self, row: dict | None) -> str:
+        item = row if isinstance(row, dict) else {}
+        existing = trim(str(item.get("subtask_id", "") or "").strip(), 100)
+        if existing.startswith("rt:"):
+            return existing
+        identity = self._flat_todo_identity({key: value for key, value in item.items() if key != "subtask_id"})
+        if not identity:
+            return ""
+        return "rt:" + hashlib.sha1(identity.encode("utf-8", "ignore")).hexdigest()[:20]
+
+    def _ensure_root_todo_baseline(self, rows: list[dict], *, board: dict | None = None) -> list[dict]:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        baseline = list(bb.get("todo_tree_baseline", []) if isinstance(bb.get("todo_tree_baseline"), list) else [])
+        known = {
+            str(row.get("identity", "") or "")
+            for row in baseline
+            if isinstance(row, dict) and str(row.get("identity", "") or "")
+        }
+        changed = False
+        for raw in rows:
+            if not isinstance(raw, dict) or self._todo_row_kind(raw) == "system":
+                continue
+            identity = self._flat_todo_identity(raw) or self._stable_root_todo_id(raw)
+            if not identity or identity in known:
+                continue
+            baseline.append({
+                "identity": identity,
+                "content": trim(str(raw.get("content", "") or ""), 500),
+                "owner": self._sanitize_agent_role(raw.get("owner", "")),
+                "status": self._normalize_todo_status_value(raw.get("status", ""), "pending"),
+                "created_at": float(raw.get("created_at", 0.0) or now_ts()),
+            })
+            known.add(identity)
+            changed = True
+        if changed or "todo_tree_baseline" not in bb:
+            bb["todo_tree_baseline"] = baseline[:40]
+            bb["updated_at"] = float(now_ts())
+            self.blackboard = bb
+        return baseline[:40]
+
+    def _root_todo_revision_evidence(self, revision_evidence: object, *, board: dict | None = None) -> list[str]:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        evidence: list[str] = []
+        if isinstance(revision_evidence, str):
+            if revision_evidence.strip():
+                evidence.append(revision_evidence.strip())
+        elif isinstance(revision_evidence, list):
+            evidence.extend(str(value or "").strip() for value in revision_evidence if str(value or "").strip())
+        elif isinstance(revision_evidence, dict):
+            evidence.append(json.dumps(revision_evidence, ensure_ascii=False, sort_keys=True))
+        for section, label in (("execution_logs", "execution"), ("review_feedback", "review")):
+            rows = bb.get(section, []) if isinstance(bb.get(section), list) else []
+            for row in rows[-8:]:
+                if not isinstance(row, dict):
+                    continue
+                content = str(row.get("content", "") or "").strip()
+                if content:
+                    evidence.append(f"{label}: {content}")
+        artifacts = bb.get("code_artifacts", {}) if isinstance(bb.get("code_artifacts"), dict) else {}
+        for path, row in list(artifacts.items())[-12:]:
+            summary = str((row or {}).get("summary", "") or "").strip() if isinstance(row, dict) else ""
+            evidence.append(f"artifact: {path}" + (f" - {summary}" if summary else ""))
+        return list(dict.fromkeys(trim(value, 900) for value in evidence if value))[:24]
+
+    @staticmethod
+    def _normalize_root_todo_replacement_mapping(value: object) -> list[dict]:
+        if isinstance(value, dict):
+            value = [
+                {"removed": key, "replacement": replacement, "reason": ""}
+                for key, replacement in value.items()
+            ]
+        if not isinstance(value, list):
+            return []
+        rows: list[dict] = []
+        for raw in value[:40]:
+            if not isinstance(raw, dict):
+                continue
+            removed = str(raw.get("removed", raw.get("from", raw.get("objective", ""))) or "").strip()
+            replacement = str(raw.get("replacement", raw.get("to", raw.get("covered_by", ""))) or "").strip()
+            reason = str(raw.get("reason", raw.get("rationale", "")) or "").strip()
+            if removed:
+                rows.append({
+                    "removed": trim(removed, 500),
+                    "replacement": trim(replacement, 500),
+                    "reason": trim(reason, 500),
+                })
+        return rows
+
+    def _semantic_audit_root_todo_revision(
+        self,
+        *,
+        reason: str,
+        baseline: list[dict],
+        current_rows: list[dict],
+        proposed_rows: list[dict],
+        removed_objectives: list[str],
+        evidence: list[str],
+    ) -> dict:
+        goal = str(self._authoritative_user_goal_for_model() or self._ensure_blackboard().get("original_goal", "") or "").strip()
+        completed = [
+            str(row.get("content", "") or "").strip()
+            for row in current_rows
+            if isinstance(row, dict) and self._normalize_todo_status_value(row.get("status", ""), "pending") == "completed"
+        ]
+
+        def _render(rows: list[dict]) -> str:
+            return "\n".join(
+                f"- [{self._normalize_todo_status_value(row.get('status', ''), 'pending')}] {str(row.get('content', '') or '').strip()}"
+                for row in rows
+                if isinstance(row, dict) and str(row.get("content", "") or "").strip()
+            ) or "(none)"
+
+        prompt = (
+            "/no_think\n"
+            "You are the independent safety reviewer for a proposed rewrite of an execution Todo tree. "
+            "Dynamic replanning is allowed, but task completion and every authoritative user requirement must remain covered.\n"
+            "Reject when an unfinished objective disappears without a concrete replacement or completion proof, when the proposal narrows scope, "
+            "when the stated reason merely restates the new list, or when evidence/coverage is uncertain. Do not classify stages by keywords; judge semantics.\n"
+            "Return JSON only with ALL fields: "
+            "{\"decision\":\"approve|reject\",\"confidence\":\"high|medium|low\",\"reason\":\"...\","
+            "\"removed_objectives\":[\"...\"],\"replacement_mapping\":[{\"removed\":\"...\",\"replacement\":\"...\",\"reason\":\"...\"}],"
+            "\"requirement_coverage\":[\"requirement -> proposed objective/evidence\"],\"completion_risk\":\"low|medium|high\","
+            "\"evidence\":[\"...\"]}.\n\n"
+            f"AUTHORITATIVE USER GOAL:\n{goal or '(unavailable)'}\n\n"
+            "ORIGINAL TODO BASELINE:\n" + _render(baseline) + "\n\n"
+            "CURRENT CANONICAL TODO TREE:\n" + _render(current_rows) + "\n\n"
+            "PROPOSED COMPLETE TODO TREE:\n" + _render(proposed_rows) + "\n\n"
+            f"PROPOSER REASON:\n{reason}\n\n"
+            "DETERMINISTICALLY REMOVED OR MATERIALLY REWRITTEN OPEN OBJECTIVES:\n"
+            + ("\n".join(f"- {value}" for value in removed_objectives) or "(none)")
+            + "\n\nCOMPLETED ROWS:\n"
+            + ("\n".join(f"- {value}" for value in completed) or "(none)")
+            + "\n\nAVAILABLE EVIDENCE:\n"
+            + ("\n".join(f"- {value}" for value in evidence) or "(none)")
+        )
+        try:
+            response = self.ollama.chat(
+                [{"role": "user", "content": prompt}],
+                system=self._inject_runtime_environment_context(
+                    "/no_think\nYou audit Todo-tree rewrites for requirement preservation. Reply only valid JSON."
+                ),
+                max_tokens=1000,
+                temperature=0.1,
+                think=False,
+            )
+            raw = str(response.get("content", "") or response.get("text", "") or "").strip()
+            payload = extract_json_object_from_text(raw, {})
+            if not isinstance(payload, dict) or not payload:
+                return {"available": False, "approved": False, "reason": "Todo-tree review returned invalid structured JSON"}
+            decision = str(payload.get("decision", "") or "").strip().lower()
+            confidence = str(payload.get("confidence", "low") or "low").strip().lower()
+            risk = str(payload.get("completion_risk", "high") or "high").strip().lower()
+            review_reason = str(payload.get("reason", "") or "").strip()
+            reported_removed = payload.get("removed_objectives", [])
+            coverage = payload.get("requirement_coverage", [])
+            review_evidence = payload.get("evidence", [])
+            mapping = self._normalize_root_todo_replacement_mapping(payload.get("replacement_mapping", []))
+            required_shape = (
+                decision in {"approve", "reject"}
+                and confidence in {"high", "medium", "low"}
+                and risk in {"low", "medium", "high"}
+                and len(review_reason) >= 6
+                and isinstance(reported_removed, list)
+                and isinstance(coverage, list)
+                and isinstance(review_evidence, list)
+            )
+            if not required_shape:
+                return {"available": False, "approved": False, "reason": "Todo-tree review omitted required decision, reason, mapping, coverage, risk, or evidence fields"}
+            reported_removed = [trim(str(value or ""), 500) for value in reported_removed[:40] if str(value or "").strip()]
+            coverage = [trim(str(value or ""), 700) for value in coverage[:40] if str(value or "").strip()]
+            review_evidence = [trim(str(value or ""), 700) for value in review_evidence[:20] if str(value or "").strip()]
+            # All semantic judgment belongs to the reviewer model. The runtime
+            # validates only the response contract and honors its decision; it
+            # does not second-guess coverage with keywords, similarity scores,
+            # locally assigned risk thresholds, or stage classifiers.
+            approved = decision == "approve"
+            return {
+                "available": True,
+                "approved": approved,
+                "decision": decision,
+                "confidence": confidence,
+                "reason": trim(review_reason, 1200),
+                "removed_objectives": reported_removed,
+                "replacement_mapping": mapping,
+                "requirement_coverage": coverage,
+                "completion_risk": risk,
+                "evidence": review_evidence,
+            }
+        except Exception as exc:
+            return {
+                "available": False,
+                "approved": False,
+                "confidence": "low",
+                "completion_risk": "high",
+                "reason": f"Todo-tree semantic review unavailable: {trim(str(exc), 240)}",
+            }
+
+    def _append_root_todo_revision_audit(
+        self,
+        *,
+        actor: str,
+        status: str,
+        mode: str,
+        reason: str,
+        review: dict,
+        before_open: list[str],
+        after_open: list[str],
+        board: dict | None = None,
+    ) -> None:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        rows = list(bb.get("todo_tree_revisions", []) if isinstance(bb.get("todo_tree_revisions"), list) else [])
+        rows.append({
+            "actor": trim(str(actor or ""), 40),
+            "status": trim(str(status or ""), 24),
+            "mode": trim(str(mode or ""), 32),
+            "reason": trim(str(reason or ""), 1200),
+            "review_reason": trim(str(review.get("reason", "") or ""), 1200),
+            "completion_risk": trim(str(review.get("completion_risk", "high") or "high"), 24),
+            "removed_objectives": list(review.get("removed_objectives", []) or [])[:40],
+            "replacement_mapping": list(review.get("replacement_mapping", []) or [])[:40],
+            "requirement_coverage": list(review.get("requirement_coverage", []) or [])[:40],
+            "evidence": list(review.get("evidence", []) or [])[:20],
+            "before_open": [trim(str(value or ""), 500) for value in before_open[:40]],
+            "after_open": [trim(str(value or ""), 500) for value in after_open[:40]],
+            "ts": float(now_ts()),
+        })
+        bb["todo_tree_revisions"] = rows[-40:]
+        bb["updated_at"] = float(now_ts())
+        self.blackboard = bb
+        self._emit(
+            "status",
+            {
+                "summary": trim(
+                    f"Todo-tree revision {status}: {review.get('reason', reason)}",
+                    300,
+                )
+            },
+        )
+
+    def _root_todo_material_changes(self, existing_rows: list[dict], proposed_rows: list[dict]) -> tuple[list[str], list[str], list[str]]:
+        before_open = [
+            str(row.get("content", "") or "").strip()
+            for row in existing_rows
+            if isinstance(row, dict) and self._normalize_todo_status_value(row.get("status", ""), "pending") != "completed"
+        ]
+        after_open = [
+            str(row.get("content", "") or "").strip()
+            for row in proposed_rows
+            if isinstance(row, dict) and self._normalize_todo_status_value(row.get("status", ""), "pending") != "completed"
+        ]
+        proposed_by_id = {
+            self._flat_todo_identity(row): row
+            for row in proposed_rows
+            if isinstance(row, dict) and self._flat_todo_identity(row)
+        }
+        removed: list[str] = []
+        for row in existing_rows:
+            if not isinstance(row, dict) or self._normalize_todo_status_value(row.get("status", ""), "pending") == "completed":
+                continue
+            identity = self._flat_todo_identity(row)
+            proposed = proposed_by_id.get(identity)
+            old_content = str(row.get("content", "") or "").strip()
+            if not isinstance(proposed, dict) or self._normalize_todo_status_value(proposed.get("status", ""), "pending") == "completed":
+                removed.append(old_content)
+                continue
+            new_content = str(proposed.get("content", "") or "").strip()
+            if normalize_work_text(old_content) != normalize_work_text(new_content):
+                removed.append(old_content)
+        return before_open, after_open, list(dict.fromkeys(value for value in removed if value))
+
+    def _merge_root_todo_scope(
+        self,
+        items: list[dict],
+        *,
+        role: str,
+        existing_scope: list[dict],
+        preserved_rows: list[dict],
+        update_mode: str,
+        revision_reason: str,
+        revision_evidence: object,
+        transaction: dict | None,
+    ) -> str:
+        role_key = self._sanitize_agent_role(role)
+        bb = self._ensure_blackboard()
+        self._ensure_root_todo_baseline(existing_scope, board=bb)
+        mode = str(update_mode or "status_update").strip().lower().replace("-", "_")
+        if mode not in {"status_update", "revise_open", "rework_completed"}:
+            mode = "status_update"
+        if mode == "status_update" and (str(revision_reason or "").strip() or self._plan_worker_revision_references(revision_evidence)):
+            mode = "revise_open"
+
+        normalized: list[dict] = []
+        passthrough: list[dict] = []
+        for item in items:
+            row = self._normalize_generic_todo_row(item, owner=role_key)
+            if not row:
+                continue
+            if str(row.get("key", "") or "").startswith("bb:"):
+                passthrough.append(row)
+                continue
+            if role_key in {"manager", "explorer", "developer", "reviewer"}:
+                row["owner"] = role_key
+            row["subtask_id"] = self._stable_root_todo_id(row)
+            normalized.append(row)
+        if not normalized:
+            return self.todo.update(preserved_rows + passthrough + existing_scope)
+
+        existing_entries: list[tuple[str, dict, int]] = []
+        for index, row in enumerate(existing_scope):
+            identity = self._flat_todo_identity(row)
+            if identity:
+                existing_entries.append((identity, dict(row), index))
+        used: set[str] = set()
+        matched: list[tuple[dict, str, dict | None, int]] = []
+        for incoming in normalized:
+            identity = self._flat_todo_identity(incoming)
+            prior: dict | None = None
+            prior_index = -1
+            for candidate_id, candidate, candidate_index in existing_entries:
+                if candidate_id == identity and candidate_id not in used:
+                    prior = candidate
+                    prior_index = candidate_index
+                    identity = candidate_id
+                    break
+            if prior is None:
+                scored: list[tuple[float, str, dict, int]] = []
+                for candidate_id, candidate, candidate_index in existing_entries:
+                    if candidate_id in used:
+                        continue
+                    score = self._plan_worker_todo_match_score(incoming, candidate)
+                    if score >= 0.64:
+                        scored.append((score, candidate_id, candidate, candidate_index))
+                scored.sort(key=lambda value: value[0], reverse=True)
+                if scored and (scored[0][0] >= 0.86 or len(scored) == 1 or scored[0][0] - scored[1][0] >= 0.08):
+                    _score, identity, prior, prior_index = scored[0]
+            if isinstance(prior, dict):
+                used.add(identity)
+                incoming["subtask_id"] = prior.get("subtask_id", "") or self._stable_root_todo_id(prior)
+                if prior.get("external_subtask_id") and not incoming.get("external_subtask_id"):
+                    incoming["external_subtask_id"] = prior.get("external_subtask_id")
+            matched.append((incoming, identity, prior, prior_index))
+
+        if not existing_scope:
+            result = self.todo.update(preserved_rows + passthrough + normalized)
+            self._ensure_root_todo_baseline(normalized, board=bb)
+            return result
+
+        if mode == "status_update":
+            merged_scope = [dict(row) for row in existing_scope]
+            for incoming, _identity, prior, prior_index in matched:
+                if isinstance(prior, dict) and prior_index >= 0:
+                    merged = dict(prior)
+                    prior_status = self._normalize_todo_status_value(prior.get("status", ""), "pending")
+                    incoming_status = self._normalize_todo_status_value(incoming.get("status", ""), prior_status)
+                    if prior_status == "completed" and incoming_status != "completed":
+                        incoming_status = "completed"
+                    merged["status"] = incoming_status
+                    merged["updated_at"] = float(now_ts())
+                    for meta_key in ("evidence", "evidence_binding", "evidence_ids", "completed_at", "completed_by", "started_at"):
+                        if incoming.get(meta_key) not in (None, "", []):
+                            merged[meta_key] = incoming.get(meta_key)
+                    # Status updates cannot silently abbreviate or redirect an
+                    # objective. Structural text changes belong to revise_open.
+                    merged_scope[prior_index] = merged
+                else:
+                    incoming["created_at"] = float(incoming.get("created_at", 0.0) or now_ts())
+                    merged_scope.append(incoming)
+            state_lock = getattr(self, "lock", None)
+            if state_lock is not None:
+                state_lock.acquire()
+            try:
+                valid, stale_reason = self._todo_write_transaction_is_current(transaction, board=self._ensure_blackboard())
+                if not valid:
+                    return self._emit_stale_todo_write_discarded(stale_reason)
+                return self.todo.update(preserved_rows + passthrough + merged_scope)
+            finally:
+                if state_lock is not None:
+                    state_lock.release()
+
+        reason = trim(str(revision_reason or "").strip(), 1200)
+        if not (normalize_work_text(reason) or reason).strip():
+            review = {"reason": "revision_reason must explain why the existing open objectives no longer form a completion-safe tree", "completion_risk": "high"}
+            before_open, after_open, _removed = self._root_todo_material_changes(existing_scope, existing_scope)
+            self._append_root_todo_revision_audit(
+                actor=role_key, status="rejected", mode=mode, reason=reason,
+                review=review, before_open=before_open, after_open=after_open, board=bb,
+            )
+            return self._plan_control_feedback("preserve_todo_tree", f"Todo-tree revision rejected: {review['reason']}.\n\n{self.todo.render()}")
+
+        proposed_scope: list[dict] = []
+        represented: set[str] = set()
+        for incoming, identity, prior, _prior_index in matched:
+            if isinstance(prior, dict):
+                represented.add(identity)
+                prior_status = self._normalize_todo_status_value(prior.get("status", ""), "pending")
+                if prior_status == "completed" and mode != "rework_completed":
+                    proposed_scope.append(dict(prior))
+                    continue
+                revised = dict(prior)
+                revised.update(incoming)
+                revised["subtask_id"] = prior.get("subtask_id", "") or self._stable_root_todo_id(prior)
+                revised["updated_at"] = float(now_ts())
+                proposed_scope.append(revised)
+            else:
+                incoming["created_at"] = float(incoming.get("created_at", 0.0) or now_ts())
+                proposed_scope.append(incoming)
+        # Completed history is immutable unless the explicit rework mode names
+        # and successfully reviews the row. Omission alone can never erase it.
+        for identity, prior, _index in existing_entries:
+            if identity in represented:
+                continue
+            if self._normalize_todo_status_value(prior.get("status", ""), "pending") == "completed":
+                proposed_scope.insert(0, dict(prior))
+
+        before_open, after_open, removed = self._root_todo_material_changes(existing_scope, proposed_scope)
+        evidence = self._root_todo_revision_evidence(revision_evidence, board=bb)
+        baseline = self._ensure_root_todo_baseline(existing_scope, board=bb)
+        review = self._semantic_audit_root_todo_revision(
+            reason=reason,
+            baseline=baseline,
+            current_rows=existing_scope,
+            proposed_rows=proposed_scope,
+            removed_objectives=removed,
+            evidence=evidence,
+        )
+        if not bool(review.get("available", False)) or not bool(review.get("approved", False)):
+            self._append_root_todo_revision_audit(
+                actor=role_key, status="rejected", mode=mode, reason=reason,
+                review=review, before_open=before_open, after_open=after_open, board=bb,
+            )
+            return self._plan_control_feedback(
+                "preserve_todo_tree",
+                f"Todo-tree revision rejected: {review.get('reason', 'semantic review did not prove full requirement coverage')}. "
+                f"The canonical tree was preserved.\n\n{self.todo.render()}",
+            )
+
+        state_lock = getattr(self, "lock", None)
+        if state_lock is not None:
+            state_lock.acquire()
+        try:
+            valid, stale_reason = self._todo_write_transaction_is_current(transaction, board=self._ensure_blackboard())
+            if not valid:
+                return self._emit_stale_todo_write_discarded(stale_reason)
+            result = self.todo.update(preserved_rows + passthrough + proposed_scope)
+        finally:
+            if state_lock is not None:
+                state_lock.release()
+        self._append_root_todo_revision_audit(
+            actor=role_key, status="accepted", mode=mode, reason=reason,
+            review=review, before_open=before_open, after_open=after_open, board=bb,
+        )
+        return (
+            f"{result}\nTODO TREE REVISION: accepted after independent LLM coverage/risk review. "
+            f"Reason: {review.get('reason', reason)}"
+        )
+
+    def _merge_flat_todo_items(
+        self,
+        items: list[dict],
+        role: str = "",
+        *,
+        update_mode: str = "status_update",
+        revision_reason: str = "",
+        revision_evidence: object = None,
+        transaction: dict | None = None,
+    ) -> str:
         if not isinstance(items, list):
             raise ValueError("items must be array")
         role_key = self._sanitize_agent_role(role)
         existing = self.todo.snapshot()
         route_existing = self._todo_route_rows("pure_single", rows=existing, role=role_key)
-        existing_by_identity: dict[str, dict] = {}
-        preserved_system: list[dict] = []
-        for row in existing:
-            if self._todo_row_kind(row) != "system":
-                continue
-            preserved_system.append(dict(row))
-        for row in route_existing:
-            if not isinstance(row, dict):
-                continue
-            identity = self._flat_todo_identity(row)
-            if not identity:
-                continue
-            if identity not in existing_by_identity:
-                existing_by_identity[identity] = dict(row)
-
-        passthrough_rows: list[dict] = []
-        merged_rows: list[dict] = []
-        seen_identities: set[str] = set()
-        for idx, item in enumerate(items):
-            raw = self._normalize_generic_todo_row(item, owner=role_key)
-            if not raw:
-                continue
-            key = trim(str(raw.get("key", "") or "").strip(), 120)
-            if key.startswith("bb:"):
-                passthrough_rows.append(raw)
-                continue
-            normalized = dict(raw)
-            normalized["owner"] = role_key if role_key in {"manager", "explorer", "developer", "reviewer"} else str(normalized.get("owner", "") or "")
-            identity = self._flat_todo_identity(normalized)
-            if not identity:
-                identity = f"ad-hoc:{idx}:{trim(str(normalized.get('content', '')), 80)}"
-            prior = existing_by_identity.get(identity)
-            if prior is None:
-                candidates = []
-                for candidate_id, candidate in existing_by_identity.items():
-                    if candidate_id in seen_identities:
-                        continue
-                    score = self._plan_worker_todo_match_score(normalized, candidate)
-                    if score >= 0.64:
-                        candidates.append((score, candidate_id, candidate))
-                candidates.sort(key=lambda value: value[0], reverse=True)
-                if candidates and (candidates[0][0] >= 0.86 or len(candidates) == 1 or candidates[0][0] - candidates[1][0] >= 0.08):
-                    _score, identity, prior = candidates[0]
-            merged = dict(prior or {})
-            prior_status = self._normalize_todo_status_value(merged.get("status", ""), "pending")
-            incoming_status = self._normalize_todo_status_value(normalized.get("status", ""), prior_status)
-            if prior_status == "completed" and incoming_status != "completed":
-                incoming_status = "completed"
-            merged.update(normalized)
-            merged["status"] = incoming_status
-            merged["owner"] = normalized.get("owner", role_key)
-            if identity in seen_identities:
-                continue
-            seen_identities.add(identity)
-            merged_rows.append(merged)
-        return self.todo.update(preserved_system + passthrough_rows + merged_rows)
+        preserved_system = [
+            dict(row) for row in existing
+            if isinstance(row, dict) and self._todo_row_kind(row) == "system"
+        ]
+        return self._merge_root_todo_scope(
+            items,
+            role=role_key,
+            existing_scope=route_existing,
+            preserved_rows=preserved_system,
+            update_mode=update_mode,
+            revision_reason=revision_reason,
+            revision_evidence=revision_evidence,
+            transaction=transaction,
+        )
 
     # --- Active-step worker todo reconciliation -------------------------------
     # Merge worker-submitted subtasks into the active plan step while
@@ -52615,6 +53551,20 @@ body{padding:18px}
             if not valid:
                 return self._emit_stale_todo_write_discarded(stale_reason)
             result = self.todo.update(final_rows)
+            # The Todo commit itself is the expected mutation. Refresh the
+            # transaction signature before the blackboard mirror revalidates
+            # the same atomic operation.
+            if isinstance(transaction, dict):
+                try:
+                    transaction["todo_signature"] = hashlib.sha256(
+                        json.dumps(
+                            self._todo_progress_signature(self.todo.snapshot()),
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ).encode("utf-8", "ignore")
+                    ).hexdigest()
+                except Exception:
+                    transaction["todo_signature"] = ""
             try:
                 self._sync_plan_worker_todos_to_blackboard(
                     step_id,
@@ -52681,12 +53631,28 @@ body{padding:18px}
         except Exception:
             return ""
 
-    def _merge_owner_scoped_todo_items(self, items: list[dict], role: str = "") -> str:
+    def _merge_owner_scoped_todo_items(
+        self,
+        items: list[dict],
+        role: str = "",
+        *,
+        update_mode: str = "status_update",
+        revision_reason: str = "",
+        revision_evidence: object = None,
+        transaction: dict | None = None,
+    ) -> str:
         if not isinstance(items, list):
             raise ValueError("items must be array")
         role_key = self._sanitize_agent_role(role)
         if role_key not in {"developer", "explorer", "reviewer"}:
-            return self.todo.update(items)
+            return self._merge_flat_todo_items(
+                items,
+                role=role_key,
+                update_mode=update_mode,
+                revision_reason=revision_reason,
+                revision_evidence=revision_evidence,
+                transaction=transaction,
+            )
         existing = self.todo.snapshot()
         preserved: list[dict] = []
         existing_owner_rows: list[dict] = []
@@ -52702,65 +53668,16 @@ body{padding:18px}
                 existing_owner_rows.append(dict(row))
                 continue
             preserved.append(dict(row))
-        normalized: list[dict] = []
-        for idx, item in enumerate(items):
-            row = self._normalize_generic_todo_row(item, owner=role_key)
-            if not row:
-                continue
-            if str(row.get("key", "") or "").startswith("bb:"):
-                normalized.append(row)
-                continue
-            row["owner"] = role_key
-            normalized.append(row)
-        if not normalized:
-            return self.todo.update(preserved + existing_owner_rows)
-
-        def identity(row: dict) -> str:
-            return self._flat_todo_identity(row)
-
-        existing_by_id = {identity(row): row for row in existing_owner_rows if identity(row)}
-        merged: list[dict] = []
-        used: set[str] = set()
-        for incoming in normalized:
-            incoming_id = identity(incoming)
-            prior_id = incoming_id if incoming_id in existing_by_id else ""
-            prior = existing_by_id.get(prior_id) if prior_id else None
-            if prior is None:
-                scored = []
-                for candidate_id, candidate in existing_by_id.items():
-                    if candidate_id in used:
-                        continue
-                    score = self._plan_worker_todo_match_score(incoming, candidate)
-                    if score >= 0.64:
-                        scored.append((score, candidate_id, candidate))
-                scored.sort(key=lambda value: value[0], reverse=True)
-                if scored and (scored[0][0] >= 0.86 or len(scored) == 1 or scored[0][0] - scored[1][0] >= 0.08):
-                    _score, prior_id, prior = scored[0]
-            if isinstance(prior, dict):
-                used.add(prior_id)
-                merged_row = dict(prior)
-                prior_status = self._normalize_todo_status_value(prior.get("status", ""), "pending")
-                incoming_status = self._normalize_todo_status_value(incoming.get("status", ""), prior_status)
-                if prior_status == "completed" and incoming_status != "completed":
-                    incoming_status = "completed"
-                merged_row.update(incoming)
-                merged_row["status"] = incoming_status
-                merged_row["owner"] = role_key
-                if prior_status == "completed":
-                    for key in ("completed_at", "completed_by", "evidence", "evidence_ids", "evidence_binding"):
-                        if merged_row.get(key) in (None, "", []):
-                            if prior.get(key) not in (None, "", []):
-                                merged_row[key] = prior.get(key)
-                merged.append(merged_row)
-            else:
-                incoming["owner"] = role_key
-                merged.append(incoming)
-        # A worker often sends only the row that changed. Keep untouched rows in
-        # sync mode so a handoff cannot erase another completed/current row.
-        for candidate_id, candidate in existing_by_id.items():
-            if candidate_id not in used:
-                merged.append(dict(candidate))
-        return self.todo.update(preserved + merged)
+        return self._merge_root_todo_scope(
+            items,
+            role=role_key,
+            existing_scope=existing_owner_rows,
+            preserved_rows=preserved,
+            update_mode=update_mode,
+            revision_reason=revision_reason,
+            revision_evidence=revision_evidence,
+            transaction=transaction,
+        )
 
     def _append_instruction_bubble(self, content: str, *, target_roles: tuple[str, ...] = (), summary: str = "") -> bool:
         text = trim(str(content or "").strip(), PLAN_NOTICE_BODY_MAX_CHARS)
@@ -61626,7 +62543,22 @@ body{padding:18px}
             health_line = mgr.health_line()
         except Exception:
             health_line = ""
+        try:
+            approval_pending = [
+                str(row.get("name", "") or "")
+                for row in mgr.status()
+                if str(row.get("state", "") or "") == "approval_required"
+            ]
+        except Exception:
+            approval_pending = []
         if not names:
+            if approval_pending:
+                return (
+                    "External MCP tools are configured but intentionally inactive pending an administrator's "
+                    f"workspace-command approval: {', '.join(approval_pending)}. Do not retry, restart, or search "
+                    "the filesystem. The administrator must review the resolved command, config digest, environment "
+                    "keys, and referenced files on the MCP service page before these tools can become available."
+                )
             # No external MCP tools READY. If servers are configured but down,
             # say so (with health) instead of claiming none exist; otherwise the
             # plain grounding line. Either way: answer from the tool list, never
@@ -62917,6 +63849,13 @@ body{padding:18px}
         key = trim(str(raw.get("key", "") or "").strip(), 120)
         if key:
             row["key"] = key
+        # Explicit stage IDs from no-plan/L2 Todo lists are stable root-row
+        # identities, not approved-plan parent links. Preserve them as an
+        # external identity so abbreviated status snapshots still match the
+        # original detailed objective without being routed as plan subtasks.
+        root_stage_id = trim(str(raw.get("parent_step_id", raw.get("parentStepId", "")) or "").strip(), 120)
+        if root_stage_id and not root_stage_id.startswith("bb:"):
+            row["external_subtask_id"] = root_stage_id
         for alias_key in (
             "external_subtask_id", "externalSubtaskId", "external_id", "externalId",
             "todo_id", "todoId", "task_id", "taskId", "item_id", "itemId",
@@ -63006,8 +63945,22 @@ body{padding:18px}
                 transaction=transaction,
             )
         if route_kind == "pure_sync":
-            return self._merge_owner_scoped_todo_items(normalized_items, role=role_key)
-        return self._merge_flat_todo_items(normalized_items, role=role_key)
+            return self._merge_owner_scoped_todo_items(
+                normalized_items,
+                role=role_key,
+                update_mode=mode,
+                revision_reason=reason,
+                revision_evidence=revision_evidence,
+                transaction=transaction,
+            )
+        return self._merge_flat_todo_items(
+            normalized_items,
+            role=role_key,
+            update_mode=mode,
+            revision_reason=reason,
+            revision_evidence=revision_evidence,
+            transaction=transaction,
+        )
 
     def _todo_progress_signature(self, rows: list[dict] | None = None) -> list[tuple[str, str, str, str]]:
         items = rows if isinstance(rows, list) else self.todo.snapshot()
@@ -96626,7 +97579,7 @@ IDE_JS = r"""
 const E=id=>document.getElementById(id);
 class ApiError extends Error{constructor(message,status,code,data){super(message);this.status=status;this.code=code||'';this.data=data||{}}}
 const S={
-  csrf:'',config:null,account:null,capabilities:{},sessions:[],roots:[],activeSession:'',activeRoot:'session',
+  csrf:'',config:null,account:null,capabilities:{},sessions:[],roots:[],activeSession:'',activeRoot:'session',autoLogin:false,authRefreshPromise:null,
   treeCache:new Map(),openFiles:new Map(),activeByGroup:['',''],activeGroup:0,monaco:null,editors:[],diffEditors:[],models:new Map(),historyOriginalModels:new Map(),historyDecorations:new Map(),viewStates:new Map(),suppressEditorChange:false,codeHistoryMode:'all',
   activeView:'explorer',panel:'terminal',primaryVisible:true,secondaryVisible:true,panelVisible:true,panelMaximized:false,
   diagnostics:[],searchResults:[],scm:null,tasks:[],installedExtensions:[],extensionWorkers:new Map(),
@@ -96638,15 +97591,32 @@ const HTML_ESCAPE={'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'};
 const escapeHtml=value=>String(value??'').replace(/[&<>"']/g,ch=>HTML_ESCAPE[ch]);
 const qs=value=>encodeURIComponent(String(value??''));
 const isWrite=method=>!['GET','HEAD','OPTIONS'].includes(String(method||'GET').toUpperCase());
-async function api(path,opts={}){
+const isIDEAuthPath=path=>String(path||'').startsWith('/api/ide/v2/auth/');
+async function refreshAutomaticAuth(){
+  if(!S.autoLogin)throw new ApiError('Automatic IDE sign-in is disabled.',401,'authentication_required',{});
+  if(S.authRefreshPromise)return S.authRefreshPromise;
+  S.authRefreshPromise=(async()=>{
+    const out=await api('/api/ide/v2/auth/local',{method:'POST',body:'{}'},false);
+    S.account=out.account||S.account;S.capabilities=out.capabilities||S.capabilities;S.csrf=out.csrf_token||'';
+    return out;
+  })().finally(()=>{S.authRefreshPromise=null});
+  return S.authRefreshPromise;
+}
+async function api(path,opts={},allowAuthRetry=true){
   const method=String(opts.method||'GET').toUpperCase();
   const headers=Object.assign({},opts.headers||{});
   if(opts.body!=null&&!headers['Content-Type'])headers['Content-Type']='application/json';
   if(isWrite(method)&&S.csrf)headers['X-CSRF-Token']=S.csrf;
-  const res=await fetch(path,Object.assign({credentials:'same-origin',headers},opts));
+  const res=await fetch(path,Object.assign({},opts,{credentials:'same-origin',headers}));
   const text=await res.text();let data={};
   try{data=text?JSON.parse(text):{}}catch{data={error:text||res.statusText}}
-  if(!res.ok)throw new ApiError(data.error||res.statusText,res.status,data.code,data);
+  if(!res.ok){
+    if(res.status===401&&allowAuthRetry&&S.autoLogin&&!isIDEAuthPath(path)){
+      await refreshAutomaticAuth();
+      return api(path,opts,false);
+    }
+    throw new ApiError(data.error||res.statusText,res.status,data.code,data);
+  }
   return data;
 }
 function setStatus(message,tone=''){E('statusMessage').textContent=String(message||'Ready');E('statusMessage').dataset.tone=tone}
@@ -96879,9 +97849,9 @@ async function newTerminal(cwd=''){if(S.terminalStarting)return S.terminalPromis
 function setupTerminalWidget(){E('terminalHost').innerHTML='';E('terminalEmpty').classList.add('is-hidden');if(window.Terminal){S.terminalWidget=new window.Terminal({convertEol:true,cursorBlink:true,fontSize:12,fontFamily:'SFMono-Regular, Menlo, Monaco, Consolas, monospace',theme:{background:'#181818',foreground:'#cccccc',cursor:'#ffffff',selectionBackground:'#264f78'},scrollback:5000});const Fit=window.FitAddon?.FitAddon;if(Fit){S.terminalFit=new Fit();S.terminalWidget.loadAddon(S.terminalFit)}S.terminalWidget.open(E('terminalHost'));if(S.terminalFit)S.terminalFit.fit();S.terminalWidget.onData(data=>terminalInput(data));if(S.terminalWidget.onResize)S.terminalWidget.onResize(size=>terminalResize(size.cols,size.rows));E('terminalFallback').classList.remove('is-active')}else{const fallback=E('terminalFallback');fallback.classList.add('is-active');fallback.contentEditable='true';fallback.setAttribute('role','textbox');fallback.setAttribute('aria-label','Terminal compatibility renderer');fallback.onkeydown=event=>{if(event.key.length===1){event.preventDefault();terminalInput(event.key)}else if(event.key==='Enter'){event.preventDefault();terminalInput('\r')}else if(event.key==='Backspace'){event.preventDefault();terminalInput('\x7f')}}}}
 async function terminalInput(data){if(!S.terminal)return;try{await api(`/api/ide/v2/terminals/${qs(S.terminal.id)}/input`,{method:'POST',body:JSON.stringify({data})})}catch(error){logOutput(error.message)}}
 async function terminalResize(cols,rows){if(!S.terminal)return;try{await api(`/api/ide/v2/terminals/${qs(S.terminal.id)}/resize`,{method:'POST',body:JSON.stringify({cols,rows})})}catch(error){logOutput(error.message)}}
-async function pollTerminal(){clearTimeout(S.terminalPoll);if(!S.terminal)return;try{const out=await api(`/api/ide/v2/terminals/${qs(S.terminal.id)}/output?offset=${S.terminalOffset}`);S.terminalOffset=out.next_offset??S.terminalOffset;if(out.reset){S.terminalAnsiState={pending:''};S.terminalPlainState=createTerminalTextState();if(S.terminalWidget)S.terminalWidget.reset()}const data=decodeTerminalPayload(out);if(data){const plain=stripTerminalControlChunk(data,S.terminalAnsiState,false);if(plain)logOutputChunk(plain.replace(/\r(?!\n)/g,'\n').replace(/\x08/g,''));if(S.terminalWidget)S.terminalWidget.write(data);else appendTerminalPlainText(E('terminalFallback'),plain)}if(out.closed){const tail=stripTerminalControlChunk('',S.terminalAnsiState,true);if(tail&&!S.terminalWidget)appendTerminalPlainText(E('terminalFallback'),tail);setStatus(`Terminal exited with code ${out.returncode}`);logOutput(`Process exited with code ${out.returncode}`);S.terminal=null;await refreshWorkspaceSnapshot();return}}catch(error){logOutput(`Terminal: ${error.message}`);return}S.terminalPoll=setTimeout(pollTerminal,220)}
+async function pollTerminal(){clearTimeout(S.terminalPoll);if(!S.terminal)return;try{const out=await api(`/api/ide/v2/terminals/${qs(S.terminal.id)}/output?offset=${S.terminalOffset}`);S.terminalOffset=out.next_offset??S.terminalOffset;if(out.reset){S.terminalAnsiState={pending:''};S.terminalPlainState=createTerminalTextState();if(S.terminalWidget)S.terminalWidget.reset()}const data=decodeTerminalPayload(out);if(data){const plain=stripTerminalControlChunk(data,S.terminalAnsiState,false);if(plain)logOutputChunk(plain.replace(/\r(?!\n)/g,'\n').replace(/\x08/g,''));if(S.terminalWidget)S.terminalWidget.write(data);else appendTerminalPlainText(E('terminalFallback'),plain)}if(out.closed){const tail=stripTerminalControlChunk('',S.terminalAnsiState,true);if(tail&&!S.terminalWidget)appendTerminalPlainText(E('terminalFallback'),tail);setStatus(`Terminal exited with code ${out.returncode}`);logOutput(`Process exited with code ${out.returncode}`);S.terminal=null;await refreshWorkspaceSnapshot();return}}catch(error){logOutput(`Terminal: ${error.message}`)}if(S.terminal)S.terminalPoll=setTimeout(pollTerminal,220)}
 async function killTerminal(){if(!S.terminal)return;const current=S.terminal;S.terminal=null;clearTimeout(S.terminalPoll);try{await api(`/api/ide/v2/terminals/${qs(current.id)}`,{method:'DELETE',body:'{}'})}catch(error){logOutput(error.message)}if(S.terminalWidget){S.terminalWidget.dispose();S.terminalWidget=null}S.terminalDecoder=null;S.terminalAnsiState=null;S.terminalPlainState=null;E('terminalHost').innerHTML='';E('terminalFallback').classList.remove('is-active');E('terminalEmpty').textContent='No active terminal.';E('terminalEmpty').classList.remove('is-hidden')}
-async function runActiveFile(){const file=activeFile();if(!file)return toast('Open a file to run.','warning');if(file.binary)return toast('This artifact is not executable.','warning');if(file.dirty)await saveFile(file);const lang=languageFor(file.path),python=/^win/i.test(String(S.config?.platform||''))?'python':'python3',command=lang==='python'?`${python} ${shellQuote(file.name)}`:['javascript','typescript'].includes(lang)?`node ${shellQuote(file.name)}`:`${shellQuote(file.name)}`;logOutput(`> ${command}`);if(S.capabilities.terminal){await newTerminal(file.dir||'.');setTimeout(()=>terminalInput(command+'\r'),300);return}showPanel('output');const out=await api(`/api/ide/sessions/${qs(S.activeSession)}/terminal/run`,{method:'POST',body:JSON.stringify({root_id:file.root_id,cwd:file.dir||'.',command})});if(out.stdout)logOutputChunk(out.stdout);if(out.stderr)logOutputChunk(out.stderr);logOutput(`Process exited with code ${out.returncode}`);await refreshWorkspaceSnapshot()}
+async function runActiveFile(){const file=activeFile();if(!file)return toast('Open a file to run.','warning');if(file.binary)return toast('This artifact is not executable.','warning');if(file.dirty)await saveFile(file);const lang=languageFor(file.path),python=/^win/i.test(String(S.config?.platform||''))?'python':'python3',command=lang==='python'?`${python} ${shellQuote(file.name)}`:['javascript','typescript'].includes(lang)?`node ${shellQuote(file.name)}`:`${shellQuote(file.name)}`;logOutput(`> ${command}`);if(S.panel==='terminal'&&S.capabilities.terminal){await newTerminal(file.dir||'.');setTimeout(()=>terminalInput(command+'\r'),300);return}showPanel('output');const out=await api(`/api/ide/sessions/${qs(S.activeSession)}/terminal/run`,{method:'POST',body:JSON.stringify({root_id:file.root_id,cwd:file.dir||'.',command})});if(out.stdout)logOutputChunk(out.stdout);if(out.stderr)logOutputChunk(out.stderr);logOutput(`Process exited with code ${out.returncode}`);await refreshWorkspaceSnapshot()}
 async function startStandardLibraryDebugger(file){if(!S.capabilities.terminal)throw new Error('Python standard-library debugging requires the interactive terminal capability.');const python=/^win/i.test(String(S.config?.platform||''))?'python':'python3',command=`${python} -m pdb ${shellQuote(file.name)}`;logDebug('debugpy is unavailable. Using the built-in Python pdb compatibility debugger in Terminal.');await newTerminal(file.dir||'.');setTimeout(()=>terminalInput(command+'\r'),300);toast('Using Python pdb compatibility debugger. Install debugpy for full IDE debug-adapter support.','warning',8000)}
 async function debugActiveFile(){const file=activeFile();if(!file||languageFor(file.path)!=='python')return toast('Open a Python file to debug.','warning');if(file.dirty)await saveFile(file);if(S.debug)await stopDebug();showPanel('debug');logDebug(`Starting debugger for ${file.path}...`);let out;try{out=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/debug`,{method:'POST',body:JSON.stringify({root_id:file.root_id})})}catch(error){if(error.code==='debugpy_unavailable'){await startStandardLibraryDebugger(file);return}throw error}S.debug=out.debug;S.debugFile=file;S.debugSeq=1;await sendDebug({seq:S.debugSeq++,type:'request',command:'initialize',arguments:{clientID:'clouds-coder',clientName:'Clouds Coder Program',adapterID:'python',pathFormat:'path',linesStartAt1:true,columnsStartAt1:true,supportsRunInTerminalRequest:false}});pollDebug()}
 async function sendDebug(message){if(!S.debug)return;await api(`/api/ide/v2/debug/${qs(S.debug.id)}/send`,{method:'POST',body:JSON.stringify({message})})}
@@ -97069,9 +98039,9 @@ function deviceKey(){let key=localStorage.getItem('clouds_coder_device_key')||''
 function devicePayload(){return{device_key:deviceKey(),label:[navigator.platform||'Web',navigator.userAgentData?.platform||'',navigator.userAgentData?.mobile?'Mobile':'Browser'].filter(Boolean).join(' / '),fingerprint:[navigator.userAgent||'',navigator.language||'',screen.width+'x'+screen.height].join('|')}}
 async function waitForDevicePairing(){clearTimeout(S.devicePoll);E('authTitle').textContent='Clouds Coder';E('authSubtitle').textContent='Connecting this device to its isolated workspace...';E('authForm').hidden=true;E('authMessage').textContent='';try{const out=await api('/api/ide/v2/auth/device',{method:'POST',body:JSON.stringify(devicePayload())});if(out.account){S.account=out.account;S.capabilities=out.capabilities||{};S.csrf=out.csrf_token||'';E('authGate').classList.add('is-hidden');await startWorkbench();return true}const pairing=out.device?.pairing_id||'';E('authTitle').textContent='Device Access Pending';E('authSubtitle').textContent='This older device record still requires local approval.';E('authMessage').innerHTML=`<div class="pairing-code">${escapeHtml(pairing)}</div><div class="auth-secondary">${escapeHtml(out.device?.label||'Web browser')} / ${escapeHtml(out.device?.source_ip||'')}</div>`;S.devicePoll=setTimeout(waitForDevicePairing,2200)}catch(error){E('authMessage').textContent=error.message}}
 async function authenticate(){
-  let status;try{status=await api('/api/ide/v2/auth/status')}catch(error){E('authMessage').textContent=error.message;return false}
+  let status;try{status=await api('/api/ide/v2/auth/status');S.autoLogin=!!status.local_auto_login}catch(error){E('authMessage').textContent=error.message;return false}
   try{const me=await api('/api/ide/v2/auth/me');S.account=me.account;S.capabilities=me.capabilities||{};S.csrf=me.csrf_token||'';if(S.account?.must_change_password){showPasswordChangeGate();return false}return true}catch(error){if(error.status!==401){E('authMessage').textContent=error.message}}
-  if(status.local_auto_login){try{const out=await api('/api/ide/v2/auth/local',{method:'POST',body:'{}'});S.account=out.account;S.capabilities=out.capabilities||{};S.csrf=out.csrf_token||'';return true}catch(error){E('authMessage').textContent=error.message;return false}}
+  if(status.local_auto_login){try{await refreshAutomaticAuth();return true}catch(error){E('authMessage').textContent=error.message;return false}}
   if(!status.password_login_enabled){waitForDevicePairing();return false}
   const setup=!!status.setup_required;E('authTitle').textContent=setup?'Create IDE Administrator':'Clouds Coder';E('authSubtitle').textContent=setup?'Local setup for Program':'Sign in to Program';E('authSubmit').textContent=setup?'Create Administrator':'Sign in';E('authConfirmLabel').hidden=!setup;E('authConfirm').hidden=!setup;E('authConfirm').required=setup;
   if(setup&&!status.local_setup_allowed){E('authMessage').textContent='The first IDE administrator must be created from localhost.';E('authSubmit').disabled=true}
@@ -97396,16 +98366,24 @@ class AppContext:
             wiki_store=self.code_wiki,
         )
         self.code_source_roots = self._discover_external_code_source_roots()
-        # Global MCP manager (one per app, mounted on agent port + 4). Loaded from the
-        # trusted on-disk config; sessions reference this shared instance so health
-        # and the available tool set are consistent everywhere and hot-swap is seen
-        # at call time. Connection + health monitor start in main() after mount.
+        # Global MCP manager (one per app, mounted on agent port + 4). Workspace
+        # declarations are readable configuration, not execution authority. The
+        # approval store is outside the workspace and binds each spawn to the
+        # workspace/config/command identity checked immediately before Popen.
         self._mcp_config_path = self.workspace / "LLM.config.json"
+        self.mcp_trust_store_path = mcp_default_trust_store_path(self.workspace)
+        self.mcp_trust_store = MCPWorkspaceTrustStore(self.mcp_trust_store_path)
         try:
             _mcp_records = mcp_extract_server_configs(self.default_llm_config)
         except Exception:
             _mcp_records = {}
-        self.mcp = MCPManager(_mcp_records, logger=self._mcp_app_log, config_path=self._mcp_config_path)
+        self.mcp = MCPManager(
+            _mcp_records,
+            logger=self._mcp_app_log,
+            config_path=self._mcp_config_path,
+            workspace=self.workspace,
+            trust_store=self.mcp_trust_store,
+        )
         self.mcp.note_config_loaded()
         self._session_watchdog_stop = threading.Event()
         self._session_watchdog_thread = threading.Thread(
@@ -97489,19 +98467,23 @@ class AppContext:
     def ide_auth_status(self, *, local_setup_allowed: bool) -> dict:
         configured = bool(self.ide_auth.configured())
         setup_required = bool(self.ide_password_login_enabled and not configured)
+        automatic_login = bool(
+            not self.ide_password_login_enabled
+            or (local_setup_allowed and not setup_required)
+        )
         return {
             "setup_required": setup_required,
             "password_login_enabled": bool(self.ide_password_login_enabled),
-            "device_pairing_enabled": True,
+            "device_pairing_enabled": bool(self.ide_password_login_enabled),
             "local_setup_allowed": bool(local_setup_allowed and setup_required),
-            "local_auto_login": bool(local_setup_allowed and not setup_required),
+            "local_auto_login": automatic_login,
             "setup_local_only": True,
             "lan_https_required": False,
             "session_ttl_seconds": IDE_AUTH_SESSION_TTL_SECONDS,
         }
 
     def local_ide_login(self, *, local_allowed: bool, client_ip: str) -> dict:
-        if not local_allowed:
+        if not local_allowed and self.ide_password_login_enabled:
             raise IDEAuthError("loopback_required", "Local IDE sign-in requires an actual loopback connection.", 403)
         return self.ide_auth.local_session(
             legacy_user_id=user_id_from_ip("127.0.0.1"),
@@ -99862,7 +100844,7 @@ document.addEventListener('DOMContentLoaded', function(){{
         terminal = self._ide_terminal_for_user(user_id, terminal_id)
         text = str(payload.get("data", "") or "")
         if str(terminal.get("mode", "pty")) == "pipe":
-            text = text.replace("\r\n", "\n").replace("\r", "\n")
+            text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
         data = text.encode("utf-8", errors="replace")
         if len(data) > 64_000:
             raise ValueError("terminal input is too large")
@@ -100176,7 +101158,7 @@ document.addEventListener('DOMContentLoaded', function(){{
             debug = self.ide_debug_sessions.get(debug_id)
         if not debug:
             return
-        stream = debug["process"].stdout
+        stream = debug["reader"]
         try:
             while True:
                 headers: dict[str, str] = {}
@@ -100205,6 +101187,131 @@ document.addEventListener('DOMContentLoaded', function(){{
             with debug["lock"]:
                 debug["closed"] = True
 
+    @staticmethod
+    def _ide_debug_ephemeral_port() -> int:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            probe.bind(("127.0.0.1", 0))
+            return int(probe.getsockname()[1])
+        finally:
+            probe.close()
+
+    @staticmethod
+    def _ide_debug_stop_process(process: subprocess.Popen) -> None:
+        if process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+
+    @staticmethod
+    def _ide_debug_process_error(process: subprocess.Popen) -> str:
+        if process.poll() is None or process.stderr is None:
+            return ""
+        try:
+            raw = process.stderr.read(32_000)
+        except Exception:
+            return ""
+        if isinstance(raw, bytes):
+            return raw.decode("utf-8", errors="replace").strip()
+        return str(raw or "").strip()
+
+    def _ide_debug_start_adapter(
+        self,
+        *,
+        root: Path,
+        prefix: list[str],
+        process_env: dict,
+    ) -> tuple[subprocess.Popen, socket.socket, object, int]:
+        last_error = "debug adapter did not start"
+        for _attempt in range(IDE_DEBUG_ADAPTER_START_ATTEMPTS):
+            port = self._ide_debug_ephemeral_port()
+            containerized = bool(
+                prefix
+                and Path(str(prefix[0])).name.lower() in {"docker", "podman"}
+                and len(prefix) > 1
+            )
+            adapter_host = "0.0.0.0" if containerized else "127.0.0.1"
+            adapter_python = "python3" if containerized else sys.executable
+            process_command = [
+                adapter_python,
+                "-m",
+                "debugpy.adapter",
+                "--host",
+                adapter_host,
+                "--port",
+                str(port),
+            ]
+            launch_prefix = prefix
+            if containerized:
+                launch_prefix = [
+                    *prefix[:-1],
+                    "--publish",
+                    f"127.0.0.1:{port}:{port}",
+                    prefix[-1],
+                ]
+            process_kwargs = {
+                "stdin": subprocess.DEVNULL,
+                "stdout": subprocess.DEVNULL,
+                "stderr": subprocess.PIPE,
+                "bufsize": 0,
+            }
+            try:
+                if _is_windows_job_sandbox_prefix(prefix):
+                    process = _popen_windows_sandboxed(
+                        process_command,
+                        workspace_root=root,
+                        cwd=root,
+                        env=process_env,
+                        **process_kwargs,
+                    )
+                else:
+                    process = subprocess.Popen(
+                        [*launch_prefix, *process_command],
+                        cwd=str(root),
+                        env=process_env,
+                        **process_kwargs,
+                    )
+            except Exception as exc:
+                last_error = str(exc)
+                continue
+
+            deadline = time.monotonic() + IDE_DEBUG_ADAPTER_START_TIMEOUT_SECONDS
+            while process.poll() is None and time.monotonic() < deadline:
+                transport: socket.socket | None = None
+                try:
+                    transport = socket.create_connection(("127.0.0.1", port), timeout=0.25)
+                    transport.settimeout(None)
+                    reader = transport.makefile("rb")
+                    return process, transport, reader, port
+                except OSError as exc:
+                    if transport is not None:
+                        transport.close()
+                    last_error = str(exc)
+                    time.sleep(0.05)
+                except Exception as exc:
+                    last_error = str(exc)
+                    if transport is not None:
+                        transport.close()
+                    break
+
+            self._ide_debug_stop_process(process)
+            adapter_error = self._ide_debug_process_error(process)
+            if adapter_error:
+                last_error = adapter_error
+
+        raise IDECapabilityError(
+            "debug_adapter_start_failed",
+            f"debugpy adapter failed to start on loopback: {last_error}",
+            502,
+        )
+
     def ide_debug_create(self, user_id: str, session_id: str, payload: dict, *, remote: bool = False) -> dict:
         if importlib.util.find_spec("debugpy") is None:
             raise IDECapabilityError("debugpy_unavailable", "debugpy is not installed.", 501)
@@ -100212,29 +101319,12 @@ document.addEventListener('DOMContentLoaded', function(){{
         root, _, meta = self.ide_resolve_workspace(user_id, session_id, root_id, ".")
         sess = self._ide_session(user_id, session_id)
         prefix = self._ide_process_prefix(sess, remote=remote, cwd=root, feature="debug")
-        process_command = [sys.executable, "-m", "debugpy.adapter"]
-        process_kwargs = {
-            "stdin": subprocess.PIPE,
-            "stdout": subprocess.PIPE,
-            "stderr": subprocess.PIPE,
-            "bufsize": 0,
-        }
         process_env = sess._shell_process_env()
-        if _is_windows_job_sandbox_prefix(prefix):
-            process = _popen_windows_sandboxed(
-                process_command,
-                workspace_root=root,
-                cwd=root,
-                env=process_env,
-                **process_kwargs,
-            )
-        else:
-            process = subprocess.Popen(
-                [*prefix, *process_command],
-                cwd=str(root),
-                env=process_env,
-                **process_kwargs,
-            )
+        process, transport, reader, adapter_port = self._ide_debug_start_adapter(
+            root=root,
+            prefix=prefix,
+            process_env=process_env,
+        )
         debug_id = "debug_" + uuid.uuid4().hex[:20]
         debug = {
             "id": debug_id,
@@ -100243,6 +101333,9 @@ document.addEventListener('DOMContentLoaded', function(){{
             "root_id": root_id,
             "root": root,
             "process": process,
+            "transport": transport,
+            "reader": reader,
+            "adapter_port": adapter_port,
             "messages": deque(),
             "next_index": 0,
             "closed": False,
@@ -100273,9 +101366,11 @@ document.addEventListener('DOMContentLoaded', function(){{
         with debug["lock"]:
             if debug["closed"] or debug["process"].poll() is not None:
                 raise ValueError("debug session is closed")
-            stream = debug["process"].stdin
-            stream.write(f"Content-Length: {len(raw)}\r\n\r\n".encode("ascii") + raw)
-            stream.flush()
+            try:
+                debug["transport"].sendall(f"Content-Length: {len(raw)}\r\n\r\n".encode("ascii") + raw)
+            except OSError as exc:
+                debug["closed"] = True
+                raise ValueError(f"debug transport is closed: {exc}") from exc
             debug["last_activity"] = now_ts()
         return {"ok": True}
 
@@ -100295,14 +101390,23 @@ document.addEventListener('DOMContentLoaded', function(){{
     def ide_debug_close(self, user_id: str, debug_id: str) -> dict:
         debug = self._ide_debug_for_user(user_id, debug_id)
         process = debug["process"]
-        if process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                process.kill()
         with debug["lock"]:
             debug["closed"] = True
+            transport = debug["transport"]
+            reader = debug["reader"]
+        try:
+            transport.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            reader.close()
+        except Exception:
+            pass
+        try:
+            transport.close()
+        except OSError:
+            pass
+        self._ide_debug_stop_process(process)
         return {"ok": True, "debug_id": debug_id}
 
     def ide_run_command(self, user_id: str, session_id: str, payload: dict, *, remote: bool = False) -> dict:
@@ -109529,10 +110633,10 @@ class McpServiceHandler(BaseHTTPRequestHandler):
     """HTTP control/health surface for the global MCP manager (ide_port+1).
 
     Read endpoints (GET): / (status HTML), /mcp/health, /mcp/tools, /mcp/status.
-    Control endpoints (POST): /mcp/reload (re-read trusted on-disk config and
-    hot-swap), /mcp/restart {server}, /mcp/call {name, arguments} (invoke an
-    already-registered mcp__ tool). No inline server specs are accepted, so the
-    service never spawns a process from request data — only from on-disk config.
+    Admin endpoints expose pending workspace-command approvals and accept an
+    explicit approve/revoke decision bound to the displayed config digest and
+    effective-command fingerprint. Reload, restart and crash recovery all pass
+    through the same pre-spawn authorization gate.
     """
     protocol_version = "HTTP/1.1"
     server_version = f"CloudsCoderMCP/{APP_VERSION}"
@@ -109621,14 +110725,42 @@ class McpServiceHandler(BaseHTTPRequestHandler):
             "<!doctype html><html><head><meta charset='utf-8'><title>MCP Service</title>"
             "<style>body{font:14px system-ui;margin:24px;background:#0b0e14;color:#cdd6f4}"
             "table{border-collapse:collapse;width:100%}td,th{border:1px solid #313244;padding:6px 10px;text-align:left}"
-            "th{background:#181825}code{color:#89b4fa}</style></head><body>"
+            "th{background:#181825}code{color:#89b4fa}input,button{font:inherit;padding:6px 9px;margin:4px 4px 4px 0}"
+            "button{cursor:pointer}article{border:1px solid #313244;padding:10px;margin:10px 0}pre{white-space:pre-wrap;overflow-wrap:anywhere}"
+            ".ok{color:#a6e3a1}.warn{color:#f9e2af}.err{color:#f38ba8}</style></head><body>"
             f"<h2>Clouds_Coder MCP Service</h2>"
             f"<p>ready <b>{h.get('ready',0)}/{h.get('total',0)}</b> · tools <b>{h.get('tool_count',0)}</b> · "
             f"monitor {'on' if h.get('monitor') else 'off'}</p>"
             "<table><tr><th>server</th><th>state</th><th>alive</th><th>tools</th><th>error</th></tr>"
             f"{body}</table>"
+            "<h3>Workspace command approvals</h3>"
+            "<p>Review the exact resolved command before allowing a workspace MCP declaration to run.</p>"
+            "<label>Admin token <input id='admin-token' type='password' autocomplete='off'></label>"
+            "<button id='review-approvals' type='button'>Review approvals</button>"
+            "<div id='approval-error' class='err' role='alert'></div><div id='approval-list'></div>"
             "<p style='color:#6c7086'>GET /mcp/health · /mcp/tools · /mcp/status — "
-            "POST /mcp/reload · /mcp/restart · /mcp/call</p>"
+            "POST /mcp/trust · /mcp/reload · /mcp/restart · /mcp/call</p>"
+            "<script>"
+            "const token=()=>document.getElementById('admin-token').value.trim();"
+            "async function api(path,options={}){const headers=Object.assign({'X-Admin-Token':token()},options.headers||{});"
+            "if(options.body)headers['Content-Type']='application/json';const response=await fetch(path,Object.assign({},options,{headers}));"
+            "const data=await response.json();if(!response.ok)throw new Error(data.error||('HTTP '+response.status));return data;}"
+            "function addLine(pre,label,value){pre.textContent+=label+': '+value+'\\n';}"
+            "async function loadApprovals(){const error=document.getElementById('approval-error'),host=document.getElementById('approval-list');"
+            "error.textContent='';host.replaceChildren();try{const data=await api('/mcp/approvals');"
+            "for(const row of data.approvals||[]){const card=document.createElement('article'),title=document.createElement('strong');"
+            "title.textContent=row.server+' - '+(row.approved?'approved':'approval required');title.className=row.approved?'ok':'warn';"
+            "const pre=document.createElement('pre');addLine(pre,'Command',[row.resolved_command||row.command,...(row.args||[])].join(' '));"
+            "addLine(pre,'Working directory',row.cwd||'-');addLine(pre,'Environment keys',(row.env_keys||[]).join(', ')||'-');"
+            "addLine(pre,'Config digest',row.config_digest||'-');addLine(pre,'Command fingerprint',row.fingerprint||'-');"
+            "for(const file of row.referenced_files||[])addLine(pre,'Referenced file',file.path+' sha256='+file.sha256);"
+            "addLine(pre,'Decision',row.reason||'-');const button=document.createElement('button');button.type='button';"
+            "button.textContent=row.approved?'Revoke':'Approve exact command';button.onclick=async()=>{button.disabled=true;try{"
+            "await api('/mcp/trust',{method:'POST',body:JSON.stringify({server:row.server,decision:row.approved?'revoke':'approve',"
+            "config_digest:row.config_digest,fingerprint:row.fingerprint})});await loadApprovals();}catch(err){error.textContent=err.message;}finally{button.disabled=false;}};"
+            "card.append(title,pre,button);host.append(card);}}catch(err){error.textContent=err.message;}}"
+            "document.getElementById('review-approvals').addEventListener('click',loadApprovals);"
+            "</script>"
             "</body></html>"
         )
 
@@ -109650,6 +110782,14 @@ class McpServiceHandler(BaseHTTPRequestHandler):
             })
         if path == "/mcp/status":
             return self._send_json({"servers": mgr.status()})
+        if path == "/mcp/approvals":
+            if not self._require_admin_write():
+                return
+            return self._send_json({
+                "workspace": str(getattr(mgr, "_workspace", "") or ""),
+                "config_path": str(getattr(mgr, "_config_path", "") or ""),
+                "approvals": mgr.approval_requests(),
+            })
         return self._send_json({"error": "not found"}, status=404)
 
     def do_POST(self):
@@ -109664,7 +110804,8 @@ class McpServiceHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             return self._send_json({"error": f"bad json: {exc}"}, status=400)
         if path == "/mcp/reload":
-            # Hot-swap from TRUSTED on-disk config only (never inline specs).
+            # Inline process specs are never accepted. Workspace declarations
+            # still require a matching user-private approval before spawn.
             cfg_path = getattr(mgr, "_config_path", "") or ""
             cfg = {}
             if cfg_path:
@@ -109672,6 +110813,22 @@ class McpServiceHandler(BaseHTTPRequestHandler):
             diff = mgr.reload_from_config(cfg)
             mgr.note_config_loaded()
             return self._send_json(diff)
+        if path == "/mcp/trust":
+            server = str(payload.get("server", "") or "").strip()
+            decision = str(payload.get("decision", "approve") or "approve").strip().lower()
+            if not server:
+                return self._send_json({"error": "server is required"}, status=400)
+            if decision == "approve":
+                result = mgr.approve_server(
+                    server,
+                    expected_config_digest=str(payload.get("config_digest", "") or ""),
+                    expected_fingerprint=str(payload.get("fingerprint", "") or ""),
+                )
+            elif decision == "revoke":
+                result = mgr.revoke_server_approval(server)
+            else:
+                return self._send_json({"error": "decision must be approve or revoke"}, status=400)
+            return self._send_json(result, status=200 if result.get("ok") else 409)
         if path == "/mcp/restart":
             server = str(payload.get("server", "") or "").strip()
             if not server:
@@ -111144,6 +112301,7 @@ def main():
         print(f"[web-agent] llm_config={LLM_CONFIG_PATH}")
     else:
         print("[web-agent] llm_config missing; you can upload LLM.config.json in WebUI")
+    print(f"[web-agent] mcp_trust_store={getattr(app, 'mcp_trust_store_path', '')}")
     if external_default_provider and external_default_provider != "ollama":
         print(
             "[web-agent] default profile="
