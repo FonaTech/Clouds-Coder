@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=816 original-lines=16485-16550 hash=e3208bbabbb43929
+# split-source: order=816 original-lines=16486-16551 hash=e3208bbabbb43929
 
 class MessageBus:
     def __init__(self, inbox_dir: Path, crypto: CryptoBox):

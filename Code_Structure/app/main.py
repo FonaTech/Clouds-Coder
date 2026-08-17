@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=967 original-lines=110936-112600 hash=69f0287be280dd3c
+# split-source: order=967 original-lines=110937-112601 hash=69f0287be280dd3c
 
 
 # 第九层：进程入口与服务启动。
@@ -1672,7 +1672,7 @@ def main():
             error_path=app.admin_restart_error_path,
         )
 
-# split-source: order=968 original-lines=112601-112603 hash=032e6922518465de
+# split-source: order=968 original-lines=112602-112604 hash=032e6922518465de
 
 if __name__ == "__main__":
     main()

@@ -5,41 +5,41 @@
 
 from __future__ import annotations
 
-# split-source: order=66 original-lines=84-84 hash=ba75d7debc8faf30
+# split-source: order=66 original-lines=85-85 hash=ba75d7debc8faf30
 ADMIN_STATE_DIRNAME = ".clouds_coder_admin"
 
-# split-source: order=67 original-lines=85-85 hash=a7fc266725f53e4c
+# split-source: order=67 original-lines=86-86 hash=a7fc266725f53e4c
 ADMIN_CONFIG_FILENAME = "startup_config.json"
 
-# split-source: order=68 original-lines=86-86 hash=de32f15d9bd5d6fc
+# split-source: order=68 original-lines=87-87 hash=de32f15d9bd5d6fc
 ADMIN_APPS_FILENAME = "shared_apps.json"
 
-# split-source: order=69 original-lines=87-87 hash=43a96d0e5164b2d4
+# split-source: order=69 original-lines=88-88 hash=43a96d0e5164b2d4
 ADMIN_TELEMETRY_FILENAME = "telemetry.sqlite"
 
-# split-source: order=70 original-lines=88-88 hash=df177de1f99d6676
+# split-source: order=70 original-lines=89-89 hash=df177de1f99d6676
 ADMIN_AUTH_FILENAME = "auth.sqlite"
 
-# split-source: order=80 original-lines=135-135 hash=def27da409b9ad7d
+# split-source: order=80 original-lines=136-136 hash=def27da409b9ad7d
 ADMIN_MAX_APP_SKILLS = 8
 
-# split-source: order=81 original-lines=136-136 hash=de3edd9e47c1fd02
+# split-source: order=81 original-lines=137-137 hash=de3edd9e47c1fd02
 ADMIN_MAX_APP_CAPSULE_CHARS = 12_000
 
-# split-source: order=82 original-lines=137-137 hash=e166449a5f670908
+# split-source: order=82 original-lines=138-138 hash=e166449a5f670908
 ADMIN_MAX_APP_RESOURCE_FILES = 128
 
-# split-source: order=83 original-lines=138-138 hash=3c0c67698e4d1dd4
+# split-source: order=83 original-lines=139-139 hash=3c0c67698e4d1dd4
 ADMIN_MAX_APP_RESOURCE_BYTES = 64_000_000
 
-# split-source: order=84 original-lines=139-139 hash=d7b3d490cabf04c5
+# split-source: order=84 original-lines=140-140 hash=d7b3d490cabf04c5
 ADMIN_APP_INLINE_BLOB_BYTES = 256_000
 
-# split-source: order=85 original-lines=140-140 hash=2269cfe84a5c17ac
+# split-source: order=85 original-lines=141-141 hash=2269cfe84a5c17ac
 ADMIN_AUTH_SESSION_TTL_SECONDS = 12 * 60 * 60
 
-# split-source: order=86 original-lines=141-141 hash=881b2fd32105454d
+# split-source: order=86 original-lines=142-142 hash=881b2fd32105454d
 ADMIN_AUTH_PASSWORD_ITERATIONS = 600_000
 
-# split-source: order=87 original-lines=142-142 hash=525aa27e7d272210
+# split-source: order=87 original-lines=143-143 hash=525aa27e7d272210
 ADMIN_AUTH_MAX_ACTIVE_SESSIONS = 32

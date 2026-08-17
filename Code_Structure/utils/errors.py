@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=673 original-lines=6669-6672 hash=7837bc958e112591
+# split-source: order=673 original-lines=6670-6673 hash=7837bc958e112591
 
 
 class EmptyActionError(RuntimeError):

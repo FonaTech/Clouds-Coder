@@ -5,14 +5,14 @@
 
 from __future__ import annotations
 
-# split-source: order=575 original-lines=3478-3482 hash=3c6fc91449015a09
+# split-source: order=575 original-lines=3479-3483 hash=3c6fc91449015a09
 
 
 def guess_mime_from_name(name: str, fallback: str = "application/octet-stream") -> str:
     mime, _ = mimetypes.guess_type(str(name or ""))
     return str(mime or fallback)
 
-# split-source: order=576 original-lines=3483-3502 hash=c9712a640fddd6e2
+# split-source: order=576 original-lines=3484-3503 hash=c9712a640fddd6e2
 
 
 def _convert_image_to_safe_format(fp) -> tuple:
@@ -34,7 +34,7 @@ def _convert_image_to_safe_format(fp) -> tuple:
     except Exception:
         return None, "", ""
 
-# split-source: order=577 original-lines=3503-3511 hash=0412fdcc6759d0d3
+# split-source: order=577 original-lines=3504-3512 hash=0412fdcc6759d0d3
 
 
 def guess_ext_from_mime(mime: str, fallback: str = ".bin") -> str:

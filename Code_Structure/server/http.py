@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=958 original-lines=106413-106452 hash=72f9d812840a61ba
+# split-source: order=958 original-lines=106414-106453 hash=72f9d812840a61ba
 
 # ============================================================================
 # Architecture / 架构 / アーキテクチャ
@@ -47,7 +47,7 @@ class AgentHTTPServer(ThreadingHTTPServer):
                 return
             raise
 
-# split-source: order=961 original-lines=107572-108941 hash=3bbfee7bb4b32c5d
+# split-source: order=961 original-lines=107573-108942 hash=3bbfee7bb4b32c5d
 
 
 # Request router: serves chat APIs, admin APIs, SSE streams, asset endpoints,

@@ -407,8 +407,11 @@ class IDEAuthStoreTests(unittest.TestCase):
     def test_local_session_is_passwordless_and_device_ip_change_rebinds_automatically(
         self,
     ):
-        local = self.store.local_session(legacy_user_id=cc.user_id_from_ip("127.0.0.1"))
-        self.assertEqual(local["account"]["username"], "local-admin")
+        local_user_id = cc.user_id_from_ip("127.0.0.1")
+        local = self.store.local_session(legacy_user_id=local_user_id)
+        self.assertEqual(local["account"]["user_id"], local_user_id)
+        self.assertTrue(local["account"]["username"].startswith("local-user_"))
+        self.assertEqual(local["account"]["role"], "user")
         self.assertIsNotNone(
             self.store.verify_session(local["access_token"], "127.0.0.1")
         )
@@ -455,8 +458,70 @@ class IDEAuthStoreTests(unittest.TestCase):
             )
         self.assertEqual(caught.exception.code, "device_revoked")
 
+    def test_local_session_isolated_by_caller_identity(self):
+        first_id = cc.user_id_from_ip("192.168.1.21")
+        second_id = cc.user_id_from_ip("192.168.1.22")
+        first = self.store.local_session(legacy_user_id=first_id, client_ip="192.168.1.21")
+        second = self.store.local_session(legacy_user_id=second_id, client_ip="192.168.1.22")
+
+        self.assertNotEqual(first["account"]["user_id"], second["account"]["user_id"])
+        self.assertNotEqual(first["account"]["username"], second["account"]["username"])
+        self.assertEqual(first["account"]["role"], "user")
+        self.assertEqual(second["account"]["role"], "user")
+        self.assertIsNotNone(self.store.verify_session(first["access_token"], "192.168.1.21"))
+        self.assertIsNone(self.store.verify_session(first["access_token"], "192.168.1.22"))
+
+        same_identity = self.store.local_session(
+            legacy_user_id=first_id,
+            client_ip="192.168.1.21",
+        )
+        self.assertEqual(same_identity["account"]["user_id"], first_id)
+        self.assertNotEqual(same_identity["access_token"], first["access_token"])
+
+    def test_schema_upgrade_revokes_unclassified_legacy_sessions(self):
+        local_user_id = cc.user_id_from_ip("127.0.0.1")
+        local = self.store.local_session(
+            legacy_user_id=local_user_id,
+            client_ip="127.0.0.1",
+        )
+        with sqlite3.connect(str(self.store.path)) as conn:
+            conn.execute("PRAGMA foreign_keys=OFF")
+            conn.execute("ALTER TABLE ide_sessions RENAME TO ide_sessions_current")
+            conn.execute(
+                """CREATE TABLE ide_sessions (
+                    token_digest TEXT PRIMARY KEY, username_key TEXT NOT NULL,
+                    auth_version INTEGER NOT NULL, csrf_token TEXT NOT NULL,
+                    created_at REAL NOT NULL, expires_at REAL NOT NULL,
+                    revoked_at REAL NOT NULL DEFAULT 0, last_ip TEXT NOT NULL DEFAULT '',
+                    device_digest TEXT NOT NULL DEFAULT ''
+                )"""
+            )
+            conn.execute(
+                """INSERT INTO ide_sessions
+                   (token_digest,username_key,auth_version,csrf_token,created_at,expires_at,
+                    revoked_at,last_ip,device_digest)
+                   SELECT token_digest,username_key,auth_version,csrf_token,created_at,expires_at,
+                          revoked_at,last_ip,device_digest FROM ide_sessions_current"""
+            )
+            conn.execute("DROP TABLE ide_sessions_current")
+        upgraded = cc.IDEAuthStore(self.store.path)
+        self.assertIsNone(upgraded.verify_session(local["access_token"], "127.0.0.1"))
+        with sqlite3.connect(str(self.store.path)) as conn:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(ide_sessions)")}
+            active = conn.execute(
+                "SELECT COUNT(*) FROM ide_sessions WHERE revoked_at=0"
+            ).fetchone()[0]
+        self.assertIn("session_kind", columns)
+        self.assertEqual(active, 0)
+
     def test_local_admin_can_set_password_when_optional_login_is_enabled(self):
+        self.store.setup_admin(
+            "local-admin",
+            "Strong-Passphrase-42!",
+            legacy_user_id=cc.user_id_from_ip("127.0.0.1"),
+        )
         local = self.store.local_session(legacy_user_id=cc.user_id_from_ip("127.0.0.1"))
+        self.assertEqual(local["account"]["username"], "local-admin")
         self.store.reset_password("local-admin", "Known-Passphrase-73!")
         self.assertIsNone(self.store.verify_session(local["access_token"], "127.0.0.1"))
         logged_in = self.store.login("local-admin", "Known-Passphrase-73!", "127.0.0.1")
@@ -1782,6 +1847,7 @@ class IDEHTTPAuthTests(unittest.TestCase):
     class FakeApp:
         def __init__(self, root):
             self.ide_auth = cc.IDEAuthStore(root / "auth.sqlite")
+            self.ide_password_login_enabled = True
             self.saved = None
 
         ide_is_loopback_address = staticmethod(cc.AppContext.ide_is_loopback_address)
@@ -1796,9 +1862,16 @@ class IDEHTTPAuthTests(unittest.TestCase):
             return {
                 "setup_required": not self.ide_auth.configured(),
                 "local_setup_allowed": local_setup_allowed,
-                "local_auto_login": False,
-                "password_login_enabled": True,
+                "local_auto_login": not self.ide_password_login_enabled,
+                "password_login_enabled": self.ide_password_login_enabled,
             }
+
+        def local_ide_login(self, *, local_allowed, client_ip):
+            return cc.AppContext.local_ide_login(
+                self,
+                local_allowed=local_allowed,
+                client_ip=client_ip,
+            )
 
         def setup_ide_admin(self, username, password, *, local_setup_allowed):
             if not local_setup_allowed:
@@ -1891,6 +1964,66 @@ class IDEHTTPAuthTests(unittest.TestCase):
         self.assertEqual(saved["state"]["active_view"], "search")
         self.assertEqual(self.app.saved[0], setup["account"]["user_id"])
 
+    def test_local_auto_login_isolates_clients_and_rejects_ip_reuse(self):
+        previous = os.environ.get("CLOUDS_CODER_TRUST_PROXY")
+        os.environ["CLOUDS_CODER_TRUST_PROXY"] = "1"
+        try:
+            self.app.ide_password_login_enabled = False
+
+            def login(ip):
+                status, headers, result = self.request(
+                    "POST",
+                    "/api/ide/v2/auth/local",
+                    {},
+                    {
+                        "Origin": f"http://127.0.0.1:{self.port}",
+                        "X-Forwarded-For": ip,
+                    },
+                )
+                self.assertEqual(status, 200)
+                return headers["Set-Cookie"].split(";", 1)[0], result
+
+            cookie_a, auth_a = login("192.168.1.21")
+            _cookie_b, auth_b = login("192.168.1.22")
+            self.assertNotEqual(auth_a["account"]["user_id"], auth_b["account"]["user_id"])
+            self.assertEqual(auth_a["account"]["role"], "user")
+            self.assertEqual(auth_b["account"]["role"], "user")
+
+            status, _, _ = self.request(
+                "GET",
+                "/api/ide/v2/auth/me",
+                headers={"Cookie": cookie_a, "X-Forwarded-For": "192.168.1.22"},
+            )
+            self.assertEqual(status, 401)
+
+            cookie_same, auth_same = login("192.168.1.21")
+            status, _, error = self.request(
+                "POST",
+                "/api/ide/v2/workbench/state",
+                {"state": {"active_view": "search"}},
+                {
+                    "Cookie": cookie_same,
+                    "Origin": f"http://127.0.0.1:{self.port}",
+                    "X-Forwarded-For": "192.168.1.21",
+                    "X-CSRF-Token": auth_a["csrf_token"],
+                },
+            )
+            self.assertEqual(status, 403)
+            self.assertEqual(error["code"], "csrf_required")
+
+            status, _, current = self.request(
+                "GET",
+                "/api/ide/v2/auth/me",
+                headers={"Cookie": cookie_same, "X-Forwarded-For": "192.168.1.21"},
+            )
+            self.assertEqual(status, 200)
+            self.assertEqual(current["csrf_token"], auth_same["csrf_token"])
+        finally:
+            if previous is None:
+                os.environ.pop("CLOUDS_CODER_TRUST_PROXY", None)
+            else:
+                os.environ["CLOUDS_CODER_TRUST_PROXY"] = previous
+
     def test_plain_http_lan_device_session_is_allowed_and_ip_bound(self):
         previous = os.environ.get("CLOUDS_CODER_TRUST_PROXY")
         os.environ["CLOUDS_CODER_TRUST_PROXY"] = "1"
@@ -1946,6 +2079,13 @@ class IDEHTTPAuthTests(unittest.TestCase):
 
 
 class IDEWorkbenchSourceTests(unittest.TestCase):
+    def test_automatic_auth_is_identity_bound_and_csrf_can_resync(self):
+        self.assertIn("legacy_user_id=user_id_from_ip(client_ip)", inspect.getsource(cc.AppContext.local_ide_login))
+        self.assertIn("session_kind=\"local_auto\"", inspect.getsource(cc.IDEAuthStore.local_session))
+        self.assertIn("if(res.status===403&&data.code==='csrf_required'", cc.IDE_JS)
+        self.assertIn("async function refreshCsrfToken()", cc.IDE_JS)
+        self.assertIn("await refreshCsrfToken();", cc.IDE_JS)
+
     def test_bash_read_loop_intervention_allows_ten_identical_reads(self):
         self.assertEqual(cc.BASH_READ_LOOP_THRESHOLD, 10)
 

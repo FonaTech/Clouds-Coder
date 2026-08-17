@@ -5,10 +5,10 @@
 
 from __future__ import annotations
 
-# split-source: order=65 original-lines=83-83 hash=bc447feb3084cf2f
+# split-source: order=65 original-lines=84-84 hash=bc447feb3084cf2f
 SCRIPT_DIR = Path(__file__).resolve().parent
 
-# split-source: order=90 original-lines=177-182 hash=97094c81404bcef6
+# split-source: order=90 original-lines=178-183 hash=97094c81404bcef6
 
 def _resolve_default_agent_workdir() -> Path:
     raw = str(os.getenv("AGENT_WORKDIR", "") or "").strip()
@@ -16,7 +16,7 @@ def _resolve_default_agent_workdir() -> Path:
         return Path(raw).expanduser().resolve()
     return SCRIPT_DIR
 
-# split-source: order=91 original-lines=183-212 hash=807fc7578605cd9a
+# split-source: order=91 original-lines=184-213 hash=807fc7578605cd9a
 
 def _migrate_legacy_runtime_roots(workspace: Path) -> dict:
     root = Path(workspace).resolve()
@@ -48,17 +48,17 @@ def _migrate_legacy_runtime_roots(workspace: Path) -> dict:
         "errors": errors,
     }
 
-# split-source: order=92 original-lines=213-214 hash=ade2cecdb185f771
+# split-source: order=92 original-lines=214-215 hash=ade2cecdb185f771
 
 WORKDIR = _resolve_default_agent_workdir()
 
-# split-source: order=93 original-lines=215-215 hash=3e4d58d57d1e261b
+# split-source: order=93 original-lines=216-216 hash=3e4d58d57d1e261b
 CODES_ROOT = WORKDIR / "Codes"
 
-# split-source: order=94 original-lines=216-216 hash=29dd970e5b14e924
+# split-source: order=94 original-lines=217-217 hash=29dd970e5b14e924
 LLM_CONFIG_PATH = WORKDIR / "LLM.config.json"
 
-# split-source: order=604 original-lines=3846-3861 hash=eb1a175423f35715
+# split-source: order=604 original-lines=3847-3862 hash=eb1a175423f35715
 
 def detect_repo_root(cwd: Path) -> Path | None:
     try:
@@ -76,6 +76,6 @@ def detect_repo_root(cwd: Path) -> Path | None:
     except Exception:
         return None
 
-# split-source: order=605 original-lines=3862-3863 hash=abb03f0e9fd37533
+# split-source: order=605 original-lines=3863-3864 hash=abb03f0e9fd37533
 
 REPO_ROOT = detect_repo_root(WORKDIR) or WORKDIR

@@ -22,9 +22,7 @@ class FakeOllama:
             else {
                 "decision": "reject",
                 "confidence": "high",
-                "reason": (
-                    "The proposal has not demonstrated complete requirement coverage."
-                ),
+                "reason": "The proposal has not demonstrated complete requirement coverage.",
                 "removed_objectives": [],
                 "replacement_mapping": [],
                 "requirement_coverage": [],
@@ -50,9 +48,8 @@ class TodoTreeRevisionGuardTests(unittest.TestCase):
         session.runtime_plan_mode_needed = False
         session.runtime_reclassify_required = False
         session.runtime_authoritative_goal = (
-            "Build all ten ordered stages of the offline city game, including "
-            "terrain, roads, zoning, buildings, utilities, traffic, management, "
-            "save/load, and final acceptance."
+            "Build all ten ordered stages of the offline city game, including terrain, roads, "
+            "zoning, buildings, utilities, traffic, management, save/load, and final acceptance."
         )
         session.run_generation = 1
         session.messages = []
@@ -68,6 +65,77 @@ class TodoTreeRevisionGuardTests(unittest.TestCase):
         bind(session, "_emit", lambda self, *args, **kwargs: None)
         bind(session, "_inject_runtime_environment_context", lambda self, text: text)
         return session
+
+    def plan_session(self, mode="single", responses=None):
+        session = self.bare_session(mode, responses)
+        session.runtime_plan_approved = True
+        step_id = "pt:test:todo-guard"
+        step = {
+            "id": step_id,
+            "key": f"bb:proj:{step_id}",
+            "content": "实现完整城市系统",
+            "full_content": (
+                "实现完整城市系统\n"
+                "1.1 检查现有接口\n"
+                "1.2 实现核心模块\n"
+                "验收：运行集成测试并记录通过证据"
+            ),
+            "category": "plan_step",
+            "status": "in_progress",
+            "plan_step_index": 0,
+            "activated_at": 10.0,
+        }
+        session.blackboard.update(
+            {
+                "project_todos": [step],
+                "plan_step_total": 1,
+                "plan_worker_todos": {},
+                "plan_subtask_evidence_bindings": {},
+                "plan_step_evidence": {},
+                "plan_todo_revisions": [],
+            }
+        )
+        session.todo.update(
+            [
+                {
+                    "key": step["key"],
+                    "content": step["content"],
+                    "status": "in_progress",
+                },
+                {
+                    "content": "1.1 检查现有接口",
+                    "status": "in_progress",
+                    "owner": "developer",
+                    "parent_step_id": step_id,
+                },
+                {
+                    "content": "1.2 实现核心模块",
+                    "status": "pending",
+                    "owner": "developer",
+                    "parent_step_id": step_id,
+                },
+                {
+                    "content": "验收：运行集成测试并记录通过证据",
+                    "status": "pending",
+                    "owner": "developer",
+                    "parent_step_id": step_id,
+                },
+            ]
+        )
+        bind(
+            session,
+            "_sync_plan_worker_todos_to_blackboard",
+            lambda self, *args, **kwargs: True,
+        )
+        bind(
+            session, "_update_plan_file_step_status", lambda self, *args, **kwargs: None
+        )
+        bind(
+            session,
+            "_advance_completed_acceptance_after_todo_commit",
+            lambda self, *args, **kwargs: False,
+        )
+        return session, step
 
     @staticmethod
     def stages(count=10):
@@ -153,13 +221,98 @@ class TodoTreeRevisionGuardTests(unittest.TestCase):
         )
         self.assertEqual(len(session.ollama.calls), 0)
 
+    def test_resume_alias_preserves_omitted_root_rows(self):
+        session = self.bare_session("single")
+        session._dispatch_todo_update({"todos": self.stages(5)}, role="developer")
+
+        session._dispatch_todo_update(
+            {
+                "todos": [
+                    {
+                        "content": "阶段1",
+                        "status": "completed",
+                        "parent_step_id": "stage1",
+                    },
+                    {
+                        "content": "阶段2",
+                        "status": "in_progress",
+                        "parent_step_id": "stage2",
+                    },
+                ]
+            },
+            role="developer",
+            resume=True,
+        )
+
+        stored = session._todo_route_rows("pure_single", role="developer")
+        self.assertEqual(len(stored), 5)
+        self.assertEqual(
+            [row["status"] for row in stored],
+            ["completed", "in_progress"] + ["pending"] * 3,
+        )
+        self.assertEqual(len(session.ollama.calls), 0)
+
+    def test_status_update_can_add_work_without_replacing_the_roadmap(self):
+        session = self.bare_session("single")
+        session._dispatch_todo_update({"todos": self.stages(4)}, role="developer")
+
+        session._dispatch_todo_update(
+            {
+                "todos": [
+                    {
+                        "content": "补充跨模块回归测试",
+                        "status": "pending",
+                        "parent_step_id": "extra-regression",
+                    }
+                ],
+                "update_mode": "status_update",
+            },
+            role="developer",
+        )
+
+        stored = session._todo_route_rows("pure_single", role="developer")
+        self.assertEqual(len(stored), 5)
+        self.assertEqual(
+            [row["content"] for row in stored[:4]],
+            [row["content"] for row in self.stages(4)],
+        )
+        self.assertEqual(stored[-1]["content"], "补充跨模块回归测试")
+        self.assertEqual(len(session.ollama.calls), 0)
+
+    def test_stale_todo_transaction_cannot_overwrite_a_newer_tree(self):
+        session = self.bare_session("single")
+        session._dispatch_todo_update({"todos": self.stages(3)}, role="developer")
+        transaction = session._capture_todo_write_transaction(session.blackboard)
+        current = session.todo.snapshot()
+        session.todo.update(
+            current
+            + [
+                {
+                    "content": "并发新增的任务",
+                    "status": "pending",
+                    "owner": "developer",
+                    "subtask_id": "rt:concurrent",
+                }
+            ]
+        )
+
+        result = session._merge_flat_todo_items(
+            [{"content": "阶段1", "status": "completed", "parent_step_id": "stage1"}],
+            role="developer",
+            transaction=transaction,
+        )
+
+        self.assertIn("stale_todo_transaction", result)
+        self.assertEqual(
+            len(session._todo_route_rows("pure_single", role="developer")), 4
+        )
+        self.assertEqual(session.todo.snapshot()[-1]["content"], "并发新增的任务")
+
     def test_explicit_replan_is_rejected_by_llm_and_preserves_tree(self):
         rejection = {
             "decision": "reject",
             "confidence": "high",
-            "reason": (
-                "Stages three and four still carry uncovered acceptance requirements."
-            ),
+            "reason": "Stages three and four still carry uncovered acceptance requirements.",
             "removed_objectives": ["阶段3", "阶段4"],
             "replacement_mapping": [],
             "requirement_coverage": ["Stages one and two remain covered"],
@@ -173,10 +326,7 @@ class TodoTreeRevisionGuardTests(unittest.TestCase):
             {
                 "todos": self.stages(2),
                 "update_mode": "revise_open",
-                "revision_reason": (
-                    "Use a shorter execution tree after the latest implementation "
-                    "findings."
-                ),
+                "revision_reason": "Use a shorter execution tree after the latest implementation findings.",
                 "revision_evidence": [
                     "Only stages one and two have observable results"
                 ],
@@ -200,23 +350,17 @@ class TodoTreeRevisionGuardTests(unittest.TestCase):
         approval = {
             "decision": "approve",
             "confidence": "medium",
-            "reason": (
-                "The merged objective explicitly retains every implementation and "
-                "acceptance obligation."
-            ),
+            "reason": "The merged objective explicitly retains every implementation and acceptance obligation.",
             "removed_objectives": ["stage two", "stage three", "stage four"],
             "replacement_mapping": [
                 {
                     "removed": "stages two through four",
                     "replacement": "combined implementation and acceptance objective",
-                    "reason": (
-                        "The replacement preserves all three scopes and their checks."
-                    ),
+                    "reason": "The replacement preserves all three scopes and their checks.",
                 }
             ],
             "requirement_coverage": [
-                "rendering, terrain, and roads -> combined implementation and "
-                "acceptance objective"
+                "rendering, terrain, and roads -> combined implementation and acceptance objective"
             ],
             "completion_risk": "medium",
             "evidence": ["The replacement text carries the full obligations"],
@@ -240,10 +384,7 @@ class TodoTreeRevisionGuardTests(unittest.TestCase):
             {
                 "todos": proposal,
                 "update_mode": "revise_open",
-                "revision_reason": (
-                    "Current module boundaries require one integrated implementation "
-                    "transaction."
-                ),
+                "revision_reason": "Current module boundaries require one integrated implementation transaction.",
                 "revision_evidence": [
                     "The modules now share one verified integration boundary"
                 ],
@@ -258,8 +399,7 @@ class TodoTreeRevisionGuardTests(unittest.TestCase):
             session.blackboard["todo_tree_revisions"][-1]["status"], "accepted"
         )
         self.assertEqual(
-            session.blackboard["todo_tree_revisions"][-1]["completion_risk"],
-            "medium",
+            session.blackboard["todo_tree_revisions"][-1]["completion_risk"], "medium"
         )
 
     def test_invalid_review_json_fails_closed(self):
@@ -269,9 +409,7 @@ class TodoTreeRevisionGuardTests(unittest.TestCase):
             {
                 "todos": self.stages(1),
                 "update_mode": "revise_open",
-                "revision_reason": (
-                    "Replace the remaining objectives based on a new execution shape."
-                ),
+                "revision_reason": "Replace the remaining objectives based on a new execution shape.",
             },
             role="developer",
         )
@@ -282,6 +420,98 @@ class TodoTreeRevisionGuardTests(unittest.TestCase):
         )
         self.assertEqual(
             session.blackboard["todo_tree_revisions"][-1]["status"], "rejected"
+        )
+
+    def test_plan_status_update_preserves_omitted_subtasks_in_single_and_sync(self):
+        for mode in ("single", "sync"):
+            with self.subTest(mode=mode):
+                session, step = self.plan_session(mode)
+                session._dispatch_todo_update(
+                    {
+                        "todos": [
+                            {
+                                "content": "1.1 检查现有接口",
+                                "status": "in_progress",
+                                "parent_step_id": step["id"],
+                            }
+                        ],
+                        "update_mode": "status_update",
+                    },
+                    role="developer",
+                )
+
+                stored = [
+                    row
+                    for row in session.todo.snapshot()
+                    if row.get("parent_step_id") == step["id"]
+                ]
+                self.assertEqual(len(stored), 3)
+                self.assertEqual(
+                    [row["content"] for row in stored[:2]],
+                    ["1.1 检查现有接口", "1.2 实现核心模块"],
+                )
+                self.assertTrue(
+                    stored[2]["content"].startswith("验收：运行集成测试并记录通过证据")
+                )
+                self.assertEqual(len(session.ollama.calls), 0)
+
+    def test_plan_structural_revision_always_uses_llm_semantic_review(self):
+        response = {
+            "approved": True,
+            "confidence": "low",
+            "reason": "The expanded current subtask preserves the parent step and its acceptance obligation.",
+            "unsupported_changes": [],
+        }
+        session, step = self.plan_session("single", [response])
+        session.blackboard["plan_step_evidence"] = {
+            step["id"]: [
+                {
+                    "id": "ev:plan-revision",
+                    "step_id": step["id"],
+                    "subtask_id": session._stable_plan_worker_subtask_id(
+                        step["id"],
+                        {"content": "1.1 检查现有接口"},
+                    ),
+                    "subtask_content": "1.1 检查现有接口",
+                    "kind": "runtime",
+                    "tool": "read_file",
+                    "ok": True,
+                    "summary": "接口检查发现还需记录跨模块约束",
+                    "ts": 20.0,
+                }
+            ]
+        }
+
+        result = session._dispatch_todo_update(
+            {
+                "todos": [
+                    {
+                        "content": "1.1 检查现有接口并记录跨模块约束",
+                        "status": "in_progress",
+                        "parent_step_id": step["id"],
+                    },
+                    {
+                        "content": "1.2 实现核心模块",
+                        "status": "pending",
+                        "parent_step_id": step["id"],
+                    },
+                    {
+                        "content": "验收：运行集成测试并记录通过证据",
+                        "status": "pending",
+                        "parent_step_id": step["id"],
+                    },
+                ],
+                "update_mode": "revise_open",
+                "revision_reason": "接口检查证明当前子任务需要包含跨模块约束记录。",
+                "revision_evidence": ["ev:plan-revision"],
+            },
+            role="developer",
+        )
+
+        self.assertIn("ROLLING SUBPLAN REVISION: accepted", result)
+        self.assertEqual(len(session.ollama.calls), 1)
+        self.assertEqual(
+            session.blackboard["plan_todo_revisions"][-1]["status"], "accepted"
         )
 
 

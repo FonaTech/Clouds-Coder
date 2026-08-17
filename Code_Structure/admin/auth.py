@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=725 original-lines=8084-8116 hash=28ee420b5a6d9364
+# split-source: order=725 original-lines=8085-8117 hash=28ee420b5a6d9364
 
 def trusted_client_ip(handler: BaseHTTPRequestHandler) -> str:
     peer = handler.client_address[0] if getattr(handler, "client_address", None) else "0.0.0.0"
@@ -40,7 +40,7 @@ def trusted_client_ip(handler: BaseHTTPRequestHandler) -> str:
         current = candidate
     return current
 
-# split-source: order=733 original-lines=8507-8514 hash=d6f677beb0fa793e
+# split-source: order=733 original-lines=8508-8515 hash=d6f677beb0fa793e
 
 
 class AdminAuthError(Exception):
@@ -50,7 +50,7 @@ class AdminAuthError(Exception):
         self.status = int(status or 400)
         self.retry_after = max(0, int(retry_after or 0))
 
-# split-source: order=734 original-lines=8515-8785 hash=998fc7ce701e59c6
+# split-source: order=734 original-lines=8516-8786 hash=998fc7ce701e59c6
 
 
 class AdminAuthStore:
