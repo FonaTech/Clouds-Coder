@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=950 original-lines=96797-96919 hash=9c6605dc4a5d0f9d
+# split-source: order=950 original-lines=97232-97354 hash=9c6605dc4a5d0f9d
 
 IDE_INDEX_HTML = """<!doctype html>
 <html lang="zh-CN">
@@ -130,7 +130,7 @@ IDE_INDEX_HTML = """<!doctype html>
 </html>
 """
 
-# split-source: order=951 original-lines=96920-96956 hash=64ea2816e22645c6
+# split-source: order=951 original-lines=97355-97391 hash=64ea2816e22645c6
 
 IDE_CSS = """
 .icons-fallback .codicon::before{display:inline-block;min-width:1em;font-family:"Segoe UI Symbol","Apple Symbols",Arial,sans-serif!important;font-style:normal;font-weight:400;line-height:1;text-align:center;content:"□"!important}
@@ -169,7 +169,7 @@ input,select,textarea{border:1px solid transparent;border-radius:2px;background:
 @media(max-width:480px){.title-bar{grid-template-columns:28px 22px minmax(0,1fr) auto;padding:0 3px}.layout-controls button:not(#toggleSecondaryBtn){display:none}.command-center span:last-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.activity-button{width:43px}.workbench-grid{grid-template-columns:44px minmax(0,1fr)!important}.primary-sidebar{left:44px}.status-left #syncStatus,.status-left #errorStatus{display:none}.panel-tabs{gap:9px}.panel-tabs button{max-width:62px;overflow:hidden;text-overflow:ellipsis}.auth-dialog{padding:28px 22px}.extension-row{grid-template-columns:36px minmax(0,1fr)}.extension-icon{width:36px;height:36px}.extension-row .button{grid-column:2;justify-self:start}}
 """
 
-# split-source: order=952 original-lines=96957-97150 hash=8de1c72f24ea8922
+# split-source: order=952 original-lines=97392-97585 hash=8de1c72f24ea8922
 
 IDE_JS = """
 const E=id=>document.getElementById(id);
@@ -365,7 +365,7 @@ function bind(){
 window.addEventListener('DOMContentLoaded',async()=>{bind();try{await refreshConfig();setStatus('ready')}catch(err){setStatus(err.message,true)}});
 """
 
-# split-source: order=953 original-lines=97151-97371 hash=961e8a7a9f938ab0
+# split-source: order=953 original-lines=97586-97806 hash=961e8a7a9f938ab0
 
 IDE_JS = r"""
 const E=id=>document.getElementById(id);
@@ -588,7 +588,7 @@ function downloadWorkspacePath(path=''){triggerDownload(workspaceArchiveUrl(path
 function downloadExplorerEntry(row){if(row.type==='dir')downloadWorkspacePath(row.path);else triggerDownload(workspaceRawDownloadUrl(row.path),row.name||'')}
 """
 
-# split-source: order=954 original-lines=97372-97435 hash=9098cf2e1bd311a2
+# split-source: order=954 original-lines=97807-97870 hash=9098cf2e1bd311a2
 
 IDE_JS += r"""
 function scheduleDiagnostics(file){clearTimeout(S.diagnosticTimer);if(file&&languageFor(file.path)==='python')S.diagnosticTimer=setTimeout(()=>runDiagnostics(file).catch(error=>logOutput(error.message)),450)}
@@ -654,7 +654,7 @@ async function handleDebugMessage(msg){if(msg.type==='response'&&msg.command==='
 async function stopDebug(closeRemote=true){clearTimeout(S.debugPoll);const current=S.debug;S.debug=null;if(closeRemote&&current)try{await api(`/api/ide/v2/debug/${qs(current.id)}`,{method:'DELETE',body:'{}'})}catch(error){logDebug(error.message)}}
 """
 
-# split-source: order=955 original-lines=97436-97607 hash=765b5fb956b54475
+# split-source: order=955 original-lines=97871-98042 hash=765b5fb956b54475
 
 IDE_JS += r"""
 async function refreshExtensions(query=''){if(query.trim()){const out=await api(`/api/ide/v2/extensions/search?query=${qs(query)}&size=40`);renderExtensions(out.extensions||[],false);E('extensionSummary').textContent=`${out.totalSize||0} Open VSX results`}else{const out=await api('/api/ide/v2/extensions');S.installedExtensions=out.extensions||[];renderExtensions(S.installedExtensions,true);E('extensionSummary').textContent=`${S.installedExtensions.length} installed`}}
@@ -828,7 +828,7 @@ const MENUS={file:['file.new','file.open','file.uploadFolder','file.downloadWork
 function showError(error){const message=error?.message||String(error);toast(message,error?.status===403?'warning':'error');setStatus(message,'error');logOutput(message)}
 """
 
-# split-source: order=956 original-lines=97608-97642 hash=c8e37d53886fdf6c
+# split-source: order=956 original-lines=98043-98077 hash=c8e37d53886fdf6c
 
 IDE_JS += r"""
 async function refreshConfig(){const out=await api('/api/ide/config');S.config=out;S.account=out.account||S.account;S.capabilities=out.capabilities||S.capabilities;S.csrf=out.csrf_token||S.csrf;S.sessions=Array.isArray(out.sessions)?out.sessions:[];if(!S.activeSession||!S.sessions.some(row=>row.id===S.activeSession))S.activeSession=out.active_session_id||S.sessions[0]?.id||'';renderSessions();renderTools();E('accountName').textContent=S.account?.username||'';E('remoteStatus').title=S.capabilities.local?'Local window':'LAN workspace';E('newTerminalBtn').disabled=!S.capabilities.terminal;E('runActiveBtn').disabled=!S.capabilities.processes;E('debugActiveBtn').disabled=!S.capabilities.debug;updateAgentContext();if(!S.activeSession)await createSession()}

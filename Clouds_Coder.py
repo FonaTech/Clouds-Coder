@@ -20491,9 +20491,11 @@ TOOLS = [
     tool_def(
         "TodoWrite",
         (
-            "Update current todos. In approved plan mode, use update_mode='status_update' for status-only progress. "
+            "Update current todos. update_mode='status_update' is merge-only: omitted unfinished rows are preserved, "
+            "so a partial progress payload can never shorten the task tree. In approved plan mode, use it for status-only progress. "
             "When new current-step tool evidence or reviewer findings prove the open subplan is no longer suitable, "
-            "use update_mode='revise_open' with a concrete revision_reason and revision_evidence references; the runtime audits the revision atomically. "
+            "use update_mode='revise_open' with a concrete revision_reason and revision_evidence references; the runtime performs an atomic LLM audit "
+            "against the authoritative goal, original Todo baseline, completed evidence, and remaining requirement coverage before replacing open rows. "
             "Use 'rework_completed' only when failure/reviewer evidence requires reopening completed work. "
             "Preferred items are objects with content/status/owner/parent_step_id/subtask_id."
         ),
@@ -20522,7 +20524,7 @@ TOOLS = [
             "update_mode": {
                 "type": "string",
                 "enum": ["status_update", "revise_open", "rework_completed"],
-                "description": "status_update changes statuses only; revise_open replaces the current open-subtask snapshot after evidence audit; rework_completed requires failure/reviewer evidence.",
+                "description": "status_update merges statuses and preserves omitted rows; revise_open proposes a complete open snapshot and requires an LLM coverage/risk audit; rework_completed additionally proposes reopening completed work.",
             },
             "revision_reason": {"type": "string", "description": "Concrete new finding that justifies a structural rolling-plan revision."},
             "revision_evidence": {},
@@ -20532,7 +20534,7 @@ TOOLS = [
     ),
     tool_def(
         "TodoWriteRescue",
-        "Fallback todo writer. Preferred format: objects with content/status/owner/parent_step_id. String fallback should use only '[ ] task', '[>] task', or '[x] task'.",
+        "Fallback todo writer using the same protected merge/replan transaction as TodoWrite. Omitted rows are preserved unless an explicit revise_open passes LLM review. Preferred format: objects with content/status/owner/parent_step_id. String fallback should use only '[ ] task', '[>] task', or '[x] task'.",
         {
             "items": {"type": "array", "items": {}},
             "todos": {"type": "array", "items": {}},
@@ -42253,6 +42255,12 @@ body{padding:18px}
             "plan_step_quality_reviews": {},
             "plan_step_recovery": {},
             "plan_todo_revisions": [],
+            # Root TodoWrite plans (single and sync without an approved Plan)
+            # need the same durable revision protection as plan-step subtasks.
+            # The baseline never changes inside a task epoch; accepted/rejected
+            # structural proposals are kept in a bounded audit ledger.
+            "todo_tree_baseline": [],
+            "todo_tree_revisions": [],
             "status": "INITIALIZING",
             "task_epoch": float(now_ts()),
             "focus": {
@@ -42794,6 +42802,73 @@ body{padding:18px}
                     "ts": float(raw_revision.get("ts", 0.0) or 0.0),
                 })
             board["plan_todo_revisions"] = revisions
+        raw_tree_baseline = src.get("todo_tree_baseline", [])
+        if isinstance(raw_tree_baseline, list):
+            baseline: list[dict] = []
+            for raw_row in raw_tree_baseline[:40]:
+                if not isinstance(raw_row, dict):
+                    continue
+                content = trim(str(raw_row.get("content", "") or "").strip(), 500)
+                if not content:
+                    continue
+                baseline.append({
+                    "identity": trim(str(raw_row.get("identity", "") or "").strip(), 160),
+                    "content": content,
+                    "owner": self._sanitize_agent_role(raw_row.get("owner", "")),
+                    "status": self._normalize_todo_status_value(raw_row.get("status", ""), "pending"),
+                    "created_at": float(raw_row.get("created_at", 0.0) or 0.0),
+                })
+            board["todo_tree_baseline"] = baseline
+        raw_tree_revisions = src.get("todo_tree_revisions", [])
+        if isinstance(raw_tree_revisions, list):
+            tree_revisions: list[dict] = []
+            for raw_revision in raw_tree_revisions[-40:]:
+                if not isinstance(raw_revision, dict):
+                    continue
+                mapping = raw_revision.get("replacement_mapping", [])
+                clean_mapping: list[dict] = []
+                if isinstance(mapping, dict):
+                    mapping = [
+                        {"removed": key, "replacement": value, "reason": ""}
+                        for key, value in mapping.items()
+                    ]
+                if isinstance(mapping, list):
+                    for raw_map in mapping[:40]:
+                        if not isinstance(raw_map, dict):
+                            continue
+                        clean_mapping.append({
+                            "removed": trim(str(raw_map.get("removed", "") or ""), 500),
+                            "replacement": trim(str(raw_map.get("replacement", "") or ""), 500),
+                            "reason": trim(str(raw_map.get("reason", "") or ""), 500),
+                        })
+                tree_revisions.append({
+                    "actor": trim(str(raw_revision.get("actor", "") or ""), 40),
+                    "status": trim(str(raw_revision.get("status", "") or ""), 24),
+                    "mode": trim(str(raw_revision.get("mode", "") or ""), 32),
+                    "reason": trim(str(raw_revision.get("reason", "") or ""), 1200),
+                    "review_reason": trim(str(raw_revision.get("review_reason", "") or ""), 1200),
+                    "completion_risk": trim(str(raw_revision.get("completion_risk", "") or ""), 24),
+                    "removed_objectives": [
+                        trim(str(value or ""), 500)
+                        for value in (raw_revision.get("removed_objectives", []) if isinstance(raw_revision.get("removed_objectives"), list) else [])[:40]
+                        if str(value or "").strip()
+                    ],
+                    "replacement_mapping": clean_mapping,
+                    "requirement_coverage": [
+                        trim(str(value or ""), 700)
+                        for value in (raw_revision.get("requirement_coverage", []) if isinstance(raw_revision.get("requirement_coverage"), list) else [])[:40]
+                        if str(value or "").strip()
+                    ],
+                    "evidence": [
+                        trim(str(value or ""), 700)
+                        for value in (raw_revision.get("evidence", []) if isinstance(raw_revision.get("evidence"), list) else [])[:20]
+                        if str(value or "").strip()
+                    ],
+                    "before_open": [trim(str(value or ""), 500) for value in (raw_revision.get("before_open", []) or [])[:40]],
+                    "after_open": [trim(str(value or ""), 500) for value in (raw_revision.get("after_open", []) or [])[:40]],
+                    "ts": float(raw_revision.get("ts", 0.0) or 0.0),
+                })
+            board["todo_tree_revisions"] = tree_revisions
         board["watchdog"] = self._normalize_watchdog_state(src.get("watchdog", {}))
         board["decomposition_queue"] = self._normalize_decomposition_queue_state(
             src.get("decomposition_queue", {})
@@ -43939,6 +44014,8 @@ body{padding:18px}
         preserved_step_evidence = old_bb.get("plan_step_evidence", {})
         preserved_quality_reviews = old_bb.get("plan_step_quality_reviews", {})
         preserved_todo_revisions = old_bb.get("plan_todo_revisions", [])
+        preserved_tree_baseline = old_bb.get("todo_tree_baseline", [])
+        preserved_tree_revisions = old_bb.get("todo_tree_revisions", [])
         preserved_step_files = old_bb.get("step_files", {})
         if not preserve_active_state:
             self.runtime_requires_todos = None
@@ -43981,6 +44058,10 @@ body{padding:18px}
                 self.blackboard["plan_step_quality_reviews"] = preserved_quality_reviews
             if isinstance(preserved_todo_revisions, list):
                 self.blackboard["plan_todo_revisions"] = preserved_todo_revisions
+            if isinstance(preserved_tree_baseline, list):
+                self.blackboard["todo_tree_baseline"] = preserved_tree_baseline
+            if isinstance(preserved_tree_revisions, list):
+                self.blackboard["todo_tree_revisions"] = preserved_tree_revisions
             if isinstance(preserved_step_files, dict):
                 self.blackboard["step_files"] = preserved_step_files
         self.manager_context = []
@@ -44645,10 +44726,22 @@ body{padding:18px}
             task_epoch = float(bb.get("task_epoch", 0.0) or 0.0)
         except Exception:
             task_epoch = 0.0
+        todo_signature = ""
+        try:
+            todo_signature = hashlib.sha256(
+                json.dumps(
+                    self._todo_progress_signature(self.todo.snapshot()),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8", "ignore")
+            ).hexdigest()
+        except Exception:
+            todo_signature = ""
         return {
             "task_epoch": task_epoch,
             "plan_step_id": resolved_step_id,
             "run_generation": int(getattr(self, "run_generation", 0) or 0),
+            "todo_signature": todo_signature,
             "started_at": float(now_ts()),
         }
 
@@ -44674,6 +44767,20 @@ body{padding:18px}
         actual_generation = int(getattr(self, "run_generation", 0) or 0)
         if expected_generation and actual_generation and expected_generation != actual_generation:
             return False, "run generation changed"
+        expected_todo_signature = str(transaction.get("todo_signature", "") or "").strip()
+        if expected_todo_signature:
+            try:
+                actual_todo_signature = hashlib.sha256(
+                    json.dumps(
+                        self._todo_progress_signature(self.todo.snapshot()),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8", "ignore")
+                ).hexdigest()
+            except Exception:
+                return False, "Todo tree revision is unavailable"
+            if actual_todo_signature != expected_todo_signature:
+                return False, "Todo tree changed during review"
         expected_step_id = trim(str(transaction.get("plan_step_id", "") or "").strip(), 40)
         if expected_step_id:
             current = self._get_active_plan_step(bb)
@@ -52194,7 +52301,7 @@ body{padding:18px}
             if not isinstance(payload, dict):
                 return {"available": False, "approved": False, "reason": "semantic audit returned invalid JSON"}
             confidence = str(payload.get("confidence", "low") or "low").strip().lower()
-            approved = bool(payload.get("approved", False)) and confidence in {"high", "medium"}
+            approved = bool(payload.get("approved", False))
             return {
                 "available": True,
                 "approved": approved,
@@ -52240,102 +52347,6 @@ body{padding:18px}
         )
         sequence_score = difflib.SequenceMatcher(None, left_text.lower(), right_text.lower()).ratio()
         return max(token_score, sequence_score) >= float(minimum)
-
-    def _bounded_current_subtask_revision_audit(
-        self,
-        plan_step: dict,
-        existing_rows: list[dict],
-        proposed_rows: list[dict],
-        matched_evidence: list[dict],
-        *,
-        reason: str,
-        mode: str,
-        step_id: str,
-    ) -> dict:
-        if mode != "revise_open":
-            return {}
-        existing_open = [
-            row for row in existing_rows
-            if isinstance(row, dict)
-            and str(row.get("status", "pending") or "pending").lower() != "completed"
-            and not self._is_plan_step_acceptance_subtask(row.get("content", ""))
-        ]
-        proposed_open = [
-            row for row in proposed_rows
-            if isinstance(row, dict)
-            and str(row.get("status", "pending") or "pending").lower() != "completed"
-            and not self._is_plan_step_acceptance_subtask(row.get("content", ""))
-        ]
-        if len(existing_open) != len(proposed_open):
-            return {}
-        existing_acceptance = [
-            self._normalize_plan_step_acceptance_subtask_text(row.get("content", ""))
-            for row in existing_rows
-            if isinstance(row, dict) and self._is_plan_step_acceptance_subtask(row.get("content", ""))
-        ]
-        proposed_acceptance = [
-            self._normalize_plan_step_acceptance_subtask_text(row.get("content", ""))
-            for row in proposed_rows
-            if isinstance(row, dict) and self._is_plan_step_acceptance_subtask(row.get("content", ""))
-        ]
-        if existing_acceptance != proposed_acceptance:
-            return {}
-        before_core = [self._plan_worker_content_core(row.get("content", "")) for row in existing_open]
-        after_core = [self._plan_worker_content_core(row.get("content", "")) for row in proposed_open]
-        changed_indexes = [
-            index for index, pair in enumerate(zip(before_core, after_core))
-            if pair[0] != pair[1]
-        ]
-        if len(changed_indexes) != 1:
-            return {}
-        changed_index = changed_indexes[0]
-        prior = existing_open[changed_index]
-        revised = proposed_open[changed_index]
-        if self._normalize_todo_status_value(prior.get("status", ""), "pending") != "in_progress":
-            return {}
-        if self._normalize_todo_status_value(revised.get("status", ""), "pending") != "in_progress":
-            return {}
-        prior_id = self._stable_plan_worker_subtask_id(step_id, prior)
-        directly_bound = [
-            row for row in matched_evidence
-            if prior_id and str(row.get("subtask_id", "") or "").strip() == prior_id
-        ]
-        if not directly_bound:
-            return {}
-        prior_core = self._plan_worker_content_core(prior.get("content", ""))
-        revised_core = self._plan_worker_content_core(revised.get("content", ""))
-        if not prior_core or prior_core not in revised_core:
-            return {}
-        added_detail = revised_core.replace(prior_core, "", 1).strip(" ：:;；,.，。()（）[]【】-")
-        if not added_detail:
-            return {}
-        scope_change_markers = (
-            "remove", "delete", "drop", "skip", "replace", "instead", "without", "no longer",
-            "删除", "刪除", "移除", "跳过", "跳過", "替换", "替換", "取代", "取消",
-            "不再", "无需", "無需", "改为", "改為", "舍弃", "捨棄",
-        )
-        normalized_added_detail = unicodedata.normalize("NFKC", added_detail).lower()
-        if any(marker in normalized_added_detail for marker in scope_change_markers):
-            return {}
-        evidence_text = "\n".join(
-            " ".join(
-                str(row.get(field, "") or "")
-                for field in ("summary", "command", "path", "subtask_content")
-            )
-            for row in directly_bound
-        )
-        if not self._plan_revision_texts_related(added_detail, evidence_text, 0.18):
-            return {}
-        if not self._plan_revision_texts_related(reason, evidence_text, 0.18):
-            return {}
-        return {
-            "ok": True,
-            "structural": True,
-            "reason": "bounded current-subtask revision accepted by direct evidence audit",
-            "before_open": before_core,
-            "after_open": after_core,
-            "evidence_ids": [str(row.get("id", "") or "") for row in directly_bound],
-        }
 
     def _review_plan_worker_revision(
         self,
@@ -52432,17 +52443,6 @@ body{padding:18px}
                 "after_open": after_open,
                 "evidence_ids": [str(row.get("id", "") or "") for row in matched],
             }
-        bounded_review = self._bounded_current_subtask_revision_audit(
-            plan_step,
-            existing_rows,
-            proposed_rows,
-            matched,
-            reason=reason,
-            mode=mode,
-            step_id=step_id,
-        )
-        if bounded_review:
-            return bounded_review
         semantic_audit = self._semantic_audit_plan_worker_revision(
             plan_step,
             reason=reason,
@@ -52508,68 +52508,501 @@ body{padding:18px}
             return f"substep:{match.group(1)}"
         return f"text:{content}"
 
-    def _merge_flat_todo_items(self, items: list[dict], role: str = "") -> str:
+    def _stable_root_todo_id(self, row: dict | None) -> str:
+        item = row if isinstance(row, dict) else {}
+        existing = trim(str(item.get("subtask_id", "") or "").strip(), 100)
+        if existing.startswith("rt:"):
+            return existing
+        identity = self._flat_todo_identity({key: value for key, value in item.items() if key != "subtask_id"})
+        if not identity:
+            return ""
+        return "rt:" + hashlib.sha1(identity.encode("utf-8", "ignore")).hexdigest()[:20]
+
+    def _ensure_root_todo_baseline(self, rows: list[dict], *, board: dict | None = None) -> list[dict]:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        baseline = list(bb.get("todo_tree_baseline", []) if isinstance(bb.get("todo_tree_baseline"), list) else [])
+        known = {
+            str(row.get("identity", "") or "")
+            for row in baseline
+            if isinstance(row, dict) and str(row.get("identity", "") or "")
+        }
+        changed = False
+        for raw in rows:
+            if not isinstance(raw, dict) or self._todo_row_kind(raw) == "system":
+                continue
+            identity = self._flat_todo_identity(raw) or self._stable_root_todo_id(raw)
+            if not identity or identity in known:
+                continue
+            baseline.append({
+                "identity": identity,
+                "content": trim(str(raw.get("content", "") or ""), 500),
+                "owner": self._sanitize_agent_role(raw.get("owner", "")),
+                "status": self._normalize_todo_status_value(raw.get("status", ""), "pending"),
+                "created_at": float(raw.get("created_at", 0.0) or now_ts()),
+            })
+            known.add(identity)
+            changed = True
+        if changed or "todo_tree_baseline" not in bb:
+            bb["todo_tree_baseline"] = baseline[:40]
+            bb["updated_at"] = float(now_ts())
+            self.blackboard = bb
+        return baseline[:40]
+
+    def _root_todo_revision_evidence(self, revision_evidence: object, *, board: dict | None = None) -> list[str]:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        evidence: list[str] = []
+        if isinstance(revision_evidence, str):
+            if revision_evidence.strip():
+                evidence.append(revision_evidence.strip())
+        elif isinstance(revision_evidence, list):
+            evidence.extend(str(value or "").strip() for value in revision_evidence if str(value or "").strip())
+        elif isinstance(revision_evidence, dict):
+            evidence.append(json.dumps(revision_evidence, ensure_ascii=False, sort_keys=True))
+        for section, label in (("execution_logs", "execution"), ("review_feedback", "review")):
+            rows = bb.get(section, []) if isinstance(bb.get(section), list) else []
+            for row in rows[-8:]:
+                if not isinstance(row, dict):
+                    continue
+                content = str(row.get("content", "") or "").strip()
+                if content:
+                    evidence.append(f"{label}: {content}")
+        artifacts = bb.get("code_artifacts", {}) if isinstance(bb.get("code_artifacts"), dict) else {}
+        for path, row in list(artifacts.items())[-12:]:
+            summary = str((row or {}).get("summary", "") or "").strip() if isinstance(row, dict) else ""
+            evidence.append(f"artifact: {path}" + (f" - {summary}" if summary else ""))
+        return list(dict.fromkeys(trim(value, 900) for value in evidence if value))[:24]
+
+    @staticmethod
+    def _normalize_root_todo_replacement_mapping(value: object) -> list[dict]:
+        if isinstance(value, dict):
+            value = [
+                {"removed": key, "replacement": replacement, "reason": ""}
+                for key, replacement in value.items()
+            ]
+        if not isinstance(value, list):
+            return []
+        rows: list[dict] = []
+        for raw in value[:40]:
+            if not isinstance(raw, dict):
+                continue
+            removed = str(raw.get("removed", raw.get("from", raw.get("objective", ""))) or "").strip()
+            replacement = str(raw.get("replacement", raw.get("to", raw.get("covered_by", ""))) or "").strip()
+            reason = str(raw.get("reason", raw.get("rationale", "")) or "").strip()
+            if removed:
+                rows.append({
+                    "removed": trim(removed, 500),
+                    "replacement": trim(replacement, 500),
+                    "reason": trim(reason, 500),
+                })
+        return rows
+
+    def _semantic_audit_root_todo_revision(
+        self,
+        *,
+        reason: str,
+        baseline: list[dict],
+        current_rows: list[dict],
+        proposed_rows: list[dict],
+        removed_objectives: list[str],
+        evidence: list[str],
+    ) -> dict:
+        goal = str(self._authoritative_user_goal_for_model() or self._ensure_blackboard().get("original_goal", "") or "").strip()
+        completed = [
+            str(row.get("content", "") or "").strip()
+            for row in current_rows
+            if isinstance(row, dict) and self._normalize_todo_status_value(row.get("status", ""), "pending") == "completed"
+        ]
+
+        def _render(rows: list[dict]) -> str:
+            return "\n".join(
+                f"- [{self._normalize_todo_status_value(row.get('status', ''), 'pending')}] {str(row.get('content', '') or '').strip()}"
+                for row in rows
+                if isinstance(row, dict) and str(row.get("content", "") or "").strip()
+            ) or "(none)"
+
+        prompt = (
+            "/no_think\n"
+            "You are the independent safety reviewer for a proposed rewrite of an execution Todo tree. "
+            "Dynamic replanning is allowed, but task completion and every authoritative user requirement must remain covered.\n"
+            "Reject when an unfinished objective disappears without a concrete replacement or completion proof, when the proposal narrows scope, "
+            "when the stated reason merely restates the new list, or when evidence/coverage is uncertain. Do not classify stages by keywords; judge semantics.\n"
+            "Return JSON only with ALL fields: "
+            "{\"decision\":\"approve|reject\",\"confidence\":\"high|medium|low\",\"reason\":\"...\","
+            "\"removed_objectives\":[\"...\"],\"replacement_mapping\":[{\"removed\":\"...\",\"replacement\":\"...\",\"reason\":\"...\"}],"
+            "\"requirement_coverage\":[\"requirement -> proposed objective/evidence\"],\"completion_risk\":\"low|medium|high\","
+            "\"evidence\":[\"...\"]}.\n\n"
+            f"AUTHORITATIVE USER GOAL:\n{goal or '(unavailable)'}\n\n"
+            "ORIGINAL TODO BASELINE:\n" + _render(baseline) + "\n\n"
+            "CURRENT CANONICAL TODO TREE:\n" + _render(current_rows) + "\n\n"
+            "PROPOSED COMPLETE TODO TREE:\n" + _render(proposed_rows) + "\n\n"
+            f"PROPOSER REASON:\n{reason}\n\n"
+            "DETERMINISTICALLY REMOVED OR MATERIALLY REWRITTEN OPEN OBJECTIVES:\n"
+            + ("\n".join(f"- {value}" for value in removed_objectives) or "(none)")
+            + "\n\nCOMPLETED ROWS:\n"
+            + ("\n".join(f"- {value}" for value in completed) or "(none)")
+            + "\n\nAVAILABLE EVIDENCE:\n"
+            + ("\n".join(f"- {value}" for value in evidence) or "(none)")
+        )
+        try:
+            response = self.ollama.chat(
+                [{"role": "user", "content": prompt}],
+                system=self._inject_runtime_environment_context(
+                    "/no_think\nYou audit Todo-tree rewrites for requirement preservation. Reply only valid JSON."
+                ),
+                max_tokens=1000,
+                temperature=0.1,
+                think=False,
+            )
+            raw = str(response.get("content", "") or response.get("text", "") or "").strip()
+            payload = extract_json_object_from_text(raw, {})
+            if not isinstance(payload, dict) or not payload:
+                return {"available": False, "approved": False, "reason": "Todo-tree review returned invalid structured JSON"}
+            decision = str(payload.get("decision", "") or "").strip().lower()
+            confidence = str(payload.get("confidence", "low") or "low").strip().lower()
+            risk = str(payload.get("completion_risk", "high") or "high").strip().lower()
+            review_reason = str(payload.get("reason", "") or "").strip()
+            reported_removed = payload.get("removed_objectives", [])
+            coverage = payload.get("requirement_coverage", [])
+            review_evidence = payload.get("evidence", [])
+            mapping = self._normalize_root_todo_replacement_mapping(payload.get("replacement_mapping", []))
+            required_shape = (
+                decision in {"approve", "reject"}
+                and confidence in {"high", "medium", "low"}
+                and risk in {"low", "medium", "high"}
+                and len(review_reason) >= 6
+                and isinstance(reported_removed, list)
+                and isinstance(coverage, list)
+                and isinstance(review_evidence, list)
+            )
+            if not required_shape:
+                return {"available": False, "approved": False, "reason": "Todo-tree review omitted required decision, reason, mapping, coverage, risk, or evidence fields"}
+            reported_removed = [trim(str(value or ""), 500) for value in reported_removed[:40] if str(value or "").strip()]
+            coverage = [trim(str(value or ""), 700) for value in coverage[:40] if str(value or "").strip()]
+            review_evidence = [trim(str(value or ""), 700) for value in review_evidence[:20] if str(value or "").strip()]
+            # All semantic judgment belongs to the reviewer model. The runtime
+            # validates only the response contract and honors its decision; it
+            # does not second-guess coverage with keywords, similarity scores,
+            # locally assigned risk thresholds, or stage classifiers.
+            approved = decision == "approve"
+            return {
+                "available": True,
+                "approved": approved,
+                "decision": decision,
+                "confidence": confidence,
+                "reason": trim(review_reason, 1200),
+                "removed_objectives": reported_removed,
+                "replacement_mapping": mapping,
+                "requirement_coverage": coverage,
+                "completion_risk": risk,
+                "evidence": review_evidence,
+            }
+        except Exception as exc:
+            return {
+                "available": False,
+                "approved": False,
+                "confidence": "low",
+                "completion_risk": "high",
+                "reason": f"Todo-tree semantic review unavailable: {trim(str(exc), 240)}",
+            }
+
+    def _append_root_todo_revision_audit(
+        self,
+        *,
+        actor: str,
+        status: str,
+        mode: str,
+        reason: str,
+        review: dict,
+        before_open: list[str],
+        after_open: list[str],
+        board: dict | None = None,
+    ) -> None:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        rows = list(bb.get("todo_tree_revisions", []) if isinstance(bb.get("todo_tree_revisions"), list) else [])
+        rows.append({
+            "actor": trim(str(actor or ""), 40),
+            "status": trim(str(status or ""), 24),
+            "mode": trim(str(mode or ""), 32),
+            "reason": trim(str(reason or ""), 1200),
+            "review_reason": trim(str(review.get("reason", "") or ""), 1200),
+            "completion_risk": trim(str(review.get("completion_risk", "high") or "high"), 24),
+            "removed_objectives": list(review.get("removed_objectives", []) or [])[:40],
+            "replacement_mapping": list(review.get("replacement_mapping", []) or [])[:40],
+            "requirement_coverage": list(review.get("requirement_coverage", []) or [])[:40],
+            "evidence": list(review.get("evidence", []) or [])[:20],
+            "before_open": [trim(str(value or ""), 500) for value in before_open[:40]],
+            "after_open": [trim(str(value or ""), 500) for value in after_open[:40]],
+            "ts": float(now_ts()),
+        })
+        bb["todo_tree_revisions"] = rows[-40:]
+        bb["updated_at"] = float(now_ts())
+        self.blackboard = bb
+        self._emit(
+            "status",
+            {
+                "summary": trim(
+                    f"Todo-tree revision {status}: {review.get('reason', reason)}",
+                    300,
+                )
+            },
+        )
+
+    def _root_todo_material_changes(self, existing_rows: list[dict], proposed_rows: list[dict]) -> tuple[list[str], list[str], list[str]]:
+        before_open = [
+            str(row.get("content", "") or "").strip()
+            for row in existing_rows
+            if isinstance(row, dict) and self._normalize_todo_status_value(row.get("status", ""), "pending") != "completed"
+        ]
+        after_open = [
+            str(row.get("content", "") or "").strip()
+            for row in proposed_rows
+            if isinstance(row, dict) and self._normalize_todo_status_value(row.get("status", ""), "pending") != "completed"
+        ]
+        proposed_by_id = {
+            self._flat_todo_identity(row): row
+            for row in proposed_rows
+            if isinstance(row, dict) and self._flat_todo_identity(row)
+        }
+        removed: list[str] = []
+        for row in existing_rows:
+            if not isinstance(row, dict) or self._normalize_todo_status_value(row.get("status", ""), "pending") == "completed":
+                continue
+            identity = self._flat_todo_identity(row)
+            proposed = proposed_by_id.get(identity)
+            old_content = str(row.get("content", "") or "").strip()
+            if not isinstance(proposed, dict) or self._normalize_todo_status_value(proposed.get("status", ""), "pending") == "completed":
+                removed.append(old_content)
+                continue
+            new_content = str(proposed.get("content", "") or "").strip()
+            if normalize_work_text(old_content) != normalize_work_text(new_content):
+                removed.append(old_content)
+        return before_open, after_open, list(dict.fromkeys(value for value in removed if value))
+
+    def _merge_root_todo_scope(
+        self,
+        items: list[dict],
+        *,
+        role: str,
+        existing_scope: list[dict],
+        preserved_rows: list[dict],
+        update_mode: str,
+        revision_reason: str,
+        revision_evidence: object,
+        transaction: dict | None,
+    ) -> str:
+        role_key = self._sanitize_agent_role(role)
+        bb = self._ensure_blackboard()
+        self._ensure_root_todo_baseline(existing_scope, board=bb)
+        mode = str(update_mode or "status_update").strip().lower().replace("-", "_")
+        if mode not in {"status_update", "revise_open", "rework_completed"}:
+            mode = "status_update"
+        if mode == "status_update" and (str(revision_reason or "").strip() or self._plan_worker_revision_references(revision_evidence)):
+            mode = "revise_open"
+
+        normalized: list[dict] = []
+        passthrough: list[dict] = []
+        for item in items:
+            row = self._normalize_generic_todo_row(item, owner=role_key)
+            if not row:
+                continue
+            if str(row.get("key", "") or "").startswith("bb:"):
+                passthrough.append(row)
+                continue
+            if role_key in {"manager", "explorer", "developer", "reviewer"}:
+                row["owner"] = role_key
+            row["subtask_id"] = self._stable_root_todo_id(row)
+            normalized.append(row)
+        if not normalized:
+            return self.todo.update(preserved_rows + passthrough + existing_scope)
+
+        existing_entries: list[tuple[str, dict, int]] = []
+        for index, row in enumerate(existing_scope):
+            identity = self._flat_todo_identity(row)
+            if identity:
+                existing_entries.append((identity, dict(row), index))
+        used: set[str] = set()
+        matched: list[tuple[dict, str, dict | None, int]] = []
+        for incoming in normalized:
+            identity = self._flat_todo_identity(incoming)
+            prior: dict | None = None
+            prior_index = -1
+            for candidate_id, candidate, candidate_index in existing_entries:
+                if candidate_id == identity and candidate_id not in used:
+                    prior = candidate
+                    prior_index = candidate_index
+                    identity = candidate_id
+                    break
+            if prior is None:
+                scored: list[tuple[float, str, dict, int]] = []
+                for candidate_id, candidate, candidate_index in existing_entries:
+                    if candidate_id in used:
+                        continue
+                    score = self._plan_worker_todo_match_score(incoming, candidate)
+                    if score >= 0.64:
+                        scored.append((score, candidate_id, candidate, candidate_index))
+                scored.sort(key=lambda value: value[0], reverse=True)
+                if scored and (scored[0][0] >= 0.86 or len(scored) == 1 or scored[0][0] - scored[1][0] >= 0.08):
+                    _score, identity, prior, prior_index = scored[0]
+            if isinstance(prior, dict):
+                used.add(identity)
+                incoming["subtask_id"] = prior.get("subtask_id", "") or self._stable_root_todo_id(prior)
+                if prior.get("external_subtask_id") and not incoming.get("external_subtask_id"):
+                    incoming["external_subtask_id"] = prior.get("external_subtask_id")
+            matched.append((incoming, identity, prior, prior_index))
+
+        if not existing_scope:
+            state_lock = getattr(self, "lock", None)
+            if state_lock is not None:
+                state_lock.acquire()
+            try:
+                valid, stale_reason = self._todo_write_transaction_is_current(transaction, board=self._ensure_blackboard())
+                if not valid:
+                    return self._emit_stale_todo_write_discarded(stale_reason)
+                result = self.todo.update(preserved_rows + passthrough + normalized)
+            finally:
+                if state_lock is not None:
+                    state_lock.release()
+            self._ensure_root_todo_baseline(normalized, board=bb)
+            return result
+
+        if mode == "status_update":
+            merged_scope = [dict(row) for row in existing_scope]
+            for incoming, _identity, prior, prior_index in matched:
+                if isinstance(prior, dict) and prior_index >= 0:
+                    merged = dict(prior)
+                    prior_status = self._normalize_todo_status_value(prior.get("status", ""), "pending")
+                    incoming_status = self._normalize_todo_status_value(incoming.get("status", ""), prior_status)
+                    if prior_status == "completed" and incoming_status != "completed":
+                        incoming_status = "completed"
+                    merged["status"] = incoming_status
+                    merged["updated_at"] = float(now_ts())
+                    for meta_key in ("evidence", "evidence_binding", "evidence_ids", "completed_at", "completed_by", "started_at"):
+                        if incoming.get(meta_key) not in (None, "", []):
+                            merged[meta_key] = incoming.get(meta_key)
+                    # Status updates cannot silently abbreviate or redirect an
+                    # objective. Structural text changes belong to revise_open.
+                    merged_scope[prior_index] = merged
+                else:
+                    incoming["created_at"] = float(incoming.get("created_at", 0.0) or now_ts())
+                    merged_scope.append(incoming)
+            state_lock = getattr(self, "lock", None)
+            if state_lock is not None:
+                state_lock.acquire()
+            try:
+                valid, stale_reason = self._todo_write_transaction_is_current(transaction, board=self._ensure_blackboard())
+                if not valid:
+                    return self._emit_stale_todo_write_discarded(stale_reason)
+                return self.todo.update(preserved_rows + passthrough + merged_scope)
+            finally:
+                if state_lock is not None:
+                    state_lock.release()
+
+        reason = trim(str(revision_reason or "").strip(), 1200)
+        if not (normalize_work_text(reason) or reason).strip():
+            review = {"reason": "revision_reason must explain why the existing open objectives no longer form a completion-safe tree", "completion_risk": "high"}
+            before_open, after_open, _removed = self._root_todo_material_changes(existing_scope, existing_scope)
+            self._append_root_todo_revision_audit(
+                actor=role_key, status="rejected", mode=mode, reason=reason,
+                review=review, before_open=before_open, after_open=after_open, board=bb,
+            )
+            return self._plan_control_feedback("preserve_todo_tree", f"Todo-tree revision rejected: {review['reason']}.\n\n{self.todo.render()}")
+
+        proposed_scope: list[dict] = []
+        represented: set[str] = set()
+        for incoming, identity, prior, _prior_index in matched:
+            if isinstance(prior, dict):
+                represented.add(identity)
+                prior_status = self._normalize_todo_status_value(prior.get("status", ""), "pending")
+                if prior_status == "completed" and mode != "rework_completed":
+                    proposed_scope.append(dict(prior))
+                    continue
+                revised = dict(prior)
+                revised.update(incoming)
+                revised["subtask_id"] = prior.get("subtask_id", "") or self._stable_root_todo_id(prior)
+                revised["updated_at"] = float(now_ts())
+                proposed_scope.append(revised)
+            else:
+                incoming["created_at"] = float(incoming.get("created_at", 0.0) or now_ts())
+                proposed_scope.append(incoming)
+        # Completed history is immutable unless the explicit rework mode names
+        # and successfully reviews the row. Omission alone can never erase it.
+        for identity, prior, _index in existing_entries:
+            if identity in represented:
+                continue
+            if self._normalize_todo_status_value(prior.get("status", ""), "pending") == "completed":
+                proposed_scope.insert(0, dict(prior))
+
+        before_open, after_open, removed = self._root_todo_material_changes(existing_scope, proposed_scope)
+        evidence = self._root_todo_revision_evidence(revision_evidence, board=bb)
+        baseline = self._ensure_root_todo_baseline(existing_scope, board=bb)
+        review = self._semantic_audit_root_todo_revision(
+            reason=reason,
+            baseline=baseline,
+            current_rows=existing_scope,
+            proposed_rows=proposed_scope,
+            removed_objectives=removed,
+            evidence=evidence,
+        )
+        if not bool(review.get("available", False)) or not bool(review.get("approved", False)):
+            self._append_root_todo_revision_audit(
+                actor=role_key, status="rejected", mode=mode, reason=reason,
+                review=review, before_open=before_open, after_open=after_open, board=bb,
+            )
+            return self._plan_control_feedback(
+                "preserve_todo_tree",
+                f"Todo-tree revision rejected: {review.get('reason', 'semantic review did not prove full requirement coverage')}. "
+                f"The canonical tree was preserved.\n\n{self.todo.render()}",
+            )
+
+        state_lock = getattr(self, "lock", None)
+        if state_lock is not None:
+            state_lock.acquire()
+        try:
+            valid, stale_reason = self._todo_write_transaction_is_current(transaction, board=self._ensure_blackboard())
+            if not valid:
+                return self._emit_stale_todo_write_discarded(stale_reason)
+            result = self.todo.update(preserved_rows + passthrough + proposed_scope)
+        finally:
+            if state_lock is not None:
+                state_lock.release()
+        self._append_root_todo_revision_audit(
+            actor=role_key, status="accepted", mode=mode, reason=reason,
+            review=review, before_open=before_open, after_open=after_open, board=bb,
+        )
+        return (
+            f"{result}\nTODO TREE REVISION: accepted after independent LLM coverage/risk review. "
+            f"Reason: {review.get('reason', reason)}"
+        )
+
+    def _merge_flat_todo_items(
+        self,
+        items: list[dict],
+        role: str = "",
+        *,
+        update_mode: str = "status_update",
+        revision_reason: str = "",
+        revision_evidence: object = None,
+        transaction: dict | None = None,
+    ) -> str:
         if not isinstance(items, list):
             raise ValueError("items must be array")
         role_key = self._sanitize_agent_role(role)
         existing = self.todo.snapshot()
         route_existing = self._todo_route_rows("pure_single", rows=existing, role=role_key)
-        existing_by_identity: dict[str, dict] = {}
-        preserved_system: list[dict] = []
-        for row in existing:
-            if self._todo_row_kind(row) != "system":
-                continue
-            preserved_system.append(dict(row))
-        for row in route_existing:
-            if not isinstance(row, dict):
-                continue
-            identity = self._flat_todo_identity(row)
-            if not identity:
-                continue
-            if identity not in existing_by_identity:
-                existing_by_identity[identity] = dict(row)
-
-        passthrough_rows: list[dict] = []
-        merged_rows: list[dict] = []
-        seen_identities: set[str] = set()
-        for idx, item in enumerate(items):
-            raw = self._normalize_generic_todo_row(item, owner=role_key)
-            if not raw:
-                continue
-            key = trim(str(raw.get("key", "") or "").strip(), 120)
-            if key.startswith("bb:"):
-                passthrough_rows.append(raw)
-                continue
-            normalized = dict(raw)
-            normalized["owner"] = role_key if role_key in {"manager", "explorer", "developer", "reviewer"} else str(normalized.get("owner", "") or "")
-            identity = self._flat_todo_identity(normalized)
-            if not identity:
-                identity = f"ad-hoc:{idx}:{trim(str(normalized.get('content', '')), 80)}"
-            prior = existing_by_identity.get(identity)
-            if prior is None:
-                candidates = []
-                for candidate_id, candidate in existing_by_identity.items():
-                    if candidate_id in seen_identities:
-                        continue
-                    score = self._plan_worker_todo_match_score(normalized, candidate)
-                    if score >= 0.64:
-                        candidates.append((score, candidate_id, candidate))
-                candidates.sort(key=lambda value: value[0], reverse=True)
-                if candidates and (candidates[0][0] >= 0.86 or len(candidates) == 1 or candidates[0][0] - candidates[1][0] >= 0.08):
-                    _score, identity, prior = candidates[0]
-            merged = dict(prior or {})
-            prior_status = self._normalize_todo_status_value(merged.get("status", ""), "pending")
-            incoming_status = self._normalize_todo_status_value(normalized.get("status", ""), prior_status)
-            if prior_status == "completed" and incoming_status != "completed":
-                incoming_status = "completed"
-            merged.update(normalized)
-            merged["status"] = incoming_status
-            merged["owner"] = normalized.get("owner", role_key)
-            if identity in seen_identities:
-                continue
-            seen_identities.add(identity)
-            merged_rows.append(merged)
-        return self.todo.update(preserved_system + passthrough_rows + merged_rows)
+        preserved_system = [
+            dict(row) for row in existing
+            if isinstance(row, dict) and self._todo_row_kind(row) == "system"
+        ]
+        return self._merge_root_todo_scope(
+            items,
+            role=role_key,
+            existing_scope=route_existing,
+            preserved_rows=preserved_system,
+            update_mode=update_mode,
+            revision_reason=revision_reason,
+            revision_evidence=revision_evidence,
+            transaction=transaction,
+        )
 
     # --- Active-step worker todo reconciliation -------------------------------
     # Merge worker-submitted subtasks into the active plan step while
@@ -53127,6 +53560,20 @@ body{padding:18px}
             if not valid:
                 return self._emit_stale_todo_write_discarded(stale_reason)
             result = self.todo.update(final_rows)
+            # The Todo commit itself is the expected mutation. Refresh the
+            # transaction signature before the blackboard mirror revalidates
+            # the same atomic operation.
+            if isinstance(transaction, dict):
+                try:
+                    transaction["todo_signature"] = hashlib.sha256(
+                        json.dumps(
+                            self._todo_progress_signature(self.todo.snapshot()),
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ).encode("utf-8", "ignore")
+                    ).hexdigest()
+                except Exception:
+                    transaction["todo_signature"] = ""
             try:
                 self._sync_plan_worker_todos_to_blackboard(
                     step_id,
@@ -53193,12 +53640,28 @@ body{padding:18px}
         except Exception:
             return ""
 
-    def _merge_owner_scoped_todo_items(self, items: list[dict], role: str = "") -> str:
+    def _merge_owner_scoped_todo_items(
+        self,
+        items: list[dict],
+        role: str = "",
+        *,
+        update_mode: str = "status_update",
+        revision_reason: str = "",
+        revision_evidence: object = None,
+        transaction: dict | None = None,
+    ) -> str:
         if not isinstance(items, list):
             raise ValueError("items must be array")
         role_key = self._sanitize_agent_role(role)
         if role_key not in {"developer", "explorer", "reviewer"}:
-            return self.todo.update(items)
+            return self._merge_flat_todo_items(
+                items,
+                role=role_key,
+                update_mode=update_mode,
+                revision_reason=revision_reason,
+                revision_evidence=revision_evidence,
+                transaction=transaction,
+            )
         existing = self.todo.snapshot()
         preserved: list[dict] = []
         existing_owner_rows: list[dict] = []
@@ -53214,65 +53677,16 @@ body{padding:18px}
                 existing_owner_rows.append(dict(row))
                 continue
             preserved.append(dict(row))
-        normalized: list[dict] = []
-        for idx, item in enumerate(items):
-            row = self._normalize_generic_todo_row(item, owner=role_key)
-            if not row:
-                continue
-            if str(row.get("key", "") or "").startswith("bb:"):
-                normalized.append(row)
-                continue
-            row["owner"] = role_key
-            normalized.append(row)
-        if not normalized:
-            return self.todo.update(preserved + existing_owner_rows)
-
-        def identity(row: dict) -> str:
-            return self._flat_todo_identity(row)
-
-        existing_by_id = {identity(row): row for row in existing_owner_rows if identity(row)}
-        merged: list[dict] = []
-        used: set[str] = set()
-        for incoming in normalized:
-            incoming_id = identity(incoming)
-            prior_id = incoming_id if incoming_id in existing_by_id else ""
-            prior = existing_by_id.get(prior_id) if prior_id else None
-            if prior is None:
-                scored = []
-                for candidate_id, candidate in existing_by_id.items():
-                    if candidate_id in used:
-                        continue
-                    score = self._plan_worker_todo_match_score(incoming, candidate)
-                    if score >= 0.64:
-                        scored.append((score, candidate_id, candidate))
-                scored.sort(key=lambda value: value[0], reverse=True)
-                if scored and (scored[0][0] >= 0.86 or len(scored) == 1 or scored[0][0] - scored[1][0] >= 0.08):
-                    _score, prior_id, prior = scored[0]
-            if isinstance(prior, dict):
-                used.add(prior_id)
-                merged_row = dict(prior)
-                prior_status = self._normalize_todo_status_value(prior.get("status", ""), "pending")
-                incoming_status = self._normalize_todo_status_value(incoming.get("status", ""), prior_status)
-                if prior_status == "completed" and incoming_status != "completed":
-                    incoming_status = "completed"
-                merged_row.update(incoming)
-                merged_row["status"] = incoming_status
-                merged_row["owner"] = role_key
-                if prior_status == "completed":
-                    for key in ("completed_at", "completed_by", "evidence", "evidence_ids", "evidence_binding"):
-                        if merged_row.get(key) in (None, "", []):
-                            if prior.get(key) not in (None, "", []):
-                                merged_row[key] = prior.get(key)
-                merged.append(merged_row)
-            else:
-                incoming["owner"] = role_key
-                merged.append(incoming)
-        # A worker often sends only the row that changed. Keep untouched rows in
-        # sync mode so a handoff cannot erase another completed/current row.
-        for candidate_id, candidate in existing_by_id.items():
-            if candidate_id not in used:
-                merged.append(dict(candidate))
-        return self.todo.update(preserved + merged)
+        return self._merge_root_todo_scope(
+            items,
+            role=role_key,
+            existing_scope=existing_owner_rows,
+            preserved_rows=preserved,
+            update_mode=update_mode,
+            revision_reason=revision_reason,
+            revision_evidence=revision_evidence,
+            transaction=transaction,
+        )
 
     def _append_instruction_bubble(self, content: str, *, target_roles: tuple[str, ...] = (), summary: str = "") -> bool:
         text = trim(str(content or "").strip(), PLAN_NOTICE_BODY_MAX_CHARS)
@@ -62848,9 +63262,9 @@ body{padding:18px}
                 "TODO TRACKING: "
                 "When a plan step is active, treat its current todo list as a rolling, evidence-governed subplan instead of inventing a parallel path. "
                 "After completing ONE subtask, call TodoWrite when possible to mark that subtask as 'completed' and move the next one to 'in_progress'. "
-                "For ordinary status progress use update_mode='status_update'. If fresh current-step tool evidence or reviewer findings show that OPEN subtasks are missing, obsolete, wrongly ordered, or poorly split, "
+                "For ordinary status progress use update_mode='status_update'; it is merge-only, so omitted unfinished objectives remain in the canonical tree. If fresh current-step tool evidence or reviewer findings show that OPEN subtasks are missing, obsolete, wrongly ordered, or poorly split, "
                 "first inspect the canonical list and evidence, then submit the complete revised open snapshot with update_mode='revise_open', a concrete revision_reason, and exact revision_evidence references. "
-                "Do not revise from preference or speculation; the runtime audits structural changes and preserves completed history. Use update_mode='rework_completed' only with cited failure/reviewer evidence. "
+                "Do not revise from preference or speculation; an independent LLM reviews semantic requirement coverage and explains its decision, while the runtime preserves completed history and commits atomically. Use update_mode='rework_completed' only with cited failure/reviewer evidence. "
                 "If TodoWrite fails, repeats unchanged, or is unavailable, do not loop on it; continue one concrete action or report the blocker with exact evidence. "
                 "Prefer TodoWrite items as objects with explicit fields: "
             "{content, status, owner?, parent_step_id?}. "
@@ -63444,6 +63858,13 @@ body{padding:18px}
         key = trim(str(raw.get("key", "") or "").strip(), 120)
         if key:
             row["key"] = key
+        # Explicit stage IDs from no-plan/L2 Todo lists are stable root-row
+        # identities, not approved-plan parent links. Preserve them as an
+        # external identity so abbreviated status snapshots still match the
+        # original detailed objective without being routed as plan subtasks.
+        root_stage_id = trim(str(raw.get("parent_step_id", raw.get("parentStepId", "")) or "").strip(), 120)
+        if root_stage_id and not root_stage_id.startswith("bb:"):
+            row["external_subtask_id"] = root_stage_id
         for alias_key in (
             "external_subtask_id", "externalSubtaskId", "external_id", "externalId",
             "todo_id", "todoId", "task_id", "taskId", "item_id", "itemId",
@@ -63533,8 +63954,22 @@ body{padding:18px}
                 transaction=transaction,
             )
         if route_kind == "pure_sync":
-            return self._merge_owner_scoped_todo_items(normalized_items, role=role_key)
-        return self._merge_flat_todo_items(normalized_items, role=role_key)
+            return self._merge_owner_scoped_todo_items(
+                normalized_items,
+                role=role_key,
+                update_mode=mode,
+                revision_reason=reason,
+                revision_evidence=revision_evidence,
+                transaction=transaction,
+            )
+        return self._merge_flat_todo_items(
+            normalized_items,
+            role=role_key,
+            update_mode=mode,
+            revision_reason=reason,
+            revision_evidence=revision_evidence,
+            transaction=transaction,
+        )
 
     def _todo_progress_signature(self, rows: list[dict] | None = None) -> list[tuple[str, str, str, str]]:
         items = rows if isinstance(rows, list) else self.todo.snapshot()

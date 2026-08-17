@@ -65,7 +65,7 @@ def tool_def(name: str, description: str, properties: dict, required: list[str] 
         },
     }
 
-# split-source: order=841 original-lines=20457-20939 hash=af0b495ef6b10417
+# split-source: order=841 original-lines=20457-20941 hash=7e04884c2080e744
 
 TOOLS = [
     tool_def("bash", "Run a shell command.", {"command": {"type": "string"}}, ["command"]),
@@ -103,9 +103,11 @@ TOOLS = [
     tool_def(
         "TodoWrite",
         (
-            "Update current todos. In approved plan mode, use update_mode='status_update' for status-only progress. "
+            "Update current todos. update_mode='status_update' is merge-only: omitted unfinished rows are preserved, "
+            "so a partial progress payload can never shorten the task tree. In approved plan mode, use it for status-only progress. "
             "When new current-step tool evidence or reviewer findings prove the open subplan is no longer suitable, "
-            "use update_mode='revise_open' with a concrete revision_reason and revision_evidence references; the runtime audits the revision atomically. "
+            "use update_mode='revise_open' with a concrete revision_reason and revision_evidence references; the runtime performs an atomic LLM audit "
+            "against the authoritative goal, original Todo baseline, completed evidence, and remaining requirement coverage before replacing open rows. "
             "Use 'rework_completed' only when failure/reviewer evidence requires reopening completed work. "
             "Preferred items are objects with content/status/owner/parent_step_id/subtask_id."
         ),
@@ -134,7 +136,7 @@ TOOLS = [
             "update_mode": {
                 "type": "string",
                 "enum": ["status_update", "revise_open", "rework_completed"],
-                "description": "status_update changes statuses only; revise_open replaces the current open-subtask snapshot after evidence audit; rework_completed requires failure/reviewer evidence.",
+                "description": "status_update merges statuses and preserves omitted rows; revise_open proposes a complete open snapshot and requires an LLM coverage/risk audit; rework_completed additionally proposes reopening completed work.",
             },
             "revision_reason": {"type": "string", "description": "Concrete new finding that justifies a structural rolling-plan revision."},
             "revision_evidence": {},
@@ -144,7 +146,7 @@ TOOLS = [
     ),
     tool_def(
         "TodoWriteRescue",
-        "Fallback todo writer. Preferred format: objects with content/status/owner/parent_step_id. String fallback should use only '[ ] task', '[>] task', or '[x] task'.",
+        "Fallback todo writer using the same protected merge/replan transaction as TodoWrite. Omitted rows are preserved unless an explicit revise_open passes LLM review. Preferred format: objects with content/status/owner/parent_step_id. String fallback should use only '[ ] task', '[>] task', or '[x] task'.",
         {
             "items": {"type": "array", "items": {}},
             "todos": {"type": "array", "items": {}},
@@ -550,14 +552,14 @@ TOOLS = [
     ),
 ]
 
-# split-source: order=842 original-lines=20940-20941 hash=3ee29b226eaf3576
+# split-source: order=842 original-lines=20942-20943 hash=3ee29b226eaf3576
 
 TOOL_REQUIRED_ARGS: dict[str, list[str]] = {}
 
-# split-source: order=843 original-lines=20942-20942 hash=08ea091c248842a3
+# split-source: order=843 original-lines=20944-20944 hash=08ea091c248842a3
 TOOL_SPEC_BY_NAME: dict[str, dict] = {}
 
-# split-source: order=844 original-lines=20943-20952 hash=5b49546953f9369c
+# split-source: order=844 original-lines=20945-20954 hash=5b49546953f9369c
 for _tool in TOOLS:
     try:
         _fn = _tool.get("function", {})
@@ -569,17 +571,17 @@ for _tool in TOOLS:
     except Exception:
         continue
 
-# split-source: order=845 original-lines=20953-20954 hash=bfed07d2aedc6126
+# split-source: order=845 original-lines=20955-20956 hash=bfed07d2aedc6126
 
 TOOL_NAME_FUZZY_MAP: dict[str, str] = {}
 
-# split-source: order=846 original-lines=20955-20958 hash=61dd6436d3455b98
+# split-source: order=846 original-lines=20957-20960 hash=61dd6436d3455b98
 for _name in TOOL_SPEC_BY_NAME.keys():
     _key = re.sub(r"[^a-z0-9]+", "", str(_name or "").lower())
     if _key and _key not in TOOL_NAME_FUZZY_MAP:
         TOOL_NAME_FUZZY_MAP[_key] = str(_name)
 
-# split-source: order=847 original-lines=20959-20976 hash=8c7992dc17a67107
+# split-source: order=847 original-lines=20961-20978 hash=8c7992dc17a67107
 
 for _alias, _target in {
     "writefile": "write_file",
@@ -599,7 +601,7 @@ for _alias, _target in {
 }.items():
     TOOL_NAME_FUZZY_MAP[_alias] = _target
 
-# split-source: order=848 original-lines=20977-20993 hash=a168e414b363725e
+# split-source: order=848 original-lines=20979-20995 hash=a168e414b363725e
 
 
 def is_todo_resume_tool_name(raw: object) -> bool:
@@ -618,7 +620,7 @@ def is_todo_resume_tool_name(raw: object) -> bool:
         "resumetodos",
     }
 
-# split-source: order=849 original-lines=20994-21012 hash=b3e6ffc2768f20fa
+# split-source: order=849 original-lines=20996-21014 hash=b3e6ffc2768f20fa
 
 
 def canonicalize_tool_name(raw: object) -> str:
@@ -639,7 +641,7 @@ def canonicalize_tool_name(raw: object) -> str:
         return lowered
     return mapped or name
 
-# split-source: order=850 original-lines=21013-21028 hash=b445806005f59898
+# split-source: order=850 original-lines=21015-21030 hash=b445806005f59898
 
 
 def filter_tool_specs_for_runtime(tools: list[dict] | None, *, web_search_enabled: bool = DEFAULT_WEB_SEARCH_ENABLED) -> list[dict]:
@@ -657,7 +659,7 @@ def filter_tool_specs_for_runtime(tools: list[dict] | None, *, web_search_enable
         out.append(tool)
     return out
 
-# split-source: order=851 original-lines=21029-21039 hash=9ed4253b5af25719
+# split-source: order=851 original-lines=21031-21041 hash=9ed4253b5af25719
 
 
 # Fix F: orchestration / worktree / teammate-management tools a sync-mode developer
@@ -670,7 +672,7 @@ DEVELOPER_TOOL_DROP: set[str] = {
     "shutdown_request", "plan_approval", "scan_skills", "write_skill",
 }
 
-# split-source: order=852 original-lines=21040-21100 hash=6d3b7a2b319abd41
+# split-source: order=852 original-lines=21042-21102 hash=6d3b7a2b319abd41
 
 AGENT_TOOL_ALLOWLIST: dict[str, set[str]] = {
     "explorer": {

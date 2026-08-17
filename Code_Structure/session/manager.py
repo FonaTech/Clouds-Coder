@@ -13,7 +13,7 @@ class SessionCreationLimitExceeded(RuntimeError):
         self.status = dict(status or {})
         super().__init__(str(self.status.get("message", "daily session limit reached")))
 
-# split-source: order=872 original-lines=74237-75548 hash=fc419b36f32453ae
+# split-source: order=872 original-lines=74672-75983 hash=fc419b36f32453ae
 
 class SessionManager:
     def __init__(
