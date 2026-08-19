@@ -73,7 +73,11 @@ COLLAB_MAX_AVATAR_BYTES = 2 * 1024 * 1024
 COLLAB_MAX_TEXT_BYTES = 2 * 1024 * 1024
 COLLAB_DELETE_RETENTION_DAYS = 30
 COLLAB_EVENT_RETENTION = 100_000
-COLLAB_SCHEMA_VERSION = 2
+COLLAB_AGENT_STALE_SECONDS = 15 * 60
+COLLAB_AGENT_HEARTBEAT_INTERVAL_SECONDS = 5
+COLLAB_EXTERNAL_WRITE_SETTLE_SECONDS = 0.75
+COLLAB_EXTERNAL_WRITE_CONFIRMATIONS = 2
+COLLAB_SCHEMA_VERSION = 3
 
 
 def _now() -> float:
@@ -172,8 +176,33 @@ def _collaboration_public_text(value: object, maximum: int = 500) -> str:
     return text if len(text) <= limit else text[: max(1, limit - 3)].rstrip() + "..."
 
 
+def _collaboration_task_objective(value: object, maximum: int = 4000) -> str:
+    """Extract the user objective from the private IDE workspace envelope."""
+    raw = unicodedata.normalize("NFKC", str(value or "")).strip()
+    if raw.startswith("IDE programming request."):
+        _header, separator, objective = raw.partition("\n\n")
+        if separator and objective.strip():
+            raw = objective.strip()
+        else:
+            lines = raw.splitlines()
+            payload_index = next(
+                (
+                    index
+                    for index, line in enumerate(lines[1:], 1)
+                    if not line.strip().lower().startswith(
+                        ("workspace root:", "writable path:", "active file:", "attached workspace files")
+                    )
+                    and not line.lstrip().startswith("-")
+                    and line.strip()
+                ),
+                len(lines),
+            )
+            raw = "\n".join(lines[payload_index:]).strip()
+    return _collaboration_public_text(raw, maximum)
+
+
 def _collaboration_task_title(value: object) -> str:
-    safe = _collaboration_public_text(value, 1200)
+    safe = _collaboration_task_objective(value, 1200)
     if not safe:
         return "Shared Agent task"
     first = re.split(r"(?<=[.!?。！？])\s+", safe, maxsplit=1)[0].strip()
@@ -181,7 +210,7 @@ def _collaboration_task_title(value: object) -> str:
 
 
 def _collaboration_task_key(value: object) -> str:
-    safe = _collaboration_public_text(value, 4000).casefold()
+    safe = _collaboration_task_objective(value, 4000).casefold()
     normalized = re.sub(r"[^\w\u3400-\u9fff]+", " ", safe, flags=re.UNICODE)
     normalized = re.sub(r"\s+", " ", normalized).strip()
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest() if normalized else ""
@@ -380,7 +409,9 @@ class CollaborationStore:
         self.admission_failures: dict[tuple[str, str], list[float]] = {}
         self.document_locks: dict[tuple[str, str], threading.RLock] = {}
         self.project_mutation_locks: dict[str, threading.RLock] = {}
+        self.external_write_observations: dict[tuple[str, str], dict] = {}
         self._initialize()
+        self.recover_abandoned_agent_runtime()
         self.recover_files()
         self.purge_expired_projects()
 
@@ -1289,6 +1320,35 @@ class CollaborationStore:
         with self.lock:
             return self.project_mutation_locks.setdefault(project_id, threading.RLock())
 
+    def _clear_external_write_observation(self, project_id: str, rel: str) -> None:
+        with self.lock:
+            self.external_write_observations.pop((str(project_id), str(rel)), None)
+
+    def _external_write_is_stable(self, project_id: str, rel: str, signature: str) -> bool:
+        """Require a mismatching filesystem state to survive multiple scans."""
+        key = (str(project_id), str(rel))
+        now = _now()
+        with self.lock:
+            previous = self.external_write_observations.get(key)
+            if previous is None or str(previous.get("signature", "")) != str(signature):
+                self.external_write_observations[key] = {
+                    "signature": str(signature),
+                    "first_seen": now,
+                    "last_seen": now,
+                    "count": 1,
+                }
+                return False
+            previous["last_seen"] = now
+            previous["count"] = int(previous.get("count", 1) or 1) + 1
+            stable = (
+                int(previous["count"]) >= COLLAB_EXTERNAL_WRITE_CONFIRMATIONS
+                and now - float(previous.get("first_seen", now) or now)
+                >= COLLAB_EXTERNAL_WRITE_SETTLE_SECONDS
+            )
+            if stable:
+                self.external_write_observations.pop(key, None)
+            return stable
+
     def _external_conflict(self, conn: sqlite3.Connection, row: sqlite3.Row, disk: bytes, reason: str = "external_write") -> dict:
         existing = conn.execute("SELECT * FROM conflicts WHERE document_id=? AND status IN ('open','ask_user') ORDER BY created_at DESC LIMIT 1", (row["document_id"],)).fetchone()
         if existing:
@@ -1324,7 +1384,10 @@ class CollaborationStore:
 
     def read_document(self, project_id: str, relative: object) -> dict:
         rel, path = self.resolve_path(project_id, relative)
-        with self._document_lock(project_id, rel):
+        # Unknown shell/process writes hold the project mutation lease. Readers
+        # must wait for that lease so they never observe a truncate-then-write
+        # intermediate state as an external empty-file conflict.
+        with self.project_mutation_lock(project_id), self._document_lock(project_id, rel):
             with self._connect() as conn:
                 conn.execute("BEGIN IMMEDIATE")
                 row = self._load_document(conn, project_id, rel, path)
@@ -1387,6 +1450,48 @@ class CollaborationStore:
             "path": rel,
             "current_revision": int(document["revision"]),
             "versions": [dict(row) for row in versions],
+        }
+
+    def document_version(
+        self,
+        project_id: str,
+        relative: object,
+        revision: int | None = None,
+    ) -> dict:
+        """Read one immutable text version for an authenticated IDE history view."""
+        rel, _ = self.resolve_path(project_id, relative)
+        with self._connect() as conn:
+            document = conn.execute(
+                "SELECT * FROM documents WHERE project_id=? AND path=?",
+                (project_id, rel),
+            ).fetchone()
+            if document is None:
+                raise CollaborationError("file_not_found", "file not found", 404)
+            requested = int(document["revision"]) if revision is None else int(revision)
+            version = conn.execute(
+                "SELECT * FROM document_versions WHERE document_id=? AND revision=?",
+                (document["document_id"], requested),
+            ).fetchone()
+            if version is None:
+                raise CollaborationError("version_not_found", "document version not found", 404)
+        content = bytes(version["content"])
+        if len(content) > CODE_PREVIEW_STAGE_MAX_BYTES:
+            raise CollaborationError("document_too_large", "document version is too large to preview", 413)
+        try:
+            text = content.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise CollaborationError("binary_document", "binary document history cannot be previewed as text", 409) from exc
+        return {
+            "document_id": str(document["document_id"]),
+            "path": rel,
+            "revision": requested,
+            "current_revision": int(document["revision"]),
+            "content_hash": str(version["content_hash"] or ""),
+            "actor_member_id": str(version["actor_member_id"] or ""),
+            "reason": str(version["reason"] or ""),
+            "created_at": float(version["created_at"] or 0.0),
+            "content": text,
+            "size": len(content),
         }
 
     def restore_document_version(
@@ -1517,13 +1622,25 @@ class CollaborationStore:
             conn.execute("BEGIN IMMEDIATE")
             row = self._load_document(conn, principal.project_id, rel, path)
             current = int(row["revision"]) if row else 0
+            digest = hashlib.sha256(content).hexdigest()
             if int(expected_revision) != current:
+                if row is not None and hmac.compare_digest(str(row["content_hash"]), digest):
+                    conn.execute("ROLLBACK")
+                    self._clear_external_write_observation(principal.project_id, rel)
+                    return {
+                        "ok": True,
+                        "idempotent": True,
+                        "document_id": str(row["document_id"]),
+                        "path": rel,
+                        "revision": current,
+                        "content_hash": digest,
+                        "is_text": bool(row["is_text"]),
+                    }
                 conflict = self._create_write_conflict(conn, principal, rel, row, content, "stale_file_write")
                 conn.execute("COMMIT")
                 raise CollaborationError("revision_conflict", "file revision changed", 409, details={"current_revision": current, "conflict": conflict})
             document_id = str(row["document_id"]) if row else str(uuid.uuid4())
             revision = current + 1
-            digest = hashlib.sha256(content).hexdigest()
             try:
                 content.decode("utf-8")
                 is_text = 1
@@ -1540,6 +1657,7 @@ class CollaborationStore:
             self._publish_in_tx(conn, principal.project_id, "file_change", {"document_id": document_id, "path": rel, "revision": revision, "content_hash": digest, "member_id": principal.member_id, "reason": str(reason)[:80]})
             conn.execute("COMMIT")
             self._atomic_write(path, content)
+            self._clear_external_write_observation(principal.project_id, rel)
         with self.event_condition:
             self.event_condition.notify_all()
         return {"ok": True, "document_id": document_id, "path": rel, "revision": revision, "content_hash": digest, "is_text": bool(is_text)}
@@ -1646,7 +1764,18 @@ class CollaborationStore:
                 (principal.project_id, rel),
             ).fetchone()
             current = int(row["revision"]) if row else 0
+            digest = hashlib.sha256(content).hexdigest()
             if current != int(expected_revision):
+                if row is not None and hmac.compare_digest(str(row["content_hash"]), digest):
+                    conn.execute("ROLLBACK")
+                    self._clear_external_write_observation(principal.project_id, rel)
+                    return {
+                        "ok": True,
+                        "idempotent": True,
+                        "path": rel,
+                        "revision": current,
+                        "content_hash": digest,
+                    }
                 conflict = self._create_write_conflict(
                     conn, principal, rel, row, content, "concurrent_process_write"
                 )
@@ -1654,7 +1783,6 @@ class CollaborationStore:
                 return {"ok": False, "conflict": conflict, "path": rel, "current_revision": current}
             document_id = str(row["document_id"]) if row else str(uuid.uuid4())
             revision = current + 1
-            digest = hashlib.sha256(content).hexdigest()
             try:
                 content.decode("utf-8")
                 is_text = 1
@@ -1689,9 +1817,88 @@ class CollaborationStore:
                 },
             )
             conn.execute("COMMIT")
+            self._clear_external_write_observation(principal.project_id, rel)
         with self.event_condition:
             self.event_condition.notify_all()
         return {"ok": True, "path": rel, "revision": revision, "content_hash": digest}
+
+    def adopt_process_delete(
+        self,
+        principal: CollaborationPrincipal,
+        relative: object,
+        expected_revision: int,
+    ) -> dict:
+        """Commit a deletion performed while the project mutation lease was held."""
+        rel, path = self.resolve_path(principal.project_id, relative)
+        with self._document_lock(principal.project_id, rel), self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM documents WHERE project_id=? AND path=?",
+                (principal.project_id, rel),
+            ).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                self._clear_external_write_observation(principal.project_id, rel)
+                return {"ok": True, "idempotent": True, "action": "delete", "path": rel}
+            current = int(row["revision"])
+            if current != int(expected_revision):
+                conflict = self._create_write_conflict(
+                    conn, principal, rel, row, b"", "concurrent_process_delete"
+                )
+                conn.execute("COMMIT")
+                return {
+                    "ok": False,
+                    "conflict": conflict,
+                    "action": "delete",
+                    "path": rel,
+                    "current_revision": current,
+                }
+            document_id = str(row["document_id"])
+            conflict_ids = [
+                str(value[0])
+                for value in conn.execute(
+                    "SELECT conflict_id FROM conflicts WHERE document_id=?", (document_id,)
+                ).fetchall()
+            ]
+            for conflict_id in conflict_ids:
+                conn.execute("DELETE FROM conflict_confirmations WHERE conflict_id=?", (conflict_id,))
+                conn.execute("DELETE FROM conflict_reviews WHERE conflict_id=?", (conflict_id,))
+                conn.execute("DELETE FROM conflict_candidates WHERE conflict_id=?", (conflict_id,))
+            conn.execute("DELETE FROM conflicts WHERE document_id=?", (document_id,))
+            conn.execute("DELETE FROM operations WHERE document_id=?", (document_id,))
+            conn.execute("DELETE FROM document_versions WHERE document_id=?", (document_id,))
+            conn.execute("DELETE FROM documents WHERE document_id=?", (document_id,))
+            now = _now()
+            conn.execute(
+                "UPDATE file_intents SET status='closed',updated_at=? WHERE project_id=? AND path=?",
+                (now, principal.project_id, rel),
+            )
+            conn.execute(
+                "UPDATE authorization_leases SET invalidated_at=?,invalidation_reason='agent_process_delete' "
+                "WHERE project_id=? AND path=? AND invalidated_at=0",
+                (now, principal.project_id, rel),
+            )
+            self._publish_in_tx(
+                conn,
+                principal.project_id,
+                "file_change",
+                {"action": "delete", "path": rel, "member_id": principal.member_id, "reason": "agent_process"},
+            )
+            self._audit(
+                conn,
+                project_id=principal.project_id,
+                actor_kind="agent",
+                actor_id=principal.member_id,
+                action="document.process_delete",
+                target_kind="document",
+                target_id=document_id,
+                details={"path": rel, "revision": current},
+            )
+            conn.execute("COMMIT")
+        self._clear_external_write_observation(principal.project_id, rel)
+        with self.event_condition:
+            self.event_condition.notify_all()
+        return {"ok": True, "action": "delete", "path": rel, "revision": current}
 
     def _create_write_conflict(self, conn: sqlite3.Connection, principal: CollaborationPrincipal, rel: str, row: sqlite3.Row | None, candidate: bytes, reason: str) -> dict:
         now = _now()
@@ -1775,20 +1982,27 @@ class CollaborationStore:
             try:
                 with self.project_mutation_lock(project_id), self._document_lock(project_id, rel):
                     _, path = self.resolve_path(project_id, rel)
-                    disk = path.read_bytes() if path.exists() and path.is_file() else b""
-                    if hashlib.sha256(disk).hexdigest() == str(original["content_hash"]):
+                    present = bool(path.exists() and path.is_file())
+                    disk = path.read_bytes() if present else b""
+                    digest = hashlib.sha256(disk).hexdigest()
+                    if digest == str(original["content_hash"]):
+                        self._clear_external_write_observation(project_id, rel)
+                        continue
+                    signature = ("present:" if present else "missing:") + digest
+                    if not self._external_write_is_stable(project_id, rel, signature):
                         continue
                     with self._connect() as conn:
                         conn.execute("BEGIN IMMEDIATE")
                         current = conn.execute("SELECT * FROM documents WHERE document_id=?", (original["document_id"],)).fetchone()
-                        if current is None or hashlib.sha256(disk).hexdigest() == str(current["content_hash"]):
+                        if current is None or digest == str(current["content_hash"]):
                             conn.execute("ROLLBACK")
+                            self._clear_external_write_observation(project_id, rel)
                             continue
                         case = self._external_conflict(
                             conn,
                             current,
                             disk,
-                            "external_delete" if not path.exists() else "external_write",
+                            "external_delete" if not present else "external_write",
                         )
                         conn.execute("COMMIT")
                         created.append(str(case["conflict_id"]))
@@ -1831,18 +2045,34 @@ class CollaborationStore:
         return {"ok": True, "last_seen": now}
 
     @staticmethod
-    def _assignment_default(role: str, ordinal: int, coordination: list[str]) -> str:
+    def _assignment_default(
+        role: str,
+        ordinal: int,
+        coordination: list[str],
+        participant_count: int = 1,
+    ) -> str:
         index = max(0, int(ordinal))
-        if index < len(coordination):
-            return coordination[index]
+        count = max(1, int(participant_count or 1))
+        assigned = [str(step) for step in coordination[index::count] if str(step or "").strip()]
+        if assigned:
+            label = "Coordinator working slices" if role == "coordinator" else f"Contributor {index + 1} slices"
+            suffix = (
+                " Continue implementing these slices and integrate participant results."
+                if role == "coordinator"
+                else " Work only within these slices, respect claimed files, and publish evidence."
+            )
+            return _collaboration_public_text(
+                f"{label}: " + " | ".join(assigned) + suffix,
+                1800,
+            )
         if role == "coordinator":
             return (
                 "Execute the first concrete workstream, divide remaining work into non-overlapping slices, "
                 "and integrate participant results."
             )
         return (
-            f"Execute contributor slice {index + 1}; follow the coordinator plan, avoid claimed files, "
-            "and publish concise evidence."
+            "Read the latest public coordinator plan before modifying files. If it is not initialized yet, "
+            "inspect shared state and publish clues only; then execute only your assigned slice."
         )
 
     def _agent_assignment_in_tx(
@@ -1866,6 +2096,162 @@ class CollaborationStore:
             params,
         ).fetchone()
 
+    @staticmethod
+    def _close_agent_intents_in_tx(
+        conn: sqlite3.Connection,
+        project_id: str,
+        agent_id: str,
+        now: float,
+    ) -> int:
+        cursor = conn.execute(
+            "UPDATE file_intents SET status='closed',updated_at=? "
+            "WHERE project_id=? AND agent_id=? AND status='active'",
+            (now, project_id, agent_id),
+        )
+        return max(0, int(cursor.rowcount or 0))
+
+    @staticmethod
+    def _blackboard_status_from_assignments_in_tx(
+        conn: sqlite3.Connection,
+        item_id: str,
+    ) -> str:
+        statuses = [
+            str(row[0] or "")
+            for row in conn.execute(
+                "SELECT status FROM blackboard_agent_assignments WHERE item_id=?",
+                (item_id,),
+            ).fetchall()
+        ]
+        if any(value == "in_progress" for value in statuses):
+            return "in_progress"
+        if any(value == "blocked" for value in statuses):
+            return "blocked"
+        if any(value == "completed" for value in statuses):
+            return "completed"
+        return "cancelled"
+
+    def recover_abandoned_agent_runtime(self) -> dict:
+        """Close process-owned runtime state that cannot survive a server restart."""
+        now = _now()
+        recovered_agents: list[str] = []
+        closed_intents = 0
+        affected_items: set[str] = set()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                "SELECT agent_id,project_id FROM agents WHERE status IN ('running','queued')"
+            ).fetchall()
+            for row in rows:
+                agent_id = str(row["agent_id"] or "")
+                project_id = str(row["project_id"] or "")
+                recovered_agents.append(agent_id)
+                conn.execute(
+                    "UPDATE agents SET status='idle',current_file='',tool_summary=?,updated_at=? WHERE agent_id=?",
+                    ("Recovered after server restart; previous run is no longer active.", now, agent_id),
+                )
+                closed_intents += self._close_agent_intents_in_tx(conn, project_id, agent_id, now)
+                assignments = conn.execute(
+                    "SELECT item_id FROM blackboard_agent_assignments "
+                    "WHERE project_id=? AND agent_id=? AND status='in_progress'",
+                    (project_id, agent_id),
+                ).fetchall()
+                for assignment in assignments:
+                    affected_items.add(str(assignment["item_id"] or ""))
+                conn.execute(
+                    "UPDATE blackboard_agent_assignments SET status='blocked',result_summary=?,updated_at=?,finished_at=? "
+                    "WHERE project_id=? AND agent_id=? AND status='in_progress'",
+                    ("Agent process ended before the task completed.", now, now, project_id, agent_id),
+                )
+            stale_intents = conn.execute(
+                "SELECT DISTINCT f.project_id,f.agent_id FROM file_intents f "
+                "LEFT JOIN agents a ON a.agent_id=f.agent_id "
+                "WHERE f.status='active' AND f.agent_id!='' "
+                "AND (a.agent_id IS NULL OR a.status NOT IN ('running','queued'))"
+            ).fetchall()
+            for row in stale_intents:
+                closed_intents += self._close_agent_intents_in_tx(
+                    conn,
+                    str(row["project_id"] or ""),
+                    str(row["agent_id"] or ""),
+                    now,
+                )
+            for item_id in affected_items:
+                status = self._blackboard_status_from_assignments_in_tx(conn, item_id)
+                conn.execute(
+                    "UPDATE blackboard_items SET status=?,updated_at=? WHERE item_id=?",
+                    (status, now, item_id),
+                )
+            if recovered_agents or closed_intents:
+                self._audit(
+                    conn,
+                    actor_kind="system",
+                    actor_id="startup-recovery",
+                    action="collaboration.runtime.recover",
+                    target_kind="runtime",
+                    target_id="agent-state",
+                    details={"agents": recovered_agents, "closed_intents": closed_intents},
+                )
+            conn.execute("COMMIT")
+        return {"agents": recovered_agents, "closed_intents": closed_intents}
+
+    def reap_stale_agents(self, max_idle_seconds: float = COLLAB_AGENT_STALE_SECONDS) -> dict:
+        cutoff = _now() - max(30.0, float(max_idle_seconds or COLLAB_AGENT_STALE_SECONDS))
+        now = _now()
+        reaped: list[str] = []
+        closed_intents = 0
+        affected_items: set[str] = set()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                "SELECT agent_id,project_id FROM agents "
+                "WHERE status IN ('running','queued') AND updated_at<?",
+                (cutoff,),
+            ).fetchall()
+            for row in rows:
+                agent_id = str(row["agent_id"] or "")
+                project_id = str(row["project_id"] or "")
+                reaped.append(agent_id)
+                conn.execute(
+                    "UPDATE agents SET status='idle',current_file='',tool_summary=?,updated_at=? WHERE agent_id=?",
+                    ("Agent heartbeat expired; run marked inactive.", now, agent_id),
+                )
+                closed_intents += self._close_agent_intents_in_tx(conn, project_id, agent_id, now)
+                assignments = conn.execute(
+                    "SELECT item_id FROM blackboard_agent_assignments "
+                    "WHERE project_id=? AND agent_id=? AND status='in_progress'",
+                    (project_id, agent_id),
+                ).fetchall()
+                affected_items.update(str(value["item_id"] or "") for value in assignments)
+                conn.execute(
+                    "UPDATE blackboard_agent_assignments SET status='blocked',result_summary=?,updated_at=?,finished_at=? "
+                    "WHERE project_id=? AND agent_id=? AND status='in_progress'",
+                    ("Agent heartbeat expired before completion.", now, now, project_id, agent_id),
+                )
+                self._publish_in_tx(
+                    conn,
+                    project_id,
+                    "agent",
+                    {"agent_id": agent_id, "status": "idle", "reason": "heartbeat_expired", "updated_at": now},
+                )
+            for item_id in affected_items:
+                status = self._blackboard_status_from_assignments_in_tx(conn, item_id)
+                conn.execute("UPDATE blackboard_items SET status=?,updated_at=? WHERE item_id=?", (status, now, item_id))
+            if reaped:
+                self._audit(
+                    conn,
+                    actor_kind="system",
+                    actor_id="agent-watchdog",
+                    action="collaboration.agent.reap",
+                    target_kind="runtime",
+                    target_id="stale-agents",
+                    details={"agents": reaped, "closed_intents": closed_intents},
+                )
+            conn.execute("COMMIT")
+        if reaped:
+            with self.event_condition:
+                self.event_condition.notify_all()
+        return {"agents": reaped, "closed_intents": closed_intents}
+
     def _reassign_blackboard_participants_in_tx(self, conn: sqlite3.Connection, item_id: str, now: float) -> None:
         item = conn.execute(
             "SELECT owner_agent_id,coordination_json FROM blackboard_items WHERE item_id=?",
@@ -1880,9 +2266,10 @@ class CollaborationStore:
             "SELECT agent_id,role FROM blackboard_agent_assignments WHERE item_id=? ORDER BY started_at,agent_id",
             (item_id,),
         ).fetchall()
+        participant_count = len(participants)
         for index, participant in enumerate(participants):
             role = "coordinator" if participant["agent_id"] == item["owner_agent_id"] else "contributor"
-            assignment = self._assignment_default(role, index, coordination)
+            assignment = self._assignment_default(role, index, coordination, participant_count)
             conn.execute(
                 "UPDATE blackboard_agent_assignments SET role=?,assignment=?,updated_at=? WHERE item_id=? AND agent_id=?",
                 (role, assignment, now, item_id, participant["agent_id"]),
@@ -1936,11 +2323,10 @@ class CollaborationStore:
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             item = conn.execute(
-                "SELECT * FROM blackboard_items WHERE project_id=? "
-                "AND (task_key=? OR (origin='agent_bridge' AND title=?)) "
+                "SELECT * FROM blackboard_items WHERE project_id=? AND task_key=? "
                 "AND status IN ('pending','in_progress','blocked') "
-                "ORDER BY CASE WHEN task_key=? THEN 0 ELSE 1 END,created_at LIMIT 1",
-                (principal.project_id, task_key, title, task_key),
+                "ORDER BY created_at LIMIT 1",
+                (principal.project_id, task_key),
             ).fetchone()
             created = item is None
             if created:
@@ -1955,6 +2341,25 @@ class CollaborationStore:
             else:
                 item_id = str(item["item_id"])
             role = "coordinator" if str(item["owner_agent_id"] or "") == clean_agent else "contributor"
+            previous_items = conn.execute(
+                "SELECT item_id FROM blackboard_agent_assignments "
+                "WHERE project_id=? AND agent_id=? AND item_id!=? AND status IN ('in_progress','blocked')",
+                (principal.project_id, clean_agent, item_id),
+            ).fetchall()
+            if previous_items:
+                conn.execute(
+                    "UPDATE blackboard_agent_assignments SET status='cancelled',result_summary=?,updated_at=?,finished_at=? "
+                    "WHERE project_id=? AND agent_id=? AND item_id!=? AND status IN ('in_progress','blocked')",
+                    ("Superseded by a new Agent task.", now, now, principal.project_id, clean_agent, item_id),
+                )
+                self._close_agent_intents_in_tx(conn, principal.project_id, clean_agent, now)
+                for previous in previous_items:
+                    previous_item_id = str(previous["item_id"] or "")
+                    previous_status = self._blackboard_status_from_assignments_in_tx(conn, previous_item_id)
+                    conn.execute(
+                        "UPDATE blackboard_items SET status=?,updated_at=? WHERE item_id=?",
+                        (previous_status, now, previous_item_id),
+                    )
             existing = conn.execute(
                 "SELECT 1 FROM blackboard_agent_assignments WHERE item_id=? AND agent_id=?",
                 (item_id, clean_agent),
@@ -2101,6 +2506,7 @@ class CollaborationStore:
         section: str,
         content: str,
         status: str = "",
+        initialize_only: bool = False,
     ) -> dict:
         clean_agent = str(agent_id or "").strip()[:100]
         clean_section = str(section or "").strip().lower().replace(".", "_")[:60]
@@ -2146,6 +2552,19 @@ class CollaborationStore:
             evidence_kind = kind_map.get(clean_section, "progress")
             if clean_section == "plan_steps":
                 steps = _collaboration_plan_steps(content)
+                existing_plan = _load_json(assignment["coordination_json"], [])
+                if initialize_only and isinstance(existing_plan, list) and existing_plan:
+                    conn.execute("ROLLBACK")
+                    return {
+                        "ok": True,
+                        "skipped": True,
+                        "reason": "coordination_already_initialized",
+                        "item_id": item_id,
+                        "coordination_plan": existing_plan,
+                    }
+                if not steps:
+                    conn.execute("ROLLBACK")
+                    return {"ok": True, "skipped": True, "reason": "empty_coordination_plan", "item_id": item_id}
                 conn.execute(
                     "UPDATE blackboard_items SET coordination_json=?,updated_at=? WHERE item_id=?",
                     (_json(steps), now, item_id),
@@ -2227,24 +2646,19 @@ class CollaborationStore:
                 "WHERE item_id=? AND agent_id=?",
                 (clean_status, safe_result, now, now, item_id, clean_agent),
             )
+            closed_intents = self._close_agent_intents_in_tx(
+                conn,
+                principal.project_id,
+                clean_agent,
+                now,
+            )
             dedupe_key = _digest(f"result\0{clean_status}\0{safe_result}")
             conn.execute(
                 "INSERT OR IGNORE INTO blackboard_agent_evidence(item_id,project_id,member_id,agent_id,kind,summary,path,revision,dedupe_key,created_at) "
                 "VALUES(?,?,?,?,?,?, '',0,?,?)",
                 (item_id, principal.project_id, principal.member_id, clean_agent, "result" if clean_status == "completed" else "blocker", safe_result, dedupe_key, now),
             )
-            statuses = [
-                str(row[0] or "")
-                for row in conn.execute("SELECT status FROM blackboard_agent_assignments WHERE item_id=?", (item_id,)).fetchall()
-            ]
-            if any(value == "in_progress" for value in statuses):
-                item_status = "in_progress"
-            elif any(value == "blocked" for value in statuses):
-                item_status = "blocked"
-            elif any(value == "completed" for value in statuses):
-                item_status = "completed"
-            else:
-                item_status = "cancelled"
+            item_status = self._blackboard_status_from_assignments_in_tx(conn, item_id)
             summaries = [
                 str(row[0] or "").strip()
                 for row in conn.execute(
@@ -2272,12 +2686,18 @@ class CollaborationStore:
                 action=f"blackboard.agent.{clean_status}",
                 target_kind="blackboard_item",
                 target_id=item_id,
-                details={"item_status": item_status},
+                details={"item_status": item_status, "closed_intents": closed_intents},
             )
             conn.execute("COMMIT")
         with self.event_condition:
             self.event_condition.notify_all()
-        return {"ok": True, "item_id": item_id, "agent_status": clean_status, "status": item_status}
+        return {
+            "ok": True,
+            "item_id": item_id,
+            "agent_status": clean_status,
+            "status": item_status,
+            "closed_intents": closed_intents,
+        }
 
     def blackboard(self, project_id: str) -> list[dict]:
         with self._connect() as conn:
@@ -2405,12 +2825,21 @@ class CollaborationStore:
         if not clean_agent:
             raise CollaborationError("invalid_agent_id", "agent_id is required", 400)
         now = _now()
+        clean_status = str(status or "idle").strip().lower()[:40]
+        safe_file = _collaboration_public_text(current_file, 500)
+        safe_tool = _collaboration_public_text(tool_summary, 800)
+        safe_result = _collaboration_public_text(result_summary, 1200)
+        closed_intents = 0
         with self._connect() as conn:
-            conn.execute("INSERT INTO agents(agent_id,project_id,member_id,session_id,status,current_file,tool_summary,result_summary,updated_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(agent_id) DO UPDATE SET status=excluded.status,current_file=excluded.current_file,tool_summary=excluded.tool_summary,result_summary=excluded.result_summary,updated_at=excluded.updated_at", (clean_agent, principal.project_id, principal.member_id, str(session_id)[:100], str(status)[:40], str(current_file)[:500], str(tool_summary)[:2000], str(result_summary)[:4000], now))
-            self._publish_in_tx(conn, principal.project_id, "agent", {"agent_id": clean_agent, "member_id": principal.member_id, "status": str(status)[:40], "current_file": str(current_file)[:500], "tool_summary": str(tool_summary)[:2000], "result_summary": str(result_summary)[:4000], "updated_at": now})
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("INSERT INTO agents(agent_id,project_id,member_id,session_id,status,current_file,tool_summary,result_summary,updated_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(agent_id) DO UPDATE SET status=excluded.status,current_file=excluded.current_file,tool_summary=excluded.tool_summary,result_summary=excluded.result_summary,updated_at=excluded.updated_at", (clean_agent, principal.project_id, principal.member_id, str(session_id)[:100], clean_status, safe_file, safe_tool, safe_result, now))
+            if clean_status not in {"running", "queued"}:
+                closed_intents = self._close_agent_intents_in_tx(conn, principal.project_id, clean_agent, now)
+            self._publish_in_tx(conn, principal.project_id, "agent", {"agent_id": clean_agent, "member_id": principal.member_id, "status": clean_status, "current_file": safe_file, "tool_summary": safe_tool, "result_summary": safe_result, "updated_at": now})
+            conn.execute("COMMIT")
         with self.event_condition:
             self.event_condition.notify_all()
-        return {"ok": True, "agent_id": clean_agent, "updated_at": now}
+        return {"ok": True, "agent_id": clean_agent, "updated_at": now, "closed_intents": closed_intents}
 
     def list_conflicts(self, project_id: str, *, status: str = "") -> list[dict]:
         where = "project_id=?" + (" AND status=?" if status else "")
@@ -2751,6 +3180,44 @@ class CollaborationWriteCoordinator:
             status=status,
         )
 
+    def initialize_task_plan(self, session_id: str, steps: list[str]) -> dict:
+        clean_steps = [
+            _collaboration_public_text(step, 280)
+            for step in list(steps or [])[:20]
+            if _collaboration_public_text(step, 280)
+        ]
+        if len(clean_steps) < 2:
+            return {"ok": True, "skipped": True, "reason": "insufficient_coordination_steps"}
+        content = "\n".join(f"{index}. {step}" for index, step in enumerate(clean_steps, 1))
+        return self.store.record_agent_blackboard_update(
+            self.principal,
+            agent_id=f"agent:{session_id}",
+            session_id=session_id,
+            section="plan_steps",
+            content=content,
+            status="in_progress",
+            initialize_only=True,
+        )
+
+    def heartbeat(
+        self,
+        session_id: str,
+        *,
+        status: str = "running",
+        current_file: str = "",
+        tool_summary: str = "",
+        result_summary: str = "",
+    ) -> dict:
+        return self.store.update_agent(
+            self.principal,
+            agent_id=f"agent:{session_id}",
+            session_id=session_id,
+            status=status,
+            current_file=current_file,
+            tool_summary=tool_summary,
+            result_summary=result_summary,
+        )
+
     def finish_task(self, session_id: str, *, status: str, result_summary: str) -> dict:
         return self.store.finish_agent_task(
             self.principal,
@@ -2784,12 +3251,12 @@ class CollaborationWriteCoordinator:
         seen: set[str] = set()
         for row in self.store.list_documents(self.principal.project_id, limit=2000):
             rel = row["path"]
-            seen.add(rel)
             path = root / rel
             try:
                 content = path.read_bytes()
             except OSError:
                 continue
+            seen.add(rel)
             digest = hashlib.sha256(content).hexdigest()
             prior = before.get(rel, {})
             if digest == prior.get("hash"):
@@ -2810,6 +3277,22 @@ class CollaborationWriteCoordinator:
             if rel in seen or rel in before:
                 continue
             results.append(self.store.adopt_process_write(self.principal, rel, path.read_bytes(), 0))
+        # A process may intentionally remove a known file. Because the project
+        # mutation lease is still held, commit that deletion now rather than
+        # letting the external-write watcher turn it into an empty B branch.
+        for rel, prior in before.items():
+            if rel in seen:
+                continue
+            path = root / rel
+            if path.exists():
+                continue
+            results.append(
+                self.store.adopt_process_delete(
+                    self.principal,
+                    rel,
+                    int(prior.get("revision", 0)),
+                )
+            )
         return results
 
     def scan_after_process(self, before: dict[str, tuple[int, int]]) -> list[dict]:
@@ -3150,6 +3633,17 @@ AGENT_WEB_SEARCH_FETCH_TIMEOUT = 12.0
 AGENT_WEB_SEARCH_TOOL_SOFT_TIMEOUT = 76.0
 AGENT_WEB_SEARCH_MAX_PAGE_BYTES = 1_200_000
 AGENT_WEB_SEARCH_MAX_TEXT_CHARS = 80_000
+AGENT_WEB_SEARCH_PUBLIC_DISCOVERY_ENABLED = str(
+    os.getenv("AGENT_WEB_SEARCH_PUBLIC_DISCOVERY", "true") or "true"
+).strip().lower() not in {"0", "false", "no", "off"}
+AGENT_WEB_SEARCH_PUBLIC_FEED_URL = "https://www.bing.com/search?format=rss&q={query}"
+AGENT_WEB_SEARCH_PUBLIC_FEED_MAX_BYTES = 600_000
+AGENT_WEB_SEARCH_LOCAL_GRAPH_MAX_NODES = 300
+AGENT_WEB_SEARCH_LOCAL_GRAPH_MAX_EDGES = 4_000
+AGENT_WEB_SEARCH_LOCAL_GRAPH_EDGE_SCAN_MULTIPLIER = 3
+AGENT_WEB_SEARCH_LOCAL_GRAPH_PAGERANK_ITERATIONS = 24
+AGENT_WEB_SEARCH_LOCAL_GRAPH_PAGERANK_DAMPING = 0.85
+AGENT_WEB_SEARCH_LOCAL_GRAPH_AUTHORITY_BONUS_MAX = 1.5
 WEB_SEARCH_CONTEXT_REGISTRY_MAX = 80
 WEB_SEARCH_CONTEXT_PROMPT_MAX_ITEMS = 4
 WEB_SEARCH_CONTEXT_PROMPT_MAX_CHARS = 3_200
@@ -3447,6 +3941,33 @@ _SHELL_AUTO_CONFIRM_PATTERNS: tuple[bytes, ...] = (
 )
 MIN_SHELL_COMMAND_TIMEOUT_SECONDS = 10
 MAX_SHELL_COMMAND_TIMEOUT_SECONDS = 86_400
+SHELL_TIMEOUT_MODES = ("fixed", "auto", "async")
+_DEFAULT_SHELL_TIMEOUT_MODE_RAW = str(
+    os.getenv("AGENT_SHELL_TIMEOUT_MODE", os.getenv("AGENT_BASH_TIMEOUT_MODE", "auto"))
+    or "auto"
+).strip().lower()
+DEFAULT_SHELL_TIMEOUT_MODE = (
+    _DEFAULT_SHELL_TIMEOUT_MODE_RAW
+    if _DEFAULT_SHELL_TIMEOUT_MODE_RAW in SHELL_TIMEOUT_MODES
+    else "auto"
+)
+MIN_SHELL_ASYNC_HANDOFF_SECONDS = 10
+MAX_SHELL_ASYNC_HANDOFF_SECONDS = 86_400
+DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS = max(
+    MIN_SHELL_ASYNC_HANDOFF_SECONDS,
+    min(
+        MAX_SHELL_ASYNC_HANDOFF_SECONDS,
+        int(
+            str(
+                os.getenv(
+                    "AGENT_SHELL_ASYNC_HANDOFF_SECONDS",
+                    os.getenv("AGENT_BASH_ASYNC_HANDOFF_SECONDS", "600"),
+                )
+                or "600"
+            )
+        ),
+    ),
+)
 DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS = max(
     MIN_SHELL_COMMAND_TIMEOUT_SECONDS,
     min(
@@ -5776,6 +6297,65 @@ def extract_shell_command_timeout_setting(raw: object) -> int | None:
     return None
 
 
+def normalize_shell_timeout_mode(value: object, default: str = DEFAULT_SHELL_TIMEOUT_MODE) -> str:
+    fallback = str(default or DEFAULT_SHELL_TIMEOUT_MODE).strip().lower()
+    if fallback not in SHELL_TIMEOUT_MODES:
+        fallback = DEFAULT_SHELL_TIMEOUT_MODE
+    text = str(value or "").strip().lower().replace("_", "-")
+    aliases = {
+        "total": "fixed",
+        "deadline": "fixed",
+        "idle": "auto",
+        "activity": "auto",
+        "adaptive": "auto",
+        "background": "async",
+        "asynchronous": "async",
+    }
+    text = aliases.get(text, text)
+    return text if text in SHELL_TIMEOUT_MODES else fallback
+
+
+def extract_shell_timeout_mode_setting(raw: object) -> str | None:
+    if not isinstance(raw, dict):
+        return None
+    keys = ("shell_timeout_mode", "bash_timeout_mode", "command_timeout_mode")
+    for container in (raw, *(raw.get(key) for key in ("startup", "runtime", "shell", "tools", "execution"))):
+        if not isinstance(container, dict):
+            continue
+        for key in keys:
+            if key in container and str(container.get(key) or "").strip():
+                return normalize_shell_timeout_mode(container.get(key))
+    return None
+
+
+def extract_shell_async_handoff_setting(raw: object) -> int | None:
+    if not isinstance(raw, dict):
+        return None
+    keys = (
+        "shell_async_handoff_seconds",
+        "shell_async_handoff",
+        "shell_async_after",
+        "bash_async_handoff_seconds",
+        "bash_async_after",
+    )
+    for container in (raw, *(raw.get(key) for key in ("startup", "runtime", "shell", "tools", "execution"))):
+        if not isinstance(container, dict):
+            continue
+        for key in keys:
+            if key not in container or isinstance(container.get(key), bool):
+                continue
+            try:
+                return normalize_timeout_seconds(
+                    container.get(key),
+                    minimum=MIN_SHELL_ASYNC_HANDOFF_SECONDS,
+                    maximum=MAX_SHELL_ASYNC_HANDOFF_SECONDS,
+                    fallback=DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS,
+                )
+            except Exception:
+                return None
+    return None
+
+
 def extract_context_token_limit_setting(raw: object) -> int | None:
     if not isinstance(raw, dict):
         return None
@@ -7901,6 +8481,7 @@ class AgentWebSearchEngine:
                     dst TEXT,
                     anchor TEXT,
                     discovered_at REAL,
+                    occurrences INTEGER NOT NULL DEFAULT 1,
                     PRIMARY KEY (src, dst, anchor)
                 )
                 """
@@ -7945,6 +8526,11 @@ class AgentWebSearchEngine:
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_pages_domain ON pages(domain)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_pages_fetched ON pages(fetched_at)")
+            link_columns = {str(row["name"] or "") for row in conn.execute("PRAGMA table_info(links)")}
+            if "occurrences" not in link_columns:
+                conn.execute("ALTER TABLE links ADD COLUMN occurrences INTEGER NOT NULL DEFAULT 1")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_links_src ON links(src)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_links_dst ON links(dst)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_page_evidence_query ON page_evidence(query)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_page_evidence_url ON page_evidence(url)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_page_evidence_type ON page_evidence(evidence_type)")
@@ -8050,7 +8636,7 @@ class AgentWebSearchEngine:
         host = (parsed.hostname or "").lower()
         path = (parsed.path or "").lower()
         stype = str(source_type or "").lower()
-        if host.endswith((".gov", ".edu")):
+        if host.endswith((".gov", ".edu", ".ac.uk", ".edu.cn", ".gc.ca", ".go.jp", ".gouv.fr", ".gov.au", ".gov.cn", ".gov.uk")):
             return "official_public"
         if any(part in host for part in ("github.com", "gitlab.com", "sourceforge.net")):
             return "code_repository"
@@ -8063,6 +8649,127 @@ class AgentWebSearchEngine:
         if any(part in host for part in ("arxiv.org", "doi.org", "semanticscholar.org", "acm.org", "ieee.org", "springer.com")):
             return "scholarly"
         return "web_page"
+
+    def _link_domain_identity(self, url_or_host: str) -> str:
+        raw = str(url_or_host or "").strip().lower().strip(".")
+        host = (urlparse(raw).hostname or "").lower().strip(".") if "://" in raw else raw
+        if not host:
+            return ""
+        try:
+            return str(ipaddress.ip_address(host))
+        except Exception:
+            pass
+        if host.startswith("www."):
+            host = host[4:]
+        labels = [part for part in host.split(".") if part]
+        if len(labels) <= 2:
+            return host
+        compound_suffixes = {
+            "ac.uk", "co.in", "co.jp", "co.kr", "co.nz", "co.uk", "com.au", "com.br",
+            "com.cn", "com.hk", "com.sg", "com.tw", "gov.cn", "gov.uk", "net.cn", "org.cn",
+            "org.uk",
+        }
+        suffix = ".".join(labels[-2:])
+        return ".".join(labels[-3:]) if suffix in compound_suffixes else suffix
+
+    def _graph_url_key(self, raw_url: str) -> str:
+        canonical = _agent_web_canonical_url(raw_url)
+        if not canonical:
+            return ""
+        parsed = urlparse(canonical)
+        retained: list[str] = []
+        tracking_keys = {
+            "fbclid", "gclid", "mc_cid", "mc_eid", "ref_src", "spm", "yclid",
+        }
+        for pair in str(parsed.query or "").split("&"):
+            if not pair:
+                continue
+            key = unquote(pair.split("=", 1)[0]).strip().lower()
+            if key.startswith("utm_") or key in tracking_keys:
+                continue
+            retained.append(pair)
+        query = "&".join(sorted(retained))
+        return urlunparse((parsed.scheme, parsed.netloc, parsed.path or "/", "", query, ""))
+
+    def _source_title_fingerprint(self, title: str) -> str:
+        value = unicodedata.normalize("NFKC", str(title or "")).lower()
+        value = re.sub(r"\s+[|\-–—:]\s+[^|\-–—:]{1,60}$", "", value)
+        return "".join(re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]", value))[:240]
+
+    def _classify_source_role(self, row: sqlite3.Row | dict, query: str = "") -> dict:
+        item = dict(row)
+        url = str(item.get("url", "") or "")
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        path = (parsed.path or "/").lower()
+        title = str(item.get("title", "") or "").lower()
+        desc = str(item.get("description", "") or "").lower()
+        source_type = str(item.get("source_type", "") or "").lower()
+        quality = self._classify_source_quality(url, source_type)
+        domain = self._link_domain_identity(host)
+        hinted_domains = {
+            self._link_domain_identity(hint)
+            for hint in _agent_web_query_domain_hints(query)
+            if self._link_domain_identity(hint)
+        }
+        if domain and domain in hinted_domains:
+            return {"role": "official", "trust": 1.0, "reasons": ["query_official_domain"]}
+        if quality == "official_public":
+            return {"role": "official", "trust": 1.0, "reasons": [quality]}
+        aggregator_hosts = (
+            "alltop.com", "bing.com", "feedly.com", "flipboard.com", "news.google.com",
+            "search.yahoo.com", "techmeme.com",
+        )
+        aggregator_paths = ("/archive/", "/category/", "/feed/", "/search/", "/tag/", "/tags/", "/topic/")
+        if source_type in {"rss", "sitemap"} or any(host == name or host.endswith("." + name) for name in aggregator_hosts):
+            return {"role": "aggregator", "trust": 0.2, "reasons": ["feed_or_aggregation_host"]}
+        if any(part in path for part in aggregator_paths):
+            return {"role": "aggregator", "trust": 0.25, "reasons": ["aggregation_path"]}
+        repost_markers = ("repost", "republished", "syndicated", "转载", "转自", "来源于", "原文来自")
+        if any(marker in (title + " " + desc) for marker in repost_markers):
+            return {"role": "repost", "trust": 0.3, "reasons": ["repost_disclosure"]}
+        primary_paths = (
+            "/changelog", "/dataset", "/paper", "/publication", "/release", "/research",
+            "/spec", "/standard", "/whitepaper",
+        )
+        if quality in {"code_repository", "official_docs", "scholarly"} or any(part in path for part in primary_paths):
+            return {"role": "primary", "trust": 0.9, "reasons": [quality if quality != "web_page" else "primary_material_path"]}
+        if url:
+            return {"role": "secondary", "trust": 0.6, "reasons": [quality]}
+        return {"role": "unknown", "trust": 0.35, "reasons": ["missing_page_metadata"]}
+
+    def _seo_link_reasons(
+        self,
+        anchor: str,
+        dst: str,
+        terms: list[str],
+        *,
+        duplicate_count: int = 0,
+        reciprocal: bool = False,
+        repeated_anchor_edges: int = 0,
+    ) -> list[str]:
+        value = re.sub(r"\s+", " ", unicodedata.normalize("NFKC", str(anchor or "")).lower()).strip()
+        url_low = str(dst or "").lower()
+        reasons: list[str] = []
+        commercial = (
+            "backlink", "best price", "buy now", "casino", "cheap", "coupon", "loan", "payday",
+            "seo service", "sponsored link", "代购", "优惠券", "博彩", "返利", "外链", "贷款",
+        )
+        if any(token in value for token in commercial):
+            reasons.append("commercial_or_link_scheme_anchor")
+        if any(token in url_low for token in ("/backlink", "/link-exchange", "/seo-links", "?ref=affiliate", "&ref=affiliate")):
+            reasons.append("link_scheme_url_pattern")
+        words = re.findall(r"[a-z0-9]{2,}|[\u4e00-\u9fff]{2,}", value)
+        if words and max(Counter(words).values()) >= 3:
+            reasons.append("repeated_anchor_terms")
+        query_hits = sum(1 for term in terms if term.lower() in value)
+        if terms and query_hits >= min(3, max(2, len(terms))) and (duplicate_count > 0 or repeated_anchor_edges >= 3):
+            reasons.append("repeated_exact_query_anchor")
+        if duplicate_count >= 2:
+            reasons.append("duplicate_link_placement")
+        if reciprocal and repeated_anchor_edges >= 3:
+            reasons.append("reciprocal_repeated_anchor")
+        return list(dict.fromkeys(reasons))
 
     def _classify_evidence_type(self, row: dict, terms: list[str]) -> str:
         url = str(row.get("url", "") or "").lower()
@@ -8174,15 +8881,21 @@ class AgentWebSearchEngine:
                 )
             except Exception:
                 pass
+            src_url = str(payload.get("url", "") or "")
+            conn.execute("DELETE FROM links WHERE src = ?", (src_url,))
+            link_counts: Counter[tuple[str, str]] = Counter()
             for link in payload.get("links", []) or []:
                 if not isinstance(link, dict):
                     continue
                 dst = str(link.get("url", "") or "")
                 if not dst:
                     continue
+                anchor = trim(str(link.get("anchor", "") or ""), 240)
+                link_counts[(dst, anchor)] += 1
+            for (dst, anchor), occurrences in link_counts.items():
                 conn.execute(
-                    "INSERT OR IGNORE INTO links(src, dst, anchor, discovered_at) VALUES (?, ?, ?, ?)",
-                    (payload.get("url", ""), dst, trim(str(link.get("anchor", "") or ""), 240), now_ts()),
+                    "INSERT INTO links(src, dst, anchor, discovered_at, occurrences) VALUES (?, ?, ?, ?, ?)",
+                    (src_url, dst, anchor, now_ts(), max(1, int(occurrences or 1))),
                 )
 
     def fetch(self, url: str, *, depth: int = 0, source_type: str = "fetch", max_chars: int | None = None) -> dict:
@@ -8399,6 +9112,95 @@ class AgentWebSearchEngine:
                     break
         return urls[:budget]
 
+    def _public_search_feed_candidates(self, query: str, budget: int) -> dict:
+        """Discover cold-start URLs from a public RSS search feed without API keys."""
+        q = trim(str(query or "").strip(), 1000)
+        limit = _agent_web_int(budget, AGENT_WEB_SEARCH_DEFAULT_MAX_PAGES, 1, 30)
+        payload = {"provider": "bing-rss", "query": q, "results": [], "error": ""}
+        if not q or not AGENT_WEB_SEARCH_PUBLIC_DISCOVERY_ENABLED:
+            payload["error"] = "public discovery disabled or empty query"
+            return payload
+        if self._deadline_reached(3.0):
+            payload["error"] = "agent_web_search soft deadline reached before public discovery"
+            return payload
+        feed_url = AGENT_WEB_SEARCH_PUBLIC_FEED_URL.format(query=quote(q))
+        ok, safe_url, reason = self._validate_url(feed_url)
+        if not ok:
+            payload["error"] = reason
+            return payload
+        self._progress(
+            "public_discovery_start",
+            provider="bing-rss",
+            query=q,
+            conversation_visible=False,
+        )
+        try:
+            request = Request(
+                safe_url,
+                headers={
+                    "User-Agent": AGENT_WEB_SEARCH_USER_AGENT,
+                    "Accept": "application/rss+xml,application/xml,text/xml;q=0.9,*/*;q=0.2",
+                    "Accept-Encoding": "gzip, deflate",
+                },
+                method="GET",
+            )
+            with urlopen(request, timeout=self._network_timeout(10.0)) as response:
+                raw = response.read(AGENT_WEB_SEARCH_PUBLIC_FEED_MAX_BYTES + 1)
+                content_type = str(response.headers.get("Content-Type", "") or "")
+                content_encoding = str(response.headers.get("Content-Encoding", "") or "")
+            if len(raw) > AGENT_WEB_SEARCH_PUBLIC_FEED_MAX_BYTES:
+                raise ValueError("public search feed exceeds byte budget")
+            decoded = _agent_web_decode_text_bytes(raw, content_type, content_encoding)
+            xml_bytes = decoded.get("bytes", raw)
+            if not isinstance(xml_bytes, bytes):
+                xml_bytes = str(decoded.get("text", "") or "").encode("utf-8", errors="replace")
+            root = ET.fromstring(xml_bytes)
+            results: list[dict] = []
+            seen: set[str] = set()
+            for item in root.iter():
+                if item.tag.split("}", 1)[-1].lower() not in {"item", "entry"}:
+                    continue
+                fields: dict[str, str] = {}
+                for child in list(item):
+                    tag = child.tag.split("}", 1)[-1].lower()
+                    value = str(child.text or "").strip()
+                    if tag == "link" and not value:
+                        value = str(child.attrib.get("href", "") or "").strip()
+                    if tag in {"title", "link", "description", "summary"} and value:
+                        fields[tag] = value
+                candidate = _agent_web_canonical_url(fields.get("link", ""))
+                valid, candidate, _ = self._validate_url(candidate)
+                if not valid or not candidate or candidate in seen:
+                    continue
+                seen.add(candidate)
+                description = html.unescape(
+                    re.sub(r"<[^>]+>", " ", fields.get("description", fields.get("summary", "")))
+                )
+                results.append(
+                    {
+                        "url": candidate,
+                        "title": trim(html.unescape(fields.get("title", "")), 500),
+                        "snippet": trim(re.sub(r"\s+", " ", description).strip(), 1000),
+                        "provider": "bing-rss",
+                    }
+                )
+                if len(results) >= limit:
+                    break
+            payload["results"] = results
+            if not results:
+                payload["error"] = "public search feed returned no usable URLs"
+        except Exception as exc:
+            payload["error"] = trim(str(exc), 300)
+        self._progress(
+            "public_discovery_done",
+            provider="bing-rss",
+            query=q,
+            result_count=len(payload.get("results", [])),
+            error=payload.get("error", ""),
+            conversation_visible=False,
+        )
+        return payload
+
     def _seed_urls(self, query: str, seed_urls: list[str] | None, domains: list[str] | None) -> list[str]:
         seeds: list[str] = []
         for raw in list(seed_urls or []):
@@ -8430,11 +9232,24 @@ class AgentWebSearchEngine:
         depth_budget = _agent_web_int(depth, AGENT_WEB_SEARCH_DEFAULT_DEPTH, 0, AGENT_WEB_SEARCH_HARD_DEPTH)
         terms = _agent_web_query_terms(query)
         seeds = self._seed_urls(query, seed_urls, domains)
+        public_discovery: dict = {}
+        public_seed_urls: set[str] = set()
+        if not seeds and query:
+            public_discovery = self._public_search_feed_candidates(query, page_budget)
+            for row in public_discovery.get("results", []) if isinstance(public_discovery.get("results", []), list) else []:
+                if not isinstance(row, dict):
+                    continue
+                candidate = str(row.get("url", "") or "")
+                if candidate and candidate not in seeds:
+                    seeds.append(candidate)
+                    public_seed_urls.add(candidate)
         queue_rows: deque[tuple[str, int, str]] = deque()
         for seed in seeds:
             if self._deadline_reached(3.0):
                 break
-            queue_rows.append((seed, 0, "seed"))
+            queue_rows.append((seed, 0, "public_search_feed" if seed in public_seed_urls else "seed"))
+            if seed in public_seed_urls:
+                continue
             for xml_url, stype in self._discover_sitemaps_and_feeds(seed):
                 if self._deadline_reached(2.0):
                     break
@@ -8493,6 +9308,7 @@ class AgentWebSearchEngine:
             "fetched": len(fetched),
             "deadline_reached": bool(deadline_reached),
             "errors": errors[:10],
+            "public_discovery": public_discovery,
             "pages": [
                 {
                     "url": p.get("url", ""),
@@ -8506,7 +9322,13 @@ class AgentWebSearchEngine:
             ],
         }
 
-    def _score_row(self, row: sqlite3.Row | dict, terms: list[str], anchors: dict[str, list[str]]) -> dict:
+    def _score_row(
+        self,
+        row: sqlite3.Row | dict,
+        terms: list[str],
+        anchors: dict[str, list[str]],
+        query: str = "",
+    ) -> dict:
         item = dict(row)
         title = str(item.get("title", "") or "")
         desc = str(item.get("description", "") or "")
@@ -8551,19 +9373,447 @@ class AgentWebSearchEngine:
             score += 0.4
         if not terms:
             score += 1.0
+        source_quality = self._classify_source_quality(url, source)
+        role = self._classify_source_role(item, query)
         return {
             "url": url,
+            "canonical_url": str(item.get("canonical_url", "") or url),
             "title": title or url,
             "description": desc,
             "domain": item.get("domain", ""),
             "source_type": source,
+            "source_quality": source_quality,
+            "source_role": role["role"],
+            "source_trust": role["trust"],
+            "source_role_reasons": role["reasons"],
             "fetched_at": fetched_at,
             "score": round(score, 4),
             "matched_terms": matched[:12],
             "snippet": _agent_web_extract_text_snippet(text or desc, terms),
         }
 
-    def _search_index(self, query: str, max_results: int = AGENT_WEB_SEARCH_DEFAULT_MAX_RESULTS, freshness_days: int = 0) -> list[dict]:
+    def _query_local_link_analysis(self, query: str, candidate_rows: list[dict]) -> dict:
+        max_nodes = max(1, int(AGENT_WEB_SEARCH_LOCAL_GRAPH_MAX_NODES))
+        max_edges = max(1, int(AGENT_WEB_SEARCH_LOCAL_GRAPH_MAX_EDGES))
+        scan_limit = max_edges * max(1, int(AGENT_WEB_SEARCH_LOCAL_GRAPH_EDGE_SCAN_MULTIPLIER))
+        iterations = max(1, int(AGENT_WEB_SEARCH_LOCAL_GRAPH_PAGERANK_ITERATIONS))
+        damping = max(0.0, min(0.99, float(AGENT_WEB_SEARCH_LOCAL_GRAPH_PAGERANK_DAMPING)))
+        terms = _agent_web_query_terms(query)
+        candidates = [dict(row) for row in (candidate_rows or []) if isinstance(row, dict) and row.get("url")]
+        empty_summary = {
+            "scope": "query_local",
+            "candidate_count": 0,
+            "node_count": 0,
+            "edge_count": 0,
+            "budgets": {
+                "max_nodes": max_nodes,
+                "max_edges": max_edges,
+                "nodes_truncated": False,
+                "edges_truncated": False,
+            },
+            "pagerank": {
+                "personalized": True,
+                "damping": damping,
+                "iterations": 0,
+                "converged": True,
+                "score_sum": 0.0,
+            },
+            "signals": {
+                "reciprocal_edges": 0,
+                "duplicate_edges": 0,
+                "suspected_seo_edges": 0,
+                "canonical_alias_groups": 0,
+            },
+            "source_roles": {},
+            "shared_original_sources": [],
+            "authority_policy": {
+                "max_bonus": float(AGENT_WEB_SEARCH_LOCAL_GRAPH_AUTHORITY_BONUS_MAX),
+                "max_base_score_ratio": 0.12,
+                "priority": "content_relevance_and_source_trust_first",
+            },
+        }
+        if not candidates:
+            return {"nodes": {}, "summary": empty_summary}
+
+        seed_urls: list[str] = []
+        for row in candidates[:max_nodes]:
+            for value in (row.get("url", ""), row.get("canonical_url", "")):
+                url = str(value or "")
+                if url and url not in seed_urls:
+                    seed_urls.append(url)
+        if not seed_urls:
+            return {"nodes": {}, "summary": empty_summary}
+
+        placeholders = ",".join("?" for _ in seed_urls)
+        with self._connect() as conn:
+            raw_edge_rows = [
+                dict(row)
+                for row in conn.execute(
+                    f"SELECT src, dst, anchor, discovered_at, COALESCE(occurrences, 1) AS occurrences "
+                    f"FROM links WHERE src IN ({placeholders}) OR dst IN ({placeholders}) "
+                    "ORDER BY discovered_at DESC, src, dst, anchor LIMIT ?",
+                    tuple(seed_urls) + tuple(seed_urls) + (scan_limit,),
+                )
+            ]
+            endpoint_urls = set(seed_urls)
+            seed_set = set(seed_urls)
+            endpoint_budget = max(len(endpoint_urls), max_nodes * 3)
+            endpoint_rows = sorted(
+                raw_edge_rows,
+                key=lambda row: (
+                    0 if row.get("src") in seed_set and row.get("dst") in seed_set else (1 if row.get("dst") in seed_set else 2),
+                    -float(row.get("discovered_at", 0.0) or 0.0),
+                    str(row.get("src", "") or ""),
+                    str(row.get("dst", "") or ""),
+                ),
+            )
+            for row in endpoint_rows:
+                for value in (row.get("src", ""), row.get("dst", "")):
+                    url = str(value or "")
+                    if url and (url in endpoint_urls or len(endpoint_urls) < endpoint_budget):
+                        endpoint_urls.add(url)
+                if len(endpoint_urls) >= endpoint_budget:
+                    break
+            page_rows: list[dict] = []
+            endpoint_list = sorted(url for url in endpoint_urls if url)
+            for offset in range(0, len(endpoint_list), 400):
+                chunk = endpoint_list[offset : offset + 400]
+                chunk_placeholders = ",".join("?" for _ in chunk)
+                page_rows.extend(
+                    dict(row)
+                    for row in conn.execute(
+                        f"SELECT url, canonical_url, domain, title, description, source_type, fetched_at "
+                        f"FROM pages WHERE url IN ({chunk_placeholders}) OR canonical_url IN ({chunk_placeholders})",
+                        tuple(chunk) + tuple(chunk),
+                    )
+                )
+
+        aliases: dict[str, str] = {}
+        for row in page_rows:
+            raw_key = self._graph_url_key(str(row.get("url", "") or ""))
+            canonical_key = self._graph_url_key(str(row.get("canonical_url", "") or "")) or raw_key
+            if raw_key:
+                aliases[raw_key] = canonical_key
+            if canonical_key:
+                aliases[canonical_key] = canonical_key
+        for row in candidates:
+            raw_key = self._graph_url_key(str(row.get("url", "") or ""))
+            canonical_key = self._graph_url_key(str(row.get("canonical_url", "") or "")) or raw_key
+            if raw_key:
+                aliases[raw_key] = canonical_key
+            if canonical_key:
+                aliases[canonical_key] = canonical_key
+
+        def resolve_url(value: object) -> str:
+            key = self._graph_url_key(str(value or ""))
+            return aliases.get(key, key)
+
+        candidate_nodes: list[str] = []
+        candidate_by_node: dict[str, dict] = {}
+        for row in candidates:
+            node = resolve_url(row.get("canonical_url") or row.get("url"))
+            if not node:
+                continue
+            if node not in candidate_nodes and len(candidate_nodes) < max_nodes:
+                candidate_nodes.append(node)
+            previous = candidate_by_node.get(node)
+            if previous is None or float(row.get("score", 0.0) or 0.0) > float(previous.get("score", 0.0) or 0.0):
+                candidate_by_node[node] = row
+        candidate_set = set(candidate_nodes)
+
+        normalized_edges: list[tuple[int, float, str, str, dict]] = []
+        all_endpoint_nodes = set(candidate_nodes)
+        for row in raw_edge_rows:
+            src = resolve_url(row.get("src"))
+            dst = resolve_url(row.get("dst"))
+            if not src or not dst or src == dst:
+                continue
+            all_endpoint_nodes.update((src, dst))
+            priority = 0 if src in candidate_set and dst in candidate_set else (1 if dst in candidate_set else 2)
+            normalized_edges.append((priority, -float(row.get("discovered_at", 0.0) or 0.0), src, dst, row))
+        normalized_edges.sort(key=lambda item: (item[0], item[1], item[2], item[3], str(item[4].get("anchor", "") or "")))
+
+        selected_nodes = set(candidate_nodes[:max_nodes])
+        for _priority, _time_key, src, dst, _row in normalized_edges:
+            if src not in selected_nodes and len(selected_nodes) < max_nodes:
+                selected_nodes.add(src)
+            if dst not in selected_nodes and len(selected_nodes) < max_nodes:
+                selected_nodes.add(dst)
+            if len(selected_nodes) >= max_nodes:
+                break
+
+        edge_map: dict[tuple[str, str], dict] = {}
+        edges_truncated = len(raw_edge_rows) >= scan_limit
+        for _priority, _time_key, src, dst, row in normalized_edges:
+            if src not in selected_nodes or dst not in selected_nodes:
+                continue
+            key = (src, dst)
+            if key not in edge_map:
+                if len(edge_map) >= max_edges:
+                    edges_truncated = True
+                    continue
+                edge_map[key] = {"src": src, "dst": dst, "anchors": Counter(), "occurrences": 0}
+            anchor = re.sub(r"\s+", " ", str(row.get("anchor", "") or "")).strip().lower()
+            occurrences = max(1, int(row.get("occurrences", 1) or 1))
+            edge_map[key]["anchors"][anchor] += occurrences
+            edge_map[key]["occurrences"] += occurrences
+
+        metadata_by_node: dict[str, dict] = {}
+        raw_aliases_by_node: dict[str, set[str]] = defaultdict(set)
+        for row in page_rows:
+            node = resolve_url(row.get("canonical_url") or row.get("url"))
+            if not node or node not in selected_nodes:
+                continue
+            raw_url = str(row.get("url", "") or "")
+            if raw_url:
+                raw_aliases_by_node[node].add(raw_url)
+            current = metadata_by_node.get(node)
+            if current is None or float(row.get("fetched_at", 0.0) or 0.0) > float(current.get("fetched_at", 0.0) or 0.0):
+                metadata_by_node[node] = row
+        for node, row in candidate_by_node.items():
+            if node in selected_nodes:
+                metadata_by_node[node] = row
+                raw_aliases_by_node[node].add(str(row.get("url", "") or node))
+
+        roles: dict[str, dict] = {}
+        for node in selected_nodes:
+            metadata = dict(metadata_by_node.get(node, {}))
+            metadata["url"] = str(metadata.get("url", "") or node)
+            roles[node] = self._classify_source_role(metadata, query)
+        title_clusters: dict[str, list[str]] = defaultdict(list)
+        for node, metadata in metadata_by_node.items():
+            fingerprint = self._source_title_fingerprint(str(metadata.get("title", "") or ""))
+            if len(fingerprint) >= 16:
+                title_clusters[fingerprint].append(node)
+        for nodes in title_clusters.values():
+            domains = {self._link_domain_identity(node) for node in nodes if self._link_domain_identity(node)}
+            if len(nodes) < 2 or len(domains) < 2:
+                continue
+            if not any(roles.get(node, {}).get("role") in {"official", "primary"} for node in nodes):
+                continue
+            for node in nodes:
+                if roles.get(node, {}).get("role") == "secondary":
+                    roles[node] = {"role": "repost", "trust": 0.3, "reasons": ["exact_cross_domain_title_copy"]}
+
+        anchor_edge_counts: Counter[str] = Counter()
+        for edge in edge_map.values():
+            for anchor in edge["anchors"]:
+                if anchor:
+                    anchor_edge_counts[anchor] += 1
+        reciprocal_pairs: set[frozenset[str]] = set()
+        duplicate_edge_count = 0
+        seo_edge_count = 0
+        for key, edge in edge_map.items():
+            reciprocal = (key[1], key[0]) in edge_map
+            if reciprocal:
+                reciprocal_pairs.add(frozenset(key))
+            duplicate_count = max(0, int(edge["occurrences"] or 0) - 1)
+            if duplicate_count:
+                duplicate_edge_count += 1
+            seo_reasons: list[str] = []
+            for anchor in edge["anchors"] or {"": 1}:
+                seo_reasons.extend(
+                    self._seo_link_reasons(
+                        anchor,
+                        edge["dst"],
+                        terms,
+                        duplicate_count=duplicate_count,
+                        reciprocal=reciprocal,
+                        repeated_anchor_edges=int(anchor_edge_counts.get(anchor, 0) or 0),
+                    )
+                )
+            edge["reciprocal"] = reciprocal
+            edge["duplicate_count"] = duplicate_count
+            edge["seo_reasons"] = list(dict.fromkeys(seo_reasons))
+            if edge["seo_reasons"]:
+                seo_edge_count += 1
+
+        incoming: dict[str, list[dict]] = defaultdict(list)
+        outgoing: dict[str, list[dict]] = defaultdict(list)
+        adjacency: dict[str, list[tuple[str, float]]] = defaultdict(list)
+        for edge in edge_map.values():
+            incoming[edge["dst"]].append(edge)
+            outgoing[edge["src"]].append(edge)
+            src_domain = self._link_domain_identity(edge["src"])
+            dst_domain = self._link_domain_identity(edge["dst"])
+            weight = 0.65 if src_domain and src_domain == dst_domain else 1.0
+            if edge["reciprocal"]:
+                weight *= 0.75
+            if edge["seo_reasons"]:
+                weight *= 0.35
+            adjacency[edge["src"]].append((edge["dst"], max(0.05, weight)))
+
+        ordered_nodes = sorted(selected_nodes)
+        max_base_score = max((float(row.get("score", 0.0) or 0.0) for row in candidate_by_node.values()), default=0.0)
+        personalization_raw: dict[str, float] = {}
+        for node in ordered_nodes:
+            trust = float(roles.get(node, {}).get("trust", 0.35) or 0.35)
+            if node in candidate_by_node:
+                base = max(0.0, float(candidate_by_node[node].get("score", 0.0) or 0.0))
+                relevance = base / max_base_score if max_base_score > 0 else 1.0
+                personalization_raw[node] = 0.02 + relevance * (0.7 + 0.3 * trust)
+            else:
+                personalization_raw[node] = 0.002 * (0.65 + 0.35 * trust)
+        personalization_total = sum(personalization_raw.values()) or 1.0
+        personalization = {node: personalization_raw[node] / personalization_total for node in ordered_nodes}
+        pagerank = dict(personalization)
+        converged = not bool(edge_map)
+        iterations_used = 0
+        for iteration in range(iterations):
+            next_rank = {node: (1.0 - damping) * personalization[node] for node in ordered_nodes}
+            dangling = sum(pagerank[node] for node in ordered_nodes if not adjacency.get(node))
+            for node in ordered_nodes:
+                next_rank[node] += damping * dangling * personalization[node]
+            for src, destinations in adjacency.items():
+                total_weight = sum(weight for _dst, weight in destinations) or 1.0
+                for dst, weight in destinations:
+                    next_rank[dst] += damping * pagerank.get(src, 0.0) * weight / total_weight
+            total_rank = sum(next_rank.values()) or 1.0
+            next_rank = {node: value / total_rank for node, value in next_rank.items()}
+            delta = sum(abs(next_rank[node] - pagerank.get(node, 0.0)) for node in ordered_nodes)
+            pagerank = next_rank
+            iterations_used = iteration + 1
+            if delta < 1e-10:
+                converged = True
+                break
+
+        common_sources: list[dict] = []
+        shared_sources_by_page: dict[str, list[str]] = defaultdict(list)
+        for target, target_edges in incoming.items():
+            citing_pages = sorted({str(edge["src"]) for edge in target_edges})
+            if len(citing_pages) < 2:
+                continue
+            citing_domains = sorted({self._link_domain_identity(src) for src in citing_pages if self._link_domain_identity(src)})
+            target_role = str(roles.get(target, {}).get("role", "unknown") or "unknown")
+            target_domain = self._link_domain_identity(target)
+            external_domains = [domain for domain in citing_domains if domain != target_domain]
+            likely_original = target_role in {"official", "primary"} or len(external_domains) >= 2
+            if not likely_original:
+                continue
+            common_sources.append(
+                {
+                    "original_url": target,
+                    "source_role": target_role,
+                    "citing_page_count": len(citing_pages),
+                    "independent_citing_domains": len(citing_domains),
+                    "external_citing_domains": len(external_domains),
+                    "citing_pages": citing_pages[:8],
+                }
+            )
+            for src in citing_pages:
+                shared_sources_by_page[src].append(target)
+        common_sources.sort(
+            key=lambda row: (
+                -int(row["external_citing_domains"]),
+                -int(row["citing_page_count"]),
+                str(row["original_url"]),
+            )
+        )
+
+        max_rank = max(pagerank.values(), default=0.0) or 1.0
+        node_metrics: dict[str, dict] = {}
+        for node in ordered_nodes:
+            node_domain = self._link_domain_identity(node)
+            inbound_edges = incoming.get(node, [])
+            outbound_edges = outgoing.get(node, [])
+            referring_domains = sorted(
+                {self._link_domain_identity(edge["src"]) for edge in inbound_edges if self._link_domain_identity(edge["src"])}
+            )
+            external_domains = [domain for domain in referring_domains if domain != node_domain]
+            reciprocal_links = sum(1 for edge in inbound_edges + outbound_edges if edge.get("reciprocal"))
+            duplicate_links = sum(int(edge.get("duplicate_count", 0) or 0) for edge in inbound_edges + outbound_edges)
+            seo_reasons = sorted(
+                {reason for edge in inbound_edges + outbound_edges for reason in (edge.get("seo_reasons", []) or [])}
+            )
+            ppr_normalized = float(pagerank.get(node, 0.0) or 0.0) / max_rank
+            reference_signal = min(1.0, math.log1p(len(external_domains)) / math.log(6.0))
+            evidence_gate = min(1.0, (len(inbound_edges) + len(external_domains)) / 2.0)
+            risk_penalty = min(0.8, len(seo_reasons) * 0.15 + duplicate_links * 0.04 + reciprocal_links * 0.03)
+            trust = float(roles.get(node, {}).get("trust", 0.35) or 0.35)
+            authority_signal = max(0.0, (0.7 * ppr_normalized + 0.3 * reference_signal) * evidence_gate - risk_penalty)
+            authority_signal = min(1.0, authority_signal * (0.65 + 0.35 * trust))
+            node_metrics[node] = {
+                "canonical_url": node,
+                "source_role": str(roles.get(node, {}).get("role", "unknown") or "unknown"),
+                "source_trust": round(trust, 4),
+                "source_role_reasons": list(roles.get(node, {}).get("reasons", []) or []),
+                "personalized_pagerank": round(float(pagerank.get(node, 0.0) or 0.0), 12),
+                "authority_signal": round(authority_signal, 6),
+                "referring_domain_count": len(referring_domains),
+                "external_referring_domain_count": len(external_domains),
+                "referring_domains": referring_domains[:12],
+                "inbound_link_count": len(inbound_edges),
+                "outbound_link_count": len(outbound_edges),
+                "reciprocal_link_count": reciprocal_links,
+                "duplicate_link_count": duplicate_links,
+                "suspected_seo_link_count": sum(1 for edge in inbound_edges + outbound_edges if edge.get("seo_reasons")),
+                "suspected_seo_reasons": seo_reasons,
+                "shared_original_sources": sorted(shared_sources_by_page.get(node, []))[:12],
+            }
+
+        canonical_alias_groups = [
+            {"canonical_url": node, "aliases": sorted(urls)[:12]}
+            for node, urls in sorted(raw_aliases_by_node.items())
+            if len(urls) > 1
+        ]
+        role_counts = Counter(
+            str(roles.get(node, {}).get("role", "unknown") or "unknown") for node in candidate_nodes if node in selected_nodes
+        )
+        referring_leaders = sorted(
+            (
+                {
+                    "url": node,
+                    "independent_domains": int(node_metrics[node]["referring_domain_count"]),
+                    "external_domains": int(node_metrics[node]["external_referring_domain_count"]),
+                    "personalized_pagerank": node_metrics[node]["personalized_pagerank"],
+                }
+                for node in candidate_nodes
+                if node in node_metrics and int(node_metrics[node]["referring_domain_count"]) > 0
+            ),
+            key=lambda row: (-int(row["external_domains"]), -float(row["personalized_pagerank"]), str(row["url"])),
+        )
+        summary = {
+            "scope": "query_local",
+            "candidate_count": len(candidate_nodes),
+            "node_count": len(selected_nodes),
+            "edge_count": len(edge_map),
+            "budgets": {
+                "max_nodes": max_nodes,
+                "max_edges": max_edges,
+                "nodes_truncated": len(all_endpoint_nodes) > max_nodes,
+                "edges_truncated": bool(edges_truncated),
+            },
+            "pagerank": {
+                "personalized": True,
+                "damping": damping,
+                "iterations": iterations_used,
+                "converged": bool(converged),
+                "score_sum": round(sum(pagerank.values()), 12),
+            },
+            "signals": {
+                "reciprocal_edges": len(reciprocal_pairs),
+                "duplicate_edges": duplicate_edge_count,
+                "suspected_seo_edges": seo_edge_count,
+                "canonical_alias_groups": len(canonical_alias_groups),
+            },
+            "source_roles": dict(sorted(role_counts.items())),
+            "shared_original_sources": common_sources[:20],
+            "canonical_source_groups": canonical_alias_groups[:20],
+            "referring_domain_leaders": referring_leaders[:10],
+            "authority_policy": {
+                "max_bonus": float(AGENT_WEB_SEARCH_LOCAL_GRAPH_AUTHORITY_BONUS_MAX),
+                "max_base_score_ratio": 0.12,
+                "priority": "content_relevance_and_source_trust_first",
+            },
+        }
+        return {"nodes": node_metrics, "summary": summary}
+
+    def _search_index_with_graph(
+        self,
+        query: str,
+        max_results: int = AGENT_WEB_SEARCH_DEFAULT_MAX_RESULTS,
+        freshness_days: int = 0,
+    ) -> tuple[list[dict], dict]:
         terms = _agent_web_query_terms(query)
         limit = _agent_web_int(max_results, AGENT_WEB_SEARCH_DEFAULT_MAX_RESULTS, 1, 30)
         since = now_ts() - int(freshness_days or 0) * 86400 if int(freshness_days or 0) > 0 else 0.0
@@ -8604,8 +9854,35 @@ class AgentWebSearchEngine:
                     where = f"({where}) AND fetched_at >= ?"
                     params_list.append(since)
                 rows = list(conn.execute(f"SELECT * FROM pages WHERE {where} ORDER BY fetched_at DESC LIMIT 160", tuple(params_list)))
-        scored = [self._score_row(row, terms, anchors) for row in rows]
+        scored = [self._score_row(row, terms, anchors, query=query) for row in rows]
         scored = [row for row in scored if row.get("score", 0) > 0 or not terms]
+        graph = self._query_local_link_analysis(query, scored)
+        graph_nodes = graph.get("nodes", {}) if isinstance(graph.get("nodes", {}), dict) else {}
+        for row in scored:
+            base_score = max(0.0, float(row.get("score", 0.0) or 0.0))
+            node = self._graph_url_key(str(row.get("canonical_url", "") or row.get("url", "")))
+            metrics = dict(graph_nodes.get(node, {})) if isinstance(graph_nodes.get(node, {}), dict) else {}
+            authority_signal = max(0.0, min(1.0, float(metrics.get("authority_signal", 0.0) or 0.0)))
+            absolute_cap = max(0.0, float(AGENT_WEB_SEARCH_LOCAL_GRAPH_AUTHORITY_BONUS_MAX))
+            relative_cap = base_score * 0.12
+            link_bonus = min(absolute_cap, relative_cap, absolute_cap * authority_signal)
+            if metrics:
+                row["source_role"] = str(metrics.get("source_role", row.get("source_role", "unknown")) or "unknown")
+                row["source_trust"] = float(metrics.get("source_trust", row.get("source_trust", 0.35)) or 0.35)
+                row["source_role_reasons"] = list(metrics.get("source_role_reasons", row.get("source_role_reasons", [])) or [])
+            row["base_score"] = round(base_score, 4)
+            row["link_authority_bonus"] = round(link_bonus, 4)
+            row["score"] = round(base_score + link_bonus, 4)
+            row["link_graph"] = {
+                "personalized_pagerank": float(metrics.get("personalized_pagerank", 0.0) or 0.0),
+                "referring_domain_count": int(metrics.get("referring_domain_count", 0) or 0),
+                "external_referring_domain_count": int(metrics.get("external_referring_domain_count", 0) or 0),
+                "reciprocal_link_count": int(metrics.get("reciprocal_link_count", 0) or 0),
+                "duplicate_link_count": int(metrics.get("duplicate_link_count", 0) or 0),
+                "suspected_seo_link_count": int(metrics.get("suspected_seo_link_count", 0) or 0),
+                "suspected_seo_reasons": list(metrics.get("suspected_seo_reasons", []) or []),
+                "shared_original_sources": list(metrics.get("shared_original_sources", []) or []),
+            }
         scored.sort(key=lambda row: float(row.get("score", 0.0) or 0.0), reverse=True)
         selected: list[dict] = []
         domain_counts: dict[str, int] = defaultdict(int)
@@ -8617,7 +9894,11 @@ class AgentWebSearchEngine:
             domain_counts[domain] += 1
             if len(selected) >= limit:
                 break
-        return selected
+        return selected, dict(graph.get("summary", {}) or {})
+
+    def _search_index(self, query: str, max_results: int = AGENT_WEB_SEARCH_DEFAULT_MAX_RESULTS, freshness_days: int = 0) -> list[dict]:
+        results, _graph = self._search_index_with_graph(query, max_results=max_results, freshness_days=freshness_days)
+        return results
 
     def _related_links_for_results(self, results: list[dict], terms: list[str], budget: int) -> list[str]:
         urls = [str(row.get("url", "") or "") for row in (results or []) if isinstance(row, dict) and row.get("url")]
@@ -8708,7 +9989,11 @@ class AgentWebSearchEngine:
                 if page.get("deadline_reached"):
                     deadline_reached = True
                     break
-        results = self._search_index(query, max_results=max_results, freshness_days=freshness_days)
+        results, local_link_graph = self._search_index_with_graph(
+            query,
+            max_results=max_results,
+            freshness_days=freshness_days,
+        )
         payload = {
             "ok": True,
             "mode": "deepen",
@@ -8719,6 +10004,7 @@ class AgentWebSearchEngine:
             "deadline_reached": bool(deadline_reached),
             "follow_errors": errors[:10],
             "results": results,
+            "local_link_graph": local_link_graph,
             "evidence_layers": self._evidence_summary(query),
             "next_actions": [
                 "fetch an exact high-scoring URL for full page evidence",
@@ -8797,23 +10083,30 @@ class AgentWebSearchEngine:
                 allow_html_discovery=allow_html_discovery,
                 max_chars=max_chars,
             )
-        results = self._search_index(query, max_results=max_results, freshness_days=freshness_days)
+        results, local_link_graph = self._search_index_with_graph(
+            query,
+            max_results=max_results,
+            freshness_days=freshness_days,
+        )
         payload = {
             "ok": True,
             "mode": "search",
             "query": query,
             "index": str(self.db_path),
             "results": results,
+            "local_link_graph": local_link_graph,
             "pages": discover_payload.get("pages", []) if discover_payload else [],
             "discovery": {
                 "ran": bool(discover_payload),
                 "fetched": int(discover_payload.get("fetched", 0) or 0) if discover_payload else 0,
                 "seeds": discover_payload.get("seeds", []) if discover_payload else [],
                 "errors": discover_payload.get("errors", []) if discover_payload else [],
+                "public": discover_payload.get("public_discovery", {}) if discover_payload else {},
             },
             "ranking_note": (
-                "Scores use query-local lexical, URL/path, source, freshness, anchor, and domain-diversity signals only; "
-                "no global iterative link ranking is used."
+                "Scores prioritize query relevance and source trust, then apply bounded query-local link authority. "
+                "Personalized PageRank runs only on this query's bounded candidate neighborhood; its bonus is capped "
+                "at 1.5 points and 12% of the page's base score, so link popularity cannot override relevance."
             ),
         }
         payload["evidence_layers"] = self._evidence_summary(query)
@@ -12432,6 +13725,8 @@ def _admin_config_schema() -> list[dict]:
         row("max_rounds", "runtime", "Maximum agent rounds", "integer", MAX_AGENT_ROUNDS, "--max_rounds", minimum=MIN_AGENT_ROUNDS, maximum=MAX_AGENT_ROUNDS_CAP),
         row("run_timeout", "runtime", "Run timeout (seconds)", "integer", MAX_RUN_SECONDS, "--run_timeout", minimum=MIN_RUN_TIMEOUT_SECONDS, maximum=MAX_RUN_TIMEOUT_SECONDS),
         row("shell_command_timeout", "runtime", "Shell timeout (seconds)", "integer", DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS, "--shell_command_timeout", minimum=MIN_SHELL_COMMAND_TIMEOUT_SECONDS, maximum=MAX_SHELL_COMMAND_TIMEOUT_SECONDS),
+        row("shell_timeout_mode", "runtime", "Shell timeout mode", "enum", DEFAULT_SHELL_TIMEOUT_MODE, "--shell-timeout-mode", choices=list(SHELL_TIMEOUT_MODES)),
+        row("shell_async_handoff_seconds", "runtime", "Shell async handoff (seconds)", "integer", DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS, "--shell-async-handoff", minimum=MIN_SHELL_ASYNC_HANDOFF_SECONDS, maximum=MAX_SHELL_ASYNC_HANDOFF_SECONDS),
         row("live_input_delay_write", "live_input", "Write-phase delay rounds", "integer", LIVE_INPUT_DELAY_WRITE_ROUNDS, "--live_input_delay_write", minimum=0, maximum=20),
         row("live_input_delay_tool", "live_input", "Tool-phase delay rounds", "integer", LIVE_INPUT_DELAY_TOOL_ROUNDS, "--live_input_delay_tool", minimum=0, maximum=20),
         row("live_input_delay_normal", "live_input", "Normal-phase delay rounds", "integer", LIVE_INPUT_DELAY_NORMAL_ROUNDS, "--live_input_delay_normal", minimum=0, maximum=20),
@@ -13820,7 +15115,7 @@ class TodoManager:
             for meta_key in (
                 "subtask_id", "created_at", "updated_at", "started_at", "completed_at",
                 "completed_by", "evidence", "evidence_binding", "evidence_ids",
-                "revision_reason", "revision_evidence", "external_subtask_id",
+                "revision_reason", "revision_evidence", "external_subtask_id", "root_group_id",
             ):
                 if meta_key in raw and raw.get(meta_key) not in (None, ""):
                     row[meta_key] = raw.get(meta_key)
@@ -17165,12 +18460,12 @@ preferred_tools:
 
 # Agent Web Search
 
-Use this skill when the task needs current open-web information, source discovery, or evidence beyond uploaded files and local RAG. The built-in `agent_web_search` tool does not call third-party search APIs. It fetches HTTP/HTTPS sources directly with strict budgets, robots compliance, SSRF protection, local SQLite/FTS indexing, and query-local ranking.
+Use this skill when the task needs current open-web information, source discovery, or evidence beyond uploaded files and local RAG. The built-in `agent_web_search` tool requires no search API key. For a cold query it can discover candidate URLs through a public RSS search feed, then fetches HTTP/HTTPS sources directly with strict budgets, robots compliance on destination pages, SSRF protection, local SQLite/FTS indexing, and query-local ranking.
 
 ## Core Workflow
 
 1. Resolve relative dates and local assumptions against the runtime temporal/local context injected into the system prompt. For current/news/finance queries, convert "today", "latest", "this week", "今年", "今日", "最近" into explicit current-date/current-year search terms and set `freshness_days` when useful.
-2. Start with `agent_web_search(mode="search", query=..., domains=[...])` when you know likely official domains, or `seed_urls=[...]` when the user gives URLs.
+2. Start with `agent_web_search(mode="search", query=...)`. Supply `domains=[...]` when you know likely official domains, or `seed_urls=[...]` when the user gives URLs; explicit primary sources remain more reliable than broad public discovery.
 3. Treat each search/fetch/follow/deepen call as a node in one task-local search tree. Inherit useful URLs, failed/dynamic domains, evidence types, and `next_actions` from the latest search context before choosing the next query.
 4. If results are thin or too broad, call `agent_web_search(mode="deepen", query=..., max_pages=...)` to follow promising links already discovered from roots, sitemaps, feeds, and page anchors.
 5. Use `agent_web_search(mode="follow", url=..., query=...)` to inspect one useful page's outgoing evidence map before fetching more.
@@ -19305,13 +20600,313 @@ class TaskManager:
             return tasks
 
 class BackgroundManager:
-    def __init__(self, workdir: Path, command_wrapper=None, env_wrapper=None):
+    def __init__(self, workdir: Path, command_wrapper=None, env_wrapper=None, output_dir: Path | None = None):
         self.workdir = workdir
         self.command_wrapper = command_wrapper
         self.env_wrapper = env_wrapper
         self.tasks: dict[str, dict] = {}
+        self.processes: dict[str, subprocess.Popen] = {}
         self.notifications: queue.Queue = queue.Queue()
         self.lock = threading.Lock()
+        self.output_dir = Path(output_dir) if output_dir is not None else self.workdir / ".clouds_coder" / "background"
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _decode_output(data: bytes | bytearray) -> str:
+        return bytes(data or b"").decode("utf-8", errors="replace")
+
+    @staticmethod
+    def _terminate_process(process: subprocess.Popen) -> None:
+        try:
+            if os.name == "nt" and getattr(process, "_clouds_windows_job_handle", None):
+                _windows_close_sandbox_job(process, terminate=True)
+                process.wait(timeout=1.5)
+                return
+            if os.name == "posix":
+                try:
+                    os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                except Exception:
+                    process.terminate()
+            else:
+                process.terminate()
+            process.wait(timeout=1.5)
+        except Exception:
+            try:
+                if os.name == "posix":
+                    try:
+                        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                    except Exception:
+                        process.kill()
+                else:
+                    process.kill()
+            except Exception:
+                pass
+
+    def adopt_process(
+        self,
+        process: subprocess.Popen,
+        command: str,
+        *,
+        cwd: Path,
+        initial_stdout: bytes = b"",
+        initial_stderr: bytes = b"",
+        started_at: float | None = None,
+        last_activity_at: float | None = None,
+        idle_timeout_seconds: int = DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
+        hard_timeout_seconds: int = MAX_SHELL_COMMAND_TIMEOUT_SECONDS,
+        io_queue: queue.Queue | None = None,
+        active_readers: set[str] | None = None,
+        reader_threads: list[threading.Thread] | None = None,
+        completion_callback=None,
+    ) -> str:
+        """Adopt an already-running Bash process without restarting it."""
+        task_id = make_id("bg")
+        started = float(started_at or now_ts())
+        activity = float(last_activity_at or started)
+        log_path: Path | None = self.output_dir / f"{task_id}.log"
+        initial = bytes(initial_stdout or b"") + bytes(initial_stderr or b"")
+        try:
+            log_path.write_bytes(initial)
+        except Exception:
+            log_path = None
+        display_path = ""
+        if log_path is not None:
+            try:
+                display_path = log_path.resolve().relative_to(self.workdir.resolve()).as_posix()
+            except Exception:
+                display_path = str(log_path)
+        tail_bytes = bytearray(initial[-400_000:])
+        now = now_ts()
+        with self.lock:
+            self.tasks[task_id] = {
+                "status": "running",
+                "source": "bash_async_handoff",
+                "command": command,
+                "cwd": str(cwd),
+                "pid": int(getattr(process, "pid", 0) or 0),
+                "result": None,
+                "output_tail": self._decode_output(tail_bytes),
+                "output_bytes": len(initial),
+                "full_output_path": display_path,
+                "started_at": started,
+                "handed_off_at": now,
+                "last_activity_at": activity,
+                "idle_timeout_seconds": int(idle_timeout_seconds or 0),
+                "hard_timeout_seconds": int(hard_timeout_seconds or 0),
+                "duration_seconds": max(0.0, now - started),
+            }
+            self.processes[task_id] = process
+        thread = threading.Thread(
+            target=self._monitor_adopted_process,
+            args=(
+                task_id,
+                process,
+                command,
+                Path(cwd),
+                log_path,
+                tail_bytes,
+                started,
+                activity,
+                int(idle_timeout_seconds or 0),
+                int(hard_timeout_seconds or 0),
+                io_queue,
+                set(active_readers or set()),
+                list(reader_threads or []),
+                completion_callback,
+            ),
+            daemon=True,
+        )
+        thread.start()
+        return task_id
+
+    def _monitor_adopted_process(
+        self,
+        task_id: str,
+        process: subprocess.Popen,
+        command: str,
+        cwd: Path,
+        log_path: Path | None,
+        tail_bytes: bytearray,
+        started_at: float,
+        last_activity_at: float,
+        idle_timeout_seconds: int,
+        hard_timeout_seconds: int,
+        io_queue: queue.Queue | None,
+        active_readers: set[str],
+        reader_threads: list[threading.Thread],
+        completion_callback,
+    ) -> None:
+        local_queue: queue.Queue = io_queue if io_queue is not None else queue.Queue()
+
+        def spawn_reader(label: str, stream) -> None:
+            if stream is None:
+                return
+            active_readers.add(label)
+            try:
+                os.set_blocking(stream.fileno(), True)
+            except Exception:
+                pass
+
+            def reader() -> None:
+                try:
+                    while True:
+                        try:
+                            chunk = stream.read(65536)
+                        except Exception:
+                            break
+                        if not chunk:
+                            break
+                        local_queue.put((label, chunk))
+                finally:
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
+                    local_queue.put((label, None))
+
+            thread = threading.Thread(target=reader, daemon=True)
+            thread.start()
+            reader_threads.append(thread)
+
+        if io_queue is None:
+            spawn_reader("stdout", process.stdout)
+            spawn_reader("stderr", process.stderr)
+
+        output_bytes = 0
+        with self.lock:
+            output_bytes = int(self.tasks.get(task_id, {}).get("output_bytes", 0) or 0)
+        timeout_error = ""
+        termination_started = 0.0
+        while True:
+            now = now_ts()
+            elapsed = max(0.0, now - started_at)
+            idle = max(0.0, now - last_activity_at)
+            if not timeout_error and idle_timeout_seconds > 0 and idle >= idle_timeout_seconds:
+                timeout_error = f"Error: timeout (idle {int(idle)}s / limit {idle_timeout_seconds}s)"
+                termination_started = now
+                self._terminate_process(process)
+            elif not timeout_error and hard_timeout_seconds > 0 and elapsed >= hard_timeout_seconds:
+                timeout_error = f"Error: hard cap reached ({int(elapsed)}s)"
+                termination_started = now
+                self._terminate_process(process)
+            try:
+                label, chunk = local_queue.get(timeout=0.12)
+                if chunk is None:
+                    active_readers.discard(str(label))
+                else:
+                    raw = bytes(chunk)
+                    last_activity_at = now_ts()
+                    output_bytes += len(raw)
+                    tail_bytes.extend(raw)
+                    if len(tail_bytes) > 400_000:
+                        del tail_bytes[: len(tail_bytes) - 400_000]
+                    if log_path is not None:
+                        try:
+                            with log_path.open("ab") as handle:
+                                handle.write(raw)
+                        except Exception:
+                            pass
+            except queue.Empty:
+                pass
+            while True:
+                try:
+                    label, chunk = local_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if chunk is None:
+                    active_readers.discard(str(label))
+                    continue
+                raw = bytes(chunk)
+                last_activity_at = now_ts()
+                output_bytes += len(raw)
+                tail_bytes.extend(raw)
+                if len(tail_bytes) > 400_000:
+                    del tail_bytes[: len(tail_bytes) - 400_000]
+                if log_path is not None:
+                    try:
+                        with log_path.open("ab") as handle:
+                            handle.write(raw)
+                    except Exception:
+                        pass
+            tail_text, _ = filter_runtime_noise_lines(self._decode_output(tail_bytes))
+            with self.lock:
+                task = self.tasks.get(task_id, {})
+                task.update(
+                    {
+                        "output_tail": trim(tail_text, 24_000),
+                        "output_bytes": output_bytes,
+                        "last_activity_at": last_activity_at,
+                        "duration_seconds": round(max(0.0, now_ts() - started_at), 3),
+                    }
+                )
+            if process.poll() is not None and not active_readers and local_queue.empty():
+                break
+            if termination_started and now_ts() - termination_started > 3.0:
+                break
+
+        for thread in reader_threads:
+            try:
+                thread.join(timeout=0.4)
+            except Exception:
+                pass
+        exit_code = int(process.returncode if process.returncode is not None else (-1 if timeout_error else 0))
+        status = "completed" if exit_code == 0 and not timeout_error else "error"
+        tail_text, _ = filter_runtime_noise_lines(self._decode_output(tail_bytes))
+        result = trim(tail_text or timeout_error or "(no output)", 24_000)
+        finished = now_ts()
+        completion: dict = {}
+        if callable(completion_callback):
+            try:
+                callback_result = completion_callback(
+                    {
+                        "task_id": task_id,
+                        "command": command,
+                        "cwd": str(cwd),
+                        "status": status,
+                        "exit_code": exit_code,
+                        "error": timeout_error,
+                        "result": result,
+                        "output_tail": tail_text,
+                        "output_bytes": output_bytes,
+                        "started_at": started_at,
+                        "finished_at": finished,
+                    }
+                )
+                if isinstance(callback_result, dict):
+                    completion = callback_result
+            except Exception as exc:
+                completion = {"completion_error": trim(str(exc), 500)}
+        with self.lock:
+            task = self.tasks.get(task_id, {})
+            task.update(
+                {
+                    "status": status,
+                    "result": result,
+                    "output_tail": trim(tail_text, 24_000),
+                    "output_bytes": output_bytes,
+                    "exit_code": exit_code,
+                    "error": timeout_error,
+                    "finished_at": finished,
+                    "duration_seconds": round(max(0.0, finished - started_at), 3),
+                    **completion,
+                }
+            )
+            self.processes.pop(task_id, None)
+            notification = dict(task)
+        self.notifications.put(
+            {
+                "task_id": task_id,
+                "status": status,
+                "command": command,
+                "result": trim(result, 4000),
+                "exit_code": exit_code,
+                "error": timeout_error,
+                "duration_seconds": notification.get("duration_seconds", 0),
+                "full_output_path": notification.get("full_output_path", ""),
+                "changed_files": notification.get("changed_files", []),
+                "output_bytes": output_bytes,
+            }
+        )
 
     def run(self, command: str, timeout: int = 120) -> str:
         task_id = make_id("bg")
@@ -19393,7 +20988,14 @@ class BackgroundManager:
                     f" exit_code={int(task.get('exit_code'))}"
                     if task.get("exit_code") is not None else ""
                 )
-                return f"[{task['status']}]{exit_text} {task.get('result') or '(running)'}"
+                elapsed = float(task.get("duration_seconds", 0.0) or 0.0)
+                path_text = f"\nfull_output_path={task.get('full_output_path')}" if task.get("full_output_path") else ""
+                body = task.get("result") or task.get("output_tail") or "(running; no output yet)"
+                return (
+                    f"[{task['status']}]{exit_text} pid={int(task.get('pid', 0) or 0)} "
+                    f"elapsed={elapsed:.1f}s bytes={int(task.get('output_bytes', 0) or 0)}"
+                    f"{path_text}\n{body}"
+                )
             if not self.tasks:
                 return "No bg tasks."
             lines = []
@@ -19413,6 +21015,17 @@ class BackgroundManager:
     def list_objects(self) -> list[dict]:
         with self.lock:
             return [{**v, "id": k} for k, v in self.tasks.items()]
+
+    def stop_all(self) -> int:
+        with self.lock:
+            processes = list(self.processes.values())
+        stopped = 0
+        for process in processes:
+            if process.poll() is not None:
+                continue
+            self._terminate_process(process)
+            stopped += 1
+        return stopped
 
 class MessageBus:
     def __init__(self, inbox_dir: Path, crypto: CryptoBox):
@@ -23737,9 +25350,9 @@ TOOLS = [
     tool_def(
         "agent_web_search",
         (
-            "Autonomous bounded web research without third-party search APIs. "
-            "Use explicit seed_urls/domains when possible; otherwise it derives official/source domains from the query, "
-            "probes roots, robots, sitemaps, RSS/Atom, and bounded same-domain HTML links, then stores fetched pages in a local SQLite/FTS index. "
+            "Autonomous bounded web research without a search API key. "
+            "Use explicit seed_urls/domains when possible; otherwise cold queries use a public RSS search feed for candidate URLs, then the tool "
+            "probes roots, robots, sitemaps, RSS/Atom, and bounded same-domain HTML links and stores fetched pages in a local SQLite/FTS index. "
             "Use this for current open-web facts or source discovery; cite only returned fetched URLs. "
             "For relative dates or time-sensitive queries, ground query terms and freshness_days against the injected runtime temporal/local context; do not use stale years from model memory. "
             "Safety: http/https only, private/local networks blocked by default, robots obeyed, strict page/depth budgets."
@@ -24610,6 +26223,8 @@ class SessionState:
         collaboration_context: dict | None = None,
         collaboration_context_provider=None,
         collaboration_write_coordinator=None,
+        shell_timeout_mode: str = DEFAULT_SHELL_TIMEOUT_MODE,
+        shell_async_handoff_seconds: int = DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS,
     ):
         self.id = session_id
         self.title = title
@@ -24670,6 +26285,8 @@ class SessionState:
         self.collaboration_write_coordinator = collaboration_write_coordinator
         self.collaboration_revisions: dict[str, int] = {}
         self.collaboration_declared_intents: set[str] = set()
+        self.collaboration_agent_last_heartbeat = 0.0
+        self.collaboration_agent_current_file = ""
         self.upload_callback = upload_callback
         self.run_finished_callback = run_finished_callback
         self.reference_prepare_callback = reference_prepare_callback
@@ -24746,6 +26363,7 @@ class SessionState:
             self.files_root,
             command_wrapper=self._hard_snapshot_shell_prefix,
             env_wrapper=self._shell_process_env,
+            output_dir=self.long_output_dir / "background",
         )
         self.bus = MessageBus(self.root / "team" / "inbox", crypto)
         self.worktrees = WorktreeManager(self.id, self.tasks, self.root, crypto, repo_root)
@@ -24978,6 +26596,13 @@ class SessionState:
             minimum=MIN_SHELL_COMMAND_TIMEOUT_SECONDS,
             maximum=MAX_SHELL_COMMAND_TIMEOUT_SECONDS,
             fallback=DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
+        )
+        self.shell_timeout_mode = normalize_shell_timeout_mode(shell_timeout_mode)
+        self.shell_async_handoff_seconds = normalize_timeout_seconds(
+            shell_async_handoff_seconds,
+            minimum=MIN_SHELL_ASYNC_HANDOFF_SECONDS,
+            maximum=MAX_SHELL_ASYNC_HANDOFF_SECONDS,
+            fallback=DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS,
         )
         self.truncation_count = 0
         self.last_truncation_ts = 0.0
@@ -26776,6 +28401,15 @@ class SessionState:
                         return
                 time.sleep(0.05)
 
+    def _todos_for_persist(self) -> list[dict]:
+        """Return a canonical Todo snapshot and repair legacy root-ID collisions."""
+        snapshot = self.todo.snapshot()
+        repaired = self._normalize_loaded_todo_rows(snapshot, self.messages)
+        if repaired != snapshot:
+            with self.todo.lock:
+                self.todo.items = [dict(row) for row in repaired]
+        return repaired
+
     def _persist(self):
         self._prune_skill_load_cache()
         self._prune_code_preview_locked()
@@ -26805,7 +28439,7 @@ class SessionState:
             "bound_skill_ids": list(self.bound_skill_ids)[:ADMIN_MAX_APP_SKILLS],
             "bound_skill_capsule": trim(str(self.bound_skill_capsule or ""), ADMIN_MAX_APP_CAPSULE_CHARS),
             "skill_mode": "hard" if self.skill_mode == "hard" else "dynamic",
-            "todos": self.todo.snapshot(),
+            "todos": self._todos_for_persist(),
             "thinking": self.thinking,
             "context_limit_locked": bool(self.context_limit_locked),
             "context_estimate_calibration": float(getattr(self, "context_estimate_calibration", CONTEXT_ESTIMATE_SAFETY_MULTIPLIER) or CONTEXT_ESTIMATE_SAFETY_MULTIPLIER),
@@ -27657,6 +29291,49 @@ class SessionState:
             ]
         return public
 
+    def _publish_collaboration_event_heartbeat(self, kind: str, payload: dict) -> None:
+        if not bool(getattr(self, "running", False)):
+            return
+        coordinator = getattr(self, "collaboration_write_coordinator", None)
+        if coordinator is None:
+            return
+        now = now_ts()
+        force = str(kind or "").strip().lower() in {
+            "tool_start", "tool_result", "file_patch", "command", "error",
+        }
+        last = float(getattr(self, "collaboration_agent_last_heartbeat", 0.0) or 0.0)
+        if not force and now - last < COLLAB_AGENT_HEARTBEAT_INTERVAL_SECONDS:
+            return
+        public = payload if isinstance(payload, dict) else {}
+        current_file = ""
+        for key in ("path", "file_path", "target_path"):
+            value = str(public.get(key, "") or "").strip()
+            if value:
+                current_file = value
+                break
+        if not current_file and isinstance(public.get("changed_files"), list):
+            current_file = next(
+                (str(value or "").strip() for value in public["changed_files"] if str(value or "").strip()),
+                "",
+            )
+        if current_file:
+            self.collaboration_agent_current_file = _collaboration_public_text(current_file, 500)
+        tool_name = str(public.get("name", "") or getattr(self, "current_tool_name", "") or "").strip()
+        summary = str(public.get("summary", "") or "").strip()
+        if not summary:
+            summary = f"{kind}: {tool_name}" if tool_name else str(kind or "Agent activity")
+        try:
+            coordinator.heartbeat(
+                self.id,
+                status="running",
+                current_file=str(getattr(self, "collaboration_agent_current_file", "") or ""),
+                tool_summary=_collaboration_public_text(summary, 800),
+                result_summary="Agent run is active.",
+            )
+            self.collaboration_agent_last_heartbeat = now
+        except Exception:
+            pass
+
     def _emit(self, kind: str, data: dict):
         try:
             if bool(getattr(self, "running", False)):
@@ -27689,6 +29366,7 @@ class SessionState:
             )
             self.activity = self.activity[-300:]
         self._maybe_persist_after_event(kind, payload)
+        self._publish_collaboration_event_heartbeat(kind, payload)
 
     def record_scheduler_queued_message(
         self,
@@ -34702,6 +36380,7 @@ class SessionState:
     def _remote_agent_file_scope_error(self, path_text: object, action: str = "access") -> str:
         if not bool(getattr(self, "ide_remote_sandbox_required", False)):
             return ""
+        action_key = str(action or "access").strip().lower()
         raw = str(path_text or "").strip().strip("'\"").replace("\\", "/").lower()
         if (
             raw in {"file_buffer", "file_buffer/", "/file_buffer", "/file_buffer/"}
@@ -34718,11 +36397,18 @@ class SessionState:
             normalized = self._normalize_tool_path_text(path_text)
         except Exception as exc:
             return f"Error: {type(exc).__name__}: {exc}"
-        external_virtual_roots = (".__skills__", ".__js_lib__", ".__file_buffer__")
-        if any(normalized == root or normalized.startswith(root + "/") for root in external_virtual_roots):
+        shared_read_roots = (".__skills__", ".__js_lib__")
+        if any(normalized == root or normalized.startswith(root + "/") for root in shared_read_roots):
+            if action_key in {"read", "list", "search", "inspect", "access"}:
+                return ""
+            return (
+                f"Error: remote Program Agent {action} cannot modify shared Skills or packaged libraries. "
+                "These roots are read-only; global Skill changes require an authenticated IDE administrator."
+            )
+        if normalized == ".__file_buffer__" or normalized.startswith(".__file_buffer__/"):
             return (
                 f"Error: remote Program Agent {action} is limited to the isolated session workspace. "
-                "Global skills, packaged libraries, and runtime file buffers are outside that workspace."
+                "Runtime file buffers are private to the host session."
             )
         try:
             target = safe_path(normalized, self.files_root).resolve()
@@ -35104,8 +36790,9 @@ class SessionState:
         stage_meta: dict = {}
         total = len(stages)
         idx = -1
+        latest_requested = requested.lower() in {"", "latest", "current"}
         if stages:
-            if requested.lower() in {"", "latest", "current"}:
+            if latest_requested:
                 idx = len(stages) - 1
             else:
                 for i, row in enumerate(stages):
@@ -35116,7 +36803,12 @@ class SessionState:
                 stage_meta = dict(stages[idx])
                 before_text = self._read_code_preview_blob(str(stage_meta.get("before_blob", "") or ""))
                 after_text = self._read_code_preview_blob(str(stage_meta.get("after_blob", "") or ""))
-                if not after_text and fp.exists() and fp.is_file():
+                # "Latest" means the authoritative file on disk, not merely the
+                # last persisted stage blob. This also covers process writes that
+                # land between the event and the next stage-index refresh.
+                if latest_requested and fp.exists() and fp.is_file():
+                    after_text = try_read_text(fp, max_bytes=CODE_PREVIEW_STAGE_MAX_BYTES) or ""
+                elif not after_text and fp.exists() and fp.is_file():
                     after_text = try_read_text(fp, max_bytes=CODE_PREVIEW_STAGE_MAX_BYTES) or ""
                 if not before_text and after_text:
                     before_text = after_text
@@ -35140,14 +36832,15 @@ class SessionState:
             idx = 0
             total = max(total, 1)
         rows, truncated = build_code_preview_rows(before_text, after_text, max_rows=CODE_PREVIEW_STAGE_MAX_ROWS)
+        _, actual_added, actual_deleted = make_unified_diff(rel, before_text, after_text)
         stage_out = {
             "id": str(stage_meta.get("id", "current") or "current"),
             "index": int(idx + 1),
             "total": int(total if total > 0 else 1),
             "ts": float(stage_meta.get("ts", 0.0) or 0.0),
             "change_type": str(stage_meta.get("change_type", "modified") or "modified"),
-            "added": int(stage_meta.get("added", 0) or 0),
-            "deleted": int(stage_meta.get("deleted", 0) or 0),
+            "added": int(actual_added if latest_requested else (stage_meta.get("added", 0) or 0)),
+            "deleted": int(actual_deleted if latest_requested else (stage_meta.get("deleted", 0) or 0)),
             "virtual": bool(stage_meta.get("virtual", False)),
             "bytes_after": int(stage_meta.get("bytes_after", len(after_text.encode("utf-8", errors="ignore"))) or 0),
             "lines_after": int(stage_meta.get("lines_after", after_text.count("\n") + (1 if after_text else 0)) or 0),
@@ -37685,6 +39378,7 @@ body{padding:18px}
             "domains_total", "evidence_records", "query_trails", "ok", "title", "status",
             "bytes", "links", "source_type", "deadline_reached", "runtime_context",
             "next_actions", "search_context",
+            "public_discovery", "provider",
         ):
             if key in data:
                 event_data[key] = data[key]
@@ -40984,7 +42678,10 @@ body{padding:18px}
 
     def _is_allowed_absolute_write_path(self, raw_path: str) -> bool:
         txt = str(raw_path or "").strip().strip("'\"")
-        if not txt.startswith("/"):
+        is_windows_absolute = bool(
+            re.match(r"^[A-Za-z]:[\\/]", txt) or txt.startswith("\\\\")
+        )
+        if not txt.startswith("/") and not is_windows_absolute:
             return True
         special = {"/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty"}
         if txt in special:
@@ -41016,6 +42713,14 @@ body{padding:18px}
 
     def _shell_quote_virtual_root(self, path_text: str, quote_mode: str) -> str:
         txt = str(path_text or "")
+        if os.name == "nt":
+            if quote_mode == "double":
+                return txt.replace('"', '""')
+            if quote_mode == "single":
+                return txt.replace("'", "''")
+            if re.search(r"[\s&()\[\]{}^=;!'+,`~]", txt):
+                return f'"{txt.replace(chr(34), chr(34) * 2)}"'
+            return txt
         if quote_mode == "double":
             return (
                 txt.replace("\\", "\\\\")
@@ -41029,7 +42734,7 @@ body{padding:18px}
 
     def _rewrite_shell_virtual_paths(self, command: str, cwd: Path) -> str:
         raw = str(command or "")
-        if not raw or os.name == "nt":
+        if not raw:
             return raw
         try:
             workspace_root = str(cwd.resolve())
@@ -41104,6 +42809,7 @@ body{padding:18px}
         low = cmd.lower()
         has_write_intent = bool(
             re.search(r"(^|[^<])>>?\s*", cmd)
+            or self._shell_command_has_mutation_intent(cmd)
             or any(
                 token in low
                 for token in (
@@ -41128,13 +42834,22 @@ body{padding:18px}
             return []
 
         targets: list[str] = []
+
+        def _absolute_shell_path(value: object) -> bool:
+            text = str(value or "").strip().strip("'\"")
+            return bool(
+                text.startswith("/")
+                or re.match(r"^[A-Za-z]:[\\/]", text)
+                or text.startswith("\\\\")
+            )
+
         # Redirection targets.
         for m in re.finditer(
             r"(^|[^<])>>?\s*(?:'(?P<sq>[^']+)'|\"(?P<dq>[^\"]+)\"|(?P<raw>[^\s;&|]+))",
             cmd,
         ):
             p = str(m.group("sq") or m.group("dq") or m.group("raw") or "").strip()
-            if p.startswith("/"):
+            if _absolute_shell_path(p):
                 targets.append(p)
 
         clauses = [x for x in re.split(r"(?:&&|\|\||;)", cmd) if str(x or "").strip()]
@@ -41149,25 +42864,43 @@ body{padding:18px}
             args = [t for t in toks[1:] if str(t or "").strip() and (not str(t).startswith("-"))]
             if tool in {"mkdir", "touch", "rm", "rmdir", "chmod", "chown", "truncate"}:
                 for tok in args:
-                    if tok.startswith("/"):
+                    if _absolute_shell_path(tok):
                         targets.append(tok)
             elif tool == "mv":
                 for tok in args:
-                    if tok.startswith("/"):
+                    if _absolute_shell_path(tok):
                         targets.append(tok)
             elif tool in {"cp", "install", "ln"}:
                 if args:
                     dst = args[-1]
-                    if dst.startswith("/"):
+                    if _absolute_shell_path(dst):
                         targets.append(dst)
             elif tool == "tee":
                 for tok in args:
-                    if tok.startswith("/"):
+                    if _absolute_shell_path(tok):
                         targets.append(tok)
             elif tool == "dd":
                 for tok in toks[1:]:
-                    if str(tok).startswith("of=/"):
-                        targets.append(str(tok)[3:])
+                    raw_tok = str(tok)
+                    if raw_tok.startswith("of=") and _absolute_shell_path(raw_tok[3:]):
+                        targets.append(raw_tok[3:])
+
+        # Inline Python/Node writes do not have a shell-level destination token.
+        # If their write primitive directly names a shared read-only root, block
+        # them before launch (the OS sandbox remains the second enforcement layer).
+        if self._shell_command_has_mutation_intent(cmd):
+            code_write_markers = (
+                ".write_text(", ".write_bytes(", "open(", "fs.writefile",
+                "fs.mkdir", "fs.rm", "shutil.copy", "shutil.move",
+            )
+            if any(marker in low for marker in code_write_markers):
+                shared_roots = [str(root).replace("\\", "/").lower() for root in self._remote_shared_read_roots()]
+                normalized_cmd = cmd.replace("\\", "/").lower()
+                if (
+                    re.search(r"(?:^|[^A-Za-z0-9_.~-])/(?:skills|js_lib)(?:/|\b)", normalized_cmd)
+                    or any(root and root in normalized_cmd for root in shared_roots)
+                ):
+                    targets.append(str(self.skills.skills_root))
 
         blocked: list[str] = []
         seen: set[str] = set()
@@ -41314,6 +43047,36 @@ body{padding:18px}
                 continue
         return roots
 
+    def _remote_shared_read_mounts(self) -> list[tuple[Path, str]]:
+        """Return host roots and portable read-only destinations inside container sandboxes."""
+        candidates: list[tuple[object, str]] = [
+            (getattr(getattr(self, "skills", None), "skills_root", None), "/clouds_shared/skills"),
+            (getattr(self, "js_lib_root", None), "/clouds_shared/js_lib"),
+        ]
+        try:
+            for index, (_virtual, raw) in enumerate(self.skills.shell_virtual_mappings(), 1):
+                candidates.append((raw, f"/clouds_shared/skill_providers/{index}"))
+        except Exception:
+            pass
+        mounts: list[tuple[Path, str]] = []
+        seen: set[str] = set()
+        for raw, virtual in candidates:
+            try:
+                candidate = Path(raw).resolve() if raw else None
+                if candidate is None or not candidate.exists() or not candidate.is_dir():
+                    continue
+                key = os.path.normcase(str(candidate))
+                if key in seen:
+                    continue
+                seen.add(key)
+                mounts.append((candidate, virtual))
+            except Exception:
+                continue
+        return mounts
+
+    def _remote_shared_read_roots(self) -> list[Path]:
+        return [host for host, _virtual in self._remote_shared_read_mounts()]
+
     def _remote_process_path(self) -> str:
         workspace_root = self.files_root.resolve()
         allowed_roots = [workspace_root, *self._remote_runtime_read_roots()]
@@ -41371,6 +43134,9 @@ body{padding:18px}
             (str(Path(cwd or self.files_root)), virtual_cwd),
             (str(self.files_root), "/workspace"),
         ]
+        replacements.extend(
+            (str(host), virtual) for host, virtual in self._remote_shared_read_mounts()
+        )
         out = str(command or "")
         for host_path, virtual_path in sorted(replacements, key=lambda row: len(row[0]), reverse=True):
             out = out.replace(shlex.quote(host_path), shlex.quote(virtual_path))
@@ -41395,6 +43161,9 @@ body{padding:18px}
             runtime_read_rules = " ".join(
                 f"(subpath {json.dumps(str(root))})" for root in self._remote_runtime_read_roots()
             )
+            shared_read_rules = " ".join(
+                f"(subpath {json.dumps(str(root))})" for root in self._remote_shared_read_roots()
+            )
             policy = (
                 "(version 1) "
                 "(allow default) "
@@ -41404,7 +43173,8 @@ body{padding:18px}
                 "(subpath \"/Users\") (subpath \"/Volumes\") "
                 "(subpath \"/private/tmp\") (subpath \"/tmp\") (subpath \"/var/tmp\") "
                 "(subpath \"/private/var/folders\")) "
-                f"(allow file-read* (subpath {json.dumps(str(workspace_root))}) {runtime_read_rules})"
+                f"(allow file-read* (subpath {json.dumps(str(workspace_root))}) "
+                f"{runtime_read_rules} {shared_read_rules})"
             )
             return [sandbox, "-p", policy]
         virtual_cwd = "/workspace" + (f"/{rel}" if rel else "")
@@ -41446,6 +43216,18 @@ body{padding:18px}
                             prefix.extend(["--dir", directory])
                     prefix.extend(["--ro-bind", raw, raw])
                     mounted.add(raw)
+            shared_dirs: set[str] = set()
+            for shared_root, virtual_root in self._remote_shared_read_mounts():
+                parent = PurePosixPath(virtual_root).parent
+                parents: list[str] = []
+                while str(parent) not in {"", "/", "."}:
+                    parents.append(str(parent))
+                    parent = parent.parent
+                for directory in reversed(parents):
+                    if directory not in shared_dirs:
+                        prefix.extend(["--dir", directory])
+                        shared_dirs.add(directory)
+                prefix.extend(["--ro-bind", str(shared_root), virtual_root])
             prefix.extend([
                 "--bind", str(workspace_root), "/workspace",
                 "--proc", "/proc",
@@ -41460,7 +43242,7 @@ body{padding:18px}
             image = str(backend.get("image", "") or "")
             if not runtime or not image:
                 return []
-            return [
+            prefix = [
                 runtime,
                 "run",
                 "--rm",
@@ -41481,8 +43263,21 @@ body{padding:18px}
                 "--env", "TMPDIR=/tmp",
                 "--env", "PYTHONIOENCODING=utf-8",
                 "--env", "PYTHONUTF8=1",
-                image,
             ]
+            for shared_root, virtual_root in self._remote_shared_read_mounts():
+                prefix.extend([
+                    "--mount",
+                    f"type=bind,src={shared_root},dst={virtual_root},readonly",
+                ])
+                try:
+                    if shared_root == Path(self.skills.skills_root).resolve():
+                        prefix.extend(["--env", f"SKILLS_ROOT={virtual_root}"])
+                    if shared_root == Path(self.js_lib_root).resolve():
+                        prefix.extend(["--env", f"JS_LIB_ROOT={virtual_root}"])
+                except Exception:
+                    pass
+            prefix.append(image)
+            return prefix
         return []
 
     def _hard_snapshot_shell_prefix(self, cwd: Path | None = None) -> list[str]:
@@ -41549,6 +43344,29 @@ body{padding:18px}
                 "PYTHONUTF8": "1",
             }
         )
+        shared_mounts = self._remote_shared_read_mounts()
+        shared_roots = [host for host, _virtual in shared_mounts]
+        virtual_shared = {os.path.normcase(str(host)): virtual for host, virtual in shared_mounts}
+        try:
+            skills_root = Path(self.skills.skills_root).resolve()
+            if skills_root in shared_roots:
+                env["SKILLS_ROOT"] = (
+                    virtual_shared.get(os.path.normcase(str(skills_root)), str(skills_root))
+                    if virtual_root
+                    else str(skills_root)
+                )
+        except Exception:
+            pass
+        try:
+            js_root = Path(self.js_lib_root).resolve()
+            if js_root in shared_roots:
+                env["JS_LIB_ROOT"] = (
+                    virtual_shared.get(os.path.normcase(str(js_root)), str(js_root))
+                    if virtual_root
+                    else str(js_root)
+                )
+        except Exception:
+            pass
         if os.name == "nt":
             env["PYTHONLEGACYWINDOWSSTDIO"] = "0"
         elif sys.platform == "darwin":
@@ -41584,7 +43402,10 @@ body{padding:18px}
 
     def _guard_shell_write_scope(self, command: str, cwd: Path | None = None) -> str:
         effective = self._rewrite_shell_virtual_paths(command, cwd or self.files_root)
-        if self._command_targets_global_skills(command) or self._command_targets_global_skills(effective):
+        if (
+            not bool(getattr(self, "ide_remote_sandbox_required", False))
+            and (self._command_targets_global_skills(command) or self._command_targets_global_skills(effective))
+        ):
             return (
                 "Error: shell access to global skills is disabled. "
                 "Use list_skills/load_skill/read_file for skill reads; only the authenticated administrator may mutate skills."
@@ -41607,18 +43428,36 @@ body{padding:18px}
 
     def _run_shell_meta(self, command: str, cwd: Path, timeout: int) -> dict:
         effective_command = self._rewrite_shell_virtual_paths(command, cwd)
+        requested_timeout_mode = self._shell_timeout_mode()
+        timeout_mode = requested_timeout_mode
+        if timeout_mode == "async" and getattr(self, "collaboration_write_coordinator", None) is not None:
+            timeout_mode = "auto"
+        async_handoff_seconds = self._shell_async_handoff_seconds()
+        timeout_mode_notice = (
+            "Notice: async Bash handoff is disabled in collaboration workspaces; this command used auto mode "
+            "so the project mutation lease remains active until file writes are scanned."
+            if requested_timeout_mode == "async" and timeout_mode == "auto"
+            else ""
+        )
         meta = {
             "command": command,
             "effective_command": effective_command,
             "cwd": str(cwd),
             "timeout": timeout,
+            "timeout_mode": timeout_mode,
+            "requested_timeout_mode": requested_timeout_mode,
+            "async_handoff_seconds": async_handoff_seconds,
+            "timeout_mode_notice": timeout_mode_notice,
             "exit_code": None,
             "duration_ms": 0,
             "changed_files": [],
             "output": "",
             "error": "",
         }
-        if self._command_targets_global_skills(command) or self._command_targets_global_skills(effective_command):
+        if (
+            not bool(getattr(self, "ide_remote_sandbox_required", False))
+            and (self._command_targets_global_skills(command) or self._command_targets_global_skills(effective_command))
+        ):
             meta["error"] = (
                 "Error: shell access to global skills is disabled. "
                 "Use list_skills/load_skill/read_file for skill reads; only the authenticated administrator may mutate skills."
@@ -41636,10 +43475,9 @@ body{padding:18px}
         out_buf = bytearray()
         err_buf = bytearray()
         next_progress_emit = start + 0.8
-        # Idle-timeout tracking: reset whenever output is captured.
-        # Timeout fires only when no output has arrived for `timeout` seconds;
-        # a hard cap of MAX_SHELL_COMMAND_TIMEOUT_SECONDS prevents infinite runs.
         last_activity_ts = [start]
+        handed_off = [False]
+        handoff_failed = [False]
 
         def _stop_process(p: subprocess.Popen):
             # shell=True may spawn child processes; stop the whole process group on POSIX.
@@ -41689,9 +43527,110 @@ body{padding:18px}
             text = str(output_value or "").strip()
             if not text:
                 text = str(meta.get("error") or "(no output)")
+            if timeout_mode_notice and timeout_mode_notice not in text:
+                text = f"{timeout_mode_notice}\n{text}"
             if exit_code is not None:
                 meta["exit_code"] = int(exit_code)
             meta.update(self._prepare_shell_output_payload(command, text, cwd=cwd))
+
+        def _timeout_error(now: float) -> str:
+            elapsed = now - start
+            if timeout > 0:
+                if timeout_mode == "fixed" and elapsed >= timeout:
+                    return f"Error: timeout (elapsed {int(elapsed)}s / limit {timeout}s, mode=fixed)"
+                if timeout_mode in {"auto", "async"} and (now - last_activity_ts[0]) >= timeout:
+                    return f"Error: timeout (idle {int(now - last_activity_ts[0])}s / limit {timeout}s, mode={timeout_mode})"
+            if elapsed >= MAX_SHELL_COMMAND_TIMEOUT_SECONDS:
+                return f"Error: hard cap reached ({int(elapsed)}s)"
+            return ""
+
+        def _background_completion(payload: dict) -> dict:
+            try:
+                _windows_close_sandbox_job(proc)
+            except Exception:
+                pass
+            try:
+                self._restore_application_snapshot_permissions()
+            except Exception:
+                pass
+            after_status = self._git_status_map(cwd)
+            changed = self._status_delta(before, after_status) if before or after_status else []
+            try:
+                self._emit(
+                    "background",
+                    {
+                        "task_id": str(payload.get("task_id", "") or ""),
+                        "status": str(payload.get("status", "") or ""),
+                        "exit_code": payload.get("exit_code"),
+                        "changed_files": changed,
+                        "summary": (
+                            f"async bash {payload.get('status', 'finished')} "
+                            f"(exit={payload.get('exit_code')}, changed={len(changed)})"
+                        ),
+                    },
+                )
+            except Exception:
+                pass
+            return {"changed_files": changed}
+
+        def _should_handoff(now: float) -> bool:
+            return bool(
+                timeout_mode == "async"
+                and not handed_off[0]
+                and not handoff_failed[0]
+                and (now - start) >= async_handoff_seconds
+                and proc is not None
+                and proc.poll() is None
+            )
+
+        def _handoff_process(
+            p: subprocess.Popen,
+            *,
+            io_queue: queue.Queue | None = None,
+            active_readers: set[str] | None = None,
+            reader_threads: list[threading.Thread] | None = None,
+        ) -> bool:
+            try:
+                task_id = self.bg.adopt_process(
+                    p,
+                    command,
+                    cwd=cwd,
+                    initial_stdout=bytes(out_buf),
+                    initial_stderr=bytes(err_buf),
+                    started_at=start,
+                    last_activity_at=last_activity_ts[0],
+                    idle_timeout_seconds=timeout,
+                    hard_timeout_seconds=MAX_SHELL_COMMAND_TIMEOUT_SECONDS,
+                    io_queue=io_queue,
+                    active_readers=active_readers,
+                    reader_threads=reader_threads,
+                    completion_callback=_background_completion,
+                )
+            except Exception as exc:
+                handoff_failed[0] = True
+                self._emit_transient(
+                    "status",
+                    {"summary": f"async bash handoff failed; continuing in auto mode: {trim(str(exc), 180)}"},
+                )
+                return False
+            handed_off[0] = True
+            meta["background_task_id"] = task_id
+            meta["handed_off"] = True
+            meta["exit_code"] = None
+            snapshot_raw = _merge_output_text()
+            snapshot, _ = filter_runtime_noise_lines(snapshot_raw)
+            handoff_text = (
+                f"Background task {task_id} adopted the same running process (pid={int(p.pid)}); "
+                "the command was not restarted.\n"
+                f"Use check_background with task_id=\"{task_id}\" and mode=\"tail\" to trace progress, "
+                "or mode=\"detail\" for metadata. Continue independent work only when its inputs do not "
+                "depend on this command. The final exit code, output path, changed files, and required "
+                "post-processing checks will be injected automatically when it finishes."
+            )
+            if snapshot:
+                handoff_text += f"\n\nOutput snapshot before handoff:\n{snapshot}"
+            _store_shell_output(handoff_text)
+            return True
 
         def _collect_with_reader_threads(proc: subprocess.Popen):
             nonlocal next_progress_emit
@@ -41746,19 +43685,18 @@ body{padding:18px}
                     meta["error"] = "Error: interrupted by user"
                     meta["exit_code"] = -130
                     break
-                elif (not meta.get("error")) and timeout > 0 and (
-                    (now - last_activity_ts[0]) >= timeout
-                    or elapsed >= MAX_SHELL_COMMAND_TIMEOUT_SECONDS
-                ):
-                    idle_secs = int(now - last_activity_ts[0])
-                    meta["error"] = (
-                        f"Error: timeout (idle {idle_secs}s / limit {timeout}s)"
-                        if (now - last_activity_ts[0]) >= timeout
-                        else f"Error: hard cap reached ({int(elapsed)}s)"
-                    )
+                elif (not meta.get("error")) and _timeout_error(now):
+                    meta["error"] = _timeout_error(now)
                     _stop_process(proc)
                     meta["exit_code"] = -1
                     break
+                elif _should_handoff(now) and _handoff_process(
+                    proc,
+                    io_queue=io_queue,
+                    active_readers=active_readers,
+                    reader_threads=reader_threads,
+                ):
+                    return
                 try:
                     label, chunk = io_queue.get(timeout=0.12)
                     if chunk is None:
@@ -41906,18 +43844,12 @@ body{padding:18px}
                                 meta["error"] = "Error: interrupted by user"
                                 meta["exit_code"] = -130
                                 break
-                            elif timeout > 0 and (
-                                (now - last_activity_ts[0]) >= timeout
-                                or elapsed >= MAX_SHELL_COMMAND_TIMEOUT_SECONDS
-                            ):
-                                idle_secs = int(now - last_activity_ts[0])
-                                meta["error"] = (
-                                    f"Error: timeout (idle {idle_secs}s / limit {timeout}s)"
-                                    if (now - last_activity_ts[0]) >= timeout
-                                    else f"Error: hard cap reached ({int(elapsed)}s)"
-                                )
+                            elif _timeout_error(now):
+                                meta["error"] = _timeout_error(now)
                                 _stop_process(proc)
                                 meta["exit_code"] = -1
+                                break
+                            elif _should_handoff(now) and _handoff_process(proc):
                                 break
                             events = sel.select(timeout=0.12)
                             for key, _ in events:
@@ -41965,15 +43897,16 @@ body{padding:18px}
                                         break
                             if (proc.poll() is not None) and (not sel.get_map()):
                                 break
-                        merged_raw = _merge_output_text()
-                        merged, _ = filter_runtime_noise_lines(merged_raw)
-                        if meta.get("error"):
-                            _store_shell_output(merged or str(meta["error"]))
-                        else:
-                            _store_shell_output(
-                                merged or "(no output)",
-                                int(proc.returncode if proc.returncode is not None else 0),
-                            )
+                        if not handed_off[0]:
+                            merged_raw = _merge_output_text()
+                            merged, _ = filter_runtime_noise_lines(merged_raw)
+                            if meta.get("error"):
+                                _store_shell_output(merged or str(meta["error"]))
+                            else:
+                                _store_shell_output(
+                                    merged or "(no output)",
+                                    int(proc.returncode if proc.returncode is not None else 0),
+                                )
                 except Exception as exc:
                     # Some platforms may reject selector registration for PIPEs.
                     # On Windows, also catch any OSError (e.g. WinError 10093 WSANOTINITIALISED).
@@ -41991,12 +43924,15 @@ body{padding:18px}
                 meta["output"] = meta["error"]
                 meta["exit_code"] = -1
         finally:
-            _windows_close_sandbox_job(proc)
+            if not handed_off[0]:
+                _windows_close_sandbox_job(proc)
             self._running_bash_proc = None
-            self._restore_application_snapshot_permissions()
+            if not handed_off[0]:
+                self._restore_application_snapshot_permissions()
         meta["duration_ms"] = int((time.time() - start) * 1000)
-        after = self._git_status_map(cwd)
-        meta["changed_files"] = self._status_delta(before, after) if before or after else []
+        if not handed_off[0]:
+            after = self._git_status_map(cwd)
+            meta["changed_files"] = self._status_delta(before, after) if before or after else []
         if not meta.get("ui_output_pages"):
             meta.update(
                 self._prepare_shell_output_payload(
@@ -42013,6 +43949,19 @@ body{padding:18px}
             minimum=MIN_SHELL_COMMAND_TIMEOUT_SECONDS,
             maximum=MAX_SHELL_COMMAND_TIMEOUT_SECONDS,
             fallback=DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
+        )
+
+    def _shell_timeout_mode(self) -> str:
+        return normalize_shell_timeout_mode(
+            getattr(self, "shell_timeout_mode", DEFAULT_SHELL_TIMEOUT_MODE)
+        )
+
+    def _shell_async_handoff_seconds(self) -> int:
+        return normalize_timeout_seconds(
+            getattr(self, "shell_async_handoff_seconds", DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS),
+            minimum=MIN_SHELL_ASYNC_HANDOFF_SECONDS,
+            maximum=MAX_SHELL_ASYNC_HANDOFF_SECONDS,
+            fallback=DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS,
         )
 
     def _run_bash(self, command: str) -> str:
@@ -55605,6 +57554,134 @@ body{padding:18px}
             return ""
         return "rt:" + hashlib.sha1(identity.encode("utf-8", "ignore")).hexdigest()[:20]
 
+    def _dedupe_root_todo_rows(self, rows: list[dict]) -> list[dict]:
+        """Repair root Todo collisions without merging distinct objectives."""
+        source = [dict(row) for row in list(rows or []) if isinstance(row, dict)]
+        if len(source) <= 1:
+            return source
+        merged_rows: list[dict] = []
+        passthrough_positions: list[tuple[int, dict]] = []
+        root_positions: list[int] = []
+        status_rank = {"pending": 0, "in_progress": 1, "completed": 2}
+
+        for position, row in enumerate(source):
+            if self._todo_row_kind(row) not in {"flat", "owner_worker"}:
+                passthrough_positions.append((position, row))
+                continue
+            root_positions.append(position)
+            content_key = re.sub(
+                r"\s+",
+                " ",
+                (normalize_work_text(str(row.get("content", "") or "")) or str(row.get("content", "") or ""))
+                .strip()
+                .casefold(),
+            )
+            old_id = trim(str(row.get("subtask_id", "") or "").strip(), 100)
+            match_index = -1
+            for index, prior in enumerate(merged_rows):
+                prior_key = re.sub(
+                    r"\s+",
+                    " ",
+                    (normalize_work_text(str(prior.get("content", "") or "")) or str(prior.get("content", "") or ""))
+                    .strip()
+                    .casefold(),
+                )
+                if content_key and content_key == prior_key:
+                    match_index = index
+                    break
+                prior_id = trim(str(prior.get("subtask_id", "") or "").strip(), 100)
+                if old_id and prior_id == old_id:
+                    row_for_score = {
+                        key: value
+                        for key, value in row.items()
+                        if key not in {"subtask_id", "external_subtask_id"}
+                    }
+                    prior_for_score = {
+                        key: value
+                        for key, value in prior.items()
+                        if key not in {"subtask_id", "external_subtask_id"}
+                    }
+                    if self._plan_worker_todo_match_score(row_for_score, prior_for_score) >= 0.80:
+                        match_index = index
+                        break
+            if match_index < 0:
+                merged_rows.append(row)
+                continue
+
+            prior = dict(merged_rows[match_index])
+            prior_status = self._normalize_todo_status_value(prior.get("status", ""), "pending")
+            row_status = self._normalize_todo_status_value(row.get("status", ""), "pending")
+            latest = row
+            try:
+                prior_time = float(prior.get("updated_at", prior.get("created_at", 0.0)) or 0.0)
+            except Exception:
+                prior_time = 0.0
+            try:
+                row_time = float(row.get("updated_at", row.get("created_at", 0.0)) or 0.0)
+            except Exception:
+                row_time = 0.0
+            if row_time and prior_time and row_time < prior_time:
+                latest = prior
+            combined = dict(prior)
+            combined.update(latest)
+            combined["status"] = max(
+                (prior_status, row_status),
+                key=lambda value: status_rank.get(value, -1),
+            )
+            created_values = []
+            for candidate in (prior.get("created_at"), row.get("created_at")):
+                try:
+                    if float(candidate or 0.0) > 0:
+                        created_values.append(float(candidate))
+                except Exception:
+                    pass
+            if created_values:
+                combined["created_at"] = min(created_values)
+            updated_values = []
+            for candidate in (prior.get("updated_at"), row.get("updated_at")):
+                try:
+                    if float(candidate or 0.0) > 0:
+                        updated_values.append(float(candidate))
+                except Exception:
+                    pass
+            if updated_values:
+                combined["updated_at"] = max(updated_values)
+            merged_rows[match_index] = combined
+
+        external_counts = Counter(
+            trim(str(row.get("external_subtask_id", "") or "").strip(), 120).casefold()
+            for row in merged_rows
+            if trim(str(row.get("external_subtask_id", "") or "").strip(), 120)
+        )
+        used_ids: set[str] = set()
+        for index, row in enumerate(merged_rows):
+            external = trim(str(row.get("external_subtask_id", "") or "").strip(), 120).casefold()
+            if external and external_counts.get(external, 0) > 1:
+                row.pop("external_subtask_id", None)
+            row.pop("subtask_id", None)
+            stable_id = self._stable_root_todo_id(row)
+            if stable_id in used_ids:
+                content = re.sub(r"\s+", " ", str(row.get("content", "") or "").strip().casefold())
+                stable_id = "rt:" + hashlib.sha1(
+                    f"text:{content}\0{index}".encode("utf-8", "ignore")
+                ).hexdigest()[:20]
+            row["subtask_id"] = stable_id
+            used_ids.add(stable_id)
+
+        root_iter = iter(merged_rows)
+        passthrough = {position: row for position, row in passthrough_positions}
+        output: list[dict] = []
+        for position in range(len(source)):
+            if position in passthrough:
+                output.append(passthrough[position])
+            elif position in root_positions:
+                try:
+                    output.append(next(root_iter))
+                except StopIteration:
+                    pass
+        output.extend(list(root_iter))
+        return output
+
     def _ensure_root_todo_baseline(self, rows: list[dict], *, board: dict | None = None) -> list[dict]:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         baseline = list(bb.get("todo_tree_baseline", []) if isinstance(bb.get("todo_tree_baseline"), list) else [])
@@ -55899,6 +57976,8 @@ body{padding:18px}
                 row["owner"] = role_key
             row["subtask_id"] = self._stable_root_todo_id(row)
             normalized.append(row)
+        normalized = self._dedupe_root_todo_rows(normalized)
+        existing_scope = self._dedupe_root_todo_rows(existing_scope)
         if not normalized:
             return self.todo.update(preserved_rows + passthrough + existing_scope)
 
@@ -55919,6 +57998,44 @@ body{padding:18px}
                     prior_index = candidate_index
                     identity = candidate_id
                     break
+            if prior is None:
+                incoming_group = trim(str(incoming.get("root_group_id", "") or "").strip(), 120).casefold()
+                grouped: list[tuple[float, str, dict, int]] = []
+                if incoming_group:
+                    for candidate_id, candidate, candidate_index in existing_entries:
+                        if candidate_id in used:
+                            continue
+                        candidate_group = trim(
+                            str(candidate.get("root_group_id", "") or "").strip(),
+                            120,
+                        ).casefold()
+                        if candidate_group != incoming_group:
+                            continue
+                        incoming_for_score = {
+                            key: value
+                            for key, value in incoming.items()
+                            if key not in {"subtask_id", "external_subtask_id"}
+                        }
+                        candidate_for_score = {
+                            key: value
+                            for key, value in candidate.items()
+                            if key not in {"subtask_id", "external_subtask_id"}
+                        }
+                        grouped.append(
+                            (
+                                self._plan_worker_todo_match_score(incoming_for_score, candidate_for_score),
+                                candidate_id,
+                                candidate,
+                                candidate_index,
+                            )
+                        )
+                    grouped.sort(key=lambda value: value[0], reverse=True)
+                    if grouped and (
+                        len(grouped) == 1
+                        or grouped[0][0] >= 0.86
+                        or grouped[0][0] - grouped[1][0] >= 0.08
+                    ):
+                        _score, identity, prior, prior_index = grouped[0]
             if prior is None:
                 scored: list[tuple[float, str, dict, int]] = []
                 for candidate_id, candidate, candidate_index in existing_entries:
@@ -66675,19 +68792,13 @@ body{padding:18px}
         raw_rows: object,
         messages: object,
     ) -> list[dict]:
-        """Repair only the legacy one-row stringified Todo payload shape.
-
-        Normal persisted lists are returned byte-for-byte equivalent. When an
-        older run stored a truncated Python representation as the sole Todo, the
-        corresponding structured TodoWrite arguments remain in the conversation
-        and provide a bounded, same-session recovery source.
-        """
+        """Repair legacy stringified payloads and root Todo identity collisions."""
         rows = [dict(row) for row in raw_rows if isinstance(row, dict)] if isinstance(raw_rows, list) else []
         if len(rows) != 1:
-            return rows
+            return self._dedupe_root_todo_rows(rows)
         content = str(rows[0].get("content", "") or "").strip()
         if not (content.startswith("[") and "content" in content.casefold()):
-            return rows
+            return self._dedupe_root_todo_rows(rows)
 
         recovered: list[object] = []
         decoded = decode_structured_todo_container(content)
@@ -66728,13 +68839,13 @@ body{padding:18px}
                     break
 
         if len(recovered) < 2:
-            return rows
+            return self._dedupe_root_todo_rows(rows)
         normalized = TodoManager(getattr(self, "ui_language", DEFAULT_UI_LANGUAGE))
         try:
             normalized.update(recovered)
         except Exception:
-            return rows
-        return normalized.snapshot() or rows
+            return self._dedupe_root_todo_rows(rows)
+        return self._dedupe_root_todo_rows(normalized.snapshot() or rows)
 
     def _todo_payload_in_progress_index(self, args: object) -> int | None:
         """Read legacy/current cursor aliases without treating an empty value as 0."""
@@ -66945,13 +69056,16 @@ body{padding:18px}
         key = trim(str(raw.get("key", "") or "").strip(), 120)
         if key:
             row["key"] = key
-        # Explicit stage IDs from no-plan/L2 Todo lists are stable root-row
-        # identities, not approved-plan parent links. Preserve them as an
-        # external identity so abbreviated status snapshots still match the
-        # original detailed objective without being routed as plan subtasks.
-        root_stage_id = trim(str(raw.get("parent_step_id", raw.get("parentStepId", "")) or "").strip(), 120)
-        if root_stage_id and not root_stage_id.startswith("bb:"):
-            row["external_subtask_id"] = root_stage_id
+        # parent_step_id groups work under a stage; it is not a root Todo ID.
+        # Different root objectives commonly share one stage (for example two
+        # renderer tasks), so promoting it to external_subtask_id corrupts both
+        # identities and causes every later status snapshot to append a row.
+        root_group_id = trim(
+            str(raw.get("parent_step_id", raw.get("parentStepId", raw.get("root_group_id", ""))) or "").strip(),
+            120,
+        )
+        if root_group_id and not root_group_id.startswith("bb:"):
+            row["root_group_id"] = root_group_id
         for alias_key in (
             "external_subtask_id", "externalSubtaskId", "external_id", "externalId",
             "todo_id", "todoId", "task_id", "taskId", "item_id", "itemId",
@@ -66964,6 +69078,7 @@ body{padding:18px}
         for meta_key in (
             "activeForm", "active_form", "subtask_id", "created_at", "updated_at", "started_at",
             "completed_at", "completed_by", "evidence", "evidence_binding", "evidence_ids",
+            "root_group_id",
         ):
             if raw.get(meta_key) not in (None, ""):
                 row[meta_key] = raw.get(meta_key)
@@ -67032,7 +69147,7 @@ body{padding:18px}
         mode, reason, revision_evidence = self._todo_payload_controls(source, resume=is_resume)
         route_kind = self._todo_route_kind(role=role_key, board=bb)
         if route_kind in {"plan_single", "plan_sync"}:
-            return self._merge_plan_worker_todo_items(
+            result = self._merge_plan_worker_todo_items(
                 normalized_items,
                 role=role_key,
                 update_mode=mode,
@@ -67040,8 +69155,8 @@ body{padding:18px}
                 revision_evidence=revision_evidence,
                 transaction=transaction,
             )
-        if route_kind == "pure_sync":
-            return self._merge_owner_scoped_todo_items(
+        elif route_kind == "pure_sync":
+            result = self._merge_owner_scoped_todo_items(
                 normalized_items,
                 role=role_key,
                 update_mode=mode,
@@ -67049,14 +69164,55 @@ body{padding:18px}
                 revision_evidence=revision_evidence,
                 transaction=transaction,
             )
-        return self._merge_flat_todo_items(
-            normalized_items,
-            role=role_key,
-            update_mode=mode,
-            revision_reason=reason,
-            revision_evidence=revision_evidence,
-            transaction=transaction,
-        )
+        else:
+            result = self._merge_flat_todo_items(
+                normalized_items,
+                role=role_key,
+                update_mode=mode,
+                revision_reason=reason,
+                revision_evidence=revision_evidence,
+                transaction=transaction,
+            )
+        self._initialize_collaboration_plan_from_todos(normalized_items)
+        return result
+
+    def _initialize_collaboration_plan_from_todos(self, items: list[object]) -> None:
+        coordinator = getattr(self, "collaboration_write_coordinator", None)
+        if coordinator is None:
+            return
+        steps: list[str] = []
+        seen: set[str] = set()
+        for raw in list(items or [])[:40]:
+            if not isinstance(raw, dict) or str(raw.get("key", "") or "").startswith("bb:"):
+                continue
+            content = _collaboration_public_text(
+                normalize_work_text(str(raw.get("content", "") or "")),
+                280,
+            )
+            identity = re.sub(r"\s+", " ", content.casefold()).strip()
+            if not content or identity in seen:
+                continue
+            seen.add(identity)
+            steps.append(content)
+        if len(steps) < 2:
+            return
+        try:
+            shared = coordinator.initialize_task_plan(self.id, steps)
+            if shared.get("recorded"):
+                self._emit(
+                    "status",
+                    {
+                        "summary": (
+                            "shared coordinator plan initialized from canonical Todo; "
+                            f"slices={len(steps)}"
+                        )
+                    },
+                )
+        except Exception as exc:
+            self._emit(
+                "status",
+                {"summary": f"shared coordinator plan unavailable: {_collaboration_public_text(exc, 160)}"},
+            )
 
     def _todo_progress_signature(self, rows: list[dict] | None = None) -> list[tuple[str, str, str, str]]:
         items = rows if isinstance(rows, list) else self.todo.snapshot()
@@ -67978,7 +70134,7 @@ body{padding:18px}
         task_id = str(args.get("task_id", "") or "").strip()
         mode = str(args.get("mode", "") or "").strip().lower()
         query = str(args.get("query", "") or "").strip()
-        if task_id and not mode and not query:
+        if task_id and (not mode or mode in {"tail", "recent"}) and not query:
             out = self.bg.check(task_id)
             task = next(
                 (row for row in self.bg.list_objects() if str(row.get("id", "") or "") == task_id),
@@ -68014,7 +70170,7 @@ body{padding:18px}
             limit=args.get("limit", 20),
             max_chars=args.get("max_chars"),
             filters=filters,
-            summary_fields=["id", "status", "command", "started_at", "finished_at"],
+            summary_fields=["id", "status", "command", "pid", "duration_seconds", "last_activity_at", "output_bytes", "started_at", "finished_at"],
             detail_fields=[],
             default_limit=20,
         )
@@ -68474,12 +70630,11 @@ body{padding:18px}
         """Inner tool dispatcher — all tool logic lives here."""
         if bool(getattr(self, "ide_remote_sandbox_required", False)):
             blocked_remote_tools = {
-                "load_skill", "list_skills", "read_skill", "write_skill",
-                "query_code_library", "query_knowledge_library", "rag_remember",
+                "write_skill",
                 "worktree_create", "worktree_list", "worktree_status", "worktree_run",
                 "worktree_keep", "worktree_remove",
             }
-            if self._is_mcp_tool_name(name) or canonicalize_tool_name(name) in blocked_remote_tools:
+            if canonicalize_tool_name(name) in blocked_remote_tools:
                 return (
                     f"Error: tool '{name}' is unavailable to remote Program sessions because it can access "
                     "resources outside the isolated session workspace."
@@ -68578,6 +70733,10 @@ body{padding:18px}
                     "cwd": meta["cwd"],
                     "exit_code": effective_exit,
                     "shell_exit_code": meta.get("exit_code"),
+                    "timeout_mode": meta.get("timeout_mode", DEFAULT_SHELL_TIMEOUT_MODE),
+                    "requested_timeout_mode": meta.get("requested_timeout_mode", DEFAULT_SHELL_TIMEOUT_MODE),
+                    "async_handoff_seconds": int(meta.get("async_handoff_seconds", DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS) or DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS),
+                    "background_task_id": str(meta.get("background_task_id", "") or ""),
                     "duration_ms": meta["duration_ms"],
                     "changed_files": meta["changed_files"],
                     "output": meta.get("ui_output_preview", trim(meta["output"], 1200)),
@@ -69986,6 +72145,8 @@ body{padding:18px}
                 self.running = True
                 self.run_started_at = now_ts()
                 self.run_last_heartbeat = self.run_started_at
+                self.collaboration_agent_last_heartbeat = 0.0
+                self.collaboration_agent_current_file = ""
                 self.run_recovered_at = 0.0
                 self.run_recovered_reason = ""
                 self.current_phase = "starting"
@@ -74937,7 +77098,27 @@ body{padding:18px}
                     self._maybe_create_checkpoint()
                 notifs = self.bg.drain()
                 if notifs:
-                    text = "\n".join(f"[bg:{n['task_id']}] {n['status']}: {n['result']}" for n in notifs)
+                    rows = []
+                    for n in notifs:
+                        changed = [str(path) for path in (n.get("changed_files", []) or []) if str(path).strip()]
+                        row = (
+                            f"[bg:{n['task_id']}] {n['status']} exit_code={n.get('exit_code')} "
+                            f"duration={float(n.get('duration_seconds', 0) or 0):.1f}s "
+                            f"bytes={int(n.get('output_bytes', 0) or 0)}\n"
+                            f"command: {n.get('command', '')}\n"
+                        )
+                        if n.get("full_output_path"):
+                            row += f"full_output_path: {n.get('full_output_path')}\n"
+                        if changed:
+                            row += f"changed_files: {json_dumps(changed)}\n"
+                        row += f"output_tail:\n{n.get('result', '(no output)')}\n"
+                        row += (
+                            "Required follow-up: interpret the exit code and final output, inspect any expected "
+                            "artifacts or changed files, run necessary validation/post-processing, and report a "
+                            "failure or dependency impact before treating downstream work as complete."
+                        )
+                        rows.append(row)
+                    text = "\n\n".join(rows)
                     self.messages.append({"role": "user", "content": f"<background-results>\n{text}\n</background-results>", "ts": now_ts()})
                     self._emit("background", {"summary": f"{len(notifs)} background notifications"})
                 inbox = self.bus.read_inbox("lead")
@@ -77423,6 +79604,8 @@ body{padding:18px}
                 "max_agent_rounds": int(self.max_agent_rounds),
                 "max_run_seconds": int(self.max_run_seconds),
                 "shell_command_timeout_seconds": int(getattr(self, "shell_command_timeout_seconds", DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS) or DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS),
+                "shell_timeout_mode": normalize_shell_timeout_mode(getattr(self, "shell_timeout_mode", DEFAULT_SHELL_TIMEOUT_MODE)),
+                "shell_async_handoff_seconds": int(getattr(self, "shell_async_handoff_seconds", DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS) or DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS),
                 "auto_model_switch": bool(self.auto_model_switch),
                 "arbiter_enabled": bool(self.arbiter_enabled),
                 "arbiter_model": str(self.arbiter_model or ""),
@@ -77995,6 +80178,8 @@ class SessionManager:
         collaboration_context: dict | None = None,
         collaboration_context_provider=None,
         collaboration_write_coordinator=None,
+        shell_timeout_mode: str = DEFAULT_SHELL_TIMEOUT_MODE,
+        shell_async_handoff_seconds: int = DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS,
     ):
         self.root = root
         self.root.mkdir(parents=True, exist_ok=True)
@@ -78034,6 +80219,13 @@ class SessionManager:
             minimum=MIN_SHELL_COMMAND_TIMEOUT_SECONDS,
             maximum=MAX_SHELL_COMMAND_TIMEOUT_SECONDS,
             fallback=DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
+        )
+        self.shell_timeout_mode = normalize_shell_timeout_mode(shell_timeout_mode)
+        self.shell_async_handoff_seconds = normalize_timeout_seconds(
+            shell_async_handoff_seconds,
+            minimum=MIN_SHELL_ASYNC_HANDOFF_SECONDS,
+            maximum=MAX_SHELL_ASYNC_HANDOFF_SECONDS,
+            fallback=DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS,
         )
         self.auto_task_level_ceiling = normalize_auto_task_level_ceiling(auto_task_level_ceiling)
         cfg_l2_todo_policy = extract_l2_todo_policy_setting(self.default_llm_config)
@@ -78452,6 +80644,13 @@ class SessionManager:
             maximum=MAX_SHELL_COMMAND_TIMEOUT_SECONDS,
             fallback=DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
         )
+        sess.shell_timeout_mode = normalize_shell_timeout_mode(self.shell_timeout_mode)
+        sess.shell_async_handoff_seconds = normalize_timeout_seconds(
+            self.shell_async_handoff_seconds,
+            minimum=MIN_SHELL_ASYNC_HANDOFF_SECONDS,
+            maximum=MAX_SHELL_ASYNC_HANDOFF_SECONDS,
+            fallback=DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS,
+        )
         sess._apply_active_profile()
         sess.updated_at = now_ts()
         sess._persist()
@@ -78671,6 +80870,8 @@ class SessionManager:
                 collaboration_context=self.collaboration_context,
                 collaboration_context_provider=self.collaboration_context_provider,
                 collaboration_write_coordinator=self.collaboration_write_coordinator,
+                shell_timeout_mode=self.shell_timeout_mode,
+                shell_async_handoff_seconds=self.shell_async_handoff_seconds,
             )
         sess.set_telemetry_callback(self.telemetry_callback)
         desired_mode = normalize_execution_mode(self.execution_mode, default=EXECUTION_MODE_SYNC)
@@ -78784,6 +80985,8 @@ class SessionManager:
                 collaboration_context=self.collaboration_context,
                 collaboration_context_provider=self.collaboration_context_provider,
                 collaboration_write_coordinator=self.collaboration_write_coordinator,
+                shell_timeout_mode=self.shell_timeout_mode,
+                shell_async_handoff_seconds=self.shell_async_handoff_seconds,
             )
             sess.set_telemetry_callback(self.telemetry_callback)
             self._apply_user_defaults_to_session(sess)
@@ -80689,6 +82892,7 @@ function _deltaRemoveSchedulerQueued(queueId=0,text=''){
   return feedRemoved;
 }
 function _deltaAppendOperation(type,data,ts){if(!_deltaEnsureSnapshot())return;const op={id:String(data?.id||''),seq:Number(data?.seq||0),ts:Number(ts||Date.now()/1000),type:String(type||''),data:(data&&typeof data==='object')?{...data}:{}};_deltaPushLimited(S.snap.operations,op,DELTA_MAX_OPERATIONS)}
+function _refreshActivePreviewForPath(path){const tab=activePreviewTab();const rel=normalizePreviewPath(path);if(!tab||!rel||normalizePreviewPath(tab.path)!==rel)return;const body=E('previewBody');if(body){body.removeAttribute('data-preview-key');body.removeAttribute('data-preview-ready')}renderActivePreview(true)}
 function _deltaConversationTextByType(type,data){
   const d=(data&&typeof data==='object')?data:{};
   if(type==='command'){
@@ -80928,6 +83132,7 @@ function _deltaApplyRuntimeEvent(evt){
   }
   if(typ==='command'||typ==='file_patch'||typ==='upload'||typ==='web_search'){
     _deltaAppendOperation(typ,data,ts);
+    if(typ==='file_patch')_refreshActivePreviewForPath(data.session_rel_path||data.path||'');
     const visible=(typ!=='web_search')||Boolean(data.conversation_visible!==false);
     if(visible&&!(typ==='upload'&&String(data.parse_status||'').trim().toLowerCase()==='pending')){
       const row={role:'system',type:typ,ts:ts,text:_deltaConversationTextByType(typ,data),data:{...data}};
@@ -81023,7 +83228,7 @@ function sessionsSignature(list){const rows=Array.isArray(list)?list:[];const si
 function mergeSessionRows(base,incoming){const map=new Map();for(const row of Array.isArray(base)?base:[]){const id=String(row?.id||'').trim();if(id)map.set(id,{...row})}for(const row of Array.isArray(incoming)?incoming:[]){const id=String(row?.id||'').trim();if(id)map.set(id,{...(map.get(id)||{}),...row})}return Array.from(map.values()).sort((a,b)=>Number(b?.updated_at||0)-Number(a?.updated_at||0))}
 function applySessionPage(rowsRaw,opt={}){const payload=(rowsRaw&&typeof rowsRaw==='object'&&!Array.isArray(rowsRaw))?rowsRaw:{};const rows=Array.isArray(rowsRaw)?rowsRaw:(Array.isArray(payload.sessions)?payload.sessions:[]);const append=!!opt.append;const keepExisting=append||Number(S.sessions?.length||0)>rows.length;S.sessions=keepExisting?mergeSessionRows(S.sessions,rows):rows;const total=Number(payload.total);S.sessionTotal=Number.isFinite(total)&&total>=S.sessions.length?total:S.sessions.length;const offset=Number(payload.offset||0);const limit=Number(payload.limit||rows.length||0);const next=Number.isFinite(offset)&&Number.isFinite(limit)?offset+rows.length:S.sessions.length;S.sessionNextOffset=Math.max(Number(S.sessionNextOffset||0),next,S.sessions.length);const payloadHasMore=Object.prototype.hasOwnProperty.call(payload,'has_more')?!!payload.has_more:(S.sessionNextOffset<S.sessionTotal);S.sessionHasMore=!!(payloadHasMore&&S.sessionNextOffset<S.sessionTotal);return{rows,selectedId:'',total:S.sessionTotal,hasMore:S.sessionHasMore}}
 function _statInfinite(n){const v=Number(n);return(Number.isFinite(v)&&v>0)?String(v):'∞'}
-function applyRuntimeConfigStats(cfg){if(!cfg||typeof cfg!=='object')return;S.config=S.config||{};if(cfg.scheduler&&typeof cfg.scheduler==='object')S.config.scheduler=cfg.scheduler;if(cfg.session_creation_limit&&typeof cfg.session_creation_limit==='object')S.config.session_creation_limit=cfg.session_creation_limit;if(Object.prototype.hasOwnProperty.call(cfg,'daily_session_limit'))S.config.daily_session_limit=cfg.daily_session_limit;if(Object.prototype.hasOwnProperty.call(cfg,'download_js_lib_enabled'))S.config.download_js_lib_enabled=!!cfg.download_js_lib_enabled;if(Object.prototype.hasOwnProperty.call(cfg,'request_timeout_default'))S.config.request_timeout_default=cfg.request_timeout_default;if(Object.prototype.hasOwnProperty.call(cfg,'run_timeout'))S.config.run_timeout=cfg.run_timeout;if(Object.prototype.hasOwnProperty.call(cfg,'shell_command_timeout_seconds'))S.config.shell_command_timeout_seconds=cfg.shell_command_timeout_seconds;if(Object.prototype.hasOwnProperty.call(cfg,'user_memory_mode'))S.config.user_memory_mode=String(cfg.user_memory_mode||'weak');if(Object.prototype.hasOwnProperty.call(cfg,'user_memory_setting_locked'))S.config.user_memory_setting_locked=!!cfg.user_memory_setting_locked;if(Object.prototype.hasOwnProperty.call(cfg,'model')&&String(cfg.model||'').trim())S.config.model=cfg.model;renderMemoryModeAction()}
+function applyRuntimeConfigStats(cfg){if(!cfg||typeof cfg!=='object')return;S.config=S.config||{};if(cfg.scheduler&&typeof cfg.scheduler==='object')S.config.scheduler=cfg.scheduler;if(cfg.session_creation_limit&&typeof cfg.session_creation_limit==='object')S.config.session_creation_limit=cfg.session_creation_limit;if(Object.prototype.hasOwnProperty.call(cfg,'daily_session_limit'))S.config.daily_session_limit=cfg.daily_session_limit;if(Object.prototype.hasOwnProperty.call(cfg,'download_js_lib_enabled'))S.config.download_js_lib_enabled=!!cfg.download_js_lib_enabled;if(Object.prototype.hasOwnProperty.call(cfg,'request_timeout_default'))S.config.request_timeout_default=cfg.request_timeout_default;if(Object.prototype.hasOwnProperty.call(cfg,'run_timeout'))S.config.run_timeout=cfg.run_timeout;if(Object.prototype.hasOwnProperty.call(cfg,'shell_command_timeout_seconds'))S.config.shell_command_timeout_seconds=cfg.shell_command_timeout_seconds;if(Object.prototype.hasOwnProperty.call(cfg,'shell_timeout_mode'))S.config.shell_timeout_mode=String(cfg.shell_timeout_mode||'auto');if(Object.prototype.hasOwnProperty.call(cfg,'shell_async_handoff_seconds'))S.config.shell_async_handoff_seconds=cfg.shell_async_handoff_seconds;if(Object.prototype.hasOwnProperty.call(cfg,'user_memory_mode'))S.config.user_memory_mode=String(cfg.user_memory_mode||'weak');if(Object.prototype.hasOwnProperty.call(cfg,'user_memory_setting_locked'))S.config.user_memory_setting_locked=!!cfg.user_memory_setting_locked;if(Object.prototype.hasOwnProperty.call(cfg,'model')&&String(cfg.model||'').trim())S.config.model=cfg.model;renderMemoryModeAction()}
 function renderStats(){const sessions=Math.max(Number(S.sessionTotal||0),S.sessions.length);const running=S.sessions.filter(x=>x.running).length;const msgs=S.sessions.reduce((n,x)=>n+x.message_count,0);const model=S.config?.model||'-';const sched=(S.config&&typeof S.config.scheduler==='object')?S.config.scheduler:{};const quota=(S.config&&typeof S.config.session_creation_limit==='object')?S.config.session_creation_limit:{};const runningTotal=Math.max(0,Number(sched?.running_total||0));const maxTasks=Number(sched?.max_user||0);const globalTasks=`${runningTotal}/${_statInfinite(maxTasks)}`;const dailySessions=(quota&&quota.enabled)?`${Math.max(0,Number(quota.used||0))}/${Math.max(0,Number(quota.limit||0))}`:'∞';const compact=[[t('stat_sessions'),sessions],[t('stat_running'),running],[t('stat_messages'),msgs],[t('stat_global_tasks'),globalTasks],[t('stat_daily_sessions'),dailySessions]].map(([k,v])=>`<div class=\"stat compact\"><div class=\"k\">${esc(k)}</div><div class=\"v\">${esc(v)}</div></div>`).join('');const modelHtml=`<div class=\"stat model\"><div class=\"k\">${esc(t('stat_model'))}</div><div class=\"v\">${esc(model)}</div></div>`;setHtmlIfChanged('topStats',`<div class=\"top-stats-primary\">${compact}</div><div class=\"top-stats-model\">${modelHtml}</div>`,'topStats')}
 function renderSessions(){
   const host=E('sessionList');
@@ -82020,7 +84225,7 @@ function _setPreviewToolbarState(tab){
   const dlBtn=E('previewDownloadBtn');
   const linkBtn=E('previewCopyLinkBtn');
   const openBtn=E('previewOpenBtn');
-  const isCode=!!(tab&&tab.kind==='code');
+  const isCode=!!(tab&&(tab.kind==='code'||(tab.kind==='html'&&String(tab.htmlMode||'preview')==='source')));
   const isHtml=!!(tab&&tab.kind==='html');
   const hasDownload=!!(tab&&tab.path);
   if(btn){
@@ -82034,10 +84239,9 @@ function _setPreviewToolbarState(tab){
     if(isHtml)modeBtn.textContent=(String(tab.htmlMode||'preview')==='source')?t('preview_rendered'):t('preview_source');
     modeBtn.onclick=(ev)=>{ev.preventDefault();togglePreviewMode()};
   }
-  // Copy-link + open-in-browser: HTML only. The cramped in-pane iframe distorts rendered
-  // pages, so a real browser tab is the fix; other file kinds (code/images/text) preview
-  // fine in-pane and just get the download button.
-  const canOpen=isHtml&&hasDownload;
+  // HTML pages and PDFs benefit from a real browser tab. In particular, PDF viewers
+  // are browser components and can be unavailable inside a constrained iframe.
+  const canOpen=!!(tab&&['html','pdf'].includes(tab.kind)&&hasDownload);
   if(linkBtn){
     linkBtn.classList.toggle('hidden',!canOpen);
     linkBtn.disabled=!canOpen;
@@ -82061,7 +84265,7 @@ function previewAbsoluteUrl(tab){
   if(!tab||!S.activeId||!tab.path)return'';
   // Use the same endpoint the in-pane preview renders, so the opened/copied link shows the
   // identical content (HTML is served with the right content-type and renders properly).
-  const rel=previewFileUrl(S.activeId,tab.path,false);
+  const rel=previewFileUrl(S.activeId,tab.path,true);
   try{return new URL(rel,location.origin).href}catch(_){return location.origin+rel}
 }
 function openPreviewInBrowser(){
@@ -82130,7 +84334,7 @@ function _selectedCodePreviewText(body,sel){
 }
 async function copyPreviewCode(){
   const tab=activePreviewTab();
-  if(!tab||tab.kind!=='code')return;
+  if(!tab||!(tab.kind==='code'||(tab.kind==='html'&&String(tab.htmlMode||'preview')==='source')))return;
   const body=E('previewBody');
   if(!body)return;
   const text=String(body._previewCopyText||'');
@@ -82343,7 +84547,7 @@ async function _renderCodePreviewTab(tab,body,forceReload=false){
 const PREVIEW_KIND_SET=new Set(['html','markdown','image','video','audio','pdf','csv','excel','document','presentation','code']);
 function previewKindFromPathOrFallback(path,fallbackKind=''){const kind=previewModeFromPath(path);if(kind)return kind;const fallback=String(fallbackKind||'').trim().toLowerCase();return PREVIEW_KIND_SET.has(fallback)?fallback:''}
 function previewButtonHtml(path,fallbackKind=''){const rel=normalizePreviewPath(path);const kind=previewKindFromPathOrFallback(rel,fallbackKind);if(!rel||!kind)return '';const title=rel.split('/').pop()||rel;return `<div class=\"msg-preview-row\"><button class=\"msg-preview-btn\" data-preview-path=\"${esc(rel)}\" data-preview-kind=\"${esc(kind)}\" title=\"${esc(title)}\">${previewKindIcon(kind)} ${esc(title)}</button></div>`}
-function openPreviewTab(path,fallbackKind=''){if(!S.activeId)return;const rel=normalizePreviewPath(path);const kind=previewKindFromPathOrFallback(rel,fallbackKind);if(!rel||!kind)return;const st=ensurePreviewState(S.activeId);const id=previewTabId(rel);let row=st.tabs.find(x=>x.id===id);if(!row){row={id,path:rel,kind,title:rel.split('/').pop()||rel,codeStageId:(kind==='code'?'latest':''),htmlMode:'preview'};st.tabs.push(row)}else if(!previewModeFromPath(rel)&&fallbackKind&&kind!==row.kind){row.kind=kind;if(kind==='code'&&!row.codeStageId)row.codeStageId='latest'}if(kind==='html'&&!row.htmlMode)row.htmlMode='preview';st.active=id;renderPreviewTabs();renderPreviewVisibility();renderActivePreview(false)}
+function openPreviewTab(path,fallbackKind=''){if(!S.activeId)return;const rel=normalizePreviewPath(path);const kind=previewKindFromPathOrFallback(rel,fallbackKind);if(!rel||!kind)return;const st=ensurePreviewState(S.activeId);const id=previewTabId(rel);let row=st.tabs.find(x=>x.id===id);if(!row){row={id,path:rel,kind,title:rel.split('/').pop()||rel,codeStageId:(kind==='code'||kind==='html'?'latest':''),htmlMode:'preview'};st.tabs.push(row)}else if(!previewModeFromPath(rel)&&fallbackKind&&kind!==row.kind){row.kind=kind;if((kind==='code'||kind==='html')&&!row.codeStageId)row.codeStageId='latest'}if(kind==='html'&&!row.htmlMode)row.htmlMode='preview';st.active=id;renderPreviewTabs();renderPreviewVisibility();renderActivePreview(false)}
 function closePreviewTab(tabId){if(!S.activeId)return;const st=ensurePreviewState(S.activeId);const id=String(tabId||'');const idx=st.tabs.findIndex(x=>x.id===id);if(idx<0)return;st.tabs.splice(idx,1);if(st.active===id)st.active='conversation';renderPreviewTabs();renderPreviewVisibility();renderActivePreview(false)}
 function activatePreviewTab(tabId){if(!S.activeId)return;const st=ensurePreviewState(S.activeId);const id=String(tabId||'');if(id==='conversation'){st.active='conversation'}else if(st.tabs.some(x=>x.id===id)){st.active=id}else{st.active='conversation'}renderPreviewTabs();renderPreviewVisibility();renderActivePreview(false)}
 function activePreviewTab(){if(!S.activeId)return null;const st=ensurePreviewState(S.activeId);if(st.active==='conversation')return null;return st.tabs.find(x=>x.id===st.active)||null}
@@ -82351,6 +84555,20 @@ function renderPreviewTabs(){const host=E('chatTabs');if(!host)return;if(!S.acti
 function renderPreviewVisibility(){const conv=E('convView');const pv=E('previewView');if(!conv||!pv)return;const tab=activePreviewTab();_setPreviewToolbarState(tab);if(!tab){pv.classList.add('hidden');conv.classList.remove('hidden');return}conv.classList.add('hidden');pv.classList.remove('hidden')}
 function togglePreviewMode(){const tab=activePreviewTab();if(!tab||tab.kind!=='html')return;tab.htmlMode=(String(tab.htmlMode||'preview')==='source')?'preview':'source';const body=E('previewBody');if(body){body.removeAttribute('data-preview-key');body.removeAttribute('data-preview-ready')}renderPreviewVisibility();renderActivePreview(false)}
 function downloadActivePreview(){const tab=activePreviewTab();if(!tab||!S.activeId||!tab.path)return;const url=(tab.kind==='html')?previewHtmlBundleUrl(S.activeId,tab.path):previewDownloadUrl(S.activeId,tab.path);const a=document.createElement('a');a.href=url;a.download='';a.rel='noreferrer';document.body.appendChild(a);a.click();setTimeout(()=>{try{document.body.removeChild(a)}catch(_){}},0)}
+function _htmlPreviewStageDocument(source,path){const doc=new DOMParser().parseFromString(String(source||''),'text/html');const sid=encodeURIComponent(String(S.activeId||'')),parts=normalizePreviewPath(path).split('/').filter(Boolean);parts.pop();const rel=parts.map(x=>encodeURIComponent(x)).join('/');const base=doc.createElement('base');base.href=new URL(`/api/sessions/${sid}/preview-file/${rel?rel+'/':''}`,location.origin).href;doc.head.prepend(base);return '<!doctype html>'+doc.documentElement.outerHTML}
+async function _renderHtmlPreviewTab(tab,body,forceReload=false){
+  const ticket=String(++S.previewNonce);body.setAttribute('data-preview-ticket',ticket);body.innerHTML='<div class="preview-md msg-md">...</div>';
+  try{
+    const stageList=await api(previewCodeStagesUrl(S.activeId,tab.path,true));if(body.getAttribute('data-preview-ticket')!==ticket)return;
+    const stages=Array.isArray(stageList?.stages)?stageList.stages:[];let requested=String(tab.codeStageId||'latest').trim()||'latest';
+    if(requested!=='latest'&&!stages.some(row=>String(row?.id||'')===requested)){requested='latest';tab.codeStageId='latest'}
+    const latestId=String(stageList?.latest_id||stages[stages.length-1]?.id||'');const key=`${tab.id}|html|rendered|${requested==='latest'?'latest:'+latestId:'fixed:'+requested}`;
+    if(!forceReload&&body.getAttribute('data-preview-key')===key&&body.getAttribute('data-preview-ready')==='1'){_previewRenderStageSelector(tab,stages,requested,null);return}
+    let payload=null,source='';if(requested!=='latest'){payload=await api(previewCodeUrl(S.activeId,tab.path,requested,true));source=String(payload?.full_text||'');if(body.getAttribute('data-preview-ticket')!==ticket)return}
+    body.innerHTML='';const frame=document.createElement('iframe');frame.className='preview-frame';frame.loading='lazy';frame.referrerPolicy='no-referrer';frame.sandbox='allow-scripts';if(requested==='latest')frame.src=previewFileUrl(S.activeId,tab.path,true);else frame.srcdoc=_htmlPreviewStageDocument(source,tab.path);body.appendChild(frame);
+    body.setAttribute('data-preview-key',key);body.setAttribute('data-preview-ready','1');_previewRenderStageSelector(tab,stages,requested,payload);
+  }catch(err){if(body.getAttribute('data-preview-ticket')!==ticket)return;body.removeAttribute('data-preview-ready');_previewResetStageUi();body.innerHTML=`<div class="preview-md msg-md"><p>${esc(err.message||String(err))}</p></div>`}
+}
 function renderActivePreview(forceReload=false){
   const pv=E('previewView');
   const body=E('previewBody');
@@ -82368,7 +84586,7 @@ function renderActivePreview(forceReload=false){
     return;
   }
   meta.textContent=tab.kind==='html'?`${tab.path} · ${String(tab.htmlMode||'preview')==='source'?'source':'preview'}`:tab.path;
-  if(tab.kind==='code'){
+  if(tab.kind==='code'||(tab.kind==='html'&&String(tab.htmlMode||'preview')==='source')){
     const req=String(tab.codeStageId||'latest');
     const hint=_previewLatestCodeStageHint(tab.path);
     const guard=(req==='latest')?`latest:${hint}`:`fixed:${req}`;
@@ -82379,6 +84597,7 @@ function renderActivePreview(forceReload=false){
     void _renderCodePreviewTab(tab,body,forceReload);
     return;
   }
+  if(tab.kind==='html'){body._previewCopyText='';void _renderHtmlPreviewTab(tab,body,forceReload);return}
   body._previewCopyText='';
   _previewResetStageUi();
   const key=`${tab.id}|${tab.kind}|${tab.kind==='html'?String(tab.htmlMode||'preview'):''}`;
@@ -82386,28 +84605,6 @@ function renderActivePreview(forceReload=false){
   body.setAttribute('data-preview-key',key);
   body.removeAttribute('data-preview-ready');
   const url=previewFileUrl(S.activeId,tab.path,forceReload);
-  if(tab.kind==='html'){
-    if(String(tab.htmlMode||'preview')==='source'){
-      body.innerHTML='<div class=\"preview-md msg-md\">...</div>';
-      const ticket=String(++S.previewNonce);
-      body.setAttribute('data-preview-ticket',ticket);
-      fetch(url,{cache:'no-store'}).then(async r=>{if(!r.ok){throw new Error(await r.text())}return await r.text()}).then(txt=>{
-        if(body.getAttribute('data-preview-ticket')!==ticket)return;
-        body._previewCopyText=txt;
-        const lang=_previewLangFromPath(tab.path)||'html';
-        const rows=_codeRowsFromFullText(txt);
-        if(rows.length>=CODE_PREVIEW_VIRT_THRESHOLD){
-          _renderCodeRowsVirtual(body,rows,lang,1);
-        }else{
-          body.innerHTML=`<div class=\"preview-code-scroll\"><div class=\"preview-code-shell\">${_renderCodeRows(rows,lang)}</div></div>`;
-          _bindNestedScrollGuards(body);
-        }
-      }).catch(err=>{if(body.getAttribute('data-preview-ticket')!==ticket)return;body.innerHTML=`<div class=\"preview-md msg-md\"><p>${esc(err.message||String(err))}</p></div>`});
-      return;
-    }
-    body.innerHTML=`<iframe class=\"preview-frame\" src=\"${esc(url)}\" loading=\"lazy\"></iframe>`;
-    return;
-  }
   if(tab.kind==='image'){
     body.innerHTML=`<div class=\"preview-media-wrap\"><img class=\"preview-media-img\" src=\"${esc(url)}\" alt=\"${esc(tab.title||tab.path)}\" loading=\"lazy\"></div>`;
     return;
@@ -98220,6 +100417,57 @@ RAG_ADMIN_INDEX_HTML = """<!doctype html>
   <script defer src="/assets/rag-admin.js"></script>
 </head>
 <body>
+  <div id="authOverlay" class="auth-overlay" role="dialog" aria-modal="true" aria-labelledby="authTitle">
+    <section class="auth-card">
+      <div>
+        <p class="eyebrow">Clouds Coder Library</p>
+        <h2 id="authTitle">Administrator sign in</h2>
+        <p id="authDescription" class="auth-description">Checking the administrator account...</p>
+      </div>
+      <form id="setupForm" class="auth-form hidden">
+        <div class="field">
+          <label for="setupUsername">Administrator username</label>
+          <input id="setupUsername" name="username" autocomplete="username" minlength="3" maxlength="64" required>
+        </div>
+        <div class="field">
+          <label for="setupPassword">Password</label>
+          <input id="setupPassword" name="password" type="password" autocomplete="new-password" minlength="12" maxlength="512" required>
+        </div>
+        <div class="field">
+          <label for="setupPasswordConfirm">Confirm password</label>
+          <input id="setupPasswordConfirm" type="password" autocomplete="new-password" minlength="12" maxlength="512" required>
+        </div>
+        <button class="btn btn-accent btn-wide" type="submit">Create administrator</button>
+      </form>
+      <form id="passwordLoginForm" class="auth-form hidden">
+        <div class="field">
+          <label for="loginUsername">Administrator username</label>
+          <input id="loginUsername" name="username" autocomplete="username" required>
+        </div>
+        <div class="field">
+          <label for="loginPassword">Password</label>
+          <input id="loginPassword" name="password" type="password" autocomplete="current-password" required>
+        </div>
+        <button class="btn btn-accent btn-wide" type="submit">Sign in</button>
+      </form>
+      <details id="tokenLoginDetails" class="token-login hidden">
+        <summary>Advanced: use Admin Token</summary>
+        <p id="tokenLoginHelp" class="field-note"></p>
+        <form id="tokenLoginForm" class="auth-form">
+          <div class="field">
+            <label for="tokenInput">Admin Token</label>
+            <input id="tokenInput" type="password" autocomplete="off" spellcheck="false">
+          </div>
+          <button id="tokenLoginBtn" class="btn btn-wide" type="submit">Use token</button>
+        </form>
+      </details>
+      <div id="loginError" class="auth-error" role="alert"></div>
+      <div class="auth-secondary-actions">
+        <button id="readOnlyBtn" class="btn btn-quiet" type="button">Continue read-only</button>
+        <button id="retryAuthBtn" class="btn btn-quiet hidden" type="button">Retry</button>
+      </div>
+    </section>
+  </div>
   <main class="rag-shell">
     <header class="rag-hero">
       <div>
@@ -98228,10 +100476,17 @@ RAG_ADMIN_INDEX_HTML = """<!doctype html>
         <p class="subtitle">Global knowledge library, graph view, batch import, backup, and retrieval control.</p>
       </div>
       <div class="hero-actions">
+        <span id="authBadge" class="status-chip">checking access</span>
+        <button id="signInBtn" class="btn hidden" type="button">Admin sign in</button>
+        <button id="logoutBtn" class="btn hidden" type="button">Sign out</button>
         <button id="refreshBtn" class="btn">Refresh</button>
-        <button id="rebuildBtn" class="btn btn-accent">Rebuild Index</button>
+        <button id="rebuildBtn" class="btn btn-accent" data-admin-action>Rebuild Index</button>
       </div>
     </header>
+
+    <div id="readOnlyNotice" class="access-notice hidden">
+      Library content is available read-only. Sign in as administrator to import, query, or rebuild the index.
+    </div>
 
     <section class="rag-grid stats-grid" id="statsGrid"></section>
 
@@ -98410,6 +100665,17 @@ body{min-height:100vh}
 .rag-hero h1{margin:0;font-size:34px;line-height:1.05}
 .subtitle{margin:10px 0 0;max-width:760px;color:var(--muted)}
 .hero-actions{display:flex;gap:10px;flex-wrap:wrap}
+.auth-overlay{position:fixed;inset:0;z-index:100;display:flex;align-items:center;justify-content:center;padding:18px;background:rgba(13,31,21,.72);backdrop-filter:blur(8px)}
+.auth-overlay.hidden{display:none}
+.auth-card{width:min(440px,100%);max-height:calc(100vh - 36px);overflow:auto;padding:24px;border:1px solid rgba(23,49,34,.12);border-radius:18px;background:#fff;box-shadow:0 28px 80px rgba(0,0,0,.3)}
+.auth-card h2{margin:0;font-size:24px}.auth-description{margin:8px 0 18px;color:var(--muted);line-height:1.55}
+.auth-form{display:flex;flex-direction:column;gap:2px}.auth-form .field{margin-bottom:12px}
+.token-login{margin-top:14px;padding-top:14px;border-top:1px solid var(--line)}
+.token-login summary{cursor:pointer;color:var(--ink);font-size:13px;font-weight:700}.token-login .auth-form{padding-top:12px}
+.token-login .field-note{margin:8px 0 0}.auth-error{min-height:20px;margin-top:10px;color:var(--danger);font-size:13px;line-height:1.45}
+.auth-secondary-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:6px}.btn-quiet{background:transparent;border:1px solid var(--line);color:var(--muted)}
+.access-notice{margin:-4px 0 18px;padding:11px 14px;border:1px solid #e5c482;border-radius:12px;background:#fff7dd;color:#76510b;font-size:13px;line-height:1.5}
+.hero-actions .status-chip{align-self:center}.btn:disabled{cursor:not-allowed;opacity:.58}
 .rag-grid{display:grid;gap:18px;margin-bottom:18px}
 .stats-grid{grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}
 .form-grid{grid-template-columns:1.15fr 1fr}
@@ -98474,11 +100740,14 @@ textarea{resize:vertical;min-height:120px}
 @media (max-width:720px){
   .graph-stage{height:380px;min-height:380px}
   .graph-toolbar{align-items:flex-start}
+  .auth-secondary-actions{align-items:stretch;flex-direction:column}
 }
 """
 
 RAG_ADMIN_JS = """
 const S={config:null,library:null,tasks:null,graph:null,filesystem:null,query:null};
+const AUTH_KEY='clouds_coder_admin_token';
+const A={token:String(sessionStorage.getItem(AUTH_KEY)||''),authenticated:false,status:null,readOnly:false};
 const G={
   mode:'static',
   layout:null,
@@ -98547,18 +100816,142 @@ const GRAPH_FOCUS_EDGE_LIMIT=260;
 const GRAPH_ZOOM_MIN_FACTOR=0.22;
 const GRAPH_ZOOM_MAX_FACTOR=14;
 const E=id=>document.getElementById(id);
-async function api(path,init){
-  const opts=Object.assign({},init||{}),headers=Object.assign({'Content-Type':'application/json'},opts.headers||{});
-  if(String(opts.method||'GET').toUpperCase()!=='GET'){let token=String(sessionStorage.getItem('clouds_coder_admin_token')||'').trim();if(!token){token=String(prompt('Admin token required for library changes')||'').trim();if(token)sessionStorage.setItem('clouds_coder_admin_token',token)}if(token)headers.Authorization='Bearer '+token}
+async function request(path,init){
+  const opts=Object.assign({},init||{}),headers=Object.assign({},opts.headers||{});
+  if(opts.body!==undefined&&!headers['Content-Type'])headers['Content-Type']='application/json';
   const res=await fetch(path,Object.assign(opts,{headers}));
   const text=await res.text();
   let data=text;
   try{data=text?JSON.parse(text):{}}catch{}
   if(!res.ok){
     const msg=(data&&typeof data==='object'&&data.error)?String(data.error):String(text||`HTTP ${res.status}`);
-    throw new Error(msg);
+    const err=new Error(msg);err.status=res.status;err.code=String(data?.code||'');err.body=data;throw err;
   }
   return data;
+}
+function updateAuthUi(){
+  const ok=!!A.authenticated;
+  E('authBadge').textContent=ok?'administrator':'read-only';
+  E('authBadge').classList.toggle('bad',!ok);
+  E('signInBtn').classList.toggle('hidden',ok);
+  E('logoutBtn').classList.toggle('hidden',!ok);
+  E('readOnlyNotice').classList.toggle('hidden',ok||!A.readOnly);
+}
+function clearAdminSession(){sessionStorage.removeItem(AUTH_KEY);A.token='';A.authenticated=false;updateAuthUi()}
+function showAuth(message=''){
+  A.readOnly=false;
+  E('authOverlay').classList.remove('hidden');
+  E('readOnlyNotice').classList.add('hidden');
+  if(message)E('loginError').textContent=String(message);
+  if(!A.status)loadAuthStatus().catch(()=>{});
+}
+function continueReadOnly(){A.readOnly=true;E('authOverlay').classList.add('hidden');updateAuthUi()}
+async function api(path,init){
+  const opts=Object.assign({},init||{}),headers=Object.assign({},opts.headers||{});
+  const method=String(opts.method||'GET').toUpperCase();
+  if(method!=='GET'&&!A.token){
+    showAuth('Administrator sign-in is required for this action.');
+    const err=new Error('Administrator sign-in required');err.status=401;err.code='auth_required';throw err;
+  }
+  if(A.token)headers.Authorization='Bearer '+A.token;
+  try{return await request(path,Object.assign(opts,{headers}))}
+  catch(err){
+    if(err.status===401&&method!=='GET'){
+      clearAdminSession();
+      showAuth('Your administrator session expired. Sign in again to continue.');
+      loadAuthStatus().catch(()=>{});
+    }
+    throw err;
+  }
+}
+function setAuthBusy(form,busy){const btn=form?.querySelector('button[type="submit"]');if(btn)btn.disabled=!!busy}
+function renderAuthState(status){
+  A.status=status||{};
+  const setup=!!A.status.setup_required;
+  E('retryAuthBtn').classList.add('hidden');
+  E('setupForm').classList.toggle('hidden',!setup);
+  E('passwordLoginForm').classList.toggle('hidden',setup);
+  E('tokenLoginDetails').classList.toggle('hidden',!A.status.token_login_enabled);
+  E('tokenLoginBtn').textContent=setup?'Create administrator with token':'Exchange token for session';
+  E('authTitle').textContent=setup?'Create the administrator account':'Administrator sign in';
+  if(setup){
+    E('authDescription').textContent=A.status.local_setup_allowed
+      ?'First run setup. Create the administrator used by the main Admin, Knowledge RAG, and Code RAG services.'
+      :'First setup is local-only. Open this page on localhost, or provide the existing Admin Token below.';
+    E('tokenLoginHelp').textContent='For remote first setup, enter the existing Admin Token, then complete the account form above. The token is not stored.';
+    setTimeout(()=>E('setupUsername').focus(),0);
+  }else{
+    E('authDescription').textContent='Use the same administrator account as the main Admin console. This tab stores only a short-lived session.';
+    E('tokenLoginHelp').textContent='The original Admin Token is exchanged for a short-lived session and is not stored.';
+    setTimeout(()=>E('loginUsername').focus(),0);
+  }
+}
+async function loadAuthStatus(){
+  try{const status=await request('/api/admin/auth/status');renderAuthState(status);return status}
+  catch(err){
+    A.status=null;
+    E('setupForm').classList.add('hidden');E('passwordLoginForm').classList.add('hidden');E('tokenLoginDetails').classList.add('hidden');
+    E('authTitle').textContent='Authentication service unavailable';E('authDescription').textContent='The administrator account status could not be loaded.';
+    E('retryAuthBtn').classList.remove('hidden');throw err;
+  }
+}
+function showAuthError(err){
+  const retry=Number(err?.body?.retry_after||0);
+  E('loginError').textContent=retry?`${String(err.message)} (retry in about ${retry}s)`:String(err?.message||err||'Authentication failed');
+}
+async function acceptAdminSession(token){
+  A.token=String(token||'').trim();A.authenticated=!!A.token;A.readOnly=false;
+  sessionStorage.setItem(AUTH_KEY,A.token);E('authOverlay').classList.add('hidden');E('loginError').textContent='';
+  for(const id of ['setupPassword','setupPasswordConfirm','loginPassword','tokenInput']){const el=E(id);if(el)el.value=''}
+  updateAuthUi();
+}
+async function registerAdmin(){
+  const form=E('setupForm'),password=E('setupPassword').value,confirm=E('setupPasswordConfirm').value;
+  if(password!==confirm){E('loginError').textContent='The two passwords do not match.';E('setupPasswordConfirm').focus();return}
+  setAuthBusy(form,true);E('loginError').textContent='';
+  try{
+    const headers={},bootstrap=E('tokenInput').value.trim();if(bootstrap)headers.Authorization='Bearer '+bootstrap;
+    const out=await request('/api/admin/auth/setup',{method:'POST',headers,body:JSON.stringify({username:E('setupUsername').value.trim(),password})});
+    await acceptAdminSession(out.access_token);
+  }catch(err){showAuthError(err);if(err.status===409)await loadAuthStatus().catch(()=>{})}finally{setAuthBusy(form,false)}
+}
+async function loginWithPassword(){
+  const form=E('passwordLoginForm');setAuthBusy(form,true);E('loginError').textContent='';
+  try{const out=await request('/api/admin/auth/login',{method:'POST',body:JSON.stringify({username:E('loginUsername').value.trim(),password:E('loginPassword').value})});await acceptAdminSession(out.access_token)}
+  catch(err){showAuthError(err);E('loginPassword').value='';E('loginPassword').focus()}finally{setAuthBusy(form,false)}
+}
+async function loginWithToken(){
+  if(!E('setupForm').classList.contains('hidden')){await registerAdmin();return}
+  const form=E('tokenLoginForm'),candidate=E('tokenInput').value.trim();if(!candidate){E('loginError').textContent='Enter the Admin Token.';return}
+  setAuthBusy(form,true);E('loginError').textContent='';
+  try{const out=await request('/api/admin/auth/token-login',{method:'POST',headers:{Authorization:'Bearer '+candidate},body:'{}'});await acceptAdminSession(out.access_token)}
+  catch(err){showAuthError(err);E('tokenInput').value='';E('tokenInput').focus()}finally{setAuthBusy(form,false)}
+}
+async function logoutAdmin(){
+  const token=A.token;
+  try{if(token)await request('/api/admin/auth/logout',{method:'POST',headers:{Authorization:'Bearer '+token},body:'{}'})}catch(_){}
+  clearAdminSession();await loadAuthStatus().catch(showAuthError);showAuth();
+}
+async function bootstrapAuth(){
+  updateAuthUi();
+  if(A.token){
+    try{
+      const state=await request('/api/admin/auth/session',{headers:{Authorization:'Bearer '+A.token}});
+      if(state.auth_kind==='token'){
+        const out=await request('/api/admin/auth/token-login',{method:'POST',headers:{Authorization:'Bearer '+A.token},body:'{}'});
+        await acceptAdminSession(out.access_token);
+      }else await acceptAdminSession(A.token);
+      return;
+    }catch(err){if(err.status===401)clearAdminSession();else{showAuthError(err);E('retryAuthBtn').classList.remove('hidden');return}}
+  }
+  await loadAuthStatus();showAuth();
+}
+function bindAuthUi(){
+  E('setupForm').onsubmit=ev=>{ev.preventDefault();registerAdmin()};
+  E('passwordLoginForm').onsubmit=ev=>{ev.preventDefault();loginWithPassword()};
+  E('tokenLoginForm').onsubmit=ev=>{ev.preventDefault();loginWithToken()};
+  E('readOnlyBtn').onclick=continueReadOnly;E('retryAuthBtn').onclick=()=>bootstrapAuth().catch(showAuthError);
+  E('signInBtn').onclick=()=>showAuth();E('logoutBtn').onclick=()=>logoutAdmin();
 }
 function esc(s){return String(s??'').replace(/[&<>"]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[m]))}
 function fmtTs(v){const n=Number(v||0);if(!n)return '-';const d=new Date(n*1000);return isNaN(d.getTime())?'-':d.toLocaleString()}
@@ -100556,6 +102949,7 @@ async function rebuildIndex(){
   setChip('importStatus','rebuilt'); await refreshAll();
 }
 window.addEventListener('DOMContentLoaded',async()=>{
+  bindAuthUi();
   initGraphUi();
   E('refreshBtn').onclick=()=>refreshAll().catch(err=>setChip('importStatus',err.message,true));
   E('rebuildBtn').onclick=()=>rebuildIndex().catch(err=>setChip('importStatus',err.message,true));
@@ -100565,7 +102959,9 @@ window.addEventListener('DOMContentLoaded',async()=>{
   if(E('folderInput'))E('folderInput').onchange=()=>onFolderInputChange().catch(err=>setChip('importStatus',err.message,true));
   E('importTextBtn').onclick=()=>runImportText().catch(err=>setChip('importStatus',err.message,true));
   E('queryBtn').onclick=()=>runQuery().catch(err=>setChip('queryStatus',err.message,true));
-  try{await refreshAll()}catch(err){setChip('importStatus',err.message,true)}
+  const results=await Promise.allSettled([refreshAll(),bootstrapAuth()]);
+  if(results[0].status==='rejected')setChip('importStatus',results[0].reason?.message||'Library data unavailable',true);
+  if(results[1].status==='rejected')showAuthError(results[1].reason);
 });
 """
 
@@ -101112,7 +103508,7 @@ async function initTerminalLibrary(){
   try{await loadScript('/assets/js_lib/xterm/lib/xterm.js');await loadScript('/assets/js_lib/xterm-addon-fit/lib/addon-fit.js')}catch(error){logOutput(`Terminal renderer fallback: ${error.message}`)}
 }
 function editorValue(group=S.activeGroup){const file=activeFile(group);if(!file)return '';if(S.monaco){const model=S.models.get(file.key);return model?model.getValue():file.content}return E(`fallbackEditor${group}`).value}
-function isHistoryCandidate(file){return !!file&&!file.binary&&file.root_id==='session'&&!file.preview&&file.previewKind!=='markdown'}
+function isHistoryCandidate(file){return !!file&&!file.binary&&file.root_id==='session'&&(!file.preview||file.previewKind==='html')&&file.previewKind!=='markdown'}
 function protectDeletedReviewZones(host){const deletedNode=node=>{const element=node?.nodeType===Node.ELEMENT_NODE?node:node?.parentElement;return element?.closest?.('.line-delete-selectable,.inline-deleted-margin-view-zone')||null};const block=event=>{if(!deletedNode(event.target))return;event.preventDefault();event.stopImmediatePropagation();const selection=document.getSelection?.();if(selection&&!selection.isCollapsed)selection.removeAllRanges()};['pointerdown','mousedown','touchstart','selectstart','dragstart','contextmenu','copy'].forEach(type=>host.addEventListener(type,block,true))}
 function disposeHistoryOriginal(group){const model=S.historyOriginalModels.get(group);if(model){model.dispose();S.historyOriginalModels.delete(group)}const diff=S.diffEditors[group];if(diff)diff.setModel(null)}
 function clearHistoryDecorations(file){const old=S.historyDecorations.get(file?.key)||[];const model=file&&S.models.get(file.key);if(model&&old.length)S.historyDecorations.set(file.key,model.deltaDecorations(old,[]));else if(file)S.historyDecorations.delete(file.key)}
@@ -101133,13 +103529,13 @@ async function restoreHistoryStage(file){if(file.stageId==='latest'||!confirm(`R
 function showArtifactPreviewError(stage,file,message){stage.innerHTML='';const error=document.createElement('div');error.className='artifact-preview-error';error.innerHTML=`<span class="codicon codicon-warning"></span><strong>Unable to preview ${escapeHtml(file.name)}</strong><small>${escapeHtml(message||'The preview could not be loaded.')}</small>`;stage.appendChild(error)}
 function renderArtifactPreview(group,file){
   const host=E(`artifactPreview${group}`);host.innerHTML='';host.classList.toggle('is-hidden',!isArtifactFile(file));if(!isArtifactFile(file))return;
-  const toolbar=document.createElement('div');toolbar.className='artifact-toolbar';toolbar.innerHTML=`<strong>${escapeHtml(file.name)}</strong><span class="artifact-meta">${escapeHtml(file.previewKind||file.mime||'binary')}${file.size?` / ${formatFileSize(file.size)}`:''}</span><button class="icon-button" title="Refresh Preview"><span class="codicon codicon-refresh"></span></button>${file.previewKind==='html'?'<a class="icon-button artifact-open-browser" target="_blank" rel="noopener" title="Open in Browser" aria-label="Open in Browser"><span class="codicon codicon-link-external"></span></a>':''}<a class="icon-button artifact-download" title="Download" aria-label="Download"><span class="codicon codicon-cloud-download"></span></a>`;
-  const stage=document.createElement('div');stage.className='artifact-stage';host.append(toolbar,stage);toolbar.querySelector('button').onclick=()=>refreshOpenFile(file,true).catch(showError);const download=toolbar.querySelector('.artifact-download');download.href=artifactUrl(file,'raw')+'&download=1';download.download=file.name;const browser=toolbar.querySelector('.artifact-open-browser');if(browser)browser.href=htmlArtifactUrl(file);
+  const toolbar=document.createElement('div');toolbar.className='artifact-toolbar';toolbar.innerHTML=`<strong>${escapeHtml(file.name)}</strong><span class="artifact-meta">${escapeHtml(file.previewKind||file.mime||'binary')}${file.size?` / ${formatFileSize(file.size)}`:''}</span><button class="icon-button" title="Refresh Preview"><span class="codicon codicon-refresh"></span></button>${['html','pdf'].includes(file.previewKind)?'<a class="icon-button artifact-open-browser" target="_blank" rel="noopener" title="Open in Browser" aria-label="Open in Browser"><span class="codicon codicon-link-external"></span></a>':''}<a class="icon-button artifact-download" title="Download" aria-label="Download"><span class="codicon codicon-cloud-download"></span></a>`;
+  const stage=document.createElement('div');stage.className='artifact-stage';host.append(toolbar,stage);toolbar.querySelector('button').onclick=()=>refreshOpenFile(file,true).catch(showError);const download=toolbar.querySelector('.artifact-download');download.href=artifactUrl(file,'raw')+'&download=1';download.download=file.name;const browser=toolbar.querySelector('.artifact-open-browser');if(browser)browser.href=file.previewKind==='html'?htmlArtifactUrl(file):artifactUrl(file,'raw');
   const url=file.previewKind==='html'?htmlArtifactUrl(file):artifactUrl(file,'raw'),kind=file.previewKind;
   if(kind==='image'){const media=document.createElement('img');media.src=artifactUrl(file,'image-preview');media.alt=file.name;media.decoding='async';media.loading='eager';media.onerror=()=>showArtifactPreviewError(stage,file,'The image is invalid or exceeds the safe preview dimensions.');stage.appendChild(media)}
   else if(kind==='video'){const media=document.createElement('video');media.src=url;media.controls=true;media.onerror=()=>showArtifactPreviewError(stage,file,'The video format could not be loaded by this browser.');stage.appendChild(media)}
   else if(kind==='audio'){const media=document.createElement('audio');media.src=url;media.controls=true;media.onerror=()=>showArtifactPreviewError(stage,file,'The audio format could not be loaded by this browser.');stage.appendChild(media)}
-  else if(kind==='pdf'||kind==='html'){const frame=document.createElement('iframe');frame.title=`Preview ${file.name}`;frame.referrerPolicy='no-referrer';frame.sandbox='allow-scripts';frame.src=url;stage.appendChild(frame)}
+  else if(kind==='pdf'||kind==='html'){const frame=document.createElement('iframe');frame.title=`Preview ${file.name}`;frame.referrerPolicy='no-referrer';if(kind==='html')frame.sandbox='allow-scripts';frame.src=url;stage.appendChild(frame)}
   else if(['csv','excel','presentation','document','markdown','text'].includes(kind)){const frame=document.createElement('iframe');frame.title=`Preview ${file.name}`;frame.referrerPolicy='no-referrer';frame.sandbox='allow-scripts';frame.src=artifactUrl(file,'preview');frame.onerror=()=>showArtifactPreviewError(stage,file,'The preview renderer did not return a document.');stage.appendChild(frame)}
   else{stage.innerHTML=`<div class="artifact-binary"><span class="codicon codicon-file-binary"></span><strong>${escapeHtml(file.name)}</strong><small>Preview is not available for this file type.</small><a class="button" href="${escapeHtml(url+'&download=1')}" download="${escapeHtml(file.name)}">Download</a></div>`}
 }
@@ -101210,7 +103606,7 @@ async function newFolder(){const rel=prompt('Folder path',activeDir()?`${activeD
 async function renameEntry(row){const next=normalizeUploadPath(prompt('New path',row.path)||'');if(!next||next===row.path)return;workspaceAssertNoDirtyFiles(row.path,'renaming this entry');await api(`/api/ide/sessions/${qs(S.activeSession)}/workspace/rename`,{method:'PATCH',body:JSON.stringify({root_id:S.activeRoot,old_path:row.path,new_path:next})});await remapWorkspaceOpenFiles(row.path,next);const selected=explorerSelectionRow();if(selected&&(selected.path===row.path||selected.path.startsWith(`${row.path}/`)))S.explorerSelection=Object.assign({},selected,{path:`${next}${selected.path.slice(row.path.length)}`,name:selected.path===row.path?next.split('/').pop():selected.name});const clip=S.workspaceClipboard;if(clip?.session_id===S.activeSession&&clip?.root_id===S.activeRoot&&(clip.path===row.path||clip.path.startsWith(`${row.path}/`)))S.workspaceClipboard=Object.assign({},clip,{path:`${next}${clip.path.slice(row.path.length)}`,name:clip.path===row.path?next.split('/').pop():clip.name});S.treeCache.clear();await loadTree('')}
 async function deleteEntry(row){workspaceAssertNoDirtyFiles(row.path,'deleting this entry');if(!confirm(`Delete ${row.path}? This cannot be undone.`))return;await api(`/api/ide/sessions/${qs(S.activeSession)}/workspace/file`,{method:'DELETE',body:JSON.stringify({root_id:S.activeRoot,path:row.path,recursive:true})});for(const file of workspaceOpenFilesUnder(row.path))closeFile(file.key);const selected=explorerSelectionRow();if(selected&&(selected.path===row.path||selected.path.startsWith(`${row.path}/`)))S.explorerSelection=null;if(S.workspaceClipboard?.session_id===S.activeSession&&S.workspaceClipboard?.root_id===S.activeRoot&&(S.workspaceClipboard.path===row.path||S.workspaceClipboard.path.startsWith(`${row.path}/`)))S.workspaceClipboard=null;S.treeCache.clear();await loadTree('')}
 function readFileAsB64(file){return new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(String(reader.result||'').split(',',2)[1]||'');reader.onerror=()=>reject(reader.error||new Error('Read failed'));reader.readAsDataURL(file)})}
-function normalizeUploadPath(value){return String(value||'').replace(/\\/g,'/').split('/').filter(part=>part&&part!=='.'&&part!=='..').join('/')}
+function normalizeUploadPath(value){let raw=String(value||'').replace(/\\/g,'/').replace(/^file:\/+/i,'');if(/^[a-z]:\//i.test(raw))raw=raw.split('/').pop()||'';return raw.split('/').filter(part=>part&&part!=='.'&&part!=='..'&&!part.includes('\0')).join('/')}
 function uploadDirectoriesFor(entries,directories=[]){const found=new Set((directories||[]).map(normalizeUploadPath).filter(Boolean));for(const entry of entries||[]){const parts=normalizeUploadPath(entry.path).split('/');parts.pop();let current='';for(const part of parts){current=current?`${current}/${part}`:part;found.add(current)}}return [...found].sort((a,b)=>a.split('/').length-b.split('/').length||a.localeCompare(b))}
 async function postUploadBatch(dest,items=[],directories=[]){return api(`/api/ide/sessions/${qs(S.activeSession)}/workspace/upload`,{method:'POST',body:JSON.stringify({root_id:S.activeRoot,dest:normalizeUploadPath(dest),items,directories})})}
 function newUploadId(){if(globalThis.crypto?.randomUUID)return `up_${crypto.randomUUID().replace(/-/g,'')}`;const bytes=new Uint8Array(20);if(globalThis.crypto?.getRandomValues)crypto.getRandomValues(bytes);else for(let i=0;i<bytes.length;i++)bytes[i]=Math.floor(Math.random()*256);return `up_${[...bytes].map(value=>value.toString(16).padStart(2,'0')).join('')}`}
@@ -101223,7 +103619,7 @@ function legacyEntryFile(entry){return new Promise((resolve,reject)=>entry.file(
 function legacyDirectoryEntries(entry){return new Promise((resolve,reject)=>{const reader=entry.createReader(),rows=[];const next=()=>reader.readEntries(batch=>{if(!batch.length)return resolve(rows);rows.push(...batch);next()},reject);next()})}
 async function scanLegacyDirectoryEntries(rootEntries){const entries=[],directories=[];const walk=async entry=>{const path=normalizeUploadPath(entry.fullPath||entry.name);if(entry.isDirectory){directories.push(path);for(const child of await legacyDirectoryEntries(entry))await walk(child)}else if(entry.isFile)entries.push({file:await legacyEntryFile(entry),path})};for(const entry of rootEntries||[])await walk(entry);return{entries,directories}}
 function workspaceDragHasFiles(dataTransfer){return [...(dataTransfer?.types||[])].includes('Files')||[...(dataTransfer?.items||[])].some(item=>item.kind==='file')}
-async function scanDroppedDataTransfer(dataTransfer){const items=[...(dataTransfer?.items||[])].filter(item=>item.kind==='file'),entries=[],directories=[];if(items.some(item=>typeof item.getAsFileSystemHandle==='function')){try{for(const item of items){if(typeof item.getAsFileSystemHandle!=='function')continue;const handle=await item.getAsFileSystemHandle();if(!handle)continue;if(handle.kind==='directory'){const scanned=await scanDirectoryHandle(handle);entries.push(...scanned.entries);directories.push(...scanned.directories)}else if(handle.kind==='file'){const file=await handle.getFile();entries.push({file,path:normalizeUploadPath(handle.name||file.name)})}}if(entries.length||directories.length)return{entries,directories}}catch(error){logOutput(`Dropped handle scan fallback: ${error.message}`)}}const legacy=items.map(item=>typeof item.webkitGetAsEntry==='function'?item.webkitGetAsEntry():null).filter(Boolean);if(legacy.length){const scanned=await scanLegacyDirectoryEntries(legacy);if(scanned.entries.length||scanned.directories.length)return scanned}const files=[...(dataTransfer?.files||[])];return{entries:files.map(file=>({file,path:normalizeUploadPath(file.webkitRelativePath||file.name)})),directories:[]}}
+async function scanDroppedDataTransfer(dataTransfer){const items=[...(dataTransfer?.items||[])].filter(item=>item.kind==='file'),entries=[],directories=[],fallbackEntries=[];for(const item of items){try{const file=item.getAsFile?.();if(file)fallbackEntries.push({file,path:normalizeUploadPath(file.webkitRelativePath||file.name)})}catch(_){} }const files=[...(dataTransfer?.files||[])],legacy=items.map(item=>{try{return typeof item.webkitGetAsEntry==='function'?item.webkitGetAsEntry():null}catch(_){return null}}).filter(Boolean),handleTasks=items.map(item=>{try{return typeof item.getAsFileSystemHandle==='function'?item.getAsFileSystemHandle():null}catch(_){return null}}).filter(Boolean);if(handleTasks.length){try{for(const handle of await Promise.all(handleTasks)){if(!handle)continue;if(handle.kind==='directory'){const scanned=await scanDirectoryHandle(handle);entries.push(...scanned.entries);directories.push(...scanned.directories)}else if(handle.kind==='file'){const file=await handle.getFile();entries.push({file,path:normalizeUploadPath(handle.name||file.name)})}}if(entries.length||directories.length)return{entries,directories}}catch(error){logOutput(`Dropped handle scan fallback: ${error.message}`)}}if(legacy.length){try{const scanned=await scanLegacyDirectoryEntries(legacy);if(scanned.entries.length||scanned.directories.length)return scanned}catch(error){logOutput(`Dropped entry scan fallback: ${error.message}`)}}const rows=fallbackEntries.length?fallbackEntries:files.map(file=>({file,path:normalizeUploadPath(file.webkitRelativePath||file.name)}));return{entries:rows.filter(row=>row.file&&row.path),directories:[]}}
 function clearWorkspaceDropState(){const tree=E('tree');tree.classList.remove('is-file-drag');tree.removeAttribute('data-drop-label');document.querySelectorAll('#tree .is-drop-target').forEach(node=>node.classList.remove('is-drop-target'));E('workspaceSectionLabel').classList.remove('workspace-drop-root')}
 function workspaceDropDestination(event,rootOnly=false){if(rootOnly)return '';const row=event.target?.closest?.('.tree-row');return normalizeUploadPath(row?.dataset?.dropDir||'')}
 function renderWorkspaceDropTarget(event,destination,rootOnly=false){clearWorkspaceDropState();const tree=E('tree');tree.classList.add('is-file-drag');tree.dataset.dropLabel=`Upload to ${destination||'Session Workspace'}`;const row=!rootOnly?event.target?.closest?.('.tree-row'):null;if(row)row.classList.add('is-drop-target');else if(rootOnly)E('workspaceSectionLabel').classList.add('workspace-drop-root');if(event.dataTransfer)event.dataTransfer.dropEffect='copy'}
@@ -101490,15 +103886,15 @@ function collaborationDeviceLabel(){return[navigator.userAgentData?.platform||na
 function collaborationValue(file){if(!file)return'';const model=S.models.get(file.key);if(model)return model.getValue();const group=S.activeByGroup.findIndex(key=>key===file.key);return group>=0?E(`fallbackEditor${group}`).value:file.content}
 function buildCollaborationOperation(oldText,newText){const oldChars=Array.from(String(oldText||'')),newChars=Array.from(String(newText||''));let prefix=0;while(prefix<oldChars.length&&prefix<newChars.length&&oldChars[prefix]===newChars[prefix])prefix++;let suffix=0;while(suffix<oldChars.length-prefix&&suffix<newChars.length-prefix&&oldChars[oldChars.length-1-suffix]===newChars[newChars.length-1-suffix])suffix++;const operation=[];if(prefix)operation.push({retain:prefix});const removed=oldChars.length-prefix-suffix,inserted=newChars.slice(prefix,newChars.length-suffix).join('');if(removed)operation.push({delete:removed});if(inserted)operation.push({insert:inserted});if(suffix)operation.push({retain:suffix});return operation}
 function scheduleCollaborationFlush(file,delay=180){if(!S.collaborationMode||!file||file.binary||file.preview||file.root_id!=='session'||file.stageId!=='latest')return;clearTimeout(S.collaborationFlushTimers.get(file.key));S.collaborationFlushTimers.set(file.key,setTimeout(()=>flushCollaborationFile(file).catch(showError),delay))}
-function applyCollaborationDocument(file,document,{updateEditor=true}={}){if(!file||!document)return;file.content=String(document.content||'');file.revision=String(document.revision??file.revision??'0');file.size=Number(document.size||new TextEncoder().encode(file.content).length);file.collaborationFrozen=!!document.frozen;if(updateEditor){const model=S.models.get(file.key);const group=S.activeByGroup.findIndex(key=>key===file.key),position=group>=0&&S.editors[group]?S.editors[group].getPosition():null;S.suppressEditorChange=true;try{if(model&&model.getValue()!==file.content)model.setValue(file.content);else if(group>=0&&!S.monaco)E(`fallbackEditor${group}`).value=file.content}finally{S.suppressEditorChange=false}if(position&&group>=0&&S.editors[group])S.editors[group].setPosition(position)}renderTabs();renderOpenEditors();updateStatusBar()}
+function applyCollaborationDocument(file,document,{updateEditor=true}={}){if(!file||!document)return;file.content=String(document.content||'');file.revision=String(document.revision??file.revision??'0');file.size=Number(document.size||new TextEncoder().encode(file.content).length);file.collaborationFrozen=!!document.frozen;file.historyStages=null;file.historyPayload=null;if(updateEditor){const model=S.models.get(file.key);const group=S.activeByGroup.findIndex(key=>key===file.key),position=group>=0&&S.editors[group]?S.editors[group].getPosition():null;S.suppressEditorChange=true;try{if(model&&model.getValue()!==file.content)model.setValue(file.content);else if(group>=0&&!S.monaco)E(`fallbackEditor${group}`).value=file.content}finally{S.suppressEditorChange=false}if(position&&group>=0&&S.editors[group])S.editors[group].setPosition(position)}renderTabs();renderOpenEditors();updateStatusBar()}
 async function flushCollaborationFile(file,explicit=false){if(!S.collaborationMode||!file||file.binary||file.preview||file.root_id!=='session')return false;clearTimeout(S.collaborationFlushTimers.get(file.key));S.collaborationFlushTimers.delete(file.key);const pending=S.collaborationFlushes.get(file.key);if(pending){if(explicit)await pending;return pending}const target=collaborationValue(file),base=String(file.content||'');if(target===base){file.dirty=false;renderTabs();renderOpenEditors();return true}const operation=buildCollaborationOperation(base,target);if(!operation.length)return true;file.dirty=false;renderTabs();renderOpenEditors();setStatus(`Syncing ${file.name}...`);const task=(async()=>{try{await api(`/api/collab/v1/documents/${qs(file.path)}/operations`,{method:'POST',body:JSON.stringify({base_revision:Number(file.revision||0),client_operation_id:`ide-${Date.now()}-${crypto.randomUUID()}`,operation})});const document=await api(`/api/collab/v1/documents/${qs(file.path)}`);const current=collaborationValue(file);applyCollaborationDocument(file,document,{updateEditor:current===target});if(current!==target){file.dirty=true;scheduleCollaborationFlush(file,60)}else file.dirty=false;setStatus(`Synced ${file.name} · rev ${file.revision}`);renderCollaborationSnapshot();return true}catch(error){file.dirty=true;renderTabs();renderOpenEditors();if(['document_frozen','external_write_conflict','revision_conflict'].includes(error.code)){showView('collaboration');scheduleCollaborationRefresh(0)}throw error}finally{S.collaborationFlushes.delete(file.key)}})();S.collaborationFlushes.set(file.key,task);return task}
-async function refreshCollaborationOpenFile(path){for(const file of S.openFiles.values()){if(file.root_id!=='session'||file.path!==path||file.dirty||S.collaborationFlushes.has(file.key))continue;try{const document=await api(`/api/collab/v1/documents/${qs(path)}`);applyCollaborationDocument(file,document)}catch(error){logOutput(`Collaboration refresh ${path}: ${error.message}`)}}}
+async function refreshCollaborationOpenFile(path){for(const file of S.openFiles.values()){if(file.root_id!=='session'||file.path!==path||file.dirty||S.collaborationFlushes.has(file.key))continue;try{const document=await api(`/api/collab/v1/documents/${qs(path)}`);applyCollaborationDocument(file,document);await loadCodeHistory(file,'latest');if(activeFile(file.group)?.key===file.key&&!isArtifactFile(file))applyHistoryView(file.group,file)}catch(error){logOutput(`Collaboration refresh ${path}: ${error.message}`)}}}
 function postCollaborationPresence(file=activeFile(),line,column){if(!S.collaborationMode)return Promise.resolve();const sharedFile=file?.root_id==='session'?file:null,position=S.editors[S.activeGroup]?.getPosition?.(),cursor=sharedFile?{line:Number(line||position?.lineNumber||1),column:Number(column||position?.column||1)}:{};return api('/api/collab/v1/presence',{method:'POST',body:JSON.stringify({document_path:sharedFile?.path||'',cursor})})}
 function sendCollaborationPresence(file,line,column){if(!S.collaborationMode)return;clearTimeout(S.collaborationPresenceTimer);S.collaborationPresenceTimer=setTimeout(()=>postCollaborationPresence(file,line,column).catch(()=>{}),160)}
 function startCollaborationPresenceHeartbeat(){clearInterval(S.collaborationPresenceHeartbeat);S.collaborationPresenceHeartbeat=null;if(!S.collaborationMode)return;postCollaborationPresence().catch(()=>{});S.collaborationPresenceHeartbeat=setInterval(()=>postCollaborationPresence().catch(()=>{}),60000)}
 function stopCollaborationPresenceHeartbeat(){clearTimeout(S.collaborationPresenceTimer);clearInterval(S.collaborationPresenceHeartbeat);S.collaborationPresenceTimer=null;S.collaborationPresenceHeartbeat=null}
 function collaborationEmpty(text){return `<div class="collaboration-empty">${escapeHtml(text)}</div>`}
-function renderCollaborationResources(){const host=E('collaborationResources');if(!host)return;const resources=S.config?.shared_resources||{},llm=resources.llm||{},skills=resources.skills||{},apps=resources.shared_apps||{},libraries=resources.libraries||{},services=resources.services||{};const count=(stats)=>Number(stats?.document_count??stats?.file_count??stats?.item_count??stats?.count??0);const source=llm.source==='admin_global'?'Admin service':'Current IP user';const rows=[['LLM profiles',Number(llm.profile_count||0),source],['Skills',Number(skills.count||0),'Shared'],['Shared apps',Number(apps.count||0),'Published'],['Knowledge library',count(libraries.knowledge?.stats),'Agent access'],['Code library',count(libraries.code?.stats),'Agent access']];const links=Object.entries(services).filter(([,row])=>row?.enabled&&row?.url&&row?.port).map(([name,row])=>`<a class="collaboration-resource-link" href="${escapeHtml(row.url)}" target="_blank" rel="noreferrer">${escapeHtml(name)} :${Number(row.port)}</a>`).join('');host.innerHTML=rows.map(([name,value,state])=>`<div class="collaboration-card"><strong>${escapeHtml(name)}</strong><span class="collaboration-state">${escapeHtml(state)}</span><small>${Number(value).toLocaleString()}</small></div>`).join('')+(links?`<div class="collaboration-resource-links">${links}</div>`:'')}
+function renderCollaborationResources(){const host=E('collaborationResources');if(!host)return;const resources=S.config?.shared_resources||{},llm=resources.llm||{},skills=resources.skills||{},jsLib=resources.js_libraries||{},mcp=resources.mcp||{},apps=resources.shared_apps||{},libraries=resources.libraries||{},services=resources.services||{};const count=(stats)=>Number(stats?.document_count??stats?.file_count??stats?.item_count??stats?.count??0);const source=llm.source==='admin_global'?'Admin service':'Current IP user';const rows=[['LLM profiles',Number(llm.profile_count||0),source],['Skills',Number(skills.count||0),skills.can_write?'Admin write':'Shared read'],['JS libraries',Number(jsLib.count||0),'Shared read'],['MCP tools',Number(mcp.tool_count||0),mcp.degraded?'Degraded':`${Number(mcp.ready||0)}/${Number(mcp.total||0)} ready`],['Shared apps',Number(apps.count||0),'Published'],['Knowledge library',count(libraries.knowledge?.stats),'Agent access'],['Code library',count(libraries.code?.stats),'Agent access']];const links=Object.entries(services).filter(([,row])=>row?.enabled&&row?.url&&row?.port).map(([name,row])=>`<a class="collaboration-resource-link" href="${escapeHtml(row.url)}" target="_blank" rel="noreferrer">${escapeHtml(name)} :${Number(row.port)}</a>`).join('');host.innerHTML=rows.map(([name,value,state])=>`<div class="collaboration-card"><strong>${escapeHtml(name)}</strong><span class="collaboration-state">${escapeHtml(state)}</span><small>${Number(value).toLocaleString()}</small></div>`).join('')+(links?`<div class="collaboration-resource-links">${links}</div>`:'')}
 function renderCollaborationRemoteCursors(){if(!S.collaborationMode||!S.monaco)return;const snapshot=S.collaboration||{},activeMembers=new Map((snapshot.members||[]).map(row=>[row.member_id,row.nickname||row.member_id.slice(0,8)]));for(const file of S.openFiles.values()){const model=S.models.get(file.key);if(!model)continue;const rows=(snapshot.presence||[]).filter(row=>row.member_id!==snapshot.member?.member_id&&row.document_path===file.path&&row.cursor?.line);const decorations=rows.map((row,index)=>{const pos=model.validatePosition({lineNumber:Number(row.cursor.line||1),column:Number(row.cursor.column||1)});return{range:new S.monaco.Range(pos.lineNumber,pos.column,pos.lineNumber,pos.column),options:{className:`remote-cursor remote-cursor-${index%5}`,hoverMessage:{value:`${activeMembers.get(row.member_id)||row.member_id} cursor`},stickiness:S.monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges}}});const previous=S.collaborationRemoteDecorations.get(file.key)||[];S.collaborationRemoteDecorations.set(file.key,model.deltaDecorations(previous,decorations))}}
 function activeCollaborationConflicts(conflicts=S.collaboration?.conflicts||[]){return(conflicts||[]).filter(row=>!['resolved','aborted'].includes(String(row.status||'').toLowerCase()))}
 function showCollaborationConflictNotice(conflicts=S.collaboration?.conflicts||[],force=false){
@@ -101691,6 +104087,8 @@ class AppContext:
         single_no_plan_todo_prompt: str = "",
         l2_todo_policy: str | None = None,
         ide_password_login_enabled: bool = False,
+        shell_timeout_mode: str = DEFAULT_SHELL_TIMEOUT_MODE,
+        shell_async_handoff_seconds: int = DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS,
     ):
         self.workspace = Path(workspace).resolve()
         self.workspace_migration = _migrate_legacy_runtime_roots(self.workspace)
@@ -101725,6 +104123,13 @@ class AppContext:
             minimum=MIN_SHELL_COMMAND_TIMEOUT_SECONDS,
             maximum=MAX_SHELL_COMMAND_TIMEOUT_SECONDS,
             fallback=DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
+        )
+        self.shell_timeout_mode = normalize_shell_timeout_mode(shell_timeout_mode)
+        self.shell_async_handoff_seconds = normalize_timeout_seconds(
+            shell_async_handoff_seconds,
+            minimum=MIN_SHELL_ASYNC_HANDOFF_SECONDS,
+            maximum=MAX_SHELL_ASYNC_HANDOFF_SECONDS,
+            fallback=DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS,
         )
         self.auto_task_level_ceiling = normalize_auto_task_level_ceiling(auto_task_level_ceiling)
         # The AppContext loads its base config below.  Keep an explicit
@@ -102492,6 +104897,8 @@ class AppContext:
             "ui_style": normalize_ui_style(getattr(self, "ui_style", DEFAULT_UI_STYLE)),
             "js_lib_download_enabled": bool(getattr(self, "js_lib_download_enabled", True)),
             "shell_command_timeout_seconds": int(getattr(self, "shell_command_timeout_seconds", DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS) or DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS),
+            "shell_timeout_mode": normalize_shell_timeout_mode(getattr(self, "shell_timeout_mode", DEFAULT_SHELL_TIMEOUT_MODE)),
+            "shell_async_handoff_seconds": int(getattr(self, "shell_async_handoff_seconds", DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS) or DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS),
             "daily_session_limit_per_ip": int(getattr(self, "daily_session_limit_per_ip", 0) or 0),
             "daily_session_reset_hour": int(getattr(self, "daily_session_reset_hour", 8) or 8),
             "validation": dict(self.web_ui_validation or {}),
@@ -102803,6 +105210,7 @@ class AppContext:
             "active_session_id": str(sessions.get("active_session_id", "") or ""),
             "session_creation_limit": sessions.get("session_creation_limit", {}),
             "password_login_enabled": bool(self.ide_password_login_enabled),
+            "shared_resources": self.shared_resource_manifest(user_id),
         }
         principal = self._collaboration_principal_for_ide_user(user_id)
         if principal is not None:
@@ -102823,14 +105231,115 @@ class AppContext:
             })
         return out
 
-    def collaboration_resource_manifest(self, user_id: str) -> dict:
+    def shared_mcp_health(self) -> dict:
+        mgr = getattr(self, "mcp", None)
+        if mgr is None:
+            return {
+                "enabled": False,
+                "ready": 0,
+                "total": 0,
+                "degraded": False,
+                "tool_count": 0,
+                "crashed": [],
+                "monitor": False,
+                "servers": [],
+            }
+        try:
+            health = dict(mgr.health() or {})
+        except Exception as exc:
+            return {
+                "enabled": True,
+                "ready": 0,
+                "total": 0,
+                "degraded": True,
+                "tool_count": 0,
+                "crashed": [],
+                "monitor": False,
+                "servers": [],
+                "error": trim(str(exc), 240),
+            }
+        servers: list[dict] = []
+        for raw in health.get("servers", []) if isinstance(health.get("servers"), list) else []:
+            if not isinstance(raw, dict):
+                continue
+            authorization = raw.get("authorization", {})
+            auth_public = {}
+            if isinstance(authorization, dict):
+                auth_public = {
+                    "approved": bool(authorization.get("approved", False)),
+                    "approval_required": bool(authorization.get("approval_required", False)),
+                    "reason": trim(str(authorization.get("reason", "") or ""), 240),
+                }
+            servers.append({
+                "name": trim(str(raw.get("name", "") or ""), 120),
+                "state": trim(str(raw.get("state", "") or ""), 40),
+                "alive": bool(raw.get("alive", False)),
+                "transport": trim(str(raw.get("transport", "") or ""), 40),
+                "tools": [trim(str(x or ""), 160) for x in list(raw.get("tools", []) or [])[:200]],
+                "error": trim(str(raw.get("error", "") or ""), 300),
+                "authorization": auth_public,
+            })
+        return {
+            "enabled": True,
+            "ready": int(health.get("ready", 0) or 0),
+            "total": int(health.get("total", 0) or 0),
+            "degraded": bool(health.get("degraded", False)),
+            "tool_count": int(health.get("tool_count", 0) or 0),
+            "crashed": [trim(str(x or ""), 120) for x in list(health.get("crashed", []) or [])[:100]],
+            "monitor": bool(health.get("monitor", False)),
+            "servers": servers,
+        }
+
+    def shared_mcp_tools(self) -> dict:
+        mgr = getattr(self, "mcp", None)
+        specs = list(mgr.tool_specs()) if mgr is not None else []
+        return {
+            "count": len(specs),
+            "names": sorted(str(x) for x in (mgr.tool_names() if mgr is not None else set())),
+            "tools": specs,
+        }
+
+    def manage_shared_mcp(self, action: str, payload: dict | None = None) -> dict:
+        mgr = getattr(self, "mcp", None)
+        if mgr is None:
+            raise RuntimeError("MCP manager is unavailable")
+        data = dict(payload or {})
+        action_key = str(action or "").strip().lower()
+        if action_key == "reload":
+            config_path = str(getattr(mgr, "_config_path", "") or "")
+            config = parse_json_object(try_read_text(Path(config_path))) if config_path else {}
+            result = mgr.reload_from_config(config or {})
+            mgr.note_config_loaded()
+            return result
+        server = str(data.get("server", "") or "").strip()
+        if not server:
+            raise ValueError("server is required")
+        if action_key == "restart":
+            return {"ok": bool(mgr.restart_server(server)), "server": server}
+        if action_key == "trust":
+            decision = str(data.get("decision", "approve") or "approve").strip().lower()
+            if decision == "approve":
+                return mgr.approve_server(
+                    server,
+                    expected_config_digest=str(data.get("config_digest", "") or ""),
+                    expected_fingerprint=str(data.get("fingerprint", "") or ""),
+                )
+            if decision == "revoke":
+                return mgr.revoke_server_approval(server)
+            raise ValueError("decision must be approve or revoke")
+        raise ValueError("unsupported MCP management action")
+
+    def shared_resource_manifest(self, user_id: str, *, collaboration: bool = False) -> dict:
         with self._lock:
             manager = self._session_mgrs.get(str(user_id or ""))
         profile_count = len(getattr(manager, "user_model_profiles", {}) or {}) if manager else 0
         source_kind = str(
-            getattr(manager, "collaboration_llm_source_kind", "admin_global")
+            (
+                getattr(manager, "collaboration_llm_source_kind", "")
+                or ("current_ip_user" if not collaboration else "admin_global")
+            )
             if manager
-            else "admin_global"
+            else ("current_ip_user" if not collaboration else "admin_global")
         )
         try:
             skill_count = len(self._ensure_skills_store(force=False).skills)
@@ -102848,17 +105357,45 @@ class AppContext:
             code_stats = dict(self.code_store.library_payload(limit=0).get("stats", {}) or {})
         except Exception:
             code_stats = {}
+        js_summary = dict(getattr(self, "offline_js_summary", {}) or {})
+        mcp_health = self.shared_mcp_health()
         return {
             "llm": {
                 "source": source_kind,
                 "profile_count": profile_count,
                 "server_side_credentials": True,
             },
-            "skills": {"enabled": True, "count": skill_count, "read_only": True},
+            "skills": {
+                "enabled": True,
+                "count": skill_count,
+                "read_only": True,
+                "agent_read": True,
+                "admin_write": not collaboration,
+                "virtual_root": "/skills",
+            },
+            "js_libraries": {
+                "enabled": True,
+                "count": int(js_summary.get("total", 0) or 0),
+                "catalog_available": int(js_summary.get("available", 0) or 0),
+                "read_only": True,
+                "agent_read": True,
+                "virtual_root": "/js_lib",
+                "asset_prefix": "/assets/js_lib/",
+            },
             "shared_apps": {"enabled": True, "count": shared_app_count, "read_only": True},
             "libraries": {
-                "knowledge": {"enabled": True, "stats": knowledge_stats, "agent_access": True},
-                "code": {"enabled": True, "stats": code_stats, "agent_access": True},
+                "knowledge": {"enabled": True, "stats": knowledge_stats, "agent_access": True, "controlled_write": True},
+                "code": {"enabled": True, "stats": code_stats, "agent_access": True, "read_only": True},
+            },
+            "mcp": {
+                "enabled": bool(mcp_health.get("enabled", False)),
+                "ready": int(mcp_health.get("ready", 0) or 0),
+                "total": int(mcp_health.get("total", 0) or 0),
+                "tool_count": int(mcp_health.get("tool_count", 0) or 0),
+                "degraded": bool(mcp_health.get("degraded", False)),
+                "agent_access": True,
+                "approved_tools_only": True,
+                "configuration_managed_by_admin": True,
             },
             "api_paths": {
                 "models": "/api/ide/v2/sessions/{session_id}/models",
@@ -102866,7 +105403,12 @@ class AppContext:
                 "skills_providers": "/api/skills/providers",
                 "shared_apps": "/api/apps/shared",
                 "shared_app_skills": "/api/apps/skills",
-                "resources": "/api/collab/v1/resources",
+                "resources": "/api/collab/v1/resources" if collaboration else "/api/ide/v2/resources",
+                "mcp_health": "/api/ide/v2/resources/mcp/health",
+                "mcp_status": "/api/ide/v2/resources/mcp/status",
+                "mcp_tools": "/api/ide/v2/resources/mcp/tools",
+                "skill_detail": "/api/ide/v2/resources/skills/detail?skill_file={skill_file}",
+                "skill_admin_write": "/api/ide/v2/resources/skills",
             },
             "services": {
                 "main": {"enabled": True, "port": int(getattr(self, "agent_port", 0) or 0)},
@@ -102878,6 +105420,9 @@ class AppContext:
                 "collaboration": {"enabled": bool(getattr(self, "collaboration_enabled", False)), "port": int(getattr(self, "collaboration_port", 0) or 0)},
             },
         }
+
+    def collaboration_resource_manifest(self, user_id: str) -> dict:
+        return self.shared_resource_manifest(user_id, collaboration=True)
 
     def ide_create_session(self, user_id: str, title: str | None = None, client_ip: str = "") -> dict:
         if str(user_id or "").startswith("collab:"):
@@ -103566,6 +106111,38 @@ document.addEventListener('DOMContentLoaded', function(){{
     def ide_code_preview_stages(self, user_id: str, session_id: str, *, root_id: str, rel: str) -> dict:
         if str(root_id or "session").strip() != "session":
             return {"path": normalize_rel_preview_path(rel), "latest_id": "", "stages": []}
+        principal = self._collaboration_principal_for_ide_user(user_id)
+        if principal is not None:
+            history = self.collaboration.document_history(principal.project_id, rel, limit=500)
+            versions = sorted(
+                list(history.get("versions", []) or []),
+                key=lambda row: int(row.get("revision", 0) or 0),
+            )
+            total = len(versions)
+            stages = []
+            for index, row in enumerate(versions, start=1):
+                revision = int(row.get("revision", 0) or 0)
+                stages.append(
+                    {
+                        "id": f"collab:{revision}",
+                        "index": index,
+                        "total": total,
+                        "ts": float(row.get("created_at", 0.0) or 0.0),
+                        "change_type": str(row.get("reason", "modified") or "modified"),
+                        "added": 0,
+                        "deleted": 0,
+                        "label": f"rev {revision}",
+                        "bytes_after": int(row.get("size", 0) or 0),
+                        "lines_after": 0,
+                        "virtual": False,
+                    }
+                )
+            current = int(history.get("current_revision", 0) or 0)
+            return {
+                "path": normalize_rel_preview_path(rel),
+                "latest_id": f"collab:{current}" if current else "",
+                "stages": stages,
+            }
         return self._ide_session(user_id, session_id).code_preview_stages(rel)
 
     def ide_code_preview_payload(
@@ -103579,6 +106156,64 @@ document.addEventListener('DOMContentLoaded', function(){{
     ) -> dict:
         if str(root_id or "session").strip() != "session":
             raise ValueError("code history is available only for the session workspace")
+        principal = self._collaboration_principal_for_ide_user(user_id)
+        if principal is not None:
+            requested = str(stage_id or "latest").strip() or "latest"
+            history = self.collaboration.document_history(principal.project_id, rel, limit=500)
+            revisions = sorted(
+                int(row.get("revision", 0) or 0)
+                for row in list(history.get("versions", []) or [])
+                if int(row.get("revision", 0) or 0) > 0
+            )
+            if not revisions:
+                raise FileNotFoundError(f"file history not found: {normalize_rel_preview_path(rel)}")
+            if requested.lower() in {"", "latest", "current"}:
+                selected_revision = int(history.get("current_revision", revisions[-1]) or revisions[-1])
+            else:
+                match = re.fullmatch(r"collab:(\d+)", requested)
+                if not match:
+                    raise KeyError(f"stage not found: {requested}")
+                selected_revision = int(match.group(1))
+            if selected_revision not in revisions:
+                raise KeyError(f"stage not found: {requested}")
+            index = revisions.index(selected_revision)
+            selected = self.collaboration.document_version(
+                principal.project_id, rel, selected_revision
+            )
+            before = selected
+            if index > 0:
+                before = self.collaboration.document_version(
+                    principal.project_id, rel, revisions[index - 1]
+                )
+            before_text = str(before.get("content", "") or "")
+            after_text = str(selected.get("content", "") or "")
+            _, added, deleted = make_unified_diff(
+                normalize_rel_preview_path(rel), before_text, after_text
+            )
+            rows, truncated = build_code_preview_rows(
+                before_text, after_text, max_rows=CODE_PREVIEW_STAGE_MAX_ROWS
+            )
+            return {
+                "path": normalize_rel_preview_path(rel),
+                "requested_stage": requested,
+                "stage": {
+                    "id": f"collab:{selected_revision}",
+                    "index": index + 1,
+                    "total": len(revisions),
+                    "ts": float(selected.get("created_at", 0.0) or 0.0),
+                    "change_type": str(selected.get("reason", "modified") or "modified"),
+                    "added": int(added),
+                    "deleted": int(deleted),
+                    "virtual": False,
+                    "bytes_after": int(selected.get("size", 0) or 0),
+                    "lines_after": after_text.count("\n") + (1 if after_text else 0),
+                },
+                "rows": rows,
+                "row_count": len(rows),
+                "truncated": bool(truncated),
+                "before_text": before_text,
+                "full_text": after_text,
+            }
         return self._ide_session(user_id, session_id).code_preview_payload(rel, stage_id)
 
     def _ide_emit_workspace_change(
@@ -103695,6 +106330,17 @@ document.addEventListener('DOMContentLoaded', function(){{
         stage_id = str(payload.get("stage_id", "") or "").strip()
         if root_id != "session" or not rel or not stage_id or stage_id == "latest":
             raise ValueError("a session file and historical stage are required")
+        principal = self._collaboration_principal_for_ide_user(user_id)
+        if principal is not None:
+            match = re.fullmatch(r"collab:(\d+)", stage_id)
+            if not match:
+                raise ValueError("a collaboration document revision is required")
+            return self.collaboration.restore_document_version(
+                principal,
+                rel,
+                int(match.group(1)),
+                int(str(payload.get("expected_revision", "0") or "0")),
+            )
         stage = self.ide_code_preview_payload(
             user_id,
             session_id,
@@ -106561,6 +109207,19 @@ document.addEventListener('DOMContentLoaded', function(){{
                     "role": trim(str(raw_question.get("role", "") or "agent"), 40),
                     "ts": float(raw_question.get("ts", 0.0) or 0.0),
                 }
+        if bool(snap.get("running", False)):
+            try:
+                active_tool = str(snap.get("agent_active_tool", "") or "").strip()
+                active_phase = str(snap.get("agent_phase", "") or "").strip()
+                sess._publish_collaboration_event_heartbeat(
+                    "poll",
+                    {
+                        "name": active_tool,
+                        "summary": "Agent active" + (f": {active_phase}" if active_phase else ""),
+                    },
+                )
+            except Exception:
+                pass
         return {
             "ok": True,
             "session_id": str(session_id or ""),
@@ -108473,6 +111132,10 @@ document.addEventListener('DOMContentLoaded', function(){{
                     sess.cancel_requested = True
                 except Exception:
                     pass
+                try:
+                    report["bash_terminated"] += int(sess.bg.stop_all())
+                except Exception:
+                    pass
                 proc = getattr(sess, "_running_bash_proc", None)
                 if proc is None or proc.poll() is not None:
                     continue
@@ -108885,11 +111548,24 @@ document.addEventListener('DOMContentLoaded', function(){{
         completion = board.get("completion", {}) if isinstance(board.get("completion"), dict) else {}
         completion_state = str(completion.get("state", "") or "").strip().lower()
         board_status = str(board.get("status", "") or "").strip().lower()
+        todo_manager = getattr(sess, "todo", None)
+        try:
+            todo_rows = list(todo_manager.snapshot() or []) if todo_manager is not None else []
+        except Exception:
+            todo_rows = []
+        open_todos = [
+            row
+            for row in todo_rows
+            if isinstance(row, dict)
+            and str(row.get("status", "pending") or "pending").strip().lower() != "completed"
+        ]
         if bool(getattr(sess, "cancel_requested", False)):
             status = "cancelled"
         elif isinstance(getattr(sess, "pending_user_question", None), dict):
             status = "blocked"
         elif completion_state == "blocked" or board_status in {"blocked", "paused", "ask_user", "error", "failed"}:
+            status = "blocked"
+        elif open_todos:
             status = "blocked"
         else:
             status = "completed"
@@ -108932,6 +111608,10 @@ document.addEventListener('DOMContentLoaded', function(){{
                 "Agent work was cancelled." if status == "cancelled" else "Agent work requires follow-up."
             )
         ]
+        if open_todos:
+            pieces.append(
+                f"Outstanding Todos: {len(open_todos)} of {len(todo_rows)} remain unfinished."
+            )
         if paths:
             pieces.append("Shared files: " + ", ".join(paths[:12]) + (" and more" if len(paths) > 12 else "") + ".")
         if validation_passed or validation_failed:
@@ -109284,6 +111964,8 @@ document.addEventListener('DOMContentLoaded', function(){{
                 web_search_setting_locked=self.web_search_setting_locked,
                 user_memory_mode=self.user_memory_mode,
                 user_memory_setting_locked=self.user_memory_setting_locked,
+                shell_timeout_mode=self.shell_timeout_mode,
+                shell_async_handoff_seconds=self.shell_async_handoff_seconds,
                 upload_callback=self._on_session_upload,
                 run_finished_callback=self._on_session_run_finished,
                 reference_prepare_callback=self._prepare_runtime_references,
@@ -109631,6 +112313,8 @@ document.addEventListener('DOMContentLoaded', function(){{
                 web_search_setting_locked=self.web_search_setting_locked,
                 user_memory_mode="off",
                 user_memory_setting_locked=True,
+                shell_timeout_mode=self.shell_timeout_mode,
+                shell_async_handoff_seconds=self.shell_async_handoff_seconds,
                 upload_callback=self._on_session_upload,
                 run_finished_callback=self._on_session_run_finished,
                 reference_prepare_callback=self._prepare_runtime_references,
@@ -112171,6 +114855,8 @@ class Handler(BaseHTTPRequestHandler):
                         "request_timeout_default": int(DEFAULT_REQUEST_TIMEOUT),
                         "run_timeout": int(mgr.max_run_seconds),
                         "shell_command_timeout_seconds": int(getattr(mgr, "shell_command_timeout_seconds", DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS) or DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS),
+                        "shell_timeout_mode": normalize_shell_timeout_mode(getattr(mgr, "shell_timeout_mode", DEFAULT_SHELL_TIMEOUT_MODE)),
+                        "shell_async_handoff_seconds": int(getattr(mgr, "shell_async_handoff_seconds", DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS) or DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS),
                         "read_context_policy": normalize_read_context_policy(
                             getattr(mgr, "read_context_policy", DEFAULT_READ_CONTEXT_POLICY)
                         ),
@@ -112262,6 +114948,8 @@ class Handler(BaseHTTPRequestHandler):
                     "user_memory_setting_locked": bool(getattr(mgr, "user_memory_setting_locked", False)),
                     "run_timeout": int(mgr.max_run_seconds),
                     "shell_command_timeout_seconds": int(getattr(mgr, "shell_command_timeout_seconds", DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS) or DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS),
+                    "shell_timeout_mode": normalize_shell_timeout_mode(getattr(mgr, "shell_timeout_mode", DEFAULT_SHELL_TIMEOUT_MODE)),
+                    "shell_async_handoff_seconds": int(getattr(mgr, "shell_async_handoff_seconds", DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS) or DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS),
                     "auto_model_switch": bool(mgr.auto_model_switch),
                     "execution_mode": normalize_execution_mode(getattr(mgr, "execution_mode", EXECUTION_MODE_SYNC), default=EXECUTION_MODE_SYNC),
                     "execution_mode_choices": list(EXECUTION_MODE_CHOICES),
@@ -113419,6 +116107,8 @@ class SkillsHandler(BaseHTTPRequestHandler):
                     "web_ui": web_ui_state,
                     "run_timeout": int(mgr.max_run_seconds),
                     "shell_command_timeout_seconds": int(getattr(mgr, "shell_command_timeout_seconds", DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS) or DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS),
+                    "shell_timeout_mode": normalize_shell_timeout_mode(getattr(mgr, "shell_timeout_mode", DEFAULT_SHELL_TIMEOUT_MODE)),
+                    "shell_async_handoff_seconds": int(getattr(mgr, "shell_async_handoff_seconds", DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS) or DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS),
                     "read_context_policy": normalize_read_context_policy(
                         getattr(mgr, "read_context_policy", DEFAULT_READ_CONTEXT_POLICY)
                     ),
@@ -113525,7 +116215,139 @@ class SkillsHandler(BaseHTTPRequestHandler):
                 return self._send_json({"error": str(exc)}, status=400)
         return self._send_json({"error": "not found"}, status=404)
 
-class RagAdminHandler(BaseHTTPRequestHandler):
+class _RagAdminAuthMixin:
+    """Shared administrator authentication for the knowledge and code RAG UIs."""
+
+    _ADMIN_AUTH_POST_PATHS = {
+        "/api/admin/auth/setup",
+        "/api/admin/auth/login",
+        "/api/admin/auth/token-login",
+        "/api/admin/auth/logout",
+    }
+
+    def _bearer_token(self) -> str:
+        auth = str(self.headers.get("Authorization", "") or "").strip()
+        if auth.lower().startswith("bearer "):
+            return auth[7:].strip()
+        return str(self.headers.get("X-Admin-Token", "") or "").strip()
+
+    def _same_origin_write(self) -> bool:
+        origin = str(self.headers.get("Origin", "") or "").strip()
+        if not origin:
+            return True
+        host = str(self.headers.get("Host", "") or "").strip()
+        parsed = urlparse(origin)
+        return bool(host and parsed.netloc == host and parsed.scheme in {"http", "https"})
+
+    def _local_admin_setup_request(self) -> bool:
+        peer = str(self.client_address[0] if getattr(self, "client_address", None) else "")
+        try:
+            if not ipaddress.ip_address(peer).is_loopback:
+                return False
+            if not ipaddress.ip_address(self._client_ip()).is_loopback:
+                return False
+        except Exception:
+            return False
+        host = str(self.headers.get("Host", "") or "").strip().lower()
+        if host.startswith("["):
+            hostname = host.split("]", 1)[0].lstrip("[")
+        else:
+            hostname = host.rsplit(":", 1)[0] if host.count(":") <= 1 else host
+        return hostname in {"localhost", "127.0.0.1", "::1"}
+
+    def _auth_error(self, exc: AdminAuthError):
+        payload = {"error": str(exc), "code": exc.code}
+        if exc.retry_after:
+            payload["retry_after"] = exc.retry_after
+        return self._send_json(payload, status=exc.status)
+
+    def _require_admin_write(self) -> bool:
+        if not self._same_origin_write():
+            self._send_json({"error": "cross-origin write rejected", "code": "cross_origin"}, status=403)
+            return False
+        if self.app.verify_admin_token(self._bearer_token()):
+            return True
+        self._send_json({"error": "admin authentication required", "code": "unauthorized"}, status=401)
+        return False
+
+    def _handle_admin_auth_get(self, path: str) -> bool:
+        if path == "/api/admin/auth/status":
+            self._send_json(
+                self.app.admin_auth_status(local_setup_allowed=self._local_admin_setup_request())
+            )
+            return True
+        if path == "/api/admin/auth/session":
+            kind = self.app.verify_admin_token(self._bearer_token())
+            if kind:
+                self._send_json({"ok": True, "auth_kind": kind})
+            else:
+                self._send_json(
+                    {"error": "admin authentication required", "code": "unauthorized"},
+                    status=401,
+                )
+            return True
+        return False
+
+    def _handle_admin_auth_post(self, path: str) -> bool:
+        if path not in self._ADMIN_AUTH_POST_PATHS:
+            return False
+        if not self._same_origin_write():
+            self._send_json({"error": "cross-origin write rejected", "code": "cross_origin"}, status=403)
+            return True
+        content_type = str(self.headers.get("Content-Type", "") or "").split(";", 1)[0].strip().lower()
+        if content_type != "application/json":
+            self._send_json(
+                {"error": "application/json is required", "code": "invalid_content_type"},
+                status=415,
+            )
+            return True
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+        except Exception:
+            length = 0
+        if length < 0 or length > 8192:
+            self.close_connection = True
+            self._send_json(
+                {"error": "authentication request is too large", "code": "payload_too_large"},
+                status=413,
+            )
+            return True
+        try:
+            payload = self._read_json()
+            if path == "/api/admin/auth/setup":
+                out = self.app.setup_admin(
+                    payload.get("username"),
+                    payload.get("password"),
+                    local_setup_allowed=self._local_admin_setup_request(),
+                    bootstrap_token=self._bearer_token(),
+                )
+                self._send_json(out, status=201)
+            elif path == "/api/admin/auth/login":
+                self._send_json(
+                    self.app.login_admin(
+                        payload.get("username"),
+                        payload.get("password"),
+                        self._client_ip(),
+                    )
+                )
+            elif path == "/api/admin/auth/token-login":
+                self._send_json(self.app.exchange_admin_token(self._bearer_token()))
+            else:
+                token = self._bearer_token()
+                if token:
+                    self.app.logout_admin(token)
+                self._send_json({"ok": True})
+        except AdminAuthError as exc:
+            self._auth_error(exc)
+        except Exception:
+            self._send_json(
+                {"error": "invalid authentication request", "code": "invalid_request"},
+                status=400,
+            )
+        return True
+
+
+class RagAdminHandler(_RagAdminAuthMixin, BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = f"StandaloneWebRAG/{APP_VERSION}"
 
@@ -113557,17 +116379,6 @@ class RagAdminHandler(BaseHTTPRequestHandler):
     def _read_json(self) -> dict:
         return read_http_json_body(self)
 
-    def _require_admin_write(self) -> bool:
-        auth = str(self.headers.get("Authorization", "") or "").strip()
-        token = auth[7:].strip() if auth.lower().startswith("bearer ") else str(self.headers.get("X-Admin-Token", "") or "").strip()
-        origin = str(self.headers.get("Origin", "") or "").strip()
-        parsed = urlparse(origin)
-        same_origin = not origin or (parsed.scheme in {"http", "https"} and parsed.netloc == str(self.headers.get("Host", "") or ""))
-        if self.app.verify_admin_token(token) and same_origin:
-            return True
-        self._send_json({"error": "admin authentication and same-origin request required"}, status=401)
-        return False
-
     def _send_json(self, obj: object, status: int = 200):
         body = json_response_bytes(obj)
         try:
@@ -113575,6 +116386,9 @@ class RagAdminHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            retry_after = int(obj.get("retry_after", 0) or 0) if isinstance(obj, dict) else 0
+            if status == 429 and retry_after > 0:
+                self.send_header("Retry-After", str(retry_after))
             if close_if_http_request_body_unread(self):
                 self.send_header("Connection", "close")
             self.end_headers()
@@ -113647,6 +116461,8 @@ class RagAdminHandler(BaseHTTPRequestHandler):
                 return self._send_exception(exc)
         if path == "/api/health":
             return self._send_json({"ok": True, "app": "rag-admin", "version": APP_VERSION})
+        if self._handle_admin_auth_get(path):
+            return
         if path == "/api/rag/config":
             return self._send_json(self.app.rag_config(self._user_id()))
         if path == "/api/rag/library":
@@ -113689,6 +116505,8 @@ class RagAdminHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = unquote(urlparse(self.path).path)
+        if self._handle_admin_auth_post(path):
+            return
         if not self._require_admin_write():
             return
         if path == "/api/rag/import":
@@ -113718,7 +116536,7 @@ class RagAdminHandler(BaseHTTPRequestHandler):
         return self._send_json({"error": "not found"}, status=404)
 
 
-class CodeAdminHandler(BaseHTTPRequestHandler):
+class CodeAdminHandler(_RagAdminAuthMixin, BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = f"StandaloneWebCode/{APP_VERSION}"
 
@@ -113750,17 +116568,6 @@ class CodeAdminHandler(BaseHTTPRequestHandler):
     def _read_json(self) -> dict:
         return read_http_json_body(self)
 
-    def _require_admin_write(self) -> bool:
-        auth = str(self.headers.get("Authorization", "") or "").strip()
-        token = auth[7:].strip() if auth.lower().startswith("bearer ") else str(self.headers.get("X-Admin-Token", "") or "").strip()
-        origin = str(self.headers.get("Origin", "") or "").strip()
-        parsed = urlparse(origin)
-        same_origin = not origin or (parsed.scheme in {"http", "https"} and parsed.netloc == str(self.headers.get("Host", "") or ""))
-        if self.app.verify_admin_token(token) and same_origin:
-            return True
-        self._send_json({"error": "admin authentication and same-origin request required"}, status=401)
-        return False
-
     def _send_json(self, obj: object, status: int = 200):
         body = json_response_bytes(obj)
         try:
@@ -113768,6 +116575,9 @@ class CodeAdminHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            retry_after = int(obj.get("retry_after", 0) or 0) if isinstance(obj, dict) else 0
+            if status == 429 and retry_after > 0:
+                self.send_header("Retry-After", str(retry_after))
             if close_if_http_request_body_unread(self):
                 self.send_header("Connection", "close")
             self.end_headers()
@@ -113832,6 +116642,8 @@ class CodeAdminHandler(BaseHTTPRequestHandler):
             return self._send_inline_bytes(data, content_type)
         if path == "/api/health":
             return self._send_json({"ok": True, "app": "code-admin", "version": APP_VERSION})
+        if self._handle_admin_auth_get(path):
+            return
         if path == "/api/code/config":
             return self._send_json(self.app.code_config(self._user_id()))
         if path == "/api/code/library":
@@ -113880,6 +116692,8 @@ class CodeAdminHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = unquote(urlparse(self.path).path)
+        if self._handle_admin_auth_post(path):
+            return
         if not self._require_admin_write():
             return
         if path == "/api/code/import":
@@ -113945,8 +116759,48 @@ class IdeHandler(BaseHTTPRequestHandler):
     def app(self) -> AppContext:
         return self.server.app  # type: ignore[attr-defined]
 
+    def _decorate_resource_manifest(self, manifest: dict, context: dict | None = None) -> dict:
+        out = dict(manifest or {})
+        ctx = context if isinstance(context, dict) else self._auth_context(required=False)
+        account = ctx.get("account", {}) if isinstance(ctx, dict) else {}
+        is_admin = bool(str(account.get("role", "") or "") == "admin")
+        is_collaboration = bool(account.get("collaboration_mode", False))
+        skills = dict(out.get("skills", {}) or {})
+        skills["can_write"] = bool(is_admin and not is_collaboration and skills.get("admin_write", False))
+        out["skills"] = skills
+        mcp = dict(out.get("mcp", {}) or {})
+        mcp["can_manage"] = bool(is_admin and not is_collaboration)
+        out["mcp"] = mcp
+        host_header = str(self.headers.get("Host", "") or "").strip()
+        try:
+            hostname = str(urlparse("//" + host_header).hostname or "")
+        except Exception:
+            hostname = ""
+        if not hostname:
+            hostname = str(getattr(self.server, "server_address", ("127.0.0.1", 0))[0] or "127.0.0.1")
+        public_host = f"[{hostname}]" if ":" in hostname and not hostname.startswith("[") else hostname
+        scheme = "https" if self._trusted_https() else "http"
+        current_origin = f"{scheme}://{host_header}" if host_header else ""
+        services = {}
+        for name, value in dict(out.get("services", {}) or {}).items():
+            row = dict(value or {})
+            port = int(row.get("port", 0) or 0)
+            row["url"] = f"{scheme}://{public_host}:{port}" if row.get("enabled") and port else ""
+            services[str(name)] = row
+        out["services"] = services
+        out["api_urls"] = {
+            str(name): current_origin + str(path)
+            for name, path in dict(out.get("api_paths", {}) or {}).items()
+            if current_origin and str(path).startswith("/")
+        }
+        return out
+
     def _decorate_ide_config(self, payload: dict, context: dict) -> dict:
-        return payload
+        out = dict(payload or {})
+        resources = out.get("shared_resources")
+        if isinstance(resources, dict):
+            out["shared_resources"] = self._decorate_resource_manifest(resources, context)
+        return out
 
     def _client_ip(self) -> str:
         return trusted_client_ip(self)
@@ -114069,6 +116923,19 @@ class IdeHandler(BaseHTTPRequestHandler):
             return None
         if not self._direct_loopback() or str(context["account"].get("role", "")) != "admin":
             self._send_json({"error": "Local IDE administrator access required.", "code": "local_admin_required"}, status=403)
+            return None
+        return context
+
+    def _require_resource_admin(self) -> dict | None:
+        context = self._require_write()
+        if not context:
+            return None
+        account = context.get("account", {}) if isinstance(context, dict) else {}
+        if bool(account.get("collaboration_mode", False)) or str(account.get("role", "") or "") != "admin":
+            self._send_json(
+                {"error": "IDE administrator access required for shared resource changes.", "code": "admin_required"},
+                status=403,
+            )
             return None
         return context
 
@@ -114305,6 +117172,50 @@ class IdeHandler(BaseHTTPRequestHandler):
             if fp.suffix.lower() in {".js", ".mjs", ".cjs"}:
                 content_type = "application/javascript; charset=utf-8"
             return self._send_inline_bytes(data, content_type)
+        if path in {
+            "/api/ide/v2/resources",
+            "/api/skills",
+            "/api/apps/skills",
+            "/api/skills/providers",
+            "/api/skills/protocols",
+            "/api/skills/protocol-examples",
+            "/api/apps/shared",
+            "/api/ide/v2/resources/skills/scan",
+            "/api/ide/v2/resources/skills/detail",
+            "/api/ide/v2/resources/mcp/health",
+            "/api/ide/v2/resources/mcp/status",
+            "/api/ide/v2/resources/mcp/tools",
+        }:
+            try:
+                context = self._auth_context(required=True)
+                user_id = str(context["account"].get("user_id", "") or "")
+                if path == "/api/ide/v2/resources":
+                    collaboration = bool(context["account"].get("collaboration_mode", False))
+                    manifest = self.app.shared_resource_manifest(user_id, collaboration=collaboration)
+                    return self._send_json(self._decorate_resource_manifest(manifest, context))
+                if path in {"/api/skills", "/api/apps/skills"}:
+                    return self._send_json(self.app.skills_catalog())
+                if path == "/api/skills/providers":
+                    return self._send_json(self.app.skill_providers_catalog())
+                if path == "/api/skills/protocols":
+                    return self._send_json(self.app.skill_protocols_catalog())
+                if path == "/api/skills/protocol-examples":
+                    return self._send_json(self.app.skill_protocol_examples())
+                if path == "/api/apps/shared":
+                    return self._send_json(self.app.applications.list_shared())
+                if path == "/api/ide/v2/resources/skills/scan":
+                    return self._send_json(self.app.scan_skills())
+                if path == "/api/ide/v2/resources/skills/detail":
+                    skill_file = str((query.get("skill_file", [""]) or [""])[0] or "")
+                    return self._send_json(self.app.skill_detail(skill_file))
+                if path == "/api/ide/v2/resources/mcp/tools":
+                    return self._send_json(self.app.shared_mcp_tools())
+                health = self.app.shared_mcp_health()
+                if path == "/api/ide/v2/resources/mcp/status":
+                    return self._send_json({"servers": health.get("servers", [])})
+                return self._send_json(health)
+            except Exception as exc:
+                return self._send_exception(exc)
         if path == "/api/health":
             return self._send_json({"ok": True, "app": "clouds-coder-ide", "version": APP_VERSION})
         if path == "/api/ide/v2/auth/status":
@@ -114749,6 +117660,32 @@ class IdeHandler(BaseHTTPRequestHandler):
                 return self._send_json({"ok": True, "account": account}, status=201)
             except Exception as exc:
                 return self._send_exception(exc)
+        if path == "/api/ide/v2/resources/skills":
+            context = self._require_resource_admin()
+            if not context:
+                return
+            try:
+                payload = self._read_json()
+                return self._send_json(
+                    self.app.write_skill_file(
+                        str(payload.get("path", "") or ""),
+                        str(payload.get("content", "") or ""),
+                        overwrite=bool(payload.get("overwrite", False)),
+                    ),
+                    status=201,
+                )
+            except Exception as exc:
+                return self._send_exception(exc)
+        m_resource_mcp = re.match(r"^/api/ide/v2/resources/mcp/(reload|restart|trust)$", path)
+        if m_resource_mcp:
+            context = self._require_resource_admin()
+            if not context:
+                return
+            try:
+                result = self.app.manage_shared_mcp(m_resource_mcp.group(1), self._read_json())
+                return self._send_json(result, status=200 if result.get("ok", False) else 409)
+            except Exception as exc:
+                return self._send_exception(exc)
         if path == "/api/ide/v2/workbench/state":
             context = self._require_write()
             if not context:
@@ -115157,31 +118094,8 @@ class CollaborationHandler(IdeHandler):
                 return
         print(f"[collaboration] {self.address_string()} {fmt % args}")
 
-    def _decorate_resource_manifest(self, manifest: dict) -> dict:
-        out = dict(manifest or {})
-        host_header = str(self.headers.get("Host", "") or "").strip()
-        try:
-            hostname = str(urlparse("//" + host_header).hostname or "")
-        except Exception:
-            hostname = ""
-        if not hostname:
-            hostname = str(getattr(self.server, "server_address", ("127.0.0.1", 0))[0] or "127.0.0.1")
-        public_host = f"[{hostname}]" if ":" in hostname and not hostname.startswith("[") else hostname
-        scheme = "https" if self._trusted_https() else "http"
-        current_origin = f"{scheme}://{host_header}" if host_header else ""
-        services = {}
-        for name, value in dict(out.get("services", {}) or {}).items():
-            row = dict(value or {})
-            port = int(row.get("port", 0) or 0)
-            row["url"] = f"{scheme}://{public_host}:{port}" if row.get("enabled") and port else ""
-            services[str(name)] = row
-        out["services"] = services
-        out["api_urls"] = {
-            str(name): current_origin + str(path)
-            for name, path in dict(out.get("api_paths", {}) or {}).items()
-            if current_origin and str(path).startswith("/")
-        }
-        return out
+    def _decorate_resource_manifest(self, manifest: dict, context: dict | None = None) -> dict:
+        return super()._decorate_resource_manifest(manifest, context)
 
     def _decorate_ide_config(self, payload: dict, context: dict) -> dict:
         out = dict(payload or {})
@@ -115877,6 +118791,34 @@ def main():
         ),
     )
     parser.add_argument(
+        "--shell_timeout_mode",
+        "--shell-timeout-mode",
+        "--bash_timeout_mode",
+        "--bash-timeout-mode",
+        dest="shell_timeout_mode",
+        default=None,
+        choices=list(SHELL_TIMEOUT_MODES),
+        help=(
+            "Shell timeout policy: fixed counts total process time; auto resets the timeout on any "
+            "stdout/stderr byte; async behaves like auto and hands a still-running process to the "
+            "background list after --shell-async-handoff seconds."
+        ),
+    )
+    parser.add_argument(
+        "--shell_async_handoff_seconds",
+        "--shell-async-handoff",
+        "--shell_async_after",
+        "--bash-async-handoff",
+        dest="shell_async_handoff_seconds",
+        default=None,
+        type=int,
+        help=(
+            "Foreground wait before async shell mode adopts the same process as a background task "
+            f"(default {DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS}s; allowed "
+            f"{MIN_SHELL_ASYNC_HANDOFF_SECONDS}-{MAX_SHELL_ASYNC_HANDOFF_SECONDS})."
+        ),
+    )
+    parser.add_argument(
         "--live_input_delay_write",
         default=LIVE_INPUT_DELAY_WRITE_ROUNDS,
         type=int,
@@ -116101,6 +119043,7 @@ def main():
         help=(
             "LLM config source (URL or local file path). "
             "Also reads startup keys like show_upload_list, download_js_lib, shell_command_timeout, "
+            "shell_timeout_mode, shell_async_handoff_seconds, "
             "ctx_limit/context_token_limit, tool_memory_policy/read_context_policy, auto_task_level_ceiling, "
             "l2_todo_policy (force|auto|off) and "
             "daily_session_limit (aliases: daily_sessions_per_ip / "
@@ -116352,6 +119295,8 @@ def main():
         show_upload_list=None,
         download_js_lib=None,
         shell_command_timeout=None,
+        shell_timeout_mode=None,
+        shell_async_handoff_seconds=None,
         web_search_enabled=None,
         user_memory_mode=None,
         single_no_plan_todo_enabled=None,
@@ -116400,6 +119345,8 @@ def main():
     resolved_show_upload_list = False
     resolved_daily_session_limit_per_ip = 0
     resolved_shell_command_timeout = DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS
+    resolved_shell_timeout_mode = DEFAULT_SHELL_TIMEOUT_MODE
+    resolved_shell_async_handoff_seconds = DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS
     resolved_read_context_policy = DEFAULT_READ_CONTEXT_POLICY
     resolved_tool_memory_policy = DEFAULT_TOOL_MEMORY_POLICY
     resolved_auto_task_level_ceiling = DEFAULT_AUTO_TASK_LEVEL_CEILING
@@ -116443,6 +119390,17 @@ def main():
                     minimum=MIN_SHELL_COMMAND_TIMEOUT_SECONDS,
                     maximum=MAX_SHELL_COMMAND_TIMEOUT_SECONDS,
                     fallback=DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
+                )
+            external_shell_timeout_mode = extract_shell_timeout_mode_setting(external_config)
+            if external_shell_timeout_mode is not None:
+                resolved_shell_timeout_mode = normalize_shell_timeout_mode(external_shell_timeout_mode)
+            external_shell_async_handoff = extract_shell_async_handoff_setting(external_config)
+            if external_shell_async_handoff is not None:
+                resolved_shell_async_handoff_seconds = normalize_timeout_seconds(
+                    external_shell_async_handoff,
+                    minimum=MIN_SHELL_ASYNC_HANDOFF_SECONDS,
+                    maximum=MAX_SHELL_ASYNC_HANDOFF_SECONDS,
+                    fallback=DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS,
                 )
             external_read_context_policy = extract_read_context_policy_setting(external_config)
             if external_read_context_policy:
@@ -116489,6 +119447,17 @@ def main():
             maximum=MAX_SHELL_COMMAND_TIMEOUT_SECONDS,
             fallback=DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
         )
+    web_ui_shell_timeout_mode = extract_shell_timeout_mode_setting(web_ui_config)
+    if web_ui_shell_timeout_mode is not None:
+        resolved_shell_timeout_mode = normalize_shell_timeout_mode(web_ui_shell_timeout_mode)
+    web_ui_shell_async_handoff = extract_shell_async_handoff_setting(web_ui_config)
+    if web_ui_shell_async_handoff is not None:
+        resolved_shell_async_handoff_seconds = normalize_timeout_seconds(
+            web_ui_shell_async_handoff,
+            minimum=MIN_SHELL_ASYNC_HANDOFF_SECONDS,
+            maximum=MAX_SHELL_ASYNC_HANDOFF_SECONDS,
+            fallback=DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS,
+        )
     web_ui_read_context_policy = extract_read_context_policy_setting(web_ui_config)
     if web_ui_read_context_policy:
         resolved_read_context_policy = web_ui_read_context_policy
@@ -116532,6 +119501,17 @@ def main():
             minimum=MIN_SHELL_COMMAND_TIMEOUT_SECONDS,
             maximum=MAX_SHELL_COMMAND_TIMEOUT_SECONDS,
             fallback=DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
+        )
+    cli_shell_timeout_mode = getattr(args, "shell_timeout_mode", None)
+    if cli_shell_timeout_mode is not None:
+        resolved_shell_timeout_mode = normalize_shell_timeout_mode(cli_shell_timeout_mode)
+    cli_shell_async_handoff = getattr(args, "shell_async_handoff_seconds", None)
+    if cli_shell_async_handoff is not None:
+        resolved_shell_async_handoff_seconds = normalize_timeout_seconds(
+            cli_shell_async_handoff,
+            minimum=MIN_SHELL_ASYNC_HANDOFF_SECONDS,
+            maximum=MAX_SHELL_ASYNC_HANDOFF_SECONDS,
+            fallback=DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS,
         )
     cli_read_context_policy = normalize_read_context_policy(
         getattr(args, "read_context_policy", "") or "",
@@ -116680,7 +119660,11 @@ def main():
             f"[web-agent] run_timeout adjusted {requested_run_timeout}->{resolved_run_timeout} "
             f"(allowed range {MIN_RUN_TIMEOUT_SECONDS}-{MAX_RUN_TIMEOUT_SECONDS})"
     )
-    print(f"[web-agent] shell_command_timeout={int(resolved_shell_command_timeout)}s")
+    print(
+        f"[web-agent] shell_timeout={normalize_shell_timeout_mode(resolved_shell_timeout_mode)} "
+        f"limit={int(resolved_shell_command_timeout)}s "
+        f"async_handoff={int(resolved_shell_async_handoff_seconds)}s"
+    )
     print(f"[web-agent] read_context_policy={resolved_read_context_policy}")
     print(f"[web-agent] tool_memory_policy={resolved_tool_memory_policy}")
     print(f"[web-agent] web_search={'on' if resolved_web_search_enabled else 'off'}")
@@ -116899,6 +119883,8 @@ def main():
         bool(_js_dl_enabled),
         resolved_rag_include_filename_entities,
         web_search_enabled=resolved_web_search_enabled,
+        shell_timeout_mode=resolved_shell_timeout_mode,
+        shell_async_handoff_seconds=resolved_shell_async_handoff_seconds,
         web_search_setting_locked=web_search_setting_locked,
         user_memory_mode=resolved_user_memory_mode,
         user_memory_setting_locked=user_memory_setting_locked,
@@ -116982,6 +119968,9 @@ def main():
         _mgr.web_search_setting_locked = bool(web_search_setting_locked)
         _mgr.user_memory_mode = normalize_user_memory_mode(getattr(app, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
         _mgr.user_memory_setting_locked = bool(user_memory_setting_locked)
+        _mgr.shell_command_timeout_seconds = int(resolved_shell_command_timeout)
+        _mgr.shell_timeout_mode = normalize_shell_timeout_mode(resolved_shell_timeout_mode)
+        _mgr.shell_async_handoff_seconds = int(resolved_shell_async_handoff_seconds)
         for _sess in getattr(_mgr, "sessions", {}).values():
             _sess.read_context_policy = resolved_read_context_policy
             _sess.tool_memory_policy = resolved_tool_memory_policy
@@ -116991,6 +119980,9 @@ def main():
             _sess.single_no_plan_todo_prompt = str(resolved_single_no_plan_todo_prompt or "").strip()[:6000]
             _sess.web_search_enabled = bool(getattr(app, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED))
             _sess.user_memory_mode = normalize_user_memory_mode(getattr(app, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
+            _sess.shell_command_timeout_seconds = int(resolved_shell_command_timeout)
+            _sess.shell_timeout_mode = normalize_shell_timeout_mode(resolved_shell_timeout_mode)
+            _sess.shell_async_handoff_seconds = int(resolved_shell_async_handoff_seconds)
             _sess.updated_at = now_ts()
             _sess._persist()
     # JS lib download (default on; set download_js_lib: false in --config to disable)
@@ -117037,6 +120029,8 @@ def main():
         "max_rounds": int(resolved_max_rounds),
         "run_timeout": int(resolved_run_timeout),
         "shell_command_timeout": int(resolved_shell_command_timeout),
+        "shell_timeout_mode": normalize_shell_timeout_mode(resolved_shell_timeout_mode),
+        "shell_async_handoff_seconds": int(resolved_shell_async_handoff_seconds),
         "live_input_delay_write": int(resolved_live_input_delay_write),
         "live_input_delay_tool": int(resolved_live_input_delay_tool),
         "live_input_delay_normal": int(resolved_live_input_delay_normal),
@@ -117305,9 +120299,13 @@ def main():
             collaboration_thread.start()
 
             def _collaboration_watch_loop():
+                last_agent_reap = 0.0
                 while not collaboration_watch_stop.wait(1.0):
                     try:
                         app.collaboration.scan_external_writes()
+                        if time.monotonic() - last_agent_reap >= 30.0:
+                            app.collaboration.reap_stale_agents()
+                            last_agent_reap = time.monotonic()
                     except Exception as exc:
                         print(f"[collaboration] file watcher error: {trim(str(exc), 240)}")
 
