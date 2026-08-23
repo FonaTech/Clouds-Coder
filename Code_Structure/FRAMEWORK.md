@@ -102,67 +102,67 @@ Code_Structure/
 | Module | Statements | Exported names | Dependencies | Original line span |
 | --- | ---: | ---: | --- | --- |
 | `_imports.py` | 68 | 83 | — | 1–3461 |
-| `admin/auth.py` | 3 | 3 | `admin/constants.py`, `utils/misc.py` | 12622–13329 |
-| `admin/config.py` | 8 | 8 | `config/constants.py`, `config/paths.py`, `config/settings.py`, `llm/constants.py`, `utils/http.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 14075–14535 |
-| `admin/constants.py` | 16 | 16 | — | 3468–108372 |
-| `agent/background.py` | 1 | 1 | `agent/process.py`, `config/constants.py`, `ide/sandbox.py`, `utils/misc.py`, `utils/text.py` | 21821–22446 |
-| `agent/bus.py` | 1 | 1 | `config/constants.py`, `utils/crypto.py`, `utils/misc.py` | 22447–22512 |
-| `agent/errors.py` | 1 | 1 | — | 11212–11215 |
-| `agent/events.py` | 1 | 1 | — | 15227–15273 |
-| `agent/process.py` | 7 | 7 | `ide/sandbox.py`, `utils/errors.py`, `utils/misc.py`, `utils/text.py` | 7529–21820 |
-| `agent/tasks.py` | 1 | 1 | `utils/crypto.py`, `utils/json_utils.py`, `utils/misc.py` | 21320–21454 |
-| `agent/todo.py` | 1 | 1 | `config/constants.py`, `config/settings.py`, `utils/misc.py`, `utils/text.py` | 15274–15634 |
-| `agent/tools.py` | 15 | 19 | `config/constants.py`, `utils/text.py` | 15106–27150 |
-| `agent/worktree.py` | 1 | 1 | `agent/process.py`, `agent/tasks.py`, `config/constants.py`, `utils/crypto.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 22513–22725 |
-| `app/context.py` | 1 | 1 | `admin/auth.py`, `admin/config.py`, `admin/constants.py`, `agent/process.py`, `agent/tools.py`, `app/services.py`, `collaboration/core.py`, `config/constants.py`, `config/paths.py`, `config/settings.py`, `ide/assets.py`, `ide/auth.py`, `ide/errors.py`, `ide/events.py`, `ide/preview.py`, `ide/sandbox.py`, `llm/client.py`, `llm/constants.py`, `llm/utils.py`, `mcp/driver.py`, `rag/assets.py`, `rag/constants.py`, `rag/ingestion.py`, `rag/parsers.py`, `rag/store.py`, `session/manager.py`, `session/state.py`, `skills/provisioning.py`, `skills/store.py`, `skills/studio.py`, `utils/crypto.py`, `utils/files.py`, `utils/http.py`, `utils/json_utils.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py`, `web/assets.py`, `web/skills_assets.py` | 108373–118142 |
-| `app/main.py` | 2 | 1 | `admin/config.py`, `admin/constants.py`, `agent/tools.py`, `app/context.py`, `collaboration/watcher.py`, `config/constants.py`, `config/paths.py`, `config/settings.py`, `ide/handler.py`, `llm/constants.py`, `llm/utils.py`, `mcp/constants.py`, `mcp/service.py`, `rag/constants.py`, `server/http.py`, `server/rag_admin.py`, `server/skills.py`, `skills/provisioning.py`, `utils/files.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 124559–126448 |
-| `app/services.py` | 2 | 2 | `admin/constants.py`, `config/settings.py`, `skills/embedded.py`, `skills/store.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 118183–119368 |
+| `admin/auth.py` | 3 | 3 | `admin/constants.py`, `utils/misc.py` | 12644–13351 |
+| `admin/config.py` | 8 | 8 | `config/constants.py`, `config/paths.py`, `config/settings.py`, `llm/constants.py`, `utils/http.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 14097–14557 |
+| `admin/constants.py` | 16 | 16 | — | 3468–108395 |
+| `agent/background.py` | 1 | 1 | `agent/process.py`, `config/constants.py`, `ide/sandbox.py`, `utils/misc.py`, `utils/text.py` | 21843–22468 |
+| `agent/bus.py` | 1 | 1 | `config/constants.py`, `utils/crypto.py`, `utils/misc.py` | 22469–22534 |
+| `agent/errors.py` | 1 | 1 | — | 11234–11237 |
+| `agent/events.py` | 1 | 1 | — | 15249–15295 |
+| `agent/process.py` | 7 | 7 | `ide/sandbox.py`, `utils/errors.py`, `utils/misc.py`, `utils/text.py` | 7551–21842 |
+| `agent/tasks.py` | 1 | 1 | `utils/crypto.py`, `utils/json_utils.py`, `utils/misc.py` | 21342–21476 |
+| `agent/todo.py` | 1 | 1 | `config/constants.py`, `config/settings.py`, `utils/misc.py`, `utils/text.py` | 15296–15656 |
+| `agent/tools.py` | 15 | 19 | `config/constants.py`, `utils/text.py` | 15128–27173 |
+| `agent/worktree.py` | 1 | 1 | `agent/process.py`, `agent/tasks.py`, `config/constants.py`, `utils/crypto.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 22535–22747 |
+| `app/context.py` | 1 | 1 | `admin/auth.py`, `admin/config.py`, `admin/constants.py`, `agent/process.py`, `agent/tools.py`, `app/services.py`, `collaboration/core.py`, `config/constants.py`, `config/paths.py`, `config/settings.py`, `ide/assets.py`, `ide/auth.py`, `ide/errors.py`, `ide/events.py`, `ide/preview.py`, `ide/sandbox.py`, `llm/client.py`, `llm/constants.py`, `llm/utils.py`, `mcp/driver.py`, `rag/assets.py`, `rag/constants.py`, `rag/ingestion.py`, `rag/parsers.py`, `rag/store.py`, `session/manager.py`, `session/state.py`, `skills/provisioning.py`, `skills/store.py`, `skills/studio.py`, `utils/crypto.py`, `utils/files.py`, `utils/http.py`, `utils/json_utils.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py`, `web/assets.py`, `web/skills_assets.py` | 108396–118165 |
+| `app/main.py` | 2 | 1 | `admin/config.py`, `admin/constants.py`, `agent/tools.py`, `app/context.py`, `collaboration/watcher.py`, `config/constants.py`, `config/paths.py`, `config/settings.py`, `ide/handler.py`, `llm/constants.py`, `llm/utils.py`, `mcp/constants.py`, `mcp/service.py`, `rag/constants.py`, `server/http.py`, `server/rag_admin.py`, `server/skills.py`, `skills/provisioning.py`, `utils/files.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 124582–126471 |
+| `app/services.py` | 2 | 2 | `admin/constants.py`, `config/settings.py`, `skills/embedded.py`, `skills/store.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 118206–119391 |
 | `collaboration/core.py` | 23 | 23 | `config/constants.py` | 83–3322 |
-| `collaboration/watcher.py` | 2 | 2 | `utils/misc.py`, `utils/text.py` | 124468–124558 |
-| `config/constants.py` | 425 | 421 | `rag/constants.py` | 68–108368 |
-| `config/paths.py` | 13 | 13 | `agent/process.py`, `utils/crypto.py`, `utils/text.py` | 3467–7689 |
-| `config/settings.py` | 66 | 66 | `agent/tools.py`, `config/constants.py`, `config/paths.py`, `llm/constants.py`, `llm/utils.py`, `rag/constants.py`, `skills/provisioning.py`, `utils/http.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 5640–12962 |
-| `ide/assets.py` | 8 | 3 | — | 105399–106439 |
-| `ide/auth.py` | 2 | 2 | `admin/auth.py`, `admin/constants.py`, `config/constants.py`, `utils/misc.py`, `utils/text.py` | 13330–14059 |
-| `ide/errors.py` | 2 | 2 | — | 14060–14074 |
-| `ide/events.py` | 1 | 1 | `config/constants.py`, `utils/text.py` | 8297–8343 |
-| `ide/handler.py` | 1 | 1 | `admin/auth.py`, `app/context.py`, `collaboration/core.py`, `config/constants.py`, `config/settings.py`, `ide/auth.py`, `ide/errors.py`, `ide/events.py`, `session/manager.py`, `session/state.py`, `utils/http.py`, `utils/json_utils.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py` | 122304–123778 |
-| `ide/preview.py` | 12 | 12 | `config/constants.py`, `utils/text.py` | 14821–15226 |
-| `ide/sandbox.py` | 21 | 21 | `agent/process.py`, `utils/misc.py` | 7511–27679 |
-| `llm/client.py` | 2 | 2 | `agent/tools.py`, `config/constants.py`, `config/settings.py`, `llm/utils.py`, `utils/http.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 24108–26445 |
-| `llm/constants.py` | 17 | 17 | — | 3465–11654 |
-| `llm/utils.py` | 22 | 22 | `agent/process.py`, `config/settings.py`, `llm/constants.py`, `utils/http.py`, `utils/json_utils.py`, `utils/text.py` | 11186–11868 |
-| `mcp/constants.py` | 8 | 8 | — | 3832–22761 |
-| `mcp/driver.py` | 13 | 13 | `mcp/constants.py`, `utils/files.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 22762–24107 |
-| `mcp/service.py` | 1 | 1 | `app/context.py`, `config/constants.py`, `utils/files.py`, `utils/http.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 124250–124467 |
-| `rag/assets.py` | 6 | 6 | — | 102792–105398 |
-| `rag/constants.py` | 74 | 74 | — | 3828–95938 |
-| `rag/index.py` | 5 | 5 | `rag/constants.py`, `rag/ingestion.py`, `rag/parsers.py`, `utils/misc.py`, `utils/text.py` | 95963–102437 |
-| `rag/ingestion.py` | 13 | 13 | `config/constants.py`, `config/settings.py`, `rag/constants.py`, `rag/parsers.py`, `rag/store.py`, `session/state.py`, `utils/files.py`, `utils/json_utils.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py` | 95331–102791 |
-| `rag/parsers.py` | 24 | 24 | `agent/process.py`, `config/constants.py`, `rag/constants.py`, `rag/ingestion.py`, `utils/files.py`, `utils/json_utils.py`, `utils/media.py`, `utils/text.py` | 95121–97067 |
-| `rag/store.py` | 7 | 7 | `config/constants.py`, `config/settings.py`, `ide/preview.py`, `rag/constants.py`, `rag/index.py`, `rag/ingestion.py`, `rag/parsers.py`, `skills/provisioning.py`, `utils/files.py`, `utils/json_utils.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py` | 98745–102703 |
-| `rag/web_search.py` | 15 | 15 | `config/constants.py`, `config/paths.py`, `rag/constants.py`, `utils/http.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 8378–10538 |
-| `server/http.py` | 4 | 4 | `admin/auth.py`, `admin/config.py`, `admin/constants.py`, `agent/process.py`, `app/context.py`, `collaboration/core.py`, `collaboration/watcher.py`, `config/constants.py`, `config/paths.py`, `config/settings.py`, `ide/handler.py`, `ide/preview.py`, `llm/utils.py`, `server/rag_admin.py`, `session/manager.py`, `session/state.py`, `skills/studio.py`, `utils/errors.py`, `utils/files.py`, `utils/http.py`, `utils/json_utils.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py`, `web/admin_assets.py` | 118143–124249 |
-| `server/rag_admin.py` | 3 | 3 | `admin/auth.py`, `app/context.py`, `config/constants.py`, `rag/constants.py`, `utils/http.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py` | 121644–122303 |
-| `server/skills.py` | 1 | 1 | `admin/auth.py`, `app/context.py`, `config/constants.py`, `config/paths.py`, `config/settings.py`, `session/manager.py`, `skills/provisioning.py`, `skills/studio.py`, `utils/http.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py` | 121001–121643 |
-| `session/manager.py` | 2 | 2 | `agent/process.py`, `config/constants.py`, `config/paths.py`, `config/settings.py`, `llm/client.py`, `llm/utils.py`, `rag/store.py`, `session/state.py`, `utils/crypto.py`, `utils/files.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 6837–83837 |
-| `session/state.py` | 1 | 1 | `admin/constants.py`, `agent/background.py`, `agent/bus.py`, `agent/errors.py`, `agent/events.py`, `agent/process.py`, `agent/tasks.py`, `agent/todo.py`, `agent/tools.py`, `agent/worktree.py`, `collaboration/core.py`, `config/constants.py`, `config/paths.py`, `config/settings.py`, `ide/preview.py`, `ide/sandbox.py`, `llm/client.py`, `llm/constants.py`, `llm/utils.py`, `mcp/constants.py`, `mcp/driver.py`, `rag/constants.py`, `rag/parsers.py`, `rag/web_search.py`, `skills/provisioning.py`, `skills/store.py`, `utils/compress.py`, `utils/crypto.py`, `utils/errors.py`, `utils/files.py`, `utils/http.py`, `utils/json_utils.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py` | 27680–82457 |
-| `skills/embedded.py` | 10 | 10 | — | 15635–19434 |
-| `skills/provisioning.py` | 26 | 26 | `config/paths.py`, `skills/embedded.py`, `utils/files.py`, `utils/json_utils.py`, `utils/misc.py` | 15661–19397 |
-| `skills/store.py` | 2 | 2 | `config/constants.py`, `config/settings.py`, `llm/utils.py`, `skills/embedded.py`, `utils/files.py`, `utils/http.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 19435–21319 |
-| `skills/studio.py` | 5 | 5 | `agent/process.py`, `collaboration/core.py`, `config/constants.py`, `config/settings.py`, `ide/sandbox.py`, `llm/client.py`, `llm/constants.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 106465–108363 |
-| `utils/compress.py` | 2 | 2 | — | 10703–10719 |
-| `utils/crypto.py` | 1 | 1 | `utils/json_utils.py` | 12655–12773 |
-| `utils/errors.py` | 2 | 2 | — | 11208–21460 |
-| `utils/files.py` | 27 | 27 | `config/constants.py`, `config/paths.py`, `utils/http.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 5559–12986 |
-| `utils/http.py` | 7 | 7 | `utils/json_utils.py`, `utils/text.py` | 3462–7665 |
-| `utils/json_utils.py` | 13 | 13 | `utils/text.py` | 3827–13044 |
-| `utils/media.py` | 3 | 3 | — | 7185–7218 |
-| `utils/misc.py` | 16 | 16 | `config/constants.py` | 7219–15736 |
-| `utils/text.py` | 30 | 30 | `config/constants.py` | 3815–14820 |
-| `web/admin_assets.py` | 3 | 3 | — | 89719–90186 |
-| `web/assets.py` | 4 | 4 | — | 83838–89319 |
-| `web/skills_assets.py` | 3 | 3 | — | 89320–89718 |
+| `collaboration/watcher.py` | 2 | 2 | `utils/misc.py`, `utils/text.py` | 124491–124581 |
+| `config/constants.py` | 422 | 418 | `rag/constants.py` | 68–108391 |
+| `config/paths.py` | 13 | 13 | `agent/process.py`, `utils/crypto.py`, `utils/text.py` | 3467–7711 |
+| `config/settings.py` | 66 | 66 | `agent/tools.py`, `config/constants.py`, `config/paths.py`, `llm/constants.py`, `llm/utils.py`, `rag/constants.py`, `skills/provisioning.py`, `utils/http.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 5662–12984 |
+| `ide/assets.py` | 8 | 3 | — | 105422–106462 |
+| `ide/auth.py` | 2 | 2 | `admin/auth.py`, `admin/constants.py`, `config/constants.py`, `utils/misc.py`, `utils/text.py` | 13352–14081 |
+| `ide/errors.py` | 2 | 2 | — | 14082–14096 |
+| `ide/events.py` | 1 | 1 | `config/constants.py`, `utils/text.py` | 8319–8365 |
+| `ide/handler.py` | 1 | 1 | `admin/auth.py`, `app/context.py`, `collaboration/core.py`, `config/constants.py`, `config/settings.py`, `ide/auth.py`, `ide/errors.py`, `ide/events.py`, `session/manager.py`, `session/state.py`, `utils/http.py`, `utils/json_utils.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py` | 122327–123801 |
+| `ide/preview.py` | 12 | 12 | `config/constants.py`, `utils/text.py` | 14843–15248 |
+| `ide/sandbox.py` | 21 | 21 | `agent/process.py`, `utils/misc.py` | 7533–27702 |
+| `llm/client.py` | 2 | 2 | `agent/tools.py`, `config/constants.py`, `config/settings.py`, `llm/utils.py`, `utils/http.py`, `utils/json_utils.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py` | 24130–26468 |
+| `llm/constants.py` | 17 | 17 | — | 3465–11676 |
+| `llm/utils.py` | 22 | 22 | `agent/process.py`, `config/settings.py`, `llm/constants.py`, `utils/http.py`, `utils/json_utils.py`, `utils/text.py` | 11208–11890 |
+| `mcp/constants.py` | 8 | 8 | — | 3832–22783 |
+| `mcp/driver.py` | 13 | 13 | `mcp/constants.py`, `utils/files.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 22784–24129 |
+| `mcp/service.py` | 1 | 1 | `app/context.py`, `config/constants.py`, `utils/files.py`, `utils/http.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 124273–124490 |
+| `rag/assets.py` | 6 | 6 | — | 102815–105421 |
+| `rag/constants.py` | 74 | 74 | — | 3828–95961 |
+| `rag/index.py` | 5 | 5 | `rag/constants.py`, `rag/ingestion.py`, `rag/parsers.py`, `utils/misc.py`, `utils/text.py` | 95986–102460 |
+| `rag/ingestion.py` | 13 | 13 | `config/constants.py`, `config/settings.py`, `rag/constants.py`, `rag/parsers.py`, `rag/store.py`, `session/state.py`, `utils/files.py`, `utils/json_utils.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py` | 95354–102814 |
+| `rag/parsers.py` | 24 | 24 | `agent/process.py`, `config/constants.py`, `rag/constants.py`, `rag/ingestion.py`, `utils/files.py`, `utils/json_utils.py`, `utils/media.py`, `utils/text.py` | 95144–97090 |
+| `rag/store.py` | 7 | 7 | `config/constants.py`, `config/settings.py`, `ide/preview.py`, `rag/constants.py`, `rag/index.py`, `rag/ingestion.py`, `rag/parsers.py`, `skills/provisioning.py`, `utils/files.py`, `utils/json_utils.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py` | 98768–102726 |
+| `rag/web_search.py` | 15 | 15 | `config/constants.py`, `config/paths.py`, `rag/constants.py`, `utils/http.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 8400–10560 |
+| `server/http.py` | 4 | 4 | `admin/auth.py`, `admin/config.py`, `admin/constants.py`, `agent/process.py`, `app/context.py`, `collaboration/core.py`, `collaboration/watcher.py`, `config/constants.py`, `config/paths.py`, `config/settings.py`, `ide/handler.py`, `ide/preview.py`, `llm/utils.py`, `server/rag_admin.py`, `session/manager.py`, `session/state.py`, `skills/studio.py`, `utils/errors.py`, `utils/files.py`, `utils/http.py`, `utils/json_utils.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py`, `web/admin_assets.py` | 118166–124272 |
+| `server/rag_admin.py` | 3 | 3 | `admin/auth.py`, `app/context.py`, `config/constants.py`, `rag/constants.py`, `utils/http.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py` | 121667–122326 |
+| `server/skills.py` | 1 | 1 | `admin/auth.py`, `app/context.py`, `config/constants.py`, `config/paths.py`, `config/settings.py`, `session/manager.py`, `skills/provisioning.py`, `skills/studio.py`, `utils/http.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py` | 121024–121666 |
+| `session/manager.py` | 2 | 2 | `agent/process.py`, `config/constants.py`, `config/paths.py`, `config/settings.py`, `llm/client.py`, `llm/utils.py`, `rag/store.py`, `session/state.py`, `utils/crypto.py`, `utils/files.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 6859–83860 |
+| `session/state.py` | 1 | 1 | `admin/constants.py`, `agent/background.py`, `agent/bus.py`, `agent/errors.py`, `agent/events.py`, `agent/process.py`, `agent/tasks.py`, `agent/todo.py`, `agent/tools.py`, `agent/worktree.py`, `collaboration/core.py`, `config/constants.py`, `config/paths.py`, `config/settings.py`, `ide/preview.py`, `ide/sandbox.py`, `llm/client.py`, `llm/constants.py`, `llm/utils.py`, `mcp/constants.py`, `mcp/driver.py`, `rag/constants.py`, `rag/parsers.py`, `rag/web_search.py`, `skills/provisioning.py`, `skills/store.py`, `utils/compress.py`, `utils/crypto.py`, `utils/errors.py`, `utils/files.py`, `utils/http.py`, `utils/json_utils.py`, `utils/media.py`, `utils/misc.py`, `utils/text.py` | 27703–82480 |
+| `skills/embedded.py` | 10 | 10 | — | 15657–19456 |
+| `skills/provisioning.py` | 26 | 26 | `config/paths.py`, `skills/embedded.py`, `utils/files.py`, `utils/json_utils.py`, `utils/misc.py` | 15683–19419 |
+| `skills/store.py` | 2 | 2 | `config/constants.py`, `config/settings.py`, `llm/utils.py`, `skills/embedded.py`, `utils/files.py`, `utils/http.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 19457–21341 |
+| `skills/studio.py` | 5 | 5 | `agent/process.py`, `collaboration/core.py`, `config/constants.py`, `config/settings.py`, `ide/sandbox.py`, `llm/client.py`, `llm/constants.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 106488–108386 |
+| `utils/compress.py` | 2 | 2 | — | 10725–10741 |
+| `utils/crypto.py` | 1 | 1 | `utils/json_utils.py` | 12677–12795 |
+| `utils/errors.py` | 2 | 2 | — | 11230–21482 |
+| `utils/files.py` | 27 | 27 | `config/constants.py`, `config/paths.py`, `utils/http.py`, `utils/json_utils.py`, `utils/misc.py`, `utils/text.py` | 5581–13008 |
+| `utils/http.py` | 7 | 7 | `utils/json_utils.py`, `utils/text.py` | 3462–7687 |
+| `utils/json_utils.py` | 13 | 13 | `utils/text.py` | 3827–13066 |
+| `utils/media.py` | 6 | 6 | — | 5219–7240 |
+| `utils/misc.py` | 16 | 16 | `config/constants.py` | 7241–15758 |
+| `utils/text.py` | 30 | 30 | `config/constants.py` | 3815–14842 |
+| `web/admin_assets.py` | 3 | 3 | — | 89742–90209 |
+| `web/assets.py` | 4 | 4 | — | 83861–89342 |
+| `web/skills_assets.py` | 3 | 3 | — | 89343–89741 |
 
 ## Source Mapping
 
@@ -239,20 +239,20 @@ Code_Structure/
 
 ### `admin/auth.py`
 
-- order 804: `trusted_client_ip` (function), lines 12622-12654, exports `trusted_client_ip`
-- order 812: `AdminAuthError` (class), lines 13045-13052, exports `AdminAuthError`
-- order 813: `AdminAuthStore` (class), lines 13053-13329, exports `AdminAuthStore`
+- order 804: `trusted_client_ip` (function), lines 12644-12676, exports `trusted_client_ip`
+- order 812: `AdminAuthError` (class), lines 13067-13074, exports `AdminAuthError`
+- order 813: `AdminAuthStore` (class), lines 13075-13351, exports `AdminAuthStore`
 
 ### `admin/config.py`
 
-- order 818: `_admin_config_schema` (function), lines 14075-14192, exports `_admin_config_schema`
-- order 819: `_admin_factory_config` (function), lines 14193-14196, exports `_admin_factory_config`
-- order 820: `_admin_coerce_config` (function), lines 14197-14352, exports `_admin_coerce_config`
-- order 821: `_admin_config_to_argv` (function), lines 14353-14389, exports `_admin_config_to_argv`
-- order 822: `_admin_restart_probe_url` (function), lines 14390-14405, exports `_admin_restart_probe_url`
-- order 823: `_admin_supervised_restart` (function), lines 14406-14492, exports `_admin_supervised_restart`
-- order 824: `_admin_argparse_defaults` (function), lines 14493-14514, exports `_admin_argparse_defaults`
-- order 825: `_admin_config_from_namespace` (function), lines 14515-14535, exports `_admin_config_from_namespace`
+- order 818: `_admin_config_schema` (function), lines 14097-14214, exports `_admin_config_schema`
+- order 819: `_admin_factory_config` (function), lines 14215-14218, exports `_admin_factory_config`
+- order 820: `_admin_coerce_config` (function), lines 14219-14374, exports `_admin_coerce_config`
+- order 821: `_admin_config_to_argv` (function), lines 14375-14411, exports `_admin_config_to_argv`
+- order 822: `_admin_restart_probe_url` (function), lines 14412-14427, exports `_admin_restart_probe_url`
+- order 823: `_admin_supervised_restart` (function), lines 14428-14514, exports `_admin_supervised_restart`
+- order 824: `_admin_argparse_defaults` (function), lines 14515-14536, exports `_admin_argparse_defaults`
+- order 825: `_admin_config_from_namespace` (function), lines 14537-14557, exports `_admin_config_from_namespace`
 
 ### `admin/constants.py`
 
@@ -269,79 +269,79 @@ Code_Structure/
 - order 132: `ADMIN_AUTH_SESSION_TTL_SECONDS` (constant), lines 3524-3524, exports `ADMIN_AUTH_SESSION_TTL_SECONDS`
 - order 133: `ADMIN_AUTH_PASSWORD_ITERATIONS` (constant), lines 3525-3525, exports `ADMIN_AUTH_PASSWORD_ITERATIONS`
 - order 134: `ADMIN_AUTH_MAX_ACTIVE_SESSIONS` (constant), lines 3526-3526, exports `ADMIN_AUTH_MAX_ACTIVE_SESSIONS`
-- order 1057: `ADMIN_SKILLS_REVIEW_HTML` (constant), lines 108369-108370, exports `ADMIN_SKILLS_REVIEW_HTML`
-- order 1058: `ADMIN_SKILLS_REVIEW_CSS` (constant), lines 108371-108371, exports `ADMIN_SKILLS_REVIEW_CSS`
-- order 1059: `ADMIN_SKILLS_REVIEW_JS` (constant), lines 108372-108372, exports `ADMIN_SKILLS_REVIEW_JS`
+- order 1057: `ADMIN_SKILLS_REVIEW_HTML` (constant), lines 108392-108393, exports `ADMIN_SKILLS_REVIEW_HTML`
+- order 1058: `ADMIN_SKILLS_REVIEW_CSS` (constant), lines 108394-108394, exports `ADMIN_SKILLS_REVIEW_CSS`
+- order 1059: `ADMIN_SKILLS_REVIEW_JS` (constant), lines 108395-108395, exports `ADMIN_SKILLS_REVIEW_JS`
 
 ### `agent/background.py`
 
-- order 896: `BackgroundManager` (class), lines 21821-22446, exports `BackgroundManager`
+- order 896: `BackgroundManager` (class), lines 21843-22468, exports `BackgroundManager`
 
 ### `agent/bus.py`
 
-- order 897: `MessageBus` (class), lines 22447-22512, exports `MessageBus`
+- order 897: `MessageBus` (class), lines 22469-22534, exports `MessageBus`
 
 ### `agent/errors.py`
 
-- order 753: `CircuitBreakerTriggered` (class), lines 11212-11215, exports `CircuitBreakerTriggered`
+- order 753: `CircuitBreakerTriggered` (class), lines 11234-11237, exports `CircuitBreakerTriggered`
 
 ### `agent/events.py`
 
-- order 852: `EventHub` (class), lines 15227-15273, exports `EventHub`
+- order 852: `EventHub` (class), lines 15249-15295, exports `EventHub`
 
 ### `agent/process.py`
 
-- order 671: `subprocess_text_encodings` (function), lines 7529-7550, exports `subprocess_text_encodings`
-- order 672: `decode_subprocess_bytes` (function), lines 7551-7577, exports `decode_subprocess_bytes`
-- order 673: `run_subprocess_text` (function), lines 7578-7600, exports `run_subprocess_text`
-- order 674: `windows_utf8_shell_command` (function), lines 7601-7607, exports `windows_utf8_shell_command`
-- order 675: `shell_process_invocation` (function), lines 7608-7618, exports `shell_process_invocation`
-- order 676: `join_shell_task_command` (function), lines 7619-7630, exports `join_shell_task_command`
-- order 895: `UserProcessManager` (class), lines 21461-21820, exports `UserProcessManager`
+- order 671: `subprocess_text_encodings` (function), lines 7551-7572, exports `subprocess_text_encodings`
+- order 672: `decode_subprocess_bytes` (function), lines 7573-7599, exports `decode_subprocess_bytes`
+- order 673: `run_subprocess_text` (function), lines 7600-7622, exports `run_subprocess_text`
+- order 674: `windows_utf8_shell_command` (function), lines 7623-7629, exports `windows_utf8_shell_command`
+- order 675: `shell_process_invocation` (function), lines 7630-7640, exports `shell_process_invocation`
+- order 676: `join_shell_task_command` (function), lines 7641-7652, exports `join_shell_task_command`
+- order 895: `UserProcessManager` (class), lines 21483-21842, exports `UserProcessManager`
 
 ### `agent/tasks.py`
 
-- order 893: `TaskManager` (class), lines 21320-21454, exports `TaskManager`
+- order 893: `TaskManager` (class), lines 21342-21476, exports `TaskManager`
 
 ### `agent/todo.py`
 
-- order 853: `TodoManager` (class), lines 15274-15634, exports `TodoManager`
+- order 853: `TodoManager` (class), lines 15296-15656, exports `TodoManager`
 
 ### `agent/tools.py`
 
-- order 847: `_ask_user_option_rows` (function), lines 15106-15139, exports `_ask_user_option_rows`
-- order 848: `_ask_user_option_value` (function), lines 15140-15145, exports `_ask_user_option_value`
-- order 921: `tool_def` (function), lines 26446-26459, exports `tool_def`
-- order 922: `TOOLS` (constant), lines 26460-26986, exports `TOOLS`
-- order 923: `TOOL_REQUIRED_ARGS` (constant), lines 26987-26988, exports `TOOL_REQUIRED_ARGS`
-- order 924: `TOOL_SPEC_BY_NAME` (constant), lines 26989-26989, exports `TOOL_SPEC_BY_NAME`
-- order 925: `_for_26990` (statement), lines 26990-26999, exports `_tool`, `_fn`, `_name`, `_required`
-- order 926: `TOOL_NAME_FUZZY_MAP` (constant), lines 27000-27001, exports `TOOL_NAME_FUZZY_MAP`
-- order 927: `_for_27002` (statement), lines 27002-27005, exports `_name`, `_key`
-- order 928: `_for_27007` (statement), lines 27006-27023, exports `_alias`, `_target`
-- order 929: `is_todo_resume_tool_name` (function), lines 27024-27040, exports `is_todo_resume_tool_name`
-- order 930: `canonicalize_tool_name` (function), lines 27041-27059, exports `canonicalize_tool_name`
-- order 931: `filter_tool_specs_for_runtime` (function), lines 27060-27075, exports `filter_tool_specs_for_runtime`
-- order 932: `DEVELOPER_TOOL_DROP` (constant), lines 27076-27086, exports `DEVELOPER_TOOL_DROP`
-- order 933: `AGENT_TOOL_ALLOWLIST` (constant), lines 27087-27150, exports `AGENT_TOOL_ALLOWLIST`
+- order 847: `_ask_user_option_rows` (function), lines 15128-15161, exports `_ask_user_option_rows`
+- order 848: `_ask_user_option_value` (function), lines 15162-15167, exports `_ask_user_option_value`
+- order 921: `tool_def` (function), lines 26469-26482, exports `tool_def`
+- order 922: `TOOLS` (constant), lines 26483-27009, exports `TOOLS`
+- order 923: `TOOL_REQUIRED_ARGS` (constant), lines 27010-27011, exports `TOOL_REQUIRED_ARGS`
+- order 924: `TOOL_SPEC_BY_NAME` (constant), lines 27012-27012, exports `TOOL_SPEC_BY_NAME`
+- order 925: `_for_27013` (statement), lines 27013-27022, exports `_tool`, `_fn`, `_name`, `_required`
+- order 926: `TOOL_NAME_FUZZY_MAP` (constant), lines 27023-27024, exports `TOOL_NAME_FUZZY_MAP`
+- order 927: `_for_27025` (statement), lines 27025-27028, exports `_name`, `_key`
+- order 928: `_for_27030` (statement), lines 27029-27046, exports `_alias`, `_target`
+- order 929: `is_todo_resume_tool_name` (function), lines 27047-27063, exports `is_todo_resume_tool_name`
+- order 930: `canonicalize_tool_name` (function), lines 27064-27082, exports `canonicalize_tool_name`
+- order 931: `filter_tool_specs_for_runtime` (function), lines 27083-27098, exports `filter_tool_specs_for_runtime`
+- order 932: `DEVELOPER_TOOL_DROP` (constant), lines 27099-27109, exports `DEVELOPER_TOOL_DROP`
+- order 933: `AGENT_TOOL_ALLOWLIST` (constant), lines 27110-27173, exports `AGENT_TOOL_ALLOWLIST`
 
 ### `agent/worktree.py`
 
-- order 898: `WorktreeManager` (class), lines 22513-22725, exports `WorktreeManager`
+- order 898: `WorktreeManager` (class), lines 22535-22747, exports `WorktreeManager`
 
 ### `app/context.py`
 
-- order 1060: `AppContext` (class), lines 108373-118142, exports `AppContext`
+- order 1060: `AppContext` (class), lines 108396-118165, exports `AppContext`
 
 ### `app/main.py`
 
-- order 1075: `main` (function), lines 124559-126445, exports `main`
-- order 1076: `_main_guard_126447` (main_guard), lines 126446-126448, exports —
+- order 1075: `main` (function), lines 124582-126468, exports `main`
+- order 1076: `_main_guard_126470` (main_guard), lines 126469-126471, exports —
 
 ### `app/services.py`
 
-- order 1062: `TelemetryStore` (class), lines 118183-118558, exports `TelemetryStore`
-- order 1063: `ApplicationRegistry` (class), lines 118559-119368, exports `ApplicationRegistry`
+- order 1062: `TelemetryStore` (class), lines 118206-118581, exports `TelemetryStore`
+- order 1063: `ApplicationRegistry` (class), lines 118582-119391, exports `ApplicationRegistry`
 
 ### `collaboration/core.py`
 
@@ -371,8 +371,8 @@ Code_Structure/
 
 ### `collaboration/watcher.py`
 
-- order 1073: `collaboration_file_watcher_loop` (function), lines 124468-124540, exports `collaboration_file_watcher_loop`
-- order 1074: `collaboration_watcher_health` (function), lines 124541-124558, exports `collaboration_watcher_health`
+- order 1073: `collaboration_file_watcher_loop` (function), lines 124491-124563, exports `collaboration_file_watcher_loop`
+- order 1074: `collaboration_watcher_health` (function), lines 124564-124581, exports `collaboration_watcher_health`
 
 ### `config/constants.py`
 
@@ -774,33 +774,30 @@ Code_Structure/
 - order 582: `CODE_PREVIEW_EXTS` (constant), lines 5031-5158, exports `CODE_PREVIEW_EXTS`
 - order 583: `CODE_PREVIEW_FILENAMES` (constant), lines 5159-5210, exports `CODE_PREVIEW_FILENAMES`
 - order 584: `MEDIA_CAPABILITY_KEYS` (constant), lines 5211-5218, exports `MEDIA_CAPABILITY_KEYS`
-- order 585: `SAMPLE_IMAGE_PNG_B64` (constant), lines 5219-5222, exports `SAMPLE_IMAGE_PNG_B64`
-- order 586: `SAMPLE_AUDIO_WAV_B64` (constant), lines 5223-5225, exports `SAMPLE_AUDIO_WAV_B64`
-- order 587: `SAMPLE_VIDEO_MP4_B64` (constant), lines 5226-5228, exports `SAMPLE_VIDEO_MP4_B64`
-- order 588: `OFFLINE_JS_LIB_CATALOG` (constant), lines 5229-5555, exports `OFFLINE_JS_LIB_CATALOG`
-- order 589: `OFFLINE_JS_ASSET_LOCK` (constant), lines 5556-5556, exports `OFFLINE_JS_ASSET_LOCK`
-- order 590: `OFFLINE_JS_LIB_INDEX_FILE` (constant), lines 5557-5557, exports `OFFLINE_JS_LIB_INDEX_FILE`
-- order 591: `OFFLINE_JS_LIB_README_FILE` (constant), lines 5558-5558, exports `OFFLINE_JS_LIB_README_FILE`
-- order 601: `BACKEND_I18N` (constant), lines 5752-5823, exports `BACKEND_I18N`
-- order 602: `_call_backend_i18n_en_update_5825` (expression), lines 5824-5925, exports —
-- order 603: `_call_backend_i18n_zh_cn_update_5926` (expression), lines 5926-6026, exports —
-- order 604: `_call_backend_i18n_zh_tw_update_6027` (expression), lines 6027-6127, exports —
-- order 605: `_call_backend_i18n_ja_update_6128` (expression), lines 6128-6228, exports —
-- order 836: `TABULAR_PREVIEW_EXTS` (constant), lines 14846-14848, exports `TABULAR_PREVIEW_EXTS`
-- order 837: `EXCEL_PREVIEW_EXTS` (constant), lines 14849-14849, exports `EXCEL_PREVIEW_EXTS`
-- order 838: `PRESENTATION_PREVIEW_EXTS` (constant), lines 14850-14850, exports `PRESENTATION_PREVIEW_EXTS`
-- order 839: `DOCUMENT_PREVIEW_EXTS` (constant), lines 14851-14851, exports `DOCUMENT_PREVIEW_EXTS`
-- order 1041: `STUDIO_DEVICE_COOKIE` (constant), lines 106440-106457, exports `STUDIO_DEVICE_COOKIE`
-- order 1042: `STUDIO_SESSION_COOKIE` (constant), lines 106458-106458, exports `STUDIO_SESSION_COOKIE`
-- order 1043: `STUDIO_DEVICE_TTL` (constant), lines 106459-106459, exports `STUDIO_DEVICE_TTL`
-- order 1044: `STUDIO_SESSION_TTL` (constant), lines 106460-106460, exports `STUDIO_SESSION_TTL`
-- order 1045: `STUDIO_MAX_FILE_BYTES` (constant), lines 106461-106461, exports `STUDIO_MAX_FILE_BYTES`
-- order 1046: `STUDIO_MAX_PROJECT_BYTES` (constant), lines 106462-106462, exports `STUDIO_MAX_PROJECT_BYTES`
-- order 1047: `STUDIO_MAX_FILES` (constant), lines 106463-106463, exports `STUDIO_MAX_FILES`
-- order 1048: `STUDIO_MAX_JOB_SECONDS` (constant), lines 106464-106464, exports `STUDIO_MAX_JOB_SECONDS`
-- order 1054: `STUDIO_INDEX_HTML` (constant), lines 108364-108366, exports `STUDIO_INDEX_HTML`
-- order 1055: `STUDIO_CSS` (constant), lines 108367-108367, exports `STUDIO_CSS`
-- order 1056: `STUDIO_JS` (constant), lines 108368-108368, exports `STUDIO_JS`
+- order 588: `OFFLINE_JS_LIB_CATALOG` (constant), lines 5251-5577, exports `OFFLINE_JS_LIB_CATALOG`
+- order 589: `OFFLINE_JS_ASSET_LOCK` (constant), lines 5578-5578, exports `OFFLINE_JS_ASSET_LOCK`
+- order 590: `OFFLINE_JS_LIB_INDEX_FILE` (constant), lines 5579-5579, exports `OFFLINE_JS_LIB_INDEX_FILE`
+- order 591: `OFFLINE_JS_LIB_README_FILE` (constant), lines 5580-5580, exports `OFFLINE_JS_LIB_README_FILE`
+- order 601: `BACKEND_I18N` (constant), lines 5774-5845, exports `BACKEND_I18N`
+- order 602: `_call_backend_i18n_en_update_5847` (expression), lines 5846-5947, exports —
+- order 603: `_call_backend_i18n_zh_cn_update_5948` (expression), lines 5948-6048, exports —
+- order 604: `_call_backend_i18n_zh_tw_update_6049` (expression), lines 6049-6149, exports —
+- order 605: `_call_backend_i18n_ja_update_6150` (expression), lines 6150-6250, exports —
+- order 836: `TABULAR_PREVIEW_EXTS` (constant), lines 14868-14870, exports `TABULAR_PREVIEW_EXTS`
+- order 837: `EXCEL_PREVIEW_EXTS` (constant), lines 14871-14871, exports `EXCEL_PREVIEW_EXTS`
+- order 838: `PRESENTATION_PREVIEW_EXTS` (constant), lines 14872-14872, exports `PRESENTATION_PREVIEW_EXTS`
+- order 839: `DOCUMENT_PREVIEW_EXTS` (constant), lines 14873-14873, exports `DOCUMENT_PREVIEW_EXTS`
+- order 1041: `STUDIO_DEVICE_COOKIE` (constant), lines 106463-106480, exports `STUDIO_DEVICE_COOKIE`
+- order 1042: `STUDIO_SESSION_COOKIE` (constant), lines 106481-106481, exports `STUDIO_SESSION_COOKIE`
+- order 1043: `STUDIO_DEVICE_TTL` (constant), lines 106482-106482, exports `STUDIO_DEVICE_TTL`
+- order 1044: `STUDIO_SESSION_TTL` (constant), lines 106483-106483, exports `STUDIO_SESSION_TTL`
+- order 1045: `STUDIO_MAX_FILE_BYTES` (constant), lines 106484-106484, exports `STUDIO_MAX_FILE_BYTES`
+- order 1046: `STUDIO_MAX_PROJECT_BYTES` (constant), lines 106485-106485, exports `STUDIO_MAX_PROJECT_BYTES`
+- order 1047: `STUDIO_MAX_FILES` (constant), lines 106486-106486, exports `STUDIO_MAX_FILES`
+- order 1048: `STUDIO_MAX_JOB_SECONDS` (constant), lines 106487-106487, exports `STUDIO_MAX_JOB_SECONDS`
+- order 1054: `STUDIO_INDEX_HTML` (constant), lines 108387-108389, exports `STUDIO_INDEX_HTML`
+- order 1055: `STUDIO_CSS` (constant), lines 108390-108390, exports `STUDIO_CSS`
+- order 1056: `STUDIO_JS` (constant), lines 108391-108391, exports `STUDIO_JS`
 
 ### `config/paths.py`
 
@@ -815,235 +812,235 @@ Code_Structure/
 - order 144: `WORKDIR` (constant), lines 3811-3812, exports `WORKDIR`
 - order 145: `CODES_ROOT` (constant), lines 3813-3813, exports `CODES_ROOT`
 - order 146: `LLM_CONFIG_PATH` (constant), lines 3814-3814, exports `LLM_CONFIG_PATH`
-- order 683: `detect_repo_root` (function), lines 7673-7687, exports `detect_repo_root`
-- order 684: `REPO_ROOT` (constant), lines 7688-7689, exports `REPO_ROOT`
+- order 683: `detect_repo_root` (function), lines 7695-7709, exports `detect_repo_root`
+- order 684: `REPO_ROOT` (constant), lines 7710-7711, exports `REPO_ROOT`
 
 ### `config/settings.py`
 
-- order 595: `normalize_ui_language` (function), lines 5640-5664, exports `normalize_ui_language`
-- order 596: `normalize_ui_style` (function), lines 5665-5684, exports `normalize_ui_style`
-- order 597: `supported_ui_languages_payload` (function), lines 5685-5688, exports `supported_ui_languages_payload`
-- order 598: `agent_language_preference_payload` (function), lines 5689-5698, exports `agent_language_preference_payload`
-- order 599: `normalize_execution_mode` (function), lines 5699-5720, exports `normalize_execution_mode`
-- order 600: `model_language_instruction` (function), lines 5721-5751, exports `model_language_instruction`
-- order 606: `backend_i18n_text` (function), lines 6229-6241, exports `backend_i18n_text`
-- order 607: `backend_role_label` (function), lines 6242-6248, exports `backend_role_label`
-- order 608: `_detect_os_shell_instruction` (function), lines 6249-6290, exports `_detect_os_shell_instruction`
-- order 609: `resolve_web_ui_dir_path` (function), lines 6291-6299, exports `resolve_web_ui_dir_path`
-- order 610: `resolve_optional_file_path` (function), lines 6300-6309, exports `resolve_optional_file_path`
-- order 611: `resolve_skills_root_path` (function), lines 6310-6319, exports `resolve_skills_root_path`
-- order 612: `_count_skill_markdown_files` (function), lines 6320-6333, exports `_count_skill_markdown_files`
-- order 613: `select_preferred_skills_root` (function), lines 6334-6370, exports `select_preferred_skills_root`
-- order 614: `load_web_ui_config_file` (function), lines 6371-6387, exports `load_web_ui_config_file`
-- order 615: `extract_show_upload_list_setting` (function), lines 6388-6404, exports `extract_show_upload_list_setting`
-- order 616: `extract_ui_style_setting` (function), lines 6405-6421, exports `extract_ui_style_setting`
-- order 617: `extract_js_lib_download_setting` (function), lines 6422-6443, exports `extract_js_lib_download_setting`
-- order 618: `extract_daily_session_limit_setting` (function), lines 6444-6489, exports `extract_daily_session_limit_setting`
-- order 619: `extract_shell_command_timeout_setting` (function), lines 6490-6538, exports `extract_shell_command_timeout_setting`
-- order 620: `normalize_shell_timeout_mode` (function), lines 6539-6556, exports `normalize_shell_timeout_mode`
-- order 621: `extract_shell_timeout_mode_setting` (function), lines 6557-6569, exports `extract_shell_timeout_mode_setting`
-- order 622: `extract_shell_async_handoff_setting` (function), lines 6570-6597, exports `extract_shell_async_handoff_setting`
-- order 623: `extract_context_token_limit_setting` (function), lines 6598-6632, exports `extract_context_token_limit_setting`
-- order 624: `normalize_auto_task_level_ceiling` (function), lines 6633-6654, exports `normalize_auto_task_level_ceiling`
-- order 625: `normalize_l2_todo_policy` (function), lines 6655-6690, exports `normalize_l2_todo_policy`
-- order 626: `extract_l2_todo_policy_setting` (function), lines 6691-6733, exports `extract_l2_todo_policy_setting`
-- order 627: `extract_auto_task_level_ceiling_setting` (function), lines 6734-6763, exports `extract_auto_task_level_ceiling_setting`
-- order 628: `normalize_read_context_policy` (function), lines 6764-6784, exports `normalize_read_context_policy`
-- order 629: `normalize_tool_memory_policy` (function), lines 6785-6788, exports `normalize_tool_memory_policy`
-- order 630: `extract_read_context_policy_setting` (function), lines 6789-6812, exports `extract_read_context_policy_setting`
-- order 631: `extract_tool_memory_policy_setting` (function), lines 6813-6836, exports `extract_tool_memory_policy_setting`
-- order 633: `default_multimodal_capabilities` (function), lines 6843-6853, exports `default_multimodal_capabilities`
-- order 634: `_to_bool_like` (function), lines 6854-6866, exports `_to_bool_like`
-- order 635: `extract_web_search_enabled_setting` (function), lines 6867-6879, exports `extract_web_search_enabled_setting`
-- order 636: `_single_no_plan_todo_setting_sections` (function), lines 6880-6906, exports `_single_no_plan_todo_setting_sections`
-- order 637: `_single_no_plan_todo_setting_present` (function), lines 6907-6932, exports `_single_no_plan_todo_setting_present`
-- order 638: `extract_single_no_plan_todo_settings` (function), lines 6933-6979, exports `extract_single_no_plan_todo_settings`
-- order 639: `normalize_user_memory_mode` (function), lines 6980-7010, exports `normalize_user_memory_mode`
-- order 640: `user_memory_enabled_from_mode` (function), lines 7011-7014, exports `user_memory_enabled_from_mode`
-- order 641: `extract_user_memory_mode_setting` (function), lines 7015-7054, exports `extract_user_memory_mode_setting`
-- order 642: `set_web_search_enabled_on_runtime` (function), lines 7055-7070, exports `set_web_search_enabled_on_runtime`
-- order 643: `infer_model_multimodal_capabilities` (function), lines 7071-7117, exports `infer_model_multimodal_capabilities`
-- order 644: `parse_capability_overrides` (function), lines 7118-7157, exports `parse_capability_overrides`
-- order 645: `merge_multimodal_capabilities` (function), lines 7158-7167, exports `merge_multimodal_capabilities`
-- order 646: `parse_media_endpoints` (function), lines 7168-7184, exports `parse_media_endpoints`
-- order 662: `extract_runtime_region_hint_setting` (function), lines 7362-7387, exports `extract_runtime_region_hint_setting`
-- order 663: `extract_runtime_timezone_hint_setting` (function), lines 7388-7405, exports `extract_runtime_timezone_hint_setting`
-- order 664: `runtime_environment_context_snapshot` (function), lines 7406-7455, exports `runtime_environment_context_snapshot`
-- order 665: `runtime_environment_context_block` (function), lines 7456-7485, exports `runtime_environment_context_block`
-- order 701: `load_offline_js_lib_index` (function), lines 7960-7970, exports `load_offline_js_lib_index`
-- order 755: `resolve_ollama_model` (function), lines 11255-11266, exports `resolve_ollama_model`
-- order 756: `infer_thinking_model` (function), lines 11267-11270, exports `infer_thinking_model`
-- order 767: `extract_base_url` (function), lines 11480-11489, exports `extract_base_url`
-- order 769: `infer_user_complexity_value` (function), lines 11501-11518, exports `infer_user_complexity_value`
-- order 770: `normalize_task_complexity` (function), lines 11519-11548, exports `normalize_task_complexity`
-- order 771: `task_complexity_rank` (function), lines 11549-11551, exports `task_complexity_rank`
-- order 772: `task_complexity_at_least` (function), lines 11552-11554, exports `task_complexity_at_least`
-- order 773: `max_task_complexity` (function), lines 11555-11565, exports `max_task_complexity`
-- order 774: `normalize_openai_compat_provider_name` (function), lines 11566-11582, exports `normalize_openai_compat_provider_name`
-- order 794: `resolve_reasoning_payload` (function), lines 11704-11754, exports `resolve_reasoning_payload`
-- order 797: `extract_openai_compat_model_ids` (function), lines 11802-11836, exports `extract_openai_compat_model_ids`
-- order 800: `load_llm_config_from_source` (function), lines 11869-11904, exports `load_llm_config_from_source`
-- order 801: `parse_llm_config_profiles` (function), lines 11905-12535, exports `parse_llm_config_profiles`
-- order 802: `looks_like_llm_config` (function), lines 12536-12613, exports `looks_like_llm_config`
-- order 806: `parse_front_matter` (function), lines 12774-12962, exports `parse_front_matter`
+- order 595: `normalize_ui_language` (function), lines 5662-5686, exports `normalize_ui_language`
+- order 596: `normalize_ui_style` (function), lines 5687-5706, exports `normalize_ui_style`
+- order 597: `supported_ui_languages_payload` (function), lines 5707-5710, exports `supported_ui_languages_payload`
+- order 598: `agent_language_preference_payload` (function), lines 5711-5720, exports `agent_language_preference_payload`
+- order 599: `normalize_execution_mode` (function), lines 5721-5742, exports `normalize_execution_mode`
+- order 600: `model_language_instruction` (function), lines 5743-5773, exports `model_language_instruction`
+- order 606: `backend_i18n_text` (function), lines 6251-6263, exports `backend_i18n_text`
+- order 607: `backend_role_label` (function), lines 6264-6270, exports `backend_role_label`
+- order 608: `_detect_os_shell_instruction` (function), lines 6271-6312, exports `_detect_os_shell_instruction`
+- order 609: `resolve_web_ui_dir_path` (function), lines 6313-6321, exports `resolve_web_ui_dir_path`
+- order 610: `resolve_optional_file_path` (function), lines 6322-6331, exports `resolve_optional_file_path`
+- order 611: `resolve_skills_root_path` (function), lines 6332-6341, exports `resolve_skills_root_path`
+- order 612: `_count_skill_markdown_files` (function), lines 6342-6355, exports `_count_skill_markdown_files`
+- order 613: `select_preferred_skills_root` (function), lines 6356-6392, exports `select_preferred_skills_root`
+- order 614: `load_web_ui_config_file` (function), lines 6393-6409, exports `load_web_ui_config_file`
+- order 615: `extract_show_upload_list_setting` (function), lines 6410-6426, exports `extract_show_upload_list_setting`
+- order 616: `extract_ui_style_setting` (function), lines 6427-6443, exports `extract_ui_style_setting`
+- order 617: `extract_js_lib_download_setting` (function), lines 6444-6465, exports `extract_js_lib_download_setting`
+- order 618: `extract_daily_session_limit_setting` (function), lines 6466-6511, exports `extract_daily_session_limit_setting`
+- order 619: `extract_shell_command_timeout_setting` (function), lines 6512-6560, exports `extract_shell_command_timeout_setting`
+- order 620: `normalize_shell_timeout_mode` (function), lines 6561-6578, exports `normalize_shell_timeout_mode`
+- order 621: `extract_shell_timeout_mode_setting` (function), lines 6579-6591, exports `extract_shell_timeout_mode_setting`
+- order 622: `extract_shell_async_handoff_setting` (function), lines 6592-6619, exports `extract_shell_async_handoff_setting`
+- order 623: `extract_context_token_limit_setting` (function), lines 6620-6654, exports `extract_context_token_limit_setting`
+- order 624: `normalize_auto_task_level_ceiling` (function), lines 6655-6676, exports `normalize_auto_task_level_ceiling`
+- order 625: `normalize_l2_todo_policy` (function), lines 6677-6712, exports `normalize_l2_todo_policy`
+- order 626: `extract_l2_todo_policy_setting` (function), lines 6713-6755, exports `extract_l2_todo_policy_setting`
+- order 627: `extract_auto_task_level_ceiling_setting` (function), lines 6756-6785, exports `extract_auto_task_level_ceiling_setting`
+- order 628: `normalize_read_context_policy` (function), lines 6786-6806, exports `normalize_read_context_policy`
+- order 629: `normalize_tool_memory_policy` (function), lines 6807-6810, exports `normalize_tool_memory_policy`
+- order 630: `extract_read_context_policy_setting` (function), lines 6811-6834, exports `extract_read_context_policy_setting`
+- order 631: `extract_tool_memory_policy_setting` (function), lines 6835-6858, exports `extract_tool_memory_policy_setting`
+- order 633: `default_multimodal_capabilities` (function), lines 6865-6875, exports `default_multimodal_capabilities`
+- order 634: `_to_bool_like` (function), lines 6876-6888, exports `_to_bool_like`
+- order 635: `extract_web_search_enabled_setting` (function), lines 6889-6901, exports `extract_web_search_enabled_setting`
+- order 636: `_single_no_plan_todo_setting_sections` (function), lines 6902-6928, exports `_single_no_plan_todo_setting_sections`
+- order 637: `_single_no_plan_todo_setting_present` (function), lines 6929-6954, exports `_single_no_plan_todo_setting_present`
+- order 638: `extract_single_no_plan_todo_settings` (function), lines 6955-7001, exports `extract_single_no_plan_todo_settings`
+- order 639: `normalize_user_memory_mode` (function), lines 7002-7032, exports `normalize_user_memory_mode`
+- order 640: `user_memory_enabled_from_mode` (function), lines 7033-7036, exports `user_memory_enabled_from_mode`
+- order 641: `extract_user_memory_mode_setting` (function), lines 7037-7076, exports `extract_user_memory_mode_setting`
+- order 642: `set_web_search_enabled_on_runtime` (function), lines 7077-7092, exports `set_web_search_enabled_on_runtime`
+- order 643: `infer_model_multimodal_capabilities` (function), lines 7093-7139, exports `infer_model_multimodal_capabilities`
+- order 644: `parse_capability_overrides` (function), lines 7140-7179, exports `parse_capability_overrides`
+- order 645: `merge_multimodal_capabilities` (function), lines 7180-7189, exports `merge_multimodal_capabilities`
+- order 646: `parse_media_endpoints` (function), lines 7190-7206, exports `parse_media_endpoints`
+- order 662: `extract_runtime_region_hint_setting` (function), lines 7384-7409, exports `extract_runtime_region_hint_setting`
+- order 663: `extract_runtime_timezone_hint_setting` (function), lines 7410-7427, exports `extract_runtime_timezone_hint_setting`
+- order 664: `runtime_environment_context_snapshot` (function), lines 7428-7477, exports `runtime_environment_context_snapshot`
+- order 665: `runtime_environment_context_block` (function), lines 7478-7507, exports `runtime_environment_context_block`
+- order 701: `load_offline_js_lib_index` (function), lines 7982-7992, exports `load_offline_js_lib_index`
+- order 755: `resolve_ollama_model` (function), lines 11277-11288, exports `resolve_ollama_model`
+- order 756: `infer_thinking_model` (function), lines 11289-11292, exports `infer_thinking_model`
+- order 767: `extract_base_url` (function), lines 11502-11511, exports `extract_base_url`
+- order 769: `infer_user_complexity_value` (function), lines 11523-11540, exports `infer_user_complexity_value`
+- order 770: `normalize_task_complexity` (function), lines 11541-11570, exports `normalize_task_complexity`
+- order 771: `task_complexity_rank` (function), lines 11571-11573, exports `task_complexity_rank`
+- order 772: `task_complexity_at_least` (function), lines 11574-11576, exports `task_complexity_at_least`
+- order 773: `max_task_complexity` (function), lines 11577-11587, exports `max_task_complexity`
+- order 774: `normalize_openai_compat_provider_name` (function), lines 11588-11604, exports `normalize_openai_compat_provider_name`
+- order 794: `resolve_reasoning_payload` (function), lines 11726-11776, exports `resolve_reasoning_payload`
+- order 797: `extract_openai_compat_model_ids` (function), lines 11824-11858, exports `extract_openai_compat_model_ids`
+- order 800: `load_llm_config_from_source` (function), lines 11891-11926, exports `load_llm_config_from_source`
+- order 801: `parse_llm_config_profiles` (function), lines 11927-12557, exports `parse_llm_config_profiles`
+- order 802: `looks_like_llm_config` (function), lines 12558-12635, exports `looks_like_llm_config`
+- order 806: `parse_front_matter` (function), lines 12796-12984, exports `parse_front_matter`
 
 ### `ide/assets.py`
 
-- order 1033: `IDE_INDEX_HTML` (constant), lines 105399-105554, exports `IDE_INDEX_HTML`
-- order 1034: `IDE_CSS` (constant), lines 105555-105594, exports `IDE_CSS`
-- order 1035: `IDE_JS` (constant), lines 105595-105788, exports `IDE_JS`
-- order 1036: `IDE_CSS` (constant), lines 105789-105795, exports `IDE_CSS`
-- order 1037: `IDE_JS` (constant), lines 105796-106032, exports `IDE_JS`
-- order 1038: `IDE_JS` (constant), lines 106033-106160, exports `IDE_JS`
-- order 1039: `IDE_JS` (constant), lines 106161-106342, exports `IDE_JS`
-- order 1040: `IDE_JS` (constant), lines 106343-106439, exports `IDE_JS`
+- order 1033: `IDE_INDEX_HTML` (constant), lines 105422-105577, exports `IDE_INDEX_HTML`
+- order 1034: `IDE_CSS` (constant), lines 105578-105617, exports `IDE_CSS`
+- order 1035: `IDE_JS` (constant), lines 105618-105811, exports `IDE_JS`
+- order 1036: `IDE_CSS` (constant), lines 105812-105818, exports `IDE_CSS`
+- order 1037: `IDE_JS` (constant), lines 105819-106055, exports `IDE_JS`
+- order 1038: `IDE_JS` (constant), lines 106056-106183, exports `IDE_JS`
+- order 1039: `IDE_JS` (constant), lines 106184-106365, exports `IDE_JS`
+- order 1040: `IDE_JS` (constant), lines 106366-106462, exports `IDE_JS`
 
 ### `ide/auth.py`
 
-- order 814: `IDEAuthError` (class), lines 13330-13337, exports `IDEAuthError`
-- order 815: `IDEAuthStore` (class), lines 13338-14059, exports `IDEAuthStore`
+- order 814: `IDEAuthError` (class), lines 13352-13359, exports `IDEAuthError`
+- order 815: `IDEAuthStore` (class), lines 13360-14081, exports `IDEAuthStore`
 
 ### `ide/errors.py`
 
-- order 816: `IDECapabilityError` (class), lines 14060-14066, exports `IDECapabilityError`
-- order 817: `IDEFileConflict` (class), lines 14067-14074, exports `IDEFileConflict`
+- order 816: `IDECapabilityError` (class), lines 14082-14088, exports `IDECapabilityError`
+- order 817: `IDEFileConflict` (class), lines 14089-14096, exports `IDEFileConflict`
 
 ### `ide/events.py`
 
-- order 711: `ide_public_operation_data` (function), lines 8297-8343, exports `ide_public_operation_data`
+- order 711: `ide_public_operation_data` (function), lines 8319-8365, exports `ide_public_operation_data`
 
 ### `ide/handler.py`
 
-- order 1070: `IdeHandler` (class), lines 122304-123778, exports `IdeHandler`
+- order 1070: `IdeHandler` (class), lines 122327-123801, exports `IdeHandler`
 
 ### `ide/preview.py`
 
-- order 834: `normalize_rel_preview_path` (function), lines 14821-14834, exports `normalize_rel_preview_path`
-- order 835: `is_code_preview_candidate` (function), lines 14835-14845, exports `is_code_preview_candidate`
-- order 840: `preview_kind_for_path` (function), lines 14852-14881, exports `preview_kind_for_path`
-- order 841: `normalize_markdown_preview_text` (function), lines 14882-14915, exports `normalize_markdown_preview_text`
-- order 842: `_preview_markdown_value_html` (function), lines 14916-14936, exports `_preview_markdown_value_html`
-- order 843: `_preview_markdown_frontmatter_html` (function), lines 14937-14952, exports `_preview_markdown_frontmatter_html`
-- order 844: `_preview_markdown_task_lists` (function), lines 14953-14966, exports `_preview_markdown_task_lists`
-- order 845: `_preview_markdown_fallback_inline` (function), lines 14967-15008, exports `_preview_markdown_fallback_inline`
-- order 846: `_preview_markdown_fallback_html` (function), lines 15009-15105, exports `_preview_markdown_fallback_html`
-- order 849: `workspace_file_revision_map` (function), lines 15146-15170, exports `workspace_file_revision_map`
-- order 850: `workspace_revision_delta` (function), lines 15171-15177, exports `workspace_revision_delta`
-- order 851: `build_code_preview_rows` (function), lines 15178-15226, exports `build_code_preview_rows`
+- order 834: `normalize_rel_preview_path` (function), lines 14843-14856, exports `normalize_rel_preview_path`
+- order 835: `is_code_preview_candidate` (function), lines 14857-14867, exports `is_code_preview_candidate`
+- order 840: `preview_kind_for_path` (function), lines 14874-14903, exports `preview_kind_for_path`
+- order 841: `normalize_markdown_preview_text` (function), lines 14904-14937, exports `normalize_markdown_preview_text`
+- order 842: `_preview_markdown_value_html` (function), lines 14938-14958, exports `_preview_markdown_value_html`
+- order 843: `_preview_markdown_frontmatter_html` (function), lines 14959-14974, exports `_preview_markdown_frontmatter_html`
+- order 844: `_preview_markdown_task_lists` (function), lines 14975-14988, exports `_preview_markdown_task_lists`
+- order 845: `_preview_markdown_fallback_inline` (function), lines 14989-15030, exports `_preview_markdown_fallback_inline`
+- order 846: `_preview_markdown_fallback_html` (function), lines 15031-15127, exports `_preview_markdown_fallback_html`
+- order 849: `workspace_file_revision_map` (function), lines 15168-15192, exports `workspace_file_revision_map`
+- order 850: `workspace_revision_delta` (function), lines 15193-15199, exports `workspace_revision_delta`
+- order 851: `build_code_preview_rows` (function), lines 15200-15248, exports `build_code_preview_rows`
 
 ### `ide/sandbox.py`
 
-- order 670: `_windows_subprocess_encodings` (function), lines 7511-7528, exports `_windows_subprocess_encodings`
-- order 934: `_IDE_SANDBOX_BACKEND_CACHE` (assignment), lines 27151-27159, exports `_IDE_SANDBOX_BACKEND_CACHE`
-- order 935: `_IDE_SANDBOX_BACKEND_LOCK` (assignment), lines 27160-27160, exports `_IDE_SANDBOX_BACKEND_LOCK`
-- order 936: `WINDOWS_JOB_SANDBOX_MARKER` (constant), lines 27161-27161, exports `WINDOWS_JOB_SANDBOX_MARKER`
-- order 937: `_WINDOWS_LOW_INTEGRITY_ROOTS` (assignment), lines 27162-27162, exports `_WINDOWS_LOW_INTEGRITY_ROOTS`
-- order 938: `_WINDOWS_LOW_INTEGRITY_FAILED_ROOTS` (assignment), lines 27163-27163, exports `_WINDOWS_LOW_INTEGRITY_FAILED_ROOTS`
-- order 939: `_WINDOWS_LOW_INTEGRITY_LOCK` (assignment), lines 27164-27164, exports `_WINDOWS_LOW_INTEGRITY_LOCK`
-- order 940: `_is_windows_job_sandbox_prefix` (function), lines 27165-27171, exports `_is_windows_job_sandbox_prefix`
-- order 941: `_windows_builtin_sandbox_probe` (function), lines 27172-27195, exports `_windows_builtin_sandbox_probe`
-- order 942: `_windows_last_error` (function), lines 27196-27203, exports `_windows_last_error`
-- order 943: `_windows_set_integrity_label` (function), lines 27204-27257, exports `_windows_set_integrity_label`
-- order 944: `_windows_set_low_integrity_label` (function), lines 27258-27260, exports `_windows_set_low_integrity_label`
-- order 945: `_windows_protect_application_snapshot` (function), lines 27261-27284, exports `_windows_protect_application_snapshot`
-- order 946: `_windows_prepare_low_integrity_workspace` (function), lines 27285-27322, exports `_windows_prepare_low_integrity_workspace`
-- order 947: `_windows_job_memory_limit` (function), lines 27323-27330, exports `_windows_job_memory_limit`
-- order 948: `_windows_lower_process_integrity` (function), lines 27331-27378, exports `_windows_lower_process_integrity`
-- order 949: `_windows_attach_sandbox_job` (function), lines 27379-27471, exports `_windows_attach_sandbox_job`
-- order 950: `_windows_close_sandbox_job` (function), lines 27472-27488, exports `_windows_close_sandbox_job`
-- order 951: `_popen_windows_sandboxed` (function), lines 27489-27520, exports `_popen_windows_sandboxed`
-- order 952: `_run_windows_sandboxed_command` (function), lines 27521-27574, exports `_run_windows_sandboxed_command`
-- order 953: `_detect_ide_sandbox_backend` (function), lines 27575-27679, exports `_detect_ide_sandbox_backend`
+- order 670: `_windows_subprocess_encodings` (function), lines 7533-7550, exports `_windows_subprocess_encodings`
+- order 934: `_IDE_SANDBOX_BACKEND_CACHE` (assignment), lines 27174-27182, exports `_IDE_SANDBOX_BACKEND_CACHE`
+- order 935: `_IDE_SANDBOX_BACKEND_LOCK` (assignment), lines 27183-27183, exports `_IDE_SANDBOX_BACKEND_LOCK`
+- order 936: `WINDOWS_JOB_SANDBOX_MARKER` (constant), lines 27184-27184, exports `WINDOWS_JOB_SANDBOX_MARKER`
+- order 937: `_WINDOWS_LOW_INTEGRITY_ROOTS` (assignment), lines 27185-27185, exports `_WINDOWS_LOW_INTEGRITY_ROOTS`
+- order 938: `_WINDOWS_LOW_INTEGRITY_FAILED_ROOTS` (assignment), lines 27186-27186, exports `_WINDOWS_LOW_INTEGRITY_FAILED_ROOTS`
+- order 939: `_WINDOWS_LOW_INTEGRITY_LOCK` (assignment), lines 27187-27187, exports `_WINDOWS_LOW_INTEGRITY_LOCK`
+- order 940: `_is_windows_job_sandbox_prefix` (function), lines 27188-27194, exports `_is_windows_job_sandbox_prefix`
+- order 941: `_windows_builtin_sandbox_probe` (function), lines 27195-27218, exports `_windows_builtin_sandbox_probe`
+- order 942: `_windows_last_error` (function), lines 27219-27226, exports `_windows_last_error`
+- order 943: `_windows_set_integrity_label` (function), lines 27227-27280, exports `_windows_set_integrity_label`
+- order 944: `_windows_set_low_integrity_label` (function), lines 27281-27283, exports `_windows_set_low_integrity_label`
+- order 945: `_windows_protect_application_snapshot` (function), lines 27284-27307, exports `_windows_protect_application_snapshot`
+- order 946: `_windows_prepare_low_integrity_workspace` (function), lines 27308-27345, exports `_windows_prepare_low_integrity_workspace`
+- order 947: `_windows_job_memory_limit` (function), lines 27346-27353, exports `_windows_job_memory_limit`
+- order 948: `_windows_lower_process_integrity` (function), lines 27354-27401, exports `_windows_lower_process_integrity`
+- order 949: `_windows_attach_sandbox_job` (function), lines 27402-27494, exports `_windows_attach_sandbox_job`
+- order 950: `_windows_close_sandbox_job` (function), lines 27495-27511, exports `_windows_close_sandbox_job`
+- order 951: `_popen_windows_sandboxed` (function), lines 27512-27543, exports `_popen_windows_sandboxed`
+- order 952: `_run_windows_sandboxed_command` (function), lines 27544-27597, exports `_run_windows_sandboxed_command`
+- order 953: `_detect_ide_sandbox_backend` (function), lines 27598-27702, exports `_detect_ide_sandbox_backend`
 
 ### `llm/client.py`
 
-- order 919: `OllamaError` (class), lines 24108-24130, exports `OllamaError`
-- order 920: `OllamaClient` (class), lines 24131-26445, exports `OllamaClient`
+- order 919: `OllamaError` (class), lines 24130-24152, exports `OllamaError`
+- order 920: `OllamaClient` (class), lines 24153-26468, exports `OllamaClient`
 
 ### `llm/constants.py`
 
 - order 110: `DEFAULT_OLLAMA_BASE_URL` (constant), lines 3465-3465, exports `DEFAULT_OLLAMA_BASE_URL`
 - order 111: `DEFAULT_OLLAMA_MODEL` (constant), lines 3466-3466, exports `DEFAULT_OLLAMA_MODEL`
-- order 775: `OPENAI_COMPAT_PROVIDER_NAMES` (constant), lines 11583-11592, exports `OPENAI_COMPAT_PROVIDER_NAMES`
-- order 776: `OPENAI_LIKE_PROVIDER_NAMES` (constant), lines 11593-11594, exports `OPENAI_LIKE_PROVIDER_NAMES`
-- order 779: `EFFORT_OFF` (constant), lines 11601-11612, exports `EFFORT_OFF`
-- order 780: `EFFORT_LOW` (constant), lines 11613-11613, exports `EFFORT_LOW`
-- order 781: `EFFORT_MEDIUM` (constant), lines 11614-11614, exports `EFFORT_MEDIUM`
-- order 782: `EFFORT_HIGH` (constant), lines 11615-11615, exports `EFFORT_HIGH`
-- order 783: `EFFORT_MAX` (constant), lines 11616-11616, exports `EFFORT_MAX`
-- order 784: `EFFORT_LEVELS` (constant), lines 11617-11617, exports `EFFORT_LEVELS`
-- order 785: `EFFORT_ORDER` (constant), lines 11618-11618, exports `EFFORT_ORDER`
-- order 786: `EFFORT_DEFAULT` (constant), lines 11619-11619, exports `EFFORT_DEFAULT`
-- order 787: `EFFORT_ANTHROPIC_BUDGET` (constant), lines 11620-11627, exports `EFFORT_ANTHROPIC_BUDGET`
-- order 788: `EFFORT_OPENAI_REASONING` (constant), lines 11628-11634, exports `EFFORT_OPENAI_REASONING`
-- order 789: `TASK_LEVEL_EFFORT` (constant), lines 11635-11644, exports `TASK_LEVEL_EFFORT`
-- order 790: `ROLE_EFFORT_FLOOR` (constant), lines 11645-11650, exports `ROLE_EFFORT_FLOOR`
-- order 791: `COORDINATION_EFFORT` (constant), lines 11651-11654, exports `COORDINATION_EFFORT`
+- order 775: `OPENAI_COMPAT_PROVIDER_NAMES` (constant), lines 11605-11614, exports `OPENAI_COMPAT_PROVIDER_NAMES`
+- order 776: `OPENAI_LIKE_PROVIDER_NAMES` (constant), lines 11615-11616, exports `OPENAI_LIKE_PROVIDER_NAMES`
+- order 779: `EFFORT_OFF` (constant), lines 11623-11634, exports `EFFORT_OFF`
+- order 780: `EFFORT_LOW` (constant), lines 11635-11635, exports `EFFORT_LOW`
+- order 781: `EFFORT_MEDIUM` (constant), lines 11636-11636, exports `EFFORT_MEDIUM`
+- order 782: `EFFORT_HIGH` (constant), lines 11637-11637, exports `EFFORT_HIGH`
+- order 783: `EFFORT_MAX` (constant), lines 11638-11638, exports `EFFORT_MAX`
+- order 784: `EFFORT_LEVELS` (constant), lines 11639-11639, exports `EFFORT_LEVELS`
+- order 785: `EFFORT_ORDER` (constant), lines 11640-11640, exports `EFFORT_ORDER`
+- order 786: `EFFORT_DEFAULT` (constant), lines 11641-11641, exports `EFFORT_DEFAULT`
+- order 787: `EFFORT_ANTHROPIC_BUDGET` (constant), lines 11642-11649, exports `EFFORT_ANTHROPIC_BUDGET`
+- order 788: `EFFORT_OPENAI_REASONING` (constant), lines 11650-11656, exports `EFFORT_OPENAI_REASONING`
+- order 789: `TASK_LEVEL_EFFORT` (constant), lines 11657-11666, exports `TASK_LEVEL_EFFORT`
+- order 790: `ROLE_EFFORT_FLOOR` (constant), lines 11667-11672, exports `ROLE_EFFORT_FLOOR`
+- order 791: `COORDINATION_EFFORT` (constant), lines 11673-11676, exports `COORDINATION_EFFORT`
 
 ### `llm/utils.py`
 
-- order 748: `probe_ollama_environment` (function), lines 11186-11200, exports `probe_ollama_environment`
-- order 749: `list_ollama_models` (function), lines 11201-11204, exports `list_ollama_models`
-- order 750: `_OLLAMA_TAG_CACHE_LOCK` (assignment), lines 11205-11206, exports `_OLLAMA_TAG_CACHE_LOCK`
-- order 751: `_OLLAMA_TAG_CACHE` (assignment), lines 11207-11207, exports `_OLLAMA_TAG_CACHE`
-- order 754: `list_ollama_models_cached` (function), lines 11216-11254, exports `list_ollama_models_cached`
-- order 757: `split_thinking_content` (function), lines 11271-11315, exports `split_thinking_content`
-- order 758: `strip_thinking_content` (function), lines 11316-11318, exports `strip_thinking_content`
-- order 759: `check_ollama_model_ready` (function), lines 11319-11344, exports `check_ollama_model_ready`
-- order 760: `list_loaded_ollama_models` (function), lines 11345-11359, exports `list_loaded_ollama_models`
-- order 761: `wake_ollama_model` (function), lines 11360-11391, exports `wake_ollama_model`
-- order 762: `try_pull_ollama_model` (function), lines 11392-11410, exports `try_pull_ollama_model`
-- order 763: `ordered_model_candidates` (function), lines 11411-11430, exports `ordered_model_candidates`
-- order 764: `pick_working_ollama_model` (function), lines 11431-11448, exports `pick_working_ollama_model`
-- order 768: `complete_chat_endpoint` (function), lines 11490-11500, exports `complete_chat_endpoint`
-- order 777: `is_openai_compat_provider` (function), lines 11595-11597, exports `is_openai_compat_provider`
-- order 778: `is_openai_like_provider` (function), lines 11598-11600, exports `is_openai_like_provider`
-- order 792: `clamp_effort` (function), lines 11655-11666, exports `clamp_effort`
-- order 793: `model_reasoning_style` (function), lines 11667-11703, exports `model_reasoning_style`
-- order 795: `openai_compat_probe_headers` (function), lines 11755-11767, exports `openai_compat_probe_headers`
-- order 796: `openai_compat_model_list_urls` (function), lines 11768-11801, exports `openai_compat_model_list_urls`
-- order 798: `_is_http_url` (function), lines 11837-11850, exports `_is_http_url`
-- order 799: `_resolve_local_path` (function), lines 11851-11868, exports `_resolve_local_path`
+- order 748: `probe_ollama_environment` (function), lines 11208-11222, exports `probe_ollama_environment`
+- order 749: `list_ollama_models` (function), lines 11223-11226, exports `list_ollama_models`
+- order 750: `_OLLAMA_TAG_CACHE_LOCK` (assignment), lines 11227-11228, exports `_OLLAMA_TAG_CACHE_LOCK`
+- order 751: `_OLLAMA_TAG_CACHE` (assignment), lines 11229-11229, exports `_OLLAMA_TAG_CACHE`
+- order 754: `list_ollama_models_cached` (function), lines 11238-11276, exports `list_ollama_models_cached`
+- order 757: `split_thinking_content` (function), lines 11293-11337, exports `split_thinking_content`
+- order 758: `strip_thinking_content` (function), lines 11338-11340, exports `strip_thinking_content`
+- order 759: `check_ollama_model_ready` (function), lines 11341-11366, exports `check_ollama_model_ready`
+- order 760: `list_loaded_ollama_models` (function), lines 11367-11381, exports `list_loaded_ollama_models`
+- order 761: `wake_ollama_model` (function), lines 11382-11413, exports `wake_ollama_model`
+- order 762: `try_pull_ollama_model` (function), lines 11414-11432, exports `try_pull_ollama_model`
+- order 763: `ordered_model_candidates` (function), lines 11433-11452, exports `ordered_model_candidates`
+- order 764: `pick_working_ollama_model` (function), lines 11453-11470, exports `pick_working_ollama_model`
+- order 768: `complete_chat_endpoint` (function), lines 11512-11522, exports `complete_chat_endpoint`
+- order 777: `is_openai_compat_provider` (function), lines 11617-11619, exports `is_openai_compat_provider`
+- order 778: `is_openai_like_provider` (function), lines 11620-11622, exports `is_openai_like_provider`
+- order 792: `clamp_effort` (function), lines 11677-11688, exports `clamp_effort`
+- order 793: `model_reasoning_style` (function), lines 11689-11725, exports `model_reasoning_style`
+- order 795: `openai_compat_probe_headers` (function), lines 11777-11789, exports `openai_compat_probe_headers`
+- order 796: `openai_compat_model_list_urls` (function), lines 11790-11823, exports `openai_compat_model_list_urls`
+- order 798: `_is_http_url` (function), lines 11859-11872, exports `_is_http_url`
+- order 799: `_resolve_local_path` (function), lines 11873-11890, exports `_resolve_local_path`
 
 ### `mcp/constants.py`
 
 - order 164: `MCP_SERVICE_PORT_OFFSET` (constant), lines 3832-3832, exports `MCP_SERVICE_PORT_OFFSET`
-- order 899: `MCP_PROTOCOL_VERSION` (constant), lines 22726-22755, exports `MCP_PROTOCOL_VERSION`
-- order 900: `MCP_NAME_RE` (constant), lines 22756-22756, exports `MCP_NAME_RE`
-- order 901: `MCP_TOOL_PREFIX` (constant), lines 22757-22757, exports `MCP_TOOL_PREFIX`
-- order 902: `_MCP_DEFAULT_HANDSHAKE_TIMEOUT` (assignment), lines 22758-22758, exports `_MCP_DEFAULT_HANDSHAKE_TIMEOUT`
-- order 903: `_MCP_DEFAULT_CALL_TIMEOUT` (assignment), lines 22759-22759, exports `_MCP_DEFAULT_CALL_TIMEOUT`
-- order 904: `_MCP_MAX_RESULT_CHARS` (assignment), lines 22760-22760, exports `_MCP_MAX_RESULT_CHARS`
-- order 905: `_MCP_TRUST_STORE_VERSION` (assignment), lines 22761-22761, exports `_MCP_TRUST_STORE_VERSION`
+- order 899: `MCP_PROTOCOL_VERSION` (constant), lines 22748-22777, exports `MCP_PROTOCOL_VERSION`
+- order 900: `MCP_NAME_RE` (constant), lines 22778-22778, exports `MCP_NAME_RE`
+- order 901: `MCP_TOOL_PREFIX` (constant), lines 22779-22779, exports `MCP_TOOL_PREFIX`
+- order 902: `_MCP_DEFAULT_HANDSHAKE_TIMEOUT` (assignment), lines 22780-22780, exports `_MCP_DEFAULT_HANDSHAKE_TIMEOUT`
+- order 903: `_MCP_DEFAULT_CALL_TIMEOUT` (assignment), lines 22781-22781, exports `_MCP_DEFAULT_CALL_TIMEOUT`
+- order 904: `_MCP_MAX_RESULT_CHARS` (assignment), lines 22782-22782, exports `_MCP_MAX_RESULT_CHARS`
+- order 905: `_MCP_TRUST_STORE_VERSION` (assignment), lines 22783-22783, exports `_MCP_TRUST_STORE_VERSION`
 
 ### `mcp/driver.py`
 
-- order 906: `mcp_normalize_name` (function), lines 22762-22771, exports `mcp_normalize_name`
-- order 907: `mcp_normalize_server_configs` (function), lines 22772-22856, exports `mcp_normalize_server_configs`
-- order 908: `mcp_extract_server_configs` (function), lines 22857-22876, exports `mcp_extract_server_configs`
-- order 909: `_mcp_sha256_file` (function), lines 22877-22887, exports `_mcp_sha256_file`
-- order 910: `_mcp_file_identity` (function), lines 22888-22905, exports `_mcp_file_identity`
-- order 911: `mcp_workspace_identity` (function), lines 22906-22924, exports `mcp_workspace_identity`
-- order 912: `mcp_config_file_digest` (function), lines 22925-22932, exports `mcp_config_file_digest`
-- order 913: `mcp_default_trust_store_path` (function), lines 22933-22967, exports `mcp_default_trust_store_path`
-- order 914: `mcp_record_definition_fingerprint` (function), lines 22968-22982, exports `mcp_record_definition_fingerprint`
-- order 915: `_mcp_effective_spawn` (function), lines 22983-23070, exports `_mcp_effective_spawn`
-- order 916: `MCPWorkspaceTrustStore` (class), lines 23071-23132, exports `MCPWorkspaceTrustStore`
-- order 917: `MCPServerProcess` (class), lines 23133-23488, exports `MCPServerProcess`
-- order 918: `MCPManager` (class), lines 23489-24107, exports `MCPManager`
+- order 906: `mcp_normalize_name` (function), lines 22784-22793, exports `mcp_normalize_name`
+- order 907: `mcp_normalize_server_configs` (function), lines 22794-22878, exports `mcp_normalize_server_configs`
+- order 908: `mcp_extract_server_configs` (function), lines 22879-22898, exports `mcp_extract_server_configs`
+- order 909: `_mcp_sha256_file` (function), lines 22899-22909, exports `_mcp_sha256_file`
+- order 910: `_mcp_file_identity` (function), lines 22910-22927, exports `_mcp_file_identity`
+- order 911: `mcp_workspace_identity` (function), lines 22928-22946, exports `mcp_workspace_identity`
+- order 912: `mcp_config_file_digest` (function), lines 22947-22954, exports `mcp_config_file_digest`
+- order 913: `mcp_default_trust_store_path` (function), lines 22955-22989, exports `mcp_default_trust_store_path`
+- order 914: `mcp_record_definition_fingerprint` (function), lines 22990-23004, exports `mcp_record_definition_fingerprint`
+- order 915: `_mcp_effective_spawn` (function), lines 23005-23092, exports `_mcp_effective_spawn`
+- order 916: `MCPWorkspaceTrustStore` (class), lines 23093-23154, exports `MCPWorkspaceTrustStore`
+- order 917: `MCPServerProcess` (class), lines 23155-23510, exports `MCPServerProcess`
+- order 918: `MCPManager` (class), lines 23511-24129, exports `MCPManager`
 
 ### `mcp/service.py`
 
-- order 1072: `McpServiceHandler` (class), lines 124250-124467, exports `McpServiceHandler`
+- order 1072: `McpServiceHandler` (class), lines 124273-124490, exports `McpServiceHandler`
 
 ### `rag/assets.py`
 
-- order 1027: `RAG_ADMIN_INDEX_HTML` (constant), lines 102792-103024, exports `RAG_ADMIN_INDEX_HTML`
-- order 1028: `RAG_ADMIN_CSS` (constant), lines 103025-103128, exports `RAG_ADMIN_CSS`
-- order 1029: `RAG_ADMIN_JS` (constant), lines 103129-105349, exports `RAG_ADMIN_JS`
-- order 1030: `CODE_ADMIN_INDEX_HTML` (constant), lines 105350-105362, exports `CODE_ADMIN_INDEX_HTML`
-- order 1031: `CODE_ADMIN_CSS` (constant), lines 105363-105393, exports `CODE_ADMIN_CSS`
-- order 1032: `CODE_ADMIN_JS` (constant), lines 105394-105398, exports `CODE_ADMIN_JS`
+- order 1027: `RAG_ADMIN_INDEX_HTML` (constant), lines 102815-103047, exports `RAG_ADMIN_INDEX_HTML`
+- order 1028: `RAG_ADMIN_CSS` (constant), lines 103048-103151, exports `RAG_ADMIN_CSS`
+- order 1029: `RAG_ADMIN_JS` (constant), lines 103152-105372, exports `RAG_ADMIN_JS`
+- order 1030: `CODE_ADMIN_INDEX_HTML` (constant), lines 105373-105385, exports `CODE_ADMIN_INDEX_HTML`
+- order 1031: `CODE_ADMIN_CSS` (constant), lines 105386-105416, exports `CODE_ADMIN_CSS`
+- order 1032: `CODE_ADMIN_JS` (constant), lines 105417-105421, exports `CODE_ADMIN_JS`
 
 ### `rag/constants.py`
 
@@ -1109,222 +1106,222 @@ Code_Structure/
 - order 248: `RAG_EMBEDDING_MODE_VALUES` (constant), lines 3955-3955, exports `RAG_EMBEDDING_MODE_VALUES`
 - order 249: `RAG_IMPORT_WORKER_COUNT` (constant), lines 3956-3959, exports `RAG_IMPORT_WORKER_COUNT`
 - order 251: `RAG_PARSE_TIMEOUT_SECONDS` (constant), lines 3964-3967, exports `RAG_PARSE_TIMEOUT_SECONDS`
-- order 966: `RAG_TERM_GROUPS` (constant), lines 90187-94820, exports `RAG_TERM_GROUPS`
-- order 967: `RAG_RESEARCH_HINTS` (constant), lines 94821-94842, exports `RAG_RESEARCH_HINTS`
-- order 968: `RAG_CODE_HINTS` (constant), lines 94843-94853, exports `RAG_CODE_HINTS`
-- order 969: `RAG_SHORT_TOKEN_ALLOWLIST` (constant), lines 94854-94869, exports `RAG_SHORT_TOKEN_ALLOWLIST`
-- order 970: `RAG_EN_STOPWORDS` (constant), lines 94870-94942, exports `RAG_EN_STOPWORDS`
-- order 971: `RAG_ZH_STOPWORDS` (constant), lines 94943-94979, exports `RAG_ZH_STOPWORDS`
-- order 972: `RAG_GENERIC_ENTITY_TERMS_EN` (constant), lines 94980-95058, exports `RAG_GENERIC_ENTITY_TERMS_EN`
-- order 973: `RAG_GENERIC_ENTITY_TERMS_ZH` (constant), lines 95059-95101, exports `RAG_GENERIC_ENTITY_TERMS_ZH`
-- order 974: `RAG_STRUCTURAL_ENTITY_PATTERNS` (constant), lines 95102-95120, exports `RAG_STRUCTURAL_ENTITY_PATTERNS`
-- order 999: `CODE_LIBRARY_IGNORED_DIRS` (constant), lines 95865-95874, exports `CODE_LIBRARY_IGNORED_DIRS`
-- order 1000: `CODE_LIBRARY_LANGUAGE_BY_EXT` (constant), lines 95875-95931, exports `CODE_LIBRARY_LANGUAGE_BY_EXT`
-- order 1001: `CODE_LIBRARY_SPECIAL_FILENAMES` (constant), lines 95932-95938, exports `CODE_LIBRARY_SPECIAL_FILENAMES`
+- order 966: `RAG_TERM_GROUPS` (constant), lines 90210-94843, exports `RAG_TERM_GROUPS`
+- order 967: `RAG_RESEARCH_HINTS` (constant), lines 94844-94865, exports `RAG_RESEARCH_HINTS`
+- order 968: `RAG_CODE_HINTS` (constant), lines 94866-94876, exports `RAG_CODE_HINTS`
+- order 969: `RAG_SHORT_TOKEN_ALLOWLIST` (constant), lines 94877-94892, exports `RAG_SHORT_TOKEN_ALLOWLIST`
+- order 970: `RAG_EN_STOPWORDS` (constant), lines 94893-94965, exports `RAG_EN_STOPWORDS`
+- order 971: `RAG_ZH_STOPWORDS` (constant), lines 94966-95002, exports `RAG_ZH_STOPWORDS`
+- order 972: `RAG_GENERIC_ENTITY_TERMS_EN` (constant), lines 95003-95081, exports `RAG_GENERIC_ENTITY_TERMS_EN`
+- order 973: `RAG_GENERIC_ENTITY_TERMS_ZH` (constant), lines 95082-95124, exports `RAG_GENERIC_ENTITY_TERMS_ZH`
+- order 974: `RAG_STRUCTURAL_ENTITY_PATTERNS` (constant), lines 95125-95143, exports `RAG_STRUCTURAL_ENTITY_PATTERNS`
+- order 999: `CODE_LIBRARY_IGNORED_DIRS` (constant), lines 95888-95897, exports `CODE_LIBRARY_IGNORED_DIRS`
+- order 1000: `CODE_LIBRARY_LANGUAGE_BY_EXT` (constant), lines 95898-95954, exports `CODE_LIBRARY_LANGUAGE_BY_EXT`
+- order 1001: `CODE_LIBRARY_SPECIAL_FILENAMES` (constant), lines 95955-95961, exports `CODE_LIBRARY_SPECIAL_FILENAMES`
 
 ### `rag/index.py`
 
-- order 1004: `_code_module_name` (function), lines 95963-95979, exports `_code_module_name`
-- order 1005: `_code_choose_community` (function), lines 95980-95989, exports `_code_choose_community`
-- order 1006: `_code_query_terms` (function), lines 95990-96004, exports `_code_query_terms`
-- order 1015: `TFGraphIDFIndex` (class), lines 97068-98744, exports `TFGraphIDFIndex`
-- order 1024: `CodeGraphIndex` (class), lines 101952-102437, exports `CodeGraphIndex`
+- order 1004: `_code_module_name` (function), lines 95986-96002, exports `_code_module_name`
+- order 1005: `_code_choose_community` (function), lines 96003-96012, exports `_code_choose_community`
+- order 1006: `_code_query_terms` (function), lines 96013-96027, exports `_code_query_terms`
+- order 1015: `TFGraphIDFIndex` (class), lines 97091-98767, exports `TFGraphIDFIndex`
+- order 1024: `CodeGraphIndex` (class), lines 101975-102460, exports `CodeGraphIndex`
 
 ### `rag/ingestion.py`
 
-- order 984: `_rag_trigram_set` (function), lines 95331-95338, exports `_rag_trigram_set`
-- order 985: `_rag_jaccard_sim` (function), lines 95339-95348, exports `_rag_jaccard_sim`
-- order 986: `_rag_mmr_select` (function), lines 95349-95398, exports `_rag_mmr_select`
-- order 991: `_rag_embed_text` (function), lines 95533-95556, exports `_rag_embed_text`
-- order 992: `_rag_embed_batch` (function), lines 95557-95565, exports `_rag_embed_batch`
-- order 993: `_rag_window_for_query` (function), lines 95566-95580, exports `_rag_window_for_query`
-- order 994: `_rag_focused_excerpt` (function), lines 95581-95623, exports `_rag_focused_excerpt`
-- order 995: `_rag_query_variants` (function), lines 95624-95663, exports `_rag_query_variants`
-- order 996: `_rag_parse_segments` (function), lines 95664-95726, exports `_rag_parse_segments`
-- order 997: `_rag_boundary_split` (function), lines 95727-95784, exports `_rag_boundary_split`
-- order 1022: `_rag_parse_file_worker` (function), lines 101053-101069, exports `_rag_parse_file_worker`
-- order 1023: `RAGIngestionService` (class), lines 101070-101951, exports `RAGIngestionService`
-- order 1026: `CodeIngestionService` (class), lines 102704-102791, exports `CodeIngestionService`
+- order 984: `_rag_trigram_set` (function), lines 95354-95361, exports `_rag_trigram_set`
+- order 985: `_rag_jaccard_sim` (function), lines 95362-95371, exports `_rag_jaccard_sim`
+- order 986: `_rag_mmr_select` (function), lines 95372-95421, exports `_rag_mmr_select`
+- order 991: `_rag_embed_text` (function), lines 95556-95579, exports `_rag_embed_text`
+- order 992: `_rag_embed_batch` (function), lines 95580-95588, exports `_rag_embed_batch`
+- order 993: `_rag_window_for_query` (function), lines 95589-95603, exports `_rag_window_for_query`
+- order 994: `_rag_focused_excerpt` (function), lines 95604-95646, exports `_rag_focused_excerpt`
+- order 995: `_rag_query_variants` (function), lines 95647-95686, exports `_rag_query_variants`
+- order 996: `_rag_parse_segments` (function), lines 95687-95749, exports `_rag_parse_segments`
+- order 997: `_rag_boundary_split` (function), lines 95750-95807, exports `_rag_boundary_split`
+- order 1022: `_rag_parse_file_worker` (function), lines 101076-101092, exports `_rag_parse_file_worker`
+- order 1023: `RAGIngestionService` (class), lines 101093-101974, exports `RAGIngestionService`
+- order 1026: `CodeIngestionService` (class), lines 102727-102814, exports `CodeIngestionService`
 
 ### `rag/parsers.py`
 
-- order 975: `_rag_safe_name` (function), lines 95121-95135, exports `_rag_safe_name`
-- order 976: `_rag_detect_language` (function), lines 95136-95152, exports `_rag_detect_language`
-- order 977: `_rag_cjk_ngrams` (function), lines 95153-95167, exports `_rag_cjk_ngrams`
-- order 978: `_rag_is_noise_token` (function), lines 95168-95189, exports `_rag_is_noise_token`
-- order 979: `_rag_entity_allowed` (function), lines 95190-95204, exports `_rag_entity_allowed`
-- order 980: `_rag_filter_entities` (function), lines 95205-95221, exports `_rag_filter_entities`
-- order 981: `_rag_filename_entity_aliases` (function), lines 95222-95257, exports `_rag_filename_entity_aliases`
-- order 982: `_rag_apply_filename_entity_policy` (function), lines 95258-95290, exports `_rag_apply_filename_entity_policy`
-- order 983: `_rag_choose_community` (function), lines 95291-95330, exports `_rag_choose_community`
-- order 987: `_rag_tokenize` (function), lines 95399-95452, exports `_rag_tokenize`
-- order 988: `_rag_expand_tokens` (function), lines 95453-95476, exports `_rag_expand_tokens`
-- order 989: `_rag_extract_entities` (function), lines 95477-95495, exports `_rag_extract_entities`
-- order 990: `_rag_classify_document` (function), lines 95496-95532, exports `_rag_classify_document`
-- order 998: `_rag_chunk_text` (function), lines 95785-95864, exports `_rag_chunk_text`
-- order 1002: `_code_language_from_name` (function), lines 95939-95957, exports `_code_language_from_name`
-- order 1003: `_code_is_test_path` (function), lines 95958-95962, exports `_code_is_test_path`
-- order 1007: `_CallCollector` (class), lines 96005-96019, exports `_CallCollector`
-- order 1008: `_ALGO_COMPLEXITY_RE` (assignment), lines 96020-96022, exports `_ALGO_COMPLEXITY_RE`
-- order 1009: `_ALGO_STEP_RE` (assignment), lines 96023-96023, exports `_ALGO_STEP_RE`
-- order 1010: `_ALGO_MATH_VARS` (assignment), lines 96024-96024, exports `_ALGO_MATH_VARS`
-- order 1011: `_ALGO_DOC_KEYWORDS` (assignment), lines 96025-96025, exports `_ALGO_DOC_KEYWORDS`
-- order 1012: `_detect_algo_chunk` (function), lines 96026-96051, exports `_detect_algo_chunk`
-- order 1013: `CodeContentParser` (class), lines 96052-96561, exports `CodeContentParser`
-- order 1014: `RAGContentParser` (class), lines 96562-97067, exports `RAGContentParser`
+- order 975: `_rag_safe_name` (function), lines 95144-95158, exports `_rag_safe_name`
+- order 976: `_rag_detect_language` (function), lines 95159-95175, exports `_rag_detect_language`
+- order 977: `_rag_cjk_ngrams` (function), lines 95176-95190, exports `_rag_cjk_ngrams`
+- order 978: `_rag_is_noise_token` (function), lines 95191-95212, exports `_rag_is_noise_token`
+- order 979: `_rag_entity_allowed` (function), lines 95213-95227, exports `_rag_entity_allowed`
+- order 980: `_rag_filter_entities` (function), lines 95228-95244, exports `_rag_filter_entities`
+- order 981: `_rag_filename_entity_aliases` (function), lines 95245-95280, exports `_rag_filename_entity_aliases`
+- order 982: `_rag_apply_filename_entity_policy` (function), lines 95281-95313, exports `_rag_apply_filename_entity_policy`
+- order 983: `_rag_choose_community` (function), lines 95314-95353, exports `_rag_choose_community`
+- order 987: `_rag_tokenize` (function), lines 95422-95475, exports `_rag_tokenize`
+- order 988: `_rag_expand_tokens` (function), lines 95476-95499, exports `_rag_expand_tokens`
+- order 989: `_rag_extract_entities` (function), lines 95500-95518, exports `_rag_extract_entities`
+- order 990: `_rag_classify_document` (function), lines 95519-95555, exports `_rag_classify_document`
+- order 998: `_rag_chunk_text` (function), lines 95808-95887, exports `_rag_chunk_text`
+- order 1002: `_code_language_from_name` (function), lines 95962-95980, exports `_code_language_from_name`
+- order 1003: `_code_is_test_path` (function), lines 95981-95985, exports `_code_is_test_path`
+- order 1007: `_CallCollector` (class), lines 96028-96042, exports `_CallCollector`
+- order 1008: `_ALGO_COMPLEXITY_RE` (assignment), lines 96043-96045, exports `_ALGO_COMPLEXITY_RE`
+- order 1009: `_ALGO_STEP_RE` (assignment), lines 96046-96046, exports `_ALGO_STEP_RE`
+- order 1010: `_ALGO_MATH_VARS` (assignment), lines 96047-96047, exports `_ALGO_MATH_VARS`
+- order 1011: `_ALGO_DOC_KEYWORDS` (assignment), lines 96048-96048, exports `_ALGO_DOC_KEYWORDS`
+- order 1012: `_detect_algo_chunk` (function), lines 96049-96074, exports `_detect_algo_chunk`
+- order 1013: `CodeContentParser` (class), lines 96075-96584, exports `CodeContentParser`
+- order 1014: `RAGContentParser` (class), lines 96585-97090, exports `RAGContentParser`
 
 ### `rag/store.py`
 
-- order 1016: `RAGLibraryStore` (class), lines 98745-99330, exports `RAGLibraryStore`
-- order 1017: `WikiStore` (class), lines 99331-99862, exports `WikiStore`
-- order 1018: `UserMemoryStore` (class), lines 99863-100540, exports `UserMemoryStore`
-- order 1019: `UserInteractionOptimizer` (class), lines 100541-100609, exports `UserInteractionOptimizer`
-- order 1020: `UserIntentProfiler` (class), lines 100610-100651, exports `UserIntentProfiler`
-- order 1021: `WorkflowMemoryStore` (class), lines 100652-101052, exports `WorkflowMemoryStore`
-- order 1025: `CodeLibraryStore` (class), lines 102438-102703, exports `CodeLibraryStore`
+- order 1016: `RAGLibraryStore` (class), lines 98768-99353, exports `RAGLibraryStore`
+- order 1017: `WikiStore` (class), lines 99354-99885, exports `WikiStore`
+- order 1018: `UserMemoryStore` (class), lines 99886-100563, exports `UserMemoryStore`
+- order 1019: `UserInteractionOptimizer` (class), lines 100564-100632, exports `UserInteractionOptimizer`
+- order 1020: `UserIntentProfiler` (class), lines 100633-100674, exports `UserIntentProfiler`
+- order 1021: `WorkflowMemoryStore` (class), lines 100675-101075, exports `WorkflowMemoryStore`
+- order 1025: `CodeLibraryStore` (class), lines 102461-102726, exports `CodeLibraryStore`
 
 ### `rag/web_search.py`
 
-- order 714: `_agent_web_bool` (function), lines 8378-8385, exports `_agent_web_bool`
-- order 715: `_agent_web_int` (function), lines 8386-8393, exports `_agent_web_int`
-- order 716: `_agent_web_host_is_local_name` (function), lines 8394-8400, exports `_agent_web_host_is_local_name`
-- order 717: `_agent_web_ip_is_blocked` (function), lines 8401-8415, exports `_agent_web_ip_is_blocked`
-- order 718: `_agent_web_canonical_url` (function), lines 8416-8445, exports `_agent_web_canonical_url`
-- order 719: `_agent_web_domain_to_seed` (function), lines 8446-8457, exports `_agent_web_domain_to_seed`
-- order 720: `_agent_web_query_terms` (function), lines 8458-8475, exports `_agent_web_query_terms`
-- order 721: `_agent_web_query_domain_hints` (function), lines 8476-8516, exports `_agent_web_query_domain_hints`
-- order 722: `_agent_web_query_needs_fresh_network` (function), lines 8517-8539, exports `_agent_web_query_needs_fresh_network`
-- order 723: `_agent_web_extract_text_snippet` (function), lines 8540-8557, exports `_agent_web_extract_text_snippet`
-- order 724: `AgentWebHTMLParser` (class), lines 8558-8637, exports `AgentWebHTMLParser`
-- order 725: `_agent_web_decompress_bytes` (function), lines 8638-8661, exports `_agent_web_decompress_bytes`
-- order 726: `_agent_web_charset_candidates` (function), lines 8662-8720, exports `_agent_web_charset_candidates`
-- order 727: `_agent_web_decode_text_bytes` (function), lines 8721-8755, exports `_agent_web_decode_text_bytes`
-- order 728: `AgentWebSearchEngine` (class), lines 8756-10538, exports `AgentWebSearchEngine`
+- order 714: `_agent_web_bool` (function), lines 8400-8407, exports `_agent_web_bool`
+- order 715: `_agent_web_int` (function), lines 8408-8415, exports `_agent_web_int`
+- order 716: `_agent_web_host_is_local_name` (function), lines 8416-8422, exports `_agent_web_host_is_local_name`
+- order 717: `_agent_web_ip_is_blocked` (function), lines 8423-8437, exports `_agent_web_ip_is_blocked`
+- order 718: `_agent_web_canonical_url` (function), lines 8438-8467, exports `_agent_web_canonical_url`
+- order 719: `_agent_web_domain_to_seed` (function), lines 8468-8479, exports `_agent_web_domain_to_seed`
+- order 720: `_agent_web_query_terms` (function), lines 8480-8497, exports `_agent_web_query_terms`
+- order 721: `_agent_web_query_domain_hints` (function), lines 8498-8538, exports `_agent_web_query_domain_hints`
+- order 722: `_agent_web_query_needs_fresh_network` (function), lines 8539-8561, exports `_agent_web_query_needs_fresh_network`
+- order 723: `_agent_web_extract_text_snippet` (function), lines 8562-8579, exports `_agent_web_extract_text_snippet`
+- order 724: `AgentWebHTMLParser` (class), lines 8580-8659, exports `AgentWebHTMLParser`
+- order 725: `_agent_web_decompress_bytes` (function), lines 8660-8683, exports `_agent_web_decompress_bytes`
+- order 726: `_agent_web_charset_candidates` (function), lines 8684-8742, exports `_agent_web_charset_candidates`
+- order 727: `_agent_web_decode_text_bytes` (function), lines 8743-8777, exports `_agent_web_decode_text_bytes`
+- order 728: `AgentWebSearchEngine` (class), lines 8778-10560, exports `AgentWebSearchEngine`
 
 ### `server/http.py`
 
-- order 1061: `AgentHTTPServer` (class), lines 118143-118182, exports `AgentHTTPServer`
-- order 1064: `Handler` (class), lines 119369-121000, exports `Handler`
-- order 1067: `SkillsReviewHandler` (class), lines 121802-121915, exports `SkillsReviewHandler`
-- order 1071: `CollaborationHandler` (class), lines 123779-124249, exports `CollaborationHandler`
+- order 1061: `AgentHTTPServer` (class), lines 118166-118205, exports `AgentHTTPServer`
+- order 1064: `Handler` (class), lines 119392-121023, exports `Handler`
+- order 1067: `SkillsReviewHandler` (class), lines 121825-121938, exports `SkillsReviewHandler`
+- order 1071: `CollaborationHandler` (class), lines 123802-124272, exports `CollaborationHandler`
 
 ### `server/rag_admin.py`
 
-- order 1066: `_RagAdminAuthMixin` (class), lines 121644-121801, exports `_RagAdminAuthMixin`
-- order 1068: `RagAdminHandler` (class), lines 121916-122104, exports `RagAdminHandler`
-- order 1069: `CodeAdminHandler` (class), lines 122105-122303, exports `CodeAdminHandler`
+- order 1066: `_RagAdminAuthMixin` (class), lines 121667-121824, exports `_RagAdminAuthMixin`
+- order 1068: `RagAdminHandler` (class), lines 121939-122127, exports `RagAdminHandler`
+- order 1069: `CodeAdminHandler` (class), lines 122128-122326, exports `CodeAdminHandler`
 
 ### `server/skills.py`
 
-- order 1065: `SkillsHandler` (class), lines 121001-121643, exports `SkillsHandler`
+- order 1065: `SkillsHandler` (class), lines 121024-121666, exports `SkillsHandler`
 
 ### `session/manager.py`
 
-- order 632: `SessionCreationLimitExceeded` (class), lines 6837-6842, exports `SessionCreationLimitExceeded`
-- order 955: `SessionManager` (class), lines 82458-83837, exports `SessionManager`
+- order 632: `SessionCreationLimitExceeded` (class), lines 6859-6864, exports `SessionCreationLimitExceeded`
+- order 955: `SessionManager` (class), lines 82481-83860, exports `SessionManager`
 
 ### `session/state.py`
 
-- order 954: `SessionState` (class), lines 27680-82457, exports `SessionState`
+- order 954: `SessionState` (class), lines 27703-82480, exports `SessionState`
 
 ### `skills/embedded.py`
 
-- order 854: `EMBEDDED_SKILLS_ARCHIVE_B64` (constant), lines 15635-15636, exports `EMBEDDED_SKILLS_ARCHIVE_B64`
-- order 855: `EMBEDDED_SKILLS_ARCHIVE_SHA256` (constant), lines 15637-15637, exports `EMBEDDED_SKILLS_ARCHIVE_SHA256`
-- order 856: `EMBEDDED_SKILLS_ARCHIVE_FILES` (constant), lines 15638-15660, exports `EMBEDDED_SKILLS_ARCHIVE_FILES`
-- order 881: `BUILTIN_CLAWHUB_SKILLS_VERSION` (constant), lines 18896-18898, exports `BUILTIN_CLAWHUB_SKILLS_VERSION`
-- order 882: `EMBEDDED_CLAWHUB_SKILLS_ARCHIVE_B64` (constant), lines 18899-19144, exports `EMBEDDED_CLAWHUB_SKILLS_ARCHIVE_B64`
-- order 884: `MCP_BUILDER_SKILL_MD` (constant), lines 19192-19366, exports `MCP_BUILDER_SKILL_MD`
-- order 887: `SKILL_PROTOCOL_LOCAL` (constant), lines 19398-19399, exports `SKILL_PROTOCOL_LOCAL`
-- order 888: `SKILL_PROTOCOL_CLAWHUB` (constant), lines 19400-19400, exports `SKILL_PROTOCOL_CLAWHUB`
-- order 889: `SKILL_PROTOCOL_HTTP_JSON` (constant), lines 19401-19401, exports `SKILL_PROTOCOL_HTTP_JSON`
-- order 890: `SKILL_PROTOCOL_SPECS` (constant), lines 19402-19434, exports `SKILL_PROTOCOL_SPECS`
+- order 854: `EMBEDDED_SKILLS_ARCHIVE_B64` (constant), lines 15657-15658, exports `EMBEDDED_SKILLS_ARCHIVE_B64`
+- order 855: `EMBEDDED_SKILLS_ARCHIVE_SHA256` (constant), lines 15659-15659, exports `EMBEDDED_SKILLS_ARCHIVE_SHA256`
+- order 856: `EMBEDDED_SKILLS_ARCHIVE_FILES` (constant), lines 15660-15682, exports `EMBEDDED_SKILLS_ARCHIVE_FILES`
+- order 881: `BUILTIN_CLAWHUB_SKILLS_VERSION` (constant), lines 18918-18920, exports `BUILTIN_CLAWHUB_SKILLS_VERSION`
+- order 882: `EMBEDDED_CLAWHUB_SKILLS_ARCHIVE_B64` (constant), lines 18921-19166, exports `EMBEDDED_CLAWHUB_SKILLS_ARCHIVE_B64`
+- order 884: `MCP_BUILDER_SKILL_MD` (constant), lines 19214-19388, exports `MCP_BUILDER_SKILL_MD`
+- order 887: `SKILL_PROTOCOL_LOCAL` (constant), lines 19420-19421, exports `SKILL_PROTOCOL_LOCAL`
+- order 888: `SKILL_PROTOCOL_CLAWHUB` (constant), lines 19422-19422, exports `SKILL_PROTOCOL_CLAWHUB`
+- order 889: `SKILL_PROTOCOL_HTTP_JSON` (constant), lines 19423-19423, exports `SKILL_PROTOCOL_HTTP_JSON`
+- order 890: `SKILL_PROTOCOL_SPECS` (constant), lines 19424-19456, exports `SKILL_PROTOCOL_SPECS`
 
 ### `skills/provisioning.py`
 
-- order 857: `ensure_embedded_skills_at_root` (function), lines 15661-15726, exports `ensure_embedded_skills_at_root`
-- order 858: `ensure_embedded_skills` (function), lines 15727-15730, exports `ensure_embedded_skills`
-- order 860: `detect_upload_parser_capabilities` (function), lines 15737-15753, exports `detect_upload_parser_capabilities`
-- order 861: `_render_cap_markdown` (function), lines 15754-15769, exports `_render_cap_markdown`
-- order 862: `_write_text_if_changed` (function), lines 15770-15776, exports `_write_text_if_changed`
-- order 863: `ensure_generated_document_skills` (function), lines 15777-15866, exports `ensure_generated_document_skills`
-- order 864: `ensure_generated_image_coding_feedback_skill` (function), lines 15867-15967, exports `ensure_generated_image_coding_feedback_skill`
-- order 865: `_skill_knowledge_files` (function), lines 15968-15988, exports `_skill_knowledge_files`
-- order 866: `analyze_skill_building_knowledge` (function), lines 15989-16044, exports `analyze_skill_building_knowledge`
-- order 867: `_sanitize_skill_slug` (function), lines 16045-16048, exports `_sanitize_skill_slug`
-- order 868: `_build_skills_gen_skill_content` (function), lines 16049-16081, exports `_build_skills_gen_skill_content`
-- order 869: `ensure_generated_skills_gen_skill` (function), lines 16082-16087, exports `ensure_generated_skills_gen_skill`
-- order 870: `ensure_generated_execution_recovery_skill` (function), lines 16088-16172, exports `ensure_generated_execution_recovery_skill`
-- order 871: `ensure_generated_systematic_debugging_skill` (function), lines 16173-16446, exports `ensure_generated_systematic_debugging_skill`
-- order 872: `ensure_generated_code_engineering_mastery_skill` (function), lines 16447-16566, exports `ensure_generated_code_engineering_mastery_skill`
-- order 873: `ensure_generated_smart_file_navigation_skill` (function), lines 16567-16683, exports `ensure_generated_smart_file_navigation_skill`
-- order 874: `ensure_generated_html_frontend_report_skills` (function), lines 16684-16892, exports `ensure_generated_html_frontend_report_skills`
-- order 875: `ensure_generated_deep_research_skills` (function), lines 16893-17162, exports `ensure_generated_deep_research_skills`
-- order 876: `ensure_generated_research_scientific_skills` (function), lines 17163-17800, exports `ensure_generated_research_scientific_skills`
-- order 877: `ensure_generated_rag_mastery_skills` (function), lines 17801-18102, exports `ensure_generated_rag_mastery_skills`
-- order 878: `ensure_generated_multimodal_comprehension_skills` (function), lines 18103-18797, exports `ensure_generated_multimodal_comprehension_skills`
-- order 879: `ensure_generated_runtime_skills_manifest` (function), lines 18798-18832, exports `ensure_generated_runtime_skills_manifest`
-- order 880: `ensure_generated_agent_web_search_skill` (function), lines 18833-18895, exports `ensure_generated_agent_web_search_skill`
-- order 883: `ensure_embedded_clawhub_skills` (function), lines 19145-19191, exports `ensure_embedded_clawhub_skills`
-- order 885: `ensure_generated_mcp_builder_skill` (function), lines 19367-19378, exports `ensure_generated_mcp_builder_skill`
-- order 886: `ensure_runtime_skills` (function), lines 19379-19397, exports `ensure_runtime_skills`
+- order 857: `ensure_embedded_skills_at_root` (function), lines 15683-15748, exports `ensure_embedded_skills_at_root`
+- order 858: `ensure_embedded_skills` (function), lines 15749-15752, exports `ensure_embedded_skills`
+- order 860: `detect_upload_parser_capabilities` (function), lines 15759-15775, exports `detect_upload_parser_capabilities`
+- order 861: `_render_cap_markdown` (function), lines 15776-15791, exports `_render_cap_markdown`
+- order 862: `_write_text_if_changed` (function), lines 15792-15798, exports `_write_text_if_changed`
+- order 863: `ensure_generated_document_skills` (function), lines 15799-15888, exports `ensure_generated_document_skills`
+- order 864: `ensure_generated_image_coding_feedback_skill` (function), lines 15889-15989, exports `ensure_generated_image_coding_feedback_skill`
+- order 865: `_skill_knowledge_files` (function), lines 15990-16010, exports `_skill_knowledge_files`
+- order 866: `analyze_skill_building_knowledge` (function), lines 16011-16066, exports `analyze_skill_building_knowledge`
+- order 867: `_sanitize_skill_slug` (function), lines 16067-16070, exports `_sanitize_skill_slug`
+- order 868: `_build_skills_gen_skill_content` (function), lines 16071-16103, exports `_build_skills_gen_skill_content`
+- order 869: `ensure_generated_skills_gen_skill` (function), lines 16104-16109, exports `ensure_generated_skills_gen_skill`
+- order 870: `ensure_generated_execution_recovery_skill` (function), lines 16110-16194, exports `ensure_generated_execution_recovery_skill`
+- order 871: `ensure_generated_systematic_debugging_skill` (function), lines 16195-16468, exports `ensure_generated_systematic_debugging_skill`
+- order 872: `ensure_generated_code_engineering_mastery_skill` (function), lines 16469-16588, exports `ensure_generated_code_engineering_mastery_skill`
+- order 873: `ensure_generated_smart_file_navigation_skill` (function), lines 16589-16705, exports `ensure_generated_smart_file_navigation_skill`
+- order 874: `ensure_generated_html_frontend_report_skills` (function), lines 16706-16914, exports `ensure_generated_html_frontend_report_skills`
+- order 875: `ensure_generated_deep_research_skills` (function), lines 16915-17184, exports `ensure_generated_deep_research_skills`
+- order 876: `ensure_generated_research_scientific_skills` (function), lines 17185-17822, exports `ensure_generated_research_scientific_skills`
+- order 877: `ensure_generated_rag_mastery_skills` (function), lines 17823-18124, exports `ensure_generated_rag_mastery_skills`
+- order 878: `ensure_generated_multimodal_comprehension_skills` (function), lines 18125-18819, exports `ensure_generated_multimodal_comprehension_skills`
+- order 879: `ensure_generated_runtime_skills_manifest` (function), lines 18820-18854, exports `ensure_generated_runtime_skills_manifest`
+- order 880: `ensure_generated_agent_web_search_skill` (function), lines 18855-18917, exports `ensure_generated_agent_web_search_skill`
+- order 883: `ensure_embedded_clawhub_skills` (function), lines 19167-19213, exports `ensure_embedded_clawhub_skills`
+- order 885: `ensure_generated_mcp_builder_skill` (function), lines 19389-19400, exports `ensure_generated_mcp_builder_skill`
+- order 886: `ensure_runtime_skills` (function), lines 19401-19419, exports `ensure_runtime_skills`
 
 ### `skills/store.py`
 
-- order 891: `_BUILTIN_SKILLS` (assignment), lines 19435-19543, exports `_BUILTIN_SKILLS`
-- order 892: `SkillStore` (class), lines 19544-21319, exports `SkillStore`
+- order 891: `_BUILTIN_SKILLS` (assignment), lines 19457-19565, exports `_BUILTIN_SKILLS`
+- order 892: `SkillStore` (class), lines 19566-21341, exports `SkillStore`
 
 ### `skills/studio.py`
 
-- order 1049: `SkillsStudioError` (class), lines 106465-106474, exports `SkillsStudioError`
-- order 1050: `_studio_slug` (function), lines 106475-106490, exports `_studio_slug`
-- order 1051: `_studio_hash` (function), lines 106491-106494, exports `_studio_hash`
-- order 1052: `_studio_cookie_value` (function), lines 106495-106504, exports `_studio_cookie_value`
-- order 1053: `SkillsStudioStore` (class), lines 106505-108363, exports `SkillsStudioStore`
+- order 1049: `SkillsStudioError` (class), lines 106488-106497, exports `SkillsStudioError`
+- order 1050: `_studio_slug` (function), lines 106498-106513, exports `_studio_slug`
+- order 1051: `_studio_hash` (function), lines 106514-106517, exports `_studio_hash`
+- order 1052: `_studio_cookie_value` (function), lines 106518-106527, exports `_studio_cookie_value`
+- order 1053: `SkillsStudioStore` (class), lines 106528-108386, exports `SkillsStudioStore`
 
 ### `utils/compress.py`
 
-- order 732: `compress_text_blob` (function), lines 10703-10709, exports `compress_text_blob`
-- order 733: `decompress_text_blob` (function), lines 10710-10719, exports `decompress_text_blob`
+- order 732: `compress_text_blob` (function), lines 10725-10731, exports `compress_text_blob`
+- order 733: `decompress_text_blob` (function), lines 10732-10741, exports `decompress_text_blob`
 
 ### `utils/crypto.py`
 
-- order 805: `CryptoBox` (class), lines 12655-12773, exports `CryptoBox`
+- order 805: `CryptoBox` (class), lines 12677-12795, exports `CryptoBox`
 
 ### `utils/errors.py`
 
-- order 752: `EmptyActionError` (class), lines 11208-11211, exports `EmptyActionError`
-- order 894: `ProcessManagerError` (class), lines 21455-21460, exports `ProcessManagerError`
+- order 752: `EmptyActionError` (class), lines 11230-11233, exports `EmptyActionError`
+- order 894: `ProcessManagerError` (class), lines 21477-21482, exports `ProcessManagerError`
 
 ### `utils/files.py`
 
-- order 592: `_normalize_js_lib_asset_ref` (function), lines 5559-5574, exports `_normalize_js_lib_asset_ref`
-- order 593: `_resolve_js_lib_asset_path` (function), lines 5575-5606, exports `_resolve_js_lib_asset_path`
-- order 594: `_discover_extra_js_lib_files` (function), lines 5607-5639, exports `_discover_extra_js_lib_files`
-- order 685: `safe_path` (function), lines 7690-7700, exports `safe_path`
-- order 686: `_safe_js_filename` (function), lines 7701-7709, exports `_safe_js_filename`
-- order 687: `_sha256_bytes` (function), lines 7710-7712, exports `_sha256_bytes`
-- order 688: `_sha256_file` (function), lines 7713-7722, exports `_sha256_file`
-- order 689: `_download_http_bytes` (function), lines 7723-7732, exports `_download_http_bytes`
-- order 690: `offline_js_lib_root` (function), lines 7733-7735, exports `offline_js_lib_root`
-- order 691: `_offline_js_entry_relative_path` (function), lines 7736-7741, exports `_offline_js_entry_relative_path`
-- order 692: `_archive_member_relative_path` (function), lines 7742-7752, exports `_archive_member_relative_path`
-- order 693: `_path_size_bytes` (function), lines 7753-7769, exports `_path_size_bytes`
-- order 694: `_extract_archive_to_dir` (function), lines 7770-7811, exports `_extract_archive_to_dir`
-- order 695: `_package_required_paths` (function), lines 7812-7819, exports `_package_required_paths`
-- order 696: `_package_required_globs` (function), lines 7820-7836, exports `_package_required_globs`
-- order 697: `_package_install_ready` (function), lines 7837-7859, exports `_package_install_ready`
-- order 698: `_postprocess_offline_js_package` (function), lines 7860-7896, exports `_postprocess_offline_js_package`
-- order 699: `_ensure_offline_js_package` (function), lines 7897-7941, exports `_ensure_offline_js_package`
-- order 700: `_render_offline_js_catalog_md` (function), lines 7942-7959, exports `_render_offline_js_catalog_md`
-- order 702: `ensure_offline_js_libs` (function), lines 7971-8129, exports `ensure_offline_js_libs`
-- order 703: `_offline_js_catalog_entry_for_asset` (function), lines 8130-8150, exports `_offline_js_catalog_entry_for_asset`
-- order 704: `ensure_offline_js_asset` (function), lines 8151-8208, exports `ensure_offline_js_asset`
-- order 705: `_normalize_external_js_url` (function), lines 8209-8214, exports `_normalize_external_js_url`
-- order 706: `is_external_js_src` (function), lines 8215-8218, exports `is_external_js_src`
-- order 707: `match_offline_js_catalog_by_url` (function), lines 8219-8236, exports `match_offline_js_catalog_by_url`
-- order 708: `cache_external_js_url` (function), lines 8237-8272, exports `cache_external_js_url`
-- order 808: `try_read_text` (function), lines 12977-12986, exports `try_read_text`
+- order 592: `_normalize_js_lib_asset_ref` (function), lines 5581-5596, exports `_normalize_js_lib_asset_ref`
+- order 593: `_resolve_js_lib_asset_path` (function), lines 5597-5628, exports `_resolve_js_lib_asset_path`
+- order 594: `_discover_extra_js_lib_files` (function), lines 5629-5661, exports `_discover_extra_js_lib_files`
+- order 685: `safe_path` (function), lines 7712-7722, exports `safe_path`
+- order 686: `_safe_js_filename` (function), lines 7723-7731, exports `_safe_js_filename`
+- order 687: `_sha256_bytes` (function), lines 7732-7734, exports `_sha256_bytes`
+- order 688: `_sha256_file` (function), lines 7735-7744, exports `_sha256_file`
+- order 689: `_download_http_bytes` (function), lines 7745-7754, exports `_download_http_bytes`
+- order 690: `offline_js_lib_root` (function), lines 7755-7757, exports `offline_js_lib_root`
+- order 691: `_offline_js_entry_relative_path` (function), lines 7758-7763, exports `_offline_js_entry_relative_path`
+- order 692: `_archive_member_relative_path` (function), lines 7764-7774, exports `_archive_member_relative_path`
+- order 693: `_path_size_bytes` (function), lines 7775-7791, exports `_path_size_bytes`
+- order 694: `_extract_archive_to_dir` (function), lines 7792-7833, exports `_extract_archive_to_dir`
+- order 695: `_package_required_paths` (function), lines 7834-7841, exports `_package_required_paths`
+- order 696: `_package_required_globs` (function), lines 7842-7858, exports `_package_required_globs`
+- order 697: `_package_install_ready` (function), lines 7859-7881, exports `_package_install_ready`
+- order 698: `_postprocess_offline_js_package` (function), lines 7882-7918, exports `_postprocess_offline_js_package`
+- order 699: `_ensure_offline_js_package` (function), lines 7919-7963, exports `_ensure_offline_js_package`
+- order 700: `_render_offline_js_catalog_md` (function), lines 7964-7981, exports `_render_offline_js_catalog_md`
+- order 702: `ensure_offline_js_libs` (function), lines 7993-8151, exports `ensure_offline_js_libs`
+- order 703: `_offline_js_catalog_entry_for_asset` (function), lines 8152-8172, exports `_offline_js_catalog_entry_for_asset`
+- order 704: `ensure_offline_js_asset` (function), lines 8173-8230, exports `ensure_offline_js_asset`
+- order 705: `_normalize_external_js_url` (function), lines 8231-8236, exports `_normalize_external_js_url`
+- order 706: `is_external_js_src` (function), lines 8237-8240, exports `is_external_js_src`
+- order 707: `match_offline_js_catalog_by_url` (function), lines 8241-8258, exports `match_offline_js_catalog_by_url`
+- order 708: `cache_external_js_url` (function), lines 8259-8294, exports `cache_external_js_url`
+- order 808: `try_read_text` (function), lines 12999-13008, exports `try_read_text`
 
 ### `utils/http.py`
 
@@ -1332,99 +1329,102 @@ Code_Structure/
 - order 108: `_HTTP_SSL_CONTEXT` (assignment), lines 3463-3463, exports `_HTTP_SSL_CONTEXT`
 - order 135: `_shared_http_ssl_context` (function), lines 3527-3550, exports `_shared_http_ssl_context`
 - order 136: `urlopen` (function), lines 3551-3560, exports `urlopen`
-- order 678: `json_response_bytes` (function), lines 7635-7637, exports `json_response_bytes`
-- order 679: `read_http_json_body` (function), lines 7638-7651, exports `read_http_json_body`
-- order 680: `close_if_http_request_body_unread` (function), lines 7652-7665, exports `close_if_http_request_body_unread`
+- order 678: `json_response_bytes` (function), lines 7657-7659, exports `json_response_bytes`
+- order 679: `read_http_json_body` (function), lines 7660-7673, exports `read_http_json_body`
+- order 680: `close_if_http_request_body_unread` (function), lines 7674-7687, exports `close_if_http_request_body_unread`
 
 ### `utils/json_utils.py`
 
 - order 159: `JSON_FSYNC_ENABLED` (constant), lines 3827-3827, exports `JSON_FSYNC_ENABLED`
-- order 677: `json_dumps` (function), lines 7631-7634, exports `json_dumps`
-- order 742: `parse_tool_arguments` (function), lines 11013-11023, exports `parse_tool_arguments`
-- order 743: `repair_truncated_json_object` (function), lines 11024-11078, exports `repair_truncated_json_object`
-- order 744: `parse_tool_arguments_with_error` (function), lines 11079-11110, exports `parse_tool_arguments_with_error`
-- order 745: `_is_valid_json_object` (function), lines 11111-11116, exports `_is_valid_json_object`
-- order 746: `_scan_top_level_json_objects` (function), lines 11117-11140, exports `_scan_top_level_json_objects`
-- order 747: `reconstruct_streamed_tool_args` (function), lines 11141-11185, exports `reconstruct_streamed_tool_args`
-- order 765: `parse_json_object` (function), lines 11449-11455, exports `parse_json_object`
-- order 766: `extract_json_object_from_text` (function), lines 11456-11479, exports `extract_json_object_from_text`
-- order 809: `_json_default_copy` (function), lines 12987-12993, exports `_json_default_copy`
-- order 810: `_read_json_file` (function), lines 12994-13015, exports `_read_json_file`
-- order 811: `_write_json_file` (function), lines 13016-13044, exports `_write_json_file`
+- order 677: `json_dumps` (function), lines 7653-7656, exports `json_dumps`
+- order 742: `parse_tool_arguments` (function), lines 11035-11045, exports `parse_tool_arguments`
+- order 743: `repair_truncated_json_object` (function), lines 11046-11100, exports `repair_truncated_json_object`
+- order 744: `parse_tool_arguments_with_error` (function), lines 11101-11132, exports `parse_tool_arguments_with_error`
+- order 745: `_is_valid_json_object` (function), lines 11133-11138, exports `_is_valid_json_object`
+- order 746: `_scan_top_level_json_objects` (function), lines 11139-11162, exports `_scan_top_level_json_objects`
+- order 747: `reconstruct_streamed_tool_args` (function), lines 11163-11207, exports `reconstruct_streamed_tool_args`
+- order 765: `parse_json_object` (function), lines 11471-11477, exports `parse_json_object`
+- order 766: `extract_json_object_from_text` (function), lines 11478-11501, exports `extract_json_object_from_text`
+- order 809: `_json_default_copy` (function), lines 13009-13015, exports `_json_default_copy`
+- order 810: `_read_json_file` (function), lines 13016-13037, exports `_read_json_file`
+- order 811: `_write_json_file` (function), lines 13038-13066, exports `_write_json_file`
 
 ### `utils/media.py`
 
-- order 647: `guess_mime_from_name` (function), lines 7185-7189, exports `guess_mime_from_name`
-- order 648: `_convert_image_to_safe_format` (function), lines 7190-7209, exports `_convert_image_to_safe_format`
-- order 649: `guess_ext_from_mime` (function), lines 7210-7218, exports `guess_ext_from_mime`
+- order 585: `_capability_probe_png_bytes` (function), lines 5219-5233, exports `_capability_probe_png_bytes`
+- order 586: `_capability_probe_audio_bytes` (function), lines 5234-5245, exports `_capability_probe_audio_bytes`
+- order 587: `_capability_probe_video_bytes` (function), lines 5246-5250, exports `_capability_probe_video_bytes`
+- order 647: `guess_mime_from_name` (function), lines 7207-7211, exports `guess_mime_from_name`
+- order 648: `_convert_image_to_safe_format` (function), lines 7212-7231, exports `_convert_image_to_safe_format`
+- order 649: `guess_ext_from_mime` (function), lines 7232-7240, exports `guess_ext_from_mime`
 
 ### `utils/misc.py`
 
-- order 650: `now_ts` (function), lines 7219-7221, exports `now_ts`
-- order 651: `_benign_socket_log_lock` (assignment), lines 7222-7224, exports `_benign_socket_log_lock`
-- order 652: `_benign_socket_log_state` (assignment), lines 7225-7225, exports `_benign_socket_log_state`
-- order 654: `is_benign_socket_error` (function), lines 7241-7261, exports `is_benign_socket_error`
-- order 655: `_socket_error_code` (function), lines 7262-7273, exports `_socket_error_code`
-- order 656: `_log_benign_socket_error_limited` (function), lines 7274-7310, exports `_log_benign_socket_error_limited`
-- order 657: `swallow_benign_socket_error` (function), lines 7311-7317, exports `swallow_benign_socket_error`
-- order 658: `normalize_timeout_seconds` (function), lines 7318-7333, exports `normalize_timeout_seconds`
-- order 659: `detect_local_lan_ip` (function), lines 7334-7345, exports `detect_local_lan_ip`
-- order 660: `_LOCAL_LAN_IP_CACHE` (assignment), lines 7346-7347, exports `_LOCAL_LAN_IP_CACHE`
-- order 661: `detect_local_lan_ip_cached` (function), lines 7348-7361, exports `detect_local_lan_ip_cached`
-- order 681: `make_id` (function), lines 7666-7668, exports `make_id`
-- order 682: `sanitize_profile_id` (function), lines 7669-7672, exports `sanitize_profile_id`
-- order 803: `user_id_from_ip` (function), lines 12614-12621, exports `user_id_from_ip`
-- order 807: `_meta_string_list` (function), lines 12963-12976, exports `_meta_string_list`
-- order 859: `_module_exists` (function), lines 15731-15736, exports `_module_exists`
+- order 650: `now_ts` (function), lines 7241-7243, exports `now_ts`
+- order 651: `_benign_socket_log_lock` (assignment), lines 7244-7246, exports `_benign_socket_log_lock`
+- order 652: `_benign_socket_log_state` (assignment), lines 7247-7247, exports `_benign_socket_log_state`
+- order 654: `is_benign_socket_error` (function), lines 7263-7283, exports `is_benign_socket_error`
+- order 655: `_socket_error_code` (function), lines 7284-7295, exports `_socket_error_code`
+- order 656: `_log_benign_socket_error_limited` (function), lines 7296-7332, exports `_log_benign_socket_error_limited`
+- order 657: `swallow_benign_socket_error` (function), lines 7333-7339, exports `swallow_benign_socket_error`
+- order 658: `normalize_timeout_seconds` (function), lines 7340-7355, exports `normalize_timeout_seconds`
+- order 659: `detect_local_lan_ip` (function), lines 7356-7367, exports `detect_local_lan_ip`
+- order 660: `_LOCAL_LAN_IP_CACHE` (assignment), lines 7368-7369, exports `_LOCAL_LAN_IP_CACHE`
+- order 661: `detect_local_lan_ip_cached` (function), lines 7370-7383, exports `detect_local_lan_ip_cached`
+- order 681: `make_id` (function), lines 7688-7690, exports `make_id`
+- order 682: `sanitize_profile_id` (function), lines 7691-7694, exports `sanitize_profile_id`
+- order 803: `user_id_from_ip` (function), lines 12636-12643, exports `user_id_from_ip`
+- order 807: `_meta_string_list` (function), lines 12985-12998, exports `_meta_string_list`
+- order 859: `_module_exists` (function), lines 15753-15758, exports `_module_exists`
 
 ### `utils/text.py`
 
 - order 147: `MAX_TOOL_OUTPUT` (constant), lines 3815-3815, exports `MAX_TOOL_OUTPUT`
 - order 419: `SOCKET_NOISE_LINE_PATTERNS` (constant), lines 4379-4384, exports `SOCKET_NOISE_LINE_PATTERNS`
-- order 653: `filter_runtime_noise_lines` (function), lines 7226-7240, exports `filter_runtime_noise_lines`
-- order 666: `safe_utf8_bytes` (function), lines 7486-7488, exports `safe_utf8_bytes`
-- order 667: `escape_invalid_utf8_text` (function), lines 7489-7491, exports `escape_invalid_utf8_text`
-- order 668: `sanitize_utf8_surrogates` (function), lines 7492-7505, exports `sanitize_utf8_surrogates`
-- order 669: `decode_utf8_replace` (function), lines 7506-7510, exports `decode_utf8_replace`
-- order 709: `trim` (function), lines 8273-8276, exports `trim`
-- order 710: `is_synthetic_public_progress` (function), lines 8277-8296, exports `is_synthetic_public_progress`
-- order 712: `display_clean` (function), lines 8344-8358, exports `display_clean`
-- order 713: `short_title_from` (function), lines 8359-8377, exports `short_title_from`
-- order 729: `_fmt_export_ts` (function), lines 10539-10549, exports `_fmt_export_ts`
-- order 730: `_html_esc` (function), lines 10550-10553, exports `_html_esc`
-- order 731: `_text_to_minimal_pdf` (function), lines 10554-10702, exports `_text_to_minimal_pdf`
-- order 734: `normalize_embedded_newlines` (function), lines 10720-10729, exports `normalize_embedded_newlines`
-- order 735: `_map_todo_status_token` (function), lines 10730-10768, exports `_map_todo_status_token`
-- order 736: `split_todo_status_text` (function), lines 10769-10828, exports `split_todo_status_text`
-- order 737: `extract_todo_rows_from_text` (function), lines 10829-10898, exports `extract_todo_rows_from_text`
-- order 738: `decode_structured_todo_container` (function), lines 10899-10917, exports `decode_structured_todo_container`
-- order 739: `infer_todo_status_from_text` (function), lines 10918-10926, exports `infer_todo_status_from_text`
-- order 740: `split_structured_todo_content` (function), lines 10927-10982, exports `split_structured_todo_content`
-- order 741: `normalize_work_text` (function), lines 10983-11012, exports `normalize_work_text`
-- order 826: `make_unified_diff` (function), lines 14536-14554, exports `make_unified_diff`
-- order 827: `_skip_row` (function), lines 14555-14560, exports `_skip_row`
-- order 828: `_row_is_hot` (function), lines 14561-14564, exports `_row_is_hot`
-- order 829: `_hotspot_index` (function), lines 14565-14588, exports `_hotspot_index`
-- order 830: `_compress_rows_keep_hotspot` (function), lines 14589-14638, exports `_compress_rows_keep_hotspot`
-- order 831: `_focused_diff_rows_from_opcodes` (function), lines 14639-14773, exports `_focused_diff_rows_from_opcodes`
-- order 832: `make_numbered_diff` (function), lines 14774-14806, exports `make_numbered_diff`
-- order 833: `render_numbered_diff_text` (function), lines 14807-14820, exports `render_numbered_diff_text`
+- order 653: `filter_runtime_noise_lines` (function), lines 7248-7262, exports `filter_runtime_noise_lines`
+- order 666: `safe_utf8_bytes` (function), lines 7508-7510, exports `safe_utf8_bytes`
+- order 667: `escape_invalid_utf8_text` (function), lines 7511-7513, exports `escape_invalid_utf8_text`
+- order 668: `sanitize_utf8_surrogates` (function), lines 7514-7527, exports `sanitize_utf8_surrogates`
+- order 669: `decode_utf8_replace` (function), lines 7528-7532, exports `decode_utf8_replace`
+- order 709: `trim` (function), lines 8295-8298, exports `trim`
+- order 710: `is_synthetic_public_progress` (function), lines 8299-8318, exports `is_synthetic_public_progress`
+- order 712: `display_clean` (function), lines 8366-8380, exports `display_clean`
+- order 713: `short_title_from` (function), lines 8381-8399, exports `short_title_from`
+- order 729: `_fmt_export_ts` (function), lines 10561-10571, exports `_fmt_export_ts`
+- order 730: `_html_esc` (function), lines 10572-10575, exports `_html_esc`
+- order 731: `_text_to_minimal_pdf` (function), lines 10576-10724, exports `_text_to_minimal_pdf`
+- order 734: `normalize_embedded_newlines` (function), lines 10742-10751, exports `normalize_embedded_newlines`
+- order 735: `_map_todo_status_token` (function), lines 10752-10790, exports `_map_todo_status_token`
+- order 736: `split_todo_status_text` (function), lines 10791-10850, exports `split_todo_status_text`
+- order 737: `extract_todo_rows_from_text` (function), lines 10851-10920, exports `extract_todo_rows_from_text`
+- order 738: `decode_structured_todo_container` (function), lines 10921-10939, exports `decode_structured_todo_container`
+- order 739: `infer_todo_status_from_text` (function), lines 10940-10948, exports `infer_todo_status_from_text`
+- order 740: `split_structured_todo_content` (function), lines 10949-11004, exports `split_structured_todo_content`
+- order 741: `normalize_work_text` (function), lines 11005-11034, exports `normalize_work_text`
+- order 826: `make_unified_diff` (function), lines 14558-14576, exports `make_unified_diff`
+- order 827: `_skip_row` (function), lines 14577-14582, exports `_skip_row`
+- order 828: `_row_is_hot` (function), lines 14583-14586, exports `_row_is_hot`
+- order 829: `_hotspot_index` (function), lines 14587-14610, exports `_hotspot_index`
+- order 830: `_compress_rows_keep_hotspot` (function), lines 14611-14660, exports `_compress_rows_keep_hotspot`
+- order 831: `_focused_diff_rows_from_opcodes` (function), lines 14661-14795, exports `_focused_diff_rows_from_opcodes`
+- order 832: `make_numbered_diff` (function), lines 14796-14828, exports `make_numbered_diff`
+- order 833: `render_numbered_diff_text` (function), lines 14829-14842, exports `render_numbered_diff_text`
 
 ### `web/admin_assets.py`
 
-- order 963: `ADMIN_INDEX_HTML` (constant), lines 89719-89954, exports `ADMIN_INDEX_HTML`
-- order 964: `ADMIN_CSS` (constant), lines 89955-90088, exports `ADMIN_CSS`
-- order 965: `ADMIN_JS` (constant), lines 90089-90186, exports `ADMIN_JS`
+- order 963: `ADMIN_INDEX_HTML` (constant), lines 89742-89977, exports `ADMIN_INDEX_HTML`
+- order 964: `ADMIN_CSS` (constant), lines 89978-90111, exports `ADMIN_CSS`
+- order 965: `ADMIN_JS` (constant), lines 90112-90209, exports `ADMIN_JS`
 
 ### `web/assets.py`
 
-- order 956: `INDEX_HTML` (constant), lines 83838-84089, exports `INDEX_HTML`
-- order 957: `APP_CSS` (constant), lines 84090-84626, exports `APP_CSS`
-- order 958: `APP_JS` (constant), lines 84627-89279, exports `APP_JS`
-- order 959: `APP_TS` (constant), lines 89280-89319, exports `APP_TS`
+- order 956: `INDEX_HTML` (constant), lines 83861-84112, exports `INDEX_HTML`
+- order 957: `APP_CSS` (constant), lines 84113-84649, exports `APP_CSS`
+- order 958: `APP_JS` (constant), lines 84650-89302, exports `APP_JS`
+- order 959: `APP_TS` (constant), lines 89303-89342, exports `APP_TS`
 
 ### `web/skills_assets.py`
 
-- order 960: `SKILLS_INDEX_HTML` (constant), lines 89320-89475, exports `SKILLS_INDEX_HTML`
-- order 961: `SKILLS_EXTRA_CSS` (constant), lines 89476-89572, exports `SKILLS_EXTRA_CSS`
-- order 962: `SKILLS_APP_JS` (constant), lines 89573-89718, exports `SKILLS_APP_JS`
+- order 960: `SKILLS_INDEX_HTML` (constant), lines 89343-89498, exports `SKILLS_INDEX_HTML`
+- order 961: `SKILLS_EXTRA_CSS` (constant), lines 89499-89595, exports `SKILLS_EXTRA_CSS`
+- order 962: `SKILLS_APP_JS` (constant), lines 89596-89741, exports `SKILLS_APP_JS`

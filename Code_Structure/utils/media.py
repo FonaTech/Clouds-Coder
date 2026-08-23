@@ -5,14 +5,52 @@
 
 from __future__ import annotations
 
-# split-source: order=647 original-lines=7185-7189 hash=3c6fc91449015a09
+# split-source: order=585 original-lines=5219-5233 hash=7e2e42243d6e04fe
+
+
+def _capability_probe_png_bytes() -> bytes:
+    """Return a deterministic, valid 1x1 PNG for provider capability probes."""
+    def chunk(kind: bytes, payload: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(payload))
+            + kind
+            + payload
+            + struct.pack(">I", zlib.crc32(kind + payload) & 0xFFFFFFFF)
+        )
+
+    header = struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0)
+    pixels = zlib.compress(b"\x00\x00\x00\x00\x00")
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", pixels) + chunk(b"IEND", b"")
+
+# split-source: order=586 original-lines=5234-5245 hash=d5baf21b90a6374f
+
+
+def _capability_probe_audio_bytes() -> bytes:
+    """Return a valid, empty PCM/WAV payload for provider capability probes."""
+    return (
+        b"RIFF"
+        + struct.pack("<I", 36)
+        + b"WAVEfmt "
+        + struct.pack("<IHHIIHH", 16, 1, 1, 8000, 8000, 1, 8)
+        + b"data"
+        + struct.pack("<I", 0)
+    )
+
+# split-source: order=587 original-lines=5246-5250 hash=c538f54f4c828c25
+
+
+def _capability_probe_video_bytes() -> bytes:
+    """Return a minimal ISO-BMFF header for provider capability probes."""
+    return struct.pack(">I", 20) + b"ftypisom" + struct.pack(">I", 0) + b"isomiso2"
+
+# split-source: order=647 original-lines=7207-7211 hash=3c6fc91449015a09
 
 
 def guess_mime_from_name(name: str, fallback: str = "application/octet-stream") -> str:
     mime, _ = mimetypes.guess_type(str(name or ""))
     return str(mime or fallback)
 
-# split-source: order=648 original-lines=7190-7209 hash=c9712a640fddd6e2
+# split-source: order=648 original-lines=7212-7231 hash=c9712a640fddd6e2
 
 
 def _convert_image_to_safe_format(fp) -> tuple:
@@ -34,7 +72,7 @@ def _convert_image_to_safe_format(fp) -> tuple:
     except Exception:
         return None, "", ""
 
-# split-source: order=649 original-lines=7210-7218 hash=0412fdcc6759d0d3
+# split-source: order=649 original-lines=7232-7240 hash=0412fdcc6759d0d3
 
 
 def guess_ext_from_mime(mime: str, fallback: str = ".bin") -> str:

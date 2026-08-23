@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=1061 original-lines=118143-118182 hash=72f9d812840a61ba
+# split-source: order=1061 original-lines=118166-118205 hash=72f9d812840a61ba
 
 # ============================================================================
 # Architecture / 架构 / アーキテクチャ
@@ -47,7 +47,7 @@ class AgentHTTPServer(ThreadingHTTPServer):
                 return
             raise
 
-# split-source: order=1064 original-lines=119369-121000 hash=6357bd493df55e3a
+# split-source: order=1064 original-lines=119392-121023 hash=6357bd493df55e3a
 
 
 # Request router: serves chat APIs, admin APIs, SSE streams, asset endpoints,
@@ -1681,7 +1681,7 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             sess.events.unsubscribe(sub)
 
-# split-source: order=1067 original-lines=121802-121915 hash=79a78cd04af97eeb
+# split-source: order=1067 original-lines=121825-121938 hash=79a78cd04af97eeb
 
 
 class SkillsReviewHandler(_RagAdminAuthMixin, BaseHTTPRequestHandler):
@@ -1797,7 +1797,7 @@ class SkillsReviewHandler(_RagAdminAuthMixin, BaseHTTPRequestHandler):
         if not self._handle_admin_auth_post(path):
             return self._send_json({"error": "not found"}, 404)
 
-# split-source: order=1071 original-lines=123779-124249 hash=e5c3c84a1d0a44ec
+# split-source: order=1071 original-lines=123802-124272 hash=e5c3c84a1d0a44ec
 
 class CollaborationHandler(IdeHandler):
     server_version = "CloudsCoderCollaboration/1.0"

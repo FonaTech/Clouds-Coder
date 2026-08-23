@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=954 original-lines=27680-82457 hash=0b8f21e57a1f4842
+# split-source: order=954 original-lines=27703-82480 hash=2493f1ec4ab7082f
 
 # Per-session orchestrator: maintains conversation state, plan state, tool
 # routing, todo synchronization, completion checks, and agent coordination.
@@ -54781,6 +54781,6 @@ h1{{font-size:20px;margin-bottom:4px}}
             # A minimal valid PNG keeps the endpoint functional in deliberately
             # dependency-free deployments. Rich content remains available from
             # the sibling Markdown/PDF exports.
-            return base64.b64decode(SAMPLE_IMAGE_PNG_B64)
+            return _capability_probe_png_bytes()
         except Exception:
-            return base64.b64decode(SAMPLE_IMAGE_PNG_B64)
+            return _capability_probe_png_bytes()

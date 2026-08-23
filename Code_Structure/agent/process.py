@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=671 original-lines=7529-7550 hash=95e5ae12873a4310
+# split-source: order=671 original-lines=7551-7572 hash=95e5ae12873a4310
 
 def subprocess_text_encodings() -> list[str]:
     candidates: list[str] = ["utf-8", *_windows_subprocess_encodings()]
@@ -29,7 +29,7 @@ def subprocess_text_encodings() -> list[str]:
         out.append(encoding)
     return out or ["utf-8"]
 
-# split-source: order=672 original-lines=7551-7577 hash=6bce8faef6bf011c
+# split-source: order=672 original-lines=7573-7599 hash=6bce8faef6bf011c
 
 def decode_subprocess_bytes(data: bytes | bytearray | str | None) -> tuple[str, dict]:
     if data is None:
@@ -58,7 +58,7 @@ def decode_subprocess_bytes(data: bytes | bytearray | str | None) -> tuple[str, 
         "replacement": True,
     }
 
-# split-source: order=673 original-lines=7578-7600 hash=b24b8ba5b5793915
+# split-source: order=673 original-lines=7600-7622 hash=b24b8ba5b5793915
 
 def run_subprocess_text(*popenargs, **kwargs) -> subprocess.CompletedProcess:
     """Run a captured subprocess without allowing platform decoding to fail."""
@@ -83,7 +83,7 @@ def run_subprocess_text(*popenargs, **kwargs) -> subprocess.CompletedProcess:
     completed.decoding_diagnostics = {"stdout": stdout_diag, "stderr": stderr_diag}
     return completed
 
-# split-source: order=674 original-lines=7601-7607 hash=322031603b8faa1f
+# split-source: order=674 original-lines=7623-7629 hash=322031603b8faa1f
 
 
 def windows_utf8_shell_command(command: object) -> str:
@@ -92,7 +92,7 @@ def windows_utf8_shell_command(command: object) -> str:
         return text
     return f"chcp 65001>nul & {text}"
 
-# split-source: order=675 original-lines=7608-7618 hash=48571f90d386fb9d
+# split-source: order=675 original-lines=7630-7640 hash=48571f90d386fb9d
 
 
 def shell_process_invocation(command: str, prefix: list[str] | tuple[str, ...] | None = None) -> tuple[object, bool, bool]:
@@ -105,7 +105,7 @@ def shell_process_invocation(command: str, prefix: list[str] | tuple[str, ...] |
         return windows_utf8_shell_command(command), True, windows_job
     return str(command or ""), True, windows_job
 
-# split-source: order=676 original-lines=7619-7630 hash=1f92ebf8c91d329f
+# split-source: order=676 original-lines=7641-7652 hash=1f92ebf8c91d329f
 
 
 def join_shell_task_command(command: object, args: object) -> str:
@@ -119,7 +119,7 @@ def join_shell_task_command(command: object, args: object) -> str:
         return subprocess.list2cmdline(parts)
     return shlex.join(parts)
 
-# split-source: order=895 original-lines=21461-21820 hash=a9a553f635f6c8c1
+# split-source: order=895 original-lines=21483-21842 hash=a9a553f635f6c8c1
 
 
 class UserProcessManager:

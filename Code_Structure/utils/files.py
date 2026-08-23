@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=592 original-lines=5559-5574 hash=cf719689c29b9fe5
+# split-source: order=592 original-lines=5581-5596 hash=cf719689c29b9fe5
 
 
 def _normalize_js_lib_asset_ref(value: str) -> str:
@@ -23,7 +23,7 @@ def _normalize_js_lib_asset_ref(value: str) -> str:
         parts.append(part)
     return "/".join(parts)
 
-# split-source: order=593 original-lines=5575-5606 hash=3a5d75d402cda3c1
+# split-source: order=593 original-lines=5597-5628 hash=3a5d75d402cda3c1
 
 
 def _resolve_js_lib_asset_path(js_root: Path, asset_ref: str) -> Path | None:
@@ -57,7 +57,7 @@ def _resolve_js_lib_asset_path(js_root: Path, asset_ref: str) -> Path | None:
     candidates.sort(key=lambda p: (len(p.relative_to(js_root).parts), p.relative_to(js_root).as_posix()))
     return candidates[0]
 
-# split-source: order=594 original-lines=5607-5639 hash=b8a72269c55092be
+# split-source: order=594 original-lines=5629-5661 hash=b8a72269c55092be
 
 
 def _discover_extra_js_lib_files(js_root: Path, known_relative_paths: set[str]) -> list[dict]:
@@ -92,7 +92,7 @@ def _discover_extra_js_lib_files(js_root: Path, known_relative_paths: set[str]) 
         )
     return rows
 
-# split-source: order=685 original-lines=7690-7700 hash=697972e605b9b600
+# split-source: order=685 original-lines=7712-7722 hash=697972e605b9b600
 
 def safe_path(path_text: str, base: Path | None = None) -> Path:
     root = (base or WORKDIR).resolve()
@@ -105,7 +105,7 @@ def safe_path(path_text: str, base: Path | None = None) -> Path:
         raise ValueError(f"path escapes workspace: {path_text}")
     return path
 
-# split-source: order=686 original-lines=7701-7709 hash=316ad17289f49e36
+# split-source: order=686 original-lines=7723-7731 hash=316ad17289f49e36
 
 def _safe_js_filename(name: str, fallback: str = "lib.js") -> str:
     raw = Path(str(name or fallback)).name
@@ -116,12 +116,12 @@ def _safe_js_filename(name: str, fallback: str = "lib.js") -> str:
         safe = f"{safe}.js"
     return safe
 
-# split-source: order=687 original-lines=7710-7712 hash=c93f45cca8221fcf
+# split-source: order=687 original-lines=7732-7734 hash=c93f45cca8221fcf
 
 def _sha256_bytes(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
-# split-source: order=688 original-lines=7713-7722 hash=36451639056075f8
+# split-source: order=688 original-lines=7735-7744 hash=36451639056075f8
 
 def _sha256_file(fp: Path) -> str:
     h = hashlib.sha256()
@@ -133,7 +133,7 @@ def _sha256_file(fp: Path) -> str:
             h.update(block)
     return h.hexdigest()
 
-# split-source: order=689 original-lines=7723-7732 hash=54b483b1e7e9d8f0
+# split-source: order=689 original-lines=7745-7754 hash=54b483b1e7e9d8f0
 
 def _download_http_bytes(url: str, timeout: float = 25.0) -> tuple[bytes, str]:
     req = Request(
@@ -145,12 +145,12 @@ def _download_http_bytes(url: str, timeout: float = 25.0) -> tuple[bytes, str]:
         ctype = str(resp.headers.get("Content-Type", "") or "").strip()
         return resp.read(), ctype
 
-# split-source: order=690 original-lines=7733-7735 hash=faccd60e74e6e648
+# split-source: order=690 original-lines=7755-7757 hash=faccd60e74e6e648
 
 def offline_js_lib_root(workdir: Path = WORKDIR) -> Path:
     return (workdir / "js_lib").resolve()
 
-# split-source: order=691 original-lines=7736-7741 hash=ffde0fbf35697ed4
+# split-source: order=691 original-lines=7758-7763 hash=ffde0fbf35697ed4
 
 def _offline_js_entry_relative_path(entry: dict[str, object], fallback_name: str) -> str:
     rel = _normalize_js_lib_asset_ref(str(entry.get("relative_path", "") or ""))
@@ -158,7 +158,7 @@ def _offline_js_entry_relative_path(entry: dict[str, object], fallback_name: str
         return rel
     return _safe_js_filename(fallback_name, fallback_name)
 
-# split-source: order=692 original-lines=7742-7752 hash=17ffddf48af112d8
+# split-source: order=692 original-lines=7764-7774 hash=17ffddf48af112d8
 
 def _archive_member_relative_path(name: str) -> str:
     raw = _normalize_js_lib_asset_ref(name)
@@ -171,7 +171,7 @@ def _archive_member_relative_path(name: str) -> str:
         return ""
     return "/".join(parts)
 
-# split-source: order=693 original-lines=7753-7769 hash=173a419966e6f8f3
+# split-source: order=693 original-lines=7775-7791 hash=173a419966e6f8f3
 
 def _path_size_bytes(target: Path) -> int:
     try:
@@ -190,7 +190,7 @@ def _path_size_bytes(target: Path) -> int:
     except Exception:
         return 0
 
-# split-source: order=694 original-lines=7770-7811 hash=9d68a11646625063
+# split-source: order=694 original-lines=7792-7833 hash=9d68a11646625063
 
 def _extract_archive_to_dir(raw: bytes, install_root: Path) -> list[str]:
     install_root.mkdir(parents=True, exist_ok=True)
@@ -234,7 +234,7 @@ def _extract_archive_to_dir(raw: bytes, install_root: Path) -> list[str]:
             _write_bytes(rel, extracted.read())
     return written
 
-# split-source: order=695 original-lines=7812-7819 hash=a50266eec0068e7a
+# split-source: order=695 original-lines=7834-7841 hash=a50266eec0068e7a
 
 def _package_required_paths(entry: dict[str, object]) -> list[str]:
     rows: list[str] = []
@@ -244,7 +244,7 @@ def _package_required_paths(entry: dict[str, object]) -> list[str]:
             rows.append(rel)
     return rows
 
-# split-source: order=696 original-lines=7820-7836 hash=1b9c8268492b026e
+# split-source: order=696 original-lines=7842-7858 hash=1b9c8268492b026e
 
 def _package_required_globs(entry: dict[str, object]) -> list[tuple[str, int]]:
     rows: list[tuple[str, int]] = []
@@ -263,7 +263,7 @@ def _package_required_globs(entry: dict[str, object]) -> list[tuple[str, int]]:
         rows.append((pattern, minimum))
     return rows
 
-# split-source: order=697 original-lines=7837-7859 hash=6e59ff6950865a94
+# split-source: order=697 original-lines=7859-7881 hash=6e59ff6950865a94
 
 def _package_install_ready(
     install_root: Path,
@@ -288,7 +288,7 @@ def _package_install_ready(
     except Exception:
         return False
 
-# split-source: order=698 original-lines=7860-7896 hash=5f7a27ed100a7a2d
+# split-source: order=698 original-lines=7882-7918 hash=5f7a27ed100a7a2d
 
 def _postprocess_offline_js_package(entry: dict[str, object], install_root: Path):
     action = str(entry.get("package_postprocess", "") or "").strip().lower()
@@ -327,7 +327,7 @@ def _postprocess_offline_js_package(entry: dict[str, object], install_root: Path
         pkg_json.parent.mkdir(parents=True, exist_ok=True)
         pkg_json.write_text(json_dumps(obj, indent=2), encoding="utf-8")
 
-# split-source: order=699 original-lines=7897-7941 hash=4ab36bf5ad701f8e
+# split-source: order=699 original-lines=7919-7963 hash=4ab36bf5ad701f8e
 
 def _ensure_offline_js_package(
     root: Path,
@@ -374,7 +374,7 @@ def _ensure_offline_js_package(
             source = url
     return False, source, error, install_dir
 
-# split-source: order=700 original-lines=7942-7959 hash=d4f4dd20d3769b41
+# split-source: order=700 original-lines=7964-7981 hash=d4f4dd20d3769b41
 
 def _render_offline_js_catalog_md() -> str:
     rows = [
@@ -394,7 +394,7 @@ def _render_offline_js_catalog_md() -> str:
         rows.append(f"| `{lib_id}` | `{filename}` | {'<br>'.join(urls)} | {'<br>'.join(package_urls)} |")
     return "\n".join(rows) + "\n"
 
-# split-source: order=702 original-lines=7971-8129 hash=78b50a563c075547
+# split-source: order=702 original-lines=7993-8151 hash=78b50a563c075547
 
 def ensure_offline_js_libs(
     workdir: Path = WORKDIR,
@@ -555,7 +555,7 @@ def ensure_offline_js_libs(
     (root / OFFLINE_JS_LIB_README_FILE).write_text(_render_offline_js_catalog_md(), encoding="utf-8")
     return payload
 
-# split-source: order=703 original-lines=8130-8150 hash=e4aca336847a1b38
+# split-source: order=703 original-lines=8152-8172 hash=e4aca336847a1b38
 
 def _offline_js_catalog_entry_for_asset(asset_ref: str) -> dict | None:
     normalized = _normalize_js_lib_asset_ref(asset_ref)
@@ -578,7 +578,7 @@ def _offline_js_catalog_entry_for_asset(asset_ref: str) -> dict | None:
                 package_match = entry
     return package_match or exact
 
-# split-source: order=704 original-lines=8151-8208 hash=8ddd983ccf227371
+# split-source: order=704 original-lines=8173-8230 hash=8ddd983ccf227371
 
 def ensure_offline_js_asset(
     js_root: Path,
@@ -638,7 +638,7 @@ def ensure_offline_js_asset(
                 error = trim(str(exc), 220)
         return None, error
 
-# split-source: order=705 original-lines=8209-8214 hash=552bb8592df027b7
+# split-source: order=705 original-lines=8231-8236 hash=552bb8592df027b7
 
 def _normalize_external_js_url(url: str) -> str:
     raw = html.unescape(str(url or "").strip())
@@ -646,13 +646,13 @@ def _normalize_external_js_url(url: str) -> str:
         raw = f"https:{raw}"
     return raw
 
-# split-source: order=706 original-lines=8215-8218 hash=aa68cf01c617a357
+# split-source: order=706 original-lines=8237-8240 hash=aa68cf01c617a357
 
 def is_external_js_src(url: str) -> bool:
     low = str(url or "").strip().lower()
     return low.startswith("http://") or low.startswith("https://") or low.startswith("//")
 
-# split-source: order=707 original-lines=8219-8236 hash=7a832f0a00d387ec
+# split-source: order=707 original-lines=8241-8258 hash=7a832f0a00d387ec
 
 def match_offline_js_catalog_by_url(url: str) -> dict | None:
     target = _normalize_external_js_url(url).lower()
@@ -672,7 +672,7 @@ def match_offline_js_catalog_by_url(url: str) -> dict | None:
             return entry
     return None
 
-# split-source: order=708 original-lines=8237-8272 hash=f6b98368b8c7d7e3
+# split-source: order=708 original-lines=8259-8294 hash=f6b98368b8c7d7e3
 
 def cache_external_js_url(js_root: Path, url: str, *, allow_download: bool = True) -> tuple[Path | None, str]:
     target_url = _normalize_external_js_url(url)
@@ -710,7 +710,7 @@ def cache_external_js_url(js_root: Path, url: str, *, allow_download: bool = Tru
     except Exception as exc:
         return None, trim(str(exc), 220)
 
-# split-source: order=808 original-lines=12977-12986 hash=2201010e78ad76eb
+# split-source: order=808 original-lines=12999-13008 hash=2201010e78ad76eb
 
 def try_read_text(path: Path, max_bytes: int = 400_000) -> str | None:
     try:

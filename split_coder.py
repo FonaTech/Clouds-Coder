@@ -139,6 +139,8 @@ DEFAULT_LAYOUT: dict[str, list[str]] = {
     "config/paths.py": [
         "SCRIPT_DIR", "WORKDIR", "CODES_ROOT", "LLM_CONFIG_PATH", "REPO_ROOT",
         "_resolve_default_agent_workdir", "_migrate_legacy_runtime_roots", "detect_repo_root",
+        "_is_installed_python_runtime", "_runtime_storage_mode", "_runtime_tree_has_content",
+        "_copy_runtime_tree_with_crypto_migration", "_merge_legacy_codes_root",
     ],
     "config/settings.py": [
         "~^(?:normalize|extract|infer|load|looks_like|parse|merge|resolve|select|supported|backend|runtime_environment|model_language|default_multimodal|set_web_search)_",
@@ -200,7 +202,11 @@ DEFAULT_LAYOUT: dict[str, list[str]] = {
         "safe_path", "try_read_text", "_normalize_js_lib_asset_ref",
         "~^(?:_?sha256|_?safe_js|_?download_http|offline_js|load_offline_js|ensure_offline_js|cache_external_js|is_external_js|match_offline_js|_normalize_external_js|_resolve_js|_discover_extra_js|_offline_js|_archive_member|_path_size|_extract_archive|_package_|_postprocess_offline|_ensure_offline|_render_offline_js)",
     ],
-    "utils/media.py": ["guess_mime_from_name", "guess_ext_from_mime", "_convert_image_to_safe_format"],
+    "utils/media.py": [
+        "guess_mime_from_name", "guess_ext_from_mime", "_convert_image_to_safe_format",
+        "_capability_probe_png_bytes", "_capability_probe_audio_bytes",
+        "_capability_probe_video_bytes",
+    ],
     "utils/compress.py": ["compress_text_blob", "decompress_text_blob"],
     "utils/crypto.py": ["CryptoBox"],
     "utils/misc.py": [
@@ -229,6 +235,11 @@ DEFAULT_LAYOUT: dict[str, list[str]] = {
     "agent/background.py": ["BackgroundManager"],
     "agent/bus.py": ["MessageBus"],
     "agent/worktree.py": ["WorktreeManager"],
+    "agent/process.py": [
+        "subprocess_text_encodings", "decode_subprocess_bytes", "run_subprocess_text",
+        "windows_utf8_shell_command", "shell_process_invocation", "join_shell_task_command",
+        "UserProcessManager",
+    ],
     "agent/tools.py": [
         "tool_def", "TOOLS", "TOOL_REQUIRED_ARGS", "TOOL_SPEC_BY_NAME", "TOOL_NAME_FUZZY_MAP",
         "is_todo_resume_tool_name", "canonicalize_tool_name", "filter_tool_specs_for_runtime",
@@ -236,6 +247,21 @@ DEFAULT_LAYOUT: dict[str, list[str]] = {
         "DEVELOPER_TOOL_DROP", "AGENT_TOOL_ALLOWLIST",
     ],
     "agent/errors.py": ["CircuitBreakerTriggered"],
+
+    "collaboration/__init__.py": [],
+    "collaboration/core.py": [
+        "_now", "_json", "_load_json", "_b64_token", "_branch_label", "_digest",
+        "_password_hash", "_normalize_ip", "_normalize_name",
+        "_COLLAB_PUBLIC_SECRET_PATTERNS", "_collaboration_public_text",
+        "_collaboration_task_objective", "_collaboration_task_title",
+        "_collaboration_task_key", "_collaboration_plan_steps", "CollaborationError",
+        "CollaborationPrincipal", "_normalize_operation", "operation_input_length",
+        "apply_text_operation", "transform_text_operation", "CollaborationStore",
+        "CollaborationWriteCoordinator",
+    ],
+    "collaboration/watcher.py": [
+        "collaboration_file_watcher_loop", "collaboration_watcher_health",
+    ],
 
     "skills/__init__.py": [],
     "skills/embedded.py": [
@@ -245,6 +271,10 @@ DEFAULT_LAYOUT: dict[str, list[str]] = {
         "SKILL_PROTOCOL_LOCAL", "SKILL_PROTOCOL_CLAWHUB", "SKILL_PROTOCOL_HTTP_JSON",
     ],
     "skills/provisioning.py": ["~^(?:ensure_|detect_upload|_render_cap|_write_text|_skill_knowledge|analyze_skill|_sanitize_skill|_build_skills)"],
+    "skills/studio.py": [
+        "SkillsStudioError", "_studio_slug", "_studio_hash", "_studio_cookie_value",
+        "SkillsStudioStore",
+    ],
     "skills/store.py": ["_BUILTIN_SKILLS", "SkillStore"],
 
     "mcp/__init__.py": [],
@@ -282,10 +312,13 @@ DEFAULT_LAYOUT: dict[str, list[str]] = {
     "server/__init__.py": [],
     "server/http.py": ["AgentHTTPServer", "Handler"],
     "server/skills.py": ["SkillsHandler"],
-    "server/rag_admin.py": ["RagAdminHandler", "CodeAdminHandler"],
+    "server/rag_admin.py": ["_RagAdminAuthMixin", "RagAdminHandler", "CodeAdminHandler"],
 
     # Specific regex buckets above run before this general constant rule.
-    "config/constants.py": ["~^[A-Z][A-Z0-9_]{2,}$", "_SHELL_AUTO_CONFIRM_PATTERNS", "_TOOL_TIMEOUT_MAP", "_DEFAULT_TOOL_TIMEOUT"],
+    "config/constants.py": [
+        "~^[A-Z][A-Z0-9_]{2,}$", "_SHELL_AUTO_CONFIRM_PATTERNS", "_TOOL_TIMEOUT_MAP",
+        "_DEFAULT_TOOL_TIMEOUT", "_DEFAULT_SHELL_TIMEOUT_MODE_RAW",
+    ],
     "_unclassified.py": [],
 }
 

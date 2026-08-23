@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=670 original-lines=7511-7528 hash=ac928f4957da521b
+# split-source: order=670 original-lines=7533-7550 hash=ac928f4957da521b
 
 def _windows_subprocess_encodings() -> list[str]:
     if os.name != "nt" and not sys.platform.startswith("win"):
@@ -25,7 +25,7 @@ def _windows_subprocess_encodings() -> list[str]:
         pass
     return out
 
-# split-source: order=934 original-lines=27151-27159 hash=9e668c7c3fcbd2dc
+# split-source: order=934 original-lines=27174-27182 hash=9e668c7c3fcbd2dc
 
 # ============================================================================
 # Architecture / 架构 / アーキテクチャ
@@ -36,22 +36,22 @@ def _windows_subprocess_encodings() -> list[str]:
 
 _IDE_SANDBOX_BACKEND_CACHE: dict[str, object] = {}
 
-# split-source: order=935 original-lines=27160-27160 hash=6fd3520014763931
+# split-source: order=935 original-lines=27183-27183 hash=6fd3520014763931
 _IDE_SANDBOX_BACKEND_LOCK = threading.RLock()
 
-# split-source: order=936 original-lines=27161-27161 hash=8a49dbb25dd35c5c
+# split-source: order=936 original-lines=27184-27184 hash=8a49dbb25dd35c5c
 WINDOWS_JOB_SANDBOX_MARKER = "__clouds_windows_job__"
 
-# split-source: order=937 original-lines=27162-27162 hash=e9091a7636337ff2
+# split-source: order=937 original-lines=27185-27185 hash=e9091a7636337ff2
 _WINDOWS_LOW_INTEGRITY_ROOTS: set[str] = set()
 
-# split-source: order=938 original-lines=27163-27163 hash=e81acd4ddab152d2
+# split-source: order=938 original-lines=27186-27186 hash=e81acd4ddab152d2
 _WINDOWS_LOW_INTEGRITY_FAILED_ROOTS: set[str] = set()
 
-# split-source: order=939 original-lines=27164-27164 hash=5e5351da59b8c3e5
+# split-source: order=939 original-lines=27187-27187 hash=5e5351da59b8c3e5
 _WINDOWS_LOW_INTEGRITY_LOCK = threading.RLock()
 
-# split-source: order=940 original-lines=27165-27171 hash=77416c0f2acc726f
+# split-source: order=940 original-lines=27188-27194 hash=77416c0f2acc726f
 
 def _is_windows_job_sandbox_prefix(prefix: object) -> bool:
     return bool(
@@ -60,7 +60,7 @@ def _is_windows_job_sandbox_prefix(prefix: object) -> bool:
         and str(prefix[0]) == WINDOWS_JOB_SANDBOX_MARKER
     )
 
-# split-source: order=941 original-lines=27172-27195 hash=916341a37017a4ba
+# split-source: order=941 original-lines=27195-27218 hash=916341a37017a4ba
 
 def _windows_builtin_sandbox_probe() -> tuple[bool, str]:
     if os.name != "nt" or not sys.platform.startswith("win"):
@@ -86,7 +86,7 @@ def _windows_builtin_sandbox_probe() -> tuple[bool, str]:
     except Exception as exc:
         return False, f"Windows security API initialization failed: {exc}"
 
-# split-source: order=942 original-lines=27196-27203 hash=7e07dad19e17b216
+# split-source: order=942 original-lines=27219-27226 hash=7e07dad19e17b216
 
 def _windows_last_error(label: str) -> OSError:
     code = int(ctypes.get_last_error() or 1)
@@ -96,7 +96,7 @@ def _windows_last_error(label: str) -> OSError:
         detail = "Windows API error"
     return OSError(code, f"{label}: {detail}")
 
-# split-source: order=943 original-lines=27204-27257 hash=9bc6a284727c424d
+# split-source: order=943 original-lines=27227-27280 hash=9bc6a284727c424d
 
 def _windows_set_integrity_label(path: Path, *, inherit: bool, sid_string: str) -> None:
     from ctypes import wintypes
@@ -152,12 +152,12 @@ def _windows_set_integrity_label(path: Path, *, inherit: bool, sid_string: str) 
         kernel32.LocalFree.restype = ctypes.c_void_p
         kernel32.LocalFree(sid)
 
-# split-source: order=944 original-lines=27258-27260 hash=1b60eda767ee08cf
+# split-source: order=944 original-lines=27281-27283 hash=1b60eda767ee08cf
 
 def _windows_set_low_integrity_label(path: Path, *, inherit: bool) -> None:
     _windows_set_integrity_label(path, inherit=inherit, sid_string="S-1-16-4096")
 
-# split-source: order=945 original-lines=27261-27284 hash=9037185914e9a128
+# split-source: order=945 original-lines=27284-27307 hash=9037185914e9a128
 
 def _windows_protect_application_snapshot(workspace_root: Path) -> None:
     snapshot = Path(workspace_root) / ".application_skills"
@@ -183,7 +183,7 @@ def _windows_protect_application_snapshot(workspace_root: Path) -> None:
             except Exception:
                 pass
 
-# split-source: order=946 original-lines=27285-27322 hash=0427774e9b45bad0
+# split-source: order=946 original-lines=27308-27345 hash=0427774e9b45bad0
 
 def _windows_prepare_low_integrity_workspace(workspace_root: Path) -> bool:
     canonical = Path(os.path.realpath(workspace_root)).resolve()
@@ -223,7 +223,7 @@ def _windows_prepare_low_integrity_workspace(workspace_root: Path) -> bool:
         _WINDOWS_LOW_INTEGRITY_ROOTS.add(key)
         return True
 
-# split-source: order=947 original-lines=27323-27330 hash=f8b21aa8be386c16
+# split-source: order=947 original-lines=27346-27353 hash=f8b21aa8be386c16
 
 def _windows_job_memory_limit() -> int:
     raw = str(os.environ.get("CLOUDS_CODER_SANDBOX_MEMORY", "1g") or "1g").strip().lower()
@@ -233,7 +233,7 @@ def _windows_job_memory_limit() -> int:
     factor = {"": 1, "k": 1024, "m": 1024**2, "g": 1024**3, "t": 1024**4}[match.group(2)]
     return max(128 * 1024 * 1024, min(16 * 1024**3, int(float(match.group(1)) * factor)))
 
-# split-source: order=948 original-lines=27331-27378 hash=7a33e21232b7a212
+# split-source: order=948 original-lines=27354-27401 hash=7a33e21232b7a212
 
 def _windows_lower_process_integrity(process_handle: object) -> None:
     from ctypes import wintypes
@@ -283,7 +283,7 @@ def _windows_lower_process_integrity(process_handle: object) -> None:
             kernel32.CloseHandle.restype = wintypes.BOOL
             kernel32.CloseHandle(token)
 
-# split-source: order=949 original-lines=27379-27471 hash=8b61c117b2a11d8e
+# split-source: order=949 original-lines=27402-27494 hash=8b61c117b2a11d8e
 
 def _windows_attach_sandbox_job(
     proc: subprocess.Popen,
@@ -378,7 +378,7 @@ def _windows_attach_sandbox_job(
         if job:
             kernel32.CloseHandle(job)
 
-# split-source: order=950 original-lines=27472-27488 hash=a01de1a457312922
+# split-source: order=950 original-lines=27495-27511 hash=a01de1a457312922
 
 def _windows_close_sandbox_job(proc: subprocess.Popen | None, *, terminate: bool = False) -> None:
     if proc is None:
@@ -397,7 +397,7 @@ def _windows_close_sandbox_job(proc: subprocess.Popen | None, *, terminate: bool
     finally:
         proc._clouds_windows_job_handle = None
 
-# split-source: order=951 original-lines=27489-27520 hash=c4a14a964d9cd5dc
+# split-source: order=951 original-lines=27512-27543 hash=c4a14a964d9cd5dc
 
 def _popen_windows_sandboxed(
     command: object,
@@ -431,7 +431,7 @@ def _popen_windows_sandboxed(
         _windows_close_sandbox_job(proc, terminate=True)
         raise
 
-# split-source: order=952 original-lines=27521-27574 hash=3712bcbfdf4619bd
+# split-source: order=952 original-lines=27544-27597 hash=3712bcbfdf4619bd
 
 def _run_windows_sandboxed_command(
     command: str,
@@ -487,7 +487,7 @@ def _run_windows_sandboxed_command(
     finally:
         _windows_close_sandbox_job(proc)
 
-# split-source: order=953 original-lines=27575-27679 hash=9dd286da7d9bf200
+# split-source: order=953 original-lines=27598-27702 hash=9dd286da7d9bf200
 
 def _detect_ide_sandbox_backend(*, force: bool = False) -> dict:
     preference = str(os.environ.get("CLOUDS_CODER_SANDBOX_BACKEND", "auto") or "auto").strip().lower()

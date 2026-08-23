@@ -2276,23 +2276,7 @@ MEDIA_CAPABILITY_KEYS = {
     "output_video",
 }
 
-# split-source: order=585 original-lines=5219-5222 hash=947f2df7c50b7629
-SAMPLE_IMAGE_PNG_B64 = (
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/"
-    "b0cAAAAASUVORK5CYII="
-)
-
-# split-source: order=586 original-lines=5223-5225 hash=6fb6a13ea37fdaf8
-SAMPLE_AUDIO_WAV_B64 = (
-    "UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA="
-)
-
-# split-source: order=587 original-lines=5226-5228 hash=37b12b3c40ce93cc
-SAMPLE_VIDEO_MP4_B64 = (
-    "AAAAFGZ0eXBpc29tAAAAAGlzb21pc28y"
-)
-
-# split-source: order=588 original-lines=5229-5555 hash=aafa6e4f2233e391
+# split-source: order=588 original-lines=5251-5577 hash=aafa6e4f2233e391
 
 OFFLINE_JS_LIB_CATALOG: list[dict[str, object]] = [
     {
@@ -2621,16 +2605,16 @@ OFFLINE_JS_LIB_CATALOG: list[dict[str, object]] = [
     },
 ]
 
-# split-source: order=589 original-lines=5556-5556 hash=a3dde32b74501c9b
+# split-source: order=589 original-lines=5578-5578 hash=a3dde32b74501c9b
 OFFLINE_JS_ASSET_LOCK = threading.RLock()
 
-# split-source: order=590 original-lines=5557-5557 hash=12eae3e20bb41a04
+# split-source: order=590 original-lines=5579-5579 hash=12eae3e20bb41a04
 OFFLINE_JS_LIB_INDEX_FILE = "index.json"
 
-# split-source: order=591 original-lines=5558-5558 hash=48655aedbd13d83e
+# split-source: order=591 original-lines=5580-5580 hash=48655aedbd13d83e
 OFFLINE_JS_LIB_README_FILE = "README.md"
 
-# split-source: order=601 original-lines=5752-5823 hash=6efa3f69661023a6
+# split-source: order=601 original-lines=5774-5845 hash=6efa3f69661023a6
 
 
 BACKEND_I18N = {
@@ -2704,7 +2688,7 @@ BACKEND_I18N = {
     },
 }
 
-# split-source: order=602 original-lines=5824-5925 hash=06aa475848b86f52
+# split-source: order=602 original-lines=5846-5947 hash=06aa475848b86f52
 
 BACKEND_I18N["en"].update(
     {
@@ -2808,7 +2792,7 @@ BACKEND_I18N["en"].update(
     }
 )
 
-# split-source: order=603 original-lines=5926-6026 hash=6200995927dae9da
+# split-source: order=603 original-lines=5948-6048 hash=6200995927dae9da
 BACKEND_I18N["zh-CN"].update(
     {
         "todo_node_suffix": " | 当前节点：{topic}",
@@ -2911,7 +2895,7 @@ BACKEND_I18N["zh-CN"].update(
     }
 )
 
-# split-source: order=604 original-lines=6027-6127 hash=1af71834ce8cb90e
+# split-source: order=604 original-lines=6049-6149 hash=1af71834ce8cb90e
 BACKEND_I18N["zh-TW"].update(
     {
         "todo_node_suffix": " | 目前節點：{topic}",
@@ -3014,7 +2998,7 @@ BACKEND_I18N["zh-TW"].update(
     }
 )
 
-# split-source: order=605 original-lines=6128-6228 hash=26c197a7d8238e44
+# split-source: order=605 original-lines=6150-6250 hash=26c197a7d8238e44
 BACKEND_I18N["ja"].update(
     {
         "todo_node_suffix": " | 現在のノード: {topic}",
@@ -3117,21 +3101,21 @@ BACKEND_I18N["ja"].update(
     }
 )
 
-# split-source: order=836 original-lines=14846-14848 hash=fe64e14cf82a6abb
+# split-source: order=836 original-lines=14868-14870 hash=fe64e14cf82a6abb
 
 
 TABULAR_PREVIEW_EXTS = {".csv", ".tsv"}
 
-# split-source: order=837 original-lines=14849-14849 hash=43ed1e050832d382
+# split-source: order=837 original-lines=14871-14871 hash=43ed1e050832d382
 EXCEL_PREVIEW_EXTS = {".xlsx", ".xls", ".xlsm"}
 
-# split-source: order=838 original-lines=14850-14850 hash=41505360f13ba6a7
+# split-source: order=838 original-lines=14872-14872 hash=41505360f13ba6a7
 PRESENTATION_PREVIEW_EXTS = {".pptx", ".ppt", ".pptm"}
 
-# split-source: order=839 original-lines=14851-14851 hash=8d36725f2e52a335
+# split-source: order=839 original-lines=14873-14873 hash=8d36725f2e52a335
 DOCUMENT_PREVIEW_EXTS = {".docx", ".doc", ".docm"}
 
-# split-source: order=1041 original-lines=106440-106457 hash=58c9260037425107
+# split-source: order=1041 original-lines=106463-106480 hash=58c9260037425107
 
 # ============================================================================
 # Architecture / 架构 / アーキテクチャ
@@ -3151,34 +3135,34 @@ DOCUMENT_PREVIEW_EXTS = {".docx", ".doc", ".docm"}
 
 STUDIO_DEVICE_COOKIE = "cc_studio_device"
 
-# split-source: order=1042 original-lines=106458-106458 hash=96e8c851e2302159
+# split-source: order=1042 original-lines=106481-106481 hash=96e8c851e2302159
 STUDIO_SESSION_COOKIE = "cc_studio_session"
 
-# split-source: order=1043 original-lines=106459-106459 hash=d6411ff144d2b2e9
+# split-source: order=1043 original-lines=106482-106482 hash=d6411ff144d2b2e9
 STUDIO_DEVICE_TTL = 180 * 24 * 60 * 60
 
-# split-source: order=1044 original-lines=106460-106460 hash=955afcde4cb400ac
+# split-source: order=1044 original-lines=106483-106483 hash=955afcde4cb400ac
 STUDIO_SESSION_TTL = 24 * 60 * 60
 
-# split-source: order=1045 original-lines=106461-106461 hash=569c087422548fbf
+# split-source: order=1045 original-lines=106484-106484 hash=569c087422548fbf
 STUDIO_MAX_FILE_BYTES = 10 * 1024 * 1024
 
-# split-source: order=1046 original-lines=106462-106462 hash=a9fdb060d056c458
+# split-source: order=1046 original-lines=106485-106485 hash=a9fdb060d056c458
 STUDIO_MAX_PROJECT_BYTES = 50 * 1024 * 1024
 
-# split-source: order=1047 original-lines=106463-106463 hash=349eab79a6a7f9a7
+# split-source: order=1047 original-lines=106486-106486 hash=349eab79a6a7f9a7
 STUDIO_MAX_FILES = 256
 
-# split-source: order=1048 original-lines=106464-106464 hash=1f1795a6e43689f3
+# split-source: order=1048 original-lines=106487-106487 hash=1f1795a6e43689f3
 STUDIO_MAX_JOB_SECONDS = 15 * 60
 
-# split-source: order=1054 original-lines=108364-108366 hash=f4c00c1faeb747fb
+# split-source: order=1054 original-lines=108387-108389 hash=f4c00c1faeb747fb
 
 
 STUDIO_INDEX_HTML = r'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Skills Studio 2.0</title><link rel="stylesheet" href="/assets/studio.css"></head><body><div class="studio"><header><div><span class="eyebrow">CLOUDS CODER</span><h1>Skills Studio <em>2.0</em></h1><p>Design private, testable Skill packages. Nothing reaches global agents before approval.</p></div><button id="newProject">New project</button></header><main><aside><div class="side-title">Projects</div><div id="projects"></div></aside><section class="workspace"><div id="empty" class="empty"><h2>Start a private Skill draft</h2><p>Create a project to design requirements, files, workflow and evaluations.</p><button id="emptyNew">Create project</button></div><div id="editor" class="hidden"><div class="project-head"><div><h2 id="projectTitle"></h2><div id="projectMeta" class="meta"></div></div><div class="actions"><button data-action="validate">Validate</button><button data-action="evaluate">Evaluate</button><button data-action="submit" class="primary">Request review</button></div></div><nav class="tabs"><button class="active" data-tab="brief">Brief</button><button data-tab="design">Design</button><button data-tab="files">Files</button><button data-tab="workflow">Workflow</button><button data-tab="evaluation">Evaluation</button></nav><div id="tabContent"></div></div></section><aside class="copilot"><div class="side-title">Copilot</div><p class="muted">Choose stepwise interview or one-click generation. Candidate patches stay private until you accept them.</p><textarea id="copilotInput" placeholder="Describe the skill goal, examples, constraints and references…"></textarea><div class="mode"><button data-mode="stepwise" class="selected">Stepwise</button><button data-mode="one_click">One-click</button></div><button id="copilotRun" class="primary wide">Generate private candidate</button><pre id="copilotStatus" class="status"></pre></aside></main></div><script src="/assets/js_lib/monaco/min/vs/loader.js"></script><script src="/assets/studio.js"></script></body></html>'''
 
-# split-source: order=1055 original-lines=108367-108367 hash=4b782b7dd294d57e
+# split-source: order=1055 original-lines=108390-108390 hash=4b782b7dd294d57e
 STUDIO_CSS = r'''*{box-sizing:border-box}body{margin:0;background:#f4f7fb;color:#182538;font:14px/1.5 Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.studio{min-height:100vh}header{height:90px;background:#0d1b2a;color:#fff;padding:16px 28px;display:flex;align-items:center;justify-content:space-between}h1{margin:2px 0;font-size:25px}h1 em{font-style:normal;color:#64d6ff}.eyebrow{font-size:10px;letter-spacing:.18em;color:#8ba8c4}header p{margin:2px 0;color:#a9bdcf}button{border:1px solid #ccd8e5;background:#fff;color:#29415d;border-radius:8px;padding:8px 13px;cursor:pointer;font-weight:600}button:hover{border-color:#6aa8db}button.primary{background:#1668c7;border-color:#1668c7;color:#fff}button.wide{width:100%;margin-top:10px}.studio main{height:calc(100vh - 90px);display:grid;grid-template-columns:230px minmax(420px,1fr) 310px}.studio aside{background:#fff;border-right:1px solid #dce5ee;padding:16px;overflow:auto}.studio .copilot{border-left:1px solid #dce5ee;border-right:0;background:#fbfdff}.side-title{font-weight:800;color:#526a83;margin-bottom:12px}.project-item{padding:10px;border:1px solid transparent;border-radius:9px;margin-bottom:6px;cursor:pointer}.project-item:hover,.project-item.active{background:#eef6ff;border-color:#b7d7f5}.project-item small,.meta,.muted{color:#70859a;font-size:12px}.workspace{padding:24px;overflow:auto}.empty{max-width:520px;margin:12vh auto;text-align:center}.hidden{display:none!important}.project-head{display:flex;justify-content:space-between;gap:18px;align-items:start;border-bottom:1px solid #dce5ee;padding-bottom:15px}.project-head h2{margin:0}.actions{display:flex;gap:7px}.tabs{display:flex;gap:2px;margin:14px 0;border-bottom:1px solid #dce5ee}.tabs button{border:0;border-bottom:2px solid transparent;border-radius:0;background:transparent}.tabs button.active{color:#1668c7;border-bottom-color:#1668c7}.panel{background:#fff;border:1px solid #dce5ee;border-radius:12px;padding:18px;margin-bottom:12px}.file-row{display:flex;justify-content:space-between;width:100%;padding:9px;border:0;border-bottom:1px solid #edf1f5;border-radius:0;text-align:left}.file-row code{color:#1668c7}.file-workbench{display:grid;grid-template-columns:minmax(180px,28%) 1fr;gap:12px;min-height:460px}.file-tools{height:38px;display:flex;justify-content:space-between;align-items:center;color:#60768c}.monaco-host,.file-fallback{height:410px;width:100%;border:1px solid #d5e0ea}.file-fallback{display:none;min-height:410px;border-radius:0}textarea{width:100%;min-height:160px;border:1px solid #cbd8e5;border-radius:9px;padding:10px;font:13px/1.5 ui-monospace,monospace;resize:vertical}.mode{display:flex;gap:6px;margin-top:10px}.mode button{flex:1}.mode button.selected{background:#e7f2ff;border-color:#79b4ea;color:#075da9}.status{min-height:140px;white-space:pre-wrap;background:#0e1c2a;color:#bee4ff;border-radius:9px;padding:10px;font-size:11px}@media(max-width:1000px){.studio main{grid-template-columns:190px minmax(300px,1fr)}.copilot{position:fixed;right:0;top:90px;bottom:0;width:300px;box-shadow:-10px 0 30px #9eacbb;display:none}.copilot.open{display:block}}@media(max-width:700px){header{padding:12px 16px;height:auto}.studio main{height:auto;min-height:calc(100vh - 76px);grid-template-columns:1fr}.studio main>aside:first-child{display:none}.workspace{padding:14px}.actions{flex-wrap:wrap}.project-head{display:block}.actions{margin-top:10px}.file-workbench{grid-template-columns:1fr}.monaco-host,.file-fallback{height:330px;min-height:330px}}'''
 
-# split-source: order=1056 original-lines=108368-108368 hash=ca9a737435a250bf
+# split-source: order=1056 original-lines=108391-108391 hash=ca9a737435a250bf
 STUDIO_JS = r'''const S={csrf:'',device:'',session:'',projects:[],project:null,mode:'stepwise',tab:'brief',job:null,monaco:null,editor:null,model:null};const $=id=>document.getElementById(id);const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));async function api(path,opt={}){const h=new Headers(opt.headers||{});if(opt.body&&!h.has('Content-Type'))h.set('Content-Type','application/json');if(opt.method&&opt.method!=='GET')h.set('X-CSRF-Token',S.csrf);const r=await fetch(path,{credentials:'same-origin',cache:'no-store',...opt,headers:h});const b=await r.json();if(!r.ok)throw Error(b.error||`HTTP ${r.status}`);return b}async function boot(){const b=await api('/api/skillslab/v2/bootstrap');S.csrf=b.csrf_token;S.projects=b.projects||[];renderProjects();if(S.projects[0])openProject(S.projects[0].id)}function renderProjects(){const h=$('projects');h.innerHTML=S.projects.map(p=>`<div class="project-item ${S.project?.id===p.id?'active':''}" data-id="${esc(p.id)}"><strong>${esc(p.title)}</strong><br><small>${esc(p.status)} · v${p.revision}</small></div>`).join('')||'<p class="muted">No private drafts yet.</p>';h.querySelectorAll('[data-id]').forEach(x=>x.onclick=()=>openProject(x.dataset.id))}async function openProject(id){S.project=await api('/api/skillslab/v2/projects/'+encodeURIComponent(id));$('empty').classList.add('hidden');$('editor').classList.remove('hidden');$('projectTitle').textContent=S.project.title;$('projectMeta').textContent=`${S.project.status} · revision ${S.project.revision}`;renderProjects();renderTab()}function renderTab(){const c=$('tabContent');if(!S.project)return;const v=S.project.validation||{};if(S.tab==='files'){c.innerHTML=`<div class="panel"><div class="file-workbench"><div id="studioFileList">${(S.project.files||[]).map(f=>`<button class="file-row" data-file="${esc(f.path)}"><code>${esc(f.path)}</code><span>${f.size} bytes</span></button>`).join('')}</div><div><div class="file-tools"><span id="activeFile">Select a file</span><button id="saveFile" disabled>Save</button></div><div id="monacoHost" class="monaco-host"></div><textarea id="fileFallback" class="file-fallback"></textarea></div></div></div>`;c.querySelectorAll('[data-file]').forEach(x=>x.onclick=()=>openStudioFile(x.dataset.file));}else if(S.tab==='evaluation')c.innerHTML=`<div class="panel"><h3>Deterministic validation</h3><pre>${esc(JSON.stringify(v,null,2))}</pre></div>`;else c.innerHTML=`<div class="panel"><h3>${S.tab==='brief'?'Requirements brief':S.tab==='design'?'Design decisions':'Workflow view'}</h3><p>${esc(S.project.summary?.description||'Describe the target, triggers, inputs/outputs, tools, trust boundary and quality bar in Copilot.')}</p><p class="muted">Private draft only · global agents are unaffected.</p></div>`}async function initStudioEditor(value,path){const host=$('monacoHost'),fallback=$('fileFallback');if(window.require&&window.monaco){if(!S.editor){window.MonacoEnvironment={getWorker:()=>new Worker('/assets/studio-monaco-worker.js')};window.require.config({paths:{vs:'/assets/js_lib/monaco/min/vs'}});await new Promise((resolve,reject)=>window.require(['vs/editor/editor.main'],resolve,reject));S.monaco=window.monaco;S.editor=S.monaco.editor.create(host,{automaticLayout:true,minimap:{enabled:false},fontSize:13,wordWrap:'on'});}if(S.model)S.model.dispose();S.model=S.monaco.editor.createModel(value,path.endsWith('.md')?'markdown':path.endsWith('.yaml')||path.endsWith('.yml')?'yaml':'plaintext');S.editor.setModel(S.model);fallback.classList.add('hidden')}else{fallback.value=value;fallback.classList.remove('hidden')}}async function openStudioFile(path){const f=await api(`/api/skillslab/v2/projects/${S.project.id}/files/${encodeURIComponent(path)}`);S.activeFile=path;$('activeFile').textContent=path;$('saveFile').disabled=!!f.is_binary;if(!f.is_binary){await initStudioEditor(f.content,path);$('saveFile').onclick=async()=>{const content=S.editor&&S.model?S.model.getValue():$('fileFallback').value;await api(`/api/skillslab/v2/projects/${S.project.id}/files`,{method:'POST',body:JSON.stringify({path,content,expected_revision:S.project.revision})});await openProject(S.project.id)}}}async function newProject(){const title=prompt('Skill title');if(!title)return;const p=await api('/api/skillslab/v2/projects',{method:'POST',body:JSON.stringify({title})});S.projects.unshift(p);renderProjects();openProject(p.id)}document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{S.tab=b.dataset.tab;document.querySelectorAll('[data-tab]').forEach(x=>x.classList.toggle('active',x===b));renderTab()});document.querySelectorAll('[data-mode]').forEach(b=>b.onclick=()=>{S.mode=b.dataset.mode;document.querySelectorAll('[data-mode]').forEach(x=>x.classList.toggle('selected',x===b))});$('newProject').onclick=$('emptyNew').onclick=()=>newProject().catch(e=>alert(e.message));document.querySelectorAll('[data-action]').forEach(b=>b.onclick=async()=>{try{if(b.dataset.action==='validate'){$('copilotStatus').textContent=JSON.stringify(await api(`/api/skillslab/v2/projects/${S.project.id}/validate`),null,2)}else if(b.dataset.action==='evaluate'){$('copilotStatus').textContent=JSON.stringify(await api(`/api/skillslab/v2/projects/${S.project.id}/evaluations`,{method:'POST',body:JSON.stringify({expected_revision:S.project.revision})}),null,2)}else{const out=await api(`/api/skillslab/v2/projects/${S.project.id}/submissions`,{method:'POST',body:JSON.stringify({expected_revision:S.project.revision})});$('copilotStatus').textContent=JSON.stringify(out,null,2)}openProject(S.project.id)}catch(e){alert(e.message)}});$('copilotRun').onclick=async()=>{try{const out=await api(`/api/skillslab/v2/projects/${S.project.id}/copilot/jobs`,{method:'POST',body:JSON.stringify({mode:S.mode,goal:$('copilotInput').value,expected_revision:S.project.revision})});$('copilotStatus').textContent=JSON.stringify(out,null,2);setTimeout(async()=>{$('copilotStatus').textContent=JSON.stringify(await api(`/api/skillslab/v2/copilot/jobs/${out.id}`),null,2)},250)}catch(e){alert(e.message)}};boot().catch(e=>{$('copilotStatus').textContent=e.message});'''

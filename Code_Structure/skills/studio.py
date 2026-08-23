@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=1049 original-lines=106465-106474 hash=9c0c3a1fff932193
+# split-source: order=1049 original-lines=106488-106497 hash=9c0c3a1fff932193
 
 
 class SkillsStudioError(Exception):
@@ -17,7 +17,7 @@ class SkillsStudioError(Exception):
         self.status = int(status or 400)
         self.details = dict(details or {})
 
-# split-source: order=1050 original-lines=106475-106490 hash=d2fe3603f0912f53
+# split-source: order=1050 original-lines=106498-106513 hash=d2fe3603f0912f53
 
 
 def _studio_slug(value: object, fallback: str = "skill") -> str:
@@ -35,13 +35,13 @@ def _studio_slug(value: object, fallback: str = "skill") -> str:
         )
     return text
 
-# split-source: order=1051 original-lines=106491-106494 hash=0128d9491e800215
+# split-source: order=1051 original-lines=106514-106517 hash=0128d9491e800215
 
 
 def _studio_hash(value: str) -> str:
     return hashlib.sha256(str(value or "").encode("utf-8", errors="ignore")).hexdigest()
 
-# split-source: order=1052 original-lines=106495-106504 hash=9448eda197483a51
+# split-source: order=1052 original-lines=106518-106527 hash=9448eda197483a51
 
 
 def _studio_cookie_value(headers, name: str) -> str:
@@ -53,7 +53,7 @@ def _studio_cookie_value(headers, name: str) -> str:
     except Exception:
         return ""
 
-# split-source: order=1053 original-lines=106505-108363 hash=3cd5b26888a127df
+# split-source: order=1053 original-lines=106528-108386 hash=3cd5b26888a127df
 
 
 class SkillsStudioStore:

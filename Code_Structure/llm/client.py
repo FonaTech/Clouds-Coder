@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=919 original-lines=24108-24130 hash=ec5cc2a0de1c5071
+# split-source: order=919 original-lines=24130-24152 hash=ec5cc2a0de1c5071
 
 
 class OllamaError(RuntimeError):
@@ -30,7 +30,7 @@ class OllamaError(RuntimeError):
         self.retryable = retryable
         self.transient = transient
 
-# split-source: order=920 original-lines=24131-26445 hash=d5d12e721e8f75da
+# split-source: order=920 original-lines=24153-26468 hash=ea6456c19eb701d3
 
 class OllamaClient:
     _probe_cache: dict[str, dict] = {}
@@ -1323,12 +1323,13 @@ class OllamaClient:
             return False, "unsupported media type"
         if str(self.provider or "").strip().lower() == "ollama" and mtype in {"audio", "video"}:
             return False, "ollama chat payload currently supports image attachments only"
-        sample_map = {
-            "image": (SAMPLE_IMAGE_PNG_B64, "image/png"),
-            "audio": (SAMPLE_AUDIO_WAV_B64, "audio/wav"),
-            "video": (SAMPLE_VIDEO_MP4_B64, "video/mp4"),
+        probe_map = {
+            "image": (_capability_probe_png_bytes(), "image/png"),
+            "audio": (_capability_probe_audio_bytes(), "audio/wav"),
+            "video": (_capability_probe_video_bytes(), "video/mp4"),
         }
-        data_b64, mime = sample_map[mtype]
+        probe_bytes, mime = probe_map[mtype]
+        data_b64 = base64.b64encode(probe_bytes).decode("ascii")
         prompt_map = {
             "image": "Capability probe: briefly describe this image in one sentence.",
             "audio": "Capability probe: transcribe or describe this audio in one sentence.",

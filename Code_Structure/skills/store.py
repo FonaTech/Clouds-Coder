@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=891 original-lines=19435-19543 hash=745fa615d6fc251e
+# split-source: order=891 original-lines=19457-19565 hash=745fa615d6fc251e
 
 # ---------------------------------------------------------------------------
 # Built-in skill guides injected into SkillStore on reload.
@@ -116,7 +116,7 @@ _BUILTIN_SKILLS: dict[str, dict] = {
     },
 }
 
-# split-source: order=892 original-lines=19544-21319 hash=bdbb27beff242352
+# split-source: order=892 original-lines=19566-21341 hash=bdbb27beff242352
 
 # ============================================================================
 # Architecture / 架构 / アーキテクチャ

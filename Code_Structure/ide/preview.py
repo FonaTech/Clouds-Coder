@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=834 original-lines=14821-14834 hash=31577b90e3bcda44
+# split-source: order=834 original-lines=14843-14856 hash=31577b90e3bcda44
 
 
 def normalize_rel_preview_path(path_text: str) -> str:
@@ -21,7 +21,7 @@ def normalize_rel_preview_path(path_text: str) -> str:
     except Exception:
         return raw.lstrip("/")
 
-# split-source: order=835 original-lines=14835-14845 hash=6c03436acef9b8b8
+# split-source: order=835 original-lines=14857-14867 hash=6c03436acef9b8b8
 
 
 def is_code_preview_candidate(path_text: str) -> bool:
@@ -34,7 +34,7 @@ def is_code_preview_candidate(path_text: str) -> bool:
         return True
     return name in CODE_PREVIEW_FILENAMES
 
-# split-source: order=840 original-lines=14852-14881 hash=5ef14b7c7f7b1be9
+# split-source: order=840 original-lines=14874-14903 hash=5ef14b7c7f7b1be9
 
 
 def preview_kind_for_path(path_text: str) -> str:
@@ -66,7 +66,7 @@ def preview_kind_for_path(path_text: str) -> str:
         return "document"
     return ""
 
-# split-source: order=841 original-lines=14882-14915 hash=ebe8b075d1a4bf10
+# split-source: order=841 original-lines=14904-14937 hash=ebe8b075d1a4bf10
 
 
 def normalize_markdown_preview_text(text: object) -> str:
@@ -102,7 +102,7 @@ def normalize_markdown_preview_text(text: object) -> str:
         out.append(line[index:] if consumed >= common else line.lstrip(" \t"))
     return "\n".join(out)
 
-# split-source: order=842 original-lines=14916-14936 hash=c4d0ef74bf50f451
+# split-source: order=842 original-lines=14938-14958 hash=c4d0ef74bf50f451
 
 
 def _preview_markdown_value_html(value: object, *, depth: int = 0) -> str:
@@ -125,7 +125,7 @@ def _preview_markdown_value_html(value: object, *, depth: int = 0) -> str:
         return f"<ul>{items}</ul>"
     return html.escape(str(value if value is not None else ""))
 
-# split-source: order=843 original-lines=14937-14952 hash=5f26c37d49e6339a
+# split-source: order=843 original-lines=14959-14974 hash=5f26c37d49e6339a
 
 
 def _preview_markdown_frontmatter_html(meta: dict) -> str:
@@ -143,7 +143,7 @@ def _preview_markdown_frontmatter_html(meta: dict) -> str:
         f"<div class=\"pv-frontmatter-grid\">{''.join(rows)}</div></details>"
     )
 
-# split-source: order=844 original-lines=14953-14966 hash=d714807f812ac552
+# split-source: order=844 original-lines=14975-14988 hash=d714807f812ac552
 
 
 def _preview_markdown_task_lists(rendered: str) -> str:
@@ -159,7 +159,7 @@ def _preview_markdown_task_lists(rendered: str) -> str:
     return re.sub(r'(<li(?:\s[^>]*)?>)\s*\[([ xX])\]\s+(.*?)(</li>)',
                   lambda m: replace_item(m) + m.group(4), rendered, flags=re.S)
 
-# split-source: order=845 original-lines=14967-15008 hash=e38a80adabe7b352
+# split-source: order=845 original-lines=14989-15030 hash=e38a80adabe7b352
 
 
 def _preview_markdown_fallback_inline(text: str) -> str:
@@ -203,7 +203,7 @@ def _preview_markdown_fallback_inline(text: str) -> str:
         escaped = escaped.replace(f"\x00PV_TOKEN_{idx}\x00", value)
     return escaped
 
-# split-source: order=846 original-lines=15009-15105 hash=95a54ed61144ff81
+# split-source: order=846 original-lines=15031-15127 hash=95a54ed61144ff81
 
 
 def _preview_markdown_fallback_html(text: str) -> str:
@@ -302,7 +302,7 @@ def _preview_markdown_fallback_html(text: str) -> str:
         blocks.append(paragraph(paragraph_lines))
     return "".join(blocks)
 
-# split-source: order=849 original-lines=15146-15170 hash=abf937895bd7e4bb
+# split-source: order=849 original-lines=15168-15192 hash=abf937895bd7e4bb
 
 
 def workspace_file_revision_map(root: Path, max_files: int = 30_000) -> dict[str, str]:
@@ -329,7 +329,7 @@ def workspace_file_revision_map(root: Path, max_files: int = 30_000) -> dict[str
                 return out
     return out
 
-# split-source: order=850 original-lines=15171-15177 hash=55e686d35dd4e59e
+# split-source: order=850 original-lines=15193-15199 hash=55e686d35dd4e59e
 
 
 def workspace_revision_delta(before: dict[str, str], after: dict[str, str], limit: int = 80) -> list[str]:
@@ -338,7 +338,7 @@ def workspace_revision_delta(before: dict[str, str], after: dict[str, str], limi
         if before.get(path) != after.get(path)
     ][:max(1, int(limit or 80))]
 
-# split-source: order=851 original-lines=15178-15226 hash=22a7c9af9a04af7d
+# split-source: order=851 original-lines=15200-15248 hash=22a7c9af9a04af7d
 
 
 def build_code_preview_rows(

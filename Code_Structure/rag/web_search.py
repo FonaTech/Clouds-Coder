@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=714 original-lines=8378-8385 hash=c5ad9e231dfe7a14
+# split-source: order=714 original-lines=8400-8407 hash=c5ad9e231dfe7a14
 
 
 def _agent_web_bool(value: object, default: bool = False) -> bool:
@@ -15,7 +15,7 @@ def _agent_web_bool(value: object, default: bool = False) -> bool:
         return value
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
-# split-source: order=715 original-lines=8386-8393 hash=ce9e153b14840a57
+# split-source: order=715 original-lines=8408-8415 hash=ce9e153b14840a57
 
 
 def _agent_web_int(value: object, default: int, minimum: int, maximum: int) -> int:
@@ -25,7 +25,7 @@ def _agent_web_int(value: object, default: int, minimum: int, maximum: int) -> i
         num = int(default)
     return max(int(minimum), min(int(maximum), num))
 
-# split-source: order=716 original-lines=8394-8400 hash=035e9295e82698b6
+# split-source: order=716 original-lines=8416-8422 hash=035e9295e82698b6
 
 
 def _agent_web_host_is_local_name(host: str) -> bool:
@@ -34,7 +34,7 @@ def _agent_web_host_is_local_name(host: str) -> bool:
         return True
     return low.endswith(".localhost") or low.endswith(".local")
 
-# split-source: order=717 original-lines=8401-8415 hash=a2d4cea120f5c6a7
+# split-source: order=717 original-lines=8423-8437 hash=a2d4cea120f5c6a7
 
 
 def _agent_web_ip_is_blocked(raw_ip: str) -> bool:
@@ -51,7 +51,7 @@ def _agent_web_ip_is_blocked(raw_ip: str) -> bool:
         or ip.is_unspecified
     )
 
-# split-source: order=718 original-lines=8416-8445 hash=4d279cd33c02cadb
+# split-source: order=718 original-lines=8438-8467 hash=4d279cd33c02cadb
 
 
 def _agent_web_canonical_url(raw_url: str, base_url: str = "") -> str:
@@ -83,7 +83,7 @@ def _agent_web_canonical_url(raw_url: str, base_url: str = "") -> str:
     query = parsed.query
     return urlunparse((scheme, netloc, path, "", query, ""))
 
-# split-source: order=719 original-lines=8446-8457 hash=bbc6813ce54f894a
+# split-source: order=719 original-lines=8468-8479 hash=bbc6813ce54f894a
 
 
 def _agent_web_domain_to_seed(domain: str) -> str:
@@ -97,7 +97,7 @@ def _agent_web_domain_to_seed(domain: str) -> str:
         return ""
     return _agent_web_canonical_url(urlunparse((parsed.scheme or "https", parsed.netloc, "/", "", "", "")))
 
-# split-source: order=720 original-lines=8458-8475 hash=3e359369a4d81885
+# split-source: order=720 original-lines=8480-8497 hash=3e359369a4d81885
 
 
 def _agent_web_query_terms(text: str) -> list[str]:
@@ -117,7 +117,7 @@ def _agent_web_query_terms(text: str) -> list[str]:
             out.append(tok)
     return out[:24]
 
-# split-source: order=721 original-lines=8476-8516 hash=1d6ca1959a8c4750
+# split-source: order=721 original-lines=8498-8538 hash=1d6ca1959a8c4750
 
 
 def _agent_web_query_domain_hints(query: str) -> list[str]:
@@ -160,7 +160,7 @@ def _agent_web_query_domain_hints(query: str) -> list[str]:
                 hints.append(domain)
     return hints[:8]
 
-# split-source: order=722 original-lines=8517-8539 hash=fa102eb767ea8673
+# split-source: order=722 original-lines=8539-8561 hash=fa102eb767ea8673
 
 
 def _agent_web_query_needs_fresh_network(query: str) -> bool:
@@ -185,7 +185,7 @@ def _agent_web_query_needs_fresh_network(query: str) -> bool:
         pass
     return False
 
-# split-source: order=723 original-lines=8540-8557 hash=ebd97959abfa53d4
+# split-source: order=723 original-lines=8562-8579 hash=ebd97959abfa53d4
 
 
 def _agent_web_extract_text_snippet(text: str, terms: list[str], max_chars: int = 420) -> str:
@@ -205,7 +205,7 @@ def _agent_web_extract_text_snippet(text: str, terms: list[str], max_chars: int 
     start = max(0, end - max_chars)
     return trim(clean[start:end].strip(), max_chars)
 
-# split-source: order=724 original-lines=8558-8637 hash=153a43b333240a9d
+# split-source: order=724 original-lines=8580-8659 hash=153a43b333240a9d
 
 
 class AgentWebHTMLParser(HTMLParser):
@@ -287,7 +287,7 @@ class AgentWebHTMLParser(HTMLParser):
             "links": self.links[:1500],
         }
 
-# split-source: order=725 original-lines=8638-8661 hash=34ed062702481c7f
+# split-source: order=725 original-lines=8660-8683 hash=34ed062702481c7f
 
 
 def _agent_web_decompress_bytes(raw: bytes, content_encoding: str = "") -> tuple[bytes, str, bool, str]:
@@ -313,7 +313,7 @@ def _agent_web_decompress_bytes(raw: bytes, content_encoding: str = "") -> tuple
         return data, enc, False, f"decompress failed: {trim(str(exc), 160)}"
     return data, enc, False, ""
 
-# split-source: order=726 original-lines=8662-8720 hash=5c6154eb65ae20e7
+# split-source: order=726 original-lines=8684-8742 hash=5c6154eb65ae20e7
 
 def _agent_web_charset_candidates(raw: bytes, content_type: str = "") -> list[str]:
     candidates: list[str] = []
@@ -374,7 +374,7 @@ def _agent_web_charset_candidates(raw: bytes, content_type: str = "") -> list[st
     candidates = deduped
     return candidates
 
-# split-source: order=727 original-lines=8721-8755 hash=151ab73cabe35914
+# split-source: order=727 original-lines=8743-8777 hash=151ab73cabe35914
 
 def _agent_web_decode_text_bytes(raw: bytes, content_type: str = "", content_encoding: str = "") -> dict:
     decoded_bytes, encoding, decompressed, decode_error = _agent_web_decompress_bytes(raw, content_encoding)
@@ -411,7 +411,7 @@ def _agent_web_decode_text_bytes(raw: bytes, content_type: str = "", content_enc
         "binary_like": bool(binary_like),
     }
 
-# split-source: order=728 original-lines=8756-10538 hash=486254b4708c3b70
+# split-source: order=728 original-lines=8778-10560 hash=486254b4708c3b70
 
 
 class AgentWebSearchEngine:
