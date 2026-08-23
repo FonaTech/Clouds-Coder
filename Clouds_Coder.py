@@ -14922,10 +14922,12 @@ def normalize_upload_rel_path(path_text: str) -> str:
         # workspace directory.  Keep only the path below that prefix.
         parts = [part for part in raw.split("/") if part]
         raw = "/".join(parts[2:]) if len(parts) > 2 else ""
-    raw = "/".join(
+    leading_slash = raw.startswith("/")
+    cleaned = "/".join(
         part for part in raw.split("/")
         if part and part != "." and "\x00" not in part
     )
+    raw = f"/{cleaned}" if leading_slash else cleaned
     return normalize_rel_preview_path(raw)
 
 
