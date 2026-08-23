@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=1062 original-lines=118294-118669 hash=dad83c8a109695ff
+# split-source: order=1062 original-lines=118318-118693 hash=dad83c8a109695ff
 
 
 class TelemetryStore:
@@ -383,7 +383,7 @@ class TelemetryStore:
             "generated_at": current,
         }
 
-# split-source: order=1063 original-lines=118670-119479 hash=6620df1b5b9667dc
+# split-source: order=1063 original-lines=118694-119503 hash=6620df1b5b9667dc
 
 
 class ApplicationRegistry:

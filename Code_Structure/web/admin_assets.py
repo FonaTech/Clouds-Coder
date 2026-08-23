@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=963 original-lines=89830-90065 hash=677637c6e3db5aac
+# split-source: order=963 original-lines=89854-90089 hash=677637c6e3db5aac
 
 ADMIN_INDEX_HTML = """<!doctype html>
 <html lang="zh-CN">
@@ -243,7 +243,7 @@ ADMIN_INDEX_HTML = """<!doctype html>
 </html>
 """
 
-# split-source: order=964 original-lines=90066-90199 hash=e36a3affc315442c
+# split-source: order=964 original-lines=90090-90223 hash=e36a3affc315442c
 
 ADMIN_CSS = """
 :root{--bg:#f3f6fb;--surface:#fff;--surface2:#f7f9fc;--text:#172033;--muted:#667085;--line:#dce3ee;--brand:#2563eb;--brand2:#0f9f8f;--danger:#b42318;--warn:#b54708;--shadow:0 18px 44px rgba(27,39,71,.09)}
@@ -379,7 +379,7 @@ th{color:var(--muted);font-size:.72rem;text-transform:uppercase;letter-spacing:.
 @media(max-width:720px){.admin-shell{padding:14px}.admin-header,.section-head,.collab-detail-head,.collab-service-bar{flex-direction:column;align-items:stretch}.header-actions{justify-content:flex-start}.metric-grid{grid-template-columns:repeat(2,1fr)}.two-column,.chart-grid{grid-template-columns:1fr}.config-grid,.process-toolbar{grid-template-columns:1fr}.admin-nav{overflow:auto}.action-bar button{flex:1 1 145px}.user-tracking-head{align-items:stretch}.user-filter{align-items:stretch;flex-direction:column}.focus-user-summary{grid-template-columns:repeat(2,minmax(0,1fr))}.chart-host{min-height:215px}.collab-filter-row,.collab-member-filter{grid-template-columns:1fr}.collab-service-actions{justify-content:flex-start}.collab-service-actions>*{flex:1 1 180px;text-align:center}}
 """
 
-# split-source: order=965 original-lines=90200-90297 hash=6f56e5641b01c670
+# split-source: order=965 original-lines=90224-90321 hash=6f56e5641b01c670
 
 ADMIN_JS = r"""
 const A={token:sessionStorage.getItem('clouds_coder_admin_token')||'',config:null,metrics:null,metricUserHash:'',metricResizeTimer:0,apps:[],skills:[],reviewStatus:'pending',selectedSkills:[],toastTimer:0,serverErrors:[],bootId:'',restartNonce:'',collabProjects:[],collabProject:null,collabMembers:[],collabConflicts:[],collabAudit:[],processPayload:null,selectedProcesses:[],processDetailId:''};

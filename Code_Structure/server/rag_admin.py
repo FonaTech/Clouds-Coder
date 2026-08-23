@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=1066 original-lines=121755-121912 hash=854829282d494ae6
+# split-source: order=1066 original-lines=121779-121936 hash=854829282d494ae6
 
 
 class _RagAdminAuthMixin:
@@ -165,7 +165,7 @@ class _RagAdminAuthMixin:
             )
         return True
 
-# split-source: order=1068 original-lines=122027-122215 hash=c1b91099095057bf
+# split-source: order=1068 original-lines=122051-122239 hash=c1b91099095057bf
 
 
 class RagAdminHandler(_RagAdminAuthMixin, BaseHTTPRequestHandler):
@@ -356,7 +356,7 @@ class RagAdminHandler(_RagAdminAuthMixin, BaseHTTPRequestHandler):
                 return self._send_json({"error": str(exc)}, status=400)
         return self._send_json({"error": "not found"}, status=404)
 
-# split-source: order=1069 original-lines=122216-122414 hash=6e5644e269e55ae3
+# split-source: order=1069 original-lines=122240-122438 hash=6e5644e269e55ae3
 
 
 class CodeAdminHandler(_RagAdminAuthMixin, BaseHTTPRequestHandler):

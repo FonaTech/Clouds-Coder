@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=893 original-lines=21388-21522 hash=c02177d86b64b0a6
+# split-source: order=893 original-lines=21412-21546 hash=c02177d86b64b0a6
 
 # ============================================================================
 # Architecture / 架构 / アーキテクチャ

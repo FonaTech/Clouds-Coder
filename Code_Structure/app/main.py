@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=1075 original-lines=124670-126556 hash=22ab5dc6515a18fe
+# split-source: order=1075 original-lines=124694-126580 hash=22ab5dc6515a18fe
 
 
 def main():
@@ -1894,7 +1894,7 @@ def main():
             error_path=app.admin_restart_error_path,
         )
 
-# split-source: order=1076 original-lines=126557-126559 hash=032e6922518465de
+# split-source: order=1076 original-lines=126581-126583 hash=032e6922518465de
 
 if __name__ == "__main__":
     main()
