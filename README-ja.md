@@ -27,7 +27,7 @@
     <th width="50%">IDE ワークスペース</th>
   </tr>
   <tr>
-    <td><p><strong>従来の Web UI</strong></p><p>タスク中心の従来 Web UI は組み込みランタイムから引き続き利用でき、IDE と同じ実行カーネルを共有します。</p></td>
+    <td><img src="./Intro.png" alt="Clouds Coder Introduction" width="980" style="max-width:100%;height:auto" /><p><strong>従来の Web UI</strong></p><p>タスク中心の従来 Web UI は組み込みランタイムから引き続き利用でき、IDE と同じ実行カーネルを共有します。</p></td>
     <td><img src="./Images/clouds-coder-ide.png" alt="Clouds Coder ブラウザー IDE：セッションワークスペース、コード編集、Agent 進捗、診断" width="100%" /></td>
   </tr>
 </table>

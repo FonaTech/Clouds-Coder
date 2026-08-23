@@ -27,7 +27,7 @@
     <th width="50%">IDE Workspace</th>
   </tr>
   <tr>
-    <td><p><strong>Original Web UI</strong></p><p>The task-focused Web UI remains available from the embedded runtime and shares the same execution kernel.</p></td>
+    <td><img src="./Intro.png" alt="Clouds Coder Introduction" width="980" style="max-width:100%;height:auto" /><p><strong>Original Web UI</strong></p><p>The task-focused Web UI remains available from the embedded runtime and shares the same execution kernel.</p></td>
     <td><img src="./Images/clouds-coder-ide.png" alt="Clouds Coder browser IDE with session workspace, code editor, Agent progress, and diagnostics" width="100%" /></td>
   </tr>
 </table>
@@ -230,7 +230,7 @@ sequenceDiagram
   Board-->>AgentB: contributor + assigned slices
 
   AgentA->>Board: declare file intent and evidence
-  AgentB->>Board: read plan; declare non-overlapping intent
+  AgentB->>Board: read plan, declare non-overlapping intent
   AgentA->>Files: coordinated write
   AgentB->>Files: coordinated write
   Files-->>Board: revisions and validation evidence

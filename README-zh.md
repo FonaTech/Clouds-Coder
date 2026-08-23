@@ -27,7 +27,7 @@
     <th width="50%">IDE 工作区</th>
   </tr>
   <tr>
-    <td><p><strong>原版 Web 界面</strong></p><p>面向任务的原版 Web 界面仍由内嵌运行时提供，并与 IDE 共用同一执行内核。</p></td>
+    <td><img src="./Intro.png" alt="Clouds Coder Introduction" width="980" style="max-width:100%;height:auto" /><p><strong>原版 Web 界面</strong></p><p>面向任务的原版 Web 界面仍由内嵌运行时提供，并与 IDE 共用同一执行内核。</p></td>
     <td><img src="./Images/clouds-coder-ide.png" alt="Clouds Coder 浏览器 IDE：会话工作区、代码编辑、Agent 进度与诊断面板" width="100%" /></td>
   </tr>
 </table>
