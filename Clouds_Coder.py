@@ -12846,12 +12846,52 @@ def parse_front_matter(text: str) -> tuple[dict, str]:
             return value
         return str(value)
 
+    def _split_inline_items(raw: str) -> list[str]:
+        items: list[str] = []
+        start = 0
+        depth = 0
+        quote = ""
+        escaped = False
+        for index, char in enumerate(str(raw or "")):
+            if quote:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == quote:
+                    quote = ""
+                continue
+            if char in {"'", '"'}:
+                quote = char
+            elif char in "[{(":
+                depth += 1
+            elif char in "]})":
+                depth = max(0, depth - 1)
+            elif char == "," and depth == 0:
+                items.append(str(raw)[start:index].strip())
+                start = index + 1
+        tail = str(raw)[start:].strip()
+        if tail:
+            items.append(tail)
+        return items
+
     def _parse_scalar(raw: str):
         txt = str(raw or "").strip()
         if not txt:
             return ""
         if len(txt) >= 2 and txt[0] == txt[-1] and txt[0] in {"'", '"'}:
             return txt[1:-1]
+        if txt.startswith("[") and txt.endswith("]"):
+            inner = txt[1:-1].strip()
+            return [_parse_scalar(item) for item in _split_inline_items(inner)] if inner else []
+        if txt.startswith("{") and txt.endswith("}"):
+            result: dict[str, object] = {}
+            for item in _split_inline_items(txt[1:-1]):
+                if ":" not in item:
+                    continue
+                key, value = item.split(":", 1)
+                result[str(_parse_scalar(key)).strip()] = _parse_scalar(value)
+            return result
         low = txt.lower()
         if low == "true":
             return True
@@ -20323,12 +20363,18 @@ class SkillStore:
         if cc_sidecar.exists() and cc_sidecar.is_file() and not cc_sidecar.is_symlink():
             try:
                 sidecar_raw = cc_sidecar.read_text(encoding="utf-8")
-                sidecar = _yaml.safe_load(sidecar_raw) if _yaml is not None else {}
+                if _yaml is not None:
+                    sidecar = _yaml.safe_load(sidecar_raw)
+                else:
+                    sidecar, _ = parse_front_matter(f"---\n{sidecar_raw.strip()}\n---\n")
                 if isinstance(sidecar, dict):
                     section = sidecar.get("clouds_coder", sidecar)
                     if isinstance(section, dict):
                         meta = dict(meta)
-                        meta["clouds_coder"] = dict(section)
+                        existing = meta.get("clouds_coder")
+                        merged = dict(existing) if isinstance(existing, dict) else {}
+                        merged.update(section)
+                        meta["clouds_coder"] = merged
             except Exception as exc:
                 self.warnings.append(f"{cc_sidecar}: invalid Clouds Coder sidecar: {exc}")
         name = str(meta.get("name", "")).strip() or skill_dir.name
@@ -31469,6 +31515,44 @@ class SessionState:
         })
         return f"Skill unloaded: {skill_name}"
 
+    def _reconcile_active_skills(self, selected: object, *, source: str = "auto") -> list[str]:
+        """Keep active skill state aligned with the current metadata selection.
+
+        Automatic focus changes are a replacement operation: explicitly pinned
+        skills remain available, while active skills from the previous focus are
+        removed when they are no longer selected.  The normal unload path is
+        used so context cleanup and lifecycle events stay consistent.
+        """
+        desired: set[str] = set()
+        rows = selected.get("selected", []) if isinstance(selected, dict) else selected
+        if isinstance(rows, dict):
+            rows = [rows]
+        for row in rows if isinstance(rows, (list, tuple, set)) else []:
+            if isinstance(row, dict):
+                value = row.get("canonical_id", row.get("id", ""))
+            else:
+                value = row
+            normalized = str(value or "").strip().casefold()
+            if normalized:
+                desired.add(normalized)
+        board = self._ensure_blackboard()
+        loaded = board.get("loaded_skills", {})
+        if not isinstance(loaded, dict):
+            return []
+        stale = [
+            str(key)
+            for key, row in loaded.items()
+            if isinstance(row, dict)
+            and str(row.get("scope", "active") or "active").strip().lower() == "active"
+            and str(key).casefold() not in desired
+        ]
+        removed: list[str] = []
+        for key in stale:
+            result = self._unload_skill(key, source=source)
+            if not str(result).startswith("Error:"):
+                removed.append(key)
+        return removed
+
     def _loaded_skills_goal_signature(self, goal_text: str) -> str:
         goal = trim(str(goal_text or ""), 1200).strip().casefold()
         if not goal:
@@ -31915,6 +31999,10 @@ class SessionState:
                 goal,
                 step=self._current_execution_step_full_text(),
                 phase=trigger or "execution",
+            )
+            self._reconcile_active_skills(
+                selection,
+                source=f"auto:{trigger or 'discovery'}",
             )
             selected_ids = [str(row.get("id", "") or "") for row in selection.get("selected", []) if isinstance(row, dict)]
             loaded_names: list[str] = []
