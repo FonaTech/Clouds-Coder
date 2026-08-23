@@ -611,7 +611,7 @@ def normalize_work_text(text: object, status: str = "") -> str:
     )
     return s.strip(" -")
 
-# split-source: order=826 original-lines=14558-14576 hash=b4fd9c47feae07d0
+# split-source: order=826 original-lines=14598-14616 hash=b4fd9c47feae07d0
 
 def make_unified_diff(path: str, old_text: str, new_text: str, max_lines: int = 400) -> tuple[str, int, int]:
     old_lines = old_text.splitlines()
@@ -632,7 +632,7 @@ def make_unified_diff(path: str, old_text: str, new_text: str, max_lines: int = 
     text = "\n".join(diff) if diff else f"@@ no textual diff for {path}"
     return text, added, deleted
 
-# split-source: order=827 original-lines=14577-14582 hash=fc6e1578f1dfb8e0
+# split-source: order=827 original-lines=14617-14622 hash=fc6e1578f1dfb8e0
 
 def _skip_row(text: str) -> dict:
     msg = str(text or "").strip() or "⋮"
@@ -640,13 +640,13 @@ def _skip_row(text: str) -> dict:
         msg = f"⋮ {msg}"
     return {"kind": "skip", "sign": "⋮", "old_line": None, "new_line": None, "text": msg}
 
-# split-source: order=828 original-lines=14583-14586 hash=f5d9ac4c2c90cef7
+# split-source: order=828 original-lines=14623-14626 hash=f5d9ac4c2c90cef7
 
 
 def _row_is_hot(row: dict) -> bool:
     return str((row or {}).get("kind", "")).strip().lower() in {"add", "delete"}
 
-# split-source: order=829 original-lines=14587-14610 hash=5862d764d6ac180a
+# split-source: order=829 original-lines=14627-14650 hash=5862d764d6ac180a
 
 
 def _hotspot_index(rows: list[dict]) -> int:
@@ -672,7 +672,7 @@ def _hotspot_index(rows: list[dict]) -> int:
             best_score = score
     return best_idx
 
-# split-source: order=830 original-lines=14611-14660 hash=6f30990ffc308229
+# split-source: order=830 original-lines=14651-14700 hash=6f30990ffc308229
 
 
 def _compress_rows_keep_hotspot(
@@ -724,7 +724,7 @@ def _compress_rows_keep_hotspot(
         truncated = True
     return out, truncated
 
-# split-source: order=831 original-lines=14661-14795 hash=220a462e9f681355
+# split-source: order=831 original-lines=14701-14835 hash=220a462e9f681355
 
 
 def _focused_diff_rows_from_opcodes(
@@ -861,7 +861,7 @@ def _focused_diff_rows_from_opcodes(
     out, truncated = _compress_rows_keep_hotspot(rows, max_rows)
     return out, bool(truncated or len(out) < len(rows))
 
-# split-source: order=832 original-lines=14796-14828 hash=a8b71f66e76048d1
+# split-source: order=832 original-lines=14836-14868 hash=a8b71f66e76048d1
 
 
 def make_numbered_diff(old_text: str, new_text: str, max_lines: int = 320) -> list[dict]:
@@ -896,7 +896,7 @@ def make_numbered_diff(old_text: str, new_text: str, max_lines: int = 320) -> li
         out.append(_skip_row(f"⋮ ... ({len(new_lines) - show} lines omitted)"))
     return out
 
-# split-source: order=833 original-lines=14829-14842 hash=effc08a63226e126
+# split-source: order=833 original-lines=14869-14882 hash=effc08a63226e126
 
 def render_numbered_diff_text(entries: list[dict]) -> str:
     out = []

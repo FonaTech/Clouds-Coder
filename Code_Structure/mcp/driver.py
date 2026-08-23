@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=906 original-lines=22784-22793 hash=19ebd92811495fa7
+# split-source: order=906 original-lines=22830-22839 hash=19ebd92811495fa7
 
 
 def mcp_normalize_name(name: object) -> str:
@@ -17,7 +17,7 @@ def mcp_normalize_name(name: object) -> str:
     """
     return MCP_NAME_RE.sub("_", str(name or "").strip())
 
-# split-source: order=907 original-lines=22794-22878 hash=4b332b8de0a78786
+# split-source: order=907 original-lines=22840-22924 hash=4b332b8de0a78786
 
 
 def mcp_normalize_server_configs(raw: object) -> dict[str, dict]:
@@ -104,7 +104,7 @@ def mcp_normalize_server_configs(raw: object) -> dict[str, dict]:
         }
     return out
 
-# split-source: order=908 original-lines=22879-22898 hash=74b736e5080b3642
+# split-source: order=908 original-lines=22925-22944 hash=74b736e5080b3642
 
 
 def mcp_extract_server_configs(config: object) -> dict[str, dict]:
@@ -126,7 +126,7 @@ def mcp_extract_server_configs(config: object) -> dict[str, dict]:
                 merged.setdefault(n, rec)
     return merged
 
-# split-source: order=909 original-lines=22899-22909 hash=495cc820a7e8f96c
+# split-source: order=909 original-lines=22945-22955 hash=495cc820a7e8f96c
 
 
 def _mcp_sha256_file(path: Path) -> str:
@@ -139,7 +139,7 @@ def _mcp_sha256_file(path: Path) -> str:
             digest.update(chunk)
     return digest.hexdigest()
 
-# split-source: order=910 original-lines=22910-22927 hash=7f1b9a21dac5f0a0
+# split-source: order=910 original-lines=22956-22973 hash=7f1b9a21dac5f0a0
 
 
 def _mcp_file_identity(path: object) -> dict:
@@ -159,7 +159,7 @@ def _mcp_file_identity(path: object) -> dict:
     except Exception:
         return {}
 
-# split-source: order=911 original-lines=22928-22946 hash=ba25d209349997bc
+# split-source: order=911 original-lines=22974-22992 hash=ba25d209349997bc
 
 
 def mcp_workspace_identity(workspace: object) -> dict:
@@ -180,7 +180,7 @@ def mcp_workspace_identity(workspace: object) -> dict:
     payload["id"] = hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()
     return payload
 
-# split-source: order=912 original-lines=22947-22954 hash=12e13e87ce55eda1
+# split-source: order=912 original-lines=22993-23000 hash=12e13e87ce55eda1
 
 
 def mcp_config_file_digest(config_path: object) -> str:
@@ -190,7 +190,7 @@ def mcp_config_file_digest(config_path: object) -> str:
     except Exception:
         return ""
 
-# split-source: order=913 original-lines=22955-22989 hash=0a6f0c485dfccbe4
+# split-source: order=913 original-lines=23001-23035 hash=0a6f0c485dfccbe4
 
 
 def mcp_default_trust_store_path(workspace: object) -> Path:
@@ -227,7 +227,7 @@ def mcp_default_trust_store_path(workspace: object) -> Path:
         pass
     return fallback / f"{workspace_id}.json"
 
-# split-source: order=914 original-lines=22990-23004 hash=1d696753c65c59cb
+# split-source: order=914 original-lines=23036-23050 hash=1d696753c65c59cb
 
 
 def mcp_record_definition_fingerprint(record: dict) -> str:
@@ -244,7 +244,7 @@ def mcp_record_definition_fingerprint(record: dict) -> str:
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()
 
-# split-source: order=915 original-lines=23005-23092 hash=eae2216527b4a4fc
+# split-source: order=915 original-lines=23051-23138 hash=eae2216527b4a4fc
 
 
 def _mcp_effective_spawn(record: dict, workspace: object = None) -> tuple[dict, list[str], dict, str | None]:
@@ -334,7 +334,7 @@ def _mcp_effective_spawn(record: dict, workspace: object = None) -> tuple[dict, 
     argv = [resolved_command or command] + args
     return descriptor, argv, env, str(cwd_path) if raw_cwd else None
 
-# split-source: order=916 original-lines=23093-23154 hash=40bcd20c1ebf3871
+# split-source: order=916 original-lines=23139-23200 hash=40bcd20c1ebf3871
 
 
 class MCPWorkspaceTrustStore:
@@ -398,7 +398,7 @@ class MCPWorkspaceTrustStore:
                 self._write_unlocked(payload)
             return existed
 
-# split-source: order=917 original-lines=23155-23510 hash=cdf8cf6e74804fc8
+# split-source: order=917 original-lines=23201-23556 hash=cdf8cf6e74804fc8
 
 
 class MCPServerProcess:
@@ -756,7 +756,7 @@ class MCPServerProcess:
             "authorization": authorization,
         }
 
-# split-source: order=918 original-lines=23511-24129 hash=376178e1322daff7
+# split-source: order=918 original-lines=23557-24175 hash=376178e1322daff7
 
 
 class MCPManager:

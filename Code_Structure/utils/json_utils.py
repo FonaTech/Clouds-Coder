@@ -234,7 +234,7 @@ def extract_json_object_from_text(text: str, default: dict | None = None) -> dic
             return obj
     return default or {}
 
-# split-source: order=809 original-lines=13009-13015 hash=447a2de5bc82a133
+# split-source: order=809 original-lines=13049-13055 hash=447a2de5bc82a133
 
 def _json_default_copy(default: object) -> object:
     if isinstance(default, dict):
@@ -243,7 +243,7 @@ def _json_default_copy(default: object) -> object:
         return list(default)
     return default
 
-# split-source: order=810 original-lines=13016-13037 hash=3bf3649f6416e766
+# split-source: order=810 original-lines=13056-13077 hash=3bf3649f6416e766
 
 def _read_json_file(path: Path, default: object) -> object:
     bak = path.with_name(f"{path.name}.bak")
@@ -267,7 +267,7 @@ def _read_json_file(path: Path, default: object) -> object:
         return obj
     return _json_default_copy(default)
 
-# split-source: order=811 original-lines=13038-13066 hash=a8537823069e1ffa
+# split-source: order=811 original-lines=13078-13106 hash=a8537823069e1ffa
 
 def _write_json_file(path: Path, obj: object):
     path.parent.mkdir(parents=True, exist_ok=True)

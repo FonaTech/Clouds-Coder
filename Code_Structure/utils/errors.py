@@ -11,7 +11,7 @@ from __future__ import annotations
 class EmptyActionError(RuntimeError):
     """Raised when assistant returns only thinking but no actionable output."""
 
-# split-source: order=894 original-lines=21477-21482 hash=577f6c7ce048cc8a
+# split-source: order=894 original-lines=21523-21528 hash=577f6c7ce048cc8a
 
 class ProcessManagerError(Exception):
     def __init__(self, message: str, *, status: int = 400, code: str = "process_error"):

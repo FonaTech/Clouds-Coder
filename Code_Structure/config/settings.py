@@ -2271,7 +2271,7 @@ def looks_like_llm_config(config: dict) -> bool:
     }
     return bool(keys & markers)
 
-# split-source: order=806 original-lines=12796-12984 hash=e99df837f830598b
+# split-source: order=806 original-lines=12796-13024 hash=c72333b87d914997
 
 def parse_front_matter(text: str) -> tuple[dict, str]:
     text = text or ""
@@ -2325,12 +2325,52 @@ def parse_front_matter(text: str) -> tuple[dict, str]:
             return value
         return str(value)
 
+    def _split_inline_items(raw: str) -> list[str]:
+        items: list[str] = []
+        start = 0
+        depth = 0
+        quote = ""
+        escaped = False
+        for index, char in enumerate(str(raw or "")):
+            if quote:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == quote:
+                    quote = ""
+                continue
+            if char in {"'", '"'}:
+                quote = char
+            elif char in "[{(":
+                depth += 1
+            elif char in "]})":
+                depth = max(0, depth - 1)
+            elif char == "," and depth == 0:
+                items.append(str(raw)[start:index].strip())
+                start = index + 1
+        tail = str(raw)[start:].strip()
+        if tail:
+            items.append(tail)
+        return items
+
     def _parse_scalar(raw: str):
         txt = str(raw or "").strip()
         if not txt:
             return ""
         if len(txt) >= 2 and txt[0] == txt[-1] and txt[0] in {"'", '"'}:
             return txt[1:-1]
+        if txt.startswith("[") and txt.endswith("]"):
+            inner = txt[1:-1].strip()
+            return [_parse_scalar(item) for item in _split_inline_items(inner)] if inner else []
+        if txt.startswith("{") and txt.endswith("}"):
+            result: dict[str, object] = {}
+            for item in _split_inline_items(txt[1:-1]):
+                if ":" not in item:
+                    continue
+                key, value = item.split(":", 1)
+                result[str(_parse_scalar(key)).strip()] = _parse_scalar(value)
+            return result
         low = txt.lower()
         if low == "true":
             return True

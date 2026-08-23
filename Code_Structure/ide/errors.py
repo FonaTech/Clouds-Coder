@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=816 original-lines=14082-14088 hash=a7a3f693afd66024
+# split-source: order=816 original-lines=14122-14128 hash=a7a3f693afd66024
 
 
 class IDECapabilityError(Exception):
@@ -14,7 +14,7 @@ class IDECapabilityError(Exception):
         self.code = str(code or "ide_capability_denied")
         self.status = int(status or 403)
 
-# split-source: order=817 original-lines=14089-14096 hash=a89c4b79be3974b9
+# split-source: order=817 original-lines=14129-14136 hash=a89c4b79be3974b9
 
 
 class IDEFileConflict(Exception):

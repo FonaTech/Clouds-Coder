@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=954 original-lines=27703-82480 hash=2493f1ec4ab7082f
+# split-source: order=954 original-lines=27749-82568 hash=7dd3919a8921e051
 
 # Per-session orchestrator: maintains conversation state, plan state, tool
 # routing, todo synchronization, completion checks, and agent coordination.
@@ -3775,6 +3775,44 @@ class SessionState:
         })
         return f"Skill unloaded: {skill_name}"
 
+    def _reconcile_active_skills(self, selected: object, *, source: str = "auto") -> list[str]:
+        """Keep active skill state aligned with the current metadata selection.
+
+        Automatic focus changes are a replacement operation: explicitly pinned
+        skills remain available, while active skills from the previous focus are
+        removed when they are no longer selected.  The normal unload path is
+        used so context cleanup and lifecycle events stay consistent.
+        """
+        desired: set[str] = set()
+        rows = selected.get("selected", []) if isinstance(selected, dict) else selected
+        if isinstance(rows, dict):
+            rows = [rows]
+        for row in rows if isinstance(rows, (list, tuple, set)) else []:
+            if isinstance(row, dict):
+                value = row.get("canonical_id", row.get("id", ""))
+            else:
+                value = row
+            normalized = str(value or "").strip().casefold()
+            if normalized:
+                desired.add(normalized)
+        board = self._ensure_blackboard()
+        loaded = board.get("loaded_skills", {})
+        if not isinstance(loaded, dict):
+            return []
+        stale = [
+            str(key)
+            for key, row in loaded.items()
+            if isinstance(row, dict)
+            and str(row.get("scope", "active") or "active").strip().lower() == "active"
+            and str(key).casefold() not in desired
+        ]
+        removed: list[str] = []
+        for key in stale:
+            result = self._unload_skill(key, source=source)
+            if not str(result).startswith("Error:"):
+                removed.append(key)
+        return removed
+
     def _loaded_skills_goal_signature(self, goal_text: str) -> str:
         goal = trim(str(goal_text or ""), 1200).strip().casefold()
         if not goal:
@@ -4221,6 +4259,10 @@ class SessionState:
                 goal,
                 step=self._current_execution_step_full_text(),
                 phase=trigger or "execution",
+            )
+            self._reconcile_active_skills(
+                selection,
+                source=f"auto:{trigger or 'discovery'}",
             )
             selected_ids = [str(row.get("id", "") or "") for row in selection.get("selected", []) if isinstance(row, dict)]
             loaded_names: list[str] = []

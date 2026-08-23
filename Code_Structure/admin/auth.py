@@ -40,7 +40,7 @@ def trusted_client_ip(handler: BaseHTTPRequestHandler) -> str:
         current = candidate
     return current
 
-# split-source: order=812 original-lines=13067-13074 hash=d6f677beb0fa793e
+# split-source: order=812 original-lines=13107-13114 hash=d6f677beb0fa793e
 
 
 class AdminAuthError(Exception):
@@ -50,7 +50,7 @@ class AdminAuthError(Exception):
         self.status = int(status or 400)
         self.retry_after = max(0, int(retry_after or 0))
 
-# split-source: order=813 original-lines=13075-13351 hash=927375521985540f
+# split-source: order=813 original-lines=13115-13391 hash=927375521985540f
 
 
 class AdminAuthStore:

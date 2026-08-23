@@ -176,7 +176,7 @@ def user_id_from_ip(ip: str) -> str:
     safe_ip = re.sub(r"[^A-Za-z0-9._-]", "_", raw)
     return f"user_{safe_ip}_{token}"
 
-# split-source: order=807 original-lines=12985-12998 hash=80f1c7a9452235b7
+# split-source: order=807 original-lines=13025-13038 hash=80f1c7a9452235b7
 
 
 def _meta_string_list(value: object) -> list[str]:
@@ -192,7 +192,7 @@ def _meta_string_list(value: object) -> list[str]:
             out.append(txt)
     return out
 
-# split-source: order=859 original-lines=15753-15758 hash=f5ed28063e7e4a7a
+# split-source: order=859 original-lines=15793-15798 hash=f5ed28063e7e4a7a
 
 def _module_exists(name: str) -> bool:
     try:

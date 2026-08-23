@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=1033 original-lines=105422-105577 hash=641e10fc7e09ef39
+# split-source: order=1033 original-lines=105510-105665 hash=641e10fc7e09ef39
 
 IDE_INDEX_HTML = """<!doctype html>
 <html lang="zh-CN">
@@ -163,7 +163,7 @@ IDE_INDEX_HTML = """<!doctype html>
 </html>
 """
 
-# split-source: order=1034 original-lines=105578-105617 hash=673d6d09c1b573fc
+# split-source: order=1034 original-lines=105666-105705 hash=673d6d09c1b573fc
 
 IDE_CSS = """
 .icons-fallback .codicon::before{display:inline-block;min-width:1em;font-family:"Segoe UI Symbol","Apple Symbols",Arial,sans-serif!important;font-style:normal;font-weight:400;line-height:1;text-align:center;content:"□"!important}
@@ -205,7 +205,7 @@ input,select,textarea{border:1px solid transparent;border-radius:2px;background:
 @media(max-width:480px){.title-bar{grid-template-columns:28px 22px minmax(0,1fr) auto;padding:0 3px}.layout-controls button:not(#toggleSecondaryBtn){display:none}.command-center span:last-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.activity-button{width:43px}.workbench-grid{grid-template-columns:44px minmax(0,1fr)!important}.primary-sidebar{left:44px}.status-left #syncStatus,.status-left #errorStatus{display:none}.panel-tabs{gap:9px}.panel-tabs button{max-width:62px;overflow:hidden;text-overflow:ellipsis}.auth-dialog{padding:28px 22px}.extension-row{grid-template-columns:36px minmax(0,1fr)}.extension-icon{width:36px;height:36px}.extension-row .button{grid-column:2;justify-self:start}}
 """
 
-# split-source: order=1035 original-lines=105618-105811 hash=8de1c72f24ea8922
+# split-source: order=1035 original-lines=105706-105899 hash=8de1c72f24ea8922
 
 IDE_JS = """
 const E=id=>document.getElementById(id);
@@ -401,7 +401,7 @@ function bind(){
 window.addEventListener('DOMContentLoaded',async()=>{bind();try{await refreshConfig();setStatus('ready')}catch(err){setStatus(err.message,true)}});
 """
 
-# split-source: order=1036 original-lines=105812-105818 hash=be9902cabc46519f
+# split-source: order=1036 original-lines=105900-105906 hash=be9902cabc46519f
 
 IDE_CSS += r"""
 .collaboration-only{display:none}.collaboration-mode .collaboration-only{display:grid}
@@ -410,7 +410,7 @@ IDE_CSS += r"""
 @media(max-width:820px){.collaboration-view{grid-template-rows:35px auto auto 22px minmax(70px,1fr) 22px minmax(70px,1fr) 22px minmax(70px,1fr) 22px minmax(70px,1fr) 22px minmax(70px,1fr)}}
 """
 
-# split-source: order=1037 original-lines=105819-106055 hash=80f1ad547cbd2f2e
+# split-source: order=1037 original-lines=105907-106143 hash=80f1ad547cbd2f2e
 
 IDE_JS = r"""
 const E=id=>document.getElementById(id);
@@ -649,7 +649,7 @@ function downloadWorkspacePath(path=''){triggerDownload(workspaceArchiveUrl(path
 function downloadExplorerEntry(row){if(row.type==='dir')downloadWorkspacePath(row.path);else triggerDownload(workspaceRawDownloadUrl(row.path),row.name||'')}
 """
 
-# split-source: order=1038 original-lines=106056-106183 hash=159cc01507be128a
+# split-source: order=1038 original-lines=106144-106271 hash=159cc01507be128a
 
 IDE_JS += r"""
 function scheduleDiagnostics(file){clearTimeout(S.diagnosticTimer);if(file&&languageFor(file.path)==='python')S.diagnosticTimer=setTimeout(()=>runDiagnostics(file).catch(error=>logOutput(error.message)),450)}
@@ -779,7 +779,7 @@ async function handleDebugMessage(msg){if(msg.type==='response'&&msg.command==='
 async function stopDebug(closeRemote=true){clearTimeout(S.debugPoll);const current=S.debug;S.debug=null;if(closeRemote&&current)try{await api(`/api/ide/v2/debug/${qs(current.id)}`,{method:'DELETE',body:'{}'})}catch(error){logDebug(error.message)}}
 """
 
-# split-source: order=1039 original-lines=106184-106365 hash=c6d2e6edc176aaf4
+# split-source: order=1039 original-lines=106272-106453 hash=c6d2e6edc176aaf4
 
 IDE_JS += r"""
 async function refreshExtensions(query=''){if(query.trim()){const out=await api(`/api/ide/v2/extensions/search?query=${qs(query)}&size=40`);renderExtensions(out.extensions||[],false);E('extensionSummary').textContent=`${out.totalSize||0} Open VSX results`}else{const out=await api('/api/ide/v2/extensions');S.installedExtensions=out.extensions||[];renderExtensions(S.installedExtensions,true);E('extensionSummary').textContent=`${S.installedExtensions.length} installed`}}
@@ -963,7 +963,7 @@ const MENUS={file:['file.new','file.open','file.uploadFolder','file.downloadWork
 function showError(error){const message=error?.message||String(error);toast(message,error?.status===403?'warning':'error');setStatus(message,'error');logOutput(message)}
 """
 
-# split-source: order=1040 original-lines=106366-106462 hash=de81b34a91891ff7
+# split-source: order=1040 original-lines=106454-106550 hash=de81b34a91891ff7
 
 IDE_JS += r"""
 function collaborationDeviceKey(){let key=localStorage.getItem('clouds_collab_device_key')||'';if(key.length<32){const bytes=new Uint8Array(32);crypto.getRandomValues(bytes);key='device_'+Array.from(bytes,value=>value.toString(16).padStart(2,'0')).join('');localStorage.setItem('clouds_collab_device_key',key)}return key}

@@ -710,7 +710,7 @@ def cache_external_js_url(js_root: Path, url: str, *, allow_download: bool = Tru
     except Exception as exc:
         return None, trim(str(exc), 220)
 
-# split-source: order=808 original-lines=12999-13008 hash=2201010e78ad76eb
+# split-source: order=808 original-lines=13039-13048 hash=2201010e78ad76eb
 
 def try_read_text(path: Path, max_bytes: int = 400_000) -> str | None:
     try:

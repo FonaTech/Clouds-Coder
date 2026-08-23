@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=891 original-lines=19457-19565 hash=745fa615d6fc251e
+# split-source: order=891 original-lines=19497-19605 hash=745fa615d6fc251e
 
 # ---------------------------------------------------------------------------
 # Built-in skill guides injected into SkillStore on reload.
@@ -116,7 +116,7 @@ _BUILTIN_SKILLS: dict[str, dict] = {
     },
 }
 
-# split-source: order=892 original-lines=19566-21341 hash=bdbb27beff242352
+# split-source: order=892 original-lines=19606-21387 hash=29325413d9e237d7
 
 # ============================================================================
 # Architecture / 架构 / アーキテクチャ
@@ -877,12 +877,18 @@ class SkillStore:
         if cc_sidecar.exists() and cc_sidecar.is_file() and not cc_sidecar.is_symlink():
             try:
                 sidecar_raw = cc_sidecar.read_text(encoding="utf-8")
-                sidecar = _yaml.safe_load(sidecar_raw) if _yaml is not None else {}
+                if _yaml is not None:
+                    sidecar = _yaml.safe_load(sidecar_raw)
+                else:
+                    sidecar, _ = parse_front_matter(f"---\n{sidecar_raw.strip()}\n---\n")
                 if isinstance(sidecar, dict):
                     section = sidecar.get("clouds_coder", sidecar)
                     if isinstance(section, dict):
                         meta = dict(meta)
-                        meta["clouds_coder"] = dict(section)
+                        existing = meta.get("clouds_coder")
+                        merged = dict(existing) if isinstance(existing, dict) else {}
+                        merged.update(section)
+                        meta["clouds_coder"] = merged
             except Exception as exc:
                 self.warnings.append(f"{cc_sidecar}: invalid Clouds Coder sidecar: {exc}")
         name = str(meta.get("name", "")).strip() or skill_dir.name
