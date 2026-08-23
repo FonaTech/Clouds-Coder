@@ -34,6 +34,7 @@ import signal
 import socket
 import sqlite3
 import ssl
+import stat
 import struct
 import subprocess
 import sys
@@ -7508,6 +7509,126 @@ def decode_utf8_replace(data: bytes | bytearray | str) -> str:
         return escape_invalid_utf8_text(data)
     return bytes(data).decode("utf-8", errors="replace")
 
+def _windows_subprocess_encodings() -> list[str]:
+    if os.name != "nt" and not sys.platform.startswith("win"):
+        return []
+    out: list[str] = []
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        for function_name in ("GetOEMCP", "GetACP"):
+            function = getattr(kernel32, function_name, None)
+            if function is None:
+                continue
+            function.restype = ctypes.c_uint
+            codepage = int(function() or 0)
+            if codepage > 0:
+                out.append(f"cp{codepage}")
+    except Exception:
+        pass
+    return out
+
+def subprocess_text_encodings() -> list[str]:
+    candidates: list[str] = ["utf-8", *_windows_subprocess_encodings()]
+    try:
+        candidates.append(str(locale.getpreferredencoding(False) or ""))
+    except Exception:
+        pass
+    candidates.append("gb18030")
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in candidates:
+        encoding = str(value or "").strip()
+        key = encoding.casefold().replace("_", "-")
+        if not encoding or key in seen:
+            continue
+        try:
+            "".encode(encoding)
+        except LookupError:
+            continue
+        seen.add(key)
+        out.append(encoding)
+    return out or ["utf-8"]
+
+def decode_subprocess_bytes(data: bytes | bytearray | str | None) -> tuple[str, dict]:
+    if data is None:
+        return "", {"encoding": "", "fallback": False, "replacement": False}
+    if isinstance(data, str):
+        return escape_invalid_utf8_text(data), {
+            "encoding": "text",
+            "fallback": False,
+            "replacement": False,
+        }
+    raw = bytes(data)
+    encodings = subprocess_text_encodings()
+    for index, encoding in enumerate(encodings):
+        try:
+            return raw.decode(encoding, errors="strict"), {
+                "encoding": encoding,
+                "fallback": index > 0,
+                "replacement": False,
+            }
+        except UnicodeDecodeError:
+            continue
+    encoding = encodings[0]
+    return raw.decode(encoding, errors="replace"), {
+        "encoding": encoding,
+        "fallback": True,
+        "replacement": True,
+    }
+
+def run_subprocess_text(*popenargs, **kwargs) -> subprocess.CompletedProcess:
+    """Run a captured subprocess without allowing platform decoding to fail."""
+    options = dict(kwargs)
+    options.pop("encoding", None)
+    options.pop("errors", None)
+    options.pop("universal_newlines", None)
+    options["text"] = False
+    try:
+        completed = subprocess.run(*popenargs, **options)
+    except subprocess.TimeoutExpired as exc:
+        stdout, stdout_diag = decode_subprocess_bytes(getattr(exc, "stdout", None))
+        stderr, stderr_diag = decode_subprocess_bytes(getattr(exc, "stderr", None))
+        exc.stdout = exc.output = stdout
+        exc.stderr = stderr
+        exc.decoding_diagnostics = {"stdout": stdout_diag, "stderr": stderr_diag}
+        raise
+    stdout, stdout_diag = decode_subprocess_bytes(completed.stdout)
+    stderr, stderr_diag = decode_subprocess_bytes(completed.stderr)
+    completed.stdout = stdout
+    completed.stderr = stderr
+    completed.decoding_diagnostics = {"stdout": stdout_diag, "stderr": stderr_diag}
+    return completed
+
+
+def windows_utf8_shell_command(command: object) -> str:
+    text = str(command or "")
+    if re.match(r"(?is)^\s*chcp\s+65001\s*>\s*nul\s*&", text):
+        return text
+    return f"chcp 65001>nul & {text}"
+
+
+def shell_process_invocation(command: str, prefix: list[str] | tuple[str, ...] | None = None) -> tuple[object, bool, bool]:
+    """Build one platform-correct shell invocation for foreground and background runners."""
+    shell_prefix = [str(item) for item in (prefix or [])]
+    windows_job = _is_windows_job_sandbox_prefix(shell_prefix)
+    if shell_prefix and not windows_job:
+        return [*shell_prefix, "/bin/sh", "-c", str(command or "")], False, False
+    if os.name == "nt":
+        return windows_utf8_shell_command(command), True, windows_job
+    return str(command or ""), True, windows_job
+
+
+def join_shell_task_command(command: object, args: object) -> str:
+    parts = [str(command or "").strip()]
+    if isinstance(args, list):
+        parts.extend(str(item) for item in args)
+    parts = [item for item in parts if item]
+    if not parts:
+        return ""
+    if os.name == "nt":
+        return subprocess.list2cmdline(parts)
+    return shlex.join(parts)
+
 def json_dumps(obj: object, *, indent: int | None = None, ensure_ascii: bool = False) -> str:
     raw = json.dumps(obj, ensure_ascii=ensure_ascii, indent=indent)
     return escape_invalid_utf8_text(raw)
@@ -7552,11 +7673,10 @@ def sanitize_profile_id(raw: str) -> str:
 
 def detect_repo_root(cwd: Path) -> Path | None:
     try:
-        r = subprocess.run(
+        r = run_subprocess_text(
             ["git", "rev-parse", "--show-toplevel"],
             cwd=cwd,
             capture_output=True,
-            text=True,
             timeout=10,
         )
         if r.returncode != 0:
@@ -11275,10 +11395,9 @@ def try_pull_ollama_model(model: str, timeout: int = 180) -> tuple[bool, str]:
     if not cli:
         return False, "ollama CLI not found"
     try:
-        r = subprocess.run(
+        r = run_subprocess_text(
             [cli, "pull", model],
             capture_output=True,
-            text=True,
             timeout=timeout,
         )
         output = trim((r.stdout + r.stderr).strip() or "(no output)", 1200)
@@ -21658,20 +21777,24 @@ class BackgroundManager:
         self,
         workdir: Path,
         command_wrapper=None,
+        command_rewriter=None,
         env_wrapper=None,
         output_dir: Path | None = None,
         process_manager: UserProcessManager | None = None,
         owner_user_id: str = "",
         session_id: str = "",
         session_title=None,
+        integrity_callback=None,
     ):
         self.workdir = workdir
         self.command_wrapper = command_wrapper
+        self.command_rewriter = command_rewriter
         self.env_wrapper = env_wrapper
         self.process_manager = process_manager
         self.owner_user_id = str(owner_user_id or "")
         self.session_id = str(session_id or "")
         self.session_title = session_title
+        self.integrity_callback = integrity_callback
         self.tasks: dict[str, dict] = {}
         self.processes: dict[str, subprocess.Popen] = {}
         self.notifications: queue.Queue = queue.Queue()
@@ -21714,7 +21837,8 @@ class BackgroundManager:
 
     @staticmethod
     def _decode_output(data: bytes | bytearray) -> str:
-        return bytes(data or b"").decode("utf-8", errors="replace")
+        text, _diagnostics = decode_subprocess_bytes(data)
+        return text
 
     @staticmethod
     def _terminate_process(process: subprocess.Popen) -> None:
@@ -22000,6 +22124,13 @@ class BackgroundManager:
                     completion = callback_result
             except Exception as exc:
                 completion = {"completion_error": trim(str(exc), 500)}
+        status = str(completion.get("status", status) or status)
+        if completion.get("exit_code") is not None:
+            exit_code = int(completion.get("exit_code"))
+        if completion.get("error") is not None:
+            timeout_error = str(completion.get("error") or "")
+        if completion.get("result") is not None:
+            result = str(completion.get("result") or "")
         with self.lock:
             task = self.tasks.get(task_id, {})
             task.update(
@@ -22071,13 +22202,17 @@ class BackgroundManager:
         process: subprocess.Popen | None = None
         started = now_ts()
         try:
-            run_command: object = command
-            run_shell = True
+            if callable(self.integrity_callback):
+                preflight_error = str(self.integrity_callback("before", command) or "")
+                if preflight_error:
+                    raise PermissionError(preflight_error)
             wrapper = self.command_wrapper() if callable(self.command_wrapper) else []
-            windows_job = _is_windows_job_sandbox_prefix(wrapper)
-            if wrapper and not windows_job:
-                run_command = [*wrapper, "/bin/sh", "-c", command]
-                run_shell = False
+            prepared_command = (
+                str(self.command_rewriter(command, self.workdir, wrapper) or "")
+                if callable(self.command_rewriter)
+                else str(command or "")
+            )
+            run_command, run_shell, windows_job = shell_process_invocation(prepared_command, wrapper)
             process_env = self.env_wrapper() if callable(self.env_wrapper) else os.environ.copy()
             popen_kwargs = {
                 "shell": run_shell,
@@ -22095,7 +22230,7 @@ class BackgroundManager:
                 popen_kwargs["creationflags"] = int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) or 0)
             if windows_job:
                 process = _popen_windows_sandboxed(
-                    f"chcp 65001>nul & {command}",
+                    windows_utf8_shell_command(prepared_command),
                     workspace_root=self.workdir,
                     cwd=self.workdir,
                     env=process_env,
@@ -22139,6 +22274,17 @@ class BackgroundManager:
             exit_code = -1
             error = trim(str(exc), 500)
             output_raw = safe_utf8_bytes(output)
+        if callable(self.integrity_callback):
+            try:
+                integrity_error = str(self.integrity_callback("after", command) or "")
+            except Exception as exc:
+                integrity_error = f"immutable application snapshot verification failed: {exc}"
+            if integrity_error:
+                status = "error"
+                exit_code = -1
+                error = trim(integrity_error, 500)
+                output = trim(f"{output}\nError: {integrity_error}".strip(), 24_000)
+                output_raw = safe_utf8_bytes(output)
         finished = now_ts()
         output_text = output or error or "(no output)"
         log_path = self.output_dir / f"{task_id}.log"
@@ -22345,11 +22491,10 @@ class WorktreeManager:
 
     def _is_git_repo(self) -> bool:
         try:
-            r = subprocess.run(
+            r = run_subprocess_text(
                 ["git", "rev-parse", "--is-inside-work-tree"],
                 cwd=self.repo_root,
                 capture_output=True,
-                text=True,
                 timeout=10,
             )
             return r.returncode == 0
@@ -22388,11 +22533,10 @@ class WorktreeManager:
     def _run_git(self, args: list[str]) -> str:
         if not self.git_available:
             raise RuntimeError("Not in a git repository")
-        r = subprocess.run(
+        r = run_subprocess_text(
             ["git", *args],
             cwd=self.repo_root,
             capture_output=True,
-            text=True,
             timeout=240,
         )
         if r.returncode != 0:
@@ -22451,11 +22595,10 @@ class WorktreeManager:
         path = Path(wt["path"])
         if not path.exists():
             return f"Error: worktree path missing: {path}"
-        r = subprocess.run(
+        r = run_subprocess_text(
             ["git", "status", "--short", "--branch"],
             cwd=path,
             capture_output=True,
-            text=True,
             timeout=60,
         )
         return (r.stdout + r.stderr).strip() or "Clean worktree"
@@ -22470,12 +22613,11 @@ class WorktreeManager:
         if not path.exists():
             return f"Error: worktree path missing: {path}"
         try:
-            r = subprocess.run(
+            r = run_subprocess_text(
                 command,
                 shell=True,
                 cwd=path,
                 capture_output=True,
-                text=True,
                 timeout=300,
             )
             return trim((r.stdout + r.stderr).strip() or "(no output)")
@@ -27012,7 +27154,7 @@ def _windows_last_error(label: str) -> OSError:
         detail = "Windows API error"
     return OSError(code, f"{label}: {detail}")
 
-def _windows_set_low_integrity_label(path: Path, *, inherit: bool) -> None:
+def _windows_set_integrity_label(path: Path, *, inherit: bool, sid_string: str) -> None:
     from ctypes import wintypes
 
     advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
@@ -27020,7 +27162,7 @@ def _windows_set_low_integrity_label(path: Path, *, inherit: bool) -> None:
     sid = ctypes.c_void_p()
     advapi32.ConvertStringSidToSidW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p)]
     advapi32.ConvertStringSidToSidW.restype = wintypes.BOOL
-    if not advapi32.ConvertStringSidToSidW("S-1-16-4096", ctypes.byref(sid)):
+    if not advapi32.ConvertStringSidToSidW(sid_string, ctypes.byref(sid)):
         raise _windows_last_error("ConvertStringSidToSidW")
     try:
         advapi32.GetLengthSid.argtypes = [ctypes.c_void_p]
@@ -27066,10 +27208,38 @@ def _windows_set_low_integrity_label(path: Path, *, inherit: bool) -> None:
         kernel32.LocalFree.restype = ctypes.c_void_p
         kernel32.LocalFree(sid)
 
+def _windows_set_low_integrity_label(path: Path, *, inherit: bool) -> None:
+    _windows_set_integrity_label(path, inherit=inherit, sid_string="S-1-16-4096")
+
+def _windows_protect_application_snapshot(workspace_root: Path) -> None:
+    snapshot = Path(workspace_root) / ".application_skills"
+    if not snapshot.exists() or snapshot.is_symlink():
+        return
+    for dirpath, dirnames, filenames in os.walk(snapshot, topdown=True, followlinks=False):
+        current = Path(dirpath)
+        dirnames[:] = [name for name in dirnames if not (current / name).is_symlink()]
+        try:
+            _windows_set_integrity_label(current, inherit=True, sid_string="S-1-16-8192")
+        except OSError:
+            pass
+        for name in filenames:
+            target = current / name
+            if target.is_symlink():
+                continue
+            try:
+                _windows_set_integrity_label(target, inherit=False, sid_string="S-1-16-8192")
+            except OSError:
+                pass
+            try:
+                os.chmod(target, stat.S_IREAD)
+            except Exception:
+                pass
+
 def _windows_prepare_low_integrity_workspace(workspace_root: Path) -> bool:
     canonical = Path(os.path.realpath(workspace_root)).resolve()
     key = os.path.normcase(str(canonical))
     with _WINDOWS_LOW_INTEGRITY_LOCK:
+        _windows_protect_application_snapshot(canonical)
         if key in _WINDOWS_LOW_INTEGRITY_ROOTS or key in _WINDOWS_LOW_INTEGRITY_FAILED_ROOTS:
             return key in _WINDOWS_LOW_INTEGRITY_ROOTS
         # The low-integrity label is defense-in-depth. Standard Windows users can
@@ -27085,6 +27255,8 @@ def _windows_prepare_low_integrity_workspace(workspace_root: Path) -> bool:
         for dirpath, dirnames, filenames in os.walk(canonical, topdown=True, followlinks=False):
             current = Path(dirpath)
             dirnames[:] = [name for name in dirnames if not (current / name).is_symlink()]
+            if current == canonical:
+                dirnames[:] = [name for name in dirnames if name != ".application_skills"]
             for name in dirnames:
                 try:
                     _windows_set_low_integrity_label(current / name, inherit=True)
@@ -27321,19 +27493,35 @@ def _run_windows_sandboxed_command(
     )
     try:
         stdout, stderr = proc.communicate(timeout=timeout)
-        return subprocess.CompletedProcess(
+        stdout_text, stdout_diagnostics = decode_subprocess_bytes(stdout)
+        stderr_text, stderr_diagnostics = decode_subprocess_bytes(stderr)
+        completed = subprocess.CompletedProcess(
             command,
             int(proc.returncode or 0),
-            bytes(stdout or b"").decode("utf-8", errors="replace"),
-            bytes(stderr or b"").decode("utf-8", errors="replace"),
+            stdout_text,
+            stderr_text,
         )
-    except subprocess.TimeoutExpired:
+        completed.decoding_diagnostics = {
+            "stdout": stdout_diagnostics,
+            "stderr": stderr_diagnostics,
+        }
+        return completed
+    except subprocess.TimeoutExpired as exc:
         _windows_close_sandbox_job(proc, terminate=True)
         try:
-            proc.wait(timeout=2)
+            stdout, stderr = proc.communicate(timeout=2)
         except Exception:
-            pass
-        raise
+            stdout = getattr(exc, "stdout", None)
+            stderr = getattr(exc, "stderr", None)
+        stdout_text, stdout_diagnostics = decode_subprocess_bytes(stdout)
+        stderr_text, stderr_diagnostics = decode_subprocess_bytes(stderr)
+        exc.stdout = exc.output = stdout_text
+        exc.stderr = stderr_text
+        exc.decoding_diagnostics = {
+            "stdout": stdout_diagnostics,
+            "stderr": stderr_diagnostics,
+        }
+        raise exc
     finally:
         _windows_close_sandbox_job(proc)
 
@@ -27614,6 +27802,7 @@ class SessionState:
         # structured outcome metadata (notably the real shell exit code) is
         # carried alongside it in thread-local state for the orchestrator.
         self._tool_result_local = threading.local()
+        self._application_snapshot_integrity_lock = threading.RLock()
         self.single_advance_prompt_enhance = False
         cfg_single_todo_enabled, cfg_single_todo_prompt = extract_single_no_plan_todo_settings(
             default_llm_config or {}
@@ -27632,12 +27821,14 @@ class SessionState:
         self.bg = BackgroundManager(
             self.files_root,
             command_wrapper=self._hard_snapshot_shell_prefix,
+            command_rewriter=self._background_shell_command,
             env_wrapper=self._shell_process_env,
             output_dir=self.long_output_dir / "background",
             process_manager=process_manager,
             owner_user_id=self.owner_user_id,
             session_id=self.id,
             session_title=lambda: self.title,
+            integrity_callback=self._hard_snapshot_integrity_callback,
         )
         self.bus = MessageBus(self.root / "team" / "inbox", crypto)
         self.worktrees = WorktreeManager(self.id, self.tasks, self.root, crypto, repo_root)
@@ -28994,7 +29185,7 @@ class SessionState:
                 raw = self.crypto.read_json(self.state_path, {})
                 self.messages = raw.get("messages", [])
                 persisted_origin = str(raw.get("title_origin", "") or "").strip().lower()
-                if persisted_origin in {"default", "auto", "manual", "legacy"}:
+                if persisted_origin in {"default", "auto", "application", "manual", "legacy"}:
                     self.title_origin = persisted_origin
                 self.last_auto_title_source = trim(
                     str(raw.get("last_auto_title_source", "") or ""),
@@ -29589,7 +29780,7 @@ class SessionState:
                 meta = self.crypto.read_json(self.meta_path, {})
                 self.title = meta.get("title", self.title)
                 persisted_origin = str(meta.get("title_origin", "") or "").strip().lower()
-                if persisted_origin in {"default", "auto", "manual", "legacy"}:
+                if persisted_origin in {"default", "auto", "application", "manual", "legacy"}:
                     self.title_origin = persisted_origin
                 elif self._is_default_session_title(self.title):
                     self.title_origin = "default"
@@ -37721,20 +37912,18 @@ class SessionState:
 
     def _git_status_map(self, cwd: Path) -> dict[str, str]:
         try:
-            check = subprocess.run(
+            check = run_subprocess_text(
                 ["git", "rev-parse", "--is-inside-work-tree"],
                 cwd=cwd,
                 capture_output=True,
-                text=True,
                 timeout=8,
             )
             if check.returncode != 0:
                 return {}
-            r = subprocess.run(
+            r = run_subprocess_text(
                 ["git", "status", "--porcelain"],
                 cwd=cwd,
                 capture_output=True,
-                text=True,
                 timeout=8,
             )
             if r.returncode != 0:
@@ -40248,10 +40437,9 @@ body{padding:18px}
         tool = shutil.which("pdftotext")
         if tool:
             try:
-                r = subprocess.run(
+                r = run_subprocess_text(
                     [tool, "-layout", str(pdf_path), "-"],
                     capture_output=True,
-                    text=True,
                     timeout=min(30, CHAT_UPLOAD_PARSE_TIMEOUT_SECONDS),
                 )
                 if r.returncode == 0 and r.stdout.strip():
@@ -40282,11 +40470,9 @@ body{padding:18px}
             return ""
         real_cmd = [exe] + [str(x) for x in cmd[1:]]
         try:
-            r = subprocess.run(
+            r = run_subprocess_text(
                 real_cmd,
                 capture_output=True,
-                text=True,
-                errors="ignore",
                 timeout=timeout,
             )
             if r.returncode == 0 and r.stdout.strip():
@@ -43468,6 +43654,76 @@ body{padding:18px}
             return ""
         return text
 
+    def _application_title_name(self) -> str:
+        binding = getattr(self, "app_binding", {})
+        if not isinstance(binding, dict):
+            return ""
+        return trim(str(binding.get("name", "") or "").strip(), 100)
+
+    def _application_title(self, task_title: str) -> str:
+        app_name = self._application_title_name()
+        task = trim(str(task_title or "").strip(), 80)
+        if not app_name:
+            return task
+        if not task:
+            return app_name
+        if task.casefold() == app_name.casefold():
+            return app_name
+        if re.match(rf"^{re.escape(app_name)}\s*[-—:：]\s*", task, flags=re.IGNORECASE):
+            return trim(task, 120)
+        return trim(f"{app_name}-{task}", 120)
+
+    def _application_title_suffix(self, title: str) -> str | None:
+        app_name = self._application_title_name()
+        current = str(title or "").strip()
+        if not app_name:
+            return None
+        if current.casefold() == app_name.casefold():
+            return ""
+        marker = f"{app_name}-"
+        if current.casefold().startswith(marker.casefold()):
+            return current[len(marker):].strip()
+        return None
+
+    def _title_is_replaceable(self, title: str, origin: str) -> bool:
+        current = str(title or "").strip()
+        source = str(origin or "").strip().lower()
+        if source == "default":
+            return True
+        if source in {"application", "auto"}:
+            suffix = self._application_title_suffix(current)
+            if suffix is not None and (
+                not suffix
+                or self._is_default_session_title(suffix)
+                or self._is_low_quality_auto_title(suffix)
+            ):
+                return True
+        return source == "auto" and (
+            self._is_default_session_title(current)
+            or self._is_low_quality_auto_title(current)
+        )
+
+    def bind_application_title(self) -> bool:
+        """Mark an application-launched session as auto-titleable without overriding manual names."""
+        app_name = self._application_title_name()
+        if not app_name:
+            return False
+        with self.lock:
+            current = str(self.title or "").strip()
+            origin = str(getattr(self, "title_origin", "") or "").strip().lower()
+            if origin == "manual":
+                return False
+            if not self._title_is_replaceable(current, origin) and current.casefold() != app_name.casefold():
+                return False
+            if current != app_name or origin != "application":
+                self.title = app_name
+                self.title_origin = "application"
+                self.last_auto_title_source = ""
+                self.updated_at = now_ts()
+                self._persist()
+                return True
+            return False
+
     def _fallback_auto_title(self) -> str:
         goal = self._best_session_title_goal_text()
         if not goal:
@@ -43492,20 +43748,37 @@ body{padding:18px}
     def _migrate_legacy_auto_title_on_load(self) -> bool:
         current_title = str(self.title or "").strip()
         current_origin = str(getattr(self, "title_origin", "") or "").strip().lower()
+        changed = False
+        app_name = self._application_title_name()
+        if app_name and current_origin == "legacy":
+            suffix = self._application_title_suffix(current_title)
+            if suffix is not None and (
+                not suffix
+                or self._is_default_session_title(suffix)
+                or self._is_low_quality_auto_title(suffix)
+            ):
+                self.title_origin = "application"
+                current_origin = "application"
+                self.updated_at = now_ts()
+                changed = True
         if current_origin == "legacy" and self._is_default_session_title(current_title):
             self.title_origin = "default"
             current_origin = "default"
-        if current_origin not in {"default", "auto"}:
-            return False
-        if not (
-            self._is_default_session_title(current_title)
-            or self._is_low_quality_auto_title(current_title)
-        ):
-            return False
+            changed = True
+        if current_origin not in {"default", "auto", "application"}:
+            if changed:
+                self._persist()
+            return changed
+        if not self._title_is_replaceable(current_title, current_origin):
+            if changed:
+                self._persist()
+            return changed
         migrated_title = self._fallback_auto_title()
         if not migrated_title or migrated_title == current_title:
-            return False
-        self.title = migrated_title
+            if changed:
+                self._persist()
+            return changed
+        self.title = self._application_title(migrated_title)
         self.title_origin = "auto"
         self.last_auto_title_source = "migration"
         self.updated_at = now_ts()
@@ -43516,16 +43789,7 @@ body{padding:18px}
         with self.lock:
             current = str(self.title or "").strip()
             origin = str(getattr(self, "title_origin", "") or "").strip().lower()
-            replaceable = (
-                origin == "default"
-                or (
-                    origin == "auto"
-                    and (
-                        self._is_default_session_title(current)
-                        or self._is_low_quality_auto_title(current)
-                    )
-                )
-            )
+            replaceable = self._title_is_replaceable(current, origin)
             if not replaceable:
                 return False
             if (now_tick - float(self.last_auto_title_ts or 0.0)) < 12:
@@ -43573,20 +43837,12 @@ body{padding:18px}
                 return False
             old_title = str(self.title or "").strip()
             old_origin = str(getattr(self, "title_origin", "") or "").strip().lower()
-            if not (
-                old_origin == "default"
-                or (
-                    old_origin == "auto"
-                    and (
-                        self._is_default_session_title(old_title)
-                        or self._is_low_quality_auto_title(old_title)
-                    )
-                )
-            ):
+            if not self._title_is_replaceable(old_title, old_origin):
                 return False
-            if candidate == old_title:
+            final_title = self._application_title(candidate)
+            if final_title == old_title:
                 return False
-            self.title = candidate
+            self.title = final_title
             self.title_origin = "auto"
             self.last_auto_title_source = candidate_source
             self.updated_at = now_ts()
@@ -43596,7 +43852,7 @@ body{padding:18px}
             {
                 "summary": (
                     f"session auto-renamed ({trigger or 'progress'}): "
-                    f"'{trim(old_title, 36)}' -> '{candidate}'"
+                        f"'{trim(old_title, 36)}' -> '{final_title}'"
                 )
             },
         )
@@ -44521,6 +44777,280 @@ body{padding:18px}
     def _application_snapshot_root(self) -> Path:
         return self.files_root / ".application_skills"
 
+    def _application_snapshot_recovery_path(self) -> Path:
+        return self.root / ".application_snapshot_recovery.json"
+
+    @staticmethod
+    def _application_resources_digest(resources: list[dict], snapshot_version: int) -> str:
+        if int(snapshot_version or 1) < 2:
+            material = "\n".join(
+                f"{str(x.get('skill_id', '') or '')}:{str(x.get('path', '') or '')}:{str(x.get('digest', '') or '')}"
+                for x in resources
+            )
+        else:
+            material = json.dumps(
+                [
+                    {
+                        "skill_id": str(x.get("skill_id", "") or ""),
+                        "skill_order": int(x.get("skill_order", 0) or 0),
+                        "kind": str(x.get("kind", "attachment") or "attachment"),
+                        "path": str(x.get("path", "") or ""),
+                        "digest": str(x.get("digest", "") or ""),
+                        "size": int(x.get("size", 0) or 0),
+                    }
+                    for x in resources
+                ],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+    def _application_snapshot_tree_payload(self) -> dict:
+        root = self._application_snapshot_root()
+        if not root.exists() or not root.is_dir() or root.is_symlink():
+            raise ValueError("immutable application snapshot is missing")
+        directories: list[str] = []
+        files: list[dict] = []
+        for current, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
+            current_path = Path(current)
+            if current_path.is_symlink():
+                raise ValueError("immutable application snapshot contains a symbolic link")
+            dirnames.sort()
+            filenames.sort()
+            for name in list(dirnames):
+                target = current_path / name
+                if target.is_symlink():
+                    raise ValueError("immutable application snapshot contains a symbolic link")
+                directories.append(target.relative_to(root).as_posix())
+            for name in filenames:
+                target = current_path / name
+                if target.is_symlink() or not target.is_file():
+                    raise ValueError("immutable application snapshot contains an unsupported entry")
+                raw = target.read_bytes()
+                files.append({
+                    "path": target.relative_to(root).as_posix(),
+                    "size": len(raw),
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                    "mode": stat.S_IMODE(target.stat().st_mode),
+                    "content_b64": base64.b64encode(raw).decode("ascii"),
+                })
+        return {"directories": sorted(directories), "files": files}
+
+    def _application_snapshot_manifest_valid(self) -> tuple[bool, str]:
+        root = self._application_snapshot_root()
+        manifest_path = root / "MANIFEST.json"
+        try:
+            raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+            rows = raw.get("resources", []) if isinstance(raw, dict) else []
+            if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+                return False, "application snapshot manifest is invalid"
+            expected_paths = {"MANIFEST.json"}
+            normalized: list[dict] = []
+            for row in rows:
+                order = int(row.get("skill_order", 0) or 0)
+                rel = str(PurePosixPath(str(row.get("path", "") or "").replace("\\", "/"))).lstrip("/")
+                if order <= 0 or not rel or ".." in PurePosixPath(rel).parts:
+                    return False, "application snapshot manifest contains an invalid path"
+                mounted = f"{order:02d}/{rel}"
+                target = safe_path(mounted, root)
+                if target.is_symlink() or not target.is_file():
+                    return False, f"application snapshot resource is missing: {mounted}"
+                size = int(row.get("size", -1) or 0)
+                digest = str(row.get("digest", "") or "")
+                if target.stat().st_size != size or not hmac.compare_digest(_sha256_file(target), digest):
+                    return False, f"application snapshot resource failed verification: {mounted}"
+                expected_paths.add(mounted)
+                item = dict(row)
+                item["kind"] = str(
+                    row.get("kind", "skill_source" if rel == "SKILL.md" else "attachment")
+                    or "attachment"
+                )
+                normalized.append(item)
+            actual_paths = {
+                fp.relative_to(root).as_posix()
+                for fp in root.rglob("*")
+                if fp.is_file() and not fp.is_symlink()
+            }
+            if actual_paths != expected_paths:
+                return False, "application snapshot file tree does not match its manifest"
+            expected_count = int((self.app_binding or {}).get("resource_count", len(rows)) or 0)
+            if expected_count != len(rows):
+                return False, "application snapshot resource count does not match its binding"
+            expected_digest = str((self.app_binding or {}).get("resources_digest", "") or "")
+            if expected_digest:
+                candidates = {
+                    self._application_resources_digest(normalized, 1),
+                    self._application_resources_digest(normalized, 2),
+                }
+                if not any(hmac.compare_digest(expected_digest, candidate) for candidate in candidates):
+                    return False, "application snapshot manifest digest does not match its binding"
+            return True, ""
+        except Exception as exc:
+            return False, f"application snapshot verification failed: {exc}"
+
+    def _write_application_snapshot_recovery(self) -> None:
+        if self.skill_mode != "hard":
+            return
+        tree = self._application_snapshot_tree_payload()
+        payload = {
+            "version": 1,
+            "session_id": self.id,
+            "app_id": str((self.app_binding or {}).get("app_id", "") or ""),
+            "capsule_digest": str((self.app_binding or {}).get("capsule_digest", "") or ""),
+            "resources_digest": str((self.app_binding or {}).get("resources_digest", "") or ""),
+            "created_at": now_ts(),
+            **tree,
+        }
+        self.crypto.write_json(self._application_snapshot_recovery_path(), payload)
+
+    def _load_application_snapshot_recovery(self) -> dict:
+        payload = self.crypto.read_json(self._application_snapshot_recovery_path(), {})
+        if not isinstance(payload, dict) or int(payload.get("version", 0) or 0) != 1:
+            raise ValueError("application snapshot recovery package is invalid")
+        if str(payload.get("session_id", "") or "") != self.id:
+            raise ValueError("application snapshot recovery package belongs to another session")
+        for key in ("app_id", "capsule_digest", "resources_digest"):
+            bound = str((self.app_binding or {}).get(key, "") or "")
+            stored = str(payload.get(key, "") or "")
+            if bound and not hmac.compare_digest(bound, stored):
+                raise ValueError("application snapshot recovery package does not match its binding")
+        files = payload.get("files", [])
+        directories = payload.get("directories", [])
+        if not isinstance(files, list) or not isinstance(directories, list):
+            raise ValueError("application snapshot recovery package has an invalid tree")
+        seen: set[str] = set()
+        for item in files:
+            if not isinstance(item, dict):
+                raise ValueError("application snapshot recovery package has an invalid file")
+            rel = str(item.get("path", "") or "")
+            parts = PurePosixPath(rel).parts
+            if not rel or rel in seen or "." in parts or ".." in parts:
+                raise ValueError("application snapshot recovery package has an invalid path")
+            raw = base64.b64decode(str(item.get("content_b64", "") or ""), validate=True)
+            if len(raw) != int(item.get("size", -1) or 0) or not hmac.compare_digest(
+                hashlib.sha256(raw).hexdigest(), str(item.get("sha256", "") or "")
+            ):
+                raise ValueError("application snapshot recovery package failed integrity verification")
+            seen.add(rel)
+        return payload
+
+    def _ensure_application_snapshot_recovery(self) -> str:
+        if self.skill_mode != "hard":
+            return ""
+        with self._application_snapshot_integrity_lock:
+            path = self._application_snapshot_recovery_path()
+            try:
+                if path.exists():
+                    self._load_application_snapshot_recovery()
+                    return ""
+                valid, error = self._application_snapshot_manifest_valid()
+                if not valid:
+                    return error or "immutable application snapshot could not be verified"
+                self._write_application_snapshot_recovery()
+                self._load_application_snapshot_recovery()
+                return ""
+            except Exception as exc:
+                return f"immutable application snapshot recovery is unavailable: {exc}"
+
+    def _restore_application_snapshot_from_recovery(self, payload: dict) -> None:
+        root = self._application_snapshot_root()
+        if root.exists():
+            for current, dirnames, filenames in os.walk(root, topdown=False, followlinks=False):
+                current_path = Path(current)
+                for name in filenames:
+                    try:
+                        os.chmod(current_path / name, 0o600, follow_symlinks=False)
+                    except Exception:
+                        pass
+                for name in dirnames:
+                    try:
+                        os.chmod(current_path / name, 0o700, follow_symlinks=False)
+                    except Exception:
+                        pass
+            try:
+                os.chmod(root, 0o700, follow_symlinks=False)
+            except Exception:
+                pass
+            shutil.rmtree(root)
+        root.mkdir(parents=True, exist_ok=False)
+        for rel in sorted((str(x or "") for x in payload.get("directories", [])), key=lambda x: (x.count("/"), x)):
+            safe_path(rel, root).mkdir(parents=True, exist_ok=True)
+        for item in payload.get("files", []):
+            target = safe_path(str(item.get("path", "") or ""), root)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(base64.b64decode(str(item.get("content_b64", "") or ""), validate=True))
+            try:
+                os.chmod(target, int(item.get("mode", 0o400) or 0o400), follow_symlinks=False)
+            except Exception:
+                pass
+        self._restore_application_snapshot_permissions()
+
+    def _verify_application_snapshot_integrity(self, *, restore: bool = True) -> str:
+        if self.skill_mode != "hard":
+            return ""
+        with self._application_snapshot_integrity_lock:
+            ensure_error = self._ensure_application_snapshot_recovery()
+            if ensure_error:
+                return ensure_error
+            try:
+                recovery = self._load_application_snapshot_recovery()
+                current = self._application_snapshot_tree_payload()
+                expected_dirs = sorted(str(x or "") for x in recovery.get("directories", []))
+                current_dirs = sorted(str(x or "") for x in current.get("directories", []))
+                expected_files = [
+                    (str(x.get("path", "") or ""), int(x.get("size", 0) or 0), str(x.get("sha256", "") or ""))
+                    for x in recovery.get("files", []) if isinstance(x, dict)
+                ]
+                current_files = [
+                    (str(x.get("path", "") or ""), int(x.get("size", 0) or 0), str(x.get("sha256", "") or ""))
+                    for x in current.get("files", []) if isinstance(x, dict)
+                ]
+                if expected_dirs == current_dirs and expected_files == current_files:
+                    self._restore_application_snapshot_permissions()
+                    return ""
+                if restore:
+                    self._restore_application_snapshot_from_recovery(recovery)
+                    repaired = self._application_snapshot_tree_payload()
+                    repaired_files = [
+                        (str(x.get("path", "") or ""), int(x.get("size", 0) or 0), str(x.get("sha256", "") or ""))
+                        for x in repaired.get("files", []) if isinstance(x, dict)
+                    ]
+                    if sorted(str(x or "") for x in repaired.get("directories", [])) != expected_dirs or repaired_files != expected_files:
+                        return "immutable application snapshot was modified and automatic restoration failed"
+                return "immutable application snapshot was modified; the approved snapshot was restored"
+            except Exception as exc:
+                return f"immutable application snapshot verification failed: {exc}"
+
+    def _command_targets_application_snapshot_mutation(self, command: str) -> bool:
+        raw = str(command or "")
+        normalized = raw.replace("\\", "/").casefold()
+        root = str(self._application_snapshot_root()).replace("\\", "/").casefold()
+        references_snapshot = ".application_skills" in normalized or (root and root in normalized)
+        scripted_mutation = bool(
+            re.search(
+                r"(?i)(?:unlink|remove|rmdir|rename|replace|chmod|chown|write_text|write_bytes|"
+                r"writefile|rmSync|renameSync|chmodSync|rmtree|copyfile|move)\s*\(",
+                raw,
+            )
+        )
+        return bool(
+            references_snapshot
+            and (self._shell_command_has_mutation_intent(raw) or scripted_mutation)
+        )
+
+    def _hard_snapshot_integrity_callback(self, phase: str, command: str = "") -> str:
+        if self.skill_mode != "hard":
+            return ""
+        if str(phase or "") == "before":
+            ensure_error = self._ensure_application_snapshot_recovery()
+            if ensure_error:
+                return ensure_error
+            if self._command_targets_application_snapshot_mutation(command):
+                return "immutable application skill resources are read-only"
+            return self._verify_application_snapshot_integrity(restore=True)
+        return self._verify_application_snapshot_integrity(restore=True)
+
     def _path_targets_application_snapshot(self, path_text: object) -> bool:
         text = str(path_text or "").strip().strip("'\"")
         if not text:
@@ -44685,6 +45215,12 @@ body{padding:18px}
             shared_read_rules = " ".join(
                 f"(subpath {json.dumps(str(root))})" for root in self._remote_shared_read_roots()
             )
+            snapshot_root = self._application_snapshot_root().resolve()
+            snapshot_deny_rule = (
+                f"(deny file-write* (subpath {json.dumps(str(snapshot_root))})) "
+                if getattr(self, "skill_mode", "dynamic") == "hard" and snapshot_root.exists()
+                else ""
+            )
             policy = (
                 "(version 1) "
                 "(allow default) "
@@ -44695,7 +45231,8 @@ body{padding:18px}
                 "(subpath \"/private/tmp\") (subpath \"/tmp\") (subpath \"/var/tmp\") "
                 "(subpath \"/private/var/folders\")) "
                 f"(allow file-read* (subpath {json.dumps(str(workspace_root))}) "
-                f"{runtime_read_rules} {shared_read_rules})"
+                f"{runtime_read_rules} {shared_read_rules}) "
+                f"{snapshot_deny_rule}"
             )
             return [sandbox, "-p", policy]
         virtual_cwd = "/workspace" + (f"/{rel}" if rel else "")
@@ -44751,6 +45288,11 @@ body{padding:18px}
                 prefix.extend(["--ro-bind", str(shared_root), virtual_root])
             prefix.extend([
                 "--bind", str(workspace_root), "/workspace",
+            ])
+            snapshot_root = self._application_snapshot_root().resolve()
+            if getattr(self, "skill_mode", "dynamic") == "hard" and snapshot_root.exists():
+                prefix.extend(["--ro-bind", str(snapshot_root), "/workspace/.application_skills"])
+            prefix.extend([
                 "--proc", "/proc",
                 "--dev", "/dev",
                 "--tmpfs", "/tmp",
@@ -44785,6 +45327,12 @@ body{padding:18px}
                 "--env", "PYTHONIOENCODING=utf-8",
                 "--env", "PYTHONUTF8=1",
             ]
+            snapshot_root = self._application_snapshot_root().resolve()
+            if getattr(self, "skill_mode", "dynamic") == "hard" and snapshot_root.exists():
+                prefix.extend([
+                    "--mount",
+                    f"type=bind,src={snapshot_root},dst=/workspace/.application_skills,readonly",
+                ])
             for shared_root, virtual_root in self._remote_shared_read_mounts():
                 prefix.extend([
                     "--mount",
@@ -44801,10 +45349,15 @@ body{padding:18px}
             return prefix
         return []
 
-    def _hard_snapshot_shell_prefix(self, cwd: Path | None = None) -> list[str]:
+    def _hard_snapshot_shell_prefix(self, cwd: Path | None = None, *, feature: str = "processes") -> list[str]:
         if bool(getattr(self, "ide_remote_sandbox_required", False)):
-            return self._workspace_sandbox_shell_prefix(cwd)
-        if self.skill_mode != "hard" or os.name != "posix" or sys.platform != "darwin":
+            return self._workspace_sandbox_shell_prefix(cwd, feature=feature)
+        if self.skill_mode != "hard":
+            return []
+        isolated = self._workspace_sandbox_shell_prefix(cwd, feature=feature)
+        if isolated:
+            return isolated
+        if os.name != "posix" or sys.platform != "darwin":
             return []
         sandbox = shutil.which("sandbox-exec")
         snapshot_root = self._application_snapshot_root()
@@ -44816,6 +45369,10 @@ body{padding:18px}
             f"(deny file-write* (subpath {json.dumps(str(snapshot_root.resolve()))}))"
         )
         return [sandbox, "-p", policy]
+
+    def _background_shell_command(self, command: str, cwd: Path, prefix: list[str]) -> str:
+        effective = self._rewrite_shell_virtual_paths(command, cwd)
+        return self._sandbox_virtualize_command(effective, cwd) if prefix else effective
 
     def _hard_snapshot_shell_supported(self) -> bool:
         return bool(self._hard_snapshot_shell_prefix())
@@ -44931,11 +45488,10 @@ body{padding:18px}
                 "Error: shell access to global skills is disabled. "
                 "Use list_skills/load_skill/read_file for skill reads; only the authenticated administrator may mutate skills."
             )
-        if self.skill_mode == "hard" and self._application_snapshot_root().exists() and not self._hard_snapshot_shell_prefix():
-            return (
-                "Error: shell execution is disabled for hard applications on this platform because "
-                "an OS-level read-only snapshot policy is unavailable. Use read_file and the bound Skill instructions."
-            )
+        if self.skill_mode == "hard":
+            integrity_error = self._hard_snapshot_integrity_callback("before", effective)
+            if integrity_error:
+                return f"Error: {integrity_error}"
         blocked = self._shell_write_targets_outside_scope(effective)
         if not blocked:
             return ""
@@ -44989,6 +45545,11 @@ body{padding:18px}
             meta["error"] = "Error: dangerous command blocked"
             meta["output"] = meta["error"]
             return meta
+        integrity_preflight = self._hard_snapshot_integrity_callback("before", effective_command)
+        if integrity_preflight:
+            meta["error"] = f"Error: {integrity_preflight}"
+            meta["output"] = meta["error"]
+            return meta
         before = self._git_status_map(cwd)
         start = time.time()
         proc: subprocess.Popen | None = None
@@ -45037,11 +45598,8 @@ body{padding:18px}
                 del target[:overflow]
 
         def _merge_output_text() -> str:
-            # On Windows, cmd.exe outputs in the system OEM codepage (e.g. cp936/GBK),
-            # not UTF-8.  Detect and use the correct encoding for decoding.
-            enc = "utf-8"
-            out_text = out_buf.decode(enc, errors="replace")
-            err_text = err_buf.decode(enc, errors="replace")
+            out_text, _out_diagnostics = decode_subprocess_bytes(out_buf)
+            err_text, _err_diagnostics = decode_subprocess_bytes(err_buf)
             return (out_text + err_text).strip()
 
         def _store_shell_output(output_value: str, exit_code: int | None = None):
@@ -45092,6 +45650,16 @@ body{padding:18px}
                 )
             except Exception:
                 pass
+            integrity_error = self._hard_snapshot_integrity_callback("after", command)
+            if integrity_error:
+                prior = str(payload.get("result", "") or "").strip()
+                return {
+                    "changed_files": changed,
+                    "status": "error",
+                    "exit_code": -1,
+                    "error": integrity_error,
+                    "result": trim(f"{prior}\nError: {integrity_error}".strip(), 24_000),
+                }
             return {"changed_files": changed}
 
         def _should_handoff(now: float) -> bool:
@@ -45304,14 +45872,7 @@ body{padding:18px}
                 proc_env["JS_LIB_ROOT"] = str(self.js_lib_root)
             shell_prefix = self._hard_snapshot_shell_prefix(cwd)
             sandboxed_command = self._sandbox_virtualize_command(effective_command, cwd) if shell_prefix else effective_command
-            windows_job = _is_windows_job_sandbox_prefix(shell_prefix)
-            popen_command: object = sandboxed_command
-            use_shell = True
-            if os.name == "nt" and (not shell_prefix or windows_job):
-                popen_command = f"chcp 65001>nul & {effective_command}"
-            if shell_prefix and not windows_job:
-                popen_command = [*shell_prefix, "/bin/sh", "-c", sandboxed_command]
-                use_shell = False
+            popen_command, use_shell, windows_job = shell_process_invocation(sandboxed_command, shell_prefix)
             popen_kwargs = {
                 "shell": use_shell,
                 "cwd": cwd,
@@ -45450,6 +46011,12 @@ body{padding:18px}
             self._running_bash_proc = None
             if not handed_off[0]:
                 self._restore_application_snapshot_permissions()
+                integrity_error = self._hard_snapshot_integrity_callback("after", command)
+                if integrity_error:
+                    meta["error"] = f"Error: {integrity_error}"
+                    meta["exit_code"] = -1
+                    prior = str(meta.get("output", "") or "").strip()
+                    meta["output"] = trim(f"{prior}\n{meta['error']}".strip(), 24_000)
         meta["duration_ms"] = int((time.time() - start) * 1000)
         if not handed_off[0]:
             after = self._git_status_map(cwd)
@@ -95983,11 +96550,9 @@ class RAGContentParser:
         if not exe:
             return ""
         try:
-            r = subprocess.run(
+            r = run_subprocess_text(
                 [exe] + [str(x) for x in cmd[1:]],
                 capture_output=True,
-                text=True,
-                errors="ignore",
                 timeout=timeout,
             )
             if r.returncode == 0 and r.stdout.strip():
@@ -96046,10 +96611,9 @@ class RAGContentParser:
         tool = shutil.which("pdftotext")
         if tool:
             try:
-                r = subprocess.run(
+                r = run_subprocess_text(
                     [tool, "-layout", str(pdf_path), "-"],
                     capture_output=True,
-                    text=True,
                     timeout=max(60, int(RAG_PARSE_TIMEOUT_SECONDS)),
                 )
                 if r.returncode == 0 and r.stdout.strip():
@@ -96322,7 +96886,7 @@ class RAGContentParser:
             ffprobe = shutil.which("ffprobe")
             if ffprobe:
                 try:
-                    r = subprocess.run(
+                    r = run_subprocess_text(
                         [
                             ffprobe,
                             "-v",
@@ -96334,7 +96898,6 @@ class RAGContentParser:
                             str(fp),
                         ],
                         capture_output=True,
-                        text=True,
                         timeout=30,
                     )
                     payload = parse_json_object(r.stdout, {})
@@ -104843,6 +105406,7 @@ IDE_INDEX_HTML = """<!doctype html>
         <button class="activity-button" data-view="scm" title="Source Control" aria-label="Source Control"><span class="codicon codicon-source-control"></span><b id="scmBadge" class="activity-badge"></b></button>
         <button class="activity-button" data-view="run" title="Run and Debug" aria-label="Run and Debug"><span class="codicon codicon-debug-alt"></span></button>
         <button class="activity-button" data-view="extensions" title="Extensions" aria-label="Extensions"><span class="codicon codicon-extensions"></span></button>
+        <button class="activity-button" data-view="applications" title="Applications" aria-label="Applications"><span class="codicon codicon-library"></span></button>
         <button id="collaborationActivityBtn" class="activity-button collaboration-only" data-view="collaboration" title="Collaboration" aria-label="Collaboration"><span class="codicon codicon-organization"></span><b id="collaborationBadge" class="activity-badge"></b></button>
         <button id="agentActivityBtn" class="activity-button" title="Clouds Coder Agent" aria-label="Clouds Coder Agent"><span class="codicon codicon-sparkle"></span></button>
       </div>
@@ -104885,6 +105449,15 @@ IDE_INDEX_HTML = """<!doctype html>
         <header class="side-header"><span>Extensions</span><div class="header-actions"><button id="refreshExtensionsBtn" class="icon-button" title="Refresh Installed Extensions"><span class="codicon codicon-refresh"></span></button></div></header>
         <div class="extension-search"><input id="extensionSearchInput" placeholder="Search Open VSX"><button id="installVsixBtn" class="icon-button" title="Install from VSIX"><span class="codicon codicon-cloud-upload"></span></button><input id="vsixInput" type="file" accept=".vsix" hidden></div>
         <div id="extensionSummary" class="side-summary"></div><div id="extensionList" class="side-list"></div>
+      </section>
+      <section class="side-view applications-view" data-side-view="applications">
+        <header class="side-header"><span>Applications</span><div class="header-actions"><button id="refreshApplicationsBtn" class="icon-button" title="Refresh Applications" aria-label="Refresh Applications"><span class="codicon codicon-refresh"></span></button></div></header>
+        <div class="section-label"><span class="codicon codicon-chevron-down"></span><strong>Personal</strong><button id="newIdeApplicationBtn" class="icon-button section-download application-create-button" type="button" title="Create Personal Application" aria-label="Create Personal Application"><span class="application-create-glyph" aria-hidden="true">+</span></button></div>
+        <div id="applicationsPersonal" class="application-list"></div>
+        <div class="section-label"><span class="codicon codicon-chevron-down"></span><strong>Shared</strong></div>
+        <div id="applicationsShared" class="application-list"></div>
+        <div class="section-label"><span class="codicon codicon-chevron-down"></span><strong>Web Sessions</strong></div>
+        <div id="applicationsWebSessions" class="application-list"></div>
       </section>
       <section class="side-view collaboration-view" data-side-view="collaboration">
         <header class="side-header"><span id="collaborationProjectName">Collaboration</span><div class="header-actions"><button id="refreshCollaborationBtn" class="icon-button" title="Refresh Collaboration"><span class="codicon codicon-refresh"></span></button><button id="returnCollaborationLobbyBtn" class="icon-button" title="Return to Project Lobby" aria-label="Return to Project Lobby"><span class="codicon codicon-sign-out"></span></button></div></header>
@@ -104964,6 +105537,9 @@ input,select,textarea{border:1px solid transparent;border-radius:2px;background:
 .overlay{position:fixed;inset:0;z-index:500;background:rgba(0,0,0,.28)}.palette{width:min(700px,calc(100vw - 28px));margin:44px auto 0;background:#252526;border:1px solid #454545;box-shadow:0 10px 32px rgba(0,0,0,.52)}.palette-input-row{height:40px;display:grid;grid-template-columns:24px minmax(0,1fr);align-items:center;margin:6px;border:1px solid var(--focus);background:var(--input);padding:0 7px}.palette-input-row input{height:100%;border:0;background:transparent;font-size:14px}.palette-results{max-height:min(440px,65vh);overflow:auto;padding-bottom:5px}.palette-row{height:34px;display:flex;align-items:center;gap:8px;padding:0 10px;cursor:default}.palette-row.is-active,.palette-row:hover{background:#04395e}.palette-row .palette-label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.palette-row .keybinding{margin-left:auto;flex:none;color:#aaa}.palette-empty{padding:12px 14px;color:#999}.modal{width:min(620px,calc(100vw - 30px));max-height:calc(100vh - 80px);margin:48px auto;background:#252526;border:1px solid #454545;box-shadow:0 12px 40px rgba(0,0,0,.55);overflow:auto}.modal.is-wide{width:min(920px,calc(100vw - 30px))}.modal>header{height:42px;display:flex;align-items:center;justify-content:space-between;padding:0 10px 0 16px;border-bottom:1px solid var(--line)}.modal h2{margin:0;color:#ddd;font-size:15px;font-weight:500}.modal-form{display:grid;gap:8px;padding:14px}.modal-form input{height:30px;padding:5px 7px}.modal-actions{display:flex;justify-content:flex-end;gap:7px;margin-top:8px}.account-list{padding:8px}.account-row{min-height:38px;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:8px;padding:4px 7px;border-bottom:1px solid var(--line)}.account-row small{display:block;color:#999}.conflict-review{display:grid;gap:12px;padding:14px}.conflict-review-summary{display:flex;gap:7px;flex-wrap:wrap;color:#aaa;font-size:11px}.conflict-review-summary span{padding:3px 6px;border:1px solid #555;background:#2d2d2d}.conflict-candidates{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:7px}.conflict-candidate{display:grid;grid-template-columns:auto minmax(0,1fr);gap:7px;padding:8px;border:1px solid #454545;background:#1f1f1f;color:#ccc;cursor:pointer}.conflict-candidate.is-selected{border-color:var(--focus);background:#12344a}.conflict-candidate input{margin:2px 0 0}.conflict-candidate strong,.conflict-candidate small{display:block}.conflict-candidate small{margin-top:3px;color:#999;overflow-wrap:anywhere}.conflict-preview{min-height:130px;max-height:300px;margin:0;overflow:auto;padding:9px;border:1px solid #414141;background:#171717;color:#d4d4d4;font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere}.conflict-review-form{display:grid;grid-template-columns:160px minmax(0,1fr);gap:8px}.conflict-review-form select,.conflict-review-form input,.conflict-review-form textarea{width:100%;padding:6px 7px;border:1px solid #454545;background:#1e1e1e;color:#ddd}.conflict-review-form textarea{grid-column:1/-1;min-height:58px;resize:vertical}.conflict-review-status{min-height:18px;color:#aaa;font-size:11px}.conflict-review-status.is-error{color:#f48771}.conflict-decision-actions{display:flex;justify-content:flex-end;gap:7px;flex-wrap:wrap}.prompt-enhance-dialog{display:grid;grid-template-rows:auto minmax(0,1fr) auto;width:min(820px,calc(100vw - 28px));height:min(720px,calc(100vh - 48px));margin:24px auto;background:#252526;border:1px solid #4b4b4b;box-shadow:0 14px 44px rgba(0,0,0,.58)}.prompt-enhance-dialog>header{min-height:48px;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:7px 10px 7px 16px;border-bottom:1px solid var(--line)}.prompt-enhance-dialog h2{margin:0;color:#e5e5e5;font-size:15px;font-weight:500}.prompt-enhance-dialog header small{display:block;margin-top:2px;color:#8f8f8f}.prompt-enhance-body{min-height:0;overflow:auto;padding:14px 16px}.prompt-enhance-loading{display:none;height:100%;min-height:260px;place-content:center;justify-items:center;gap:9px;text-align:center;color:#bbb}.prompt-enhance-loading .codicon{font-size:34px;color:#e5c365;animation:prompt-pulse 1s ease-in-out infinite}.prompt-enhance-loading strong{color:#e5e5e5;font-size:14px}.prompt-enhance-loading p{max-width:520px;margin:0;line-height:1.5}.prompt-enhance-loading small{color:#8f8f8f}.prompt-editor-label{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin:0 0 7px;color:#ddd}.prompt-editor-label strong{font-size:12px}.prompt-editor-label small{color:#8f8f8f}.prompt-enhance-body textarea{box-sizing:border-box;width:100%;height:calc(100% - 48px);min-height:320px;resize:vertical;padding:10px 12px;background:#1e1e1e;color:#d4d4d4;border:1px solid #444;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}.prompt-enhance-body textarea:focus{border-color:var(--focus);outline:0}.prompt-enhance-note{min-height:18px;margin-top:6px;color:#999;font-size:11px}.prompt-enhance-dialog>footer{min-height:48px;display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;align-items:center;gap:7px;padding:7px 12px;border-top:1px solid var(--line)}.prompt-enhance-dialog>footer .button{min-height:29px}.prompt-enhance-dialog.is-busy .prompt-enhance-loading{display:grid}.prompt-enhance-dialog.is-busy .prompt-editor-label,.prompt-enhance-dialog.is-busy .prompt-enhance-body textarea,.prompt-enhance-dialog.is-busy .prompt-enhance-note{display:none}.prompt-enhance-dialog.is-busy>footer button{pointer-events:none;opacity:.62}@media(max-width:640px){.prompt-enhance-dialog{height:calc(100vh - 16px);margin:8px auto}.conflict-review-form{grid-template-columns:1fr}.conflict-review-form textarea{grid-column:auto}.prompt-editor-label{display:block}.prompt-editor-label small{display:block;margin-top:2px}.prompt-enhance-dialog>footer{grid-template-columns:1fr 1fr}.prompt-enhance-dialog>footer>span{display:none}.prompt-enhance-dialog>footer .button{width:100%}}
 .prompt-enhance-dialog{width:min(880px,calc(100vw - 28px));height:min(760px,calc(100vh - 48px))}.prompt-enhance-body{display:flex;flex-direction:column;gap:10px}.prompt-enhance-analysis{flex:none;padding:10px 12px;background:#202020;border:1px solid #3c3c3c}.prompt-analysis-heading{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:6px;color:#ddd}.prompt-analysis-heading strong{font-size:12px}.prompt-analysis-heading small{color:#858585}.prompt-intent{margin:0 0 8px;color:#ddd;line-height:1.5}.prompt-enhance-details{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}.prompt-detail-group{min-width:0;padding:7px 8px;background:#262626;border-left:2px solid #4b86b4}.prompt-detail-group>strong{display:block;margin-bottom:4px;color:#bbb;font-size:11px;text-transform:uppercase}.prompt-detail-group ul{margin:0;padding-left:17px;color:#c8c8c8}.prompt-detail-group li{margin:2px 0;line-height:1.45}.prompt-detail-group.clarifications{grid-column:1/-1;border-left-color:#d7ba7d}.prompt-clarification{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:8px;padding:5px 0;border-top:1px solid #383838}.prompt-clarification:first-of-type{border-top:0}.prompt-clarification span{overflow-wrap:anywhere}.prompt-clarification .default-answer{color:#dcdcaa}.prompt-enhance-body textarea{flex:1 0 250px;height:auto;min-height:250px}.prompt-enhance-dialog.is-busy .prompt-enhance-analysis,.prompt-enhance-dialog.is-busy .prompt-editor-label,.prompt-enhance-dialog.is-busy .prompt-enhance-body textarea,.prompt-enhance-dialog.is-busy .prompt-enhance-note{display:none}@media(max-width:640px){.prompt-enhance-details{grid-template-columns:1fr}.prompt-clarification{grid-template-columns:1fr}.prompt-enhance-analysis{padding:8px}.prompt-enhance-body textarea{min-height:220px}}
 .prompt-detail-group.execution{grid-column:1/-1;border-left-color:#4ec9b0}.prompt-detail-group.skills{grid-column:1/-1;border-left-color:#c586c0}.prompt-step,.prompt-skill{display:grid;grid-template-columns:22px minmax(0,1fr);gap:7px;padding:5px 0;border-top:1px solid #383838}.prompt-step:first-of-type,.prompt-skill:first-of-type{border-top:0}.prompt-step-index{display:grid;place-items:center;width:19px;height:19px;border-radius:50%;background:#164f45;color:#d7fff8;font-size:10px}.prompt-step-content,.prompt-skill-content{display:grid;gap:2px;min-width:0}.prompt-step-content span,.prompt-skill-content span{color:#c8c8c8;line-height:1.4;overflow-wrap:anywhere}.prompt-step-content small,.prompt-skill-content small{color:#929292;line-height:1.35}.menu-popup{position:fixed;z-index:700;min-width:210px;padding:4px;background:#252526;border:1px solid #454545;box-shadow:0 8px 22px rgba(0,0,0,.5)}.menu-popup button{width:100%;height:27px;display:flex;align-items:center;gap:8px;padding:0 10px;border:0;background:transparent;color:#ddd;text-align:left;cursor:pointer}.menu-popup button:hover{background:#04395e}.menu-popup .separator{height:1px;margin:4px;background:#454545}.menu-popup .shortcut{margin-left:auto;color:#aaa}.toast-host{position:fixed;z-index:900;right:12px;bottom:34px;width:min(390px,calc(100vw - 24px));display:grid;gap:7px}.toast{display:grid;grid-template-columns:20px minmax(0,1fr) 22px;gap:7px;align-items:start;padding:10px;background:#252526;border:1px solid #454545;box-shadow:0 5px 18px rgba(0,0,0,.42)}.toast.error{border-left:3px solid var(--danger)}.toast.warning{border-left:3px solid var(--warning)}.toast.success{border-left:3px solid var(--success)}.toast button{border:0;background:transparent;color:#aaa;cursor:pointer}
+.side-view[data-side-view="applications"]{grid-template-rows:35px 22px minmax(72px,1fr) 22px minmax(72px,1fr) 22px minmax(72px,1fr)}.application-list{min-height:0;overflow:auto}.application-row{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:7px;min-height:52px;padding:7px 8px 7px 12px;border-bottom:1px solid #252525}.application-row:hover{background:var(--hover)}.application-info{min-width:0}.application-info strong,.application-info small{display:block;overflow:hidden;text-overflow:ellipsis}.application-info strong{color:#ddd;font-size:12px;font-weight:500;white-space:nowrap}.application-info small{margin-top:2px;color:#8f8f8f;font-size:10px;line-height:1.35;white-space:normal;overflow-wrap:anywhere}.application-row .button{min-width:58px;min-height:24px;padding:2px 7px;font-size:10px}.application-row-actions{display:flex;align-items:center;gap:2px}.application-row-action{width:24px;min-width:24px;height:24px;min-height:24px;padding:0}.application-row-action .codicon{font-size:13px}.application-row-action.is-danger:hover{background:#5a1d1d;color:#fff}.application-empty,.application-error{padding:9px 12px;color:#858585;font-size:11px;line-height:1.4}.application-error{color:#f48771}
+.collaboration-mode #newIdeApplicationBtn{display:none}.application-create-button{width:20px!important;height:20px!important;border:0!important;background:transparent!important;color:#c5c5c5!important}.application-create-button:hover{background:var(--hover)!important;color:var(--bright)!important}.application-create-glyph{display:block;font:400 17px/1 Arial,sans-serif;color:inherit}.ide-application-form{display:grid;grid-template-columns:minmax(220px,.7fr) minmax(300px,1.3fr);gap:12px;padding:14px;min-height:420px;max-height:min(72vh,680px)}.ide-application-fields,.ide-application-skills{display:flex;min-width:0;min-height:0;flex-direction:column;gap:9px}.ide-application-form label{display:grid;gap:5px;color:#bbb;font-size:11px}.ide-application-form input,.ide-application-form textarea{width:100%;border:1px solid #444;background:#1e1e1e;color:#ddd;padding:7px 8px;font:inherit}.ide-application-form textarea{min-height:110px;resize:vertical}.ide-application-form input:focus,.ide-application-form textarea:focus{border-color:var(--focus);outline:0}.ide-application-skill-heading{display:flex;align-items:center;justify-content:space-between;color:#bbb;font-size:11px}.ide-application-selected{display:flex;min-height:34px;max-height:132px;flex-direction:column;gap:3px;overflow:auto}.ide-application-selected-empty{padding:7px 8px;color:#858585;font-size:11px}.ide-application-selected-row{display:grid;grid-template-columns:minmax(0,1fr) repeat(3,24px);align-items:center;gap:2px;min-height:29px;padding-left:8px;background:#252526}.ide-application-selected-row span{overflow:hidden;color:#ddd;font-size:11px;text-overflow:ellipsis;white-space:nowrap}.ide-application-selected-row .icon-button{width:24px;min-width:24px;height:24px;min-height:24px}.ide-application-catalog{min-height:160px;flex:1;overflow:auto;border:1px solid #333}.ide-application-skill-row{display:grid;grid-template-columns:20px minmax(0,1fr);gap:5px;padding:7px 8px;border-bottom:1px solid #2c2c2c;cursor:pointer}.ide-application-skill-row:hover,.ide-application-skill-row.is-selected{background:#2a2d2e}.ide-application-skill-row input{width:auto;margin:2px 0 0}.ide-application-skill-row strong,.ide-application-skill-row small{display:block;overflow:hidden;text-overflow:ellipsis}.ide-application-skill-row strong{color:#ddd;font-size:11px;font-weight:500;white-space:nowrap}.ide-application-skill-row small{margin-top:2px;color:#888;font-size:10px;line-height:1.35;overflow-wrap:anywhere}.ide-application-error{min-height:18px;color:#f48771;font-size:11px;line-height:1.4}.ide-application-footer{grid-column:1/-1;display:flex;align-items:center;justify-content:flex-end;gap:7px;padding-top:4px;border-top:1px solid #333}.ide-application-footer .ide-application-error{margin-right:auto}.application-status-pending{color:#d7ba7d}.application-status-published{color:#89d185}.application-status-rejected{color:#f48771}@media(max-width:680px){.ide-application-form{grid-template-columns:1fr;min-height:0;max-height:calc(100vh - 110px);overflow:auto}.ide-application-footer{grid-column:auto}.ide-application-catalog{min-height:220px}}
+.modal.is-application-editor{display:grid;grid-template-rows:42px minmax(0,1fr);height:min(720px,calc(100vh - 48px));max-height:none;margin:24px auto;overflow:hidden}.modal.is-application-editor>#modalBody{min-height:0;overflow:hidden}.modal.is-application-editor .ide-application-form{height:100%;min-height:0;max-height:none;grid-template-rows:minmax(0,1fr) auto}.modal.is-application-editor .ide-application-fields{min-height:0;overflow:auto}.modal.is-application-editor .ide-application-skills{display:grid;grid-template-rows:auto minmax(34px,132px) 29px minmax(0,1fr);min-height:0}.modal.is-application-editor .ide-application-selected,.modal.is-application-editor .ide-application-catalog{min-height:0;scrollbar-width:thin;scrollbar-color:#686868 #1e1e1e}.modal.is-application-editor .ide-application-catalog{height:auto;overflow-y:scroll;overflow-x:hidden;scrollbar-gutter:stable}.modal.is-application-editor .ide-application-catalog::-webkit-scrollbar,.modal.is-application-editor .ide-application-selected::-webkit-scrollbar{width:10px}.modal.is-application-editor .ide-application-catalog::-webkit-scrollbar-track,.modal.is-application-editor .ide-application-selected::-webkit-scrollbar-track{background:#1e1e1e}.modal.is-application-editor .ide-application-catalog::-webkit-scrollbar-thumb,.modal.is-application-editor .ide-application-selected::-webkit-scrollbar-thumb{border:2px solid #1e1e1e;background:#686868}.modal.is-application-editor .ide-application-catalog::-webkit-scrollbar-thumb:hover,.modal.is-application-editor .ide-application-selected::-webkit-scrollbar-thumb:hover{background:#858585}@media(max-width:680px){.modal.is-application-editor{height:calc(100vh - 16px);margin:8px auto}.modal.is-application-editor>#modalBody{overflow:auto}.modal.is-application-editor .ide-application-form{height:auto;min-height:100%;grid-template-columns:1fr;grid-template-rows:auto minmax(360px,55vh) auto;overflow:visible}.modal.is-application-editor .ide-application-fields{overflow:visible}.modal.is-application-editor .ide-application-skills{min-height:360px}.modal.is-application-editor .ide-application-footer{grid-column:auto}}
 @media(max-width:1080px){:root{--sidebar-width:250px;--secondary-width:280px}.menu-bar button:nth-child(n+5){display:none}.status-right button:nth-child(-n+3){display:none}}
 @media(max-width:820px){:root{--sidebar-width:min(300px,calc(100vw - 48px));--secondary-width:min(320px,calc(100vw - 48px));--panel-height:190px}.title-bar{grid-template-columns:28px 25px 1fr auto}.menu-bar{display:none}.command-center{width:100%;min-width:0}.workbench-grid{position:relative;grid-template-columns:48px minmax(0,1fr)!important}.primary-sidebar,.secondary-sidebar{position:absolute;z-index:90;top:0;bottom:0;width:var(--sidebar-width);box-shadow:5px 0 18px rgba(0,0,0,.42)}.primary-sidebar{left:48px}.secondary-sidebar{right:0;width:var(--secondary-width);box-shadow:-5px 0 18px rgba(0,0,0,.42)}.primary-hidden .primary-sidebar,.secondary-hidden .secondary-sidebar{display:none}.editor-area{grid-column:2}.editor-grid.split{grid-template-columns:minmax(0,1fr)}.editor-grid.split .editor-group:not(.is-active){display:none}.layout-controls #togglePanelBtn{display:none}.empty-actions{grid-template-columns:auto}.status-right button{display:none!important}.status-right #accountStatus,.status-right #notificationsBtn{display:flex!important}.panel-tabs{gap:12px}.panel-tabs button{font-size:10px}.panel-header .header-actions .icon-button:nth-child(-n+2){display:none}}
 @media(max-width:480px){.title-bar{grid-template-columns:28px 22px minmax(0,1fr) auto;padding:0 3px}.layout-controls button:not(#toggleSecondaryBtn){display:none}.command-center span:last-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.activity-button{width:43px}.workbench-grid{grid-template-columns:44px minmax(0,1fr)!important}.primary-sidebar{left:44px}.status-left #syncStatus,.status-left #errorStatus{display:none}.panel-tabs{gap:9px}.panel-tabs button{max-width:62px;overflow:hidden;text-overflow:ellipsis}.auth-dialog{padding:28px 22px}.extension-row{grid-template-columns:36px minmax(0,1fr)}.extension-icon{width:36px;height:36px}.extension-row .button{grid-column:2;justify-self:start}}
@@ -105181,6 +105757,7 @@ const S={
   terminal:null,terminalStarting:false,terminalPromise:null,terminalWidget:null,terminalFit:null,terminalOffset:0,terminalPoll:null,terminalDecoder:null,terminalAnsiState:null,terminalPlainState:null,stateTimer:null,diagnosticTimer:null,paletteItems:[],paletteIndex:0,paletteMode:'commands',quickFiles:[],quickFilesLoading:false,quickFilesKey:'',quickFilesTruncated:false,
   debug:null,debugSeq:0,debugPoll:null,debugFile:null,
   agentPoll:null,agentPollDue:0,agentPollBusy:false,agentPollRequested:false,agentState:null,agentRendered:new Set(),agentToolCards:new Map(),agentPlanCards:new Map(),agentOperationSeq:0,agentEventSeq:0,agentWasBusy:false,agentSession:'',agentSubmitting:false,agentInterrupting:false,agentTreeTimer:null,agentFileRefresh:new Set(),agentAttachments:[],agentModelCatalog:null,agentTodoCollapsed:false,promptEnhanceEnabled:false,promptEnhancePersistent:false,promptEnhanceSkillsAware:false,promptEnhanceBudget:'medium',promptEnhancing:false,promptEnhanceDraft:null,promptEnhanceAbort:null,promptEnhanceStartedAt:0,promptEnhanceElapsedTimer:null,promptEnhanceLoadingLabel:'',workspaceRefreshBusy:false,workspaceRefreshSeq:0,workspaceClipboard:null,explorerSelection:null,sessionSwitchSeq:0,sessionSwitching:false,renderingAgentState:false,devicePoll:null,agentEvents:null,agentEventsConnected:false,agentEventReconnect:null,pendingUploadDest:'',pendingOpenUpload:false,pendingFolderUploadDest:'',
+  applications:null,applicationsLoading:false,applicationBusy:new Set(),applicationDraft:{id:'',selectedSkillIds:[],saving:false},
   collaborationMode:false,collaboration:null,collaborationWarning:'',collaborationEvents:null,collaborationEventCursor:0,collaborationRefreshTimer:null,collaborationPresenceTimer:null,collaborationPresenceHeartbeat:null,collaborationConflictNoticeSignature:'',collaborationConflictNoticeTimer:null,collaborationConflictReviewId:'',collaborationFlushes:new Map(),collaborationFlushTimers:new Map(),collaborationRemoteDecorations:new Map(),collaborationSessionRefresh:null
 };
 const HTML_ESCAPE={'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'};
@@ -105412,7 +105989,71 @@ async function runDiagnostics(file){const group=S.activeByGroup.findIndex(key=>k
 function renderProblems(){const host=E('problemsList');host.innerHTML='';for(const row of S.diagnostics){const div=document.createElement('div');div.className=`problem-row ${row.severity||'error'}`;div.innerHTML=`<span class="codicon codicon-${row.severity==='warning'?'warning':'error'}"></span><span>${escapeHtml(row.message)} <small>${escapeHtml(row.path)}</small></span><span>${row.line||1}:${row.column||1}</span>`;div.onclick=()=>openFile(row.path,{root_id:row.root_id,line:row.line,column:row.column}).catch(showError);host.appendChild(div)}E('problemCount').textContent=String(S.diagnostics.length)}
 function renderProblems(){const host=E('problemsList');host.innerHTML='';if(!S.diagnostics.length)host.innerHTML='<div class="panel-empty">No problems detected.</div>';for(const row of S.diagnostics){const div=document.createElement('div');div.className=`problem-row ${row.severity||'error'}`;div.innerHTML=`<span class="codicon codicon-${row.severity==='warning'?'warning':'error'}"></span><span>${escapeHtml(row.message)} <small>${escapeHtml(row.path)}</small></span><span>${row.line||1}:${row.column||1}</span>`;div.onclick=()=>openFile(row.path,{root_id:row.root_id,line:row.line,column:row.column}).catch(showError);host.appendChild(div)}E('problemCount').textContent=String(S.diagnostics.length)}
 function updateStatusBar(){const file=activeFile();E('fileSizeStatus').textContent=file?formatFileSize(file.size):'0 B';E('languageStatus').textContent=file?languageFor(file.path).replace(/^./,char=>char.toUpperCase()):'Plain Text';E('encodingStatus').textContent=file?String(file.encoding||'utf-8').toUpperCase():'UTF-8';E('accountName').textContent=S.account?.username||'';const errors=S.diagnostics.filter(row=>row.severity!=='warning').length;const warnings=S.diagnostics.length-errors;E('errorCount').textContent=errors;E('warningCount').textContent=warnings;E('errorStatus').title=`${errors} Errors, ${warnings} Warnings`;if(S.monaco&&S.editors[S.activeGroup]){const visibleDiff=!E(`diffEditor${S.activeGroup}`).classList.contains('is-hidden');const pos=(visibleDiff?S.diffEditors[S.activeGroup]?.getModifiedEditor():S.editors[S.activeGroup])?.getPosition();if(pos)E('indentStatus').textContent=`Ln ${pos.lineNumber}, Col ${pos.column}`}else E('indentStatus').textContent='Spaces: 2'}
-function showView(view){S.activeView=view;S.primaryVisible=true;E('ideShell').classList.remove('primary-hidden');document.querySelectorAll('.activity-button[data-view]').forEach(button=>button.classList.toggle('is-active',button.dataset.view===view));document.querySelectorAll('.side-view').forEach(section=>section.classList.toggle('is-active',section.dataset.sideView===view));if(view==='scm')refreshScm().catch(showError);if(view==='run')refreshTasks().catch(showError);if(view==='extensions')refreshExtensions().catch(showError);scheduleStateSave()}
+function applicationEmpty(host,message,error=false){host.innerHTML=`<div class="${error?'application-error':'application-empty'}">${escapeHtml(message)}</div>`}
+function applicationActionButton(label,icon,disabled,handler,title=''){
+  const button=document.createElement('button');button.type='button';button.className='button';button.disabled=!!disabled;button.title=title||label;button.innerHTML=`<span class="codicon codicon-${icon}"></span><span>${escapeHtml(label)}</span>`;if(handler)button.onclick=handler;return button
+}
+function applicationIconButton(icon,label,disabled,handler,danger=false){
+  const button=document.createElement('button');button.type='button';button.className=`icon-button application-row-action${danger?' is-danger':''}`;button.disabled=!!disabled;button.title=label;button.setAttribute('aria-label',label);button.innerHTML=`<span class="codicon codicon-${icon}"></span>`;if(handler)button.onclick=handler;return button
+}
+function appendApplicationRow(host,row,{meta,actionLabel,actionIcon='play',busyKey,disabled=false,disabledTitle='',action}={}){
+  const item=document.createElement('div');item.className='application-row';const info=document.createElement('div');info.className='application-info';const title=document.createElement('strong');title.textContent=row.name||row.title||row.id||'Application';const detail=document.createElement('small');detail.textContent=meta||row.description||'';info.append(title,detail);const busy=S.applicationBusy.has(busyKey);item.append(info,applicationActionButton(busy?'Working...':actionLabel,actionIcon,disabled||busy,busy?null:()=>action(row),disabledTitle));host.appendChild(item)
+}
+function appendPersonalApplicationRow(host,row){
+  const latest=row.latest_submission||{},current=Number(latest.submitted_revision||0)===Number(row.revision||0),status=current?String(latest.status||'pending'):'draft';
+  const labels={draft:'Draft',pending:'In review',published:'Published',rejected:'Rejected'},review=String(current?latest.review?.note||'':'').trim();
+  const item=document.createElement('div');item.className='application-row';const info=document.createElement('div');info.className='application-info';
+  const title=document.createElement('strong');title.textContent=(String(row.icon||'').trim()?`${String(row.icon).trim()} `:'')+(row.name||row.id||'Application');
+  const detail=document.createElement('small');detail.className=`application-status-${status}`;detail.textContent=`Personal · v${row.revision||1} · ${labels[status]||status}${review?` · ${review}`:''}`;info.append(title,detail);
+  const actions=document.createElement('div');actions.className='application-row-actions';const launching=S.applicationBusy.has(`launch:${row.id}`),submitting=S.applicationBusy.has(`submit:${row.id}`),deleting=S.applicationBusy.has(`delete:${row.id}`);
+  actions.append(
+    applicationIconButton('play',launching?'Launching...':'Launch',launching,launching?null:()=>launchIdeApplication(row)),
+    applicationIconButton('edit','Edit Personal Application',launching||submitting||deleting,()=>openIdeApplicationEditor(row)),
+    applicationIconButton('cloud-upload',current?`${labels[status]||status}: edit the application before submitting another revision`:(submitting?'Submitting...':'Submit for Shared Review'),current||submitting||deleting,()=>submitIdeApplication(row)),
+    applicationIconButton('trash',deleting?'Deleting...':'Delete Personal Application',launching||submitting||deleting,()=>deleteIdeApplication(row),true),
+  );
+  item.append(info,actions);host.appendChild(item)
+}
+function renderApplications(){
+  const personal=E('applicationsPersonal'),shared=E('applicationsShared'),sessions=E('applicationsWebSessions');if(!personal||!shared||!sessions)return;
+  personal.innerHTML='';shared.innerHTML='';sessions.innerHTML='';
+  if(S.applicationsLoading&&!S.applications){for(const host of [personal,shared,sessions])applicationEmpty(host,'Loading...');return}
+  const data=S.applications;if(!data){for(const host of [personal,shared,sessions])applicationEmpty(host,'Applications are unavailable.',true);return}
+  E('newIdeApplicationBtn').hidden=!!data.collaboration;
+  for(const row of data.personal||[])appendPersonalApplicationRow(personal,row);
+  for(const row of data.legacy_personal||[])appendApplicationRow(personal,row,{meta:`WebUI · v${row.revision||1}`,actionLabel:'Import',actionIcon:'cloud-download',busyKey:`import:${row.id}`,action:importLegacyApplication});
+  if(!(data.personal||[]).length&&!(data.legacy_personal||[]).length)applicationEmpty(personal,'No personal applications');
+  for(const row of data.shared||[])appendApplicationRow(shared,row,{meta:`Published · v${row.submitted_revision||row.revision||1}`,actionLabel:row.launchable===false?'Unavailable':'Launch',busyKey:`launch:${row.id}`,disabled:row.launchable===false,disabledTitle:'Shared launch is unavailable in this workspace.',action:launchIdeApplication});
+  if(!(data.shared||[]).length)applicationEmpty(shared,'No published applications');
+  for(const row of data.web_sessions||[]){const app=row.app_binding||{};appendApplicationRow(sessions,row,{meta:`${app.name||'Application'} · ${row.running?'Running':'Idle'}`,actionLabel:row.running?'Running':'Import Session',actionIcon:'cloud-download',busyKey:`session:${row.id}`,disabled:!!row.running,disabledTitle:'Stop the WebUI session before importing it.',action:importLegacyApplicationSession})}
+  if(!(data.web_sessions||[]).length)applicationEmpty(sessions,'No WebUI application sessions');
+}
+async function refreshApplications(){if(S.applicationsLoading)return;S.applicationsLoading=true;renderApplications();try{S.applications=await api('/api/ide/v2/applications')}catch(error){S.applications=null;renderApplications();throw error}finally{S.applicationsLoading=false;renderApplications()}}
+async function withApplicationBusy(key,work){if(S.applicationBusy.has(key))return;S.applicationBusy.add(key);renderApplications();try{return await work()}finally{S.applicationBusy.delete(key);renderApplications()}}
+async function launchIdeApplication(row){await withApplicationBusy(`launch:${row.id}`,async()=>{const out=await api(`/api/ide/v2/applications/${qs(row.id)}/launch`,{method:'POST',body:'{}'});await refreshSessionCatalog();await switchSession(out.id,true);await refreshApplications();toast(`Launched ${row.name||'application'}.`,'success')})}
+async function importLegacyApplication(row){await withApplicationBusy(`import:${row.id}`,async()=>{await api('/api/ide/v2/applications/import',{method:'POST',body:JSON.stringify({app_id:row.id})});await refreshApplications();toast(`Imported ${row.name||'application'}.`,'success')})}
+async function importLegacyApplicationSession(row){await withApplicationBusy(`session:${row.id}`,async()=>{const out=await api('/api/ide/v2/application-sessions/import',{method:'POST',body:JSON.stringify({session_id:row.id})});await refreshSessionCatalog();await switchSession(out.id,true);await refreshApplications();toast(`Imported ${row.title||'WebUI session'}.`,'success')})}
+function setIdeApplicationEditorError(message=''){const host=E('ideApplicationEditorError');if(host)host.textContent=String(message||'')}
+function openIdeApplicationEditor(row=null){
+  const draft=S.applicationDraft;draft.id=String(row?.id||'');draft.selectedSkillIds=[...(row?.skills||[])].sort((a,b)=>Number(a.order||0)-Number(b.order||0)).map(skill=>String(skill.id||'')).filter(Boolean);draft.saving=false;
+  openModal(draft.id?'Edit Personal Application':'Create Personal Application',`<form id="ideApplicationForm" class="ide-application-form"><section class="ide-application-fields"><label>Name<input id="ideApplicationName" maxlength="100" required value="${escapeHtml(row?.name||'')}" placeholder="Application name"></label><label>Icon<input id="ideApplicationIcon" maxlength="20" value="${escapeHtml(row?.icon||'')}" placeholder="Optional icon"></label><label>Description<textarea id="ideApplicationDescription" maxlength="1000" placeholder="Use cases and expected output">${escapeHtml(row?.description||'')}</textarea></label></section><section class="ide-application-skills"><div class="ide-application-skill-heading"><strong>Selected Skills</strong><span id="ideApplicationSkillCount">0 / 8</span></div><div id="ideApplicationSelected" class="ide-application-selected"></div><input id="ideApplicationSkillSearch" type="search" placeholder="Search Skills"><div id="ideApplicationCatalog" class="ide-application-catalog"></div></section><footer class="ide-application-footer"><div id="ideApplicationEditorError" class="ide-application-error" role="status"></div><button id="ideApplicationCancel" class="button" type="button">Cancel</button><button id="ideApplicationSave" class="button primary" type="submit">Save Personal App</button></footer></form>`,{wide:true,applicationEditor:true});
+  E('ideApplicationCancel').onclick=closeModal;E('ideApplicationSkillSearch').oninput=renderIdeApplicationSkillEditor;E('ideApplicationForm').onsubmit=event=>{event.preventDefault();saveIdeApplication().catch(error=>setIdeApplicationEditorError(error.message||String(error)))};renderIdeApplicationSkillEditor();setTimeout(()=>E('ideApplicationName')?.focus(),0)
+}
+function toggleIdeApplicationSkill(id){const selected=S.applicationDraft.selectedSkillIds,index=selected.indexOf(id);if(index>=0)selected.splice(index,1);else{if(selected.length>=8){setIdeApplicationEditorError('An application can bind at most 8 Skills.');return}selected.push(id)}setIdeApplicationEditorError();renderIdeApplicationSkillEditor()}
+function moveIdeApplicationSkill(index,delta){const selected=S.applicationDraft.selectedSkillIds,target=index+delta;if(target<0||target>=selected.length)return;[selected[index],selected[target]]=[selected[target],selected[index]];renderIdeApplicationSkillEditor()}
+function renderIdeApplicationSkillEditor(){
+  const selectedHost=E('ideApplicationSelected'),catalogHost=E('ideApplicationCatalog'),count=E('ideApplicationSkillCount');if(!selectedHost||!catalogHost||!count)return;const selected=S.applicationDraft.selectedSkillIds,catalog=S.applications?.skill_catalog||[],chosen=new Set(selected),query=String(E('ideApplicationSkillSearch')?.value||'').trim().toLowerCase();selectedHost.innerHTML='';catalogHost.innerHTML='';count.textContent=`${selected.length} / 8`;
+  if(!selected.length)selectedHost.innerHTML='<div class="ide-application-selected-empty">Select at least one Skill from the catalog.</div>';
+  selected.forEach((id,index)=>{const skill=catalog.find(item=>String(item.id||'')===id),entry=document.createElement('div');entry.className='ide-application-selected-row';const label=document.createElement('span');label.textContent=`${index+1}. ${skill?.name||id}`;label.title=id;entry.append(label,applicationIconButton('arrow-up','Move up',index===0,()=>moveIdeApplicationSkill(index,-1)),applicationIconButton('arrow-down','Move down',index===selected.length-1,()=>moveIdeApplicationSkill(index,1)),applicationIconButton('close','Remove Skill',false,()=>toggleIdeApplicationSkill(id)));selectedHost.appendChild(entry)});
+  const rows=catalog.filter(skill=>!query||[skill.id,skill.name,skill.description].join(' ').toLowerCase().includes(query));if(!rows.length){applicationEmpty(catalogHost,query?'No matching Skills':'No application Skills are available');return}
+  for(const skill of rows){const id=String(skill.id||''),entry=document.createElement('label');entry.className=`ide-application-skill-row${chosen.has(id)?' is-selected':''}`;const input=document.createElement('input');input.type='checkbox';input.checked=chosen.has(id);input.onchange=()=>toggleIdeApplicationSkill(id);const body=document.createElement('div'),name=document.createElement('strong'),key=document.createElement('small'),description=document.createElement('small');name.textContent=String(skill.name||id);key.textContent=id;description.textContent=String(skill.description||'');body.append(name,key,description);entry.append(input,body);catalogHost.appendChild(entry)}
+}
+async function saveIdeApplication(){
+  const draft=S.applicationDraft;if(draft.saving)return;const payload={name:E('ideApplicationName').value.trim(),icon:E('ideApplicationIcon').value.trim(),description:E('ideApplicationDescription').value.trim(),skills:[...draft.selectedSkillIds]};if(!payload.name){setIdeApplicationEditorError('Enter an application name.');return}if(!payload.skills.length){setIdeApplicationEditorError('Select at least one Skill.');return}draft.saving=true;E('ideApplicationSave').disabled=true;E('ideApplicationCancel').disabled=true;setIdeApplicationEditorError('Saving...');try{await api(draft.id?`/api/ide/v2/applications/${qs(draft.id)}`:'/api/ide/v2/applications',{method:draft.id?'PATCH':'POST',body:JSON.stringify(payload)});closeModal();await refreshApplications();toast('Personal application saved.','success')}finally{draft.saving=false}
+}
+async function submitIdeApplication(row){if(!confirm(`Submit ${row.name||'this application'} revision ${row.revision||1} for administrator review?`))return;await withApplicationBusy(`submit:${row.id}`,async()=>{const out=await api(`/api/ide/v2/applications/${qs(row.id)}/submit`,{method:'POST',body:'{}'});await refreshApplications();toast(out.status==='pending'?'Submitted for administrator review.':`Current revision is ${out.status||'already submitted'}.`,'success')})}
+async function deleteIdeApplication(row){if(!confirm(`Delete personal application ${row.name||row.id}?`))return;await withApplicationBusy(`delete:${row.id}`,async()=>{await api(`/api/ide/v2/applications/${qs(row.id)}`,{method:'DELETE'});await refreshApplications();toast('Personal application deleted.','success')})}
+function showView(view){S.activeView=view;S.primaryVisible=true;E('ideShell').classList.remove('primary-hidden');document.querySelectorAll('.activity-button[data-view]').forEach(button=>button.classList.toggle('is-active',button.dataset.view===view));document.querySelectorAll('.side-view').forEach(section=>section.classList.toggle('is-active',section.dataset.sideView===view));if(view==='scm')refreshScm().catch(showError);if(view==='run')refreshTasks().catch(showError);if(view==='extensions')refreshExtensions().catch(showError);if(view==='applications')refreshApplications().catch(showError);scheduleStateSave()}
 function showPanel(tab='terminal'){S.panel=tab;S.panelVisible=true;E('ideShell').classList.remove('panel-hidden');document.querySelectorAll('[data-panel-tab]').forEach(button=>button.classList.toggle('is-active',button.dataset.panelTab===tab));document.querySelectorAll('.panel-content').forEach(panel=>panel.classList.toggle('is-active',panel.id===`${tab}Panel`));if(tab==='terminal'){if(!S.terminal&&S.capabilities.terminal)newTerminal().catch(showError);else if(S.terminalFit)setTimeout(()=>S.terminalFit.fit(),30)}scheduleStateSave()}
 function togglePrimary(){S.primaryVisible=!S.primaryVisible;E('ideShell').classList.toggle('primary-hidden',!S.primaryVisible);scheduleStateSave()}
 function toggleSecondary(force){S.secondaryVisible=typeof force==='boolean'?force:!S.secondaryVisible;E('ideShell').classList.toggle('secondary-hidden',!S.secondaryVisible);scheduleStateSave()}
@@ -105624,8 +106265,8 @@ async function requestPromptEnhancement(draft,{regenerate=false}={}){if(S.prompt
 async function usePromptReview(original=false){const draft=S.promptEnhanceDraft;if(!draft)return;const message=original?draft.original:E('promptEnhanceEditor').value.trim();if(!message)return toast('Enhanced prompt is empty.','warning');S.promptEnhanceAbort=null;setPromptEnhanceBusy(false);E('promptEnhanceOverlay').classList.add('is-hidden');S.promptEnhanceDraft=null;await submitAgentDraft(draft,message)}
 async function regeneratePromptReview(){const draft=S.promptEnhanceDraft;if(!draft)return;await requestPromptEnhancement(draft,{regenerate:true})}
 async function sendAgent(){const input=E('agentPrompt'),message=input.value.trim(),pending=!S.agentState?.running&&S.agentState?.pending_user_question;if(pending)return answerAgentQuestion(message);if(!message||S.agentSubmitting||S.promptEnhancing)return;const file=activeFile(),draft={session_id:S.activeSession,session_seq:S.sessionSwitchSeq,root_id:S.activeRoot,active_path:file?.path||'',original:message,attachments:S.agentAttachments.map(item=>item.path),regeneration:0,result:null,budget:S.promptEnhanceBudget,skills_aware:S.promptEnhanceSkillsAware,enhance_requested:S.promptEnhanceEnabled};if(S.promptEnhanceEnabled)return requestPromptEnhancement(draft);return submitAgentDraft(draft,message)}
-function openModal(title,html,{wide=false}={}){E('modalTitle').textContent=title;E('modalBody').innerHTML=html;E('modal').classList.toggle('is-wide',!!wide);E('modalOverlay').classList.remove('is-hidden')}
-function closeModal(){S.collaborationConflictReviewId='';E('modal').classList.remove('is-wide');E('modalOverlay').classList.add('is-hidden');E('modalBody').innerHTML=''}
+function openModal(title,html,{wide=false,applicationEditor=false}={}){E('modalTitle').textContent=title;E('modalBody').innerHTML=html;E('modal').classList.toggle('is-wide',!!wide);E('modal').classList.toggle('is-application-editor',!!applicationEditor);E('modalOverlay').classList.remove('is-hidden')}
+function closeModal(){S.collaborationConflictReviewId='';E('modal').classList.remove('is-wide','is-application-editor');E('modalOverlay').classList.add('is-hidden');E('modalBody').innerHTML=''}
 async function showAccountModal(){let users=[],devices=[];if(S.capabilities.admin&&S.capabilities.local){try{[users,devices]=await Promise.all([api('/api/ide/v2/admin/users').then(x=>x.accounts||[]),api('/api/ide/v2/admin/devices').then(x=>x.devices||[])])}catch(error){logOutput(error.message)}}const userRows=users.map(row=>`<div class="account-row"><div><strong>${escapeHtml(row.username)}</strong><small>${escapeHtml(row.role)}${row.disabled?' / disabled':''}</small></div>${row.role==='admin'?'':`<button class="button" data-user="${escapeHtml(row.username)}" data-disabled="${row.disabled?'0':'1'}">${row.disabled?'Enable':'Disable'}</button>`}</div>`).join('');const deviceRows=devices.map(row=>`<div class="account-row"><div><strong>${escapeHtml(row.label||row.pairing_id)}</strong><small>${escapeHtml(row.pairing_id)} / ${escapeHtml(row.source_ip)} / ${escapeHtml(row.status)}</small></div><div>${row.status==='pending'?`<button class="button primary" data-device-approve="${escapeHtml(row.pairing_id)}">Approve</button>`:''}${row.status!=='revoked'?` <button class="button" data-device-revoke="${escapeHtml(row.pairing_id)}">Revoke</button>`:''}</div></div>`).join('');const passwordForm=S.config?.password_login_enabled?`<form id="resetPasswordForm" class="modal-form"><h3>Password Login</h3><input id="resetUsername" value="${escapeHtml(S.account.username)}" required><input id="resetPassword" type="password" placeholder="New password" required><div class="modal-actions"><button class="button primary">Set Password</button></div></form>`:'';openModal('Access',`<div class="account-list"><div class="account-row"><div><strong>${escapeHtml(S.account.username)}</strong><small>${escapeHtml(S.account.role)} / current</small></div><button id="logoutBtn" class="button">Sign Out</button></div>${userRows}</div>${S.capabilities.admin&&S.capabilities.local?`<div class="section-label"><strong>Web Devices</strong></div><div class="account-list">${deviceRows||'<div class="side-summary">No Web devices requested access.</div>'}</div>${passwordForm}`:''}`);E('logoutBtn').onclick=logout;document.querySelectorAll('[data-user]').forEach(button=>button.onclick=async()=>{await api('/api/ide/v2/admin/users',{method:'PATCH',body:JSON.stringify({username:button.dataset.user,disabled:button.dataset.disabled==='1'})});showAccountModal()});document.querySelectorAll('[data-device-approve]').forEach(button=>button.onclick=async()=>{await api('/api/ide/v2/admin/devices/approve',{method:'POST',body:JSON.stringify({pairing_id:button.dataset.deviceApprove})});showAccountModal()});document.querySelectorAll('[data-device-revoke]').forEach(button=>button.onclick=async()=>{await api('/api/ide/v2/admin/devices/revoke',{method:'POST',body:JSON.stringify({pairing_id:button.dataset.deviceRevoke})});showAccountModal()});if(E('resetPasswordForm'))E('resetPasswordForm').onsubmit=async event=>{event.preventDefault();await api('/api/ide/v2/admin/password-reset',{method:'POST',body:JSON.stringify({username:E('resetUsername').value,new_password:E('resetPassword').value})});location.reload()}}
 async function logout(){try{await api('/api/ide/v2/auth/logout',{method:'POST',body:'{}'})}finally{if(S.collaborationMode)sessionStorage.removeItem('clouds_collab_csrf');location.reload()}}
 function showMountModal(){const mounts=S.config?.mounts||[];openModal('Workspace Folders',`<div class="account-list">${mounts.map(row=>`<div class="account-row"><div><strong>${escapeHtml(row.label)}</strong><small>${escapeHtml(row.path)}</small></div><button class="button" data-mount="${escapeHtml(row.id)}">Remove</button></div>`).join('')||'<div class="side-summary">No external folders mounted.</div>'}</div><form id="mountForm" class="modal-form"><input id="mountPath" placeholder="/absolute/path/to/project" required><div class="modal-actions"><button class="button primary">Add Folder</button></div></form>`);document.querySelectorAll('[data-mount]').forEach(button=>button.onclick=async()=>{await api('/api/ide/mounts',{method:'DELETE',body:JSON.stringify({mount_id:button.dataset.mount})});await refreshConfig();showMountModal()});E('mountForm').onsubmit=async event=>{event.preventDefault();await api('/api/ide/mounts',{method:'POST',body:JSON.stringify({path:E('mountPath').value})});await refreshConfig();closeModal()}}
@@ -105734,7 +106375,7 @@ function bindUI(){
   document.querySelectorAll('.empty-actions [data-command]').forEach(button=>button.onclick=event=>{event.preventDefault();runCommandById(button.dataset.command)});
   E('newFileBtn').onclick=()=>newFile().catch(showError);E('newFolderBtn').onclick=()=>newFolder().catch(showError);E('refreshTreeBtn').onclick=()=>refreshWorkspaceSnapshot().catch(showError);E('explorerMoreBtn').onclick=event=>showMenu(event.currentTarget,['file.open','file.uploadFolder','file.downloadWorkspace','file.openFolder','session.new']);E('sessionSelect').onchange=()=>switchSession(E('sessionSelect').value).catch(showError);E('renameSessionBtn').onclick=()=>renameCurrentSession().catch(showError);E('rootSelect').onchange=async()=>{S.workspaceClipboard=null;S.explorerSelection=null;clearWorkspaceDropState();S.activeRoot=E('rootSelect').value;S.treeCache.clear();await loadTree('');updateAgentContext()};const workspaceLabel=E('workspaceSectionLabel'),tree=E('tree');workspaceLabel.onclick=event=>{if(event.target.closest('#downloadWorkspaceBtn'))return;setExplorerSelection(null);workspaceLabel.focus()};workspaceLabel.onkeydown=event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();const rect=workspaceLabel.getBoundingClientRect();showWorkspaceMenu(rect.left+8,rect.bottom)}};workspaceLabel.oncontextmenu=event=>{event.preventDefault();setExplorerSelection(null);workspaceLabel.focus();showWorkspaceMenu(event.clientX,event.clientY)};tree.onclick=event=>{if(event.target!==tree)return;setExplorerSelection(null);tree.focus()};tree.oncontextmenu=event=>{if(event.target.closest('.tree-row'))return;event.preventDefault();setExplorerSelection(null);tree.focus();showWorkspaceMenu(event.clientX,event.clientY)};bindWorkspaceDropZone(tree);bindWorkspaceDropZone(workspaceLabel,{rootOnly:true});window.addEventListener('dragover',event=>{if(workspaceDragHasFiles(event.dataTransfer))event.preventDefault()});window.addEventListener('drop',event=>{if(workspaceDragHasFiles(event.dataTransfer))event.preventDefault();clearWorkspaceDropState()});window.addEventListener('dragend',clearWorkspaceDropState);E('downloadWorkspaceBtn').onclick=event=>{event.preventDefault();event.stopPropagation();downloadWorkspacePath('')};
   E('fileInput').onchange=()=>{const input=E('fileInput'),files=[...(input.files||[])],dest=S.pendingUploadDest,openAfter=S.pendingOpenUpload,firstPath=files[0]?normalizeUploadPath(dest?`${dest}/${files[0].name}`:files[0].name):'';S.pendingUploadDest='';S.pendingOpenUpload=false;uploadFiles(files,dest).then(()=>openAfter&&firstPath?openFile(firstPath):null).catch(showError).finally(()=>{input.value=''})};E('folderInput').onchange=()=>{const input=E('folderInput'),dest=S.pendingFolderUploadDest,legacy=[...(input.webkitEntries||[])];S.pendingFolderUploadDest='';const task=legacy.length?scanLegacyDirectoryEntries(legacy).then(scanned=>uploadEntries(scanned.entries,scanned.directories,dest)):uploadFiles(input.files,dest);task.catch(showError).finally(()=>{input.value=''})};E('searchInput').oninput=debounce(()=>runSearch().catch(showError),300);E('includeInput').onchange=()=>runSearch().catch(showError);E('excludeInput').onchange=()=>runSearch().catch(showError);E('matchCaseBtn').onclick=()=>{E('matchCaseBtn').classList.toggle('is-active');runSearch().catch(showError)};E('regexBtn').onclick=()=>{E('regexBtn').classList.toggle('is-active');runSearch().catch(showError)};E('clearSearchBtn').onclick=()=>{E('searchInput').value='';S.searchResults=[];E('searchSummary').textContent='';renderSearch()};
-  E('refreshScmBtn').onclick=()=>refreshScm().catch(showError);E('refreshTasksBtn').onclick=()=>refreshTasks().catch(showError);E('runActiveBtn').onclick=()=>runActiveFile().catch(showError);E('debugActiveBtn').onclick=()=>debugActiveFile().catch(showError);E('newTerminalBtn').onclick=()=>newTerminal().catch(showError);E('killTerminalBtn').onclick=()=>killTerminal().catch(showError);E('refreshExtensionsBtn').onclick=()=>refreshExtensions(E('extensionSearchInput').value).catch(showError);E('extensionSearchInput').oninput=debounce(()=>refreshExtensions(E('extensionSearchInput').value).catch(showError),400);E('installVsixBtn').onclick=()=>E('vsixInput').click();E('vsixInput').onchange=()=>installVsix(E('vsixInput').files?.[0]).catch(showError);
+  E('refreshScmBtn').onclick=()=>refreshScm().catch(showError);E('refreshTasksBtn').onclick=()=>refreshTasks().catch(showError);E('runActiveBtn').onclick=()=>runActiveFile().catch(showError);E('debugActiveBtn').onclick=()=>debugActiveFile().catch(showError);E('newTerminalBtn').onclick=()=>newTerminal().catch(showError);E('killTerminalBtn').onclick=()=>killTerminal().catch(showError);E('refreshExtensionsBtn').onclick=()=>refreshExtensions(E('extensionSearchInput').value).catch(showError);E('extensionSearchInput').oninput=debounce(()=>refreshExtensions(E('extensionSearchInput').value).catch(showError),400);E('installVsixBtn').onclick=()=>E('vsixInput').click();E('vsixInput').onchange=()=>installVsix(E('vsixInput').files?.[0]).catch(showError);E('newIdeApplicationBtn').onclick=()=>openIdeApplicationEditor();E('refreshApplicationsBtn').onclick=()=>refreshApplications().catch(showError);
   E('sendAgentBtn').onclick=()=>sendAgent().catch(showError);E('stopAgentBtn').onclick=()=>stopAgent().catch(showError);E('agentPrompt').onkeydown=event=>{if((event.ctrlKey||event.metaKey)&&event.key==='Enter'){event.preventDefault();sendAgent().catch(showError)}};E('attachContextBtn').onclick=()=>E('agentAttachmentInput').click();E('promptEnhanceBtn').onclick=togglePromptEnhancement;E('agentAttachmentInput').onchange=()=>uploadAgentAttachments(E('agentAttachmentInput').files).catch(showError);const agentComposer=E('agentComposer'),agentPrompt=E('agentPrompt'),dropHint=E('agentDropHint');let agentDragDepth=0;for(const type of ['dragenter','dragover'])agentComposer.addEventListener(type,event=>{event.preventDefault();if(type==='dragenter')agentDragDepth++;agentComposer.classList.add('is-dragover');dropHint.classList.remove('is-hidden')});for(const type of ['dragleave','dragend'])agentComposer.addEventListener(type,event=>{event.preventDefault();if(type==='dragleave')agentDragDepth--;if(agentDragDepth<=0){agentDragDepth=0;agentComposer.classList.remove('is-dragover');dropHint.classList.add('is-hidden')}});agentComposer.addEventListener('drop',event=>{event.preventDefault();agentDragDepth=0;agentComposer.classList.remove('is-dragover');dropHint.classList.add('is-hidden');const files=event.dataTransfer?.files;if(files?.length)uploadAgentAttachments(files).catch(showError)});agentPrompt.addEventListener('paste',event=>{const files=agentClipboardFiles(event);if(!files.length)return;event.preventDefault();uploadAgentAttachments(files).catch(showError)});E('agentModelBtn').onclick=event=>{event.stopPropagation();showAgentModelMenu(event.currentTarget).catch(showError)};E('agentTodoToggle').onclick=()=>{S.agentTodoCollapsed=!S.agentTodoCollapsed;E('agentTodoPanel').classList.toggle('is-collapsed',S.agentTodoCollapsed);E('agentTodoToggle').setAttribute('aria-expanded',String(!S.agentTodoCollapsed));scheduleStateSave()};E('newAgentChatBtn').onclick=()=>createSession().catch(showError);E('promptEnhanceClose').onclick=()=>closePromptEnhanceReview();E('promptUseOriginal').onclick=()=>usePromptReview(true).catch(showError);E('promptRegenerate').onclick=()=>regeneratePromptReview().catch(showError);E('promptUseEnhanced').onclick=()=>usePromptReview(false).catch(showError);E('promptEnhanceEditor').onkeydown=event=>{if((event.ctrlKey||event.metaKey)&&event.key==='Enter'){event.preventDefault();usePromptReview(false).catch(showError)}};E('promptEnhanceOverlay').onclick=event=>{if(event.target===E('promptEnhanceOverlay'))closePromptEnhanceReview()};renderPromptEnhanceToggle();
   bindPromptEnhanceButton();
   E('accountsBtn').onclick=()=>showAccountModal().catch(showError);E('accountStatus').onclick=()=>showAccountModal().catch(showError);E('manageBtn').onclick=event=>showMenu(event.currentTarget,['accounts.manage','file.openFolder','workbench.action.showCommands']);E('notificationsBtn').onclick=()=>toast('No new notifications.','success',2500);E('gitStatus').onclick=()=>showView('scm');E('errorStatus').onclick=()=>showPanel('problems');
@@ -106326,7 +106967,7 @@ class SkillsStudioStore:
             else:
                 raise SkillsStudioError("isolation_unavailable", f"backend {name or 'unknown'} is not supported for Studio evaluation", 503)
             try:
-                completed = subprocess.run(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
+                completed = run_subprocess_text(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
                 passed = completed.returncode == 0; evidence = {"isolated": True, "passed": passed, "backend": name, "network": "disabled", "scripts": [x["path"] for x in scripts], "exit_code": completed.returncode, "stdout": trim(completed.stdout, 4000), "stderr": trim(completed.stderr, 4000), "evaluated_at": now_ts()}
             except subprocess.TimeoutExpired as exc:
                 evidence = {"isolated": True, "passed": False, "backend": name, "network": "disabled", "scripts": [x["path"] for x in scripts], "timeout": True, "stderr": trim(str(exc), 2000), "evaluated_at": now_ts()}
@@ -106952,7 +107593,7 @@ class AppContext:
         feature: str = "processes",
     ) -> list[str]:
         if not remote:
-            return []
+            return sess._hard_snapshot_shell_prefix(cwd, feature=feature) if sess.skill_mode == "hard" else []
         sess.ide_remote_sandbox_required = True
         prefix = sess._workspace_sandbox_shell_prefix(cwd, feature=feature)
         if not prefix:
@@ -107767,6 +108408,269 @@ class AppContext:
             "active_session_id": latest_id,
             "session_creation_limit": quota,
         }
+
+    def _ide_legacy_source_user(self, client_ip: str) -> str:
+        return user_id_from_ip(_normalize_ip(client_ip))
+
+    def _ide_legacy_session_running(self, user_id: str, sess: SessionState) -> bool:
+        if bool(getattr(sess, "running", False)) or bool(getattr(sess, "scheduler_starting", False)):
+            return True
+        try:
+            if any(
+                str(row.get("status", "") or "") in {"starting", "running", "stopping"}
+                for row in sess.bg.list_objects()
+            ):
+                return True
+        except Exception:
+            pass
+        try:
+            processes = self.process_manager.list_processes(
+                owner_user_id=user_id,
+                session_id=sess.id,
+                limit=500,
+            ).get("processes", [])
+            if any(str(row.get("status", "") or "") in {"starting", "running", "stopping"} for row in processes):
+                return True
+        except Exception:
+            pass
+        with self.ide_terminal_lock:
+            for terminal in self.ide_terminals.values():
+                if (
+                    str(terminal.get("user_id", "") or "") == user_id
+                    and str(terminal.get("session_id", "") or "") == sess.id
+                    and terminal.get("process") is not None
+                    and terminal["process"].poll() is None
+                ):
+                    return True
+        with self.ide_debug_lock:
+            for debug in self.ide_debug_sessions.values():
+                if (
+                    str(debug.get("user_id", "") or "") == user_id
+                    and str(debug.get("session_id", "") or "") == sess.id
+                    and debug.get("process") is not None
+                    and debug["process"].poll() is None
+                ):
+                    return True
+        return False
+
+    def ide_applications_payload(
+        self,
+        user_id: str,
+        *,
+        client_ip: str,
+        collaboration: bool = False,
+    ) -> dict:
+        skill_catalog_fn = getattr(self.applications, "skill_catalog", None)
+        skill_catalog = list(skill_catalog_fn()) if callable(skill_catalog_fn) and not collaboration else []
+        shared = []
+        for row in self.applications.list_shared():
+            item = dict(row)
+            item.update({"origin": "shared", "launchable": not collaboration})
+            shared.append(item)
+        if collaboration:
+            return {
+                "ok": True,
+                "personal": [],
+                "shared": shared,
+                "legacy_personal": [],
+                "web_sessions": [],
+                "skill_catalog": [],
+                "collaboration": True,
+            }
+        personal = []
+        for row in self.applications.list_personal(user_id):
+            item = dict(row)
+            item.update({"origin": "ide", "launchable": True})
+            personal.append(item)
+        source_user = self._ide_legacy_source_user(client_ip)
+        legacy_personal: list[dict] = []
+        web_sessions: list[dict] = []
+        if source_user != user_id:
+            for row in self.applications.list_personal(source_user):
+                item = dict(row)
+                item.update({"origin": "web", "importable": True})
+                legacy_personal.append(item)
+            source_manager = self.manager_for_user(source_user)
+            listed = source_manager.list(limit=2000, offset=0)
+            summaries = listed.get("sessions", []) if isinstance(listed, dict) else listed
+            for summary in summaries:
+                source_session = source_manager.get(str(summary.get("id", "") or ""))
+                if source_session is None or source_session.skill_mode != "hard" or not source_session.app_binding:
+                    continue
+                running = self._ide_legacy_session_running(source_user, source_session)
+                web_sessions.append({
+                    "id": source_session.id,
+                    "title": source_session.title,
+                    "updated_at": float(source_session.updated_at or 0.0),
+                    "message_count": int(summary.get("message_count", 0) or 0),
+                    "running": running,
+                    "importable": not running,
+                    "app_binding": dict(source_session.app_binding),
+                })
+        return {
+            "ok": True,
+            "personal": personal,
+            "shared": shared,
+            "legacy_personal": legacy_personal,
+            "web_sessions": web_sessions,
+            "skill_catalog": skill_catalog,
+            "collaboration": False,
+        }
+
+    def ide_launch_application(
+        self,
+        user_id: str,
+        app_id: str,
+        *,
+        client_ip: str,
+        collaboration: bool = False,
+    ) -> dict:
+        if collaboration or str(user_id or "").startswith("collab:"):
+            raise IDECapabilityError(
+                "collaboration_application_launch_unavailable",
+                "Shared application launch is unavailable because collaboration sessions share one workspace.",
+                409,
+            )
+        return self.launch_application_for_user(user_id, app_id, client_ip=client_ip)
+
+    def ide_import_application(self, user_id: str, app_id: str, *, client_ip: str) -> dict:
+        if str(user_id or "").startswith("collab:"):
+            raise IDECapabilityError("collaboration_import_denied", "IP-private applications cannot be imported into collaboration.", 403)
+        source_user = self._ide_legacy_source_user(client_ip)
+        if source_user == user_id:
+            raise IDECapabilityError("application_already_available", "The application already belongs to this IDE identity.", 409)
+        out = self.applications.import_personal(source_user, user_id, app_id)
+        return {"ok": True, **out}
+
+    def _rollback_session_quota_reservation(self, user_id: str) -> None:
+        with self._lock:
+            state = self._load_session_daily_limit_state_locked(user_id)
+            state["used"] = max(0, int(state.get("used", 0) or 0) - 1)
+            self._save_session_daily_limit_state_locked(user_id, state)
+
+    def ide_import_application_session(
+        self,
+        user_id: str,
+        session_id: str,
+        *,
+        client_ip: str,
+    ) -> dict:
+        if str(user_id or "").startswith("collab:"):
+            raise IDECapabilityError("collaboration_import_denied", "IP-private sessions cannot be imported into collaboration.", 403)
+        source_user = self._ide_legacy_source_user(client_ip)
+        if source_user == user_id:
+            raise IDECapabilityError("session_already_available", "The session already belongs to this IDE identity.", 409)
+        source_manager = self.manager_for_user(source_user)
+        source = source_manager.get(str(session_id or "").strip())
+        if source is None or source.skill_mode != "hard" or not source.app_binding:
+            raise KeyError("importable application session not found")
+        if self._ide_legacy_session_running(source_user, source):
+            raise IDECapabilityError("source_session_running", "Stop the WebUI session and its processes before importing it.", 409)
+
+        imported_app_id = ""
+        created_session_id = ""
+        staging: Path | None = None
+        target_manager = self.manager_for_user(user_id)
+        quota_status: dict = {}
+        try:
+            source_binding = dict(source.app_binding)
+            source_app_id = str(source_binding.get("app_id", "") or "")
+            if str(source_binding.get("scope", "personal") or "personal") == "personal":
+                imported = self.applications.import_personal(source_user, user_id, source_app_id)
+                imported_app_id = str(imported.get("application", {}).get("id", "") or "")
+            else:
+                self.applications.resolve_launch(user_id, source_app_id)
+                imported_app_id = source_app_id
+
+            target, quota_status = self.create_session_for_user(
+                user_id,
+                source.title,
+                client_ip=client_ip,
+            )
+            created_session_id = target.id
+            target_root = target.root
+            staging = target_manager.root / f".{created_session_id}.{uuid.uuid4().hex}.import"
+            with source.lock:
+                if self._ide_legacy_session_running(source_user, source):
+                    raise IDECapabilityError("source_session_running", "The WebUI session started running during import.", 409)
+                integrity_error = source._verify_application_snapshot_integrity(restore=True)
+                if integrity_error:
+                    raise ValueError(integrity_error)
+                source._persist()
+                shutil.copytree(source.root, staging, symlinks=True)
+
+            with target_manager.lock:
+                target_manager.sessions.pop(created_session_id, None)
+                target_manager.session_index.pop(created_session_id, None)
+            shutil.rmtree(target_root, ignore_errors=True)
+
+            state_path = staging / "state.json"
+            state = self.crypto.read_json(state_path, {})
+            if not isinstance(state, dict):
+                raise ValueError("source session state is invalid")
+            state["id"] = created_session_id
+            binding = dict(state.get("app_binding", {}) or {})
+            binding["app_id"] = imported_app_id
+            if imported_app_id != source_app_id:
+                binding["source_app_id"] = source_app_id
+                binding["scope"] = "personal"
+            state["app_binding"] = binding
+            state["thinking"] = False
+            self.crypto.write_json(state_path, state)
+            shutil.copy2(state_path, state_path.with_name("state.json.bak"))
+
+            meta_path = staging / "meta.json"
+            meta = self.crypto.read_json(meta_path, {})
+            if not isinstance(meta, dict):
+                meta = {}
+            meta["id"] = created_session_id
+            self.crypto.write_json(meta_path, meta)
+            shutil.copy2(meta_path, meta_path.with_name("meta.json.bak"))
+
+            recovery_path = staging / ".application_snapshot_recovery.json"
+            if recovery_path.exists():
+                recovery = self.crypto.read_json(recovery_path, {})
+                if not isinstance(recovery, dict):
+                    raise ValueError("source application recovery package is invalid")
+                recovery["session_id"] = created_session_id
+                recovery["app_id"] = imported_app_id
+                self.crypto.write_json(recovery_path, recovery)
+                shutil.copy2(recovery_path, recovery_path.with_name(recovery_path.name + ".bak"))
+            os.replace(staging, target_root)
+            staging = None
+            imported_session = target_manager.get(created_session_id)
+            if imported_session is None:
+                raise RuntimeError("imported session could not be loaded")
+            integrity_error = imported_session._ensure_application_snapshot_recovery()
+            if integrity_error:
+                raise ValueError(integrity_error)
+            return {
+                "ok": True,
+                "id": imported_session.id,
+                "title": imported_session.title,
+                "ui_language": imported_session.ui_language,
+                "app_binding": dict(imported_session.app_binding),
+                "source_session_id": source.id,
+                "session_creation_limit": quota_status,
+            }
+        except Exception:
+            if staging is not None:
+                shutil.rmtree(staging, ignore_errors=True)
+            if created_session_id:
+                with target_manager.lock:
+                    target_manager.sessions.pop(created_session_id, None)
+                    target_manager.session_index.pop(created_session_id, None)
+                shutil.rmtree(target_manager.root / created_session_id, ignore_errors=True)
+                try:
+                    self._rollback_session_quota_reservation(user_id)
+                except Exception:
+                    pass
+            if imported_app_id and imported_app_id != str((source.app_binding or {}).get("app_id", "") or ""):
+                try:
+                    self.applications.remove_imported_copy(user_id, imported_app_id)
+                except Exception:
+                    pass
+            raise
 
     def ide_config(self, user_id: str, client_ip: str = "") -> dict:
         if str(client_ip or "").strip() and not str(user_id or "").startswith("collab:"):
@@ -109574,18 +110478,18 @@ document.addEventListener('DOMContentLoaded', function(){{
         body = payload if isinstance(payload, dict) else {}
         root_id = str(body.get("root_id", body.get("root", "session")) or "session")
         root, _, meta = self.ide_resolve_workspace(user_id, session_id, root_id, ".")
-        probe = subprocess.run(["git", "-C", str(root), "rev-parse", "--show-toplevel"], capture_output=True, text=True, timeout=8)
+        probe = run_subprocess_text(["git", "-C", str(root), "rev-parse", "--show-toplevel"], capture_output=True, timeout=8)
         if probe.returncode != 0:
             return {"ok": True, "repository": False, "root": meta, "changes": [], "branch": ""}
         repo_root = Path(probe.stdout.strip()).resolve()
         if repo_root != root.resolve() and not repo_root.is_relative_to(root.resolve()):
             return {"ok": True, "repository": False, "root": meta, "changes": [], "branch": ""}
-        status = subprocess.run(
+        status = run_subprocess_text(
             ["git", "-C", str(root), "status", "--porcelain=v1", "-z", "--branch"],
             capture_output=True,
             timeout=12,
         )
-        raw = status.stdout.decode("utf-8", errors="replace")
+        raw = status.stdout
         parts = raw.split("\0")
         branch = ""
         changes: list[dict] = []
@@ -109615,7 +110519,7 @@ document.addEventListener('DOMContentLoaded', function(){{
             command.append("--cached")
         if rel:
             command.extend(["--", rel])
-        proc = subprocess.run(command, capture_output=True, text=True, timeout=15)
+        proc = run_subprocess_text(command, capture_output=True, timeout=15)
         return {"ok": proc.returncode == 0, "root": meta, "path": rel, "diff": trim(proc.stdout, 400_000), "error": trim(proc.stderr, 4000)}
 
     def _ide_terminal_for_user(self, user_id: str, terminal_id: str) -> dict:
@@ -109665,6 +110569,10 @@ document.addEventListener('DOMContentLoaded', function(){{
                     terminal["closed"] = True
                     terminal["returncode"] = int(returncode)
             if returncode is not None and not chunk:
+                if not terminal.get("integrity_checked", False):
+                    sess = self._ide_session(str(terminal.get("user_id", "")), str(terminal.get("session_id", "")))
+                    terminal["integrity_error"] = sess._hard_snapshot_integrity_callback("after", "interactive terminal")
+                    terminal["integrity_checked"] = True
                 if mode == "pty" and fd is not None:
                     try:
                         os.close(int(fd))
@@ -109699,56 +110607,70 @@ document.addEventListener('DOMContentLoaded', function(){{
         cols = max(20, min(500, int(payload.get("cols", 100) or 100)))
         rows = max(5, min(200, int(payload.get("rows", 30) or 30)))
         sess = self._ide_session(user_id, session_id)
+        integrity_error = sess._hard_snapshot_integrity_callback("before", "interactive terminal")
+        if integrity_error:
+            raise PermissionError(integrity_error)
         prefix = self._ide_process_prefix(sess, remote=remote, cwd=cwd, feature="terminal")
         env = sess._shell_process_env()
         env.update({"TERM": "xterm-256color", "COLORTERM": "truecolor", "CLOUDS_CODER_IDE": "1"})
         master_fd: int | None = None
         mode = "pipe" if windows_pipe else "pty"
-        if mode == "pipe":
-            shell_name = Path(shell).name.lower()
-            if shell_name in {"powershell", "powershell.exe", "pwsh", "pwsh.exe"}:
-                process_command: object = [shell, "-NoLogo", "-NoProfile", "-NoExit", "-Command", "[Console]::InputEncoding=[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false)"]
+        try:
+            if mode == "pipe":
+                shell_name = Path(shell).name.lower()
+                if shell_name in {"powershell", "powershell.exe", "pwsh", "pwsh.exe"}:
+                    process_command: object = [shell, "-NoLogo", "-NoProfile", "-NoExit", "-Command", "[Console]::InputEncoding=[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false)"]
+                else:
+                    process_command = [shell, "/Q", "/K", "chcp 65001>nul"]
+                popen_kwargs = {
+                    "stdin": subprocess.PIPE,
+                    "stdout": subprocess.PIPE,
+                    "stderr": subprocess.STDOUT,
+                    "bufsize": 0,
+                }
+                if _is_windows_job_sandbox_prefix(prefix):
+                    process = _popen_windows_sandboxed(
+                        process_command,
+                        workspace_root=root,
+                        cwd=cwd,
+                        env=env,
+                        **popen_kwargs,
+                    )
+                else:
+                    process = subprocess.Popen(
+                        process_command,
+                        cwd=str(cwd),
+                        env=env,
+                        creationflags=int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) or 0),
+                        **popen_kwargs,
+                    )
             else:
-                process_command = [shell, "/Q", "/K", "chcp 65001>nul"]
-            popen_kwargs = {
-                "stdin": subprocess.PIPE,
-                "stdout": subprocess.PIPE,
-                "stderr": subprocess.STDOUT,
-                "bufsize": 0,
-            }
-            if _is_windows_job_sandbox_prefix(prefix):
-                process = _popen_windows_sandboxed(
-                    process_command,
-                    workspace_root=root,
-                    cwd=cwd,
-                    env=env,
-                    **popen_kwargs,
-                )
-            else:
-                process = subprocess.Popen(
-                    process_command,
-                    cwd=str(cwd),
-                    env=env,
-                    creationflags=int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) or 0),
-                    **popen_kwargs,
-                )
-        else:
-            master_fd, slave_fd = _pty.openpty()
-            self._ide_terminal_set_size(slave_fd, cols, rows)
-            process_command = [*prefix, shell, "-f"] if prefix else [shell, "-l"]
-            try:
-                process = subprocess.Popen(
-                    process_command,
-                    cwd=str(cwd),
-                    env=env,
-                    stdin=slave_fd,
-                    stdout=slave_fd,
-                    stderr=slave_fd,
-                    start_new_session=True,
-                    close_fds=True,
-                )
-            finally:
-                os.close(slave_fd)
+                master_fd, slave_fd = _pty.openpty()
+                self._ide_terminal_set_size(slave_fd, cols, rows)
+                process_command = [*prefix, shell, "-f"] if prefix else [shell, "-l"]
+                try:
+                    process = subprocess.Popen(
+                        process_command,
+                        cwd=str(cwd),
+                        env=env,
+                        stdin=slave_fd,
+                        stdout=slave_fd,
+                        stderr=slave_fd,
+                        start_new_session=True,
+                        close_fds=True,
+                    )
+                finally:
+                    os.close(slave_fd)
+        except Exception as exc:
+            if master_fd is not None:
+                try:
+                    os.close(master_fd)
+                except OSError:
+                    pass
+            integrity_error = sess._hard_snapshot_integrity_callback("after", "interactive terminal")
+            if integrity_error:
+                raise RuntimeError(f"{exc}; {integrity_error}") from exc
+            raise
         terminal_id = "term_" + uuid.uuid4().hex[:20]
         terminal = {
             "id": terminal_id,
@@ -109765,6 +110687,8 @@ document.addEventListener('DOMContentLoaded', function(){{
             "output_end": 0,
             "closed": False,
             "returncode": None,
+            "integrity_checked": False,
+            "integrity_error": "",
             "created_at": now_ts(),
             "last_activity": now_ts(),
             "lock": threading.RLock(),
@@ -109789,11 +110713,12 @@ document.addEventListener('DOMContentLoaded', function(){{
                 "offset": effective,
                 "next_offset": end,
                 "reset": requested < start,
-                "data": data.decode("utf-8", errors="replace"),
+                "data": decode_subprocess_bytes(data)[0],
                 "data_b64": base64.b64encode(data).decode("ascii"),
                 "encoding": "utf-8",
                 "closed": bool(terminal["closed"]),
                 "returncode": terminal["returncode"],
+                "integrity_error": str(terminal.get("integrity_error", "") or ""),
             }
 
     def ide_terminal_input(self, user_id: str, terminal_id: str, payload: dict) -> dict:
@@ -109847,7 +110772,12 @@ document.addEventListener('DOMContentLoaded', function(){{
         with terminal["lock"]:
             terminal["closed"] = True
             terminal["returncode"] = process.poll()
-        return {"ok": True, "terminal_id": terminal_id}
+            if not terminal.get("integrity_checked", False):
+                sess = self._ide_session(user_id, str(terminal.get("session_id", "")))
+                terminal["integrity_error"] = sess._hard_snapshot_integrity_callback("after", "interactive terminal")
+                terminal["integrity_checked"] = True
+            integrity_error = str(terminal.get("integrity_error", "") or "")
+        return {"ok": not bool(integrity_error), "terminal_id": terminal_id, "error": integrity_error}
 
     @staticmethod
     def _ide_parse_jsonc(text: str) -> dict:
@@ -109879,7 +110809,7 @@ document.addEventListener('DOMContentLoaded', function(){{
         task = next((row for row in listed["tasks"] if str(row.get("id", "")) == task_id), None)
         if not task:
             raise KeyError("task not found")
-        command = " ".join([shlex.quote(str(task["command"])), *[shlex.quote(str(x)) for x in task.get("args", [])]])
+        command = join_shell_task_command(task["command"], task.get("args", []))
         return self.ide_run_command(
             user_id,
             session_id,
@@ -110175,7 +111105,7 @@ document.addEventListener('DOMContentLoaded', function(){{
         except Exception:
             return ""
         if isinstance(raw, bytes):
-            return raw.decode("utf-8", errors="replace").strip()
+            return decode_subprocess_bytes(raw)[0].strip()
         return str(raw or "").strip()
 
     def _ide_debug_start_adapter(
@@ -110274,13 +111204,22 @@ document.addEventListener('DOMContentLoaded', function(){{
         root_id = str(payload.get("root_id", "session") or "session")
         root, _, meta = self.ide_resolve_workspace(user_id, session_id, root_id, ".")
         sess = self._ide_session(user_id, session_id)
+        integrity_error = sess._hard_snapshot_integrity_callback("before", "debug adapter")
+        if integrity_error:
+            raise PermissionError(integrity_error)
         prefix = self._ide_process_prefix(sess, remote=remote, cwd=root, feature="debug")
         process_env = sess._shell_process_env()
-        process, transport, reader, adapter_port = self._ide_debug_start_adapter(
-            root=root,
-            prefix=prefix,
-            process_env=process_env,
-        )
+        try:
+            process, transport, reader, adapter_port = self._ide_debug_start_adapter(
+                root=root,
+                prefix=prefix,
+                process_env=process_env,
+            )
+        except Exception as exc:
+            integrity_error = sess._hard_snapshot_integrity_callback("after", "debug adapter")
+            if integrity_error:
+                raise RuntimeError(f"{exc}; {integrity_error}") from exc
+            raise
         debug_id = "debug_" + uuid.uuid4().hex[:20]
         debug = {
             "id": debug_id,
@@ -110297,6 +111236,8 @@ document.addEventListener('DOMContentLoaded', function(){{
             "closed": False,
             "created_at": now_ts(),
             "last_activity": now_ts(),
+            "integrity_checked": False,
+            "integrity_error": "",
             "lock": threading.RLock(),
         }
         with self.ide_debug_lock:
@@ -110341,7 +111282,11 @@ document.addEventListener('DOMContentLoaded', function(){{
                     stderr = debug["process"].stderr.read(32_000)
                 except Exception:
                     pass
-            return {"ok": True, "messages": messages, "closed": bool(debug["closed"]), "stderr": stderr.decode("utf-8", errors="replace")}
+                if not debug.get("integrity_checked", False):
+                    sess = self._ide_session(user_id, str(debug.get("session_id", "")))
+                    debug["integrity_error"] = sess._hard_snapshot_integrity_callback("after", "debug adapter")
+                    debug["integrity_checked"] = True
+            return {"ok": not bool(debug.get("integrity_error")), "messages": messages, "closed": bool(debug["closed"]), "stderr": decode_subprocess_bytes(stderr)[0], "integrity_error": str(debug.get("integrity_error", "") or "")}
 
     def ide_debug_close(self, user_id: str, debug_id: str) -> dict:
         debug = self._ide_debug_for_user(user_id, debug_id)
@@ -110363,7 +111308,13 @@ document.addEventListener('DOMContentLoaded', function(){{
         except OSError:
             pass
         self._ide_debug_stop_process(process)
-        return {"ok": True, "debug_id": debug_id}
+        with debug["lock"]:
+            if not debug.get("integrity_checked", False):
+                sess = self._ide_session(user_id, str(debug.get("session_id", "")))
+                debug["integrity_error"] = sess._hard_snapshot_integrity_callback("after", "debug adapter")
+                debug["integrity_checked"] = True
+            integrity_error = str(debug.get("integrity_error", "") or "")
+        return {"ok": not bool(integrity_error), "debug_id": debug_id, "error": integrity_error}
 
     def ide_run_command(self, user_id: str, session_id: str, payload: dict, *, remote: bool = False) -> dict:
         command = str(payload.get("command", "") or "").strip()
@@ -110390,16 +111341,9 @@ document.addEventListener('DOMContentLoaded', function(){{
             shell_prefix = self._ide_process_prefix(sess, remote=remote, cwd=cwd)
             if not shell_prefix and sess.skill_mode == "hard":
                 shell_prefix = sess._hard_snapshot_shell_prefix(cwd)
-            if shell_prefix and remote:
+            if shell_prefix:
                 effective_command = sess._sandbox_virtualize_command(effective_command, cwd)
-            windows_job = _is_windows_job_sandbox_prefix(shell_prefix)
-            run_command: object = effective_command
-            run_shell = True
-            if os.name == "nt" and (not shell_prefix or windows_job):
-                run_command = f"chcp 65001>nul & {effective_command}"
-            if shell_prefix and not windows_job:
-                run_command = [*shell_prefix, "/bin/sh", "-c", effective_command]
-                run_shell = False
+            run_command, run_shell, windows_job = shell_process_invocation(effective_command, shell_prefix)
             process_env = sess._shell_process_env()
             if windows_job:
                 proc = _run_windows_sandboxed_command(
@@ -110410,13 +111354,10 @@ document.addEventListener('DOMContentLoaded', function(){{
                     timeout=timeout,
                 )
             else:
-                proc = subprocess.run(
+                proc = run_subprocess_text(
                     run_command,
                     cwd=str(cwd),
                     shell=run_shell,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
                     capture_output=True,
                     timeout=timeout,
                     env=process_env,
@@ -110432,6 +111373,14 @@ document.addEventListener('DOMContentLoaded', function(){{
                 "duration_ms": int((now_ts() - started) * 1000),
                 "timeout": timeout,
             }
+            integrity_error = sess._hard_snapshot_integrity_callback("after", command)
+            if integrity_error:
+                result.update({
+                    "ok": False,
+                    "returncode": -1,
+                    "stderr": trim(f"{result['stderr']}\n{integrity_error}".strip(), 120_000),
+                    "integrity_error": integrity_error,
+                })
             changed_files = workspace_revision_delta(before_files, workspace_file_revision_map(root))
             result["changed_files"] = changed_files
             if changed_files:
@@ -110456,6 +111405,10 @@ document.addEventListener('DOMContentLoaded', function(){{
                 "timeout": timeout,
                 "timed_out": True,
             }
+            integrity_error = sess._hard_snapshot_integrity_callback("after", command)
+            if integrity_error:
+                result["stderr"] = trim(f"{result['stderr']}\n{integrity_error}".strip(), 80_000)
+                result["integrity_error"] = integrity_error
             changed_files = workspace_revision_delta(before_files, workspace_file_revision_map(root))
             result["changed_files"] = changed_files
             if changed_files:
@@ -110467,6 +111420,20 @@ document.addEventListener('DOMContentLoaded', function(){{
                     paths=changed_files,
                 )
             return result
+        except Exception as exc:
+            integrity_error = sess._hard_snapshot_integrity_callback("after", command)
+            changed_files = workspace_revision_delta(before_files, workspace_file_revision_map(root))
+            if changed_files:
+                self._ide_emit_workspace_change(
+                    user_id,
+                    session_id,
+                    root_id=root_id,
+                    action="command",
+                    paths=changed_files,
+                )
+            if integrity_error:
+                raise RuntimeError(f"{exc}; {integrity_error}") from exc
+            raise
 
     def ide_agent_task(
         self,
@@ -113966,8 +114933,10 @@ document.addEventListener('DOMContentLoaded', function(){{
             if snapshot_version >= 2:
                 capsule_data = json.loads(capsule)
                 self.applications._verify_v2_runtime_contract_manifest(skills, capsule_data, decoded_resources)
+            requested_title = str(title or "").strip()
+            app_name = str(app_row.get("name", "") or "Application")
             sess, quota_status = self.create_session_for_user(
-                user_id, title or str(app_row.get("name", "") or "Application"), client_ip=client_ip,
+                user_id, requested_title or app_name, client_ip=client_ip,
             )
             try:
                 with sess.lock:
@@ -113987,6 +114956,7 @@ document.addEventListener('DOMContentLoaded', function(){{
                     if resources:
                         manifest = [{
                             "skill_id": str(x.get("skill_id", "") or ""), "skill_order": int(x.get("skill_order", 0) or 0),
+                            "kind": str(x.get("kind", "attachment") or "attachment"),
                             "path": str(x.get("path", "") or ""), "digest": str(x.get("digest", "") or ""), "size": int(x.get("size", 0) or 0),
                         } for x in resources]
                         manifest_path = snapshot_root / "MANIFEST.json"
@@ -113999,12 +114969,19 @@ document.addEventListener('DOMContentLoaded', function(){{
                         "app_id": str(app_row.get("id", "") or ""), "source_app_id": str(app_row.get("source_app_id", "") or ""),
                         "name": str(app_row.get("name", "") or ""), "scope": str(app_row.get("scope", "personal") or "personal"),
                         "revision": int(app_row.get("submitted_revision", app_row.get("revision", 1)) or 1), "capsule_digest": digest,
-                        "resources_digest": resources_digest, "resource_count": len(resources),
+                        "resources_digest": resources_digest, "resource_count": len(resources), "snapshot_version": snapshot_version,
                     }
                     sess.bound_skill_ids = [str(x.get("id", "") or "") for x in skills if str(x.get("id", "") or "")][:ADMIN_MAX_APP_SKILLS]
                     sess.bound_skill_capsule = trim(capsule, ADMIN_MAX_APP_CAPSULE_CHARS)
                     sess.skill_mode = "hard"
+                    if requested_title:
+                        sess.title = trim(requested_title, 120)
+                        sess.title_origin = "manual"
+                        sess.last_auto_title_source = ""
+                    else:
+                        sess.bind_application_title()
                     sess._restore_application_snapshot_permissions()
+                    sess._write_application_snapshot_recovery()
                     sess.updated_at = now_ts()
                     sess._persist()
                 run = None
@@ -116503,6 +117480,8 @@ class ApplicationRegistry:
             "updated_at": float(row.get("updated_at", 0.0) or 0.0),
             "review": dict(row.get("review", {}) or {}),
             "snapshot_version": int(row.get("snapshot_version", 1) or 1),
+            "imported_from": dict(row.get("imported_from", {}) or {}),
+            "version_summary": dict(row.get("version_summary", {}) or {}),
         }
         if admin:
             out["owner_hash"] = hashlib.sha256(str(row.get("owner", "") or "").encode()).hexdigest()[:16]
@@ -116984,6 +117963,71 @@ class ApplicationRegistry:
                 rows.append(row)
             self._write_rows(path, rows)
         return self._public(row)
+
+    def import_personal(self, source_user_id: str, target_user_id: str, app_id: str) -> dict:
+        source_user = str(source_user_id or "").strip()
+        target_user = str(target_user_id or "").strip()
+        source_id = str(app_id or "").strip()
+        if not source_user or not target_user or not source_id:
+            raise ValueError("source, target, and application id are required")
+        now = now_ts()
+        with self.lock:
+            source_rows = self._read_rows(self._personal_path(source_user))
+            source = next(
+                (
+                    row for row in source_rows
+                    if str(row.get("id", "") or "") == source_id
+                    and str(row.get("owner", "") or "") == source_user
+                    and not row.get("deleted_at")
+                ),
+                None,
+            )
+            if source is None:
+                raise KeyError(source_id)
+            target_path = self._personal_path(target_user)
+            target_rows = self._read_rows(target_path)
+            copied = json.loads(json.dumps(source, ensure_ascii=False))
+            existing_ids = {str(row.get("id", "") or "") for row in target_rows}
+            new_id = make_id("app")
+            while new_id in existing_ids:
+                new_id = make_id("app")
+            source_revision = int(source.get("revision", 1) or 1)
+            copied.update({
+                "id": new_id,
+                "owner": target_user,
+                "scope": "personal",
+                "status": "draft",
+                "revision": 1,
+                "created_at": now,
+                "updated_at": now,
+                "imported_from": {
+                    "user_hash": hashlib.sha256(source_user.encode("utf-8")).hexdigest()[:16],
+                    "app_id": source_id,
+                    "revision": source_revision,
+                    "imported_at": now,
+                },
+                "version_summary": {
+                    "source_revision": source_revision,
+                    "capsule_digest": str(source.get("capsule_digest", "") or ""),
+                    "resources_digest": str(source.get("resources_digest", "") or ""),
+                    "snapshot_version": int(source.get("snapshot_version", 1) or 1),
+                },
+            })
+            for key in ("deleted_at", "latest_submission", "lifecycle_history", "lifecycle_revision", "submitted_revision", "submitted_at", "review"):
+                copied.pop(key, None)
+            target_rows.append(copied)
+            self._write_rows(target_path, target_rows)
+        return {"application": self._public(copied), "source_app_id": source_id}
+
+    def remove_imported_copy(self, user_id: str, app_id: str) -> bool:
+        with self.lock:
+            path = self._personal_path(user_id)
+            rows = self._read_rows(path)
+            kept = [row for row in rows if str(row.get("id", "") or "") != str(app_id or "")]
+            if len(kept) == len(rows):
+                return False
+            self._write_rows(path, kept)
+            return True
 
     def delete_personal(self, user_id: str, app_id: str) -> bool:
         with self.lock:
@@ -120186,6 +121230,19 @@ class IdeHandler(BaseHTTPRequestHandler):
             if not fp:
                 return self._send_json({"error": "Monaco worker asset not found"}, status=404)
             return self._send_inline_bytes(fp.read_bytes(), "application/javascript; charset=utf-8")
+        if path == "/api/ide/v2/applications":
+            try:
+                context = self._auth_context(required=True)
+                account = context["account"]
+                return self._send_json(
+                    self.app.ide_applications_payload(
+                        str(account.get("user_id", "") or ""),
+                        client_ip=self._client_ip(),
+                        collaboration=bool(account.get("collaboration_mode", False)),
+                    )
+                )
+            except Exception as exc:
+                return self._send_exception(exc)
         if path.startswith("/assets/js_lib/"):
             asset_ref = path[len("/assets/js_lib/"):]
             fp = self.app.rag_js_lib_asset_path(asset_ref)
@@ -120734,6 +121791,85 @@ class IdeHandler(BaseHTTPRequestHandler):
         if not context:
             return
         user_id = str(context["account"].get("user_id", "") or "")
+        if path == "/api/ide/v2/applications":
+            try:
+                if bool(context["account"].get("collaboration_mode", False)):
+                    raise IDECapabilityError(
+                        "collaboration_application_authoring_unavailable",
+                        "Personal application authoring is unavailable in collaboration workspaces.",
+                        403,
+                    )
+                return self._send_json(
+                    self.app.applications.save_personal(user_id, self._read_json()),
+                    status=201,
+                )
+            except Exception as exc:
+                return self._send_exception(exc)
+        m_application_submit = re.match(r"^/api/ide/v2/applications/([^/]+)/submit$", path)
+        if m_application_submit:
+            try:
+                if bool(context["account"].get("collaboration_mode", False)):
+                    raise IDECapabilityError(
+                        "collaboration_application_authoring_unavailable",
+                        "Personal application authoring is unavailable in collaboration workspaces.",
+                        403,
+                    )
+                return self._send_json(
+                    self.app.applications.submit(user_id, m_application_submit.group(1)),
+                    status=201,
+                )
+            except Exception as exc:
+                return self._send_exception(exc)
+        m_application_launch = re.match(r"^/api/ide/v2/applications/([^/]+)/launch$", path)
+        if m_application_launch:
+            try:
+                return self._send_json(
+                    self.app.ide_launch_application(
+                        user_id,
+                        m_application_launch.group(1),
+                        client_ip=self._client_ip(),
+                        collaboration=bool(context["account"].get("collaboration_mode", False)),
+                    ),
+                    status=201,
+                )
+            except SessionCreationLimitExceeded as exc:
+                return self._send_json(
+                    {"error": str(exc), "session_creation_limit": dict(exc.status or {})},
+                    status=429,
+                )
+            except Exception as exc:
+                return self._send_exception(exc)
+        if path == "/api/ide/v2/applications/import":
+            try:
+                payload = self._read_json()
+                return self._send_json(
+                    self.app.ide_import_application(
+                        user_id,
+                        str(payload.get("app_id", payload.get("id", "")) or ""),
+                        client_ip=self._client_ip(),
+                    ),
+                    status=201,
+                )
+            except Exception as exc:
+                return self._send_exception(exc)
+        if path == "/api/ide/v2/application-sessions/import":
+            try:
+                payload = self._read_json()
+                return self._send_json(
+                    self.app.ide_import_application_session(
+                        user_id,
+                        str(payload.get("session_id", payload.get("id", "")) or ""),
+                        client_ip=self._client_ip(),
+                    ),
+                    status=201,
+                )
+            except SessionCreationLimitExceeded as exc:
+                return self._send_json(
+                    {"error": str(exc), "session_creation_limit": dict(exc.status or {})},
+                    status=429,
+                )
+            except Exception as exc:
+                return self._send_exception(exc)
         if path == "/api/ide/v2/llm-config/shared":
             try:
                 payload = self._read_json()
@@ -121043,6 +122179,24 @@ class IdeHandler(BaseHTTPRequestHandler):
                 return self._send_json({"ok": True, "account": self.app.ide_auth.set_disabled(payload.get("username"), bool(payload.get("disabled", True)))})
             except Exception as exc:
                 return self._send_exception(exc)
+        m_application = re.match(r"^/api/ide/v2/applications/([^/]+)$", path)
+        if m_application:
+            try:
+                if bool(context["account"].get("collaboration_mode", False)):
+                    raise IDECapabilityError(
+                        "collaboration_application_authoring_unavailable",
+                        "Personal application authoring is unavailable in collaboration workspaces.",
+                        403,
+                    )
+                return self._send_json(
+                    self.app.applications.save_personal(
+                        str(context["account"].get("user_id", "") or ""),
+                        self._read_json(),
+                        app_id=m_application.group(1),
+                    )
+                )
+            except Exception as exc:
+                return self._send_exception(exc)
         m = re.match(r"^/api/ide/sessions/([^/]+)$", path)
         if m:
             try:
@@ -121071,6 +122225,21 @@ class IdeHandler(BaseHTTPRequestHandler):
                 self.app.ide_require_capability(context["capabilities"], "mounts")
                 payload = self._read_json()
                 return self._send_json(self.app.ide_remove_mount(user_id, str(payload.get("mount_id", "") or "")))
+            except Exception as exc:
+                return self._send_exception(exc)
+        m_application = re.match(r"^/api/ide/v2/applications/([^/]+)$", path)
+        if m_application:
+            try:
+                if bool(context["account"].get("collaboration_mode", False)):
+                    raise IDECapabilityError(
+                        "collaboration_application_authoring_unavailable",
+                        "Personal application authoring is unavailable in collaboration workspaces.",
+                        403,
+                    )
+                deleted = self.app.applications.delete_personal(user_id, m_application.group(1))
+                if not deleted:
+                    raise KeyError(m_application.group(1))
+                return self._send_json({"ok": True})
             except Exception as exc:
                 return self._send_exception(exc)
         m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/file$", path)
