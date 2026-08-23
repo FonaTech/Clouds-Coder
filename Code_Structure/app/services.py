@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=959 original-lines=106454-106829 hash=dad83c8a109695ff
+# split-source: order=1062 original-lines=118183-118558 hash=dad83c8a109695ff
 
 
 class TelemetryStore:
@@ -383,7 +383,7 @@ class TelemetryStore:
             "generated_at": current,
         }
 
-# split-source: order=960 original-lines=106830-107572 hash=b970cca7d2391654
+# split-source: order=1063 original-lines=118559-119368 hash=6620df1b5b9667dc
 
 
 class ApplicationRegistry:
@@ -484,6 +484,8 @@ class ApplicationRegistry:
             "updated_at": float(row.get("updated_at", 0.0) or 0.0),
             "review": dict(row.get("review", {}) or {}),
             "snapshot_version": int(row.get("snapshot_version", 1) or 1),
+            "imported_from": dict(row.get("imported_from", {}) or {}),
+            "version_summary": dict(row.get("version_summary", {}) or {}),
         }
         if admin:
             out["owner_hash"] = hashlib.sha256(str(row.get("owner", "") or "").encode()).hexdigest()[:16]
@@ -965,6 +967,71 @@ class ApplicationRegistry:
                 rows.append(row)
             self._write_rows(path, rows)
         return self._public(row)
+
+    def import_personal(self, source_user_id: str, target_user_id: str, app_id: str) -> dict:
+        source_user = str(source_user_id or "").strip()
+        target_user = str(target_user_id or "").strip()
+        source_id = str(app_id or "").strip()
+        if not source_user or not target_user or not source_id:
+            raise ValueError("source, target, and application id are required")
+        now = now_ts()
+        with self.lock:
+            source_rows = self._read_rows(self._personal_path(source_user))
+            source = next(
+                (
+                    row for row in source_rows
+                    if str(row.get("id", "") or "") == source_id
+                    and str(row.get("owner", "") or "") == source_user
+                    and not row.get("deleted_at")
+                ),
+                None,
+            )
+            if source is None:
+                raise KeyError(source_id)
+            target_path = self._personal_path(target_user)
+            target_rows = self._read_rows(target_path)
+            copied = json.loads(json.dumps(source, ensure_ascii=False))
+            existing_ids = {str(row.get("id", "") or "") for row in target_rows}
+            new_id = make_id("app")
+            while new_id in existing_ids:
+                new_id = make_id("app")
+            source_revision = int(source.get("revision", 1) or 1)
+            copied.update({
+                "id": new_id,
+                "owner": target_user,
+                "scope": "personal",
+                "status": "draft",
+                "revision": 1,
+                "created_at": now,
+                "updated_at": now,
+                "imported_from": {
+                    "user_hash": hashlib.sha256(source_user.encode("utf-8")).hexdigest()[:16],
+                    "app_id": source_id,
+                    "revision": source_revision,
+                    "imported_at": now,
+                },
+                "version_summary": {
+                    "source_revision": source_revision,
+                    "capsule_digest": str(source.get("capsule_digest", "") or ""),
+                    "resources_digest": str(source.get("resources_digest", "") or ""),
+                    "snapshot_version": int(source.get("snapshot_version", 1) or 1),
+                },
+            })
+            for key in ("deleted_at", "latest_submission", "lifecycle_history", "lifecycle_revision", "submitted_revision", "submitted_at", "review"):
+                copied.pop(key, None)
+            target_rows.append(copied)
+            self._write_rows(target_path, target_rows)
+        return {"application": self._public(copied), "source_app_id": source_id}
+
+    def remove_imported_copy(self, user_id: str, app_id: str) -> bool:
+        with self.lock:
+            path = self._personal_path(user_id)
+            rows = self._read_rows(path)
+            kept = [row for row in rows if str(row.get("id", "") or "") != str(app_id or "")]
+            if len(kept) == len(rows):
+                return False
+            self._write_rows(path, kept)
+            return True
 
     def delete_personal(self, user_id: str, app_id: str) -> bool:
         with self.lock:

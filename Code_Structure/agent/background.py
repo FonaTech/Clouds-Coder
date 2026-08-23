@@ -5,26 +5,429 @@
 
 from __future__ import annotations
 
-# split-source: order=815 original-lines=16376-16485 hash=8ca288a9a3b391d7
+# split-source: order=896 original-lines=21821-22446 hash=d3603104a725ad0a
+
 
 class BackgroundManager:
-    def __init__(self, workdir: Path, command_wrapper=None, env_wrapper=None):
+    def __init__(
+        self,
+        workdir: Path,
+        command_wrapper=None,
+        command_rewriter=None,
+        env_wrapper=None,
+        output_dir: Path | None = None,
+        process_manager: UserProcessManager | None = None,
+        owner_user_id: str = "",
+        session_id: str = "",
+        session_title=None,
+        integrity_callback=None,
+    ):
         self.workdir = workdir
         self.command_wrapper = command_wrapper
+        self.command_rewriter = command_rewriter
         self.env_wrapper = env_wrapper
+        self.process_manager = process_manager
+        self.owner_user_id = str(owner_user_id or "")
+        self.session_id = str(session_id or "")
+        self.session_title = session_title
+        self.integrity_callback = integrity_callback
         self.tasks: dict[str, dict] = {}
+        self.processes: dict[str, subprocess.Popen] = {}
         self.notifications: queue.Queue = queue.Queue()
         self.lock = threading.Lock()
+        self.output_dir = Path(output_dir) if output_dir is not None else self.workdir / ".clouds_coder" / "background"
+        self.output_dir.mkdir(parents=True, exist_ok=True)
 
-    def run(self, command: str, timeout: int = 120) -> str:
+    def _session_title_value(self) -> str:
+        try:
+            value = self.session_title() if callable(self.session_title) else self.session_title
+        except Exception:
+            value = ""
+        return str(value or self.session_id or "")
+
+    def _registry_register(self, task_id: str, task: dict, process: subprocess.Popen | None = None) -> None:
+        manager = self.process_manager
+        if manager is None:
+            return
+        manager.register(
+            process_id=task_id,
+            task_id=task_id,
+            owner_user_id=self.owner_user_id,
+            session_id=self.session_id,
+            session_title=self._session_title_value(),
+            command=str(task.get("command", "") or ""),
+            cwd=Path(str(task.get("cwd", self.workdir) or self.workdir)),
+            source=str(task.get("source", "background_run") or "background_run"),
+            started_at=float(task.get("started_at", now_ts()) or now_ts()),
+            timeout_seconds=int(task.get("hard_timeout_seconds", task.get("timeout_seconds", 0)) or 0),
+            pid=int(task.get("pid", getattr(process, "pid", 0)) or 0),
+            status=str(task.get("status", "starting") or "starting"),
+            terminator=(lambda key=task_id: self.stop(key)) if process is not None else None,
+        )
+        if process is not None:
+            manager.attach_process(task_id, process, terminator=lambda key=task_id: self.stop(key))
+
+    def _registry_update(self, task_id: str, **fields) -> None:
+        if self.process_manager is not None:
+            self.process_manager.update(task_id, **fields)
+
+    @staticmethod
+    def _decode_output(data: bytes | bytearray) -> str:
+        text, _diagnostics = decode_subprocess_bytes(data)
+        return text
+
+    @staticmethod
+    def _terminate_process(process: subprocess.Popen) -> None:
+        try:
+            if os.name == "nt" and getattr(process, "_clouds_windows_job_handle", None):
+                _windows_close_sandbox_job(process, terminate=True)
+                process.wait(timeout=1.5)
+                return
+            if os.name == "posix":
+                try:
+                    os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                except Exception:
+                    process.terminate()
+            else:
+                process.terminate()
+            process.wait(timeout=1.5)
+        except Exception:
+            try:
+                if os.name == "posix":
+                    try:
+                        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+                    except Exception:
+                        process.kill()
+                else:
+                    process.kill()
+            except Exception:
+                pass
+
+    def adopt_process(
+        self,
+        process: subprocess.Popen,
+        command: str,
+        *,
+        cwd: Path,
+        initial_stdout: bytes = b"",
+        initial_stderr: bytes = b"",
+        started_at: float | None = None,
+        last_activity_at: float | None = None,
+        idle_timeout_seconds: int = DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
+        hard_timeout_seconds: int = MAX_SHELL_COMMAND_TIMEOUT_SECONDS,
+        io_queue: queue.Queue | None = None,
+        active_readers: set[str] | None = None,
+        reader_threads: list[threading.Thread] | None = None,
+        completion_callback=None,
+    ) -> str:
+        """Adopt an already-running Bash process without restarting it."""
         task_id = make_id("bg")
+        started = float(started_at or now_ts())
+        activity = float(last_activity_at or started)
+        log_path: Path | None = self.output_dir / f"{task_id}.log"
+        initial = bytes(initial_stdout or b"") + bytes(initial_stderr or b"")
+        try:
+            log_path.write_bytes(initial)
+        except Exception:
+            log_path = None
+        display_path = ""
+        if log_path is not None:
+            try:
+                display_path = log_path.resolve().relative_to(self.workdir.resolve()).as_posix()
+            except Exception:
+                display_path = str(log_path)
+        tail_bytes = bytearray(initial[-400_000:])
+        now = now_ts()
         with self.lock:
             self.tasks[task_id] = {
                 "status": "running",
+                "source": "bash_async_handoff",
                 "command": command,
+                "cwd": str(cwd),
+                "pid": int(getattr(process, "pid", 0) or 0),
                 "result": None,
-                "started_at": now_ts(),
+                "output_tail": self._decode_output(tail_bytes),
+                "output_bytes": len(initial),
+                "full_output_path": display_path,
+                "started_at": started,
+                "handed_off_at": now,
+                "last_activity_at": activity,
+                "idle_timeout_seconds": int(idle_timeout_seconds or 0),
+                "hard_timeout_seconds": int(hard_timeout_seconds or 0),
+                "duration_seconds": max(0.0, now - started),
             }
+            self.processes[task_id] = process
+            registered_task = dict(self.tasks[task_id])
+        self._registry_register(task_id, registered_task, process)
+        thread = threading.Thread(
+            target=self._monitor_adopted_process,
+            args=(
+                task_id,
+                process,
+                command,
+                Path(cwd),
+                log_path,
+                tail_bytes,
+                started,
+                activity,
+                int(idle_timeout_seconds or 0),
+                int(hard_timeout_seconds or 0),
+                io_queue,
+                set(active_readers or set()),
+                list(reader_threads or []),
+                completion_callback,
+            ),
+            daemon=True,
+        )
+        thread.start()
+        return task_id
+
+    def _monitor_adopted_process(
+        self,
+        task_id: str,
+        process: subprocess.Popen,
+        command: str,
+        cwd: Path,
+        log_path: Path | None,
+        tail_bytes: bytearray,
+        started_at: float,
+        last_activity_at: float,
+        idle_timeout_seconds: int,
+        hard_timeout_seconds: int,
+        io_queue: queue.Queue | None,
+        active_readers: set[str],
+        reader_threads: list[threading.Thread],
+        completion_callback,
+    ) -> None:
+        local_queue: queue.Queue = io_queue if io_queue is not None else queue.Queue()
+
+        def spawn_reader(label: str, stream) -> None:
+            if stream is None:
+                return
+            active_readers.add(label)
+            try:
+                os.set_blocking(stream.fileno(), True)
+            except Exception:
+                pass
+
+            def reader() -> None:
+                try:
+                    while True:
+                        try:
+                            chunk = stream.read(65536)
+                        except Exception:
+                            break
+                        if not chunk:
+                            break
+                        local_queue.put((label, chunk))
+                finally:
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
+                    local_queue.put((label, None))
+
+            thread = threading.Thread(target=reader, daemon=True)
+            thread.start()
+            reader_threads.append(thread)
+
+        if io_queue is None:
+            spawn_reader("stdout", process.stdout)
+            spawn_reader("stderr", process.stderr)
+
+        output_bytes = 0
+        with self.lock:
+            output_bytes = int(self.tasks.get(task_id, {}).get("output_bytes", 0) or 0)
+        timeout_error = ""
+        termination_started = 0.0
+        while True:
+            now = now_ts()
+            elapsed = max(0.0, now - started_at)
+            idle = max(0.0, now - last_activity_at)
+            if not timeout_error and idle_timeout_seconds > 0 and idle >= idle_timeout_seconds:
+                timeout_error = f"Error: timeout (idle {int(idle)}s / limit {idle_timeout_seconds}s)"
+                termination_started = now
+                self._terminate_process(process)
+            elif not timeout_error and hard_timeout_seconds > 0 and elapsed >= hard_timeout_seconds:
+                timeout_error = f"Error: hard cap reached ({int(elapsed)}s)"
+                termination_started = now
+                self._terminate_process(process)
+            try:
+                label, chunk = local_queue.get(timeout=0.12)
+                if chunk is None:
+                    active_readers.discard(str(label))
+                else:
+                    raw = bytes(chunk)
+                    last_activity_at = now_ts()
+                    output_bytes += len(raw)
+                    tail_bytes.extend(raw)
+                    if len(tail_bytes) > 400_000:
+                        del tail_bytes[: len(tail_bytes) - 400_000]
+                    if log_path is not None:
+                        try:
+                            with log_path.open("ab") as handle:
+                                handle.write(raw)
+                        except Exception:
+                            pass
+            except queue.Empty:
+                pass
+            while True:
+                try:
+                    label, chunk = local_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if chunk is None:
+                    active_readers.discard(str(label))
+                    continue
+                raw = bytes(chunk)
+                last_activity_at = now_ts()
+                output_bytes += len(raw)
+                tail_bytes.extend(raw)
+                if len(tail_bytes) > 400_000:
+                    del tail_bytes[: len(tail_bytes) - 400_000]
+                if log_path is not None:
+                    try:
+                        with log_path.open("ab") as handle:
+                            handle.write(raw)
+                    except Exception:
+                        pass
+            tail_text, _ = filter_runtime_noise_lines(self._decode_output(tail_bytes))
+            with self.lock:
+                task = self.tasks.get(task_id, {})
+                task.update(
+                    {
+                        "output_tail": trim(tail_text, 24_000),
+                        "output_bytes": output_bytes,
+                        "last_activity_at": last_activity_at,
+                        "duration_seconds": round(max(0.0, now_ts() - started_at), 3),
+                    }
+                )
+            self._registry_update(
+                task_id,
+                status="running",
+                last_activity_at=last_activity_at,
+                output_bytes=output_bytes,
+                output_tail=trim(tail_text, 24_000),
+                duration_seconds=round(max(0.0, now_ts() - started_at), 3),
+            )
+            if process.poll() is not None and not active_readers and local_queue.empty():
+                break
+            if termination_started and now_ts() - termination_started > 3.0:
+                break
+
+        for thread in reader_threads:
+            try:
+                thread.join(timeout=0.4)
+            except Exception:
+                pass
+        exit_code = int(process.returncode if process.returncode is not None else (-1 if timeout_error else 0))
+        with self.lock:
+            stopping = str(self.tasks.get(task_id, {}).get("status", "")) == "stopping"
+        termination_requested = bool(
+            stopping
+            or (
+                self.process_manager is not None
+                and self.process_manager.was_termination_requested(task_id)
+            )
+        )
+        status = (
+            "terminated"
+            if termination_requested
+            else ("completed" if exit_code == 0 and not timeout_error else "error")
+        )
+        tail_text, _ = filter_runtime_noise_lines(self._decode_output(tail_bytes))
+        result = trim(tail_text or timeout_error or "(no output)", 24_000)
+        finished = now_ts()
+        completion: dict = {}
+        if callable(completion_callback):
+            try:
+                callback_result = completion_callback(
+                    {
+                        "task_id": task_id,
+                        "command": command,
+                        "cwd": str(cwd),
+                        "status": status,
+                        "exit_code": exit_code,
+                        "error": timeout_error,
+                        "result": result,
+                        "output_tail": tail_text,
+                        "output_bytes": output_bytes,
+                        "started_at": started_at,
+                        "finished_at": finished,
+                    }
+                )
+                if isinstance(callback_result, dict):
+                    completion = callback_result
+            except Exception as exc:
+                completion = {"completion_error": trim(str(exc), 500)}
+        status = str(completion.get("status", status) or status)
+        if completion.get("exit_code") is not None:
+            exit_code = int(completion.get("exit_code"))
+        if completion.get("error") is not None:
+            timeout_error = str(completion.get("error") or "")
+        if completion.get("result") is not None:
+            result = str(completion.get("result") or "")
+        with self.lock:
+            task = self.tasks.get(task_id, {})
+            task.update(
+                {
+                    "status": status,
+                    "result": result,
+                    "output_tail": trim(tail_text, 24_000),
+                    "output_bytes": output_bytes,
+                    "exit_code": exit_code,
+                    "error": timeout_error,
+                    "finished_at": finished,
+                    "duration_seconds": round(max(0.0, finished - started_at), 3),
+                    **completion,
+                }
+            )
+            self.processes.pop(task_id, None)
+            notification = dict(task)
+        self._registry_update(
+            task_id,
+            status=status,
+            output_tail=trim(tail_text, 24_000),
+            output_bytes=output_bytes,
+            exit_code=exit_code,
+            error=timeout_error,
+            finished_at=finished,
+            last_activity_at=last_activity_at,
+            duration_seconds=round(max(0.0, finished - started_at), 3),
+        )
+        self.notifications.put(
+            {
+                "task_id": task_id,
+                "status": status,
+                "command": command,
+                "result": trim(result, 4000),
+                "exit_code": exit_code,
+                "error": timeout_error,
+                "duration_seconds": notification.get("duration_seconds", 0),
+                "full_output_path": notification.get("full_output_path", ""),
+                "changed_files": notification.get("changed_files", []),
+                "output_bytes": output_bytes,
+            }
+        )
+
+    def run(self, command: str, timeout: int = 120) -> str:
+        task_id = make_id("bg")
+        started = now_ts()
+        with self.lock:
+            self.tasks[task_id] = {
+                "status": "starting",
+                "source": "background_run",
+                "command": command,
+                "cwd": str(self.workdir),
+                "pid": 0,
+                "result": None,
+                "output_tail": "",
+                "output_bytes": 0,
+                "timeout_seconds": max(1, int(timeout or 120)),
+                "started_at": started,
+            }
+            registered_task = dict(self.tasks[task_id])
+        self._registry_register(task_id, registered_task)
         th = threading.Thread(
             target=self._exec, args=(task_id, command, timeout), daemon=True
         )
@@ -32,59 +435,156 @@ class BackgroundManager:
         return f"Background task {task_id} started: {command[:80]}"
 
     def _exec(self, task_id: str, command: str, timeout: int):
+        process: subprocess.Popen | None = None
+        started = now_ts()
         try:
-            run_command: object = command
-            run_shell = True
+            if callable(self.integrity_callback):
+                preflight_error = str(self.integrity_callback("before", command) or "")
+                if preflight_error:
+                    raise PermissionError(preflight_error)
             wrapper = self.command_wrapper() if callable(self.command_wrapper) else []
-            windows_job = _is_windows_job_sandbox_prefix(wrapper)
-            if wrapper and not windows_job:
-                run_command = [*wrapper, "/bin/sh", "-c", command]
-                run_shell = False
+            prepared_command = (
+                str(self.command_rewriter(command, self.workdir, wrapper) or "")
+                if callable(self.command_rewriter)
+                else str(command or "")
+            )
+            run_command, run_shell, windows_job = shell_process_invocation(prepared_command, wrapper)
             process_env = self.env_wrapper() if callable(self.env_wrapper) else os.environ.copy()
+            popen_kwargs = {
+                "shell": run_shell,
+                "cwd": self.workdir,
+                "stdin": subprocess.DEVNULL,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "text": False,
+                "bufsize": 0,
+                "env": process_env,
+            }
+            if os.name == "posix":
+                popen_kwargs["start_new_session"] = True
+            elif os.name == "nt":
+                popen_kwargs["creationflags"] = int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) or 0)
             if windows_job:
-                r = _run_windows_sandboxed_command(
-                    command,
+                process = _popen_windows_sandboxed(
+                    windows_utf8_shell_command(prepared_command),
                     workspace_root=self.workdir,
                     cwd=self.workdir,
                     env=process_env,
-                    timeout=timeout,
+                    shell=True,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=False,
+                    bufsize=0,
                 )
             else:
-                r = subprocess.run(
-                    run_command,
-                    shell=run_shell,
-                    cwd=self.workdir,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout,
-                    env=process_env,
-                )
-            output = trim((r.stdout + r.stderr).strip())
-            exit_code = int(r.returncode)
-            status = "completed" if exit_code == 0 else "error"
+                process = subprocess.Popen(run_command, **popen_kwargs)
+            with self.lock:
+                task = self.tasks.get(task_id, {})
+                task.update({"status": "running", "pid": int(process.pid or 0), "started_at": float(task.get("started_at", started) or started)})
+                self.processes[task_id] = process
+                registered_task = dict(task)
+            self._registry_register(task_id, registered_task, process)
+            try:
+                stdout, stderr = process.communicate(timeout=max(1, int(timeout or 120)))
+                timeout_error = ""
+            except subprocess.TimeoutExpired:
+                timeout_error = f"Error: timeout ({max(1, int(timeout or 120))}s)"
+                self._terminate_process(process)
+                try:
+                    stdout, stderr = process.communicate(timeout=1)
+                except Exception:
+                    stdout, stderr = b"", b""
+            output_raw = bytes(stdout or b"") + bytes(stderr or b"")
+            output = trim(self._decode_output(output_raw).strip())
+            exit_code = int(process.returncode if process.returncode is not None else -1)
+            termination_requested = bool(
+                (self.process_manager is not None and self.process_manager.was_termination_requested(task_id))
+                or str(self.tasks.get(task_id, {}).get("status", "")) == "stopping"
+            )
+            status = "terminated" if termination_requested else ("completed" if exit_code == 0 and not timeout_error else "error")
+            error = timeout_error
         except Exception as exc:
             output = f"Error: {exc}"
             status = "error"
             exit_code = -1
+            error = trim(str(exc), 500)
+            output_raw = safe_utf8_bytes(output)
+        if callable(self.integrity_callback):
+            try:
+                integrity_error = str(self.integrity_callback("after", command) or "")
+            except Exception as exc:
+                integrity_error = f"immutable application snapshot verification failed: {exc}"
+            if integrity_error:
+                status = "error"
+                exit_code = -1
+                error = trim(integrity_error, 500)
+                output = trim(f"{output}\nError: {integrity_error}".strip(), 24_000)
+                output_raw = safe_utf8_bytes(output)
+        finished = now_ts()
+        output_text = output or error or "(no output)"
+        log_path = self.output_dir / f"{task_id}.log"
+        display_path = ""
+        try:
+            log_path.write_bytes(bytes(output_raw or b""))
+            try:
+                display_path = log_path.resolve().relative_to(self.workdir.resolve()).as_posix()
+            except Exception:
+                display_path = str(log_path)
+        except Exception:
+            pass
         with self.lock:
             task = self.tasks.get(task_id, {})
             task.update(
                 {
                     "status": status,
-                    "result": output or "(no output)",
+                    "result": output_text,
+                    "output_tail": trim(output_text, 24_000),
+                    "output_bytes": len(bytes(output_raw or b"")),
+                    "full_output_path": display_path,
                     "exit_code": exit_code,
-                    "finished_at": now_ts(),
+                    "error": error,
+                    "finished_at": finished,
+                    "last_activity_at": finished,
+                    "duration_seconds": round(max(0.0, finished - float(task.get("started_at", started) or started)), 3),
                 }
             )
             self.tasks[task_id] = task
+            self.processes.pop(task_id, None)
+        if self.process_manager is not None and task_id not in self.process_manager.records:
+            self._registry_register(task_id, task, process)
+        self._registry_update(
+            task_id,
+            status=status,
+            output_tail=trim(output_text, 24_000),
+            output_bytes=len(bytes(output_raw or b"")),
+            exit_code=exit_code,
+            error=error,
+            finished_at=finished,
+            last_activity_at=finished,
+            duration_seconds=task.get("duration_seconds", 0.0),
+        )
+        if os.name == "nt":
+            _windows_close_sandbox_job(process)
         self.notifications.put(
             {
                 "task_id": task_id,
                 "status": status,
-                "result": (output or "(no output)")[:500],
+                "result": output_text[:500],
                 "exit_code": exit_code,
             }
         )
+
+    def stop(self, task_id: str) -> bool:
+        key = str(task_id or "").strip()
+        with self.lock:
+            process = self.processes.get(key)
+            task = self.tasks.get(key)
+            if task is None or process is None or process.poll() is not None:
+                return False
+            task["status"] = "stopping"
+        self._terminate_process(process)
+        return True
 
     def check(self, task_id: str | None = None) -> str:
         with self.lock:
@@ -96,7 +596,14 @@ class BackgroundManager:
                     f" exit_code={int(task.get('exit_code'))}"
                     if task.get("exit_code") is not None else ""
                 )
-                return f"[{task['status']}]{exit_text} {task.get('result') or '(running)'}"
+                elapsed = float(task.get("duration_seconds", 0.0) or 0.0)
+                path_text = f"\nfull_output_path={task.get('full_output_path')}" if task.get("full_output_path") else ""
+                body = task.get("result") or task.get("output_tail") or "(running; no output yet)"
+                return (
+                    f"[{task['status']}]{exit_text} pid={int(task.get('pid', 0) or 0)} "
+                    f"elapsed={elapsed:.1f}s bytes={int(task.get('output_bytes', 0) or 0)}"
+                    f"{path_text}\n{body}"
+                )
             if not self.tasks:
                 return "No bg tasks."
             lines = []
@@ -116,3 +623,12 @@ class BackgroundManager:
     def list_objects(self) -> list[dict]:
         with self.lock:
             return [{**v, "id": k} for k, v in self.tasks.items()]
+
+    def stop_all(self) -> int:
+        with self.lock:
+            task_ids = list(self.processes.keys())
+        stopped = 0
+        for task_id in task_ids:
+            if self.stop(task_id):
+                stopped += 1
+        return stopped

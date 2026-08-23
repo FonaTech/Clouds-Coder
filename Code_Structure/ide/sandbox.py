@@ -5,7 +5,27 @@
 
 from __future__ import annotations
 
-# split-source: order=853 original-lines=21149-21157 hash=9e668c7c3fcbd2dc
+# split-source: order=670 original-lines=7511-7528 hash=ac928f4957da521b
+
+def _windows_subprocess_encodings() -> list[str]:
+    if os.name != "nt" and not sys.platform.startswith("win"):
+        return []
+    out: list[str] = []
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        for function_name in ("GetOEMCP", "GetACP"):
+            function = getattr(kernel32, function_name, None)
+            if function is None:
+                continue
+            function.restype = ctypes.c_uint
+            codepage = int(function() or 0)
+            if codepage > 0:
+                out.append(f"cp{codepage}")
+    except Exception:
+        pass
+    return out
+
+# split-source: order=934 original-lines=27151-27159 hash=9e668c7c3fcbd2dc
 
 # ============================================================================
 # Architecture / 架构 / アーキテクチャ
@@ -16,22 +36,22 @@ from __future__ import annotations
 
 _IDE_SANDBOX_BACKEND_CACHE: dict[str, object] = {}
 
-# split-source: order=854 original-lines=21158-21158 hash=6fd3520014763931
+# split-source: order=935 original-lines=27160-27160 hash=6fd3520014763931
 _IDE_SANDBOX_BACKEND_LOCK = threading.RLock()
 
-# split-source: order=855 original-lines=21159-21159 hash=8a49dbb25dd35c5c
+# split-source: order=936 original-lines=27161-27161 hash=8a49dbb25dd35c5c
 WINDOWS_JOB_SANDBOX_MARKER = "__clouds_windows_job__"
 
-# split-source: order=856 original-lines=21160-21160 hash=e9091a7636337ff2
+# split-source: order=937 original-lines=27162-27162 hash=e9091a7636337ff2
 _WINDOWS_LOW_INTEGRITY_ROOTS: set[str] = set()
 
-# split-source: order=857 original-lines=21161-21161 hash=e81acd4ddab152d2
+# split-source: order=938 original-lines=27163-27163 hash=e81acd4ddab152d2
 _WINDOWS_LOW_INTEGRITY_FAILED_ROOTS: set[str] = set()
 
-# split-source: order=858 original-lines=21162-21162 hash=5e5351da59b8c3e5
+# split-source: order=939 original-lines=27164-27164 hash=5e5351da59b8c3e5
 _WINDOWS_LOW_INTEGRITY_LOCK = threading.RLock()
 
-# split-source: order=859 original-lines=21163-21169 hash=77416c0f2acc726f
+# split-source: order=940 original-lines=27165-27171 hash=77416c0f2acc726f
 
 def _is_windows_job_sandbox_prefix(prefix: object) -> bool:
     return bool(
@@ -40,7 +60,7 @@ def _is_windows_job_sandbox_prefix(prefix: object) -> bool:
         and str(prefix[0]) == WINDOWS_JOB_SANDBOX_MARKER
     )
 
-# split-source: order=860 original-lines=21170-21193 hash=916341a37017a4ba
+# split-source: order=941 original-lines=27172-27195 hash=916341a37017a4ba
 
 def _windows_builtin_sandbox_probe() -> tuple[bool, str]:
     if os.name != "nt" or not sys.platform.startswith("win"):
@@ -66,7 +86,7 @@ def _windows_builtin_sandbox_probe() -> tuple[bool, str]:
     except Exception as exc:
         return False, f"Windows security API initialization failed: {exc}"
 
-# split-source: order=861 original-lines=21194-21201 hash=7e07dad19e17b216
+# split-source: order=942 original-lines=27196-27203 hash=7e07dad19e17b216
 
 def _windows_last_error(label: str) -> OSError:
     code = int(ctypes.get_last_error() or 1)
@@ -76,9 +96,9 @@ def _windows_last_error(label: str) -> OSError:
         detail = "Windows API error"
     return OSError(code, f"{label}: {detail}")
 
-# split-source: order=862 original-lines=21202-21255 hash=468af7790913e754
+# split-source: order=943 original-lines=27204-27257 hash=9bc6a284727c424d
 
-def _windows_set_low_integrity_label(path: Path, *, inherit: bool) -> None:
+def _windows_set_integrity_label(path: Path, *, inherit: bool, sid_string: str) -> None:
     from ctypes import wintypes
 
     advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
@@ -86,7 +106,7 @@ def _windows_set_low_integrity_label(path: Path, *, inherit: bool) -> None:
     sid = ctypes.c_void_p()
     advapi32.ConvertStringSidToSidW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p)]
     advapi32.ConvertStringSidToSidW.restype = wintypes.BOOL
-    if not advapi32.ConvertStringSidToSidW("S-1-16-4096", ctypes.byref(sid)):
+    if not advapi32.ConvertStringSidToSidW(sid_string, ctypes.byref(sid)):
         raise _windows_last_error("ConvertStringSidToSidW")
     try:
         advapi32.GetLengthSid.argtypes = [ctypes.c_void_p]
@@ -132,12 +152,44 @@ def _windows_set_low_integrity_label(path: Path, *, inherit: bool) -> None:
         kernel32.LocalFree.restype = ctypes.c_void_p
         kernel32.LocalFree(sid)
 
-# split-source: order=863 original-lines=21256-21290 hash=2e148e5007d284ed
+# split-source: order=944 original-lines=27258-27260 hash=1b60eda767ee08cf
+
+def _windows_set_low_integrity_label(path: Path, *, inherit: bool) -> None:
+    _windows_set_integrity_label(path, inherit=inherit, sid_string="S-1-16-4096")
+
+# split-source: order=945 original-lines=27261-27284 hash=9037185914e9a128
+
+def _windows_protect_application_snapshot(workspace_root: Path) -> None:
+    snapshot = Path(workspace_root) / ".application_skills"
+    if not snapshot.exists() or snapshot.is_symlink():
+        return
+    for dirpath, dirnames, filenames in os.walk(snapshot, topdown=True, followlinks=False):
+        current = Path(dirpath)
+        dirnames[:] = [name for name in dirnames if not (current / name).is_symlink()]
+        try:
+            _windows_set_integrity_label(current, inherit=True, sid_string="S-1-16-8192")
+        except OSError:
+            pass
+        for name in filenames:
+            target = current / name
+            if target.is_symlink():
+                continue
+            try:
+                _windows_set_integrity_label(target, inherit=False, sid_string="S-1-16-8192")
+            except OSError:
+                pass
+            try:
+                os.chmod(target, stat.S_IREAD)
+            except Exception:
+                pass
+
+# split-source: order=946 original-lines=27285-27322 hash=0427774e9b45bad0
 
 def _windows_prepare_low_integrity_workspace(workspace_root: Path) -> bool:
     canonical = Path(os.path.realpath(workspace_root)).resolve()
     key = os.path.normcase(str(canonical))
     with _WINDOWS_LOW_INTEGRITY_LOCK:
+        _windows_protect_application_snapshot(canonical)
         if key in _WINDOWS_LOW_INTEGRITY_ROOTS or key in _WINDOWS_LOW_INTEGRITY_FAILED_ROOTS:
             return key in _WINDOWS_LOW_INTEGRITY_ROOTS
         # The low-integrity label is defense-in-depth. Standard Windows users can
@@ -153,6 +205,8 @@ def _windows_prepare_low_integrity_workspace(workspace_root: Path) -> bool:
         for dirpath, dirnames, filenames in os.walk(canonical, topdown=True, followlinks=False):
             current = Path(dirpath)
             dirnames[:] = [name for name in dirnames if not (current / name).is_symlink()]
+            if current == canonical:
+                dirnames[:] = [name for name in dirnames if name != ".application_skills"]
             for name in dirnames:
                 try:
                     _windows_set_low_integrity_label(current / name, inherit=True)
@@ -169,7 +223,7 @@ def _windows_prepare_low_integrity_workspace(workspace_root: Path) -> bool:
         _WINDOWS_LOW_INTEGRITY_ROOTS.add(key)
         return True
 
-# split-source: order=864 original-lines=21291-21298 hash=f8b21aa8be386c16
+# split-source: order=947 original-lines=27323-27330 hash=f8b21aa8be386c16
 
 def _windows_job_memory_limit() -> int:
     raw = str(os.environ.get("CLOUDS_CODER_SANDBOX_MEMORY", "1g") or "1g").strip().lower()
@@ -179,7 +233,7 @@ def _windows_job_memory_limit() -> int:
     factor = {"": 1, "k": 1024, "m": 1024**2, "g": 1024**3, "t": 1024**4}[match.group(2)]
     return max(128 * 1024 * 1024, min(16 * 1024**3, int(float(match.group(1)) * factor)))
 
-# split-source: order=865 original-lines=21299-21346 hash=7a33e21232b7a212
+# split-source: order=948 original-lines=27331-27378 hash=7a33e21232b7a212
 
 def _windows_lower_process_integrity(process_handle: object) -> None:
     from ctypes import wintypes
@@ -229,7 +283,7 @@ def _windows_lower_process_integrity(process_handle: object) -> None:
             kernel32.CloseHandle.restype = wintypes.BOOL
             kernel32.CloseHandle(token)
 
-# split-source: order=866 original-lines=21347-21439 hash=8b61c117b2a11d8e
+# split-source: order=949 original-lines=27379-27471 hash=8b61c117b2a11d8e
 
 def _windows_attach_sandbox_job(
     proc: subprocess.Popen,
@@ -324,7 +378,7 @@ def _windows_attach_sandbox_job(
         if job:
             kernel32.CloseHandle(job)
 
-# split-source: order=867 original-lines=21440-21456 hash=a01de1a457312922
+# split-source: order=950 original-lines=27472-27488 hash=a01de1a457312922
 
 def _windows_close_sandbox_job(proc: subprocess.Popen | None, *, terminate: bool = False) -> None:
     if proc is None:
@@ -343,7 +397,7 @@ def _windows_close_sandbox_job(proc: subprocess.Popen | None, *, terminate: bool
     finally:
         proc._clouds_windows_job_handle = None
 
-# split-source: order=868 original-lines=21457-21488 hash=c4a14a964d9cd5dc
+# split-source: order=951 original-lines=27489-27520 hash=c4a14a964d9cd5dc
 
 def _popen_windows_sandboxed(
     command: object,
@@ -377,7 +431,7 @@ def _popen_windows_sandboxed(
         _windows_close_sandbox_job(proc, terminate=True)
         raise
 
-# split-source: order=869 original-lines=21489-21526 hash=276785b490e12f96
+# split-source: order=952 original-lines=27521-27574 hash=3712bcbfdf4619bd
 
 def _run_windows_sandboxed_command(
     command: str,
@@ -401,23 +455,39 @@ def _run_windows_sandboxed_command(
     )
     try:
         stdout, stderr = proc.communicate(timeout=timeout)
-        return subprocess.CompletedProcess(
+        stdout_text, stdout_diagnostics = decode_subprocess_bytes(stdout)
+        stderr_text, stderr_diagnostics = decode_subprocess_bytes(stderr)
+        completed = subprocess.CompletedProcess(
             command,
             int(proc.returncode or 0),
-            bytes(stdout or b"").decode("utf-8", errors="replace"),
-            bytes(stderr or b"").decode("utf-8", errors="replace"),
+            stdout_text,
+            stderr_text,
         )
-    except subprocess.TimeoutExpired:
+        completed.decoding_diagnostics = {
+            "stdout": stdout_diagnostics,
+            "stderr": stderr_diagnostics,
+        }
+        return completed
+    except subprocess.TimeoutExpired as exc:
         _windows_close_sandbox_job(proc, terminate=True)
         try:
-            proc.wait(timeout=2)
+            stdout, stderr = proc.communicate(timeout=2)
         except Exception:
-            pass
-        raise
+            stdout = getattr(exc, "stdout", None)
+            stderr = getattr(exc, "stderr", None)
+        stdout_text, stdout_diagnostics = decode_subprocess_bytes(stdout)
+        stderr_text, stderr_diagnostics = decode_subprocess_bytes(stderr)
+        exc.stdout = exc.output = stdout_text
+        exc.stderr = stderr_text
+        exc.decoding_diagnostics = {
+            "stdout": stdout_diagnostics,
+            "stderr": stderr_diagnostics,
+        }
+        raise exc
     finally:
         _windows_close_sandbox_job(proc)
 
-# split-source: order=870 original-lines=21527-21631 hash=9dd286da7d9bf200
+# split-source: order=953 original-lines=27575-27679 hash=9dd286da7d9bf200
 
 def _detect_ide_sandbox_backend(*, force: bool = False) -> dict:
     preference = str(os.environ.get("CLOUDS_CODER_SANDBOX_BACKEND", "auto") or "auto").strip().lower()

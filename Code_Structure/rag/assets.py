@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=944 original-lines=94870-95044 hash=700955ea1b1952e5
+# split-source: order=1027 original-lines=102792-103024 hash=95e14dc259996fcc
 
 RAG_ADMIN_INDEX_HTML = """<!doctype html>
 <html lang="en">
@@ -17,6 +17,57 @@ RAG_ADMIN_INDEX_HTML = """<!doctype html>
   <script defer src="/assets/rag-admin.js"></script>
 </head>
 <body>
+  <div id="authOverlay" class="auth-overlay" role="dialog" aria-modal="true" aria-labelledby="authTitle">
+    <section class="auth-card">
+      <div>
+        <p class="eyebrow">Clouds Coder Library</p>
+        <h2 id="authTitle">Administrator sign in</h2>
+        <p id="authDescription" class="auth-description">Checking the administrator account...</p>
+      </div>
+      <form id="setupForm" class="auth-form hidden">
+        <div class="field">
+          <label for="setupUsername">Administrator username</label>
+          <input id="setupUsername" name="username" autocomplete="username" minlength="3" maxlength="64" required>
+        </div>
+        <div class="field">
+          <label for="setupPassword">Password</label>
+          <input id="setupPassword" name="password" type="password" autocomplete="new-password" minlength="12" maxlength="512" required>
+        </div>
+        <div class="field">
+          <label for="setupPasswordConfirm">Confirm password</label>
+          <input id="setupPasswordConfirm" type="password" autocomplete="new-password" minlength="12" maxlength="512" required>
+        </div>
+        <button class="btn btn-accent btn-wide" type="submit">Create administrator</button>
+      </form>
+      <form id="passwordLoginForm" class="auth-form hidden">
+        <div class="field">
+          <label for="loginUsername">Administrator username</label>
+          <input id="loginUsername" name="username" autocomplete="username" required>
+        </div>
+        <div class="field">
+          <label for="loginPassword">Password</label>
+          <input id="loginPassword" name="password" type="password" autocomplete="current-password" required>
+        </div>
+        <button class="btn btn-accent btn-wide" type="submit">Sign in</button>
+      </form>
+      <details id="tokenLoginDetails" class="token-login hidden">
+        <summary>Advanced: use Admin Token</summary>
+        <p id="tokenLoginHelp" class="field-note"></p>
+        <form id="tokenLoginForm" class="auth-form">
+          <div class="field">
+            <label for="tokenInput">Admin Token</label>
+            <input id="tokenInput" type="password" autocomplete="off" spellcheck="false">
+          </div>
+          <button id="tokenLoginBtn" class="btn btn-wide" type="submit">Use token</button>
+        </form>
+      </details>
+      <div id="loginError" class="auth-error" role="alert"></div>
+      <div class="auth-secondary-actions">
+        <button id="readOnlyBtn" class="btn btn-quiet" type="button">Continue read-only</button>
+        <button id="retryAuthBtn" class="btn btn-quiet hidden" type="button">Retry</button>
+      </div>
+    </section>
+  </div>
   <main class="rag-shell">
     <header class="rag-hero">
       <div>
@@ -25,10 +76,17 @@ RAG_ADMIN_INDEX_HTML = """<!doctype html>
         <p class="subtitle">Global knowledge library, graph view, batch import, backup, and retrieval control.</p>
       </div>
       <div class="hero-actions">
+        <span id="authBadge" class="status-chip">checking access</span>
+        <button id="signInBtn" class="btn hidden" type="button">Admin sign in</button>
+        <button id="logoutBtn" class="btn hidden" type="button">Sign out</button>
         <button id="refreshBtn" class="btn">Refresh</button>
-        <button id="rebuildBtn" class="btn btn-accent">Rebuild Index</button>
+        <button id="rebuildBtn" class="btn btn-accent" data-admin-action>Rebuild Index</button>
       </div>
     </header>
+
+    <div id="readOnlyNotice" class="access-notice hidden">
+      Library content is available read-only. Sign in as administrator to import, query, or rebuild the index.
+    </div>
 
     <section class="rag-grid stats-grid" id="statsGrid"></section>
 
@@ -182,7 +240,7 @@ RAG_ADMIN_INDEX_HTML = """<!doctype html>
 </html>
 """
 
-# split-source: order=945 original-lines=95045-95136 hash=aeb6e8dd7a2ccb02
+# split-source: order=1028 original-lines=103025-103128 hash=dc08c3ef867f7c4e
 
 RAG_ADMIN_CSS = """
 :root{
@@ -209,6 +267,17 @@ body{min-height:100vh}
 .rag-hero h1{margin:0;font-size:34px;line-height:1.05}
 .subtitle{margin:10px 0 0;max-width:760px;color:var(--muted)}
 .hero-actions{display:flex;gap:10px;flex-wrap:wrap}
+.auth-overlay{position:fixed;inset:0;z-index:100;display:flex;align-items:center;justify-content:center;padding:18px;background:rgba(13,31,21,.72);backdrop-filter:blur(8px)}
+.auth-overlay.hidden{display:none}
+.auth-card{width:min(440px,100%);max-height:calc(100vh - 36px);overflow:auto;padding:24px;border:1px solid rgba(23,49,34,.12);border-radius:18px;background:#fff;box-shadow:0 28px 80px rgba(0,0,0,.3)}
+.auth-card h2{margin:0;font-size:24px}.auth-description{margin:8px 0 18px;color:var(--muted);line-height:1.55}
+.auth-form{display:flex;flex-direction:column;gap:2px}.auth-form .field{margin-bottom:12px}
+.token-login{margin-top:14px;padding-top:14px;border-top:1px solid var(--line)}
+.token-login summary{cursor:pointer;color:var(--ink);font-size:13px;font-weight:700}.token-login .auth-form{padding-top:12px}
+.token-login .field-note{margin:8px 0 0}.auth-error{min-height:20px;margin-top:10px;color:var(--danger);font-size:13px;line-height:1.45}
+.auth-secondary-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:6px}.btn-quiet{background:transparent;border:1px solid var(--line);color:var(--muted)}
+.access-notice{margin:-4px 0 18px;padding:11px 14px;border:1px solid #e5c482;border-radius:12px;background:#fff7dd;color:#76510b;font-size:13px;line-height:1.5}
+.hero-actions .status-chip{align-self:center}.btn:disabled{cursor:not-allowed;opacity:.58}
 .rag-grid{display:grid;gap:18px;margin-bottom:18px}
 .stats-grid{grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}
 .form-grid{grid-template-columns:1.15fr 1fr}
@@ -273,13 +342,16 @@ textarea{resize:vertical;min-height:120px}
 @media (max-width:720px){
   .graph-stage{height:380px;min-height:380px}
   .graph-toolbar{align-items:flex-start}
+  .auth-secondary-actions{align-items:stretch;flex-direction:column}
 }
 """
 
-# split-source: order=946 original-lines=95137-97228 hash=e4626dbb9f3df1ab
+# split-source: order=1029 original-lines=103129-105349 hash=c6a477b4e27f05ec
 
 RAG_ADMIN_JS = """
 const S={config:null,library:null,tasks:null,graph:null,filesystem:null,query:null};
+const AUTH_KEY='clouds_coder_admin_token';
+const A={token:String(sessionStorage.getItem(AUTH_KEY)||''),authenticated:false,status:null,readOnly:false};
 const G={
   mode:'static',
   layout:null,
@@ -348,18 +420,142 @@ const GRAPH_FOCUS_EDGE_LIMIT=260;
 const GRAPH_ZOOM_MIN_FACTOR=0.22;
 const GRAPH_ZOOM_MAX_FACTOR=14;
 const E=id=>document.getElementById(id);
-async function api(path,init){
-  const opts=Object.assign({},init||{}),headers=Object.assign({'Content-Type':'application/json'},opts.headers||{});
-  if(String(opts.method||'GET').toUpperCase()!=='GET'){let token=String(sessionStorage.getItem('clouds_coder_admin_token')||'').trim();if(!token){token=String(prompt('Admin token required for library changes')||'').trim();if(token)sessionStorage.setItem('clouds_coder_admin_token',token)}if(token)headers.Authorization='Bearer '+token}
+async function request(path,init){
+  const opts=Object.assign({},init||{}),headers=Object.assign({},opts.headers||{});
+  if(opts.body!==undefined&&!headers['Content-Type'])headers['Content-Type']='application/json';
   const res=await fetch(path,Object.assign(opts,{headers}));
   const text=await res.text();
   let data=text;
   try{data=text?JSON.parse(text):{}}catch{}
   if(!res.ok){
     const msg=(data&&typeof data==='object'&&data.error)?String(data.error):String(text||`HTTP ${res.status}`);
-    throw new Error(msg);
+    const err=new Error(msg);err.status=res.status;err.code=String(data?.code||'');err.body=data;throw err;
   }
   return data;
+}
+function updateAuthUi(){
+  const ok=!!A.authenticated;
+  E('authBadge').textContent=ok?'administrator':'read-only';
+  E('authBadge').classList.toggle('bad',!ok);
+  E('signInBtn').classList.toggle('hidden',ok);
+  E('logoutBtn').classList.toggle('hidden',!ok);
+  E('readOnlyNotice').classList.toggle('hidden',ok||!A.readOnly);
+}
+function clearAdminSession(){sessionStorage.removeItem(AUTH_KEY);A.token='';A.authenticated=false;updateAuthUi()}
+function showAuth(message=''){
+  A.readOnly=false;
+  E('authOverlay').classList.remove('hidden');
+  E('readOnlyNotice').classList.add('hidden');
+  if(message)E('loginError').textContent=String(message);
+  if(!A.status)loadAuthStatus().catch(()=>{});
+}
+function continueReadOnly(){A.readOnly=true;E('authOverlay').classList.add('hidden');updateAuthUi()}
+async function api(path,init){
+  const opts=Object.assign({},init||{}),headers=Object.assign({},opts.headers||{});
+  const method=String(opts.method||'GET').toUpperCase();
+  if(method!=='GET'&&!A.token){
+    showAuth('Administrator sign-in is required for this action.');
+    const err=new Error('Administrator sign-in required');err.status=401;err.code='auth_required';throw err;
+  }
+  if(A.token)headers.Authorization='Bearer '+A.token;
+  try{return await request(path,Object.assign(opts,{headers}))}
+  catch(err){
+    if(err.status===401&&method!=='GET'){
+      clearAdminSession();
+      showAuth('Your administrator session expired. Sign in again to continue.');
+      loadAuthStatus().catch(()=>{});
+    }
+    throw err;
+  }
+}
+function setAuthBusy(form,busy){const btn=form?.querySelector('button[type="submit"]');if(btn)btn.disabled=!!busy}
+function renderAuthState(status){
+  A.status=status||{};
+  const setup=!!A.status.setup_required;
+  E('retryAuthBtn').classList.add('hidden');
+  E('setupForm').classList.toggle('hidden',!setup);
+  E('passwordLoginForm').classList.toggle('hidden',setup);
+  E('tokenLoginDetails').classList.toggle('hidden',!A.status.token_login_enabled);
+  E('tokenLoginBtn').textContent=setup?'Create administrator with token':'Exchange token for session';
+  E('authTitle').textContent=setup?'Create the administrator account':'Administrator sign in';
+  if(setup){
+    E('authDescription').textContent=A.status.local_setup_allowed
+      ?'First run setup. Create the administrator used by the main Admin, Knowledge RAG, and Code RAG services.'
+      :'First setup is local-only. Open this page on localhost, or provide the existing Admin Token below.';
+    E('tokenLoginHelp').textContent='For remote first setup, enter the existing Admin Token, then complete the account form above. The token is not stored.';
+    setTimeout(()=>E('setupUsername').focus(),0);
+  }else{
+    E('authDescription').textContent='Use the same administrator account as the main Admin console. This tab stores only a short-lived session.';
+    E('tokenLoginHelp').textContent='The original Admin Token is exchanged for a short-lived session and is not stored.';
+    setTimeout(()=>E('loginUsername').focus(),0);
+  }
+}
+async function loadAuthStatus(){
+  try{const status=await request('/api/admin/auth/status');renderAuthState(status);return status}
+  catch(err){
+    A.status=null;
+    E('setupForm').classList.add('hidden');E('passwordLoginForm').classList.add('hidden');E('tokenLoginDetails').classList.add('hidden');
+    E('authTitle').textContent='Authentication service unavailable';E('authDescription').textContent='The administrator account status could not be loaded.';
+    E('retryAuthBtn').classList.remove('hidden');throw err;
+  }
+}
+function showAuthError(err){
+  const retry=Number(err?.body?.retry_after||0);
+  E('loginError').textContent=retry?`${String(err.message)} (retry in about ${retry}s)`:String(err?.message||err||'Authentication failed');
+}
+async function acceptAdminSession(token){
+  A.token=String(token||'').trim();A.authenticated=!!A.token;A.readOnly=false;
+  sessionStorage.setItem(AUTH_KEY,A.token);E('authOverlay').classList.add('hidden');E('loginError').textContent='';
+  for(const id of ['setupPassword','setupPasswordConfirm','loginPassword','tokenInput']){const el=E(id);if(el)el.value=''}
+  updateAuthUi();
+}
+async function registerAdmin(){
+  const form=E('setupForm'),password=E('setupPassword').value,confirm=E('setupPasswordConfirm').value;
+  if(password!==confirm){E('loginError').textContent='The two passwords do not match.';E('setupPasswordConfirm').focus();return}
+  setAuthBusy(form,true);E('loginError').textContent='';
+  try{
+    const headers={},bootstrap=E('tokenInput').value.trim();if(bootstrap)headers.Authorization='Bearer '+bootstrap;
+    const out=await request('/api/admin/auth/setup',{method:'POST',headers,body:JSON.stringify({username:E('setupUsername').value.trim(),password})});
+    await acceptAdminSession(out.access_token);
+  }catch(err){showAuthError(err);if(err.status===409)await loadAuthStatus().catch(()=>{})}finally{setAuthBusy(form,false)}
+}
+async function loginWithPassword(){
+  const form=E('passwordLoginForm');setAuthBusy(form,true);E('loginError').textContent='';
+  try{const out=await request('/api/admin/auth/login',{method:'POST',body:JSON.stringify({username:E('loginUsername').value.trim(),password:E('loginPassword').value})});await acceptAdminSession(out.access_token)}
+  catch(err){showAuthError(err);E('loginPassword').value='';E('loginPassword').focus()}finally{setAuthBusy(form,false)}
+}
+async function loginWithToken(){
+  if(!E('setupForm').classList.contains('hidden')){await registerAdmin();return}
+  const form=E('tokenLoginForm'),candidate=E('tokenInput').value.trim();if(!candidate){E('loginError').textContent='Enter the Admin Token.';return}
+  setAuthBusy(form,true);E('loginError').textContent='';
+  try{const out=await request('/api/admin/auth/token-login',{method:'POST',headers:{Authorization:'Bearer '+candidate},body:'{}'});await acceptAdminSession(out.access_token)}
+  catch(err){showAuthError(err);E('tokenInput').value='';E('tokenInput').focus()}finally{setAuthBusy(form,false)}
+}
+async function logoutAdmin(){
+  const token=A.token;
+  try{if(token)await request('/api/admin/auth/logout',{method:'POST',headers:{Authorization:'Bearer '+token},body:'{}'})}catch(_){}
+  clearAdminSession();await loadAuthStatus().catch(showAuthError);showAuth();
+}
+async function bootstrapAuth(){
+  updateAuthUi();
+  if(A.token){
+    try{
+      const state=await request('/api/admin/auth/session',{headers:{Authorization:'Bearer '+A.token}});
+      if(state.auth_kind==='token'){
+        const out=await request('/api/admin/auth/token-login',{method:'POST',headers:{Authorization:'Bearer '+A.token},body:'{}'});
+        await acceptAdminSession(out.access_token);
+      }else await acceptAdminSession(A.token);
+      return;
+    }catch(err){if(err.status===401)clearAdminSession();else{showAuthError(err);E('retryAuthBtn').classList.remove('hidden');return}}
+  }
+  await loadAuthStatus();showAuth();
+}
+function bindAuthUi(){
+  E('setupForm').onsubmit=ev=>{ev.preventDefault();registerAdmin()};
+  E('passwordLoginForm').onsubmit=ev=>{ev.preventDefault();loginWithPassword()};
+  E('tokenLoginForm').onsubmit=ev=>{ev.preventDefault();loginWithToken()};
+  E('readOnlyBtn').onclick=continueReadOnly;E('retryAuthBtn').onclick=()=>bootstrapAuth().catch(showAuthError);
+  E('signInBtn').onclick=()=>showAuth();E('logoutBtn').onclick=()=>logoutAdmin();
 }
 function esc(s){return String(s??'').replace(/[&<>"]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[m]))}
 function fmtTs(v){const n=Number(v||0);if(!n)return '-';const d=new Date(n*1000);return isNaN(d.getTime())?'-':d.toLocaleString()}
@@ -2357,6 +2553,7 @@ async function rebuildIndex(){
   setChip('importStatus','rebuilt'); await refreshAll();
 }
 window.addEventListener('DOMContentLoaded',async()=>{
+  bindAuthUi();
   initGraphUi();
   E('refreshBtn').onclick=()=>refreshAll().catch(err=>setChip('importStatus',err.message,true));
   E('rebuildBtn').onclick=()=>rebuildIndex().catch(err=>setChip('importStatus',err.message,true));
@@ -2366,11 +2563,13 @@ window.addEventListener('DOMContentLoaded',async()=>{
   if(E('folderInput'))E('folderInput').onchange=()=>onFolderInputChange().catch(err=>setChip('importStatus',err.message,true));
   E('importTextBtn').onclick=()=>runImportText().catch(err=>setChip('importStatus',err.message,true));
   E('queryBtn').onclick=()=>runQuery().catch(err=>setChip('queryStatus',err.message,true));
-  try{await refreshAll()}catch(err){setChip('importStatus',err.message,true)}
+  const results=await Promise.allSettled([refreshAll(),bootstrapAuth()]);
+  if(results[0].status==='rejected')setChip('importStatus',results[0].reason?.message||'Library data unavailable',true);
+  if(results[1].status==='rejected')showAuthError(results[1].reason);
 });
 """
 
-# split-source: order=947 original-lines=97229-97241 hash=a629a6953651964d
+# split-source: order=1030 original-lines=105350-105362 hash=a629a6953651964d
 
 CODE_ADMIN_INDEX_HTML = (
     RAG_ADMIN_INDEX_HTML
@@ -2385,7 +2584,7 @@ CODE_ADMIN_INDEX_HTML = (
     )
 )
 
-# split-source: order=948 original-lines=97242-97272 hash=2392d18fa3cd2280
+# split-source: order=1031 original-lines=105363-105393 hash=2392d18fa3cd2280
 CODE_ADMIN_CSS = (
     RAG_ADMIN_CSS
     + """
@@ -2418,7 +2617,7 @@ html,body{background:radial-gradient(circle at top left,#fff8fc 0,#ffeef5 42%,#f
 """
 )
 
-# split-source: order=949 original-lines=97273-97277 hash=25e2546e58f05805
+# split-source: order=1032 original-lines=105394-105398 hash=25e2546e58f05805
 CODE_ADMIN_JS = (
     RAG_ADMIN_JS
     .replace("/api/rag/", "/api/code/")

@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=774 original-lines=10663-11023 hash=f9a47050aba673a4
+# split-source: order=853 original-lines=15274-15634 hash=c27ca69f2081e0f9
 
 class TodoManager:
     def __init__(self, language: str = DEFAULT_UI_LANGUAGE):
@@ -236,7 +236,7 @@ class TodoManager:
             for meta_key in (
                 "subtask_id", "created_at", "updated_at", "started_at", "completed_at",
                 "completed_by", "evidence", "evidence_binding", "evidence_ids",
-                "revision_reason", "revision_evidence", "external_subtask_id",
+                "revision_reason", "revision_evidence", "external_subtask_id", "root_group_id",
             ):
                 if meta_key in raw and raw.get(meta_key) not in (None, ""):
                     row[meta_key] = raw.get(meta_key)

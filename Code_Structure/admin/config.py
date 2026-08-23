@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=739 original-lines=9511-9619 hash=1f332fcf893a600c
+# split-source: order=818 original-lines=14075-14192 hash=17976d61369fbde7
 
 
 def _admin_config_schema() -> list[dict]:
@@ -39,10 +39,14 @@ def _admin_config_schema() -> list[dict]:
         row("code_admin_port", "network", "Code admin port", "integer", None, "--code_admin_port", nullable=True, minimum=1, maximum=65535, derived="port + 3"),
         row("mcp_service_port", "network", "MCP service port", "integer", None, "--mcp_service_port", nullable=True, minimum=1, maximum=65535, derived="port + 4"),
         row("ide_port", "network", "IDE port", "integer", None, "--ide_port", nullable=True, minimum=1, maximum=65535, derived="port + 5"),
+        row("collab_host", "network", "Collaboration bind host", "host", "0.0.0.0", "--collab_host", nullable=True, derived="host"),
+        row("collab_port", "network", "Collaboration port", "integer", None, "--collab_port", nullable=True, minimum=1, maximum=65535, derived="port + 7"),
         row("ctx_limit", "runtime", "Context token limit", "integer", DEFAULT_CONTEXT_TOKEN_LIMIT, "--ctx_limit", minimum=MIN_CONTEXT_TOKEN_LIMIT, maximum=TOKEN_THRESHOLD),
         row("max_rounds", "runtime", "Maximum agent rounds", "integer", MAX_AGENT_ROUNDS, "--max_rounds", minimum=MIN_AGENT_ROUNDS, maximum=MAX_AGENT_ROUNDS_CAP),
         row("run_timeout", "runtime", "Run timeout (seconds)", "integer", MAX_RUN_SECONDS, "--run_timeout", minimum=MIN_RUN_TIMEOUT_SECONDS, maximum=MAX_RUN_TIMEOUT_SECONDS),
         row("shell_command_timeout", "runtime", "Shell timeout (seconds)", "integer", DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS, "--shell_command_timeout", minimum=MIN_SHELL_COMMAND_TIMEOUT_SECONDS, maximum=MAX_SHELL_COMMAND_TIMEOUT_SECONDS),
+        row("shell_timeout_mode", "runtime", "Shell timeout mode", "enum", DEFAULT_SHELL_TIMEOUT_MODE, "--shell-timeout-mode", choices=list(SHELL_TIMEOUT_MODES)),
+        row("shell_async_handoff_seconds", "runtime", "Shell async handoff (seconds)", "integer", DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS, "--shell-async-handoff", minimum=MIN_SHELL_ASYNC_HANDOFF_SECONDS, maximum=MAX_SHELL_ASYNC_HANDOFF_SECONDS),
         row("live_input_delay_write", "live_input", "Write-phase delay rounds", "integer", LIVE_INPUT_DELAY_WRITE_ROUNDS, "--live_input_delay_write", minimum=0, maximum=20),
         row("live_input_delay_tool", "live_input", "Tool-phase delay rounds", "integer", LIVE_INPUT_DELAY_TOOL_ROUNDS, "--live_input_delay_tool", minimum=0, maximum=20),
         row("live_input_delay_normal", "live_input", "Normal-phase delay rounds", "integer", LIVE_INPUT_DELAY_NORMAL_ROUNDS, "--live_input_delay_normal", minimum=0, maximum=20),
@@ -62,6 +66,11 @@ def _admin_config_schema() -> list[dict]:
         row("ide_enabled", "services", "Programming IDE", "boolean", True, true_flag="--enable_ide", false_flag="--no_ide"),
         row("ide_password_login_enabled", "services", "IDE password login", "boolean", False, true_flag="--ide-password-login", false_flag="--no-ide-password-login"),
         row("mcp_service_enabled", "services", "MCP service", "boolean", True, true_flag="", false_flag="--no_mcp_service"),
+        row("collaboration_enabled", "services", "LAN collaboration", "boolean", True, true_flag="--enable_collaboration", false_flag="--no_collaboration"),
+        row("collab_tls_cert", "security", "Collaboration TLS certificate", "file", "", "--collab_tls_cert"),
+        row("collab_tls_key", "security", "Collaboration TLS private key", "file", "", "--collab_tls_key"),
+        row("collab_https_proxy", "security", "Trusted HTTPS reverse proxy", "boolean", False, true_flag="--collab_https_proxy", false_flag="--no_collab_https_proxy"),
+        row("collab_allow_insecure_http", "security", "Trusted LAN HTTP mode", "boolean", True, true_flag="--collab_allow_insecure_http", false_flag="--no_collab_allow_insecure_http"),
         row("use_external_web_ui", "webui", "External WebUI mode", "tri_state", "inherit", true_flag="--use_external_web_ui", false_flag="--no_external_web_ui", choices=["inherit", "enabled", "disabled"]),
         row("export_web_ui", "webui", "Export built-in WebUI on start", "boolean", False, true_flag="--export_web_ui", false_flag=""),
         row("export_web_ui_force", "webui", "Overwrite WebUI export", "boolean", False, true_flag="--export_web_ui_force", false_flag=""),
@@ -116,13 +125,13 @@ def _admin_config_schema() -> list[dict]:
         row("rag_file_name", "runtime", "Use filenames as RAG entities", "boolean", False, true_flag="--RAG_File_Name=on", false_flag="--RAG_File_Name=off"),
     ]
 
-# split-source: order=740 original-lines=9620-9623 hash=40890890ea051821
+# split-source: order=819 original-lines=14193-14196 hash=40890890ea051821
 
 
 def _admin_factory_config() -> dict:
     return {row["key"]: row.get("factory_default") for row in _admin_config_schema()}
 
-# split-source: order=741 original-lines=9624-9744 hash=dc8951a1020569f6
+# split-source: order=820 original-lines=14197-14352 hash=e4ee3c750cce4f1e
 
 
 def _admin_coerce_config(raw: object) -> tuple[dict, list[dict]]:
@@ -207,6 +216,38 @@ def _admin_coerce_config(raw: object) -> tuple[dict, list[dict]]:
             errors.append({"key": key, "error": str(exc)})
     if bool(out.get("export_web_ui_force")) and not bool(out.get("export_web_ui")):
         errors.append({"key": "export_web_ui_force", "error": "requires export_web_ui"})
+    if bool(out.get("collab_tls_cert")) != bool(out.get("collab_tls_key")):
+        errors.append({"key": "collab_tls_cert", "error": "collaboration TLS certificate and private key must be configured together"})
+    for tls_key in ("collab_tls_cert", "collab_tls_key"):
+        tls_value = str(out.get(tls_key, "") or "").strip()
+        if tls_value:
+            tls_path = Path(tls_value).expanduser()
+            if not tls_path.is_absolute():
+                tls_path = WORKDIR / tls_path
+            if not tls_path.is_file():
+                errors.append({"key": tls_key, "error": "TLS path must be an existing file"})
+    if bool(out.get("collab_https_proxy")):
+        proxy_enabled = str(os.getenv("CLOUDS_CODER_TRUST_PROXY", "") or "").strip().lower() in {"1", "true", "yes", "on"}
+        proxy_ranges = bool(str(os.getenv("CLOUDS_CODER_TRUSTED_PROXIES", "") or "").strip())
+        if not (proxy_enabled and proxy_ranges):
+            errors.append({"key": "collab_https_proxy", "error": "requires CLOUDS_CODER_TRUST_PROXY and CLOUDS_CODER_TRUSTED_PROXIES"})
+    collab_host = str(out.get("collab_host") or out.get("host") or "").strip()
+    collab_is_loopback = False
+    try:
+        collab_is_loopback = bool(ipaddress.ip_address(collab_host).is_loopback)
+    except Exception:
+        collab_is_loopback = collab_host.lower() == "localhost"
+    if (
+        bool(out.get("collaboration_enabled"))
+        and not collab_is_loopback
+        and not (bool(out.get("collab_tls_cert")) and bool(out.get("collab_tls_key")))
+        and not bool(out.get("collab_https_proxy"))
+        and not bool(out.get("collab_allow_insecure_http"))
+    ):
+        errors.append({
+            "key": "collaboration_enabled",
+            "error": "non-loopback collaboration requires TLS, a trusted HTTPS proxy, or the explicit insecure HTTP development switch",
+        })
     effective_ports = {
         "agent": int(out["port"]),
         "skills": int(out["skills_port"] if out.get("skills_port") is not None else int(out["port"]) + 1),
@@ -214,6 +255,7 @@ def _admin_coerce_config(raw: object) -> tuple[dict, list[dict]]:
         "code": int(out["code_admin_port"] if out.get("code_admin_port") is not None else int(out["port"]) + 3),
         "mcp": int(out["mcp_service_port"] if out.get("mcp_service_port") is not None else int(out["port"]) + 4),
         "ide": int(out["ide_port"] if out.get("ide_port") is not None else int(out["port"]) + 5),
+        "collaboration": int(out["collab_port"] if out.get("collab_port") is not None else int(out["port"]) + 7),
     }
     enabled = {
         "agent": True,
@@ -222,6 +264,7 @@ def _admin_coerce_config(raw: object) -> tuple[dict, list[dict]]:
         "code": bool(out.get("code_admin_enabled")),
         "mcp": bool(out.get("mcp_service_enabled")),
         "ide": bool(out.get("ide_enabled")),
+        "collaboration": bool(out.get("collaboration_enabled")),
     }
     seen: dict[int, str] = {}
     port_error_keys = {
@@ -231,6 +274,7 @@ def _admin_coerce_config(raw: object) -> tuple[dict, list[dict]]:
         "code": "code_admin_port",
         "mcp": "mcp_service_port",
         "ide": "ide_port",
+        "collaboration": "collab_port",
     }
     for service, port in effective_ports.items():
         if not enabled.get(service):
@@ -245,7 +289,7 @@ def _admin_coerce_config(raw: object) -> tuple[dict, list[dict]]:
     out["_effective_ports"] = effective_ports
     return out, errors
 
-# split-source: order=742 original-lines=9745-9781 hash=80095834e40509e0
+# split-source: order=821 original-lines=14353-14389 hash=80095834e40509e0
 
 
 def _admin_config_to_argv(config: dict) -> list[str]:
@@ -284,7 +328,7 @@ def _admin_config_to_argv(config: dict) -> list[str]:
                 argv.extend([flag, value_text])
     return argv
 
-# split-source: order=743 original-lines=9782-9797 hash=12dc636b75f461e9
+# split-source: order=822 original-lines=14390-14405 hash=12dc636b75f461e9
 
 
 def _admin_restart_probe_url(config: dict, restart_nonce: str, restart_from_boot_id: str) -> str:
@@ -302,7 +346,7 @@ def _admin_restart_probe_url(config: dict, restart_nonce: str, restart_from_boot
     )
     return f"http://{host}:{port}/api/health?{query}"
 
-# split-source: order=744 original-lines=9798-9884 hash=0c9904b7a02980a4
+# split-source: order=823 original-lines=14406-14492 hash=0c9904b7a02980a4
 
 
 def _admin_supervised_restart(
@@ -390,7 +434,7 @@ def _admin_supervised_restart(
     )
     return False
 
-# split-source: order=745 original-lines=9885-9904 hash=131500c48f7797e8
+# split-source: order=824 original-lines=14493-14514 hash=1bc6ac699682e60b
 
 def _admin_argparse_defaults(config: dict) -> dict:
     """Map canonical Admin config keys to argparse destinations."""
@@ -402,17 +446,19 @@ def _admin_argparse_defaults(config: dict) -> dict:
         "enable_ide": bool(config.get("ide_enabled", False)),
         "no_ide": not bool(config.get("ide_enabled", False)),
         "no_mcp_service": not bool(config.get("mcp_service_enabled", True)),
+        "enable_collaboration": bool(config.get("collaboration_enabled", False)),
+        "no_collaboration": not bool(config.get("collaboration_enabled", False)),
         "use_external_web_ui": None if config.get("use_external_web_ui") == "inherit" else config.get("use_external_web_ui") == "enabled",
         "show_upload_list": None if config.get("show_upload_list") == "inherit" else config.get("show_upload_list") == "enabled",
         "download_js_lib": None if config.get("download_js_lib") == "inherit" else config.get("download_js_lib") == "enabled",
         "web_search_enabled": None if config.get("web_search_enabled") == "inherit" else config.get("web_search_enabled") == "enabled",
         "rag_file_name": "on" if bool(config.get("rag_file_name")) else "off",
     })
-    for key in ("skills_ui_enabled", "rag_admin_enabled", "code_admin_enabled", "ide_enabled", "mcp_service_enabled"):
+    for key in ("skills_ui_enabled", "rag_admin_enabled", "code_admin_enabled", "ide_enabled", "mcp_service_enabled", "collaboration_enabled"):
         out.pop(key, None)
     return out
 
-# split-source: order=746 original-lines=9905-9924 hash=74581d4419b4cfc5
+# split-source: order=825 original-lines=14515-14535 hash=77b9b0b9223e21aa
 
 def _admin_config_from_namespace(args: argparse.Namespace) -> dict:
     values = _admin_factory_config()
@@ -426,6 +472,7 @@ def _admin_config_from_namespace(args: argparse.Namespace) -> dict:
         "code_admin_enabled": not bool(getattr(args, "no_code_admin", False)),
         "ide_enabled": bool(getattr(args, "enable_ide", False)) and not bool(getattr(args, "no_ide", False)),
         "mcp_service_enabled": not bool(getattr(args, "no_mcp_service", False)),
+        "collaboration_enabled": bool(getattr(args, "enable_collaboration", False)) and not bool(getattr(args, "no_collaboration", False)),
         "use_external_web_ui": "inherit" if getattr(args, "use_external_web_ui", None) is None else ("enabled" if bool(args.use_external_web_ui) else "disabled"),
         "show_upload_list": "inherit" if getattr(args, "show_upload_list", None) is None else ("enabled" if bool(args.show_upload_list) else "disabled"),
         "download_js_lib": "inherit" if getattr(args, "download_js_lib", None) is None else ("enabled" if bool(args.download_js_lib) else "disabled"),

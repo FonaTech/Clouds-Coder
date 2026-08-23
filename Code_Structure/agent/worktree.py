@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=817 original-lines=16552-16768 hash=f18b8776aeb48c5e
+# split-source: order=898 original-lines=22513-22725 hash=b20ebea8e953a4f2
 
 class WorktreeManager:
     def __init__(
@@ -35,11 +35,10 @@ class WorktreeManager:
 
     def _is_git_repo(self) -> bool:
         try:
-            r = subprocess.run(
+            r = run_subprocess_text(
                 ["git", "rev-parse", "--is-inside-work-tree"],
                 cwd=self.repo_root,
                 capture_output=True,
-                text=True,
                 timeout=10,
             )
             return r.returncode == 0
@@ -78,11 +77,10 @@ class WorktreeManager:
     def _run_git(self, args: list[str]) -> str:
         if not self.git_available:
             raise RuntimeError("Not in a git repository")
-        r = subprocess.run(
+        r = run_subprocess_text(
             ["git", *args],
             cwd=self.repo_root,
             capture_output=True,
-            text=True,
             timeout=240,
         )
         if r.returncode != 0:
@@ -141,11 +139,10 @@ class WorktreeManager:
         path = Path(wt["path"])
         if not path.exists():
             return f"Error: worktree path missing: {path}"
-        r = subprocess.run(
+        r = run_subprocess_text(
             ["git", "status", "--short", "--branch"],
             cwd=path,
             capture_output=True,
-            text=True,
             timeout=60,
         )
         return (r.stdout + r.stderr).strip() or "Clean worktree"
@@ -160,12 +157,11 @@ class WorktreeManager:
         if not path.exists():
             return f"Error: worktree path missing: {path}"
         try:
-            r = subprocess.run(
+            r = run_subprocess_text(
                 command,
                 shell=True,
                 cwd=path,
                 capture_output=True,
-                text=True,
                 timeout=300,
             )
             return trim((r.stdout + r.stderr).strip() or "(no output)")

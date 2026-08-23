@@ -5,7 +5,8 @@
 
 from __future__ import annotations
 
-# split-source: order=966 original-lines=110720-110936 hash=113b4291bf0a35b1
+# split-source: order=1072 original-lines=124250-124467 hash=a8018e2d340fe392
+
 
 class McpServiceHandler(BaseHTTPRequestHandler):
     """HTTP control/health surface for the global MCP manager (ide_port+1).

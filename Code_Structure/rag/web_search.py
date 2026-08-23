@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=635 original-lines=4553-4560 hash=c5ad9e231dfe7a14
+# split-source: order=714 original-lines=8378-8385 hash=c5ad9e231dfe7a14
 
 
 def _agent_web_bool(value: object, default: bool = False) -> bool:
@@ -15,7 +15,7 @@ def _agent_web_bool(value: object, default: bool = False) -> bool:
         return value
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
-# split-source: order=636 original-lines=4561-4568 hash=ce9e153b14840a57
+# split-source: order=715 original-lines=8386-8393 hash=ce9e153b14840a57
 
 
 def _agent_web_int(value: object, default: int, minimum: int, maximum: int) -> int:
@@ -25,7 +25,7 @@ def _agent_web_int(value: object, default: int, minimum: int, maximum: int) -> i
         num = int(default)
     return max(int(minimum), min(int(maximum), num))
 
-# split-source: order=637 original-lines=4569-4575 hash=035e9295e82698b6
+# split-source: order=716 original-lines=8394-8400 hash=035e9295e82698b6
 
 
 def _agent_web_host_is_local_name(host: str) -> bool:
@@ -34,7 +34,7 @@ def _agent_web_host_is_local_name(host: str) -> bool:
         return True
     return low.endswith(".localhost") or low.endswith(".local")
 
-# split-source: order=638 original-lines=4576-4590 hash=a2d4cea120f5c6a7
+# split-source: order=717 original-lines=8401-8415 hash=a2d4cea120f5c6a7
 
 
 def _agent_web_ip_is_blocked(raw_ip: str) -> bool:
@@ -51,7 +51,7 @@ def _agent_web_ip_is_blocked(raw_ip: str) -> bool:
         or ip.is_unspecified
     )
 
-# split-source: order=639 original-lines=4591-4620 hash=4d279cd33c02cadb
+# split-source: order=718 original-lines=8416-8445 hash=4d279cd33c02cadb
 
 
 def _agent_web_canonical_url(raw_url: str, base_url: str = "") -> str:
@@ -83,7 +83,7 @@ def _agent_web_canonical_url(raw_url: str, base_url: str = "") -> str:
     query = parsed.query
     return urlunparse((scheme, netloc, path, "", query, ""))
 
-# split-source: order=640 original-lines=4621-4632 hash=bbc6813ce54f894a
+# split-source: order=719 original-lines=8446-8457 hash=bbc6813ce54f894a
 
 
 def _agent_web_domain_to_seed(domain: str) -> str:
@@ -97,7 +97,7 @@ def _agent_web_domain_to_seed(domain: str) -> str:
         return ""
     return _agent_web_canonical_url(urlunparse((parsed.scheme or "https", parsed.netloc, "/", "", "", "")))
 
-# split-source: order=641 original-lines=4633-4650 hash=3e359369a4d81885
+# split-source: order=720 original-lines=8458-8475 hash=3e359369a4d81885
 
 
 def _agent_web_query_terms(text: str) -> list[str]:
@@ -117,7 +117,7 @@ def _agent_web_query_terms(text: str) -> list[str]:
             out.append(tok)
     return out[:24]
 
-# split-source: order=642 original-lines=4651-4691 hash=1d6ca1959a8c4750
+# split-source: order=721 original-lines=8476-8516 hash=1d6ca1959a8c4750
 
 
 def _agent_web_query_domain_hints(query: str) -> list[str]:
@@ -160,7 +160,7 @@ def _agent_web_query_domain_hints(query: str) -> list[str]:
                 hints.append(domain)
     return hints[:8]
 
-# split-source: order=643 original-lines=4692-4714 hash=fa102eb767ea8673
+# split-source: order=722 original-lines=8517-8539 hash=fa102eb767ea8673
 
 
 def _agent_web_query_needs_fresh_network(query: str) -> bool:
@@ -185,7 +185,7 @@ def _agent_web_query_needs_fresh_network(query: str) -> bool:
         pass
     return False
 
-# split-source: order=644 original-lines=4715-4732 hash=ebd97959abfa53d4
+# split-source: order=723 original-lines=8540-8557 hash=ebd97959abfa53d4
 
 
 def _agent_web_extract_text_snippet(text: str, terms: list[str], max_chars: int = 420) -> str:
@@ -205,7 +205,7 @@ def _agent_web_extract_text_snippet(text: str, terms: list[str], max_chars: int 
     start = max(0, end - max_chars)
     return trim(clean[start:end].strip(), max_chars)
 
-# split-source: order=645 original-lines=4733-4812 hash=153a43b333240a9d
+# split-source: order=724 original-lines=8558-8637 hash=153a43b333240a9d
 
 
 class AgentWebHTMLParser(HTMLParser):
@@ -287,7 +287,7 @@ class AgentWebHTMLParser(HTMLParser):
             "links": self.links[:1500],
         }
 
-# split-source: order=646 original-lines=4813-4836 hash=34ed062702481c7f
+# split-source: order=725 original-lines=8638-8661 hash=34ed062702481c7f
 
 
 def _agent_web_decompress_bytes(raw: bytes, content_encoding: str = "") -> tuple[bytes, str, bool, str]:
@@ -313,7 +313,7 @@ def _agent_web_decompress_bytes(raw: bytes, content_encoding: str = "") -> tuple
         return data, enc, False, f"decompress failed: {trim(str(exc), 160)}"
     return data, enc, False, ""
 
-# split-source: order=647 original-lines=4837-4895 hash=5c6154eb65ae20e7
+# split-source: order=726 original-lines=8662-8720 hash=5c6154eb65ae20e7
 
 def _agent_web_charset_candidates(raw: bytes, content_type: str = "") -> list[str]:
     candidates: list[str] = []
@@ -374,7 +374,7 @@ def _agent_web_charset_candidates(raw: bytes, content_type: str = "") -> list[st
     candidates = deduped
     return candidates
 
-# split-source: order=648 original-lines=4896-4930 hash=151ab73cabe35914
+# split-source: order=727 original-lines=8721-8755 hash=151ab73cabe35914
 
 def _agent_web_decode_text_bytes(raw: bytes, content_type: str = "", content_encoding: str = "") -> dict:
     decoded_bytes, encoding, decompressed, decode_error = _agent_web_decompress_bytes(raw, content_encoding)
@@ -411,7 +411,7 @@ def _agent_web_decode_text_bytes(raw: bytes, content_type: str = "", content_enc
         "binary_like": bool(binary_like),
     }
 
-# split-source: order=649 original-lines=4931-6000 hash=416dfaddf24b5343
+# split-source: order=728 original-lines=8756-10538 hash=486254b4708c3b70
 
 
 class AgentWebSearchEngine:
@@ -500,6 +500,7 @@ class AgentWebSearchEngine:
                     dst TEXT,
                     anchor TEXT,
                     discovered_at REAL,
+                    occurrences INTEGER NOT NULL DEFAULT 1,
                     PRIMARY KEY (src, dst, anchor)
                 )
                 """
@@ -544,6 +545,11 @@ class AgentWebSearchEngine:
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_pages_domain ON pages(domain)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_pages_fetched ON pages(fetched_at)")
+            link_columns = {str(row["name"] or "") for row in conn.execute("PRAGMA table_info(links)")}
+            if "occurrences" not in link_columns:
+                conn.execute("ALTER TABLE links ADD COLUMN occurrences INTEGER NOT NULL DEFAULT 1")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_links_src ON links(src)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_links_dst ON links(dst)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_page_evidence_query ON page_evidence(query)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_page_evidence_url ON page_evidence(url)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_page_evidence_type ON page_evidence(evidence_type)")
@@ -649,7 +655,7 @@ class AgentWebSearchEngine:
         host = (parsed.hostname or "").lower()
         path = (parsed.path or "").lower()
         stype = str(source_type or "").lower()
-        if host.endswith((".gov", ".edu")):
+        if host.endswith((".gov", ".edu", ".ac.uk", ".edu.cn", ".gc.ca", ".go.jp", ".gouv.fr", ".gov.au", ".gov.cn", ".gov.uk")):
             return "official_public"
         if any(part in host for part in ("github.com", "gitlab.com", "sourceforge.net")):
             return "code_repository"
@@ -662,6 +668,127 @@ class AgentWebSearchEngine:
         if any(part in host for part in ("arxiv.org", "doi.org", "semanticscholar.org", "acm.org", "ieee.org", "springer.com")):
             return "scholarly"
         return "web_page"
+
+    def _link_domain_identity(self, url_or_host: str) -> str:
+        raw = str(url_or_host or "").strip().lower().strip(".")
+        host = (urlparse(raw).hostname or "").lower().strip(".") if "://" in raw else raw
+        if not host:
+            return ""
+        try:
+            return str(ipaddress.ip_address(host))
+        except Exception:
+            pass
+        if host.startswith("www."):
+            host = host[4:]
+        labels = [part for part in host.split(".") if part]
+        if len(labels) <= 2:
+            return host
+        compound_suffixes = {
+            "ac.uk", "co.in", "co.jp", "co.kr", "co.nz", "co.uk", "com.au", "com.br",
+            "com.cn", "com.hk", "com.sg", "com.tw", "gov.cn", "gov.uk", "net.cn", "org.cn",
+            "org.uk",
+        }
+        suffix = ".".join(labels[-2:])
+        return ".".join(labels[-3:]) if suffix in compound_suffixes else suffix
+
+    def _graph_url_key(self, raw_url: str) -> str:
+        canonical = _agent_web_canonical_url(raw_url)
+        if not canonical:
+            return ""
+        parsed = urlparse(canonical)
+        retained: list[str] = []
+        tracking_keys = {
+            "fbclid", "gclid", "mc_cid", "mc_eid", "ref_src", "spm", "yclid",
+        }
+        for pair in str(parsed.query or "").split("&"):
+            if not pair:
+                continue
+            key = unquote(pair.split("=", 1)[0]).strip().lower()
+            if key.startswith("utm_") or key in tracking_keys:
+                continue
+            retained.append(pair)
+        query = "&".join(sorted(retained))
+        return urlunparse((parsed.scheme, parsed.netloc, parsed.path or "/", "", query, ""))
+
+    def _source_title_fingerprint(self, title: str) -> str:
+        value = unicodedata.normalize("NFKC", str(title or "")).lower()
+        value = re.sub(r"\s+[|\-–—:]\s+[^|\-–—:]{1,60}$", "", value)
+        return "".join(re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]", value))[:240]
+
+    def _classify_source_role(self, row: sqlite3.Row | dict, query: str = "") -> dict:
+        item = dict(row)
+        url = str(item.get("url", "") or "")
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        path = (parsed.path or "/").lower()
+        title = str(item.get("title", "") or "").lower()
+        desc = str(item.get("description", "") or "").lower()
+        source_type = str(item.get("source_type", "") or "").lower()
+        quality = self._classify_source_quality(url, source_type)
+        domain = self._link_domain_identity(host)
+        hinted_domains = {
+            self._link_domain_identity(hint)
+            for hint in _agent_web_query_domain_hints(query)
+            if self._link_domain_identity(hint)
+        }
+        if domain and domain in hinted_domains:
+            return {"role": "official", "trust": 1.0, "reasons": ["query_official_domain"]}
+        if quality == "official_public":
+            return {"role": "official", "trust": 1.0, "reasons": [quality]}
+        aggregator_hosts = (
+            "alltop.com", "bing.com", "feedly.com", "flipboard.com", "news.google.com",
+            "search.yahoo.com", "techmeme.com",
+        )
+        aggregator_paths = ("/archive/", "/category/", "/feed/", "/search/", "/tag/", "/tags/", "/topic/")
+        if source_type in {"rss", "sitemap"} or any(host == name or host.endswith("." + name) for name in aggregator_hosts):
+            return {"role": "aggregator", "trust": 0.2, "reasons": ["feed_or_aggregation_host"]}
+        if any(part in path for part in aggregator_paths):
+            return {"role": "aggregator", "trust": 0.25, "reasons": ["aggregation_path"]}
+        repost_markers = ("repost", "republished", "syndicated", "转载", "转自", "来源于", "原文来自")
+        if any(marker in (title + " " + desc) for marker in repost_markers):
+            return {"role": "repost", "trust": 0.3, "reasons": ["repost_disclosure"]}
+        primary_paths = (
+            "/changelog", "/dataset", "/paper", "/publication", "/release", "/research",
+            "/spec", "/standard", "/whitepaper",
+        )
+        if quality in {"code_repository", "official_docs", "scholarly"} or any(part in path for part in primary_paths):
+            return {"role": "primary", "trust": 0.9, "reasons": [quality if quality != "web_page" else "primary_material_path"]}
+        if url:
+            return {"role": "secondary", "trust": 0.6, "reasons": [quality]}
+        return {"role": "unknown", "trust": 0.35, "reasons": ["missing_page_metadata"]}
+
+    def _seo_link_reasons(
+        self,
+        anchor: str,
+        dst: str,
+        terms: list[str],
+        *,
+        duplicate_count: int = 0,
+        reciprocal: bool = False,
+        repeated_anchor_edges: int = 0,
+    ) -> list[str]:
+        value = re.sub(r"\s+", " ", unicodedata.normalize("NFKC", str(anchor or "")).lower()).strip()
+        url_low = str(dst or "").lower()
+        reasons: list[str] = []
+        commercial = (
+            "backlink", "best price", "buy now", "casino", "cheap", "coupon", "loan", "payday",
+            "seo service", "sponsored link", "代购", "优惠券", "博彩", "返利", "外链", "贷款",
+        )
+        if any(token in value for token in commercial):
+            reasons.append("commercial_or_link_scheme_anchor")
+        if any(token in url_low for token in ("/backlink", "/link-exchange", "/seo-links", "?ref=affiliate", "&ref=affiliate")):
+            reasons.append("link_scheme_url_pattern")
+        words = re.findall(r"[a-z0-9]{2,}|[\u4e00-\u9fff]{2,}", value)
+        if words and max(Counter(words).values()) >= 3:
+            reasons.append("repeated_anchor_terms")
+        query_hits = sum(1 for term in terms if term.lower() in value)
+        if terms and query_hits >= min(3, max(2, len(terms))) and (duplicate_count > 0 or repeated_anchor_edges >= 3):
+            reasons.append("repeated_exact_query_anchor")
+        if duplicate_count >= 2:
+            reasons.append("duplicate_link_placement")
+        if reciprocal and repeated_anchor_edges >= 3:
+            reasons.append("reciprocal_repeated_anchor")
+        return list(dict.fromkeys(reasons))
 
     def _classify_evidence_type(self, row: dict, terms: list[str]) -> str:
         url = str(row.get("url", "") or "").lower()
@@ -773,15 +900,21 @@ class AgentWebSearchEngine:
                 )
             except Exception:
                 pass
+            src_url = str(payload.get("url", "") or "")
+            conn.execute("DELETE FROM links WHERE src = ?", (src_url,))
+            link_counts: Counter[tuple[str, str]] = Counter()
             for link in payload.get("links", []) or []:
                 if not isinstance(link, dict):
                     continue
                 dst = str(link.get("url", "") or "")
                 if not dst:
                     continue
+                anchor = trim(str(link.get("anchor", "") or ""), 240)
+                link_counts[(dst, anchor)] += 1
+            for (dst, anchor), occurrences in link_counts.items():
                 conn.execute(
-                    "INSERT OR IGNORE INTO links(src, dst, anchor, discovered_at) VALUES (?, ?, ?, ?)",
-                    (payload.get("url", ""), dst, trim(str(link.get("anchor", "") or ""), 240), now_ts()),
+                    "INSERT INTO links(src, dst, anchor, discovered_at, occurrences) VALUES (?, ?, ?, ?, ?)",
+                    (src_url, dst, anchor, now_ts(), max(1, int(occurrences or 1))),
                 )
 
     def fetch(self, url: str, *, depth: int = 0, source_type: str = "fetch", max_chars: int | None = None) -> dict:
@@ -998,6 +1131,95 @@ class AgentWebSearchEngine:
                     break
         return urls[:budget]
 
+    def _public_search_feed_candidates(self, query: str, budget: int) -> dict:
+        """Discover cold-start URLs from a public RSS search feed without API keys."""
+        q = trim(str(query or "").strip(), 1000)
+        limit = _agent_web_int(budget, AGENT_WEB_SEARCH_DEFAULT_MAX_PAGES, 1, 30)
+        payload = {"provider": "bing-rss", "query": q, "results": [], "error": ""}
+        if not q or not AGENT_WEB_SEARCH_PUBLIC_DISCOVERY_ENABLED:
+            payload["error"] = "public discovery disabled or empty query"
+            return payload
+        if self._deadline_reached(3.0):
+            payload["error"] = "agent_web_search soft deadline reached before public discovery"
+            return payload
+        feed_url = AGENT_WEB_SEARCH_PUBLIC_FEED_URL.format(query=quote(q))
+        ok, safe_url, reason = self._validate_url(feed_url)
+        if not ok:
+            payload["error"] = reason
+            return payload
+        self._progress(
+            "public_discovery_start",
+            provider="bing-rss",
+            query=q,
+            conversation_visible=False,
+        )
+        try:
+            request = Request(
+                safe_url,
+                headers={
+                    "User-Agent": AGENT_WEB_SEARCH_USER_AGENT,
+                    "Accept": "application/rss+xml,application/xml,text/xml;q=0.9,*/*;q=0.2",
+                    "Accept-Encoding": "gzip, deflate",
+                },
+                method="GET",
+            )
+            with urlopen(request, timeout=self._network_timeout(10.0)) as response:
+                raw = response.read(AGENT_WEB_SEARCH_PUBLIC_FEED_MAX_BYTES + 1)
+                content_type = str(response.headers.get("Content-Type", "") or "")
+                content_encoding = str(response.headers.get("Content-Encoding", "") or "")
+            if len(raw) > AGENT_WEB_SEARCH_PUBLIC_FEED_MAX_BYTES:
+                raise ValueError("public search feed exceeds byte budget")
+            decoded = _agent_web_decode_text_bytes(raw, content_type, content_encoding)
+            xml_bytes = decoded.get("bytes", raw)
+            if not isinstance(xml_bytes, bytes):
+                xml_bytes = str(decoded.get("text", "") or "").encode("utf-8", errors="replace")
+            root = ET.fromstring(xml_bytes)
+            results: list[dict] = []
+            seen: set[str] = set()
+            for item in root.iter():
+                if item.tag.split("}", 1)[-1].lower() not in {"item", "entry"}:
+                    continue
+                fields: dict[str, str] = {}
+                for child in list(item):
+                    tag = child.tag.split("}", 1)[-1].lower()
+                    value = str(child.text or "").strip()
+                    if tag == "link" and not value:
+                        value = str(child.attrib.get("href", "") or "").strip()
+                    if tag in {"title", "link", "description", "summary"} and value:
+                        fields[tag] = value
+                candidate = _agent_web_canonical_url(fields.get("link", ""))
+                valid, candidate, _ = self._validate_url(candidate)
+                if not valid or not candidate or candidate in seen:
+                    continue
+                seen.add(candidate)
+                description = html.unescape(
+                    re.sub(r"<[^>]+>", " ", fields.get("description", fields.get("summary", "")))
+                )
+                results.append(
+                    {
+                        "url": candidate,
+                        "title": trim(html.unescape(fields.get("title", "")), 500),
+                        "snippet": trim(re.sub(r"\s+", " ", description).strip(), 1000),
+                        "provider": "bing-rss",
+                    }
+                )
+                if len(results) >= limit:
+                    break
+            payload["results"] = results
+            if not results:
+                payload["error"] = "public search feed returned no usable URLs"
+        except Exception as exc:
+            payload["error"] = trim(str(exc), 300)
+        self._progress(
+            "public_discovery_done",
+            provider="bing-rss",
+            query=q,
+            result_count=len(payload.get("results", [])),
+            error=payload.get("error", ""),
+            conversation_visible=False,
+        )
+        return payload
+
     def _seed_urls(self, query: str, seed_urls: list[str] | None, domains: list[str] | None) -> list[str]:
         seeds: list[str] = []
         for raw in list(seed_urls or []):
@@ -1029,11 +1251,24 @@ class AgentWebSearchEngine:
         depth_budget = _agent_web_int(depth, AGENT_WEB_SEARCH_DEFAULT_DEPTH, 0, AGENT_WEB_SEARCH_HARD_DEPTH)
         terms = _agent_web_query_terms(query)
         seeds = self._seed_urls(query, seed_urls, domains)
+        public_discovery: dict = {}
+        public_seed_urls: set[str] = set()
+        if not seeds and query:
+            public_discovery = self._public_search_feed_candidates(query, page_budget)
+            for row in public_discovery.get("results", []) if isinstance(public_discovery.get("results", []), list) else []:
+                if not isinstance(row, dict):
+                    continue
+                candidate = str(row.get("url", "") or "")
+                if candidate and candidate not in seeds:
+                    seeds.append(candidate)
+                    public_seed_urls.add(candidate)
         queue_rows: deque[tuple[str, int, str]] = deque()
         for seed in seeds:
             if self._deadline_reached(3.0):
                 break
-            queue_rows.append((seed, 0, "seed"))
+            queue_rows.append((seed, 0, "public_search_feed" if seed in public_seed_urls else "seed"))
+            if seed in public_seed_urls:
+                continue
             for xml_url, stype in self._discover_sitemaps_and_feeds(seed):
                 if self._deadline_reached(2.0):
                     break
@@ -1092,6 +1327,7 @@ class AgentWebSearchEngine:
             "fetched": len(fetched),
             "deadline_reached": bool(deadline_reached),
             "errors": errors[:10],
+            "public_discovery": public_discovery,
             "pages": [
                 {
                     "url": p.get("url", ""),
@@ -1105,7 +1341,13 @@ class AgentWebSearchEngine:
             ],
         }
 
-    def _score_row(self, row: sqlite3.Row | dict, terms: list[str], anchors: dict[str, list[str]]) -> dict:
+    def _score_row(
+        self,
+        row: sqlite3.Row | dict,
+        terms: list[str],
+        anchors: dict[str, list[str]],
+        query: str = "",
+    ) -> dict:
         item = dict(row)
         title = str(item.get("title", "") or "")
         desc = str(item.get("description", "") or "")
@@ -1150,19 +1392,447 @@ class AgentWebSearchEngine:
             score += 0.4
         if not terms:
             score += 1.0
+        source_quality = self._classify_source_quality(url, source)
+        role = self._classify_source_role(item, query)
         return {
             "url": url,
+            "canonical_url": str(item.get("canonical_url", "") or url),
             "title": title or url,
             "description": desc,
             "domain": item.get("domain", ""),
             "source_type": source,
+            "source_quality": source_quality,
+            "source_role": role["role"],
+            "source_trust": role["trust"],
+            "source_role_reasons": role["reasons"],
             "fetched_at": fetched_at,
             "score": round(score, 4),
             "matched_terms": matched[:12],
             "snippet": _agent_web_extract_text_snippet(text or desc, terms),
         }
 
-    def _search_index(self, query: str, max_results: int = AGENT_WEB_SEARCH_DEFAULT_MAX_RESULTS, freshness_days: int = 0) -> list[dict]:
+    def _query_local_link_analysis(self, query: str, candidate_rows: list[dict]) -> dict:
+        max_nodes = max(1, int(AGENT_WEB_SEARCH_LOCAL_GRAPH_MAX_NODES))
+        max_edges = max(1, int(AGENT_WEB_SEARCH_LOCAL_GRAPH_MAX_EDGES))
+        scan_limit = max_edges * max(1, int(AGENT_WEB_SEARCH_LOCAL_GRAPH_EDGE_SCAN_MULTIPLIER))
+        iterations = max(1, int(AGENT_WEB_SEARCH_LOCAL_GRAPH_PAGERANK_ITERATIONS))
+        damping = max(0.0, min(0.99, float(AGENT_WEB_SEARCH_LOCAL_GRAPH_PAGERANK_DAMPING)))
+        terms = _agent_web_query_terms(query)
+        candidates = [dict(row) for row in (candidate_rows or []) if isinstance(row, dict) and row.get("url")]
+        empty_summary = {
+            "scope": "query_local",
+            "candidate_count": 0,
+            "node_count": 0,
+            "edge_count": 0,
+            "budgets": {
+                "max_nodes": max_nodes,
+                "max_edges": max_edges,
+                "nodes_truncated": False,
+                "edges_truncated": False,
+            },
+            "pagerank": {
+                "personalized": True,
+                "damping": damping,
+                "iterations": 0,
+                "converged": True,
+                "score_sum": 0.0,
+            },
+            "signals": {
+                "reciprocal_edges": 0,
+                "duplicate_edges": 0,
+                "suspected_seo_edges": 0,
+                "canonical_alias_groups": 0,
+            },
+            "source_roles": {},
+            "shared_original_sources": [],
+            "authority_policy": {
+                "max_bonus": float(AGENT_WEB_SEARCH_LOCAL_GRAPH_AUTHORITY_BONUS_MAX),
+                "max_base_score_ratio": 0.12,
+                "priority": "content_relevance_and_source_trust_first",
+            },
+        }
+        if not candidates:
+            return {"nodes": {}, "summary": empty_summary}
+
+        seed_urls: list[str] = []
+        for row in candidates[:max_nodes]:
+            for value in (row.get("url", ""), row.get("canonical_url", "")):
+                url = str(value or "")
+                if url and url not in seed_urls:
+                    seed_urls.append(url)
+        if not seed_urls:
+            return {"nodes": {}, "summary": empty_summary}
+
+        placeholders = ",".join("?" for _ in seed_urls)
+        with self._connect() as conn:
+            raw_edge_rows = [
+                dict(row)
+                for row in conn.execute(
+                    f"SELECT src, dst, anchor, discovered_at, COALESCE(occurrences, 1) AS occurrences "
+                    f"FROM links WHERE src IN ({placeholders}) OR dst IN ({placeholders}) "
+                    "ORDER BY discovered_at DESC, src, dst, anchor LIMIT ?",
+                    tuple(seed_urls) + tuple(seed_urls) + (scan_limit,),
+                )
+            ]
+            endpoint_urls = set(seed_urls)
+            seed_set = set(seed_urls)
+            endpoint_budget = max(len(endpoint_urls), max_nodes * 3)
+            endpoint_rows = sorted(
+                raw_edge_rows,
+                key=lambda row: (
+                    0 if row.get("src") in seed_set and row.get("dst") in seed_set else (1 if row.get("dst") in seed_set else 2),
+                    -float(row.get("discovered_at", 0.0) or 0.0),
+                    str(row.get("src", "") or ""),
+                    str(row.get("dst", "") or ""),
+                ),
+            )
+            for row in endpoint_rows:
+                for value in (row.get("src", ""), row.get("dst", "")):
+                    url = str(value or "")
+                    if url and (url in endpoint_urls or len(endpoint_urls) < endpoint_budget):
+                        endpoint_urls.add(url)
+                if len(endpoint_urls) >= endpoint_budget:
+                    break
+            page_rows: list[dict] = []
+            endpoint_list = sorted(url for url in endpoint_urls if url)
+            for offset in range(0, len(endpoint_list), 400):
+                chunk = endpoint_list[offset : offset + 400]
+                chunk_placeholders = ",".join("?" for _ in chunk)
+                page_rows.extend(
+                    dict(row)
+                    for row in conn.execute(
+                        f"SELECT url, canonical_url, domain, title, description, source_type, fetched_at "
+                        f"FROM pages WHERE url IN ({chunk_placeholders}) OR canonical_url IN ({chunk_placeholders})",
+                        tuple(chunk) + tuple(chunk),
+                    )
+                )
+
+        aliases: dict[str, str] = {}
+        for row in page_rows:
+            raw_key = self._graph_url_key(str(row.get("url", "") or ""))
+            canonical_key = self._graph_url_key(str(row.get("canonical_url", "") or "")) or raw_key
+            if raw_key:
+                aliases[raw_key] = canonical_key
+            if canonical_key:
+                aliases[canonical_key] = canonical_key
+        for row in candidates:
+            raw_key = self._graph_url_key(str(row.get("url", "") or ""))
+            canonical_key = self._graph_url_key(str(row.get("canonical_url", "") or "")) or raw_key
+            if raw_key:
+                aliases[raw_key] = canonical_key
+            if canonical_key:
+                aliases[canonical_key] = canonical_key
+
+        def resolve_url(value: object) -> str:
+            key = self._graph_url_key(str(value or ""))
+            return aliases.get(key, key)
+
+        candidate_nodes: list[str] = []
+        candidate_by_node: dict[str, dict] = {}
+        for row in candidates:
+            node = resolve_url(row.get("canonical_url") or row.get("url"))
+            if not node:
+                continue
+            if node not in candidate_nodes and len(candidate_nodes) < max_nodes:
+                candidate_nodes.append(node)
+            previous = candidate_by_node.get(node)
+            if previous is None or float(row.get("score", 0.0) or 0.0) > float(previous.get("score", 0.0) or 0.0):
+                candidate_by_node[node] = row
+        candidate_set = set(candidate_nodes)
+
+        normalized_edges: list[tuple[int, float, str, str, dict]] = []
+        all_endpoint_nodes = set(candidate_nodes)
+        for row in raw_edge_rows:
+            src = resolve_url(row.get("src"))
+            dst = resolve_url(row.get("dst"))
+            if not src or not dst or src == dst:
+                continue
+            all_endpoint_nodes.update((src, dst))
+            priority = 0 if src in candidate_set and dst in candidate_set else (1 if dst in candidate_set else 2)
+            normalized_edges.append((priority, -float(row.get("discovered_at", 0.0) or 0.0), src, dst, row))
+        normalized_edges.sort(key=lambda item: (item[0], item[1], item[2], item[3], str(item[4].get("anchor", "") or "")))
+
+        selected_nodes = set(candidate_nodes[:max_nodes])
+        for _priority, _time_key, src, dst, _row in normalized_edges:
+            if src not in selected_nodes and len(selected_nodes) < max_nodes:
+                selected_nodes.add(src)
+            if dst not in selected_nodes and len(selected_nodes) < max_nodes:
+                selected_nodes.add(dst)
+            if len(selected_nodes) >= max_nodes:
+                break
+
+        edge_map: dict[tuple[str, str], dict] = {}
+        edges_truncated = len(raw_edge_rows) >= scan_limit
+        for _priority, _time_key, src, dst, row in normalized_edges:
+            if src not in selected_nodes or dst not in selected_nodes:
+                continue
+            key = (src, dst)
+            if key not in edge_map:
+                if len(edge_map) >= max_edges:
+                    edges_truncated = True
+                    continue
+                edge_map[key] = {"src": src, "dst": dst, "anchors": Counter(), "occurrences": 0}
+            anchor = re.sub(r"\s+", " ", str(row.get("anchor", "") or "")).strip().lower()
+            occurrences = max(1, int(row.get("occurrences", 1) or 1))
+            edge_map[key]["anchors"][anchor] += occurrences
+            edge_map[key]["occurrences"] += occurrences
+
+        metadata_by_node: dict[str, dict] = {}
+        raw_aliases_by_node: dict[str, set[str]] = defaultdict(set)
+        for row in page_rows:
+            node = resolve_url(row.get("canonical_url") or row.get("url"))
+            if not node or node not in selected_nodes:
+                continue
+            raw_url = str(row.get("url", "") or "")
+            if raw_url:
+                raw_aliases_by_node[node].add(raw_url)
+            current = metadata_by_node.get(node)
+            if current is None or float(row.get("fetched_at", 0.0) or 0.0) > float(current.get("fetched_at", 0.0) or 0.0):
+                metadata_by_node[node] = row
+        for node, row in candidate_by_node.items():
+            if node in selected_nodes:
+                metadata_by_node[node] = row
+                raw_aliases_by_node[node].add(str(row.get("url", "") or node))
+
+        roles: dict[str, dict] = {}
+        for node in selected_nodes:
+            metadata = dict(metadata_by_node.get(node, {}))
+            metadata["url"] = str(metadata.get("url", "") or node)
+            roles[node] = self._classify_source_role(metadata, query)
+        title_clusters: dict[str, list[str]] = defaultdict(list)
+        for node, metadata in metadata_by_node.items():
+            fingerprint = self._source_title_fingerprint(str(metadata.get("title", "") or ""))
+            if len(fingerprint) >= 16:
+                title_clusters[fingerprint].append(node)
+        for nodes in title_clusters.values():
+            domains = {self._link_domain_identity(node) for node in nodes if self._link_domain_identity(node)}
+            if len(nodes) < 2 or len(domains) < 2:
+                continue
+            if not any(roles.get(node, {}).get("role") in {"official", "primary"} for node in nodes):
+                continue
+            for node in nodes:
+                if roles.get(node, {}).get("role") == "secondary":
+                    roles[node] = {"role": "repost", "trust": 0.3, "reasons": ["exact_cross_domain_title_copy"]}
+
+        anchor_edge_counts: Counter[str] = Counter()
+        for edge in edge_map.values():
+            for anchor in edge["anchors"]:
+                if anchor:
+                    anchor_edge_counts[anchor] += 1
+        reciprocal_pairs: set[frozenset[str]] = set()
+        duplicate_edge_count = 0
+        seo_edge_count = 0
+        for key, edge in edge_map.items():
+            reciprocal = (key[1], key[0]) in edge_map
+            if reciprocal:
+                reciprocal_pairs.add(frozenset(key))
+            duplicate_count = max(0, int(edge["occurrences"] or 0) - 1)
+            if duplicate_count:
+                duplicate_edge_count += 1
+            seo_reasons: list[str] = []
+            for anchor in edge["anchors"] or {"": 1}:
+                seo_reasons.extend(
+                    self._seo_link_reasons(
+                        anchor,
+                        edge["dst"],
+                        terms,
+                        duplicate_count=duplicate_count,
+                        reciprocal=reciprocal,
+                        repeated_anchor_edges=int(anchor_edge_counts.get(anchor, 0) or 0),
+                    )
+                )
+            edge["reciprocal"] = reciprocal
+            edge["duplicate_count"] = duplicate_count
+            edge["seo_reasons"] = list(dict.fromkeys(seo_reasons))
+            if edge["seo_reasons"]:
+                seo_edge_count += 1
+
+        incoming: dict[str, list[dict]] = defaultdict(list)
+        outgoing: dict[str, list[dict]] = defaultdict(list)
+        adjacency: dict[str, list[tuple[str, float]]] = defaultdict(list)
+        for edge in edge_map.values():
+            incoming[edge["dst"]].append(edge)
+            outgoing[edge["src"]].append(edge)
+            src_domain = self._link_domain_identity(edge["src"])
+            dst_domain = self._link_domain_identity(edge["dst"])
+            weight = 0.65 if src_domain and src_domain == dst_domain else 1.0
+            if edge["reciprocal"]:
+                weight *= 0.75
+            if edge["seo_reasons"]:
+                weight *= 0.35
+            adjacency[edge["src"]].append((edge["dst"], max(0.05, weight)))
+
+        ordered_nodes = sorted(selected_nodes)
+        max_base_score = max((float(row.get("score", 0.0) or 0.0) for row in candidate_by_node.values()), default=0.0)
+        personalization_raw: dict[str, float] = {}
+        for node in ordered_nodes:
+            trust = float(roles.get(node, {}).get("trust", 0.35) or 0.35)
+            if node in candidate_by_node:
+                base = max(0.0, float(candidate_by_node[node].get("score", 0.0) or 0.0))
+                relevance = base / max_base_score if max_base_score > 0 else 1.0
+                personalization_raw[node] = 0.02 + relevance * (0.7 + 0.3 * trust)
+            else:
+                personalization_raw[node] = 0.002 * (0.65 + 0.35 * trust)
+        personalization_total = sum(personalization_raw.values()) or 1.0
+        personalization = {node: personalization_raw[node] / personalization_total for node in ordered_nodes}
+        pagerank = dict(personalization)
+        converged = not bool(edge_map)
+        iterations_used = 0
+        for iteration in range(iterations):
+            next_rank = {node: (1.0 - damping) * personalization[node] for node in ordered_nodes}
+            dangling = sum(pagerank[node] for node in ordered_nodes if not adjacency.get(node))
+            for node in ordered_nodes:
+                next_rank[node] += damping * dangling * personalization[node]
+            for src, destinations in adjacency.items():
+                total_weight = sum(weight for _dst, weight in destinations) or 1.0
+                for dst, weight in destinations:
+                    next_rank[dst] += damping * pagerank.get(src, 0.0) * weight / total_weight
+            total_rank = sum(next_rank.values()) or 1.0
+            next_rank = {node: value / total_rank for node, value in next_rank.items()}
+            delta = sum(abs(next_rank[node] - pagerank.get(node, 0.0)) for node in ordered_nodes)
+            pagerank = next_rank
+            iterations_used = iteration + 1
+            if delta < 1e-10:
+                converged = True
+                break
+
+        common_sources: list[dict] = []
+        shared_sources_by_page: dict[str, list[str]] = defaultdict(list)
+        for target, target_edges in incoming.items():
+            citing_pages = sorted({str(edge["src"]) for edge in target_edges})
+            if len(citing_pages) < 2:
+                continue
+            citing_domains = sorted({self._link_domain_identity(src) for src in citing_pages if self._link_domain_identity(src)})
+            target_role = str(roles.get(target, {}).get("role", "unknown") or "unknown")
+            target_domain = self._link_domain_identity(target)
+            external_domains = [domain for domain in citing_domains if domain != target_domain]
+            likely_original = target_role in {"official", "primary"} or len(external_domains) >= 2
+            if not likely_original:
+                continue
+            common_sources.append(
+                {
+                    "original_url": target,
+                    "source_role": target_role,
+                    "citing_page_count": len(citing_pages),
+                    "independent_citing_domains": len(citing_domains),
+                    "external_citing_domains": len(external_domains),
+                    "citing_pages": citing_pages[:8],
+                }
+            )
+            for src in citing_pages:
+                shared_sources_by_page[src].append(target)
+        common_sources.sort(
+            key=lambda row: (
+                -int(row["external_citing_domains"]),
+                -int(row["citing_page_count"]),
+                str(row["original_url"]),
+            )
+        )
+
+        max_rank = max(pagerank.values(), default=0.0) or 1.0
+        node_metrics: dict[str, dict] = {}
+        for node in ordered_nodes:
+            node_domain = self._link_domain_identity(node)
+            inbound_edges = incoming.get(node, [])
+            outbound_edges = outgoing.get(node, [])
+            referring_domains = sorted(
+                {self._link_domain_identity(edge["src"]) for edge in inbound_edges if self._link_domain_identity(edge["src"])}
+            )
+            external_domains = [domain for domain in referring_domains if domain != node_domain]
+            reciprocal_links = sum(1 for edge in inbound_edges + outbound_edges if edge.get("reciprocal"))
+            duplicate_links = sum(int(edge.get("duplicate_count", 0) or 0) for edge in inbound_edges + outbound_edges)
+            seo_reasons = sorted(
+                {reason for edge in inbound_edges + outbound_edges for reason in (edge.get("seo_reasons", []) or [])}
+            )
+            ppr_normalized = float(pagerank.get(node, 0.0) or 0.0) / max_rank
+            reference_signal = min(1.0, math.log1p(len(external_domains)) / math.log(6.0))
+            evidence_gate = min(1.0, (len(inbound_edges) + len(external_domains)) / 2.0)
+            risk_penalty = min(0.8, len(seo_reasons) * 0.15 + duplicate_links * 0.04 + reciprocal_links * 0.03)
+            trust = float(roles.get(node, {}).get("trust", 0.35) or 0.35)
+            authority_signal = max(0.0, (0.7 * ppr_normalized + 0.3 * reference_signal) * evidence_gate - risk_penalty)
+            authority_signal = min(1.0, authority_signal * (0.65 + 0.35 * trust))
+            node_metrics[node] = {
+                "canonical_url": node,
+                "source_role": str(roles.get(node, {}).get("role", "unknown") or "unknown"),
+                "source_trust": round(trust, 4),
+                "source_role_reasons": list(roles.get(node, {}).get("reasons", []) or []),
+                "personalized_pagerank": round(float(pagerank.get(node, 0.0) or 0.0), 12),
+                "authority_signal": round(authority_signal, 6),
+                "referring_domain_count": len(referring_domains),
+                "external_referring_domain_count": len(external_domains),
+                "referring_domains": referring_domains[:12],
+                "inbound_link_count": len(inbound_edges),
+                "outbound_link_count": len(outbound_edges),
+                "reciprocal_link_count": reciprocal_links,
+                "duplicate_link_count": duplicate_links,
+                "suspected_seo_link_count": sum(1 for edge in inbound_edges + outbound_edges if edge.get("seo_reasons")),
+                "suspected_seo_reasons": seo_reasons,
+                "shared_original_sources": sorted(shared_sources_by_page.get(node, []))[:12],
+            }
+
+        canonical_alias_groups = [
+            {"canonical_url": node, "aliases": sorted(urls)[:12]}
+            for node, urls in sorted(raw_aliases_by_node.items())
+            if len(urls) > 1
+        ]
+        role_counts = Counter(
+            str(roles.get(node, {}).get("role", "unknown") or "unknown") for node in candidate_nodes if node in selected_nodes
+        )
+        referring_leaders = sorted(
+            (
+                {
+                    "url": node,
+                    "independent_domains": int(node_metrics[node]["referring_domain_count"]),
+                    "external_domains": int(node_metrics[node]["external_referring_domain_count"]),
+                    "personalized_pagerank": node_metrics[node]["personalized_pagerank"],
+                }
+                for node in candidate_nodes
+                if node in node_metrics and int(node_metrics[node]["referring_domain_count"]) > 0
+            ),
+            key=lambda row: (-int(row["external_domains"]), -float(row["personalized_pagerank"]), str(row["url"])),
+        )
+        summary = {
+            "scope": "query_local",
+            "candidate_count": len(candidate_nodes),
+            "node_count": len(selected_nodes),
+            "edge_count": len(edge_map),
+            "budgets": {
+                "max_nodes": max_nodes,
+                "max_edges": max_edges,
+                "nodes_truncated": len(all_endpoint_nodes) > max_nodes,
+                "edges_truncated": bool(edges_truncated),
+            },
+            "pagerank": {
+                "personalized": True,
+                "damping": damping,
+                "iterations": iterations_used,
+                "converged": bool(converged),
+                "score_sum": round(sum(pagerank.values()), 12),
+            },
+            "signals": {
+                "reciprocal_edges": len(reciprocal_pairs),
+                "duplicate_edges": duplicate_edge_count,
+                "suspected_seo_edges": seo_edge_count,
+                "canonical_alias_groups": len(canonical_alias_groups),
+            },
+            "source_roles": dict(sorted(role_counts.items())),
+            "shared_original_sources": common_sources[:20],
+            "canonical_source_groups": canonical_alias_groups[:20],
+            "referring_domain_leaders": referring_leaders[:10],
+            "authority_policy": {
+                "max_bonus": float(AGENT_WEB_SEARCH_LOCAL_GRAPH_AUTHORITY_BONUS_MAX),
+                "max_base_score_ratio": 0.12,
+                "priority": "content_relevance_and_source_trust_first",
+            },
+        }
+        return {"nodes": node_metrics, "summary": summary}
+
+    def _search_index_with_graph(
+        self,
+        query: str,
+        max_results: int = AGENT_WEB_SEARCH_DEFAULT_MAX_RESULTS,
+        freshness_days: int = 0,
+    ) -> tuple[list[dict], dict]:
         terms = _agent_web_query_terms(query)
         limit = _agent_web_int(max_results, AGENT_WEB_SEARCH_DEFAULT_MAX_RESULTS, 1, 30)
         since = now_ts() - int(freshness_days or 0) * 86400 if int(freshness_days or 0) > 0 else 0.0
@@ -1203,8 +1873,35 @@ class AgentWebSearchEngine:
                     where = f"({where}) AND fetched_at >= ?"
                     params_list.append(since)
                 rows = list(conn.execute(f"SELECT * FROM pages WHERE {where} ORDER BY fetched_at DESC LIMIT 160", tuple(params_list)))
-        scored = [self._score_row(row, terms, anchors) for row in rows]
+        scored = [self._score_row(row, terms, anchors, query=query) for row in rows]
         scored = [row for row in scored if row.get("score", 0) > 0 or not terms]
+        graph = self._query_local_link_analysis(query, scored)
+        graph_nodes = graph.get("nodes", {}) if isinstance(graph.get("nodes", {}), dict) else {}
+        for row in scored:
+            base_score = max(0.0, float(row.get("score", 0.0) or 0.0))
+            node = self._graph_url_key(str(row.get("canonical_url", "") or row.get("url", "")))
+            metrics = dict(graph_nodes.get(node, {})) if isinstance(graph_nodes.get(node, {}), dict) else {}
+            authority_signal = max(0.0, min(1.0, float(metrics.get("authority_signal", 0.0) or 0.0)))
+            absolute_cap = max(0.0, float(AGENT_WEB_SEARCH_LOCAL_GRAPH_AUTHORITY_BONUS_MAX))
+            relative_cap = base_score * 0.12
+            link_bonus = min(absolute_cap, relative_cap, absolute_cap * authority_signal)
+            if metrics:
+                row["source_role"] = str(metrics.get("source_role", row.get("source_role", "unknown")) or "unknown")
+                row["source_trust"] = float(metrics.get("source_trust", row.get("source_trust", 0.35)) or 0.35)
+                row["source_role_reasons"] = list(metrics.get("source_role_reasons", row.get("source_role_reasons", [])) or [])
+            row["base_score"] = round(base_score, 4)
+            row["link_authority_bonus"] = round(link_bonus, 4)
+            row["score"] = round(base_score + link_bonus, 4)
+            row["link_graph"] = {
+                "personalized_pagerank": float(metrics.get("personalized_pagerank", 0.0) or 0.0),
+                "referring_domain_count": int(metrics.get("referring_domain_count", 0) or 0),
+                "external_referring_domain_count": int(metrics.get("external_referring_domain_count", 0) or 0),
+                "reciprocal_link_count": int(metrics.get("reciprocal_link_count", 0) or 0),
+                "duplicate_link_count": int(metrics.get("duplicate_link_count", 0) or 0),
+                "suspected_seo_link_count": int(metrics.get("suspected_seo_link_count", 0) or 0),
+                "suspected_seo_reasons": list(metrics.get("suspected_seo_reasons", []) or []),
+                "shared_original_sources": list(metrics.get("shared_original_sources", []) or []),
+            }
         scored.sort(key=lambda row: float(row.get("score", 0.0) or 0.0), reverse=True)
         selected: list[dict] = []
         domain_counts: dict[str, int] = defaultdict(int)
@@ -1216,7 +1913,11 @@ class AgentWebSearchEngine:
             domain_counts[domain] += 1
             if len(selected) >= limit:
                 break
-        return selected
+        return selected, dict(graph.get("summary", {}) or {})
+
+    def _search_index(self, query: str, max_results: int = AGENT_WEB_SEARCH_DEFAULT_MAX_RESULTS, freshness_days: int = 0) -> list[dict]:
+        results, _graph = self._search_index_with_graph(query, max_results=max_results, freshness_days=freshness_days)
+        return results
 
     def _related_links_for_results(self, results: list[dict], terms: list[str], budget: int) -> list[str]:
         urls = [str(row.get("url", "") or "") for row in (results or []) if isinstance(row, dict) and row.get("url")]
@@ -1307,7 +2008,11 @@ class AgentWebSearchEngine:
                 if page.get("deadline_reached"):
                     deadline_reached = True
                     break
-        results = self._search_index(query, max_results=max_results, freshness_days=freshness_days)
+        results, local_link_graph = self._search_index_with_graph(
+            query,
+            max_results=max_results,
+            freshness_days=freshness_days,
+        )
         payload = {
             "ok": True,
             "mode": "deepen",
@@ -1318,6 +2023,7 @@ class AgentWebSearchEngine:
             "deadline_reached": bool(deadline_reached),
             "follow_errors": errors[:10],
             "results": results,
+            "local_link_graph": local_link_graph,
             "evidence_layers": self._evidence_summary(query),
             "next_actions": [
                 "fetch an exact high-scoring URL for full page evidence",
@@ -1396,23 +2102,30 @@ class AgentWebSearchEngine:
                 allow_html_discovery=allow_html_discovery,
                 max_chars=max_chars,
             )
-        results = self._search_index(query, max_results=max_results, freshness_days=freshness_days)
+        results, local_link_graph = self._search_index_with_graph(
+            query,
+            max_results=max_results,
+            freshness_days=freshness_days,
+        )
         payload = {
             "ok": True,
             "mode": "search",
             "query": query,
             "index": str(self.db_path),
             "results": results,
+            "local_link_graph": local_link_graph,
             "pages": discover_payload.get("pages", []) if discover_payload else [],
             "discovery": {
                 "ran": bool(discover_payload),
                 "fetched": int(discover_payload.get("fetched", 0) or 0) if discover_payload else 0,
                 "seeds": discover_payload.get("seeds", []) if discover_payload else [],
                 "errors": discover_payload.get("errors", []) if discover_payload else [],
+                "public": discover_payload.get("public_discovery", {}) if discover_payload else {},
             },
             "ranking_note": (
-                "Scores use query-local lexical, URL/path, source, freshness, anchor, and domain-diversity signals only; "
-                "no global iterative link ranking is used."
+                "Scores prioritize query relevance and source trust, then apply bounded query-local link authority. "
+                "Personalized PageRank runs only on this query's bounded candidate neighborhood; its bonus is capped "
+                "at 1.5 points and 12% of the page's base score, so link popularity cannot override relevance."
             ),
         }
         payload["evidence_layers"] = self._evidence_summary(query)

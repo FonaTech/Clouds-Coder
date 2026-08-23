@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=768 original-lines=10495-10528 hash=494ce756bc5b35d8
+# split-source: order=847 original-lines=15106-15139 hash=494ce756bc5b35d8
 
 
 def _ask_user_option_rows(raw_options: object, *, limit: int = 8) -> list[object]:
@@ -41,7 +41,7 @@ def _ask_user_option_rows(raw_options: object, *, limit: int = 8) -> list[object
             break
     return rows
 
-# split-source: order=769 original-lines=10529-10534 hash=4bfe2fe5ea6ce1a8
+# split-source: order=848 original-lines=15140-15145 hash=4bfe2fe5ea6ce1a8
 
 
 def _ask_user_option_value(option: object) -> str:
@@ -49,7 +49,7 @@ def _ask_user_option_value(option: object) -> str:
         return trim(str(option.get("value", option.get("id", option.get("label", ""))) or "").strip(), 400)
     return trim(str(option or "").strip(), 400)
 
-# split-source: order=840 original-lines=20489-20502 hash=f19c222e839c27ec
+# split-source: order=921 original-lines=26446-26459 hash=f19c222e839c27ec
 
 def tool_def(name: str, description: str, properties: dict, required: list[str] | None = None) -> dict:
     return {
@@ -65,7 +65,7 @@ def tool_def(name: str, description: str, properties: dict, required: list[str] 
         },
     }
 
-# split-source: order=841 original-lines=20503-20987 hash=7e04884c2080e744
+# split-source: order=922 original-lines=26460-26986 hash=06fb072ba785b90b
 
 TOOLS = [
     tool_def("bash", "Run a shell command.", {"command": {"type": "string"}}, ["command"]),
@@ -238,8 +238,18 @@ TOOLS = [
         ["question"],
     ),
     tool_def("task", "Spawn a subagent for isolated work.", {"prompt": {"type": "string"}, "agent_type": {"type": "string"}}, ["prompt"]),
-    tool_def("list_skills", "List skill names.", {}),
+    tool_def(
+        "list_skills",
+        "List skill names or recall a bounded metadata candidate set. No skill body is loaded.",
+        {
+            "query": {"type": "string"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+            "include_infrastructure": {"type": "boolean"},
+            "metadata": {"type": "boolean"},
+        },
+    ),
     tool_def("load_skill", "Load a skill by name.", {"name": {"type": "string"}}, ["name"]),
+    tool_def("unload_skill", "Unload a currently active or pinned skill. Hard-bound skills cannot be unloaded.", {"name": {"type": "string"}}, ["name"]),
     tool_def("list_skill_providers", "List discovered skill providers.", {}),
     tool_def("list_skill_protocols", "List supported skill backend protocols.", {}),
     tool_def(
@@ -373,9 +383,9 @@ TOOLS = [
     tool_def(
         "agent_web_search",
         (
-            "Autonomous bounded web research without third-party search APIs. "
-            "Use explicit seed_urls/domains when possible; otherwise it derives official/source domains from the query, "
-            "probes roots, robots, sitemaps, RSS/Atom, and bounded same-domain HTML links, then stores fetched pages in a local SQLite/FTS index. "
+            "Autonomous bounded web research without a search API key. "
+            "Use explicit seed_urls/domains when possible; otherwise cold queries use a public RSS search feed for candidate URLs, then the tool "
+            "probes roots, robots, sitemaps, RSS/Atom, and bounded same-domain HTML links and stores fetched pages in a local SQLite/FTS index. "
             "Use this for current open-web facts or source discovery; cite only returned fetched URLs. "
             "For relative dates or time-sensitive queries, ground query terms and freshness_days against the injected runtime temporal/local context; do not use stale years from model memory. "
             "Safety: http/https only, private/local networks blocked by default, robots obeyed, strict page/depth budgets."
@@ -410,7 +420,7 @@ TOOLS = [
         ["media_type", "prompt"],
     ),
     tool_def("background_run", "Run command in background.", {"command": {"type": "string"}, "timeout": {"type": "integer"}}, ["command"]),
-        tool_def(
+    tool_def(
             "check_background",
             (
                 "Inspect background tasks with summary/search/detail/tail modes. "
@@ -425,6 +435,38 @@ TOOLS = [
             "limit": {"type": "integer"},
             "max_chars": {"type": "integer"},
         },
+    ),
+    tool_def(
+        "list_background_processes",
+        (
+            "List or inspect background processes owned by the current authenticated user, including jobs from "
+            "other sessions belonging to that same user. Use process_id for exact detail, including the redacted "
+            "output tail. The ownership scope is enforced by the runtime and cannot be overridden."
+        ),
+        {
+            "process_id": {"type": "string"},
+            "session_id": {"type": "string"},
+            "status": {
+                "type": "string",
+                "enum": ["starting", "running", "stopping", "completed", "error", "terminated"],
+            },
+            "query": {"type": "string"},
+            "detail": {"type": "boolean"},
+            "limit": {"type": "integer"},
+        },
+    ),
+    tool_def(
+        "stop_background_process",
+        (
+            "Stop exactly one background process owned by the current authenticated user. First use "
+            "list_background_processes to obtain the exact process_id. Processes owned by other users remain "
+            "invisible and cannot be targeted."
+        ),
+        {
+            "process_id": {"type": "string"},
+            "reason": {"type": "string"},
+        },
+        ["process_id"],
     ),
     tool_def("task_create", "Create task.", {"subject": {"type": "string"}, "description": {"type": "string"}}, ["subject"]),
     tool_def("task_get", "Get task.", {"task_id": {"type": "integer"}}, ["task_id"]),
@@ -552,14 +594,14 @@ TOOLS = [
     ),
 ]
 
-# split-source: order=842 original-lines=20988-20989 hash=3ee29b226eaf3576
+# split-source: order=923 original-lines=26987-26988 hash=3ee29b226eaf3576
 
 TOOL_REQUIRED_ARGS: dict[str, list[str]] = {}
 
-# split-source: order=843 original-lines=20990-20990 hash=08ea091c248842a3
+# split-source: order=924 original-lines=26989-26989 hash=08ea091c248842a3
 TOOL_SPEC_BY_NAME: dict[str, dict] = {}
 
-# split-source: order=844 original-lines=20991-21000 hash=5b49546953f9369c
+# split-source: order=925 original-lines=26990-26999 hash=5b49546953f9369c
 for _tool in TOOLS:
     try:
         _fn = _tool.get("function", {})
@@ -571,17 +613,17 @@ for _tool in TOOLS:
     except Exception:
         continue
 
-# split-source: order=845 original-lines=21001-21002 hash=bfed07d2aedc6126
+# split-source: order=926 original-lines=27000-27001 hash=bfed07d2aedc6126
 
 TOOL_NAME_FUZZY_MAP: dict[str, str] = {}
 
-# split-source: order=846 original-lines=21003-21006 hash=61dd6436d3455b98
+# split-source: order=927 original-lines=27002-27005 hash=61dd6436d3455b98
 for _name in TOOL_SPEC_BY_NAME.keys():
     _key = re.sub(r"[^a-z0-9]+", "", str(_name or "").lower())
     if _key and _key not in TOOL_NAME_FUZZY_MAP:
         TOOL_NAME_FUZZY_MAP[_key] = str(_name)
 
-# split-source: order=847 original-lines=21007-21024 hash=8c7992dc17a67107
+# split-source: order=928 original-lines=27006-27023 hash=8c7992dc17a67107
 
 for _alias, _target in {
     "writefile": "write_file",
@@ -601,7 +643,7 @@ for _alias, _target in {
 }.items():
     TOOL_NAME_FUZZY_MAP[_alias] = _target
 
-# split-source: order=848 original-lines=21025-21041 hash=a168e414b363725e
+# split-source: order=929 original-lines=27024-27040 hash=a168e414b363725e
 
 
 def is_todo_resume_tool_name(raw: object) -> bool:
@@ -620,7 +662,7 @@ def is_todo_resume_tool_name(raw: object) -> bool:
         "resumetodos",
     }
 
-# split-source: order=849 original-lines=21042-21060 hash=b3e6ffc2768f20fa
+# split-source: order=930 original-lines=27041-27059 hash=b3e6ffc2768f20fa
 
 
 def canonicalize_tool_name(raw: object) -> str:
@@ -641,7 +683,7 @@ def canonicalize_tool_name(raw: object) -> str:
         return lowered
     return mapped or name
 
-# split-source: order=850 original-lines=21061-21076 hash=b445806005f59898
+# split-source: order=931 original-lines=27060-27075 hash=b445806005f59898
 
 
 def filter_tool_specs_for_runtime(tools: list[dict] | None, *, web_search_enabled: bool = DEFAULT_WEB_SEARCH_ENABLED) -> list[dict]:
@@ -659,7 +701,7 @@ def filter_tool_specs_for_runtime(tools: list[dict] | None, *, web_search_enable
         out.append(tool)
     return out
 
-# split-source: order=851 original-lines=21077-21087 hash=9ed4253b5af25719
+# split-source: order=932 original-lines=27076-27086 hash=9ed4253b5af25719
 
 
 # Fix F: orchestration / worktree / teammate-management tools a sync-mode developer
@@ -672,7 +714,7 @@ DEVELOPER_TOOL_DROP: set[str] = {
     "shutdown_request", "plan_approval", "scan_skills", "write_skill",
 }
 
-# split-source: order=852 original-lines=21088-21148 hash=6d3b7a2b319abd41
+# split-source: order=933 original-lines=27087-27150 hash=c3efb64c9011ad20
 
 AGENT_TOOL_ALLOWLIST: dict[str, set[str]] = {
     "explorer": {
@@ -683,6 +725,7 @@ AGENT_TOOL_ALLOWLIST: dict[str, set[str]] = {
         "ask_user",
         "list_skills",
         "load_skill",
+        "unload_skill",
         "list_skill_providers",
         "list_skill_protocols",
         "scan_skills",
@@ -691,6 +734,7 @@ AGENT_TOOL_ALLOWLIST: dict[str, set[str]] = {
         "task_get",
         "task_list",
         "check_background",
+        "list_background_processes",
         "read_inbox",
         "ask_colleague",
         "read_from_blackboard",
@@ -724,6 +768,7 @@ AGENT_TOOL_ALLOWLIST: dict[str, set[str]] = {
         "task_get",
         "task_list",
         "check_background",
+        "list_background_processes",
         "ask_colleague",
         "read_from_blackboard",
         "write_to_blackboard",

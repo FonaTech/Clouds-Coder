@@ -5,31 +5,198 @@
 
 from __future__ import annotations
 
-# split-source: order=62 original-lines=81-81 hash=03128a27cd7f6781
+# split-source: order=65 original-lines=68-70 hash=989c6f13a40655b6
+
+# BEGIN EMBEDDED COLLABORATION BACKEND
+COLLAB_DB_FILENAME = "collaboration.sqlite"
+
+# split-source: order=66 original-lines=71-71 hash=c56c7cb111836469
+COLLAB_SESSION_TTL_SECONDS = 24 * 60 * 60
+
+# split-source: order=67 original-lines=72-72 hash=8832150c0059657b
+COLLAB_PRESENCE_TTL_SECONDS = 10 * 60
+
+# split-source: order=68 original-lines=73-73 hash=de8ed94ab7864cc9
+COLLAB_PASSWORD_ITERATIONS = 600_000
+
+# split-source: order=69 original-lines=74-74 hash=36b49430566c8d18
+COLLAB_MAX_AVATAR_BYTES = 2 * 1024 * 1024
+
+# split-source: order=70 original-lines=75-75 hash=00e70de6f00e2d5b
+COLLAB_MAX_TEXT_BYTES = 2 * 1024 * 1024
+
+# split-source: order=71 original-lines=76-76 hash=01ff3e0cd1c8937d
+COLLAB_DELETE_RETENTION_DAYS = 30
+
+# split-source: order=72 original-lines=77-77 hash=64b98b9081f195c3
+COLLAB_EVENT_RETENTION = 100_000
+
+# split-source: order=73 original-lines=78-78 hash=b074247e70bde3e4
+COLLAB_AGENT_STALE_SECONDS = 15 * 60
+
+# split-source: order=74 original-lines=79-79 hash=1a5f7f9ad8a9f1ed
+COLLAB_AGENT_HEARTBEAT_INTERVAL_SECONDS = 5
+
+# split-source: order=75 original-lines=80-80 hash=023a10a71eb84937
+COLLAB_EXTERNAL_WRITE_SETTLE_SECONDS = 0.75
+
+# split-source: order=76 original-lines=81-81 hash=f5c7be3867936c6b
+COLLAB_EXTERNAL_WRITE_CONFIRMATIONS = 2
+
+# split-source: order=77 original-lines=82-82 hash=a696c4cb0610567f
+COLLAB_SCHEMA_VERSION = 3
+
+# split-source: order=101 original-lines=3323-3394 hash=2e2668bbaef4489c
+# END EMBEDDED COLLABORATION BACKEND
+
+# BEGIN EMBEDDED COLLABORATION WEB ASSETS
+COLLAB_INDEX_HTML = r"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Clouds Coder Collaboration</title>
+  <link rel="stylesheet" href="/assets/collaboration.css">
+</head>
+<body>
+  <main id="lobby" class="lobby-shell">
+    <section class="lobby-panel">
+      <div class="brand-row"><span class="brand-mark">CC</span><div><h1>协作空间</h1><p>Clouds Coder LAN Workspace</p></div></div>
+      <div id="transportWarning" class="warning hidden"></div>
+      <form id="admissionForm">
+        <label>项目名称或邀请码<input id="projectReference" required maxlength="100" autocomplete="off"></label>
+        <div class="field-grid">
+          <label>昵称<input id="nickname" required minlength="2" maxlength="48" autocomplete="nickname"></label>
+          <label>设备名称<input id="deviceLabel" maxlength="120" autocomplete="off"></label>
+        </div>
+        <label>项目密码<input id="projectPassword" type="password" required maxlength="512" autocomplete="current-password"></label>
+        <button class="primary" type="submit">申请加入</button>
+      </form>
+      <div id="pendingState" class="pending hidden"><strong>等待管理员批准</strong><p id="pendingDetail"></p><button id="retryAdmission" type="button">重新检查</button></div>
+      <p id="lobbyError" class="error-text"></p>
+    </section>
+  </main>
+
+  <main id="workspace" class="workbench hidden">
+    <header class="topbar">
+      <div class="project-title"><span class="brand-mark small">CC</span><div><strong id="projectName">Collaboration</strong><span id="memberName"></span></div></div>
+      <div id="connectionState" class="connection">连接中</div>
+      <button id="toggleAgentPane" class="mobile-agent-toggle" type="button">Agent</button>
+      <button id="returnLobby" type="button">返回大厅</button>
+    </header>
+    <nav class="tabs" aria-label="协作视图">
+      <button class="tab active" data-view="editor">工作区</button>
+      <button class="tab" data-view="blackboard">Blackboard</button>
+      <button class="tab" data-view="conflicts">冲突</button>
+      <button class="tab" data-view="members">成员</button>
+      <button class="tab" data-view="agents">Agents</button>
+    </nav>
+    <section id="editorView" class="view editor-view active">
+      <aside class="explorer">
+        <div class="pane-head"><strong>共享文件</strong><button id="refreshFiles" type="button" title="刷新文件">刷新</button></div>
+        <div id="fileList" class="file-list"></div>
+      </aside>
+      <section class="editor-column">
+        <div class="editor-toolbar"><span id="activePath">选择文件</span><span id="revisionState"></span><button id="saveFile" type="button" disabled>保存</button></div>
+        <div id="editorHost" class="editor-host"></div>
+        <textarea id="fallbackEditor" class="fallback-editor" spellcheck="false"></textarea>
+        <div id="editorEmpty" class="editor-empty">从左侧选择 UTF-8 文本文件</div>
+        <footer class="presence-bar"><span id="activeEditors">无人编辑</span><span id="cursorState"></span></footer>
+      </section>
+      <aside class="agent-pane">
+        <div class="pane-head"><strong>我的 Agent</strong><button id="newAgentSession" type="button">新会话</button></div>
+        <select id="agentSession"></select>
+        <div id="agentFeed" class="agent-feed"></div>
+        <form id="agentForm"><textarea id="agentPrompt" rows="3" placeholder="给我的私有 Agent 发送任务"></textarea><button class="primary" type="submit">发送</button></form>
+      </aside>
+    </section>
+    <section id="blackboardView" class="view data-view"><div class="section-head"><div><h2>Public Blackboard</h2><p>项目任务、文件意图和结果摘要</p></div><button id="newBlackboardItem" type="button">新建任务</button></div><div id="blackboardList" class="data-list"></div></section>
+    <section id="conflictsView" class="view data-view"><div class="section-head"><div><h2>冲突队列</h2><p>冻结文件、候选分支与人工仲裁</p></div></div><div id="conflictList" class="data-list"></div></section>
+    <section id="membersView" class="view data-view"><div class="section-head"><div><h2>在线成员</h2><p>昵称仅用于显示，权限绑定成员与设备身份</p></div></div><div id="memberList" class="member-grid"></div></section>
+    <section id="agentsView" class="view data-view"><div class="section-head"><div><h2>项目 Agents</h2><p>仅显示公共状态、工具摘要和结果，不显示私有对话</p></div></div><div id="agentList" class="data-list"></div></section>
+  </main>
+  <div id="toast" class="toast hidden"></div>
+  <script src="/assets/collaboration.js"></script>
+</body>
+</html>"""
+
+# split-source: order=102 original-lines=3395-3401 hash=d423b9107813c88d
+
+
+COLLAB_CSS = r"""
+:root{color-scheme:dark;--bg:#121416;--panel:#1a1d20;--panel2:#202429;--line:#30363d;--text:#e7e9ec;--muted:#9aa2ac;--accent:#3fb950;--blue:#58a6ff;--danger:#f85149;--warn:#d29922;--radius:6px}
+*{box-sizing:border-box}html,body{height:100%;margin:0}body{font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:var(--bg);color:var(--text);letter-spacing:0}button,input,textarea,select{font:inherit;letter-spacing:0}button{border:1px solid var(--line);border-radius:4px;background:#272c32;color:var(--text);padding:6px 10px;cursor:pointer}button:hover{background:#30363d}button:disabled{opacity:.45;cursor:not-allowed}.primary{background:#238636;border-color:#2ea043;font-weight:600}.primary:hover{background:#2ea043}.hidden{display:none!important}.brand-mark{display:grid;place-items:center;width:42px;height:42px;border:1px solid #3fb950;background:#17351e;color:#7ee787;border-radius:6px;font-weight:800}.brand-mark.small{width:30px;height:30px;font-size:11px}.lobby-shell{min-height:100%;display:grid;place-items:center;padding:24px;background:linear-gradient(135deg,#121416 0,#171b1f 65%,#152019 100%)}.lobby-panel{width:min(480px,100%);border:1px solid var(--line);background:var(--panel);padding:28px;border-radius:8px;box-shadow:0 22px 70px rgba(0,0,0,.35)}.brand-row{display:flex;align-items:center;gap:13px;margin-bottom:24px}.brand-row h1{font-size:22px;margin:0}.brand-row p{margin:2px 0 0;color:var(--muted)}label{display:grid;gap:6px;color:#c9d1d9;margin-bottom:14px}input,textarea,select{width:100%;border:1px solid var(--line);border-radius:4px;background:#0d1117;color:var(--text);padding:8px 9px;outline:none}input:focus,textarea:focus,select:focus{border-color:var(--blue);box-shadow:0 0 0 2px rgba(88,166,255,.15)}.field-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.lobby-panel form>.primary{width:100%;min-height:38px}.warning{border-left:3px solid var(--warn);background:#2d250e;color:#e3b341;padding:10px 12px;margin-bottom:16px}.pending{border:1px solid #4d4013;background:#26210f;padding:16px;border-radius:var(--radius)}.pending p{color:#d9bd67}.error-text{min-height:20px;color:#ff7b72}.workbench{height:100%;display:grid;grid-template-rows:46px 38px minmax(0,1fr);overflow:hidden}.topbar{display:flex;align-items:center;gap:16px;padding:0 12px;border-bottom:1px solid var(--line);background:#191c20}.project-title{display:flex;align-items:center;gap:10px;min-width:0}.project-title>div{display:grid}.project-title strong,.project-title span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.project-title span{font-size:11px;color:var(--muted)}.connection{margin-left:auto;color:var(--muted)}.connection.online{color:#7ee787}.connection.offline{color:#ff7b72}.tabs{display:flex;gap:0;border-bottom:1px solid var(--line);background:#171a1d;padding-left:10px;overflow:auto}.tab{border:0;border-bottom:2px solid transparent;border-radius:0;background:transparent;color:var(--muted);padding:0 14px}.tab.active{border-bottom-color:var(--blue);color:var(--text)}.view{display:none;min-height:0}.view.active{display:block}.editor-view.active{display:grid;grid-template-columns:230px minmax(340px,1fr) 310px;overflow:hidden}.explorer,.agent-pane{min-width:0;min-height:0;border-right:1px solid var(--line);background:#171a1d;display:flex;flex-direction:column}.agent-pane{border-right:0;border-left:1px solid var(--line)}.pane-head,.editor-toolbar{height:38px;flex:0 0 38px;display:flex;align-items:center;gap:8px;padding:0 9px;border-bottom:1px solid var(--line);background:#1b1f23}.pane-head strong,.editor-toolbar span:first-child{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.pane-head button,.editor-toolbar button{margin-left:auto;padding:3px 7px;font-size:11px}.file-list{overflow:auto;padding:4px}.file-row{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:5px;width:100%;border:0;background:transparent;text-align:left;padding:5px 7px;color:#c9d1d9}.file-row:hover,.file-row.active{background:#262b31}.file-row span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.file-row small{color:#6e7681}.editor-column{position:relative;min-width:0;min-height:0;display:grid;grid-template-rows:38px minmax(0,1fr) 25px;background:#0f1113}.editor-host,.fallback-editor{grid-row:2;min-width:0;min-height:0}.fallback-editor{display:none;resize:none;border:0;border-radius:0;padding:12px;font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.fallback-mode .fallback-editor{display:block}.editor-empty{position:absolute;inset:38px 0 25px;display:grid;place-items:center;color:#6e7681;background:#111315}.presence-bar{display:flex;align-items:center;justify-content:space-between;padding:0 9px;background:#1d2227;color:var(--muted);font-size:11px}.agent-pane select{margin:7px;width:calc(100% - 14px)}.agent-feed{flex:1;overflow:auto;padding:8px}.agent-message{border-bottom:1px solid #292e34;padding:8px 3px;white-space:pre-wrap;overflow-wrap:anywhere}.agent-message.user{color:#c9d1d9}.agent-message.assistant{color:#a5d6ff}.agent-pane form{border-top:1px solid var(--line);padding:8px}.agent-pane form button{width:100%;margin-top:6px}.data-view{overflow:auto;padding:20px max(18px,4vw)}.section-head{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;padding-bottom:14px;border-bottom:1px solid var(--line)}.section-head h2{margin:0;font-size:18px}.section-head p{margin:4px 0 0;color:var(--muted)}.data-list,.member-grid{display:grid;gap:8px;margin-top:14px}.member-grid{grid-template-columns:repeat(auto-fill,minmax(210px,1fr))}.data-card,.member-card{border:1px solid var(--line);background:var(--panel);padding:12px;border-radius:var(--radius)}.data-card h3,.member-card h3{margin:0 0 5px;font-size:14px}.meta{display:flex;gap:10px;flex-wrap:wrap;color:var(--muted);font-size:11px}.badge{display:inline-block;border:1px solid #3b434c;border-radius:10px;padding:1px 7px;color:#b8c0ca}.badge.warn{border-color:#6e5b19;color:#e3b341}.badge.good{border-color:#286c36;color:#7ee787}.empty{color:var(--muted);padding:24px;text-align:center}.toast{position:fixed;right:16px;bottom:16px;max-width:min(420px,calc(100vw - 32px));background:#272c32;border:1px solid #49515a;border-radius:6px;padding:10px 14px;box-shadow:0 12px 32px rgba(0,0,0,.4);z-index:50}.toast.error{border-color:#9e3632;color:#ffb4ad}
+.remote-cursor{border-left:2px solid #f778ba}.remote-cursor-1{border-left-color:#d2a8ff}.remote-cursor-2{border-left-color:#ffa657}.remote-cursor-3{border-left-color:#79c0ff}.remote-cursor-4{border-left-color:#7ee787}.mobile-agent-toggle{display:none}@media(max-width:980px){.editor-view.active{grid-template-columns:190px minmax(300px,1fr)}.mobile-agent-toggle{display:block}.agent-pane{display:none;position:fixed;right:0;top:84px;bottom:0;width:min(340px,90vw);z-index:20;box-shadow:-14px 0 32px rgba(0,0,0,.3)}.agent-pane.open{display:flex}.field-grid{grid-template-columns:1fr}}@media(max-width:640px){.editor-view.active{grid-template-columns:132px minmax(260px,1fr)}.topbar{gap:7px}.project-title{max-width:43vw}.tabs{padding-left:0}.tab{padding:0 10px}.lobby-panel{padding:20px}.data-view{padding:14px}.editor-toolbar #revisionState{display:none}}
+"""
+
+# split-source: order=103 original-lines=3402-3442 hash=2b5738a3354ee2ee
+
+
+COLLAB_JS = r"""
+const C={csrf:sessionStorage.getItem('clouds_collab_csrf')||'',deviceKey:localStorage.getItem('clouds_collab_device_key')||'',snapshot:null,eventSource:null,lastEvent:0,monaco:null,editor:null,model:null,doc:null,suppress:false,flushTimer:0,flushPromise:null,agentPoll:0,activeSession:'',refreshTimer:0,remoteDecorations:[]};
+const E=id=>document.getElementById(id),q=v=>encodeURIComponent(String(v??''));
+function node(tag,attrs={},text=''){const el=document.createElement(tag);for(const [k,v] of Object.entries(attrs)){if(k==='class')el.className=v;else el.setAttribute(k,v)}if(text!==''&&text!==undefined)el.textContent=String(text);return el}
+function toast(message,error=false){const el=E('toast');el.textContent=String(message||'');el.classList.toggle('error',error);el.classList.remove('hidden');clearTimeout(C.toastTimer);C.toastTimer=setTimeout(()=>el.classList.add('hidden'),3500)}
+function ensureDeviceKey(){if(C.deviceKey.length>=32)return C.deviceKey;const bytes=crypto.getRandomValues(new Uint8Array(32));C.deviceKey='device_'+Array.from(bytes,x=>x.toString(16).padStart(2,'0')).join('');localStorage.setItem('clouds_collab_device_key',C.deviceKey);return C.deviceKey}
+async function api(path,opt={}){const headers=new Headers(opt.headers||{});if(opt.body&&!headers.has('Content-Type'))headers.set('Content-Type','application/json');if(opt.method&&opt.method!=='GET'&&C.csrf)headers.set('X-CSRF-Token',C.csrf);const res=await fetch(path,{credentials:'same-origin',cache:'no-store',...opt,headers});const type=res.headers.get('content-type')||'';const body=type.includes('json')?await res.json():await res.text();if(!res.ok){const err=new Error(body?.error||body?.message||String(body)||`HTTP ${res.status}`);err.code=body?.code;err.details=body?.details;err.status=res.status;throw err}return body}
+async function bootstrap(){ensureDeviceKey();bind();try{const status=await api('/api/collab/v1/status');if(status.warning){E('transportWarning').textContent=status.warning;E('transportWarning').classList.remove('hidden')}if(status.authenticated){C.csrf=status.csrf_token||C.csrf;sessionStorage.setItem('clouds_collab_csrf',C.csrf);await enterWorkspace(status.snapshot,status.expires_at)}else showLobby()}catch(err){showLobby();E('lobbyError').textContent=err.message}}
+function showLobby(){clearTimeout(C.refreshTimer);E('workspace').classList.add('hidden');E('lobby').classList.remove('hidden');if(C.eventSource){C.eventSource.close();C.eventSource=null}}
+async function requestAdmission(){E('lobbyError').textContent='';const payload={project:E('projectReference').value.trim(),password:E('projectPassword').value,nickname:E('nickname').value.trim(),device_label:E('deviceLabel').value.trim(),device_key:ensureDeviceKey()};try{const out=await api('/api/collab/v1/admission',{method:'POST',body:JSON.stringify(payload)});E('projectPassword').value='';if(out.status==='pending'){E('admissionForm').classList.add('hidden');E('pendingState').classList.remove('hidden');E('pendingDetail').textContent=`设备短码 ${out.device_short_code}，批准后再次输入项目密码即可进入。`;return}C.csrf=out.csrf_token||'';sessionStorage.setItem('clouds_collab_csrf',C.csrf);await enterWorkspace(out.snapshot,out.expires_at)}catch(err){E('lobbyError').textContent=err.message}}
+async function enterWorkspace(snapshot,expiresAt=0){C.snapshot=snapshot;E('lobby').classList.add('hidden');E('workspace').classList.remove('hidden');E('projectName').textContent=snapshot?.project?.name||'Collaboration';E('memberName').textContent=snapshot?.member?.nickname||'';renderSnapshot();scheduleRefresh(expiresAt);await initMonaco();connectEvents();await loadAgentSessions()}
+function scheduleRefresh(expiresAt){clearTimeout(C.refreshTimer);const expiry=Number(expiresAt||0)*1000;if(!expiry)return;const delay=Math.max(60000,Math.min(23*3600000,expiry-Date.now()-3600000));C.refreshTimer=setTimeout(silentRefresh,delay)}
+async function silentRefresh(){try{const out=await api('/api/collab/v1/refresh',{method:'POST',body:JSON.stringify({device_key:ensureDeviceKey()})});C.csrf=out.csrf_token||'';sessionStorage.setItem('clouds_collab_csrf',C.csrf);scheduleRefresh(out.expires_at);connectEvents()}catch(err){toast(err.message,true);showLobby()}}
+async function initMonaco(){if(C.monaco||document.body.classList.contains('fallback-mode'))return;try{await loadScript('/assets/js_lib/monaco/min/vs/loader.js');window.MonacoEnvironment={getWorker:()=>new Worker('/assets/collab-monaco-worker.js')};window.require.config({paths:{vs:'/assets/js_lib/monaco/min/vs'}});await new Promise((resolve,reject)=>window.require(['vs/editor/editor.main'],resolve,reject));C.monaco=window.monaco;C.monaco.editor.defineTheme('collab-dark',{base:'vs-dark',inherit:true,rules:[],colors:{'editor.background':'#0f1113','editorLineNumber.foreground':'#59636e','editor.selectionBackground':'#264f78'}});C.editor=C.monaco.editor.create(E('editorHost'),{theme:'collab-dark',automaticLayout:true,fontSize:13,minimap:{enabled:false},scrollBeyondLastLine:false,wordWrap:'off'});C.editor.onDidChangeModelContent(()=>{if(C.suppress||!C.doc)return;C.doc.dirty=true;E('saveFile').disabled=false;clearTimeout(C.flushTimer);C.flushTimer=setTimeout(flushDocument,180)});C.editor.onDidChangeCursorSelection(ev=>sendPresence(ev.selection.positionLineNumber,ev.selection.positionColumn))}catch(err){document.body.classList.add('fallback-mode');E('fallbackEditor').oninput=()=>{if(C.suppress||!C.doc)return;C.doc.dirty=true;E('saveFile').disabled=false;clearTimeout(C.flushTimer);C.flushTimer=setTimeout(flushDocument,220)}}}
+function loadScript(src){return new Promise((resolve,reject)=>{const s=node('script',{src});s.onload=resolve;s.onerror=reject;document.head.appendChild(s)})}
+function editorValue(){return C.monaco&&C.model?C.model.getValue():E('fallbackEditor').value}
+function setEditorValue(value,path){C.suppress=true;if(C.monaco){if(C.model)C.model.dispose();C.model=C.monaco.editor.createModel(value,languageFor(path));C.editor.setModel(C.model)}else E('fallbackEditor').value=value;C.suppress=false}
+function languageFor(path){const ext=String(path).split('.').pop().toLowerCase();return ({js:'javascript',jsx:'javascript',ts:'typescript',tsx:'typescript',py:'python',json:'json',html:'html',css:'css',md:'markdown',yaml:'yaml',yml:'yaml',sh:'shell',sql:'sql'})[ext]||'plaintext'}
+function buildOp(oldText,newText){let prefix=0;while(prefix<oldText.length&&prefix<newText.length&&oldText[prefix]===newText[prefix])prefix++;let suffix=0;while(suffix<oldText.length-prefix&&suffix<newText.length-prefix&&oldText[oldText.length-1-suffix]===newText[newText.length-1-suffix])suffix++;const op=[];if(prefix)op.push({retain:prefix});const oldMid=oldText.length-prefix-suffix,newMid=newText.slice(prefix,newText.length-suffix);if(oldMid)op.push({delete:oldMid});if(newMid)op.push({insert:newMid});if(suffix)op.push({retain:suffix});return op.length?op:[{retain:oldText.length}]}
+async function flushDocument(){if(!C.doc||!C.doc.dirty||C.flushPromise)return;const target=editorValue(),base=C.doc.baseValue,op=buildOp(base,target);C.doc.dirty=false;E('revisionState').textContent='同步中';C.flushPromise=api(`/api/collab/v1/documents/${q(C.doc.path)}/operations`,{method:'POST',body:JSON.stringify({base_revision:C.doc.revision,client_operation_id:`${Date.now()}-${crypto.randomUUID()}`,operation:op})});try{await C.flushPromise;await openFile(C.doc.path,true);E('revisionState').textContent=`rev ${C.doc.revision}`}catch(err){C.doc.dirty=true;E('revisionState').textContent='冲突';toast(err.message,true);if(err.code==='document_frozen'||err.code==='external_write_conflict')await refreshSnapshot()}finally{C.flushPromise=null;E('saveFile').disabled=!C.doc?.dirty;if(C.doc?.dirty)setTimeout(flushDocument,80)}}
+async function openFile(path,preserveCursor=false){const beforePath=C.doc?.path;const position=preserveCursor&&beforePath===path&&C.editor?C.editor.getPosition():null;const out=await api(`/api/collab/v1/documents/${q(path)}`);if(!out.is_text){toast('二进制文件需要 revision 写入，当前编辑器只打开 UTF-8 文本。',true);return}C.doc={path,revision:out.revision,baseValue:out.content,dirty:false,frozen:!!out.frozen};setEditorValue(out.content,path);if(position&&C.editor)C.editor.setPosition(position);E('activePath').textContent=path;E('revisionState').textContent=`rev ${out.revision}${out.frozen?' · 已冻结':''}`;E('editorEmpty').classList.add('hidden');E('saveFile').disabled=true;renderFiles();await sendPresence(1,1)}
+function renderSnapshot(){renderFiles();renderMembers();renderBlackboard();renderConflicts();renderAgents();renderPresence()}
+function renderPresence(){const rows=(C.snapshot?.presence||[]).filter(row=>row.document_path&&(row.document_path===C.doc?.path));const names=rows.map(row=>(C.snapshot?.members||[]).find(member=>member.member_id===row.member_id)?.nickname||row.member_id.slice(0,8));E('activeEditors').textContent=names.length?`${names.join('、')} 正在编辑`:'无人编辑';const mine=rows.find(row=>row.member_id===C.snapshot?.member?.member_id);E('cursorState').textContent=mine?.cursor?.line?`Ln ${mine.cursor.line}, Col ${mine.cursor.column||1}`:'';if(C.monaco&&C.model){const remote=rows.filter(row=>row.member_id!==C.snapshot?.member?.member_id&&row.cursor?.line).map((row,index)=>{const pos=C.model.validatePosition({lineNumber:Number(row.cursor.line||1),column:Number(row.cursor.column||1)}),nickname=(C.snapshot?.members||[]).find(member=>member.member_id===row.member_id)?.nickname||row.member_id.slice(0,8);return{range:new C.monaco.Range(pos.lineNumber,pos.column,pos.lineNumber,pos.column),options:{inlineClassName:`remote-cursor remote-cursor-${index%5}`,hoverMessage:{value:`${nickname} 的光标`},stickiness:C.monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges}}});C.remoteDecorations=C.model.deltaDecorations(C.remoteDecorations||[],remote)}}
+function renderFiles(){const host=E('fileList');host.innerHTML='';const rows=C.snapshot?.documents||[];if(!rows.length){host.appendChild(node('div',{class:'empty'},'暂无文件'));return}for(const file of rows){const btn=node('button',{class:'file-row'+(C.doc?.path===file.path?' active':'')});btn.append(node('span',{},file.path),node('small',{},formatSize(file.size)));btn.onclick=()=>openFile(file.path).catch(err=>toast(err.message,true));host.appendChild(btn)}}
+function renderMembers(){const host=E('memberList');host.innerHTML='';for(const member of C.snapshot?.members||[]){const card=node('article',{class:'member-card'});card.append(node('h3',{},member.nickname),node('div',{class:'meta'},member.member_id===C.snapshot?.member?.member_id?'当前成员':'已批准'));host.appendChild(card)}if(!host.children.length)host.appendChild(node('div',{class:'empty'},'暂无成员'))}
+function renderBlackboard(){const host=E('blackboardList');host.innerHTML='';for(const item of C.snapshot?.blackboard||[]){const card=node('article',{class:'data-card'});card.append(node('h3',{},item.title),node('p',{},item.details||item.result_summary||''));const meta=node('div',{class:'meta'});meta.append(node('span',{class:'badge '+(item.status==='completed'?'good':'')},item.status),node('span',{},`revision ${item.revision}`));card.appendChild(meta);host.appendChild(card)}if(!host.children.length)host.appendChild(node('div',{class:'empty'},'Blackboard 暂无任务'))}
+function renderConflicts(){const host=E('conflictList');host.innerHTML='';for(const item of C.snapshot?.conflicts||[]){const card=node('article',{class:'data-card'});card.append(node('h3',{},item.path),node('p',{},item.reason));const meta=node('div',{class:'meta'});meta.append(node('span',{class:'badge warn'},item.status),node('span',{},`${(item.candidates||[]).length} 个候选分支`));card.appendChild(meta);host.appendChild(card)}if(!host.children.length)host.appendChild(node('div',{class:'empty'},'没有待处理冲突'))}
+function renderAgents(){const host=E('agentList');host.innerHTML='';for(const item of C.snapshot?.agents||[]){const card=node('article',{class:'data-card'});card.append(node('h3',{},item.agent_id),node('p',{},item.result_summary||item.tool_summary||'暂无公开摘要'));card.appendChild(node('div',{class:'meta'},`${item.status} · ${item.current_file||'未声明文件'}`));host.appendChild(card)}if(!host.children.length)host.appendChild(node('div',{class:'empty'},'暂无活跃 Agent'))}
+async function refreshSnapshot(){C.snapshot=await api('/api/collab/v1/snapshot');renderSnapshot()}
+function connectEvents(){if(C.eventSource)C.eventSource.close();C.eventSource=new EventSource(`/api/collab/v1/events?after=${Number(C.lastEvent||C.snapshot?.last_event_id||0)}`,{withCredentials:true});C.eventSource.onopen=()=>{E('connectionState').textContent='在线';E('connectionState').className='connection online'};C.eventSource.onerror=()=>{E('connectionState').textContent='重连中';E('connectionState').className='connection offline'};C.eventSource.onmessage=async ev=>{C.lastEvent=Math.max(C.lastEvent,Number(ev.lastEventId||0));let row={};try{row=JSON.parse(ev.data)}catch{return}if(row.type==='operation'&&row.data?.path===C.doc?.path&&row.data?.member_id!==C.snapshot?.member?.member_id&&!C.doc?.dirty&&!C.flushPromise)openFile(C.doc.path,true).catch(()=>{});if(['presence','blackboard','conflict','agent','permission','profile','file_change'].includes(row.type))refreshSnapshot().catch(()=>{})}}
+let presenceTimer=0;function sendPresence(line,column){clearTimeout(presenceTimer);presenceTimer=setTimeout(()=>api('/api/collab/v1/presence',{method:'POST',body:JSON.stringify({document_path:C.doc?.path||'',cursor:{line,column}})}).catch(()=>{}),180)}
+async function loadAgentSessions(){const out=await api('/api/collab/v1/agents/sessions');const select=E('agentSession');select.innerHTML='';for(const row of out.sessions||[]){const opt=node('option',{value:row.id},row.title||row.id);select.appendChild(opt)}if(!select.children.length){const created=await api('/api/collab/v1/agents/sessions',{method:'POST',body:JSON.stringify({title:'Shared workspace'})});select.appendChild(node('option',{value:created.id},created.title));}C.activeSession=select.value;select.onchange=()=>{C.activeSession=select.value;pollAgent()};pollAgent()}
+async function pollAgent(){clearTimeout(C.agentPoll);if(!C.activeSession)return;try{const out=await api(`/api/collab/v1/agents/sessions/${q(C.activeSession)}`);const feed=E('agentFeed');feed.innerHTML='';for(const row of out.conversation_feed||out.messages||[]){if(!['user','assistant'].includes(row.role))continue;feed.appendChild(node('div',{class:`agent-message ${row.role}`},row.content||''))}feed.scrollTop=feed.scrollHeight}catch(_){}C.agentPoll=setTimeout(pollAgent,1800)}
+async function sendAgentPrompt(){const text=E('agentPrompt').value.trim();if(!text||!C.activeSession)return;E('agentPrompt').value='';await api(`/api/collab/v1/agents/sessions/${q(C.activeSession)}/messages`,{method:'POST',body:JSON.stringify({content:text})});pollAgent()}
+function switchView(name){document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x.dataset.view===name));document.querySelectorAll('.view').forEach(x=>x.classList.remove('active'));E(name+'View').classList.add('active');E('workspace').querySelector('.agent-pane')?.classList.remove('open')}
+function bind(){E('admissionForm').onsubmit=ev=>{ev.preventDefault();requestAdmission()};E('retryAdmission').onclick=()=>{E('pendingState').classList.add('hidden');E('admissionForm').classList.remove('hidden');E('projectPassword').focus()};E('returnLobby').onclick=async()=>{try{await api('/api/collab/v1/logout',{method:'POST',body:'{}'})}catch{}C.csrf='';sessionStorage.removeItem('clouds_collab_csrf');showLobby()};E('toggleAgentPane').onclick=()=>E('workspace').querySelector('.agent-pane')?.classList.toggle('open');document.querySelectorAll('.tab').forEach(x=>x.onclick=()=>switchView(x.dataset.view));E('refreshFiles').onclick=()=>refreshSnapshot().catch(err=>toast(err.message,true));E('saveFile').onclick=()=>flushDocument();E('fallbackEditor').onkeyup=ev=>sendPresence(ev.target.value.slice(0,ev.target.selectionStart).split('\n').length,1);E('agentForm').onsubmit=ev=>{ev.preventDefault();sendAgentPrompt().catch(err=>toast(err.message,true))};E('newAgentSession').onclick=async()=>{const out=await api('/api/collab/v1/agents/sessions',{method:'POST',body:JSON.stringify({title:'Shared workspace'})});await loadAgentSessions();E('agentSession').value=out.id;C.activeSession=out.id};E('newBlackboardItem').onclick=async()=>{const title=prompt('任务标题');if(!title)return;await api('/api/collab/v1/blackboard',{method:'POST',body:JSON.stringify({title,status:'pending'})});await refreshSnapshot()}}
+function formatSize(n){const x=Number(n||0);return x<1024?`${x} B`:x<1048576?`${(x/1024).toFixed(1)} KB`:`${(x/1048576).toFixed(1)} MB`}
+window.addEventListener('DOMContentLoaded',bootstrap);
+"""
+
+# split-source: order=109 original-lines=3464-3464 hash=03128a27cd7f6781
 APP_VERSION = "0.1.1"
 
-# split-source: order=71 original-lines=90-90 hash=374dd0959ba27624
+# split-source: order=118 original-lines=3473-3473 hash=374dd0959ba27624
 IDE_AUTH_FILENAME = "ide_auth.sqlite"
 
-# split-source: order=72 original-lines=91-91 hash=0b4c17aeb10f1f74
+# split-source: order=119 original-lines=3474-3474 hash=0b4c17aeb10f1f74
 IDE_AUTH_SESSION_TTL_SECONDS = 24 * 60 * 60
 
-# split-source: order=73 original-lines=92-92 hash=5aaa76336d790f72
+# split-source: order=120 original-lines=3475-3475 hash=5aaa76336d790f72
 IDE_AUTH_MAX_ACTIVE_SESSIONS = 12
 
-# split-source: order=74 original-lines=93-93 hash=98f6060068fa0002
+# split-source: order=121 original-lines=3476-3476 hash=98f6060068fa0002
 IDE_DEVICE_SECRET_MIN_BYTES = 32
 
-# split-source: order=75 original-lines=94-94 hash=a404d9ae80b9befe
+# split-source: order=122 original-lines=3477-3477 hash=a404d9ae80b9befe
 IDE_DEVICE_LABEL_MAX_CHARS = 120
 
-# split-source: order=76 original-lines=95-95 hash=c617e0b20384cebb
+# split-source: order=123 original-lines=3478-3478 hash=c617e0b20384cebb
 IDE_DEVICE_PAIRING_TTL_SECONDS = 15 * 60
 
-# split-source: order=77 original-lines=96-96 hash=aa5a9ec9aa119f83
+# split-source: order=124 original-lines=3479-3479 hash=aa5a9ec9aa119f83
 IDE_WORKBENCH_STATE_FILENAME = "ide_workbench.json"
 
-# split-source: order=78 original-lines=97-134 hash=b803f271aab0220a
+# split-source: order=125 original-lines=3480-3517 hash=b803f271aab0220a
 IDE_PROMPT_ENHANCEMENT_BUDGETS = {
     "low": {
         "max_tokens": 1800,
@@ -69,178 +236,210 @@ IDE_PROMPT_ENHANCEMENT_BUDGETS = {
     },
 }
 
-# split-source: order=79 original-lines=135-135 hash=1545eb3da1b940f9
+# split-source: order=126 original-lines=3518-3518 hash=1545eb3da1b940f9
 IDE_EXTENSIONS_DIRNAME = "ide_extensions"
 
-# split-source: order=96 original-lines=219-219 hash=a997d472618f8d52
+# split-source: order=148 original-lines=3816-3816 hash=a997d472618f8d52
 LONG_OUTPUT_MODEL_PAGE_CHARS = 12_000
 
-# split-source: order=97 original-lines=220-220 hash=8c2491abb6e0cc7e
+# split-source: order=149 original-lines=3817-3817 hash=8c2491abb6e0cc7e
 LONG_OUTPUT_UI_PAGE_CHARS = 2_400
 
-# split-source: order=98 original-lines=221-221 hash=544872ccd2e85e14
+# split-source: order=150 original-lines=3818-3818 hash=544872ccd2e85e14
 LONG_OUTPUT_UI_PREVIEW_MAX_PAGES = 4
 
-# split-source: order=99 original-lines=222-222 hash=534ab4c23d27943f
+# split-source: order=151 original-lines=3819-3819 hash=534ab4c23d27943f
 LONG_OUTPUT_LISTING_OFFLOAD_CHARS = 6_000
 
-# split-source: order=100 original-lines=223-223 hash=915131cba81fe455
+# split-source: order=152 original-lines=3820-3820 hash=915131cba81fe455
 LONG_OUTPUT_READ_PAGE_LINES = 240
 
-# split-source: order=101 original-lines=224-224 hash=5ba10b04660cf554
+# split-source: order=153 original-lines=3821-3821 hash=5ba10b04660cf554
 LONG_OUTPUT_READ_PAGE_MAX_CHARS = 16_000
 
-# split-source: order=102 original-lines=225-225 hash=0f137f7221565dbc
+# split-source: order=154 original-lines=3822-3822 hash=0f137f7221565dbc
 LONG_OUTPUT_TEMP_MAX_FILES = 160
 
-# split-source: order=103 original-lines=226-226 hash=6f730f958cee9bf9
+# split-source: order=155 original-lines=3823-3823 hash=6f730f958cee9bf9
 READ_FILE_DEFAULT_MAX_CHARS = 50_000
 
-# split-source: order=104 original-lines=227-227 hash=5f1d47ca5e792fcf
+# split-source: order=156 original-lines=3824-3824 hash=5f1d47ca5e792fcf
 READ_FILE_HARD_MAX_CHARS = 120_000
 
-# split-source: order=105 original-lines=228-228 hash=458d55e17e7f2069
+# split-source: order=157 original-lines=3825-3825 hash=458d55e17e7f2069
 READ_FILE_OVERVIEW_HEAD_LINES = 80
 
-# split-source: order=106 original-lines=229-229 hash=50730e30641f4d18
+# split-source: order=158 original-lines=3826-3826 hash=50730e30641f4d18
 READ_FILE_SEARCH_MAX_MATCHES = 24
 
-# split-source: order=111 original-lines=234-234 hash=8b7e1cb77524d088
+# split-source: order=163 original-lines=3831-3831 hash=8b7e1cb77524d088
 CODE_ADMIN_PORT_OFFSET = 3
 
-# split-source: order=113 original-lines=236-239 hash=4f1953580ab11aba
+# split-source: order=165 original-lines=3833-3836 hash=4f1953580ab11aba
 # IDE follows the agent port like every other service (skills+1/rag+2/code+3/mcp+4),
 # at +5, instead of squatting on a fixed port that would collide with mcp-service at the
 # default --port. IDE_DEFAULT_PORT is kept only as a pre-config fallback constant.
 IDE_PORT_OFFSET = 5
 
-# split-source: order=114 original-lines=240-240 hash=5d58f0c9149c60a8
+# split-source: order=166 original-lines=3837-3837 hash=5d58f0c9149c60a8
 IDE_DEFAULT_PORT = 8084
 
-# split-source: order=116 original-lines=242-242 hash=5d2ec5bed6df683b
+# split-source: order=167 original-lines=3838-3838 hash=d82339baad5a90c5
+COLLAB_PORT_OFFSET = 7
+
+# split-source: order=169 original-lines=3840-3840 hash=5d2ec5bed6df683b
 DEFAULT_WEB_SEARCH_ENABLED = True
 
-# split-source: order=121 original-lines=247-247 hash=b42636ef8fc02ea6
+# split-source: order=174 original-lines=3845-3845 hash=b42636ef8fc02ea6
 DEFAULT_USER_MEMORY_MODE = "weak"
 
-# split-source: order=129 original-lines=258-258 hash=cb0ecd939b7207f4
+# split-source: order=182 original-lines=3856-3856 hash=cb0ecd939b7207f4
 AGENT_WEB_SEARCH_USER_AGENT = "CloudsCoderAgentWebSearch/1.0 (+bounded autonomous agent research)"
 
-# split-source: order=130 original-lines=259-259 hash=48f97c2fe1dea0f5
+# split-source: order=183 original-lines=3857-3857 hash=48f97c2fe1dea0f5
 AGENT_WEB_SEARCH_DEFAULT_MAX_RESULTS = 8
 
-# split-source: order=131 original-lines=260-260 hash=04cbb6f9caed1662
+# split-source: order=184 original-lines=3858-3858 hash=04cbb6f9caed1662
 AGENT_WEB_SEARCH_DEFAULT_MAX_PAGES = 12
 
-# split-source: order=132 original-lines=261-261 hash=08da7aca32d704a4
+# split-source: order=185 original-lines=3859-3859 hash=08da7aca32d704a4
 AGENT_WEB_SEARCH_HARD_MAX_PAGES = 60
 
-# split-source: order=133 original-lines=262-262 hash=6d9b4580a7f0aca5
+# split-source: order=186 original-lines=3860-3860 hash=6d9b4580a7f0aca5
 AGENT_WEB_SEARCH_DEFAULT_DEPTH = 1
 
-# split-source: order=134 original-lines=263-263 hash=8cd74128bb1256e5
+# split-source: order=187 original-lines=3861-3861 hash=8cd74128bb1256e5
 AGENT_WEB_SEARCH_HARD_DEPTH = 2
 
-# split-source: order=135 original-lines=264-264 hash=490574a43d92b115
+# split-source: order=188 original-lines=3862-3862 hash=490574a43d92b115
 AGENT_WEB_SEARCH_FETCH_TIMEOUT = 12.0
 
-# split-source: order=136 original-lines=265-265 hash=0e696a345340d3e2
+# split-source: order=189 original-lines=3863-3863 hash=0e696a345340d3e2
 AGENT_WEB_SEARCH_TOOL_SOFT_TIMEOUT = 76.0
 
-# split-source: order=137 original-lines=266-266 hash=2c9401545c0b495b
+# split-source: order=190 original-lines=3864-3864 hash=2c9401545c0b495b
 AGENT_WEB_SEARCH_MAX_PAGE_BYTES = 1_200_000
 
-# split-source: order=138 original-lines=267-267 hash=ca9c9e400a625eed
+# split-source: order=191 original-lines=3865-3865 hash=ca9c9e400a625eed
 AGENT_WEB_SEARCH_MAX_TEXT_CHARS = 80_000
 
-# split-source: order=148 original-lines=289-289 hash=6d9c418366a43fc9
+# split-source: order=192 original-lines=3866-3868 hash=3f86128c62290c9e
+AGENT_WEB_SEARCH_PUBLIC_DISCOVERY_ENABLED = str(
+    os.getenv("AGENT_WEB_SEARCH_PUBLIC_DISCOVERY", "true") or "true"
+).strip().lower() not in {"0", "false", "no", "off"}
+
+# split-source: order=193 original-lines=3869-3869 hash=4f7bd9752dc1f741
+AGENT_WEB_SEARCH_PUBLIC_FEED_URL = "https://www.bing.com/search?format=rss&q={query}"
+
+# split-source: order=194 original-lines=3870-3870 hash=03e9d05405290318
+AGENT_WEB_SEARCH_PUBLIC_FEED_MAX_BYTES = 600_000
+
+# split-source: order=195 original-lines=3871-3871 hash=b0b8c24a0933d4f9
+AGENT_WEB_SEARCH_LOCAL_GRAPH_MAX_NODES = 300
+
+# split-source: order=196 original-lines=3872-3872 hash=fb9eeff9e5ae0dfc
+AGENT_WEB_SEARCH_LOCAL_GRAPH_MAX_EDGES = 4_000
+
+# split-source: order=197 original-lines=3873-3873 hash=6af26e24dfda231b
+AGENT_WEB_SEARCH_LOCAL_GRAPH_EDGE_SCAN_MULTIPLIER = 3
+
+# split-source: order=198 original-lines=3874-3874 hash=2821e54095c94d31
+AGENT_WEB_SEARCH_LOCAL_GRAPH_PAGERANK_ITERATIONS = 24
+
+# split-source: order=199 original-lines=3875-3875 hash=169bb0e5c20e8fda
+AGENT_WEB_SEARCH_LOCAL_GRAPH_PAGERANK_DAMPING = 0.85
+
+# split-source: order=200 original-lines=3876-3876 hash=cd815eb666bcee9e
+AGENT_WEB_SEARCH_LOCAL_GRAPH_AUTHORITY_BONUS_MAX = 1.5
+
+# split-source: order=210 original-lines=3898-3898 hash=6d9c418366a43fc9
 CODE_CHUNK_CHARS = 1800
 
-# split-source: order=149 original-lines=290-290 hash=a3d5d3f00ca60280
+# split-source: order=211 original-lines=3899-3899 hash=a3d5d3f00ca60280
 CODE_CHUNK_OVERLAP = 120
 
-# split-source: order=150 original-lines=291-291 hash=5fb1eb141b1d74ed
+# split-source: order=212 original-lines=3900-3900 hash=5fb1eb141b1d74ed
 CODE_MAX_CHUNKS_PER_DOC = 260
 
-# split-source: order=188 original-lines=351-354 hash=3b4caf8923937cc0
+# split-source: order=250 original-lines=3960-3963 hash=3b4caf8923937cc0
 CODE_IMPORT_WORKER_COUNT = max(
     1,
     min(4, int(str(os.getenv("AGENT_CODE_IMPORT_WORKERS", str(RAG_IMPORT_WORKER_COUNT)) or str(RAG_IMPORT_WORKER_COUNT)))),
 )
 
-# split-source: order=190 original-lines=359-362 hash=d7f2530a10690848
+# split-source: order=252 original-lines=3968-3971 hash=d7f2530a10690848
 CODE_PARSE_TIMEOUT_SECONDS = max(
     10,
     min(180, int(str(os.getenv("AGENT_CODE_PARSE_TIMEOUT", str(RAG_PARSE_TIMEOUT_SECONDS)) or str(RAG_PARSE_TIMEOUT_SECONDS)))),
 )
 
-# split-source: order=191 original-lines=363-363 hash=38461f46593b5137
+# split-source: order=253 original-lines=3972-3972 hash=38461f46593b5137
 DEFAULT_CONTEXT_TOKEN_LIMIT = 200_000
 
-# split-source: order=192 original-lines=364-364 hash=ef2e26c29b28b031
+# split-source: order=254 original-lines=3973-3973 hash=ef2e26c29b28b031
 TOKEN_THRESHOLD = 1_000_000
 
-# split-source: order=193 original-lines=365-368 hash=c013e04d841477da
+# split-source: order=255 original-lines=3974-3977 hash=c013e04d841477da
 CONTEXT_AUTO_COMPACT_RESERVE_RATIO = max(
     0.01,
     min(0.20, float(str(os.getenv("AGENT_CONTEXT_RESERVE_RATIO", "0.05") or "0.05"))),
 )
 
-# split-source: order=194 original-lines=369-372 hash=05d2e021f1dc5f13
+# split-source: order=256 original-lines=3978-3981 hash=05d2e021f1dc5f13
 CONTEXT_ESTIMATE_SAFETY_MULTIPLIER = max(
     1.0,
     min(1.8, float(str(os.getenv("AGENT_CONTEXT_ESTIMATE_SAFETY_MULTIPLIER", "1.18") or "1.18"))),
 )
 
-# split-source: order=195 original-lines=373-376 hash=77d61ff3bf4f06da
+# split-source: order=257 original-lines=3982-3985 hash=77d61ff3bf4f06da
 CONTEXT_USAGE_CALIBRATION_MAX = max(
     CONTEXT_ESTIMATE_SAFETY_MULTIPLIER,
     min(2.5, float(str(os.getenv("AGENT_CONTEXT_USAGE_CALIBRATION_MAX", "2.20") or "2.20"))),
 )
 
-# split-source: order=196 original-lines=377-380 hash=259b43e78198df07
+# split-source: order=258 original-lines=3986-3989 hash=259b43e78198df07
 CONTEXT_ACTUAL_USAGE_RECENT_SECONDS = max(
     60,
     min(3600, int(str(os.getenv("AGENT_CONTEXT_ACTUAL_USAGE_RECENT_SECONDS", "600") or "600"))),
 )
 
-# split-source: order=197 original-lines=381-384 hash=1fff81f82b548117
+# split-source: order=259 original-lines=3990-3993 hash=1fff81f82b548117
 LARGE_FILE_AUTO_PAGE_BYTES = max(
     32 * 1024,
     int(str(os.getenv("AGENT_LARGE_FILE_AUTO_PAGE_BYTES", str(256 * 1024)) or str(256 * 1024))),
 )
 
-# split-source: order=198 original-lines=385-388 hash=408454e15a6e2540
+# split-source: order=260 original-lines=3994-3997 hash=408454e15a6e2540
 LARGE_FILE_AUTO_PAGE_LINES = max(
     1000,
     int(str(os.getenv("AGENT_LARGE_FILE_AUTO_PAGE_LINES", "4000") or "4000")),
 )
 
-# split-source: order=199 original-lines=389-392 hash=e8075bf3af10bf51
+# split-source: order=261 original-lines=3998-4001 hash=e8075bf3af10bf51
 LARGE_SOURCE_UPLOAD_EXCERPT_CHARS = max(
     1200,
     int(str(os.getenv("AGENT_LARGE_SOURCE_UPLOAD_EXCERPT_CHARS", "3200") or "3200")),
 )
 
-# split-source: order=200 original-lines=393-396 hash=098812c34988096a
+# split-source: order=262 original-lines=4002-4005 hash=098812c34988096a
 CHAT_UPLOAD_PARSE_QUEUE_MAX = max(
     2,
     min(64, int(str(os.getenv("AGENT_CHAT_UPLOAD_PARSE_QUEUE_MAX", "12") or "12"))),
 )
 
-# split-source: order=201 original-lines=397-400 hash=95d56f16eebe147a
+# split-source: order=263 original-lines=4006-4009 hash=95d56f16eebe147a
 CHAT_UPLOAD_PARSE_TIMEOUT_SECONDS = max(
     5,
     min(180, int(str(os.getenv("AGENT_CHAT_UPLOAD_PARSE_TIMEOUT", "45") or "45"))),
 )
 
-# split-source: order=202 original-lines=401-404 hash=27076b5c61066281
+# split-source: order=264 original-lines=4010-4013 hash=27076b5c61066281
 CHAT_UPLOAD_INLINE_TEXT_BYTES = max(
     16 * 1024,
     min(512 * 1024, int(str(os.getenv("AGENT_CHAT_UPLOAD_INLINE_TEXT_BYTES", "131072") or "131072"))),
 )
 
-# split-source: order=203 original-lines=405-411 hash=dcff8e90c538f8fd
+# split-source: order=265 original-lines=4014-4020 hash=dcff8e90c538f8fd
 CHAT_UPLOAD_PARSE_MAX_BYTES = max(
     256 * 1024,
     min(
@@ -249,7 +448,7 @@ CHAT_UPLOAD_PARSE_MAX_BYTES = max(
     ),
 )
 
-# split-source: order=204 original-lines=412-418 hash=0bb9a7b183a0333f
+# split-source: order=266 original-lines=4021-4027 hash=0bb9a7b183a0333f
 CHAT_UPLOAD_ZIP_ENTRY_MAX_BYTES = max(
     64 * 1024,
     min(
@@ -258,261 +457,261 @@ CHAT_UPLOAD_ZIP_ENTRY_MAX_BYTES = max(
     ),
 )
 
-# split-source: order=205 original-lines=419-422 hash=bc70a02d8eb365d6
+# split-source: order=267 original-lines=4028-4031 hash=bc70a02d8eb365d6
 CHAT_UPLOAD_TEXT_CONTEXT_CHARS = max(
     1200,
     min(12_000, int(str(os.getenv("AGENT_CHAT_UPLOAD_TEXT_CONTEXT_CHARS", "3200") or "3200"))),
 )
 
-# split-source: order=206 original-lines=423-426 hash=e45fad91a055c809
+# split-source: order=268 original-lines=4032-4035 hash=e45fad91a055c809
 CHAT_UPLOAD_PROMPT_MAX_FILES = max(
     2,
     min(12, int(str(os.getenv("AGENT_CHAT_UPLOAD_PROMPT_MAX_FILES", "6") or "6"))),
 )
 
-# split-source: order=207 original-lines=427-430 hash=f14bba4ce211c5f2
+# split-source: order=269 original-lines=4036-4039 hash=f14bba4ce211c5f2
 CHAT_UPLOAD_PROMPT_MAX_CHARS = max(
     2400,
     min(16_000, int(str(os.getenv("AGENT_CHAT_UPLOAD_PROMPT_MAX_CHARS", "6000") or "6000"))),
 )
 
-# split-source: order=208 original-lines=431-434 hash=31dca3d77d7f4e96
+# split-source: order=270 original-lines=4040-4043 hash=31dca3d77d7f4e96
 CHAT_UPLOAD_PROMPT_PER_FILE_CHARS = max(
     240,
     min(2000, int(str(os.getenv("AGENT_CHAT_UPLOAD_PROMPT_PER_FILE_CHARS", "700") or "700"))),
 )
 
-# split-source: order=209 original-lines=435-438 hash=cab80bd9623e4f2b
+# split-source: order=271 original-lines=4044-4047 hash=cab80bd9623e4f2b
 CHAT_UPLOAD_FRONTEND_WAIT_MS = max(
     0,
     min(5_000, int(str(os.getenv("AGENT_CHAT_UPLOAD_FRONTEND_WAIT_MS", "250") or "250"))),
 )
 
-# split-source: order=210 original-lines=439-442 hash=c1850ba4c94e4833
+# split-source: order=272 original-lines=4048-4051 hash=c1850ba4c94e4833
 CHAT_UPLOAD_AUTO_LIBRARY_INGEST = (
     str(os.getenv("AGENT_CHAT_UPLOAD_AUTO_LIBRARY_INGEST", "false") or "false").strip().lower()
     in {"1", "true", "yes", "on"}
 )
 
-# split-source: order=211 original-lines=443-446 hash=c62a654ce3cb2808
+# split-source: order=273 original-lines=4052-4055 hash=c62a654ce3cb2808
 CHAT_UPLOAD_INGEST_QUEUE_MAX = max(
     2,
     min(64, int(str(os.getenv("AGENT_CHAT_UPLOAD_INGEST_QUEUE_MAX", "8") or "8"))),
 )
 
-# split-source: order=212 original-lines=447-450 hash=4cda7027fbfb62f9
+# split-source: order=274 original-lines=4056-4059 hash=4cda7027fbfb62f9
 SESSION_SUBMIT_LOCK_TIMEOUT_SECONDS = max(
     0.05,
     min(2.0, float(str(os.getenv("AGENT_SESSION_SUBMIT_LOCK_TIMEOUT", "0.08") or "0.08"))),
 )
 
-# split-source: order=213 original-lines=451-454 hash=638d813154db7b08
+# split-source: order=275 original-lines=4060-4063 hash=638d813154db7b08
 SESSION_DEFERRED_START_QUEUE_MAX = max(
     4,
     min(80, int(str(os.getenv("AGENT_SESSION_DEFERRED_START_QUEUE_MAX", "24") or "24"))),
 )
 
-# split-source: order=214 original-lines=455-458 hash=f0f770fff8f1760d
+# split-source: order=276 original-lines=4064-4067 hash=f0f770fff8f1760d
 SESSION_WATCHDOG_INTERVAL_SECONDS = max(
     10,
     min(300, int(str(os.getenv("AGENT_SESSION_WATCHDOG_INTERVAL_SECONDS", "30") or "30"))),
 )
 
-# split-source: order=215 original-lines=459-462 hash=2f0af45aae578f5e
+# split-source: order=277 original-lines=4068-4071 hash=2f0af45aae578f5e
 SESSION_HEARTBEAT_STALE_SECONDS = max(
     60,
     min(7200, int(str(os.getenv("AGENT_SESSION_HEARTBEAT_STALE_SECONDS", "900") or "900"))),
 )
 
-# split-source: order=216 original-lines=463-466 hash=debbc13a0bd58163
+# split-source: order=278 original-lines=4072-4075 hash=debbc13a0bd58163
 SESSION_LIST_DEFAULT_LIMIT = max(
     50,
     min(1000, int(str(os.getenv("AGENT_SESSION_LIST_DEFAULT_LIMIT", "240") or "240"))),
 )
 
-# split-source: order=217 original-lines=467-467 hash=21e8078826b7ba9b
+# split-source: order=279 original-lines=4076-4076 hash=21e8078826b7ba9b
 IDLE_TIMEOUT = 60
 
-# split-source: order=218 original-lines=468-468 hash=1a34e5cff4506d8a
+# split-source: order=280 original-lines=4077-4077 hash=1a34e5cff4506d8a
 POLL_INTERVAL = 5
 
-# split-source: order=219 original-lines=469-469 hash=ecc63ca91f81dbaf
+# split-source: order=281 original-lines=4078-4078 hash=ecc63ca91f81dbaf
 SSE_HEARTBEAT_SECONDS = 15
 
-# split-source: order=220 original-lines=470-470 hash=a30d873cdb336db5
+# split-source: order=282 original-lines=4079-4079 hash=a30d873cdb336db5
 MODEL_CALL_PROGRESS_DELAY = 8.0
 
-# split-source: order=221 original-lines=471-471 hash=ee18cc3fa25431b0
+# split-source: order=283 original-lines=4080-4080 hash=ee18cc3fa25431b0
 MODEL_CALL_PROGRESS_INTERVAL = 12.0
 
-# split-source: order=222 original-lines=472-475 hash=fc51caddf4da1aba
+# split-source: order=284 original-lines=4081-4084 hash=fc51caddf4da1aba
 RUN_COMPLETION_SUMMARY_ENABLED = (
     str(os.getenv("AGENT_RUN_COMPLETION_SUMMARY", "false") or "false").strip().lower()
     in {"1", "true", "yes", "on"}
 )
 
-# split-source: order=223 original-lines=476-479 hash=c24b4663de1ae03b
+# split-source: order=285 original-lines=4085-4088 hash=c24b4663de1ae03b
 LLM_HTTP_RETRY_MAX_ATTEMPTS = max(
     0,
     min(10, int(str(os.getenv("AGENT_LLM_HTTP_RETRY_MAX_ATTEMPTS", "5") or "5"))),
 )
 
-# split-source: order=224 original-lines=480-483 hash=b687fffa93fa8803
+# split-source: order=286 original-lines=4089-4092 hash=b687fffa93fa8803
 LLM_HTTP_RETRY_DELAY_SECONDS = max(
     1.0,
     min(600.0, float(str(os.getenv("AGENT_LLM_HTTP_RETRY_DELAY_SECONDS", "60") or "60"))),
 )
 
-# split-source: order=225 original-lines=484-487 hash=49cd4f3ffd00005a
+# split-source: order=287 original-lines=4093-4096 hash=49cd4f3ffd00005a
 LLM_HTTP_RETRY_MAX_SECONDS = max(
     LLM_HTTP_RETRY_DELAY_SECONDS,
     min(1800.0, float(str(os.getenv("AGENT_LLM_HTTP_RETRY_MAX_SECONDS", "600") or "600"))),
 )
 
-# split-source: order=226 original-lines=488-491 hash=3788f6c3fe156cbd
+# split-source: order=288 original-lines=4097-4100 hash=3788f6c3fe156cbd
 LLM_HTTP_RETRY_404_ON_VLLM = (
     str(os.getenv("AGENT_LLM_HTTP_RETRY_404_ON_VLLM", "true") or "true").strip().lower()
     in {"1", "true", "yes", "on"}
 )
 
-# split-source: order=227 original-lines=492-492 hash=f5bc75cb9e79f51e
+# split-source: order=289 original-lines=4101-4101 hash=f5bc75cb9e79f51e
 LLM_HTTP_RETRY_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
 
-# split-source: order=228 original-lines=493-493 hash=a1dfeb4d99dabe31
+# split-source: order=290 original-lines=4102-4102 hash=a1dfeb4d99dabe31
 MAX_AGENT_ROUNDS = 200
 
-# split-source: order=229 original-lines=494-494 hash=404af4c5baeb3ff0
+# split-source: order=291 original-lines=4103-4103 hash=404af4c5baeb3ff0
 MIN_AGENT_ROUNDS = 8
 
-# split-source: order=230 original-lines=495-495 hash=bc272d57db99a4d9
+# split-source: order=292 original-lines=4104-4104 hash=bc272d57db99a4d9
 MAX_AGENT_ROUNDS_CAP = 400
 
-# split-source: order=231 original-lines=496-496 hash=f26c1e0b40321513
+# split-source: order=293 original-lines=4105-4105 hash=f26c1e0b40321513
 REPEATED_TOOL_LOOP_THRESHOLD = 2
 
-# split-source: order=232 original-lines=497-497 hash=43de54d0295b2c50
+# split-source: order=294 original-lines=4106-4106 hash=43de54d0295b2c50
 BASH_READ_LOOP_THRESHOLD = 10
 
-# split-source: order=233 original-lines=498-498 hash=ba920330b8bf4e94
+# split-source: order=295 original-lines=4107-4107 hash=ba920330b8bf4e94
 READ_FILE_LOOP_THRESHOLD = 6
 
-# split-source: order=234 original-lines=499-499 hash=f291a7324309ff27
+# split-source: order=296 original-lines=4108-4108 hash=f291a7324309ff27
 READ_FILE_LOOP_DISTINCT_SOFT_LIMIT = 5
 
-# split-source: order=235 original-lines=500-500 hash=2318ec75e6ee9dad
+# split-source: order=297 original-lines=4109-4109 hash=2318ec75e6ee9dad
 READ_FILE_COMPACT_PIN_DISTINCT = 8
 
-# split-source: order=236 original-lines=501-501 hash=5dd256960ee032f1
+# split-source: order=298 original-lines=4110-4110 hash=5dd256960ee032f1
 READ_FILE_COMPACT_PIN_MAX_CHARS = 12_000
 
-# split-source: order=237 original-lines=502-502 hash=15395f4ada0504ad
+# split-source: order=299 original-lines=4111-4111 hash=15395f4ada0504ad
 READ_CONTEXT_REGISTRY_MAX = 80
 
-# split-source: order=238 original-lines=503-503 hash=3003f5ea1ba7c71d
+# split-source: order=300 original-lines=4112-4112 hash=3003f5ea1ba7c71d
 READ_CONTEXT_PROMPT_MAX_ITEMS = 14
 
-# split-source: order=239 original-lines=504-504 hash=b8522d387d0a4bd4
+# split-source: order=301 original-lines=4113-4113 hash=b8522d387d0a4bd4
 READ_CONTEXT_PROMPT_MAX_CHARS = 5_000
 
-# split-source: order=240 original-lines=505-505 hash=e9fba2dd33cbb897
+# split-source: order=302 original-lines=4114-4114 hash=e9fba2dd33cbb897
 READ_CONTEXT_SUMMARY_MAX_CHARS = 520
 
-# split-source: order=241 original-lines=506-506 hash=c6d03b12abba5754
+# split-source: order=303 original-lines=4115-4115 hash=c6d03b12abba5754
 READ_CONTEXT_SHARED_MAX_ITEMS = 4
 
-# split-source: order=242 original-lines=507-507 hash=f8a73cef7b17a635
+# split-source: order=304 original-lines=4116-4116 hash=f8a73cef7b17a635
 READ_CONTEXT_POLICY_CHOICES = {"auto", "conservative", "balanced", "wide"}
 
-# split-source: order=243 original-lines=508-508 hash=b98c5d6d9f81664e
+# split-source: order=305 original-lines=4117-4117 hash=b98c5d6d9f81664e
 DEFAULT_READ_CONTEXT_POLICY = "auto"
 
-# split-source: order=244 original-lines=509-509 hash=31649ba71abc9e9f
+# split-source: order=306 original-lines=4118-4118 hash=31649ba71abc9e9f
 TOOL_MEMORY_REGISTRY_MAX = 120
 
-# split-source: order=245 original-lines=510-510 hash=6ef3d4b6a84c12d0
+# split-source: order=307 original-lines=4119-4119 hash=6ef3d4b6a84c12d0
 TOOL_MEMORY_PROMPT_MAX_ITEMS = 18
 
-# split-source: order=246 original-lines=511-511 hash=56eaa4f69ae1742d
+# split-source: order=308 original-lines=4120-4120 hash=56eaa4f69ae1742d
 TOOL_MEMORY_PROMPT_MAX_CHARS = 5_500
 
-# split-source: order=247 original-lines=512-512 hash=961ee07c161f8002
+# split-source: order=309 original-lines=4121-4121 hash=961ee07c161f8002
 TOOL_MEMORY_SUMMARY_MAX_CHARS = 620
 
-# split-source: order=248 original-lines=513-513 hash=79a8f04ee22720f5
+# split-source: order=310 original-lines=4122-4122 hash=79a8f04ee22720f5
 TOOL_MEMORY_SHARED_MAX_ITEMS = 5
 
-# split-source: order=249 original-lines=514-514 hash=a6527a720f218397
+# split-source: order=311 original-lines=4123-4123 hash=a6527a720f218397
 TOOL_MEMORY_COMPACT_PIN_DISTINCT = 10
 
-# split-source: order=250 original-lines=515-515 hash=785140d321ff1585
+# split-source: order=312 original-lines=4124-4124 hash=785140d321ff1585
 TOOL_MEMORY_COMPACT_PIN_MAX_CHARS = 10_000
 
-# split-source: order=251 original-lines=516-516 hash=2390055a2536f16f
+# split-source: order=313 original-lines=4125-4125 hash=2390055a2536f16f
 TOOL_MEMORY_POLICY_CHOICES = READ_CONTEXT_POLICY_CHOICES
 
-# split-source: order=252 original-lines=517-517 hash=76b8b510959d7cea
+# split-source: order=314 original-lines=4126-4126 hash=76b8b510959d7cea
 DEFAULT_TOOL_MEMORY_POLICY = DEFAULT_READ_CONTEXT_POLICY
 
-# split-source: order=253 original-lines=518-518 hash=96b4ed206fb6cfbd
+# split-source: order=315 original-lines=4127-4127 hash=96b4ed206fb6cfbd
 DEFAULT_AUTO_TASK_LEVEL_CEILING = 2  # Applies only to automatic L1-L5 classification; 0 = no cap.
 
-# split-source: order=254 original-lines=519-519 hash=5dd2d6b152df4a77
+# split-source: order=316 original-lines=4128-4128 hash=5dd2d6b152df4a77
 HARD_BREAK_TOOL_ERROR_THRESHOLD = 20
 
-# split-source: order=255 original-lines=520-522 hash=4d0f227de7535157
+# split-source: order=317 original-lines=4129-4131 hash=4d0f227de7535157
 # Normal debugging often needs several corrected tool attempts before any
 # observable state changes. Keep this separate from the fused fault/error caps.
 HARD_BREAK_RECOVERY_ROUND_THRESHOLD = 10
 
-# split-source: order=256 original-lines=523-523 hash=ac753bf664ede6c7
+# split-source: order=318 original-lines=4132-4132 hash=ac753bf664ede6c7
 FUSED_FAULT_BREAK_THRESHOLD = 15
 
-# split-source: order=257 original-lines=524-524 hash=6e4792252b33bf60
+# split-source: order=319 original-lines=4133-4133 hash=6e4792252b33bf60
 STALL_SEVERITY_ESCALATION_THRESHOLD = 5
 
-# split-source: order=258 original-lines=525-525 hash=501dcba997fc15a6
+# split-source: order=320 original-lines=4134-4134 hash=501dcba997fc15a6
 STALL_SEVERITY_WEIGHT_BASH_READ_LOOP = 2
 
-# split-source: order=259 original-lines=526-526 hash=66e205b0f4cd29ff
+# split-source: order=321 original-lines=4135-4135 hash=66e205b0f4cd29ff
 STALL_SEVERITY_WEIGHT_REPEATED_TOOL = 3
 
-# split-source: order=260 original-lines=527-527 hash=7bad5632e14a7510
+# split-source: order=322 original-lines=4136-4136 hash=7bad5632e14a7510
 STALL_SEVERITY_WEIGHT_FAULT = 2
 
-# split-source: order=261 original-lines=528-528 hash=80af46bba23c9932
+# split-source: order=323 original-lines=4137-4137 hash=80af46bba23c9932
 STALL_SEVERITY_WEIGHT_RECOVERY_RETRY = 2
 
-# split-source: order=262 original-lines=529-529 hash=fa31813899fef561
+# split-source: order=324 original-lines=4138-4138 hash=fa31813899fef561
 STALL_SEVERITY_WEIGHT_WATCHDOG = 2
 
-# split-source: order=263 original-lines=530-530 hash=3bc653efe5386a7f
+# split-source: order=325 original-lines=4139-4139 hash=3bc653efe5386a7f
 STALL_SEVERITY_DECAY_ON_SUCCESS = 2
 
-# split-source: order=264 original-lines=531-531 hash=df0968fab8fcb27a
+# split-source: order=326 original-lines=4140-4140 hash=df0968fab8fcb27a
 STALL_ESCALATION_MIN_LEVEL = 2
 
-# split-source: order=265 original-lines=532-532 hash=e78e512be493c7ca
+# split-source: order=327 original-lines=4141-4141 hash=e78e512be493c7ca
 STALL_PLAN_SYNTHESIS_MAX_TOKENS = 3000
 
-# split-source: order=266 original-lines=533-533 hash=68fc0aa846eee84e
+# split-source: order=328 original-lines=4142-4142 hash=68fc0aa846eee84e
 STALL_ESCALATION_CONTEXT_MAX_CHARS = 3000
 
-# split-source: order=267 original-lines=534-534 hash=5fb0a99df98dca19
+# split-source: order=329 original-lines=4143-4143 hash=5fb0a99df98dca19
 MAX_RUN_SECONDS = 3000
 
-# split-source: order=268 original-lines=535-535 hash=ce790d7e327a4eae
+# split-source: order=330 original-lines=4144-4144 hash=ce790d7e327a4eae
 MIN_RUN_TIMEOUT_SECONDS = 600
 
-# split-source: order=269 original-lines=536-536 hash=7701edd8e6b598b7
+# split-source: order=331 original-lines=4145-4145 hash=7701edd8e6b598b7
 MAX_RUN_TIMEOUT_SECONDS = 86_400
 
-# split-source: order=270 original-lines=537-537 hash=9e0f737dcb072927
+# split-source: order=332 original-lines=4146-4146 hash=9e0f737dcb072927
 MIN_TIMEOUT_SECONDS = 600
 
-# split-source: order=271 original-lines=538-538 hash=001cc4628c24174c
+# split-source: order=333 original-lines=4147-4147 hash=001cc4628c24174c
 MAX_TIMEOUT_SECONDS = 86_400
 
-# split-source: order=272 original-lines=539-545 hash=a82f960fa474f532
+# split-source: order=334 original-lines=4148-4154 hash=a82f960fa474f532
 DEFAULT_TIMEOUT_SECONDS = max(
     MIN_TIMEOUT_SECONDS,
     min(
@@ -521,10 +720,10 @@ DEFAULT_TIMEOUT_SECONDS = max(
     ),
 )
 
-# split-source: order=273 original-lines=546-546 hash=e394d84014850541
+# split-source: order=335 original-lines=4155-4155 hash=e394d84014850541
 DEFAULT_REQUEST_TIMEOUT = DEFAULT_TIMEOUT_SECONDS
 
-# split-source: order=274 original-lines=547-562 hash=b6c694afe08a4d60
+# split-source: order=336 original-lines=4156-4171 hash=b6c694afe08a4d60
 # Patterns that indicate the shell process is waiting for interactive confirmation.
 # Checked against the tail of combined stdout+stderr (lowercased bytes).
 _SHELL_AUTO_CONFIRM_PATTERNS: tuple[bytes, ...] = (
@@ -542,13 +741,57 @@ _SHELL_AUTO_CONFIRM_PATTERNS: tuple[bytes, ...] = (
     b"enter to continue",
 )
 
-# split-source: order=275 original-lines=563-563 hash=eda5090ff7c057bc
+# split-source: order=337 original-lines=4172-4172 hash=eda5090ff7c057bc
 MIN_SHELL_COMMAND_TIMEOUT_SECONDS = 10
 
-# split-source: order=276 original-lines=564-564 hash=f8a21676c2aada41
+# split-source: order=338 original-lines=4173-4173 hash=f8a21676c2aada41
 MAX_SHELL_COMMAND_TIMEOUT_SECONDS = 86_400
 
-# split-source: order=277 original-lines=565-579 hash=872cc6e0309141ea
+# split-source: order=339 original-lines=4174-4174 hash=7936d48d534fff21
+SHELL_TIMEOUT_MODES = ("fixed", "auto", "async")
+
+# split-source: order=340 original-lines=4175-4178 hash=4e4b48f16677f0e5
+_DEFAULT_SHELL_TIMEOUT_MODE_RAW = str(
+    os.getenv("AGENT_SHELL_TIMEOUT_MODE", os.getenv("AGENT_BASH_TIMEOUT_MODE", "auto"))
+    or "auto"
+).strip().lower()
+
+# split-source: order=341 original-lines=4179-4183 hash=9a4146aac345203f
+DEFAULT_SHELL_TIMEOUT_MODE = (
+    _DEFAULT_SHELL_TIMEOUT_MODE_RAW
+    if _DEFAULT_SHELL_TIMEOUT_MODE_RAW in SHELL_TIMEOUT_MODES
+    else "auto"
+)
+
+# split-source: order=342 original-lines=4184-4184 hash=280b05b2444f1545
+MIN_SHELL_ASYNC_HANDOFF_SECONDS = 10
+
+# split-source: order=343 original-lines=4185-4185 hash=cad01336d59f25e9
+MAX_SHELL_ASYNC_HANDOFF_SECONDS = 86_400
+
+# split-source: order=344 original-lines=4186-4188 hash=47ed8d8a65266f46
+# Shell recovery guidance is event-driven. It is absent from normal prompts
+# and appears briefly after a failed or truncated shell result.
+SHELL_FAILURE_GUIDANCE_SECONDS = 900
+
+# split-source: order=345 original-lines=4189-4203 hash=cfd1f525cbdd6c02
+DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS = max(
+    MIN_SHELL_ASYNC_HANDOFF_SECONDS,
+    min(
+        MAX_SHELL_ASYNC_HANDOFF_SECONDS,
+        int(
+            str(
+                os.getenv(
+                    "AGENT_SHELL_ASYNC_HANDOFF_SECONDS",
+                    os.getenv("AGENT_BASH_ASYNC_HANDOFF_SECONDS", "600"),
+                )
+                or "600"
+            )
+        ),
+    ),
+)
+
+# split-source: order=346 original-lines=4204-4218 hash=872cc6e0309141ea
 DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS = max(
     MIN_SHELL_COMMAND_TIMEOUT_SECONDS,
     min(
@@ -565,7 +808,7 @@ DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS = max(
     ),
 )
 
-# split-source: order=278 original-lines=580-594 hash=3207ec68e115656f
+# split-source: order=347 original-lines=4219-4233 hash=3207ec68e115656f
 # Optional single-agent/no-plan bootstrap for lightweight (L1) sessions.  It is
 # deliberately disabled by default so existing L1 sessions keep their current
 # execution posture.  L2 uses the independent ``l2_todo_policy`` setting,
@@ -582,58 +825,58 @@ DEFAULT_SINGLE_NO_PLAN_TODO_PROMPT = (
     "invent unrelated work or switch to plan mode."
 )
 
-# split-source: order=279 original-lines=595-595 hash=304627c8157a045e
+# split-source: order=348 original-lines=4234-4234 hash=304627c8157a045e
 SINGLE_NO_PLAN_TODO_BOOTSTRAP_MAX_ATTEMPTS = 2
 
-# split-source: order=280 original-lines=596-596 hash=6589c7e3e6120908
+# split-source: order=349 original-lines=4235-4235 hash=6589c7e3e6120908
 AUTO_CONTINUE_BUDGET_DEFAULT = 30
 
-# split-source: order=281 original-lines=597-597 hash=81f1cdc998a51ca8
+# split-source: order=350 original-lines=4236-4236 hash=81f1cdc998a51ca8
 AGENT_MAX_OUTPUT_TOKENS = 16384
 
-# split-source: order=282 original-lines=598-598 hash=43d24a40fc50177b
+# split-source: order=351 original-lines=4237-4237 hash=43d24a40fc50177b
 OLLAMA_THINKING_TOOL_BUFFER = 4096
 
-# split-source: order=283 original-lines=599-599 hash=6cbb417436244bf5
+# split-source: order=352 original-lines=4238-4238 hash=6cbb417436244bf5
 WATCHDOG_INTENT_NO_TOOL_THRESHOLD = 2
 
-# split-source: order=284 original-lines=600-600 hash=4dcd997cebfcb00d
+# split-source: order=353 original-lines=4239-4239 hash=4dcd997cebfcb00d
 WATCHDOG_REPEAT_NO_TOOL_THRESHOLD = 2
 
-# split-source: order=285 original-lines=601-601 hash=0c4cc160a4eecc90
+# split-source: order=354 original-lines=4240-4240 hash=0c4cc160a4eecc90
 WATCHDOG_INTENT_NO_TOOL_THRESHOLD_SINGLE = 4
 
-# split-source: order=286 original-lines=602-602 hash=168b15b5d5192ecf
+# split-source: order=355 original-lines=4241-4241 hash=168b15b5d5192ecf
 WATCHDOG_REPEAT_NO_TOOL_THRESHOLD_SINGLE = 4
 
-# split-source: order=287 original-lines=603-603 hash=973603744a777214
+# split-source: order=356 original-lines=4242-4242 hash=973603744a777214
 WATCHDOG_STATE_STALL_THRESHOLD = 6
 
-# split-source: order=288 original-lines=604-604 hash=62020ffe53ec86ac
+# split-source: order=357 original-lines=4243-4243 hash=62020ffe53ec86ac
 WATCHDOG_CONTEXT_STALL_THRESHOLD = 2
 
-# split-source: order=289 original-lines=605-605 hash=a3c5037219c95cc5
+# split-source: order=358 original-lines=4244-4244 hash=a3c5037219c95cc5
 WATCHDOG_REPEAT_SIMILARITY_THRESHOLD = 0.85
 
-# split-source: order=290 original-lines=606-606 hash=bb6983fb5e4969db
+# split-source: order=359 original-lines=4245-4245 hash=bb6983fb5e4969db
 WATCHDOG_CONTEXT_NEAR_RATIO = 0.92
 
-# split-source: order=291 original-lines=607-607 hash=b2242f8e4c6b496d
+# split-source: order=360 original-lines=4246-4246 hash=b2242f8e4c6b496d
 WATCHDOG_MAX_DECOMPOSE_STEPS = 12
 
-# split-source: order=292 original-lines=608-608 hash=304c3e4c88ea8137
+# split-source: order=361 original-lines=4247-4247 hash=304c3e4c88ea8137
 WATCHDOG_STEP_MAX_ATTEMPTS = 2
 
-# split-source: order=293 original-lines=609-609 hash=349f50c558c90724
+# split-source: order=362 original-lines=4248-4248 hash=349f50c558c90724
 EMPTY_ACTION_MIN_CONTENT_CHARS = 5
 
-# split-source: order=294 original-lines=610-610 hash=d302097293b09c7b
+# split-source: order=363 original-lines=4249-4249 hash=d302097293b09c7b
 EMPTY_ACTION_WAKEUP_RETRY_LIMIT = 5
 
-# split-source: order=295 original-lines=611-611 hash=3fdbe7ffc78f5c1f
+# split-source: order=364 original-lines=4250-4250 hash=3fdbe7ffc78f5c1f
 THINKING_BUDGET_FORCE_RATIO = 0.85
 
-# split-source: order=296 original-lines=612-630 hash=9aed346389f8af8f
+# split-source: order=365 original-lines=4251-4272 hash=64ddcb605937b8ec
 # --- Tool timeout configuration ---
 _TOOL_TIMEOUT_MAP = {
     "read_file": 30,
@@ -646,7 +889,10 @@ _TOOL_TIMEOUT_MAP = {
     "agent_web_search": 90,
     "generate_media": 120,
     "load_skill": 20,
+    "unload_skill": 20,
     "list_skills": 10,
+    "list_background_processes": 10,
+    "stop_background_process": 10,
     "finish_task": 10,
     "finish_current_task": 10,
     "update_plan": 10,
@@ -654,10 +900,10 @@ _TOOL_TIMEOUT_MAP = {
     "compress": 30,
 }
 
-# split-source: order=297 original-lines=631-631 hash=3badf74b8d23a332
+# split-source: order=366 original-lines=4273-4273 hash=3badf74b8d23a332
 _DEFAULT_TOOL_TIMEOUT = 90
 
-# split-source: order=298 original-lines=632-642 hash=039047ff7ca49bcf
+# split-source: order=367 original-lines=4274-4286 hash=7b78f97cc7d886b1
 CONVERSATION_VISIBLE_TOOL_EVENTS = {
     "agent_web_search",
     "query_code_library",
@@ -665,12 +911,14 @@ CONVERSATION_VISIBLE_TOOL_EVENTS = {
     "tool_memory",
     "context_recall",
     "check_background",
+    "list_background_processes",
+    "stop_background_process",
     "list_skills",
     "list_skill_providers",
     "list_skill_protocols",
 }
 
-# split-source: order=299 original-lines=643-658 hash=bbe0a5f4bf05b6e8
+# split-source: order=368 original-lines=4287-4304 hash=fac3b78de264b375
 PERSIST_ON_EVENT_TYPES = {
     "command",
     "file_patch",
@@ -682,57 +930,59 @@ PERSIST_ON_EVENT_TYPES = {
     "error",
     "message",
     "skill_loaded",
+    "skill_unloaded",
+    "skill_selection",
     "plan_notice",
     "plan_approved_handoff",
     "step_verified",
     "todo_focus",
 }
 
-# split-source: order=300 original-lines=659-659 hash=dab464f4a6681b57
+# split-source: order=369 original-lines=4305-4305 hash=dab464f4a6681b57
 PERSIST_EVENT_MIN_INTERVAL_SECONDS = 1.5
 
-# split-source: order=301 original-lines=660-660 hash=d145e7696f8b6e7c
+# split-source: order=370 original-lines=4306-4306 hash=d145e7696f8b6e7c
 TRUNCATION_CONTINUATION_MAX_PASSES = 3
 
-# split-source: order=302 original-lines=661-661 hash=aeea6cb9a5a7802c
+# split-source: order=371 original-lines=4307-4307 hash=aeea6cb9a5a7802c
 TRUNCATION_CONTINUATION_MAX_TOKENS = 1800
 
-# split-source: order=303 original-lines=662-662 hash=b362b9a430f230bd
+# split-source: order=372 original-lines=4308-4308 hash=b362b9a430f230bd
 TRUNCATION_CONTINUATION_TAIL_CHARS = 2800
 
-# split-source: order=304 original-lines=663-663 hash=5a8c5a582672e139
+# split-source: order=373 original-lines=4309-4309 hash=5a8c5a582672e139
 TRUNCATION_CONTINUATION_ECHO_CHARS = 12000
 
-# split-source: order=305 original-lines=664-664 hash=13f883e0c500f236
+# split-source: order=374 original-lines=4310-4310 hash=13f883e0c500f236
 TRUNCATION_OVERLAP_SCAN_CHARS = 420
 
-# split-source: order=306 original-lines=665-665 hash=eae89e10ef4369ba
+# split-source: order=375 original-lines=4311-4311 hash=eae89e10ef4369ba
 TRUNCATION_PAIR_SCAN_CHARS = 120_000
 
-# split-source: order=307 original-lines=666-666 hash=206735da9ca74d98
+# split-source: order=376 original-lines=4312-4312 hash=206735da9ca74d98
 TRUNCATION_LIVE_BUFFER_MAX_CHARS = 32000
 
-# split-source: order=308 original-lines=667-667 hash=a19e06f68a32154b
+# split-source: order=377 original-lines=4313-4313 hash=a19e06f68a32154b
 MIN_CONTEXT_TOKEN_LIMIT = 4_000
 
-# split-source: order=309 original-lines=668-669 hash=82a8ec62579dfe9b
+# split-source: order=378 original-lines=4314-4315 hash=82a8ec62579dfe9b
 # Tiered compression thresholds (fraction of ctx_left / limit)
 COMPACT_TIER1_PCT = 0.40   # >40% left: normal; 20-40%: tier 1 light
 
-# split-source: order=310 original-lines=670-670 hash=fe1728c0fb47f223
+# split-source: order=379 original-lines=4316-4316 hash=fe1728c0fb47f223
 COMPACT_TIER2_PCT = 0.20   # 10-20%: tier 2 medium
 
-# split-source: order=311 original-lines=671-671 hash=8c7720b52f128bc4
+# split-source: order=380 original-lines=4317-4317 hash=8c7720b52f128bc4
 COMPACT_TIER3_PCT = 0.10   # <10%: tier 3 heavy
 
-# split-source: order=312 original-lines=672-673 hash=3908beb20becfd3e
+# split-source: order=381 original-lines=4318-4319 hash=3908beb20becfd3e
 # Absolute minimums — prevent percentage instability at low ctx_left
 COMPACT_TIER1_ABS = 3000
 
-# split-source: order=313 original-lines=674-674 hash=fe0db1a0ee5e0db6
+# split-source: order=382 original-lines=4320-4320 hash=fe0db1a0ee5e0db6
 COMPACT_TIER2_ABS = 1500
 
-# split-source: order=314 original-lines=675-681 hash=ec17bd79d731f50e
+# split-source: order=383 original-lines=4321-4327 hash=ec17bd79d731f50e
 CONTEXT_COMPACT_INEFFECTIVE_COOLDOWN_SECONDS = max(
     5.0,
     min(
@@ -741,71 +991,71 @@ CONTEXT_COMPACT_INEFFECTIVE_COOLDOWN_SECONDS = max(
     ),
 )
 
-# split-source: order=315 original-lines=682-683 hash=5e1874fbf1922a2e
+# split-source: order=384 original-lines=4328-4329 hash=5e1874fbf1922a2e
 # File buffer
 FILE_BUFFER_CONTENT_THRESHOLD = 2000  # chars: content larger than this gets offloaded
 
-# split-source: order=316 original-lines=684-684 hash=7c12351ee7dca714
+# split-source: order=385 original-lines=4330-4330 hash=7c12351ee7dca714
 FILE_BUFFER_MAX_FILES = 500
 
-# split-source: order=317 original-lines=685-685 hash=315b97aa3c361b8a
+# split-source: order=386 original-lines=4331-4331 hash=315b97aa3c361b8a
 AUTHORITATIVE_USER_GOAL_OPEN = "<authoritative-current-user-request>"
 
-# split-source: order=318 original-lines=686-686 hash=971c4cb5f712d084
+# split-source: order=387 original-lines=4332-4332 hash=971c4cb5f712d084
 AUTHORITATIVE_USER_GOAL_CLOSE = "</authoritative-current-user-request>"
 
-# split-source: order=319 original-lines=687-688 hash=86fadc5f8add80ca
+# split-source: order=388 original-lines=4333-4334 hash=86fadc5f8add80ca
 # Agent context limits per tier (messages count)
 AGENT_MSG_LIMIT_TIER0 = 800
 
-# split-source: order=320 original-lines=689-689 hash=4c34cb82b15562b1
+# split-source: order=389 original-lines=4335-4335 hash=4c34cb82b15562b1
 AGENT_MSG_LIMIT_TIER1 = 400
 
-# split-source: order=321 original-lines=690-690 hash=b344554068b7e437
+# split-source: order=390 original-lines=4336-4336 hash=b344554068b7e437
 AGENT_MSG_LIMIT_TIER2 = 200
 
-# split-source: order=322 original-lines=691-691 hash=00bba42734ec94ac
+# split-source: order=391 original-lines=4337-4337 hash=00bba42734ec94ac
 AGENT_MSG_LIMIT_TIER3 = 80
 
-# split-source: order=323 original-lines=692-692 hash=d02e0d81ccfae1f5
+# split-source: order=392 original-lines=4338-4338 hash=d02e0d81ccfae1f5
 AGENT_CTX_LIMIT_TIER0 = 400
 
-# split-source: order=324 original-lines=693-693 hash=3a49a78abe275b32
+# split-source: order=393 original-lines=4339-4339 hash=3a49a78abe275b32
 AGENT_CTX_LIMIT_TIER1 = 200
 
-# split-source: order=325 original-lines=694-694 hash=55dd310bb3da8ec8
+# split-source: order=394 original-lines=4340-4340 hash=55dd310bb3da8ec8
 AGENT_CTX_LIMIT_TIER2 = 100
 
-# split-source: order=326 original-lines=695-695 hash=06c16c04e024bf56
+# split-source: order=395 original-lines=4341-4341 hash=06c16c04e024bf56
 AGENT_CTX_LIMIT_TIER3 = 40
 
-# split-source: order=327 original-lines=696-696 hash=7b07d8695b2e312e
+# split-source: order=396 original-lines=4342-4342 hash=7b07d8695b2e312e
 MANAGER_CTX_LIMIT_TIER0 = 400
 
-# split-source: order=328 original-lines=697-697 hash=c5c2437f8ad9faca
+# split-source: order=397 original-lines=4343-4343 hash=c5c2437f8ad9faca
 MANAGER_CTX_LIMIT_TIER1 = 200
 
-# split-source: order=329 original-lines=698-698 hash=fcab4bf761597d8a
+# split-source: order=398 original-lines=4344-4344 hash=fcab4bf761597d8a
 MANAGER_CTX_LIMIT_TIER2 = 100
 
-# split-source: order=330 original-lines=699-699 hash=ba60f8163108104e
+# split-source: order=399 original-lines=4345-4345 hash=ba60f8163108104e
 MANAGER_CTX_LIMIT_TIER3 = 40
 
-# split-source: order=331 original-lines=700-700 hash=8415954b9ca23ca7
+# split-source: order=400 original-lines=4346-4346 hash=8415954b9ca23ca7
 MAX_CONTEXT_ARCHIVE_SEGMENTS = 1200
 
-# split-source: order=332 original-lines=701-702 hash=b80324a903ed6017
+# split-source: order=401 original-lines=4347-4348 hash=b80324a903ed6017
 # Display-only retained user bubbles (frontend persistence; not LLM context).
 MAX_USER_BUBBLE_LOG = 600
 
-# split-source: order=333 original-lines=703-707 hash=49ecc62e2717c14d
+# split-source: order=402 original-lines=4349-4353 hash=49ecc62e2717c14d
 # Manager->worker instruction budget. The old 1200/1400 cap forced the manager to
 # paraphrase the full goal + current step + failure context + concrete action into
 # ~200 tokens, dropping error traces and constraints — a major cause of poor
 # multi-agent worker output. Widened so handoffs keep enough intent.
 MANAGER_INSTRUCTION_MAX_CHARS = 3000
 
-# split-source: order=334 original-lines=708-713 hash=6e4a1b666867914f
+# split-source: order=403 original-lines=4354-4359 hash=6e4a1b666867914f
 # Manager-routing momentum: when a worker made real progress last round and the
 # active plan step is still in_progress, the manager would just re-route to the
 # same worker — a wasted HIGH/full LLM call. Instead reuse the prior route for up
@@ -813,56 +1063,56 @@ MANAGER_INSTRUCTION_MAX_CHARS = 3000
 # so the manager always regains control to re-plan / switch agents / finish.
 MANAGER_MOMENTUM_MAX_SKIPS = 3
 
-# split-source: order=335 original-lines=714-718 hash=0a4664c23e741dee
+# split-source: order=404 original-lines=4360-4364 hash=0a4664c23e741dee
 # How many times the explorer may be routed within the recent window on a
 # coding-type task before the anti-stall logic forces a switch to developer.
 # Was a hard-coded 2 (too aggressive — starved genuine research); raise so the
 # explorer can actually do its job. Tune down if exploration loops appear.
 MODEL_OUTPUT_RETRY_TIMES = 3
 
-# split-source: order=336 original-lines=719-719 hash=464727f244ad79e1
+# split-source: order=405 original-lines=4365-4365 hash=464727f244ad79e1
 ARBITER_TRIGGER_MIN_CONTENT_CHARS = 50
 
-# split-source: order=337 original-lines=720-720 hash=56a8b3fe8fe5417d
+# split-source: order=406 original-lines=4366-4366 hash=56a8b3fe8fe5417d
 ARBITER_VALID_PLANNING_STREAK_LIMIT = 4
 
-# split-source: order=338 original-lines=721-721 hash=75d9242b5cfeae50
+# split-source: order=407 original-lines=4367-4367 hash=75d9242b5cfeae50
 ARBITER_DEFAULT_TIMEOUT_SECONDS = 1.5
 
-# split-source: order=339 original-lines=722-722 hash=aeca2ffc3ad973e4
+# split-source: order=408 original-lines=4368-4368 hash=aeca2ffc3ad973e4
 ARBITER_DEFAULT_MAX_TOKENS = 64
 
-# split-source: order=340 original-lines=723-723 hash=321024700293cce7
+# split-source: order=409 original-lines=4369-4369 hash=321024700293cce7
 ARBITER_DEFAULT_TEMPERATURE = 0.0
 
-# split-source: order=341 original-lines=724-724 hash=1403699b26993ef1
+# split-source: order=410 original-lines=4370-4370 hash=1403699b26993ef1
 LIVE_INPUT_DELAY_WRITE_ROUNDS = 2
 
-# split-source: order=342 original-lines=725-725 hash=64b6c16b75158887
+# split-source: order=411 original-lines=4371-4371 hash=64b6c16b75158887
 LIVE_INPUT_DELAY_TOOL_ROUNDS = 1
 
-# split-source: order=343 original-lines=726-726 hash=10dcd5edc664444f
+# split-source: order=412 original-lines=4372-4372 hash=10dcd5edc664444f
 LIVE_INPUT_DELAY_NORMAL_ROUNDS = 0
 
-# split-source: order=344 original-lines=727-727 hash=b5619c6c7b833fce
+# split-source: order=413 original-lines=4373-4373 hash=b5619c6c7b833fce
 LIVE_INPUT_MAX_INJECTIONS = 3
 
-# split-source: order=345 original-lines=728-728 hash=b36d3ae9bd950bd2
+# split-source: order=414 original-lines=4374-4374 hash=b36d3ae9bd950bd2
 LIVE_INPUT_REINJECT_INTERVAL = 1
 
-# split-source: order=346 original-lines=729-729 hash=706384ac48596ed1
+# split-source: order=415 original-lines=4375-4375 hash=706384ac48596ed1
 LIVE_INPUT_WEIGHT_BASE_DELAYED = 0.35
 
-# split-source: order=347 original-lines=730-730 hash=433de4a3e5c97613
+# split-source: order=416 original-lines=4376-4376 hash=433de4a3e5c97613
 LIVE_INPUT_WEIGHT_BASE_NORMAL = 0.65
 
-# split-source: order=348 original-lines=731-731 hash=797c3add85932c2f
+# split-source: order=417 original-lines=4377-4377 hash=797c3add85932c2f
 LIVE_INPUT_WEIGHT_STEP_DELAYED = 0.30
 
-# split-source: order=349 original-lines=732-732 hash=5a2e0d6ac80c04ac
+# split-source: order=418 original-lines=4378-4378 hash=5a2e0d6ac80c04ac
 LIVE_INPUT_WEIGHT_STEP_NORMAL = 0.20
 
-# split-source: order=351 original-lines=739-745 hash=deb510a842140857
+# split-source: order=420 original-lines=4385-4391 hash=deb510a842140857
 BENIGN_SOCKET_DEBUG_LOG_ENABLED = str(os.getenv("AGENT_DEBUG_SOCKET_LOG", "") or "").strip().lower() in {
     "1",
     "true",
@@ -871,16 +1121,16 @@ BENIGN_SOCKET_DEBUG_LOG_ENABLED = str(os.getenv("AGENT_DEBUG_SOCKET_LOG", "") or
     "debug",
 }
 
-# split-source: order=352 original-lines=746-746 hash=95f173277a2b3041
+# split-source: order=421 original-lines=4392-4392 hash=95f173277a2b3041
 BENIGN_SOCKET_LOG_INTERVAL_SECONDS = 30.0
 
-# split-source: order=353 original-lines=747-747 hash=16bd723272a6a04e
+# split-source: order=422 original-lines=4393-4393 hash=16bd723272a6a04e
 FINAL_SUMMARY_MIN_CHARS = 80
 
-# split-source: order=354 original-lines=748-748 hash=2349aee5b109dfa2
+# split-source: order=423 original-lines=4394-4394 hash=2349aee5b109dfa2
 FINAL_SUMMARY_STRICT_MIN_CHARS = 120
 
-# split-source: order=355 original-lines=749-768 hash=9ccf68aa0b81c985
+# split-source: order=424 original-lines=4395-4414 hash=9ccf68aa0b81c985
 RUNTIME_CONTROL_HINT_PREFIXES = (
     "<reminder>",
     "<todo-rescue>",
@@ -902,7 +1152,7 @@ RUNTIME_CONTROL_HINT_PREFIXES = (
     "<single-no-plan-todo-bootstrap-retry>",
 )
 
-# split-source: order=356 original-lines=769-783 hash=83a5bcb924ac3de8
+# split-source: order=425 original-lines=4415-4429 hash=83a5bcb924ac3de8
 RETRY_RUNTIME_HINT_PREFIXES = (
     "<todo-rescue>",
     "<tool-retry>",
@@ -919,29 +1169,29 @@ RETRY_RUNTIME_HINT_PREFIXES = (
     "<continuation-briefing>",
 )
 
-# split-source: order=357 original-lines=784-784 hash=81f0463f9441f2a3
+# split-source: order=426 original-lines=4430-4430 hash=81f0463f9441f2a3
 EXECUTION_MODE_SINGLE = "single"
 
-# split-source: order=358 original-lines=785-785 hash=47ab04fefe7471d7
+# split-source: order=427 original-lines=4431-4431 hash=47ab04fefe7471d7
 EXECUTION_MODE_SEQUENTIAL = "sequential"
 
-# split-source: order=359 original-lines=786-786 hash=f4e504aefed6b301
+# split-source: order=428 original-lines=4432-4432 hash=f4e504aefed6b301
 EXECUTION_MODE_SYNC = "sync"
 
-# split-source: order=360 original-lines=787-791 hash=1b8183f51b9a4b20
+# split-source: order=429 original-lines=4433-4437 hash=1b8183f51b9a4b20
 EXECUTION_MODE_CHOICES = (
     EXECUTION_MODE_SINGLE,
     EXECUTION_MODE_SEQUENTIAL,
     EXECUTION_MODE_SYNC,
 )
 
-# split-source: order=361 original-lines=792-792 hash=cf12fa88884cec55
+# split-source: order=430 original-lines=4438-4438 hash=cf12fa88884cec55
 AGENT_ROLES = ("explorer", "developer", "reviewer")
 
-# split-source: order=362 original-lines=793-793 hash=09a14a28a40a39c0
+# split-source: order=431 original-lines=4439-4439 hash=09a14a28a40a39c0
 AGENT_BUBBLE_ROLES = AGENT_ROLES + ("manager", "planner")
 
-# split-source: order=363 original-lines=794-800 hash=5de25e5d5ff03185
+# split-source: order=432 original-lines=4440-4446 hash=5de25e5d5ff03185
 AGENT_ROLE_LABELS = {
     "explorer": "Explorer",
     "developer": "Developer",
@@ -950,7 +1200,7 @@ AGENT_ROLE_LABELS = {
     "planner": "Planner",
 }
 
-# split-source: order=364 original-lines=801-807 hash=639a54aac430eb2d
+# split-source: order=433 original-lines=4447-4453 hash=639a54aac430eb2d
 AGENT_ROLE_BUBBLE_COLORS = {
     "explorer": "#ff5fa2",
     "developer": "#22b455",
@@ -959,7 +1209,7 @@ AGENT_ROLE_BUBBLE_COLORS = {
     "planner": "#e8533f",
 }
 
-# split-source: order=365 original-lines=808-817 hash=e3c5d5905fbcfb2d
+# split-source: order=434 original-lines=4454-4463 hash=e3c5d5905fbcfb2d
 BLACKBOARD_STATUSES = (
     "INITIALIZING",
     "PLANNING",
@@ -971,10 +1221,10 @@ BLACKBOARD_STATUSES = (
     "PAUSED",
 )
 
-# split-source: order=366 original-lines=818-818 hash=d09e2635d60b5bfb
+# split-source: order=435 original-lines=4464-4464 hash=d09e2635d60b5bfb
 TASK_COMPLEXITY_LEVELS = ("simple", "moderate", "complex", "expert")
 
-# split-source: order=367 original-lines=819-824 hash=21ce85ef1f9b4296
+# split-source: order=436 original-lines=4465-4470 hash=21ce85ef1f9b4296
 TASK_COMPLEXITY_RANKS = {
     "simple": 1,
     "moderate": 2,
@@ -982,7 +1232,7 @@ TASK_COMPLEXITY_RANKS = {
     "expert": 4,
 }
 
-# split-source: order=368 original-lines=825-831 hash=ad6961dda434ec1e
+# split-source: order=437 original-lines=4471-4477 hash=ad6961dda434ec1e
 TASK_PROFILE_TYPES = (
     "simple_qa",
     "simple_code",
@@ -991,26 +1241,26 @@ TASK_PROFILE_TYPES = (
     "general",
 )
 
-# split-source: order=369 original-lines=832-832 hash=cf80af3ffe4a0251
+# split-source: order=438 original-lines=4478-4478 hash=cf80af3ffe4a0251
 TASK_LEVEL_CHOICES = (1, 2, 3, 4, 5)
 
-# split-source: order=370 original-lines=833-833 hash=c41281b649e13f1a
+# split-source: order=439 original-lines=4479-4479 hash=c41281b649e13f1a
 TASK_SCALE_PREFERENCES = ("fast", "balanced", "thorough")
 
-# split-source: order=371 original-lines=834-834 hash=6cb1db74570d1828
+# split-source: order=440 original-lines=4480-4480 hash=6cb1db74570d1828
 SEMANTIC_CONFIDENCE_CHOICES = ("high", "medium", "low")
 
-# split-source: order=372 original-lines=835-839 hash=9b217b4393ecb501
+# split-source: order=441 original-lines=4481-4485 hash=9b217b4393ecb501
 # Level-2 Todo behavior is configurable at startup.  ``force`` preserves the
 # default safety contract, ``auto`` lets the semantic classifier decide for the
 # current request, and ``off`` is an explicit escape hatch for callers that do
 # not want Todo scaffolding at this tier.
 L2_TODO_POLICY_CHOICES = ("force", "auto", "off")
 
-# split-source: order=373 original-lines=840-840 hash=9739b1717a08be36
+# split-source: order=442 original-lines=4486-4486 hash=9739b1717a08be36
 DEFAULT_L2_TODO_POLICY = "force"
 
-# split-source: order=374 original-lines=841-894 hash=c28cf0cbf3c45a97
+# split-source: order=443 original-lines=4487-4540 hash=c28cf0cbf3c45a97
 TASK_LEVEL_POLICIES: dict[int, dict] = {
     1: {
         "name": "simple_direct_answer",
@@ -1066,49 +1316,49 @@ TASK_LEVEL_POLICIES: dict[int, dict] = {
     },
 }
 
-# split-source: order=375 original-lines=895-895 hash=09f2fafb2cb29f14
+# split-source: order=444 original-lines=4541-4541 hash=09f2fafb2cb29f14
 MANAGER_ROUTE_TARGETS = ("explorer", "developer", "reviewer", "finish")
 
-# split-source: order=376 original-lines=896-896 hash=1ff71e4b76361d2d
+# split-source: order=445 original-lines=4542-4542 hash=1ff71e4b76361d2d
 BLACKBOARD_MAX_LOG_ENTRIES = 240
 
-# split-source: order=377 original-lines=897-897 hash=8a65b1055243dcb4
+# split-source: order=446 original-lines=4543-4543 hash=8a65b1055243dcb4
 BLACKBOARD_MAX_TEXT = 8000
 
-# split-source: order=378 original-lines=898-898 hash=cc41debd5b485726
+# split-source: order=447 original-lines=4544-4544 hash=cc41debd5b485726
 BLACKBOARD_MEMORY_SHORT_MAX = 72
 
-# split-source: order=379 original-lines=899-899 hash=4767abb9fa90c1da
+# split-source: order=448 original-lines=4545-4545 hash=4767abb9fa90c1da
 BLACKBOARD_MEMORY_MID_MAX_STEPS = 48
 
-# split-source: order=380 original-lines=900-900 hash=1bc619a7d1231b11
+# split-source: order=449 original-lines=4546-4546 hash=1bc619a7d1231b11
 BLACKBOARD_MEMORY_MID_ITEMS_PER_STEP = 20
 
-# split-source: order=381 original-lines=901-901 hash=db5aa3610914669f
+# split-source: order=450 original-lines=4547-4547 hash=db5aa3610914669f
 BLACKBOARD_MEMORY_LONG_MAX = 96
 
-# split-source: order=382 original-lines=902-902 hash=5d4e18baf68db4d8
+# split-source: order=451 original-lines=4548-4548 hash=5d4e18baf68db4d8
 BLACKBOARD_MEMORY_INDEX_MAX = 260
 
-# split-source: order=383 original-lines=903-903 hash=a7d5ae902370d370
+# split-source: order=452 original-lines=4549-4549 hash=a7d5ae902370d370
 SKILL_REFRESH_MIN_INTERVAL_SECONDS = 1.5
 
-# split-source: order=384 original-lines=904-904 hash=01431f69a39c76d0
+# split-source: order=453 original-lines=4550-4550 hash=01431f69a39c76d0
 SKILL_PROMPT_MAX_ITEMS = 40
 
-# split-source: order=385 original-lines=905-905 hash=f7ba6381bd98323e
+# split-source: order=454 original-lines=4551-4551 hash=f7ba6381bd98323e
 SKILL_PROMPT_MAX_CHARS = 2600
 
-# split-source: order=386 original-lines=906-906 hash=44a866e208737d1e
+# split-source: order=455 original-lines=4552-4552 hash=44a866e208737d1e
 SKILL_RUNTIME_CACHE_MAX_ENTRIES = 48
 
-# split-source: order=387 original-lines=907-907 hash=b6ed00eb7f2d7d09
+# split-source: order=456 original-lines=4553-4553 hash=b6ed00eb7f2d7d09
 SKILL_RUNTIME_CACHE_MAX_BYTES = 2_000_000
 
-# split-source: order=388 original-lines=908-908 hash=4953acb4cdc06413
+# split-source: order=457 original-lines=4554-4554 hash=4953acb4cdc06413
 AUTO_SKILLS_ROOT_CANDIDATES = ("skills", "Skills")
 
-# split-source: order=389 original-lines=909-939 hash=752822efd33875ac
+# split-source: order=458 original-lines=4555-4585 hash=752822efd33875ac
 SKILL_DEFAULT_ATTACHMENT_GLOBS = (
     "references/**/*.md",
     "routes/**/*.md",
@@ -1141,41 +1391,41 @@ SKILL_DEFAULT_ATTACHMENT_GLOBS = (
     "LICENSE*",
 )
 
-# split-source: order=390 original-lines=940-940 hash=a990f15e73e3e278
+# split-source: order=459 original-lines=4586-4586 hash=a990f15e73e3e278
 SKILL_INLINE_ATTACHMENT_MAX_FILES = 6
 
-# split-source: order=391 original-lines=941-941 hash=da384e686762c1ec
+# split-source: order=460 original-lines=4587-4587 hash=da384e686762c1ec
 SKILL_INLINE_ATTACHMENT_MAX_CHARS = 24_000
 
-# split-source: order=392 original-lines=942-942 hash=d9e3e9b939ec89a0
+# split-source: order=461 original-lines=4588-4588 hash=d9e3e9b939ec89a0
 SKILL_RESOURCE_MANIFEST_MAX_ITEMS = 120
 
-# split-source: order=393 original-lines=943-943 hash=edf32a28a3e7b667
+# split-source: order=462 original-lines=4589-4589 hash=edf32a28a3e7b667
 SKILL_BODY_COMPACT_THRESHOLD_CHARS = 12_000
 
-# split-source: order=394 original-lines=944-944 hash=4b6d387e27e06be8
+# split-source: order=463 original-lines=4590-4590 hash=4b6d387e27e06be8
 SKILL_BODY_PREVIEW_CHARS = 4_000
 
-# split-source: order=395 original-lines=945-945 hash=2e4c84b8d68db0d0
+# split-source: order=464 original-lines=4591-4591 hash=2e4c84b8d68db0d0
 SKILLS_VIRTUAL_PREFIX = "/skills"
 
-# split-source: order=396 original-lines=946-946 hash=efd27c0f1e41da97
+# split-source: order=465 original-lines=4592-4592 hash=efd27c0f1e41da97
 SKILLS_EXTERNAL_MOUNT = "__external__"
 
-# split-source: order=397 original-lines=947-947 hash=b83328d12be05209
+# split-source: order=466 original-lines=4593-4593 hash=b83328d12be05209
 PLAN_MODE_ENABLED_LEVELS = {3, 4, 5}
 
-# split-source: order=398 original-lines=948-948 hash=8dff7c27280b2ea0
+# split-source: order=467 original-lines=4594-4594 hash=8dff7c27280b2ea0
 PLAN_MODE_FORCED_LEVELS: set[int] = set()
 
-# split-source: order=399 original-lines=949-949 hash=47e96e03e05e112f
+# split-source: order=468 original-lines=4595-4595 hash=47e96e03e05e112f
 PLAN_MODE_USER_CHOICES = ("auto", "on", "off")
 
-# split-source: order=400 original-lines=950-951 hash=c6c5d068a132fa56
+# split-source: order=469 original-lines=4596-4597 hash=c6c5d068a132fa56
 # Task phase definitions for stage-aware delegation
 TASK_PHASES = ("research", "design", "implement", "test", "review", "deploy")
 
-# split-source: order=401 original-lines=952-959 hash=d6ec81ef240e795e
+# split-source: order=470 original-lines=4598-4605 hash=d6ec81ef240e795e
 TASK_PHASE_ROUTING = {
     "research": "explorer",
     "design": "developer",
@@ -1185,7 +1435,7 @@ TASK_PHASE_ROUTING = {
     "deploy": "developer",
 }
 
-# split-source: order=402 original-lines=960-966 hash=b807b0f79e98e9ee
+# split-source: order=471 original-lines=4606-4612 hash=b807b0f79e98e9ee
 # Complexity keywords for semantic detection
 COMPLEXITY_KEYWORDS = (
     "简单", "复杂", "难", "容易", "快速", "详细", "深入",
@@ -1194,131 +1444,132 @@ COMPLEXITY_KEYWORDS = (
     "thorough", "quick", "fast", "lightweight", "heavy",
 )
 
-# split-source: order=403 original-lines=967-971 hash=220d684aef14dca6
+# split-source: order=472 original-lines=4613-4617 hash=220d684aef14dca6
 USER_COMPLEXITY_SIMPLE_TOKENS = (
     "简单", "简易", "轻量", "低复杂度", "低难度", "快速", "低配",
     "low", "simple", "easy", "quick", "fast", "lightweight", "basic", "minimal",
     "l1", "l2",
 )
 
-# split-source: order=404 original-lines=972-976 hash=0ab4090c0bd441af
+# split-source: order=473 original-lines=4618-4622 hash=0ab4090c0bd441af
 USER_COMPLEXITY_MODERATE_TOKENS = (
     "中等复杂度", "中等难度", "适中", "平衡", "标准", "普通", "常规",
     "medium", "mid", "moderate", "balanced", "standard", "normal",
     "l3",
 )
 
-# split-source: order=405 original-lines=977-981 hash=e0ac5bacc7882dd1
+# split-source: order=474 original-lines=4623-4627 hash=e0ac5bacc7882dd1
 USER_COMPLEXITY_COMPLEX_TOKENS = (
     "复杂", "深入", "详细", "高复杂度", "高难度", "中高复杂度",
     "high", "complex", "hard", "difficult", "thorough", "detailed", "deep", "heavy",
     "l4",
 )
 
-# split-source: order=406 original-lines=982-986 hash=8fef30670baf9787
+# split-source: order=475 original-lines=4628-4632 hash=8fef30670baf9787
 USER_COMPLEXITY_EXPERT_TOKENS = (
     "专家级", "系統級", "系统级", "生产级", "企業級", "企业级", "高风险", "超高复杂度",
     "expert", "advanced", "system-level", "production-ready", "enterprise", "mission-critical",
     "l5",
 )
 
-# split-source: order=407 original-lines=987-990 hash=c075136d501b5338
+# split-source: order=476 original-lines=4633-4636 hash=c075136d501b5338
 # Planning research is a bounded evidence pass, not a second implementation
 # phase. Three productive rounds are enough to inspect local constraints and
 # hand concrete findings to synthesis; stalled/duplicate rounds stop earlier.
 PLAN_MODE_EXPLORER_MAX_ROUNDS = 4
 
-# split-source: order=408 original-lines=991-991 hash=2517e27e66b827a8
+# split-source: order=477 original-lines=4637-4637 hash=2517e27e66b827a8
 PLAN_MODE_EXPLORER_PRODUCTIVE_ROUNDS = 3
 
-# split-source: order=409 original-lines=992-992 hash=c3524b9db7d5f865
+# split-source: order=478 original-lines=4638-4638 hash=c3524b9db7d5f865
 PLAN_MODE_EXPLORER_STALE_ROUNDS = 2
 
-# split-source: order=410 original-lines=993-993 hash=ccf340fe4d6f8b34
+# split-source: order=479 original-lines=4639-4639 hash=ccf340fe4d6f8b34
 PLAN_MODE_SYNTHESIS_MAX_ATTEMPTS = 3
 
-# split-source: order=411 original-lines=994-995 hash=28021267334ad9ee
+# split-source: order=480 original-lines=4640-4641 hash=28021267334ad9ee
 # Reviewer debug mode
 REVIEWER_DEBUG_MODE_MAX_ROUNDS = 6
 
-# split-source: order=412 original-lines=996-1000 hash=dc5aa52a5db2b1e0
+# split-source: order=481 original-lines=4642-4647 hash=d42ef8ab065e43bd
 REVIEWER_DEBUG_TOOL_ALLOWLIST = {
     "bash", "read_file", "write_file", "edit_file",
+    "stop_background_process",
     "read_from_blackboard", "write_to_blackboard",
     "finish_task", "finish_current_task",
 }
 
-# split-source: order=413 original-lines=1001-1001 hash=81086e04747acc95
+# split-source: order=482 original-lines=4648-4648 hash=81086e04747acc95
 EXPLORER_STALL_THRESHOLD = 3  # consecutive same-target delegations before forced switch
 
-# split-source: order=414 original-lines=1002-1002 hash=9d7178fa44c84402
+# split-source: order=483 original-lines=4649-4649 hash=9d7178fa44c84402
 DEVELOPER_EDIT_STALL_THRESHOLD = 3  # consecutive edit_file failures on same file before forced strategy change
 
-# split-source: order=415 original-lines=1003-1006 hash=ae16b6a66fe09d23
+# split-source: order=484 original-lines=4650-4653 hash=ae16b6a66fe09d23
 # Acceptance-gate repair loop: once a step fails the heuristic gate this many
 # times, escalate from a plain rework hint to the active diagnose→repair→re-verify
 # driver (semantic judge + reviewer-debug + root-cause repair directives).
 ACCEPTANCE_GATE_STALL_THRESHOLD = 10
 
-# split-source: order=416 original-lines=1007-1010 hash=ba75a871b8cd6e93
+# split-source: order=485 original-lines=4654-4657 hash=ba75a871b8cd6e93
 # Deadlock guards: repeated no-progress rounds and an absolute repair-round cap.
 # The absolute cap prevents cosmetic evidence changes from resetting the
 # no-progress signature forever while the same acceptance decision remains stuck.
 ACCEPTANCE_GATE_HARD_CEILING = 10  # consecutive no-progress rounds before escalating to the user
 
-# split-source: order=417 original-lines=1011-1011 hash=4d18bf71288da19c
+# split-source: order=486 original-lines=4658-4658 hash=4d18bf71288da19c
 ACCEPTANCE_GATE_TOTAL_ROUND_CEILING = 10
 
-# split-source: order=418 original-lines=1012-1012 hash=a3919e0ace6358f9
+# split-source: order=487 original-lines=4659-4659 hash=a3919e0ace6358f9
 PLAN_MODE_MANAGER_SYNTHESIS_MAX_TOKENS = 8192
 
-# split-source: order=419 original-lines=1013-1013 hash=4caef42f3feddae1
+# split-source: order=488 original-lines=4660-4660 hash=4caef42f3feddae1
 PLAN_MODE_MAX_OPTIONS = 3
 
-# split-source: order=420 original-lines=1014-1014 hash=655c38e3a3568269
+# split-source: order=489 original-lines=4661-4661 hash=655c38e3a3568269
 PLAN_FILE_RELATIVE_PATH = ".clouds_coder/plan.md"
 
-# split-source: order=421 original-lines=1015-1015 hash=3e14150d669f2159
+# split-source: order=490 original-lines=4662-4662 hash=3e14150d669f2159
 PLAN_BUBBLE_MAX_CHARS = 12_000
 
-# split-source: order=422 original-lines=1016-1016 hash=790aa5759c5de751
+# split-source: order=491 original-lines=4663-4663 hash=790aa5759c5de751
 PLAN_NOTICE_BODY_MAX_CHARS = 10_000
 
-# split-source: order=423 original-lines=1017-1017 hash=f31621b9c74ebc02
+# split-source: order=492 original-lines=4664-4664 hash=f31621b9c74ebc02
 PLAN_MESSAGE_EVENT_MAX_CHARS = 12_000
 
-# split-source: order=424 original-lines=1018-1018 hash=232a43c53229de24
+# split-source: order=493 original-lines=4665-4665 hash=232a43c53229de24
 PLAN_STEP_FULL_CONTENT_MAX_CHARS = 24_000
 
-# split-source: order=425 original-lines=1019-1026 hash=7f8c415b0d73ab73
+# split-source: order=494 original-lines=4666-4673 hash=3725345fc4347a51
 PLAN_MODE_RESEARCH_TOOL_ALLOWLIST = {
     "bash", "read_file", "context_recall", "task_get", "task_list",
-    "check_background", "read_from_blackboard", "write_to_blackboard",
-    "list_skills", "load_skill", "compress", "agent_web_search",
+    "check_background", "list_background_processes", "read_from_blackboard", "write_to_blackboard",
+    "list_skills", "load_skill", "unload_skill", "compress", "agent_web_search",
     # rag_remember writes only to the RAG knowledge library (never user files), so it is
     # safe during read-only planning — analogous to write_to_blackboard scratch persistence.
     "rag_remember",
 }
 
-# split-source: order=426 original-lines=1027-1027 hash=31894e2fb777af15
+# split-source: order=495 original-lines=4674-4674 hash=31894e2fb777af15
 FAILURE_LEDGER_MAX_FIXES = 20
 
-# split-source: order=427 original-lines=1028-1028 hash=9c5a97d6c98bb447
+# split-source: order=496 original-lines=4675-4675 hash=9c5a97d6c98bb447
 FAILURE_LEDGER_MAX_COMPILE_ERRORS = 15
 
-# split-source: order=428 original-lines=1029-1029 hash=fcc70c42273cb020
+# split-source: order=497 original-lines=4676-4676 hash=fcc70c42273cb020
 FAILURE_LEDGER_MAX_DELEGATIONS = 10
 
-# split-source: order=429 original-lines=1030-1030 hash=645687fd2c3004f0
+# split-source: order=498 original-lines=4677-4677 hash=645687fd2c3004f0
 FAILURE_LEDGER_MAX_STALLS = 8
 
-# split-source: order=430 original-lines=1031-1031 hash=084849a2703a6ff5
+# split-source: order=499 original-lines=4678-4678 hash=084849a2703a6ff5
 FAILURE_LEDGER_MAX_TOOL_FPS = 30
 
-# split-source: order=431 original-lines=1032-1032 hash=27b6e640f3fa209c
+# split-source: order=500 original-lines=4679-4679 hash=27b6e640f3fa209c
 FAILURE_LEDGER_MAX_ERRORS = 25
 
-# split-source: order=432 original-lines=1033-1072 hash=76c254c6d4cf5739
+# split-source: order=501 original-lines=4680-4719 hash=76c254c6d4cf5739
 # Error category definitions: (name, {cmd_keywords, output_patterns, success_negatives, label})
 # Priority order matters — first match wins. test before runtime because pytest cmd contains 'python'.
 ERROR_CATEGORY_DEFS: list[tuple[str, dict]] = [
@@ -1360,16 +1611,16 @@ ERROR_CATEGORY_DEFS: list[tuple[str, dict]] = [
     }),
 ]
 
-# split-source: order=433 original-lines=1073-1073 hash=99072701637b946e
+# split-source: order=502 original-lines=4720-4720 hash=99072701637b946e
 CHECKPOINT_MAX_COUNT = 3
 
-# split-source: order=434 original-lines=1074-1074 hash=3b93d76b1a0091f2
+# split-source: order=503 original-lines=4721-4721 hash=3b93d76b1a0091f2
 CHECKPOINT_INTERVAL_ROUNDS = 6
 
-# split-source: order=435 original-lines=1075-1075 hash=0174f7244bd5c1e3
+# split-source: order=504 original-lines=4722-4722 hash=0174f7244bd5c1e3
 PERSISTED_ROUTES_MAX = 8
 
-# split-source: order=436 original-lines=1076-1115 hash=8936e895ba2d7fe8
+# split-source: order=505 original-lines=4723-4762 hash=8936e895ba2d7fe8
 HTML_FRONTEND_REQUEST_KEYWORDS = (
     "html",
     "web page",
@@ -1411,7 +1662,7 @@ HTML_FRONTEND_REQUEST_KEYWORDS = (
     "可視化",
 )
 
-# split-source: order=437 original-lines=1116-1138 hash=7ca137017e6dd7de
+# split-source: order=506 original-lines=4763-4785 hash=7ca137017e6dd7de
 DEEP_RESEARCH_REQUEST_KEYWORDS = (
     "deep research",
     "deep-research",
@@ -1436,7 +1687,7 @@ DEEP_RESEARCH_REQUEST_KEYWORDS = (
     "研究報告",
 )
 
-# split-source: order=438 original-lines=1139-1158 hash=cb2e500a49279d7a
+# split-source: order=507 original-lines=4786-4805 hash=cb2e500a49279d7a
 DEEP_RESEARCH_RETRIEVAL_KEYWORDS = (
     "search",
     "web search",
@@ -1458,7 +1709,7 @@ DEEP_RESEARCH_RETRIEVAL_KEYWORDS = (
     "參考文獻",
 )
 
-# split-source: order=439 original-lines=1159-1176 hash=fe2b69b23ffda282
+# split-source: order=508 original-lines=4806-4823 hash=fe2b69b23ffda282
 DEEP_RESEARCH_TEXT_ONLY_HINT_KEYWORDS = (
     "based on this text",
     "only this text",
@@ -1478,11 +1729,11 @@ DEEP_RESEARCH_TEXT_ONLY_HINT_KEYWORDS = (
     "無需檢索",
 )
 
-# split-source: order=440 original-lines=1177-1178 hash=2ad4cdd83195a323
+# split-source: order=509 original-lines=4824-4825 hash=2ad4cdd83195a323
 
 DANGEROUS_PATTERNS = ["rm -rf /", "sudo ", "shutdown", "reboot", "> /dev/"]
 
-# split-source: order=441 original-lines=1179-1185 hash=5e51c4347665cdca
+# split-source: order=510 original-lines=4826-4832 hash=5e51c4347665cdca
 VALID_MSG_TYPES = {
     "message",
     "broadcast",
@@ -1491,7 +1742,7 @@ VALID_MSG_TYPES = {
     "plan_approval_response",
 }
 
-# split-source: order=442 original-lines=1186-1192 hash=95864fa1b2c02420
+# split-source: order=511 original-lines=4833-4839 hash=95864fa1b2c02420
 
 SUPPORTED_UI_LANGUAGES = [
     {"code": "zh-CN", "label": "简体中文"},
@@ -1500,18 +1751,18 @@ SUPPORTED_UI_LANGUAGES = [
     {"code": "en", "label": "English"},
 ]
 
-# split-source: order=443 original-lines=1193-1193 hash=6c4b45d9b447348b
+# split-source: order=512 original-lines=4840-4840 hash=6c4b45d9b447348b
 UI_LANGUAGE_LABELS = {x["code"]: x["label"] for x in SUPPORTED_UI_LANGUAGES}
 
-# split-source: order=444 original-lines=1194-1194 hash=77184d3d0b573722
+# split-source: order=513 original-lines=4841-4841 hash=77184d3d0b573722
 DEFAULT_UI_LANGUAGE = "zh-CN"
 
-# split-source: order=445 original-lines=1195-1197 hash=f61b1553d4fcd571
+# split-source: order=514 original-lines=4842-4844 hash=f61b1553d4fcd571
 # Temporarily disabled: structured tool cards already expose tool activity, while
 # synthesized progress prose can anchor the next model turn to stale Todo text.
 PUBLIC_TOOL_PROGRESS_SUMMARY_ENABLED = False
 
-# split-source: order=446 original-lines=1198-1239 hash=1504f7d9a728e357
+# split-source: order=515 original-lines=4845-4886 hash=1504f7d9a728e357
 AGENT_LANGUAGE_PREFERENCES = {
     "zh-CN": {
         "id": "zh-cn-concise-milestones",
@@ -1555,22 +1806,22 @@ AGENT_LANGUAGE_PREFERENCES = {
     },
 }
 
-# split-source: order=447 original-lines=1240-1240 hash=dc9ede9e7307d1af
+# split-source: order=516 original-lines=4887-4887 hash=dc9ede9e7307d1af
 UI_STYLE_CHOICES = ("trad", "neo")
 
-# split-source: order=448 original-lines=1241-1241 hash=dbd27ce417571ffc
+# split-source: order=517 original-lines=4888-4888 hash=dbd27ce417571ffc
 UI_STYLE_LABELS = {"trad": "Trad", "neo": "Neo"}
 
-# split-source: order=449 original-lines=1242-1242 hash=cb93c5950fa7210f
+# split-source: order=518 original-lines=4889-4889 hash=cb93c5950fa7210f
 DEFAULT_UI_STYLE = "neo"
 
-# split-source: order=450 original-lines=1243-1243 hash=b1030d04dc08f944
+# split-source: order=519 original-lines=4890-4890 hash=b1030d04dc08f944
 DEFAULT_WEB_UI_DIR = "./web_UI"
 
-# split-source: order=451 original-lines=1244-1244 hash=4a3fba045723e573
+# split-source: order=520 original-lines=4891-4891 hash=4a3fba045723e573
 DEFAULT_WEB_UI_CONFIG = "web_ui.config.json"
 
-# split-source: order=452 original-lines=1245-1252 hash=fb9aef9aca2379fb
+# split-source: order=521 original-lines=4892-4899 hash=fb9aef9aca2379fb
 WEB_UI_REQUIRED_FILES = (
     "index.html",
     "style.css",
@@ -1580,13 +1831,13 @@ WEB_UI_REQUIRED_FILES = (
     "skills-extra.css",
 )
 
-# split-source: order=453 original-lines=1253-1253 hash=e1a5612614dd0088
+# split-source: order=522 original-lines=4900-4900 hash=e1a5612614dd0088
 WEB_UI_OPTIONAL_FILES = ("app.ts",)
 
-# split-source: order=454 original-lines=1254-1254 hash=cf6ccd8ac620590e
+# split-source: order=523 original-lines=4901-4901 hash=cf6ccd8ac620590e
 WEB_UI_APPLICATION_CONTRACT_VERSION = "clouds-coder-app-store-v1"
 
-# split-source: order=455 original-lines=1255-1274 hash=a3b947a92b4eb2c3
+# split-source: order=524 original-lines=4902-4921 hash=a3b947a92b4eb2c3
 WEB_UI_APPLICATION_FEATURE_MARKERS = {
     "index.html": (
         WEB_UI_APPLICATION_CONTRACT_VERSION,
@@ -1608,7 +1859,7 @@ WEB_UI_APPLICATION_FEATURE_MARKERS = {
     ),
 }
 
-# split-source: order=456 original-lines=1275-1289 hash=dab39255895e6b68
+# split-source: order=525 original-lines=4922-4936 hash=dab39255895e6b68
 
 IMAGE_EXTS = {
     ".png",
@@ -1625,13 +1876,13 @@ IMAGE_EXTS = {
     ".heif",
 }
 
-# split-source: order=457 original-lines=1290-1290 hash=50f97bb2cb31f385
+# split-source: order=526 original-lines=4937-4937 hash=50f97bb2cb31f385
 IMAGE_FORMATS_NEED_CONVERSION = {".svg", ".heic", ".heif", ".tiff", ".tif", ".bmp", ".avif"}
 
-# split-source: order=458 original-lines=1291-1291 hash=0199bc7436bec2a9
+# split-source: order=527 original-lines=4938-4938 hash=0199bc7436bec2a9
 IMAGE_SAFE_FORMATS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 
-# split-source: order=459 original-lines=1292-1302 hash=d67da696eb22f8c0
+# split-source: order=528 original-lines=4939-4949 hash=d67da696eb22f8c0
 AUDIO_EXTS = {
     ".mp3",
     ".wav",
@@ -1644,7 +1895,7 @@ AUDIO_EXTS = {
     ".webm",
 }
 
-# split-source: order=460 original-lines=1303-1313 hash=490ac44f36c5e1a4
+# split-source: order=529 original-lines=4950-4960 hash=490ac44f36c5e1a4
 VIDEO_EXTS = {
     ".mp4",
     ".mov",
@@ -1657,37 +1908,37 @@ VIDEO_EXTS = {
     ".3gp",
 }
 
-# split-source: order=461 original-lines=1314-1314 hash=292b975e52f43a3a
+# split-source: order=530 original-lines=4961-4961 hash=292b975e52f43a3a
 CODE_PREVIEW_STAGE_MAX_BYTES = 8_000_000
 
-# split-source: order=462 original-lines=1315-1315 hash=074cfa8accb5b674
+# split-source: order=531 original-lines=4962-4962 hash=074cfa8accb5b674
 CODE_PREVIEW_STAGE_MAX_ROWS = 25_000
 
-# split-source: order=463 original-lines=1316-1316 hash=fa3aa35b382a2e68
+# split-source: order=532 original-lines=4963-4963 hash=fa3aa35b382a2e68
 CODE_PREVIEW_STAGE_MAX_PER_FILE = 120
 
-# split-source: order=464 original-lines=1317-1317 hash=8fdb6a62a5acf119
+# split-source: order=533 original-lines=4964-4964 hash=8fdb6a62a5acf119
 CODE_PREVIEW_STAGE_MAX_TOTAL = 1200
 
-# split-source: order=465 original-lines=1318-1318 hash=88c38ed6f5c90f64
+# split-source: order=534 original-lines=4965-4965 hash=88c38ed6f5c90f64
 CODE_PREVIEW_DIFF_CONTEXT_LINES = 4
 
-# split-source: order=466 original-lines=1319-1319 hash=11a25a1863472126
+# split-source: order=535 original-lines=4966-4966 hash=11a25a1863472126
 CODE_PREVIEW_DIFF_MERGE_GAP = 10
 
-# split-source: order=467 original-lines=1320-1320 hash=a7169db36c59569e
+# split-source: order=536 original-lines=4967-4967 hash=a7169db36c59569e
 PREVIEW_DOWNLOAD_MAX_FILES = 500
 
-# split-source: order=468 original-lines=1321-1321 hash=d982e61e9945f820
+# split-source: order=537 original-lines=4968-4968 hash=d982e61e9945f820
 PREVIEW_DOWNLOAD_MAX_BYTES = 80_000_000
 
-# split-source: order=469 original-lines=1322-1322 hash=e1dafc3de8604e1a
+# split-source: order=538 original-lines=4969-4969 hash=e1dafc3de8604e1a
 FILES_TREE_DEFAULT_MAX_NODES = 420
 
-# split-source: order=470 original-lines=1323-1323 hash=240c54367061637b
+# split-source: order=539 original-lines=4970-4970 hash=240c54367061637b
 FILES_TREE_DEFAULT_MAX_DEPTH = 5
 
-# split-source: order=471 original-lines=1324-1332 hash=24ed387fdafed007
+# split-source: order=540 original-lines=4971-4979 hash=24ed387fdafed007
 FILES_TREE_SKIP_DIRS = {
     ".git", ".hg", ".svn", ".idea", ".vscode", ".vs",
     ".next", ".nuxt", ".svelte-kit", ".angular", ".expo",
@@ -1698,105 +1949,105 @@ FILES_TREE_SKIP_DIRS = {
     "dist", "build", "target", "coverage", "out", "bin", "obj",
 }
 
-# split-source: order=472 original-lines=1333-1335 hash=db0ff16d8c3fe7f4
+# split-source: order=541 original-lines=4980-4982 hash=db0ff16d8c3fe7f4
 FILES_TREE_SKIP_REL_DIRS = {
     ".clouds_coder/long_output",
 }
 
-# split-source: order=473 original-lines=1336-1336 hash=0700ed49990e5f14
+# split-source: order=542 original-lines=4983-4983 hash=0700ed49990e5f14
 IDE_FILE_MAX_BYTES = 12 * 1024 * 1024
 
-# split-source: order=474 original-lines=1337-1337 hash=feb3a86ec351163b
+# split-source: order=543 original-lines=4984-4984 hash=feb3a86ec351163b
 IDE_UPLOAD_MAX_BYTES = 32 * 1024 * 1024
 
-# split-source: order=475 original-lines=1338-1338 hash=35098ebc5b9c1a6a
+# split-source: order=544 original-lines=4985-4985 hash=35098ebc5b9c1a6a
 IDE_UPLOAD_TOTAL_MAX_BYTES = 220 * 1024 * 1024
 
-# split-source: order=476 original-lines=1339-1339 hash=b0e6f665c4ca5b4f
+# split-source: order=545 original-lines=4986-4986 hash=b0e6f665c4ca5b4f
 IDE_UPLOAD_MAX_ITEMS = 1200
 
-# split-source: order=477 original-lines=1340-1340 hash=167cd0b104b6d2bf
+# split-source: order=546 original-lines=4987-4987 hash=167cd0b104b6d2bf
 IDE_UPLOAD_CHUNK_MAX_BYTES = 768 * 1024
 
-# split-source: order=478 original-lines=1341-1341 hash=b51f1fa8d4eff024
+# split-source: order=547 original-lines=4988-4988 hash=b51f1fa8d4eff024
 IDE_UPLOAD_STREAM_MAX_BYTES = 4 * 1024 * 1024 * 1024
 
-# split-source: order=479 original-lines=1342-1342 hash=57b6079d828d62a1
+# split-source: order=548 original-lines=4989-4989 hash=57b6079d828d62a1
 IDE_TEXT_PREVIEW_MAX_BYTES = 2 * 1024 * 1024
 
-# split-source: order=480 original-lines=1343-1343 hash=186a5492c9d405bc
+# split-source: order=549 original-lines=4990-4990 hash=186a5492c9d405bc
 IDE_MARKDOWN_PREVIEW_MAX_LINES = 4000
 
-# split-source: order=481 original-lines=1344-1344 hash=2a2bf9e6ad207b04
+# split-source: order=550 original-lines=4991-4991 hash=2a2bf9e6ad207b04
 IDE_IMAGE_PREVIEW_MAX_EDGE = 4096
 
-# split-source: order=482 original-lines=1345-1345 hash=15bc6662a2934101
+# split-source: order=551 original-lines=4992-4992 hash=15bc6662a2934101
 IDE_IMAGE_PREVIEW_MAX_PIXELS = 24_000_000
 
-# split-source: order=483 original-lines=1346-1346 hash=494e4f64c5d7f123
+# split-source: order=552 original-lines=4993-4993 hash=494e4f64c5d7f123
 IDE_IMAGE_PREVIEW_SOURCE_MAX_PIXELS = 180_000_000
 
-# split-source: order=484 original-lines=1347-1347 hash=4601fe8fb92c28f2
+# split-source: order=553 original-lines=4994-4994 hash=4601fe8fb92c28f2
 IDE_VECTOR_PREVIEW_MAX_BYTES = 16 * 1024 * 1024
 
-# split-source: order=485 original-lines=1348-1348 hash=51496ca73db8c1c8
+# split-source: order=554 original-lines=4995-4995 hash=51496ca73db8c1c8
 IDE_TABLE_PREVIEW_SOURCE_MAX_BYTES = 4 * 1024 * 1024
 
-# split-source: order=486 original-lines=1349-1349 hash=927ce2ce0bf37764
+# split-source: order=555 original-lines=4996-4996 hash=927ce2ce0bf37764
 IDE_TABLE_PREVIEW_CELL_MAX_CHARS = 2000
 
-# split-source: order=487 original-lines=1350-1350 hash=9d884ddf5da82c31
+# split-source: order=556 original-lines=4997-4997 hash=9d884ddf5da82c31
 IDE_TABLE_PREVIEW_TOTAL_CHARS = 2_000_000
 
-# split-source: order=488 original-lines=1351-1351 hash=1e5be5a8419a8bef
+# split-source: order=557 original-lines=4998-4998 hash=1e5be5a8419a8bef
 IDE_OFFICE_PREVIEW_MAX_ENTRIES = 20_000
 
-# split-source: order=489 original-lines=1352-1352 hash=104a2545fc3fbc6b
+# split-source: order=558 original-lines=4999-4999 hash=104a2545fc3fbc6b
 IDE_OFFICE_PREVIEW_MAX_EXPANDED_BYTES = 256 * 1024 * 1024
 
-# split-source: order=490 original-lines=1353-1353 hash=98b123e3ef709833
+# split-source: order=559 original-lines=5000-5000 hash=98b123e3ef709833
 IDE_OFFICE_PREVIEW_MAX_ENTRY_BYTES = 96 * 1024 * 1024
 
-# split-source: order=491 original-lines=1354-1354 hash=93d43f8be3af0f7c
+# split-source: order=560 original-lines=5001-5001 hash=93d43f8be3af0f7c
 IDE_COMMAND_TIMEOUT_DEFAULT = 120
 
-# split-source: order=492 original-lines=1355-1355 hash=cd7cfb66322e77a9
+# split-source: order=561 original-lines=5002-5002 hash=cd7cfb66322e77a9
 IDE_TREE_DEFAULT_MAX_NODES = 800
 
-# split-source: order=493 original-lines=1356-1356 hash=2673293f7c17f5ad
+# split-source: order=562 original-lines=5003-5003 hash=2673293f7c17f5ad
 IDE_TREE_MAX_NODES = 5000
 
-# split-source: order=494 original-lines=1357-1357 hash=77d6ca3fd55aa434
+# split-source: order=563 original-lines=5004-5004 hash=77d6ca3fd55aa434
 IDE_SEARCH_MAX_RESULTS = 2000
 
-# split-source: order=495 original-lines=1358-1358 hash=2019e5b5354d60a8
+# split-source: order=564 original-lines=5005-5005 hash=2019e5b5354d60a8
 IDE_SEARCH_MAX_FILE_BYTES = 2 * 1024 * 1024
 
-# split-source: order=496 original-lines=1359-1359 hash=266197634cbc6bc7
+# split-source: order=565 original-lines=5006-5006 hash=266197634cbc6bc7
 IDE_TERMINAL_SCROLLBACK_BYTES = 2 * 1024 * 1024
 
-# split-source: order=497 original-lines=1360-1360 hash=4aec6d90d3f20384
+# split-source: order=566 original-lines=5007-5007 hash=4aec6d90d3f20384
 IDE_TERMINAL_IDLE_SECONDS = 4 * 60 * 60
 
-# split-source: order=498 original-lines=1361-1361 hash=3cf2f0b1f88350d4
+# split-source: order=567 original-lines=5008-5008 hash=3cf2f0b1f88350d4
 IDE_DEBUG_ADAPTER_START_ATTEMPTS = 3
 
-# split-source: order=499 original-lines=1362-1362 hash=dda1bcf5808752a3
+# split-source: order=568 original-lines=5009-5009 hash=dda1bcf5808752a3
 IDE_DEBUG_ADAPTER_START_TIMEOUT_SECONDS = 5.0
 
-# split-source: order=500 original-lines=1363-1363 hash=4055141fc7b1ff78
+# split-source: order=569 original-lines=5010-5010 hash=4055141fc7b1ff78
 IDE_VSIX_MAX_BYTES = 80 * 1024 * 1024
 
-# split-source: order=501 original-lines=1364-1364 hash=90e489fcef1bc95b
+# split-source: order=570 original-lines=5011-5011 hash=90e489fcef1bc95b
 IDE_VSIX_MAX_EXPANDED_BYTES = 240 * 1024 * 1024
 
-# split-source: order=502 original-lines=1365-1365 hash=f9ece5d8e20013f8
+# split-source: order=571 original-lines=5012-5012 hash=f9ece5d8e20013f8
 IDE_VSIX_MAX_FILES = 8000
 
-# split-source: order=503 original-lines=1366-1366 hash=ee1aebde989533a7
+# split-source: order=572 original-lines=5013-5013 hash=ee1aebde989533a7
 IDE_VSIX_MAX_FILE_BYTES = 40 * 1024 * 1024
 
-# split-source: order=504 original-lines=1367-1375 hash=f30ba8c32f49cc03
+# split-source: order=573 original-lines=5014-5022 hash=f30ba8c32f49cc03
 IDE_TREE_SKIP_DIRS = {
     ".git", ".hg", ".svn",
     ".next", ".nuxt", ".svelte-kit", ".angular", ".expo",
@@ -1807,31 +2058,31 @@ IDE_TREE_SKIP_DIRS = {
     "dist", "build", "target", "coverage", "out", "bin", "obj",
 }
 
-# split-source: order=505 original-lines=1376-1376 hash=1765acbe875af029
+# split-source: order=574 original-lines=5023-5023 hash=1765acbe875af029
 RENDER_FRAME_MAX_B64_CHARS = 2_200_000
 
-# split-source: order=506 original-lines=1377-1377 hash=da616551c4bfaa9d
+# split-source: order=575 original-lines=5024-5024 hash=da616551c4bfaa9d
 RENDER_FRAME_MAX_POINTS = 12_000
 
-# split-source: order=507 original-lines=1378-1378 hash=38f30b78946cc962
+# split-source: order=576 original-lines=5025-5025 hash=38f30b78946cc962
 RENDER_FRAME_MAX_LINES = 2_000
 
-# split-source: order=508 original-lines=1379-1379 hash=5f06bf5a6364bc86
+# split-source: order=577 original-lines=5026-5026 hash=5f06bf5a6364bc86
 RENDER_FRAME_MAX_LINE_POINTS = 800
 
-# split-source: order=509 original-lines=1380-1380 hash=932378e266444a69
+# split-source: order=578 original-lines=5027-5027 hash=932378e266444a69
 RENDER_FRAME_ACTIVITY_INTERVAL_SECONDS = 1.2
 
-# split-source: order=510 original-lines=1381-1381 hash=12037c5b5f37f61a
+# split-source: order=579 original-lines=5028-5028 hash=12037c5b5f37f61a
 RAW_TOOLCALL_TEXT_FILTER_THRESHOLD = 3_500
 
-# split-source: order=511 original-lines=1382-1382 hash=e7670e694a0ccbbe
+# split-source: order=580 original-lines=5029-5029 hash=e7670e694a0ccbbe
 ASSISTANT_TEXT_PERSIST_MAX_CHARS = 14_000
 
-# split-source: order=512 original-lines=1383-1383 hash=e36da78fa99dafef
+# split-source: order=581 original-lines=5030-5030 hash=e36da78fa99dafef
 ASSISTANT_MESSAGE_EVENT_MAX_CHARS = 4_000
 
-# split-source: order=513 original-lines=1384-1511 hash=ed2fa4ba6cc2c1fe
+# split-source: order=582 original-lines=5031-5158 hash=ed2fa4ba6cc2c1fe
 CODE_PREVIEW_EXTS = {
     ".html",
     ".htm",
@@ -1961,7 +2212,7 @@ CODE_PREVIEW_EXTS = {
     ".awk", ".sed", ".sparql", ".rq", ".ddl", ".dml", ".psql", ".pgsql",
 }
 
-# split-source: order=514 original-lines=1512-1563 hash=92f5041428cb9858
+# split-source: order=583 original-lines=5159-5210 hash=92f5041428cb9858
 CODE_PREVIEW_FILENAMES = {
     "dockerfile",
     "containerfile",
@@ -2015,7 +2266,7 @@ CODE_PREVIEW_FILENAMES = {
     "changelog",
 }
 
-# split-source: order=515 original-lines=1564-1571 hash=79e3361553eb2e89
+# split-source: order=584 original-lines=5211-5218 hash=79e3361553eb2e89
 MEDIA_CAPABILITY_KEYS = {
     "input_image",
     "input_audio",
@@ -2025,23 +2276,23 @@ MEDIA_CAPABILITY_KEYS = {
     "output_video",
 }
 
-# split-source: order=516 original-lines=1572-1575 hash=947f2df7c50b7629
+# split-source: order=585 original-lines=5219-5222 hash=947f2df7c50b7629
 SAMPLE_IMAGE_PNG_B64 = (
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/"
     "b0cAAAAASUVORK5CYII="
 )
 
-# split-source: order=517 original-lines=1576-1578 hash=6fb6a13ea37fdaf8
+# split-source: order=586 original-lines=5223-5225 hash=6fb6a13ea37fdaf8
 SAMPLE_AUDIO_WAV_B64 = (
     "UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA="
 )
 
-# split-source: order=518 original-lines=1579-1581 hash=37b12b3c40ce93cc
+# split-source: order=587 original-lines=5226-5228 hash=37b12b3c40ce93cc
 SAMPLE_VIDEO_MP4_B64 = (
     "AAAAFGZ0eXBpc29tAAAAAGlzb21pc28y"
 )
 
-# split-source: order=519 original-lines=1582-1908 hash=aafa6e4f2233e391
+# split-source: order=588 original-lines=5229-5555 hash=aafa6e4f2233e391
 
 OFFLINE_JS_LIB_CATALOG: list[dict[str, object]] = [
     {
@@ -2370,16 +2621,16 @@ OFFLINE_JS_LIB_CATALOG: list[dict[str, object]] = [
     },
 ]
 
-# split-source: order=520 original-lines=1909-1909 hash=a3dde32b74501c9b
+# split-source: order=589 original-lines=5556-5556 hash=a3dde32b74501c9b
 OFFLINE_JS_ASSET_LOCK = threading.RLock()
 
-# split-source: order=521 original-lines=1910-1910 hash=12eae3e20bb41a04
+# split-source: order=590 original-lines=5557-5557 hash=12eae3e20bb41a04
 OFFLINE_JS_LIB_INDEX_FILE = "index.json"
 
-# split-source: order=522 original-lines=1911-1911 hash=48655aedbd13d83e
+# split-source: order=591 original-lines=5558-5558 hash=48655aedbd13d83e
 OFFLINE_JS_LIB_README_FILE = "README.md"
 
-# split-source: order=532 original-lines=2105-2176 hash=6efa3f69661023a6
+# split-source: order=601 original-lines=5752-5823 hash=6efa3f69661023a6
 
 
 BACKEND_I18N = {
@@ -2453,7 +2704,7 @@ BACKEND_I18N = {
     },
 }
 
-# split-source: order=533 original-lines=2177-2278 hash=06aa475848b86f52
+# split-source: order=602 original-lines=5824-5925 hash=06aa475848b86f52
 
 BACKEND_I18N["en"].update(
     {
@@ -2557,7 +2808,7 @@ BACKEND_I18N["en"].update(
     }
 )
 
-# split-source: order=534 original-lines=2279-2379 hash=6200995927dae9da
+# split-source: order=603 original-lines=5926-6026 hash=6200995927dae9da
 BACKEND_I18N["zh-CN"].update(
     {
         "todo_node_suffix": " | 当前节点：{topic}",
@@ -2660,7 +2911,7 @@ BACKEND_I18N["zh-CN"].update(
     }
 )
 
-# split-source: order=535 original-lines=2380-2480 hash=1af71834ce8cb90e
+# split-source: order=604 original-lines=6027-6127 hash=1af71834ce8cb90e
 BACKEND_I18N["zh-TW"].update(
     {
         "todo_node_suffix": " | 目前節點：{topic}",
@@ -2763,7 +3014,7 @@ BACKEND_I18N["zh-TW"].update(
     }
 )
 
-# split-source: order=536 original-lines=2481-2581 hash=26c197a7d8238e44
+# split-source: order=605 original-lines=6128-6228 hash=26c197a7d8238e44
 BACKEND_I18N["ja"].update(
     {
         "todo_node_suffix": " | 現在のノード: {topic}",
@@ -2866,16 +3117,68 @@ BACKEND_I18N["ja"].update(
     }
 )
 
-# split-source: order=757 original-lines=10235-10237 hash=fe64e14cf82a6abb
+# split-source: order=836 original-lines=14846-14848 hash=fe64e14cf82a6abb
 
 
 TABULAR_PREVIEW_EXTS = {".csv", ".tsv"}
 
-# split-source: order=758 original-lines=10238-10238 hash=43ed1e050832d382
+# split-source: order=837 original-lines=14849-14849 hash=43ed1e050832d382
 EXCEL_PREVIEW_EXTS = {".xlsx", ".xls", ".xlsm"}
 
-# split-source: order=759 original-lines=10239-10239 hash=41505360f13ba6a7
+# split-source: order=838 original-lines=14850-14850 hash=41505360f13ba6a7
 PRESENTATION_PREVIEW_EXTS = {".pptx", ".ppt", ".pptm"}
 
-# split-source: order=760 original-lines=10240-10240 hash=8d36725f2e52a335
+# split-source: order=839 original-lines=14851-14851 hash=8d36725f2e52a335
 DOCUMENT_PREVIEW_EXTS = {".docx", ".doc", ".docm"}
+
+# split-source: order=1041 original-lines=106440-106457 hash=58c9260037425107
+
+# ============================================================================
+# Architecture / 架构 / アーキテクチャ
+# Layer 7: Application orchestration, runtime services, and UI integration.
+# 第七层：应用编排、运行时服务与界面集成。
+# 第7層：アプリケーション編成、ランタイムサービス、UI 統合。
+# ============================================================================
+
+# ============================================================================
+# Skills Studio 2.0
+# ============================================================================
+# The original Skills Studio was intentionally an administrator-only editor
+# that wrote directly into the global ``skills`` directory.  The v2 store is a
+# small, self-contained governance layer: browser devices own private projects,
+# revisions are immutable once submitted, and only an administrator can publish
+# a frozen snapshot into the global SkillStore.
+
+STUDIO_DEVICE_COOKIE = "cc_studio_device"
+
+# split-source: order=1042 original-lines=106458-106458 hash=96e8c851e2302159
+STUDIO_SESSION_COOKIE = "cc_studio_session"
+
+# split-source: order=1043 original-lines=106459-106459 hash=d6411ff144d2b2e9
+STUDIO_DEVICE_TTL = 180 * 24 * 60 * 60
+
+# split-source: order=1044 original-lines=106460-106460 hash=955afcde4cb400ac
+STUDIO_SESSION_TTL = 24 * 60 * 60
+
+# split-source: order=1045 original-lines=106461-106461 hash=569c087422548fbf
+STUDIO_MAX_FILE_BYTES = 10 * 1024 * 1024
+
+# split-source: order=1046 original-lines=106462-106462 hash=a9fdb060d056c458
+STUDIO_MAX_PROJECT_BYTES = 50 * 1024 * 1024
+
+# split-source: order=1047 original-lines=106463-106463 hash=349eab79a6a7f9a7
+STUDIO_MAX_FILES = 256
+
+# split-source: order=1048 original-lines=106464-106464 hash=1f1795a6e43689f3
+STUDIO_MAX_JOB_SECONDS = 15 * 60
+
+# split-source: order=1054 original-lines=108364-108366 hash=f4c00c1faeb747fb
+
+
+STUDIO_INDEX_HTML = r'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Skills Studio 2.0</title><link rel="stylesheet" href="/assets/studio.css"></head><body><div class="studio"><header><div><span class="eyebrow">CLOUDS CODER</span><h1>Skills Studio <em>2.0</em></h1><p>Design private, testable Skill packages. Nothing reaches global agents before approval.</p></div><button id="newProject">New project</button></header><main><aside><div class="side-title">Projects</div><div id="projects"></div></aside><section class="workspace"><div id="empty" class="empty"><h2>Start a private Skill draft</h2><p>Create a project to design requirements, files, workflow and evaluations.</p><button id="emptyNew">Create project</button></div><div id="editor" class="hidden"><div class="project-head"><div><h2 id="projectTitle"></h2><div id="projectMeta" class="meta"></div></div><div class="actions"><button data-action="validate">Validate</button><button data-action="evaluate">Evaluate</button><button data-action="submit" class="primary">Request review</button></div></div><nav class="tabs"><button class="active" data-tab="brief">Brief</button><button data-tab="design">Design</button><button data-tab="files">Files</button><button data-tab="workflow">Workflow</button><button data-tab="evaluation">Evaluation</button></nav><div id="tabContent"></div></div></section><aside class="copilot"><div class="side-title">Copilot</div><p class="muted">Choose stepwise interview or one-click generation. Candidate patches stay private until you accept them.</p><textarea id="copilotInput" placeholder="Describe the skill goal, examples, constraints and references…"></textarea><div class="mode"><button data-mode="stepwise" class="selected">Stepwise</button><button data-mode="one_click">One-click</button></div><button id="copilotRun" class="primary wide">Generate private candidate</button><pre id="copilotStatus" class="status"></pre></aside></main></div><script src="/assets/js_lib/monaco/min/vs/loader.js"></script><script src="/assets/studio.js"></script></body></html>'''
+
+# split-source: order=1055 original-lines=108367-108367 hash=4b782b7dd294d57e
+STUDIO_CSS = r'''*{box-sizing:border-box}body{margin:0;background:#f4f7fb;color:#182538;font:14px/1.5 Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.studio{min-height:100vh}header{height:90px;background:#0d1b2a;color:#fff;padding:16px 28px;display:flex;align-items:center;justify-content:space-between}h1{margin:2px 0;font-size:25px}h1 em{font-style:normal;color:#64d6ff}.eyebrow{font-size:10px;letter-spacing:.18em;color:#8ba8c4}header p{margin:2px 0;color:#a9bdcf}button{border:1px solid #ccd8e5;background:#fff;color:#29415d;border-radius:8px;padding:8px 13px;cursor:pointer;font-weight:600}button:hover{border-color:#6aa8db}button.primary{background:#1668c7;border-color:#1668c7;color:#fff}button.wide{width:100%;margin-top:10px}.studio main{height:calc(100vh - 90px);display:grid;grid-template-columns:230px minmax(420px,1fr) 310px}.studio aside{background:#fff;border-right:1px solid #dce5ee;padding:16px;overflow:auto}.studio .copilot{border-left:1px solid #dce5ee;border-right:0;background:#fbfdff}.side-title{font-weight:800;color:#526a83;margin-bottom:12px}.project-item{padding:10px;border:1px solid transparent;border-radius:9px;margin-bottom:6px;cursor:pointer}.project-item:hover,.project-item.active{background:#eef6ff;border-color:#b7d7f5}.project-item small,.meta,.muted{color:#70859a;font-size:12px}.workspace{padding:24px;overflow:auto}.empty{max-width:520px;margin:12vh auto;text-align:center}.hidden{display:none!important}.project-head{display:flex;justify-content:space-between;gap:18px;align-items:start;border-bottom:1px solid #dce5ee;padding-bottom:15px}.project-head h2{margin:0}.actions{display:flex;gap:7px}.tabs{display:flex;gap:2px;margin:14px 0;border-bottom:1px solid #dce5ee}.tabs button{border:0;border-bottom:2px solid transparent;border-radius:0;background:transparent}.tabs button.active{color:#1668c7;border-bottom-color:#1668c7}.panel{background:#fff;border:1px solid #dce5ee;border-radius:12px;padding:18px;margin-bottom:12px}.file-row{display:flex;justify-content:space-between;width:100%;padding:9px;border:0;border-bottom:1px solid #edf1f5;border-radius:0;text-align:left}.file-row code{color:#1668c7}.file-workbench{display:grid;grid-template-columns:minmax(180px,28%) 1fr;gap:12px;min-height:460px}.file-tools{height:38px;display:flex;justify-content:space-between;align-items:center;color:#60768c}.monaco-host,.file-fallback{height:410px;width:100%;border:1px solid #d5e0ea}.file-fallback{display:none;min-height:410px;border-radius:0}textarea{width:100%;min-height:160px;border:1px solid #cbd8e5;border-radius:9px;padding:10px;font:13px/1.5 ui-monospace,monospace;resize:vertical}.mode{display:flex;gap:6px;margin-top:10px}.mode button{flex:1}.mode button.selected{background:#e7f2ff;border-color:#79b4ea;color:#075da9}.status{min-height:140px;white-space:pre-wrap;background:#0e1c2a;color:#bee4ff;border-radius:9px;padding:10px;font-size:11px}@media(max-width:1000px){.studio main{grid-template-columns:190px minmax(300px,1fr)}.copilot{position:fixed;right:0;top:90px;bottom:0;width:300px;box-shadow:-10px 0 30px #9eacbb;display:none}.copilot.open{display:block}}@media(max-width:700px){header{padding:12px 16px;height:auto}.studio main{height:auto;min-height:calc(100vh - 76px);grid-template-columns:1fr}.studio main>aside:first-child{display:none}.workspace{padding:14px}.actions{flex-wrap:wrap}.project-head{display:block}.actions{margin-top:10px}.file-workbench{grid-template-columns:1fr}.monaco-host,.file-fallback{height:330px;min-height:330px}}'''
+
+# split-source: order=1056 original-lines=108368-108368 hash=ca9a737435a250bf
+STUDIO_JS = r'''const S={csrf:'',device:'',session:'',projects:[],project:null,mode:'stepwise',tab:'brief',job:null,monaco:null,editor:null,model:null};const $=id=>document.getElementById(id);const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));async function api(path,opt={}){const h=new Headers(opt.headers||{});if(opt.body&&!h.has('Content-Type'))h.set('Content-Type','application/json');if(opt.method&&opt.method!=='GET')h.set('X-CSRF-Token',S.csrf);const r=await fetch(path,{credentials:'same-origin',cache:'no-store',...opt,headers:h});const b=await r.json();if(!r.ok)throw Error(b.error||`HTTP ${r.status}`);return b}async function boot(){const b=await api('/api/skillslab/v2/bootstrap');S.csrf=b.csrf_token;S.projects=b.projects||[];renderProjects();if(S.projects[0])openProject(S.projects[0].id)}function renderProjects(){const h=$('projects');h.innerHTML=S.projects.map(p=>`<div class="project-item ${S.project?.id===p.id?'active':''}" data-id="${esc(p.id)}"><strong>${esc(p.title)}</strong><br><small>${esc(p.status)} · v${p.revision}</small></div>`).join('')||'<p class="muted">No private drafts yet.</p>';h.querySelectorAll('[data-id]').forEach(x=>x.onclick=()=>openProject(x.dataset.id))}async function openProject(id){S.project=await api('/api/skillslab/v2/projects/'+encodeURIComponent(id));$('empty').classList.add('hidden');$('editor').classList.remove('hidden');$('projectTitle').textContent=S.project.title;$('projectMeta').textContent=`${S.project.status} · revision ${S.project.revision}`;renderProjects();renderTab()}function renderTab(){const c=$('tabContent');if(!S.project)return;const v=S.project.validation||{};if(S.tab==='files'){c.innerHTML=`<div class="panel"><div class="file-workbench"><div id="studioFileList">${(S.project.files||[]).map(f=>`<button class="file-row" data-file="${esc(f.path)}"><code>${esc(f.path)}</code><span>${f.size} bytes</span></button>`).join('')}</div><div><div class="file-tools"><span id="activeFile">Select a file</span><button id="saveFile" disabled>Save</button></div><div id="monacoHost" class="monaco-host"></div><textarea id="fileFallback" class="file-fallback"></textarea></div></div></div>`;c.querySelectorAll('[data-file]').forEach(x=>x.onclick=()=>openStudioFile(x.dataset.file));}else if(S.tab==='evaluation')c.innerHTML=`<div class="panel"><h3>Deterministic validation</h3><pre>${esc(JSON.stringify(v,null,2))}</pre></div>`;else c.innerHTML=`<div class="panel"><h3>${S.tab==='brief'?'Requirements brief':S.tab==='design'?'Design decisions':'Workflow view'}</h3><p>${esc(S.project.summary?.description||'Describe the target, triggers, inputs/outputs, tools, trust boundary and quality bar in Copilot.')}</p><p class="muted">Private draft only · global agents are unaffected.</p></div>`}async function initStudioEditor(value,path){const host=$('monacoHost'),fallback=$('fileFallback');if(window.require&&window.monaco){if(!S.editor){window.MonacoEnvironment={getWorker:()=>new Worker('/assets/studio-monaco-worker.js')};window.require.config({paths:{vs:'/assets/js_lib/monaco/min/vs'}});await new Promise((resolve,reject)=>window.require(['vs/editor/editor.main'],resolve,reject));S.monaco=window.monaco;S.editor=S.monaco.editor.create(host,{automaticLayout:true,minimap:{enabled:false},fontSize:13,wordWrap:'on'});}if(S.model)S.model.dispose();S.model=S.monaco.editor.createModel(value,path.endsWith('.md')?'markdown':path.endsWith('.yaml')||path.endsWith('.yml')?'yaml':'plaintext');S.editor.setModel(S.model);fallback.classList.add('hidden')}else{fallback.value=value;fallback.classList.remove('hidden')}}async function openStudioFile(path){const f=await api(`/api/skillslab/v2/projects/${S.project.id}/files/${encodeURIComponent(path)}`);S.activeFile=path;$('activeFile').textContent=path;$('saveFile').disabled=!!f.is_binary;if(!f.is_binary){await initStudioEditor(f.content,path);$('saveFile').onclick=async()=>{const content=S.editor&&S.model?S.model.getValue():$('fileFallback').value;await api(`/api/skillslab/v2/projects/${S.project.id}/files`,{method:'POST',body:JSON.stringify({path,content,expected_revision:S.project.revision})});await openProject(S.project.id)}}}async function newProject(){const title=prompt('Skill title');if(!title)return;const p=await api('/api/skillslab/v2/projects',{method:'POST',body:JSON.stringify({title})});S.projects.unshift(p);renderProjects();openProject(p.id)}document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{S.tab=b.dataset.tab;document.querySelectorAll('[data-tab]').forEach(x=>x.classList.toggle('active',x===b));renderTab()});document.querySelectorAll('[data-mode]').forEach(b=>b.onclick=()=>{S.mode=b.dataset.mode;document.querySelectorAll('[data-mode]').forEach(x=>x.classList.toggle('selected',x===b))});$('newProject').onclick=$('emptyNew').onclick=()=>newProject().catch(e=>alert(e.message));document.querySelectorAll('[data-action]').forEach(b=>b.onclick=async()=>{try{if(b.dataset.action==='validate'){$('copilotStatus').textContent=JSON.stringify(await api(`/api/skillslab/v2/projects/${S.project.id}/validate`),null,2)}else if(b.dataset.action==='evaluate'){$('copilotStatus').textContent=JSON.stringify(await api(`/api/skillslab/v2/projects/${S.project.id}/evaluations`,{method:'POST',body:JSON.stringify({expected_revision:S.project.revision})}),null,2)}else{const out=await api(`/api/skillslab/v2/projects/${S.project.id}/submissions`,{method:'POST',body:JSON.stringify({expected_revision:S.project.revision})});$('copilotStatus').textContent=JSON.stringify(out,null,2)}openProject(S.project.id)}catch(e){alert(e.message)}});$('copilotRun').onclick=async()=>{try{const out=await api(`/api/skillslab/v2/projects/${S.project.id}/copilot/jobs`,{method:'POST',body:JSON.stringify({mode:S.mode,goal:$('copilotInput').value,expected_revision:S.project.revision})});$('copilotStatus').textContent=JSON.stringify(out,null,2);setTimeout(async()=>{$('copilotStatus').textContent=JSON.stringify(await api(`/api/skillslab/v2/copilot/jobs/${out.id}`),null,2)},250)}catch(e){alert(e.message)}};boot().catch(e=>{$('copilotStatus').textContent=e.message});'''

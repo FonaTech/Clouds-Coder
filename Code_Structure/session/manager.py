@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=560 original-lines=3131-3136 hash=86ab07aacf89e33f
+# split-source: order=632 original-lines=6837-6842 hash=86ab07aacf89e33f
 
 
 class SessionCreationLimitExceeded(RuntimeError):
@@ -13,7 +13,7 @@ class SessionCreationLimitExceeded(RuntimeError):
         self.status = dict(status or {})
         super().__init__(str(self.status.get("message", "daily session limit reached")))
 
-# split-source: order=872 original-lines=74718-76029 hash=fc419b36f32453ae
+# split-source: order=955 original-lines=82458-83837 hash=f2c63bcdee6ee050
 
 class SessionManager:
     def __init__(
@@ -60,6 +60,13 @@ class SessionManager:
         knowledge_library_status_callback=None,
         mcp_manager=None,
         js_lib_download_enabled: bool = True,
+        workspace_root: Path | None = None,
+        collaboration_context: dict | None = None,
+        collaboration_context_provider=None,
+        collaboration_write_coordinator=None,
+        shell_timeout_mode: str = DEFAULT_SHELL_TIMEOUT_MODE,
+        shell_async_handoff_seconds: int = DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS,
+        process_manager: UserProcessManager | None = None,
     ):
         self.root = root
         self.root.mkdir(parents=True, exist_ok=True)
@@ -71,6 +78,11 @@ class SessionManager:
         self.js_lib_download_enabled = bool(js_lib_download_enabled)
         self.crypto = crypto
         self.repo_root = repo_root
+        self.workspace_root = Path(workspace_root).resolve(strict=False) if workspace_root is not None else None
+        self.collaboration_context = dict(collaboration_context or {})
+        self.collaboration_context_provider = collaboration_context_provider
+        self.collaboration_write_coordinator = collaboration_write_coordinator
+        self.process_manager = process_manager
         self.thinking = False
         self.mcp_manager = mcp_manager
         self.default_llm_config = default_llm_config or {}
@@ -95,6 +107,13 @@ class SessionManager:
             minimum=MIN_SHELL_COMMAND_TIMEOUT_SECONDS,
             maximum=MAX_SHELL_COMMAND_TIMEOUT_SECONDS,
             fallback=DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
+        )
+        self.shell_timeout_mode = normalize_shell_timeout_mode(shell_timeout_mode)
+        self.shell_async_handoff_seconds = normalize_timeout_seconds(
+            shell_async_handoff_seconds,
+            minimum=MIN_SHELL_ASYNC_HANDOFF_SECONDS,
+            maximum=MAX_SHELL_ASYNC_HANDOFF_SECONDS,
+            fallback=DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS,
         )
         self.auto_task_level_ceiling = normalize_auto_task_level_ceiling(auto_task_level_ceiling)
         cfg_l2_todo_policy = extract_l2_todo_policy_setting(self.default_llm_config)
@@ -149,6 +168,10 @@ class SessionManager:
         self.global_llm_config_revision = ""
         self.global_llm_config_source = ""
         self.force_global_defaults_on_load = False
+        self.collaboration_llm_independent = False
+        self.collaboration_llm_source_revision = ""
+        self.collaboration_llm_source_user_id = ""
+        self.collaboration_llm_source_kind = ""
         self.user_language = normalize_ui_language(default_language)
         self._load_user_prefs()
         self._load_existing()
@@ -273,6 +296,18 @@ class SessionManager:
             "user_memory_mode": normalize_user_memory_mode(getattr(self, "user_memory_mode", DEFAULT_USER_MEMORY_MODE)),
             "global_llm_config_revision": str(getattr(self, "global_llm_config_revision", "") or ""),
             "global_llm_config_source": str(getattr(self, "global_llm_config_source", "") or ""),
+            "collaboration_llm_independent": bool(
+                getattr(self, "collaboration_llm_independent", False)
+            ),
+            "collaboration_llm_source_revision": str(
+                getattr(self, "collaboration_llm_source_revision", "") or ""
+            ),
+            "collaboration_llm_source_user_id": str(
+                getattr(self, "collaboration_llm_source_user_id", "") or ""
+            ),
+            "collaboration_llm_source_kind": str(
+                getattr(self, "collaboration_llm_source_kind", "") or ""
+            ),
             "updated_at": now_ts(),
         }
         self.crypto.write_json(self.user_prefs_path, data)
@@ -356,6 +391,18 @@ class SessionManager:
                     self.user_memory_mode = normalize_user_memory_mode(raw_user_memory_mode)
             self.global_llm_config_revision = str(raw.get("global_llm_config_revision", "") or "")
             self.global_llm_config_source = str(raw.get("global_llm_config_source", "") or "")
+            self.collaboration_llm_independent = bool(
+                raw.get("collaboration_llm_independent", False)
+            )
+            self.collaboration_llm_source_revision = str(
+                raw.get("collaboration_llm_source_revision", "") or ""
+            )
+            self.collaboration_llm_source_user_id = str(
+                raw.get("collaboration_llm_source_user_id", "") or ""
+            )
+            self.collaboration_llm_source_kind = str(
+                raw.get("collaboration_llm_source_kind", "") or ""
+            )
             profiles = raw.get("model_profiles", {})
             if isinstance(profiles, dict) and profiles:
                 for k, v in profiles.items():
@@ -484,6 +531,13 @@ class SessionManager:
             minimum=MIN_SHELL_COMMAND_TIMEOUT_SECONDS,
             maximum=MAX_SHELL_COMMAND_TIMEOUT_SECONDS,
             fallback=DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
+        )
+        sess.shell_timeout_mode = normalize_shell_timeout_mode(self.shell_timeout_mode)
+        sess.shell_async_handoff_seconds = normalize_timeout_seconds(
+            self.shell_async_handoff_seconds,
+            minimum=MIN_SHELL_ASYNC_HANDOFF_SECONDS,
+            maximum=MAX_SHELL_ASYNC_HANDOFF_SECONDS,
+            fallback=DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS,
         )
         sess._apply_active_profile()
         sess.updated_at = now_ts()
@@ -700,6 +754,13 @@ class SessionManager:
                 knowledge_library_root=self.knowledge_library_root,
                 knowledge_library_status_callback=self.knowledge_library_status_callback,
                 mcp_manager=getattr(self, "mcp_manager", None),
+                workspace_root=self.workspace_root,
+                collaboration_context=self.collaboration_context,
+                collaboration_context_provider=self.collaboration_context_provider,
+                collaboration_write_coordinator=self.collaboration_write_coordinator,
+                shell_timeout_mode=self.shell_timeout_mode,
+                shell_async_handoff_seconds=self.shell_async_handoff_seconds,
+                process_manager=self.process_manager,
             )
         sess.set_telemetry_callback(self.telemetry_callback)
         desired_mode = normalize_execution_mode(self.execution_mode, default=EXECUTION_MODE_SYNC)
@@ -809,6 +870,13 @@ class SessionManager:
                 knowledge_library_root=self.knowledge_library_root,
                 knowledge_library_status_callback=self.knowledge_library_status_callback,
                 mcp_manager=getattr(self, "mcp_manager", None),
+                workspace_root=self.workspace_root,
+                collaboration_context=self.collaboration_context,
+                collaboration_context_provider=self.collaboration_context_provider,
+                collaboration_write_coordinator=self.collaboration_write_coordinator,
+                shell_timeout_mode=self.shell_timeout_mode,
+                shell_async_handoff_seconds=self.shell_async_handoff_seconds,
+                process_manager=self.process_manager,
             )
             sess.set_telemetry_callback(self.telemetry_callback)
             self._apply_user_defaults_to_session(sess)

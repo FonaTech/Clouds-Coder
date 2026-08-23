@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=725 original-lines=8085-8117 hash=28ee420b5a6d9364
+# split-source: order=804 original-lines=12622-12654 hash=28ee420b5a6d9364
 
 def trusted_client_ip(handler: BaseHTTPRequestHandler) -> str:
     peer = handler.client_address[0] if getattr(handler, "client_address", None) else "0.0.0.0"
@@ -40,7 +40,7 @@ def trusted_client_ip(handler: BaseHTTPRequestHandler) -> str:
         current = candidate
     return current
 
-# split-source: order=733 original-lines=8508-8515 hash=d6f677beb0fa793e
+# split-source: order=812 original-lines=13045-13052 hash=d6f677beb0fa793e
 
 
 class AdminAuthError(Exception):
@@ -50,7 +50,7 @@ class AdminAuthError(Exception):
         self.status = int(status or 400)
         self.retry_after = max(0, int(retry_after or 0))
 
-# split-source: order=734 original-lines=8516-8786 hash=998fc7ce701e59c6
+# split-source: order=813 original-lines=13053-13329 hash=927375521985540f
 
 
 class AdminAuthStore:
@@ -60,13 +60,19 @@ class AdminAuthStore:
 
     def __init__(self, path: Path):
         self.path = Path(path)
+        self._initialized = False
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
         self.password_slots = threading.BoundedSemaphore(3)
         self.login_failures: dict[tuple[str, str], deque[float]] = {}
         self._initialize()
+        self._initialized = True
 
     def _connect(self) -> sqlite3.Connection:
+        if self._initialized and (
+            not self.path.parent.is_dir() or not self.path.is_file()
+        ):
+            raise sqlite3.OperationalError("administrator authentication storage is unavailable")
         conn = sqlite3.connect(str(self.path), timeout=10.0, isolation_level=None)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=10000")

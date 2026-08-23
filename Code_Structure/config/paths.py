@@ -5,68 +5,291 @@
 
 from __future__ import annotations
 
-# split-source: order=65 original-lines=84-84 hash=bc447feb3084cf2f
+# split-source: order=112 original-lines=3467-3467 hash=bc447feb3084cf2f
 SCRIPT_DIR = Path(__file__).resolve().parent
 
-# split-source: order=90 original-lines=178-183 hash=97094c81404bcef6
+# split-source: order=137 original-lines=3561-3570 hash=6d198870996eb061
 
 def _resolve_default_agent_workdir() -> Path:
     raw = str(os.getenv("AGENT_WORKDIR", "") or "").strip()
     if raw:
         return Path(raw).expanduser().resolve()
+    if _is_installed_python_runtime(SCRIPT_DIR):
+        stable_root = str(os.getenv("CLOUDS_CODER_HOME", "") or "").strip()
+        base = Path(stable_root).expanduser() if stable_root else Path.home() / ".clouds_coder"
+        return (base / "workspace").resolve()
     return SCRIPT_DIR
 
-# split-source: order=91 original-lines=184-213 hash=807fc7578605cd9a
+# split-source: order=138 original-lines=3571-3574 hash=57424d297e3b5457
+
+def _is_installed_python_runtime(path: Path) -> bool:
+    parts = {part.casefold() for part in Path(path).parts}
+    return bool(parts.intersection({"site-packages", "dist-packages"}))
+
+# split-source: order=139 original-lines=3575-3581 hash=b115426f390ac524
+
+def _runtime_storage_mode() -> str:
+    if str(os.getenv("AGENT_WORKDIR", "") or "").strip():
+        return "explicit-workdir"
+    if _is_installed_python_runtime(SCRIPT_DIR):
+        return "pip-stable-workspace"
+    return "script-local"
+
+# split-source: order=140 original-lines=3582-3587 hash=27b43b29779e59bb
+
+def _runtime_tree_has_content(path: Path) -> bool:
+    try:
+        return path.exists() and path.is_dir() and any(path.iterdir())
+    except Exception:
+        return False
+
+# split-source: order=141 original-lines=3588-3653 hash=db2d36f9a5257fbd
+
+def _copy_runtime_tree_with_crypto_migration(
+    source: Path,
+    target: Path,
+    source_crypto,
+    target_crypto,
+) -> None:
+    """Copy one missing runtime tree and re-encrypt legacy CryptoBox files."""
+    source = Path(source)
+    target = Path(target)
+    if source.is_symlink():
+        raise ValueError(f"legacy runtime tree cannot be a symbolic link: {source}")
+    stage = target.parent / f".{target.name}.legacy-migrate-{uuid.uuid4().hex}"
+    try:
+        stage.mkdir(parents=True, exist_ok=False)
+        for item in source.rglob("*"):
+            rel = item.relative_to(source)
+            output = stage / rel
+            if item.is_symlink():
+                output.parent.mkdir(parents=True, exist_ok=True)
+                os.symlink(
+                    os.readlink(item),
+                    output,
+                    target_is_directory=item.is_dir(),
+                )
+                continue
+            if item.is_dir():
+                output.mkdir(parents=True, exist_ok=True)
+                continue
+            if not item.is_file():
+                continue
+            output.parent.mkdir(parents=True, exist_ok=True)
+            encrypted_box = False
+            try:
+                if item.stat().st_size <= 256 * 1024 * 1024:
+                    with item.open("rb") as handle:
+                        head = handle.read(512).lstrip()
+                    encrypted_box = bool(
+                        head.startswith(b'{"v"')
+                        and b'"n"' in head
+                        and b'"c"' in head
+                    )
+            except Exception:
+                encrypted_box = False
+            if encrypted_box:
+                raw = item.read_text(encoding="utf-8")
+                box = json.loads(raw)
+                encrypted_box = bool(
+                    isinstance(box, dict)
+                    and {"v", "n", "c", "m"}.issubset(box)
+                )
+                if encrypted_box:
+                    plain = source_crypto.decrypt_text(raw)
+                    output.write_text(target_crypto.encrypt_text(plain), encoding="utf-8")
+                    try:
+                        shutil.copystat(item, output)
+                    except Exception:
+                        pass
+                    continue
+            shutil.copy2(item, output)
+        if target.exists():
+            raise FileExistsError(f"runtime migration target already exists: {target}")
+        os.replace(stage, target)
+    finally:
+        if stage.exists():
+            shutil.rmtree(stage, ignore_errors=True)
+
+# split-source: order=142 original-lines=3654-3719 hash=22f466bd12b905a1
+
+def _merge_legacy_codes_root(source: Path, target: Path) -> dict:
+    """Import missing users/sessions from a legacy Codes root without overwrites."""
+    result = {"imported_users": 0, "imported_sessions": 0, "skipped_sessions": 0, "errors": []}
+    source = Path(source).resolve()
+    target = Path(target).resolve()
+    source_key = source / ".encryption_key"
+    if source == target or not source.is_dir() or not source_key.is_file():
+        return result
+    try:
+        source_crypto = CryptoBox(source)
+        target_crypto = CryptoBox(target)
+    except Exception as exc:
+        result["errors"].append(f"crypto:{trim(str(exc), 220)}")
+        return result
+    for legacy_user in sorted(source.iterdir(), key=lambda p: p.name.casefold()):
+        if not legacy_user.is_dir() or legacy_user.is_symlink():
+            continue
+        target_user = target / legacy_user.name
+        if target_user.is_symlink():
+            result["errors"].append(f"{legacy_user.name}:target user root is a symbolic link")
+            continue
+        if not target_user.exists():
+            try:
+                _copy_runtime_tree_with_crypto_migration(
+                    legacy_user,
+                    target_user,
+                    source_crypto,
+                    target_crypto,
+                )
+                result["imported_users"] += 1
+                legacy_sessions = legacy_user / "sessions"
+                if legacy_sessions.is_dir():
+                    result["imported_sessions"] += sum(
+                        1 for path in legacy_sessions.iterdir() if path.is_dir()
+                    )
+            except Exception as exc:
+                result["errors"].append(
+                    f"{legacy_user.name}:{trim(str(exc), 220)}"
+                )
+            continue
+        legacy_sessions = legacy_user / "sessions"
+        if not legacy_sessions.is_dir() or legacy_sessions.is_symlink():
+            continue
+        target_sessions = target_user / "sessions"
+        target_sessions.mkdir(parents=True, exist_ok=True)
+        for legacy_session in sorted(legacy_sessions.iterdir(), key=lambda p: p.name.casefold()):
+            if not legacy_session.is_dir() or legacy_session.is_symlink():
+                continue
+            target_session = target_sessions / legacy_session.name
+            if target_session.exists():
+                result["skipped_sessions"] += 1
+                continue
+            try:
+                _copy_runtime_tree_with_crypto_migration(
+                    legacy_session,
+                    target_session,
+                    source_crypto,
+                    target_crypto,
+                )
+                result["imported_sessions"] += 1
+            except Exception as exc:
+                result["errors"].append(
+                    f"{legacy_user.name}/{legacy_session.name}:{trim(str(exc), 220)}"
+                )
+    return result
+
+# split-source: order=143 original-lines=3720-3810 hash=122908774e0cb307
 
 def _migrate_legacy_runtime_roots(workspace: Path) -> dict:
     root = Path(workspace).resolve()
     legacy_root = (root / "skills").resolve()
     moved: list[str] = []
+    copied: list[str] = []
     errors: list[str] = []
-    if legacy_root == root or (not legacy_root.exists()) or (not legacy_root.is_dir()):
-        return {
-            "root": str(root),
-            "legacy_root": str(legacy_root),
-            "moved": moved,
-            "errors": errors,
-        }
-    # Earlier builds could incorrectly place runtime data under workspace/skills when started from that cwd.
-    for name in ("RAG_Library", "Code_Library", "Codes", "js_lib", "LLM.config.json"):
-        src = legacy_root / name
-        dst = root / name
-        try:
-            if (not src.exists()) or dst.exists():
-                continue
-            shutil.move(str(src), str(dst))
-            moved.append(name)
-        except Exception as exc:
-            errors.append(f"{name}:{trim(str(exc), 220)}")
+    imported_users = 0
+    imported_sessions = 0
+    skipped_sessions = 0
+    if legacy_root != root and legacy_root.exists() and legacy_root.is_dir():
+        # Earlier builds could incorrectly place runtime data under
+        # workspace/skills. Preserve that source and copy missing data into the
+        # active root so every compatibility migration is non-destructive.
+        for name in ("RAG_Library", "Code_Library", "Codes", "js_lib", "LLM.config.json"):
+            src = legacy_root / name
+            dst = root / name
+            try:
+                if (not src.exists()) or dst.exists():
+                    continue
+                root.mkdir(parents=True, exist_ok=True)
+                if src.is_dir():
+                    shutil.copytree(src, dst, copy_function=shutil.copy2, symlinks=True)
+                else:
+                    shutil.copy2(src, dst)
+                copied.append(f"skills:{name}")
+            except Exception as exc:
+                errors.append(f"{name}:{trim(str(exc), 220)}")
+
+    # Builds before 4.84 used the module's site-packages directory as writable
+    # state. The stable-home fix must import that history instead of merely
+    # switching roots and making existing sessions appear to vanish.
+    installed_root = Path(SCRIPT_DIR).resolve()
+    if _is_installed_python_runtime(installed_root) and installed_root != root:
+        legacy_codes = installed_root / "Codes"
+        target_codes = root / "Codes"
+        if _runtime_tree_has_content(legacy_codes):
+            try:
+                if not _runtime_tree_has_content(target_codes):
+                    target_codes.parent.mkdir(parents=True, exist_ok=True)
+                    if target_codes.exists():
+                        target_codes.rmdir()
+                    shutil.copytree(
+                        legacy_codes,
+                        target_codes,
+                        copy_function=shutil.copy2,
+                        symlinks=True,
+                    )
+                    copied.append("site-packages:Codes")
+                    for user_dir in legacy_codes.iterdir():
+                        sessions_dir = user_dir / "sessions" if user_dir.is_dir() else None
+                        if sessions_dir is not None and sessions_dir.is_dir():
+                            imported_users += 1
+                            imported_sessions += sum(1 for p in sessions_dir.iterdir() if p.is_dir())
+                else:
+                    merged = _merge_legacy_codes_root(legacy_codes, target_codes)
+                    imported_users += int(merged.get("imported_users", 0) or 0)
+                    imported_sessions += int(merged.get("imported_sessions", 0) or 0)
+                    skipped_sessions += int(merged.get("skipped_sessions", 0) or 0)
+                    errors.extend(
+                        f"site-packages:Codes:{row}"
+                        for row in (merged.get("errors", []) or [])
+                    )
+            except Exception as exc:
+                errors.append(f"site-packages:Codes:{trim(str(exc), 220)}")
+        for name in (".clouds_coder_admin", "RAG_Library", "Code_Library", "js_lib", "LLM.config.json"):
+            src = installed_root / name
+            dst = root / name
+            try:
+                if not src.exists() or dst.exists():
+                    continue
+                root.mkdir(parents=True, exist_ok=True)
+                if src.is_dir():
+                    shutil.copytree(src, dst, copy_function=shutil.copy2, symlinks=True)
+                else:
+                    shutil.copy2(src, dst)
+                copied.append(f"site-packages:{name}")
+            except Exception as exc:
+                errors.append(f"site-packages:{name}:{trim(str(exc), 220)}")
     return {
         "root": str(root),
+        "storage_mode": _runtime_storage_mode(),
         "legacy_root": str(legacy_root),
+        "installed_legacy_root": str(installed_root),
         "moved": moved,
+        "copied": copied,
+        "imported_users": imported_users,
+        "imported_sessions": imported_sessions,
+        "skipped_sessions": skipped_sessions,
         "errors": errors,
     }
 
-# split-source: order=92 original-lines=214-215 hash=ade2cecdb185f771
+# split-source: order=144 original-lines=3811-3812 hash=ade2cecdb185f771
 
 WORKDIR = _resolve_default_agent_workdir()
 
-# split-source: order=93 original-lines=216-216 hash=3e4d58d57d1e261b
+# split-source: order=145 original-lines=3813-3813 hash=3e4d58d57d1e261b
 CODES_ROOT = WORKDIR / "Codes"
 
-# split-source: order=94 original-lines=217-217 hash=29dd970e5b14e924
+# split-source: order=146 original-lines=3814-3814 hash=29dd970e5b14e924
 LLM_CONFIG_PATH = WORKDIR / "LLM.config.json"
 
-# split-source: order=604 original-lines=3847-3862 hash=eb1a175423f35715
+# split-source: order=683 original-lines=7673-7687 hash=1c8289e3f7ac60a2
 
 def detect_repo_root(cwd: Path) -> Path | None:
     try:
-        r = subprocess.run(
+        r = run_subprocess_text(
             ["git", "rev-parse", "--show-toplevel"],
             cwd=cwd,
             capture_output=True,
-            text=True,
             timeout=10,
         )
         if r.returncode != 0:
@@ -76,6 +299,6 @@ def detect_repo_root(cwd: Path) -> Path | None:
     except Exception:
         return None
 
-# split-source: order=605 original-lines=3863-3864 hash=abb03f0e9fd37533
+# split-source: order=684 original-lines=7688-7689 hash=abb03f0e9fd37533
 
 REPO_ROOT = detect_repo_root(WORKDIR) or WORKDIR

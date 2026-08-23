@@ -5,9 +5,170 @@
 
 from __future__ import annotations
 
-# split-source: order=963 original-lines=109169-109360 hash=6f96b0d36eac05d1
+# split-source: order=1066 original-lines=121644-121801 hash=854829282d494ae6
 
-class RagAdminHandler(BaseHTTPRequestHandler):
+
+class _RagAdminAuthMixin:
+    """Shared administrator authentication for the knowledge and code RAG UIs."""
+
+    _ADMIN_AUTH_POST_PATHS = {
+        "/api/admin/auth/setup",
+        "/api/admin/auth/login",
+        "/api/admin/auth/token-login",
+        "/api/admin/auth/logout",
+    }
+
+    def _bearer_token(self) -> str:
+        auth = str(self.headers.get("Authorization", "") or "").strip()
+        if auth.lower().startswith("bearer "):
+            return auth[7:].strip()
+        return str(self.headers.get("X-Admin-Token", "") or "").strip()
+
+    def _same_origin_write(self) -> bool:
+        origin = str(self.headers.get("Origin", "") or "").strip()
+        if not origin:
+            return True
+        host = str(self.headers.get("Host", "") or "").strip()
+        parsed = urlparse(origin)
+        return bool(
+            host and parsed.netloc == host and parsed.scheme in {"http", "https"}
+        )
+
+    def _local_admin_setup_request(self) -> bool:
+        peer = str(
+            self.client_address[0] if getattr(self, "client_address", None) else ""
+        )
+        try:
+            if not ipaddress.ip_address(peer).is_loopback:
+                return False
+            if not ipaddress.ip_address(self._client_ip()).is_loopback:
+                return False
+        except Exception:
+            return False
+        host = str(self.headers.get("Host", "") or "").strip().lower()
+        if host.startswith("["):
+            hostname = host.split("]", 1)[0].lstrip("[")
+        else:
+            hostname = host.rsplit(":", 1)[0] if host.count(":") <= 1 else host
+        return hostname in {"localhost", "127.0.0.1", "::1"}
+
+    def _auth_error(self, exc: AdminAuthError):
+        payload = {"error": str(exc), "code": exc.code}
+        if exc.retry_after:
+            payload["retry_after"] = exc.retry_after
+        return self._send_json(payload, status=exc.status)
+
+    def _require_admin_write(self) -> bool:
+        if not self._same_origin_write():
+            self._send_json(
+                {"error": "cross-origin write rejected", "code": "cross_origin"},
+                status=403,
+            )
+            return False
+        if self.app.verify_admin_token(self._bearer_token()):
+            return True
+        self._send_json(
+            {"error": "admin authentication required", "code": "unauthorized"},
+            status=401,
+        )
+        return False
+
+    def _handle_admin_auth_get(self, path: str) -> bool:
+        if path == "/api/admin/auth/status":
+            self._send_json(
+                self.app.admin_auth_status(
+                    local_setup_allowed=self._local_admin_setup_request()
+                )
+            )
+            return True
+        if path == "/api/admin/auth/session":
+            kind = self.app.verify_admin_token(self._bearer_token())
+            if kind:
+                self._send_json({"ok": True, "auth_kind": kind})
+            else:
+                self._send_json(
+                    {"error": "admin authentication required", "code": "unauthorized"},
+                    status=401,
+                )
+            return True
+        return False
+
+    def _handle_admin_auth_post(self, path: str) -> bool:
+        if path not in self._ADMIN_AUTH_POST_PATHS:
+            return False
+        if not self._same_origin_write():
+            self._send_json(
+                {"error": "cross-origin write rejected", "code": "cross_origin"},
+                status=403,
+            )
+            return True
+        content_type = (
+            str(self.headers.get("Content-Type", "") or "")
+            .split(";", 1)[0]
+            .strip()
+            .lower()
+        )
+        if content_type != "application/json":
+            self._send_json(
+                {
+                    "error": "application/json is required",
+                    "code": "invalid_content_type",
+                },
+                status=415,
+            )
+            return True
+        try:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+        except Exception:
+            length = 0
+        if length < 0 or length > 8192:
+            self.close_connection = True
+            self._send_json(
+                {
+                    "error": "authentication request is too large",
+                    "code": "payload_too_large",
+                },
+                status=413,
+            )
+            return True
+        try:
+            payload = self._read_json()
+            if path == "/api/admin/auth/setup":
+                out = self.app.setup_admin(
+                    payload.get("username"),
+                    payload.get("password"),
+                    local_setup_allowed=self._local_admin_setup_request(),
+                    bootstrap_token=self._bearer_token(),
+                )
+                self._send_json(out, status=201)
+            elif path == "/api/admin/auth/login":
+                self._send_json(
+                    self.app.login_admin(
+                        payload.get("username"),
+                        payload.get("password"),
+                        self._client_ip(),
+                    )
+                )
+            elif path == "/api/admin/auth/token-login":
+                self._send_json(self.app.exchange_admin_token(self._bearer_token()))
+            else:
+                token = self._bearer_token()
+                if token:
+                    self.app.logout_admin(token)
+                self._send_json({"ok": True})
+        except AdminAuthError as exc:
+            self._auth_error(exc)
+        except Exception:
+            self._send_json(
+                {"error": "invalid authentication request", "code": "invalid_request"},
+                status=400,
+            )
+        return True
+
+# split-source: order=1068 original-lines=121916-122104 hash=c1b91099095057bf
+
+
+class RagAdminHandler(_RagAdminAuthMixin, BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = f"StandaloneWebRAG/{APP_VERSION}"
 
@@ -39,17 +200,6 @@ class RagAdminHandler(BaseHTTPRequestHandler):
     def _read_json(self) -> dict:
         return read_http_json_body(self)
 
-    def _require_admin_write(self) -> bool:
-        auth = str(self.headers.get("Authorization", "") or "").strip()
-        token = auth[7:].strip() if auth.lower().startswith("bearer ") else str(self.headers.get("X-Admin-Token", "") or "").strip()
-        origin = str(self.headers.get("Origin", "") or "").strip()
-        parsed = urlparse(origin)
-        same_origin = not origin or (parsed.scheme in {"http", "https"} and parsed.netloc == str(self.headers.get("Host", "") or ""))
-        if self.app.verify_admin_token(token) and same_origin:
-            return True
-        self._send_json({"error": "admin authentication and same-origin request required"}, status=401)
-        return False
-
     def _send_json(self, obj: object, status: int = 200):
         body = json_response_bytes(obj)
         try:
@@ -57,6 +207,9 @@ class RagAdminHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            retry_after = int(obj.get("retry_after", 0) or 0) if isinstance(obj, dict) else 0
+            if status == 429 and retry_after > 0:
+                self.send_header("Retry-After", str(retry_after))
             if close_if_http_request_body_unread(self):
                 self.send_header("Connection", "close")
             self.end_headers()
@@ -129,6 +282,8 @@ class RagAdminHandler(BaseHTTPRequestHandler):
                 return self._send_exception(exc)
         if path == "/api/health":
             return self._send_json({"ok": True, "app": "rag-admin", "version": APP_VERSION})
+        if self._handle_admin_auth_get(path):
+            return
         if path == "/api/rag/config":
             return self._send_json(self.app.rag_config(self._user_id()))
         if path == "/api/rag/library":
@@ -171,6 +326,8 @@ class RagAdminHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = unquote(urlparse(self.path).path)
+        if self._handle_admin_auth_post(path):
+            return
         if not self._require_admin_write():
             return
         if path == "/api/rag/import":
@@ -199,10 +356,10 @@ class RagAdminHandler(BaseHTTPRequestHandler):
                 return self._send_json({"error": str(exc)}, status=400)
         return self._send_json({"error": "not found"}, status=404)
 
-# split-source: order=964 original-lines=109361-109563 hash=5e3a9bc915382a71
+# split-source: order=1069 original-lines=122105-122303 hash=6e5644e269e55ae3
 
 
-class CodeAdminHandler(BaseHTTPRequestHandler):
+class CodeAdminHandler(_RagAdminAuthMixin, BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = f"StandaloneWebCode/{APP_VERSION}"
 
@@ -234,17 +391,6 @@ class CodeAdminHandler(BaseHTTPRequestHandler):
     def _read_json(self) -> dict:
         return read_http_json_body(self)
 
-    def _require_admin_write(self) -> bool:
-        auth = str(self.headers.get("Authorization", "") or "").strip()
-        token = auth[7:].strip() if auth.lower().startswith("bearer ") else str(self.headers.get("X-Admin-Token", "") or "").strip()
-        origin = str(self.headers.get("Origin", "") or "").strip()
-        parsed = urlparse(origin)
-        same_origin = not origin or (parsed.scheme in {"http", "https"} and parsed.netloc == str(self.headers.get("Host", "") or ""))
-        if self.app.verify_admin_token(token) and same_origin:
-            return True
-        self._send_json({"error": "admin authentication and same-origin request required"}, status=401)
-        return False
-
     def _send_json(self, obj: object, status: int = 200):
         body = json_response_bytes(obj)
         try:
@@ -252,6 +398,9 @@ class CodeAdminHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            retry_after = int(obj.get("retry_after", 0) or 0) if isinstance(obj, dict) else 0
+            if status == 429 and retry_after > 0:
+                self.send_header("Retry-After", str(retry_after))
             if close_if_http_request_body_unread(self):
                 self.send_header("Connection", "close")
             self.end_headers()
@@ -316,6 +465,8 @@ class CodeAdminHandler(BaseHTTPRequestHandler):
             return self._send_inline_bytes(data, content_type)
         if path == "/api/health":
             return self._send_json({"ok": True, "app": "code-admin", "version": APP_VERSION})
+        if self._handle_admin_auth_get(path):
+            return
         if path == "/api/code/config":
             return self._send_json(self.app.code_config(self._user_id()))
         if path == "/api/code/library":
@@ -364,6 +515,8 @@ class CodeAdminHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = unquote(urlparse(self.path).path)
+        if self._handle_admin_auth_post(path):
+            return
         if not self._require_admin_write():
             return
         if path == "/api/code/import":

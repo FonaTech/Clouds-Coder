@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=735 original-lines=8787-8794 hash=7405d447cbf41aba
+# split-source: order=814 original-lines=13330-13337 hash=7405d447cbf41aba
 
 
 class IDEAuthError(Exception):
@@ -15,7 +15,7 @@ class IDEAuthError(Exception):
         self.status = int(status or 400)
         self.retry_after = max(0, int(retry_after or 0))
 
-# split-source: order=736 original-lines=8795-9495 hash=219ecb95289d2b0b
+# split-source: order=815 original-lines=13338-14059 hash=ff607e4a4f8751ea
 
 
 class IDEAuthStore:
@@ -30,19 +30,33 @@ class IDEAuthStore:
 
     def __init__(self, path: Path):
         self.path = Path(path)
+        self._initialized = False
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
         self.password_slots = threading.BoundedSemaphore(3)
         self.login_failures: dict[tuple[str, str], deque[float]] = {}
         self._initialize()
+        self._initialized = True
 
     def _connect(self) -> sqlite3.Connection:
+        if self._initialized and (
+            not self.path.parent.is_dir() or not self.path.is_file()
+        ):
+            raise sqlite3.OperationalError("IDE authentication storage is unavailable")
         conn = sqlite3.connect(str(self.path), timeout=10.0, isolation_level=None)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=10000")
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=FULL")
         return conn
+
+    def storage_health(self) -> dict:
+        try:
+            with self._connect() as conn:
+                conn.execute("SELECT 1").fetchone()
+            return {"available": True, "code": "ok"}
+        except sqlite3.DatabaseError:
+            return {"available": False, "code": "ide_store_unavailable"}
 
     def _initialize(self) -> None:
         with self._connect() as conn:
@@ -442,17 +456,24 @@ class IDEAuthStore:
             return None
         digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
         now = now_ts()
-        with self._connect() as conn:
-            row = conn.execute(
-                """SELECT a.*,s.csrf_token,s.expires_at,s.token_digest,s.last_ip,s.device_digest,
-                          s.session_kind,
-                          d.status AS device_status,d.source_ip AS device_source_ip
-                   FROM ide_sessions s JOIN ide_accounts a ON a.username_key=s.username_key
-                   LEFT JOIN ide_devices d ON d.device_digest=s.device_digest
-                   WHERE s.token_digest=? AND s.revoked_at=0 AND s.expires_at>?
-                     AND s.auth_version=a.auth_version AND a.disabled=0""",
-                (digest, now),
-            ).fetchone()
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    """SELECT a.*,s.csrf_token,s.expires_at,s.token_digest,s.last_ip,s.device_digest,
+                              s.session_kind,
+                              d.status AS device_status,d.source_ip AS device_source_ip
+                       FROM ide_sessions s JOIN ide_accounts a ON a.username_key=s.username_key
+                       LEFT JOIN ide_devices d ON d.device_digest=s.device_digest
+                       WHERE s.token_digest=? AND s.revoked_at=0 AND s.expires_at>?
+                         AND s.auth_version=a.auth_version AND a.disabled=0""",
+                    (digest, now),
+                ).fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise IDEAuthError(
+                "auth_store_unavailable",
+                "IDE authentication storage is temporarily unavailable.",
+                503,
+            ) from exc
         if row is None:
             return None
         request_ip = str(client_ip or "")

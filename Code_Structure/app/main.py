@@ -5,15 +5,9 @@
 
 from __future__ import annotations
 
-# split-source: order=967 original-lines=110937-112601 hash=69f0287be280dd3c
+# split-source: order=1075 original-lines=124559-126445 hash=22ab5dc6515a18fe
 
 
-# 第九层：进程入口与服务启动。
-# 第9層：プロセス入口とサーバ起動。
-# ============================================================================
-
-# Bootstrap sequence: load configuration, initialize shared application state,
-# and expose the HTTP service plus background runtime workers.
 def main():
     parser = argparse.ArgumentParser(description="Standalone Web Session Agent")
     parser.add_argument("--host", default="0.0.0.0")
@@ -63,6 +57,34 @@ def main():
             "Independent from the global run timeout. Also configurable via --config keys "
             "shell_command_timeout / shell_timeout / bash_timeout / command_timeout and env "
             "AGENT_SHELL_COMMAND_TIMEOUT / AGENT_BASH_TIMEOUT / AGENT_COMMAND_TIMEOUT."
+        ),
+    )
+    parser.add_argument(
+        "--shell_timeout_mode",
+        "--shell-timeout-mode",
+        "--bash_timeout_mode",
+        "--bash-timeout-mode",
+        dest="shell_timeout_mode",
+        default=None,
+        choices=list(SHELL_TIMEOUT_MODES),
+        help=(
+            "Shell timeout policy: fixed counts total process time; auto resets the timeout on any "
+            "stdout/stderr byte; async behaves like auto and hands a still-running process to the "
+            "background list after --shell-async-handoff seconds."
+        ),
+    )
+    parser.add_argument(
+        "--shell_async_handoff_seconds",
+        "--shell-async-handoff",
+        "--shell_async_after",
+        "--bash-async-handoff",
+        dest="shell_async_handoff_seconds",
+        default=None,
+        type=int,
+        help=(
+            "Foreground wait before async shell mode adopts the same process as a background task "
+            f"(default {DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS}s; allowed "
+            f"{MIN_SHELL_ASYNC_HANDOFF_SECONDS}-{MAX_SHELL_ASYNC_HANDOFF_SECONDS})."
         ),
     )
     parser.add_argument(
@@ -216,6 +238,29 @@ def main():
         help="Disable the global MCP service mounted on agent port + 4 (enabled by default)",
     )
     parser.add_argument(
+        "--collab_port",
+        "--collab-port",
+        dest="collab_port",
+        type=int,
+        default=None,
+        help=f"LAN collaboration port (default: agent port + {COLLAB_PORT_OFFSET})",
+    )
+    parser.add_argument(
+        "--collab_host",
+        "--collab-host",
+        dest="collab_host",
+        default=None,
+        help="LAN collaboration bind host (default: main host)",
+    )
+    parser.add_argument("--enable_collaboration", "--enable-collaboration", dest="enable_collaboration", action="store_true", default=True, help="Enable the independent LAN collaboration service (default: enabled)")
+    parser.add_argument("--no_collaboration", "--no-collaboration", dest="no_collaboration", action="store_true", help="Disable the LAN collaboration service")
+    parser.add_argument("--collab_tls_cert", "--collab-tls-cert", dest="collab_tls_cert", default="", help="PEM certificate for the collaboration HTTPS listener")
+    parser.add_argument("--collab_tls_key", "--collab-tls-key", dest="collab_tls_key", default="", help="PEM private key for the collaboration HTTPS listener")
+    parser.add_argument("--collab_https_proxy", "--collab-https-proxy", dest="collab_https_proxy", action="store_true", default=False, help="Allow collaboration behind an explicitly configured trusted HTTPS reverse proxy")
+    parser.add_argument("--no_collab_https_proxy", "--no-collab-https-proxy", dest="collab_https_proxy", action="store_false", help="Disable trusted HTTPS reverse-proxy mode for collaboration")
+    parser.add_argument("--collab_allow_insecure_http", "--collab-allow-insecure-http", dest="collab_allow_insecure_http", action="store_true", default=True, help="Allow trusted-LAN collaboration over plain HTTP (default: enabled; use TLS outside a trusted LAN)")
+    parser.add_argument("--no_collab_allow_insecure_http", "--no-collab-allow-insecure-http", dest="collab_allow_insecure_http", action="store_false", help="Require HTTPS for non-loopback collaboration")
+    parser.add_argument(
         "--web_ui_config",
         default="",
         help=f"WebUI config JSON path (default: {DEFAULT_WEB_UI_CONFIG} under workspace)",
@@ -267,6 +312,7 @@ def main():
         help=(
             "LLM config source (URL or local file path). "
             "Also reads startup keys like show_upload_list, download_js_lib, shell_command_timeout, "
+            "shell_timeout_mode, shell_async_handoff_seconds, "
             "ctx_limit/context_token_limit, tool_memory_policy/read_context_policy, auto_task_level_ceiling, "
             "l2_todo_policy (force|auto|off) and "
             "daily_session_limit (aliases: daily_sessions_per_ip / "
@@ -518,6 +564,8 @@ def main():
         show_upload_list=None,
         download_js_lib=None,
         shell_command_timeout=None,
+        shell_timeout_mode=None,
+        shell_async_handoff_seconds=None,
         web_search_enabled=None,
         user_memory_mode=None,
         single_no_plan_todo_enabled=None,
@@ -566,6 +614,8 @@ def main():
     resolved_show_upload_list = False
     resolved_daily_session_limit_per_ip = 0
     resolved_shell_command_timeout = DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS
+    resolved_shell_timeout_mode = DEFAULT_SHELL_TIMEOUT_MODE
+    resolved_shell_async_handoff_seconds = DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS
     resolved_read_context_policy = DEFAULT_READ_CONTEXT_POLICY
     resolved_tool_memory_policy = DEFAULT_TOOL_MEMORY_POLICY
     resolved_auto_task_level_ceiling = DEFAULT_AUTO_TASK_LEVEL_CEILING
@@ -609,6 +659,17 @@ def main():
                     minimum=MIN_SHELL_COMMAND_TIMEOUT_SECONDS,
                     maximum=MAX_SHELL_COMMAND_TIMEOUT_SECONDS,
                     fallback=DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
+                )
+            external_shell_timeout_mode = extract_shell_timeout_mode_setting(external_config)
+            if external_shell_timeout_mode is not None:
+                resolved_shell_timeout_mode = normalize_shell_timeout_mode(external_shell_timeout_mode)
+            external_shell_async_handoff = extract_shell_async_handoff_setting(external_config)
+            if external_shell_async_handoff is not None:
+                resolved_shell_async_handoff_seconds = normalize_timeout_seconds(
+                    external_shell_async_handoff,
+                    minimum=MIN_SHELL_ASYNC_HANDOFF_SECONDS,
+                    maximum=MAX_SHELL_ASYNC_HANDOFF_SECONDS,
+                    fallback=DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS,
                 )
             external_read_context_policy = extract_read_context_policy_setting(external_config)
             if external_read_context_policy:
@@ -655,6 +716,17 @@ def main():
             maximum=MAX_SHELL_COMMAND_TIMEOUT_SECONDS,
             fallback=DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
         )
+    web_ui_shell_timeout_mode = extract_shell_timeout_mode_setting(web_ui_config)
+    if web_ui_shell_timeout_mode is not None:
+        resolved_shell_timeout_mode = normalize_shell_timeout_mode(web_ui_shell_timeout_mode)
+    web_ui_shell_async_handoff = extract_shell_async_handoff_setting(web_ui_config)
+    if web_ui_shell_async_handoff is not None:
+        resolved_shell_async_handoff_seconds = normalize_timeout_seconds(
+            web_ui_shell_async_handoff,
+            minimum=MIN_SHELL_ASYNC_HANDOFF_SECONDS,
+            maximum=MAX_SHELL_ASYNC_HANDOFF_SECONDS,
+            fallback=DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS,
+        )
     web_ui_read_context_policy = extract_read_context_policy_setting(web_ui_config)
     if web_ui_read_context_policy:
         resolved_read_context_policy = web_ui_read_context_policy
@@ -698,6 +770,17 @@ def main():
             minimum=MIN_SHELL_COMMAND_TIMEOUT_SECONDS,
             maximum=MAX_SHELL_COMMAND_TIMEOUT_SECONDS,
             fallback=DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
+        )
+    cli_shell_timeout_mode = getattr(args, "shell_timeout_mode", None)
+    if cli_shell_timeout_mode is not None:
+        resolved_shell_timeout_mode = normalize_shell_timeout_mode(cli_shell_timeout_mode)
+    cli_shell_async_handoff = getattr(args, "shell_async_handoff_seconds", None)
+    if cli_shell_async_handoff is not None:
+        resolved_shell_async_handoff_seconds = normalize_timeout_seconds(
+            cli_shell_async_handoff,
+            minimum=MIN_SHELL_ASYNC_HANDOFF_SECONDS,
+            maximum=MAX_SHELL_ASYNC_HANDOFF_SECONDS,
+            fallback=DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS,
         )
     cli_read_context_policy = normalize_read_context_policy(
         getattr(args, "read_context_policy", "") or "",
@@ -846,7 +929,11 @@ def main():
             f"[web-agent] run_timeout adjusted {requested_run_timeout}->{resolved_run_timeout} "
             f"(allowed range {MIN_RUN_TIMEOUT_SECONDS}-{MAX_RUN_TIMEOUT_SECONDS})"
     )
-    print(f"[web-agent] shell_command_timeout={int(resolved_shell_command_timeout)}s")
+    print(
+        f"[web-agent] shell_timeout={normalize_shell_timeout_mode(resolved_shell_timeout_mode)} "
+        f"limit={int(resolved_shell_command_timeout)}s "
+        f"async_handoff={int(resolved_shell_async_handoff_seconds)}s"
+    )
     print(f"[web-agent] read_context_policy={resolved_read_context_policy}")
     print(f"[web-agent] tool_memory_policy={resolved_tool_memory_policy}")
     print(f"[web-agent] web_search={'on' if resolved_web_search_enabled else 'off'}")
@@ -1065,6 +1152,8 @@ def main():
         bool(_js_dl_enabled),
         resolved_rag_include_filename_entities,
         web_search_enabled=resolved_web_search_enabled,
+        shell_timeout_mode=resolved_shell_timeout_mode,
+        shell_async_handoff_seconds=resolved_shell_async_handoff_seconds,
         web_search_setting_locked=web_search_setting_locked,
         user_memory_mode=resolved_user_memory_mode,
         user_memory_setting_locked=user_memory_setting_locked,
@@ -1148,6 +1237,9 @@ def main():
         _mgr.web_search_setting_locked = bool(web_search_setting_locked)
         _mgr.user_memory_mode = normalize_user_memory_mode(getattr(app, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
         _mgr.user_memory_setting_locked = bool(user_memory_setting_locked)
+        _mgr.shell_command_timeout_seconds = int(resolved_shell_command_timeout)
+        _mgr.shell_timeout_mode = normalize_shell_timeout_mode(resolved_shell_timeout_mode)
+        _mgr.shell_async_handoff_seconds = int(resolved_shell_async_handoff_seconds)
         for _sess in getattr(_mgr, "sessions", {}).values():
             _sess.read_context_policy = resolved_read_context_policy
             _sess.tool_memory_policy = resolved_tool_memory_policy
@@ -1157,6 +1249,9 @@ def main():
             _sess.single_no_plan_todo_prompt = str(resolved_single_no_plan_todo_prompt or "").strip()[:6000]
             _sess.web_search_enabled = bool(getattr(app, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED))
             _sess.user_memory_mode = normalize_user_memory_mode(getattr(app, "user_memory_mode", DEFAULT_USER_MEMORY_MODE))
+            _sess.shell_command_timeout_seconds = int(resolved_shell_command_timeout)
+            _sess.shell_timeout_mode = normalize_shell_timeout_mode(resolved_shell_timeout_mode)
+            _sess.shell_async_handoff_seconds = int(resolved_shell_async_handoff_seconds)
             _sess.updated_at = now_ts()
             _sess._persist()
     # JS lib download (default on; set download_js_lib: false in --config to disable)
@@ -1186,6 +1281,8 @@ def main():
     rag_admin_port = int(args.rag_admin_port) if args.rag_admin_port is not None else int(args.port) + RAG_ADMIN_PORT_OFFSET
     code_admin_port = int(args.code_admin_port) if args.code_admin_port is not None else int(args.port) + CODE_ADMIN_PORT_OFFSET
     ide_port = int(args.ide_port) if getattr(args, "ide_port", None) is not None else int(args.port) + IDE_PORT_OFFSET
+    collab_port = int(args.collab_port) if getattr(args, "collab_port", None) is not None else int(args.port) + COLLAB_PORT_OFFSET
+    collab_host = str(getattr(args, "collab_host", None) or args.host)
     active_admin_config = _admin_config_from_namespace(args)
     active_admin_config.update({
         "host": str(args.host),
@@ -1195,10 +1292,14 @@ def main():
         "code_admin_port": int(code_admin_port),
         "mcp_service_port": int(args.mcp_service_port) if getattr(args, "mcp_service_port", None) is not None else int(args.port) + MCP_SERVICE_PORT_OFFSET,
         "ide_port": int(ide_port),
+        "collab_host": collab_host,
+        "collab_port": int(collab_port),
         "ctx_limit": int(resolved_ctx_limit),
         "max_rounds": int(resolved_max_rounds),
         "run_timeout": int(resolved_run_timeout),
         "shell_command_timeout": int(resolved_shell_command_timeout),
+        "shell_timeout_mode": normalize_shell_timeout_mode(resolved_shell_timeout_mode),
+        "shell_async_handoff_seconds": int(resolved_shell_async_handoff_seconds),
         "live_input_delay_write": int(resolved_live_input_delay_write),
         "live_input_delay_tool": int(resolved_live_input_delay_tool),
         "live_input_delay_normal": int(resolved_live_input_delay_normal),
@@ -1245,6 +1346,11 @@ def main():
     setattr(app, "code_admin_enabled", False)
     setattr(app, "ide_port", int(ide_port))
     setattr(app, "ide_enabled", False)
+    setattr(app, "collaboration_host", collab_host)
+    setattr(app, "collaboration_port", int(collab_port))
+    setattr(app, "collaboration_enabled", False)
+    setattr(app, "collaboration_https", False)
+    setattr(app, "collaboration_insecure_http", bool(getattr(args, "collab_allow_insecure_http", False)))
     server = AgentHTTPServer((args.host, args.port), Handler, app)
 
     def _request_admin_restart() -> None:
@@ -1274,6 +1380,10 @@ def main():
             skills_thread = threading.Thread(target=_skills_serve_loop, daemon=True)
             skills_thread.start()
             setattr(app, "skills_ui_enabled", True)
+            # The review console is mounted on the main Admin service as API
+            # routes below.  Keeping this marker in runtime status makes the
+            # feature discoverable without allocating another public port.
+            setattr(app, "skills_review_enabled", True)
         except Exception as exc:
             print(f"[web-agent] skills studio failed to start on {args.host}:{skills_port}: {exc}")
     else:
@@ -1408,19 +1518,103 @@ def main():
                 print(f"[web-agent] MCP manager warm-up failed: {exc}")
         except Exception as exc:
             print(f"[web-agent] MCP service failed to start on {args.host}:{mcp_service_port}: {exc}")
+    collaboration_server = None
+    collaboration_thread = None
+    collaboration_watch_stop = threading.Event()
+    collaboration_watch_thread = None
+    setattr(app, "collaboration_watcher_health", {"status": "disabled"})
+    _active_ports_for_collaboration = {int(args.port)}
+    for running_server, running_port in (
+        (skills_server, skills_port),
+        (rag_admin_server, rag_admin_port),
+        (code_admin_server, code_admin_port),
+        (ide_server, ide_port),
+        (mcp_service_server, mcp_service_port),
+    ):
+        if running_server:
+            _active_ports_for_collaboration.add(int(running_port))
+    _collab_loopback = False
+    try:
+        _collab_loopback = bool(ipaddress.ip_address(collab_host).is_loopback)
+    except Exception:
+        _collab_loopback = collab_host.strip().lower() == "localhost"
+    _collab_tls_ready = bool(str(getattr(args, "collab_tls_cert", "") or "").strip() and str(getattr(args, "collab_tls_key", "") or "").strip())
+    _proxy_env_ready = (
+        str(os.getenv("CLOUDS_CODER_TRUST_PROXY", "") or "").strip().lower() in {"1", "true", "yes", "on"}
+        and bool(str(os.getenv("CLOUDS_CODER_TRUSTED_PROXIES", "") or "").strip())
+    )
+    _collab_proxy_ready = bool(getattr(args, "collab_https_proxy", False) and _proxy_env_ready)
+    _collab_insecure = bool(getattr(args, "collab_allow_insecure_http", False))
+    if getattr(args, "no_collaboration", False) or not bool(getattr(args, "enable_collaboration", False)):
+        print("[collaboration] disabled (enable from Admin or --enable_collaboration)")
+    elif int(collab_port) in _active_ports_for_collaboration:
+        print(f"[collaboration] disabled: collab_port {collab_port} conflicts with a running service")
+    elif not _collab_loopback and not (_collab_tls_ready or _collab_proxy_ready or _collab_insecure):
+        print("[collaboration] refused: non-loopback collaboration requires TLS, a configured trusted HTTPS proxy, or --collab_allow_insecure_http")
+    else:
+        try:
+            collaboration_server = AgentHTTPServer((collab_host, collab_port), CollaborationHandler, app)
+            if _collab_tls_ready:
+                cert_path = Path(str(args.collab_tls_cert)).expanduser().resolve()
+                key_path = Path(str(args.collab_tls_key)).expanduser().resolve()
+                tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                tls_context.minimum_version = ssl.TLSVersion.TLSv1_2
+                tls_context.load_cert_chain(certfile=str(cert_path), keyfile=str(key_path))
+                collaboration_server.socket = tls_context.wrap_socket(collaboration_server.socket, server_side=True)
+
+            def _collaboration_serve_loop():
+                try:
+                    collaboration_server.serve_forever()
+                except OSError as exc:
+                    if not swallow_benign_socket_error(exc, "collaboration-server.serve_forever"):
+                        raise
+
+            collaboration_thread = threading.Thread(target=_collaboration_serve_loop, name="collaboration-server", daemon=True)
+            collaboration_thread.start()
+
+            def _collaboration_watch_loop():
+                collaboration_file_watcher_loop(app, collaboration_watch_stop)
+
+            collaboration_watch_thread = threading.Thread(
+                target=_collaboration_watch_loop,
+                name="collaboration-file-watcher",
+                daemon=True,
+            )
+            collaboration_watch_thread.start()
+            setattr(app, "collaboration_enabled", True)
+            setattr(app, "collaboration_https", bool(_collab_tls_ready or _collab_proxy_ready))
+            setattr(app, "collaboration_insecure_http", bool(_collab_insecure and not _collab_tls_ready))
+            scheme = "https" if _collab_tls_ready else "http"
+            print(f"[collaboration] open {scheme}://{collab_host}:{collab_port}")
+            if _collab_insecure and not _collab_tls_ready:
+                print("[collaboration] WARNING: insecure HTTP development mode is active")
+        except Exception as exc:
+            print(f"[collaboration] failed to start on {collab_host}:{collab_port}: {exc}")
     print(f"[web-agent] workspace={WORKDIR}")
+    print(f"[web-agent] storage_mode={_runtime_storage_mode()}")
     print(f"[admin] token_file={app.admin_token_path}")
     print(f"[web-agent] repo_root={REPO_ROOT}")
     print(f"[web-agent] codes_root={app.codes_root}")
     migration = getattr(app, "workspace_migration", {}) if hasattr(app, "workspace_migration") else {}
     if isinstance(migration, dict):
         moved = [str(x) for x in (migration.get("moved", []) or []) if str(x).strip()]
+        copied = [str(x) for x in (migration.get("copied", []) or []) if str(x).strip()]
         errors = [str(x) for x in (migration.get("errors", []) or []) if str(x).strip()]
         if moved:
             print(
                 "[web-agent] workspace_migration moved="
                 + ",".join(moved)
                 + f" from {migration.get('legacy_root', '')}"
+            )
+        imported_sessions = int(migration.get("imported_sessions", 0) or 0)
+        imported_users = int(migration.get("imported_users", 0) or 0)
+        if copied or imported_sessions:
+            print(
+                "[web-agent] workspace_migration copied="
+                + (",".join(copied) if copied else "merged")
+                + f" imported_users={imported_users}"
+                + f" imported_sessions={imported_sessions}"
+                + f" source_preserved={migration.get('installed_legacy_root', '')}"
             )
         if errors:
             print(
@@ -1545,6 +1739,10 @@ def main():
         "[web-agent] programming_ide="
         + ("enabled" if bool(getattr(app, "ide_enabled", False)) else "disabled")
     )
+    print(
+        "[web-agent] collaboration="
+        + ("enabled" if bool(getattr(app, "collaboration_enabled", False)) else "disabled")
+    )
     if str(args.host).strip() in {"0.0.0.0", "::"}:
         lan_ip = detect_local_lan_ip()
         print("[web-agent] bind=all interfaces")
@@ -1579,6 +1777,18 @@ def main():
             print(f"[ide] open http://{args.host}:{ide_port}")
         if mcp_service_server:
             print(f"[mcp-service] open http://{args.host}:{mcp_service_port}")
+    if collaboration_server:
+        collab_scheme = "https" if _collab_tls_ready else "http"
+        if collab_host.strip() in {"0.0.0.0", "::"}:
+            collab_lan_ip = detect_local_lan_ip()
+            print(f"[collaboration] open local: {collab_scheme}://127.0.0.1:{collab_port}")
+            print(f"[collaboration] open lan:   {collab_scheme}://{collab_lan_ip}:{collab_port}")
+        elif _collab_loopback:
+            print(f"[collaboration] open local: {collab_scheme}://{collab_host}:{collab_port}")
+        else:
+            print(f"[collaboration] open lan:   {collab_scheme}://{collab_host}:{collab_port}")
+    else:
+        print(f"[collaboration] unavailable on {collab_host}:{collab_port}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -1660,6 +1870,18 @@ def main():
                 mcp_service_server.server_close()
             except Exception:
                 pass
+        if collaboration_server:
+            collaboration_watch_stop.set()
+            try:
+                collaboration_server.shutdown()
+            except Exception:
+                pass
+            if collaboration_watch_thread is not None:
+                collaboration_watch_thread.join(timeout=1.5)
+            try:
+                collaboration_server.server_close()
+            except Exception:
+                pass
         app.shutdown_services()
         server.server_close()
     if app.restart_pending and isinstance(app.restart_config, dict):
@@ -1672,7 +1894,7 @@ def main():
             error_path=app.admin_restart_error_path,
         )
 
-# split-source: order=968 original-lines=112602-112604 hash=032e6922518465de
+# split-source: order=1076 original-lines=126446-126448 hash=032e6922518465de
 
 if __name__ == "__main__":
     main()

@@ -5,14 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=957 original-lines=98138-106413 hash=73354b4fe6bf6101
-
-# ============================================================================
-# Architecture / 架构 / アーキテクチャ
-# Layer 7: Application orchestration, runtime services, and UI integration.
-# 第七层：应用编排、运行时服务与界面集成。
-# 第7層：アプリケーション編成、ランタイムサービス、UI 統合。
-# ============================================================================
+# split-source: order=1060 original-lines=108373-118142 hash=af020c4faf8839ed
 
 # Runtime composition root: wires models, skills, session managers, storage,
 # background services, and the browser-facing admin/chat surfaces together.
@@ -117,6 +110,8 @@ class AppContext:
         single_no_plan_todo_prompt: str = "",
         l2_todo_policy: str | None = None,
         ide_password_login_enabled: bool = False,
+        shell_timeout_mode: str = DEFAULT_SHELL_TIMEOUT_MODE,
+        shell_async_handoff_seconds: int = DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS,
     ):
         self.workspace = Path(workspace).resolve()
         self.workspace_migration = _migrate_legacy_runtime_roots(self.workspace)
@@ -151,6 +146,13 @@ class AppContext:
             minimum=MIN_SHELL_COMMAND_TIMEOUT_SECONDS,
             maximum=MAX_SHELL_COMMAND_TIMEOUT_SECONDS,
             fallback=DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
+        )
+        self.shell_timeout_mode = normalize_shell_timeout_mode(shell_timeout_mode)
+        self.shell_async_handoff_seconds = normalize_timeout_seconds(
+            shell_async_handoff_seconds,
+            minimum=MIN_SHELL_ASYNC_HANDOFF_SECONDS,
+            maximum=MAX_SHELL_ASYNC_HANDOFF_SECONDS,
+            fallback=DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS,
         )
         self.auto_task_level_ceiling = normalize_auto_task_level_ceiling(auto_task_level_ceiling)
         # The AppContext loads its base config below.  Keep an explicit
@@ -220,6 +222,7 @@ class AppContext:
         self.codes_root = (self.workspace / "Codes").resolve()
         self.codes_root.mkdir(parents=True, exist_ok=True)
         self.crypto = CryptoBox(self.codes_root)
+        self.process_manager = UserProcessManager()
         self._session_mgrs: dict[str, SessionManager] = {}
         self._lock = threading.RLock()
         self.max_user = max(0, int(max_user or 0))
@@ -259,7 +262,25 @@ class AppContext:
         self.admin_config_path = self.admin_state_root / ADMIN_CONFIG_FILENAME
         self.admin_token_path = self.admin_state_root / "admin.token"
         self.admin_auth = AdminAuthStore(self.admin_state_root / ADMIN_AUTH_FILENAME)
+        self.skills_studio = SkillsStudioStore(
+            self.admin_state_root / "skills_studio.sqlite",
+            self.admin_state_root / "skills_studio",
+            self.skills_root,
+            crypto=self.crypto,
+            app=self,
+        )
         self.ide_auth = IDEAuthStore(self.admin_state_root / IDE_AUTH_FILENAME)
+        self.collaboration_state_root = self.admin_state_root / "collaboration"
+        self.collaboration = CollaborationStore(
+            self.admin_state_root / COLLAB_DB_FILENAME,
+            self.codes_root,
+            self.collaboration_state_root,
+        )
+        self.collaboration_port = 0
+        self.collaboration_host = ""
+        self.collaboration_enabled = False
+        self.collaboration_https = False
+        self.collaboration_insecure_http = False
         self.ide_extensions_root = self.admin_state_root / IDE_EXTENSIONS_DIRNAME
         self.ide_extensions_root.mkdir(parents=True, exist_ok=True)
         try:
@@ -384,7 +405,7 @@ class AppContext:
         feature: str = "processes",
     ) -> list[str]:
         if not remote:
-            return []
+            return sess._hard_snapshot_shell_prefix(cwd, feature=feature) if sess.skill_mode == "hard" else []
         sess.ide_remote_sandbox_required = True
         prefix = sess._workspace_sandbox_shell_prefix(cwd, feature=feature)
         if not prefix:
@@ -562,6 +583,8 @@ class AppContext:
             draft, draft_errors = _admin_coerce_config(draft_raw)
             defaults, default_errors = _admin_coerce_config(defaults_raw)
             ports = dict(draft.pop("_effective_ports", {}) or {})
+            active_with_ports, active_errors = _admin_coerce_config(self.admin_active_config)
+            active_ports = dict(active_with_ports.pop("_effective_ports", {}) or {})
             defaults.pop("_effective_ports", None)
             revision_material = json.dumps(
                 {"draft": draft, "defaults": defaults, "updated_at": float(stored.get("updated_at", 0.0) or 0.0) if isinstance(stored, dict) else 0.0},
@@ -572,7 +595,15 @@ class AppContext:
                 "revision": hashlib.sha256(revision_material.encode("utf-8")).hexdigest()[:24],
                 "schema": _admin_config_schema(), "active": dict(self.admin_active_config), "draft": draft,
                 "defaults": defaults, "initial": dict(self.admin_initial_config), "effective_ports": ports,
-                "validation_errors": draft_errors + default_errors, "restart_required": draft != self.admin_active_config,
+                "active_effective_ports": active_ports,
+                "collaboration_runtime": {
+                    "enabled": bool(getattr(self, "collaboration_enabled", False)),
+                    "host": str(getattr(self, "collaboration_host", "") or ""),
+                    "port": int(getattr(self, "collaboration_port", 0) or 0),
+                    "https": bool(getattr(self, "collaboration_https", False)),
+                    "insecure_http": bool(getattr(self, "collaboration_insecure_http", False)),
+                },
+                "validation_errors": draft_errors + default_errors + active_errors, "restart_required": draft != self.admin_active_config,
                 "restart_error": _read_json_file(self.admin_restart_error_path, {}),
                 "updated_at": float(stored.get("updated_at", 0.0) or 0.0) if isinstance(stored, dict) else 0.0,
             }
@@ -603,6 +634,26 @@ class AppContext:
         except Exception:
             pass
         return {"ok": True, "draft": clean, "defaults": payload["defaults"], "effective_ports": ports, "restart_required": clean != self.admin_active_config}
+
+    def sync_admin_config_from_active(self, *, expected_revision: str = "") -> dict:
+        """Replace the restart draft with the exact parameters used by this process."""
+        return self.save_admin_config(dict(self.admin_active_config), expected_revision=expected_revision)
+
+    def save_lan_collaboration_config(self, enabled: bool, *, expected_revision: str = "") -> dict:
+        """Apply the Admin one-click LAN profile without changing unrelated fields."""
+        payload = self.admin_config_payload()
+        values = dict(payload.get("draft", {}) or {})
+        values["collaboration_enabled"] = bool(enabled)
+        if enabled:
+            values["collab_host"] = "0.0.0.0"
+            values["collab_port"] = int(values.get("port", 8080) or 8080) + COLLAB_PORT_OFFSET
+            tls_ready = bool(str(values.get("collab_tls_cert", "") or "").strip() and str(values.get("collab_tls_key", "") or "").strip())
+            if not tls_ready and not bool(values.get("collab_https_proxy", False)):
+                # This dedicated Admin action is the explicit opt-in required
+                # for trusted-LAN plain HTTP. The collaboration UI keeps a
+                # persistent warning visible while this mode is active.
+                values["collab_allow_insecure_http"] = True
+        return self.save_admin_config(values, expected_revision=expected_revision)
 
     def reset_admin_config(self, target: str = "initial") -> dict:
         current = _read_json_file(self.admin_config_path, {})
@@ -644,6 +695,7 @@ class AppContext:
             "code": bool(clean.get("code_admin_enabled")),
             "mcp": bool(clean.get("mcp_service_enabled")),
             "ide": bool(clean.get("ide_enabled")),
+            "collaboration": bool(clean.get("collaboration_enabled")),
         }
         error_keys = {
             "agent": "port",
@@ -652,6 +704,7 @@ class AppContext:
             "code": "code_admin_port",
             "mcp": "mcp_service_port",
             "ide": "ide_port",
+            "collaboration": "collab_port",
         }
         owned_ports = {int(getattr(self, "agent_port", 0) or 0)}
         for service, enabled_attr, port_attr in (
@@ -660,6 +713,7 @@ class AppContext:
             ("code", "code_admin_enabled", "code_admin_port"),
             ("mcp", "mcp_service_enabled", "mcp_service_port"),
             ("ide", "ide_enabled", "ide_port"),
+            ("collaboration", "collaboration_enabled", "collaboration_port"),
         ):
             if bool(getattr(self, enabled_attr, False)):
                 owned_ports.add(int(getattr(self, port_attr, 0) or 0))
@@ -874,6 +928,8 @@ class AppContext:
             "ui_style": normalize_ui_style(getattr(self, "ui_style", DEFAULT_UI_STYLE)),
             "js_lib_download_enabled": bool(getattr(self, "js_lib_download_enabled", True)),
             "shell_command_timeout_seconds": int(getattr(self, "shell_command_timeout_seconds", DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS) or DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS),
+            "shell_timeout_mode": normalize_shell_timeout_mode(getattr(self, "shell_timeout_mode", DEFAULT_SHELL_TIMEOUT_MODE)),
+            "shell_async_handoff_seconds": int(getattr(self, "shell_async_handoff_seconds", DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS) or DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS),
             "daily_session_limit_per_ip": int(getattr(self, "daily_session_limit_per_ip", 0) or 0),
             "daily_session_reset_hour": int(getattr(self, "daily_session_reset_hour", 8) or 8),
             "validation": dict(self.web_ui_validation or {}),
@@ -1017,6 +1073,8 @@ class AppContext:
 
     def _ide_load_mounts(self, user_id: str) -> list[dict]:
         uid = str(user_id or "")
+        if uid.startswith("collab:"):
+            return []
         with self._lock:
             cached = self.ide_mounts_cache.get(uid)
         if cached is not None:
@@ -1144,16 +1202,293 @@ class AppContext:
         if rows:
             latest = max(rows, key=lambda x: float((x or {}).get("updated_at", 0.0) or 0.0))
             latest_id = str(latest.get("id", "") or "")
-        quota = self.session_creation_quota_status(user_id, client_ip=client_ip)
+        quota = (
+            {
+                "enabled": False,
+                "limit": 0,
+                "used": len(rows),
+                "remaining": None,
+                "display_value": "collaboration",
+                "user_id": str(user_id or ""),
+                "client_ip": str(client_ip or ""),
+            }
+            if str(user_id or "").startswith("collab:")
+            else self.session_creation_quota_status(user_id, client_ip=client_ip)
+        )
         return {
             "sessions": rows,
             "active_session_id": latest_id,
             "session_creation_limit": quota,
         }
 
-    def ide_config(self, user_id: str, client_ip: str = "") -> dict:
-        sessions = self.ide_session_payload(user_id, client_ip=client_ip)
+    def _ide_legacy_source_user(self, client_ip: str) -> str:
+        return user_id_from_ip(_normalize_ip(client_ip))
+
+    def _ide_legacy_session_running(self, user_id: str, sess: SessionState) -> bool:
+        if bool(getattr(sess, "running", False)) or bool(getattr(sess, "scheduler_starting", False)):
+            return True
+        try:
+            if any(
+                str(row.get("status", "") or "") in {"starting", "running", "stopping"}
+                for row in sess.bg.list_objects()
+            ):
+                return True
+        except Exception:
+            pass
+        try:
+            processes = self.process_manager.list_processes(
+                owner_user_id=user_id,
+                session_id=sess.id,
+                limit=500,
+            ).get("processes", [])
+            if any(str(row.get("status", "") or "") in {"starting", "running", "stopping"} for row in processes):
+                return True
+        except Exception:
+            pass
+        with self.ide_terminal_lock:
+            for terminal in self.ide_terminals.values():
+                if (
+                    str(terminal.get("user_id", "") or "") == user_id
+                    and str(terminal.get("session_id", "") or "") == sess.id
+                    and terminal.get("process") is not None
+                    and terminal["process"].poll() is None
+                ):
+                    return True
+        with self.ide_debug_lock:
+            for debug in self.ide_debug_sessions.values():
+                if (
+                    str(debug.get("user_id", "") or "") == user_id
+                    and str(debug.get("session_id", "") or "") == sess.id
+                    and debug.get("process") is not None
+                    and debug["process"].poll() is None
+                ):
+                    return True
+        return False
+
+    def ide_applications_payload(
+        self,
+        user_id: str,
+        *,
+        client_ip: str,
+        collaboration: bool = False,
+    ) -> dict:
+        skill_catalog_fn = getattr(self.applications, "skill_catalog", None)
+        skill_catalog = list(skill_catalog_fn()) if callable(skill_catalog_fn) and not collaboration else []
+        shared = []
+        for row in self.applications.list_shared():
+            item = dict(row)
+            item.update({"origin": "shared", "launchable": not collaboration})
+            shared.append(item)
+        if collaboration:
+            return {
+                "ok": True,
+                "personal": [],
+                "shared": shared,
+                "legacy_personal": [],
+                "web_sessions": [],
+                "skill_catalog": [],
+                "collaboration": True,
+            }
+        personal = []
+        for row in self.applications.list_personal(user_id):
+            item = dict(row)
+            item.update({"origin": "ide", "launchable": True})
+            personal.append(item)
+        source_user = self._ide_legacy_source_user(client_ip)
+        legacy_personal: list[dict] = []
+        web_sessions: list[dict] = []
+        if source_user != user_id:
+            for row in self.applications.list_personal(source_user):
+                item = dict(row)
+                item.update({"origin": "web", "importable": True})
+                legacy_personal.append(item)
+            source_manager = self.manager_for_user(source_user)
+            listed = source_manager.list(limit=2000, offset=0)
+            summaries = listed.get("sessions", []) if isinstance(listed, dict) else listed
+            for summary in summaries:
+                source_session = source_manager.get(str(summary.get("id", "") or ""))
+                if source_session is None or source_session.skill_mode != "hard" or not source_session.app_binding:
+                    continue
+                running = self._ide_legacy_session_running(source_user, source_session)
+                web_sessions.append({
+                    "id": source_session.id,
+                    "title": source_session.title,
+                    "updated_at": float(source_session.updated_at or 0.0),
+                    "message_count": int(summary.get("message_count", 0) or 0),
+                    "running": running,
+                    "importable": not running,
+                    "app_binding": dict(source_session.app_binding),
+                })
         return {
+            "ok": True,
+            "personal": personal,
+            "shared": shared,
+            "legacy_personal": legacy_personal,
+            "web_sessions": web_sessions,
+            "skill_catalog": skill_catalog,
+            "collaboration": False,
+        }
+
+    def ide_launch_application(
+        self,
+        user_id: str,
+        app_id: str,
+        *,
+        client_ip: str,
+        collaboration: bool = False,
+    ) -> dict:
+        if collaboration or str(user_id or "").startswith("collab:"):
+            raise IDECapabilityError(
+                "collaboration_application_launch_unavailable",
+                "Shared application launch is unavailable because collaboration sessions share one workspace.",
+                409,
+            )
+        return self.launch_application_for_user(user_id, app_id, client_ip=client_ip)
+
+    def ide_import_application(self, user_id: str, app_id: str, *, client_ip: str) -> dict:
+        if str(user_id or "").startswith("collab:"):
+            raise IDECapabilityError("collaboration_import_denied", "IP-private applications cannot be imported into collaboration.", 403)
+        source_user = self._ide_legacy_source_user(client_ip)
+        if source_user == user_id:
+            raise IDECapabilityError("application_already_available", "The application already belongs to this IDE identity.", 409)
+        out = self.applications.import_personal(source_user, user_id, app_id)
+        return {"ok": True, **out}
+
+    def _rollback_session_quota_reservation(self, user_id: str) -> None:
+        with self._lock:
+            state = self._load_session_daily_limit_state_locked(user_id)
+            state["used"] = max(0, int(state.get("used", 0) or 0) - 1)
+            self._save_session_daily_limit_state_locked(user_id, state)
+
+    def ide_import_application_session(
+        self,
+        user_id: str,
+        session_id: str,
+        *,
+        client_ip: str,
+    ) -> dict:
+        if str(user_id or "").startswith("collab:"):
+            raise IDECapabilityError("collaboration_import_denied", "IP-private sessions cannot be imported into collaboration.", 403)
+        source_user = self._ide_legacy_source_user(client_ip)
+        if source_user == user_id:
+            raise IDECapabilityError("session_already_available", "The session already belongs to this IDE identity.", 409)
+        source_manager = self.manager_for_user(source_user)
+        source = source_manager.get(str(session_id or "").strip())
+        if source is None or source.skill_mode != "hard" or not source.app_binding:
+            raise KeyError("importable application session not found")
+        if self._ide_legacy_session_running(source_user, source):
+            raise IDECapabilityError("source_session_running", "Stop the WebUI session and its processes before importing it.", 409)
+
+        imported_app_id = ""
+        created_session_id = ""
+        staging: Path | None = None
+        target_manager = self.manager_for_user(user_id)
+        quota_status: dict = {}
+        try:
+            source_binding = dict(source.app_binding)
+            source_app_id = str(source_binding.get("app_id", "") or "")
+            if str(source_binding.get("scope", "personal") or "personal") == "personal":
+                imported = self.applications.import_personal(source_user, user_id, source_app_id)
+                imported_app_id = str(imported.get("application", {}).get("id", "") or "")
+            else:
+                self.applications.resolve_launch(user_id, source_app_id)
+                imported_app_id = source_app_id
+
+            target, quota_status = self.create_session_for_user(
+                user_id,
+                source.title,
+                client_ip=client_ip,
+            )
+            created_session_id = target.id
+            target_root = target.root
+            staging = target_manager.root / f".{created_session_id}.{uuid.uuid4().hex}.import"
+            with source.lock:
+                if self._ide_legacy_session_running(source_user, source):
+                    raise IDECapabilityError("source_session_running", "The WebUI session started running during import.", 409)
+                integrity_error = source._verify_application_snapshot_integrity(restore=True)
+                if integrity_error:
+                    raise ValueError(integrity_error)
+                source._persist()
+                shutil.copytree(source.root, staging, symlinks=True)
+
+            with target_manager.lock:
+                target_manager.sessions.pop(created_session_id, None)
+                target_manager.session_index.pop(created_session_id, None)
+            shutil.rmtree(target_root, ignore_errors=True)
+
+            state_path = staging / "state.json"
+            state = self.crypto.read_json(state_path, {})
+            if not isinstance(state, dict):
+                raise ValueError("source session state is invalid")
+            state["id"] = created_session_id
+            binding = dict(state.get("app_binding", {}) or {})
+            binding["app_id"] = imported_app_id
+            if imported_app_id != source_app_id:
+                binding["source_app_id"] = source_app_id
+                binding["scope"] = "personal"
+            state["app_binding"] = binding
+            state["thinking"] = False
+            self.crypto.write_json(state_path, state)
+            shutil.copy2(state_path, state_path.with_name("state.json.bak"))
+
+            meta_path = staging / "meta.json"
+            meta = self.crypto.read_json(meta_path, {})
+            if not isinstance(meta, dict):
+                meta = {}
+            meta["id"] = created_session_id
+            self.crypto.write_json(meta_path, meta)
+            shutil.copy2(meta_path, meta_path.with_name("meta.json.bak"))
+
+            recovery_path = staging / ".application_snapshot_recovery.json"
+            if recovery_path.exists():
+                recovery = self.crypto.read_json(recovery_path, {})
+                if not isinstance(recovery, dict):
+                    raise ValueError("source application recovery package is invalid")
+                recovery["session_id"] = created_session_id
+                recovery["app_id"] = imported_app_id
+                self.crypto.write_json(recovery_path, recovery)
+                shutil.copy2(recovery_path, recovery_path.with_name(recovery_path.name + ".bak"))
+            os.replace(staging, target_root)
+            staging = None
+            imported_session = target_manager.get(created_session_id)
+            if imported_session is None:
+                raise RuntimeError("imported session could not be loaded")
+            integrity_error = imported_session._ensure_application_snapshot_recovery()
+            if integrity_error:
+                raise ValueError(integrity_error)
+            return {
+                "ok": True,
+                "id": imported_session.id,
+                "title": imported_session.title,
+                "ui_language": imported_session.ui_language,
+                "app_binding": dict(imported_session.app_binding),
+                "source_session_id": source.id,
+                "session_creation_limit": quota_status,
+            }
+        except Exception:
+            if staging is not None:
+                shutil.rmtree(staging, ignore_errors=True)
+            if created_session_id:
+                with target_manager.lock:
+                    target_manager.sessions.pop(created_session_id, None)
+                    target_manager.session_index.pop(created_session_id, None)
+                shutil.rmtree(target_manager.root / created_session_id, ignore_errors=True)
+                try:
+                    self._rollback_session_quota_reservation(user_id)
+                except Exception:
+                    pass
+            if imported_app_id and imported_app_id != str((source.app_binding or {}).get("app_id", "") or ""):
+                try:
+                    self.applications.remove_imported_copy(user_id, imported_app_id)
+                except Exception:
+                    pass
+            raise
+
+    def ide_config(self, user_id: str, client_ip: str = "") -> dict:
+        if str(client_ip or "").strip() and not str(user_id or "").startswith("collab:"):
+            self._sync_ordinary_ide_llm_source(user_id, client_ip)
+        sessions = self.ide_session_payload(user_id, client_ip=client_ip)
+        out = {
             "ok": True,
             "app": "clouds-coder-ide",
             "version": APP_VERSION,
@@ -1169,10 +1504,228 @@ class AppContext:
             "active_session_id": str(sessions.get("active_session_id", "") or ""),
             "session_creation_limit": sessions.get("session_creation_limit", {}),
             "password_login_enabled": bool(self.ide_password_login_enabled),
+            "shared_resources": self.shared_resource_manifest(user_id),
+        }
+        principal = self._collaboration_principal_for_ide_user(user_id)
+        if principal is not None:
+            snapshot = self.collaboration.snapshot(principal)
+            out.update({
+                "app": "clouds-coder-collaboration-ide",
+                "workspace": str(self.collaboration.project_workspace(principal.project_id)),
+                "mounts": [],
+                "password_login_enabled": False,
+                "collaboration_mode": True,
+                "collaboration": snapshot,
+                "collaboration_warning": (
+                    "Trusted LAN HTTP mode is active. Use HTTPS outside a trusted LAN."
+                    if bool(getattr(self, "collaboration_insecure_http", False))
+                    else ""
+                ),
+                "shared_resources": self.collaboration_resource_manifest(user_id),
+            })
+        return out
+
+    def shared_mcp_health(self) -> dict:
+        mgr = getattr(self, "mcp", None)
+        if mgr is None:
+            return {
+                "enabled": False,
+                "ready": 0,
+                "total": 0,
+                "degraded": False,
+                "tool_count": 0,
+                "crashed": [],
+                "monitor": False,
+                "servers": [],
+            }
+        try:
+            health = dict(mgr.health() or {})
+        except Exception as exc:
+            return {
+                "enabled": True,
+                "ready": 0,
+                "total": 0,
+                "degraded": True,
+                "tool_count": 0,
+                "crashed": [],
+                "monitor": False,
+                "servers": [],
+                "error": trim(str(exc), 240),
+            }
+        servers: list[dict] = []
+        for raw in health.get("servers", []) if isinstance(health.get("servers"), list) else []:
+            if not isinstance(raw, dict):
+                continue
+            authorization = raw.get("authorization", {})
+            auth_public = {}
+            if isinstance(authorization, dict):
+                auth_public = {
+                    "approved": bool(authorization.get("approved", False)),
+                    "approval_required": bool(authorization.get("approval_required", False)),
+                    "reason": trim(str(authorization.get("reason", "") or ""), 240),
+                }
+            servers.append({
+                "name": trim(str(raw.get("name", "") or ""), 120),
+                "state": trim(str(raw.get("state", "") or ""), 40),
+                "alive": bool(raw.get("alive", False)),
+                "transport": trim(str(raw.get("transport", "") or ""), 40),
+                "tools": [trim(str(x or ""), 160) for x in list(raw.get("tools", []) or [])[:200]],
+                "error": trim(str(raw.get("error", "") or ""), 300),
+                "authorization": auth_public,
+            })
+        return {
+            "enabled": True,
+            "ready": int(health.get("ready", 0) or 0),
+            "total": int(health.get("total", 0) or 0),
+            "degraded": bool(health.get("degraded", False)),
+            "tool_count": int(health.get("tool_count", 0) or 0),
+            "crashed": [trim(str(x or ""), 120) for x in list(health.get("crashed", []) or [])[:100]],
+            "monitor": bool(health.get("monitor", False)),
+            "servers": servers,
         }
 
+    def shared_mcp_tools(self) -> dict:
+        mgr = getattr(self, "mcp", None)
+        specs = list(mgr.tool_specs()) if mgr is not None else []
+        return {
+            "count": len(specs),
+            "names": sorted(str(x) for x in (mgr.tool_names() if mgr is not None else set())),
+            "tools": specs,
+        }
+
+    def manage_shared_mcp(self, action: str, payload: dict | None = None) -> dict:
+        mgr = getattr(self, "mcp", None)
+        if mgr is None:
+            raise RuntimeError("MCP manager is unavailable")
+        data = dict(payload or {})
+        action_key = str(action or "").strip().lower()
+        if action_key == "reload":
+            config_path = str(getattr(mgr, "_config_path", "") or "")
+            config = parse_json_object(try_read_text(Path(config_path))) if config_path else {}
+            result = mgr.reload_from_config(config or {})
+            mgr.note_config_loaded()
+            return result
+        server = str(data.get("server", "") or "").strip()
+        if not server:
+            raise ValueError("server is required")
+        if action_key == "restart":
+            return {"ok": bool(mgr.restart_server(server)), "server": server}
+        if action_key == "trust":
+            decision = str(data.get("decision", "approve") or "approve").strip().lower()
+            if decision == "approve":
+                return mgr.approve_server(
+                    server,
+                    expected_config_digest=str(data.get("config_digest", "") or ""),
+                    expected_fingerprint=str(data.get("fingerprint", "") or ""),
+                )
+            if decision == "revoke":
+                return mgr.revoke_server_approval(server)
+            raise ValueError("decision must be approve or revoke")
+        raise ValueError("unsupported MCP management action")
+
+    def shared_resource_manifest(self, user_id: str, *, collaboration: bool = False) -> dict:
+        with self._lock:
+            manager = self._session_mgrs.get(str(user_id or ""))
+        profile_count = len(getattr(manager, "user_model_profiles", {}) or {}) if manager else 0
+        source_kind = str(
+            (
+                getattr(manager, "collaboration_llm_source_kind", "")
+                or ("current_ip_user" if not collaboration else "admin_global")
+            )
+            if manager
+            else ("current_ip_user" if not collaboration else "admin_global")
+        )
+        try:
+            skill_count = len(self._ensure_skills_store(force=False).skills)
+        except Exception:
+            skill_count = 0
+        try:
+            shared_app_count = len(self.applications.list_shared())
+        except Exception:
+            shared_app_count = 0
+        try:
+            knowledge_stats = dict(self.rag_store.library_payload(limit=0).get("stats", {}) or {})
+        except Exception:
+            knowledge_stats = {}
+        try:
+            code_stats = dict(self.code_store.library_payload(limit=0).get("stats", {}) or {})
+        except Exception:
+            code_stats = {}
+        js_summary = dict(getattr(self, "offline_js_summary", {}) or {})
+        mcp_health = self.shared_mcp_health()
+        return {
+            "llm": {
+                "source": source_kind,
+                "profile_count": profile_count,
+                "server_side_credentials": True,
+            },
+            "skills": {
+                "enabled": True,
+                "count": skill_count,
+                "read_only": True,
+                "agent_read": True,
+                "admin_write": not collaboration,
+                "virtual_root": "/skills",
+            },
+            "js_libraries": {
+                "enabled": True,
+                "count": int(js_summary.get("total", 0) or 0),
+                "catalog_available": int(js_summary.get("available", 0) or 0),
+                "read_only": True,
+                "agent_read": True,
+                "virtual_root": "/js_lib",
+                "asset_prefix": "/assets/js_lib/",
+            },
+            "shared_apps": {"enabled": True, "count": shared_app_count, "read_only": True},
+            "libraries": {
+                "knowledge": {"enabled": True, "stats": knowledge_stats, "agent_access": True, "controlled_write": True},
+                "code": {"enabled": True, "stats": code_stats, "agent_access": True, "read_only": True},
+            },
+            "mcp": {
+                "enabled": bool(mcp_health.get("enabled", False)),
+                "ready": int(mcp_health.get("ready", 0) or 0),
+                "total": int(mcp_health.get("total", 0) or 0),
+                "tool_count": int(mcp_health.get("tool_count", 0) or 0),
+                "degraded": bool(mcp_health.get("degraded", False)),
+                "agent_access": True,
+                "approved_tools_only": True,
+                "configuration_managed_by_admin": True,
+            },
+            "api_paths": {
+                "models": "/api/ide/v2/sessions/{session_id}/models",
+                "skills": "/api/skills",
+                "skills_providers": "/api/skills/providers",
+                "shared_apps": "/api/apps/shared",
+                "shared_app_skills": "/api/apps/skills",
+                "resources": "/api/collab/v1/resources" if collaboration else "/api/ide/v2/resources",
+                "mcp_health": "/api/ide/v2/resources/mcp/health",
+                "mcp_status": "/api/ide/v2/resources/mcp/status",
+                "mcp_tools": "/api/ide/v2/resources/mcp/tools",
+                "skill_detail": "/api/ide/v2/resources/skills/detail?skill_file={skill_file}",
+                "skill_admin_write": "/api/ide/v2/resources/skills",
+            },
+            "services": {
+                "main": {"enabled": True, "port": int(getattr(self, "agent_port", 0) or 0)},
+                "skills": {"enabled": bool(getattr(self, "skills_ui_enabled", False)), "port": int(getattr(self, "skills_port", 0) or 0)},
+                "knowledge": {"enabled": bool(getattr(self, "rag_admin_enabled", False)), "port": int(getattr(self, "rag_admin_port", 0) or 0)},
+                "code": {"enabled": bool(getattr(self, "code_admin_enabled", False)), "port": int(getattr(self, "code_admin_port", 0) or 0)},
+                "ide": {"enabled": bool(getattr(self, "ide_enabled", False)), "port": int(getattr(self, "ide_port", 0) or 0)},
+                "mcp": {"enabled": bool(getattr(self, "mcp_service_enabled", False)), "port": int(getattr(self, "mcp_service_port", 0) or 0)},
+                "collaboration": {"enabled": bool(getattr(self, "collaboration_enabled", False)), "port": int(getattr(self, "collaboration_port", 0) or 0)},
+            },
+        }
+
+    def collaboration_resource_manifest(self, user_id: str) -> dict:
+        return self.shared_resource_manifest(user_id, collaboration=True)
+
     def ide_create_session(self, user_id: str, title: str | None = None, client_ip: str = "") -> dict:
-        sess, quota = self.create_session_for_user(user_id, title or "IDE Workspace", client_ip=client_ip)
+        if str(user_id or "").startswith("collab:"):
+            mgr = self.manager_for_user(user_id)
+            sess = mgr.create(title or "Shared workspace")
+            sess.ide_remote_sandbox_required = True
+            quota = self.ide_session_payload(user_id, client_ip=client_ip).get("session_creation_limit", {})
+        else:
+            sess, quota = self.create_session_for_user(user_id, title or "IDE Workspace", client_ip=client_ip)
         return {
             "ok": True,
             "id": sess.id,
@@ -1206,6 +1759,8 @@ class AppContext:
                 "readonly": False,
             }
         ]
+        if str(user_id or "").startswith("collab:"):
+            return roots
         for mount in self._ide_load_mounts(user_id):
             root = Path(str(mount.get("path", "") or "")).expanduser()
             roots.append(
@@ -1489,8 +2044,14 @@ class AppContext:
         root, target, meta = self.ide_resolve_workspace(user_id, session_id, root_id, rel)
         if not target.exists() or not target.is_file():
             raise FileNotFoundError("file not found")
+        collab_document = None
+        principal = self._collaboration_principal_for_ide_user(user_id)
+        if principal is not None and str(root_id or "session") == "session":
+            collab_document = self.collaboration.read_document(principal.project_id, rel)
         size = int(target.stat().st_size)
         stat_payload = self._ide_file_stat(root, target)
+        if collab_document is not None:
+            stat_payload["revision"] = str(int(collab_document.get("revision", 0) or 0))
         preview_kind = str(stat_payload.get("preview_kind", "") or "")
         streamed_preview = preview_kind in {
             "image", "video", "audio", "pdf", "excel", "presentation", "document",
@@ -1518,6 +2079,15 @@ class AppContext:
             "encoding": "base64" if is_binary else "text",
             "revision": self._ide_file_revision(target),
         }
+        if collab_document is not None:
+            revision = str(int(collab_document.get("revision", 0) or 0))
+            payload["revision"] = revision
+            payload["file"]["revision"] = revision
+            payload["collaboration"] = {
+                "document_id": collab_document.get("document_id", ""),
+                "revision": int(collab_document.get("revision", 0) or 0),
+                "frozen": bool(collab_document.get("frozen", False)),
+            }
         if is_binary:
             payload["content_b64"] = base64.b64encode(data).decode("ascii")
         else:
@@ -1835,6 +2405,38 @@ document.addEventListener('DOMContentLoaded', function(){{
     def ide_code_preview_stages(self, user_id: str, session_id: str, *, root_id: str, rel: str) -> dict:
         if str(root_id or "session").strip() != "session":
             return {"path": normalize_rel_preview_path(rel), "latest_id": "", "stages": []}
+        principal = self._collaboration_principal_for_ide_user(user_id)
+        if principal is not None:
+            history = self.collaboration.document_history(principal.project_id, rel, limit=500)
+            versions = sorted(
+                list(history.get("versions", []) or []),
+                key=lambda row: int(row.get("revision", 0) or 0),
+            )
+            total = len(versions)
+            stages = []
+            for index, row in enumerate(versions, start=1):
+                revision = int(row.get("revision", 0) or 0)
+                stages.append(
+                    {
+                        "id": f"collab:{revision}",
+                        "index": index,
+                        "total": total,
+                        "ts": float(row.get("created_at", 0.0) or 0.0),
+                        "change_type": str(row.get("reason", "modified") or "modified"),
+                        "added": 0,
+                        "deleted": 0,
+                        "label": f"rev {revision}",
+                        "bytes_after": int(row.get("size", 0) or 0),
+                        "lines_after": 0,
+                        "virtual": False,
+                    }
+                )
+            current = int(history.get("current_revision", 0) or 0)
+            return {
+                "path": normalize_rel_preview_path(rel),
+                "latest_id": f"collab:{current}" if current else "",
+                "stages": stages,
+            }
         return self._ide_session(user_id, session_id).code_preview_stages(rel)
 
     def ide_code_preview_payload(
@@ -1848,6 +2450,64 @@ document.addEventListener('DOMContentLoaded', function(){{
     ) -> dict:
         if str(root_id or "session").strip() != "session":
             raise ValueError("code history is available only for the session workspace")
+        principal = self._collaboration_principal_for_ide_user(user_id)
+        if principal is not None:
+            requested = str(stage_id or "latest").strip() or "latest"
+            history = self.collaboration.document_history(principal.project_id, rel, limit=500)
+            revisions = sorted(
+                int(row.get("revision", 0) or 0)
+                for row in list(history.get("versions", []) or [])
+                if int(row.get("revision", 0) or 0) > 0
+            )
+            if not revisions:
+                raise FileNotFoundError(f"file history not found: {normalize_rel_preview_path(rel)}")
+            if requested.lower() in {"", "latest", "current"}:
+                selected_revision = int(history.get("current_revision", revisions[-1]) or revisions[-1])
+            else:
+                match = re.fullmatch(r"collab:(\d+)", requested)
+                if not match:
+                    raise KeyError(f"stage not found: {requested}")
+                selected_revision = int(match.group(1))
+            if selected_revision not in revisions:
+                raise KeyError(f"stage not found: {requested}")
+            index = revisions.index(selected_revision)
+            selected = self.collaboration.document_version(
+                principal.project_id, rel, selected_revision
+            )
+            before = selected
+            if index > 0:
+                before = self.collaboration.document_version(
+                    principal.project_id, rel, revisions[index - 1]
+                )
+            before_text = str(before.get("content", "") or "")
+            after_text = str(selected.get("content", "") or "")
+            _, added, deleted = make_unified_diff(
+                normalize_rel_preview_path(rel), before_text, after_text
+            )
+            rows, truncated = build_code_preview_rows(
+                before_text, after_text, max_rows=CODE_PREVIEW_STAGE_MAX_ROWS
+            )
+            return {
+                "path": normalize_rel_preview_path(rel),
+                "requested_stage": requested,
+                "stage": {
+                    "id": f"collab:{selected_revision}",
+                    "index": index + 1,
+                    "total": len(revisions),
+                    "ts": float(selected.get("created_at", 0.0) or 0.0),
+                    "change_type": str(selected.get("reason", "modified") or "modified"),
+                    "added": int(added),
+                    "deleted": int(deleted),
+                    "virtual": False,
+                    "bytes_after": int(selected.get("size", 0) or 0),
+                    "lines_after": after_text.count("\n") + (1 if after_text else 0),
+                },
+                "rows": rows,
+                "row_count": len(rows),
+                "truncated": bool(truncated),
+                "before_text": before_text,
+                "full_text": after_text,
+            }
         return self._ide_session(user_id, session_id).code_preview_payload(rel, stage_id)
 
     def _ide_emit_workspace_change(
@@ -1891,14 +2551,31 @@ document.addEventListener('DOMContentLoaded', function(){{
         if len(data) > IDE_FILE_MAX_BYTES:
             raise ValueError(f"file is too large for editor ({len(data)} bytes)")
         expected_revision = str(payload.get("expected_revision", payload.get("revision", "")) or "").strip()
-        if expected_revision and target.exists():
+        principal = self._collaboration_principal_for_ide_user(user_id)
+        collaboration_result = None
+        if principal is not None and root_id == "session":
+            try:
+                collab_revision = int(expected_revision or 0)
+            except Exception as exc:
+                raise ValueError("invalid collaboration revision") from exc
+            collaboration_result = self.collaboration.write_file(
+                principal,
+                rel,
+                data,
+                collab_revision,
+                reason="ide_editor",
+            )
+        elif expected_revision and target.exists():
             current_revision = self._ide_file_revision(target)
             if not hmac.compare_digest(expected_revision, current_revision):
                 raise IDEFileConflict({"revision": current_revision, "file": self._ide_file_stat(root, target)})
         elif expected_revision and not target.exists():
             raise IDEFileConflict({"revision": "", "missing": True})
-        self._ide_atomic_write(target, data)
+        if collaboration_result is None:
+            self._ide_atomic_write(target, data)
         stat_payload = self._ide_file_stat(root, target)
+        if collaboration_result is not None:
+            stat_payload["revision"] = str(int(collaboration_result.get("revision", 0) or 0))
         result = {"ok": True, "root": meta, "file": stat_payload, "revision": stat_payload.get("revision", "")}
         if root_id == "session" and "content_b64" not in payload and is_code_preview_candidate(rel):
             after_text = data.decode(str(payload.get("encoding", "utf-8") or "utf-8"), errors="replace")
@@ -1947,6 +2624,17 @@ document.addEventListener('DOMContentLoaded', function(){{
         stage_id = str(payload.get("stage_id", "") or "").strip()
         if root_id != "session" or not rel or not stage_id or stage_id == "latest":
             raise ValueError("a session file and historical stage are required")
+        principal = self._collaboration_principal_for_ide_user(user_id)
+        if principal is not None:
+            match = re.fullmatch(r"collab:(\d+)", stage_id)
+            if not match:
+                raise ValueError("a collaboration document revision is required")
+            return self.collaboration.restore_document_version(
+                principal,
+                rel,
+                int(match.group(1)),
+                int(str(payload.get("expected_revision", "0") or "0")),
+            )
         stage = self.ide_code_preview_payload(
             user_id,
             session_id,
@@ -1991,8 +2679,12 @@ document.addEventListener('DOMContentLoaded', function(){{
             raise FileNotFoundError("source not found")
         if new_target.exists() and not bool(payload.get("overwrite", False)):
             raise FileExistsError("target already exists")
-        new_target.parent.mkdir(parents=True, exist_ok=True)
-        old_target.replace(new_target)
+        principal = self._collaboration_principal_for_ide_user(user_id)
+        if principal is not None and root_id == "session":
+            self.collaboration.rename_path(principal, old_rel, new_rel)
+        else:
+            new_target.parent.mkdir(parents=True, exist_ok=True)
+            old_target.replace(new_target)
         result = {"ok": True, "root": meta, "file": self._ide_file_stat(root, new_target)}
         self._ide_emit_workspace_change(user_id, session_id, root_id=root_id, action="renamed", paths=[old_rel, new_rel])
         return result
@@ -2076,7 +2768,11 @@ document.addEventListener('DOMContentLoaded', function(){{
             user_id, session_id, root_id, destination
         )
         destination.parent.mkdir(parents=True, exist_ok=True)
-        if operation == "move":
+        principal = self._collaboration_principal_for_ide_user(user_id)
+        if operation == "move" and principal is not None and root_id == "session":
+            destination_rel = destination.resolve(strict=False).relative_to(root.resolve()).as_posix()
+            self.collaboration.rename_path(principal, source_rel, destination_rel)
+        elif operation == "move":
             source.replace(destination)
         else:
             temporary = destination.with_name(
@@ -2126,7 +2822,14 @@ document.addEventListener('DOMContentLoaded', function(){{
         self._ide_reject_hard_snapshot_mutation(user_id, session_id, root_id, target)
         if not target.exists():
             raise FileNotFoundError("target not found")
-        if target.is_dir():
+        principal = self._collaboration_principal_for_ide_user(user_id)
+        if principal is not None and root_id == "session":
+            self.collaboration.delete_path(
+                principal,
+                rel,
+                recursive=bool(payload.get("recursive", True)),
+            )
+        elif target.is_dir():
             if not bool(payload.get("recursive", True)):
                 target.rmdir()
             else:
@@ -2232,8 +2935,19 @@ document.addEventListener('DOMContentLoaded', function(){{
             target = safe_path(normalize_rel_preview_path(f"{dest}/{rel_item}" if dest else rel_item), root)
             self._ide_reject_hard_snapshot_mutation(user_id, session_id, root_id, target)
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(raw)
-            written.append(self._ide_file_stat(root, target))
+            principal = self._collaboration_principal_for_ide_user(user_id)
+            if principal is not None and root_id == "session":
+                target_rel = target.resolve(strict=False).relative_to(root.resolve()).as_posix()
+                current_revision = 0
+                if target.exists():
+                    current_revision = int(self.collaboration.read_document(principal.project_id, target_rel).get("revision", 0) or 0)
+                collab_result = self.collaboration.write_file(principal, target_rel, raw, current_revision, reason="ide_upload")
+                stat_payload = self._ide_file_stat(root, target)
+                stat_payload["revision"] = str(int(collab_result.get("revision", 0) or 0))
+                written.append(stat_payload)
+            else:
+                target.write_bytes(raw)
+                written.append(self._ide_file_stat(root, target))
         result = {
             "ok": True,
             "root": meta,
@@ -2368,8 +3082,20 @@ document.addEventListener('DOMContentLoaded', function(){{
                     digest.update(block)
             if not hmac.compare_digest(digest.hexdigest(), expected_sha256):
                 raise IDEFileConflict({"code": "upload_hash_conflict", "received": received})
-        os.replace(part, target)
+        principal = self._collaboration_principal_for_ide_user(user_id)
+        if principal is not None and root_id == "session":
+            target_rel = target.resolve(strict=False).relative_to(root.resolve()).as_posix()
+            current_revision = 0
+            if target.exists():
+                current_revision = int(self.collaboration.read_document(principal.project_id, target_rel).get("revision", 0) or 0)
+            collab_result = self.collaboration.write_file(principal, target_rel, part.read_bytes(), current_revision, reason="ide_upload")
+            part.unlink(missing_ok=True)
+        else:
+            collab_result = None
+            os.replace(part, target)
         stat_payload = self._ide_file_stat(root, target)
+        if collab_result is not None:
+            stat_payload["revision"] = str(int(collab_result.get("revision", 0) or 0))
         self._ide_emit_workspace_change(
             user_id,
             session_id,
@@ -2427,6 +3153,12 @@ document.addEventListener('DOMContentLoaded', function(){{
         return rows
 
     def _ide_state_path(self, user_id: str) -> Path:
+        uid = str(user_id or "")
+        if uid.startswith("collab:"):
+            with self._lock:
+                manager = self._session_mgrs.get(uid)
+            if manager is not None:
+                return manager.root / IDE_WORKBENCH_STATE_FILENAME
         return self.user_root(user_id) / IDE_WORKBENCH_STATE_FILENAME
 
     def ide_get_workbench_state(self, user_id: str) -> dict:
@@ -2558,18 +3290,18 @@ document.addEventListener('DOMContentLoaded', function(){{
         body = payload if isinstance(payload, dict) else {}
         root_id = str(body.get("root_id", body.get("root", "session")) or "session")
         root, _, meta = self.ide_resolve_workspace(user_id, session_id, root_id, ".")
-        probe = subprocess.run(["git", "-C", str(root), "rev-parse", "--show-toplevel"], capture_output=True, text=True, timeout=8)
+        probe = run_subprocess_text(["git", "-C", str(root), "rev-parse", "--show-toplevel"], capture_output=True, timeout=8)
         if probe.returncode != 0:
             return {"ok": True, "repository": False, "root": meta, "changes": [], "branch": ""}
         repo_root = Path(probe.stdout.strip()).resolve()
         if repo_root != root.resolve() and not repo_root.is_relative_to(root.resolve()):
             return {"ok": True, "repository": False, "root": meta, "changes": [], "branch": ""}
-        status = subprocess.run(
+        status = run_subprocess_text(
             ["git", "-C", str(root), "status", "--porcelain=v1", "-z", "--branch"],
             capture_output=True,
             timeout=12,
         )
-        raw = status.stdout.decode("utf-8", errors="replace")
+        raw = status.stdout
         parts = raw.split("\0")
         branch = ""
         changes: list[dict] = []
@@ -2599,7 +3331,7 @@ document.addEventListener('DOMContentLoaded', function(){{
             command.append("--cached")
         if rel:
             command.extend(["--", rel])
-        proc = subprocess.run(command, capture_output=True, text=True, timeout=15)
+        proc = run_subprocess_text(command, capture_output=True, timeout=15)
         return {"ok": proc.returncode == 0, "root": meta, "path": rel, "diff": trim(proc.stdout, 400_000), "error": trim(proc.stderr, 4000)}
 
     def _ide_terminal_for_user(self, user_id: str, terminal_id: str) -> dict:
@@ -2649,6 +3381,10 @@ document.addEventListener('DOMContentLoaded', function(){{
                     terminal["closed"] = True
                     terminal["returncode"] = int(returncode)
             if returncode is not None and not chunk:
+                if not terminal.get("integrity_checked", False):
+                    sess = self._ide_session(str(terminal.get("user_id", "")), str(terminal.get("session_id", "")))
+                    terminal["integrity_error"] = sess._hard_snapshot_integrity_callback("after", "interactive terminal")
+                    terminal["integrity_checked"] = True
                 if mode == "pty" and fd is not None:
                     try:
                         os.close(int(fd))
@@ -2683,56 +3419,70 @@ document.addEventListener('DOMContentLoaded', function(){{
         cols = max(20, min(500, int(payload.get("cols", 100) or 100)))
         rows = max(5, min(200, int(payload.get("rows", 30) or 30)))
         sess = self._ide_session(user_id, session_id)
+        integrity_error = sess._hard_snapshot_integrity_callback("before", "interactive terminal")
+        if integrity_error:
+            raise PermissionError(integrity_error)
         prefix = self._ide_process_prefix(sess, remote=remote, cwd=cwd, feature="terminal")
         env = sess._shell_process_env()
         env.update({"TERM": "xterm-256color", "COLORTERM": "truecolor", "CLOUDS_CODER_IDE": "1"})
         master_fd: int | None = None
         mode = "pipe" if windows_pipe else "pty"
-        if mode == "pipe":
-            shell_name = Path(shell).name.lower()
-            if shell_name in {"powershell", "powershell.exe", "pwsh", "pwsh.exe"}:
-                process_command: object = [shell, "-NoLogo", "-NoProfile", "-NoExit", "-Command", "[Console]::InputEncoding=[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false)"]
+        try:
+            if mode == "pipe":
+                shell_name = Path(shell).name.lower()
+                if shell_name in {"powershell", "powershell.exe", "pwsh", "pwsh.exe"}:
+                    process_command: object = [shell, "-NoLogo", "-NoProfile", "-NoExit", "-Command", "[Console]::InputEncoding=[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false)"]
+                else:
+                    process_command = [shell, "/Q", "/K", "chcp 65001>nul"]
+                popen_kwargs = {
+                    "stdin": subprocess.PIPE,
+                    "stdout": subprocess.PIPE,
+                    "stderr": subprocess.STDOUT,
+                    "bufsize": 0,
+                }
+                if _is_windows_job_sandbox_prefix(prefix):
+                    process = _popen_windows_sandboxed(
+                        process_command,
+                        workspace_root=root,
+                        cwd=cwd,
+                        env=env,
+                        **popen_kwargs,
+                    )
+                else:
+                    process = subprocess.Popen(
+                        process_command,
+                        cwd=str(cwd),
+                        env=env,
+                        creationflags=int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) or 0),
+                        **popen_kwargs,
+                    )
             else:
-                process_command = [shell, "/Q", "/K", "chcp 65001>nul"]
-            popen_kwargs = {
-                "stdin": subprocess.PIPE,
-                "stdout": subprocess.PIPE,
-                "stderr": subprocess.STDOUT,
-                "bufsize": 0,
-            }
-            if _is_windows_job_sandbox_prefix(prefix):
-                process = _popen_windows_sandboxed(
-                    process_command,
-                    workspace_root=root,
-                    cwd=cwd,
-                    env=env,
-                    **popen_kwargs,
-                )
-            else:
-                process = subprocess.Popen(
-                    process_command,
-                    cwd=str(cwd),
-                    env=env,
-                    creationflags=int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) or 0),
-                    **popen_kwargs,
-                )
-        else:
-            master_fd, slave_fd = _pty.openpty()
-            self._ide_terminal_set_size(slave_fd, cols, rows)
-            process_command = [*prefix, shell, "-f"] if prefix else [shell, "-l"]
-            try:
-                process = subprocess.Popen(
-                    process_command,
-                    cwd=str(cwd),
-                    env=env,
-                    stdin=slave_fd,
-                    stdout=slave_fd,
-                    stderr=slave_fd,
-                    start_new_session=True,
-                    close_fds=True,
-                )
-            finally:
-                os.close(slave_fd)
+                master_fd, slave_fd = _pty.openpty()
+                self._ide_terminal_set_size(slave_fd, cols, rows)
+                process_command = [*prefix, shell, "-f"] if prefix else [shell, "-l"]
+                try:
+                    process = subprocess.Popen(
+                        process_command,
+                        cwd=str(cwd),
+                        env=env,
+                        stdin=slave_fd,
+                        stdout=slave_fd,
+                        stderr=slave_fd,
+                        start_new_session=True,
+                        close_fds=True,
+                    )
+                finally:
+                    os.close(slave_fd)
+        except Exception as exc:
+            if master_fd is not None:
+                try:
+                    os.close(master_fd)
+                except OSError:
+                    pass
+            integrity_error = sess._hard_snapshot_integrity_callback("after", "interactive terminal")
+            if integrity_error:
+                raise RuntimeError(f"{exc}; {integrity_error}") from exc
+            raise
         terminal_id = "term_" + uuid.uuid4().hex[:20]
         terminal = {
             "id": terminal_id,
@@ -2749,6 +3499,8 @@ document.addEventListener('DOMContentLoaded', function(){{
             "output_end": 0,
             "closed": False,
             "returncode": None,
+            "integrity_checked": False,
+            "integrity_error": "",
             "created_at": now_ts(),
             "last_activity": now_ts(),
             "lock": threading.RLock(),
@@ -2773,11 +3525,12 @@ document.addEventListener('DOMContentLoaded', function(){{
                 "offset": effective,
                 "next_offset": end,
                 "reset": requested < start,
-                "data": data.decode("utf-8", errors="replace"),
+                "data": decode_subprocess_bytes(data)[0],
                 "data_b64": base64.b64encode(data).decode("ascii"),
                 "encoding": "utf-8",
                 "closed": bool(terminal["closed"]),
                 "returncode": terminal["returncode"],
+                "integrity_error": str(terminal.get("integrity_error", "") or ""),
             }
 
     def ide_terminal_input(self, user_id: str, terminal_id: str, payload: dict) -> dict:
@@ -2831,7 +3584,12 @@ document.addEventListener('DOMContentLoaded', function(){{
         with terminal["lock"]:
             terminal["closed"] = True
             terminal["returncode"] = process.poll()
-        return {"ok": True, "terminal_id": terminal_id}
+            if not terminal.get("integrity_checked", False):
+                sess = self._ide_session(user_id, str(terminal.get("session_id", "")))
+                terminal["integrity_error"] = sess._hard_snapshot_integrity_callback("after", "interactive terminal")
+                terminal["integrity_checked"] = True
+            integrity_error = str(terminal.get("integrity_error", "") or "")
+        return {"ok": not bool(integrity_error), "terminal_id": terminal_id, "error": integrity_error}
 
     @staticmethod
     def _ide_parse_jsonc(text: str) -> dict:
@@ -2863,7 +3621,7 @@ document.addEventListener('DOMContentLoaded', function(){{
         task = next((row for row in listed["tasks"] if str(row.get("id", "")) == task_id), None)
         if not task:
             raise KeyError("task not found")
-        command = " ".join([shlex.quote(str(task["command"])), *[shlex.quote(str(x)) for x in task.get("args", [])]])
+        command = join_shell_task_command(task["command"], task.get("args", []))
         return self.ide_run_command(
             user_id,
             session_id,
@@ -3159,7 +3917,7 @@ document.addEventListener('DOMContentLoaded', function(){{
         except Exception:
             return ""
         if isinstance(raw, bytes):
-            return raw.decode("utf-8", errors="replace").strip()
+            return decode_subprocess_bytes(raw)[0].strip()
         return str(raw or "").strip()
 
     def _ide_debug_start_adapter(
@@ -3258,13 +4016,22 @@ document.addEventListener('DOMContentLoaded', function(){{
         root_id = str(payload.get("root_id", "session") or "session")
         root, _, meta = self.ide_resolve_workspace(user_id, session_id, root_id, ".")
         sess = self._ide_session(user_id, session_id)
+        integrity_error = sess._hard_snapshot_integrity_callback("before", "debug adapter")
+        if integrity_error:
+            raise PermissionError(integrity_error)
         prefix = self._ide_process_prefix(sess, remote=remote, cwd=root, feature="debug")
         process_env = sess._shell_process_env()
-        process, transport, reader, adapter_port = self._ide_debug_start_adapter(
-            root=root,
-            prefix=prefix,
-            process_env=process_env,
-        )
+        try:
+            process, transport, reader, adapter_port = self._ide_debug_start_adapter(
+                root=root,
+                prefix=prefix,
+                process_env=process_env,
+            )
+        except Exception as exc:
+            integrity_error = sess._hard_snapshot_integrity_callback("after", "debug adapter")
+            if integrity_error:
+                raise RuntimeError(f"{exc}; {integrity_error}") from exc
+            raise
         debug_id = "debug_" + uuid.uuid4().hex[:20]
         debug = {
             "id": debug_id,
@@ -3281,6 +4048,8 @@ document.addEventListener('DOMContentLoaded', function(){{
             "closed": False,
             "created_at": now_ts(),
             "last_activity": now_ts(),
+            "integrity_checked": False,
+            "integrity_error": "",
             "lock": threading.RLock(),
         }
         with self.ide_debug_lock:
@@ -3325,7 +4094,11 @@ document.addEventListener('DOMContentLoaded', function(){{
                     stderr = debug["process"].stderr.read(32_000)
                 except Exception:
                     pass
-            return {"ok": True, "messages": messages, "closed": bool(debug["closed"]), "stderr": stderr.decode("utf-8", errors="replace")}
+                if not debug.get("integrity_checked", False):
+                    sess = self._ide_session(user_id, str(debug.get("session_id", "")))
+                    debug["integrity_error"] = sess._hard_snapshot_integrity_callback("after", "debug adapter")
+                    debug["integrity_checked"] = True
+            return {"ok": not bool(debug.get("integrity_error")), "messages": messages, "closed": bool(debug["closed"]), "stderr": decode_subprocess_bytes(stderr)[0], "integrity_error": str(debug.get("integrity_error", "") or "")}
 
     def ide_debug_close(self, user_id: str, debug_id: str) -> dict:
         debug = self._ide_debug_for_user(user_id, debug_id)
@@ -3347,7 +4120,13 @@ document.addEventListener('DOMContentLoaded', function(){{
         except OSError:
             pass
         self._ide_debug_stop_process(process)
-        return {"ok": True, "debug_id": debug_id}
+        with debug["lock"]:
+            if not debug.get("integrity_checked", False):
+                sess = self._ide_session(user_id, str(debug.get("session_id", "")))
+                debug["integrity_error"] = sess._hard_snapshot_integrity_callback("after", "debug adapter")
+                debug["integrity_checked"] = True
+            integrity_error = str(debug.get("integrity_error", "") or "")
+        return {"ok": not bool(integrity_error), "debug_id": debug_id, "error": integrity_error}
 
     def ide_run_command(self, user_id: str, session_id: str, payload: dict, *, remote: bool = False) -> dict:
         command = str(payload.get("command", "") or "").strip()
@@ -3374,16 +4153,9 @@ document.addEventListener('DOMContentLoaded', function(){{
             shell_prefix = self._ide_process_prefix(sess, remote=remote, cwd=cwd)
             if not shell_prefix and sess.skill_mode == "hard":
                 shell_prefix = sess._hard_snapshot_shell_prefix(cwd)
-            if shell_prefix and remote:
+            if shell_prefix:
                 effective_command = sess._sandbox_virtualize_command(effective_command, cwd)
-            windows_job = _is_windows_job_sandbox_prefix(shell_prefix)
-            run_command: object = effective_command
-            run_shell = True
-            if os.name == "nt" and (not shell_prefix or windows_job):
-                run_command = f"chcp 65001>nul & {effective_command}"
-            if shell_prefix and not windows_job:
-                run_command = [*shell_prefix, "/bin/sh", "-c", effective_command]
-                run_shell = False
+            run_command, run_shell, windows_job = shell_process_invocation(effective_command, shell_prefix)
             process_env = sess._shell_process_env()
             if windows_job:
                 proc = _run_windows_sandboxed_command(
@@ -3394,13 +4166,10 @@ document.addEventListener('DOMContentLoaded', function(){{
                     timeout=timeout,
                 )
             else:
-                proc = subprocess.run(
+                proc = run_subprocess_text(
                     run_command,
                     cwd=str(cwd),
                     shell=run_shell,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
                     capture_output=True,
                     timeout=timeout,
                     env=process_env,
@@ -3416,6 +4185,14 @@ document.addEventListener('DOMContentLoaded', function(){{
                 "duration_ms": int((now_ts() - started) * 1000),
                 "timeout": timeout,
             }
+            integrity_error = sess._hard_snapshot_integrity_callback("after", command)
+            if integrity_error:
+                result.update({
+                    "ok": False,
+                    "returncode": -1,
+                    "stderr": trim(f"{result['stderr']}\n{integrity_error}".strip(), 120_000),
+                    "integrity_error": integrity_error,
+                })
             changed_files = workspace_revision_delta(before_files, workspace_file_revision_map(root))
             result["changed_files"] = changed_files
             if changed_files:
@@ -3440,6 +4217,10 @@ document.addEventListener('DOMContentLoaded', function(){{
                 "timeout": timeout,
                 "timed_out": True,
             }
+            integrity_error = sess._hard_snapshot_integrity_callback("after", command)
+            if integrity_error:
+                result["stderr"] = trim(f"{result['stderr']}\n{integrity_error}".strip(), 80_000)
+                result["integrity_error"] = integrity_error
             changed_files = workspace_revision_delta(before_files, workspace_file_revision_map(root))
             result["changed_files"] = changed_files
             if changed_files:
@@ -3451,6 +4232,20 @@ document.addEventListener('DOMContentLoaded', function(){{
                     paths=changed_files,
                 )
             return result
+        except Exception as exc:
+            integrity_error = sess._hard_snapshot_integrity_callback("after", command)
+            changed_files = workspace_revision_delta(before_files, workspace_file_revision_map(root))
+            if changed_files:
+                self._ide_emit_workspace_change(
+                    user_id,
+                    session_id,
+                    root_id=root_id,
+                    action="command",
+                    paths=changed_files,
+                )
+            if integrity_error:
+                raise RuntimeError(f"{exc}; {integrity_error}") from exc
+            raise
 
     def ide_agent_task(
         self,
@@ -3461,6 +4256,8 @@ document.addEventListener('DOMContentLoaded', function(){{
         *,
         remote: bool = False,
     ) -> dict:
+        if str(client_ip or "").strip() and not str(user_id or "").startswith("collab:"):
+            self._sync_ordinary_ide_llm_source(user_id, client_ip)
         sid = str(session_id or "").strip()
         if not sid:
             created = self.ide_create_session(user_id, "IDE Workspace", client_ip=client_ip)
@@ -3588,24 +4385,35 @@ document.addEventListener('DOMContentLoaded', function(){{
             },
         }
 
-    def _ide_prompt_skill_catalog(self) -> tuple[SkillStore, list[dict], bool]:
+    def _ide_prompt_skill_catalog(self, query: str = "") -> tuple[SkillStore, list[dict], bool]:
         store = self._ensure_skills_store(force=False)
         rows: list[dict] = []
-        for item in store.list_metadata():
+        source_rows = store.recall_metadata(query, limit=12) if str(query or "").strip() else store.list_metadata()
+        total_count = len([row for row in store.list_metadata() if isinstance(row, dict) and str(row.get("id", "")) != "_warnings"])
+        for item in source_rows:
             if not isinstance(item, dict) or str(item.get("id", "") or "") == "_warnings":
                 continue
             row = {
                 "id": str(item.get("id", "") or ""),
+                "canonical_id": str(item.get("canonical_id", item.get("id", "")) or ""),
                 "name": str(item.get("name", "") or ""),
                 "description": str(item.get("description", "") or ""),
                 "provider": str(item.get("provider_id", "") or ""),
                 "triggers": [str(value) for value in list(item.get("triggers", []) or [])],
+                "negative_triggers": [str(value) for value in list(item.get("negative_triggers", []) or [])],
+                "keywords": [str(value) for value in list(item.get("keywords", []) or [])],
+                "aliases": [str(value) for value in list(item.get("aliases", []) or [])],
+                "category": str(item.get("category", "") or ""),
+                "infrastructure_only": bool(item.get("infrastructure_only", False)),
+                "requires": [str(value) for value in list(item.get("requires", []) or [])],
+                "conflicts": [str(value) for value in list(item.get("conflicts", []) or [])],
                 "entrypoints": [str(value) for value in list(item.get("entrypoints", []) or [])],
+                "_selection_query": trim(str(query or ""), 1000),
             }
             if not row["id"]:
                 continue
             rows.append(row)
-        return store, rows, False
+        return store, rows, len(rows) < total_count
 
     @staticmethod
     def _ide_validate_selected_skills(
@@ -3638,17 +4446,45 @@ document.addEventListener('DOMContentLoaded', function(){{
             else:
                 continue
             canonical = requested if requested in catalog_by_id else ""
+            resolution = {}
             if not canonical and requested:
                 try:
-                    resolved, error = store._resolve_name(requested)
+                    resolution = store.canonicalize_id(requested)
+                    if resolution.get("ok") and resolution.get("canonical_id") in catalog_by_id:
+                        canonical = str(resolution.get("canonical_id"))
                 except Exception:
-                    resolved, error = None, "unavailable"
-                if not error and resolved in catalog_by_id:
-                    canonical = str(resolved)
+                    try:
+                        resolved, error = store._resolve_name(requested)
+                    except Exception:
+                        resolved, error = None, "unavailable"
+                    if not error and resolved in catalog_by_id:
+                        canonical = str(resolved)
             if not canonical or canonical in seen:
                 continue
             seen.add(canonical)
             meta = catalog_by_id[canonical]
+            if bool(meta.get("infrastructure_only", False)):
+                continue
+            # Negative triggers are hard filters shared with runtime selection.
+            # The IDE validator receives only the selected task, so callers can
+            # optionally provide it via the catalog row's private query marker.
+            negative_query = str(meta.get("_selection_query", "") or "").casefold()
+            if negative_query and any(str(value).casefold() in negative_query for value in meta.get("negative_triggers", []) or []):
+                continue
+            selected_ids = {str(row.get("id", "") or "").casefold() for row in selected}
+            selected_names = {str(row.get("name", "") or "").casefold() for row in selected}
+            declared_conflicts = {str(value).casefold() for value in meta.get("conflicts", []) or []}
+            if declared_conflicts & (selected_ids | selected_names):
+                continue
+            reverse_conflict = False
+            for previous in selected:
+                previous_meta = catalog_by_id.get(str(previous.get("id", "") or ""), {})
+                reverse = {str(value).casefold() for value in previous_meta.get("conflicts", []) or []}
+                if canonical.casefold() in reverse or str(meta.get("name", canonical)).casefold() in reverse:
+                    reverse_conflict = True
+                    break
+            if reverse_conflict:
+                continue
             selected.append(
                 {
                     "id": canonical,
@@ -3658,7 +4494,27 @@ document.addEventListener('DOMContentLoaded', function(){{
                     "order": len(selected) + 1,
                 }
             )
-        return selected
+        selected_ids = {str(row.get("id", "") or "") for row in selected}
+        selected_names = {str(row.get("name", "") or "") for row in selected}
+        dependency_valid: list[dict] = []
+        for row in selected:
+            meta = catalog_by_id.get(str(row.get("id", "") or ""), {})
+            missing = False
+            for requirement in meta.get("requires", []) or []:
+                required_id = str(requirement)
+                try:
+                    resolved = store.canonicalize_id(requirement)
+                    if resolved.get("ok"):
+                        required_id = str(resolved.get("canonical_id", required_id))
+                except Exception:
+                    pass
+                if required_id not in selected_ids and str(requirement) not in selected_names:
+                    missing = True
+                    break
+            if not missing:
+                row["order"] = len(dependency_valid) + 1
+                dependency_valid.append(row)
+        return dependency_valid
 
     @staticmethod
     def _ide_normalize_execution_steps(raw: object) -> list[dict]:
@@ -4159,9 +5015,23 @@ document.addEventListener('DOMContentLoaded', function(){{
         skill_catalog: list[dict] = []
         skill_catalog_truncated = False
         skill_catalog_warning = ""
+        skill_catalog_total = 0
         if skills_aware:
             try:
-                skill_store, skill_catalog, skill_catalog_truncated = self._ide_prompt_skill_catalog()
+                skill_query = " ".join(
+                    [original, active_path, *attachments, *[str(row.get("path", "") or "") for row in list(workspace_snapshot.get("entries", []) or [])[:30] if isinstance(row, dict)]]
+                )
+                try:
+                    skill_store, skill_catalog, skill_catalog_truncated = self._ide_prompt_skill_catalog(skill_query)
+                except TypeError:
+                    # Compatibility for integrations overriding the historical
+                    # no-argument catalog hook.
+                    skill_store, skill_catalog, skill_catalog_truncated = self._ide_prompt_skill_catalog()
+                skill_catalog_total = (
+                    len(skill_store.skills)
+                    if skill_store is not None and hasattr(skill_store, "skills")
+                    else len(skill_catalog)
+                )
             except Exception as exc:
                 skill_catalog_warning = trim(str(exc), 500)
         sess = self._ide_session(user_id, session_id)
@@ -4213,6 +5083,8 @@ document.addEventListener('DOMContentLoaded', function(){{
                 "enabled": skills_aware,
                 "selection_limit": int(budget_spec["max_skills"]),
                 "catalog": skill_catalog if skills_aware else [],
+                "total_count": skill_catalog_total,
+                "candidate_count": len(skill_catalog),
                 "catalog_truncated": bool(skill_catalog_truncated),
                 "catalog_warning": skill_catalog_warning,
             },
@@ -4223,9 +5095,9 @@ document.addEventListener('DOMContentLoaded', function(){{
             "previous_candidate": previous_prompt,
         }
         skill_selection_instruction = (
-            f"Skills awareness is enabled. Select between 1 and {int(budget_spec['max_skills'])} materially relevant skills from skills_awareness.catalog. "
+            f"Skills awareness is enabled. Select between 0 and {int(budget_spec['max_skills'])} materially relevant skills from skills_awareness.catalog. "
             "Use only exact catalog ids. Return them in selected_skills in intended execution order with a concise task-specific rationale. "
-            "Do not select redundant skills merely to reach the limit. The server will validate ids and provide full instructions for a refinement pass. "
+            "Return an empty array for simple or unmatched work. Do not select redundant skills merely to reach the limit. The server will validate ids and provide full instructions for a refinement pass. "
             if skills_aware and skill_catalog
             else "Skills awareness is disabled or no skill catalog is available. Return selected_skills as an empty array. "
         )
@@ -4361,8 +5233,8 @@ document.addEventListener('DOMContentLoaded', function(){{
                 selection_started = time.monotonic()
                 selection_system = (
                     "Select the most materially useful skills for the downstream Agent task. "
-                    f"Choose 1 to {int(budget_spec['max_skills'])} entries using only exact ids from SKILL_CATALOG. "
-                    "Prefer a small complementary set over redundant coverage. Do not perform the task. "
+                    f"Choose 0 to {int(budget_spec['max_skills'])} entries using only exact ids from SKILL_CATALOG. "
+                    "Return an empty array for simple or unmatched work. Prefer a small complementary set over redundant coverage. Do not perform the task. "
                     "Return JSON only as {\"selected_skills\":[{\"id\":\"exact-id\",\"rationale\":\"task-specific reason\"}]}. "
                     + model_language_instruction(language)
                 )
@@ -4602,6 +5474,8 @@ document.addEventListener('DOMContentLoaded', function(){{
             "regeneration": regeneration,
             "budget": budget,
             "skills_awareness": skills_aware,
+            "skills_catalog_total": skill_catalog_total if skills_aware else 0,
+            "skills_candidate_count": len(skill_catalog) if skills_aware else 0,
             "workspace_context": {
                 "awareness": "always_on",
                 "entry_count": int(workspace_snapshot.get("entry_count", 0) or 0),
@@ -4767,6 +5641,19 @@ document.addEventListener('DOMContentLoaded', function(){{
                     "role": trim(str(raw_question.get("role", "") or "agent"), 40),
                     "ts": float(raw_question.get("ts", 0.0) or 0.0),
                 }
+        if bool(snap.get("running", False)):
+            try:
+                active_tool = str(snap.get("agent_active_tool", "") or "").strip()
+                active_phase = str(snap.get("agent_phase", "") or "").strip()
+                sess._publish_collaboration_event_heartbeat(
+                    "poll",
+                    {
+                        "name": active_tool,
+                        "summary": "Agent active" + (f": {active_phase}" if active_phase else ""),
+                    },
+                )
+            except Exception:
+                pass
         return {
             "ok": True,
             "session_id": str(session_id or ""),
@@ -4795,20 +5682,56 @@ document.addEventListener('DOMContentLoaded', function(){{
             "operations": operations[-500:],
         }
 
-    def ide_agent_models(self, user_id: str, session_id: str, *, refresh: bool = False) -> dict:
+    def ide_agent_models(
+        self,
+        user_id: str,
+        session_id: str,
+        *,
+        refresh: bool = False,
+        client_ip: str = "",
+    ) -> dict:
+        if not str(user_id or "").startswith("collab:"):
+            self._sync_ordinary_ide_llm_source(user_id, client_ip)
         return self._ide_session(user_id, session_id).model_catalog(force_probe=bool(refresh))
 
-    def ide_set_agent_model(self, user_id: str, session_id: str, selection: str) -> dict:
+    def ide_set_agent_model(
+        self,
+        user_id: str,
+        session_id: str,
+        selection: str,
+        *,
+        client_ip: str = "",
+    ) -> dict:
+        collaboration = str(user_id or "").startswith("collab:")
+        source_manager = None
+        if not collaboration:
+            _, source_manager, _ = self._sync_ordinary_ide_llm_source(user_id, client_ip)
         sess = self._ide_session(user_id, session_id)
         picked = str(selection or "").strip()
         if not picked:
             raise ValueError("selection required")
+        target_manager = self.manager_for_user(user_id)
+        if source_manager is not None and source_manager is not target_manager and any(
+            bool(getattr(item, "running", False))
+            for item in source_manager.sessions.values()
+        ):
+            raise ValueError(
+                "Stop active Agents in the main Web UI before changing its model."
+            )
         if bool(getattr(sess, "running", False)):
             sess._queue_deferred_runtime_update("model_selection", {"selection": picked, "model_override": ""})
+            if source_manager is not None:
+                source_manager.set_runtime_model(picked, None)
             queued = sess.model_catalog()
             queued["queued"] = True
             queued["note"] = "Model switch queued until the current run finishes."
             return queued
+        if source_manager is not None:
+            out = source_manager.set_runtime_model(picked, None)
+            if target_manager is not source_manager:
+                self._sync_ordinary_ide_llm_source(user_id, client_ip, force=True)
+                out = sess.model_catalog()
+            return out
         out = sess.set_runtime_selection(picked)
         self.manager_for_user(user_id)._sync_from_session(sess, apply_to_all=False)
         return out
@@ -6574,6 +7497,10 @@ document.addEventListener('DOMContentLoaded', function(){{
             pass
 
     def shutdown_services(self):
+        try:
+            self.process_manager.stop_all(actor="system", reason="service shutdown")
+        except Exception:
+            pass
         # Stop the single global MCP manager (and its health monitor) so we don't
         # orphan child subprocesses when the app exits. Sessions only reference it.
         try:
@@ -6641,6 +7568,10 @@ document.addEventListener('DOMContentLoaded', function(){{
                     report["running"] += 1
                 try:
                     sess.cancel_requested = True
+                except Exception:
+                    pass
+                try:
+                    report["bash_terminated"] += int(sess.bg.stop_all())
                 except Exception:
                     pass
                 proc = getattr(sess, "_running_bash_proc", None)
@@ -6814,8 +7745,10 @@ document.addEventListener('DOMContentLoaded', function(){{
             if snapshot_version >= 2:
                 capsule_data = json.loads(capsule)
                 self.applications._verify_v2_runtime_contract_manifest(skills, capsule_data, decoded_resources)
+            requested_title = str(title or "").strip()
+            app_name = str(app_row.get("name", "") or "Application")
             sess, quota_status = self.create_session_for_user(
-                user_id, title or str(app_row.get("name", "") or "Application"), client_ip=client_ip,
+                user_id, requested_title or app_name, client_ip=client_ip,
             )
             try:
                 with sess.lock:
@@ -6835,6 +7768,7 @@ document.addEventListener('DOMContentLoaded', function(){{
                     if resources:
                         manifest = [{
                             "skill_id": str(x.get("skill_id", "") or ""), "skill_order": int(x.get("skill_order", 0) or 0),
+                            "kind": str(x.get("kind", "attachment") or "attachment"),
                             "path": str(x.get("path", "") or ""), "digest": str(x.get("digest", "") or ""), "size": int(x.get("size", 0) or 0),
                         } for x in resources]
                         manifest_path = snapshot_root / "MANIFEST.json"
@@ -6847,12 +7781,19 @@ document.addEventListener('DOMContentLoaded', function(){{
                         "app_id": str(app_row.get("id", "") or ""), "source_app_id": str(app_row.get("source_app_id", "") or ""),
                         "name": str(app_row.get("name", "") or ""), "scope": str(app_row.get("scope", "personal") or "personal"),
                         "revision": int(app_row.get("submitted_revision", app_row.get("revision", 1)) or 1), "capsule_digest": digest,
-                        "resources_digest": resources_digest, "resource_count": len(resources),
+                        "resources_digest": resources_digest, "resource_count": len(resources), "snapshot_version": snapshot_version,
                     }
                     sess.bound_skill_ids = [str(x.get("id", "") or "") for x in skills if str(x.get("id", "") or "")][:ADMIN_MAX_APP_SKILLS]
                     sess.bound_skill_capsule = trim(capsule, ADMIN_MAX_APP_CAPSULE_CHARS)
                     sess.skill_mode = "hard"
+                    if requested_title:
+                        sess.title = trim(requested_title, 120)
+                        sess.title_origin = "manual"
+                        sess.last_auto_title_source = ""
+                    else:
+                        sess.bind_application_title()
                     sess._restore_application_snapshot_permissions()
+                    sess._write_application_snapshot_recovery()
                     sess.updated_at = now_ts()
                     sess._persist()
                 run = None
@@ -7016,6 +7957,121 @@ document.addEventListener('DOMContentLoaded', function(){{
         self._task_queue = remaining
         return started
 
+    def _publish_collaboration_agent_state(
+        self,
+        sess: SessionState,
+        status: str,
+        *,
+        result_summary: str = "",
+    ) -> bool:
+        coordinator = getattr(sess, "collaboration_write_coordinator", None)
+        principal = getattr(coordinator, "principal", None)
+        if coordinator is None or not isinstance(principal, CollaborationPrincipal):
+            return False
+        last_operation = next(
+            (
+                row
+                for row in reversed(list(getattr(sess, "operations", []) or []))
+                if isinstance(row, dict)
+            ),
+            {},
+        )
+        try:
+            self.collaboration.update_agent(
+                principal,
+                agent_id=f"agent:{sess.id}",
+                session_id=sess.id,
+                status=str(status or "idle")[:40],
+                current_file=str(last_operation.get("path", "") or ""),
+                tool_summary=trim(str(last_operation.get("summary", "") or ""), 800),
+                result_summary=trim(str(result_summary or ""), 1200),
+            )
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def _collaboration_run_outcome(sess: SessionState) -> tuple[str, str]:
+        board = dict(getattr(sess, "blackboard", {}) or {})
+        completion = board.get("completion", {}) if isinstance(board.get("completion"), dict) else {}
+        completion_state = str(completion.get("state", "") or "").strip().lower()
+        board_status = str(board.get("status", "") or "").strip().lower()
+        todo_manager = getattr(sess, "todo", None)
+        try:
+            todo_rows = list(todo_manager.snapshot() or []) if todo_manager is not None else []
+        except Exception:
+            todo_rows = []
+        open_todos = [
+            row
+            for row in todo_rows
+            if isinstance(row, dict)
+            and str(row.get("status", "pending") or "pending").strip().lower() != "completed"
+        ]
+        if bool(getattr(sess, "cancel_requested", False)):
+            status = "cancelled"
+        elif isinstance(getattr(sess, "pending_user_question", None), dict):
+            status = "blocked"
+        elif completion_state == "blocked" or board_status in {"blocked", "paused", "ask_user", "error", "failed"}:
+            status = "blocked"
+        elif open_todos:
+            status = "blocked"
+        else:
+            status = "completed"
+
+        started_at = float(getattr(sess, "run_started_at", 0.0) or 0.0)
+        paths: list[str] = []
+        validation_passed = 0
+        validation_failed = 0
+        errors = 0
+        conflicts = 0
+        for event in list(getattr(sess, "operations", []) or []):
+            if not isinstance(event, dict) or float(event.get("ts", 0.0) or 0.0) + 0.001 < started_at:
+                continue
+            kind = str(event.get("type", "") or "").strip().lower()
+            data = event.get("data", {}) if isinstance(event.get("data"), dict) else {}
+            if kind == "file_patch":
+                path = _collaboration_public_text(data.get("path", ""), 500)
+                if path and path not in paths:
+                    paths.append(path)
+            elif kind == "command":
+                command = str(data.get("command", "") or "")
+                if re.search(r"(?i)(pytest|unittest|npm\s+test|pnpm\s+test|yarn\s+test|cargo\s+test|go\s+test)", command):
+                    try:
+                        passed = int(data.get("exit_code", 1)) == 0
+                    except Exception:
+                        passed = False
+                    if passed:
+                        validation_passed += 1
+                    else:
+                        validation_failed += 1
+            elif kind == "error":
+                errors += 1
+            if "conflict" in str(data.get("summary", "") or "").lower():
+                conflicts += 1
+        if errors or validation_failed or conflicts:
+            if status == "completed" and (errors or conflicts):
+                status = "blocked"
+        pieces = [
+            "Agent work completed." if status == "completed" else (
+                "Agent work was cancelled." if status == "cancelled" else "Agent work requires follow-up."
+            )
+        ]
+        if open_todos:
+            pieces.append(
+                f"Outstanding Todos: {len(open_todos)} of {len(todo_rows)} remain unfinished."
+            )
+        if paths:
+            pieces.append("Shared files: " + ", ".join(paths[:12]) + (" and more" if len(paths) > 12 else "") + ".")
+        if validation_passed or validation_failed:
+            pieces.append(f"Validation: {validation_passed} passed, {validation_failed} failed.")
+        if conflicts:
+            pieces.append(f"Conflict review required for {conflicts} operation{'s' if conflicts != 1 else ''}.")
+        elif errors:
+            pieces.append(f"{errors} execution error{'s' if errors != 1 else ''} recorded.")
+        if not paths and not validation_passed and not validation_failed and not conflicts and not errors:
+            pieces.append("No shared file change or validation result was recorded.")
+        return status, _collaboration_public_text(" ".join(pieces), 1200)
+
     def _start_scheduler_rows(self, rows: list[dict]) -> list[dict]:
         started: list[dict] = []
         for row in rows:
@@ -7041,6 +8097,16 @@ document.addEventListener('DOMContentLoaded', function(){{
                         setattr(sess, "scheduler_starting", False)
                 except Exception:
                     pass
+            running = bool(getattr(sess, "running", False))
+            self._publish_collaboration_agent_state(
+                sess,
+                "running" if running else "idle",
+                result_summary=(
+                    "Agent run started"
+                    if running
+                    else trim(str((out or {}).get("error", "") if isinstance(out, dict) else ""), 800)
+                ),
+            )
             started.append({"request": req, "result": out, "session": sess})
         return started
 
@@ -7072,6 +8138,23 @@ document.addEventListener('DOMContentLoaded', function(){{
         except Exception:
             pass
         if sess is not None:
+            collaboration_context = dict(getattr(sess, "collaboration_context", {}) or {})
+            coordinator = getattr(sess, "collaboration_write_coordinator", None)
+            if collaboration_context and coordinator is not None:
+                public_status, public_summary = self._collaboration_run_outcome(sess)
+                try:
+                    coordinator.finish_task(
+                        sess.id,
+                        status=public_status,
+                        result_summary=public_summary,
+                    )
+                except Exception:
+                    pass
+                self._publish_collaboration_agent_state(
+                    sess,
+                    "idle",
+                    result_summary=public_summary,
+                )
             try:
                 self.workflow_memory.capture_session(sess)
             except Exception:
@@ -7126,7 +8209,19 @@ document.addEventListener('DOMContentLoaded', function(){{
             pass
         if not self.scheduler_limits_enabled():
             mgr.prepare_user_intent_for_session(sess, text)
-            return sess.submit_user_message(text)
+            response = sess.submit_user_message(text)
+            running = bool(getattr(sess, "running", False)) or bool(
+                isinstance(response, dict) and response.get("running")
+            )
+            queued = bool(isinstance(response, dict) and response.get("queued"))
+            self._publish_collaboration_agent_state(
+                sess,
+                "running" if running else ("queued" if queued else "idle"),
+                result_summary=(
+                    "Agent run started" if running else "Agent task queued" if queued else ""
+                ),
+            )
+            return response
 
         selected_rows: list[dict] = []
         response: dict = {"ok": True, "queued": True}
@@ -7220,6 +8315,13 @@ document.addEventListener('DOMContentLoaded', function(){{
         if started_rows:
             self._emit_scheduler_started(started_rows)
         if bool(response.get("queued")) and not bool(response.get("scheduler_started")):
+            self._publish_collaboration_agent_state(
+                sess,
+                "queued",
+                result_summary=(
+                    f"Agent task queued at position {int(response.get('queue_position', 1) or 1)}"
+                ),
+            )
             try:
                 sess._emit(
                     "status",
@@ -7249,6 +8351,29 @@ document.addEventListener('DOMContentLoaded', function(){{
     def set_user_memory_mode_for_user(self, user_id: str, mode: str) -> dict:
         mgr = self.manager_for_user(user_id)
         return mgr.set_user_memory_mode(mode)
+
+    def _apply_forced_global_llm_config(
+        self,
+        manager: SessionManager,
+        user_id: str,
+    ) -> bool:
+        revision = str(getattr(self, "global_llm_config_revision", "") or "")
+        if not bool(getattr(self, "force_global_llm_config_for_users", False)) or not revision:
+            return False
+        if str(user_id or "").startswith("collab:") and bool(
+            getattr(manager, "collaboration_llm_independent", False)
+        ):
+            return False
+        manager.global_llm_config_revision = revision
+        manager.global_llm_config_source = str(
+            getattr(self, "global_llm_config_source", "") or "global-config"
+        )
+        manager.force_global_defaults_on_load = True
+        manager.reset_to_llm_config(
+            self.default_llm_config,
+            source=manager.global_llm_config_source or "global-config",
+        )
+        return True
 
     def manager_for_user(self, user_id: str) -> SessionManager:
         with self._lock:
@@ -7287,6 +8412,9 @@ document.addEventListener('DOMContentLoaded', function(){{
                 web_search_setting_locked=self.web_search_setting_locked,
                 user_memory_mode=self.user_memory_mode,
                 user_memory_setting_locked=self.user_memory_setting_locked,
+                shell_timeout_mode=self.shell_timeout_mode,
+                shell_async_handoff_seconds=self.shell_async_handoff_seconds,
+                process_manager=self.process_manager,
                 upload_callback=self._on_session_upload,
                 run_finished_callback=self._on_session_run_finished,
                 reference_prepare_callback=self._prepare_runtime_references,
@@ -7324,28 +8452,390 @@ document.addEventListener('DOMContentLoaded', function(){{
                 loaded_sessions = list(mgr.sessions.values())
             for loaded_session in loaded_sessions:
                 loaded_session.set_telemetry_callback(mgr.telemetry_callback)
-            global_revision = str(getattr(self, "global_llm_config_revision", "") or "")
-            mgr_revision = str(getattr(mgr, "global_llm_config_revision", "") or "")
-            if (
-                bool(getattr(self, "force_global_llm_config_for_users", False))
-                and global_revision
-                and mgr_revision != global_revision
-            ):
-                mgr.global_llm_config_revision = global_revision
-                mgr.global_llm_config_source = str(getattr(self, "global_llm_config_source", "") or "global-config")
-                mgr.force_global_defaults_on_load = True
-                try:
-                    mgr.reset_to_llm_config(
-                        self.default_llm_config,
-                        source=mgr.global_llm_config_source or "global-config",
-                    )
-                except Exception as exc:
-                    print(
-                        "[web-agent] lazy user LLM config sync failed "
-                        f"(user={user_id}, error={trim(str(exc), 180)})"
-                    )
+            try:
+                self._apply_forced_global_llm_config(mgr, user_id)
+            except Exception as exc:
+                print(
+                    "[web-agent] lazy user LLM config sync failed "
+                    f"(user={user_id}, error={trim(str(exc), 180)})"
+                )
             self._session_mgrs[user_id] = mgr
             return mgr
+
+    def _collaboration_principal_for_ide_user(self, user_id: str) -> CollaborationPrincipal | None:
+        uid = str(user_id or "")
+        if not uid.startswith("collab:"):
+            return None
+        with self._lock:
+            manager = self._session_mgrs.get(uid)
+        coordinator = getattr(manager, "collaboration_write_coordinator", None) if manager is not None else None
+        principal = getattr(coordinator, "principal", None)
+        return principal if isinstance(principal, CollaborationPrincipal) else None
+
+    def _collaboration_runtime_source(self, client_ip: str) -> dict:
+        source_user_id = user_id_from_ip(_normalize_ip(client_ip))
+        source = self.manager_for_user(source_user_id)
+        with source.lock:
+            profiles = [dict(profile) for profile in source.user_model_profiles.values()]
+            config = {
+                "profiles": profiles,
+                "default_profile_id": str(source.user_active_profile_id or ""),
+                "read_context_policy": normalize_read_context_policy(source.read_context_policy),
+                "tool_memory_policy": normalize_tool_memory_policy(source.tool_memory_policy),
+                "auto_task_level_ceiling": normalize_auto_task_level_ceiling(source.auto_task_level_ceiling),
+                "l2_todo_policy": normalize_l2_todo_policy(source.l2_todo_policy),
+                "single_no_plan_todo_enabled": bool(source.single_no_plan_todo_enabled),
+                "single_no_plan_todo_prompt": str(source.single_no_plan_todo_prompt or ""),
+                "web_search_enabled": bool(source.web_search_enabled),
+            }
+            language = normalize_ui_language(source.user_language)
+        source_kind = (
+            "admin_global"
+            if bool(getattr(self, "force_global_llm_config_for_users", False))
+            else "current_ip_user"
+        )
+        return {
+            "config": config,
+            "revision": self._llm_config_revision(config),
+            "source_kind": source_kind,
+            "source_user_id": source_user_id,
+            "language": language,
+        }
+
+    @staticmethod
+    def _sync_collaboration_runtime_source(manager: SessionManager, source: dict) -> None:
+        revision = str(source.get("revision", "") or "")
+        source_user_id = str(source.get("source_user_id", "") or "")
+        if (
+            revision
+            and revision == str(getattr(manager, "collaboration_llm_source_revision", "") or "")
+            and source_user_id == str(getattr(manager, "collaboration_llm_source_user_id", "") or "")
+        ):
+            return
+        manager.user_language = normalize_ui_language(source.get("language", manager.user_language))
+        manager.reset_to_llm_config(
+            dict(source.get("config", {}) or {}),
+            source=str(source.get("source_kind", "current_ip_user") or "current_ip_user"),
+        )
+        manager.collaboration_llm_source_revision = revision
+        manager.collaboration_llm_source_user_id = source_user_id
+        manager.collaboration_llm_source_kind = str(source.get("source_kind", "current_ip_user") or "current_ip_user")
+        manager.collaboration_llm_independent = False
+        manager._persist_user_prefs()
+
+    def _sync_ordinary_ide_llm_source(
+        self,
+        user_id: str,
+        client_ip: str,
+        *,
+        force: bool = False,
+    ) -> tuple[SessionManager, SessionManager, dict]:
+        target = self.manager_for_user(user_id)
+        source = self._collaboration_runtime_source(client_ip)
+        source_manager = self.manager_for_user(str(source.get("source_user_id", "") or ""))
+        if target is source_manager:
+            return target, source_manager, source
+        revision = str(source.get("revision", "") or "")
+        source_user_id = str(source.get("source_user_id", "") or "")
+        if not force and (
+            revision
+            and revision == str(getattr(target, "ide_llm_source_revision", "") or "")
+            and source_user_id == str(getattr(target, "ide_llm_source_user_id", "") or "")
+        ):
+            return target, source_manager, source
+        target.user_language = normalize_ui_language(source.get("language", target.user_language))
+        target.reset_to_llm_config(
+            dict(source.get("config", {}) or {}),
+            source=str(source.get("source_kind", "current_ip_user") or "current_ip_user"),
+        )
+        target.ide_llm_source_revision = revision
+        target.ide_llm_source_user_id = source_user_id
+        return target, source_manager, source
+
+    @staticmethod
+    def _validate_ide_llm_config(config: object) -> dict:
+        if not isinstance(config, dict) or not looks_like_llm_config(config):
+            raise ValueError("A valid LLM JSON configuration is required.")
+        clean = sanitize_utf8_surrogates(config)
+        if len(json_response_bytes(clean)) > 512 * 1024:
+            raise ValueError("LLM configuration is too large (maximum 512 KB).")
+        return dict(clean)
+
+    @staticmethod
+    def _ide_llm_status_payload(
+        manager: SessionManager,
+        *,
+        collaboration: bool,
+        source_kind: str,
+    ) -> dict:
+        active = manager._active_profile()
+        independent = bool(
+            collaboration and getattr(manager, "collaboration_llm_independent", False)
+        )
+        return {
+            "ok": True,
+            "scope": "collaboration_member" if collaboration else "main_web_ui_user",
+            "source": "collaboration_private" if independent else str(source_kind or "current_ip_user"),
+            "profile_count": len(manager.user_model_profiles),
+            "independent": independent,
+            "shared": not independent,
+            "active_profile": {
+                "provider": trim(str(active.get("provider", "") or ""), 80),
+                "model": trim(str(active.get("model", "") or ""), 240),
+                "label": trim(str(active.get("label", "") or ""), 160),
+            },
+            "server_side_credentials": True,
+        }
+
+    def ide_llm_config_status(self, user_id: str, *, client_ip: str = "") -> dict:
+        collaboration = str(user_id or "").startswith("collab:")
+        if collaboration:
+            manager = self.manager_for_user(user_id)
+            source_kind = str(
+                getattr(manager, "collaboration_llm_source_kind", "current_ip_user")
+                or "current_ip_user"
+            )
+        else:
+            manager, _, source = self._sync_ordinary_ide_llm_source(user_id, client_ip)
+            source_kind = str(source.get("source_kind", "current_ip_user") or "current_ip_user")
+        return self._ide_llm_status_payload(
+            manager,
+            collaboration=collaboration,
+            source_kind=source_kind,
+        )
+
+    def ide_apply_llm_config(
+        self,
+        user_id: str,
+        session_id: str,
+        config: object,
+        *,
+        client_ip: str = "",
+    ) -> dict:
+        cfg = self._validate_ide_llm_config(config)
+        collaboration = str(user_id or "").startswith("collab:")
+        manager = self.manager_for_user(user_id)
+        session = manager.get(str(session_id or "").strip())
+        if session is None:
+            raise KeyError("session not found")
+        if bool(getattr(session, "running", False)):
+            raise ValueError("Stop the active Agent before changing its LLM configuration.")
+        if collaboration:
+            manager.apply_llm_config(session.id, cfg, source="collaboration_private")
+            manager.collaboration_llm_independent = True
+            manager.collaboration_llm_source_revision = self._llm_config_revision(cfg)
+            manager.collaboration_llm_source_user_id = ""
+            manager.collaboration_llm_source_kind = "collaboration_private"
+            manager._persist_user_prefs()
+            source_kind = "collaboration_private"
+        else:
+            manager, source_manager, source = self._sync_ordinary_ide_llm_source(
+                user_id, client_ip
+            )
+            if source_manager is not manager and any(
+                bool(getattr(item, "running", False))
+                for item in source_manager.sessions.values()
+            ):
+                raise ValueError(
+                    "Stop active Agents in the main Web UI before changing its LLM configuration."
+                )
+            source_manager.reset_to_llm_config(cfg, source="ordinary_ide_shared")
+            if manager is not source_manager:
+                manager.reset_to_llm_config(cfg, source="ordinary_ide_shared")
+                synced = self._collaboration_runtime_source(client_ip)
+                manager.ide_llm_source_revision = str(synced.get("revision", "") or "")
+                manager.ide_llm_source_user_id = str(synced.get("source_user_id", "") or "")
+            source_kind = str(source.get("source_kind", "current_ip_user") or "current_ip_user")
+        out = self._ide_llm_status_payload(
+            manager,
+            collaboration=collaboration,
+            source_kind=source_kind,
+        )
+        out["catalog"] = manager.model_catalog()
+        return out
+
+    def ide_use_shared_llm_config(
+        self,
+        user_id: str,
+        *,
+        client_ip: str = "",
+        session_id: str = "",
+    ) -> dict:
+        collaboration = str(user_id or "").startswith("collab:")
+        current_manager = self.manager_for_user(user_id)
+        current_session = (
+            current_manager.get(str(session_id or "").strip()) if session_id else None
+        )
+        if current_session is not None and bool(getattr(current_session, "running", False)):
+            raise ValueError("Stop the active Agent before changing its LLM configuration.")
+        if collaboration:
+            manager = current_manager
+            source = self._collaboration_runtime_source(client_ip)
+            manager.collaboration_llm_source_revision = ""
+            manager.collaboration_llm_source_user_id = ""
+            manager.collaboration_llm_independent = False
+            self._sync_collaboration_runtime_source(manager, source)
+            source_kind = str(source.get("source_kind", "current_ip_user") or "current_ip_user")
+        else:
+            manager, _, source = self._sync_ordinary_ide_llm_source(
+                user_id, client_ip, force=True
+            )
+            source_kind = str(source.get("source_kind", "current_ip_user") or "current_ip_user")
+        out = self._ide_llm_status_payload(
+            manager,
+            collaboration=collaboration,
+            source_kind=source_kind,
+        )
+        out["catalog"] = manager.model_catalog()
+        return out
+
+    def manager_for_collaboration(
+        self,
+        principal: CollaborationPrincipal,
+        *,
+        client_ip: str = "",
+    ) -> SessionManager:
+        manager_key = f"collab:{principal.project_id}:{principal.member_id}"
+        runtime_source = self._collaboration_runtime_source(client_ip) if str(client_ip or "").strip() else None
+        with self._lock:
+            existing = self._session_mgrs.get(manager_key)
+            if existing is not None:
+                if runtime_source is not None and not bool(
+                    getattr(existing, "collaboration_llm_independent", False)
+                ):
+                    self._sync_collaboration_runtime_source(existing, runtime_source)
+                return existing
+            workspace_root = self.collaboration.project_workspace(principal.project_id)
+            member_state_root = self.collaboration_state_root / "sessions" / principal.project_id / principal.member_id
+            private_root = member_state_root / "sessions"
+            private_root.mkdir(parents=True, exist_ok=True)
+            for legacy_session in member_state_root.glob("sess_*"):
+                if not legacy_session.is_dir():
+                    continue
+                target = private_root / legacy_session.name
+                if target.exists():
+                    continue
+                try:
+                    legacy_session.replace(target)
+                except OSError:
+                    pass
+            coordinator = CollaborationWriteCoordinator(
+                self.collaboration,
+                principal.project_id,
+                principal.member_id,
+                principal.device_id,
+            )
+            public_context = {
+                "project_id": principal.project_id,
+                "member_id": principal.member_id,
+                "device_id": principal.device_id,
+                "nickname": principal.nickname,
+            }
+            mgr = SessionManager(
+                private_root,
+                manager_key,
+                self.base_url,
+                self.model,
+                self.skills_root,
+                self.js_lib_root,
+                self.crypto,
+                workspace_root,
+                self.thinking,
+                dict(runtime_source.get("config", {}) or {}) if runtime_source else self.default_llm_config,
+                runtime_source.get("language", self.default_language) if runtime_source else self.default_language,
+                self.context_token_limit,
+                self.context_limit_locked,
+                self.max_rounds,
+                self.max_run_seconds,
+                self.shell_command_timeout_seconds,
+                self.auto_task_level_ceiling,
+                self.l2_todo_policy,
+                self.auto_model_switch,
+                self.arbiter_enabled,
+                self.arbiter_model,
+                self.arbiter_timeout_seconds,
+                self.arbiter_max_tokens,
+                self.arbiter_temperature,
+                self.execution_mode,
+                self.max_output_tokens,
+                web_search_enabled=self.web_search_enabled,
+                web_search_setting_locked=self.web_search_setting_locked,
+                user_memory_mode="off",
+                user_memory_setting_locked=True,
+                shell_timeout_mode=self.shell_timeout_mode,
+                shell_async_handoff_seconds=self.shell_async_handoff_seconds,
+                process_manager=self.process_manager,
+                upload_callback=self._on_session_upload,
+                run_finished_callback=self._on_session_run_finished,
+                reference_prepare_callback=self._prepare_runtime_references,
+                query_code_library_callback=self._query_code_library_tool,
+                query_knowledge_library_callback=self._query_knowledge_library_tool,
+                rag_remember_callback=self._rag_remember_tool,
+                code_library_root=self.code_root,
+                code_library_status_callback=self._code_library_status_for_session,
+                knowledge_library_root=self.rag_root,
+                knowledge_library_status_callback=self._knowledge_library_status_for_session,
+                mcp_manager=getattr(self, "mcp", None),
+                js_lib_download_enabled=bool(getattr(self, "js_lib_download_enabled", True)),
+                workspace_root=workspace_root,
+                collaboration_context=public_context,
+                collaboration_context_provider=lambda p=principal: self.collaboration.snapshot(p),
+                collaboration_write_coordinator=coordinator,
+            )
+            mgr.read_context_policy = normalize_read_context_policy(
+                getattr(self, "read_context_policy", DEFAULT_READ_CONTEXT_POLICY)
+            )
+            mgr.tool_memory_policy = normalize_tool_memory_policy(
+                getattr(self, "tool_memory_policy", DEFAULT_TOOL_MEMORY_POLICY)
+            )
+            mgr.telemetry_callback = lambda kind, _uid=manager_key, **fields: self.telemetry.record(
+                kind, user_id=_uid, **fields
+            )
+            if runtime_source is not None and not bool(
+                getattr(mgr, "collaboration_llm_independent", False)
+            ):
+                self._sync_collaboration_runtime_source(mgr, runtime_source)
+            self._session_mgrs[manager_key] = mgr
+            return mgr
+
+    def collaboration_sessions(self, principal: CollaborationPrincipal, *, client_ip: str = "") -> dict:
+        mgr = self.manager_for_collaboration(principal, client_ip=client_ip)
+        with mgr.lock:
+            rows = [dict(row) for row in mgr.session_index.values()]
+        rows.sort(key=lambda row: float(row.get("updated_at", 0) or 0), reverse=True)
+        return {"ok": True, "sessions": rows, "project_id": principal.project_id}
+
+    def collaboration_create_session(
+        self,
+        principal: CollaborationPrincipal,
+        title: str = "",
+        *,
+        client_ip: str = "",
+    ) -> dict:
+        sess = self.manager_for_collaboration(principal, client_ip=client_ip).create(
+            trim(str(title or "Shared workspace"), 120) or "Shared workspace"
+        )
+        sess.ide_remote_sandbox_required = True
+        return {
+            "ok": True,
+            "id": sess.id,
+            "title": sess.title,
+            "project_id": principal.project_id,
+            "workspace": str(sess.files_root),
+        }
+
+    def collaboration_session(
+        self,
+        principal: CollaborationPrincipal,
+        session_id: str,
+        *,
+        client_ip: str = "",
+    ) -> SessionState:
+        sess = self.manager_for_collaboration(principal, client_ip=client_ip).get(str(session_id or "").strip())
+        if not sess:
+            raise CollaborationError("session_not_found", "collaboration agent session not found", 404)
+        sess.ide_remote_sandbox_required = True
+        return sess
 
     def _known_user_ids(self) -> list[str]:
         ids: set[str] = set()
@@ -7478,6 +8968,10 @@ document.addEventListener('DOMContentLoaded', function(){{
         with self._lock:
             live_mgrs = list(self._session_mgrs.items())
         for uid, mgr in live_mgrs:
+            if str(uid or "").startswith("collab:") and bool(
+                getattr(mgr, "collaboration_llm_independent", False)
+            ):
+                continue
             try:
                 mgr.global_llm_config_revision = revision
                 mgr.global_llm_config_source = source or "global-config"

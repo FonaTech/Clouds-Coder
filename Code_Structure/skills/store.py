@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=812 original-lines=14824-14932 hash=745fa615d6fc251e
+# split-source: order=891 original-lines=19435-19543 hash=745fa615d6fc251e
 
 # ---------------------------------------------------------------------------
 # Built-in skill guides injected into SkillStore on reload.
@@ -116,7 +116,7 @@ _BUILTIN_SKILLS: dict[str, dict] = {
     },
 }
 
-# split-source: order=813 original-lines=14933-16240 hash=6d9d420ded36588b
+# split-source: order=892 original-lines=19544-21319 hash=bdbb27beff242352
 
 # ============================================================================
 # Architecture / 架构 / アーキテクチャ
@@ -170,7 +170,9 @@ class SkillStore:
         # Minimax nested metadata support
         mm = self._skill_meta_section(meta, "metadata")
         triggers.extend(_meta_string_list(mm.get("triggers")))
-        # Extract trigger keywords from description (for skills-main / awesome-claude-skills format)
+        # Extract only positive trigger keywords from description.  Older
+        # versions accidentally treated the ``DO NOT TRIGGER`` clause as a
+        # positive trigger, which made generic prose select unrelated skills.
         if not triggers:
             desc = str(meta.get("description", "") or "").strip()
             triggers.extend(self._extract_triggers_from_description(desc))
@@ -183,6 +185,102 @@ class SkillStore:
             seen.add(key)
             out.append(item)
         return out
+
+    def _skill_negative_triggers(self, meta: dict) -> list[str]:
+        """Return explicit exclusions without reading a skill body."""
+        values: list[str] = []
+        for key in ("negative_triggers", "negativeTriggers", "not_for", "notFor", "excludes", "exclude"):
+            values.extend(_meta_string_list(meta.get(key)))
+        cc = self._skill_meta_section(meta, "clouds_coder")
+        for key in ("negative_triggers", "not_for", "excludes", "exclude"):
+            values.extend(_meta_string_list(cc.get(key)))
+        mm = self._skill_meta_section(meta, "metadata")
+        for key in ("negative_triggers", "not_for", "excludes", "exclude"):
+            values.extend(_meta_string_list(mm.get(key)))
+        desc = str(meta.get("description", "") or "").strip()
+        # Capture the clause after DO NOT TRIGGER until a sentence boundary.
+        for match in re.finditer(
+            r"DO\s+NOT\s+TRIGGER(?:\s+WHEN)?[:\s]+([^\n.]{3,500})",
+            desc,
+            re.IGNORECASE,
+        ):
+            segment = match.group(1).strip()
+            quoted = [m.group(1) or m.group(2) for m in re.finditer(r"'([^']{2,60})'|\"([^\"]{2,60})\"", segment)]
+            values.extend(quoted or [x.strip().strip("'\"") for x in re.split(r"[,;]", segment)])
+        seen: set[str] = set()
+        out: list[str] = []
+        for value in values:
+            item = str(value or "").strip()
+            key = item.casefold()
+            if not item or len(item) < 2 or key in seen:
+                continue
+            seen.add(key)
+            out.append(item)
+        return out[:24]
+
+    def _skill_category(self, meta: dict) -> str:
+        cc = self._skill_meta_section(meta, "clouds_coder")
+        nested = self._skill_meta_section(meta, "metadata")
+        return str(
+            meta.get("category", cc.get("category", nested.get("category", ""))) or ""
+        ).strip()
+
+    def _skill_bool(self, meta: dict, key: str, default: bool = False) -> bool:
+        cc = self._skill_meta_section(meta, "clouds_coder")
+        nested = self._skill_meta_section(meta, "metadata")
+        value = meta.get(key, cc.get(key, nested.get(key, default)))
+        if isinstance(value, bool):
+            return value
+        return str(value or "").strip().lower() in {"1", "true", "yes", "on", "y"}
+
+    def _skill_relation_list(self, meta: dict, key: str) -> list[str]:
+        values = _meta_string_list(meta.get(key))
+        cc = self._skill_meta_section(meta, "clouds_coder")
+        values.extend(_meta_string_list(cc.get(key)))
+        nested = self._skill_meta_section(meta, "metadata")
+        values.extend(_meta_string_list(nested.get(key)))
+        seen: set[str] = set()
+        out: list[str] = []
+        for value in values:
+            item = str(value or "").strip()
+            if item and item.casefold() not in seen:
+                seen.add(item.casefold())
+                out.append(item)
+        return out[:24]
+
+    def _skill_metadata_record(self, key: str, data: dict, *, score: float | None = None) -> dict:
+        meta = dict(data.get("meta", {}) if isinstance(data.get("meta"), dict) else {})
+        selection_meta = dict(meta)
+        selection_meta.setdefault("description", str(data.get("description", "") or ""))
+        infrastructure_only = self._skill_bool(selection_meta, "infrastructure_only", False) or bool(meta.get("builtin", False))
+        row = {
+            "id": str(key),
+            "canonical_id": str(key),
+            "name": str(data.get("name", key) or key),
+            "qualified_name": str(key),
+            "description": str(data.get("description", meta.get("description", "-")) or "-"),
+            "provider_id": str(data.get("provider_id", "") or ""),
+            "provider": str(data.get("provider_id", "") or ""),
+            "protocol": str(data.get("protocol", "") or ""),
+            "protocol_version": str(data.get("protocol_version", "") or ""),
+            "meta": meta,
+            "skill_path": data.get("skill_path", ""),
+            "virtual_path": data.get("skill_path", ""),
+            "attachments": [x.get("path", "") for x in data.get("attachments", []) if isinstance(x, dict)],
+            "aliases": [n for n, sid in self.aliases.items() if sid == key],
+            "triggers": self._skill_triggers(selection_meta),
+            "negative_triggers": self._skill_negative_triggers(selection_meta),
+            "keywords": self._skill_keywords(selection_meta),
+            "category": self._skill_category(selection_meta),
+            "entrypoints": self._skill_entrypoints(selection_meta),
+            "preferred_tools": self._skill_relation_list(selection_meta, "preferred_tools"),
+            "requires": self._skill_relation_list(selection_meta, "requires"),
+            "conflicts": self._skill_relation_list(selection_meta, "conflicts"),
+            "infrastructure_only": infrastructure_only,
+        }
+        if score is not None:
+            row["score"] = round(float(score), 4)
+        return row
 
     @staticmethod
     def _extract_triggers_from_description(desc: str) -> list[str]:
@@ -199,7 +297,7 @@ class SkillStore:
             return []
         triggers: list[str] = []
         # Pattern 1: "TRIGGER when:" or "triggers include:" followed by comma list
-        for m in re.finditer(r'(?:TRIGGER\s+when|triggers?\s+include|DO\s+NOT\s+TRIGGER)[:\s]+([^\n.]{10,600})', desc, re.IGNORECASE):
+        for m in re.finditer(r'(?:TRIGGER\s+when|triggers?\s+include)[:\s]+([^\n.]{10,600})', desc, re.IGNORECASE):
             segment = m.group(1).strip()
             # Extract quoted phrases
             for qm in re.finditer(r"'([^']{2,40})'|\"([^\"]{2,40})\"", segment):
@@ -727,6 +825,66 @@ class SkillStore:
             return
         meta, body = parse_front_matter(raw)
         skill_dir = skill_file.parent
+        # Keep routing-table references searchable without making metadata
+        # recall reopen or parse the potentially large SKILL.md body. Skills
+        # that ship reference guides can expose stable technique entrypoints;
+        # existing domain term groups provide multilingual aliases generically.
+        reference_files = sorted(skill_dir.glob("reference/*.md"))
+        if reference_files:
+            meta = dict(meta)
+            existing_cc = meta.get("clouds_coder")
+            clouds_coder = dict(existing_cc) if isinstance(existing_cc, dict) else {}
+            entrypoints = _meta_string_list(clouds_coder.get("entrypoints"))
+            reference_stems = {
+                re.sub(r"[-_]+", " ", reference_file.stem).casefold()
+                for reference_file in reference_files
+            }
+            for reference_file in reference_files:
+                stem = reference_file.stem
+                entrypoint = f"techniques/{stem}.md"
+                if entrypoint not in entrypoints:
+                    entrypoints.append(entrypoint)
+            triggers = _meta_string_list(clouds_coder.get("triggers"))
+            for group in globals().get("RAG_TERM_GROUPS", ()):
+                terms = [str(term).strip() for term in group if str(term).strip()]
+                if not terms:
+                    continue
+                normalized_terms = [
+                    re.sub(r"[-_]+", " ", term).casefold() for term in terms
+                ]
+                if not any(
+                    part and (part in stem or stem in part)
+                    for stem in reference_stems
+                    for term in normalized_terms
+                    for part in term.split()
+                    if len(part) >= 3
+                ):
+                    continue
+                for term in terms:
+                    if term not in triggers:
+                        triggers.append(term)
+                    for token in re.findall(r"[A-Za-z][A-Za-z0-9+#.-]{2,}", term):
+                        if token not in triggers:
+                            triggers.append(token)
+            if triggers:
+                clouds_coder["triggers"] = triggers
+            clouds_coder["entrypoints"] = entrypoints
+            meta["clouds_coder"] = clouds_coder
+        # Standard SKILL.md frontmatter stays portable (name + description).
+        # Clouds Coder provider/protocol extensions live in a sidecar and are
+        # merged only at runtime.
+        cc_sidecar = skill_dir / "agents" / "clouds-coder.yaml"
+        if cc_sidecar.exists() and cc_sidecar.is_file() and not cc_sidecar.is_symlink():
+            try:
+                sidecar_raw = cc_sidecar.read_text(encoding="utf-8")
+                sidecar = _yaml.safe_load(sidecar_raw) if _yaml is not None else {}
+                if isinstance(sidecar, dict):
+                    section = sidecar.get("clouds_coder", sidecar)
+                    if isinstance(section, dict):
+                        meta = dict(meta)
+                        meta["clouds_coder"] = dict(section)
+            except Exception as exc:
+                self.warnings.append(f"{cc_sidecar}: invalid Clouds Coder sidecar: {exc}")
         name = str(meta.get("name", "")).strip() or skill_dir.name
         desc = str(meta.get("description", "-"))
         attachments = self._collect_attachments(
@@ -1198,27 +1356,7 @@ class SkillStore:
         return sorted(names)
 
     def list_metadata(self) -> list[dict]:
-        out = []
-        for key, data in sorted(self.skills.items()):
-            meta = dict(data.get("meta", {}))
-            out.append(
-                {
-                    "id": key,
-                    "name": data.get("name", key),
-                    "qualified_name": key,
-                    "description": data.get("description", meta.get("description", "-")),
-                    "provider_id": data.get("provider_id", ""),
-                    "protocol": data.get("protocol", ""),
-                    "protocol_version": data.get("protocol_version", ""),
-                    "meta": meta,
-                    "skill_path": data.get("skill_path", ""),
-                    "virtual_path": data.get("skill_path", ""),
-                    "attachments": [x["path"] for x in data.get("attachments", [])],
-                    "aliases": [n for n, sid in self.aliases.items() if sid == key],
-                    "triggers": self._skill_triggers(meta),
-                    "entrypoints": self._skill_entrypoints(meta),
-                }
-            )
+        out = [self._skill_metadata_record(key, data) for key, data in sorted(self.skills.items())]
         if self.ambiguous:
             out.append(
                 {
@@ -1237,6 +1375,337 @@ class SkillStore:
                 }
             )
         return out
+
+    def canonicalize_id(self, name: object) -> dict:
+        """Resolve any public skill identifier to one canonical id.
+
+        The structured response is intentionally separate from ``_resolve_name``
+        so older callers that expect a ``(key, error)`` tuple remain compatible.
+        """
+        requested = str(name or "").strip()
+        if not requested:
+            return {"ok": False, "requested": requested, "error": "skill name required", "code": "missing"}
+        exact = self.skills.get(requested)
+        if exact is not None:
+            return {"ok": True, "requested": requested, "canonical_id": requested, "name": exact.get("name", requested)}
+        candidates: list[str] = []
+        folded = requested.casefold()
+        for key, data in self.skills.items():
+            names = [key, str(data.get("name", "") or "")]
+            meta = data.get("meta", {}) if isinstance(data.get("meta"), dict) else {}
+            names.extend(self._skill_aliases(meta))
+            if any(str(value or "").strip().casefold() == folded for value in names):
+                candidates.append(key)
+        if requested in self.ambiguous:
+            candidates = list(self.ambiguous.get(requested, []))
+        if len(candidates) == 1:
+            key = candidates[0]
+            return {"ok": True, "requested": requested, "canonical_id": key, "name": self.skills[key].get("name", key)}
+        if len(candidates) > 1:
+            return {
+                "ok": False,
+                "requested": requested,
+                "error": f"ambiguous skill '{requested}'",
+                "code": "ambiguous",
+                "candidates": sorted(candidates),
+            }
+        return {
+            "ok": False,
+            "requested": requested,
+            "error": f"unknown skill '{requested}'",
+            "code": "unknown",
+            "candidates": [],
+        }
+
+    # Friendly aliases used by IDE/runtime integrations.
+    canonicalize = canonicalize_id
+    resolve_canonical = canonicalize_id
+
+    def recall_metadata(
+        self,
+        focus: str = "",
+        *,
+        step: str = "",
+        phase: str = "",
+        limit: int = 12,
+        include_infrastructure: bool = False,
+    ) -> list[dict]:
+        """Recall a bounded metadata candidate set without loading skill bodies."""
+        raw_query = f"{focus or ''}\n{step or ''}\n{phase or ''}"
+        # Runtime wrappers describe where the request came from, not what the
+        # user is trying to accomplish.  Letting these lines participate in
+        # recall made tokens such as ``IDE`` and ``workspace`` outrank the
+        # actual current Todo/Plan step.
+        meaningful_lines: list[str] = []
+        for raw_line in normalize_embedded_newlines(raw_query).splitlines():
+            line = re.sub(r"\s+", " ", str(raw_line or "").strip())
+            if not line:
+                continue
+            if re.fullmatch(
+                r"(?:ide programming request\.?|ide workspace\s*(?:\([^)]*\))?)\s*",
+                line,
+                flags=re.IGNORECASE,
+            ) or re.match(r"^(?:workspace root|writable path)\s*:", line, flags=re.IGNORECASE):
+                continue
+            meaningful_lines.append(line)
+        query = re.sub(r"\s+", " ", " ".join(meaningful_lines)).strip().casefold()
+        generic_tokens = {
+            "the", "and", "for", "with", "from", "this", "that", "use", "build", "create", "analyze",
+            "task", "step", "current", "plan", "phase", "direct", "objective", "execution", "run", "start",
+            "auto", "ide", "programming", "request", "workspace", "root", "writable", "path", "session",
+        }
+        tokens: list[str] = []
+        seen_tokens: set[str] = set()
+        for token in re.findall(r"[\w.+#-]{2,}", query, flags=re.UNICODE):
+            normalized = token.strip("._+-").casefold()
+            if not normalized or normalized in generic_tokens or normalized in seen_tokens:
+                continue
+            seen_tokens.add(normalized)
+            tokens.append(normalized)
+
+        def _ascii_term_match(haystack: str, term: str) -> bool:
+            if not term:
+                return False
+            if re.search(r"[\u3400-\u9fff]", term):
+                return term in haystack
+            return bool(re.search(r"(?<![A-Za-z0-9_])" + re.escape(term) + r"(?![A-Za-z0-9_])", haystack))
+
+        scored: list[tuple[float, str, dict]] = []
+        for key, data in self.skills.items():
+            meta = self._skill_metadata_record(key, data)
+            if meta.get("infrastructure_only") and not include_infrastructure:
+                continue
+            negatives = [str(x).casefold() for x in meta.get("negative_triggers", [])]
+            negative_hit = next((x for x in negatives if x and x in query), "")
+            if negative_hit:
+                meta["filter_reason"] = f"negative_trigger:{negative_hit}"
+                continue
+            score = 0.0
+            # Explicit trigger/keyword/name matches are strong. Description is
+            # deliberately weak so words like Build/Use/Analyze do not dominate.
+            seen_terms: set[str] = set()
+            for value in list(meta.get("triggers", [])) + list(meta.get("keywords", [])) + list(meta.get("aliases", [])):
+                raw_term = str(value or "").strip()
+                term = raw_term.casefold()
+                if not term or term in seen_terms or term in generic_tokens | {"skill"}:
+                    continue
+                seen_terms.add(term)
+                if _ascii_term_match(query, term):
+                    is_cjk = bool(re.search(r"[\u3400-\u9fff]", term))
+                    is_acronym = len(raw_term) >= 2 and raw_term.isupper()
+                    score += 6.0 if is_cjk or is_acronym or " " in term or len(term) >= 6 else 2.0
+            name = str(meta.get("name", "") or "").casefold()
+            if name and _ascii_term_match(query, name):
+                score += 8.0
+            name_tokens = {
+                part.casefold()
+                for part in re.findall(r"[A-Za-z0-9+#.]{2,}|[\u3400-\u9fff]{2,}", name, flags=re.UNICODE)
+            }
+            description = str(meta.get("description", "") or "").casefold()
+            description_tokens = {
+                part.casefold()
+                for part in re.findall(r"[A-Za-z0-9+#.]{3,}|[\u3400-\u9fff]{2,}", description, flags=re.UNICODE)
+            }
+            for token in tokens:
+                # Name matching uses normalized segments.  Arbitrary substring
+                # matching made ``ide`` match the middle of ``video``.
+                if token in name_tokens:
+                    score += 2.5
+                elif token in description_tokens:
+                    score += 0.35
+            # Keep unscored rows available only when the caller asks for an
+            # explicit catalog; automatic focus selection should stay empty.
+            if score > 0:
+                scored.append((score, str(meta.get("canonical_id", key)), meta))
+        scored.sort(key=lambda row: (-row[0], row[1].casefold()))
+        return [
+            dict(row[2], score=round(row[0], 4))
+            for row in scored[: max(1, min(50, int(limit or 12)))]
+        ]
+
+    metadata_recall = recall_metadata
+
+    @staticmethod
+    def _selection_json(raw: object) -> object:
+        if isinstance(raw, (dict, list)):
+            return raw
+        text = str(raw or "").strip()
+        if not text:
+            return None
+        fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", text, re.IGNORECASE)
+        if fence:
+            text = fence.group(1).strip()
+        try:
+            return json.loads(text)
+        except Exception:
+            match = re.search(r"\{[\s\S]*\}|\[[\s\S]*\]", text)
+            if not match:
+                return None
+            try:
+                return json.loads(match.group(0))
+            except Exception:
+                return None
+
+    def select_skills(
+        self,
+        focus: str = "",
+        *,
+        step: str = "",
+        phase: str = "",
+        llm_selector=None,
+        limit: int = 3,
+        candidate_limit: int = 12,
+        include_infrastructure: bool = False,
+        active_ids: list[str] | None = None,
+    ) -> dict:
+        """Shared recall -> semantic selection -> strict validation pipeline."""
+        started = time.monotonic()
+        candidates = self.recall_metadata(
+            focus,
+            step=step,
+            phase=phase,
+            limit=candidate_limit,
+            include_infrastructure=include_infrastructure,
+        )
+        result = {
+            "focus": trim(str(focus or ""), 500),
+            "step": trim(str(step or ""), 300),
+            "phase": trim(str(phase or ""), 80),
+            "candidates": candidates,
+            "selected": [],
+            "selection_order": [],
+            "filtered": [],
+            "conflicts": [],
+            "requires": [],
+            "fallback": "none",
+            "fallback_type": "none",
+            "duration_ms": 0,
+        }
+        query_text = re.sub(r"\s+", " ", f"{focus or ''} {step or ''} {phase or ''}").casefold()
+        for key, data in self.skills.items():
+            meta_row = self._skill_metadata_record(key, data)
+            negative_hit = next(
+                (str(value) for value in meta_row.get("negative_triggers", []) or [] if str(value).casefold() in query_text),
+                "",
+            )
+            if negative_hit:
+                result["filtered"].append({"id": key, "reason": f"negative_trigger:{negative_hit}"})
+                continue
+            if meta_row.get("infrastructure_only") and not include_infrastructure:
+                name = str(meta_row.get("name", "") or "").casefold()
+                if name and name in query_text:
+                    result["filtered"].append({"id": key, "reason": "infrastructure_only"})
+        if not candidates:
+            result["fallback"] = result["fallback_type"] = "empty"
+            result["duration_ms"] = int((time.monotonic() - started) * 1000)
+            return result
+        candidate_ids = {str(row.get("canonical_id", row.get("id", ""))) for row in candidates}
+        raw = None
+        if callable(llm_selector):
+            try:
+                raw = llm_selector(candidates)
+            except Exception as exc:
+                result["fallback"] = result["fallback_type"] = "llm_error"
+                result["filtered"].append({"id": "", "reason": f"llm_error:{trim(str(exc), 120)}"})
+        parsed = self._selection_json(raw)
+        if isinstance(parsed, dict):
+            parsed = parsed.get("selected", parsed.get("selected_skills", parsed.get("skills", [])))
+        if not isinstance(parsed, list):
+            if raw is not None:
+                result["fallback"] = result["fallback_type"] = "invalid_output"
+            parsed = []
+        seen: set[str] = set()
+        for item in parsed:
+            requested = item if isinstance(item, str) else (item.get("id", item.get("canonical_id", item.get("name", ""))) if isinstance(item, dict) else "")
+            rationale = item.get("rationale", item.get("reason", "")) if isinstance(item, dict) else ""
+            canonical = self.canonicalize_id(requested)
+            cid = str(canonical.get("canonical_id", "")) if canonical.get("ok") else ""
+            if not cid or cid not in candidate_ids:
+                result["filtered"].append({"id": str(requested or ""), "reason": "not_in_candidates" if cid else canonical.get("code", "unknown")})
+                continue
+            if cid in seen:
+                result["filtered"].append({"id": cid, "reason": "duplicate"})
+                continue
+            row = next((x for x in candidates if str(x.get("canonical_id", x.get("id", ""))) == cid), None)
+            if not row:
+                continue
+            seen.add(cid)
+            result["selected"].append({"id": cid, "canonical_id": cid, "name": row.get("name", cid), "rationale": trim(str(rationale or ""), 240)})
+            if len(result["selected"]) >= max(1, min(3, int(limit or 3))):
+                break
+        # Apply declared conflict/dependency metadata after canonicalization.
+        accepted: list[dict] = []
+        accepted_ids: set[str] = set()
+        accepted_names: set[str] = set()
+        active_canonical_ids: list[str] = []
+        for active in list(active_ids or []):
+            resolved = self.canonicalize_id(active)
+            if not resolved.get("ok"):
+                continue
+            active_id = str(resolved.get("canonical_id", "") or "")
+            active_row = self.skills.get(active_id, {})
+            active_canonical_ids.append(active_id)
+            accepted_ids.add(active_id)
+            accepted_names.add(str(active_row.get("name", active_id) or active_id))
+        for selected in list(result["selected"]):
+            cid = str(selected.get("id", "") or "")
+            row = next((x for x in candidates if str(x.get("canonical_id", x.get("id", ""))) == cid), {})
+            conflict_terms = {str(x).casefold() for x in row.get("conflicts", []) or []}
+            conflict_hit = next((value for value in accepted_ids | accepted_names if value.casefold() in conflict_terms), "")
+            if conflict_hit:
+                resolved_conflict = self.canonicalize_id(conflict_hit)
+                if resolved_conflict.get("ok"):
+                    conflict_hit = str(resolved_conflict.get("canonical_id", conflict_hit))
+            reverse_hit = ""
+            if not conflict_hit:
+                prior_rows = [
+                    (str(previous.get("id", "")), next((x for x in candidates if str(x.get("canonical_id", x.get("id", ""))) == previous.get("id")), {}))
+                    for previous in accepted
+                ]
+                prior_rows.extend(
+                    (active_id, self._skill_metadata_record(active_id, self.skills.get(active_id, {})))
+                    for active_id in active_canonical_ids
+                )
+                for previous_id, previous_row in prior_rows:
+                    previous_conflicts = {str(x).casefold() for x in previous_row.get("conflicts", []) or []}
+                    if cid.casefold() in previous_conflicts or str(row.get("name", "")).casefold() in previous_conflicts:
+                        reverse_hit = previous_id
+                        break
+            if conflict_hit or reverse_hit:
+                result["conflicts"].append({"id": cid, "with": conflict_hit or reverse_hit, "reason": "declared_conflict"})
+                result["filtered"].append({"id": cid, "reason": "conflict"})
+                continue
+            accepted.append(selected)
+            accepted_ids.add(cid)
+            accepted_names.add(str(row.get("name", cid) or cid))
+        result["selected"] = accepted
+        selected_ids = {str(row.get("id", "")) for row in accepted} | accepted_ids
+        selected_names = {str(row.get("name", "")) for row in accepted} | accepted_names
+        dependency_valid: list[dict] = []
+        for selected in accepted:
+            cid = str(selected.get("id", "") or "")
+            row = next((x for x in candidates if str(x.get("canonical_id", x.get("id", ""))) == cid), {})
+            missing: list[str] = []
+            for requirement in row.get("requires", []) or []:
+                resolved = self.canonicalize_id(requirement)
+                required_id = str(resolved.get("canonical_id", "")) if resolved.get("ok") else str(requirement)
+                if required_id not in selected_ids and str(requirement) not in selected_names:
+                    missing.append(required_id)
+            if missing:
+                result["requires"].append({"id": cid, "missing": missing})
+                result["filtered"].append({"id": cid, "reason": "missing_dependency", "missing": missing})
+                continue
+            dependency_valid.append(selected)
+        result["selected"] = dependency_valid
+        # Local fallback is intentionally conservative: no selected metadata
+        # means no body load, even for a large global catalog.
+        if not result["selected"] and result["fallback_type"] == "none":
+            result["fallback"] = result["fallback_type"] = "metadata"
+        result["selection_order"] = [row["id"] for row in result["selected"]]
+        result["duration_ms"] = int((time.monotonic() - started) * 1000)
+        return result
+
+    select_for_focus = select_skills
 
     def list_providers(self) -> list[dict]:
         out = []
@@ -1313,13 +1782,12 @@ class SkillStore:
         target = (name or "").strip()
         if not target:
             return None, "Error: skill name required"
-        if target in self.skills:
-            return target, None
-        alias = self.aliases.get(target)
-        if alias:
-            return alias, None
-        if target in self.ambiguous:
-            return None, f"Error: ambiguous skill '{target}'. use: {', '.join(sorted(self.ambiguous[target]))}"
+        resolved = self.canonicalize_id(target)
+        if resolved.get("ok"):
+            return str(resolved.get("canonical_id", "")), None
+        if resolved.get("code") == "ambiguous":
+            options = resolved.get("candidates", [])
+            return None, f"Error: ambiguous skill '{target}'. use: {', '.join(sorted(str(x) for x in options))}"
         return None, f"Error: unknown skill '{target}'. available: {', '.join(self.list_names())}"
 
     def load(self, name: str) -> str:

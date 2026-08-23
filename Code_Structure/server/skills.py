@@ -5,7 +5,8 @@
 
 from __future__ import annotations
 
-# split-source: order=962 original-lines=108943-109168 hash=7d0b2cd046b29af0
+# split-source: order=1065 original-lines=121001-121643 hash=cf5146e4330d26f9
+
 
 class SkillsHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -71,7 +72,12 @@ class SkillsHandler(BaseHTTPRequestHandler):
                 return
             raise
 
-    def _send_text(self, text: str, content_type: str = "text/plain; charset=utf-8", status: int = 200):
+    def _send_text(
+        self,
+        text: str,
+        content_type: str = "text/plain; charset=utf-8",
+        status: int = 200,
+    ):
         body = safe_utf8_bytes(text)
         try:
             self.send_response(status)
@@ -87,25 +93,210 @@ class SkillsHandler(BaseHTTPRequestHandler):
                 return
             raise
 
+    def _send_inline_bytes(self, data: bytes, content_type: str, status: int = 200):
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Content-Disposition", "inline")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+        except Exception as exc:
+            if swallow_benign_socket_error(exc, "skills-handler.send_inline_bytes"):
+                return
+            raise
+
+    def _studio_json(
+        self, obj: object, *, status: int = 200, cookies: dict | None = None
+    ):
+        body = json_response_bytes(obj)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            for name, value in (cookies or {}).items():
+                if not value:
+                    continue
+                max_age = (
+                    STUDIO_DEVICE_TTL
+                    if name == STUDIO_DEVICE_COOKIE
+                    else STUDIO_SESSION_TTL
+                )
+                self.send_header(
+                    "Set-Cookie",
+                    f"{name}={quote(str(value), safe='._~-')}; Max-Age={max_age}; Path=/; HttpOnly; SameSite=Lax",
+                )
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as exc:
+            if swallow_benign_socket_error(exc, "skills-handler.studio_json"):
+                return
+            raise
+
+    def _studio_auth(self, *, write: bool = False):
+        return self.app.skills_studio._auth(
+            self.headers, self._client_ip(), write=write
+        )
+
+    def _studio_error(self, exc: Exception):
+        if isinstance(exc, SkillsStudioError):
+            return self._send_json(
+                {"error": str(exc), "code": exc.code, "details": exc.details},
+                status=exc.status,
+            )
+        return self._send_json(
+            {"error": str(exc)[:500], "code": "studio_error"}, status=400
+        )
+
     def do_GET(self):
         parsed_url = urlparse(self.path)
         path = unquote(parsed_url.path)
         query = parse_qs(parsed_url.query or "")
-        refresh_probe = _to_bool_like((query.get("refresh", ["0"]) or ["0"])[0], default=False) or _to_bool_like(
-            (query.get("probe", ["0"]) or ["0"])[0], default=False
-        )
+        refresh_probe = _to_bool_like(
+            (query.get("refresh", ["0"]) or ["0"])[0], default=False
+        ) or _to_bool_like((query.get("probe", ["0"]) or ["0"])[0], default=False)
         mgr = self._session_mgr()
         if path == "/":
-            return self._send_text(self.app.web_ui_skills_index_html(), "text/html; charset=utf-8")
+            return self._send_text(STUDIO_INDEX_HTML, "text/html; charset=utf-8")
+        if path == "/legacy":
+            return self._send_text(
+                self.app.web_ui_skills_index_html(), "text/html; charset=utf-8"
+            )
+        if path == "/assets/studio.css":
+            return self._send_text(STUDIO_CSS, "text/css; charset=utf-8")
+        if path == "/assets/studio.js":
+            return self._send_text(STUDIO_JS, "application/javascript; charset=utf-8")
+        if path == "/assets/studio-monaco-worker.js":
+            fp = self.app.ide_monaco_worker_path()
+            if not fp:
+                return self._send_json({"error": "asset not found"}, status=404)
+            return self._send_inline_bytes(
+                fp.read_bytes(), "application/javascript; charset=utf-8"
+            )
+        if path.startswith("/assets/js_lib/"):
+            fp = self.app.rag_js_lib_asset_path(path[len("/assets/js_lib/") :])
+            if not fp:
+                return self._send_json({"error": "asset not found"}, status=404)
+            content_type = guess_mime_from_name(fp.name, "application/javascript")
+            if fp.suffix.lower() in {".js", ".mjs", ".cjs"}:
+                content_type = "application/javascript; charset=utf-8"
+            return self._send_inline_bytes(fp.read_bytes(), content_type)
         if path == "/assets/style.css":
-            return self._send_text(self.app.web_ui_skills_style_css(), "text/css; charset=utf-8")
+            return self._send_text(
+                self.app.web_ui_skills_style_css(), "text/css; charset=utf-8"
+            )
         if path == "/assets/skills.js":
-            return self._send_text(self.app.web_ui_skills_js(), "application/javascript; charset=utf-8")
+            return self._send_text(
+                self.app.web_ui_skills_js(), "application/javascript; charset=utf-8"
+            )
         if path == "/api/health":
-            return self._send_json({"ok": True, "app": "skills-studio", "version": APP_VERSION})
+            return self._send_json(
+                {"ok": True, "app": "skills-studio", "version": APP_VERSION}
+            )
+        if path == "/api/skillslab/v2/bootstrap":
+            try:
+                device = _studio_cookie_value(self.headers, STUDIO_DEVICE_COOKIE)
+                session = _studio_cookie_value(self.headers, STUDIO_SESSION_COOKIE)
+                out = self.app.skills_studio.bootstrap(
+                    self._client_ip(), device, session
+                )
+                return self._studio_json(
+                    out,
+                    cookies={
+                        STUDIO_DEVICE_COOKIE: out["cookies"]["device"],
+                        STUDIO_SESSION_COOKIE: out["cookies"]["session"],
+                    },
+                )
+            except Exception as exc:
+                return self._studio_error(exc)
+        if path.startswith("/api/skillslab/v2/"):
+            try:
+                principal = self._studio_auth(write=False)
+                device_id = str(principal["id"])
+                if path == "/api/skillslab/v2/profile":
+                    return self._send_json(self.app.skills_studio.profile(device_id))
+                if path == "/api/skillslab/v2/projects":
+                    return self._send_json(
+                        {"projects": self.app.skills_studio.list_projects(device_id)}
+                    )
+                m = re.match(r"^/api/skillslab/v2/projects/([^/]+)$", path)
+                if m:
+                    return self._send_json(
+                        self.app.skills_studio.get_project(device_id, m.group(1))
+                    )
+                m = re.match(r"^/api/skillslab/v2/projects/([^/]+)/files/(.+)$", path)
+                if m:
+                    return self._send_json(
+                        self.app.skills_studio.read_file(
+                            device_id, m.group(1), m.group(2)
+                        )
+                    )
+                m = re.match(r"^/api/skillslab/v2/projects/([^/]+)/revisions$", path)
+                if m:
+                    return self._send_json(
+                        {
+                            "revisions": self.app.skills_studio.revisions(
+                                device_id, m.group(1)
+                            )
+                        }
+                    )
+                m = re.match(r"^/api/skillslab/v2/projects/([^/]+)/diff$", path)
+                if m:
+                    a = int((query.get("from", ["0"]) or ["0"])[0])
+                    b = int((query.get("to", ["0"]) or ["0"])[0])
+                    return self._send_json(
+                        self.app.skills_studio.diff(device_id, m.group(1), a, b)
+                    )
+                m = re.match(r"^/api/skillslab/v2/projects/([^/]+)/validate$", path)
+                if m:
+                    return self._send_json(
+                        self.app.skills_studio.validate(device_id, m.group(1))
+                    )
+                m = re.match(r"^/api/skillslab/v2/projects/([^/]+)/evaluations$", path)
+                if m:
+                    with (
+                        self.app.skills_studio.lock,
+                        self.app.skills_studio._connect() as db,
+                    ):
+                        self.app.skills_studio._row_project(db, m.group(1), device_id)
+                        rows = [
+                            {
+                                "id": x["id"],
+                                "revision": int(x["revision"]),
+                                "kind": x["kind"],
+                                "result": json.loads(x["result_json"] or "{}"),
+                                "created_at": x["created_at"],
+                            }
+                            for x in db.execute(
+                                "SELECT * FROM studio_evaluations WHERE project_id=? ORDER BY created_at DESC",
+                                (m.group(1),),
+                            )
+                        ]
+                    return self._send_json({"evaluations": rows})
+                m = re.match(r"^/api/skillslab/v2/copilot/jobs/([^/]+)$", path)
+                if m:
+                    return self._send_json(
+                        self.app.skills_studio.job(device_id, m.group(1))
+                    )
+                m = re.match(r"^/api/skillslab/v2/copilot/jobs/([^/]+)/events$", path)
+                if m:
+                    return self._send_json(
+                        {"events": [self.app.skills_studio.job(device_id, m.group(1))]}
+                    )
+                return self._send_json(
+                    {"error": "not found", "code": "not_found"}, status=404
+                )
+            except Exception as exc:
+                return self._studio_error(exc)
         if path == "/api/webui/validate":
-            reload_external = _to_bool_like((query.get("reload", ["0"]) or ["0"])[0], default=False)
-            return self._send_json(self.app.refresh_web_ui_validation(reload_external=reload_external))
+            reload_external = _to_bool_like(
+                (query.get("reload", ["0"]) or ["0"])[0], default=False
+            )
+            return self._send_json(
+                self.app.refresh_web_ui_validation(reload_external=reload_external)
+            )
         if path == "/api/skillslab/config":
             web_ui_state = self.app.web_ui_status()
             return self._send_json(
@@ -116,25 +307,61 @@ class SkillsHandler(BaseHTTPRequestHandler):
                     "agent_port": int(getattr(self.app, "agent_port", 0) or 0),
                     "skills_port": int(getattr(self.app, "skills_port", 0) or 0),
                     "model_catalog": mgr.model_catalog(force_probe=refresh_probe),
-                    "language": normalize_ui_language(getattr(mgr, "user_language", DEFAULT_UI_LANGUAGE)),
-                    "ui_style": normalize_ui_style(getattr(self.app, "ui_style", DEFAULT_UI_STYLE)),
+                    "language": normalize_ui_language(
+                        getattr(mgr, "user_language", DEFAULT_UI_LANGUAGE)
+                    ),
+                    "ui_style": normalize_ui_style(
+                        getattr(self.app, "ui_style", DEFAULT_UI_STYLE)
+                    ),
                     "ui_style_label": UI_STYLE_LABELS.get(
-                        normalize_ui_style(getattr(self.app, "ui_style", DEFAULT_UI_STYLE)),
+                        normalize_ui_style(
+                            getattr(self.app, "ui_style", DEFAULT_UI_STYLE)
+                        ),
                         "Neo",
                     ),
                     "supported_languages": supported_ui_languages_payload(),
-                    "show_upload_list": bool(getattr(self.app, "show_upload_list", False)),
+                    "show_upload_list": bool(
+                        getattr(self.app, "show_upload_list", False)
+                    ),
                     "web_ui": web_ui_state,
                     "run_timeout": int(mgr.max_run_seconds),
-                    "shell_command_timeout_seconds": int(getattr(mgr, "shell_command_timeout_seconds", DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS) or DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS),
+                    "shell_command_timeout_seconds": int(
+                        getattr(
+                            mgr,
+                            "shell_command_timeout_seconds",
+                            DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
+                        )
+                        or DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS
+                    ),
+                    "shell_timeout_mode": normalize_shell_timeout_mode(
+                        getattr(mgr, "shell_timeout_mode", DEFAULT_SHELL_TIMEOUT_MODE)
+                    ),
+                    "shell_async_handoff_seconds": int(
+                        getattr(
+                            mgr,
+                            "shell_async_handoff_seconds",
+                            DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS,
+                        )
+                        or DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS
+                    ),
                     "read_context_policy": normalize_read_context_policy(
                         getattr(mgr, "read_context_policy", DEFAULT_READ_CONTEXT_POLICY)
                     ),
                     "tool_memory_policy": normalize_tool_memory_policy(
-                        getattr(mgr, "tool_memory_policy", getattr(mgr, "read_context_policy", DEFAULT_TOOL_MEMORY_POLICY))
+                        getattr(
+                            mgr,
+                            "tool_memory_policy",
+                            getattr(
+                                mgr, "read_context_policy", DEFAULT_TOOL_MEMORY_POLICY
+                            ),
+                        )
                     ),
                     "auto_task_level_ceiling": normalize_auto_task_level_ceiling(
-                        getattr(mgr, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
+                        getattr(
+                            mgr,
+                            "auto_task_level_ceiling",
+                            DEFAULT_AUTO_TASK_LEVEL_CEILING,
+                        )
                     ),
                     "request_timeout_default": int(DEFAULT_REQUEST_TIMEOUT),
                 }
@@ -155,18 +382,202 @@ class SkillsHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = unquote(urlparse(self.path).path)
         mgr = self._session_mgr()
-        if path in {"/api/webui/export", "/api/skillslab/generate", "/api/skillslab/save", "/api/skillslab/upload"}:
+        if path == "/api/skillslab/v2/bootstrap":
+            try:
+                device = _studio_cookie_value(self.headers, STUDIO_DEVICE_COOKIE)
+                session = _studio_cookie_value(self.headers, STUDIO_SESSION_COOKIE)
+                out = self.app.skills_studio.bootstrap(
+                    self._client_ip(), device, session
+                )
+                return self._studio_json(
+                    out,
+                    cookies={
+                        STUDIO_DEVICE_COOKIE: out["cookies"]["device"],
+                        STUDIO_SESSION_COOKIE: out["cookies"]["session"],
+                    },
+                )
+            except Exception as exc:
+                return self._studio_error(exc)
+        if path.startswith("/api/skillslab/v2/"):
+            try:
+                principal = self._studio_auth(write=True)
+                device_id = str(principal["id"])
+                payload = self._read_json()
+                if path == "/api/skillslab/v2/projects":
+                    return self._send_json(
+                        self.app.skills_studio.create_project(device_id, payload),
+                        status=201,
+                    )
+                if path == "/api/skillslab/v2/llm-config":
+                    # Studio-local profiles never mutate the main WebUI.  The
+                    # encrypted update path is intentionally narrow and returns
+                    # only redacted profile metadata.
+                    profiles = payload if isinstance(payload, dict) else {}
+                    with (
+                        self.app.skills_studio.lock,
+                        self.app.skills_studio._connect() as db,
+                    ):
+                        db.execute(
+                            "UPDATE studio_devices SET profiles_enc=? WHERE id=?",
+                            (
+                                self.app.skills_studio._secret_profiles(profiles),
+                                device_id,
+                            ),
+                        )
+                    return self._send_json(self.app.skills_studio.profile(device_id))
+                m = re.match(r"^/api/skillslab/v2/projects/([^/]+)/files$", path)
+                if m:
+                    rel = str(payload.get("path", "") or "")
+                    delete = bool(payload.get("delete", False))
+                    raw = b""
+                    if not delete:
+                        if "content_b64" in payload:
+                            raw = base64.b64decode(
+                                str(payload.get("content_b64", "")), validate=True
+                            )
+                        else:
+                            raw = str(payload.get("content", "")).encode("utf-8")
+                    return self._send_json(
+                        self.app.skills_studio.write_file(
+                            device_id,
+                            m.group(1),
+                            rel,
+                            raw,
+                            is_binary=bool(payload.get("is_binary", False)),
+                            mime=str(payload.get("mime", "") or ""),
+                            expected_revision=payload.get("expected_revision"),
+                            delete=delete,
+                        )
+                    )
+                m = re.match(r"^/api/skillslab/v2/projects/([^/]+)/files/rename$", path)
+                if m:
+                    return self._send_json(
+                        self.app.skills_studio.rename_file(
+                            device_id,
+                            m.group(1),
+                            str(payload.get("from", "") or ""),
+                            str(payload.get("to", "") or ""),
+                            expected_revision=payload.get("expected_revision"),
+                        )
+                    )
+                m = re.match(r"^/api/skillslab/v2/projects/([^/]+)/revisions$", path)
+                if m:
+                    self.app.skills_studio.assert_revision(
+                        device_id, m.group(1), payload.get("expected_revision")
+                    )
+                    return self._send_json(
+                        self.app.skills_studio.create_revision(
+                            device_id,
+                            m.group(1),
+                            freeze=bool(payload.get("freeze", False)),
+                        ),
+                        status=201,
+                    )
+                m = re.match(r"^/api/skillslab/v2/projects/([^/]+)/evaluations$", path)
+                if m:
+                    self.app.skills_studio.assert_revision(
+                        device_id, m.group(1), payload.get("expected_revision")
+                    )
+                    return self._send_json(
+                        self.app.skills_studio.evaluate(device_id, m.group(1)),
+                        status=201,
+                    )
+                m = re.match(
+                    r"^/api/skillslab/v2/projects/([^/]+)/evaluations/isolated$", path
+                )
+                if m:
+                    self.app.skills_studio.assert_revision(
+                        device_id, m.group(1), payload.get("expected_revision")
+                    )
+                    return self._send_json(
+                        self.app.skills_studio.evaluate_isolated(
+                            device_id,
+                            m.group(1),
+                            network=bool(payload.get("network", False)),
+                            confirmed=bool(payload.get("confirmed", False)),
+                        ),
+                        status=201,
+                    )
+                m = re.match(r"^/api/skillslab/v2/projects/([^/]+)/submissions$", path)
+                if m:
+                    self.app.skills_studio.assert_revision(
+                        device_id, m.group(1), payload.get("expected_revision")
+                    )
+                    return self._send_json(
+                        self.app.skills_studio.submit(
+                            device_id, m.group(1), str(payload.get("note", "") or "")
+                        ),
+                        status=201,
+                    )
+                m = re.match(r"^/api/skillslab/v2/projects/([^/]+)/withdraw$", path)
+                if m:
+                    return self._send_json(
+                        self.app.skills_studio.withdraw(
+                            device_id,
+                            str(payload.get("submission_id", "") or ""),
+                            str(payload.get("note", "") or ""),
+                        )
+                    )
+                m = re.match(r"^/api/skillslab/v2/projects/([^/]+)/copilot/jobs$", path)
+                if m:
+                    self.app.skills_studio.assert_revision(
+                        device_id, m.group(1), payload.get("expected_revision")
+                    )
+                    return self._send_json(
+                        self.app.skills_studio.start_job(
+                            device_id,
+                            m.group(1),
+                            str(payload.get("mode", "stepwise")),
+                            payload,
+                        ),
+                        status=202,
+                    )
+                m = re.match(r"^/api/skillslab/v2/copilot/jobs/([^/]+)/cancel$", path)
+                if m:
+                    return self._send_json(
+                        self.app.skills_studio.cancel_job(device_id, m.group(1))
+                    )
+                m = re.match(r"^/api/skillslab/v2/copilot/jobs/([^/]+)/apply$", path)
+                if m:
+                    return self._send_json(
+                        self.app.skills_studio.apply_job(
+                            device_id,
+                            m.group(1),
+                            expected_revision=int(payload.get("expected_revision", -1)),
+                            accepted_paths=payload.get("accepted_paths")
+                            if isinstance(payload.get("accepted_paths"), list)
+                            else None,
+                        )
+                    )
+                return self._send_json(
+                    {"error": "not found", "code": "not_found"}, status=404
+                )
+            except Exception as exc:
+                return self._studio_error(exc)
+        if path in {
+            "/api/webui/export",
+            "/api/skillslab/generate",
+            "/api/skillslab/save",
+            "/api/skillslab/upload",
+        }:
             origin = str(self.headers.get("Origin", "") or "").strip()
             parsed = urlparse(origin)
-            if origin and (parsed.scheme not in {"http", "https"} or parsed.netloc != str(self.headers.get("Host", "") or "")):
-                return self._send_json({"error": "cross-origin write rejected"}, status=403)
+            if origin and (
+                parsed.scheme not in {"http", "https"}
+                or parsed.netloc != str(self.headers.get("Host", "") or "")
+            ):
+                return self._send_json(
+                    {"error": "cross-origin write rejected"}, status=403
+                )
             if not self._require_admin():
                 return
         if path == "/api/webui/export":
             payload = self._read_json()
             ui_dir_raw = str(payload.get("dir", "") or "").strip()
             overwrite = bool(payload.get("overwrite", False))
-            ui_dir = resolve_web_ui_dir_path(ui_dir_raw or str(self.app.web_ui_dir), self.app.workspace)
+            ui_dir = resolve_web_ui_dir_path(
+                ui_dir_raw or str(self.app.web_ui_dir), self.app.workspace
+            )
             out = self.app.export_builtin_web_ui(ui_dir, overwrite=overwrite)
             return self._send_json(out, status=201 if out.get("ok") else 400)
         if path == "/api/skillslab/model":
@@ -192,7 +603,9 @@ class SkillsHandler(BaseHTTPRequestHandler):
         if path == "/api/skillslab/generate":
             payload = self._read_json()
             try:
-                out = self.app.generate_skill_from_flow(self._user_id(), payload if isinstance(payload, dict) else {})
+                out = self.app.generate_skill_from_flow(
+                    self._user_id(), payload if isinstance(payload, dict) else {}
+                )
                 return self._send_json(out)
             except Exception as exc:
                 return self._send_json({"error": str(exc)}, status=400)
@@ -219,7 +632,9 @@ class SkillsHandler(BaseHTTPRequestHandler):
             mime = str(payload.get("mime", "")).strip()
             overwrite = bool(payload.get("overwrite", False))
             if not filename or not content_b64_present:
-                return self._send_json({"error": "filename and content_b64 required"}, status=400)
+                return self._send_json(
+                    {"error": "filename and content_b64 required"}, status=400
+                )
             try:
                 raw = base64.b64decode(content_b64, validate=True)
             except Exception:
@@ -227,7 +642,9 @@ class SkillsHandler(BaseHTTPRequestHandler):
             if len(raw) > 30 * 1024 * 1024:
                 return self._send_json({"error": "max upload size is 30MB"}, status=413)
             try:
-                out = self.app.import_uploaded_skills(filename, raw, mime=mime, overwrite=overwrite)
+                out = self.app.import_uploaded_skills(
+                    filename, raw, mime=mime, overwrite=overwrite
+                )
                 return self._send_json(out)
             except Exception as exc:
                 return self._send_json({"error": str(exc)}, status=400)

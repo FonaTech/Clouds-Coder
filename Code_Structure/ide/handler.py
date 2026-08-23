@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=965 original-lines=109564-110719 hash=8a17d9ee021a07d2
+# split-source: order=1070 original-lines=122304-123778 hash=f5f31c2f57493c36
 
 
 class IdeHandler(BaseHTTPRequestHandler):
@@ -17,6 +17,7 @@ class IdeHandler(BaseHTTPRequestHandler):
 
     def parse_request(self):
         self._clouds_request_body_consumed = False
+        self._ide_auth_context_cache = None
         return super().parse_request()
 
     def handle(self):
@@ -30,6 +31,49 @@ class IdeHandler(BaseHTTPRequestHandler):
     @property
     def app(self) -> AppContext:
         return self.server.app  # type: ignore[attr-defined]
+
+    def _decorate_resource_manifest(self, manifest: dict, context: dict | None = None) -> dict:
+        out = dict(manifest or {})
+        ctx = context if isinstance(context, dict) else self._auth_context(required=False)
+        account = ctx.get("account", {}) if isinstance(ctx, dict) else {}
+        is_admin = bool(str(account.get("role", "") or "") == "admin")
+        is_collaboration = bool(account.get("collaboration_mode", False))
+        skills = dict(out.get("skills", {}) or {})
+        skills["can_write"] = bool(is_admin and not is_collaboration and skills.get("admin_write", False))
+        out["skills"] = skills
+        mcp = dict(out.get("mcp", {}) or {})
+        mcp["can_manage"] = bool(is_admin and not is_collaboration)
+        out["mcp"] = mcp
+        host_header = str(self.headers.get("Host", "") or "").strip()
+        try:
+            hostname = str(urlparse("//" + host_header).hostname or "")
+        except Exception:
+            hostname = ""
+        if not hostname:
+            hostname = str(getattr(self.server, "server_address", ("127.0.0.1", 0))[0] or "127.0.0.1")
+        public_host = f"[{hostname}]" if ":" in hostname and not hostname.startswith("[") else hostname
+        scheme = "https" if self._trusted_https() else "http"
+        current_origin = f"{scheme}://{host_header}" if host_header else ""
+        services = {}
+        for name, value in dict(out.get("services", {}) or {}).items():
+            row = dict(value or {})
+            port = int(row.get("port", 0) or 0)
+            row["url"] = f"{scheme}://{public_host}:{port}" if row.get("enabled") and port else ""
+            services[str(name)] = row
+        out["services"] = services
+        out["api_urls"] = {
+            str(name): current_origin + str(path)
+            for name, path in dict(out.get("api_paths", {}) or {}).items()
+            if current_origin and str(path).startswith("/")
+        }
+        return out
+
+    def _decorate_ide_config(self, payload: dict, context: dict) -> dict:
+        out = dict(payload or {})
+        resources = out.get("shared_resources")
+        if isinstance(resources, dict):
+            out["shared_resources"] = self._decorate_resource_manifest(resources, context)
+        return out
 
     def _client_ip(self) -> str:
         return trusted_client_ip(self)
@@ -142,7 +186,7 @@ class IdeHandler(BaseHTTPRequestHandler):
             if capability:
                 self.app.ide_require_capability(context["capabilities"], capability)
             return context
-        except (IDEAuthError, IDECapabilityError) as exc:
+        except (IDEAuthError, IDECapabilityError, CollaborationError) as exc:
             self._send_exception(exc)
             return None
 
@@ -152,6 +196,19 @@ class IdeHandler(BaseHTTPRequestHandler):
             return None
         if not self._direct_loopback() or str(context["account"].get("role", "")) != "admin":
             self._send_json({"error": "Local IDE administrator access required.", "code": "local_admin_required"}, status=403)
+            return None
+        return context
+
+    def _require_resource_admin(self) -> dict | None:
+        context = self._require_write()
+        if not context:
+            return None
+        account = context.get("account", {}) if isinstance(context, dict) else {}
+        if bool(account.get("collaboration_mode", False)) or str(account.get("role", "") or "") != "admin":
+            self._send_json(
+                {"error": "IDE administrator access required for shared resource changes.", "code": "admin_required"},
+                status=403,
+            )
             return None
         return context
 
@@ -334,6 +391,11 @@ class IdeHandler(BaseHTTPRequestHandler):
             sess.events.unsubscribe(sub)
 
     def _send_exception(self, exc: Exception):
+        if isinstance(exc, CollaborationError):
+            payload = {"error": str(exc), "code": exc.code}
+            if exc.details:
+                payload["details"] = exc.details
+            return self._send_json(payload, status=exc.status)
         if isinstance(exc, IDEAuthError):
             payload = {"error": str(exc), "code": exc.code}
             if exc.retry_after:
@@ -341,6 +403,14 @@ class IdeHandler(BaseHTTPRequestHandler):
             return self._send_json(payload, status=exc.status)
         if isinstance(exc, IDECapabilityError):
             return self._send_json({"error": str(exc), "code": exc.code}, status=exc.status)
+        if isinstance(exc, sqlite3.DatabaseError):
+            return self._send_json(
+                {
+                    "error": "IDE storage is temporarily unavailable.",
+                    "code": "ide_store_unavailable",
+                },
+                status=503,
+            )
         if isinstance(exc, IDEFileConflict):
             return self._send_json({"error": str(exc), "code": exc.code, "current": exc.current}, status=exc.status)
         if isinstance(exc, KeyError):
@@ -370,6 +440,19 @@ class IdeHandler(BaseHTTPRequestHandler):
             if not fp:
                 return self._send_json({"error": "Monaco worker asset not found"}, status=404)
             return self._send_inline_bytes(fp.read_bytes(), "application/javascript; charset=utf-8")
+        if path == "/api/ide/v2/applications":
+            try:
+                context = self._auth_context(required=True)
+                account = context["account"]
+                return self._send_json(
+                    self.app.ide_applications_payload(
+                        str(account.get("user_id", "") or ""),
+                        client_ip=self._client_ip(),
+                        collaboration=bool(account.get("collaboration_mode", False)),
+                    )
+                )
+            except Exception as exc:
+                return self._send_exception(exc)
         if path.startswith("/assets/js_lib/"):
             asset_ref = path[len("/assets/js_lib/"):]
             fp = self.app.rag_js_lib_asset_path(asset_ref)
@@ -383,8 +466,61 @@ class IdeHandler(BaseHTTPRequestHandler):
             if fp.suffix.lower() in {".js", ".mjs", ".cjs"}:
                 content_type = "application/javascript; charset=utf-8"
             return self._send_inline_bytes(data, content_type)
+        if path in {
+            "/api/ide/v2/resources",
+            "/api/skills",
+            "/api/apps/skills",
+            "/api/skills/providers",
+            "/api/skills/protocols",
+            "/api/skills/protocol-examples",
+            "/api/apps/shared",
+            "/api/ide/v2/resources/skills/scan",
+            "/api/ide/v2/resources/skills/detail",
+            "/api/ide/v2/resources/mcp/health",
+            "/api/ide/v2/resources/mcp/status",
+            "/api/ide/v2/resources/mcp/tools",
+        }:
+            try:
+                context = self._auth_context(required=True)
+                user_id = str(context["account"].get("user_id", "") or "")
+                if path == "/api/ide/v2/resources":
+                    collaboration = bool(context["account"].get("collaboration_mode", False))
+                    manifest = self.app.shared_resource_manifest(user_id, collaboration=collaboration)
+                    return self._send_json(self._decorate_resource_manifest(manifest, context))
+                if path in {"/api/skills", "/api/apps/skills"}:
+                    return self._send_json(self.app.skills_catalog())
+                if path == "/api/skills/providers":
+                    return self._send_json(self.app.skill_providers_catalog())
+                if path == "/api/skills/protocols":
+                    return self._send_json(self.app.skill_protocols_catalog())
+                if path == "/api/skills/protocol-examples":
+                    return self._send_json(self.app.skill_protocol_examples())
+                if path == "/api/apps/shared":
+                    return self._send_json(self.app.applications.list_shared())
+                if path == "/api/ide/v2/resources/skills/scan":
+                    return self._send_json(self.app.scan_skills())
+                if path == "/api/ide/v2/resources/skills/detail":
+                    skill_file = str((query.get("skill_file", [""]) or [""])[0] or "")
+                    return self._send_json(self.app.skill_detail(skill_file))
+                if path == "/api/ide/v2/resources/mcp/tools":
+                    return self._send_json(self.app.shared_mcp_tools())
+                health = self.app.shared_mcp_health()
+                if path == "/api/ide/v2/resources/mcp/status":
+                    return self._send_json({"servers": health.get("servers", [])})
+                return self._send_json(health)
+            except Exception as exc:
+                return self._send_exception(exc)
         if path == "/api/health":
-            return self._send_json({"ok": True, "app": "clouds-coder-ide", "version": APP_VERSION})
+            storage = self.app.ide_auth.storage_health()
+            return self._send_json(
+                {
+                    "ok": bool(storage.get("available", False)),
+                    "app": "clouds-coder-ide",
+                    "version": APP_VERSION,
+                    "storage": storage,
+                },
+                status=200 if storage.get("available", False) else 503,
+            )
         if path == "/api/ide/v2/auth/status":
             return self._send_json(self.app.ide_auth_status(local_setup_allowed=self._direct_loopback()))
         if path == "/api/ide/v2/auth/me":
@@ -424,6 +560,16 @@ class IdeHandler(BaseHTTPRequestHandler):
                 return self._send_json(self.app.ide_list_extensions(self._user_id()))
             except Exception as exc:
                 return self._send_exception(exc)
+        if path == "/api/ide/v2/llm-config":
+            try:
+                self._auth_context(required=True)
+                return self._send_json(
+                    self.app.ide_llm_config_status(
+                        self._user_id(), client_ip=self._client_ip()
+                    )
+                )
+            except Exception as exc:
+                return self._send_exception(exc)
         if path == "/api/ide/v2/extensions/search":
             try:
                 self._auth_context(required=True)
@@ -444,6 +590,7 @@ class IdeHandler(BaseHTTPRequestHandler):
                 if not context["capabilities"].get("mounts"):
                     out["mounts"] = []
                     out["workspace"] = ""
+                out = self._decorate_ide_config(out, context)
                 return self._send_json(out)
             except Exception as exc:
                 return self._send_exception(exc)
@@ -700,7 +847,14 @@ class IdeHandler(BaseHTTPRequestHandler):
             try:
                 self._auth_context(required=True)
                 refresh = _to_bool_like((query.get("refresh", ["0"]) or ["0"])[0], default=False)
-                return self._send_json(self.app.ide_agent_models(self._user_id(), m.group(1), refresh=refresh))
+                return self._send_json(
+                    self.app.ide_agent_models(
+                        self._user_id(),
+                        m.group(1),
+                        refresh=refresh,
+                        client_ip=self._client_ip(),
+                    )
+                )
             except Exception as exc:
                 return self._send_exception(exc)
         m = re.match(r"^/api/ide/v2/terminals/([^/]+)/output$", path)
@@ -809,6 +963,32 @@ class IdeHandler(BaseHTTPRequestHandler):
                 return self._send_json({"ok": True, "account": account}, status=201)
             except Exception as exc:
                 return self._send_exception(exc)
+        if path == "/api/ide/v2/resources/skills":
+            context = self._require_resource_admin()
+            if not context:
+                return
+            try:
+                payload = self._read_json()
+                return self._send_json(
+                    self.app.write_skill_file(
+                        str(payload.get("path", "") or ""),
+                        str(payload.get("content", "") or ""),
+                        overwrite=bool(payload.get("overwrite", False)),
+                    ),
+                    status=201,
+                )
+            except Exception as exc:
+                return self._send_exception(exc)
+        m_resource_mcp = re.match(r"^/api/ide/v2/resources/mcp/(reload|restart|trust)$", path)
+        if m_resource_mcp:
+            context = self._require_resource_admin()
+            if not context:
+                return
+            try:
+                result = self.app.manage_shared_mcp(m_resource_mcp.group(1), self._read_json())
+                return self._send_json(result, status=200 if result.get("ok", False) else 409)
+            except Exception as exc:
+                return self._send_exception(exc)
         if path == "/api/ide/v2/workbench/state":
             context = self._require_write()
             if not context:
@@ -821,6 +1001,111 @@ class IdeHandler(BaseHTTPRequestHandler):
         if not context:
             return
         user_id = str(context["account"].get("user_id", "") or "")
+        if path == "/api/ide/v2/applications":
+            try:
+                if bool(context["account"].get("collaboration_mode", False)):
+                    raise IDECapabilityError(
+                        "collaboration_application_authoring_unavailable",
+                        "Personal application authoring is unavailable in collaboration workspaces.",
+                        403,
+                    )
+                return self._send_json(
+                    self.app.applications.save_personal(user_id, self._read_json()),
+                    status=201,
+                )
+            except Exception as exc:
+                return self._send_exception(exc)
+        m_application_submit = re.match(r"^/api/ide/v2/applications/([^/]+)/submit$", path)
+        if m_application_submit:
+            try:
+                if bool(context["account"].get("collaboration_mode", False)):
+                    raise IDECapabilityError(
+                        "collaboration_application_authoring_unavailable",
+                        "Personal application authoring is unavailable in collaboration workspaces.",
+                        403,
+                    )
+                return self._send_json(
+                    self.app.applications.submit(user_id, m_application_submit.group(1)),
+                    status=201,
+                )
+            except Exception as exc:
+                return self._send_exception(exc)
+        m_application_launch = re.match(r"^/api/ide/v2/applications/([^/]+)/launch$", path)
+        if m_application_launch:
+            try:
+                return self._send_json(
+                    self.app.ide_launch_application(
+                        user_id,
+                        m_application_launch.group(1),
+                        client_ip=self._client_ip(),
+                        collaboration=bool(context["account"].get("collaboration_mode", False)),
+                    ),
+                    status=201,
+                )
+            except SessionCreationLimitExceeded as exc:
+                return self._send_json(
+                    {"error": str(exc), "session_creation_limit": dict(exc.status or {})},
+                    status=429,
+                )
+            except Exception as exc:
+                return self._send_exception(exc)
+        if path == "/api/ide/v2/applications/import":
+            try:
+                payload = self._read_json()
+                return self._send_json(
+                    self.app.ide_import_application(
+                        user_id,
+                        str(payload.get("app_id", payload.get("id", "")) or ""),
+                        client_ip=self._client_ip(),
+                    ),
+                    status=201,
+                )
+            except Exception as exc:
+                return self._send_exception(exc)
+        if path == "/api/ide/v2/application-sessions/import":
+            try:
+                payload = self._read_json()
+                return self._send_json(
+                    self.app.ide_import_application_session(
+                        user_id,
+                        str(payload.get("session_id", payload.get("id", "")) or ""),
+                        client_ip=self._client_ip(),
+                    ),
+                    status=201,
+                )
+            except SessionCreationLimitExceeded as exc:
+                return self._send_json(
+                    {"error": str(exc), "session_creation_limit": dict(exc.status or {})},
+                    status=429,
+                )
+            except Exception as exc:
+                return self._send_exception(exc)
+        if path == "/api/ide/v2/llm-config/shared":
+            try:
+                payload = self._read_json()
+                return self._send_json(
+                    self.app.ide_use_shared_llm_config(
+                        user_id,
+                        client_ip=self._client_ip(),
+                        session_id=str(payload.get("session_id", "") or ""),
+                    )
+                )
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/v2/sessions/([^/]+)/llm-config$", path)
+        if m:
+            try:
+                payload = self._read_json()
+                return self._send_json(
+                    self.app.ide_apply_llm_config(
+                        user_id,
+                        m.group(1),
+                        payload.get("config"),
+                        client_ip=self._client_ip(),
+                    )
+                )
+            except Exception as exc:
+                return self._send_exception(exc)
         if path == "/api/ide/sessions":
             payload = self._read_json()
             try:
@@ -966,6 +1251,7 @@ class IdeHandler(BaseHTTPRequestHandler):
                         user_id,
                         m.group(1),
                         str(payload.get("selection", payload.get("model", "")) or ""),
+                        client_ip=self._client_ip(),
                     )
                 )
             except Exception as exc:
@@ -1103,6 +1389,24 @@ class IdeHandler(BaseHTTPRequestHandler):
                 return self._send_json({"ok": True, "account": self.app.ide_auth.set_disabled(payload.get("username"), bool(payload.get("disabled", True)))})
             except Exception as exc:
                 return self._send_exception(exc)
+        m_application = re.match(r"^/api/ide/v2/applications/([^/]+)$", path)
+        if m_application:
+            try:
+                if bool(context["account"].get("collaboration_mode", False)):
+                    raise IDECapabilityError(
+                        "collaboration_application_authoring_unavailable",
+                        "Personal application authoring is unavailable in collaboration workspaces.",
+                        403,
+                    )
+                return self._send_json(
+                    self.app.applications.save_personal(
+                        str(context["account"].get("user_id", "") or ""),
+                        self._read_json(),
+                        app_id=m_application.group(1),
+                    )
+                )
+            except Exception as exc:
+                return self._send_exception(exc)
         m = re.match(r"^/api/ide/sessions/([^/]+)$", path)
         if m:
             try:
@@ -1131,6 +1435,21 @@ class IdeHandler(BaseHTTPRequestHandler):
                 self.app.ide_require_capability(context["capabilities"], "mounts")
                 payload = self._read_json()
                 return self._send_json(self.app.ide_remove_mount(user_id, str(payload.get("mount_id", "") or "")))
+            except Exception as exc:
+                return self._send_exception(exc)
+        m_application = re.match(r"^/api/ide/v2/applications/([^/]+)$", path)
+        if m_application:
+            try:
+                if bool(context["account"].get("collaboration_mode", False)):
+                    raise IDECapabilityError(
+                        "collaboration_application_authoring_unavailable",
+                        "Personal application authoring is unavailable in collaboration workspaces.",
+                        403,
+                    )
+                deleted = self.app.applications.delete_personal(user_id, m_application.group(1))
+                if not deleted:
+                    raise KeyError(m_application.group(1))
+                return self._send_json({"ok": True})
             except Exception as exc:
                 return self._send_exception(exc)
         m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/file$", path)

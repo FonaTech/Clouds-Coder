@@ -5,181 +5,205 @@
 
 from __future__ import annotations
 
-# split-source: order=0 original-lines=1-3 hash=8b806080ebd44d37
+# split-source: order=0 original-lines=1-2 hash=210f805d7acec7a3
 #!/usr/bin/env python3
-
 from __future__ import annotations
 
-# split-source: order=1 original-lines=4-5 hash=eec6ca36bbad0930
+# split-source: order=1 original-lines=3-4 hash=eec6ca36bbad0930
 
 import argparse
 
-# split-source: order=2 original-lines=6-6 hash=1a530f5446ff47d7
+# split-source: order=2 original-lines=5-5 hash=1a530f5446ff47d7
 import ast
 
-# split-source: order=3 original-lines=7-7 hash=0bd0be6193903c57
+# split-source: order=3 original-lines=6-6 hash=0bd0be6193903c57
 import base64
 
-# split-source: order=4 original-lines=8-8 hash=b42adf84d0c2ab80
+# split-source: order=4 original-lines=7-7 hash=b42adf84d0c2ab80
 import concurrent.futures
 
-# split-source: order=5 original-lines=9-9 hash=ac580dadffeea219
+# split-source: order=5 original-lines=8-8 hash=ac580dadffeea219
 import csv
 
-# split-source: order=6 original-lines=10-10 hash=0daed1c837449e40
+# split-source: order=6 original-lines=9-9 hash=0daed1c837449e40
 import ctypes
 
-# split-source: order=7 original-lines=11-11 hash=6f32a18263c4dfed
+# split-source: order=7 original-lines=10-10 hash=6f32a18263c4dfed
 import difflib
 
-# split-source: order=8 original-lines=12-12 hash=b17c41ffb3939b0d
+# split-source: order=8 original-lines=11-11 hash=b17c41ffb3939b0d
 import errno
 
-# split-source: order=9 original-lines=13-13 hash=286cd7a6138d111e
+# split-source: order=9 original-lines=12-12 hash=286cd7a6138d111e
 import fnmatch
 
-# split-source: order=10 original-lines=14-14 hash=3b3ea3cdc7068a9e
+# split-source: order=10 original-lines=13-13 hash=3b3ea3cdc7068a9e
 import hashlib
 
-# split-source: order=11 original-lines=15-15 hash=1ec40da6ade7ab38
+# split-source: order=11 original-lines=14-14 hash=1ec40da6ade7ab38
 import hmac
 
-# split-source: order=12 original-lines=16-16 hash=80047e256aeafcb6
+# split-source: order=12 original-lines=15-15 hash=80047e256aeafcb6
 import html
 
-# split-source: order=13 original-lines=17-17 hash=786ac52e942c0dd6
+# split-source: order=13 original-lines=16-16 hash=786ac52e942c0dd6
 import importlib.util
 
-# split-source: order=14 original-lines=18-18 hash=62cd3ae402970adf
+# split-source: order=14 original-lines=17-17 hash=62cd3ae402970adf
 import io
 
-# split-source: order=15 original-lines=19-19 hash=784e132cf085ffb1
+# split-source: order=15 original-lines=18-18 hash=784e132cf085ffb1
 import ipaddress
 
-# split-source: order=16 original-lines=20-20 hash=261a9112a2918e2a
+# split-source: order=16 original-lines=19-19 hash=261a9112a2918e2a
 import json
 
-# split-source: order=17 original-lines=21-21 hash=7c3859a2358b04fb
+# split-source: order=17 original-lines=20-20 hash=7c3859a2358b04fb
 import locale
 
-# split-source: order=18 original-lines=22-22 hash=085ea91d7cfeb4f5
+# split-source: order=18 original-lines=21-21 hash=085ea91d7cfeb4f5
 import math
 
-# split-source: order=19 original-lines=23-23 hash=b611fe54fc18b400
+# split-source: order=19 original-lines=22-22 hash=b611fe54fc18b400
 import mimetypes
 
-# split-source: order=20 original-lines=24-24 hash=1c140d4414b33b8c
+# split-source: order=20 original-lines=23-23 hash=1c140d4414b33b8c
 import multiprocessing
 
-# split-source: order=21 original-lines=25-25 hash=3727adff524e0616
+# split-source: order=21 original-lines=24-24 hash=3727adff524e0616
 import os
 
-# split-source: order=22 original-lines=26-26 hash=69d16bfa8bd547ff
+# split-source: order=22 original-lines=25-25 hash=ec915c81baecffe6
+import platform
+
+# split-source: order=23 original-lines=26-26 hash=69d16bfa8bd547ff
 import queue
 
-# split-source: order=23 original-lines=27-27 hash=a830333312c4c9c2
+# split-source: order=24 original-lines=27-27 hash=a830333312c4c9c2
 import re
 
-# split-source: order=24 original-lines=28-28 hash=4163f1c58d884948
+# split-source: order=25 original-lines=28-28 hash=aac950ab8470d652
+import secrets
+
+# split-source: order=26 original-lines=29-29 hash=4163f1c58d884948
 import select
 
-# split-source: order=25 original-lines=29-29 hash=9a60319879ee88ae
+# split-source: order=27 original-lines=30-30 hash=9a60319879ee88ae
 import selectors
 
-# split-source: order=26 original-lines=30-30 hash=b0dd8c25d7573574
+# split-source: order=28 original-lines=31-31 hash=b0dd8c25d7573574
 import shlex
 
-# split-source: order=27 original-lines=31-31 hash=7002efbd1fd0861b
+# split-source: order=29 original-lines=32-32 hash=7002efbd1fd0861b
 import shutil
 
-# split-source: order=28 original-lines=32-32 hash=5890cea262fd597e
+# split-source: order=30 original-lines=33-33 hash=5890cea262fd597e
 import signal
 
-# split-source: order=29 original-lines=33-33 hash=463c91f978872b1f
+# split-source: order=31 original-lines=34-34 hash=463c91f978872b1f
 import socket
 
-# split-source: order=30 original-lines=34-34 hash=e52ed1f9e7cc6a28
+# split-source: order=32 original-lines=35-35 hash=e52ed1f9e7cc6a28
 import sqlite3
 
-# split-source: order=31 original-lines=35-35 hash=9dd2568752a0395d
+# split-source: order=33 original-lines=36-36 hash=9dd2568752a0395d
 import ssl
 
-# split-source: order=32 original-lines=36-36 hash=412667d80c188d15
+# split-source: order=34 original-lines=37-37 hash=1fd20c880d3cde1a
+import stat
+
+# split-source: order=35 original-lines=38-38 hash=412667d80c188d15
 import struct
 
-# split-source: order=33 original-lines=37-37 hash=17ea74bb79ba96ed
+# split-source: order=36 original-lines=39-39 hash=17ea74bb79ba96ed
 import subprocess
 
-# split-source: order=34 original-lines=38-38 hash=c517577851c489e4
+# split-source: order=37 original-lines=40-40 hash=c517577851c489e4
 import sys
 
-# split-source: order=35 original-lines=39-39 hash=014ff52204a78766
+# split-source: order=38 original-lines=41-41 hash=014ff52204a78766
 import tarfile
 
-# split-source: order=36 original-lines=40-40 hash=0578139baa883523
+# split-source: order=39 original-lines=42-42 hash=0578139baa883523
 import tempfile
 
-# split-source: order=37 original-lines=41-41 hash=bfda8797d05a788b
+# split-source: order=40 original-lines=43-43 hash=bfda8797d05a788b
 import threading
 
-# split-source: order=38 original-lines=42-42 hash=7b2ddb8a2e64c616
+# split-source: order=41 original-lines=44-44 hash=7b2ddb8a2e64c616
 import time
 
-# split-source: order=39 original-lines=43-43 hash=8ae7a5d0f1e0c53a
+# split-source: order=42 original-lines=45-45 hash=8ae7a5d0f1e0c53a
 import traceback
 
-# split-source: order=40 original-lines=44-44 hash=f6b67ef23c4cd880
+# split-source: order=43 original-lines=46-46 hash=f6b67ef23c4cd880
 import unicodedata
 
-# split-source: order=41 original-lines=45-45 hash=561c5830cf644ad8
+# split-source: order=44 original-lines=47-47 hash=561c5830cf644ad8
 import urllib.robotparser as robotparser
 
-# split-source: order=42 original-lines=46-46 hash=ab270e34de38d99f
+# split-source: order=45 original-lines=48-48 hash=ab270e34de38d99f
 import uuid
 
-# split-source: order=43 original-lines=47-47 hash=d8313b379a858f18
+# split-source: order=46 original-lines=49-49 hash=d8313b379a858f18
 import xml.etree.ElementTree as ET
 
-# split-source: order=44 original-lines=48-48 hash=a61e3196c03ce192
+# split-source: order=47 original-lines=50-50 hash=a61e3196c03ce192
 import zipfile
 
-# split-source: order=45 original-lines=49-49 hash=62cca641b59a088a
+# split-source: order=48 original-lines=51-51 hash=62cca641b59a088a
 import zlib
 
-# split-source: order=46 original-lines=50-50 hash=7b6bec2c52a97699
+# split-source: order=49 original-lines=52-52 hash=7b6bec2c52a97699
 from collections import Counter, defaultdict, deque
 
-# split-source: order=47 original-lines=51-51 hash=a573797ab71c2e15
+# split-source: order=50 original-lines=53-53 hash=c0a7094c2dc95faa
+from collections.abc import Iterable
+
+# split-source: order=51 original-lines=54-54 hash=07ac27eea41ef7e0
+from dataclasses import dataclass
+
+# split-source: order=52 original-lines=55-55 hash=a573797ab71c2e15
 from datetime import datetime, timedelta, timezone
 
-# split-source: order=48 original-lines=52-52 hash=6339615e3b2c9638
+# split-source: order=53 original-lines=56-56 hash=6339615e3b2c9638
 from email.utils import parsedate_to_datetime
 
-# split-source: order=49 original-lines=53-53 hash=101c4475bacb001a
+# split-source: order=54 original-lines=57-57 hash=101c4475bacb001a
 from html.parser import HTMLParser
 
-# split-source: order=50 original-lines=54-54 hash=98d790dcee1a194d
+# split-source: order=55 original-lines=58-58 hash=98d790dcee1a194d
 from http import HTTPStatus
 
-# split-source: order=51 original-lines=55-55 hash=f19b3583956f78f7
+# split-source: order=56 original-lines=59-59 hash=f19b3583956f78f7
 from http.client import IncompleteRead
 
-# split-source: order=52 original-lines=56-56 hash=0e5aadf1adbefd21
+# split-source: order=57 original-lines=60-60 hash=066ddf47db45195e
+from http.cookies import SimpleCookie
+
+# split-source: order=58 original-lines=61-61 hash=0e5aadf1adbefd21
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-# split-source: order=53 original-lines=57-57 hash=08066edf143b296e
+# split-source: order=59 original-lines=62-62 hash=08066edf143b296e
 from pathlib import Path, PurePosixPath
 
-# split-source: order=54 original-lines=58-58 hash=79b798df1900f6f2
+# split-source: order=60 original-lines=63-63 hash=b164d2b01f2f3ef8
+from typing import Any
+
+# split-source: order=61 original-lines=64-64 hash=79b798df1900f6f2
 from urllib.error import HTTPError, URLError
 
-# split-source: order=55 original-lines=59-59 hash=f42f9dde6673af3a
+# split-source: order=62 original-lines=65-65 hash=f42f9dde6673af3a
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse, urlunparse
 
-# split-source: order=56 original-lines=60-60 hash=05d70c3370ebd04f
+# split-source: order=63 original-lines=66-66 hash=05d70c3370ebd04f
 from urllib.request import Request, urlopen
 
-# split-source: order=57 original-lines=61-69 hash=6ec86be48eae347c
+# split-source: order=64 original-lines=67-67 hash=efd0e58d35bb748e
+from zoneinfo import ZoneInfo
+
+# split-source: order=104 original-lines=3443-3452 hash=42ec21eda00bbe87
+# END EMBEDDED COLLABORATION WEB ASSETS
 
 try:
     import fcntl as _fcntl
@@ -190,14 +214,14 @@ except ImportError:
     _pty = None
     _termios = None
 
-# split-source: order=58 original-lines=70-74 hash=2bd8ec70b5d6db71
+# split-source: order=105 original-lines=3453-3457 hash=2bd8ec70b5d6db71
 
 try:
     import certifi as _certifi
 except Exception:
     _certifi = None
 
-# split-source: order=59 original-lines=75-78 hash=cba211345467525c
+# split-source: order=106 original-lines=3458-3461 hash=cba211345467525c
 try:
     import yaml as _yaml
 except Exception:

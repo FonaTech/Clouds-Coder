@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-# split-source: order=958 original-lines=106414-106453 hash=72f9d812840a61ba
+# split-source: order=1061 original-lines=118143-118182 hash=72f9d812840a61ba
 
 # ============================================================================
 # Architecture / 架构 / アーキテクチャ
@@ -47,7 +47,7 @@ class AgentHTTPServer(ThreadingHTTPServer):
                 return
             raise
 
-# split-source: order=961 original-lines=107573-108942 hash=3bbfee7bb4b32c5d
+# split-source: order=1064 original-lines=119369-121000 hash=6357bd493df55e3a
 
 
 # Request router: serves chat APIs, admin APIs, SSE streams, asset endpoints,
@@ -275,6 +275,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_text(self.app.web_ui_agent_index_html(), "text/html; charset=utf-8")
         if path == "/admin":
             return self._send_text(ADMIN_INDEX_HTML, "text/html; charset=utf-8")
+        if path == "/admin/skills":
+            return self._send_text(ADMIN_SKILLS_REVIEW_HTML, "text/html; charset=utf-8")
+        if path == "/assets/skills-review.css":
+            return self._send_text(ADMIN_SKILLS_REVIEW_CSS, "text/css; charset=utf-8", revalidate_cache=True)
+        if path == "/assets/skills-review.js":
+            return self._send_text(ADMIN_SKILLS_REVIEW_JS, "application/javascript; charset=utf-8", revalidate_cache=True)
         if path == "/assets/admin.css":
             return self._send_text(ADMIN_CSS, "text/css; charset=utf-8", revalidate_cache=True)
         if path == "/assets/admin.js":
@@ -318,6 +324,11 @@ class Handler(BaseHTTPRequestHandler):
                 "boot_id": str(getattr(self.app.telemetry, "boot_id", "") or ""),
                 "restart_verified": restart_verified,
                 "restart_rolled_back": restart_rolled_back,
+                "storage": {
+                    "ide_auth": self.app.ide_auth.storage_health(),
+                    "collaboration": self.app.collaboration.storage_health(),
+                },
+                "collaboration_watcher": collaboration_watcher_health(self.app),
             }, cors_origin="request" if requested_nonce or requested_from else "")
         if path == "/api/admin/auth/status":
             return self._send_json(
@@ -334,10 +345,56 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(self.app.applications.list_personal(self._user_id()))
         if path == "/api/apps/shared":
             return self._send_json(self.app.applications.list_shared())
+        if path == "/api/processes":
+            try:
+                return self._send_json(self.app.process_manager.list_processes(
+                    owner_user_id=self._user_id(),
+                    session_id=str((query.get("session_id", [""]) or [""])[0] or ""),
+                    status=str((query.get("status", [""]) or [""])[0] or ""),
+                    query=str((query.get("query", [""]) or [""])[0] or ""),
+                    limit=int((query.get("limit", ["100"]) or ["100"])[0] or 100),
+                    offset=int((query.get("offset", ["0"]) or ["0"])[0] or 0),
+                ))
+            except Exception as exc:
+                return self._send_json({"error": str(exc), "code": "invalid_process_query"}, status=400)
+        m_process = re.match(r"^/api/processes/([^/]+)$", path)
+        if m_process:
+            try:
+                return self._send_json({
+                    "process": self.app.process_manager.get_process(
+                        m_process.group(1), owner_user_id=self._user_id()
+                    )
+                })
+            except ProcessManagerError as exc:
+                return self._send_json({"error": str(exc), "code": exc.code}, status=exc.status)
         if path == "/api/admin/config":
             if not self._require_admin(query):
                 return
             return self._send_json(self.app.admin_config_payload())
+        if path == "/api/admin/processes":
+            if not self._require_admin(query):
+                return
+            try:
+                return self._send_json(self.app.process_manager.list_processes(
+                    user_hash=str((query.get("user_hash", [""]) or [""])[0] or ""),
+                    session_id=str((query.get("session_id", [""]) or [""])[0] or ""),
+                    status=str((query.get("status", [""]) or [""])[0] or ""),
+                    query=str((query.get("query", [""]) or [""])[0] or ""),
+                    limit=int((query.get("limit", ["200"]) or ["200"])[0] or 200),
+                    offset=int((query.get("offset", ["0"]) or ["0"])[0] or 0),
+                ))
+            except Exception as exc:
+                return self._send_json({"error": str(exc), "code": "invalid_process_query"}, status=400)
+        m_admin_process = re.match(r"^/api/admin/processes/([^/]+)$", path)
+        if m_admin_process:
+            if not self._require_admin(query):
+                return
+            try:
+                return self._send_json({
+                    "process": self.app.process_manager.get_process(m_admin_process.group(1))
+                })
+            except ProcessManagerError as exc:
+                return self._send_json({"error": str(exc), "code": exc.code}, status=exc.status)
         if path == "/api/admin/metrics":
             if not self._require_admin(query):
                 return
@@ -354,6 +411,60 @@ class Handler(BaseHTTPRequestHandler):
                 return
             status = str((query.get("status", [""]) or [""])[0] or "")
             return self._send_json(self.app.applications.list_admin(status))
+        if path == "/api/admin/skills/submissions":
+            if not self._require_admin(query):
+                return
+            status = str((query.get("status", [""]) or [""])[0] or "")
+            return self._send_json({"submissions": self.app.skills_studio.list_submissions(status)})
+        m_skill_submission = re.match(r"^/api/admin/skills/submissions/([^/]+)$", path)
+        if m_skill_submission:
+            if not self._require_admin(query):
+                return
+            try:
+                return self._send_json(self.app.skills_studio.submission_snapshot(m_skill_submission.group(1)))
+            except SkillsStudioError as exc:
+                return self._send_json({"error": str(exc), "code": exc.code, "details": exc.details}, status=exc.status)
+        if path == "/api/admin/collaboration/projects":
+            if not self._require_admin(query):
+                return
+            try:
+                return self._send_json(self.app.collaboration.list_projects(
+                    status=str((query.get("status", [""]) or [""])[0] or ""),
+                    query=str((query.get("query", [""]) or [""])[0] or ""),
+                    limit=int((query.get("limit", ["50"]) or ["50"])[0] or 50),
+                    offset=int((query.get("offset", ["0"]) or ["0"])[0] or 0),
+                ))
+            except CollaborationError as exc:
+                return self._send_json({"error": str(exc), "code": exc.code, "details": exc.details}, status=exc.status)
+        if path == "/api/admin/collaboration/audit":
+            if not self._require_admin(query):
+                return
+            return self._send_json(self.app.collaboration.audit_events(
+                project_id=str((query.get("project_id", [""]) or [""])[0] or ""),
+                action=str((query.get("action", [""]) or [""])[0] or ""),
+                limit=int((query.get("limit", ["200"]) or ["200"])[0] or 200),
+                offset=int((query.get("offset", ["0"]) or ["0"])[0] or 0),
+            ))
+        m_collab_members = re.match(r"^/api/admin/collaboration/projects/([^/]+)/members$", path)
+        if m_collab_members:
+            if not self._require_admin(query):
+                return
+            try:
+                return self._send_json(self.app.collaboration.list_members(
+                    m_collab_members.group(1),
+                    query=str((query.get("query", [""]) or [""])[0] or ""),
+                    status=str((query.get("status", [""]) or [""])[0] or ""),
+                    limit=int((query.get("limit", ["100"]) or ["100"])[0] or 100),
+                    offset=int((query.get("offset", ["0"]) or ["0"])[0] or 0),
+                ))
+            except CollaborationError as exc:
+                return self._send_json({"error": str(exc), "code": exc.code, "details": exc.details}, status=exc.status)
+        m_collab_conflicts = re.match(r"^/api/admin/collaboration/projects/([^/]+)/conflicts$", path)
+        if m_collab_conflicts:
+            if not self._require_admin(query):
+                return
+            status = str((query.get("status", [""]) or [""])[0] or "")
+            return self._send_json({"conflicts": self.app.collaboration.list_conflicts(m_collab_conflicts.group(1), status=status)})
         if path == "/api/webui/validate":
             reload_external = _to_bool_like((query.get("reload", ["0"]) or ["0"])[0], default=False)
             return self._send_json(self.app.refresh_web_ui_validation(reload_external=reload_external))
@@ -377,6 +488,8 @@ class Handler(BaseHTTPRequestHandler):
                         "request_timeout_default": int(DEFAULT_REQUEST_TIMEOUT),
                         "run_timeout": int(mgr.max_run_seconds),
                         "shell_command_timeout_seconds": int(getattr(mgr, "shell_command_timeout_seconds", DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS) or DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS),
+                        "shell_timeout_mode": normalize_shell_timeout_mode(getattr(mgr, "shell_timeout_mode", DEFAULT_SHELL_TIMEOUT_MODE)),
+                        "shell_async_handoff_seconds": int(getattr(mgr, "shell_async_handoff_seconds", DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS) or DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS),
                         "read_context_policy": normalize_read_context_policy(
                             getattr(mgr, "read_context_policy", DEFAULT_READ_CONTEXT_POLICY)
                         ),
@@ -468,6 +581,8 @@ class Handler(BaseHTTPRequestHandler):
                     "user_memory_setting_locked": bool(getattr(mgr, "user_memory_setting_locked", False)),
                     "run_timeout": int(mgr.max_run_seconds),
                     "shell_command_timeout_seconds": int(getattr(mgr, "shell_command_timeout_seconds", DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS) or DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS),
+                    "shell_timeout_mode": normalize_shell_timeout_mode(getattr(mgr, "shell_timeout_mode", DEFAULT_SHELL_TIMEOUT_MODE)),
+                    "shell_async_handoff_seconds": int(getattr(mgr, "shell_async_handoff_seconds", DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS) or DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS),
                     "auto_model_switch": bool(mgr.auto_model_switch),
                     "execution_mode": normalize_execution_mode(getattr(mgr, "execution_mode", EXECUTION_MODE_SYNC), default=EXECUTION_MODE_SYNC),
                     "execution_mode_choices": list(EXECUTION_MODE_CHOICES),
@@ -885,6 +1000,50 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 return self._send_json({"error": "invalid authentication request", "code": "invalid_request"}, status=400)
         mgr = self._session_mgr()
+        m_process_stop = re.match(r"^/api/processes/([^/]+)/stop$", path)
+        if m_process_stop:
+            payload = self._read_json()
+            try:
+                return self._send_json(self.app.process_manager.stop_process(
+                    m_process_stop.group(1),
+                    owner_user_id=self._user_id(),
+                    actor="user:" + UserProcessManager._user_hash(self._user_id()),
+                    reason=trim(str(payload.get("reason", "user requested") or "user requested"), 200),
+                ))
+            except ProcessManagerError as exc:
+                return self._send_json({"error": str(exc), "code": exc.code}, status=exc.status)
+        if path == "/api/admin/processes/bulk-stop":
+            if not self._require_admin():
+                return
+            payload = self._read_json()
+            if not _to_bool_like(payload.get("confirm", False), default=False):
+                return self._send_json({"error": "bulk stop requires confirm=true", "code": "confirmation_required"}, status=400)
+            ids = payload.get("ids", [])
+            if ids is not None and not isinstance(ids, list):
+                return self._send_json({"error": "ids must be an array", "code": "invalid_process_ids"}, status=400)
+            try:
+                return self._send_json(self.app.process_manager.bulk_stop(
+                    actor="admin",
+                    ids=ids or [],
+                    user_hash=str(payload.get("user_hash", "") or ""),
+                    session_id=str(payload.get("session_id", "") or ""),
+                    reason=trim(str(payload.get("reason", "admin bulk stop") or "admin bulk stop"), 200),
+                ))
+            except ProcessManagerError as exc:
+                return self._send_json({"error": str(exc), "code": exc.code}, status=exc.status)
+        m_admin_process_stop = re.match(r"^/api/admin/processes/([^/]+)/stop$", path)
+        if m_admin_process_stop:
+            if not self._require_admin():
+                return
+            payload = self._read_json()
+            try:
+                return self._send_json(self.app.process_manager.stop_process(
+                    m_admin_process_stop.group(1),
+                    actor="admin",
+                    reason=trim(str(payload.get("reason", "admin requested") or "admin requested"), 200),
+                ))
+            except ProcessManagerError as exc:
+                return self._send_json({"error": str(exc), "code": exc.code}, status=exc.status)
         if path == "/api/apps/personal":
             try:
                 return self._send_json(self.app.applications.save_personal(self._user_id(), self._read_json()), status=201)
@@ -922,12 +1081,29 @@ class Handler(BaseHTTPRequestHandler):
                 expected_revision=str(payload.get("revision", "") or ""),
             )
             return self._send_json(out, status=200 if out.get("ok") else (409 if out.get("conflict") else 400))
+        if path == "/api/admin/config/sync-active":
+            if not self._require_admin():
+                return
+            payload = self._read_json()
+            out = self.app.sync_admin_config_from_active(
+                expected_revision=str(payload.get("revision", "") or ""),
+            )
+            return self._send_json(out, status=200 if out.get("ok") else (409 if out.get("conflict") else 400))
         if path == "/api/admin/config/reset":
             if not self._require_admin():
                 return
             payload = self._read_json()
             out = self.app.reset_admin_config(str(payload.get("target", "initial") or "initial"))
             return self._send_json(out, status=200 if out.get("ok") else 400)
+        if path == "/api/admin/collaboration/service-config":
+            if not self._require_admin():
+                return
+            payload = self._read_json()
+            out = self.app.save_lan_collaboration_config(
+                bool(payload.get("enabled", True)),
+                expected_revision=str(payload.get("revision", "") or ""),
+            )
+            return self._send_json(out, status=200 if out.get("ok") else (409 if out.get("conflict") else 400))
         if path == "/api/admin/restart":
             if not self._require_admin():
                 return
@@ -978,6 +1154,88 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json(self.app.applications.create_shared(self._read_json()), status=201)
             except Exception as exc:
                 return self._send_json({"error": str(exc)}, status=400)
+        m_skill_review = re.match(r"^/api/admin/skills/submissions/([^/]+)/(approve|changes_requested|reject|unpublish|republish|reevaluate)$", path)
+        if m_skill_review:
+            if not self._require_admin():
+                return
+            payload = self._read_json()
+            try:
+                return self._send_json(self.app.skills_studio.review_submission(
+                    m_skill_review.group(1), m_skill_review.group(2), str(payload.get("note", "") or "")
+                ))
+            except SkillsStudioError as exc:
+                return self._send_json({"error": str(exc), "code": exc.code, "details": exc.details}, status=exc.status)
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
+        if path == "/api/admin/collaboration/projects":
+            if not self._require_admin():
+                return
+            try:
+                payload = self._read_json()
+                return self._send_json(self.app.collaboration.create_project(
+                    payload.get("name"), payload.get("password"),
+                    timezone_name=payload.get("timezone", "UTC"), actor_id="admin",
+                ), status=201)
+            except CollaborationError as exc:
+                return self._send_json({"error": str(exc), "code": exc.code, "details": exc.details}, status=exc.status)
+        m_collab_project = re.match(r"^/api/admin/collaboration/projects/([^/]+)/(rename|password|archive|activate|backup|delete|restore)$", path)
+        if m_collab_project:
+            if not self._require_admin():
+                return
+            project_id, action = m_collab_project.group(1), m_collab_project.group(2)
+            try:
+                payload = self._read_json()
+                if action == "rename":
+                    out = self.app.collaboration.rename_project(project_id, payload.get("name"), actor_id="admin")
+                elif action == "password":
+                    out = self.app.collaboration.rotate_password(project_id, payload.get("password"), actor_id="admin")
+                elif action in {"archive", "activate"}:
+                    out = self.app.collaboration.set_project_status(project_id, "archived" if action == "archive" else "active", actor_id="admin")
+                elif action == "backup":
+                    out = self.app.collaboration.backup_project(project_id, actor_id="admin")
+                elif action == "delete":
+                    out = self.app.collaboration.quarantine_project(project_id, payload.get("confirmation"), actor_id="admin")
+                else:
+                    out = self.app.collaboration.restore_project(project_id, actor_id="admin")
+                return self._send_json(out)
+            except CollaborationError as exc:
+                return self._send_json({"error": str(exc), "code": exc.code, "details": exc.details}, status=exc.status)
+            except Exception as exc:
+                return self._send_json({"error": str(exc), "code": "collaboration_admin_error"}, status=500)
+        m_collab_device = re.match(r"^/api/admin/collaboration/projects/([^/]+)/devices/([^/]+)/approve$", path)
+        if m_collab_device:
+            if not self._require_admin():
+                return
+            try:
+                payload = self._read_json()
+                return self._send_json(self.app.collaboration.approve_device(
+                    m_collab_device.group(1), m_collab_device.group(2),
+                    member_id=str(payload.get("member_id", "") or ""), actor_id="admin",
+                ))
+            except CollaborationError as exc:
+                return self._send_json({"error": str(exc), "code": exc.code, "details": exc.details}, status=exc.status)
+        m_collab_member = re.match(r"^/api/admin/collaboration/projects/([^/]+)/members/([^/]+)/(approve|block|revoke)$", path)
+        if m_collab_member:
+            if not self._require_admin():
+                return
+            try:
+                self._read_json()
+                return self._send_json(self.app.collaboration.set_member_access(
+                    m_collab_member.group(1), m_collab_member.group(2), m_collab_member.group(3), actor_id="admin",
+                ))
+            except CollaborationError as exc:
+                return self._send_json({"error": str(exc), "code": exc.code, "details": exc.details}, status=exc.status)
+        m_collab_abort = re.match(r"^/api/admin/collaboration/projects/([^/]+)/conflicts/([^/]+)/abort$", path)
+        if m_collab_abort:
+            if not self._require_admin():
+                return
+            try:
+                self._read_json()
+                return self._send_json(self.app.collaboration.emergency_abort_conflict(
+                    m_collab_abort.group(1), m_collab_abort.group(2), actor_id="admin",
+                ))
+            except CollaborationError as exc:
+                return self._send_json({"error": str(exc), "code": exc.code, "details": exc.details}, status=exc.status)
         m = re.match(r"^/api/admin/apps/([^/]+)/(approve|reject)$", path)
         if m:
             if not self._require_admin():
@@ -1404,9 +1662,13 @@ class Handler(BaseHTTPRequestHandler):
             while True:
                 try:
                     event = sub.get(timeout=SSE_HEARTBEAT_SECONDS)
-                    seq = int(event.get("seq", 0) or 0) if isinstance(event, dict) else 0
+                    seq = (
+                        int(event.get("seq", 0) or 0) if isinstance(event, dict) else 0
+                    )
                     if seq > 0:
-                        chunk = safe_utf8_bytes(f"id: {seq}\ndata: {json_dumps(event)}\n\n")
+                        chunk = safe_utf8_bytes(
+                            f"id: {seq}\ndata: {json_dumps(event)}\n\n"
+                        )
                     else:
                         chunk = safe_utf8_bytes(f"data: {json_dumps(event)}\n\n")
                 except queue.Empty:
@@ -1418,3 +1680,592 @@ class Handler(BaseHTTPRequestHandler):
                 raise
         finally:
             sess.events.unsubscribe(sub)
+
+# split-source: order=1067 original-lines=121802-121915 hash=79a78cd04af97eeb
+
+
+class SkillsReviewHandler(_RagAdminAuthMixin, BaseHTTPRequestHandler):
+    """Main Admin Skills review surface; private draft contents never leave the Studio API."""
+
+    protocol_version = "HTTP/1.1"
+    server_version = f"StandaloneWebSkillsReview/{APP_VERSION}"
+
+    def log_message(self, fmt: str, *args):
+        return
+
+    @property
+    def app(self) -> AppContext:
+        return self.server.app  # type: ignore[attr-defined]
+
+    def _client_ip(self) -> str:
+        return trusted_client_ip(self)
+
+    def _bearer_token(self) -> str:
+        auth = str(self.headers.get("Authorization", "") or "").strip()
+        if auth.lower().startswith("bearer "):
+            return auth[7:].strip()
+        return str(self.headers.get("X-Admin-Token", "") or "").strip()
+
+    def _read_json(self):
+        return read_http_json_body(self)
+
+    def _send_json(self, obj, status=200):
+        body = json_response_bytes(obj)
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_text(self, text, content_type="text/html; charset=utf-8", status=200):
+        body = safe_utf8_bytes(text)
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        path = unquote(urlparse(self.path).path)
+        query = parse_qs(urlparse(self.path).query or "")
+        if path == "/":
+            return self._send_text(ADMIN_SKILLS_REVIEW_HTML)
+        if path == "/assets/skills-review.js":
+            return self._send_text(
+                ADMIN_SKILLS_REVIEW_JS, "application/javascript; charset=utf-8"
+            )
+        if path == "/assets/skills-review.css":
+            return self._send_text(ADMIN_SKILLS_REVIEW_CSS, "text/css; charset=utf-8")
+        if path == "/api/admin/skills/submissions":
+            if not self._require_admin_write():
+                return
+            return self._send_json(
+                {
+                    "submissions": self.app.skills_studio.list_submissions(
+                        str((query.get("status", [""]) or [""])[0] or "")
+                    )
+                }
+            )
+        m = re.match(r"^/api/admin/skills/submissions/([^/]+)$", path)
+        if m:
+            if not self._require_admin_write():
+                return
+            try:
+                return self._send_json(
+                    self.app.skills_studio.submission_snapshot(m.group(1))
+                )
+            except SkillsStudioError as exc:
+                return self._send_json(
+                    {"error": str(exc), "code": exc.code}, exc.status
+                )
+        return self._send_json({"error": "not found"}, 404)
+
+    def _require_admin_write(self):
+        if not self._same_origin_write():
+            self._send_json({"error": "cross-origin write rejected"}, 403)
+            return False
+        if self.app.verify_admin_token(self._bearer_token()):
+            return True
+        self._send_json({"error": "admin authentication required"}, 401)
+        return False
+
+    def do_POST(self):
+        path = unquote(urlparse(self.path).path)
+        if path.startswith("/api/admin/skills/submissions/") and path.endswith(
+            ("/approve", "/changes_requested", "/reject", "/withdraw", "/unpublish")
+        ):
+            if not self._require_admin_write():
+                return
+            m = re.match(
+                r"^/api/admin/skills/submissions/([^/]+)/(approve|changes_requested|reject|withdraw|unpublish)$",
+                path,
+            )
+            try:
+                out = self.app.skills_studio.review_submission(
+                    m.group(1), m.group(2), str(self._read_json().get("note", "") or "")
+                )
+                return self._send_json(out)
+            except SkillsStudioError as exc:
+                return self._send_json(
+                    {"error": str(exc), "code": exc.code, "details": exc.details},
+                    exc.status,
+                )
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, 400)
+        if not self._handle_admin_auth_post(path):
+            return self._send_json({"error": "not found"}, 404)
+
+# split-source: order=1071 original-lines=123779-124249 hash=e5c3c84a1d0a44ec
+
+class CollaborationHandler(IdeHandler):
+    server_version = "CloudsCoderCollaboration/1.0"
+    protocol_version = "HTTP/1.1"
+
+    _quiet_not_found_paths = (
+        re.compile(r"^/api/ide/v2/terminals/[^/]+/output$"),
+        re.compile(r"^/api/ide/v2/sessions/[^/]+/(?:agent-state|events)$"),
+    )
+
+    @property
+    def app(self) -> AppContext:
+        return self.server.app  # type: ignore[attr-defined]
+
+    def log_message(self, fmt: str, *args):
+        access_log = str(os.getenv("CLOUDS_CODER_COLLAB_ACCESS_LOG", "") or "").strip().lower()
+        if access_log not in {"1", "true", "yes", "on"}:
+            try:
+                status = int(args[1])
+            except (IndexError, TypeError, ValueError):
+                status = 0
+            path = unquote(urlparse(str(getattr(self, "path", "") or "")).path)
+            if 200 <= status < 400:
+                return
+            if status == 404 and any(pattern.fullmatch(path) for pattern in self._quiet_not_found_paths):
+                return
+        print(f"[collaboration] {self.address_string()} {fmt % args}")
+
+    def _decorate_resource_manifest(self, manifest: dict, context: dict | None = None) -> dict:
+        return super()._decorate_resource_manifest(manifest, context)
+
+    def _decorate_ide_config(self, payload: dict, context: dict) -> dict:
+        out = dict(payload or {})
+        resources = out.get("shared_resources")
+        if isinstance(resources, dict):
+            out["shared_resources"] = self._decorate_resource_manifest(resources)
+        return out
+
+    def _client_ip(self) -> str:
+        return trusted_client_ip(self)
+
+    def _cookie(self, name: str) -> str:
+        try:
+            cookie = SimpleCookie()
+            cookie.load(str(self.headers.get("Cookie", "") or ""))
+            morsel = cookie.get(name)
+            return str(morsel.value if morsel else "")
+        except Exception:
+            return ""
+
+    def _token(self) -> str:
+        return self._cookie("clouds_collab_session")
+
+    def _trusted_https(self) -> bool:
+        if isinstance(getattr(self, "connection", None), ssl.SSLSocket):
+            return True
+        if str(self.headers.get("X-Forwarded-Proto", "") or "").strip().lower() != "https":
+            return False
+        peer = self.client_address[0] if getattr(self, "client_address", None) else ""
+        if str(os.getenv("CLOUDS_CODER_TRUST_PROXY", "") or "").strip().lower() not in {"1", "true", "yes", "on"}:
+            return False
+        raw_ranges = str(os.getenv("CLOUDS_CODER_TRUSTED_PROXIES", "127.0.0.1/32,::1/128") or "")
+        try:
+            addr = ipaddress.ip_address(peer)
+            return any(addr in ipaddress.ip_network(value.strip(), strict=False) for value in raw_ranges.split(",") if value.strip())
+        except Exception:
+            return False
+
+    def _warning(self) -> str:
+        if bool(getattr(self.app, "collaboration_insecure_http", False)) and not self._trusted_https():
+            return "开发模式：协作凭据正在通过未加密 HTTP 传输。不要在不可信网络使用。"
+        return ""
+
+    def _same_origin(self) -> bool:
+        origin = str(self.headers.get("Origin", "") or "").strip()
+        if not origin:
+            return True
+        parsed = urlparse(origin)
+        return parsed.scheme in {"http", "https"} and parsed.netloc == str(self.headers.get("Host", "") or "")
+
+    def _read_json(self) -> dict:
+        return read_http_json_body(self)
+
+    def _auth(self, *, write: bool = False) -> CollaborationPrincipal:
+        if write and not self._same_origin():
+            raise CollaborationError("same_origin_required", "collaboration writes require a same-origin request", 403)
+        return self.app.collaboration.authenticate(
+            self._token(),
+            csrf_token=str(self.headers.get("X-CSRF-Token", "") or ""),
+            require_csrf=write,
+            client_ip=self._client_ip(),
+        )
+
+    def _auth_context(self, *, required: bool = False) -> dict | None:
+        cached = getattr(self, "_ide_auth_context_cache", None)
+        if isinstance(cached, dict):
+            return cached
+        try:
+            principal = self._auth(write=False)
+        except CollaborationError:
+            if required:
+                raise
+            return None
+        user_id = f"collab:{principal.project_id}:{principal.member_id}"
+        self.app.manager_for_collaboration(principal, client_ip=self._client_ip())
+        account = {
+            "username": principal.nickname,
+            "user_id": user_id,
+            "role": "member",
+            "disabled": False,
+            "must_change_password": False,
+            "csrf_token": principal.csrf_token,
+            "collaboration_mode": True,
+            "project_id": principal.project_id,
+            "member_id": principal.member_id,
+            "device_id": principal.device_id,
+        }
+        capabilities = self.app.ide_request_capabilities(
+            account,
+            client_ip=self._client_ip(),
+            direct_loopback=self._direct_loopback(),
+        )
+        capabilities.update({"admin": False, "mounts": False, "collaboration": True})
+        context = {
+            "token": self._token(),
+            "account": account,
+            "capabilities": capabilities,
+            "principal": principal,
+        }
+        self._ide_auth_context_cache = context
+        return context
+
+    @staticmethod
+    def _public_auth_account(account: dict) -> dict:
+        return {
+            key: account.get(key)
+            for key in (
+                "username", "user_id", "role", "disabled", "must_change_password",
+                "created_at", "updated_at", "collaboration_mode", "project_id", "member_id",
+            )
+        }
+
+    def _send_json(self, obj: object, status: int = 200, *, cookies: list[str] | None = None):
+        body = json_response_bytes(obj)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "same-origin")
+            for cookie in cookies or []:
+                self.send_header("Set-Cookie", cookie)
+            if isinstance(obj, dict) and status == 429:
+                retry_after = int((obj.get("details", {}) or {}).get("retry_after", 0) or 0)
+                if retry_after:
+                    self.send_header("Retry-After", str(retry_after))
+            if close_if_http_request_body_unread(self):
+                self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as exc:
+            if not swallow_benign_socket_error(exc, "collaboration-handler.send_json"):
+                raise
+
+    def _send_text(self, value: str, content_type: str, status: int = 200):
+        body = safe_utf8_bytes(value)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; worker-src 'self' blob:; font-src 'self' data:")
+            self.end_headers()
+            self.wfile.write(body)
+        except Exception as exc:
+            if not swallow_benign_socket_error(exc, "collaboration-handler.send_text"):
+                raise
+
+    def _send_bytes(self, value: bytes, content_type: str, status: int = 200):
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(value)))
+            self.send_header("Cache-Control", "private, max-age=300")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(value)
+        except Exception as exc:
+            if not swallow_benign_socket_error(exc, "collaboration-handler.send_bytes"):
+                raise
+
+    def _error(self, exc: Exception):
+        if isinstance(exc, CollaborationError):
+            payload = {"error": str(exc), "code": exc.code}
+            if exc.details:
+                payload["details"] = exc.details
+            return self._send_json(payload, status=exc.status)
+        if isinstance(exc, KeyError):
+            return self._send_json({"error": str(exc).strip("'") or "not found", "code": "not_found"}, status=404)
+        if isinstance(exc, sqlite3.DatabaseError):
+            return self._send_json(
+                {
+                    "error": "Collaboration storage is temporarily unavailable.",
+                    "code": "collaboration_store_unavailable",
+                },
+                status=503,
+            )
+        if isinstance(exc, (ValueError, IsADirectoryError, NotADirectoryError)):
+            return self._send_json({"error": str(exc), "code": "invalid_request"}, status=400)
+        return self._send_json({"error": str(exc), "code": "internal_error"}, status=500)
+
+    def _session_cookie(self, token: str) -> str:
+        secure = "; Secure" if self._trusted_https() else ""
+        return (
+            f"clouds_collab_session={quote(str(token or ''))}; Path=/; HttpOnly; "
+            f"SameSite=Strict; Max-Age={COLLAB_SESSION_TTL_SECONDS}{secure}"
+        )
+
+    def _auth_payload(self, out: dict) -> tuple[dict, list[str]]:
+        token = str(out.get("access_token", "") or "")
+        principal = self.app.collaboration.authenticate(token, client_ip=self._client_ip())
+        payload = {
+            "ok": True,
+            "status": "approved",
+            "csrf_token": out.get("csrf_token", ""),
+            "expires_at": out.get("expires_at", 0),
+            "snapshot": self.app.collaboration.snapshot(principal),
+        }
+        return payload, [self._session_cookie(token)]
+
+    def _stream_events(self, principal: CollaborationPrincipal, after: int):
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+        except Exception as exc:
+            if swallow_benign_socket_error(exc, "collaboration-handler.events.headers"):
+                return
+            raise
+        cursor = max(0, int(after))
+        while True:
+            try:
+                # Revocation and password rotation terminate an already-open stream.
+                principal = self.app.collaboration.authenticate(self._token(), client_ip=self._client_ip())
+                batch = self.app.collaboration.wait_for_events(principal.project_id, cursor, timeout=12.0)
+                if batch.get("reset_required"):
+                    snapshot = self.app.collaboration.snapshot(principal)
+                    reset = {"type": "snapshot", "data": snapshot}
+                    self.wfile.write(safe_utf8_bytes(f"data: {json_dumps(reset)}\n\n"))
+                    self.wfile.flush()
+                    cursor = int(snapshot.get("last_event_id", cursor) or cursor)
+                    continue
+                events = batch.get("events", [])
+                if not events:
+                    self.wfile.write(safe_utf8_bytes(f": ping {int(now_ts())}\n\n"))
+                    self.wfile.flush()
+                    continue
+                for event in events:
+                    cursor = max(cursor, int(event.get("id", 0) or 0))
+                    public = {"type": event.get("type", "event"), "data": event.get("data", {}), "ts": event.get("ts", 0)}
+                    self.wfile.write(safe_utf8_bytes(f"id: {cursor}\ndata: {json_dumps(public)}\n\n"))
+                self.wfile.flush()
+            except Exception as exc:
+                if isinstance(exc, (CollaborationError, sqlite3.DatabaseError)) or swallow_benign_socket_error(exc, "collaboration-handler.events.loop"):
+                    return
+                raise
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        path = unquote(parsed.path)
+        query = parse_qs(parsed.query or "")
+        if path == "/":
+            return self._send_text(self.app.web_ui_ide_index_html(), "text/html; charset=utf-8")
+        if path == "/api/ide/v2/auth/status":
+            return self._send_json({
+                "ok": True,
+                "collaboration_mode": True,
+                "password_login_enabled": False,
+                "device_pairing_enabled": True,
+                "local_auto_login": False,
+                "setup_required": False,
+                "session_ttl_seconds": COLLAB_SESSION_TTL_SECONDS,
+                "warning": self._warning(),
+            })
+        if path.startswith("/api/ide/") or path.startswith("/api/ide/v2/"):
+            return super().do_GET()
+        if path in {"/assets/ide.css", "/assets/ide.js", "/assets/ide-monaco-worker.js"}:
+            return super().do_GET()
+        if path.startswith("/assets/js_lib/"):
+            asset = self.app.rag_js_lib_asset_path(path[len("/assets/js_lib/"):])
+            if not asset:
+                return self._send_json({"error": "asset not found"}, status=404)
+            return self._send_bytes(asset.read_bytes(), guess_mime_from_name(asset.name, "application/octet-stream"))
+        if path == "/api/health":
+            storage = self.app.collaboration.storage_health()
+            watcher = collaboration_watcher_health(self.app)
+            healthy = bool(storage.get("available", False)) and watcher.get("status") != "degraded"
+            return self._send_json(
+                {
+                    "ok": healthy,
+                    "app": "clouds-coder-collaboration",
+                    "version": APP_VERSION,
+                    "https": self._trusted_https(),
+                    "warning": self._warning(),
+                    "storage": storage,
+                    "file_watcher": watcher,
+                },
+                status=200 if healthy else 503,
+            )
+        if path == "/api/collab/v1/status":
+            try:
+                principal = self._auth()
+                return self._send_json({"ok": True, "authenticated": True, "csrf_token": principal.csrf_token, "expires_at": principal.expires_at, "snapshot": self.app.collaboration.snapshot(principal), "warning": self._warning()})
+            except CollaborationError:
+                return self._send_json({"ok": True, "authenticated": False, "warning": self._warning()})
+            except Exception as exc:
+                return self._error(exc)
+        try:
+            principal = self._auth()
+            user_id = f"collab:{principal.project_id}:{principal.member_id}"
+            self.app.manager_for_collaboration(principal, client_ip=self._client_ip())
+            if path == "/api/collab/v1/resources":
+                manifest = self.app.collaboration_resource_manifest(user_id)
+                return self._send_json(self._decorate_resource_manifest(manifest))
+            if path in {"/api/skills", "/api/apps/skills"}:
+                return self._send_json(self.app.skills_catalog())
+            if path == "/api/skills/providers":
+                return self._send_json(self.app.skill_providers_catalog())
+            if path == "/api/skills/protocols":
+                return self._send_json(self.app.skill_protocols_catalog())
+            if path == "/api/skills/protocol-examples":
+                return self._send_json(self.app.skill_protocol_examples())
+            if path == "/api/apps/shared":
+                return self._send_json(self.app.applications.list_shared())
+            if path == "/api/collab/v1/projects":
+                snapshot = self.app.collaboration.snapshot(principal)
+                return self._send_json({"projects": [snapshot["project"]]})
+            if path == "/api/collab/v1/snapshot":
+                return self._send_json(self.app.collaboration.snapshot(principal))
+            if path == "/api/collab/v1/documents":
+                return self._send_json({"documents": self.app.collaboration.list_documents(principal.project_id)})
+            if path == "/api/collab/v1/blackboard":
+                return self._send_json({"items": self.app.collaboration.blackboard(principal.project_id)})
+            if path == "/api/collab/v1/blackboard/proposals":
+                status = str((query.get("status", ["pending"]) or ["pending"])[0] or "pending")
+                return self._send_json({"proposals": self.app.collaboration.blackboard_proposals(principal.project_id, status=status)})
+            if path == "/api/collab/v1/conflicts":
+                status = str((query.get("status", [""]) or [""])[0] or "")
+                return self._send_json({"conflicts": self.app.collaboration.list_conflicts(principal.project_id, status=status)})
+            if path == "/api/collab/v1/events":
+                after = int((query.get("after", [self.headers.get("Last-Event-ID", "0")]) or ["0"])[0] or 0)
+                return self._stream_events(principal, after)
+            if path == "/api/collab/v1/agents/sessions":
+                return self._send_json(self.app.collaboration_sessions(principal, client_ip=self._client_ip()))
+            match = re.match(r"^/api/collab/v1/agents/sessions/([^/]+)$", path)
+            if match:
+                return self._send_json(self.app.collaboration_session(principal, match.group(1), client_ip=self._client_ip()).snapshot(lite=True))
+            match = re.match(r"^/api/collab/v1/members/([^/]+)/avatar$", path)
+            if match:
+                return self._send_bytes(self.app.collaboration.avatar(principal.project_id, match.group(1)), "image/webp")
+            match = re.match(r"^/api/collab/v1/conflicts/([^/]+)/candidates/([^/]+)$", path)
+            if match:
+                return self._send_json(self.app.collaboration.conflict_candidate(principal.project_id, match.group(1), match.group(2)))
+            match = re.match(r"^/api/collab/v1/documents/(.+)/history$", path)
+            if match:
+                return self._send_json(self.app.collaboration.document_history(principal.project_id, match.group(1), limit=int((query.get("limit", ["100"]) or ["100"])[0] or 100)))
+            match = re.match(r"^/api/collab/v1/documents/(.+)$", path)
+            if match:
+                return self._send_json(self.app.collaboration.read_document(principal.project_id, match.group(1)))
+        except Exception as exc:
+            return self._error(exc)
+        return self._send_json({"error": "not found", "code": "not_found"}, status=404)
+
+    def do_POST(self):
+        path = unquote(urlparse(self.path).path)
+        if path == "/api/ide/v2/auth/logout":
+            try:
+                principal = self._auth(write=True)
+                self.app.collaboration.revoke_session(self._token())
+                return self._send_json(
+                    {"ok": True, "member_id": principal.member_id},
+                    cookies=["clouds_collab_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"],
+                )
+            except Exception as exc:
+                return self._error(exc)
+        if path.startswith("/api/ide/v2/auth/"):
+            return self._send_json({"error": "Use the collaboration project admission form.", "code": "collaboration_admission_required"}, status=404)
+        if path.startswith("/api/ide/") or path.startswith("/api/ide/v2/"):
+            return super().do_POST()
+        if path == "/api/collab/v1/admission":
+            try:
+                if not self._same_origin():
+                    raise CollaborationError("same_origin_required", "admission requires a same-origin request", 403)
+                payload = self._read_json()
+                out = self.app.collaboration.request_admission(
+                    payload.get("project"), payload.get("password"), payload.get("device_key"), payload.get("nickname"),
+                    device_label=payload.get("device_label", ""), client_ip=self._client_ip(),
+                )
+                if out.get("access_token"):
+                    body, cookies = self._auth_payload(out)
+                    return self._send_json(body, cookies=cookies)
+                return self._send_json(out, status=202)
+            except Exception as exc:
+                return self._error(exc)
+        if path == "/api/collab/v1/refresh":
+            try:
+                principal = self._auth(write=True)
+                payload = self._read_json()
+                out = self.app.collaboration.refresh_session(self._token(), payload.get("device_key"), client_ip=self._client_ip())
+                body, cookies = self._auth_payload(out)
+                return self._send_json(body, cookies=cookies)
+            except Exception as exc:
+                return self._error(exc)
+        try:
+            principal = self._auth(write=True)
+            if path == "/api/collab/v1/logout":
+                self.app.collaboration.revoke_session(self._token())
+                return self._send_json({"ok": True}, cookies=["clouds_collab_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"])
+            payload = self._read_json()
+            if path == "/api/collab/v1/profile":
+                avatar = payload.get("avatar_base64")
+                avatar_bytes = base64.b64decode(str(avatar), validate=True) if avatar else None
+                return self._send_json(self.app.collaboration.update_profile(principal, nickname=payload.get("nickname") if "nickname" in payload else None, avatar_bytes=avatar_bytes))
+            if path == "/api/collab/v1/presence":
+                return self._send_json(self.app.collaboration.update_presence(principal, document_path=str(payload.get("document_path", "") or ""), cursor=payload.get("cursor") if isinstance(payload.get("cursor"), dict) else {}))
+            if path == "/api/collab/v1/file-intents":
+                return self._send_json(self.app.collaboration.declare_intent(principal, payload.get("path"), agent_id=str(payload.get("agent_id", "") or ""), intent=str(payload.get("intent", "edit") or "edit"), baseline_revision=int(payload.get("baseline_revision", 0) or 0)))
+            if path == "/api/collab/v1/blackboard":
+                return self._send_json(self.app.collaboration.upsert_blackboard_item(principal, payload))
+            match = re.match(r"^/api/collab/v1/blackboard/proposals/([^/]+)/resolve$", path)
+            if match:
+                return self._send_json(self.app.collaboration.resolve_blackboard_proposal(principal, match.group(1), accept=bool(payload.get("accept", False))))
+            if path == "/api/collab/v1/agents/status":
+                return self._send_json(self.app.collaboration.update_agent(principal, agent_id=str(payload.get("agent_id", "") or ""), session_id=str(payload.get("session_id", "") or ""), status=str(payload.get("status", "idle") or "idle"), current_file=str(payload.get("current_file", "") or ""), tool_summary=str(payload.get("tool_summary", "") or ""), result_summary=str(payload.get("result_summary", "") or "")))
+            if path == "/api/collab/v1/leases":
+                return self._send_json(self.app.collaboration.grant_lease(principal, relative=str(payload.get("path", "") or ""), agent_ids=payload.get("agent_ids", []) if isinstance(payload.get("agent_ids"), list) else [], expires_at=float(payload.get("expires_at", 0) or 0)))
+            if path == "/api/collab/v1/agents/sessions":
+                return self._send_json(self.app.collaboration_create_session(principal, str(payload.get("title", "") or ""), client_ip=self._client_ip()), status=201)
+            match = re.match(r"^/api/collab/v1/agents/sessions/([^/]+)/messages$", path)
+            if match:
+                sess = self.app.collaboration_session(principal, match.group(1), client_ip=self._client_ip())
+                self.app.collaboration.update_agent(principal, agent_id=f"agent:{sess.id}", session_id=sess.id, status="running")
+                result = sess.submit_user_message(str(payload.get("content", "") or ""))
+                return self._send_json(result if isinstance(result, dict) else {"ok": True, "result": result})
+            match = re.match(r"^/api/collab/v1/documents/(.+)/operations$", path)
+            if match:
+                return self._send_json(self.app.collaboration.submit_operation(principal, match.group(1), int(payload.get("base_revision", 0) or 0), payload.get("operation"), client_operation_id=payload.get("client_operation_id")))
+            match = re.match(r"^/api/collab/v1/documents/(.+)/file$", path)
+            if match:
+                if "content_base64" in payload:
+                    content = base64.b64decode(str(payload.get("content_base64", "")), validate=True)
+                else:
+                    content = str(payload.get("content", "") or "").encode("utf-8")
+                return self._send_json(self.app.collaboration.write_file(principal, match.group(1), content, int(payload.get("expected_revision", 0) or 0)))
+            match = re.match(r"^/api/collab/v1/documents/(.+)/restore$", path)
+            if match:
+                return self._send_json(self.app.collaboration.restore_document_version(principal, match.group(1), int(payload.get("revision", 0) or 0), int(payload.get("expected_revision", 0) or 0)))
+            match = re.match(r"^/api/collab/v1/conflicts/([^/]+)/review$", path)
+            if match:
+                return self._send_json(self.app.collaboration.submit_conflict_review(principal, match.group(1), role=str(payload.get("role", "") or ""), candidate_id=str(payload.get("candidate_id", "") or ""), risk=str(payload.get("risk", "") or ""), reason=str(payload.get("reason", "") or ""), unresolved=str(payload.get("unresolved", "") or "")))
+            match = re.match(r"^/api/collab/v1/conflicts/([^/]+)/resolve$", path)
+            if match:
+                return self._send_json(self.app.collaboration.resolve_conflict(principal, match.group(1), action=str(payload.get("action", "") or ""), candidate_id=str(payload.get("candidate_id", "") or ""), mode=str(payload.get("mode", "once") or "once")))
+        except Exception as exc:
+            return self._error(exc)
+        return self._send_json({"error": "not found", "code": "not_found"}, status=404)
