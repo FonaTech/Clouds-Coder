@@ -4,6 +4,7 @@ import re
 import sys
 import sysconfig
 import unittest
+from importlib.machinery import EXTENSION_SUFFIXES
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
@@ -50,17 +51,34 @@ def stdlib_module_names() -> set[str]:
     if native:
         return set(native)
     names = set(sys.builtin_module_names)
-    stdlib_root = Path(sysconfig.get_paths()["stdlib"])
-    try:
-        for entry in stdlib_root.iterdir():
+
+    def add_entries(root: Path) -> None:
+        try:
+            entries = list(root.iterdir())
+        except OSError:
+            return
+        for entry in entries:
             if entry.name.startswith("_"):
                 continue
             if entry.is_file() and entry.suffix == ".py":
                 names.add(entry.stem)
-            elif entry.is_dir() and (entry / "__init__.py").is_file():
+                continue
+            if entry.is_file() and any(
+                entry.name.endswith(suffix) for suffix in EXTENSION_SUFFIXES
+            ):
+                names.add(entry.name.split(".", 1)[0])
+                continue
+            if entry.is_dir() and (entry / "__init__.py").is_file():
                 names.add(entry.name)
-    except OSError:
-        pass
+
+    paths = sysconfig.get_paths()
+    stdlib_roots = {
+        Path(paths["stdlib"]),
+        Path(paths.get("platstdlib", paths["stdlib"])),
+    }
+    for root in stdlib_roots:
+        add_entries(root)
+        add_entries(root / "lib-dynload")
     return names
 
 
