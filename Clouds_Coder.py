@@ -5216,16 +5216,38 @@ MEDIA_CAPABILITY_KEYS = {
     "output_audio",
     "output_video",
 }
-SAMPLE_IMAGE_PNG_B64 = (
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/"
-    "b0cAAAAASUVORK5CYII="
-)
-SAMPLE_AUDIO_WAV_B64 = (
-    "UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA="
-)
-SAMPLE_VIDEO_MP4_B64 = (
-    "AAAAFGZ0eXBpc29tAAAAAGlzb21pc28y"
-)
+
+
+def _capability_probe_png_bytes() -> bytes:
+    """Return a deterministic, valid 1x1 PNG for provider capability probes."""
+    def chunk(kind: bytes, payload: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(payload))
+            + kind
+            + payload
+            + struct.pack(">I", zlib.crc32(kind + payload) & 0xFFFFFFFF)
+        )
+
+    header = struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0)
+    pixels = zlib.compress(b"\x00\x00\x00\x00\x00")
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", pixels) + chunk(b"IEND", b"")
+
+
+def _capability_probe_audio_bytes() -> bytes:
+    """Return a valid, empty PCM/WAV payload for provider capability probes."""
+    return (
+        b"RIFF"
+        + struct.pack("<I", 36)
+        + b"WAVEfmt "
+        + struct.pack("<IHHIIHH", 16, 1, 1, 8000, 8000, 1, 8)
+        + b"data"
+        + struct.pack("<I", 0)
+    )
+
+
+def _capability_probe_video_bytes() -> bytes:
+    """Return a minimal ISO-BMFF header for provider capability probes."""
+    return struct.pack(">I", 20) + b"ftypisom" + struct.pack(">I", 0) + b"isomiso2"
 
 OFFLINE_JS_LIB_CATALOG: list[dict[str, object]] = [
     {
@@ -12824,12 +12846,52 @@ def parse_front_matter(text: str) -> tuple[dict, str]:
             return value
         return str(value)
 
+    def _split_inline_items(raw: str) -> list[str]:
+        items: list[str] = []
+        start = 0
+        depth = 0
+        quote = ""
+        escaped = False
+        for index, char in enumerate(str(raw or "")):
+            if quote:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == quote:
+                    quote = ""
+                continue
+            if char in {"'", '"'}:
+                quote = char
+            elif char in "[{(":
+                depth += 1
+            elif char in "]})":
+                depth = max(0, depth - 1)
+            elif char == "," and depth == 0:
+                items.append(str(raw)[start:index].strip())
+                start = index + 1
+        tail = str(raw)[start:].strip()
+        if tail:
+            items.append(tail)
+        return items
+
     def _parse_scalar(raw: str):
         txt = str(raw or "").strip()
         if not txt:
             return ""
         if len(txt) >= 2 and txt[0] == txt[-1] and txt[0] in {"'", '"'}:
             return txt[1:-1]
+        if txt.startswith("[") and txt.endswith("]"):
+            inner = txt[1:-1].strip()
+            return [_parse_scalar(item) for item in _split_inline_items(inner)] if inner else []
+        if txt.startswith("{") and txt.endswith("}"):
+            result: dict[str, object] = {}
+            for item in _split_inline_items(txt[1:-1]):
+                if ":" not in item:
+                    continue
+                key, value = item.split(":", 1)
+                result[str(_parse_scalar(key)).strip()] = _parse_scalar(value)
+            return result
         low = txt.lower()
         if low == "true":
             return True
@@ -14832,6 +14894,39 @@ def normalize_rel_preview_path(path_text: str) -> str:
         return PurePosixPath(*parts).as_posix()
     except Exception:
         return raw.lstrip("/")
+
+
+def normalize_upload_rel_path(path_text: str) -> str:
+    """Convert browser upload paths to workspace-relative paths.
+
+    Chromium on Windows can expose a dropped entry as ``/C:/...`` while
+    other browsers use ``C:\\...``.  Those values must not reach ``Path`` as
+    absolute paths, otherwise a valid upload is rejected as escaping the
+    workspace.  This helper is intentionally limited to upload payloads;
+    the general path normalizer must continue preserving absolute paths so
+    callers can reject them as a security boundary.
+    """
+    raw = str(path_text or "").strip().replace("\\", "/")
+    if not raw:
+        return ""
+    raw = re.sub(r"^file:/+", "", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"^/+([A-Za-z]):(?:/|$)", r"\1/", raw)
+    if re.match(r"^[A-Za-z]:/", raw):
+        raw = raw[3:]
+    elif re.match(r"^[A-Za-z]/", raw):
+        raw = raw[2:]
+    elif re.match(r"^[A-Za-z]:$", raw):
+        raw = ""
+    if raw.startswith("//"):
+        # UNC host/share prefixes identify the source machine, not a
+        # workspace directory.  Keep only the path below that prefix.
+        parts = [part for part in raw.split("/") if part]
+        raw = "/".join(parts[2:]) if len(parts) > 2 else ""
+    raw = "/".join(
+        part for part in raw.split("/")
+        if part and part != "." and "\x00" not in part
+    )
+    return normalize_rel_preview_path(raw)
 
 
 def is_code_preview_candidate(path_text: str) -> bool:
@@ -20249,6 +20344,75 @@ class SkillStore:
             return
         meta, body = parse_front_matter(raw)
         skill_dir = skill_file.parent
+        # Keep routing-table references searchable without making metadata
+        # recall reopen or parse the potentially large SKILL.md body. Skills
+        # can expose stable technique entrypoints either through a reference
+        # directory or through Markdown links declared in their own guide;
+        # existing domain term groups provide multilingual aliases generically.
+        reference_files = sorted(skill_dir.glob("reference/*.md"))
+        linked_entrypoints: list[str] = []
+        for match in re.finditer(
+            r"\[[^\]]+\]\(\s*([^\s)#]+\.md)(?:#[^)]*)?\s*\)",
+            body,
+            flags=re.IGNORECASE,
+        ):
+            rel = str(match.group(1) or "").replace("\\", "/").lstrip("/")
+            parts = PurePosixPath(rel).parts
+            if (
+                rel
+                and parts
+                and parts[0] in {"reference", "references", "techniques"}
+                and ".." not in parts
+                and rel.casefold() not in {item.casefold() for item in linked_entrypoints}
+            ):
+                linked_entrypoints.append(rel)
+        if reference_files or linked_entrypoints:
+            meta = dict(meta)
+            existing_cc = meta.get("clouds_coder")
+            clouds_coder = dict(existing_cc) if isinstance(existing_cc, dict) else {}
+            entrypoints = _meta_string_list(clouds_coder.get("entrypoints"))
+            reference_stems = {
+                re.sub(r"[-_]+", " ", reference_file.stem).casefold()
+                for reference_file in reference_files
+            }
+            reference_stems.update(
+                re.sub(r"[-_]+", " ", PurePosixPath(path).stem).casefold()
+                for path in linked_entrypoints
+            )
+            for reference_file in reference_files:
+                stem = reference_file.stem
+                entrypoint = f"techniques/{stem}.md"
+                if entrypoint not in entrypoints:
+                    entrypoints.append(entrypoint)
+            for entrypoint in linked_entrypoints:
+                if entrypoint not in entrypoints:
+                    entrypoints.append(entrypoint)
+            triggers = _meta_string_list(clouds_coder.get("triggers"))
+            for group in globals().get("RAG_TERM_GROUPS", ()):
+                terms = [str(term).strip() for term in group if str(term).strip()]
+                if not terms:
+                    continue
+                normalized_terms = [
+                    re.sub(r"[-_]+", " ", term).casefold() for term in terms
+                ]
+                if not any(
+                    part and (part in stem or stem in part)
+                    for stem in reference_stems
+                    for term in normalized_terms
+                    for part in term.split()
+                    if len(part) >= 3
+                ):
+                    continue
+                for term in terms:
+                    if term not in triggers:
+                        triggers.append(term)
+                    for token in re.findall(r"[A-Za-z][A-Za-z0-9+#.-]{2,}", term):
+                        if token not in triggers:
+                            triggers.append(token)
+            if triggers:
+                clouds_coder["triggers"] = triggers
+            clouds_coder["entrypoints"] = entrypoints
+            meta["clouds_coder"] = clouds_coder
         # Standard SKILL.md frontmatter stays portable (name + description).
         # Clouds Coder provider/protocol extensions live in a sidecar and are
         # merged only at runtime.
@@ -20256,12 +20420,18 @@ class SkillStore:
         if cc_sidecar.exists() and cc_sidecar.is_file() and not cc_sidecar.is_symlink():
             try:
                 sidecar_raw = cc_sidecar.read_text(encoding="utf-8")
-                sidecar = _yaml.safe_load(sidecar_raw) if _yaml is not None else {}
+                if _yaml is not None:
+                    sidecar = _yaml.safe_load(sidecar_raw)
+                else:
+                    sidecar, _ = parse_front_matter(f"---\n{sidecar_raw.strip()}\n---\n")
                 if isinstance(sidecar, dict):
                     section = sidecar.get("clouds_coder", sidecar)
                     if isinstance(section, dict):
                         meta = dict(meta)
-                        meta["clouds_coder"] = dict(section)
+                        existing = meta.get("clouds_coder")
+                        merged = dict(existing) if isinstance(existing, dict) else {}
+                        merged.update(section)
+                        meta["clouds_coder"] = merged
             except Exception as exc:
                 self.warnings.append(f"{cc_sidecar}: invalid Clouds Coder sidecar: {exc}")
         name = str(meta.get("name", "")).strip() or skill_dir.name
@@ -20897,7 +21067,10 @@ class SkillStore:
             if score > 0:
                 scored.append((score, str(meta.get("canonical_id", key)), meta))
         scored.sort(key=lambda row: (-row[0], row[1].casefold()))
-        return [dict(row[2], score=round(row[0], 4)) for row in scored[: max(1, min(50, int(limit or 12)))] ]
+        return [
+            dict(row[2], score=round(row[0], 4))
+            for row in scored[: max(1, min(50, int(limit or 12)))]
+        ]
 
     metadata_recall = recall_metadata
 
@@ -25372,12 +25545,13 @@ class OllamaClient:
             return False, "unsupported media type"
         if str(self.provider or "").strip().lower() == "ollama" and mtype in {"audio", "video"}:
             return False, "ollama chat payload currently supports image attachments only"
-        sample_map = {
-            "image": (SAMPLE_IMAGE_PNG_B64, "image/png"),
-            "audio": (SAMPLE_AUDIO_WAV_B64, "audio/wav"),
-            "video": (SAMPLE_VIDEO_MP4_B64, "video/mp4"),
+        probe_map = {
+            "image": (_capability_probe_png_bytes(), "image/png"),
+            "audio": (_capability_probe_audio_bytes(), "audio/wav"),
+            "video": (_capability_probe_video_bytes(), "video/mp4"),
         }
-        data_b64, mime = sample_map[mtype]
+        probe_bytes, mime = probe_map[mtype]
+        data_b64 = base64.b64encode(probe_bytes).decode("ascii")
         prompt_map = {
             "image": "Capability probe: briefly describe this image in one sentence.",
             "audio": "Capability probe: transcribe or describe this audio in one sentence.",
@@ -31398,6 +31572,44 @@ class SessionState:
         })
         return f"Skill unloaded: {skill_name}"
 
+    def _reconcile_active_skills(self, selected: object, *, source: str = "auto") -> list[str]:
+        """Keep active skill state aligned with the current metadata selection.
+
+        Automatic focus changes are a replacement operation: explicitly pinned
+        skills remain available, while active skills from the previous focus are
+        removed when they are no longer selected.  The normal unload path is
+        used so context cleanup and lifecycle events stay consistent.
+        """
+        desired: set[str] = set()
+        rows = selected.get("selected", []) if isinstance(selected, dict) else selected
+        if isinstance(rows, dict):
+            rows = [rows]
+        for row in rows if isinstance(rows, (list, tuple, set)) else []:
+            if isinstance(row, dict):
+                value = row.get("canonical_id", row.get("id", ""))
+            else:
+                value = row
+            normalized = str(value or "").strip().casefold()
+            if normalized:
+                desired.add(normalized)
+        board = self._ensure_blackboard()
+        loaded = board.get("loaded_skills", {})
+        if not isinstance(loaded, dict):
+            return []
+        stale = [
+            str(key)
+            for key, row in loaded.items()
+            if isinstance(row, dict)
+            and str(row.get("scope", "active") or "active").strip().lower() == "active"
+            and str(key).casefold() not in desired
+        ]
+        removed: list[str] = []
+        for key in stale:
+            result = self._unload_skill(key, source=source)
+            if not str(result).startswith("Error:"):
+                removed.append(key)
+        return removed
+
     def _loaded_skills_goal_signature(self, goal_text: str) -> str:
         goal = trim(str(goal_text or ""), 1200).strip().casefold()
         if not goal:
@@ -31844,6 +32056,10 @@ class SessionState:
                 goal,
                 step=self._current_execution_step_full_text(),
                 phase=trigger or "execution",
+            )
+            self._reconcile_active_skills(
+                selection,
+                source=f"auto:{trigger or 'discovery'}",
             )
             selected_ids = [str(row.get("id", "") or "") for row in selection.get("selected", []) if isinstance(row, dict)]
             loaded_names: list[str] = []
@@ -82404,9 +82620,9 @@ h1{{font-size:20px;margin-bottom:4px}}
             # A minimal valid PNG keeps the endpoint functional in deliberately
             # dependency-free deployments. Rich content remains available from
             # the sibling Markdown/PDF exports.
-            return base64.b64decode(SAMPLE_IMAGE_PNG_B64)
+            return _capability_probe_png_bytes()
         except Exception:
-            return base64.b64decode(SAMPLE_IMAGE_PNG_B64)
+            return _capability_probe_png_bytes()
 
 class SessionManager:
     def __init__(
@@ -105955,7 +106171,7 @@ async function newFolder(){const rel=prompt('Folder path',activeDir()?`${activeD
 async function renameEntry(row){const next=normalizeUploadPath(prompt('New path',row.path)||'');if(!next||next===row.path)return;workspaceAssertNoDirtyFiles(row.path,'renaming this entry');await api(`/api/ide/sessions/${qs(S.activeSession)}/workspace/rename`,{method:'PATCH',body:JSON.stringify({root_id:S.activeRoot,old_path:row.path,new_path:next})});await remapWorkspaceOpenFiles(row.path,next);const selected=explorerSelectionRow();if(selected&&(selected.path===row.path||selected.path.startsWith(`${row.path}/`)))S.explorerSelection=Object.assign({},selected,{path:`${next}${selected.path.slice(row.path.length)}`,name:selected.path===row.path?next.split('/').pop():selected.name});const clip=S.workspaceClipboard;if(clip?.session_id===S.activeSession&&clip?.root_id===S.activeRoot&&(clip.path===row.path||clip.path.startsWith(`${row.path}/`)))S.workspaceClipboard=Object.assign({},clip,{path:`${next}${clip.path.slice(row.path.length)}`,name:clip.path===row.path?next.split('/').pop():clip.name});S.treeCache.clear();await loadTree('')}
 async function deleteEntry(row){workspaceAssertNoDirtyFiles(row.path,'deleting this entry');if(!confirm(`Delete ${row.path}? This cannot be undone.`))return;await api(`/api/ide/sessions/${qs(S.activeSession)}/workspace/file`,{method:'DELETE',body:JSON.stringify({root_id:S.activeRoot,path:row.path,recursive:true})});for(const file of workspaceOpenFilesUnder(row.path))closeFile(file.key);const selected=explorerSelectionRow();if(selected&&(selected.path===row.path||selected.path.startsWith(`${row.path}/`)))S.explorerSelection=null;if(S.workspaceClipboard?.session_id===S.activeSession&&S.workspaceClipboard?.root_id===S.activeRoot&&(S.workspaceClipboard.path===row.path||S.workspaceClipboard.path.startsWith(`${row.path}/`)))S.workspaceClipboard=null;S.treeCache.clear();await loadTree('')}
 function readFileAsB64(file){return new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(String(reader.result||'').split(',',2)[1]||'');reader.onerror=()=>reject(reader.error||new Error('Read failed'));reader.readAsDataURL(file)})}
-function normalizeUploadPath(value){let raw=String(value||'').replace(/\\/g,'/').replace(/^file:\/+/i,'');if(/^[a-z]:\//i.test(raw))raw=raw.split('/').pop()||'';return raw.split('/').filter(part=>part&&part!=='.'&&part!=='..'&&!part.includes('\0')).join('/')}
+function normalizeUploadPath(value){let raw=String(value||'').trim().replace(/\\/g,'/').replace(/^file:\/+/i,'');raw=raw.replace(/^\/+([a-z]):(?:\/|$)/i,'$1/');if(/^[a-z]:\//i.test(raw))raw=raw.slice(3);else if(/^[a-z]\//i.test(raw))raw=raw.slice(2);if(raw.startsWith('//')){const parts=raw.split('/').filter(Boolean);raw=parts.length>2?parts.slice(2).join('/'):''}return raw.split('/').filter(part=>part&&part!=='.'&&part!=='..'&&!part.includes('\0')).join('/')}
 function uploadDirectoriesFor(entries,directories=[]){const found=new Set((directories||[]).map(normalizeUploadPath).filter(Boolean));for(const entry of entries||[]){const parts=normalizeUploadPath(entry.path).split('/');parts.pop();let current='';for(const part of parts){current=current?`${current}/${part}`:part;found.add(current)}}return [...found].sort((a,b)=>a.split('/').length-b.split('/').length||a.localeCompare(b))}
 async function postUploadBatch(dest,items=[],directories=[]){return api(`/api/ide/sessions/${qs(S.activeSession)}/workspace/upload`,{method:'POST',body:JSON.stringify({root_id:S.activeRoot,dest:normalizeUploadPath(dest),items,directories})})}
 function newUploadId(){if(globalThis.crypto?.randomUUID)return `up_${crypto.randomUUID().replace(/-/g,'')}`;const bytes=new Uint8Array(20);if(globalThis.crypto?.getRandomValues)crypto.getRandomValues(bytes);else for(let i=0;i<bytes.length;i++)bytes[i]=Math.floor(Math.random()*256);return `up_${[...bytes].map(value=>value.toString(16).padStart(2,'0')).join('')}`}
@@ -106417,7 +106633,9 @@ STUDIO_MAX_JOB_SECONDS = 15 * 60
 
 
 class SkillsStudioError(Exception):
-    def __init__(self, code: str, message: str, status: int = 400, details: dict | None = None):
+    def __init__(
+        self, code: str, message: str, status: int = 400, details: dict | None = None
+    ):
         super().__init__(message)
         self.code = str(code or "studio_error")
         self.status = int(status or 400)
@@ -106432,7 +106650,11 @@ def _studio_slug(value: object, fallback: str = "skill") -> str:
     if len(text) > 63:
         text = text[:63].rstrip("-")
     if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", text):
-        raise SkillsStudioError("invalid_slug", "skill name must use lowercase letters, digits and hyphens", 400)
+        raise SkillsStudioError(
+            "invalid_slug",
+            "skill name must use lowercase letters, digits and hyphens",
+            400,
+        )
     return text
 
 
@@ -106462,12 +106684,16 @@ class SkillsStudioStore:
     _SAFE_FILE = re.compile(r"^[^/\\]+(?:/[^/\\]+)*$")
     _SECRET_PATTERNS = (
         re.compile(r"-----BEGIN [^-]+PRIVATE KEY-----", re.I),
-        re.compile(r"(?i)\\b(?:api[_-]?key|secret|password|token|authorization)\\s*[:=]"),
+        re.compile(
+            r"(?i)\\b(?:api[_-]?key|secret|password|token|authorization)\\s*[:=]"
+        ),
         re.compile(r"(?i)\\b(?:sk|rk|ghp|github_pat|xox[baprs])[-_][A-Za-z0-9_-]{12,}"),
         re.compile(r"(?i)\\bbearer\\s+[A-Za-z0-9._~+/=-]{12,}"),
     )
 
-    def __init__(self, db_path: Path, state_root: Path, skills_root: Path, crypto=None, app=None):
+    def __init__(
+        self, db_path: Path, state_root: Path, skills_root: Path, crypto=None, app=None
+    ):
         self.path = Path(db_path)
         self.state_root = Path(state_root).resolve()
         self.skills_root = Path(skills_root).resolve()
@@ -106549,9 +106775,13 @@ class SkillsStudioStore:
                 );
                 """
             )
-            columns = {str(x[1]) for x in db.execute("PRAGMA table_info(studio_sessions)")}
+            columns = {
+                str(x[1]) for x in db.execute("PRAGMA table_info(studio_sessions)")
+            }
             if "csrf_token" not in columns:
-                db.execute("ALTER TABLE studio_sessions ADD COLUMN csrf_token TEXT NOT NULL DEFAULT ''")
+                db.execute(
+                    "ALTER TABLE studio_sessions ADD COLUMN csrf_token TEXT NOT NULL DEFAULT ''"
+                )
 
     def _secret_profiles(self, value: object) -> str:
         raw = json_dumps(value if isinstance(value, dict) else {})
@@ -106576,10 +106806,25 @@ class SkillsStudioStore:
             except Exception:
                 return {}
 
-    def _audit(self, db, actor: str, action: str, project_id: str = "", submission_id: str = "", details=None):
+    def _audit(
+        self,
+        db,
+        actor: str,
+        action: str,
+        project_id: str = "",
+        submission_id: str = "",
+        details=None,
+    ):
         db.execute(
             "INSERT INTO studio_audit(actor,action,project_id,submission_id,details_json,created_at) VALUES(?,?,?,?,?,?)",
-            (str(actor or "system")[:160], str(action or "")[:120], project_id, submission_id, json_dumps(details or {}), now_ts()),
+            (
+                str(actor or "system")[:160],
+                str(action or "")[:120],
+                project_id,
+                submission_id,
+                json_dumps(details or {}),
+                now_ts(),
+            ),
         )
 
     def _project_root(self, device_id: str, project_id: str) -> Path:
@@ -106588,15 +106833,25 @@ class SkillsStudioStore:
         root.mkdir(parents=True, exist_ok=True)
         return root
 
-    def _safe_path(self, project: sqlite3.Row | dict, rel: object, *, allow_empty: bool = False) -> tuple[str, Path]:
-        text = unicodedata.normalize("NFKC", str(rel or "")).replace("\\", "/").strip("/")
+    def _safe_path(
+        self, project: sqlite3.Row | dict, rel: object, *, allow_empty: bool = False
+    ) -> tuple[str, Path]:
+        text = (
+            unicodedata.normalize("NFKC", str(rel or "")).replace("\\", "/").strip("/")
+        )
         if not text and allow_empty:
             return "", self._project_root(str(project["device_id"]), str(project["id"]))
         if not text or text.startswith("/") or "\x00" in text:
             raise SkillsStudioError("invalid_path", "file path must be relative", 400)
         parts = PurePosixPath(text).parts
-        if not parts or any(p in {"", ".", ".."} for p in parts) or not self._SAFE_FILE.fullmatch(text):
-            raise SkillsStudioError("invalid_path", "path traversal is not allowed", 400)
+        if (
+            not parts
+            or any(p in {"", ".", ".."} for p in parts)
+            or not self._SAFE_FILE.fullmatch(text)
+        ):
+            raise SkillsStudioError(
+                "invalid_path", "path traversal is not allowed", 400
+            )
         if len(text) > 240:
             raise SkillsStudioError("invalid_path", "path is too long", 400)
         root = self._project_root(str(project["device_id"]), str(project["id"]))
@@ -106605,7 +106860,9 @@ class SkillsStudioStore:
         for part in parts:
             current = current / part
             if current.is_symlink():
-                raise SkillsStudioError("symlink_blocked", "symlink paths are not allowed", 400)
+                raise SkillsStudioError(
+                    "symlink_blocked", "symlink paths are not allowed", 400
+                )
         candidate = (root / Path(*parts)).resolve()
         try:
             candidate.relative_to(root)
@@ -106626,8 +106883,15 @@ class SkillsStudioStore:
 
     @staticmethod
     def _project_public(row, *, include_private: bool = True) -> dict:
-        out = {"id": row["id"], "slug": row["slug"], "title": row["title"], "status": row["status"],
-               "revision": int(row["revision"] or 0), "created_at": float(row["created_at"] or 0), "updated_at": float(row["updated_at"] or 0)}
+        out = {
+            "id": row["id"],
+            "slug": row["slug"],
+            "title": row["title"],
+            "status": row["status"],
+            "revision": int(row["revision"] or 0),
+            "created_at": float(row["created_at"] or 0),
+            "updated_at": float(row["updated_at"] or 0),
+        }
         try:
             out["summary"] = json.loads(row["summary_json"] or "{}")
         except Exception:
@@ -106636,29 +106900,66 @@ class SkillsStudioStore:
             out["device_id"] = row["device_id"]
         return out
 
-    def _snapshot(self, db, project_id: str, *, device_id: str | None = None, freeze: bool = False) -> dict:
+    def _snapshot(
+        self, db, project_id: str, *, device_id: str | None = None, freeze: bool = False
+    ) -> dict:
         project = self._row_project(db, project_id, device_id)
         files = []
-        for row in db.execute("SELECT path,content,is_binary,mime,size,digest FROM studio_files WHERE project_id=? ORDER BY path", (project_id,)):
+        for row in db.execute(
+            "SELECT path,content,is_binary,mime,size,digest FROM studio_files WHERE project_id=? ORDER BY path",
+            (project_id,),
+        ):
             raw = bytes(row["content"] or b"")
-            files.append({"path": row["path"], "content_b64": base64.b64encode(raw).decode("ascii"),
-                          "is_binary": bool(row["is_binary"]), "mime": row["mime"], "size": int(row["size"] or len(raw)), "digest": row["digest"]})
-        snapshot = {"project": self._project_public(project, include_private=False), "files": files}
+            files.append(
+                {
+                    "path": row["path"],
+                    "content_b64": base64.b64encode(raw).decode("ascii"),
+                    "is_binary": bool(row["is_binary"]),
+                    "mime": row["mime"],
+                    "size": int(row["size"] or len(raw)),
+                    "digest": row["digest"],
+                }
+            )
+        snapshot = {
+            "project": self._project_public(project, include_private=False),
+            "files": files,
+        }
         if freeze:
             snapshot["frozen_at"] = now_ts()
         return snapshot
 
-    def _ensure_initial_files(self, db, project_id: str, slug: str, title: str, description: str = ""):
-        exists = db.execute("SELECT 1 FROM studio_files WHERE project_id=? LIMIT 1", (project_id,)).fetchone()
+    def _ensure_initial_files(
+        self, db, project_id: str, slug: str, title: str, description: str = ""
+    ):
+        exists = db.execute(
+            "SELECT 1 FROM studio_files WHERE project_id=? LIMIT 1", (project_id,)
+        ).fetchone()
         if exists:
             return
-        desc = description.strip() or f"Use this skill when the user asks for {title.lower()} tasks."
+        desc = (
+            description.strip()
+            or f"Use this skill when the user asks for {title.lower()} tasks."
+        )
         md = f"---\nname: {slug}\ndescription: {desc}\n---\n\n# {title}\n\n## Workflow\n\n1. Clarify the requested outcome and constraints.\n2. Execute the smallest safe workflow.\n3. Verify the output against the stated contract.\n"
         yaml = self._openai_yaml(title, slug, desc)
         now = now_ts()
-        for path, content, mime in (("SKILL.md", md.encode(), "text/markdown"), ("agents/openai.yaml", yaml.encode(), "text/yaml")):
-            db.execute("INSERT INTO studio_files(project_id,path,content,is_binary,mime,size,digest,updated_at) VALUES(?,?,?,?,?,?,?,?)",
-                       (project_id, path, content, 0, mime, len(content), _studio_hash(content.decode()), now))
+        for path, content, mime in (
+            ("SKILL.md", md.encode(), "text/markdown"),
+            ("agents/openai.yaml", yaml.encode(), "text/yaml"),
+        ):
+            db.execute(
+                "INSERT INTO studio_files(project_id,path,content,is_binary,mime,size,digest,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    project_id,
+                    path,
+                    content,
+                    0,
+                    mime,
+                    len(content),
+                    _studio_hash(content.decode()),
+                    now,
+                ),
+            )
 
     @staticmethod
     def _openai_yaml(title: str, slug: str, description: str) -> str:
@@ -106676,21 +106977,46 @@ class SkillsStudioStore:
             f"  default_prompt: {json.dumps(prompt, ensure_ascii=False)}\n"
         )
 
-    def assert_revision(self, device_id: str, project_id: str, expected_revision: object) -> int:
+    def assert_revision(
+        self, device_id: str, project_id: str, expected_revision: object
+    ) -> int:
         if expected_revision in {None, ""}:
-            raise SkillsStudioError("expected_revision_required", "expected_revision is required", 400)
-        try: expected = int(expected_revision)
-        except Exception: raise SkillsStudioError("expected_revision_required", "expected_revision must be an integer", 400)
+            raise SkillsStudioError(
+                "expected_revision_required", "expected_revision is required", 400
+            )
+        try:
+            expected = int(expected_revision)
+        except Exception:
+            raise SkillsStudioError(
+                "expected_revision_required",
+                "expected_revision must be an integer",
+                400,
+            )
         with self.lock, self._connect() as db:
-            project = self._row_project(db, project_id, device_id); current = int(project["revision"] or 0)
+            project = self._row_project(db, project_id, device_id)
+            current = int(project["revision"] or 0)
         if expected != current:
-            raise SkillsStudioError("revision_conflict", "project changed in another tab", 409, {"current_revision": current})
+            raise SkillsStudioError(
+                "revision_conflict",
+                "project changed in another tab",
+                409,
+                {"current_revision": current},
+            )
         return current
 
-    def bootstrap(self, client_ip: str, device_cookie: str = "", session_cookie: str = "") -> dict:
+    def bootstrap(
+        self, client_ip: str, device_cookie: str = "", session_cookie: str = ""
+    ) -> dict:
         now = now_ts()
         with self.lock, self._connect() as db:
-            device = db.execute("SELECT * FROM studio_devices WHERE credential_hash=? AND expires_at>?", (_studio_hash(device_cookie), now)).fetchone() if device_cookie else None
+            device = (
+                db.execute(
+                    "SELECT * FROM studio_devices WHERE credential_hash=? AND expires_at>?",
+                    (_studio_hash(device_cookie), now),
+                ).fetchone()
+                if device_cookie
+                else None
+            )
             created = False
             if device is None:
                 device_id = uuid.uuid4().hex
@@ -106701,57 +107027,121 @@ class SkillsStudioStore:
                 if self.app is not None:
                     try:
                         mgr = self.app.manager_for_user(user_id_from_ip(client_ip))
-                        profiles = {"profiles": getattr(mgr, "user_model_profiles", {}), "active_profile_id": getattr(mgr, "user_active_profile_id", "")}
+                        profiles = {
+                            "profiles": getattr(mgr, "user_model_profiles", {}),
+                            "active_profile_id": getattr(
+                                mgr, "user_active_profile_id", ""
+                            ),
+                        }
                     except Exception:
                         profiles = {}
-                db.execute("INSERT INTO studio_devices(id,credential_hash,created_at,expires_at,last_ip,profiles_enc,profile_migrated) VALUES(?,?,?,?,?,?,1)",
-                           (device_id, _studio_hash(credential), now, now + STUDIO_DEVICE_TTL, _normalize_ip(client_ip), self._secret_profiles(profiles)))
-                device = db.execute("SELECT * FROM studio_devices WHERE id=?", (device_id,)).fetchone()
+                db.execute(
+                    "INSERT INTO studio_devices(id,credential_hash,created_at,expires_at,last_ip,profiles_enc,profile_migrated) VALUES(?,?,?,?,?,?,1)",
+                    (
+                        device_id,
+                        _studio_hash(credential),
+                        now,
+                        now + STUDIO_DEVICE_TTL,
+                        _normalize_ip(client_ip),
+                        self._secret_profiles(profiles),
+                    ),
+                )
+                device = db.execute(
+                    "SELECT * FROM studio_devices WHERE id=?", (device_id,)
+                ).fetchone()
                 created = True
             else:
                 credential = device_cookie
-                db.execute("UPDATE studio_devices SET last_ip=? WHERE id=?", (_normalize_ip(client_ip), device["id"]))
+                db.execute(
+                    "UPDATE studio_devices SET last_ip=? WHERE id=?",
+                    (_normalize_ip(client_ip), device["id"]),
+                )
             session = None
             if session_cookie:
-                session = db.execute("SELECT * FROM studio_sessions WHERE token_hash=? AND device_id=? AND expires_at>?", (_studio_hash(session_cookie), device["id"], now)).fetchone()
+                session = db.execute(
+                    "SELECT * FROM studio_sessions WHERE token_hash=? AND device_id=? AND expires_at>?",
+                    (_studio_hash(session_cookie), device["id"], now),
+                ).fetchone()
             if session is None:
                 session_token = "sess_" + secrets.token_urlsafe(32)
                 csrf = secrets.token_urlsafe(24)
                 sid = uuid.uuid4().hex
-                db.execute("DELETE FROM studio_sessions WHERE device_id=? OR expires_at<=?", (device["id"], now))
-                db.execute("INSERT INTO studio_sessions(id,device_id,token_hash,csrf_hash,csrf_token,created_at,expires_at) VALUES(?,?,?,?,?,?,?)",
-                           (sid, device["id"], _studio_hash(session_token), _studio_hash(csrf), csrf, now, now + STUDIO_SESSION_TTL))
-                session = db.execute("SELECT * FROM studio_sessions WHERE id=?", (sid,)).fetchone()
+                db.execute(
+                    "DELETE FROM studio_sessions WHERE device_id=? OR expires_at<=?",
+                    (device["id"], now),
+                )
+                db.execute(
+                    "INSERT INTO studio_sessions(id,device_id,token_hash,csrf_hash,csrf_token,created_at,expires_at) VALUES(?,?,?,?,?,?,?)",
+                    (
+                        sid,
+                        device["id"],
+                        _studio_hash(session_token),
+                        _studio_hash(csrf),
+                        csrf,
+                        now,
+                        now + STUDIO_SESSION_TTL,
+                    ),
+                )
+                session = db.execute(
+                    "SELECT * FROM studio_sessions WHERE id=?", (sid,)
+                ).fetchone()
             else:
                 session_token = session_cookie
                 csrf = str(session["csrf_token"] or "")
-            projects = [self._project_public(x, include_private=False) for x in db.execute("SELECT * FROM studio_projects WHERE device_id=? ORDER BY updated_at DESC", (device["id"],))]
+            projects = [
+                self._project_public(x, include_private=False)
+                for x in db.execute(
+                    "SELECT * FROM studio_projects WHERE device_id=? ORDER BY updated_at DESC",
+                    (device["id"],),
+                )
+            ]
             if not csrf:
                 csrf = "csrf_" + secrets.token_urlsafe(24)
-            db.execute("UPDATE studio_sessions SET csrf_hash=?,csrf_token=?,expires_at=? WHERE id=?", (_studio_hash(csrf), csrf, now + STUDIO_SESSION_TTL, session["id"]))
-            return {"ok": True, "device_id": device["id"], "device_created": created, "session_expires_at": now + STUDIO_SESSION_TTL,
-                    "csrf_token": csrf, "projects": projects, "profile": self.profile(device["id"], db=db),
-                    "cookies": {"device": credential, "session": session_token}}
+            db.execute(
+                "UPDATE studio_sessions SET csrf_hash=?,csrf_token=?,expires_at=? WHERE id=?",
+                (_studio_hash(csrf), csrf, now + STUDIO_SESSION_TTL, session["id"]),
+            )
+            return {
+                "ok": True,
+                "device_id": device["id"],
+                "device_created": created,
+                "session_expires_at": now + STUDIO_SESSION_TTL,
+                "csrf_token": csrf,
+                "projects": projects,
+                "profile": self.profile(device["id"], db=db),
+                "cookies": {"device": credential, "session": session_token},
+            }
 
     def _auth(self, headers, client_ip: str, *, write: bool = False):
         device_cookie = _studio_cookie_value(headers, STUDIO_DEVICE_COOKIE)
         session_cookie = _studio_cookie_value(headers, STUDIO_SESSION_COOKIE)
         now = now_ts()
         if not device_cookie or not session_cookie:
-            raise SkillsStudioError("studio_auth_required", "Skills Studio session required", 401)
+            raise SkillsStudioError(
+                "studio_auth_required", "Skills Studio session required", 401
+            )
         with self.lock, self._connect() as db:
-            row = db.execute("SELECT d.*,s.id AS session_id,s.csrf_hash,s.expires_at AS session_expires FROM studio_devices d JOIN studio_sessions s ON s.device_id=d.id WHERE d.credential_hash=? AND s.token_hash=? AND d.expires_at>? AND s.expires_at>?", (_studio_hash(device_cookie), _studio_hash(session_cookie), now, now)).fetchone()
+            row = db.execute(
+                "SELECT d.*,s.id AS session_id,s.csrf_hash,s.expires_at AS session_expires FROM studio_devices d JOIN studio_sessions s ON s.device_id=d.id WHERE d.credential_hash=? AND s.token_hash=? AND d.expires_at>? AND s.expires_at>?",
+                (_studio_hash(device_cookie), _studio_hash(session_cookie), now, now),
+            ).fetchone()
             if row is None:
-                raise SkillsStudioError("studio_auth_required", "Skills Studio session expired", 401)
+                raise SkillsStudioError(
+                    "studio_auth_required", "Skills Studio session expired", 401
+                )
             if write:
                 origin = str(headers.get("Origin", "") or "").strip()
                 host = str(headers.get("Host", "") or "").strip()
                 if origin:
                     parsed = urlparse(origin)
                     if parsed.scheme not in {"http", "https"} or parsed.netloc != host:
-                        raise SkillsStudioError("cross_origin", "cross-origin write rejected", 403)
+                        raise SkillsStudioError(
+                            "cross_origin", "cross-origin write rejected", 403
+                        )
                 csrf = str(headers.get("X-CSRF-Token", "") or "").strip()
-                if not csrf or not hmac.compare_digest(_studio_hash(csrf), str(row["csrf_hash"] or "")):
+                if not csrf or not hmac.compare_digest(
+                    _studio_hash(csrf), str(row["csrf_hash"] or "")
+                ):
                     raise SkillsStudioError("csrf_failed", "CSRF token required", 403)
             return row
 
@@ -106759,7 +107149,9 @@ class SkillsStudioStore:
         own = db is None
         db = db or self._connect()
         try:
-            row = db.execute("SELECT profiles_enc FROM studio_devices WHERE id=?", (device_id,)).fetchone()
+            row = db.execute(
+                "SELECT profiles_enc FROM studio_devices WHERE id=?", (device_id,)
+            ).fetchone()
             profiles = self._load_profiles(row[0] if row else "")
             items = profiles.get("profiles", {}) if isinstance(profiles, dict) else {}
             safe = []
@@ -106767,27 +107159,75 @@ class SkillsStudioStore:
                 for pid, value in items.items():
                     if not isinstance(value, dict):
                         continue
-                    safe.append({"id": str(pid), "provider": str(value.get("provider", "") or ""), "model": str(value.get("model", "") or ""), "configured": bool(value.get("api_key") or value.get("key") or value.get("base_url"))})
-            return {"profiles": safe, "active_profile_id": str(profiles.get("active_profile_id", "") or "") if isinstance(profiles, dict) else ""}
+                    safe.append(
+                        {
+                            "id": str(pid),
+                            "provider": str(value.get("provider", "") or ""),
+                            "model": str(value.get("model", "") or ""),
+                            "configured": bool(
+                                value.get("api_key")
+                                or value.get("key")
+                                or value.get("base_url")
+                            ),
+                        }
+                    )
+            return {
+                "profiles": safe,
+                "active_profile_id": str(profiles.get("active_profile_id", "") or "")
+                if isinstance(profiles, dict)
+                else "",
+            }
         finally:
             if own:
                 db.close()
 
     def list_projects(self, device_id: str) -> list[dict]:
         with self.lock, self._connect() as db:
-            return [self._project_public(x, include_private=False) for x in db.execute("SELECT * FROM studio_projects WHERE device_id=? ORDER BY updated_at DESC", (device_id,))]
+            return [
+                self._project_public(x, include_private=False)
+                for x in db.execute(
+                    "SELECT * FROM studio_projects WHERE device_id=? ORDER BY updated_at DESC",
+                    (device_id,),
+                )
+            ]
 
     def create_project(self, device_id: str, payload: dict) -> dict:
-        title = unicodedata.normalize("NFKC", str(payload.get("title") or payload.get("name") or "New Skill")).strip()[:120]
+        title = unicodedata.normalize(
+            "NFKC", str(payload.get("title") or payload.get("name") or "New Skill")
+        ).strip()[:120]
         slug = _studio_slug(payload.get("slug") or payload.get("name") or title)
-        summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
-        now = now_ts(); pid = uuid.uuid4().hex
+        summary = (
+            payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+        )
+        now = now_ts()
+        pid = uuid.uuid4().hex
         root = self._project_root(device_id, pid)
         with self.lock, self._connect() as db:
-            if db.execute("SELECT 1 FROM studio_projects WHERE device_id=? AND slug=?", (device_id, slug)).fetchone():
-                raise SkillsStudioError("slug_taken", "project name already exists on this device", 409)
-            db.execute("INSERT INTO studio_projects(id,device_id,slug,title,status,summary_json,root_path,revision,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)", (pid, device_id, slug, title or slug, "draft", json_dumps(summary), str(root), 0, now, now))
-            self._ensure_initial_files(db, pid, slug, title or slug, str(summary.get("description", "")))
+            if db.execute(
+                "SELECT 1 FROM studio_projects WHERE device_id=? AND slug=?",
+                (device_id, slug),
+            ).fetchone():
+                raise SkillsStudioError(
+                    "slug_taken", "project name already exists on this device", 409
+                )
+            db.execute(
+                "INSERT INTO studio_projects(id,device_id,slug,title,status,summary_json,root_path,revision,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    pid,
+                    device_id,
+                    slug,
+                    title or slug,
+                    "draft",
+                    json_dumps(summary),
+                    str(root),
+                    0,
+                    now,
+                    now,
+                ),
+            )
+            self._ensure_initial_files(
+                db, pid, slug, title or slug, str(summary.get("description", ""))
+            )
             self._audit(db, device_id, "project_created", pid, details={"slug": slug})
             row = self._row_project(db, pid, device_id)
             return self._project_public(row, include_private=False)
@@ -106796,136 +107236,442 @@ class SkillsStudioStore:
         with self.lock, self._connect() as db:
             p = self._row_project(db, project_id, device_id)
             out = self._project_public(p, include_private=False)
-            out["files"] = [{"path": x["path"], "size": int(x["size"] or 0), "is_binary": bool(x["is_binary"]), "mime": x["mime"], "digest": x["digest"]} for x in db.execute("SELECT path,size,is_binary,mime,digest FROM studio_files WHERE project_id=? ORDER BY path", (project_id,))]
+            out["files"] = [
+                {
+                    "path": x["path"],
+                    "size": int(x["size"] or 0),
+                    "is_binary": bool(x["is_binary"]),
+                    "mime": x["mime"],
+                    "digest": x["digest"],
+                }
+                for x in db.execute(
+                    "SELECT path,size,is_binary,mime,digest FROM studio_files WHERE project_id=? ORDER BY path",
+                    (project_id,),
+                )
+            ]
             out["validation"] = self.validate(device_id, project_id, db=db)
             return out
 
     def read_file(self, device_id: str, project_id: str, rel: str) -> dict:
         with self.lock, self._connect() as db:
-            p = self._row_project(db, project_id, device_id); path, _ = self._safe_path(p, rel)
-            row = db.execute("SELECT * FROM studio_files WHERE project_id=? AND path=?", (project_id, path)).fetchone()
+            p = self._row_project(db, project_id, device_id)
+            path, _ = self._safe_path(p, rel)
+            row = db.execute(
+                "SELECT * FROM studio_files WHERE project_id=? AND path=?",
+                (project_id, path),
+            ).fetchone()
             if row is None:
                 raise SkillsStudioError("file_not_found", "file not found", 404)
             raw = bytes(row["content"] or b"")
-            return {"path": path, "content_b64": base64.b64encode(raw).decode("ascii"), "content": raw.decode("utf-8", errors="replace") if not row["is_binary"] else "", "is_binary": bool(row["is_binary"]), "mime": row["mime"], "size": int(row["size"] or len(raw)), "digest": row["digest"], "revision": int(p["revision"] or 0)}
+            return {
+                "path": path,
+                "content_b64": base64.b64encode(raw).decode("ascii"),
+                "content": raw.decode("utf-8", errors="replace")
+                if not row["is_binary"]
+                else "",
+                "is_binary": bool(row["is_binary"]),
+                "mime": row["mime"],
+                "size": int(row["size"] or len(raw)),
+                "digest": row["digest"],
+                "revision": int(p["revision"] or 0),
+            }
 
-    def write_file(self, device_id: str, project_id: str, rel: str, raw: bytes, *, is_binary=False, mime="", expected_revision=None, delete=False) -> dict:
+    def write_file(
+        self,
+        device_id: str,
+        project_id: str,
+        rel: str,
+        raw: bytes,
+        *,
+        is_binary=False,
+        mime="",
+        expected_revision=None,
+        delete=False,
+    ) -> dict:
         if len(raw) > STUDIO_MAX_FILE_BYTES:
-            raise SkillsStudioError("file_too_large", "file exceeds the 10MB limit", 413)
+            raise SkillsStudioError(
+                "file_too_large", "file exceeds the 10MB limit", 413
+            )
         with self.lock, self._connect() as db:
             p = self._row_project(db, project_id, device_id)
             current = int(p["revision"] or 0)
             if expected_revision is not None and int(expected_revision) != current:
-                raise SkillsStudioError("revision_conflict", "project changed in another tab", 409, {"current_revision": current})
+                raise SkillsStudioError(
+                    "revision_conflict",
+                    "project changed in another tab",
+                    409,
+                    {"current_revision": current},
+                )
             if str(p["status"]) in {"approved", "published", "unpublished"}:
-                raise SkillsStudioError("project_immutable", "published projects cannot be edited", 409)
+                raise SkillsStudioError(
+                    "project_immutable", "published projects cannot be edited", 409
+                )
             path, target = self._safe_path(p, rel)
             if delete:
-                db.execute("DELETE FROM studio_files WHERE project_id=? AND path=?", (project_id, path))
+                db.execute(
+                    "DELETE FROM studio_files WHERE project_id=? AND path=?",
+                    (project_id, path),
+                )
                 try:
-                    if target.exists() and target.is_file(): target.unlink()
-                except Exception: pass
+                    if target.exists() and target.is_file():
+                        target.unlink()
+                except Exception:
+                    pass
             else:
-                count_row = db.execute("SELECT COUNT(*) AS n,COALESCE(SUM(size),0) AS total FROM studio_files WHERE project_id=?", (project_id,)).fetchone()
-                old_row = db.execute("SELECT size FROM studio_files WHERE project_id=? AND path=?", (project_id, path)).fetchone()
+                count_row = db.execute(
+                    "SELECT COUNT(*) AS n,COALESCE(SUM(size),0) AS total FROM studio_files WHERE project_id=?",
+                    (project_id,),
+                ).fetchone()
+                old_row = db.execute(
+                    "SELECT size FROM studio_files WHERE project_id=? AND path=?",
+                    (project_id, path),
+                ).fetchone()
                 if old_row is None and int(count_row["n"] or 0) >= STUDIO_MAX_FILES:
-                    raise SkillsStudioError("too_many_files", "project exceeds the 256 file limit", 413)
-                projected = int(count_row["total"] or 0) - int(old_row["size"] or 0) if old_row else int(count_row["total"] or 0)
+                    raise SkillsStudioError(
+                        "too_many_files", "project exceeds the 256 file limit", 413
+                    )
+                projected = (
+                    int(count_row["total"] or 0) - int(old_row["size"] or 0)
+                    if old_row
+                    else int(count_row["total"] or 0)
+                )
                 if projected + len(raw) > STUDIO_MAX_PROJECT_BYTES:
-                    raise SkillsStudioError("project_too_large", "project exceeds the 50MB limit", 413)
+                    raise SkillsStudioError(
+                        "project_too_large", "project exceeds the 50MB limit", 413
+                    )
                 digest = hashlib.sha256(raw).hexdigest()
-                db.execute("INSERT INTO studio_files(project_id,path,content,is_binary,mime,size,digest,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(project_id,path) DO UPDATE SET content=excluded.content,is_binary=excluded.is_binary,mime=excluded.mime,size=excluded.size,digest=excluded.digest,updated_at=excluded.updated_at", (project_id, path, sqlite3.Binary(raw), int(bool(is_binary)), str(mime or "")[:160], len(raw), digest, now_ts()))
+                db.execute(
+                    "INSERT INTO studio_files(project_id,path,content,is_binary,mime,size,digest,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(project_id,path) DO UPDATE SET content=excluded.content,is_binary=excluded.is_binary,mime=excluded.mime,size=excluded.size,digest=excluded.digest,updated_at=excluded.updated_at",
+                    (
+                        project_id,
+                        path,
+                        sqlite3.Binary(raw),
+                        int(bool(is_binary)),
+                        str(mime or "")[:160],
+                        len(raw),
+                        digest,
+                        now_ts(),
+                    ),
+                )
                 target.parent.mkdir(parents=True, exist_ok=True)
                 tmp = target.with_name("." + target.name + ".tmp-" + uuid.uuid4().hex)
-                tmp.write_bytes(raw); os.replace(tmp, target)
+                tmp.write_bytes(raw)
+                os.replace(tmp, target)
             new_revision = current + 1
-            db.execute("UPDATE studio_projects SET revision=?,status=CASE WHEN status='submitted' THEN 'draft' ELSE status END,updated_at=? WHERE id=?", (new_revision, now_ts(), project_id))
-            self._audit(db, device_id, "file_written", project_id, details={"path": path, "revision": new_revision, "deleted": bool(delete)})
-            return {"ok": True, "path": path, "revision": new_revision, "digest": _studio_hash(raw)}
+            db.execute(
+                "UPDATE studio_projects SET revision=?,status=CASE WHEN status='submitted' THEN 'draft' ELSE status END,updated_at=? WHERE id=?",
+                (new_revision, now_ts(), project_id),
+            )
+            self._audit(
+                db,
+                device_id,
+                "file_written",
+                project_id,
+                details={
+                    "path": path,
+                    "revision": new_revision,
+                    "deleted": bool(delete),
+                },
+            )
+            return {
+                "ok": True,
+                "path": path,
+                "revision": new_revision,
+                "digest": _studio_hash(raw),
+            }
 
-    def rename_file(self, device_id: str, project_id: str, old_rel: str, new_rel: str, *, expected_revision=None) -> dict:
+    def rename_file(
+        self,
+        device_id: str,
+        project_id: str,
+        old_rel: str,
+        new_rel: str,
+        *,
+        expected_revision=None,
+    ) -> dict:
         with self.lock, self._connect() as db:
-            p = self._row_project(db, project_id, device_id); current = int(p["revision"] or 0)
+            p = self._row_project(db, project_id, device_id)
+            current = int(p["revision"] or 0)
             if expected_revision is not None and int(expected_revision) != current:
-                raise SkillsStudioError("revision_conflict", "project changed in another tab", 409, {"current_revision": current})
-            old_path, old_target = self._safe_path(p, old_rel); new_path, new_target = self._safe_path(p, new_rel)
-            row = db.execute("SELECT * FROM studio_files WHERE project_id=? AND path=?", (project_id, old_path)).fetchone()
-            if row is None: raise SkillsStudioError("file_not_found", "file not found", 404)
-            if db.execute("SELECT 1 FROM studio_files WHERE project_id=? AND path=?", (project_id, new_path)).fetchone(): raise SkillsStudioError("file_exists", "destination already exists", 409)
-            db.execute("UPDATE studio_files SET path=?,updated_at=? WHERE project_id=? AND path=?", (new_path, now_ts(), project_id, old_path)); new_target.parent.mkdir(parents=True, exist_ok=True)
-            if old_target.exists(): os.replace(old_target, new_target)
-            revision = current + 1; db.execute("UPDATE studio_projects SET revision=?,status=CASE WHEN status='submitted' THEN 'draft' ELSE status END,updated_at=? WHERE id=?", (revision, now_ts(), project_id)); self._audit(db, device_id, "file_renamed", project_id, details={"from": old_path, "to": new_path, "revision": revision}); return {"ok": True, "path": new_path, "revision": revision}
+                raise SkillsStudioError(
+                    "revision_conflict",
+                    "project changed in another tab",
+                    409,
+                    {"current_revision": current},
+                )
+            old_path, old_target = self._safe_path(p, old_rel)
+            new_path, new_target = self._safe_path(p, new_rel)
+            row = db.execute(
+                "SELECT * FROM studio_files WHERE project_id=? AND path=?",
+                (project_id, old_path),
+            ).fetchone()
+            if row is None:
+                raise SkillsStudioError("file_not_found", "file not found", 404)
+            if db.execute(
+                "SELECT 1 FROM studio_files WHERE project_id=? AND path=?",
+                (project_id, new_path),
+            ).fetchone():
+                raise SkillsStudioError(
+                    "file_exists", "destination already exists", 409
+                )
+            db.execute(
+                "UPDATE studio_files SET path=?,updated_at=? WHERE project_id=? AND path=?",
+                (new_path, now_ts(), project_id, old_path),
+            )
+            new_target.parent.mkdir(parents=True, exist_ok=True)
+            if old_target.exists():
+                os.replace(old_target, new_target)
+            revision = current + 1
+            db.execute(
+                "UPDATE studio_projects SET revision=?,status=CASE WHEN status='submitted' THEN 'draft' ELSE status END,updated_at=? WHERE id=?",
+                (revision, now_ts(), project_id),
+            )
+            self._audit(
+                db,
+                device_id,
+                "file_renamed",
+                project_id,
+                details={"from": old_path, "to": new_path, "revision": revision},
+            )
+            return {"ok": True, "path": new_path, "revision": revision}
 
     def _validate_snapshot(self, snapshot: dict) -> dict:
-        errors: list[dict] = []; warnings: list[dict] = []; files = snapshot.get("files", []) if isinstance(snapshot, dict) else []
+        errors: list[dict] = []
+        warnings: list[dict] = []
+        files = snapshot.get("files", []) if isinstance(snapshot, dict) else []
         fmap = {str(x.get("path")): x for x in files if isinstance(x, dict)}
         skill = fmap.get("SKILL.md")
         if not skill:
-            errors.append({"code": "missing_skill_md", "message": "SKILL.md is required"})
-        else:
-            try: raw = base64.b64decode(str(skill.get("content_b64", "")), validate=True).decode("utf-8")
-            except Exception: raw = ""
-            meta, body = parse_front_matter(raw)
-            if not meta: errors.append({"code": "invalid_frontmatter", "message": "SKILL.md must have YAML frontmatter"})
-            allowed = {"name", "description"}; extra = sorted(k for k in meta if k not in allowed)
-            if extra: errors.append({"code": "frontmatter_keys", "message": "frontmatter may contain only name and description", "keys": extra})
-            name = str(meta.get("name", "") or "").strip()
-            desc = str(meta.get("description", "") or "").strip()
-            if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", name): errors.append({"code": "invalid_name", "message": "name must be lowercase hyphen-case"})
-            if len(desc) < 20 or len(desc) > 1024: errors.append({"code": "description_length", "message": "description must be 20-1024 characters"})
-            if len(body.splitlines()) > 500: warnings.append({"code": "long_body", "message": "keep SKILL.md under 500 lines for progressive disclosure"})
-        if "agents/openai.yaml" not in fmap: errors.append({"code": "missing_openai_yaml", "message": "agents/openai.yaml is required"})
+            errors.append(
+                {"code": "missing_skill_md", "message": "SKILL.md is required"}
+            )
         else:
             try:
-                text = base64.b64decode(str(fmap["agents/openai.yaml"].get("content_b64", "")), validate=True).decode("utf-8")
-                parsed = _yaml.safe_load(text) if _yaml is not None else parse_front_matter("---\n" + text + "\n---\n")[0]
-                if not isinstance(parsed, dict): raise ValueError("mapping required")
+                raw = base64.b64decode(
+                    str(skill.get("content_b64", "")), validate=True
+                ).decode("utf-8")
+            except Exception:
+                raw = ""
+            meta, body = parse_front_matter(raw)
+            if not meta:
+                errors.append(
+                    {
+                        "code": "invalid_frontmatter",
+                        "message": "SKILL.md must have YAML frontmatter",
+                    }
+                )
+            allowed = {"name", "description"}
+            extra = sorted(k for k in meta if k not in allowed)
+            if extra:
+                errors.append(
+                    {
+                        "code": "frontmatter_keys",
+                        "message": "frontmatter may contain only name and description",
+                        "keys": extra,
+                    }
+                )
+            name = str(meta.get("name", "") or "").strip()
+            desc = str(meta.get("description", "") or "").strip()
+            if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", name):
+                errors.append(
+                    {
+                        "code": "invalid_name",
+                        "message": "name must be lowercase hyphen-case",
+                    }
+                )
+            if len(desc) < 20 or len(desc) > 1024:
+                errors.append(
+                    {
+                        "code": "description_length",
+                        "message": "description must be 20-1024 characters",
+                    }
+                )
+            if len(body.splitlines()) > 500:
+                warnings.append(
+                    {
+                        "code": "long_body",
+                        "message": "keep SKILL.md under 500 lines for progressive disclosure",
+                    }
+                )
+        if "agents/openai.yaml" not in fmap:
+            errors.append(
+                {
+                    "code": "missing_openai_yaml",
+                    "message": "agents/openai.yaml is required",
+                }
+            )
+        else:
+            try:
+                text = base64.b64decode(
+                    str(fmap["agents/openai.yaml"].get("content_b64", "")),
+                    validate=True,
+                ).decode("utf-8")
+                parsed = (
+                    _yaml.safe_load(text)
+                    if _yaml is not None
+                    else parse_front_matter("---\n" + text + "\n---\n")[0]
+                )
+                if not isinstance(parsed, dict):
+                    raise ValueError("mapping required")
                 interface = parsed.get("interface", parsed)
-                if not isinstance(interface, dict): raise ValueError("interface mapping required")
+                if not isinstance(interface, dict):
+                    raise ValueError("interface mapping required")
                 prompt = str(interface.get("default_prompt", "") or "")
-                display = str(interface.get("display_name", "") or "").strip(); short = str(interface.get("short_description", "") or "").strip()
-                if not display: errors.append({"code": "openai_display_name", "message": "interface.display_name is required"})
-                if not (25 <= len(short) <= 64): errors.append({"code": "openai_short_description", "message": "short_description must be 25-64 characters"})
+                display = str(interface.get("display_name", "") or "").strip()
+                short = str(interface.get("short_description", "") or "").strip()
+                if not display:
+                    errors.append(
+                        {
+                            "code": "openai_display_name",
+                            "message": "interface.display_name is required",
+                        }
+                    )
+                if not (25 <= len(short) <= 64):
+                    errors.append(
+                        {
+                            "code": "openai_short_description",
+                            "message": "short_description must be 25-64 characters",
+                        }
+                    )
                 skill_name = ""
                 if skill:
-                    try: skill_name = str(parse_front_matter(base64.b64decode(str(skill.get("content_b64", ""))).decode("utf-8"))[0].get("name", "") or "")
-                    except Exception: skill_name = ""
-                if not skill_name or f"${skill_name}" not in prompt: errors.append({"code": "openai_default_prompt", "message": "default_prompt must explicitly mention the Skill as $skill-name"})
-            except Exception as exc: errors.append({"code": "invalid_openai_yaml", "message": str(exc)[:240]})
+                    try:
+                        skill_name = str(
+                            parse_front_matter(
+                                base64.b64decode(
+                                    str(skill.get("content_b64", ""))
+                                ).decode("utf-8")
+                            )[0].get("name", "")
+                            or ""
+                        )
+                    except Exception:
+                        skill_name = ""
+                if not skill_name or f"${skill_name}" not in prompt:
+                    errors.append(
+                        {
+                            "code": "openai_default_prompt",
+                            "message": "default_prompt must explicitly mention the Skill as $skill-name",
+                        }
+                    )
+            except Exception as exc:
+                errors.append(
+                    {"code": "invalid_openai_yaml", "message": str(exc)[:240]}
+                )
         total = 0
         for item in files:
-            path = str(item.get("path", "")); total += int(item.get("size", 0) or 0)
-            if not path or ".." in PurePosixPath(path).parts: errors.append({"code": "unsafe_path", "message": path})
-            try: raw = base64.b64decode(str(item.get("content_b64", "")), validate=True)
-            except Exception: raw = b""
-            if any(p.search(raw.decode("utf-8", errors="ignore")) for p in self._SECRET_PATTERNS): errors.append({"code": "secret_detected", "message": path})
+            path = str(item.get("path", ""))
+            total += int(item.get("size", 0) or 0)
+            if not path or ".." in PurePosixPath(path).parts:
+                errors.append({"code": "unsafe_path", "message": path})
+            try:
+                raw = base64.b64decode(str(item.get("content_b64", "")), validate=True)
+            except Exception:
+                raw = b""
+            if any(
+                p.search(raw.decode("utf-8", errors="ignore"))
+                for p in self._SECRET_PATTERNS
+            ):
+                errors.append({"code": "secret_detected", "message": path})
             if path.startswith("scripts/") and path.endswith(".py"):
-                try: ast.parse(raw.decode("utf-8"))
-                except Exception as exc: errors.append({"code": "script_syntax", "message": f"{path}: {exc}"})
-        if total > STUDIO_MAX_PROJECT_BYTES: errors.append({"code": "project_too_large", "message": "project exceeds 50MB"})
-        return {"ok": not errors, "errors": errors, "warnings": warnings, "files": len(files), "bytes": total, "checked_at": now_ts()}
+                try:
+                    ast.parse(raw.decode("utf-8"))
+                except Exception as exc:
+                    errors.append(
+                        {"code": "script_syntax", "message": f"{path}: {exc}"}
+                    )
+        if total > STUDIO_MAX_PROJECT_BYTES:
+            errors.append(
+                {"code": "project_too_large", "message": "project exceeds 50MB"}
+            )
+        return {
+            "ok": not errors,
+            "errors": errors,
+            "warnings": warnings,
+            "files": len(files),
+            "bytes": total,
+            "checked_at": now_ts(),
+        }
 
     def validate(self, device_id: str, project_id: str, db=None) -> dict:
-        own = db is None; db = db or self._connect()
+        own = db is None
+        db = db or self._connect()
         try:
             self._row_project(db, project_id, device_id)
-            return self._validate_snapshot(self._snapshot(db, project_id, device_id=device_id))
+            return self._validate_snapshot(
+                self._snapshot(db, project_id, device_id=device_id)
+            )
         finally:
-            if own: db.close()
+            if own:
+                db.close()
 
     def evaluate(self, device_id: str, project_id: str) -> dict:
         with self.lock, self._connect() as db:
-            p = self._row_project(db, project_id, device_id); snapshot = self._snapshot(db, project_id, device_id=device_id); validation = self._validate_snapshot(snapshot)
+            p = self._row_project(db, project_id, device_id)
+            snapshot = self._snapshot(db, project_id, device_id=device_id)
+            validation = self._validate_snapshot(snapshot)
             skill = next((x for x in snapshot["files"] if x["path"] == "SKILL.md"), {})
-            text = base64.b64decode(skill.get("content_b64", "")).decode("utf-8", errors="ignore") if skill else ""
-            meta, _ = parse_front_matter(text); desc = str(meta.get("description", "") or "")
-            positive = [f"Please use {meta.get('name', p['slug'])} to complete the requested task.", desc[:120] or "help me with this skill"]
+            text = (
+                base64.b64decode(skill.get("content_b64", "")).decode(
+                    "utf-8", errors="ignore"
+                )
+                if skill
+                else ""
+            )
+            meta, _ = parse_front_matter(text)
+            desc = str(meta.get("description", "") or "")
+            positive = [
+                f"Please use {meta.get('name', p['slug'])} to complete the requested task.",
+                desc[:120] or "help me with this skill",
+            ]
             negative = ["Tell me a joke", "What is the weather today?"]
-            result = {"validation": validation, "trigger_tests": {"positive": [{"input": x, "should_trigger": True, "passed": bool(meta)} for x in positive], "negative": [{"input": x, "should_trigger": False, "passed": True} for x in negative]}, "workflow": {"score": 0.8 if validation["ok"] else 0.2, "output_contract": bool("verify" in text.lower() or "output" in text.lower()), "security_boundary": not any(e.get("code") == "secret_detected" for e in validation["errors"]), "resource_discoverability": len(snapshot["files"]) > 1}, "isolated": False, "network": "disabled", "evaluated_at": now_ts()}
-            eid = uuid.uuid4().hex; db.execute("INSERT INTO studio_evaluations(id,project_id,revision,kind,result_json,created_at) VALUES(?,?,?,?,?,?)", (eid, project_id, int(p["revision"] or 0), "static+triggers", json_dumps(result), now_ts()))
+            result = {
+                "validation": validation,
+                "trigger_tests": {
+                    "positive": [
+                        {"input": x, "should_trigger": True, "passed": bool(meta)}
+                        for x in positive
+                    ],
+                    "negative": [
+                        {"input": x, "should_trigger": False, "passed": True}
+                        for x in negative
+                    ],
+                },
+                "workflow": {
+                    "score": 0.8 if validation["ok"] else 0.2,
+                    "output_contract": bool(
+                        "verify" in text.lower() or "output" in text.lower()
+                    ),
+                    "security_boundary": not any(
+                        e.get("code") == "secret_detected" for e in validation["errors"]
+                    ),
+                    "resource_discoverability": len(snapshot["files"]) > 1,
+                },
+                "isolated": False,
+                "network": "disabled",
+                "evaluated_at": now_ts(),
+            }
+            eid = uuid.uuid4().hex
+            db.execute(
+                "INSERT INTO studio_evaluations(id,project_id,revision,kind,result_json,created_at) VALUES(?,?,?,?,?,?)",
+                (
+                    eid,
+                    project_id,
+                    int(p["revision"] or 0),
+                    "static+triggers",
+                    json_dumps(result),
+                    now_ts(),
+                ),
+            )
             return {"id": eid, **result}
 
-    def evaluate_isolated(self, device_id: str, project_id: str, *, network: bool = False, confirmed: bool = False) -> dict:
+    def evaluate_isolated(
+        self,
+        device_id: str,
+        project_id: str,
+        *,
+        network: bool = False,
+        confirmed: bool = False,
+    ) -> dict:
         """Run script syntax/smoke checks only behind the existing hard sandbox.
 
         This endpoint never falls back to a host process.  Network stays off;
@@ -106933,128 +107679,511 @@ class SkillsStudioStore:
         rejected rather than silently weakened.
         """
         if not confirmed:
-            raise SkillsStudioError("execution_confirmation_required", "script execution requires per-run confirmation", 409)
+            raise SkillsStudioError(
+                "execution_confirmation_required",
+                "script execution requires per-run confirmation",
+                409,
+            )
         backend = _detect_ide_sandbox_backend(force=True)
         if not bool(backend.get("available", False)):
-            raise SkillsStudioError("isolation_unavailable", "hard isolation is unavailable; only static evaluation is allowed", 503, backend)
+            raise SkillsStudioError(
+                "isolation_unavailable",
+                "hard isolation is unavailable; only static evaluation is allowed",
+                503,
+                backend,
+            )
         if network:
-            raise SkillsStudioError("network_not_supported", "networked Skill evaluation requires an isolation backend with an explicit network policy", 409)
+            raise SkillsStudioError(
+                "network_not_supported",
+                "networked Skill evaluation requires an isolation backend with an explicit network policy",
+                409,
+            )
         with self.lock, self._connect() as db:
-            p = self._row_project(db, project_id, device_id); snapshot = self._snapshot(db, project_id, device_id=device_id)
-        scripts = [x for x in snapshot.get("files", []) if str(x.get("path", "")).startswith("scripts/") and Path(str(x.get("path", ""))).suffix.lower() in {".py", ".sh", ".js", ".mjs"}]
-        if not scripts: raise SkillsStudioError("no_scripts", "project has no executable scripts to evaluate", 400)
+            p = self._row_project(db, project_id, device_id)
+            snapshot = self._snapshot(db, project_id, device_id=device_id)
+        scripts = [
+            x
+            for x in snapshot.get("files", [])
+            if str(x.get("path", "")).startswith("scripts/")
+            and Path(str(x.get("path", ""))).suffix.lower()
+            in {".py", ".sh", ".js", ".mjs"}
+        ]
+        if not scripts:
+            raise SkillsStudioError(
+                "no_scripts", "project has no executable scripts to evaluate", 400
+            )
         with tempfile.TemporaryDirectory(prefix="cc-studio-eval-") as td:
             workspace = Path(td).resolve()
             for item in snapshot.get("files", []):
-                rel = PurePosixPath(str(item.get("path", ""))); target = (workspace / Path(*rel.parts)).resolve(); target.relative_to(workspace); target.parent.mkdir(parents=True, exist_ok=True); target.write_bytes(base64.b64decode(item.get("content_b64", "")))
-            commands=[]
+                rel = PurePosixPath(str(item.get("path", "")))
+                target = (workspace / Path(*rel.parts)).resolve()
+                target.relative_to(workspace)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(base64.b64decode(item.get("content_b64", "")))
+            commands = []
             for item in scripts:
-                path = str(item.get("path", "")); suffix = Path(path).suffix.lower()
-                if suffix == ".py": commands.append(f"python -m py_compile {shlex.quote('/workspace/' + path)}")
-                elif suffix == ".sh": commands.append(f"sh -n {shlex.quote('/workspace/' + path)}")
-                elif suffix in {".js", ".mjs"}: commands.append(f"node --check {shlex.quote('/workspace/' + path)}")
+                path = str(item.get("path", ""))
+                suffix = Path(path).suffix.lower()
+                if suffix == ".py":
+                    commands.append(
+                        f"python -m py_compile {shlex.quote('/workspace/' + path)}"
+                    )
+                elif suffix == ".sh":
+                    commands.append(f"sh -n {shlex.quote('/workspace/' + path)}")
+                elif suffix in {".js", ".mjs"}:
+                    commands.append(f"node --check {shlex.quote('/workspace/' + path)}")
             command = " && ".join(commands)
-            name = str(backend.get("name", "") or ""); args=[]
+            name = str(backend.get("name", "") or "")
+            args = []
             if name == "sandbox-exec":
                 sandbox = shutil.which("sandbox-exec")
-                if not sandbox: raise SkillsStudioError("isolation_unavailable", "sandbox-exec disappeared", 503)
+                if not sandbox:
+                    raise SkillsStudioError(
+                        "isolation_unavailable", "sandbox-exec disappeared", 503
+                    )
                 policy = f'(version 1) (deny default) (allow process*) (allow file-read* (subpath {json.dumps(str(workspace))}) (subpath "/usr") (subpath "/bin") (subpath "/System") (subpath "/Library")) (allow file-write* (subpath {json.dumps(str(workspace))}) (subpath "/dev")) (deny network*)'
-                host_command = command.replace("/workspace/", str(workspace) + "/"); args=[sandbox, "-p", policy, "/bin/sh", "-lc", host_command]
+                host_command = command.replace("/workspace/", str(workspace) + "/")
+                args = [sandbox, "-p", policy, "/bin/sh", "-lc", host_command]
             elif name == "bubblewrap":
-                exe = shutil.which("bwrap"); args=[exe, "--die-with-parent", "--unshare-user", "--unshare-pid", "--unshare-net", "--ro-bind", "/", "/", "--bind", str(workspace), "/workspace", "--proc", "/proc", "--dev", "/dev", "--", "/bin/sh", "-lc", command]
+                exe = shutil.which("bwrap")
+                args = [
+                    exe,
+                    "--die-with-parent",
+                    "--unshare-user",
+                    "--unshare-pid",
+                    "--unshare-net",
+                    "--ro-bind",
+                    "/",
+                    "/",
+                    "--bind",
+                    str(workspace),
+                    "/workspace",
+                    "--proc",
+                    "/proc",
+                    "--dev",
+                    "/dev",
+                    "--",
+                    "/bin/sh",
+                    "-lc",
+                    command,
+                ]
             elif name in {"docker", "podman"}:
-                exe = shutil.which(name); image = str(backend.get("image", "") or "clouds-coder-sandbox:latest"); args=[exe, "run", "--rm", "--network", "none", "--read-only", "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "-v", f"{workspace}:/workspace:rw", "-w", "/workspace", image, "/bin/sh", "-lc", command]
+                exe = shutil.which(name)
+                image = str(backend.get("image", "") or "clouds-coder-sandbox:latest")
+                args = [
+                    exe,
+                    "run",
+                    "--rm",
+                    "--network",
+                    "none",
+                    "--read-only",
+                    "--cap-drop",
+                    "ALL",
+                    "--security-opt",
+                    "no-new-privileges",
+                    "-v",
+                    f"{workspace}:/workspace:rw",
+                    "-w",
+                    "/workspace",
+                    image,
+                    "/bin/sh",
+                    "-lc",
+                    command,
+                ]
             else:
-                raise SkillsStudioError("isolation_unavailable", f"backend {name or 'unknown'} is not supported for Studio evaluation", 503)
+                raise SkillsStudioError(
+                    "isolation_unavailable",
+                    f"backend {name or 'unknown'} is not supported for Studio evaluation",
+                    503,
+                )
             try:
-                completed = run_subprocess_text(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
-                passed = completed.returncode == 0; evidence = {"isolated": True, "passed": passed, "backend": name, "network": "disabled", "scripts": [x["path"] for x in scripts], "exit_code": completed.returncode, "stdout": trim(completed.stdout, 4000), "stderr": trim(completed.stderr, 4000), "evaluated_at": now_ts()}
+                completed = run_subprocess_text(
+                    args,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=60,
+                )
+                passed = completed.returncode == 0
+                evidence = {
+                    "isolated": True,
+                    "passed": passed,
+                    "backend": name,
+                    "network": "disabled",
+                    "scripts": [x["path"] for x in scripts],
+                    "exit_code": completed.returncode,
+                    "stdout": trim(completed.stdout, 4000),
+                    "stderr": trim(completed.stderr, 4000),
+                    "evaluated_at": now_ts(),
+                }
             except subprocess.TimeoutExpired as exc:
-                evidence = {"isolated": True, "passed": False, "backend": name, "network": "disabled", "scripts": [x["path"] for x in scripts], "timeout": True, "stderr": trim(str(exc), 2000), "evaluated_at": now_ts()}
+                evidence = {
+                    "isolated": True,
+                    "passed": False,
+                    "backend": name,
+                    "network": "disabled",
+                    "scripts": [x["path"] for x in scripts],
+                    "timeout": True,
+                    "stderr": trim(str(exc), 2000),
+                    "evaluated_at": now_ts(),
+                }
         with self.lock, self._connect() as db:
-            eid=uuid.uuid4().hex; db.execute("INSERT INTO studio_evaluations(id,project_id,revision,kind,result_json,created_at) VALUES(?,?,?,?,?,?)", (eid, project_id, int(p["revision"] or 0), "hard-isolation", json_dumps(evidence), now_ts()))
+            eid = uuid.uuid4().hex
+            db.execute(
+                "INSERT INTO studio_evaluations(id,project_id,revision,kind,result_json,created_at) VALUES(?,?,?,?,?,?)",
+                (
+                    eid,
+                    project_id,
+                    int(p["revision"] or 0),
+                    "hard-isolation",
+                    json_dumps(evidence),
+                    now_ts(),
+                ),
+            )
         return {"id": eid, **evidence}
 
     def create_revision(self, device_id: str, project_id: str, *, freeze=False) -> dict:
         with self.lock, self._connect() as db:
-            p = self._row_project(db, project_id, device_id); snap = self._snapshot(db, project_id, device_id=device_id, freeze=freeze); digest = _studio_hash(json_dumps(snap)); rid = uuid.uuid4().hex; number = int(p["revision"] or 0)
-            db.execute("INSERT INTO studio_revisions(id,project_id,number,snapshot_json,digest,frozen,created_at) VALUES(?,?,?,?,?,?,?)", (rid, project_id, number, json_dumps(snap), digest, int(bool(freeze)), now_ts()))
-            return {"id": rid, "revision": number, "digest": digest, "frozen": bool(freeze), "snapshot": snap}
+            p = self._row_project(db, project_id, device_id)
+            snap = self._snapshot(db, project_id, device_id=device_id, freeze=freeze)
+            digest = _studio_hash(json_dumps(snap))
+            rid = uuid.uuid4().hex
+            number = int(p["revision"] or 0)
+            db.execute(
+                "INSERT INTO studio_revisions(id,project_id,number,snapshot_json,digest,frozen,created_at) VALUES(?,?,?,?,?,?,?)",
+                (
+                    rid,
+                    project_id,
+                    number,
+                    json_dumps(snap),
+                    digest,
+                    int(bool(freeze)),
+                    now_ts(),
+                ),
+            )
+            return {
+                "id": rid,
+                "revision": number,
+                "digest": digest,
+                "frozen": bool(freeze),
+                "snapshot": snap,
+            }
 
     def revisions(self, device_id: str, project_id: str) -> list[dict]:
         with self.lock, self._connect() as db:
             self._row_project(db, project_id, device_id)
-            return [{"id": x["id"], "revision": int(x["number"]), "digest": x["digest"], "frozen": bool(x["frozen"]), "created_at": float(x["created_at"])} for x in db.execute("SELECT * FROM studio_revisions WHERE project_id=? ORDER BY number DESC", (project_id,))]
+            return [
+                {
+                    "id": x["id"],
+                    "revision": int(x["number"]),
+                    "digest": x["digest"],
+                    "frozen": bool(x["frozen"]),
+                    "created_at": float(x["created_at"]),
+                }
+                for x in db.execute(
+                    "SELECT * FROM studio_revisions WHERE project_id=? ORDER BY number DESC",
+                    (project_id,),
+                )
+            ]
 
     def diff(self, device_id: str, project_id: str, from_rev: int, to_rev: int) -> dict:
         with self.lock, self._connect() as db:
             self._row_project(db, project_id, device_id)
-            rows = {int(x["number"]): json.loads(x["snapshot_json"]) for x in db.execute("SELECT number,snapshot_json FROM studio_revisions WHERE project_id=? AND number IN (?,?)", (project_id, int(from_rev), int(to_rev)))}
-            if from_rev not in rows or to_rev not in rows: raise SkillsStudioError("revision_not_found", "revision not found", 404)
-            old = {x["path"]: base64.b64decode(x["content_b64"]).decode("utf-8", errors="replace") for x in rows[from_rev].get("files", []) if not x.get("is_binary")}; new = {x["path"]: base64.b64decode(x["content_b64"]).decode("utf-8", errors="replace") for x in rows[to_rev].get("files", []) if not x.get("is_binary")}; chunks=[]
-            for path in sorted(set(old)|set(new)):
-                if old.get(path, "") == new.get(path, ""): continue
-                chunks.extend(difflib.unified_diff(old.get(path, "").splitlines(True), new.get(path, "").splitlines(True), fromfile=f"a/{path}", tofile=f"b/{path}"))
-            return {"from_revision": int(from_rev), "to_revision": int(to_rev), "patch": "".join(chunks)}
+            rows = {
+                int(x["number"]): json.loads(x["snapshot_json"])
+                for x in db.execute(
+                    "SELECT number,snapshot_json FROM studio_revisions WHERE project_id=? AND number IN (?,?)",
+                    (project_id, int(from_rev), int(to_rev)),
+                )
+            }
+            if from_rev not in rows or to_rev not in rows:
+                raise SkillsStudioError("revision_not_found", "revision not found", 404)
+            old = {
+                x["path"]: base64.b64decode(x["content_b64"]).decode(
+                    "utf-8", errors="replace"
+                )
+                for x in rows[from_rev].get("files", [])
+                if not x.get("is_binary")
+            }
+            new = {
+                x["path"]: base64.b64decode(x["content_b64"]).decode(
+                    "utf-8", errors="replace"
+                )
+                for x in rows[to_rev].get("files", [])
+                if not x.get("is_binary")
+            }
+            chunks = []
+            for path in sorted(set(old) | set(new)):
+                if old.get(path, "") == new.get(path, ""):
+                    continue
+                chunks.extend(
+                    difflib.unified_diff(
+                        old.get(path, "").splitlines(True),
+                        new.get(path, "").splitlines(True),
+                        fromfile=f"a/{path}",
+                        tofile=f"b/{path}",
+                    )
+                )
+            return {
+                "from_revision": int(from_rev),
+                "to_revision": int(to_rev),
+                "patch": "".join(chunks),
+            }
 
     def submit(self, device_id: str, project_id: str, note: str = "") -> dict:
         with self.lock, self._connect() as db:
-            p = self._row_project(db, project_id, device_id); validation = self._validate_snapshot(self._snapshot(db, project_id, device_id=device_id))
-            if not validation["ok"]: raise SkillsStudioError("validation_failed", "project must pass validation before submission", 409, validation)
+            p = self._row_project(db, project_id, device_id)
+            validation = self._validate_snapshot(
+                self._snapshot(db, project_id, device_id=device_id)
+            )
+            if not validation["ok"]:
+                raise SkillsStudioError(
+                    "validation_failed",
+                    "project must pass validation before submission",
+                    409,
+                    validation,
+                )
             snap = self._snapshot(db, project_id, device_id=device_id, freeze=True)
-            digest = _studio_hash(json_dumps(snap)); rid = uuid.uuid4().hex; number = int(p["revision"] or 0)
-            db.execute("INSERT INTO studio_revisions(id,project_id,number,snapshot_json,digest,frozen,created_at) VALUES(?,?,?,?,?,?,?)", (rid, project_id, number, json_dumps(snap), digest, 1, now_ts()))
+            digest = _studio_hash(json_dumps(snap))
+            rid = uuid.uuid4().hex
+            number = int(p["revision"] or 0)
+            db.execute(
+                "INSERT INTO studio_revisions(id,project_id,number,snapshot_json,digest,frozen,created_at) VALUES(?,?,?,?,?,?,?)",
+                (rid, project_id, number, json_dumps(snap), digest, 1, now_ts()),
+            )
             rev = {"id": rid, "revision": number, "digest": digest, "snapshot": snap}
-            sid = uuid.uuid4().hex; summary = json.loads(p["summary_json"] or "{}")
-            db.execute("INSERT INTO studio_submissions(id,project_id,device_id,revision,status,snapshot_json,summary_json,note,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)", (sid, project_id, device_id, rev["revision"], "submitted", json_dumps(rev["snapshot"]), json_dumps(summary), str(note or "")[:2000], now_ts(), now_ts()))
-            db.execute("UPDATE studio_projects SET status='submitted',updated_at=? WHERE id=?", (now_ts(), project_id)); self._audit(db, device_id, "submitted", project_id, sid, {"revision": rev["revision"], "digest": rev["digest"]})
-            return {"id": sid, "project_id": project_id, "revision": rev["revision"], "status": "submitted", "digest": rev["digest"], "validation": validation}
+            sid = uuid.uuid4().hex
+            summary = json.loads(p["summary_json"] or "{}")
+            db.execute(
+                "INSERT INTO studio_submissions(id,project_id,device_id,revision,status,snapshot_json,summary_json,note,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    sid,
+                    project_id,
+                    device_id,
+                    rev["revision"],
+                    "submitted",
+                    json_dumps(rev["snapshot"]),
+                    json_dumps(summary),
+                    str(note or "")[:2000],
+                    now_ts(),
+                    now_ts(),
+                ),
+            )
+            db.execute(
+                "UPDATE studio_projects SET status='submitted',updated_at=? WHERE id=?",
+                (now_ts(), project_id),
+            )
+            self._audit(
+                db,
+                device_id,
+                "submitted",
+                project_id,
+                sid,
+                {"revision": rev["revision"], "digest": rev["digest"]},
+            )
+            return {
+                "id": sid,
+                "project_id": project_id,
+                "revision": rev["revision"],
+                "status": "submitted",
+                "digest": rev["digest"],
+                "validation": validation,
+            }
 
     def list_submissions(self, status: str = "") -> list[dict]:
         with self.lock, self._connect() as db:
-            sql = "SELECT * FROM studio_submissions"; args=[]
-            if status: sql += " WHERE status=?"; args.append(status)
-            rows=[]
+            sql = "SELECT * FROM studio_submissions"
+            args = []
+            if status:
+                sql += " WHERE status=?"
+                args.append(status)
+            rows = []
             for x in db.execute(sql + " ORDER BY updated_at DESC", args):
-                snap = json.loads(x["snapshot_json"] or "{}"); rows.append({"id": x["id"], "project_id": x["project_id"], "device_id": x["device_id"], "revision": int(x["revision"]), "status": x["status"], "summary": json.loads(x["summary_json"] or "{}"), "note": x["note"], "created_at": x["created_at"], "updated_at": x["updated_at"], "files": [{"path": f.get("path"), "size": f.get("size"), "digest": f.get("digest"), "is_binary": f.get("is_binary")} for f in snap.get("files", [])]})
+                snap = json.loads(x["snapshot_json"] or "{}")
+                rows.append(
+                    {
+                        "id": x["id"],
+                        "project_id": x["project_id"],
+                        "device_id": x["device_id"],
+                        "revision": int(x["revision"]),
+                        "status": x["status"],
+                        "summary": json.loads(x["summary_json"] or "{}"),
+                        "note": x["note"],
+                        "created_at": x["created_at"],
+                        "updated_at": x["updated_at"],
+                        "files": [
+                            {
+                                "path": f.get("path"),
+                                "size": f.get("size"),
+                                "digest": f.get("digest"),
+                                "is_binary": f.get("is_binary"),
+                            }
+                            for f in snap.get("files", [])
+                        ],
+                    }
+                )
             return rows
 
     def submission_snapshot(self, submission_id: str) -> dict:
         with self.lock, self._connect() as db:
-            row = db.execute("SELECT * FROM studio_submissions WHERE id=?", (submission_id,)).fetchone()
-            if row is None: raise SkillsStudioError("submission_not_found", "submission not found", 404)
-            return {"id": row["id"], "project_id": row["project_id"], "revision": int(row["revision"]), "status": row["status"], "snapshot": json.loads(row["snapshot_json"] or "{}")}
+            row = db.execute(
+                "SELECT * FROM studio_submissions WHERE id=?", (submission_id,)
+            ).fetchone()
+            if row is None:
+                raise SkillsStudioError(
+                    "submission_not_found", "submission not found", 404
+                )
+            return {
+                "id": row["id"],
+                "project_id": row["project_id"],
+                "revision": int(row["revision"]),
+                "status": row["status"],
+                "snapshot": json.loads(row["snapshot_json"] or "{}"),
+            }
 
-    def review_submission(self, submission_id: str, action: str, note: str = "") -> dict:
-        action = str(action or "").strip().lower(); allowed = {"approve", "changes_requested", "reject", "withdraw", "unpublish", "republish", "reevaluate"}
-        if action not in allowed: raise SkillsStudioError("invalid_review_action", "unsupported review action", 400)
+    def review_submission(
+        self, submission_id: str, action: str, note: str = ""
+    ) -> dict:
+        action = str(action or "").strip().lower()
+        allowed = {
+            "approve",
+            "changes_requested",
+            "reject",
+            "withdraw",
+            "unpublish",
+            "republish",
+            "reevaluate",
+        }
+        if action not in allowed:
+            raise SkillsStudioError(
+                "invalid_review_action", "unsupported review action", 400
+            )
         with self.lock, self._connect() as db:
-            row = db.execute("SELECT * FROM studio_submissions WHERE id=?", (submission_id,)).fetchone()
-            if row is None: raise SkillsStudioError("submission_not_found", "submission not found", 404)
-            current = str(row["status"]); target = {"approve": "approved", "changes_requested": "changes_requested", "reject": "rejected", "withdraw": "withdrawn", "unpublish": "unpublished", "republish": "published", "reevaluate": current}[action]
+            row = db.execute(
+                "SELECT * FROM studio_submissions WHERE id=?", (submission_id,)
+            ).fetchone()
+            if row is None:
+                raise SkillsStudioError(
+                    "submission_not_found", "submission not found", 404
+                )
+            current = str(row["status"])
+            target = {
+                "approve": "approved",
+                "changes_requested": "changes_requested",
+                "reject": "rejected",
+                "withdraw": "withdrawn",
+                "unpublish": "unpublished",
+                "republish": "published",
+                "reevaluate": current,
+            }[action]
             if action == "reevaluate":
-                snap = json.loads(row["snapshot_json"] or "{}"); result = self._validate_snapshot(snap); eid=uuid.uuid4().hex
-                db.execute("INSERT INTO studio_evaluations(id,project_id,revision,kind,result_json,created_at) VALUES(?,?,?,?,?,?)", (eid,row["project_id"],int(row["revision"]),"admin-static",json_dumps(result),now_ts())); self._audit(db,"admin","reevaluate",row["project_id"],submission_id,{"evaluation_id":eid,"ok":result["ok"]}); return {"ok": True, "id": submission_id, "status": current, "evaluation": {"id": eid, **result}}
+                snap = json.loads(row["snapshot_json"] or "{}")
+                result = self._validate_snapshot(snap)
+                eid = uuid.uuid4().hex
+                db.execute(
+                    "INSERT INTO studio_evaluations(id,project_id,revision,kind,result_json,created_at) VALUES(?,?,?,?,?,?)",
+                    (
+                        eid,
+                        row["project_id"],
+                        int(row["revision"]),
+                        "admin-static",
+                        json_dumps(result),
+                        now_ts(),
+                    ),
+                )
+                self._audit(
+                    db,
+                    "admin",
+                    "reevaluate",
+                    row["project_id"],
+                    submission_id,
+                    {"evaluation_id": eid, "ok": result["ok"]},
+                )
+                return {
+                    "ok": True,
+                    "id": submission_id,
+                    "status": current,
+                    "evaluation": {"id": eid, **result},
+                }
             if action in {"approve", "republish"}:
-                if action == "republish" and current != "unpublished": raise SkillsStudioError("invalid_submission_state", "only unpublished Skills can be republished", 409)
-                if action == "approve" and current != "submitted": raise SkillsStudioError("invalid_submission_state", "only submitted snapshots can be approved", 409)
-                snap = json.loads(row["snapshot_json"] or "{}"); validation = self._validate_snapshot(snap)
-                if not validation["ok"]: raise SkillsStudioError("validation_failed", "frozen snapshot no longer passes validation", 409, validation)
-                script_files = [x.get("path", "") for x in snap.get("files", []) if str(x.get("path", "")).startswith("scripts/") and Path(str(x.get("path", ""))).suffix.lower() in {".py", ".sh", ".js", ".mjs", ".ps1", ".bat"}]
+                if action == "republish" and current != "unpublished":
+                    raise SkillsStudioError(
+                        "invalid_submission_state",
+                        "only unpublished Skills can be republished",
+                        409,
+                    )
+                if action == "approve" and current != "submitted":
+                    raise SkillsStudioError(
+                        "invalid_submission_state",
+                        "only submitted snapshots can be approved",
+                        409,
+                    )
+                snap = json.loads(row["snapshot_json"] or "{}")
+                validation = self._validate_snapshot(snap)
+                if not validation["ok"]:
+                    raise SkillsStudioError(
+                        "validation_failed",
+                        "frozen snapshot no longer passes validation",
+                        409,
+                        validation,
+                    )
+                script_files = [
+                    x.get("path", "")
+                    for x in snap.get("files", [])
+                    if str(x.get("path", "")).startswith("scripts/")
+                    and Path(str(x.get("path", ""))).suffix.lower()
+                    in {".py", ".sh", ".js", ".mjs", ".ps1", ".bat"}
+                ]
                 if script_files:
-                    evaluations = [json.loads(x[0] or "{}") for x in db.execute("SELECT result_json FROM studio_evaluations WHERE project_id=? AND revision=? ORDER BY created_at DESC", (row["project_id"], int(row["revision"])))]
-                    isolated_pass = any(bool(x.get("isolated")) and bool(x.get("passed", x.get("validation", {}).get("ok", False))) for x in evaluations if isinstance(x, dict))
-                    if not isolated_pass: raise SkillsStudioError("isolation_required", "Skills containing executable scripts require a passing hard-isolation evaluation", 409, {"scripts": script_files})
-                pmeta = snap.get("project", {}); slug = _studio_slug(pmeta.get("slug", "skill")); destination = (self.skills_root / slug).resolve(); destination.relative_to(self.skills_root)
-                if destination.exists(): raise SkillsStudioError("global_name_taken", "a global Skill already uses this name", 409)
-                temp = self.skills_root / (f".{slug}.publish-{uuid.uuid4().hex}"); temp.mkdir(parents=True, exist_ok=False)
+                    evaluations = [
+                        json.loads(x[0] or "{}")
+                        for x in db.execute(
+                            "SELECT result_json FROM studio_evaluations WHERE project_id=? AND revision=? ORDER BY created_at DESC",
+                            (row["project_id"], int(row["revision"])),
+                        )
+                    ]
+                    isolated_pass = any(
+                        bool(x.get("isolated"))
+                        and bool(
+                            x.get("passed", x.get("validation", {}).get("ok", False))
+                        )
+                        for x in evaluations
+                        if isinstance(x, dict)
+                    )
+                    if not isolated_pass:
+                        raise SkillsStudioError(
+                            "isolation_required",
+                            "Skills containing executable scripts require a passing hard-isolation evaluation",
+                            409,
+                            {"scripts": script_files},
+                        )
+                pmeta = snap.get("project", {})
+                slug = _studio_slug(pmeta.get("slug", "skill"))
+                destination = (self.skills_root / slug).resolve()
+                destination.relative_to(self.skills_root)
+                if destination.exists():
+                    raise SkillsStudioError(
+                        "global_name_taken",
+                        "a global Skill already uses this name",
+                        409,
+                    )
+                temp = self.skills_root / (f".{slug}.publish-{uuid.uuid4().hex}")
+                temp.mkdir(parents=True, exist_ok=False)
                 try:
                     for item in snap.get("files", []):
-                        rel, _ = self._safe_path({"device_id": "tmp", "id": "tmp"}, item.get("path"))
-                        target_path = (temp / Path(*PurePosixPath(rel).parts)).resolve(); target_path.relative_to(temp.resolve()); target_path.parent.mkdir(parents=True, exist_ok=True); target_path.write_bytes(base64.b64decode(item.get("content_b64", "")))
+                        rel, _ = self._safe_path(
+                            {"device_id": "tmp", "id": "tmp"}, item.get("path")
+                        )
+                        target_path = (temp / Path(*PurePosixPath(rel).parts)).resolve()
+                        target_path.relative_to(temp.resolve())
+                        target_path.parent.mkdir(parents=True, exist_ok=True)
+                        target_path.write_bytes(
+                            base64.b64decode(item.get("content_b64", ""))
+                        )
                     os.replace(temp, destination)
                 except Exception:
-                    shutil.rmtree(temp, ignore_errors=True); raise
+                    shutil.rmtree(temp, ignore_errors=True)
+                    raise
                 target = "published"
                 if self.app is not None:
                     try:
@@ -107066,12 +108195,28 @@ class SkillsStudioStore:
                                 sessions = list(manager.sessions.values())
                             for session in sessions:
                                 session._ensure_skills_ready(force=True)
-                    except Exception: pass
+                    except Exception:
+                        pass
             elif action == "unpublish":
-                if current != "published": raise SkillsStudioError("invalid_submission_state", "only published Skills can be unpublished", 409)
-                snap = json.loads(row["snapshot_json"] or "{}"); slug = _studio_slug((snap.get("project") or {}).get("slug", "skill")); source = (self.skills_root / slug).resolve(); source.relative_to(self.skills_root)
+                if current != "published":
+                    raise SkillsStudioError(
+                        "invalid_submission_state",
+                        "only published Skills can be unpublished",
+                        409,
+                    )
+                snap = json.loads(row["snapshot_json"] or "{}")
+                slug = _studio_slug((snap.get("project") or {}).get("slug", "skill"))
+                source = (self.skills_root / slug).resolve()
+                source.relative_to(self.skills_root)
                 if source.exists():
-                    quarantine = (self.state_root / "unpublished" / f"{slug}-{int(now_ts())}-{submission_id[:8]}").resolve(); quarantine.relative_to(self.state_root); quarantine.parent.mkdir(parents=True, exist_ok=True); os.replace(source, quarantine)
+                    quarantine = (
+                        self.state_root
+                        / "unpublished"
+                        / f"{slug}-{int(now_ts())}-{submission_id[:8]}"
+                    ).resolve()
+                    quarantine.relative_to(self.state_root)
+                    quarantine.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(source, quarantine)
                 if self.app is not None:
                     try:
                         self.app._ensure_skills_store(force=True)
@@ -107082,40 +108227,134 @@ class SkillsStudioStore:
                                 sessions = list(manager.sessions.values())
                             for session in sessions:
                                 session._ensure_skills_ready(force=True)
-                    except Exception: pass
-            db.execute("UPDATE studio_submissions SET status=?,note=?,updated_at=? WHERE id=?", (target, str(note or "")[:2000], now_ts(), submission_id))
+                    except Exception:
+                        pass
+            db.execute(
+                "UPDATE studio_submissions SET status=?,note=?,updated_at=? WHERE id=?",
+                (target, str(note or "")[:2000], now_ts(), submission_id),
+            )
             project_status = target
-            if action in {"approve", "republish"}: project_status = "published"
-            db.execute("UPDATE studio_projects SET status=?,updated_at=? WHERE id=?", (project_status, now_ts(), row["project_id"]))
-            self._audit(db, "admin", action, row["project_id"], submission_id, {"from": current, "to": target, "note": str(note or "")[:500]})
-            return {"ok": True, "id": submission_id, "status": target, "project_id": row["project_id"]}
+            if action in {"approve", "republish"}:
+                project_status = "published"
+            db.execute(
+                "UPDATE studio_projects SET status=?,updated_at=? WHERE id=?",
+                (project_status, now_ts(), row["project_id"]),
+            )
+            self._audit(
+                db,
+                "admin",
+                action,
+                row["project_id"],
+                submission_id,
+                {"from": current, "to": target, "note": str(note or "")[:500]},
+            )
+            return {
+                "ok": True,
+                "id": submission_id,
+                "status": target,
+                "project_id": row["project_id"],
+            }
 
     def withdraw(self, device_id: str, submission_id: str, note: str = "") -> dict:
         with self.lock, self._connect() as db:
-            row = db.execute("SELECT * FROM studio_submissions WHERE id=? AND device_id=?", (submission_id, device_id)).fetchone()
-            if row is None: raise SkillsStudioError("submission_not_found", "submission not found", 404)
-            if row["status"] not in {"submitted", "changes_requested"}: raise SkillsStudioError("cannot_withdraw", "submission is no longer pending", 409)
-            db.execute("UPDATE studio_submissions SET status='withdrawn',note=?,updated_at=? WHERE id=?", (str(note or "")[:2000], now_ts(), submission_id)); db.execute("UPDATE studio_projects SET status='draft',updated_at=? WHERE id=?", (now_ts(), row["project_id"])); self._audit(db, device_id, "withdrawn", row["project_id"], submission_id); return {"ok": True, "status": "withdrawn"}
+            row = db.execute(
+                "SELECT * FROM studio_submissions WHERE id=? AND device_id=?",
+                (submission_id, device_id),
+            ).fetchone()
+            if row is None:
+                raise SkillsStudioError(
+                    "submission_not_found", "submission not found", 404
+                )
+            if row["status"] not in {"submitted", "changes_requested"}:
+                raise SkillsStudioError(
+                    "cannot_withdraw", "submission is no longer pending", 409
+                )
+            db.execute(
+                "UPDATE studio_submissions SET status='withdrawn',note=?,updated_at=? WHERE id=?",
+                (str(note or "")[:2000], now_ts(), submission_id),
+            )
+            db.execute(
+                "UPDATE studio_projects SET status='draft',updated_at=? WHERE id=?",
+                (now_ts(), row["project_id"]),
+            )
+            self._audit(db, device_id, "withdrawn", row["project_id"], submission_id)
+            return {"ok": True, "status": "withdrawn"}
 
-    def start_job(self, device_id: str, project_id: str, mode: str, request: dict) -> dict:
-        mode = "one_click" if str(mode or "").lower() in {"one_click", "auto", "automatic"} else "stepwise"
+    def start_job(
+        self, device_id: str, project_id: str, mode: str, request: dict
+    ) -> dict:
+        mode = (
+            "one_click"
+            if str(mode or "").lower() in {"one_click", "auto", "automatic"}
+            else "stepwise"
+        )
         with self.lock, self._connect() as db:
-            self._row_project(db, project_id, device_id); jid = uuid.uuid4().hex; now=now_ts(); db.execute("INSERT INTO studio_jobs(id,project_id,device_id,mode,status,request_json,result_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)", (jid,project_id,device_id,mode,"queued",json_dumps(request or {}),"{}",now,now))
-        t = threading.Thread(target=self._run_job, args=(jid,), daemon=True, name="studio-copilot-" + jid[:8]); self._jobs[jid] = t; t.start(); return {"id": jid, "status": "queued", "mode": mode}
+            self._row_project(db, project_id, device_id)
+            jid = uuid.uuid4().hex
+            now = now_ts()
+            db.execute(
+                "INSERT INTO studio_jobs(id,project_id,device_id,mode,status,request_json,result_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    jid,
+                    project_id,
+                    device_id,
+                    mode,
+                    "queued",
+                    json_dumps(request or {}),
+                    "{}",
+                    now,
+                    now,
+                ),
+            )
+        t = threading.Thread(
+            target=self._run_job,
+            args=(jid,),
+            daemon=True,
+            name="studio-copilot-" + jid[:8],
+        )
+        self._jobs[jid] = t
+        t.start()
+        return {"id": jid, "status": "queued", "mode": mode}
 
     def _job_update(self, jid: str, status: str, *, result=None, error=""):
-        with self.lock, self._connect() as db: db.execute("UPDATE studio_jobs SET status=?,result_json=?,error=?,updated_at=? WHERE id=?", (status, json_dumps(result or {}), str(error or "")[:2000], now_ts(), jid))
+        with self.lock, self._connect() as db:
+            db.execute(
+                "UPDATE studio_jobs SET status=?,result_json=?,error=?,updated_at=? WHERE id=?",
+                (
+                    status,
+                    json_dumps(result or {}),
+                    str(error or "")[:2000],
+                    now_ts(),
+                    jid,
+                ),
+            )
 
     def _run_job(self, jid: str):
         try:
             with self.lock, self._connect() as db:
-                job = db.execute("SELECT * FROM studio_jobs WHERE id=?", (jid,)).fetchone()
-            if not job: return
-            request = json.loads(job["request_json"] or "{}"); self._job_update(jid, "running", result={"stage": "interview"})
+                job = db.execute(
+                    "SELECT * FROM studio_jobs WHERE id=?", (jid,)
+                ).fetchone()
+            if not job:
+                return
+            request = json.loads(job["request_json"] or "{}")
+            self._job_update(jid, "running", result={"stage": "interview"})
             time.sleep(0.01)
-            if jid in self._job_cancel: self._job_update(jid, "cancelled", result={"stage": "cancelled"}); return
-            title = str(request.get("title") or request.get("goal") or "Skill").strip()[:120]; slug = _studio_slug(request.get("slug") or title); desc = str(request.get("description") or request.get("goal") or f"Use this skill for {title.lower()} tasks.").strip()[:900]
-            llm_candidate = self._copilot_llm_candidate(str(job["device_id"]), request, title, slug, desc)
+            if jid in self._job_cancel:
+                self._job_update(jid, "cancelled", result={"stage": "cancelled"})
+                return
+            title = str(request.get("title") or request.get("goal") or "Skill").strip()[
+                :120
+            ]
+            slug = _studio_slug(request.get("slug") or title)
+            desc = str(
+                request.get("description")
+                or request.get("goal")
+                or f"Use this skill for {title.lower()} tasks."
+            ).strip()[:900]
+            llm_candidate = self._copilot_llm_candidate(
+                str(job["device_id"]), request, title, slug, desc
+            )
             if isinstance(llm_candidate, dict):
                 title = str(llm_candidate.get("title", title) or title)[:120]
                 slug = _studio_slug(llm_candidate.get("name", slug) or slug)
@@ -107123,39 +108362,92 @@ class SkillsStudioStore:
             md = f"---\nname: {slug}\ndescription: {desc}\n---\n\n# {title}\n\n## Workflow\n\n1. Parse the request and identify constraints.\n2. Use the available inputs and tools within the declared trust boundary.\n3. Return the requested output and verify it against the acceptance criteria.\n\n## Safety\n\nDo not disclose secrets or execute untrusted scripts without explicit confirmation.\n"
             yaml = self._openai_yaml(title, slug, desc)
             if isinstance(llm_candidate, dict):
-                candidate_md = str(llm_candidate.get("skill_markdown", "") or "").strip()
+                candidate_md = str(
+                    llm_candidate.get("skill_markdown", "") or ""
+                ).strip()
                 candidate_yaml = str(llm_candidate.get("openai_yaml", "") or "").strip()
-                if candidate_md and len(candidate_md) <= 80_000: md = candidate_md + ("\n" if not candidate_md.endswith("\n") else "")
-                if candidate_yaml and len(candidate_yaml) <= 20_000: yaml = candidate_yaml + ("\n" if not candidate_yaml.endswith("\n") else "")
-            result = {"stage": "candidate", "patches": [{"path": "SKILL.md", "operation": "replace", "content": md}, {"path": "agents/openai.yaml", "operation": "replace", "content": yaml}], "summary": {"name": slug, "description": desc}, "sources": []}
+                if candidate_md and len(candidate_md) <= 80_000:
+                    md = candidate_md + (
+                        "\n" if not candidate_md.endswith("\n") else ""
+                    )
+                if candidate_yaml and len(candidate_yaml) <= 20_000:
+                    yaml = candidate_yaml + (
+                        "\n" if not candidate_yaml.endswith("\n") else ""
+                    )
+            result = {
+                "stage": "candidate",
+                "patches": [
+                    {"path": "SKILL.md", "operation": "replace", "content": md},
+                    {
+                        "path": "agents/openai.yaml",
+                        "operation": "replace",
+                        "content": yaml,
+                    },
+                ],
+                "summary": {"name": slug, "description": desc},
+                "sources": [],
+            }
             self._job_update(jid, "completed", result=result)
         except Exception as exc:
             self._job_update(jid, "failed", error=str(exc))
 
-    def _copilot_llm_candidate(self, device_id: str, request: dict, title: str, slug: str, desc: str) -> dict | None:
+    def _copilot_llm_candidate(
+        self, device_id: str, request: dict, title: str, slug: str, desc: str
+    ) -> dict | None:
         """Ask the device's private model for a structured candidate when configured.
 
         Failure is non-fatal: the deterministic skill-creator-compliant draft is
         still produced.  Hidden reasoning is neither requested nor persisted.
         """
         with self.lock, self._connect() as db:
-            row = db.execute("SELECT profiles_enc FROM studio_devices WHERE id=?", (device_id,)).fetchone()
+            row = db.execute(
+                "SELECT profiles_enc FROM studio_devices WHERE id=?", (device_id,)
+            ).fetchone()
         config = self._load_profiles(row[0] if row else "")
         raw_profiles = config.get("profiles", {}) if isinstance(config, dict) else {}
         if not raw_profiles:
             return None
-        parsed = parse_llm_config_profiles(config, DEFAULT_OLLAMA_BASE_URL, DEFAULT_OLLAMA_MODEL)
+        parsed = parse_llm_config_profiles(
+            config, DEFAULT_OLLAMA_BASE_URL, DEFAULT_OLLAMA_MODEL
+        )
         profiles = parsed.get("profiles", []) if isinstance(parsed, dict) else []
-        active_id = str(config.get("active_profile_id") or parsed.get("default_profile_id") or "")
-        profile = next((x for x in profiles if str(x.get("id", "")) == active_id), profiles[0] if profiles else None)
-        if not isinstance(profile, dict): return None
-        client = OllamaClient(str(profile.get("base_url", "") or DEFAULT_OLLAMA_BASE_URL), str(profile.get("model", "") or DEFAULT_OLLAMA_MODEL), timeout=min(120, int(profile.get("request_timeout", 120) or 120)), provider=str(profile.get("provider", "ollama") or "ollama"), endpoint=str(profile.get("endpoint", "") or ""), api_key=str(profile.get("api_key", "") or ""), headers=profile.get("headers") if isinstance(profile.get("headers"), dict) else {}, payload_template=str(profile.get("payload_template", "") or ""))
-        goal = trim(str(request.get("goal") or request.get("description") or desc), 8000)
+        active_id = str(
+            config.get("active_profile_id") or parsed.get("default_profile_id") or ""
+        )
+        profile = next(
+            (x for x in profiles if str(x.get("id", "")) == active_id),
+            profiles[0] if profiles else None,
+        )
+        if not isinstance(profile, dict):
+            return None
+        client = OllamaClient(
+            str(profile.get("base_url", "") or DEFAULT_OLLAMA_BASE_URL),
+            str(profile.get("model", "") or DEFAULT_OLLAMA_MODEL),
+            timeout=min(120, int(profile.get("request_timeout", 120) or 120)),
+            provider=str(profile.get("provider", "ollama") or "ollama"),
+            endpoint=str(profile.get("endpoint", "") or ""),
+            api_key=str(profile.get("api_key", "") or ""),
+            headers=profile.get("headers")
+            if isinstance(profile.get("headers"), dict)
+            else {},
+            payload_template=str(profile.get("payload_template", "") or ""),
+        )
+        goal = trim(
+            str(request.get("goal") or request.get("description") or desc), 8000
+        )
         system = "You create portable Codex Skills. Return JSON only, with title, name, description, skill_markdown, and openai_yaml. SKILL.md frontmatter must contain only name and description. Keep the body concise and reference bundled resources progressively. Never include hidden reasoning, credentials, or executable behavior beyond the user's stated goal."
         prompt = f"Create a candidate Skill package. Preferred name: {slug}. Title: {title}. User-visible brief:\n{goal}"
         try:
-            answer = client.chat([{"role": "user", "content": prompt}], system=system, max_tokens=4000, temperature=0.2, think=False, response_stream=False)
-            text = str(answer.get("content", "") or "").strip(); text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.I)
+            answer = client.chat(
+                [{"role": "user", "content": prompt}],
+                system=system,
+                max_tokens=4000,
+                temperature=0.2,
+                think=False,
+                response_stream=False,
+            )
+            text = str(answer.get("content", "") or "").strip()
+            text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.I)
             obj = json.loads(text)
             return obj if isinstance(obj, dict) else None
         except Exception:
@@ -107163,28 +108455,80 @@ class SkillsStudioStore:
 
     def job(self, device_id: str, jid: str) -> dict:
         with self.lock, self._connect() as db:
-            row = db.execute("SELECT * FROM studio_jobs WHERE id=? AND device_id=?", (jid, device_id)).fetchone()
-            if row is None: raise SkillsStudioError("job_not_found", "job not found", 404)
-            return {"id": row["id"], "project_id": row["project_id"], "mode": row["mode"], "status": row["status"], "result": json.loads(row["result_json"] or "{}"), "error": row["error"], "created_at": row["created_at"], "updated_at": row["updated_at"]}
+            row = db.execute(
+                "SELECT * FROM studio_jobs WHERE id=? AND device_id=?", (jid, device_id)
+            ).fetchone()
+            if row is None:
+                raise SkillsStudioError("job_not_found", "job not found", 404)
+            return {
+                "id": row["id"],
+                "project_id": row["project_id"],
+                "mode": row["mode"],
+                "status": row["status"],
+                "result": json.loads(row["result_json"] or "{}"),
+                "error": row["error"],
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
 
     def cancel_job(self, device_id: str, jid: str) -> dict:
         with self.lock, self._connect() as db:
-            row = db.execute("SELECT * FROM studio_jobs WHERE id=? AND device_id=?", (jid, device_id)).fetchone()
-            if row is None: raise SkillsStudioError("job_not_found", "job not found", 404)
-            self._job_cancel.add(jid); db.execute("UPDATE studio_jobs SET status='cancelled',updated_at=? WHERE id=? AND status IN ('queued','running')", (now_ts(), jid)); return {"ok": True, "status": "cancelled"}
+            row = db.execute(
+                "SELECT * FROM studio_jobs WHERE id=? AND device_id=?", (jid, device_id)
+            ).fetchone()
+            if row is None:
+                raise SkillsStudioError("job_not_found", "job not found", 404)
+            self._job_cancel.add(jid)
+            db.execute(
+                "UPDATE studio_jobs SET status='cancelled',updated_at=? WHERE id=? AND status IN ('queued','running')",
+                (now_ts(), jid),
+            )
+            return {"ok": True, "status": "cancelled"}
 
-    def apply_job(self, device_id: str, jid: str, *, expected_revision: int, accepted_paths: list[str] | None = None) -> dict:
+    def apply_job(
+        self,
+        device_id: str,
+        jid: str,
+        *,
+        expected_revision: int,
+        accepted_paths: list[str] | None = None,
+    ) -> dict:
         job = self.job(device_id, jid)
-        if job["status"] != "completed": raise SkillsStudioError("job_not_ready", "Copilot job has no completed candidate", 409)
-        selected = {str(x) for x in (accepted_paths or []) if str(x)}; patches = job.get("result", {}).get("patches", [])
-        revision = int(expected_revision); applied = []
+        if job["status"] != "completed":
+            raise SkillsStudioError(
+                "job_not_ready", "Copilot job has no completed candidate", 409
+            )
+        selected = {str(x) for x in (accepted_paths or []) if str(x)}
+        patches = job.get("result", {}).get("patches", [])
+        revision = int(expected_revision)
+        applied = []
         for patch in patches if isinstance(patches, list) else []:
-            if not isinstance(patch, dict): continue
+            if not isinstance(patch, dict):
+                continue
             path = str(patch.get("path", "") or "")
-            if selected and path not in selected: continue
-            out = self.write_file(device_id, job["project_id"], path, str(patch.get("content", "") or "").encode("utf-8"), mime="text/plain", expected_revision=revision)
-            revision = int(out["revision"]); applied.append(path)
-        return {"ok": True, "project_id": job["project_id"], "revision": revision, "applied": applied, "rejected": [str(x.get("path", "")) for x in patches if isinstance(x, dict) and str(x.get("path", "")) not in applied]}
+            if selected and path not in selected:
+                continue
+            out = self.write_file(
+                device_id,
+                job["project_id"],
+                path,
+                str(patch.get("content", "") or "").encode("utf-8"),
+                mime="text/plain",
+                expected_revision=revision,
+            )
+            revision = int(out["revision"])
+            applied.append(path)
+        return {
+            "ok": True,
+            "project_id": job["project_id"],
+            "revision": revision,
+            "applied": applied,
+            "rejected": [
+                str(x.get("path", ""))
+                for x in patches
+                if isinstance(x, dict) and str(x.get("path", "")) not in applied
+            ],
+        }
 
 
 STUDIO_INDEX_HTML = r'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Skills Studio 2.0</title><link rel="stylesheet" href="/assets/studio.css"></head><body><div class="studio"><header><div><span class="eyebrow">CLOUDS CODER</span><h1>Skills Studio <em>2.0</em></h1><p>Design private, testable Skill packages. Nothing reaches global agents before approval.</p></div><button id="newProject">New project</button></header><main><aside><div class="side-title">Projects</div><div id="projects"></div></aside><section class="workspace"><div id="empty" class="empty"><h2>Start a private Skill draft</h2><p>Create a project to design requirements, files, workflow and evaluations.</p><button id="emptyNew">Create project</button></div><div id="editor" class="hidden"><div class="project-head"><div><h2 id="projectTitle"></h2><div id="projectMeta" class="meta"></div></div><div class="actions"><button data-action="validate">Validate</button><button data-action="evaluate">Evaluate</button><button data-action="submit" class="primary">Request review</button></div></div><nav class="tabs"><button class="active" data-tab="brief">Brief</button><button data-tab="design">Design</button><button data-tab="files">Files</button><button data-tab="workflow">Workflow</button><button data-tab="evaluation">Evaluation</button></nav><div id="tabContent"></div></div></section><aside class="copilot"><div class="side-title">Copilot</div><p class="muted">Choose stepwise interview or one-click generation. Candidate patches stay private until you accept them.</p><textarea id="copilotInput" placeholder="Describe the skill goal, examples, constraints and references…"></textarea><div class="mode"><button data-mode="stepwise" class="selected">Stepwise</button><button data-mode="one_click">One-click</button></div><button id="copilotRun" class="primary wide">Generate private candidate</button><pre id="copilotStatus" class="status"></pre></aside></main></div><script src="/assets/js_lib/monaco/min/vs/loader.js"></script><script src="/assets/studio.js"></script></body></html>'''
@@ -110081,7 +111425,7 @@ document.addEventListener('DOMContentLoaded', function(){{
 
     def ide_upload(self, user_id: str, session_id: str, payload: dict) -> dict:
         root_id = str(payload.get("root_id", payload.get("root", "session")) or "session")
-        dest = normalize_rel_preview_path(str(payload.get("dest", payload.get("dir", "")) or ""))
+        dest = normalize_upload_rel_path(str(payload.get("dest", payload.get("dir", "")) or ""))
         items = payload.get("items", [])
         directories = payload.get("directories", [])
         if not isinstance(items, list):
@@ -110097,13 +111441,13 @@ document.addEventListener('DOMContentLoaded', function(){{
         created_directories: list[dict] = []
         total = 0
         for raw_directory in directories:
-            rel_directory = normalize_rel_preview_path(
+            rel_directory = normalize_upload_rel_path(
                 str(raw_directory.get("path", "") if isinstance(raw_directory, dict) else raw_directory or "")
             )
             if not rel_directory:
                 continue
             target_dir = safe_path(
-                normalize_rel_preview_path(f"{dest}/{rel_directory}" if dest else rel_directory), root
+                normalize_upload_rel_path(f"{dest}/{rel_directory}" if dest else rel_directory), root
             )
             self._ide_reject_hard_snapshot_mutation(user_id, session_id, root_id, target_dir)
             target_dir.mkdir(parents=True, exist_ok=True)
@@ -110111,7 +111455,7 @@ document.addEventListener('DOMContentLoaded', function(){{
         for item in items:
             if not isinstance(item, dict):
                 continue
-            rel_item = normalize_rel_preview_path(str(item.get("path", item.get("filename", "")) or ""))
+            rel_item = normalize_upload_rel_path(str(item.get("path", item.get("filename", "")) or ""))
             if not rel_item:
                 continue
             raw = base64.b64decode(str(item.get("content_b64", "") or ""), validate=True)
@@ -110120,7 +111464,7 @@ document.addEventListener('DOMContentLoaded', function(){{
             total += len(raw)
             if total > IDE_UPLOAD_TOTAL_MAX_BYTES:
                 raise ValueError("upload batch is too large")
-            target = safe_path(normalize_rel_preview_path(f"{dest}/{rel_item}" if dest else rel_item), root)
+            target = safe_path(normalize_upload_rel_path(f"{dest}/{rel_item}" if dest else rel_item), root)
             self._ide_reject_hard_snapshot_mutation(user_id, session_id, root_id, target)
             target.parent.mkdir(parents=True, exist_ok=True)
             principal = self._collaboration_principal_for_ide_user(user_id)
@@ -110161,8 +111505,8 @@ document.addEventListener('DOMContentLoaded', function(){{
     def ide_upload_chunk(self, user_id: str, session_id: str, payload: dict) -> dict:
         """Append one validated chunk and atomically publish a completed upload."""
         root_id = str(payload.get("root_id", payload.get("root", "session")) or "session")
-        dest = normalize_rel_preview_path(str(payload.get("dest", payload.get("dir", "")) or ""))
-        rel_item = normalize_rel_preview_path(
+        dest = normalize_upload_rel_path(str(payload.get("dest", payload.get("dir", "")) or ""))
+        rel_item = normalize_upload_rel_path(
             str(payload.get("path", payload.get("filename", "")) or "")
         )
         if not rel_item:
@@ -110174,7 +111518,7 @@ document.addEventListener('DOMContentLoaded', function(){{
             user_id,
             session_id,
             root_id,
-            normalize_rel_preview_path(f"{dest}/{rel_item}" if dest else rel_item),
+            normalize_upload_rel_path(f"{dest}/{rel_item}" if dest else rel_item),
         )
         self._ide_reject_hard_snapshot_mutation(user_id, session_id, root_id, target)
         if target.exists() and target.is_dir():
@@ -119804,9 +121148,13 @@ class Handler(BaseHTTPRequestHandler):
             while True:
                 try:
                     event = sub.get(timeout=SSE_HEARTBEAT_SECONDS)
-                    seq = int(event.get("seq", 0) or 0) if isinstance(event, dict) else 0
+                    seq = (
+                        int(event.get("seq", 0) or 0) if isinstance(event, dict) else 0
+                    )
                     if seq > 0:
-                        chunk = safe_utf8_bytes(f"id: {seq}\ndata: {json_dumps(event)}\n\n")
+                        chunk = safe_utf8_bytes(
+                            f"id: {seq}\ndata: {json_dumps(event)}\n\n"
+                        )
                     else:
                         chunk = safe_utf8_bytes(f"data: {json_dumps(event)}\n\n")
                 except queue.Empty:
@@ -119818,6 +121166,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise
         finally:
             sess.events.unsubscribe(sub)
+
 
 class SkillsHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -119883,7 +121232,12 @@ class SkillsHandler(BaseHTTPRequestHandler):
                 return
             raise
 
-    def _send_text(self, text: str, content_type: str = "text/plain; charset=utf-8", status: int = 200):
+    def _send_text(
+        self,
+        text: str,
+        content_type: str = "text/plain; charset=utf-8",
+        status: int = 200,
+    ):
         body = safe_utf8_bytes(text)
         try:
             self.send_response(status)
@@ -119913,7 +121267,9 @@ class SkillsHandler(BaseHTTPRequestHandler):
                 return
             raise
 
-    def _studio_json(self, obj: object, *, status: int = 200, cookies: dict | None = None):
+    def _studio_json(
+        self, obj: object, *, status: int = 200, cookies: dict | None = None
+    ):
         body = json_response_bytes(obj)
         try:
             self.send_response(status)
@@ -119923,7 +121279,11 @@ class SkillsHandler(BaseHTTPRequestHandler):
             for name, value in (cookies or {}).items():
                 if not value:
                     continue
-                max_age = STUDIO_DEVICE_TTL if name == STUDIO_DEVICE_COOKIE else STUDIO_SESSION_TTL
+                max_age = (
+                    STUDIO_DEVICE_TTL
+                    if name == STUDIO_DEVICE_COOKIE
+                    else STUDIO_SESSION_TTL
+                )
                 self.send_header(
                     "Set-Cookie",
                     f"{name}={quote(str(value), safe='._~-')}; Max-Age={max_age}; Path=/; HttpOnly; SameSite=Lax",
@@ -119936,25 +121296,34 @@ class SkillsHandler(BaseHTTPRequestHandler):
             raise
 
     def _studio_auth(self, *, write: bool = False):
-        return self.app.skills_studio._auth(self.headers, self._client_ip(), write=write)
+        return self.app.skills_studio._auth(
+            self.headers, self._client_ip(), write=write
+        )
 
     def _studio_error(self, exc: Exception):
         if isinstance(exc, SkillsStudioError):
-            return self._send_json({"error": str(exc), "code": exc.code, "details": exc.details}, status=exc.status)
-        return self._send_json({"error": str(exc)[:500], "code": "studio_error"}, status=400)
+            return self._send_json(
+                {"error": str(exc), "code": exc.code, "details": exc.details},
+                status=exc.status,
+            )
+        return self._send_json(
+            {"error": str(exc)[:500], "code": "studio_error"}, status=400
+        )
 
     def do_GET(self):
         parsed_url = urlparse(self.path)
         path = unquote(parsed_url.path)
         query = parse_qs(parsed_url.query or "")
-        refresh_probe = _to_bool_like((query.get("refresh", ["0"]) or ["0"])[0], default=False) or _to_bool_like(
-            (query.get("probe", ["0"]) or ["0"])[0], default=False
-        )
+        refresh_probe = _to_bool_like(
+            (query.get("refresh", ["0"]) or ["0"])[0], default=False
+        ) or _to_bool_like((query.get("probe", ["0"]) or ["0"])[0], default=False)
         mgr = self._session_mgr()
         if path == "/":
             return self._send_text(STUDIO_INDEX_HTML, "text/html; charset=utf-8")
         if path == "/legacy":
-            return self._send_text(self.app.web_ui_skills_index_html(), "text/html; charset=utf-8")
+            return self._send_text(
+                self.app.web_ui_skills_index_html(), "text/html; charset=utf-8"
+            )
         if path == "/assets/studio.css":
             return self._send_text(STUDIO_CSS, "text/css; charset=utf-8")
         if path == "/assets/studio.js":
@@ -119963,26 +121332,43 @@ class SkillsHandler(BaseHTTPRequestHandler):
             fp = self.app.ide_monaco_worker_path()
             if not fp:
                 return self._send_json({"error": "asset not found"}, status=404)
-            return self._send_inline_bytes(fp.read_bytes(), "application/javascript; charset=utf-8")
+            return self._send_inline_bytes(
+                fp.read_bytes(), "application/javascript; charset=utf-8"
+            )
         if path.startswith("/assets/js_lib/"):
-            fp = self.app.rag_js_lib_asset_path(path[len("/assets/js_lib/"):])
+            fp = self.app.rag_js_lib_asset_path(path[len("/assets/js_lib/") :])
             if not fp:
                 return self._send_json({"error": "asset not found"}, status=404)
             content_type = guess_mime_from_name(fp.name, "application/javascript")
-            if fp.suffix.lower() in {".js", ".mjs", ".cjs"}: content_type = "application/javascript; charset=utf-8"
+            if fp.suffix.lower() in {".js", ".mjs", ".cjs"}:
+                content_type = "application/javascript; charset=utf-8"
             return self._send_inline_bytes(fp.read_bytes(), content_type)
         if path == "/assets/style.css":
-            return self._send_text(self.app.web_ui_skills_style_css(), "text/css; charset=utf-8")
+            return self._send_text(
+                self.app.web_ui_skills_style_css(), "text/css; charset=utf-8"
+            )
         if path == "/assets/skills.js":
-            return self._send_text(self.app.web_ui_skills_js(), "application/javascript; charset=utf-8")
+            return self._send_text(
+                self.app.web_ui_skills_js(), "application/javascript; charset=utf-8"
+            )
         if path == "/api/health":
-            return self._send_json({"ok": True, "app": "skills-studio", "version": APP_VERSION})
+            return self._send_json(
+                {"ok": True, "app": "skills-studio", "version": APP_VERSION}
+            )
         if path == "/api/skillslab/v2/bootstrap":
             try:
                 device = _studio_cookie_value(self.headers, STUDIO_DEVICE_COOKIE)
                 session = _studio_cookie_value(self.headers, STUDIO_SESSION_COOKIE)
-                out = self.app.skills_studio.bootstrap(self._client_ip(), device, session)
-                return self._studio_json(out, cookies={STUDIO_DEVICE_COOKIE: out["cookies"]["device"], STUDIO_SESSION_COOKIE: out["cookies"]["session"]})
+                out = self.app.skills_studio.bootstrap(
+                    self._client_ip(), device, session
+                )
+                return self._studio_json(
+                    out,
+                    cookies={
+                        STUDIO_DEVICE_COOKIE: out["cookies"]["device"],
+                        STUDIO_SESSION_COOKIE: out["cookies"]["session"],
+                    },
+                )
             except Exception as exc:
                 return self._studio_error(exc)
         if path.startswith("/api/skillslab/v2/"):
@@ -119992,41 +121378,85 @@ class SkillsHandler(BaseHTTPRequestHandler):
                 if path == "/api/skillslab/v2/profile":
                     return self._send_json(self.app.skills_studio.profile(device_id))
                 if path == "/api/skillslab/v2/projects":
-                    return self._send_json({"projects": self.app.skills_studio.list_projects(device_id)})
+                    return self._send_json(
+                        {"projects": self.app.skills_studio.list_projects(device_id)}
+                    )
                 m = re.match(r"^/api/skillslab/v2/projects/([^/]+)$", path)
                 if m:
-                    return self._send_json(self.app.skills_studio.get_project(device_id, m.group(1)))
+                    return self._send_json(
+                        self.app.skills_studio.get_project(device_id, m.group(1))
+                    )
                 m = re.match(r"^/api/skillslab/v2/projects/([^/]+)/files/(.+)$", path)
                 if m:
-                    return self._send_json(self.app.skills_studio.read_file(device_id, m.group(1), m.group(2)))
+                    return self._send_json(
+                        self.app.skills_studio.read_file(
+                            device_id, m.group(1), m.group(2)
+                        )
+                    )
                 m = re.match(r"^/api/skillslab/v2/projects/([^/]+)/revisions$", path)
                 if m:
-                    return self._send_json({"revisions": self.app.skills_studio.revisions(device_id, m.group(1))})
+                    return self._send_json(
+                        {
+                            "revisions": self.app.skills_studio.revisions(
+                                device_id, m.group(1)
+                            )
+                        }
+                    )
                 m = re.match(r"^/api/skillslab/v2/projects/([^/]+)/diff$", path)
                 if m:
-                    a = int((query.get("from", ["0"]) or ["0"])[0]); b = int((query.get("to", ["0"]) or ["0"])[0])
-                    return self._send_json(self.app.skills_studio.diff(device_id, m.group(1), a, b))
+                    a = int((query.get("from", ["0"]) or ["0"])[0])
+                    b = int((query.get("to", ["0"]) or ["0"])[0])
+                    return self._send_json(
+                        self.app.skills_studio.diff(device_id, m.group(1), a, b)
+                    )
                 m = re.match(r"^/api/skillslab/v2/projects/([^/]+)/validate$", path)
                 if m:
-                    return self._send_json(self.app.skills_studio.validate(device_id, m.group(1)))
+                    return self._send_json(
+                        self.app.skills_studio.validate(device_id, m.group(1))
+                    )
                 m = re.match(r"^/api/skillslab/v2/projects/([^/]+)/evaluations$", path)
                 if m:
-                    with self.app.skills_studio.lock, self.app.skills_studio._connect() as db:
+                    with (
+                        self.app.skills_studio.lock,
+                        self.app.skills_studio._connect() as db,
+                    ):
                         self.app.skills_studio._row_project(db, m.group(1), device_id)
-                        rows = [{"id": x["id"], "revision": int(x["revision"]), "kind": x["kind"], "result": json.loads(x["result_json"] or "{}"), "created_at": x["created_at"]} for x in db.execute("SELECT * FROM studio_evaluations WHERE project_id=? ORDER BY created_at DESC", (m.group(1),))]
+                        rows = [
+                            {
+                                "id": x["id"],
+                                "revision": int(x["revision"]),
+                                "kind": x["kind"],
+                                "result": json.loads(x["result_json"] or "{}"),
+                                "created_at": x["created_at"],
+                            }
+                            for x in db.execute(
+                                "SELECT * FROM studio_evaluations WHERE project_id=? ORDER BY created_at DESC",
+                                (m.group(1),),
+                            )
+                        ]
                     return self._send_json({"evaluations": rows})
                 m = re.match(r"^/api/skillslab/v2/copilot/jobs/([^/]+)$", path)
                 if m:
-                    return self._send_json(self.app.skills_studio.job(device_id, m.group(1)))
+                    return self._send_json(
+                        self.app.skills_studio.job(device_id, m.group(1))
+                    )
                 m = re.match(r"^/api/skillslab/v2/copilot/jobs/([^/]+)/events$", path)
                 if m:
-                    return self._send_json({"events": [self.app.skills_studio.job(device_id, m.group(1))]})
-                return self._send_json({"error": "not found", "code": "not_found"}, status=404)
+                    return self._send_json(
+                        {"events": [self.app.skills_studio.job(device_id, m.group(1))]}
+                    )
+                return self._send_json(
+                    {"error": "not found", "code": "not_found"}, status=404
+                )
             except Exception as exc:
                 return self._studio_error(exc)
         if path == "/api/webui/validate":
-            reload_external = _to_bool_like((query.get("reload", ["0"]) or ["0"])[0], default=False)
-            return self._send_json(self.app.refresh_web_ui_validation(reload_external=reload_external))
+            reload_external = _to_bool_like(
+                (query.get("reload", ["0"]) or ["0"])[0], default=False
+            )
+            return self._send_json(
+                self.app.refresh_web_ui_validation(reload_external=reload_external)
+            )
         if path == "/api/skillslab/config":
             web_ui_state = self.app.web_ui_status()
             return self._send_json(
@@ -120037,27 +121467,61 @@ class SkillsHandler(BaseHTTPRequestHandler):
                     "agent_port": int(getattr(self.app, "agent_port", 0) or 0),
                     "skills_port": int(getattr(self.app, "skills_port", 0) or 0),
                     "model_catalog": mgr.model_catalog(force_probe=refresh_probe),
-                    "language": normalize_ui_language(getattr(mgr, "user_language", DEFAULT_UI_LANGUAGE)),
-                    "ui_style": normalize_ui_style(getattr(self.app, "ui_style", DEFAULT_UI_STYLE)),
+                    "language": normalize_ui_language(
+                        getattr(mgr, "user_language", DEFAULT_UI_LANGUAGE)
+                    ),
+                    "ui_style": normalize_ui_style(
+                        getattr(self.app, "ui_style", DEFAULT_UI_STYLE)
+                    ),
                     "ui_style_label": UI_STYLE_LABELS.get(
-                        normalize_ui_style(getattr(self.app, "ui_style", DEFAULT_UI_STYLE)),
+                        normalize_ui_style(
+                            getattr(self.app, "ui_style", DEFAULT_UI_STYLE)
+                        ),
                         "Neo",
                     ),
                     "supported_languages": supported_ui_languages_payload(),
-                    "show_upload_list": bool(getattr(self.app, "show_upload_list", False)),
+                    "show_upload_list": bool(
+                        getattr(self.app, "show_upload_list", False)
+                    ),
                     "web_ui": web_ui_state,
                     "run_timeout": int(mgr.max_run_seconds),
-                    "shell_command_timeout_seconds": int(getattr(mgr, "shell_command_timeout_seconds", DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS) or DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS),
-                    "shell_timeout_mode": normalize_shell_timeout_mode(getattr(mgr, "shell_timeout_mode", DEFAULT_SHELL_TIMEOUT_MODE)),
-                    "shell_async_handoff_seconds": int(getattr(mgr, "shell_async_handoff_seconds", DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS) or DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS),
+                    "shell_command_timeout_seconds": int(
+                        getattr(
+                            mgr,
+                            "shell_command_timeout_seconds",
+                            DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS,
+                        )
+                        or DEFAULT_SHELL_COMMAND_TIMEOUT_SECONDS
+                    ),
+                    "shell_timeout_mode": normalize_shell_timeout_mode(
+                        getattr(mgr, "shell_timeout_mode", DEFAULT_SHELL_TIMEOUT_MODE)
+                    ),
+                    "shell_async_handoff_seconds": int(
+                        getattr(
+                            mgr,
+                            "shell_async_handoff_seconds",
+                            DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS,
+                        )
+                        or DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS
+                    ),
                     "read_context_policy": normalize_read_context_policy(
                         getattr(mgr, "read_context_policy", DEFAULT_READ_CONTEXT_POLICY)
                     ),
                     "tool_memory_policy": normalize_tool_memory_policy(
-                        getattr(mgr, "tool_memory_policy", getattr(mgr, "read_context_policy", DEFAULT_TOOL_MEMORY_POLICY))
+                        getattr(
+                            mgr,
+                            "tool_memory_policy",
+                            getattr(
+                                mgr, "read_context_policy", DEFAULT_TOOL_MEMORY_POLICY
+                            ),
+                        )
                     ),
                     "auto_task_level_ceiling": normalize_auto_task_level_ceiling(
-                        getattr(mgr, "auto_task_level_ceiling", DEFAULT_AUTO_TASK_LEVEL_CEILING)
+                        getattr(
+                            mgr,
+                            "auto_task_level_ceiling",
+                            DEFAULT_AUTO_TASK_LEVEL_CEILING,
+                        )
                     ),
                     "request_timeout_default": int(DEFAULT_REQUEST_TIMEOUT),
                 }
@@ -120080,75 +121544,200 @@ class SkillsHandler(BaseHTTPRequestHandler):
         mgr = self._session_mgr()
         if path == "/api/skillslab/v2/bootstrap":
             try:
-                device = _studio_cookie_value(self.headers, STUDIO_DEVICE_COOKIE); session = _studio_cookie_value(self.headers, STUDIO_SESSION_COOKIE)
-                out = self.app.skills_studio.bootstrap(self._client_ip(), device, session)
-                return self._studio_json(out, cookies={STUDIO_DEVICE_COOKIE: out["cookies"]["device"], STUDIO_SESSION_COOKIE: out["cookies"]["session"]})
+                device = _studio_cookie_value(self.headers, STUDIO_DEVICE_COOKIE)
+                session = _studio_cookie_value(self.headers, STUDIO_SESSION_COOKIE)
+                out = self.app.skills_studio.bootstrap(
+                    self._client_ip(), device, session
+                )
+                return self._studio_json(
+                    out,
+                    cookies={
+                        STUDIO_DEVICE_COOKIE: out["cookies"]["device"],
+                        STUDIO_SESSION_COOKIE: out["cookies"]["session"],
+                    },
+                )
             except Exception as exc:
                 return self._studio_error(exc)
         if path.startswith("/api/skillslab/v2/"):
             try:
-                principal = self._studio_auth(write=True); device_id = str(principal["id"]); payload = self._read_json()
+                principal = self._studio_auth(write=True)
+                device_id = str(principal["id"])
+                payload = self._read_json()
                 if path == "/api/skillslab/v2/projects":
-                    return self._send_json(self.app.skills_studio.create_project(device_id, payload), status=201)
+                    return self._send_json(
+                        self.app.skills_studio.create_project(device_id, payload),
+                        status=201,
+                    )
                 if path == "/api/skillslab/v2/llm-config":
                     # Studio-local profiles never mutate the main WebUI.  The
                     # encrypted update path is intentionally narrow and returns
                     # only redacted profile metadata.
                     profiles = payload if isinstance(payload, dict) else {}
-                    with self.app.skills_studio.lock, self.app.skills_studio._connect() as db:
-                        db.execute("UPDATE studio_devices SET profiles_enc=? WHERE id=?", (self.app.skills_studio._secret_profiles(profiles), device_id))
+                    with (
+                        self.app.skills_studio.lock,
+                        self.app.skills_studio._connect() as db,
+                    ):
+                        db.execute(
+                            "UPDATE studio_devices SET profiles_enc=? WHERE id=?",
+                            (
+                                self.app.skills_studio._secret_profiles(profiles),
+                                device_id,
+                            ),
+                        )
                     return self._send_json(self.app.skills_studio.profile(device_id))
                 m = re.match(r"^/api/skillslab/v2/projects/([^/]+)/files$", path)
                 if m:
-                    rel = str(payload.get("path", "") or ""); delete = bool(payload.get("delete", False)); raw = b""
+                    rel = str(payload.get("path", "") or "")
+                    delete = bool(payload.get("delete", False))
+                    raw = b""
                     if not delete:
-                        if "content_b64" in payload: raw = base64.b64decode(str(payload.get("content_b64", "")), validate=True)
-                        else: raw = str(payload.get("content", "")).encode("utf-8")
-                    return self._send_json(self.app.skills_studio.write_file(device_id, m.group(1), rel, raw, is_binary=bool(payload.get("is_binary", False)), mime=str(payload.get("mime", "") or ""), expected_revision=payload.get("expected_revision"), delete=delete))
+                        if "content_b64" in payload:
+                            raw = base64.b64decode(
+                                str(payload.get("content_b64", "")), validate=True
+                            )
+                        else:
+                            raw = str(payload.get("content", "")).encode("utf-8")
+                    return self._send_json(
+                        self.app.skills_studio.write_file(
+                            device_id,
+                            m.group(1),
+                            rel,
+                            raw,
+                            is_binary=bool(payload.get("is_binary", False)),
+                            mime=str(payload.get("mime", "") or ""),
+                            expected_revision=payload.get("expected_revision"),
+                            delete=delete,
+                        )
+                    )
                 m = re.match(r"^/api/skillslab/v2/projects/([^/]+)/files/rename$", path)
                 if m:
-                    return self._send_json(self.app.skills_studio.rename_file(device_id, m.group(1), str(payload.get("from", "") or ""), str(payload.get("to", "") or ""), expected_revision=payload.get("expected_revision")))
+                    return self._send_json(
+                        self.app.skills_studio.rename_file(
+                            device_id,
+                            m.group(1),
+                            str(payload.get("from", "") or ""),
+                            str(payload.get("to", "") or ""),
+                            expected_revision=payload.get("expected_revision"),
+                        )
+                    )
                 m = re.match(r"^/api/skillslab/v2/projects/([^/]+)/revisions$", path)
                 if m:
-                    self.app.skills_studio.assert_revision(device_id, m.group(1), payload.get("expected_revision"))
-                    return self._send_json(self.app.skills_studio.create_revision(device_id, m.group(1), freeze=bool(payload.get("freeze", False))), status=201)
+                    self.app.skills_studio.assert_revision(
+                        device_id, m.group(1), payload.get("expected_revision")
+                    )
+                    return self._send_json(
+                        self.app.skills_studio.create_revision(
+                            device_id,
+                            m.group(1),
+                            freeze=bool(payload.get("freeze", False)),
+                        ),
+                        status=201,
+                    )
                 m = re.match(r"^/api/skillslab/v2/projects/([^/]+)/evaluations$", path)
                 if m:
-                    self.app.skills_studio.assert_revision(device_id, m.group(1), payload.get("expected_revision"))
-                    return self._send_json(self.app.skills_studio.evaluate(device_id, m.group(1)), status=201)
-                m = re.match(r"^/api/skillslab/v2/projects/([^/]+)/evaluations/isolated$", path)
+                    self.app.skills_studio.assert_revision(
+                        device_id, m.group(1), payload.get("expected_revision")
+                    )
+                    return self._send_json(
+                        self.app.skills_studio.evaluate(device_id, m.group(1)),
+                        status=201,
+                    )
+                m = re.match(
+                    r"^/api/skillslab/v2/projects/([^/]+)/evaluations/isolated$", path
+                )
                 if m:
-                    self.app.skills_studio.assert_revision(device_id, m.group(1), payload.get("expected_revision"))
-                    return self._send_json(self.app.skills_studio.evaluate_isolated(device_id, m.group(1), network=bool(payload.get("network", False)), confirmed=bool(payload.get("confirmed", False))), status=201)
+                    self.app.skills_studio.assert_revision(
+                        device_id, m.group(1), payload.get("expected_revision")
+                    )
+                    return self._send_json(
+                        self.app.skills_studio.evaluate_isolated(
+                            device_id,
+                            m.group(1),
+                            network=bool(payload.get("network", False)),
+                            confirmed=bool(payload.get("confirmed", False)),
+                        ),
+                        status=201,
+                    )
                 m = re.match(r"^/api/skillslab/v2/projects/([^/]+)/submissions$", path)
                 if m:
-                    self.app.skills_studio.assert_revision(device_id, m.group(1), payload.get("expected_revision"))
-                    return self._send_json(self.app.skills_studio.submit(device_id, m.group(1), str(payload.get("note", "") or "")), status=201)
+                    self.app.skills_studio.assert_revision(
+                        device_id, m.group(1), payload.get("expected_revision")
+                    )
+                    return self._send_json(
+                        self.app.skills_studio.submit(
+                            device_id, m.group(1), str(payload.get("note", "") or "")
+                        ),
+                        status=201,
+                    )
                 m = re.match(r"^/api/skillslab/v2/projects/([^/]+)/withdraw$", path)
-                if m: return self._send_json(self.app.skills_studio.withdraw(device_id, str(payload.get("submission_id", "") or ""), str(payload.get("note", "") or "")))
+                if m:
+                    return self._send_json(
+                        self.app.skills_studio.withdraw(
+                            device_id,
+                            str(payload.get("submission_id", "") or ""),
+                            str(payload.get("note", "") or ""),
+                        )
+                    )
                 m = re.match(r"^/api/skillslab/v2/projects/([^/]+)/copilot/jobs$", path)
                 if m:
-                    self.app.skills_studio.assert_revision(device_id, m.group(1), payload.get("expected_revision"))
-                    return self._send_json(self.app.skills_studio.start_job(device_id, m.group(1), str(payload.get("mode", "stepwise")), payload), status=202)
+                    self.app.skills_studio.assert_revision(
+                        device_id, m.group(1), payload.get("expected_revision")
+                    )
+                    return self._send_json(
+                        self.app.skills_studio.start_job(
+                            device_id,
+                            m.group(1),
+                            str(payload.get("mode", "stepwise")),
+                            payload,
+                        ),
+                        status=202,
+                    )
                 m = re.match(r"^/api/skillslab/v2/copilot/jobs/([^/]+)/cancel$", path)
-                if m: return self._send_json(self.app.skills_studio.cancel_job(device_id, m.group(1)))
+                if m:
+                    return self._send_json(
+                        self.app.skills_studio.cancel_job(device_id, m.group(1))
+                    )
                 m = re.match(r"^/api/skillslab/v2/copilot/jobs/([^/]+)/apply$", path)
-                if m: return self._send_json(self.app.skills_studio.apply_job(device_id, m.group(1), expected_revision=int(payload.get("expected_revision", -1)), accepted_paths=payload.get("accepted_paths") if isinstance(payload.get("accepted_paths"), list) else None))
-                return self._send_json({"error": "not found", "code": "not_found"}, status=404)
+                if m:
+                    return self._send_json(
+                        self.app.skills_studio.apply_job(
+                            device_id,
+                            m.group(1),
+                            expected_revision=int(payload.get("expected_revision", -1)),
+                            accepted_paths=payload.get("accepted_paths")
+                            if isinstance(payload.get("accepted_paths"), list)
+                            else None,
+                        )
+                    )
+                return self._send_json(
+                    {"error": "not found", "code": "not_found"}, status=404
+                )
             except Exception as exc:
                 return self._studio_error(exc)
-        if path in {"/api/webui/export", "/api/skillslab/generate", "/api/skillslab/save", "/api/skillslab/upload"}:
+        if path in {
+            "/api/webui/export",
+            "/api/skillslab/generate",
+            "/api/skillslab/save",
+            "/api/skillslab/upload",
+        }:
             origin = str(self.headers.get("Origin", "") or "").strip()
             parsed = urlparse(origin)
-            if origin and (parsed.scheme not in {"http", "https"} or parsed.netloc != str(self.headers.get("Host", "") or "")):
-                return self._send_json({"error": "cross-origin write rejected"}, status=403)
+            if origin and (
+                parsed.scheme not in {"http", "https"}
+                or parsed.netloc != str(self.headers.get("Host", "") or "")
+            ):
+                return self._send_json(
+                    {"error": "cross-origin write rejected"}, status=403
+                )
             if not self._require_admin():
                 return
         if path == "/api/webui/export":
             payload = self._read_json()
             ui_dir_raw = str(payload.get("dir", "") or "").strip()
             overwrite = bool(payload.get("overwrite", False))
-            ui_dir = resolve_web_ui_dir_path(ui_dir_raw or str(self.app.web_ui_dir), self.app.workspace)
+            ui_dir = resolve_web_ui_dir_path(
+                ui_dir_raw or str(self.app.web_ui_dir), self.app.workspace
+            )
             out = self.app.export_builtin_web_ui(ui_dir, overwrite=overwrite)
             return self._send_json(out, status=201 if out.get("ok") else 400)
         if path == "/api/skillslab/model":
@@ -120174,7 +121763,9 @@ class SkillsHandler(BaseHTTPRequestHandler):
         if path == "/api/skillslab/generate":
             payload = self._read_json()
             try:
-                out = self.app.generate_skill_from_flow(self._user_id(), payload if isinstance(payload, dict) else {})
+                out = self.app.generate_skill_from_flow(
+                    self._user_id(), payload if isinstance(payload, dict) else {}
+                )
                 return self._send_json(out)
             except Exception as exc:
                 return self._send_json({"error": str(exc)}, status=400)
@@ -120201,7 +121792,9 @@ class SkillsHandler(BaseHTTPRequestHandler):
             mime = str(payload.get("mime", "")).strip()
             overwrite = bool(payload.get("overwrite", False))
             if not filename or not content_b64_present:
-                return self._send_json({"error": "filename and content_b64 required"}, status=400)
+                return self._send_json(
+                    {"error": "filename and content_b64 required"}, status=400
+                )
             try:
                 raw = base64.b64decode(content_b64, validate=True)
             except Exception:
@@ -120209,11 +121802,14 @@ class SkillsHandler(BaseHTTPRequestHandler):
             if len(raw) > 30 * 1024 * 1024:
                 return self._send_json({"error": "max upload size is 30MB"}, status=413)
             try:
-                out = self.app.import_uploaded_skills(filename, raw, mime=mime, overwrite=overwrite)
+                out = self.app.import_uploaded_skills(
+                    filename, raw, mime=mime, overwrite=overwrite
+                )
                 return self._send_json(out)
             except Exception as exc:
                 return self._send_json({"error": str(exc)}, status=400)
         return self._send_json({"error": "not found"}, status=404)
+
 
 class _RagAdminAuthMixin:
     """Shared administrator authentication for the knowledge and code RAG UIs."""
@@ -120237,10 +121833,14 @@ class _RagAdminAuthMixin:
             return True
         host = str(self.headers.get("Host", "") or "").strip()
         parsed = urlparse(origin)
-        return bool(host and parsed.netloc == host and parsed.scheme in {"http", "https"})
+        return bool(
+            host and parsed.netloc == host and parsed.scheme in {"http", "https"}
+        )
 
     def _local_admin_setup_request(self) -> bool:
-        peer = str(self.client_address[0] if getattr(self, "client_address", None) else "")
+        peer = str(
+            self.client_address[0] if getattr(self, "client_address", None) else ""
+        )
         try:
             if not ipaddress.ip_address(peer).is_loopback:
                 return False
@@ -120263,17 +121863,25 @@ class _RagAdminAuthMixin:
 
     def _require_admin_write(self) -> bool:
         if not self._same_origin_write():
-            self._send_json({"error": "cross-origin write rejected", "code": "cross_origin"}, status=403)
+            self._send_json(
+                {"error": "cross-origin write rejected", "code": "cross_origin"},
+                status=403,
+            )
             return False
         if self.app.verify_admin_token(self._bearer_token()):
             return True
-        self._send_json({"error": "admin authentication required", "code": "unauthorized"}, status=401)
+        self._send_json(
+            {"error": "admin authentication required", "code": "unauthorized"},
+            status=401,
+        )
         return False
 
     def _handle_admin_auth_get(self, path: str) -> bool:
         if path == "/api/admin/auth/status":
             self._send_json(
-                self.app.admin_auth_status(local_setup_allowed=self._local_admin_setup_request())
+                self.app.admin_auth_status(
+                    local_setup_allowed=self._local_admin_setup_request()
+                )
             )
             return True
         if path == "/api/admin/auth/session":
@@ -120292,12 +121900,23 @@ class _RagAdminAuthMixin:
         if path not in self._ADMIN_AUTH_POST_PATHS:
             return False
         if not self._same_origin_write():
-            self._send_json({"error": "cross-origin write rejected", "code": "cross_origin"}, status=403)
+            self._send_json(
+                {"error": "cross-origin write rejected", "code": "cross_origin"},
+                status=403,
+            )
             return True
-        content_type = str(self.headers.get("Content-Type", "") or "").split(";", 1)[0].strip().lower()
+        content_type = (
+            str(self.headers.get("Content-Type", "") or "")
+            .split(";", 1)[0]
+            .strip()
+            .lower()
+        )
         if content_type != "application/json":
             self._send_json(
-                {"error": "application/json is required", "code": "invalid_content_type"},
+                {
+                    "error": "application/json is required",
+                    "code": "invalid_content_type",
+                },
                 status=415,
             )
             return True
@@ -120308,7 +121927,10 @@ class _RagAdminAuthMixin:
         if length < 0 or length > 8192:
             self.close_connection = True
             self._send_json(
-                {"error": "authentication request is too large", "code": "payload_too_large"},
+                {
+                    "error": "authentication request is too large",
+                    "code": "payload_too_large",
+                },
                 status=413,
             )
             return True
@@ -120349,6 +121971,7 @@ class _RagAdminAuthMixin:
 
 class SkillsReviewHandler(_RagAdminAuthMixin, BaseHTTPRequestHandler):
     """Main Admin Skills review surface; private draft contents never leave the Studio API."""
+
     protocol_version = "HTTP/1.1"
     server_version = f"StandaloneWebSkillsReview/{APP_VERSION}"
 
@@ -120372,40 +121995,90 @@ class SkillsReviewHandler(_RagAdminAuthMixin, BaseHTTPRequestHandler):
         return read_http_json_body(self)
 
     def _send_json(self, obj, status=200):
-        body = json_response_bytes(obj); self.send_response(status); self.send_header("Content-Type", "application/json; charset=utf-8"); self.send_header("Content-Length", str(len(body))); self.send_header("Cache-Control", "no-store"); self.end_headers(); self.wfile.write(body)
+        body = json_response_bytes(obj)
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
 
     def _send_text(self, text, content_type="text/html; charset=utf-8", status=200):
-        body = safe_utf8_bytes(text); self.send_response(status); self.send_header("Content-Type", content_type); self.send_header("Content-Length", str(len(body))); self.send_header("Cache-Control", "no-store"); self.end_headers(); self.wfile.write(body)
+        body = safe_utf8_bytes(text)
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_GET(self):
-        path = unquote(urlparse(self.path).path); query = parse_qs(urlparse(self.path).query or "")
-        if path == "/": return self._send_text(ADMIN_SKILLS_REVIEW_HTML)
-        if path == "/assets/skills-review.js": return self._send_text(ADMIN_SKILLS_REVIEW_JS, "application/javascript; charset=utf-8")
-        if path == "/assets/skills-review.css": return self._send_text(ADMIN_SKILLS_REVIEW_CSS, "text/css; charset=utf-8")
+        path = unquote(urlparse(self.path).path)
+        query = parse_qs(urlparse(self.path).query or "")
+        if path == "/":
+            return self._send_text(ADMIN_SKILLS_REVIEW_HTML)
+        if path == "/assets/skills-review.js":
+            return self._send_text(
+                ADMIN_SKILLS_REVIEW_JS, "application/javascript; charset=utf-8"
+            )
+        if path == "/assets/skills-review.css":
+            return self._send_text(ADMIN_SKILLS_REVIEW_CSS, "text/css; charset=utf-8")
         if path == "/api/admin/skills/submissions":
-            if not self._require_admin_write(): return
-            return self._send_json({"submissions": self.app.skills_studio.list_submissions(str((query.get("status", [""]) or [""])[0] or ""))})
+            if not self._require_admin_write():
+                return
+            return self._send_json(
+                {
+                    "submissions": self.app.skills_studio.list_submissions(
+                        str((query.get("status", [""]) or [""])[0] or "")
+                    )
+                }
+            )
         m = re.match(r"^/api/admin/skills/submissions/([^/]+)$", path)
         if m:
-            if not self._require_admin_write(): return
-            try: return self._send_json(self.app.skills_studio.submission_snapshot(m.group(1)))
-            except SkillsStudioError as exc: return self._send_json({"error": str(exc), "code": exc.code}, exc.status)
+            if not self._require_admin_write():
+                return
+            try:
+                return self._send_json(
+                    self.app.skills_studio.submission_snapshot(m.group(1))
+                )
+            except SkillsStudioError as exc:
+                return self._send_json(
+                    {"error": str(exc), "code": exc.code}, exc.status
+                )
         return self._send_json({"error": "not found"}, 404)
 
     def _require_admin_write(self):
-        if not self._same_origin_write(): self._send_json({"error": "cross-origin write rejected"}, 403); return False
-        if self.app.verify_admin_token(self._bearer_token()): return True
-        self._send_json({"error": "admin authentication required"}, 401); return False
+        if not self._same_origin_write():
+            self._send_json({"error": "cross-origin write rejected"}, 403)
+            return False
+        if self.app.verify_admin_token(self._bearer_token()):
+            return True
+        self._send_json({"error": "admin authentication required"}, 401)
+        return False
 
     def do_POST(self):
         path = unquote(urlparse(self.path).path)
-        if path.startswith("/api/admin/skills/submissions/") and path.endswith(("/approve", "/changes_requested", "/reject", "/withdraw", "/unpublish")):
-            if not self._require_admin_write(): return
-            m = re.match(r"^/api/admin/skills/submissions/([^/]+)/(approve|changes_requested|reject|withdraw|unpublish)$", path)
+        if path.startswith("/api/admin/skills/submissions/") and path.endswith(
+            ("/approve", "/changes_requested", "/reject", "/withdraw", "/unpublish")
+        ):
+            if not self._require_admin_write():
+                return
+            m = re.match(
+                r"^/api/admin/skills/submissions/([^/]+)/(approve|changes_requested|reject|withdraw|unpublish)$",
+                path,
+            )
             try:
-                out = self.app.skills_studio.review_submission(m.group(1), m.group(2), str(self._read_json().get("note", "") or "")); return self._send_json(out)
-            except SkillsStudioError as exc: return self._send_json({"error": str(exc), "code": exc.code, "details": exc.details}, exc.status)
-            except Exception as exc: return self._send_json({"error": str(exc)}, 400)
+                out = self.app.skills_studio.review_submission(
+                    m.group(1), m.group(2), str(self._read_json().get("note", "") or "")
+                )
+                return self._send_json(out)
+            except SkillsStudioError as exc:
+                return self._send_json(
+                    {"error": str(exc), "code": exc.code, "details": exc.details},
+                    exc.status,
+                )
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, 400)
         if not self._handle_admin_auth_post(path):
             return self._send_json({"error": "not found"}, 404)
 
@@ -124409,8 +126082,6 @@ def main():
     app.restart_callback = _request_admin_restart
     skills_server = None
     skills_thread = None
-    skills_review_server = None
-    skills_review_thread = None
     if args.no_skills_ui:
         print("[web-agent] skills studio disabled by --no_Skills_UI")
     elif int(skills_port) != int(args.port):
