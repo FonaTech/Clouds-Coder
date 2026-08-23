@@ -8,8 +8,8 @@ This review compares the current `Clouds_Coder.py` with the local `Clouds_Coder_
 
 | Metric | 2026-06-22 baseline | Current `Clouds_Coder.py` | Delta |
 | --- | ---: | ---: | ---: |
-| File size | 4,723,922 bytes (local baseline) | 5,542,397 bytes | +818,475 bytes |
-| Source lines | 88,346 | 103,127 | +14,781 |
+| File size | 4,723,922 bytes (local baseline) | 5,541,692 bytes | +817,770 bytes |
+| Source lines | 88,346 | 103,114 | +14,768 |
 | Top-level AST statements | 822 | 874 | +52 |
 | Top-level assignments | 467 | 492 | +25 |
 | Top-level functions | 239 | 262 | +23 |

@@ -12,6 +12,7 @@
   <a href="https://pypi.org/project/clouds-coder/"><img src="https://img.shields.io/pypi/dm/clouds-coder.svg" alt="PyPI ダウンロード数" /></a>
 </p>
 <p align="center">
+  <a href="./log/CHANGELOG-2026-08-20.md">2026-08-20 Collaboration Mode・Skills Studio 2.0 変更ログ（EN/中文/日本語）</a> ·
   <a href="./log/CHANGELOG-2026-08-16.md">2026-08-16 IDE・ランタイム変更ログ（EN/中文/日本語）</a> ·
   <a href="./log/CHANGELOG-2026-08-10.md">2026-08-10 機能変更ログ（EN/中文/日本語）</a> ·
   <a href="./log/CHANGELOG-2026-06-22.md">2026-06-22 Changelog (EN/中文/日本語)</a> ·
@@ -26,13 +27,15 @@
     <th width="50%">IDE ワークスペース</th>
   </tr>
   <tr>
-    <td><img src="./Intro.png" alt="従来の Clouds Coder Web インターフェース" width="100%" /></td>
+    <td><p><strong>従来の Web UI</strong></p><p>タスク中心の従来 Web UI は組み込みランタイムから引き続き利用でき、IDE と同じ実行カーネルを共有します。</p></td>
     <td><img src="./Images/clouds-coder-ide.png" alt="Clouds Coder ブラウザー IDE：セッションワークスペース、コード編集、Agent 進捗、診断" width="100%" /></td>
   </tr>
 </table>
 <p align="center"><sub>Clouds Coder は、タスク中心の従来 Web UI と、ファイル・段階別コード履歴・Agent 進捗・診断を統合した IDE ワークスペースの両方を提供します。</sub></p>
 
-Clouds Coder は、CLI 実行面と Web ユーザー面の分離を中核に据えたローカルファーストの汎用タスクエージェント基盤で、コーディング専用に限定せず、Web UI・Skills Studio・堅牢なストリーミング・長タスク回復制御を備えます。
+Clouds Coder は、CLI 実行面と Web ユーザー面の分離を中核に据えたローカルファーストの汎用タスクエージェント基盤で、コーディング専用に限定せず、ブラウザー IDE・ガバナンス付き LAN Collaboration Mode・Skills Studio 2.0・堅牢なストリーミング・長タスク回復制御を備えます。
+
+複数のブラウザーとプライベート Agent セッションで同じプロジェクトを扱う場合は、[2026-08-20 Collaboration Mode 変更ログ](./log/CHANGELOG-2026-08-20.md) を参照してください。承認済みデバイス、revision-aware writes、共有タスク blackboard、凍結された競合候補、管理者による Skills 公開を、英語 README と図で詳しく説明しています。
 
 主要な問題設定は、CLI コーディングが学習コスト高く、利用者ごとの環境配布が難しい点です。Clouds Coder はバックエンド/フロントエンド分離（クラウド側 CLI 実行 + Web 側操作）で Vibe Coding の導入コストを下げると同時に、timeout・切断回復・文脈予算・思考ループ抑制を並列の中核能力として扱い、複雑タスクの実行性・収束性・再検証性を担保します。
 
@@ -133,6 +136,7 @@ Clouds Coder は「コードを書くためだけの CLI ラッパー」では�
 - 複雑タスク向け `LLM -> Coding -> LLM` 実行パターンを標準搭載
 - **Plan Mode** — UI トグル（Auto/On/Off）、調査 → 提案 → ユーザー選択 → ステップ実行、Single/Sync 両対応
 - **マルチエージェント協調** — 4 ロール（manager/explorer/developer/reviewer）+ blackboard 中心協調
+- **Governed LAN Collaboration Mode** — 承認済みデバイスとメンバーが revision 付き共有ワークスペース、Presence、公開 Agent 証拠、タスク blackboard、明示的な競合解決を利用
 - **短コンテキストモデルの長期処理強化** — マルチエージェント mode は作業をロール別コンテキストへ分割し、小さなローカルモデルでも調査・実装・レビュー・修復ループを継続しやすくします
 - **Reviewer Debug Mode** — エラー検出時に reviewer が書き込み権限を取得し、独立してバグ修正
 - **6 カテゴリ統一エラー検出**（test/lint/compilation/build/deploy/runtime）+ 統一 failure ledger
@@ -148,7 +152,7 @@ Clouds Coder は「コードを書くためだけの CLI ラッパー」では�
 - **プログラミングワークフローメモリ** — `WorkflowMemoryStore` が完了済み coding session をスコアリングし、優れた workflow cards を Code Wiki memory に保存、`workflow` ルートでツール利用・引き継ぎ・検証・実装パターンを検索可能
 - **多因子優先度コンテキスト圧縮** — 10 因子メッセージ重要性スコアリング（近接性・役割・タスク進捗・エラー・目標関連性・skills・compact-resume）で時系列のみの切り捨てを置換
 - 内蔵 Web UI + 外部 Web UI の切替
-- Skills Studio（別ポート）で skill のスキャン/編集/生成/アップロード
+- **Skills Studio 2.0** — デバイス単位の非公開マルチファイル下書き、Copilot patch、revision/Diff、決定的・隔離評価、凍結提出、管理者承認公開
 - Ollama モデル検出とカタログ読み込み
 - `LLM.config.json` による OpenAI-compatible プロファイル対応
 - プライベート vLLM / OpenAI-compatible 耐性：5 回 HTTP リトライ制御、60 秒デフォルト間隔、`Retry-After` / rate-limit 追従、endpoint cooldown、nginx/upstream 一時エラーリトライ
@@ -182,7 +186,7 @@ Clouds Coder は「コードを書くためだけの CLI ラッパー」では�
 │ 表示レイヤー                                                          │
 │  - Agent Web UI（チャット、ボード、プレビュー、状態）                │
 │  - Plan Mode トグル（Auto/On/Off）+ Planner バブル（オレンジレッド）│
-│  - Skills Studio（scan/generate/save/upload skills）                 │
+│  - Skills Studio 2.0（private drafts/Copilot/package validation）    │
 ├───────────────────────────────────────────────────────────────────────┤
 │ API・ストリームレイヤー                                                │
 │  - REST APIs：sessions/config/models/tools/preview/render/plan-mode   │
@@ -1075,7 +1079,7 @@ flowchart LR
 - リアルタイムコード追跡：write/edit 操作が段階スナップショットと操作ストリームに反映され、変更内容・時刻・実行ステップを追跡可能。
 - 履歴バックアップ指向のコードレビュー：段階バックアップ、差分行表示、ホットアンカー定位、純コードコピーによりデバッグと監査を両立。
 - 人間中心の実行フィードバック：長時間呼び出し中も会話/実行ボード内で経過時間、切断継続進捗、回復ヒントを可視化。
-- Skills 制作注入フローの一体化：Skills Studio は scan -> flow 設計 -> 生成 -> 注入 -> 保存の閉ループを提供し、可視 flow builder を搭載。
+- Skill 制作とガバナンスの一体化：Skills Studio 2.0 は非公開プロジェクト、stepwise/one-click Copilot、候補 patch、パッケージ編集、検証/評価、凍結提出、管理者審査、原子公開を提供。従来の flow builder は `/legacy` で利用可能。
 - 混在コンテンツ作業の連続性：コード/文書/表/メディアのドラッグアップロード後、即座にワークスペースへ反映し、プレビューと実行経路へ接続。
 
 ## 7. Skills システム
@@ -1083,7 +1087,7 @@ flowchart LR
 2 層構造：
 
 - **実行時ロード層**：ローカル skill ファイル + HTTP JSON provider manifest プロトコル
-- **Skills Studio 制作層**：スキャン、生成、保存、アップロード
+- **Skills Studio 2.0 制作・ガバナンス層**：デバイス単位のプロジェクト、マルチファイルパッケージ、revision/Diff、Copilot、検証/評価、凍結提出、管理者審査、公開/非公開化
 
 **エコシステム互換性** — 以下 5 大エコシステムの skills をアダプターなしでロード・実行：
 - [awesome-claude-skills](https://github.com/travisvn/awesome-claude-skills) — コミュニティ Claude skills キュレーションコレクション
@@ -1117,7 +1121,10 @@ flowchart LR
 - メッセージ/制御：`/message`、`/interrupt`、`/compact`、`/uploads`
 - モデル/言語設定：`/api/sessions/{id}/config/model`、`/config/language`
 - プレビュー/描画：`/preview-file/*`、`/preview-code/*`、`/preview-code-stages/*`、`/render-state`、`/render-frame`
-- Skills Studio：`/api/skillslab/*`
+- Skills Studio 2.0：`/api/skillslab/v2/*`（旧 `/api/skillslab/*` は互換維持）
+- Skills 審査：`/api/admin/skills/submissions/*`
+- Collaboration Mode：`/api/collab/v1/*`
+- Collaboration 管理：`/api/admin/collaboration/*`
 - 管理：`/admin`、`/api/admin/auth/*`、`/api/admin/config`、`/api/admin/config/reset`、`/api/admin/restart`、`/api/admin/metrics`
 - アプリ：`/api/apps/personal`、`/api/apps/shared`、`/api/apps/skills`、`/api/apps/`
 
@@ -1137,6 +1144,8 @@ clouds-coder --host 0.0.0.0 --port 8080
 
 - Agent UI：`http://127.0.0.1:8080`
 - Skills Studio：`http://127.0.0.1:8081`（無効化可能）
+- ブラウザー IDE：`http://127.0.0.1:8085`（無効化可能）
+- Collaboration Mode：`http://127.0.0.1:8087` または起動時に表示される LAN URL（無効化可能）
 
 > PyPI ページ：https://pypi.org/project/clouds-coder/
 
@@ -1171,6 +1180,8 @@ python Clouds_Coder.py --host 0.0.0.0 --port 8080
 
 - Agent UI：`http://127.0.0.1:8080`
 - Skills Studio：`http://127.0.0.1:8081`（無効化可能）
+- ブラウザー IDE：`http://127.0.0.1:8085`（無効化可能）
+- Collaboration Mode：`http://127.0.0.1:8087` または起動時に表示される LAN URL（無効化可能）
 
 ### 9.3 よく使うオプション
 
@@ -1180,6 +1191,9 @@ python Clouds_Coder.py --host 0.0.0.0 --port 8080
 - `--ctx_limit <tokens>`：コンテキスト上限（明示設定でロック）
 - `--max_rounds <n>`：1 run の最大ラウンド
 - `--no_Skills_UI`：Skills Studio 無効化
+- `--enable_collaboration` / `--no_collaboration`：独立 Collaboration サービスの有効/無効
+- `--collab_host <host>` / `--collab_port <port>`：Collaboration の bind（既定 `P+7`）
+- `--collab_tls_cert <pem>` / `--collab_tls_key <pem>`：Collaboration TLS 設定
 - `--config <path-or-url>`：外部 LLM 設定
 - `--use_external_web_ui` / `--no_external_web_ui`：外部 UI 切替
 - `--export_web_ui`：内蔵 UI 資産エクスポート

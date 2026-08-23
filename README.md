@@ -12,6 +12,7 @@
   <a href="https://pypi.org/project/clouds-coder/"><img src="https://img.shields.io/pypi/dm/clouds-coder.svg" alt="PyPI downloads" /></a>
 </p>
 <p align="center">
+  <a href="./log/CHANGELOG-2026-08-20.md">2026-08-20 Collaboration & Skills Studio 2.0 Changelog (EN/中文/日本語)</a> ·
   <a href="./log/CHANGELOG-2026-08-16.md">2026-08-16 IDE & Runtime Changelog (EN/中文/日本語)</a> ·
   <a href="./log/CHANGELOG-2026-08-10.md">2026-08-10 Feature Changelog (EN/中文/日本語)</a> ·
   <a href="./log/CHANGELOG-2026-06-22.md">2026-06-22 Changelog (EN/中文/日本語)</a> ·
@@ -26,17 +27,17 @@
     <th width="50%">IDE Workspace</th>
   </tr>
   <tr>
-    <td><img src="./Intro.png" alt="Original Clouds Coder Web interface" width="100%" /></td>
+    <td><p><strong>Original Web UI</strong></p><p>The task-focused Web UI remains available from the embedded runtime and shares the same execution kernel.</p></td>
     <td><img src="./Images/clouds-coder-ide.png" alt="Clouds Coder browser IDE with session workspace, code editor, Agent progress, and diagnostics" width="100%" /></td>
   </tr>
 </table>
 <p align="center"><sub>Clouds Coder offers both the original task-focused Web UI and the IDE workspace with files, staged code history, Agent progress, and diagnostics.</sub></p>
 
-Clouds Coder is a local-first, general-purpose task agent platform centered on separating the CLI execution plane from the Web user plane, with Web UI, Skills Studio, resilient streaming, and long-task recovery controls.
+Clouds Coder is a local-first, general-purpose task agent platform centered on separating the CLI execution plane from the Web user plane, with a browser IDE, governed LAN Collaboration Mode, Skills Studio 2.0, resilient streaming, and long-task recovery controls.
 
 Its primary problem framing is that CLI coding remains hard to learn and difficult to distribute consistently across users. Clouds Coder addresses this through backend/frontend separation (cloud-side CLI execution + Web-side interaction) to lower Vibe Coding onboarding cost, while timeout/truncation/context/anti-drift controls are treated as co-equal core capabilities that keep complex tasks executable, convergent, and trustworthy.
 
-Architecture changelog archive (trilingual): [`CHANGELOG-2026-08-16.md`](./log/CHANGELOG-2026-08-16.md) | [`CHANGELOG-2026-08-10.md`](./log/CHANGELOG-2026-08-10.md) | [`CHANGELOG-2026-06-22.md`](./log/CHANGELOG-2026-06-22.md) | [`CHANGELOG-2026-06-05.md`](./log/CHANGELOG-2026-06-05.md) | [`CHANGELOG-2026-05-28.md`](./log/CHANGELOG-2026-05-28.md) | [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md)
+Architecture changelog archive: [`CHANGELOG-2026-08-20.md`](./log/CHANGELOG-2026-08-20.md) | [`CHANGELOG-2026-08-16.md`](./log/CHANGELOG-2026-08-16.md) | [`CHANGELOG-2026-08-10.md`](./log/CHANGELOG-2026-08-10.md) | [`CHANGELOG-2026-06-22.md`](./log/CHANGELOG-2026-06-22.md) | [`CHANGELOG-2026-06-05.md`](./log/CHANGELOG-2026-06-05.md) | [`CHANGELOG-2026-05-28.md`](./log/CHANGELOG-2026-05-28.md) | [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md)
 
 ## IDE Workspace
 
@@ -48,10 +49,274 @@ Clouds Coder includes a session-aware browser IDE that keeps the editor, runtime
 | Editor and history | Monaco editing with a compatibility fallback, tabs, breadcrumbs, Go to File, Command Palette, structured Markdown/artifact previews, and `All` / `Changes` / `Clean` history views. |
 | Run and debug | Problems, Output, Terminal, and Debug Console panels. Python uses `debugpy` when installed and falls back to the standard-library `pdb` workflow when it is not. |
 | Agent collaboration | Session-scoped Agent chat, canonical Todo progress, structured tool and file-diff cards, context attachments, and clickable structured answers for `ask user` requests. |
+| LAN Collaboration Mode | An independent project workspace where approved devices, people, and their private Agent sessions share revisioned files, presence, a task blackboard, evidence, and explicit conflict decisions. |
 | Prompt Enhancer | One-shot by default, optional persistent mode, `Low` / `Medium` / `High` / `XHigh` depth budgets, always-on workspace awareness, and optional model-selected Skill orchestration. Budgets change planning depth, breadth, alternatives, and validation rather than clipping the original request. |
 | Workspace security | Workspace-declared stdio MCP commands remain inert until an administrator approves the exact workspace, configuration, executable, arguments, environment keys, and referenced scripts. Any relevant change invalidates the approval. |
 
 See the [2026-08-16 changelog](./log/CHANGELOG-2026-08-16.md) for the complete IDE, Agent-loop, prompt-enhancement, transport-retry, compaction, and MCP trust update.
+
+## Collaboration Mode: Human + Agent Shared Workspace
+
+Collaboration Mode is a governed LAN workspace for teams that want to edit the same project and run multiple Agents without falling back to “shared directory + last writer wins.” It is served by the same `Clouds_Coder.py` process on a separate listener—`P+7` by default—and opens the full browser IDE with a project-specific identity and filesystem.
+
+Its intent is straightforward: **parallel work should increase throughput without hiding ownership, destroying a valid branch, leaking private Agent context, or quietly expanding an Agent's authority**.
+
+### Two collaboration layers, two different jobs
+
+Clouds Coder uses the word collaboration for two complementary mechanisms:
+
+| Layer | Scope | Roles | Shared state | What it solves |
+| --- | --- | --- | --- | --- |
+| In-session multi-Agent orchestration | One Agent session | `manager`, `explorer`, `developer`, `reviewer` | Session blackboard and role-isolated contexts | Decomposes one complex run into specialized reasoning and execution roles. |
+| Project Collaboration Mode | Multiple approved members, browsers, and private Agent sessions | people plus task-level `coordinator` / `contributor` Agents | Revisioned project workspace, public task blackboard, presence, events, conflicts, audit | Coordinates real project files and decisions across devices and independent Agent sessions. |
+
+The first Agent to join a normalized shared objective becomes its project-level `coordinator`. It remains an active worker and owns public plan slicing and integration. Later Agents become `contributors` and receive non-overlapping slices. This is deliberately different from the in-session `manager`, which is an orchestration role inside one model run.
+
+```mermaid
+flowchart TB
+  UserGoal["User goal"] --> SessionA["Member A · private Agent session"]
+  UserGoal --> SessionB["Member B · private Agent session"]
+
+  subgraph PrivateA["Private session A"]
+    SessionA --> ManagerA["manager"]
+    ManagerA --> ExplorerA["explorer"]
+    ManagerA --> DeveloperA["developer"]
+    ManagerA --> ReviewerA["reviewer"]
+  end
+
+  subgraph PrivateB["Private session B"]
+    SessionB --> RuntimeB["single or multi-Agent runtime"]
+  end
+
+  SessionA -->|"sanitized plan / evidence / result"| ProjectBoard["Project task blackboard"]
+  SessionB -->|"sanitized plan / evidence / result"| ProjectBoard
+  ProjectBoard --> Coordinator["first Agent · coordinator"]
+  ProjectBoard --> Contributor["later Agent · contributor"]
+  Coordinator --> Workspace["Shared revisioned workspace"]
+  Contributor --> Workspace
+  Workspace --> ConflictGate["Revision and conflict gate"]
+```
+
+### Cooperation framework and trust boundary
+
+The collaboration service is an independent boundary around one project. Members do not receive Admin authority, raw server-side model credentials, global Skill write access, or another member's full Agent conversation. They receive a shared project workspace and read access to administrator-governed capabilities.
+
+```mermaid
+flowchart TB
+  subgraph AdminPlane["Administrator control plane"]
+    Admin["Admin UI"] --> ProjectGovernance["Create / archive / backup / quarantine"]
+    Admin --> AccessGovernance["Approve device / block / revoke / rotate password"]
+    Admin --> ResourceGovernance["Publish Skills / approve MCP / configure shared resources"]
+    Admin --> Audit["Inspect hash-linked audit chain"]
+  end
+
+  subgraph CollaborationBoundary["Collaboration service · default P+7"]
+    Admission["Project password + approved device"]
+    Session["24 h HttpOnly session + CSRF"]
+    API["Collaboration REST API"]
+    Stream["Ordered SSE events + snapshot reset"]
+    Admission --> Session --> API
+    API <--> Stream
+  end
+
+  subgraph MemberPlane["Approved project members"]
+    IDE1["Member A browser IDE"]
+    IDE2["Member B browser IDE"]
+    Agent1["Member A private Agent sessions"]
+    Agent2["Member B private Agent sessions"]
+    IDE1 <--> Agent1
+    IDE2 <--> Agent2
+  end
+
+  subgraph ProjectState["Project source of truth"]
+    Files["Isolated workspace files"]
+    Revisions["Document revisions + immutable history"]
+    Board["Assignments + public evidence"]
+    Presence["Presence / cursor / file intent"]
+    Conflicts["Frozen branches + reviews"]
+  end
+
+  subgraph SharedRead["Governed shared capabilities"]
+    LLM["Server-side LLM profiles"]
+    Skills["Published Skills · member read-only"]
+    MCP["Approved MCP tools"]
+    RAG["Knowledge / Code RAG / shared apps"]
+  end
+
+  AdminPlane --> CollaborationBoundary
+  IDE1 --> Admission
+  IDE2 --> Admission
+  API <--> MemberPlane
+  API <--> ProjectState
+  MemberPlane --> SharedRead
+```
+
+Project membership is device-based, not IP-based. A project password proves invitation knowledge; administrator approval of the device short code grants admission. Sessions expire after 24 hours and refresh only with the device credential. Password rotation revokes current sessions and outstanding leases.
+
+```mermaid
+sequenceDiagram
+  actor Member as New member
+  participant Browser as Browser device
+  participant Service as Collaboration service
+  participant Store as Identity store
+  actor Admin as Administrator
+
+  Member->>Browser: Enter project/invite, password, nickname
+  Browser->>Browser: Generate persistent device key
+  Browser->>Service: Same-origin admission request
+  Service->>Store: Rate-limit + verify PBKDF2 password
+  Store-->>Service: Create pending member/device
+  Service-->>Browser: Pending + short device code
+  Admin->>Store: Approve the exact device
+  Member->>Service: Submit admission again
+  Service->>Store: Check approval and password version
+  Store-->>Service: Issue session + CSRF
+  Service-->>Browser: HttpOnly SameSite cookie
+```
+
+### Revision-aware writes
+
+Clouds Coder chooses the consistency protocol from the write shape:
+
+```mermaid
+flowchart TD
+  Intent["Human or Agent intends to change a path"] --> Kind{"Write shape"}
+
+  Kind -->|"Small UTF-8 text"| OT["Operational transform"]
+  OT --> OTBase["base_revision + unique operation ID"]
+  OTBase --> Transform["Transform against accepted newer operations"]
+  Transform --> Commit["Commit revision + immutable version"]
+
+  Kind -->|"Binary / large / whole file"| Compare["expected_revision comparison"]
+  Compare -->|"matches"| Commit
+  Compare -->|"stale"| Freeze["Freeze document + preserve candidate"]
+
+  Kind -->|"Shell / Agent process"| MutationLease["Project mutation lease"]
+  MutationLease --> Snapshot["Capture before revisions and hashes"]
+  Snapshot --> Process["Run process while readers wait"]
+  Process --> Adopt["Adopt each resulting write"]
+  Adopt -->|"baseline matches"| Commit
+  Adopt -->|"baseline changed"| Freeze
+
+  Commit --> Publish["SSE event + snapshot + history"]
+  Publish --> Peers["Refresh other IDEs"]
+```
+
+- UTF-8 text up to the collaboration OT limit is transformed against accepted operations since the submitted base revision. Client operation IDs make retries idempotent.
+- Whole-file and binary writes use optimistic concurrency with `expected_revision`.
+- Shell and Agent tools use `CollaborationWriteCoordinator`, which holds a project mutation lease, records before/after hashes, and adopts writes into the revision catalog.
+- Stable writes made outside the collaboration protocol are detected by the watcher and turned into conflicts. An unexplained disk value never silently becomes the new shared baseline.
+
+### Shared task blackboard without shared hidden reasoning
+
+Agents publish only bounded public coordination fields: plan steps, research notes, execution logs, review feedback, file paths/revisions, validation evidence, blockers, and result summaries. The bridge strips fenced code, hidden/system prompt sections, likely secrets, bearer tokens, private keys, and private home paths. Full private prompts and hidden reasoning stay in the owning session.
+
+```mermaid
+sequenceDiagram
+  actor A as Member A
+  actor B as Member B
+  participant AgentA as Agent A
+  participant AgentB as Agent B
+  participant Board as Shared task blackboard
+  participant Files as Revisioned files
+
+  A->>AgentA: Start objective X
+  AgentA->>Board: begin_task(X)
+  Board-->>AgentA: coordinator + integration responsibility
+  AgentA->>Board: publish public plan slices
+
+  B->>AgentB: Start the same objective X
+  AgentB->>Board: begin_task(X)
+  Board-->>AgentB: contributor + assigned slices
+
+  AgentA->>Board: declare file intent and evidence
+  AgentB->>Board: read plan; declare non-overlapping intent
+  AgentA->>Files: coordinated write
+  AgentB->>Files: coordinated write
+  Files-->>Board: revisions and validation evidence
+  AgentB->>Board: contributor result
+  AgentA->>Board: integrated result
+  Board-->>A: visible status / evidence / blockers
+  Board-->>B: visible status / evidence / blockers
+```
+
+After a restart, running Agent rows are marked inactive, unfinished assignments become blocked, and stale file intents are closed. A heartbeat watchdog applies the same cleanup to abandoned sessions during normal operation.
+
+### Conflict handling keeps humans in the authority loop
+
+A stale or external write creates candidate branches and freezes the affected document. Primary and secondary reviews must be submitted by different members. Agreement makes the case ready; disagreement or unresolved concerns explicitly returns the decision to users.
+
+```mermaid
+stateDiagram-v2
+  [*] --> Open: stale / concurrent / external write
+  Open --> Reviewing: first review
+  Reviewing --> Ready: distinct reviewers agree
+  Reviewing --> AskUser: candidates or unresolved notes differ
+  Ready --> Resolved: apply candidate / keep baseline
+  AskUser --> Resolved: explicit member decision
+  Open --> Aborted: admin emergency baseline restore
+  Reviewing --> Aborted: admin emergency baseline restore
+  Resolved --> [*]
+  Aborted --> [*]
+```
+
+Discarding another member's candidate requires that owner's confirmation. Discarding every candidate requires all candidate owners to confirm. The administrator can emergency-abort a stuck case to restore the recorded baseline and unfreeze the path, but this does not masquerade as a semantic merge.
+
+### Event delivery, recovery, and project lifecycle
+
+```mermaid
+sequenceDiagram
+  participant IDE as Reconnecting IDE
+  participant Service as Collaboration service
+  participant Log as Ordered project event log
+
+  IDE->>Service: Connect with Last-Event-ID
+  alt cursor is retained
+    Service->>Log: Read missing events
+    Log-->>IDE: operation / presence / blackboard / conflict events
+  else cursor predates retention
+    Service-->>IDE: Complete snapshot reset
+  end
+  Service-->>IDE: Heartbeats while idle
+```
+
+```mermaid
+stateDiagram-v2
+  [*] --> Active: Admin creates project
+  Active --> Archived: archive and revoke sessions
+  Archived --> Active: reactivate
+  Active --> Quarantined: confirmed delete
+  Archived --> Quarantined: confirmed delete
+  Quarantined --> Archived: restore within 30 days
+  Quarantined --> Purged: retention expires
+  Purged --> [*]
+```
+
+The Admin collaboration page manages projects, device approvals, member access, password rotation, backups, quarantine/restore, active conflicts, and the hash-linked audit chain.
+
+### Start and join
+
+The current CLI enables Collaboration Mode by default unless `--no_collaboration` is supplied. An explicit source launch looks like this:
+
+```bash
+python Clouds_Coder.py \
+  --host 0.0.0.0 \
+  --port 8080 \
+  --enable_collaboration \
+  --collab_host 0.0.0.0 \
+  --collab_port 8087
+```
+
+For a main port of `8080`:
+
+- Admin: `http://127.0.0.1:8080/admin`
+- Collaboration: `http://127.0.0.1:8087` or the LAN URL printed at startup
+
+In Admin, open **Collaboration**, create a project, and distribute its name/invite code plus project password through a trusted channel. Each new browser displays a short device code; compare and approve it before the participant submits the admission form again.
+
+> Plain HTTP is intended only for a LAN you fully trust. Outside that boundary, configure `--collab_tls_cert` and `--collab_tls_key`, or use an explicitly trusted HTTPS reverse proxy. Use `--no_collab_allow_insecure_http` to require a secure non-loopback deployment.
+
+See the [2026-08-20 changelog](./log/CHANGELOG-2026-08-20.md) for the complete architecture, security, write-protocol, conflict-governance, and Skills Studio 2.0 release notes.
 
 ## 1. Project Positioning
 
@@ -133,6 +398,7 @@ This design reduces "thinking-only" drift by forcing thought to be converted int
 - Built-in `LLM -> Coding -> LLM` execution pattern for complex multi-step work
 - **Plan Mode** with UI toggle (Auto/On/Off) — research → proposal → user choice → step-by-step execution, works in both Single and Sync modes
 - **Multi-agent collaboration** with 4 roles (manager/explorer/developer/reviewer) and blackboard-centered coordination
+- **Governed LAN Collaboration Mode** — approved devices and members share a revisioned project workspace, presence, public Agent evidence, and human-authorized conflict resolution on an independent `P+7` listener
 - **Short-context long-horizon scaling** — multi-agent mode splits work into role-isolated contexts so smaller local models can continue research, implementation, and review loops without relying on one giant prompt
 - **Reviewer Debug Mode** — reviewer gains write access to independently diagnose and fix bugs when errors are detected
 - **6-category universal error detection** (test/lint/compilation/build/deploy/runtime) with unified failure ledger
@@ -148,7 +414,7 @@ This design reduces "thinking-only" drift by forcing thought to be converted int
 - **Programming workflow memory** — `WorkflowMemoryStore` scores completed coding sessions and files accepted workflow cards into Code Wiki memory, making proven tool-use, handoff, validation, and implementation patterns retrievable through the `workflow` route
 - **Multi-factor priority context compression** — 10-factor message importance scoring (recency, role, task progress, errors, goal relevance, skills, compact-resume) replaces chronological-only trimming
 - Built-in Web UI + optional external Web UI loading
-- Skills Studio (separate UI/port) for skill scanning, editing, and generation
+- **Skills Studio 2.0** — device-private multi-file drafts, Copilot patches, revisions/diffs, deterministic and isolated evaluation, frozen review submissions, and atomic administrator-approved publication
 - Ollama integration with model probing and catalog loading
 - OpenAI-compatible profile support via `LLM.config.json`
 - Private vLLM / OpenAI-compatible resilience: 5-attempt HTTP retry governance, 60s default retry interval, `Retry-After` / rate-limit-following, endpoint cooldowns, and transient nginx/upstream retry handling
@@ -182,7 +448,7 @@ This design reduces "thinking-only" drift by forcing thought to be converted int
 │ Presentation Layer                                                     │
 │  - Agent Web UI (chat, boards, preview, runtime status)              │
 │  - Plan Mode toggle (Auto/On/Off) + Planner bubble (orange-red)     │
-│  - Skills Studio UI (scan/generate/save/upload skills)               │
+│  - Skills Studio 2.0 UI (private drafts/Copilot/package validation)  │
 ├───────────────────────────────────────────────────────────────────────┤
 │ API & Stream Layer                                                     │
 │  - REST APIs: sessions/config/models/tools/preview/render/plan-mode  │
@@ -339,7 +605,9 @@ flowchart TD
   N --> O["Preview / History / Export<br/>MD/Code/HTML + stage backups"]
 ```
 
-### 3.3 Monolithic Multi-Agent Collaboration (Blackboard Mode)
+### 3.3 In-Session Multi-Agent Collaboration (Blackboard Mode)
+
+> This section describes role specialization inside one Agent session. For multiple people, devices, and independent Agent sessions sharing one revisioned project, see [Collaboration Mode](#collaboration-mode-human--agent-shared-workspace).
 
 Clouds Coder now supports role-specialized collaboration inside one monolithic runtime process:
 
@@ -1143,7 +1411,7 @@ Clouds Coder Web UI is designed for long sessions and frequent state updates.
 - Real-time code provenance: every write/edit operation feeds preview stage snapshots and operation streams, so users can trace what changed, when, and through which agent/tool step.
 - History-backup oriented code review UX: stage-based code backups, diff-aware rows, hot-anchor focus, and copy-safe plain code export support both debugging and audit scenarios.
 - Humanized runtime feedback: long-running model calls show elapsed state, truncation continuation progress, and recovery hints in the same conversation/runtime board rather than hidden logs.
-- Skill authoring as a first-class UX flow: Skills Studio provides scan -> flow design -> generation -> injection -> save workflow, including a visual flow builder for SKILL.md creation.
+- Skill authoring as a governed workflow: Skills Studio 2.0 provides private project drafts, stepwise or one-click Copilot candidates, selective patch application, package editing, validation/evaluation, frozen submissions, administrator review, and atomic publication. The legacy flow builder remains available at `/legacy`.
 - Operational continuity for mixed content tasks: drag-and-drop uploads (code/docs/tables/media) are mirrored into workspace context and immediately connected to preview and execution paths.
 
 ## 7. Skills System
@@ -1151,7 +1419,29 @@ Clouds Coder Web UI is designed for long sessions and frequent state updates.
 Two capability layers:
 
 - **Runtime skill loading** (agent execution): local skill files + HTTP JSON provider manifest protocol
-- **Skills Studio** (authoring): scan, inspect, generate, save, upload skills
+- **Skills Studio 2.0** (authoring and governance): private device-owned projects, multi-file packages, revisions/diffs, Copilot jobs, validation/evaluation, frozen submissions, administrator review, publication, and unpublication
+
+### 7.1 Skills Studio 2.0 publication model
+
+Opening `P+1` creates an independent Studio device identity. Its private drafts do not enter the global `skills/` directory and are invisible to ordinary Agent sessions. The default package starts with standard `SKILL.md` frontmatter (`name` and `description`) and `agents/openai.yaml`; authors may add `scripts/`, `references/`, `assets/`, and the optional `agents/clouds-coder.yaml` sidecar.
+
+```mermaid
+flowchart LR
+  Device["Studio device identity"] --> Draft["Private package draft"]
+  Draft --> Copilot["Stepwise / one-click Copilot"]
+  Copilot --> Candidate["Per-file candidate patches"]
+  Candidate -->|"accept selected"| Draft
+  Draft --> Validation["Static validation + trigger evaluation"]
+  Validation --> Freeze["Frozen submitted revision"]
+  Freeze --> Admin["Admin review / reevaluation"]
+  Admin -->|"changes requested"| Draft
+  Admin -->|"reject"| Rejected["Rejected snapshot"]
+  Admin -->|"approve"| Atomic["Atomic move to skills/slug"]
+  Atomic --> Refresh["Refresh SkillStore + active sessions"]
+  Atomic -->|"unpublish"| Quarantine["Recoverable unpublished area"]
+```
+
+Every mutation carries the expected project revision, preventing one browser tab from silently overwriting another. Submissions freeze an immutable file snapshot. Approval revalidates that snapshot, rejects global name collisions, requires passing hard-isolation evidence for executable scripts, publishes by atomic rename, and refreshes active Skill consumers without a restart.
 
 **Universal ecosystem compatibility** — skills from any of these ecosystems load and execute without adapters:
 - [awesome-claude-skills](https://github.com/travisvn/awesome-claude-skills) — curated community Claude skills collection
@@ -1185,7 +1475,10 @@ Major endpoint groups:
 - Message/control: `/message`, `/interrupt`, `/compact`, `/uploads`
 - Model config: `/api/sessions/{id}/config/model`, `/config/language`
 - Preview/render: `/preview-file/*`, `/preview-code/*`, `/preview-code-stages/*`, `/render-state`, `/render-frame`
-- Skills Studio: `/api/skillslab/*`
+- Skills Studio 2.0: `/api/skillslab/v2/*` (legacy administrator compatibility: `/api/skillslab/*`)
+- Skills review: `/api/admin/skills/submissions/*`
+- Collaboration Mode: `/api/collab/v1/*`
+- Collaboration administration: `/api/admin/collaboration/*`
 - Administration: `/admin`, `/api/admin/auth/*`, `/api/admin/config`, `/api/admin/config/reset`, `/api/admin/restart`, `/api/admin/metrics`
 - Applications: `/api/apps/personal`, `/api/apps/shared`, `/api/apps/skills`, `/api/apps/`
 
@@ -1205,6 +1498,8 @@ clouds-coder --host 0.0.0.0 --port 8080
 
 - Agent UI: `http://127.0.0.1:8080`
 - Skills Studio: `http://127.0.0.1:8081` (unless disabled)
+- Browser IDE: `http://127.0.0.1:8085` (unless disabled)
+- Collaboration Mode: `http://127.0.0.1:8087` or the printed LAN address (unless disabled)
 
 > PyPI page: https://pypi.org/project/clouds-coder/
 
@@ -1239,6 +1534,8 @@ Default behavior:
 
 - Agent UI: `http://127.0.0.1:8080`
 - Skills Studio: `http://127.0.0.1:8081` (unless disabled)
+- Browser IDE: `http://127.0.0.1:8085` (unless disabled)
+- Collaboration Mode: `http://127.0.0.1:8087` or the printed LAN address (unless disabled)
 
 ### 9.3 Useful CLI Options
 
@@ -1248,6 +1545,11 @@ Default behavior:
 - `--ctx_limit <tokens>`: session context limit (manual lock if explicitly set)
 - `--max_rounds <n>`: max agent rounds per run
 - `--no_Skills_UI`: disable Skills Studio server
+- `--enable_collaboration` / `--no_collaboration`: enable or disable the independent collaboration listener
+- `--collab_host <host>` / `--collab_port <port>`: collaboration bind address and port (default `P+7`)
+- `--collab_tls_cert <pem>` / `--collab_tls_key <pem>`: serve Collaboration Mode over TLS
+- `--collab_https_proxy`: accept HTTPS from an explicitly configured trusted reverse proxy
+- `--no_collab_allow_insecure_http`: reject non-loopback collaboration unless TLS or the trusted proxy is configured
 - `--config <path-or-url>`: load external LLM profile config
 - `--use_external_web_ui` / `--no_external_web_ui`: external UI mode switch
 - `--export_web_ui`: export built-in UI assets to configured web UI dir

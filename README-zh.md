@@ -12,6 +12,7 @@
   <a href="https://pypi.org/project/clouds-coder/"><img src="https://img.shields.io/pypi/dm/clouds-coder.svg" alt="PyPI 下载量" /></a>
 </p>
 <p align="center">
+  <a href="./log/CHANGELOG-2026-08-20.md">2026-08-20 协作模式与 Skills Studio 2.0 更新日志（EN/中文/日本語）</a> ·
   <a href="./log/CHANGELOG-2026-08-16.md">2026-08-16 IDE 与运行时更新日志（EN/中文/日本語）</a> ·
   <a href="./log/CHANGELOG-2026-08-10.md">2026-08-10 功能更新日志（EN/中文/日本語）</a> ·
   <a href="./log/CHANGELOG-2026-06-22.md">2026-06-22 更新日志（EN/中文/日本語）</a> ·
@@ -26,17 +27,17 @@
     <th width="50%">IDE 工作区</th>
   </tr>
   <tr>
-    <td><img src="./Intro.png" alt="Clouds Coder 原版 Web 界面" width="100%" /></td>
+    <td><p><strong>原版 Web 界面</strong></p><p>面向任务的原版 Web 界面仍由内嵌运行时提供，并与 IDE 共用同一执行内核。</p></td>
     <td><img src="./Images/clouds-coder-ide.png" alt="Clouds Coder 浏览器 IDE：会话工作区、代码编辑、Agent 进度与诊断面板" width="100%" /></td>
   </tr>
 </table>
 <p align="center"><sub>Clouds Coder 同时提供面向任务的原版 Web 界面，以及集成文件、分阶段代码历史、Agent 进度与诊断的 IDE 工作区。</sub></p>
 
-Clouds Coder 是一个以“CLI 执行层与 Web 用户层分离”为核心的本地优先（local-first）通用任务智能体平台，不局限于编程场景，集成 Web UI、Skills Studio、鲁棒流式回传与复杂任务恢复能力。
+Clouds Coder 是一个以“CLI 执行层与 Web 用户层分离”为核心的本地优先（local-first）通用任务智能体平台，不局限于编程场景，集成浏览器 IDE、受治理的局域网协作模式、Skills Studio 2.0、鲁棒流式回传与复杂任务恢复能力。
 
 它的首要问题定义是：CLI 编程门槛高、环境分发困难、学习曲线陡。Clouds Coder 通过前后端分离（云端 CLI 执行 + Web 端交互控制）来降低 Vibe Coding 上手成本，同时把超时、截断、上下文预算、空想循环治理作为并列核心能力，保障复杂任务可执行、可收敛、可复盘。
 
-架构更新日志归档：[`CHANGELOG-2026-08-16.md`](./log/CHANGELOG-2026-08-16.md) | [`CHANGELOG-2026-08-10.md`](./log/CHANGELOG-2026-08-10.md) | [`CHANGELOG-2026-06-22.md`](./log/CHANGELOG-2026-06-22.md) | [`CHANGELOG-2026-06-05.md`](./log/CHANGELOG-2026-06-05.md) | [`CHANGELOG-2026-05-28.md`](./log/CHANGELOG-2026-05-28.md) | [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md)
+架构更新日志归档：[`CHANGELOG-2026-08-20.md`](./log/CHANGELOG-2026-08-20.md) | [`CHANGELOG-2026-08-16.md`](./log/CHANGELOG-2026-08-16.md) | [`CHANGELOG-2026-08-10.md`](./log/CHANGELOG-2026-08-10.md) | [`CHANGELOG-2026-06-22.md`](./log/CHANGELOG-2026-06-22.md) | [`CHANGELOG-2026-06-05.md`](./log/CHANGELOG-2026-06-05.md) | [`CHANGELOG-2026-05-28.md`](./log/CHANGELOG-2026-05-28.md) | [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md)
 
 ## IDE 工作区
 
@@ -48,10 +49,108 @@ Clouds Coder 内置面向会话的浏览器 IDE，把编辑器、运行工具、
 | 编辑与历史 | Monaco 编辑器及兼容兜底、标签页、面包屑、Go to File、Command Palette、结构化 Markdown/工件预览，以及 `All` / `Changes` / `Clean` 历史视图。 |
 | 运行与调试 | Problems、Output、Terminal 和 Debug Console 面板；安装 `debugpy` 时使用完整 Python 调试适配器，未安装时回退到标准库 `pdb` 工作流。 |
 | Agent 协作 | 会话级 Agent 对话、规范 Todo 进度、结构化工具与文件 Diff 卡片、上下文附件，以及 `ask user` 的可点击结构化选项。 |
+| 局域网协作模式 | 独立的 `P+7` 协作服务；管理员批准设备与成员，多个浏览器和私有 Agent 会话共享版本化文件、Presence、公开证据、任务黑板和显式冲突决策。 |
 | Prompt Enhancer | 默认仅强化下一次任务，可选择跨任务常驻；提供 `Low` / `Medium` / `High` / `XHigh` 四档；工作区感知始终开启，Skill 感知可选。预算改变的是规划深度、方案广度、备选路径和验证层级，不裁剪原始请求。 |
 | 工作区安全 | 工作区声明的 stdio MCP 命令在管理员批准前保持禁用；批准绑定工作区、完整配置、可执行文件、参数、环境变量键和引用脚本，相关内容变化会自动使批准失效。 |
 
 完整的 IDE、Agent Loop、Prompt Enhancer、连接重试、上下文压缩与 MCP 信任更新见 [2026-08-16 更新日志](./log/CHANGELOG-2026-08-16.md)。
+
+## 协作模式：人类与 Agent 的共享工作区
+
+协作模式面向需要多人、多个浏览器和多个独立 Agent 会话共同完成同一项目的场景。它不是“把目录共享出去，然后最后写入者获胜”，而是把身份、文件版本、任务责任、冲突审核和恢复流程都做成显式协议。
+
+协作模式有两层：
+
+| 层级 | 范围 | 角色与状态 | 解决的问题 |
+| --- | --- | --- | --- |
+| 会话内多智能体 | 一个 Agent session | `manager / explorer / developer / reviewer`，使用单会话 blackboard | 将一个复杂运行拆成专职调研、实现、审查与修复角色。 |
+| 项目级协作模式 | 多个已批准成员、设备和私有 Agent session | 首个同目标 Agent 为 `coordinator`，后续为 `contributor` | 让真实项目文件、Presence、任务证据和跨设备决策保持可追溯。 |
+
+项目协作中的 `coordinator` 是执行者和集成负责人，不等同于会话内的 `manager`。每个成员的完整 Agent 对话仍然私有；项目黑板只接收脱敏后的计划切片、研究线索、文件意图、验证证据、阻塞原因和结果摘要。
+
+```mermaid
+flowchart TB
+  Goal["用户目标"] --> A["成员 A 私有 Agent session"]
+  Goal --> B["成员 B 私有 Agent session"]
+  A --> Board["项目任务黑板\n公开计划 / 证据 / 结果"]
+  B --> Board
+  Board --> C["coordinator\n负责切片与集成"]
+  Board --> D["contributor\n只处理分配切片"]
+  C --> Files["共享版本化工作区"]
+  D --> Files
+  Files --> Gate["revision / lease / conflict gate"]
+```
+
+### 信任边界与设备准入
+
+IP 只是传输元数据，不是用户身份。成员身份由项目、成员记录和管理员批准的设备共同决定。项目密码证明邀请知识；设备短码批准决定该浏览器是否能获得 24 小时会话。密码轮换会撤销现有会话和未完成授权租约。
+
+```mermaid
+sequenceDiagram
+  actor User as 新成员
+  participant Browser as 浏览器设备
+  participant Service as 协作服务
+  participant Admin as 管理员
+
+  User->>Browser: 输入项目/邀请码、密码、昵称
+  Browser->>Browser: 生成持久随机设备密钥
+  Browser->>Service: 同源准入请求
+  Service-->>Browser: pending + 设备短码
+  Admin->>Service: 审批对应设备
+  User->>Service: 再次提交准入
+  Service-->>Browser: HttpOnly 会话 + CSRF Token
+```
+
+### 三种写入协议
+
+协作模式按写入形态选择一致性协议，而不是让 Monaco 编辑、二进制上传和 Shell 命令共用一个脆弱的覆盖路径：
+
+```mermaid
+flowchart TD
+  W["修改路径"] --> K{"写入形态"}
+  K -->|"UTF-8 文本 ≤ OT 限制"| OT["Operational Transform\nbase_revision + operation_id"]
+  K -->|"二进制 / 整文件"| CAS["expected_revision\n乐观并发控制"]
+  K -->|"Shell / Agent 进程"| Lease["project mutation lease\n前后哈希 + 写入接管"]
+  OT --> Commit["提交新 revision\n保存不可变版本"]
+  CAS --> Check{"基线仍匹配？"}
+  Check -->|是| Commit
+  Check -->|否| Freeze["冻结文档\n保存候选分支"]
+  Lease --> Check
+  Commit --> Events["SSE 事件 + 快照 + 历史"]
+```
+
+小型 UTF-8 文本通过 OT 变换并让重试保持幂等；整文件和二进制写入必须携带 `expected_revision`；Shell/Agent 写入由 `CollaborationWriteCoordinator` 持有项目 mutation lease，并把结果重新纳入版本目录。稳定的外部磁盘写入会变成冲突，不会静默覆盖共享基线。
+
+### 冲突仲裁与恢复
+
+无法证明安全的写入会冻结文档，并保留基线和所有候选分支。主审与次审必须是不同成员；意见一致才进入 `ready`，候选或未解决事项不一致时返回用户决策。丢弃其他成员候选需要其所有者确认，丢弃全部候选需要所有候选所有者确认。
+
+```mermaid
+stateDiagram-v2
+  [*] --> Open: stale / concurrent / external write
+  Open --> Reviewing: 首次审核
+  Reviewing --> Ready: 两位不同成员意见一致
+  Reviewing --> AskUser: 候选或风险说明存在分歧
+  Ready --> Resolved: 成员应用候选或保留基线
+  AskUser --> Resolved: 成员显式决策
+  Open --> Aborted: 管理员紧急恢复基线
+  Resolved --> [*]
+  Aborted --> [*]
+```
+
+事件流通过 SSE 提供有序增量；断线重连时使用 `Last-Event-ID`，若游标已超出保留范围则返回完整快照。服务器重启或 Agent 心跳过期后，运行中的 Agent 会被标记为 inactive，未完成分配变成 blocked，过期文件意图会关闭。
+
+### 启动与加入
+
+主端口为 `P` 时，协作服务默认使用 `P+7`。例如：
+
+```bash
+python Clouds_Coder.py --host 0.0.0.0 --port 8080 --enable_collaboration --collab_host 0.0.0.0 --collab_port 8087
+```
+
+在 Admin 的“协作”页面创建项目并分发项目名/邀请码和项目密码。每个新浏览器会显示设备短码；管理员核对后批准，再让成员重新提交准入表单。非可信网络请配置 `--collab_tls_cert` 与 `--collab_tls_key`，或使用明确配置的 HTTPS 反向代理；`--no_collab_allow_insecure_http` 可强制非回环部署使用安全传输。
+
+本次协作架构、权限边界、黑板协议、冲突状态机和 Skills Studio 2.0 的完整说明见 [`CHANGELOG-2026-08-20.md`](./log/CHANGELOG-2026-08-20.md) 与 [英文 README 的详细章节](./README.md#collaboration-mode-human--agent-shared-workspace)。
 
 ## 1. 项目定位
 
@@ -133,6 +232,7 @@ Clouds Coder 并不是“只做写代码”的 CLI 包装器，而是一个可�
 - 内置 `LLM -> Coding -> LLM` 三阶段执行模式，适配复杂多步骤工作
 - **Plan Mode** — UI 开关（Auto/On/Off），研究 → 方案 → 用户选择 → 逐步执行，Single 和 Sync 模式均支持
 - **多智能体协作** — 4 角色（manager/explorer/developer/reviewer）+ blackboard 中心化协调
+- **受治理的局域网协作模式** — 独立 `P+7` 服务，支持批准设备/成员、版本化共享工作区、Presence、公开 Agent 证据、任务黑板和人工冲突仲裁
 - **短上下文模型的长线处理能力放大** — 多 Agent 将任务拆成分角色上下文，让较小的本地模型也能连续完成调研、实现、审查与修复链路，而不依赖单次巨大 prompt
 - **Reviewer Debug Mode** — 检测到错误时 reviewer 获得写权限，独立诊断修复 bug
 - **6 类通用错误检测**（test/lint/compilation/build/deploy/runtime）+ 统一 failure ledger
@@ -148,7 +248,7 @@ Clouds Coder 并不是“只做写代码”的 CLI 包装器，而是一个可�
 - **编程工作流记忆** — `WorkflowMemoryStore` 对完成的编程 session 自动评分，把优质工作流卡片收录到 Code Wiki memory，通过 `workflow` 路由召回工具调用、任务交接、验证和实现模式
 - **多因素优先级上下文压缩** — 10 因素消息重要性评分（时间近因、角色权重、任务进度、错误、目标相关性、skills、compact-resume），替代纯时序裁剪
 - 内置 Web UI + 可选外部 Web UI
-- Skills Studio（独立端口）用于扫描/编辑/生成/上传 skills
+- **Skills Studio 2.0** — 设备私有多文件草稿、分步/一键 Copilot、候选 patch、版本与 Diff、确定性/隔离评测、冻结提交和管理员原子发布
 - Ollama 探测与模型目录加载
 - 通过 `LLM.config.json` 支持 OpenAI-compatible 多配置
 - 私有 vLLM / OpenAI-compatible 韧性：5 次 HTTP 重试治理、默认 60 秒间隔、遵循 `Retry-After` / 限流恢复信号、endpoint cooldown、nginx/upstream 临时错误重试
@@ -182,7 +282,7 @@ Clouds Coder 并不是“只做写代码”的 CLI 包装器，而是一个可�
 │ 展示层                                                               │
 │  - Agent Web UI（对话、看板、预览、运行状态）                        │
 │  - Plan Mode 开关（Auto/On/Off）+ Planner 气泡（橙红色）     │
-│  - Skills Studio（扫描/生成/保存/上传 skills）                       │
+│  - Skills Studio 2.0（私有草稿/Copilot/多文件包校验/提交审核）       │
 ├───────────────────────────────────────────────────────────────────────┤
 │ API 与流式层                                                         │
 │  - REST APIs：sessions/config/models/tools/preview/render/plan-mode │
@@ -1119,7 +1219,7 @@ flowchart LR
 - 实时代码溯源：每次 write/edit 会驱动阶段快照与操作流水更新，用户可追踪“改了什么、何时改、由哪个步骤触发”。
 - 面向历史备份的代码审阅体验：阶段化 backup、差异行渲染、热点定位与可复制纯代码导出，兼顾调试与审计。
 - 更人性化的运行反馈：长调用期间在会话/运行看板实时展示计时、截断续写进度与恢复提示，而非隐藏在日志里。
-- Skills 制作注入流作为一等体验：Skills Studio 提供 scan -> flow 设计 -> 生成 -> 注入 -> 保存闭环，并包含可视化 flow builder。
+- Skills 制作与治理作为一等体验：Skills Studio 2.0 提供私有项目、分步/一键 Copilot、候选 patch 逐项接受、完整 Skill 包编辑、校验/评测、冻结提交、管理员审核与原子发布；旧 flow builder 仍可通过 `/legacy` 访问。
 - 混合内容任务连续性：拖拽上传代码/文档/表格/媒体后，文件会镜像进入工作区并立即接入预览链路与执行链路。
 
 ## 7. Skills 系统
@@ -1127,7 +1227,29 @@ flowchart LR
 两层能力：
 
 - **运行时加载层**：本地 skill 文件 + HTTP JSON provider manifest 协议
-- **Skills Studio 创作层**：扫描、生成、保存、上传
+- **Skills Studio 2.0 创作与治理层**：设备私有项目、多文件包、版本/Diff、Copilot 任务、校验评测、冻结提交、管理员审核、发布与下架
+
+### 7.1 Skills Studio 2.0 发布模型
+
+打开 `P+1` 会自动创建独立的 Studio 设备身份。私有草稿保存在 `.clouds_coder_admin/skills_studio/`，不会进入全局 `skills/`，也不会被普通 Agent 会话看到。默认包遵循标准 `SKILL.md` frontmatter（仅 `name` 与 `description`）并生成 `agents/openai.yaml`；作者可继续添加 `scripts/`、`references/`、`assets/` 和可选的 `agents/clouds-coder.yaml`。
+
+```mermaid
+flowchart LR
+  Device["Studio 设备身份"] --> Draft["私有多文件草稿"]
+  Draft --> Copilot["分步 / 一键 Copilot"]
+  Copilot --> Patch["候选文件 patch"]
+  Patch -->|"接受选中项"| Draft
+  Draft --> Validate["静态校验 + 触发评测"]
+  Validate --> Freeze["冻结提交 revision"]
+  Freeze --> Review["管理员审核 / 重评测"]
+  Review -->|"要求修改"| Draft
+  Review -->|"拒绝"| Rejected["拒绝快照"]
+  Review -->|"批准"| Publish["原子移动到 skills/slug"]
+  Publish --> Refresh["刷新 SkillStore 与活动会话"]
+  Publish -->|"下架"| Quarantine["可恢复隔离区"]
+```
+
+所有修改携带 `expected_revision`，避免多标签页互相静默覆盖。提交会冻结不可变快照；批准前重新校验、阻止全局同名、要求含可执行脚本的 Skill 通过硬隔离评测，再原子发布并刷新活动 Skill 消费者，无需重启。
 
 **生态兼容性** — 以下 5 大生态系统的 skills 均可原生加载执行：
 - [awesome-claude-skills](https://github.com/travisvn/awesome-claude-skills) — 社区 Claude skills 精选集合
@@ -1161,7 +1283,10 @@ flowchart LR
 - 控制与消息：`/message`、`/interrupt`、`/compact`、`/uploads`
 - 模型与语言配置：`/api/sessions/{id}/config/model`、`/config/language`
 - 预览与渲染：`/preview-file/*`、`/preview-code/*`、`/preview-code-stages/*`、`/render-state`、`/render-frame`
-- Skills Studio：`/api/skillslab/*`
+- Skills Studio 2.0：`/api/skillslab/v2/*`（旧 `/api/skillslab/*` 保留兼容）
+- Skills 审核：`/api/admin/skills/submissions/*`
+- 协作模式：`/api/collab/v1/*`
+- 协作管理：`/api/admin/collaboration/*`
 - 管理端：`/admin`、`/api/admin/auth/*`、`/api/admin/config`、`/api/admin/config/reset`、`/api/admin/restart`、`/api/admin/metrics`
 - 应用：`/api/apps/personal`、`/api/apps/shared`、`/api/apps/skills`、`/api/apps/`
 
@@ -1181,6 +1306,8 @@ clouds-coder --host 0.0.0.0 --port 8080
 
 - Agent UI：`http://127.0.0.1:8080`
 - Skills Studio：`http://127.0.0.1:8081`（可关闭）
+- 浏览器 IDE：`http://127.0.0.1:8085`（可关闭）
+- 协作模式：`http://127.0.0.1:8087` 或启动时打印的局域网地址（可关闭）
 
 > PyPI 页面：https://pypi.org/project/clouds-coder/
 
@@ -1215,6 +1342,8 @@ python Clouds_Coder.py --host 0.0.0.0 --port 8080
 
 - Agent UI：`http://127.0.0.1:8080`
 - Skills Studio：`http://127.0.0.1:8081`（可关闭）
+- 浏览器 IDE：`http://127.0.0.1:8085`（可关闭）
+- 协作模式：`http://127.0.0.1:8087` 或启动时打印的局域网地址（可关闭）
 
 ### 9.3 常用参数
 
@@ -1224,6 +1353,11 @@ python Clouds_Coder.py --host 0.0.0.0 --port 8080
 - `--ctx_limit <tokens>`：上下文预算（显式设置后锁定）
 - `--max_rounds <n>`：单轮最大 agent 回合
 - `--no_Skills_UI`：关闭 Skills Studio
+- `--enable_collaboration` / `--no_collaboration`：启用或关闭独立协作服务
+- `--collab_host <host>` / `--collab_port <port>`：协作绑定地址与端口（默认 `P+7`）
+- `--collab_tls_cert <pem>` / `--collab_tls_key <pem>`：为协作模式配置 TLS
+- `--collab_https_proxy`：启用显式配置的可信 HTTPS 反向代理模式
+- `--no_collab_allow_insecure_http`：非回环部署强制使用 TLS 或可信代理
 - `--config <path-or-url>`：加载外部 LLM 配置
 - `--use_external_web_ui` / `--no_external_web_ui`：切换外部 UI
 - `--export_web_ui`：导出内置 UI 资源
