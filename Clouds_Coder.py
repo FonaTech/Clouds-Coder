@@ -20313,10 +20313,27 @@ class SkillStore:
         skill_dir = skill_file.parent
         # Keep routing-table references searchable without making metadata
         # recall reopen or parse the potentially large SKILL.md body. Skills
-        # that ship reference guides can expose stable technique entrypoints;
+        # can expose stable technique entrypoints either through a reference
+        # directory or through Markdown links declared in their own guide;
         # existing domain term groups provide multilingual aliases generically.
         reference_files = sorted(skill_dir.glob("reference/*.md"))
-        if reference_files:
+        linked_entrypoints: list[str] = []
+        for match in re.finditer(
+            r"\[[^\]]+\]\(\s*([^\s)#]+\.md)(?:#[^)]*)?\s*\)",
+            body,
+            flags=re.IGNORECASE,
+        ):
+            rel = str(match.group(1) or "").replace("\\", "/").lstrip("/")
+            parts = PurePosixPath(rel).parts
+            if (
+                rel
+                and parts
+                and parts[0] in {"reference", "references", "techniques"}
+                and ".." not in parts
+                and rel.casefold() not in {item.casefold() for item in linked_entrypoints}
+            ):
+                linked_entrypoints.append(rel)
+        if reference_files or linked_entrypoints:
             meta = dict(meta)
             existing_cc = meta.get("clouds_coder")
             clouds_coder = dict(existing_cc) if isinstance(existing_cc, dict) else {}
@@ -20325,9 +20342,16 @@ class SkillStore:
                 re.sub(r"[-_]+", " ", reference_file.stem).casefold()
                 for reference_file in reference_files
             }
+            reference_stems.update(
+                re.sub(r"[-_]+", " ", PurePosixPath(path).stem).casefold()
+                for path in linked_entrypoints
+            )
             for reference_file in reference_files:
                 stem = reference_file.stem
                 entrypoint = f"techniques/{stem}.md"
+                if entrypoint not in entrypoints:
+                    entrypoints.append(entrypoint)
+            for entrypoint in linked_entrypoints:
                 if entrypoint not in entrypoints:
                     entrypoints.append(entrypoint)
             triggers = _meta_string_list(clouds_coder.get("triggers"))

@@ -2,6 +2,7 @@ import ast
 import builtins
 import re
 import sys
+import sysconfig
 import unittest
 from io import BytesIO
 from pathlib import Path
@@ -43,6 +44,26 @@ IMPORT_TO_DISTRIBUTION = {
 DYNAMIC_RUNTIME_MODULES = {"debugpy"}
 
 
+def stdlib_module_names() -> set[str]:
+    """Return stdlib top-level module names across supported Python versions."""
+    native = getattr(sys, "stdlib_module_names", None)
+    if native:
+        return set(native)
+    names = set(sys.builtin_module_names)
+    stdlib_root = Path(sysconfig.get_paths()["stdlib"])
+    try:
+        for entry in stdlib_root.iterdir():
+            if entry.name.startswith("_"):
+                continue
+            if entry.is_file() and entry.suffix == ".py":
+                names.add(entry.stem)
+            elif entry.is_dir() and (entry / "__init__.py").is_file():
+                names.add(entry.name)
+    except OSError:
+        pass
+    return names
+
+
 def canonical_distribution(value: str) -> str:
     return re.sub(r"[-_.]+", "-", str(value or "").strip()).lower()
 
@@ -71,7 +92,7 @@ class RequirementsCoverageTests(unittest.TestCase):
                 imported.add(node.module.split(".", 1)[0])
 
         local_modules = {path.stem for path in ROOT.glob("*.py") if path.is_file()}
-        third_party = imported - set(sys.stdlib_module_names) - \
+        third_party = imported - stdlib_module_names() - \
             {"__future__"} - local_modules
         unmapped = sorted(third_party - set(IMPORT_TO_DISTRIBUTION))
         self.assertEqual(unmapped, [], f"Map new third-party imports: {unmapped}")
