@@ -34,6 +34,7 @@ import signal
 import socket
 import sqlite3
 import ssl
+import stat
 import struct
 import subprocess
 import sys
@@ -396,6 +397,7 @@ def transform_text_operation(incoming: object, applied: object) -> list[dict]:
 class CollaborationStore:
     def __init__(self, db_path: Path, codes_root: Path, state_root: Path):
         self.db_path = Path(db_path)
+        self._initialized = False
         self.codes_root = Path(codes_root).resolve()
         self.state_root = Path(state_root).resolve()
         self.workspace_parent = (self.codes_root / "collaboration").resolve()
@@ -412,11 +414,16 @@ class CollaborationStore:
         self.project_mutation_locks: dict[str, threading.RLock] = {}
         self.external_write_observations: dict[tuple[str, str], dict] = {}
         self._initialize()
+        self._initialized = True
         self.recover_abandoned_agent_runtime()
         self.recover_files()
         self.purge_expired_projects()
 
     def _connect(self) -> sqlite3.Connection:
+        if self._initialized and (
+            not self.db_path.parent.is_dir() or not self.db_path.is_file()
+        ):
+            raise sqlite3.OperationalError("collaboration database storage is unavailable")
         conn = sqlite3.connect(str(self.db_path), timeout=15.0, isolation_level=None)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=15000")
@@ -424,6 +431,14 @@ class CollaborationStore:
         conn.execute("PRAGMA synchronous=FULL")
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
+
+    def storage_health(self) -> dict:
+        try:
+            with self._connect() as conn:
+                conn.execute("SELECT 1").fetchone()
+            return {"available": True, "code": "ok"}
+        except sqlite3.DatabaseError:
+            return {"available": False, "code": "collaboration_store_unavailable"}
 
     def _initialize(self) -> None:
         with self._connect() as conn:
@@ -3548,35 +3563,249 @@ def _resolve_default_agent_workdir() -> Path:
     raw = str(os.getenv("AGENT_WORKDIR", "") or "").strip()
     if raw:
         return Path(raw).expanduser().resolve()
+    if _is_installed_python_runtime(SCRIPT_DIR):
+        stable_root = str(os.getenv("CLOUDS_CODER_HOME", "") or "").strip()
+        base = Path(stable_root).expanduser() if stable_root else Path.home() / ".clouds_coder"
+        return (base / "workspace").resolve()
     return SCRIPT_DIR
+
+def _is_installed_python_runtime(path: Path) -> bool:
+    parts = {part.casefold() for part in Path(path).parts}
+    return bool(parts.intersection({"site-packages", "dist-packages"}))
+
+def _runtime_storage_mode() -> str:
+    if str(os.getenv("AGENT_WORKDIR", "") or "").strip():
+        return "explicit-workdir"
+    if _is_installed_python_runtime(SCRIPT_DIR):
+        return "pip-stable-workspace"
+    return "script-local"
+
+def _runtime_tree_has_content(path: Path) -> bool:
+    try:
+        return path.exists() and path.is_dir() and any(path.iterdir())
+    except Exception:
+        return False
+
+def _copy_runtime_tree_with_crypto_migration(
+    source: Path,
+    target: Path,
+    source_crypto,
+    target_crypto,
+) -> None:
+    """Copy one missing runtime tree and re-encrypt legacy CryptoBox files."""
+    source = Path(source)
+    target = Path(target)
+    if source.is_symlink():
+        raise ValueError(f"legacy runtime tree cannot be a symbolic link: {source}")
+    stage = target.parent / f".{target.name}.legacy-migrate-{uuid.uuid4().hex}"
+    try:
+        stage.mkdir(parents=True, exist_ok=False)
+        for item in source.rglob("*"):
+            rel = item.relative_to(source)
+            output = stage / rel
+            if item.is_symlink():
+                output.parent.mkdir(parents=True, exist_ok=True)
+                os.symlink(
+                    os.readlink(item),
+                    output,
+                    target_is_directory=item.is_dir(),
+                )
+                continue
+            if item.is_dir():
+                output.mkdir(parents=True, exist_ok=True)
+                continue
+            if not item.is_file():
+                continue
+            output.parent.mkdir(parents=True, exist_ok=True)
+            encrypted_box = False
+            try:
+                if item.stat().st_size <= 256 * 1024 * 1024:
+                    with item.open("rb") as handle:
+                        head = handle.read(512).lstrip()
+                    encrypted_box = bool(
+                        head.startswith(b'{"v"')
+                        and b'"n"' in head
+                        and b'"c"' in head
+                    )
+            except Exception:
+                encrypted_box = False
+            if encrypted_box:
+                raw = item.read_text(encoding="utf-8")
+                box = json.loads(raw)
+                encrypted_box = bool(
+                    isinstance(box, dict)
+                    and {"v", "n", "c", "m"}.issubset(box)
+                )
+                if encrypted_box:
+                    plain = source_crypto.decrypt_text(raw)
+                    output.write_text(target_crypto.encrypt_text(plain), encoding="utf-8")
+                    try:
+                        shutil.copystat(item, output)
+                    except Exception:
+                        pass
+                    continue
+            shutil.copy2(item, output)
+        if target.exists():
+            raise FileExistsError(f"runtime migration target already exists: {target}")
+        os.replace(stage, target)
+    finally:
+        if stage.exists():
+            shutil.rmtree(stage, ignore_errors=True)
+
+def _merge_legacy_codes_root(source: Path, target: Path) -> dict:
+    """Import missing users/sessions from a legacy Codes root without overwrites."""
+    result = {"imported_users": 0, "imported_sessions": 0, "skipped_sessions": 0, "errors": []}
+    source = Path(source).resolve()
+    target = Path(target).resolve()
+    source_key = source / ".encryption_key"
+    if source == target or not source.is_dir() or not source_key.is_file():
+        return result
+    try:
+        source_crypto = CryptoBox(source)
+        target_crypto = CryptoBox(target)
+    except Exception as exc:
+        result["errors"].append(f"crypto:{trim(str(exc), 220)}")
+        return result
+    for legacy_user in sorted(source.iterdir(), key=lambda p: p.name.casefold()):
+        if not legacy_user.is_dir() or legacy_user.is_symlink():
+            continue
+        target_user = target / legacy_user.name
+        if target_user.is_symlink():
+            result["errors"].append(f"{legacy_user.name}:target user root is a symbolic link")
+            continue
+        if not target_user.exists():
+            try:
+                _copy_runtime_tree_with_crypto_migration(
+                    legacy_user,
+                    target_user,
+                    source_crypto,
+                    target_crypto,
+                )
+                result["imported_users"] += 1
+                legacy_sessions = legacy_user / "sessions"
+                if legacy_sessions.is_dir():
+                    result["imported_sessions"] += sum(
+                        1 for path in legacy_sessions.iterdir() if path.is_dir()
+                    )
+            except Exception as exc:
+                result["errors"].append(
+                    f"{legacy_user.name}:{trim(str(exc), 220)}"
+                )
+            continue
+        legacy_sessions = legacy_user / "sessions"
+        if not legacy_sessions.is_dir() or legacy_sessions.is_symlink():
+            continue
+        target_sessions = target_user / "sessions"
+        target_sessions.mkdir(parents=True, exist_ok=True)
+        for legacy_session in sorted(legacy_sessions.iterdir(), key=lambda p: p.name.casefold()):
+            if not legacy_session.is_dir() or legacy_session.is_symlink():
+                continue
+            target_session = target_sessions / legacy_session.name
+            if target_session.exists():
+                result["skipped_sessions"] += 1
+                continue
+            try:
+                _copy_runtime_tree_with_crypto_migration(
+                    legacy_session,
+                    target_session,
+                    source_crypto,
+                    target_crypto,
+                )
+                result["imported_sessions"] += 1
+            except Exception as exc:
+                result["errors"].append(
+                    f"{legacy_user.name}/{legacy_session.name}:{trim(str(exc), 220)}"
+                )
+    return result
 
 def _migrate_legacy_runtime_roots(workspace: Path) -> dict:
     root = Path(workspace).resolve()
     legacy_root = (root / "skills").resolve()
     moved: list[str] = []
+    copied: list[str] = []
     errors: list[str] = []
-    if legacy_root == root or (not legacy_root.exists()) or (not legacy_root.is_dir()):
-        return {
-            "root": str(root),
-            "legacy_root": str(legacy_root),
-            "moved": moved,
-            "errors": errors,
-        }
-    # Earlier builds could incorrectly place runtime data under workspace/skills when started from that cwd.
-    for name in ("RAG_Library", "Code_Library", "Codes", "js_lib", "LLM.config.json"):
-        src = legacy_root / name
-        dst = root / name
-        try:
-            if (not src.exists()) or dst.exists():
-                continue
-            shutil.move(str(src), str(dst))
-            moved.append(name)
-        except Exception as exc:
-            errors.append(f"{name}:{trim(str(exc), 220)}")
+    imported_users = 0
+    imported_sessions = 0
+    skipped_sessions = 0
+    if legacy_root != root and legacy_root.exists() and legacy_root.is_dir():
+        # Earlier builds could incorrectly place runtime data under
+        # workspace/skills. Preserve that source and copy missing data into the
+        # active root so every compatibility migration is non-destructive.
+        for name in ("RAG_Library", "Code_Library", "Codes", "js_lib", "LLM.config.json"):
+            src = legacy_root / name
+            dst = root / name
+            try:
+                if (not src.exists()) or dst.exists():
+                    continue
+                root.mkdir(parents=True, exist_ok=True)
+                if src.is_dir():
+                    shutil.copytree(src, dst, copy_function=shutil.copy2, symlinks=True)
+                else:
+                    shutil.copy2(src, dst)
+                copied.append(f"skills:{name}")
+            except Exception as exc:
+                errors.append(f"{name}:{trim(str(exc), 220)}")
+
+    # Builds before 4.84 used the module's site-packages directory as writable
+    # state. The stable-home fix must import that history instead of merely
+    # switching roots and making existing sessions appear to vanish.
+    installed_root = Path(SCRIPT_DIR).resolve()
+    if _is_installed_python_runtime(installed_root) and installed_root != root:
+        legacy_codes = installed_root / "Codes"
+        target_codes = root / "Codes"
+        if _runtime_tree_has_content(legacy_codes):
+            try:
+                if not _runtime_tree_has_content(target_codes):
+                    target_codes.parent.mkdir(parents=True, exist_ok=True)
+                    if target_codes.exists():
+                        target_codes.rmdir()
+                    shutil.copytree(
+                        legacy_codes,
+                        target_codes,
+                        copy_function=shutil.copy2,
+                        symlinks=True,
+                    )
+                    copied.append("site-packages:Codes")
+                    for user_dir in legacy_codes.iterdir():
+                        sessions_dir = user_dir / "sessions" if user_dir.is_dir() else None
+                        if sessions_dir is not None and sessions_dir.is_dir():
+                            imported_users += 1
+                            imported_sessions += sum(1 for p in sessions_dir.iterdir() if p.is_dir())
+                else:
+                    merged = _merge_legacy_codes_root(legacy_codes, target_codes)
+                    imported_users += int(merged.get("imported_users", 0) or 0)
+                    imported_sessions += int(merged.get("imported_sessions", 0) or 0)
+                    skipped_sessions += int(merged.get("skipped_sessions", 0) or 0)
+                    errors.extend(
+                        f"site-packages:Codes:{row}"
+                        for row in (merged.get("errors", []) or [])
+                    )
+            except Exception as exc:
+                errors.append(f"site-packages:Codes:{trim(str(exc), 220)}")
+        for name in (".clouds_coder_admin", "RAG_Library", "Code_Library", "js_lib", "LLM.config.json"):
+            src = installed_root / name
+            dst = root / name
+            try:
+                if not src.exists() or dst.exists():
+                    continue
+                root.mkdir(parents=True, exist_ok=True)
+                if src.is_dir():
+                    shutil.copytree(src, dst, copy_function=shutil.copy2, symlinks=True)
+                else:
+                    shutil.copy2(src, dst)
+                copied.append(f"site-packages:{name}")
+            except Exception as exc:
+                errors.append(f"site-packages:{name}:{trim(str(exc), 220)}")
     return {
         "root": str(root),
+        "storage_mode": _runtime_storage_mode(),
         "legacy_root": str(legacy_root),
+        "installed_legacy_root": str(installed_root),
         "moved": moved,
+        "copied": copied,
+        "imported_users": imported_users,
+        "imported_sessions": imported_sessions,
+        "skipped_sessions": skipped_sessions,
         "errors": errors,
     }
 
@@ -4031,7 +4260,10 @@ _TOOL_TIMEOUT_MAP = {
     "agent_web_search": 90,
     "generate_media": 120,
     "load_skill": 20,
+    "unload_skill": 20,
     "list_skills": 10,
+    "list_background_processes": 10,
+    "stop_background_process": 10,
     "finish_task": 10,
     "finish_current_task": 10,
     "update_plan": 10,
@@ -4046,6 +4278,8 @@ CONVERSATION_VISIBLE_TOOL_EVENTS = {
     "tool_memory",
     "context_recall",
     "check_background",
+    "list_background_processes",
+    "stop_background_process",
     "list_skills",
     "list_skill_providers",
     "list_skill_protocols",
@@ -4061,6 +4295,8 @@ PERSIST_ON_EVENT_TYPES = {
     "error",
     "message",
     "skill_loaded",
+    "skill_unloaded",
+    "skill_selection",
     "plan_notice",
     "plan_approved_handoff",
     "step_verified",
@@ -4405,6 +4641,7 @@ PLAN_MODE_SYNTHESIS_MAX_ATTEMPTS = 3
 REVIEWER_DEBUG_MODE_MAX_ROUNDS = 6
 REVIEWER_DEBUG_TOOL_ALLOWLIST = {
     "bash", "read_file", "write_file", "edit_file",
+    "stop_background_process",
     "read_from_blackboard", "write_to_blackboard",
     "finish_task", "finish_current_task",
 }
@@ -4428,8 +4665,8 @@ PLAN_MESSAGE_EVENT_MAX_CHARS = 12_000
 PLAN_STEP_FULL_CONTENT_MAX_CHARS = 24_000
 PLAN_MODE_RESEARCH_TOOL_ALLOWLIST = {
     "bash", "read_file", "context_recall", "task_get", "task_list",
-    "check_background", "read_from_blackboard", "write_to_blackboard",
-    "list_skills", "load_skill", "compress", "agent_web_search",
+    "check_background", "list_background_processes", "read_from_blackboard", "write_to_blackboard",
+    "list_skills", "load_skill", "unload_skill", "compress", "agent_web_search",
     # rag_remember writes only to the RAG knowledge library (never user files), so it is
     # safe during read-only planning — analogous to write_to_blackboard scratch persistence.
     "rag_remember",
@@ -7272,6 +7509,126 @@ def decode_utf8_replace(data: bytes | bytearray | str) -> str:
         return escape_invalid_utf8_text(data)
     return bytes(data).decode("utf-8", errors="replace")
 
+def _windows_subprocess_encodings() -> list[str]:
+    if os.name != "nt" and not sys.platform.startswith("win"):
+        return []
+    out: list[str] = []
+    try:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        for function_name in ("GetOEMCP", "GetACP"):
+            function = getattr(kernel32, function_name, None)
+            if function is None:
+                continue
+            function.restype = ctypes.c_uint
+            codepage = int(function() or 0)
+            if codepage > 0:
+                out.append(f"cp{codepage}")
+    except Exception:
+        pass
+    return out
+
+def subprocess_text_encodings() -> list[str]:
+    candidates: list[str] = ["utf-8", *_windows_subprocess_encodings()]
+    try:
+        candidates.append(str(locale.getpreferredencoding(False) or ""))
+    except Exception:
+        pass
+    candidates.append("gb18030")
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in candidates:
+        encoding = str(value or "").strip()
+        key = encoding.casefold().replace("_", "-")
+        if not encoding or key in seen:
+            continue
+        try:
+            "".encode(encoding)
+        except LookupError:
+            continue
+        seen.add(key)
+        out.append(encoding)
+    return out or ["utf-8"]
+
+def decode_subprocess_bytes(data: bytes | bytearray | str | None) -> tuple[str, dict]:
+    if data is None:
+        return "", {"encoding": "", "fallback": False, "replacement": False}
+    if isinstance(data, str):
+        return escape_invalid_utf8_text(data), {
+            "encoding": "text",
+            "fallback": False,
+            "replacement": False,
+        }
+    raw = bytes(data)
+    encodings = subprocess_text_encodings()
+    for index, encoding in enumerate(encodings):
+        try:
+            return raw.decode(encoding, errors="strict"), {
+                "encoding": encoding,
+                "fallback": index > 0,
+                "replacement": False,
+            }
+        except UnicodeDecodeError:
+            continue
+    encoding = encodings[0]
+    return raw.decode(encoding, errors="replace"), {
+        "encoding": encoding,
+        "fallback": True,
+        "replacement": True,
+    }
+
+def run_subprocess_text(*popenargs, **kwargs) -> subprocess.CompletedProcess:
+    """Run a captured subprocess without allowing platform decoding to fail."""
+    options = dict(kwargs)
+    options.pop("encoding", None)
+    options.pop("errors", None)
+    options.pop("universal_newlines", None)
+    options["text"] = False
+    try:
+        completed = subprocess.run(*popenargs, **options)
+    except subprocess.TimeoutExpired as exc:
+        stdout, stdout_diag = decode_subprocess_bytes(getattr(exc, "stdout", None))
+        stderr, stderr_diag = decode_subprocess_bytes(getattr(exc, "stderr", None))
+        exc.stdout = exc.output = stdout
+        exc.stderr = stderr
+        exc.decoding_diagnostics = {"stdout": stdout_diag, "stderr": stderr_diag}
+        raise
+    stdout, stdout_diag = decode_subprocess_bytes(completed.stdout)
+    stderr, stderr_diag = decode_subprocess_bytes(completed.stderr)
+    completed.stdout = stdout
+    completed.stderr = stderr
+    completed.decoding_diagnostics = {"stdout": stdout_diag, "stderr": stderr_diag}
+    return completed
+
+
+def windows_utf8_shell_command(command: object) -> str:
+    text = str(command or "")
+    if re.match(r"(?is)^\s*chcp\s+65001\s*>\s*nul\s*&", text):
+        return text
+    return f"chcp 65001>nul & {text}"
+
+
+def shell_process_invocation(command: str, prefix: list[str] | tuple[str, ...] | None = None) -> tuple[object, bool, bool]:
+    """Build one platform-correct shell invocation for foreground and background runners."""
+    shell_prefix = [str(item) for item in (prefix or [])]
+    windows_job = _is_windows_job_sandbox_prefix(shell_prefix)
+    if shell_prefix and not windows_job:
+        return [*shell_prefix, "/bin/sh", "-c", str(command or "")], False, False
+    if os.name == "nt":
+        return windows_utf8_shell_command(command), True, windows_job
+    return str(command or ""), True, windows_job
+
+
+def join_shell_task_command(command: object, args: object) -> str:
+    parts = [str(command or "").strip()]
+    if isinstance(args, list):
+        parts.extend(str(item) for item in args)
+    parts = [item for item in parts if item]
+    if not parts:
+        return ""
+    if os.name == "nt":
+        return subprocess.list2cmdline(parts)
+    return shlex.join(parts)
+
 def json_dumps(obj: object, *, indent: int | None = None, ensure_ascii: bool = False) -> str:
     raw = json.dumps(obj, ensure_ascii=ensure_ascii, indent=indent)
     return escape_invalid_utf8_text(raw)
@@ -7316,11 +7673,10 @@ def sanitize_profile_id(raw: str) -> str:
 
 def detect_repo_root(cwd: Path) -> Path | None:
     try:
-        r = subprocess.run(
+        r = run_subprocess_text(
             ["git", "rev-parse", "--show-toplevel"],
             cwd=cwd,
             capture_output=True,
-            text=True,
             timeout=10,
         )
         if r.returncode != 0:
@@ -11039,10 +11395,9 @@ def try_pull_ollama_model(model: str, timeout: int = 180) -> tuple[bool, str]:
     if not cli:
         return False, "ollama CLI not found"
     try:
-        r = subprocess.run(
+        r = run_subprocess_text(
             [cli, "pull", model],
             capture_output=True,
-            text=True,
             timeout=timeout,
         )
         output = trim((r.stdout + r.stderr).strip() or "(no output)", 1200)
@@ -12704,13 +13059,19 @@ class AdminAuthStore:
 
     def __init__(self, path: Path):
         self.path = Path(path)
+        self._initialized = False
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
         self.password_slots = threading.BoundedSemaphore(3)
         self.login_failures: dict[tuple[str, str], deque[float]] = {}
         self._initialize()
+        self._initialized = True
 
     def _connect(self) -> sqlite3.Connection:
+        if self._initialized and (
+            not self.path.parent.is_dir() or not self.path.is_file()
+        ):
+            raise sqlite3.OperationalError("administrator authentication storage is unavailable")
         conn = sqlite3.connect(str(self.path), timeout=10.0, isolation_level=None)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=10000")
@@ -12988,19 +13349,33 @@ class IDEAuthStore:
 
     def __init__(self, path: Path):
         self.path = Path(path)
+        self._initialized = False
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
         self.password_slots = threading.BoundedSemaphore(3)
         self.login_failures: dict[tuple[str, str], deque[float]] = {}
         self._initialize()
+        self._initialized = True
 
     def _connect(self) -> sqlite3.Connection:
+        if self._initialized and (
+            not self.path.parent.is_dir() or not self.path.is_file()
+        ):
+            raise sqlite3.OperationalError("IDE authentication storage is unavailable")
         conn = sqlite3.connect(str(self.path), timeout=10.0, isolation_level=None)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=10000")
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=FULL")
         return conn
+
+    def storage_health(self) -> dict:
+        try:
+            with self._connect() as conn:
+                conn.execute("SELECT 1").fetchone()
+            return {"available": True, "code": "ok"}
+        except sqlite3.DatabaseError:
+            return {"available": False, "code": "ide_store_unavailable"}
 
     def _initialize(self) -> None:
         with self._connect() as conn:
@@ -13400,17 +13775,24 @@ class IDEAuthStore:
             return None
         digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
         now = now_ts()
-        with self._connect() as conn:
-            row = conn.execute(
-                """SELECT a.*,s.csrf_token,s.expires_at,s.token_digest,s.last_ip,s.device_digest,
-                          s.session_kind,
-                          d.status AS device_status,d.source_ip AS device_source_ip
-                   FROM ide_sessions s JOIN ide_accounts a ON a.username_key=s.username_key
-                   LEFT JOIN ide_devices d ON d.device_digest=s.device_digest
-                   WHERE s.token_digest=? AND s.revoked_at=0 AND s.expires_at>?
-                     AND s.auth_version=a.auth_version AND a.disabled=0""",
-                (digest, now),
-            ).fetchone()
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    """SELECT a.*,s.csrf_token,s.expires_at,s.token_digest,s.last_ip,s.device_digest,
+                              s.session_kind,
+                              d.status AS device_status,d.source_ip AS device_source_ip
+                       FROM ide_sessions s JOIN ide_accounts a ON a.username_key=s.username_key
+                       LEFT JOIN ide_devices d ON d.device_digest=s.device_digest
+                       WHERE s.token_digest=? AND s.revoked_at=0 AND s.expires_at>?
+                         AND s.auth_version=a.auth_version AND a.disabled=0""",
+                    (digest, now),
+                ).fetchone()
+        except sqlite3.DatabaseError as exc:
+            raise IDEAuthError(
+                "auth_store_unavailable",
+                "IDE authentication storage is temporarily unavailable.",
+                503,
+            ) from exc
         if row is None:
             return None
         request_ip = str(client_ip or "")
@@ -19212,7 +19594,9 @@ class SkillStore:
         # Minimax nested metadata support
         mm = self._skill_meta_section(meta, "metadata")
         triggers.extend(_meta_string_list(mm.get("triggers")))
-        # Extract trigger keywords from description (for skills-main / awesome-claude-skills format)
+        # Extract only positive trigger keywords from description.  Older
+        # versions accidentally treated the ``DO NOT TRIGGER`` clause as a
+        # positive trigger, which made generic prose select unrelated skills.
         if not triggers:
             desc = str(meta.get("description", "") or "").strip()
             triggers.extend(self._extract_triggers_from_description(desc))
@@ -19225,6 +19609,102 @@ class SkillStore:
             seen.add(key)
             out.append(item)
         return out
+
+    def _skill_negative_triggers(self, meta: dict) -> list[str]:
+        """Return explicit exclusions without reading a skill body."""
+        values: list[str] = []
+        for key in ("negative_triggers", "negativeTriggers", "not_for", "notFor", "excludes", "exclude"):
+            values.extend(_meta_string_list(meta.get(key)))
+        cc = self._skill_meta_section(meta, "clouds_coder")
+        for key in ("negative_triggers", "not_for", "excludes", "exclude"):
+            values.extend(_meta_string_list(cc.get(key)))
+        mm = self._skill_meta_section(meta, "metadata")
+        for key in ("negative_triggers", "not_for", "excludes", "exclude"):
+            values.extend(_meta_string_list(mm.get(key)))
+        desc = str(meta.get("description", "") or "").strip()
+        # Capture the clause after DO NOT TRIGGER until a sentence boundary.
+        for match in re.finditer(
+            r"DO\s+NOT\s+TRIGGER(?:\s+WHEN)?[:\s]+([^\n.]{3,500})",
+            desc,
+            re.IGNORECASE,
+        ):
+            segment = match.group(1).strip()
+            quoted = [m.group(1) or m.group(2) for m in re.finditer(r"'([^']{2,60})'|\"([^\"]{2,60})\"", segment)]
+            values.extend(quoted or [x.strip().strip("'\"") for x in re.split(r"[,;]", segment)])
+        seen: set[str] = set()
+        out: list[str] = []
+        for value in values:
+            item = str(value or "").strip()
+            key = item.casefold()
+            if not item or len(item) < 2 or key in seen:
+                continue
+            seen.add(key)
+            out.append(item)
+        return out[:24]
+
+    def _skill_category(self, meta: dict) -> str:
+        cc = self._skill_meta_section(meta, "clouds_coder")
+        nested = self._skill_meta_section(meta, "metadata")
+        return str(
+            meta.get("category", cc.get("category", nested.get("category", ""))) or ""
+        ).strip()
+
+    def _skill_bool(self, meta: dict, key: str, default: bool = False) -> bool:
+        cc = self._skill_meta_section(meta, "clouds_coder")
+        nested = self._skill_meta_section(meta, "metadata")
+        value = meta.get(key, cc.get(key, nested.get(key, default)))
+        if isinstance(value, bool):
+            return value
+        return str(value or "").strip().lower() in {"1", "true", "yes", "on", "y"}
+
+    def _skill_relation_list(self, meta: dict, key: str) -> list[str]:
+        values = _meta_string_list(meta.get(key))
+        cc = self._skill_meta_section(meta, "clouds_coder")
+        values.extend(_meta_string_list(cc.get(key)))
+        nested = self._skill_meta_section(meta, "metadata")
+        values.extend(_meta_string_list(nested.get(key)))
+        seen: set[str] = set()
+        out: list[str] = []
+        for value in values:
+            item = str(value or "").strip()
+            if item and item.casefold() not in seen:
+                seen.add(item.casefold())
+                out.append(item)
+        return out[:24]
+
+    def _skill_metadata_record(self, key: str, data: dict, *, score: float | None = None) -> dict:
+        meta = dict(data.get("meta", {}) if isinstance(data.get("meta"), dict) else {})
+        selection_meta = dict(meta)
+        selection_meta.setdefault("description", str(data.get("description", "") or ""))
+        infrastructure_only = self._skill_bool(selection_meta, "infrastructure_only", False) or bool(meta.get("builtin", False))
+        row = {
+            "id": str(key),
+            "canonical_id": str(key),
+            "name": str(data.get("name", key) or key),
+            "qualified_name": str(key),
+            "description": str(data.get("description", meta.get("description", "-")) or "-"),
+            "provider_id": str(data.get("provider_id", "") or ""),
+            "provider": str(data.get("provider_id", "") or ""),
+            "protocol": str(data.get("protocol", "") or ""),
+            "protocol_version": str(data.get("protocol_version", "") or ""),
+            "meta": meta,
+            "skill_path": data.get("skill_path", ""),
+            "virtual_path": data.get("skill_path", ""),
+            "attachments": [x.get("path", "") for x in data.get("attachments", []) if isinstance(x, dict)],
+            "aliases": [n for n, sid in self.aliases.items() if sid == key],
+            "triggers": self._skill_triggers(selection_meta),
+            "negative_triggers": self._skill_negative_triggers(selection_meta),
+            "keywords": self._skill_keywords(selection_meta),
+            "category": self._skill_category(selection_meta),
+            "entrypoints": self._skill_entrypoints(selection_meta),
+            "preferred_tools": self._skill_relation_list(selection_meta, "preferred_tools"),
+            "requires": self._skill_relation_list(selection_meta, "requires"),
+            "conflicts": self._skill_relation_list(selection_meta, "conflicts"),
+            "infrastructure_only": infrastructure_only,
+        }
+        if score is not None:
+            row["score"] = round(float(score), 4)
+        return row
 
     @staticmethod
     def _extract_triggers_from_description(desc: str) -> list[str]:
@@ -19241,7 +19721,7 @@ class SkillStore:
             return []
         triggers: list[str] = []
         # Pattern 1: "TRIGGER when:" or "triggers include:" followed by comma list
-        for m in re.finditer(r'(?:TRIGGER\s+when|triggers?\s+include|DO\s+NOT\s+TRIGGER)[:\s]+([^\n.]{10,600})', desc, re.IGNORECASE):
+        for m in re.finditer(r'(?:TRIGGER\s+when|triggers?\s+include)[:\s]+([^\n.]{10,600})', desc, re.IGNORECASE):
             segment = m.group(1).strip()
             # Extract quoted phrases
             for qm in re.finditer(r"'([^']{2,40})'|\"([^\"]{2,40})\"", segment):
@@ -20255,27 +20735,7 @@ class SkillStore:
         return sorted(names)
 
     def list_metadata(self) -> list[dict]:
-        out = []
-        for key, data in sorted(self.skills.items()):
-            meta = dict(data.get("meta", {}))
-            out.append(
-                {
-                    "id": key,
-                    "name": data.get("name", key),
-                    "qualified_name": key,
-                    "description": data.get("description", meta.get("description", "-")),
-                    "provider_id": data.get("provider_id", ""),
-                    "protocol": data.get("protocol", ""),
-                    "protocol_version": data.get("protocol_version", ""),
-                    "meta": meta,
-                    "skill_path": data.get("skill_path", ""),
-                    "virtual_path": data.get("skill_path", ""),
-                    "attachments": [x["path"] for x in data.get("attachments", [])],
-                    "aliases": [n for n, sid in self.aliases.items() if sid == key],
-                    "triggers": self._skill_triggers(meta),
-                    "entrypoints": self._skill_entrypoints(meta),
-                }
-            )
+        out = [self._skill_metadata_record(key, data) for key, data in sorted(self.skills.items())]
         if self.ambiguous:
             out.append(
                 {
@@ -20294,6 +20754,334 @@ class SkillStore:
                 }
             )
         return out
+
+    def canonicalize_id(self, name: object) -> dict:
+        """Resolve any public skill identifier to one canonical id.
+
+        The structured response is intentionally separate from ``_resolve_name``
+        so older callers that expect a ``(key, error)`` tuple remain compatible.
+        """
+        requested = str(name or "").strip()
+        if not requested:
+            return {"ok": False, "requested": requested, "error": "skill name required", "code": "missing"}
+        exact = self.skills.get(requested)
+        if exact is not None:
+            return {"ok": True, "requested": requested, "canonical_id": requested, "name": exact.get("name", requested)}
+        candidates: list[str] = []
+        folded = requested.casefold()
+        for key, data in self.skills.items():
+            names = [key, str(data.get("name", "") or "")]
+            meta = data.get("meta", {}) if isinstance(data.get("meta"), dict) else {}
+            names.extend(self._skill_aliases(meta))
+            if any(str(value or "").strip().casefold() == folded for value in names):
+                candidates.append(key)
+        if requested in self.ambiguous:
+            candidates = list(self.ambiguous.get(requested, []))
+        if len(candidates) == 1:
+            key = candidates[0]
+            return {"ok": True, "requested": requested, "canonical_id": key, "name": self.skills[key].get("name", key)}
+        if len(candidates) > 1:
+            return {
+                "ok": False,
+                "requested": requested,
+                "error": f"ambiguous skill '{requested}'",
+                "code": "ambiguous",
+                "candidates": sorted(candidates),
+            }
+        return {
+            "ok": False,
+            "requested": requested,
+            "error": f"unknown skill '{requested}'",
+            "code": "unknown",
+            "candidates": [],
+        }
+
+    # Friendly aliases used by IDE/runtime integrations.
+    canonicalize = canonicalize_id
+    resolve_canonical = canonicalize_id
+
+    def recall_metadata(
+        self,
+        focus: str = "",
+        *,
+        step: str = "",
+        phase: str = "",
+        limit: int = 12,
+        include_infrastructure: bool = False,
+    ) -> list[dict]:
+        """Recall a bounded metadata candidate set without loading skill bodies."""
+        raw_query = f"{focus or ''}\n{step or ''}\n{phase or ''}"
+        # Runtime wrappers describe where the request came from, not what the
+        # user is trying to accomplish.  Letting these lines participate in
+        # recall made tokens such as ``IDE`` and ``workspace`` outrank the
+        # actual current Todo/Plan step.
+        meaningful_lines: list[str] = []
+        for raw_line in normalize_embedded_newlines(raw_query).splitlines():
+            line = re.sub(r"\s+", " ", str(raw_line or "").strip())
+            if not line:
+                continue
+            if re.fullmatch(
+                r"(?:ide programming request\.?|ide workspace\s*(?:\([^)]*\))?)\s*",
+                line,
+                flags=re.IGNORECASE,
+            ) or re.match(r"^(?:workspace root|writable path)\s*:", line, flags=re.IGNORECASE):
+                continue
+            meaningful_lines.append(line)
+        query = re.sub(r"\s+", " ", " ".join(meaningful_lines)).strip().casefold()
+        generic_tokens = {
+            "the", "and", "for", "with", "from", "this", "that", "use", "build", "create", "analyze",
+            "task", "step", "current", "plan", "phase", "direct", "objective", "execution", "run", "start",
+            "auto", "ide", "programming", "request", "workspace", "root", "writable", "path", "session",
+        }
+        tokens: list[str] = []
+        seen_tokens: set[str] = set()
+        for token in re.findall(r"[\w.+#-]{2,}", query, flags=re.UNICODE):
+            normalized = token.strip("._+-").casefold()
+            if not normalized or normalized in generic_tokens or normalized in seen_tokens:
+                continue
+            seen_tokens.add(normalized)
+            tokens.append(normalized)
+
+        def _ascii_term_match(haystack: str, term: str) -> bool:
+            if not term:
+                return False
+            if re.search(r"[\u3400-\u9fff]", term):
+                return term in haystack
+            return bool(re.search(r"(?<![A-Za-z0-9_])" + re.escape(term) + r"(?![A-Za-z0-9_])", haystack))
+
+        scored: list[tuple[float, str, dict]] = []
+        for key, data in self.skills.items():
+            meta = self._skill_metadata_record(key, data)
+            if meta.get("infrastructure_only") and not include_infrastructure:
+                continue
+            negatives = [str(x).casefold() for x in meta.get("negative_triggers", [])]
+            negative_hit = next((x for x in negatives if x and x in query), "")
+            if negative_hit:
+                meta["filter_reason"] = f"negative_trigger:{negative_hit}"
+                continue
+            score = 0.0
+            # Explicit trigger/keyword/name matches are strong. Description is
+            # deliberately weak so words like Build/Use/Analyze do not dominate.
+            seen_terms: set[str] = set()
+            for value in list(meta.get("triggers", [])) + list(meta.get("keywords", [])) + list(meta.get("aliases", [])):
+                raw_term = str(value or "").strip()
+                term = raw_term.casefold()
+                if not term or term in seen_terms or term in generic_tokens | {"skill"}:
+                    continue
+                seen_terms.add(term)
+                if _ascii_term_match(query, term):
+                    is_cjk = bool(re.search(r"[\u3400-\u9fff]", term))
+                    is_acronym = len(raw_term) >= 2 and raw_term.isupper()
+                    score += 6.0 if is_cjk or is_acronym or " " in term or len(term) >= 6 else 2.0
+            name = str(meta.get("name", "") or "").casefold()
+            if name and _ascii_term_match(query, name):
+                score += 8.0
+            name_tokens = {
+                part.casefold()
+                for part in re.findall(r"[A-Za-z0-9+#.]{2,}|[\u3400-\u9fff]{2,}", name, flags=re.UNICODE)
+            }
+            description = str(meta.get("description", "") or "").casefold()
+            description_tokens = {
+                part.casefold()
+                for part in re.findall(r"[A-Za-z0-9+#.]{3,}|[\u3400-\u9fff]{2,}", description, flags=re.UNICODE)
+            }
+            for token in tokens:
+                # Name matching uses normalized segments.  Arbitrary substring
+                # matching made ``ide`` match the middle of ``video``.
+                if token in name_tokens:
+                    score += 2.5
+                elif token in description_tokens:
+                    score += 0.35
+            # Keep unscored rows available only when the caller asks for an
+            # explicit catalog; automatic focus selection should stay empty.
+            if score > 0:
+                scored.append((score, str(meta.get("canonical_id", key)), meta))
+        scored.sort(key=lambda row: (-row[0], row[1].casefold()))
+        return [dict(row[2], score=round(row[0], 4)) for row in scored[: max(1, min(50, int(limit or 12)))] ]
+
+    metadata_recall = recall_metadata
+
+    @staticmethod
+    def _selection_json(raw: object) -> object:
+        if isinstance(raw, (dict, list)):
+            return raw
+        text = str(raw or "").strip()
+        if not text:
+            return None
+        fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", text, re.IGNORECASE)
+        if fence:
+            text = fence.group(1).strip()
+        try:
+            return json.loads(text)
+        except Exception:
+            match = re.search(r"\{[\s\S]*\}|\[[\s\S]*\]", text)
+            if not match:
+                return None
+            try:
+                return json.loads(match.group(0))
+            except Exception:
+                return None
+
+    def select_skills(
+        self,
+        focus: str = "",
+        *,
+        step: str = "",
+        phase: str = "",
+        llm_selector=None,
+        limit: int = 3,
+        candidate_limit: int = 12,
+        include_infrastructure: bool = False,
+        active_ids: list[str] | None = None,
+    ) -> dict:
+        """Shared recall -> semantic selection -> strict validation pipeline."""
+        started = time.monotonic()
+        candidates = self.recall_metadata(
+            focus,
+            step=step,
+            phase=phase,
+            limit=candidate_limit,
+            include_infrastructure=include_infrastructure,
+        )
+        result = {
+            "focus": trim(str(focus or ""), 500),
+            "step": trim(str(step or ""), 300),
+            "phase": trim(str(phase or ""), 80),
+            "candidates": candidates,
+            "selected": [],
+            "selection_order": [],
+            "filtered": [],
+            "conflicts": [],
+            "requires": [],
+            "fallback": "none",
+            "fallback_type": "none",
+            "duration_ms": 0,
+        }
+        query_text = re.sub(r"\s+", " ", f"{focus or ''} {step or ''} {phase or ''}").casefold()
+        for key, data in self.skills.items():
+            meta_row = self._skill_metadata_record(key, data)
+            negative_hit = next(
+                (str(value) for value in meta_row.get("negative_triggers", []) or [] if str(value).casefold() in query_text),
+                "",
+            )
+            if negative_hit:
+                result["filtered"].append({"id": key, "reason": f"negative_trigger:{negative_hit}"})
+                continue
+            if meta_row.get("infrastructure_only") and not include_infrastructure:
+                name = str(meta_row.get("name", "") or "").casefold()
+                if name and name in query_text:
+                    result["filtered"].append({"id": key, "reason": "infrastructure_only"})
+        if not candidates:
+            result["fallback"] = result["fallback_type"] = "empty"
+            result["duration_ms"] = int((time.monotonic() - started) * 1000)
+            return result
+        candidate_ids = {str(row.get("canonical_id", row.get("id", ""))) for row in candidates}
+        raw = None
+        if callable(llm_selector):
+            try:
+                raw = llm_selector(candidates)
+            except Exception as exc:
+                result["fallback"] = result["fallback_type"] = "llm_error"
+                result["filtered"].append({"id": "", "reason": f"llm_error:{trim(str(exc), 120)}"})
+        parsed = self._selection_json(raw)
+        if isinstance(parsed, dict):
+            parsed = parsed.get("selected", parsed.get("selected_skills", parsed.get("skills", [])))
+        if not isinstance(parsed, list):
+            if raw is not None:
+                result["fallback"] = result["fallback_type"] = "invalid_output"
+            parsed = []
+        seen: set[str] = set()
+        for item in parsed:
+            requested = item if isinstance(item, str) else (item.get("id", item.get("canonical_id", item.get("name", ""))) if isinstance(item, dict) else "")
+            rationale = item.get("rationale", item.get("reason", "")) if isinstance(item, dict) else ""
+            canonical = self.canonicalize_id(requested)
+            cid = str(canonical.get("canonical_id", "")) if canonical.get("ok") else ""
+            if not cid or cid not in candidate_ids:
+                result["filtered"].append({"id": str(requested or ""), "reason": "not_in_candidates" if cid else canonical.get("code", "unknown")})
+                continue
+            if cid in seen:
+                result["filtered"].append({"id": cid, "reason": "duplicate"})
+                continue
+            row = next((x for x in candidates if str(x.get("canonical_id", x.get("id", ""))) == cid), None)
+            if not row:
+                continue
+            seen.add(cid)
+            result["selected"].append({"id": cid, "canonical_id": cid, "name": row.get("name", cid), "rationale": trim(str(rationale or ""), 240)})
+            if len(result["selected"]) >= max(1, min(3, int(limit or 3))):
+                break
+        # Apply declared conflict/dependency metadata after canonicalization.
+        accepted: list[dict] = []
+        accepted_ids: set[str] = set()
+        accepted_names: set[str] = set()
+        active_canonical_ids: list[str] = []
+        for active in list(active_ids or []):
+            resolved = self.canonicalize_id(active)
+            if not resolved.get("ok"):
+                continue
+            active_id = str(resolved.get("canonical_id", "") or "")
+            active_row = self.skills.get(active_id, {})
+            active_canonical_ids.append(active_id)
+            accepted_ids.add(active_id)
+            accepted_names.add(str(active_row.get("name", active_id) or active_id))
+        for selected in list(result["selected"]):
+            cid = str(selected.get("id", "") or "")
+            row = next((x for x in candidates if str(x.get("canonical_id", x.get("id", ""))) == cid), {})
+            conflict_terms = {str(x).casefold() for x in row.get("conflicts", []) or []}
+            conflict_hit = next((value for value in accepted_ids | accepted_names if value.casefold() in conflict_terms), "")
+            if conflict_hit:
+                resolved_conflict = self.canonicalize_id(conflict_hit)
+                if resolved_conflict.get("ok"):
+                    conflict_hit = str(resolved_conflict.get("canonical_id", conflict_hit))
+            reverse_hit = ""
+            if not conflict_hit:
+                prior_rows = [
+                    (str(previous.get("id", "")), next((x for x in candidates if str(x.get("canonical_id", x.get("id", ""))) == previous.get("id")), {}))
+                    for previous in accepted
+                ]
+                prior_rows.extend(
+                    (active_id, self._skill_metadata_record(active_id, self.skills.get(active_id, {})))
+                    for active_id in active_canonical_ids
+                )
+                for previous_id, previous_row in prior_rows:
+                    previous_conflicts = {str(x).casefold() for x in previous_row.get("conflicts", []) or []}
+                    if cid.casefold() in previous_conflicts or str(row.get("name", "")).casefold() in previous_conflicts:
+                        reverse_hit = previous_id
+                        break
+            if conflict_hit or reverse_hit:
+                result["conflicts"].append({"id": cid, "with": conflict_hit or reverse_hit, "reason": "declared_conflict"})
+                result["filtered"].append({"id": cid, "reason": "conflict"})
+                continue
+            accepted.append(selected)
+            accepted_ids.add(cid)
+            accepted_names.add(str(row.get("name", cid) or cid))
+        result["selected"] = accepted
+        selected_ids = {str(row.get("id", "")) for row in accepted} | accepted_ids
+        selected_names = {str(row.get("name", "")) for row in accepted} | accepted_names
+        dependency_valid: list[dict] = []
+        for selected in accepted:
+            cid = str(selected.get("id", "") or "")
+            row = next((x for x in candidates if str(x.get("canonical_id", x.get("id", ""))) == cid), {})
+            missing: list[str] = []
+            for requirement in row.get("requires", []) or []:
+                resolved = self.canonicalize_id(requirement)
+                required_id = str(resolved.get("canonical_id", "")) if resolved.get("ok") else str(requirement)
+                if required_id not in selected_ids and str(requirement) not in selected_names:
+                    missing.append(required_id)
+            if missing:
+                result["requires"].append({"id": cid, "missing": missing})
+                result["filtered"].append({"id": cid, "reason": "missing_dependency", "missing": missing})
+                continue
+            dependency_valid.append(selected)
+        result["selected"] = dependency_valid
+        # Local fallback is intentionally conservative: no selected metadata
+        # means no body load, even for a large global catalog.
+        if not result["selected"] and result["fallback_type"] == "none":
+            result["fallback"] = result["fallback_type"] = "metadata"
+        result["selection_order"] = [row["id"] for row in result["selected"]]
+        result["duration_ms"] = int((time.monotonic() - started) * 1000)
+        return result
+
+    select_for_focus = select_skills
 
     def list_providers(self) -> list[dict]:
         out = []
@@ -20370,13 +21158,12 @@ class SkillStore:
         target = (name or "").strip()
         if not target:
             return None, "Error: skill name required"
-        if target in self.skills:
-            return target, None
-        alias = self.aliases.get(target)
-        if alias:
-            return alias, None
-        if target in self.ambiguous:
-            return None, f"Error: ambiguous skill '{target}'. use: {', '.join(sorted(self.ambiguous[target]))}"
+        resolved = self.canonicalize_id(target)
+        if resolved.get("ok"):
+            return str(resolved.get("canonical_id", "")), None
+        if resolved.get("code") == "ambiguous":
+            options = resolved.get("candidates", [])
+            return None, f"Error: ambiguous skill '{target}'. use: {', '.join(sorted(str(x) for x in options))}"
         return None, f"Error: unknown skill '{target}'. available: {', '.join(self.list_names())}"
 
     def load(self, name: str) -> str:
@@ -20618,11 +21405,396 @@ class TaskManager:
                 tasks.append(self.crypto.read_json(file, {}))
             return tasks
 
+class ProcessManagerError(Exception):
+    def __init__(self, message: str, *, status: int = 400, code: str = "process_error"):
+        super().__init__(message)
+        self.status = int(status)
+        self.code = str(code or "process_error")
+
+
+class UserProcessManager:
+    """Application-wide registry for user-owned background child processes."""
+
+    ACTIVE_STATUSES = {"starting", "running", "stopping"}
+    MAX_RECORDS = 5000
+    MAX_BULK_TARGETS = 200
+    _SECRET_NAME = r"(?:api[_-]?key|token|secret|password|passwd|access[_-]?key|private[_-]?key)"
+
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.records: dict[str, dict] = {}
+        self.terminators: dict[str, object] = {}
+
+    @staticmethod
+    def _user_hash(user_id: str) -> str:
+        return hashlib.sha256(str(user_id or "").encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+    @classmethod
+    def _redact_text(cls, value: object, *, limit: int) -> str:
+        text = str(value or "")
+        text = re.sub(
+            rf"(?i)(\b{cls._SECRET_NAME}\b\s*[=:]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s;&|]+)",
+            r"\1[REDACTED]",
+            text,
+        )
+        text = re.sub(
+            rf"(?i)(--{cls._SECRET_NAME}(?:=|\s+))(?:\"[^\"]*\"|'[^']*'|[^\s;&|]+)",
+            r"\1[REDACTED]",
+            text,
+        )
+        text = re.sub(r"(?i)(https?://[^\s/:@]+:)[^\s/@]+(@)", r"\1[REDACTED]\2", text)
+        try:
+            home = str(Path.home())
+            if home and home != "/":
+                text = text.replace(home, "~")
+        except Exception:
+            pass
+        return trim(text, max(1, int(limit)))
+
+    @staticmethod
+    def _workspace_label(cwd: object) -> str:
+        raw = str(cwd or "").strip()
+        if not raw:
+            return "workspace"
+        try:
+            return Path(raw).name or "workspace"
+        except Exception:
+            return "workspace"
+
+    def _prune_locked(self) -> None:
+        if len(self.records) <= self.MAX_RECORDS:
+            return
+        finished = sorted(
+            (
+                row for row in self.records.values()
+                if str(row.get("status", "")) not in self.ACTIVE_STATUSES
+            ),
+            key=lambda row: float(row.get("finished_at", row.get("started_at", 0.0)) or 0.0),
+        )
+        for row in finished[: max(0, len(self.records) - self.MAX_RECORDS)]:
+            process_id = str(row.get("id", "") or "")
+            self.records.pop(process_id, None)
+            self.terminators.pop(process_id, None)
+
+    def register(
+        self,
+        *,
+        process_id: str,
+        task_id: str,
+        owner_user_id: str,
+        session_id: str,
+        session_title: str,
+        command: str,
+        cwd: Path,
+        source: str,
+        started_at: float,
+        timeout_seconds: int = 0,
+        pid: int = 0,
+        status: str = "starting",
+        terminator=None,
+    ) -> None:
+        key = str(process_id or task_id or "").strip()
+        if not key:
+            raise ValueError("process_id is required")
+        now = now_ts()
+        with self.lock:
+            existing = dict(self.records.get(key, {}))
+            self.records[key] = {
+                **existing,
+                "id": key,
+                "task_id": str(task_id or key),
+                "owner_user_id": str(owner_user_id or ""),
+                "user_hash": self._user_hash(owner_user_id),
+                "session_id": str(session_id or ""),
+                "session_title": trim(str(session_title or session_id or ""), 160),
+                "command": str(command or ""),
+                "cwd": str(cwd or ""),
+                "workspace_label": self._workspace_label(cwd),
+                "source": str(source or "background_run"),
+                "status": str(status or "starting"),
+                "pid": max(0, int(pid or 0)),
+                "started_at": float(started_at or now),
+                "updated_at": now,
+                "last_activity_at": float(existing.get("last_activity_at", started_at or now) or now),
+                "timeout_seconds": max(0, int(timeout_seconds or 0)),
+                "output_bytes": int(existing.get("output_bytes", 0) or 0),
+            }
+            if callable(terminator):
+                self.terminators[key] = terminator
+            self._prune_locked()
+
+    def update(self, process_id: str, **fields) -> None:
+        key = str(process_id or "").strip()
+        if not key:
+            return
+        allowed = {
+            "status", "pid", "last_activity_at", "output_bytes", "output_tail",
+            "exit_code", "error", "finished_at", "duration_seconds",
+            "termination_actor", "termination_reason", "termination_requested_at",
+        }
+        clean = {name: value for name, value in fields.items() if name in allowed}
+        if not clean:
+            return
+        with self.lock:
+            row = self.records.get(key)
+            if row is None:
+                return
+            row.update(clean)
+            row["updated_at"] = now_ts()
+            if str(row.get("status", "")) not in self.ACTIVE_STATUSES:
+                self.terminators.pop(key, None)
+
+    def _reconcile_locked(self) -> None:
+        now = now_ts()
+        for process_id, row in list(self.records.items()):
+            if str(row.get("status", "")) not in self.ACTIVE_STATUSES:
+                continue
+            process = row.get("_process")
+            if process is None:
+                continue
+            try:
+                returncode = process.poll()
+            except Exception:
+                returncode = None
+            if returncode is None:
+                continue
+            terminated = bool(row.get("termination_requested_at"))
+            row.update({
+                "status": "terminated" if terminated else ("completed" if int(returncode) == 0 else "error"),
+                "exit_code": int(returncode),
+                "finished_at": float(row.get("finished_at", now) or now),
+                "updated_at": now,
+            })
+            self.terminators.pop(process_id, None)
+
+    def attach_process(self, process_id: str, process: subprocess.Popen, *, terminator=None) -> None:
+        key = str(process_id or "").strip()
+        with self.lock:
+            row = self.records.get(key)
+            if row is None:
+                return
+            row["_process"] = process
+            row["pid"] = max(0, int(getattr(process, "pid", 0) or 0))
+            row["status"] = "running"
+            row["updated_at"] = now_ts()
+            if callable(terminator):
+                self.terminators[key] = terminator
+
+    def was_termination_requested(self, process_id: str) -> bool:
+        with self.lock:
+            return bool((self.records.get(str(process_id or ""), {}) or {}).get("termination_requested_at"))
+
+    def _public(self, row: dict, *, detail: bool = False) -> dict:
+        out = {
+            "id": str(row.get("id", "") or ""),
+            "task_id": str(row.get("task_id", "") or ""),
+            "user_hash": str(row.get("user_hash", "") or ""),
+            "session_id": str(row.get("session_id", "") or ""),
+            "session_title": str(row.get("session_title", "") or ""),
+            "pid": max(0, int(row.get("pid", 0) or 0)),
+            "command": self._redact_text(row.get("command", ""), limit=260),
+            "workspace": str(row.get("workspace_label", "workspace") or "workspace"),
+            "source": str(row.get("source", "") or ""),
+            "status": str(row.get("status", "") or "unknown"),
+            "started_at": float(row.get("started_at", 0.0) or 0.0),
+            "updated_at": float(row.get("updated_at", 0.0) or 0.0),
+            "last_activity_at": float(row.get("last_activity_at", 0.0) or 0.0),
+            "finished_at": float(row.get("finished_at", 0.0) or 0.0),
+            "duration_seconds": round(float(row.get("duration_seconds", 0.0) or 0.0), 3),
+            "timeout_seconds": max(0, int(row.get("timeout_seconds", 0) or 0)),
+            "output_bytes": max(0, int(row.get("output_bytes", 0) or 0)),
+            "exit_code": row.get("exit_code"),
+            "error": self._redact_text(row.get("error", ""), limit=500),
+            "termination_actor": str(row.get("termination_actor", "") or ""),
+            "termination_reason": trim(str(row.get("termination_reason", "") or ""), 200),
+            "termination_requested_at": float(row.get("termination_requested_at", 0.0) or 0.0),
+            "can_stop": str(row.get("status", "")) in {"starting", "running"},
+        }
+        if detail:
+            out["output_tail"] = self._redact_text(row.get("output_tail", ""), limit=4000)
+        return out
+
+    def list_processes(
+        self,
+        *,
+        owner_user_id: str | None = None,
+        user_hash: str = "",
+        session_id: str = "",
+        status: str = "",
+        query: str = "",
+        limit: int = 100,
+        offset: int = 0,
+    ) -> dict:
+        limit = max(1, min(500, int(limit or 100)))
+        offset = max(0, int(offset or 0))
+        wanted_status = str(status or "").strip().lower()
+        wanted_hash = str(user_hash or "").strip().lower()
+        wanted_session = str(session_id or "").strip()
+        needle = str(query or "").strip().lower()
+        with self.lock:
+            self._reconcile_locked()
+            rows = []
+            for row in self.records.values():
+                if owner_user_id is not None and str(row.get("owner_user_id", "")) != str(owner_user_id):
+                    continue
+                if wanted_hash and str(row.get("user_hash", "")).lower() != wanted_hash:
+                    continue
+                if wanted_session and str(row.get("session_id", "")) != wanted_session:
+                    continue
+                if wanted_status and str(row.get("status", "")).lower() != wanted_status:
+                    continue
+                if needle:
+                    haystack = " ".join((
+                        str(row.get("id", "")), str(row.get("session_id", "")),
+                        str(row.get("session_title", "")), str(row.get("command", "")),
+                        str(row.get("source", "")), str(row.get("status", "")),
+                    )).lower()
+                    if needle not in haystack:
+                        continue
+                rows.append(dict(row))
+            rows.sort(key=lambda row: float(row.get("started_at", 0.0) or 0.0), reverse=True)
+            total = len(rows)
+            page = rows[offset: offset + limit]
+            counts: dict[str, int] = {}
+            for row in rows:
+                state = str(row.get("status", "unknown") or "unknown")
+                counts[state] = counts.get(state, 0) + 1
+        return {
+            "processes": [self._public(row) for row in page],
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "has_more": offset + len(page) < total,
+            "counts": counts,
+        }
+
+    def get_process(self, process_id: str, *, owner_user_id: str | None = None) -> dict:
+        key = str(process_id or "").strip()
+        with self.lock:
+            self._reconcile_locked()
+            row = self.records.get(key)
+            if row is None or (owner_user_id is not None and str(row.get("owner_user_id", "")) != str(owner_user_id)):
+                raise ProcessManagerError("process not found", status=404, code="process_not_found")
+            public = self._public(dict(row), detail=True)
+        return public
+
+    def stop_process(
+        self,
+        process_id: str,
+        *,
+        owner_user_id: str | None = None,
+        actor: str,
+        reason: str = "requested",
+    ) -> dict:
+        key = str(process_id or "").strip()
+        with self.lock:
+            self._reconcile_locked()
+            row = self.records.get(key)
+            if row is None or (owner_user_id is not None and str(row.get("owner_user_id", "")) != str(owner_user_id)):
+                raise ProcessManagerError("process not found", status=404, code="process_not_found")
+            if str(row.get("status", "")) not in {"starting", "running"}:
+                raise ProcessManagerError("process is not running", status=409, code="process_not_running")
+            terminator = self.terminators.get(key)
+            if not callable(terminator):
+                raise ProcessManagerError("process cannot be stopped", status=409, code="process_not_stoppable")
+            now = now_ts()
+            row.update({
+                "status": "stopping",
+                "termination_actor": trim(str(actor or "system"), 120),
+                "termination_reason": trim(str(reason or "requested"), 200),
+                "termination_requested_at": now,
+                "updated_at": now,
+            })
+        try:
+            terminator()
+        except Exception as exc:
+            with self.lock:
+                current = self.records.get(key)
+                if current is not None:
+                    current.update({"status": "error", "error": trim(str(exc), 500), "updated_at": now_ts()})
+            raise ProcessManagerError("failed to stop process", status=500, code="process_stop_failed") from exc
+        return {"ok": True, "process": self.get_process(key, owner_user_id=owner_user_id)}
+
+    def bulk_stop(
+        self,
+        *,
+        actor: str,
+        ids: list[str] | None = None,
+        user_hash: str = "",
+        session_id: str = "",
+        reason: str = "admin bulk stop",
+    ) -> dict:
+        requested = list(dict.fromkeys(str(value or "").strip() for value in (ids or []) if str(value or "").strip()))
+        wanted_hash = str(user_hash or "").strip().lower()
+        wanted_session = str(session_id or "").strip()
+        if not requested and not wanted_hash and not wanted_session:
+            raise ProcessManagerError("bulk stop requires process ids, a user hash, or a session id", status=400, code="bulk_filter_required")
+        with self.lock:
+            self._reconcile_locked()
+            if requested:
+                targets = [key for key in requested if key in self.records]
+            else:
+                targets = [
+                    key for key, row in self.records.items()
+                    if (not wanted_hash or str(row.get("user_hash", "")).lower() == wanted_hash)
+                    and (not wanted_session or str(row.get("session_id", "")) == wanted_session)
+                ]
+            targets = [key for key in targets if str(self.records[key].get("status", "")) in {"starting", "running"}]
+        if len(targets) > self.MAX_BULK_TARGETS:
+            raise ProcessManagerError(
+                f"bulk stop matches {len(targets)} processes; maximum is {self.MAX_BULK_TARGETS}",
+                status=413,
+                code="bulk_target_limit",
+            )
+        stopped: list[str] = []
+        failed: list[dict] = []
+        for key in targets:
+            try:
+                self.stop_process(key, actor=actor, reason=reason)
+                stopped.append(key)
+            except ProcessManagerError as exc:
+                failed.append({"id": key, "code": exc.code, "error": str(exc)})
+        return {"ok": not failed, "matched": len(targets), "stopped": stopped, "failed": failed}
+
+    def stop_all(self, *, actor: str = "system", reason: str = "service shutdown") -> int:
+        with self.lock:
+            targets = [
+                key for key, row in self.records.items()
+                if str(row.get("status", "")) in {"starting", "running"} and callable(self.terminators.get(key))
+            ]
+        stopped = 0
+        for key in targets[: self.MAX_BULK_TARGETS]:
+            try:
+                self.stop_process(key, actor=actor, reason=reason)
+                stopped += 1
+            except ProcessManagerError:
+                pass
+        return stopped
+
+
 class BackgroundManager:
-    def __init__(self, workdir: Path, command_wrapper=None, env_wrapper=None, output_dir: Path | None = None):
+    def __init__(
+        self,
+        workdir: Path,
+        command_wrapper=None,
+        command_rewriter=None,
+        env_wrapper=None,
+        output_dir: Path | None = None,
+        process_manager: UserProcessManager | None = None,
+        owner_user_id: str = "",
+        session_id: str = "",
+        session_title=None,
+        integrity_callback=None,
+    ):
         self.workdir = workdir
         self.command_wrapper = command_wrapper
+        self.command_rewriter = command_rewriter
         self.env_wrapper = env_wrapper
+        self.process_manager = process_manager
+        self.owner_user_id = str(owner_user_id or "")
+        self.session_id = str(session_id or "")
+        self.session_title = session_title
+        self.integrity_callback = integrity_callback
         self.tasks: dict[str, dict] = {}
         self.processes: dict[str, subprocess.Popen] = {}
         self.notifications: queue.Queue = queue.Queue()
@@ -20630,9 +21802,43 @@ class BackgroundManager:
         self.output_dir = Path(output_dir) if output_dir is not None else self.workdir / ".clouds_coder" / "background"
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
+    def _session_title_value(self) -> str:
+        try:
+            value = self.session_title() if callable(self.session_title) else self.session_title
+        except Exception:
+            value = ""
+        return str(value or self.session_id or "")
+
+    def _registry_register(self, task_id: str, task: dict, process: subprocess.Popen | None = None) -> None:
+        manager = self.process_manager
+        if manager is None:
+            return
+        manager.register(
+            process_id=task_id,
+            task_id=task_id,
+            owner_user_id=self.owner_user_id,
+            session_id=self.session_id,
+            session_title=self._session_title_value(),
+            command=str(task.get("command", "") or ""),
+            cwd=Path(str(task.get("cwd", self.workdir) or self.workdir)),
+            source=str(task.get("source", "background_run") or "background_run"),
+            started_at=float(task.get("started_at", now_ts()) or now_ts()),
+            timeout_seconds=int(task.get("hard_timeout_seconds", task.get("timeout_seconds", 0)) or 0),
+            pid=int(task.get("pid", getattr(process, "pid", 0)) or 0),
+            status=str(task.get("status", "starting") or "starting"),
+            terminator=(lambda key=task_id: self.stop(key)) if process is not None else None,
+        )
+        if process is not None:
+            manager.attach_process(task_id, process, terminator=lambda key=task_id: self.stop(key))
+
+    def _registry_update(self, task_id: str, **fields) -> None:
+        if self.process_manager is not None:
+            self.process_manager.update(task_id, **fields)
+
     @staticmethod
     def _decode_output(data: bytes | bytearray) -> str:
-        return bytes(data or b"").decode("utf-8", errors="replace")
+        text, _diagnostics = decode_subprocess_bytes(data)
+        return text
 
     @staticmethod
     def _terminate_process(process: subprocess.Popen) -> None:
@@ -20715,6 +21921,8 @@ class BackgroundManager:
                 "duration_seconds": max(0.0, now - started),
             }
             self.processes[task_id] = process
+            registered_task = dict(self.tasks[task_id])
+        self._registry_register(task_id, registered_task, process)
         thread = threading.Thread(
             target=self._monitor_adopted_process,
             args=(
@@ -20858,6 +22066,14 @@ class BackgroundManager:
                         "duration_seconds": round(max(0.0, now_ts() - started_at), 3),
                     }
                 )
+            self._registry_update(
+                task_id,
+                status="running",
+                last_activity_at=last_activity_at,
+                output_bytes=output_bytes,
+                output_tail=trim(tail_text, 24_000),
+                duration_seconds=round(max(0.0, now_ts() - started_at), 3),
+            )
             if process.poll() is not None and not active_readers and local_queue.empty():
                 break
             if termination_started and now_ts() - termination_started > 3.0:
@@ -20869,7 +22085,20 @@ class BackgroundManager:
             except Exception:
                 pass
         exit_code = int(process.returncode if process.returncode is not None else (-1 if timeout_error else 0))
-        status = "completed" if exit_code == 0 and not timeout_error else "error"
+        with self.lock:
+            stopping = str(self.tasks.get(task_id, {}).get("status", "")) == "stopping"
+        termination_requested = bool(
+            stopping
+            or (
+                self.process_manager is not None
+                and self.process_manager.was_termination_requested(task_id)
+            )
+        )
+        status = (
+            "terminated"
+            if termination_requested
+            else ("completed" if exit_code == 0 and not timeout_error else "error")
+        )
         tail_text, _ = filter_runtime_noise_lines(self._decode_output(tail_bytes))
         result = trim(tail_text or timeout_error or "(no output)", 24_000)
         finished = now_ts()
@@ -20895,6 +22124,13 @@ class BackgroundManager:
                     completion = callback_result
             except Exception as exc:
                 completion = {"completion_error": trim(str(exc), 500)}
+        status = str(completion.get("status", status) or status)
+        if completion.get("exit_code") is not None:
+            exit_code = int(completion.get("exit_code"))
+        if completion.get("error") is not None:
+            timeout_error = str(completion.get("error") or "")
+        if completion.get("result") is not None:
+            result = str(completion.get("result") or "")
         with self.lock:
             task = self.tasks.get(task_id, {})
             task.update(
@@ -20912,6 +22148,17 @@ class BackgroundManager:
             )
             self.processes.pop(task_id, None)
             notification = dict(task)
+        self._registry_update(
+            task_id,
+            status=status,
+            output_tail=trim(tail_text, 24_000),
+            output_bytes=output_bytes,
+            exit_code=exit_code,
+            error=timeout_error,
+            finished_at=finished,
+            last_activity_at=last_activity_at,
+            duration_seconds=round(max(0.0, finished - started_at), 3),
+        )
         self.notifications.put(
             {
                 "task_id": task_id,
@@ -20929,13 +22176,22 @@ class BackgroundManager:
 
     def run(self, command: str, timeout: int = 120) -> str:
         task_id = make_id("bg")
+        started = now_ts()
         with self.lock:
             self.tasks[task_id] = {
-                "status": "running",
+                "status": "starting",
+                "source": "background_run",
                 "command": command,
+                "cwd": str(self.workdir),
+                "pid": 0,
                 "result": None,
-                "started_at": now_ts(),
+                "output_tail": "",
+                "output_bytes": 0,
+                "timeout_seconds": max(1, int(timeout or 120)),
+                "started_at": started,
             }
+            registered_task = dict(self.tasks[task_id])
+        self._registry_register(task_id, registered_task)
         th = threading.Thread(
             target=self._exec, args=(task_id, command, timeout), daemon=True
         )
@@ -20943,59 +22199,156 @@ class BackgroundManager:
         return f"Background task {task_id} started: {command[:80]}"
 
     def _exec(self, task_id: str, command: str, timeout: int):
+        process: subprocess.Popen | None = None
+        started = now_ts()
         try:
-            run_command: object = command
-            run_shell = True
+            if callable(self.integrity_callback):
+                preflight_error = str(self.integrity_callback("before", command) or "")
+                if preflight_error:
+                    raise PermissionError(preflight_error)
             wrapper = self.command_wrapper() if callable(self.command_wrapper) else []
-            windows_job = _is_windows_job_sandbox_prefix(wrapper)
-            if wrapper and not windows_job:
-                run_command = [*wrapper, "/bin/sh", "-c", command]
-                run_shell = False
+            prepared_command = (
+                str(self.command_rewriter(command, self.workdir, wrapper) or "")
+                if callable(self.command_rewriter)
+                else str(command or "")
+            )
+            run_command, run_shell, windows_job = shell_process_invocation(prepared_command, wrapper)
             process_env = self.env_wrapper() if callable(self.env_wrapper) else os.environ.copy()
+            popen_kwargs = {
+                "shell": run_shell,
+                "cwd": self.workdir,
+                "stdin": subprocess.DEVNULL,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "text": False,
+                "bufsize": 0,
+                "env": process_env,
+            }
+            if os.name == "posix":
+                popen_kwargs["start_new_session"] = True
+            elif os.name == "nt":
+                popen_kwargs["creationflags"] = int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) or 0)
             if windows_job:
-                r = _run_windows_sandboxed_command(
-                    command,
+                process = _popen_windows_sandboxed(
+                    windows_utf8_shell_command(prepared_command),
                     workspace_root=self.workdir,
                     cwd=self.workdir,
                     env=process_env,
-                    timeout=timeout,
+                    shell=True,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=False,
+                    bufsize=0,
                 )
             else:
-                r = subprocess.run(
-                    run_command,
-                    shell=run_shell,
-                    cwd=self.workdir,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout,
-                    env=process_env,
-                )
-            output = trim((r.stdout + r.stderr).strip())
-            exit_code = int(r.returncode)
-            status = "completed" if exit_code == 0 else "error"
+                process = subprocess.Popen(run_command, **popen_kwargs)
+            with self.lock:
+                task = self.tasks.get(task_id, {})
+                task.update({"status": "running", "pid": int(process.pid or 0), "started_at": float(task.get("started_at", started) or started)})
+                self.processes[task_id] = process
+                registered_task = dict(task)
+            self._registry_register(task_id, registered_task, process)
+            try:
+                stdout, stderr = process.communicate(timeout=max(1, int(timeout or 120)))
+                timeout_error = ""
+            except subprocess.TimeoutExpired:
+                timeout_error = f"Error: timeout ({max(1, int(timeout or 120))}s)"
+                self._terminate_process(process)
+                try:
+                    stdout, stderr = process.communicate(timeout=1)
+                except Exception:
+                    stdout, stderr = b"", b""
+            output_raw = bytes(stdout or b"") + bytes(stderr or b"")
+            output = trim(self._decode_output(output_raw).strip())
+            exit_code = int(process.returncode if process.returncode is not None else -1)
+            termination_requested = bool(
+                (self.process_manager is not None and self.process_manager.was_termination_requested(task_id))
+                or str(self.tasks.get(task_id, {}).get("status", "")) == "stopping"
+            )
+            status = "terminated" if termination_requested else ("completed" if exit_code == 0 and not timeout_error else "error")
+            error = timeout_error
         except Exception as exc:
             output = f"Error: {exc}"
             status = "error"
             exit_code = -1
+            error = trim(str(exc), 500)
+            output_raw = safe_utf8_bytes(output)
+        if callable(self.integrity_callback):
+            try:
+                integrity_error = str(self.integrity_callback("after", command) or "")
+            except Exception as exc:
+                integrity_error = f"immutable application snapshot verification failed: {exc}"
+            if integrity_error:
+                status = "error"
+                exit_code = -1
+                error = trim(integrity_error, 500)
+                output = trim(f"{output}\nError: {integrity_error}".strip(), 24_000)
+                output_raw = safe_utf8_bytes(output)
+        finished = now_ts()
+        output_text = output or error or "(no output)"
+        log_path = self.output_dir / f"{task_id}.log"
+        display_path = ""
+        try:
+            log_path.write_bytes(bytes(output_raw or b""))
+            try:
+                display_path = log_path.resolve().relative_to(self.workdir.resolve()).as_posix()
+            except Exception:
+                display_path = str(log_path)
+        except Exception:
+            pass
         with self.lock:
             task = self.tasks.get(task_id, {})
             task.update(
                 {
                     "status": status,
-                    "result": output or "(no output)",
+                    "result": output_text,
+                    "output_tail": trim(output_text, 24_000),
+                    "output_bytes": len(bytes(output_raw or b"")),
+                    "full_output_path": display_path,
                     "exit_code": exit_code,
-                    "finished_at": now_ts(),
+                    "error": error,
+                    "finished_at": finished,
+                    "last_activity_at": finished,
+                    "duration_seconds": round(max(0.0, finished - float(task.get("started_at", started) or started)), 3),
                 }
             )
             self.tasks[task_id] = task
+            self.processes.pop(task_id, None)
+        if self.process_manager is not None and task_id not in self.process_manager.records:
+            self._registry_register(task_id, task, process)
+        self._registry_update(
+            task_id,
+            status=status,
+            output_tail=trim(output_text, 24_000),
+            output_bytes=len(bytes(output_raw or b"")),
+            exit_code=exit_code,
+            error=error,
+            finished_at=finished,
+            last_activity_at=finished,
+            duration_seconds=task.get("duration_seconds", 0.0),
+        )
+        if os.name == "nt":
+            _windows_close_sandbox_job(process)
         self.notifications.put(
             {
                 "task_id": task_id,
                 "status": status,
-                "result": (output or "(no output)")[:500],
+                "result": output_text[:500],
                 "exit_code": exit_code,
             }
         )
+
+    def stop(self, task_id: str) -> bool:
+        key = str(task_id or "").strip()
+        with self.lock:
+            process = self.processes.get(key)
+            task = self.tasks.get(key)
+            if task is None or process is None or process.poll() is not None:
+                return False
+            task["status"] = "stopping"
+        self._terminate_process(process)
+        return True
 
     def check(self, task_id: str | None = None) -> str:
         with self.lock:
@@ -21037,13 +22390,11 @@ class BackgroundManager:
 
     def stop_all(self) -> int:
         with self.lock:
-            processes = list(self.processes.values())
+            task_ids = list(self.processes.keys())
         stopped = 0
-        for process in processes:
-            if process.poll() is not None:
-                continue
-            self._terminate_process(process)
-            stopped += 1
+        for task_id in task_ids:
+            if self.stop(task_id):
+                stopped += 1
         return stopped
 
 class MessageBus:
@@ -21140,11 +22491,10 @@ class WorktreeManager:
 
     def _is_git_repo(self) -> bool:
         try:
-            r = subprocess.run(
+            r = run_subprocess_text(
                 ["git", "rev-parse", "--is-inside-work-tree"],
                 cwd=self.repo_root,
                 capture_output=True,
-                text=True,
                 timeout=10,
             )
             return r.returncode == 0
@@ -21183,11 +22533,10 @@ class WorktreeManager:
     def _run_git(self, args: list[str]) -> str:
         if not self.git_available:
             raise RuntimeError("Not in a git repository")
-        r = subprocess.run(
+        r = run_subprocess_text(
             ["git", *args],
             cwd=self.repo_root,
             capture_output=True,
-            text=True,
             timeout=240,
         )
         if r.returncode != 0:
@@ -21246,11 +22595,10 @@ class WorktreeManager:
         path = Path(wt["path"])
         if not path.exists():
             return f"Error: worktree path missing: {path}"
-        r = subprocess.run(
+        r = run_subprocess_text(
             ["git", "status", "--short", "--branch"],
             cwd=path,
             capture_output=True,
-            text=True,
             timeout=60,
         )
         return (r.stdout + r.stderr).strip() or "Clean worktree"
@@ -21265,12 +22613,11 @@ class WorktreeManager:
         if not path.exists():
             return f"Error: worktree path missing: {path}"
         try:
-            r = subprocess.run(
+            r = run_subprocess_text(
                 command,
                 shell=True,
                 cwd=path,
                 capture_output=True,
-                text=True,
                 timeout=300,
             )
             return trim((r.stdout + r.stderr).strip() or "(no output)")
@@ -25234,8 +26581,18 @@ TOOLS = [
         ["question"],
     ),
     tool_def("task", "Spawn a subagent for isolated work.", {"prompt": {"type": "string"}, "agent_type": {"type": "string"}}, ["prompt"]),
-    tool_def("list_skills", "List skill names.", {}),
+    tool_def(
+        "list_skills",
+        "List skill names or recall a bounded metadata candidate set. No skill body is loaded.",
+        {
+            "query": {"type": "string"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+            "include_infrastructure": {"type": "boolean"},
+            "metadata": {"type": "boolean"},
+        },
+    ),
     tool_def("load_skill", "Load a skill by name.", {"name": {"type": "string"}}, ["name"]),
+    tool_def("unload_skill", "Unload a currently active or pinned skill. Hard-bound skills cannot be unloaded.", {"name": {"type": "string"}}, ["name"]),
     tool_def("list_skill_providers", "List discovered skill providers.", {}),
     tool_def("list_skill_protocols", "List supported skill backend protocols.", {}),
     tool_def(
@@ -25406,7 +26763,7 @@ TOOLS = [
         ["media_type", "prompt"],
     ),
     tool_def("background_run", "Run command in background.", {"command": {"type": "string"}, "timeout": {"type": "integer"}}, ["command"]),
-        tool_def(
+    tool_def(
             "check_background",
             (
                 "Inspect background tasks with summary/search/detail/tail modes. "
@@ -25421,6 +26778,38 @@ TOOLS = [
             "limit": {"type": "integer"},
             "max_chars": {"type": "integer"},
         },
+    ),
+    tool_def(
+        "list_background_processes",
+        (
+            "List or inspect background processes owned by the current authenticated user, including jobs from "
+            "other sessions belonging to that same user. Use process_id for exact detail, including the redacted "
+            "output tail. The ownership scope is enforced by the runtime and cannot be overridden."
+        ),
+        {
+            "process_id": {"type": "string"},
+            "session_id": {"type": "string"},
+            "status": {
+                "type": "string",
+                "enum": ["starting", "running", "stopping", "completed", "error", "terminated"],
+            },
+            "query": {"type": "string"},
+            "detail": {"type": "boolean"},
+            "limit": {"type": "integer"},
+        },
+    ),
+    tool_def(
+        "stop_background_process",
+        (
+            "Stop exactly one background process owned by the current authenticated user. First use "
+            "list_background_processes to obtain the exact process_id. Processes owned by other users remain "
+            "invisible and cannot be targeted."
+        ),
+        {
+            "process_id": {"type": "string"},
+            "reason": {"type": "string"},
+        },
+        ["process_id"],
     ),
     tool_def("task_create", "Create task.", {"subject": {"type": "string"}, "description": {"type": "string"}}, ["subject"]),
     tool_def("task_get", "Get task.", {"task_id": {"type": "integer"}}, ["task_id"]),
@@ -25657,6 +27046,7 @@ AGENT_TOOL_ALLOWLIST: dict[str, set[str]] = {
         "ask_user",
         "list_skills",
         "load_skill",
+        "unload_skill",
         "list_skill_providers",
         "list_skill_protocols",
         "scan_skills",
@@ -25665,6 +27055,7 @@ AGENT_TOOL_ALLOWLIST: dict[str, set[str]] = {
         "task_get",
         "task_list",
         "check_background",
+        "list_background_processes",
         "read_inbox",
         "ask_colleague",
         "read_from_blackboard",
@@ -25698,6 +27089,7 @@ AGENT_TOOL_ALLOWLIST: dict[str, set[str]] = {
         "task_get",
         "task_list",
         "check_background",
+        "list_background_processes",
         "ask_colleague",
         "read_from_blackboard",
         "write_to_blackboard",
@@ -25762,7 +27154,7 @@ def _windows_last_error(label: str) -> OSError:
         detail = "Windows API error"
     return OSError(code, f"{label}: {detail}")
 
-def _windows_set_low_integrity_label(path: Path, *, inherit: bool) -> None:
+def _windows_set_integrity_label(path: Path, *, inherit: bool, sid_string: str) -> None:
     from ctypes import wintypes
 
     advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
@@ -25770,7 +27162,7 @@ def _windows_set_low_integrity_label(path: Path, *, inherit: bool) -> None:
     sid = ctypes.c_void_p()
     advapi32.ConvertStringSidToSidW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p)]
     advapi32.ConvertStringSidToSidW.restype = wintypes.BOOL
-    if not advapi32.ConvertStringSidToSidW("S-1-16-4096", ctypes.byref(sid)):
+    if not advapi32.ConvertStringSidToSidW(sid_string, ctypes.byref(sid)):
         raise _windows_last_error("ConvertStringSidToSidW")
     try:
         advapi32.GetLengthSid.argtypes = [ctypes.c_void_p]
@@ -25816,10 +27208,38 @@ def _windows_set_low_integrity_label(path: Path, *, inherit: bool) -> None:
         kernel32.LocalFree.restype = ctypes.c_void_p
         kernel32.LocalFree(sid)
 
+def _windows_set_low_integrity_label(path: Path, *, inherit: bool) -> None:
+    _windows_set_integrity_label(path, inherit=inherit, sid_string="S-1-16-4096")
+
+def _windows_protect_application_snapshot(workspace_root: Path) -> None:
+    snapshot = Path(workspace_root) / ".application_skills"
+    if not snapshot.exists() or snapshot.is_symlink():
+        return
+    for dirpath, dirnames, filenames in os.walk(snapshot, topdown=True, followlinks=False):
+        current = Path(dirpath)
+        dirnames[:] = [name for name in dirnames if not (current / name).is_symlink()]
+        try:
+            _windows_set_integrity_label(current, inherit=True, sid_string="S-1-16-8192")
+        except OSError:
+            pass
+        for name in filenames:
+            target = current / name
+            if target.is_symlink():
+                continue
+            try:
+                _windows_set_integrity_label(target, inherit=False, sid_string="S-1-16-8192")
+            except OSError:
+                pass
+            try:
+                os.chmod(target, stat.S_IREAD)
+            except Exception:
+                pass
+
 def _windows_prepare_low_integrity_workspace(workspace_root: Path) -> bool:
     canonical = Path(os.path.realpath(workspace_root)).resolve()
     key = os.path.normcase(str(canonical))
     with _WINDOWS_LOW_INTEGRITY_LOCK:
+        _windows_protect_application_snapshot(canonical)
         if key in _WINDOWS_LOW_INTEGRITY_ROOTS or key in _WINDOWS_LOW_INTEGRITY_FAILED_ROOTS:
             return key in _WINDOWS_LOW_INTEGRITY_ROOTS
         # The low-integrity label is defense-in-depth. Standard Windows users can
@@ -25835,6 +27255,8 @@ def _windows_prepare_low_integrity_workspace(workspace_root: Path) -> bool:
         for dirpath, dirnames, filenames in os.walk(canonical, topdown=True, followlinks=False):
             current = Path(dirpath)
             dirnames[:] = [name for name in dirnames if not (current / name).is_symlink()]
+            if current == canonical:
+                dirnames[:] = [name for name in dirnames if name != ".application_skills"]
             for name in dirnames:
                 try:
                     _windows_set_low_integrity_label(current / name, inherit=True)
@@ -26071,19 +27493,35 @@ def _run_windows_sandboxed_command(
     )
     try:
         stdout, stderr = proc.communicate(timeout=timeout)
-        return subprocess.CompletedProcess(
+        stdout_text, stdout_diagnostics = decode_subprocess_bytes(stdout)
+        stderr_text, stderr_diagnostics = decode_subprocess_bytes(stderr)
+        completed = subprocess.CompletedProcess(
             command,
             int(proc.returncode or 0),
-            bytes(stdout or b"").decode("utf-8", errors="replace"),
-            bytes(stderr or b"").decode("utf-8", errors="replace"),
+            stdout_text,
+            stderr_text,
         )
-    except subprocess.TimeoutExpired:
+        completed.decoding_diagnostics = {
+            "stdout": stdout_diagnostics,
+            "stderr": stderr_diagnostics,
+        }
+        return completed
+    except subprocess.TimeoutExpired as exc:
         _windows_close_sandbox_job(proc, terminate=True)
         try:
-            proc.wait(timeout=2)
+            stdout, stderr = proc.communicate(timeout=2)
         except Exception:
-            pass
-        raise
+            stdout = getattr(exc, "stdout", None)
+            stderr = getattr(exc, "stderr", None)
+        stdout_text, stdout_diagnostics = decode_subprocess_bytes(stdout)
+        stderr_text, stderr_diagnostics = decode_subprocess_bytes(stderr)
+        exc.stdout = exc.output = stdout_text
+        exc.stderr = stderr_text
+        exc.decoding_diagnostics = {
+            "stdout": stdout_diagnostics,
+            "stderr": stderr_diagnostics,
+        }
+        raise exc
     finally:
         _windows_close_sandbox_job(proc)
 
@@ -26244,6 +27682,7 @@ class SessionState:
         collaboration_write_coordinator=None,
         shell_timeout_mode: str = DEFAULT_SHELL_TIMEOUT_MODE,
         shell_async_handoff_seconds: int = DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS,
+        process_manager: UserProcessManager | None = None,
     ):
         self.id = session_id
         self.title = title
@@ -26363,6 +27802,7 @@ class SessionState:
         # structured outcome metadata (notably the real shell exit code) is
         # carried alongside it in thread-local state for the orchestrator.
         self._tool_result_local = threading.local()
+        self._application_snapshot_integrity_lock = threading.RLock()
         self.single_advance_prompt_enhance = False
         cfg_single_todo_enabled, cfg_single_todo_prompt = extract_single_no_plan_todo_settings(
             default_llm_config or {}
@@ -26381,8 +27821,14 @@ class SessionState:
         self.bg = BackgroundManager(
             self.files_root,
             command_wrapper=self._hard_snapshot_shell_prefix,
+            command_rewriter=self._background_shell_command,
             env_wrapper=self._shell_process_env,
             output_dir=self.long_output_dir / "background",
+            process_manager=process_manager,
+            owner_user_id=self.owner_user_id,
+            session_id=self.id,
+            session_title=lambda: self.title,
+            integrity_callback=self._hard_snapshot_integrity_callback,
         )
         self.bus = MessageBus(self.root / "team" / "inbox", crypto)
         self.worktrees = WorktreeManager(self.id, self.tasks, self.root, crypto, repo_root)
@@ -29170,6 +30616,9 @@ class SessionState:
                     "preview": "immutable application skill snapshot",
                     "skill_name": key,
                     "pinned": True,
+                    "scope": "pinned",
+                    "step_id": "",
+                    "source": "hard-bound",
                 }
                 for key in self.bound_skill_ids
             }
@@ -29177,6 +30626,7 @@ class SessionState:
         else:
             bb["loaded_skills"] = {}
             bb["loaded_skills_goal_sig"] = ""
+            bb["loaded_skills_selection_sig"] = ""
         if previous:
             bb["previous_task_context"] = previous
         self.blackboard = bb
@@ -29774,7 +31224,20 @@ class SessionState:
             if body_z and cached_fp and cached_fp == fp:
                 restored = decompress_text_blob(body_z)
                 if restored:
-                    self._broadcast_loaded_skill(key, restored, load_source=load_source)
+                    existing = self._ensure_blackboard().get("loaded_skills", {})
+                    if isinstance(existing, dict) and key in existing:
+                        row_existing = existing.get(key) if isinstance(existing.get(key), dict) else {}
+                        row_existing["last_used"] = now_ts()
+                        if self._skill_scope_for_source(load_source) == "pinned":
+                            row_existing["scope"] = "pinned"
+                            row_existing["pinned"] = True
+                            row_existing["step_id"] = ""
+                            row_existing["source"] = trim(str(load_source or "manual"), 120)
+                        existing[key] = row_existing
+                        self._ensure_blackboard()["loaded_skills"] = existing
+                        self._blackboard_touch()
+                    else:
+                        self._broadcast_loaded_skill(key, restored, load_source=load_source)
                     return restored
         text = self.skills.load(name)
         if text and not str(text).startswith("Error:"):
@@ -29786,11 +31249,81 @@ class SessionState:
             self._prune_skill_load_cache()
             self.updated_at = now_ts()
             self._persist()
-            self._broadcast_loaded_skill(key, text, load_source=load_source)
+            existing = self._ensure_blackboard().get("loaded_skills", {})
+            if isinstance(existing, dict) and key in existing:
+                row_existing = existing.get(key) if isinstance(existing.get(key), dict) else {}
+                row_existing["last_used"] = now_ts()
+                row_existing["size"] = len(text)
+                row_existing["preview"] = trim(text, 300)
+                row_existing["digest"] = hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()[:16]
+                if self._skill_scope_for_source(load_source) == "pinned":
+                    row_existing["scope"] = "pinned"
+                    row_existing["pinned"] = True
+                    row_existing["step_id"] = ""
+                    row_existing["source"] = trim(str(load_source or "manual"), 120)
+                existing[key] = row_existing
+                self._ensure_blackboard()["loaded_skills"] = existing
+                self._blackboard_touch()
+            else:
+                self._broadcast_loaded_skill(key, text, load_source=load_source)
         return text
 
+    def _skill_scope_for_source(self, load_source: str = "") -> str:
+        return "pinned" if str(load_source or "").strip().lower().startswith("manual") else "active"
+
+    def _active_skill_step_id(self, board: dict | None = None) -> str:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        try:
+            focus = self._blackboard_focus_identity(bb)
+            return trim(str(focus.get("id", "") or ""), 100)
+        except Exception:
+            row = self._current_plan_step_row(bb) if hasattr(self, "_current_plan_step_row") else None
+            return trim(str((row or {}).get("id", "") or ""), 100)
+
+    def _emit_skill_selection_event(self, selection: dict, *, trigger: str = ""):
+        """Persist a small, auditable selector summary without model reasoning."""
+        payload = dict(selection or {}) if isinstance(selection, dict) else {}
+        payload["trigger"] = trim(str(trigger or ""), 80)
+        payload["candidate_ids"] = [
+            str(row.get("canonical_id", row.get("id", "")))
+            for row in list(payload.get("candidates", []) or [])
+            if isinstance(row, dict)
+        ][:12]
+        payload["selected_ids"] = [str(x) for x in list(payload.get("selection_order", []) or [])][:3]
+        payload["candidates"] = [
+            {"id": str(row.get("canonical_id", row.get("id", ""))), "score": row.get("score", 0)}
+            for row in list(payload.get("candidates", []) or [])
+            if isinstance(row, dict)
+        ][:12]
+        loaded = self._ensure_blackboard().get("loaded_skills", {})
+        loaded = loaded if isinstance(loaded, dict) else {}
+        payload["active_ids"] = [
+            str(key) for key, row in loaded.items()
+            if str((row or {}).get("scope", "active") if isinstance(row, dict) else "active") == "active"
+        ][:10]
+        payload["pinned_ids"] = [
+            str(key) for key, row in loaded.items()
+            if isinstance(row, dict) and str(row.get("scope", "") or "") == "pinned"
+        ][:10]
+        payload["step_id"] = self._active_skill_step_id()
+        try:
+            payload["execution_mode"] = self._effective_execution_mode()
+        except Exception:
+            payload["execution_mode"] = str(getattr(self, "runtime_execution_mode", "") or "")
+        board = self._ensure_blackboard()
+        payload["plan_focus_active"] = bool(self._current_plan_step_row(board))
+        payload["todo_focus_active"] = bool(self._current_no_plan_todo_rows(board))
+        payload["focus_kind"] = str(self._blackboard_focus_identity(board).get("kind", "task") or "task")
+        payload.pop("raw", None)
+        self._emit("skill_selection", payload)
+
     def _broadcast_loaded_skill(self, skill_key: str, skill_text: str, *, load_source: str = "manual"):
-        """Broadcast a loaded skill to blackboard, global single-agent context, and agent contexts."""
+        """Record active skill state and emit a lightweight UI event.
+
+        Full skill text remains in the compressed body cache and is rehydrated
+        in ``_loaded_skills_context_block``.  It is deliberately not copied into
+        messages or every role context on each load.
+        """
         # 1. Write skill reference to blackboard so all agents are aware
         bb = self._ensure_blackboard()
         loaded_skills = bb.get("loaded_skills", {})
@@ -29801,60 +31334,72 @@ class SessionState:
         skill_name = str(skill_row.get("name", skill_key) or skill_key).strip() or skill_key
         skill_path = str(skill_row.get("skill_path", "") or "").strip()
         aliases = self.skills._skill_aliases(meta)
+        scope = self._skill_scope_for_source(load_source)
+        step_id = self._active_skill_step_id(bb) if scope == "active" else ""
+        digest = hashlib.sha256(str(skill_text or "").encode("utf-8", errors="ignore")).hexdigest()[:16]
+        previous = loaded_skills.get(skill_key, {}) if isinstance(loaded_skills.get(skill_key), dict) else {}
         loaded_skills[skill_key] = {
             "loaded_at": now_ts(),
+            "last_used": now_ts(),
             "size": len(skill_text),
             "preview": trim(skill_text, 300),
             "skill_name": skill_name,
             "skill_path": skill_path,
             "aliases": aliases,
+            "scope": scope,
+            "pinned": scope == "pinned",
+            "step_id": step_id,
+            "source": trim(str(load_source or "manual"), 120),
+            "digest": digest,
+            "selection": previous.get("selection", {}) if isinstance(previous, dict) else {},
         }
         bb["loaded_skills"] = loaded_skills
         self.blackboard = bb
         self._blackboard_touch()
-        # 2. Inject full skill content into messages (model needs it to follow instructions)
-        #    but mark it so the frontend renders only a compact card
-        skill_desc = str(skill_row.get("description", "-")).strip()
-        inject_msg = (
-            f"<loaded-skill name=\"{skill_key}\">\n"
-            f"A skill has been loaded. IMPORTANT: This skill's workflow, tools, and commands "
-            f"OVERRIDE the plan's implementation approach for any step where it applies. "
-            f"Read the full instructions below and follow them exactly — do NOT substitute a "
-            f"different tool, library, or language unless the skill explicitly allows it.\n"
-            f"{trim(skill_text, 12000)}\n"
-            f"</loaded-skill>"
-        )
-        # UI display text: concise format that matches frontend's skill_loaded card regex
-        ui_display = f"[skill loaded: {skill_name}] {trim(skill_desc, 200)}"
-        self.messages.append(
-            {
-                "role": "user",
-                "content": inject_msg,
-                "ts": now_ts(),
-                "agent_role": "shared",
-                "_skill_notify": True,
-                "_ui_text": ui_display,
-            }
-        )
-        self.messages = self.messages[-400:]
-        # Also inject into agent_messages for multi-agent mode
-        self.agent_messages.append(
-            {
-                "role": "user",
-                "content": inject_msg,
-                "ts": now_ts(),
-                "agent_role": "shared",
-            }
-        )
-        am_limit = self._tier_agent_context_limits(self._context_budget_tier_for_dynamic_memory())["agent_messages"]
-        if len(self.agent_messages) > int(am_limit * 1.5):
-            self.agent_messages = self.agent_messages[-am_limit:]
         self._emit("status", {
             "summary": f"skill loaded: {skill_name}" + (f" ({load_source})" if load_source and load_source != "manual" else ""),
         })
+        self._emit("skill_loaded", {
+            "skill_id": skill_key,
+            "skill_name": skill_name,
+            "description": trim(str(skill_row.get("description", "") or ""), 200),
+            "summary": f"[skill loaded: {skill_name}] {trim(str(skill_row.get('description', '') or ''), 200)}",
+            "scope": scope,
+            "step_id": step_id,
+            "source": trim(str(load_source or "manual"), 120),
+            "digest": digest,
+        })
+
+    def _unload_skill(self, name: object, *, source: str = "manual") -> str:
+        """Remove a dynamic/pinned skill from active context without deleting its cache."""
+        if self.skill_mode == "hard":
+            return "Error: hard-bound skills cannot be unloaded"
+        self._ensure_skills_ready(force=False)
+        key, err = self.skills._resolve_name(str(name or ""))
+        if err or not key:
+            return err or "Error: skill not found"
+        bb = self._ensure_blackboard()
+        loaded = bb.get("loaded_skills", {})
+        if not isinstance(loaded, dict) or key not in loaded:
+            return f"Skill is not active: {key}"
+        row = loaded.get(key) if isinstance(loaded.get(key), dict) else {}
+        loaded.pop(key, None)
+        bb["loaded_skills"] = loaded
+        self.blackboard = bb
+        self._blackboard_touch()
+        self._clear_loaded_skill_contexts()
+        skill_name = str(row.get("skill_name", key) or key)
+        self._emit("status", {"summary": f"skill unloaded: {skill_name}"})
+        self._emit("skill_unloaded", {
+            "skill_id": key,
+            "skill_name": skill_name,
+            "scope": row.get("scope", "active"),
+            "source": trim(str(source or "manual"), 120),
+        })
+        return f"Skill unloaded: {skill_name}"
 
     def _loaded_skills_goal_signature(self, goal_text: str) -> str:
-        goal = trim(str(goal_text or ""), 1200).strip().lower()
+        goal = trim(str(goal_text or ""), 1200).strip().casefold()
         if not goal:
             return ""
         return hashlib.sha1(goal.encode("utf-8", errors="ignore")).hexdigest()
@@ -29883,15 +31428,75 @@ class SessionState:
             max_len,
         )
 
+    def _current_no_plan_todo_rows(self, board: dict | None = None) -> list[dict]:
+        """Return the shared current Todo focus when no approved Plan step exists."""
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        project_rows = bb.get("project_todos", []) if isinstance(bb.get("project_todos", []), list) else []
+        if any(isinstance(row, dict) and row.get("category") == "plan_step" for row in project_rows):
+            return []
+        todo = getattr(self, "todo", None)
+        if todo is None or not callable(getattr(todo, "snapshot", None)):
+            return []
+        try:
+            rows = todo.snapshot()
+        except Exception:
+            return []
+        current: list[dict] = []
+        for raw in rows if isinstance(rows, list) else []:
+            if not isinstance(raw, dict) or str(raw.get("status", "pending") or "pending") != "in_progress":
+                continue
+            if str(raw.get("key", "") or "").startswith("bb:proj:") or str(raw.get("parent_step_id", "") or "").strip():
+                continue
+            content = trim(normalize_work_text(str(raw.get("content", "") or "")).strip(), 500)
+            if not content:
+                continue
+            row = dict(raw)
+            row["content"] = content
+            current.append(row)
+        # Sync mode may have one active row per owner.  They form one shared,
+        # deterministic execution focus so manager and every worker see the
+        # same selected Skill set.
+        current.sort(
+            key=lambda row: (
+                str(row.get("owner", "") or "").casefold(),
+                str(
+                    row.get("external_subtask_id", "")
+                    or row.get("subtask_id", "")
+                    or row.get("key", "")
+                    or row.get("content", "")
+                    or ""
+                ).casefold(),
+            )
+        )
+        return current[:8]
+
+    def _current_no_plan_todo_text(self, board: dict | None = None, max_len: int = 1200) -> str:
+        rows = self._current_no_plan_todo_rows(board)
+        return trim("\n".join(str(row.get("content", "") or "") for row in rows), max_len)
+
+    def _current_execution_step_full_text(self, board: dict | None = None, max_len: int = 1200) -> str:
+        plan_text = self._current_plan_step_full_text(board, max_len=max_len)
+        if plan_text:
+            return plan_text
+        return self._current_no_plan_todo_text(board, max_len=max_len)
+
+    def _execution_focus_signature(self, board: dict | None = None) -> str:
+        focus = self._blackboard_focus_identity(board if isinstance(board, dict) else self._ensure_blackboard())
+        return trim(f"{focus.get('kind', 'task')}:{focus.get('id', '')}", 180)
+
     def _current_execution_focus_text(self) -> str:
         bb = self._ensure_blackboard()
         parts: list[str] = []
-        goal = trim(str(self.runtime_reclassify_goal or self._latest_user_goal_text() or ""), 1200)
-        if goal:
-            parts.append(goal)
         step_text = self._current_plan_step_text(bb)
         if step_text:
             parts.append(f"Current plan step: {step_text}")
+        else:
+            todo_text = self._current_no_plan_todo_text(bb, max_len=800)
+            if todo_text:
+                parts.append(f"Current Todo focus: {todo_text}")
+        goal = trim(str(self.runtime_reclassify_goal or self._latest_user_goal_text() or ""), 1200)
+        if goal:
+            parts.append(goal)
         profile = bb.get("task_profile", {}) if isinstance(bb.get("task_profile"), dict) else {}
         objective = trim(str(profile.get("direct_objective", "") or "").strip(), 600)
         if objective:
@@ -29916,7 +31521,8 @@ class SessionState:
     def _refresh_loaded_skills_for_execution_focus(self, trigger: str = ""):
         focus = self._current_execution_focus_text()
         if focus:
-            self._auto_discover_and_load_skills(focus, trigger=trigger)
+            return self._auto_discover_and_load_skills(focus, trigger=trigger)
+        return None
 
     def _loaded_skill_rows(self, board: dict | None = None) -> dict[str, dict]:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
@@ -29978,8 +31584,16 @@ class SessionState:
             "If they conflict with a generic plan, the skill workflow wins.",
         ]
         remaining = budget
-        for skill_key, row_obj in list(loaded.items())[:5]:
+        for skill_key, row_obj in list(loaded.items())[:10]:
             row = row_obj if isinstance(row_obj, dict) else {}
+            scope = str(row.get("scope", "active") or "active").strip().lower()
+            if scope not in {"active", "pinned"}:
+                scope = "active"
+            if scope == "active":
+                current_step = self._active_skill_step_id()
+                row_step = str(row.get("step_id", "") or "")
+                if row_step and current_step and row_step != current_step:
+                    continue
             skill_name = str(row.get("skill_name", skill_key) or skill_key).strip() or skill_key
             skill_path = str(row.get("skill_path", "") or "").strip()
             body = self._loaded_skill_body_from_cache(str(skill_key), row)
@@ -29989,7 +31603,7 @@ class SessionState:
                 continue
             per_skill = max(600, min(2600, remaining // max(1, len(loaded))))
             excerpt = trim(source, per_skill)
-            header = f"\n<active-skill name=\"{skill_name}\" key=\"{skill_key}\""
+            header = f"\n<active-skill scope=\"{scope}\" name=\"{skill_name}\" key=\"{skill_key}\""
             if skill_path:
                 header += f" path=\"{skill_path}\""
             header += ">"
@@ -30046,9 +31660,28 @@ class SessionState:
         loaded = bb.get("loaded_skills", {})
         if not isinstance(loaded, dict):
             loaded = {}
+        # Migrate records from older sessions and keep explicit pins across
+        # focus changes. Legacy rows are treated as active for this focus only.
+        step_id = self._active_skill_step_id(bb)
+        migrated: dict[str, dict] = {}
+        for key, value in list(loaded.items())[:20]:
+            row = dict(value) if isinstance(value, dict) else {}
+            scope = str(row.get("scope", "") or "").strip().lower()
+            if scope not in {"active", "pinned"}:
+                scope = "active"
+                row["scope"] = scope
+                row["step_id"] = step_id
+                row["source"] = str(row.get("source", "legacy") or "legacy")
+            if scope == "active" and step_id and not row.get("step_id"):
+                row["step_id"] = step_id
+            migrated[str(key)] = row
+        loaded = migrated
         changed = bool(goal_sig and current_sig and goal_sig != current_sig)
         if changed:
-            bb["loaded_skills"] = {}
+            stale = [key for key, row in loaded.items() if str((row or {}).get("scope", "active")) != "pinned"]
+            for key in stale:
+                loaded.pop(key, None)
+            bb["loaded_skills"] = loaded
             bb["loaded_skills_goal_sig"] = goal_sig
             bb["loaded_skills_goal_preview"] = trim(str(goal_text or ""), 240)
             self.blackboard = bb
@@ -30063,7 +31696,6 @@ class SessionState:
                     )
                 },
             )
-            loaded = {}
         elif goal_sig and current_sig != goal_sig:
             bb["loaded_skills_goal_sig"] = goal_sig
             bb["loaded_skills_goal_preview"] = trim(str(goal_text or ""), 240)
@@ -30075,6 +31707,106 @@ class SessionState:
             "goal_changed": changed,
             "loaded": loaded,
         }
+
+    def _select_skills_for_focus(self, focus: str, *, step: str = "", phase: str = "") -> dict:
+        """Run the shared metadata selector with a bounded LLM call."""
+        if self.skill_mode == "hard":
+            return {
+                "focus": trim(str(focus or ""), 500),
+                "step": trim(str(step or ""), 300),
+                "phase": trim(str(phase or ""), 80),
+                "candidates": [],
+                "selected": [{"id": key, "canonical_id": key, "name": key, "rationale": "hard-bound"} for key in self.bound_skill_ids],
+                "selection_order": list(self.bound_skill_ids),
+                "filtered": [],
+                "fallback": "hard-bound",
+                "fallback_type": "hard-bound",
+            }
+        self._ensure_skills_ready(force=False)
+        candidates = self.skills.recall_metadata(
+            focus,
+            step=step,
+            phase=phase,
+            limit=12,
+            include_infrastructure=False,
+        )
+        loaded_rows = self._ensure_blackboard().get("loaded_skills", {})
+        active_ids = list(loaded_rows.keys()) if isinstance(loaded_rows, dict) else []
+
+        def selector(rows: list[dict]):
+            if not rows or not getattr(self, "ollama", None):
+                return []
+            catalog = [
+                {
+                    "id": row.get("canonical_id", row.get("id", "")),
+                    "name": row.get("name", ""),
+                    "description": trim(str(row.get("description", "") or ""), 220),
+                    "category": row.get("category", ""),
+                    "triggers": list(row.get("triggers", []) or [])[:8],
+                    "requires": list(row.get("requires", []) or [])[:8],
+                    "conflicts": list(row.get("conflicts", []) or [])[:8],
+                }
+                for row in rows
+            ]
+            box: dict[str, object] = {}
+            def _chat():
+                try:
+                    box["response"] = self.ollama.chat(
+                        [{"role": "user", "content": json_dumps({"focus": trim(str(focus or ""), 700), "step": trim(str(step or ""), 400), "phase": phase, "candidates": catalog}, ensure_ascii=False)}],
+                        system=(
+                            "Select at most 3 skills for the current step. Return JSON only as "
+                            '{"selected":[{"id":"exact canonical id","rationale":"short reason"}]}. '
+                            "Use only candidate ids. Return [] when no skill materially applies."
+                        ),
+                        max_tokens=220,
+                        think=False,
+                    )
+                except Exception as exc:
+                    box["error"] = exc
+            worker = threading.Thread(target=_chat, daemon=True)
+            worker.start()
+            worker.join(timeout=5.0)
+            if worker.is_alive():
+                raise TimeoutError("skill selector timed out after 5 seconds")
+            if "error" in box:
+                raise box["error"]
+            response = box.get("response", {})
+            return str(response.get("content", "") or "") if isinstance(response, dict) else str(response or "")
+
+        selected_result = self.skills.select_skills(
+            focus,
+            step=step,
+            phase=phase,
+            llm_selector=selector,
+            limit=3,
+            candidate_limit=12,
+            include_infrastructure=False,
+            active_ids=active_ids,
+        )
+        # Controlled metadata fallback: only load a clearly matching candidate.
+        if not selected_result.get("selected"):
+            strong = [row for row in candidates if float(row.get("score", 0) or 0) >= 6.0]
+            if strong:
+                fallback = self.skills.select_skills(
+                    focus,
+                    step=step,
+                    phase=phase,
+                    llm_selector=lambda _rows: {
+                        "selected": [
+                            {"id": str(row.get("canonical_id", row.get("id", ""))), "rationale": "local metadata match"}
+                            for row in strong[:3]
+                        ]
+                    },
+                    limit=3,
+                    candidate_limit=12,
+                    include_infrastructure=False,
+                    active_ids=active_ids,
+                )
+                fallback["fallback"] = fallback["fallback_type"] = "metadata"
+                # Preserve diagnostics from the failed semantic selection.
+                fallback["filtered"] = list(selected_result.get("filtered", []) or []) + list(fallback.get("filtered", []) or [])
+                selected_result = fallback
+        return selected_result
 
     def _auto_discover_and_load_skills(self, goal_text: str, trigger: str = ""):
         """Skill discovery: LLM semantic match (with timeout) → keyword fallback → lazy load."""
@@ -30090,313 +31822,80 @@ class SessionState:
         goal = trim(str(goal_text or self.runtime_reclassify_goal or self._latest_user_goal_text() or ""), 600)
         if not goal:
             return
-        # Sig = user goal + current plan step text.
-        # Plan step text changes per node → triggers per-node skill reload (desired).
-        # direct_objective changes every manager round → excluded to prevent per-round reload.
+        # The stable signature follows the authoritative execution focus in all
+        # four plan/single/sync combinations. Manager direct_objective changes
+        # every round and is intentionally excluded.
         _user_goal = trim(str(self.runtime_reclassify_goal or self._latest_user_goal_text() or goal), 600)
-        _plan_step = self._current_plan_step_text()
-        stable_sig = trim((_user_goal + "::step::" + _plan_step) if _plan_step else _user_goal, 600)
+        _focus_sig = self._execution_focus_signature()
+        stable_sig = trim(f"{_user_goal}::focus::{_focus_sig}", 1000)
         prep = self._prepare_loaded_skills_for_goal(stable_sig, trigger=trigger)
         already_loaded = prep.get("loaded", {})
-        # Allow up to 4 concurrent non-conflicting skills for complex tasks
-        if isinstance(already_loaded, dict) and len(already_loaded) >= 4 and not bool(prep.get("goal_changed", False)):
-            return
-        goal_low = goal.lower()
-        # Build skill catalog
-        skill_catalog: list[dict] = []
-        for s in skill_meta:
-            name = str(s.get("name", "")).strip()
-            qname = str(s.get("qualified_name", name)).strip()
-            desc = trim(str(s.get("description", "")).strip(), 200)
-            meta = s.get("meta", {}) if isinstance(s.get("meta"), dict) else {}
-            keywords: list[str] = []
-            keywords.append(name.lower())
-            keywords.extend(str(x).strip().lower() for x in self.skills._skill_aliases(meta))
-            keywords.extend(str(x).strip().lower() for x in self.skills._skill_triggers(meta))
-            keywords.extend(str(x).strip().lower() for x in self.skills._skill_keywords(meta))
-            if name and desc and desc != "-":
-                skill_catalog.append(
-                    {
-                        "name": name,
-                        "qname": qname,
-                        "desc": desc,
-                        "keywords": [x for x in keywords if x],
-                    }
-                )
-        if not skill_catalog:
-            return
-
-        matched_names: list[str] = []
-
-        # --- Path 1 (primary): LLM task analysis → skill selection (5s timeout) ---
-        llm_result: list[str] = []
-        def _llm_match():
-            try:
-                catalog_text = "\n".join(f"- {s['qname']}: {s['desc']}" for s in skill_catalog[:30])
-                rsp = self.ollama.chat(
-                    [{"role": "user", "content": (
-                        f"/no_think\n"
-                        f"Available skills:\n{catalog_text}\n\n"
-                        f"Task: {goal}\n\n"
-                        f"Which skills are relevant? Reply ONLY a JSON array. Max 3. [] if none."
-                    )}],
-                    system=self._inject_runtime_environment_context("/no_think\nOutput ONLY a JSON array."),
-                    max_tokens=120,
-                    think=False,
-                )
-                answer = str(rsp.get("content", "") or "").strip()
-                m = re.search(r'\[([^\]]*)\]', answer)
-                if m:
-                    try:
-                        names = json.loads(f"[{m.group(1)}]")
-                        if isinstance(names, list):
-                            llm_result.extend([str(n).strip() for n in names if str(n).strip()][:3])
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-        t = threading.Thread(target=_llm_match, daemon=True)
-        t.start()
-        t.join(timeout=5.0)
-        if llm_result:
-            matched_names = llm_result
-            self._emit("status", {"summary": f"skill discovery (LLM task analysis): {matched_names} ({trigger})"})
-
-        # --- Path 2 (fallback): Keyword match only if LLM returned nothing ---
-        if not matched_names:
-            matched_names = self._keyword_match_skills(goal_low, skill_catalog)
-            if matched_names:
-                self._emit("status", {"summary": f"skill discovery (keyword fallback): {matched_names} ({trigger})"})
-        debug_goal = any(
-            token in goal_low
-            for token in (
-                "debug", "bug", "fix", "error", "traceback", "loop", "stuck",
-                "卡死", "空循环", "死循环", "恢复", "recovery", "test", "测试",
-                "integration", "集成", "architecture", "架构",
+        catalog_fingerprint = trim(str(getattr(self.skills, "fingerprint", "") or ""), 120)
+        selection_sig = hashlib.sha1(
+            f"{prep.get('goal_sig', '')}:{catalog_fingerprint}".encode("utf-8", errors="ignore")
+        ).hexdigest()
+        board_before_selection = self._ensure_blackboard()
+        if str(board_before_selection.get("loaded_skills_selection_sig", "") or "") == selection_sig:
+            return {"skipped": True, "reason": "unchanged_focus", "selection_sig": selection_sig}
+        # Shared metadata-only selector. Every normal outcome returns through
+        # this bounded, canonicalized pipeline.
+        try:
+            selection = self._select_skills_for_focus(
+                goal,
+                step=self._current_execution_step_full_text(),
+                phase=trigger or "execution",
             )
-        )
-        if debug_goal and not matched_names:
-            recovery_match = next(
-                (
-                    str(s.get("qname", "") or s.get("name", "")).strip()
-                    for s in skill_catalog
-                    if "execution-degradation-recovery" in str(s.get("qname", "") or s.get("name", "")).strip().lower()
-                ),
-                "",
-            )
-            if recovery_match:
-                matched_names = [recovery_match]
-                self._emit("status", {"summary": f"skill discovery (recovery bias): {matched_names} ({trigger})"})
-
-        # --- Path 3: Deferred LLM pickup if still running ---
-        if not matched_names and t.is_alive():
-            def _deferred_llm_pickup():
-                t.join(timeout=8.0)
-                if llm_result and not self._loaded_skill_rows():
-                    for name_str in llm_result[:3]:
-                        try:
-                            self._load_skill_with_cache(name_str, load_source=f"auto:llm-deferred:{trigger or 'discovery'}")
-                        except Exception:
-                            pass
-            threading.Thread(target=_deferred_llm_pickup, daemon=True).start()
-
-        # --- Load matched skills: multi-skill with conflict detection ---
-        # Filter out infrastructure/recovery skills that shouldn't be auto-triggered
-        _INFRA_SKILL_PATTERNS = {
-            "execution-degradation", "context-management", "context-recall",
-            "skill-creator", "skills_gen", "agent-builder",
-        }
-        task_skills: list[str] = []
-        infra_skills: list[str] = []
-        for name_str in matched_names[:4]:
-            name_low = str(name_str or "").strip().lower()
-            is_infra = any(pat in name_low for pat in _INFRA_SKILL_PATTERNS)
-            if is_infra and not (debug_goal and "execution-degradation-recovery" in name_low):
-                infra_skills.append(name_str)
-            else:
-                task_skills.append(name_str)
-        if not task_skills:
-            return
-        # Detect conflicts among candidate skills before loading
-        to_load: list[str] = []
-        conflicts: list[tuple[str, str, str]] = []  # (skill_a, skill_b, reason)
-        for candidate in task_skills:
-            # Check conflict with already-loaded skills
-            conflict_with = self._detect_skill_conflict(candidate, already_loaded)
-            if conflict_with:
-                conflicts.append((candidate, conflict_with[0], conflict_with[1]))
-                continue
-            # Check conflict with skills we're about to load
-            conflict_with_pending = None
-            for pending in to_load:
-                reason = self._check_skill_pair_conflict(candidate, pending)
-                if reason:
-                    conflict_with_pending = (pending, reason)
-                    break
-            if conflict_with_pending:
-                conflicts.append((candidate, conflict_with_pending[0], conflict_with_pending[1]))
-                continue
-            to_load.append(candidate)
-        # Load all non-conflicting skills
-        loaded_count = 0
-        loaded_names: list[str] = []
-        for name_str in to_load:
-            if isinstance(already_loaded, dict) and any(name_str in k for k in already_loaded):
-                continue
-            result = self._load_skill_with_cache(name_str, load_source=f"auto:{trigger or 'discovery'}")
-            if result and not str(result).startswith("Error:"):
-                loaded_count += 1
-                loaded_names.append(name_str)
-        # If conflicts found, emit to frontend for user decision
-        if conflicts:
-            conflict_details = []
-            for skill_a, skill_b, reason in conflicts[:3]:
-                conflict_details.append({"blocked": skill_a, "conflicts_with": skill_b, "reason": reason})
-            self._emit("skill_conflict", {
-                "loaded": loaded_names,
-                "conflicts": conflict_details,
-                "summary": (
-                    "Skill conflict detected: "
-                    + "; ".join(f"'{c[0]}' conflicts with '{c[1]}' ({c[2]})" for c in conflicts[:3])
-                    + ". Please choose which to keep."
-                ),
-            })
-        if loaded_count > 0:
-            self._emit("status", {
-                "summary": f"skills loaded: {', '.join(loaded_names)}" + (
-                    f" | conflicts deferred to user: {', '.join(c[0] for c in conflicts[:3])}" if conflicts else ""
-                ) + (f" ({trigger})" if trigger else ""),
-            })
-
-    def _detect_skill_conflict(self, candidate: str, loaded: dict) -> tuple[str, str] | None:
-        """Check if candidate skill conflicts with any already-loaded skill.
-        Returns (conflicting_skill_key, reason) or None."""
-        if not isinstance(loaded, dict) or not loaded:
-            return None
-        for skill_key, row in loaded.items():
-            if not isinstance(row, dict):
-                continue
-            reason = self._check_skill_pair_conflict(candidate, str(row.get("skill_name", skill_key)))
-            if reason:
-                return (str(row.get("skill_name", skill_key)), reason)
-        return None
-
-    def _check_skill_pair_conflict(self, skill_a: str, skill_b: str) -> str:
-        """Check if two skills conflict (overlapping functionality).
-        Returns conflict reason string, or empty string if no conflict."""
-        a_low = str(skill_a or "").strip().lower()
-        b_low = str(skill_b or "").strip().lower()
-        if not a_low or not b_low or a_low == b_low:
-            return ""
-        # Define conflict groups: skills in the same group are mutually exclusive
-        _CONFLICT_GROUPS = [
-            # PDF processors
-            ({"pdf", "kimi-pdf", "minimax-pdf"}, "PDF processing"),
-            # Word/DOCX processors
-            ({"docx", "kimi-docx", "minimax-docx"}, "Word document processing"),
-            # Excel/XLSX processors
-            ({"xlsx", "kimi-xlsx", "minimax-xlsx"}, "Excel/spreadsheet processing"),
-            # PPT/PPTX processors
-            ({"ppt", "ppt-master", "pptx", "academic-pptx", "slide-making-skill"}, "Presentation/PPT processing"),
-            # Research orchestrators
-            ({"deep-research-orchestrator", "research-orchestrator-pro"}, "Research orchestration"),
-        ]
-        # Normalize: strip common prefixes/suffixes for matching
-        def _norm(name: str) -> set[str]:
-            tokens = set()
-            tokens.add(name)
-            # Strip provider prefix
-            if ":" in name:
-                tokens.add(name.split(":", 1)[-1])
-            # Strip common prefixes
-            for prefix in ("local:", "ext-", "minimax-", "kimi-"):
-                if name.startswith(prefix):
-                    tokens.add(name[len(prefix):])
-            return tokens
-        a_tokens = _norm(a_low)
-        b_tokens = _norm(b_low)
-        for group, reason in _CONFLICT_GROUPS:
-            a_in = bool(a_tokens & group)
-            b_in = bool(b_tokens & group)
-            if a_in and b_in:
-                return reason
-        return ""
-
-    def _keyword_match_skills(self, goal_low: str, skill_catalog: list[dict]) -> list[str]:
-        """Metadata-driven keyword skill matching — no hardcoded mappings.
-
-        Compatible with all three skill ecosystems:
-        - Minimax: explicit triggers arrays + metadata.category
-        - skills-main: triggers extracted from description text
-        - awesome-claude-skills: triggers extracted from description text
-
-        All matching is based on keywords/aliases/triggers declared in each
-        skill's SKILL.md YAML front-matter or extracted from description,
-        making it compatible with any agent runtime (claude-code, codex, opencode).
-        """
-        _STOP_WORDS = frozenset({
-            "skill", "skills", "this", "that", "with", "from", "your", "will",
-            "used", "tool", "when", "use", "the", "and", "for", "any", "also",
-            "file", "files", "want", "wants", "user", "like", "make", "create",
-            "should", "include", "including", "mention", "need", "needs",
-        })
-        scored: list[tuple[int, int, str]] = []
-        for s in skill_catalog:
-            qname = str(s.get("qname", "")).strip()
-            if not qname:
-                continue
-            score = 0
-            longest = 0
-            # Phase 1: Match explicit keywords (from triggers + aliases + keywords metadata)
-            for kw in s.get("keywords", []) or []:
-                token = str(kw or "").strip().lower()
-                if not token or token in _STOP_WORDS:
+            selected_ids = [str(row.get("id", "") or "") for row in selection.get("selected", []) if isinstance(row, dict)]
+            loaded_names: list[str] = []
+            for skill_id in selected_ids[:3]:
+                if any(str(key).casefold() == skill_id.casefold() for key in (already_loaded or {}).keys()):
                     continue
-                if token in goal_low:
-                    longest = max(longest, len(token))
-                    # Multi-word matches get higher score
-                    score += 5 if " " in token else 2
-            # Phase 2: Match skill name tokens
-            name = str(s.get("name", "")).strip().lower()
-            if name and name not in _STOP_WORDS:
-                name_tokens = [t for t in re.split(r"[-_\s]+", name) if t and len(t) >= 3 and t not in _STOP_WORDS]
-                for nt in name_tokens:
-                    if nt in goal_low:
-                        score += 2
-                        longest = max(longest, len(nt))
-            # Phase 3: Description-based matching (for skills without explicit keywords)
-            desc = str(s.get("desc", "")).strip().lower()
-            if score == 0 and desc:
-                # Extract meaningful words from description (4+ chars, not stop words)
-                desc_words = set()
-                for w in re.split(r"[\s,;/|().\"']+", desc):
-                    w = w.strip()
-                    if len(w) >= 4 and w not in _STOP_WORDS:
-                        desc_words.add(w)
-                for w in desc_words:
-                    if w in goal_low:
-                        score += 1
-                        longest = max(longest, len(w))
-                # Also try 2-gram phrases from description
-                desc_tokens = desc.split()
-                for i in range(len(desc_tokens) - 1):
-                    bigram = f"{desc_tokens[i]} {desc_tokens[i+1]}"
-                    if len(bigram) >= 6 and bigram in goal_low:
-                        score += 3
-                        longest = max(longest, len(bigram))
-            if score > 0:
-                scored.append((score, longest, qname))
-        if not scored:
-            return []
-        scored.sort(reverse=True)
-        matched: list[str] = []
-        for _, _, qname in scored:
-            if qname not in matched:
-                matched.append(qname)
-            if len(matched) >= 3:
-                break
-        return matched[:3]
-
+                result = self._load_skill_with_cache(skill_id, load_source=f"auto:{trigger or 'discovery'}")
+                if result and not str(result).startswith("Error:"):
+                    loaded_names.append(skill_id)
+                    board_now = self._ensure_blackboard()
+                    rows_now = board_now.get("loaded_skills", {}) if isinstance(board_now.get("loaded_skills", {}), dict) else {}
+                    row_now = rows_now.get(skill_id) if isinstance(rows_now.get(skill_id), dict) else {}
+                    picked = next((row for row in selection.get("selected", []) if isinstance(row, dict) and str(row.get("id", "")) == skill_id), {})
+                    row_now["selection"] = {
+                        "phase": trim(str(selection.get("phase", "") or ""), 80),
+                        "fallback_type": trim(str(selection.get("fallback_type", selection.get("fallback", "none")) or "none"), 80),
+                        "rationale": trim(str(picked.get("rationale", "") or ""), 240),
+                        "candidate_count": len(selection.get("candidates", []) or []),
+                    }
+                    rows_now[skill_id] = row_now
+                    board_now["loaded_skills"] = rows_now
+                    self.blackboard = board_now
+            board_now = self._ensure_blackboard()
+            board_now["loaded_skills_selection_sig"] = selection_sig
+            self.blackboard = board_now
+            self._blackboard_touch()
+            self._emit_skill_selection_event(selection, trigger=trigger)
+            if loaded_names:
+                self._emit("status", {"summary": f"skills loaded: {', '.join(loaded_names)}" + (f" ({trigger})" if trigger else "")})
+            return selection
+        except Exception as exc:
+            # A selector failure is observable and controlled.  Do not fall
+            # through to an unvalidated legacy name-loading path.
+            failed = {
+                "focus": goal,
+                "step": self._current_execution_step_full_text(),
+                "phase": trigger or "execution",
+                "candidates": [],
+                "selected": [],
+                "selection_order": [],
+                "filtered": [{"id": "", "reason": f"selector_error:{trim(str(exc), 120)}"}],
+                "fallback": "selector_error",
+                "fallback_type": "selector_error",
+                "duration_ms": 0,
+            }
+            board_failed = self._ensure_blackboard()
+            board_failed["loaded_skills_selection_sig"] = selection_sig
+            self.blackboard = board_failed
+            self._blackboard_touch()
+            self._emit_skill_selection_event(failed, trigger=trigger)
+            self._emit("status", {"summary": f"skill selector fallback: {trim(str(exc), 160)}"})
+            return failed
     def _loaded_skills_prompt_hint(self, *, for_role: str = "") -> str:
         """Unified skill awareness hint for any system prompt."""
         if self.skill_mode == "hard" and self.bound_skill_ids:
@@ -30415,16 +31914,16 @@ class SessionState:
             )
             return (
                 f"ACTIVE SKILLS: {names}. "
-                "Follow the loaded skill instructions for the current step. "
-                f"When moving to a different step that needs a DIFFERENT skill, call load_skill to switch "
-                f"(or unload the current one first if it's no longer needed). "
+                "At the start of each specialized step, decide whether these Skills materially match the CURRENT focus. "
+                "Auto-loaded Skills are advisory: if one is mismatched, call list_skills(query=<focused current step>) "
+                "and load the verified canonical Skill; pinned Skills remain explicitly active until unloaded. "
                 f"{skill_count} skills available total. "
             )
         return (
             f"SKILL SYSTEM: {skill_count} skills available. "
             "Skills are loaded ON-DEMAND — decide when you need one based on the CURRENT step, not upfront. "
             "For specialized output (reports, slides/PPT, deep research, code review, PDF analysis): "
-            "call list_skills to discover options, then load_skill to activate the right one. "
+            "call list_skills(query=<focused current step>) to discover options, then load_skill to activate the right one. "
             "For bug-fix, debugging, testing, integration, API, or architecture steps, proactively check for a matching skill instead of waiting until you are stuck. "
             "Load a skill AT THE MOMENT you begin the step that requires it. "
             "Unload it (via unload_skill) when moving to a different step that needs a different skill. "
@@ -30441,7 +31940,14 @@ class SessionState:
         hint = self._loaded_skills_prompt_hint(for_role=for_role)
         active = self._loaded_skills_context_block(for_role=for_role, max_chars=6500)
         active_block = f"\n{active}\n" if active else "\n"
-        return f"{hint}{active_block}Skills:\n{self.skills.descriptions()}\n"
+        # Keep the system prompt small.  Models can recall metadata with
+        # list_skills(query=...) and only verified selections may load bodies.
+        return (
+            f"{hint}{active_block}"
+            "SKILL DISCOVERY: Do not load a skill merely because its description contains a generic verb. "
+            "For a specialized current step, call list_skills with a focused query, validate the returned canonical id, "
+            "then call load_skill. Simple questions and unmatched steps should keep the skill set empty.\n"
+        )
 
     def _refresh_runtime_code_reference(self, text: str):
         cb = getattr(self, "reference_prepare_callback", None)
@@ -30642,6 +32148,53 @@ class SessionState:
     def _runtime_environment_context_prompt_block(self) -> str:
         return runtime_environment_context_block(self._runtime_environment_context_snapshot())
 
+    def _background_processes_prompt_block(self) -> str:
+        """Expose a bounded, owner-scoped process snapshot to the active LLM."""
+        bg = getattr(self, "bg", None)
+        manager = getattr(bg, "process_manager", None)
+        if manager is None:
+            return ""
+        owner_user_id = str(getattr(self, "owner_user_id", "") or "")
+        try:
+            overview = manager.list_processes(owner_user_id=owner_user_id, limit=1)
+            active: list[dict] = []
+            for status in ("starting", "running", "stopping"):
+                page = manager.list_processes(
+                    owner_user_id=owner_user_id,
+                    status=status,
+                    limit=6,
+                )
+                active.extend(
+                    row for row in page.get("processes", [])
+                    if isinstance(row, dict)
+                )
+        except Exception:
+            return ""
+        active.sort(
+            key=lambda row: float(row.get("started_at", 0.0) or 0.0),
+            reverse=True,
+        )
+        compact_rows = []
+        for row in active[:6]:
+            session_id = str(row.get("session_id", "") or "")
+            compact_rows.append({
+                "id": str(row.get("id", "") or ""),
+                "status": str(row.get("status", "") or "unknown"),
+                "session": "current" if session_id == str(getattr(self, "id", "") or "") else "other",
+                "session_id": session_id,
+                "source": str(row.get("source", "") or ""),
+                "can_stop": bool(row.get("can_stop", False)),
+            })
+        return (
+            "BACKGROUND PROCESS STATE (runtime-enforced current-authenticated-user scope; other users are invisible):\n"
+            f"current_session_id={str(getattr(self, 'id', '') or '')}; "
+            f"total={int(overview.get('total', 0) or 0)}; "
+            f"counts={json_dumps(overview.get('counts', {}))}; "
+            f"active={json_dumps(compact_rows)}.\n"
+            "Use list_background_processes for current details or cross-session history. Use "
+            "stop_background_process only with an exact visible process_id; ownership cannot be overridden."
+        )
+
     def _shell_failure_guidance_prompt_block(self) -> str:
         """Return short-lived shell recovery rules after a bad shell result.
 
@@ -30686,7 +32239,8 @@ class SessionState:
             "the idle timer resets only when bytes arrive on the agent-visible stdout/stderr pipes; redirecting "
             "all output to a log means the agent sees no activity. `stdbuf` changes buffering only. In fixed mode "
             "the limit is total wall-clock time. A timeout terminates the process group; `nohup` cannot override it.\n"
-            "- Long jobs: prefer `background_run` and then `check_background`. For POSIX shell, split the directory "
+            "- Long jobs: prefer `background_run`, use `check_background` for the current session, and use "
+            "`list_background_processes`/`stop_background_process` for owner-scoped cross-session inspection or exact stopping. For POSIX shell, split the directory "
             "change from the background launch: `cd \"...\" || exit 1; nohup command >log 2>&1 < /dev/null & "
             "pid=$!; printf 'PID: %s\\n' \"$pid\"`. Do not use `cd ... && command &`; it can leave a wrapper "
             "shell holding the tool pipe, and `$!` may identify that wrapper rather than the worker.\n"
@@ -30827,6 +32381,10 @@ class SessionState:
         if "RUNTIME TEMPORAL AND LOCAL CONTEXT:" not in base:
             block = self._runtime_environment_context_prompt_block()
             base = f"{base}\n\n{block}" if base else block
+        if "BACKGROUND PROCESS STATE (runtime-enforced" not in base:
+            processes = self._background_processes_prompt_block()
+            if processes:
+                base = f"{base}\n\n{processes}" if base else processes
         if self.skill_mode == "hard" and "HARD-BOUND APPLICATION SKILLS (immutable approved snapshot):" not in base:
             skills = self._loaded_skills_context_block(
                 for_role="system-helper",
@@ -30949,7 +32507,7 @@ class SessionState:
         names = set(tool_names)
         if names.intersection({"read_file", "list_files", "search_files", "query_code_library", "query_knowledge_library", "tool_memory", "context_recall"}):
             groups.append("read")
-        if names.intersection({"bash", "worktree_run", "check_background"}):
+        if names.intersection({"bash", "worktree_run", "check_background", "list_background_processes", "stop_background_process"}):
             groups.append("run")
         if names.intersection({"write_file", "edit_file", "apply_patch"}):
             groups.append("edit")
@@ -31110,10 +32668,13 @@ class SessionState:
         mm_block = self._multimodal_capability_block()
         mm_hint = f"{mm_block}\n" if mm_block else ""
         runtime_env_text = self._runtime_environment_context_prompt_block() + "\n\n"
+        background_processes_text = self._background_processes_prompt_block()
+        if background_processes_text:
+            runtime_env_text += background_processes_text + "\n\n"
         shell_guidance = self._shell_failure_guidance_prompt_block()
         if shell_guidance:
             runtime_env_text += shell_guidance + "\n\n"
-        skills_catalog_text = "" if self.skill_mode == "hard" else f"Skills:\n{self.skills.descriptions()}"
+        skills_catalog_text = ""
         return (
             f"You are a coding agent. Workspace: \"{self.files_root}\" ($SESSION_ROOT). "
             f"Offline JS libraries root: $JS_LIB_ROOT. "
@@ -31134,7 +32695,7 @@ class SessionState:
                 "Use tools to inspect, edit, and execute. "
                 "If you say you will create, write, build, copy, modify, or verify an artifact, the same turn must include the concrete tool call that does it; do not stop at a promise to act. "
             "When reading files, choose the shape that matches the question: mode='window' for file:line, mode='symbol' for named code, mode='search' for keywords/errors, mode='overview' for structure, and mode='full' only when exact broad context is required. "
-            "When inspecting collections or memory, use focused modes too: tool_memory/context_recall/read_from_blackboard/task_list/check_background/read_inbox/worktree_events support mode='summary', mode='search', mode='window', and mode='detail' where applicable. Prefer query/status/actor/tool filters over repeatedly listing recent items. "
+            "When inspecting collections or memory, use focused modes too: tool_memory/context_recall/read_from_blackboard/task_list/check_background/list_background_processes/read_inbox/worktree_events support focused query/status/detail filters where applicable. `check_background` is session-local; `list_background_processes` sees only the authenticated user's processes across sessions, and `stop_background_process` requires an exact visible process_id. Prefer filters over repeatedly listing recent items. "
             "Before repeating the same successful read_file/bash/query over the same target, check the injected tool-memory-registry or call tool_memory with mode='search' or mode='detail'. "
                 f"{web_search_instruction}"
             "Use Task Memory as the shared mainline: continue the active_focus, reuse cited evidence, and do not branch into a private task unless the user changed the objective. "
@@ -31284,10 +32845,7 @@ class SessionState:
         if self.skill_mode == "hard":
             parts.append(self._loaded_skills_context_block(for_role="developer", max_chars=ADMIN_MAX_APP_CAPSULE_CHARS))
         else:
-            try:
-                parts.append(trim(self.skills.descriptions(), 12000))
-            except Exception:
-                pass
+            parts.append(self._loaded_skills_prompt_hint(for_role="developer"))
             try:
                 parts.append(trim(self._loaded_skills_context_block(for_role="developer", max_chars=5000), 5000))
             except Exception:
@@ -32856,7 +34414,7 @@ class SessionState:
             parts.append(f"command={cmd}")
             if tool == "worktree_run":
                 parts.append(f"worktree={trim(str(src.get('name', '') or ''), 120)}")
-        elif tool == "load_skill":
+        elif tool in {"load_skill", "unload_skill"}:
             parts.append(f"name={trim(str(src.get('name', '') or ''), 180)}")
         elif tool in {"query_code_library", "query_knowledge_library", "agent_web_search"}:
             parts.append(f"query={trim(str(src.get('query', '') or ''), 500)}")
@@ -33643,8 +35201,12 @@ class SessionState:
             return "file_patch" if ok else "edit_error"
         if tool in {"query_code_library", "query_knowledge_library", "agent_web_search"}:
             return "retrieval"
-        if tool == "load_skill":
+        if tool in {"load_skill", "unload_skill"}:
             return "skill_loaded"
+        if tool == "list_background_processes":
+            return "process_observation"
+        if tool == "stop_background_process":
+            return "process_control"
         if tool in {"bash", "worktree_run"}:
             if not ok or self._command_output_has_error_shape(output):
                 return "command_error"
@@ -33744,8 +35306,11 @@ class SessionState:
                     break
             body = " ".join(picked) if picked else "(no output)"
             return trim(f"{tool}: {cmd} :: {body}", TOOL_MEMORY_SUMMARY_MAX_CHARS)
-        if tool == "load_skill" and isinstance(args, dict):
-            return trim(f"loaded skill: {args.get('name', '')} :: {' '.join(lines[:4])}", TOOL_MEMORY_SUMMARY_MAX_CHARS)
+        if tool in {"load_skill", "unload_skill"} and isinstance(args, dict):
+            return trim(f"{tool}: {args.get('name', '')} :: {' '.join(lines[:4])}", TOOL_MEMORY_SUMMARY_MAX_CHARS)
+        if tool in {"list_background_processes", "stop_background_process"} and isinstance(args, dict):
+            target = str(args.get("process_id", "") or "all owned processes")
+            return trim(f"{tool}: {target} :: {' '.join(lines[:8])}", TOOL_MEMORY_SUMMARY_MAX_CHARS)
         if tool in {"query_code_library", "query_knowledge_library", "agent_web_search"} and isinstance(args, dict):
             return trim(f"{tool}: {args.get('query', '')} :: {' '.join(lines[:6])}", TOOL_MEMORY_SUMMARY_MAX_CHARS)
         return trim(" ".join(lines[:8]), TOOL_MEMORY_SUMMARY_MAX_CHARS)
@@ -34603,10 +36168,11 @@ class SessionState:
 
         evidence_tools = {
             "read_file", "bash", "background_run", "worktree_run", "check_background",
+            "list_background_processes",
             "query_code_library", "query_knowledge_library", "agent_web_search",
             "tool_memory", "context_recall", "read_from_blackboard", "list_files", "search_files",
         }
-        mutation_tools = {"write_file", "edit_file", "apply_patch"}
+        mutation_tools = {"write_file", "edit_file", "apply_patch", "stop_background_process"}
         todo_tools = {"TodoWrite", "TodoWriteRescue", "update_todos", "update_plan"}
         evidence_total = 0
         evidence_fresh = 0
@@ -34995,13 +36561,24 @@ class SessionState:
                 temp_output_path=temp_match.group(1) if temp_match else "",
             )
             return
-        if tool == "load_skill":
+        if tool in {"load_skill", "unload_skill"}:
             self._record_tool_memory(
                 tool,
                 src_args,
                 text,
                 role=role,
                 evidence_kind="skill_loaded",
+                result_status="ok" if ok else "error",
+                summary=self._tool_memory_summary_from_output(tool, src_args, text),
+            )
+            return
+        if tool in {"list_background_processes", "stop_background_process"}:
+            self._record_tool_memory(
+                tool,
+                src_args,
+                text,
+                role=role,
+                evidence_kind=("process_observation" if tool == "list_background_processes" else "process_control"),
                 result_status="ok" if ok else "error",
                 summary=self._tool_memory_summary_from_output(tool, src_args, text),
             )
@@ -35062,7 +36639,7 @@ class SessionState:
                         },
                     )
                     return True
-        evidence_tools = {"read_file", "bash", "background_run", "worktree_run", "query_code_library", "query_knowledge_library", "agent_web_search"}
+        evidence_tools = {"read_file", "bash", "background_run", "worktree_run", "list_background_processes", "query_code_library", "query_knowledge_library", "agent_web_search"}
         names = [canonicalize_tool_name(r.get("name", "")) for r in rows]
         if not names or any(name not in evidence_tools for name in names):
             if any(bool(r.get("ok", False)) and canonicalize_tool_name(r.get("name", "")) in {"write_file", "edit_file"} for r in rows):
@@ -35182,7 +36759,8 @@ class SessionState:
         max_distinct = int(budget.get("pin_distinct", TOOL_MEMORY_COMPACT_PIN_DISTINCT) or TOOL_MEMORY_COMPACT_PIN_DISTINCT)
         eligible = {
             "read_file", "write_file", "edit_file", "bash", "background_run", "worktree_run",
-            "load_skill", "query_code_library", "query_knowledge_library",
+            "load_skill", "unload_skill", "query_code_library", "query_knowledge_library",
+            "list_background_processes", "stop_background_process",
         }
         for idx in range(len(messages) - 1, -1, -1):
             msg = messages[idx]
@@ -35265,7 +36843,8 @@ class SessionState:
             return self._compact_read_file_tool_content(messages, index, msg)
         eligible = {
             "write_file", "edit_file", "bash", "background_run", "worktree_run",
-            "load_skill", "query_code_library", "query_knowledge_library",
+            "load_skill", "unload_skill", "query_code_library", "query_knowledge_library",
+            "list_background_processes", "stop_background_process",
         }
         if tool not in eligible:
             return "[cleared by microcompact]"
@@ -36333,20 +37912,18 @@ class SessionState:
 
     def _git_status_map(self, cwd: Path) -> dict[str, str]:
         try:
-            check = subprocess.run(
+            check = run_subprocess_text(
                 ["git", "rev-parse", "--is-inside-work-tree"],
                 cwd=cwd,
                 capture_output=True,
-                text=True,
                 timeout=8,
             )
             if check.returncode != 0:
                 return {}
-            r = subprocess.run(
+            r = run_subprocess_text(
                 ["git", "status", "--porcelain"],
                 cwd=cwd,
                 capture_output=True,
-                text=True,
                 timeout=8,
             )
             if r.returncode != 0:
@@ -38860,10 +40437,9 @@ body{padding:18px}
         tool = shutil.which("pdftotext")
         if tool:
             try:
-                r = subprocess.run(
+                r = run_subprocess_text(
                     [tool, "-layout", str(pdf_path), "-"],
                     capture_output=True,
-                    text=True,
                     timeout=min(30, CHAT_UPLOAD_PARSE_TIMEOUT_SECONDS),
                 )
                 if r.returncode == 0 and r.stdout.strip():
@@ -38894,11 +40470,9 @@ body{padding:18px}
             return ""
         real_cmd = [exe] + [str(x) for x in cmd[1:]]
         try:
-            r = subprocess.run(
+            r = run_subprocess_text(
                 real_cmd,
                 capture_output=True,
-                text=True,
-                errors="ignore",
                 timeout=timeout,
             )
             if r.returncode == 0 and r.stdout.strip():
@@ -43133,6 +44707,280 @@ body{padding:18px}
     def _application_snapshot_root(self) -> Path:
         return self.files_root / ".application_skills"
 
+    def _application_snapshot_recovery_path(self) -> Path:
+        return self.root / ".application_snapshot_recovery.json"
+
+    @staticmethod
+    def _application_resources_digest(resources: list[dict], snapshot_version: int) -> str:
+        if int(snapshot_version or 1) < 2:
+            material = "\n".join(
+                f"{str(x.get('skill_id', '') or '')}:{str(x.get('path', '') or '')}:{str(x.get('digest', '') or '')}"
+                for x in resources
+            )
+        else:
+            material = json.dumps(
+                [
+                    {
+                        "skill_id": str(x.get("skill_id", "") or ""),
+                        "skill_order": int(x.get("skill_order", 0) or 0),
+                        "kind": str(x.get("kind", "attachment") or "attachment"),
+                        "path": str(x.get("path", "") or ""),
+                        "digest": str(x.get("digest", "") or ""),
+                        "size": int(x.get("size", 0) or 0),
+                    }
+                    for x in resources
+                ],
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+    def _application_snapshot_tree_payload(self) -> dict:
+        root = self._application_snapshot_root()
+        if not root.exists() or not root.is_dir() or root.is_symlink():
+            raise ValueError("immutable application snapshot is missing")
+        directories: list[str] = []
+        files: list[dict] = []
+        for current, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
+            current_path = Path(current)
+            if current_path.is_symlink():
+                raise ValueError("immutable application snapshot contains a symbolic link")
+            dirnames.sort()
+            filenames.sort()
+            for name in list(dirnames):
+                target = current_path / name
+                if target.is_symlink():
+                    raise ValueError("immutable application snapshot contains a symbolic link")
+                directories.append(target.relative_to(root).as_posix())
+            for name in filenames:
+                target = current_path / name
+                if target.is_symlink() or not target.is_file():
+                    raise ValueError("immutable application snapshot contains an unsupported entry")
+                raw = target.read_bytes()
+                files.append({
+                    "path": target.relative_to(root).as_posix(),
+                    "size": len(raw),
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                    "mode": stat.S_IMODE(target.stat().st_mode),
+                    "content_b64": base64.b64encode(raw).decode("ascii"),
+                })
+        return {"directories": sorted(directories), "files": files}
+
+    def _application_snapshot_manifest_valid(self) -> tuple[bool, str]:
+        root = self._application_snapshot_root()
+        manifest_path = root / "MANIFEST.json"
+        try:
+            raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+            rows = raw.get("resources", []) if isinstance(raw, dict) else []
+            if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+                return False, "application snapshot manifest is invalid"
+            expected_paths = {"MANIFEST.json"}
+            normalized: list[dict] = []
+            for row in rows:
+                order = int(row.get("skill_order", 0) or 0)
+                rel = str(PurePosixPath(str(row.get("path", "") or "").replace("\\", "/"))).lstrip("/")
+                if order <= 0 or not rel or ".." in PurePosixPath(rel).parts:
+                    return False, "application snapshot manifest contains an invalid path"
+                mounted = f"{order:02d}/{rel}"
+                target = safe_path(mounted, root)
+                if target.is_symlink() or not target.is_file():
+                    return False, f"application snapshot resource is missing: {mounted}"
+                size = int(row.get("size", -1) or 0)
+                digest = str(row.get("digest", "") or "")
+                if target.stat().st_size != size or not hmac.compare_digest(_sha256_file(target), digest):
+                    return False, f"application snapshot resource failed verification: {mounted}"
+                expected_paths.add(mounted)
+                item = dict(row)
+                item["kind"] = str(
+                    row.get("kind", "skill_source" if rel == "SKILL.md" else "attachment")
+                    or "attachment"
+                )
+                normalized.append(item)
+            actual_paths = {
+                fp.relative_to(root).as_posix()
+                for fp in root.rglob("*")
+                if fp.is_file() and not fp.is_symlink()
+            }
+            if actual_paths != expected_paths:
+                return False, "application snapshot file tree does not match its manifest"
+            expected_count = int((self.app_binding or {}).get("resource_count", len(rows)) or 0)
+            if expected_count != len(rows):
+                return False, "application snapshot resource count does not match its binding"
+            expected_digest = str((self.app_binding or {}).get("resources_digest", "") or "")
+            if expected_digest:
+                candidates = {
+                    self._application_resources_digest(normalized, 1),
+                    self._application_resources_digest(normalized, 2),
+                }
+                if not any(hmac.compare_digest(expected_digest, candidate) for candidate in candidates):
+                    return False, "application snapshot manifest digest does not match its binding"
+            return True, ""
+        except Exception as exc:
+            return False, f"application snapshot verification failed: {exc}"
+
+    def _write_application_snapshot_recovery(self) -> None:
+        if self.skill_mode != "hard":
+            return
+        tree = self._application_snapshot_tree_payload()
+        payload = {
+            "version": 1,
+            "session_id": self.id,
+            "app_id": str((self.app_binding or {}).get("app_id", "") or ""),
+            "capsule_digest": str((self.app_binding or {}).get("capsule_digest", "") or ""),
+            "resources_digest": str((self.app_binding or {}).get("resources_digest", "") or ""),
+            "created_at": now_ts(),
+            **tree,
+        }
+        self.crypto.write_json(self._application_snapshot_recovery_path(), payload)
+
+    def _load_application_snapshot_recovery(self) -> dict:
+        payload = self.crypto.read_json(self._application_snapshot_recovery_path(), {})
+        if not isinstance(payload, dict) or int(payload.get("version", 0) or 0) != 1:
+            raise ValueError("application snapshot recovery package is invalid")
+        if str(payload.get("session_id", "") or "") != self.id:
+            raise ValueError("application snapshot recovery package belongs to another session")
+        for key in ("app_id", "capsule_digest", "resources_digest"):
+            bound = str((self.app_binding or {}).get(key, "") or "")
+            stored = str(payload.get(key, "") or "")
+            if bound and not hmac.compare_digest(bound, stored):
+                raise ValueError("application snapshot recovery package does not match its binding")
+        files = payload.get("files", [])
+        directories = payload.get("directories", [])
+        if not isinstance(files, list) or not isinstance(directories, list):
+            raise ValueError("application snapshot recovery package has an invalid tree")
+        seen: set[str] = set()
+        for item in files:
+            if not isinstance(item, dict):
+                raise ValueError("application snapshot recovery package has an invalid file")
+            rel = str(item.get("path", "") or "")
+            parts = PurePosixPath(rel).parts
+            if not rel or rel in seen or "." in parts or ".." in parts:
+                raise ValueError("application snapshot recovery package has an invalid path")
+            raw = base64.b64decode(str(item.get("content_b64", "") or ""), validate=True)
+            if len(raw) != int(item.get("size", -1) or 0) or not hmac.compare_digest(
+                hashlib.sha256(raw).hexdigest(), str(item.get("sha256", "") or "")
+            ):
+                raise ValueError("application snapshot recovery package failed integrity verification")
+            seen.add(rel)
+        return payload
+
+    def _ensure_application_snapshot_recovery(self) -> str:
+        if self.skill_mode != "hard":
+            return ""
+        with self._application_snapshot_integrity_lock:
+            path = self._application_snapshot_recovery_path()
+            try:
+                if path.exists():
+                    self._load_application_snapshot_recovery()
+                    return ""
+                valid, error = self._application_snapshot_manifest_valid()
+                if not valid:
+                    return error or "immutable application snapshot could not be verified"
+                self._write_application_snapshot_recovery()
+                self._load_application_snapshot_recovery()
+                return ""
+            except Exception as exc:
+                return f"immutable application snapshot recovery is unavailable: {exc}"
+
+    def _restore_application_snapshot_from_recovery(self, payload: dict) -> None:
+        root = self._application_snapshot_root()
+        if root.exists():
+            for current, dirnames, filenames in os.walk(root, topdown=False, followlinks=False):
+                current_path = Path(current)
+                for name in filenames:
+                    try:
+                        os.chmod(current_path / name, 0o600, follow_symlinks=False)
+                    except Exception:
+                        pass
+                for name in dirnames:
+                    try:
+                        os.chmod(current_path / name, 0o700, follow_symlinks=False)
+                    except Exception:
+                        pass
+            try:
+                os.chmod(root, 0o700, follow_symlinks=False)
+            except Exception:
+                pass
+            shutil.rmtree(root)
+        root.mkdir(parents=True, exist_ok=False)
+        for rel in sorted((str(x or "") for x in payload.get("directories", [])), key=lambda x: (x.count("/"), x)):
+            safe_path(rel, root).mkdir(parents=True, exist_ok=True)
+        for item in payload.get("files", []):
+            target = safe_path(str(item.get("path", "") or ""), root)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(base64.b64decode(str(item.get("content_b64", "") or ""), validate=True))
+            try:
+                os.chmod(target, int(item.get("mode", 0o400) or 0o400), follow_symlinks=False)
+            except Exception:
+                pass
+        self._restore_application_snapshot_permissions()
+
+    def _verify_application_snapshot_integrity(self, *, restore: bool = True) -> str:
+        if self.skill_mode != "hard":
+            return ""
+        with self._application_snapshot_integrity_lock:
+            ensure_error = self._ensure_application_snapshot_recovery()
+            if ensure_error:
+                return ensure_error
+            try:
+                recovery = self._load_application_snapshot_recovery()
+                current = self._application_snapshot_tree_payload()
+                expected_dirs = sorted(str(x or "") for x in recovery.get("directories", []))
+                current_dirs = sorted(str(x or "") for x in current.get("directories", []))
+                expected_files = [
+                    (str(x.get("path", "") or ""), int(x.get("size", 0) or 0), str(x.get("sha256", "") or ""))
+                    for x in recovery.get("files", []) if isinstance(x, dict)
+                ]
+                current_files = [
+                    (str(x.get("path", "") or ""), int(x.get("size", 0) or 0), str(x.get("sha256", "") or ""))
+                    for x in current.get("files", []) if isinstance(x, dict)
+                ]
+                if expected_dirs == current_dirs and expected_files == current_files:
+                    self._restore_application_snapshot_permissions()
+                    return ""
+                if restore:
+                    self._restore_application_snapshot_from_recovery(recovery)
+                    repaired = self._application_snapshot_tree_payload()
+                    repaired_files = [
+                        (str(x.get("path", "") or ""), int(x.get("size", 0) or 0), str(x.get("sha256", "") or ""))
+                        for x in repaired.get("files", []) if isinstance(x, dict)
+                    ]
+                    if sorted(str(x or "") for x in repaired.get("directories", [])) != expected_dirs or repaired_files != expected_files:
+                        return "immutable application snapshot was modified and automatic restoration failed"
+                return "immutable application snapshot was modified; the approved snapshot was restored"
+            except Exception as exc:
+                return f"immutable application snapshot verification failed: {exc}"
+
+    def _command_targets_application_snapshot_mutation(self, command: str) -> bool:
+        raw = str(command or "")
+        normalized = raw.replace("\\", "/").casefold()
+        root = str(self._application_snapshot_root()).replace("\\", "/").casefold()
+        references_snapshot = ".application_skills" in normalized or (root and root in normalized)
+        scripted_mutation = bool(
+            re.search(
+                r"(?i)(?:unlink|remove|rmdir|rename|replace|chmod|chown|write_text|write_bytes|"
+                r"writefile|rmSync|renameSync|chmodSync|rmtree|copyfile|move)\s*\(",
+                raw,
+            )
+        )
+        return bool(
+            references_snapshot
+            and (self._shell_command_has_mutation_intent(raw) or scripted_mutation)
+        )
+
+    def _hard_snapshot_integrity_callback(self, phase: str, command: str = "") -> str:
+        if self.skill_mode != "hard":
+            return ""
+        if str(phase or "") == "before":
+            ensure_error = self._ensure_application_snapshot_recovery()
+            if ensure_error:
+                return ensure_error
+            if self._command_targets_application_snapshot_mutation(command):
+                return "immutable application skill resources are read-only"
+            return self._verify_application_snapshot_integrity(restore=True)
+        return self._verify_application_snapshot_integrity(restore=True)
+
     def _path_targets_application_snapshot(self, path_text: object) -> bool:
         text = str(path_text or "").strip().strip("'\"")
         if not text:
@@ -43297,6 +45145,12 @@ body{padding:18px}
             shared_read_rules = " ".join(
                 f"(subpath {json.dumps(str(root))})" for root in self._remote_shared_read_roots()
             )
+            snapshot_root = self._application_snapshot_root().resolve()
+            snapshot_deny_rule = (
+                f"(deny file-write* (subpath {json.dumps(str(snapshot_root))})) "
+                if getattr(self, "skill_mode", "dynamic") == "hard" and snapshot_root.exists()
+                else ""
+            )
             policy = (
                 "(version 1) "
                 "(allow default) "
@@ -43307,7 +45161,8 @@ body{padding:18px}
                 "(subpath \"/private/tmp\") (subpath \"/tmp\") (subpath \"/var/tmp\") "
                 "(subpath \"/private/var/folders\")) "
                 f"(allow file-read* (subpath {json.dumps(str(workspace_root))}) "
-                f"{runtime_read_rules} {shared_read_rules})"
+                f"{runtime_read_rules} {shared_read_rules}) "
+                f"{snapshot_deny_rule}"
             )
             return [sandbox, "-p", policy]
         virtual_cwd = "/workspace" + (f"/{rel}" if rel else "")
@@ -43363,6 +45218,11 @@ body{padding:18px}
                 prefix.extend(["--ro-bind", str(shared_root), virtual_root])
             prefix.extend([
                 "--bind", str(workspace_root), "/workspace",
+            ])
+            snapshot_root = self._application_snapshot_root().resolve()
+            if getattr(self, "skill_mode", "dynamic") == "hard" and snapshot_root.exists():
+                prefix.extend(["--ro-bind", str(snapshot_root), "/workspace/.application_skills"])
+            prefix.extend([
                 "--proc", "/proc",
                 "--dev", "/dev",
                 "--tmpfs", "/tmp",
@@ -43397,6 +45257,12 @@ body{padding:18px}
                 "--env", "PYTHONIOENCODING=utf-8",
                 "--env", "PYTHONUTF8=1",
             ]
+            snapshot_root = self._application_snapshot_root().resolve()
+            if getattr(self, "skill_mode", "dynamic") == "hard" and snapshot_root.exists():
+                prefix.extend([
+                    "--mount",
+                    f"type=bind,src={snapshot_root},dst=/workspace/.application_skills,readonly",
+                ])
             for shared_root, virtual_root in self._remote_shared_read_mounts():
                 prefix.extend([
                     "--mount",
@@ -43413,10 +45279,15 @@ body{padding:18px}
             return prefix
         return []
 
-    def _hard_snapshot_shell_prefix(self, cwd: Path | None = None) -> list[str]:
+    def _hard_snapshot_shell_prefix(self, cwd: Path | None = None, *, feature: str = "processes") -> list[str]:
         if bool(getattr(self, "ide_remote_sandbox_required", False)):
-            return self._workspace_sandbox_shell_prefix(cwd)
-        if self.skill_mode != "hard" or os.name != "posix" or sys.platform != "darwin":
+            return self._workspace_sandbox_shell_prefix(cwd, feature=feature)
+        if self.skill_mode != "hard":
+            return []
+        isolated = self._workspace_sandbox_shell_prefix(cwd, feature=feature)
+        if isolated:
+            return isolated
+        if os.name != "posix" or sys.platform != "darwin":
             return []
         sandbox = shutil.which("sandbox-exec")
         snapshot_root = self._application_snapshot_root()
@@ -43428,6 +45299,10 @@ body{padding:18px}
             f"(deny file-write* (subpath {json.dumps(str(snapshot_root.resolve()))}))"
         )
         return [sandbox, "-p", policy]
+
+    def _background_shell_command(self, command: str, cwd: Path, prefix: list[str]) -> str:
+        effective = self._rewrite_shell_virtual_paths(command, cwd)
+        return self._sandbox_virtualize_command(effective, cwd) if prefix else effective
 
     def _hard_snapshot_shell_supported(self) -> bool:
         return bool(self._hard_snapshot_shell_prefix())
@@ -43543,11 +45418,10 @@ body{padding:18px}
                 "Error: shell access to global skills is disabled. "
                 "Use list_skills/load_skill/read_file for skill reads; only the authenticated administrator may mutate skills."
             )
-        if self.skill_mode == "hard" and self._application_snapshot_root().exists() and not self._hard_snapshot_shell_prefix():
-            return (
-                "Error: shell execution is disabled for hard applications on this platform because "
-                "an OS-level read-only snapshot policy is unavailable. Use read_file and the bound Skill instructions."
-            )
+        if self.skill_mode == "hard":
+            integrity_error = self._hard_snapshot_integrity_callback("before", effective)
+            if integrity_error:
+                return f"Error: {integrity_error}"
         blocked = self._shell_write_targets_outside_scope(effective)
         if not blocked:
             return ""
@@ -43601,6 +45475,11 @@ body{padding:18px}
             meta["error"] = "Error: dangerous command blocked"
             meta["output"] = meta["error"]
             return meta
+        integrity_preflight = self._hard_snapshot_integrity_callback("before", effective_command)
+        if integrity_preflight:
+            meta["error"] = f"Error: {integrity_preflight}"
+            meta["output"] = meta["error"]
+            return meta
         before = self._git_status_map(cwd)
         start = time.time()
         proc: subprocess.Popen | None = None
@@ -43649,11 +45528,8 @@ body{padding:18px}
                 del target[:overflow]
 
         def _merge_output_text() -> str:
-            # On Windows, cmd.exe outputs in the system OEM codepage (e.g. cp936/GBK),
-            # not UTF-8.  Detect and use the correct encoding for decoding.
-            enc = "utf-8"
-            out_text = out_buf.decode(enc, errors="replace")
-            err_text = err_buf.decode(enc, errors="replace")
+            out_text, _out_diagnostics = decode_subprocess_bytes(out_buf)
+            err_text, _err_diagnostics = decode_subprocess_bytes(err_buf)
             return (out_text + err_text).strip()
 
         def _store_shell_output(output_value: str, exit_code: int | None = None):
@@ -43704,6 +45580,16 @@ body{padding:18px}
                 )
             except Exception:
                 pass
+            integrity_error = self._hard_snapshot_integrity_callback("after", command)
+            if integrity_error:
+                prior = str(payload.get("result", "") or "").strip()
+                return {
+                    "changed_files": changed,
+                    "status": "error",
+                    "exit_code": -1,
+                    "error": integrity_error,
+                    "result": trim(f"{prior}\nError: {integrity_error}".strip(), 24_000),
+                }
             return {"changed_files": changed}
 
         def _should_handoff(now: float) -> bool:
@@ -43916,14 +45802,7 @@ body{padding:18px}
                 proc_env["JS_LIB_ROOT"] = str(self.js_lib_root)
             shell_prefix = self._hard_snapshot_shell_prefix(cwd)
             sandboxed_command = self._sandbox_virtualize_command(effective_command, cwd) if shell_prefix else effective_command
-            windows_job = _is_windows_job_sandbox_prefix(shell_prefix)
-            popen_command: object = sandboxed_command
-            use_shell = True
-            if os.name == "nt" and (not shell_prefix or windows_job):
-                popen_command = f"chcp 65001>nul & {effective_command}"
-            if shell_prefix and not windows_job:
-                popen_command = [*shell_prefix, "/bin/sh", "-c", sandboxed_command]
-                use_shell = False
+            popen_command, use_shell, windows_job = shell_process_invocation(sandboxed_command, shell_prefix)
             popen_kwargs = {
                 "shell": use_shell,
                 "cwd": cwd,
@@ -44062,6 +45941,12 @@ body{padding:18px}
             self._running_bash_proc = None
             if not handed_off[0]:
                 self._restore_application_snapshot_permissions()
+                integrity_error = self._hard_snapshot_integrity_callback("after", command)
+                if integrity_error:
+                    meta["error"] = f"Error: {integrity_error}"
+                    meta["exit_code"] = -1
+                    prior = str(meta.get("output", "") or "").strip()
+                    meta["output"] = trim(f"{prior}\n{meta['error']}".strip(), 24_000)
         meta["duration_ms"] = int((time.time() - start) * 1000)
         if not handed_off[0]:
             after = self._git_status_map(cwd)
@@ -48100,12 +49985,18 @@ body{padding:18px}
                 if isinstance(sinfo, dict):
                     clean_skills[str(skey)] = {
                         "loaded_at": float(sinfo.get("loaded_at", 0.0) or 0.0),
+                        "last_used": float(sinfo.get("last_used", sinfo.get("loaded_at", 0.0)) or 0.0),
                         "size": int(sinfo.get("size", 0) or 0),
                         "preview": trim(str(sinfo.get("preview", "") or ""), 300),
                         "skill_name": trim(str(sinfo.get("skill_name", skey) or skey), 160),
                         "skill_path": trim(str(sinfo.get("skill_path", "") or ""), 500),
                         "aliases": [trim(str(x), 120) for x in (sinfo.get("aliases", []) or []) if str(x).strip()][:12],
                         "pinned": bool(sinfo.get("pinned", False)),
+                        "scope": str(sinfo.get("scope", "pinned" if sinfo.get("pinned", False) else "active") or "active").strip().lower() if str(sinfo.get("scope", "") or "").strip().lower() in {"active", "pinned"} else ("pinned" if sinfo.get("pinned", False) else "active"),
+                        "step_id": trim(str(sinfo.get("step_id", "") or ""), 100),
+                        "source": trim(str(sinfo.get("source", "legacy") or "legacy"), 120),
+                        "digest": trim(str(sinfo.get("digest", "") or ""), 32),
+                        "selection": dict(sinfo.get("selection", {}) or {}) if isinstance(sinfo.get("selection", {}), dict) else {},
                     }
             if clean_skills:
                 board["loaded_skills"] = clean_skills
@@ -48115,6 +50006,9 @@ body{padding:18px}
         goal_preview = trim(str(src.get("loaded_skills_goal_preview", "") or ""), 240)
         if goal_preview:
             board["loaded_skills_goal_preview"] = goal_preview
+        selection_sig = trim(str(src.get("loaded_skills_selection_sig", "") or ""), 80)
+        if selection_sig:
+            board["loaded_skills_selection_sig"] = selection_sig
         # Preserve step_files registry across normalization
         raw_step_files = src.get("step_files")
         if isinstance(raw_step_files, dict):
@@ -48151,6 +50045,41 @@ body{padding:18px}
                 "total": total,
                 "epoch": epoch,
                 "title": title,
+                "full_text": full_text,
+            }
+        todo_rows = self._current_no_plan_todo_rows(bb) if isinstance(bb, dict) else []
+        if todo_rows:
+            identities: list[str] = []
+            titles: list[str] = []
+            epochs: list[float] = []
+            for row in todo_rows:
+                content = trim(str(row.get("content", "") or "").strip(), 500)
+                owner = trim(str(row.get("owner", "") or "").strip().lower(), 40)
+                row_id = trim(
+                    str(
+                        row.get("external_subtask_id", "")
+                        or row.get("subtask_id", "")
+                        or row.get("key", "")
+                        or content
+                    ).strip(),
+                    500,
+                )
+                identities.append(f"{owner}:{row_id}")
+                titles.append(content)
+                try:
+                    epochs.append(float(row.get("started_at", row.get("updated_at", 0.0)) or 0.0))
+                except Exception:
+                    pass
+            seed = "\n".join(identities)
+            focus_id = "todo:" + hashlib.sha1(seed.encode("utf-8", errors="replace")).hexdigest()[:14]
+            full_text = trim("\n".join(titles), 1200)
+            return {
+                "kind": "todo",
+                "id": focus_id,
+                "index": 0,
+                "total": len(todo_rows),
+                "epoch": max(epochs or [0.0]),
+                "title": trim(titles[0] if len(titles) == 1 else " | ".join(titles), 360),
                 "full_text": full_text,
             }
         profile = bb.get("task_profile", {}) if isinstance(bb.get("task_profile"), dict) else {}
@@ -49168,6 +51097,7 @@ body{padding:18px}
         old_bb = self._ensure_blackboard()
         preserved_skills = old_bb.get("loaded_skills", {})
         preserved_skills_sig = str(old_bb.get("loaded_skills_goal_sig", "") or "")
+        preserved_selection_sig = str(old_bb.get("loaded_skills_selection_sig", "") or "")
         preserved_previous_context = (
             dict(old_bb.get("previous_task_context", {}))
             if isinstance(old_bb.get("previous_task_context", {}), dict)
@@ -49198,6 +51128,8 @@ body{padding:18px}
             self.blackboard["loaded_skills"] = preserved_skills
             self.blackboard["loaded_skills_goal_sig"] = preserved_skills_sig
             self.blackboard["loaded_skills_goal_preview"] = trim(str(goal or ""), 240)
+            if preserved_selection_sig:
+                self.blackboard["loaded_skills_selection_sig"] = preserved_selection_sig
         if preserved_previous_context:
             self.blackboard["previous_task_context"] = preserved_previous_context
         # Restore plan state if plan is active (any phase) or todos have pending work
@@ -54233,6 +56165,10 @@ body{padding:18px}
                         self._last_step_hint_id = _ns_id
             except Exception:
                 pass
+        try:
+            self._refresh_loaded_skills_for_execution_focus(trigger="plan-step-transition")
+        except Exception:
+            pass
         return True
 
     def _post_execution_plan_step_check(self, route: dict, worker_step: dict) -> bool:
@@ -64440,12 +66376,23 @@ body{padding:18px}
             skills_constraint += skills_context
         bb_skills = board.get("loaded_skills", {})
         if isinstance(bb_skills, dict) and bb_skills:
-            skill_names = list(bb_skills.keys())[:5]
-            skills_constraint += (
-                f"CRITICAL: Skills {skill_names} are loaded. Your delegations MUST instruct agents to "
-                "follow the loaded skill's workflow and scripts. Do NOT invent alternative approaches "
-                "when a loaded skill already defines the correct procedure. "
-            )
+            pinned_names = [
+                key for key, row in bb_skills.items()
+                if isinstance(row, dict) and str(row.get("scope", "") or "") == "pinned"
+            ][:5]
+            active_names = [
+                key for key, row in bb_skills.items()
+                if not isinstance(row, dict) or str(row.get("scope", "active") or "active") == "active"
+            ][:5]
+            if pinned_names:
+                skills_constraint += (
+                    f"Pinned Skills {pinned_names} remain explicitly active; delegations must preserve their applicable constraints. "
+                )
+            if active_names:
+                skills_constraint += (
+                    f"Auto-selected Skills {active_names} apply only to the current focus. Confirm material relevance before delegation; "
+                    "when uncertain, instruct the owner to call list_skills(query=<focused current step>) and use the verified workflow. "
+                )
         user_profile_block = self._user_profile_capsule_prompt_block()
         user_profile_text = f"{user_profile_block} " if user_profile_block else ""
         todo_route_note = self._plan_todo_discipline_prompt(for_manager=True)
@@ -64461,6 +66408,7 @@ body{padding:18px}
                 if _mcp_connected else " "
             )
         shell_guidance = self._shell_failure_guidance_prompt_block()
+        background_processes_note = self._background_processes_prompt_block()
         return (
             "You are Manager in a multi-agent coding system. "
             "Read blackboard, delegate one short timeslice via route_to_next_agent. "
@@ -64493,6 +66441,7 @@ body{padding:18px}
             f"{skills_constraint}"
             f"{mcp_manager_text}"
             f"{shell_guidance + ' ' if shell_guidance else ''}"
+            f"{background_processes_note + ' ' if background_processes_note else ''}"
             "If a decision genuinely requires the user (choosing among options, confirming an ambiguous direction, missing requirements), instruct the owner to call ask_user with a clear question and options, and let the run pause for the reply — do NOT have agents guess on the user's behalf. "
             f"Level={level}, mode={mode}, progress={progress}, "
             f"budget={'unlimited' if int(budget) <= 0 else int(budget)}, "
@@ -66718,6 +68667,20 @@ body{padding:18px}
                 )
             if role_key in {"reviewer"}:
                 self._blackboard_set_status("TESTING")
+        elif name in {"list_background_processes", "stop_background_process"}:
+            process_id = trim(str(args.get("process_id", "") or ""), 120)
+            line = trim(
+                f"{name}{' ' + process_id if process_id else ''}\n{output}".strip(),
+                BLACKBOARD_MAX_TEXT,
+            )
+            self._blackboard_append_section("execution_logs", role_key, line)
+            self._blackboard_append_memory(
+                "process_observation" if name == "list_background_processes" else "process_control",
+                trim(line, 700),
+                actor=role_key,
+                tool=name,
+                tier="short",
+            )
         elif self._is_browser_runtime_tool_name(name):
             browser_record = self._browser_runtime_tool_result_record(item)
             line = trim(
@@ -66765,12 +68728,12 @@ body{padding:18px}
                 )
             if role_key == "explorer":
                 self._blackboard_set_status("RESEARCHING")
-        elif name == "load_skill" and ok:
+        elif name in {"load_skill", "unload_skill"} and ok:
             skill_name = trim(str(args.get("name", "") or "").strip(), 180)
             if skill_name:
                 self._blackboard_append_memory(
                     "skill_loaded",
-                    f"loaded skill {skill_name}: {trim(output, 300)}",
+                    f"{name} {skill_name}: {trim(output, 300)}",
                     actor=role_key,
                     tool=name,
                     tier="long",
@@ -67488,9 +69451,10 @@ body{padding:18px}
         read_names = {
             "read_file", "list_files", "search_files", "context_recall", "tool_memory",
             "task_get", "task_list", "read_from_blackboard", "check_background", "read_inbox",
+            "list_background_processes",
             "list_teammates", "worktree_list", "worktree_status", "worktree_events",
             "query_code_library", "query_knowledge_library", "agent_web_search",
-            "list_skills", "list_skill_providers", "list_skill_protocols", "scan_skills", "load_skill",
+            "list_skills", "list_skill_providers", "list_skill_protocols", "scan_skills", "load_skill", "unload_skill",
         }
         tools: list[dict] = []
         for spec in self._available_tools():
@@ -67681,7 +69645,7 @@ body{padding:18px}
             "list_teammates", "worktree_list", "worktree_status", "worktree_events",
             "query_code_library", "query_knowledge_library", "agent_web_search",
             "list_skills", "list_skill_providers", "list_skill_protocols",
-            "scan_skills", "load_skill",
+            "scan_skills", "load_skill", "unload_skill",
         }:
             return True
         if name == "bash" or name == "worktree_run":
@@ -67714,6 +69678,7 @@ body{padding:18px}
         args = item.get("args", {}) if isinstance(item.get("args"), dict) else {}
         if name in {
             "write_file", "edit_file", "background_run", "task_create", "task_update",
+            "stop_background_process",
             "claim_task", "task", "spawn_teammate", "ask_colleague", "send_message", "broadcast",
             "shutdown_request", "plan_approval", "write_skill", "write_to_blackboard", "rag_remember",
             "generate_media", "worktree_create", "worktree_keep", "worktree_remove",
@@ -68509,6 +70474,7 @@ body{padding:18px}
             else "agent_web_search is disabled by startup/config. Do not request web search; use local files, uploaded documents, RAG/code libraries, or ask the user for source material when current open-web evidence is required. "
         )
         task_memory_note = self._blackboard_memory_context_markdown(for_role=role_key, max_chars=2800)
+        background_processes_note = self._background_processes_prompt_block()
         base = (
             f"You are {self._agent_display_name(role_key)} in a multi-agent coding system. "
             f"Workspace: \"{self.files_root}\" ($SESSION_ROOT). Use relative paths or $SESSION_ROOT in bash. "
@@ -68524,7 +70490,7 @@ body{padding:18px}
             "Keep outputs concise and action-oriented. "
             f"{self._public_progress_prompt_instruction()}"
             "When reading files, choose the shape that matches the question: mode='window' for file:line, mode='symbol' for named code, mode='search' for keywords/errors, mode='overview' for structure, and mode='full' only when exact broad context is required. "
-            "When inspecting collections or memory, use focused modes too: tool_memory/context_recall/read_from_blackboard/task_list/check_background/read_inbox/worktree_events support mode='summary', mode='search', mode='window', and mode='detail' where applicable. Prefer query/status/actor/tool filters over repeatedly listing recent items. "
+            "When inspecting collections or memory, use focused modes too: tool_memory/context_recall/read_from_blackboard/task_list/check_background/list_background_processes/read_inbox/worktree_events support focused query/status/detail filters where applicable. `check_background` is session-local; `list_background_processes` sees only the authenticated user's processes across sessions, and `stop_background_process` requires an exact visible process_id. Prefer filters over repeatedly listing recent items. "
             "Before repeating the same successful read_file/bash/query over the same target, check the injected tool-memory-registry or call tool_memory with mode='search' or mode='detail'. "
             f"{web_search_instruction}"
             "Use Task Memory as the shared mainline: continue the active_focus with the other agents, reuse cited evidence, and avoid private parallel objectives. "
@@ -68533,6 +70499,7 @@ body{padding:18px}
             f"{html_note + ' ' if html_note else ''}"
             f"{_detect_os_shell_instruction()} "
             f"{shell_guidance_note + ' ' if shell_guidance_note else ''}"
+            f"{background_processes_note + ' ' if background_processes_note else ''}"
             f"{model_language_instruction(self.ui_language)} "
         )
         mm_note = self._multimodal_capability_block()
@@ -69247,6 +71214,10 @@ body{padding:18px}
         """Canonical dispatcher shared by TodoWrite, Rescue, and Resume aliases."""
         source = args if isinstance(args, dict) else {}
         bb = self._ensure_blackboard()
+        try:
+            focus_before = self._execution_focus_signature(bb)
+        except Exception:
+            focus_before = ""
         active_step = self._get_active_plan_step(bb)
         active_step_id = trim(str((active_step or {}).get("id", "") or ""), 40)
         transaction = self._capture_todo_write_transaction(
@@ -69311,6 +71282,12 @@ body{padding:18px}
                 transaction=transaction,
             )
         self._initialize_collaboration_plan_from_todos(normalized_items)
+        try:
+            focus_after = self._execution_focus_signature(self._ensure_blackboard())
+            if focus_after and focus_after != focus_before:
+                self._refresh_loaded_skills_for_execution_focus(trigger="todo-focus-transition")
+        except Exception:
+            pass
         return result
 
     def _initialize_collaboration_plan_from_todos(self, items: list[object]) -> None:
@@ -70312,6 +72289,106 @@ body{padding:18px}
             default_limit=20,
         )
 
+    def _agent_process_public(self, row: dict) -> dict:
+        """Return a least-privilege process record for model tool results."""
+        out = dict(row or {})
+        out.pop("user_hash", None)
+        session_id = str(out.get("session_id", "") or "")
+        out["ownership_scope"] = "current_authenticated_user"
+        out["session_scope"] = (
+            "current_session"
+            if session_id == str(getattr(self, "id", "") or "")
+            else "other_session"
+        )
+        return out
+
+    def _list_background_processes_enhanced(self, args: dict) -> str:
+        manager = getattr(getattr(self, "bg", None), "process_manager", None)
+        if manager is None:
+            return json_dumps({
+                "scope": "current_authenticated_user",
+                "current_session_id": str(getattr(self, "id", "") or ""),
+                "processes": [],
+                "total": 0,
+                "counts": {},
+                "registry_available": False,
+            }, indent=2)
+        owner_user_id = str(getattr(self, "owner_user_id", "") or "")
+        process_id = str(args.get("process_id", "") or "").strip()
+        try:
+            if process_id:
+                row = manager.get_process(process_id, owner_user_id=owner_user_id)
+                return json_dumps({
+                    "scope": "current_authenticated_user",
+                    "current_session_id": str(getattr(self, "id", "") or ""),
+                    "process": self._agent_process_public(row),
+                }, indent=2)
+            limit = self._tool_int_arg(args.get("limit", 50), 50, 1, 100)
+            detail = args.get("detail", False)
+            if not isinstance(detail, bool):
+                detail = str(detail or "").strip().lower() in {"1", "true", "yes", "on"}
+            if detail:
+                limit = min(limit, 20)
+            page = manager.list_processes(
+                owner_user_id=owner_user_id,
+                session_id=str(args.get("session_id", "") or "").strip(),
+                status=str(args.get("status", "") or "").strip(),
+                query=str(args.get("query", "") or "").strip(),
+                limit=limit,
+            )
+            rows = [
+                self._agent_process_public(row)
+                for row in page.get("processes", [])
+                if isinstance(row, dict)
+            ]
+            if detail:
+                detailed = []
+                for row in rows[:20]:
+                    exact = manager.get_process(
+                        str(row.get("id", "") or ""),
+                        owner_user_id=owner_user_id,
+                    )
+                    detailed.append(self._agent_process_public(exact))
+                rows = detailed
+            return json_dumps({
+                "scope": "current_authenticated_user",
+                "current_session_id": str(getattr(self, "id", "") or ""),
+                "processes": rows,
+                "total": int(page.get("total", 0) or 0),
+                "limit": limit,
+                "has_more": bool(page.get("has_more", False)),
+                "counts": dict(page.get("counts", {}) or {}),
+                "registry_available": True,
+            }, indent=2)
+        except ProcessManagerError as exc:
+            return f"Error: {exc.code}: {exc}"
+
+    def _stop_background_process(self, args: dict, role_key: str = "") -> str:
+        manager = getattr(getattr(self, "bg", None), "process_manager", None)
+        if manager is None:
+            return "Error: process_registry_unavailable: background process registry is unavailable"
+        process_id = str(args.get("process_id", "") or "").strip()
+        if not process_id:
+            return "Error: process_id_required: an exact process_id is required"
+        owner_user_id = str(getattr(self, "owner_user_id", "") or "")
+        actor_role = self._sanitize_agent_role(role_key) or "developer"
+        reason = trim(str(args.get("reason", "") or "agent requested stop"), 200)
+        try:
+            result = manager.stop_process(
+                process_id,
+                owner_user_id=owner_user_id,
+                actor=f"agent:{actor_role}",
+                reason=reason,
+            )
+        except ProcessManagerError as exc:
+            return f"Error: {exc.code}: {exc}"
+        row = result.get("process", {}) if isinstance(result, dict) else {}
+        return json_dumps({
+            "ok": True,
+            "scope": "current_authenticated_user",
+            "process": self._agent_process_public(row if isinstance(row, dict) else {}),
+        }, indent=2)
+
     def _check_background_result_meta(self, args: dict, output: object) -> dict:
         task_id = str((args or {}).get("task_id", "") or "").strip() if isinstance(args, dict) else ""
         if not task_id:
@@ -70596,6 +72673,7 @@ body{padding:18px}
                     "bash",
                     "worktree_run",
                     "check_background",
+                    "stop_background_process",
                     # TodoWrite mutates the canonical Todo/blackboard graph.
                     # It cannot be safely cancelled once semantic auditing has
                     # started, so never run it behind a cancellable worker
@@ -71191,7 +73269,7 @@ body{padding:18px}
                 )
             return out
         if name == "TodoWrite":
-            result = self._dispatch_todo_update(
+            return self._dispatch_todo_update(
                 args,
                 role=str(role_key or "developer"),
                 resume=_to_bool_like(
@@ -71199,31 +73277,8 @@ body{padding:18px}
                     default=False,
                 ),
             )
-            # Step completion skill recheck: if any item just got marked completed, re-evaluate skills
-            # This fires in ALL modes (single/sync/plan) when developer writes todos
-            try:
-                new_items = self._todo_payload_items(args, limit=40)
-                if any(
-                    isinstance(it, dict)
-                    and self._normalize_todo_status_value(
-                        it.get("status", it.get("state", "")),
-                        "pending",
-                    ) == "completed"
-                    for it in new_items
-                ):
-                    self._refresh_loaded_skills_for_execution_focus(trigger="step-completed")  # noqa: E501
-                    pass  # Skills are loaded on-demand by the model
-            except Exception:
-                pass
-            return result
         if name == "TodoWriteRescue":
-            result = self._todo_write_rescue(args, role=str(role_key or "developer"))
-            # Also recheck skills on rescue write (likely a recovery situation)
-            try:
-                pass  # Skills are loaded on-demand by the model via load_skill
-            except Exception:
-                pass
-            return result
+            return self._todo_write_rescue(args, role=str(role_key or "developer"))
         if name == "ask_user":
             return self._handle_ask_user_tool(args, role_key)
         if name in {"finish_task", "finish_current_task", "mark_done"}:
@@ -71291,7 +73346,16 @@ body{padding:18px}
             if self.skill_mode == "hard":
                 return ", ".join(self.bound_skill_ids)
             self._ensure_skills_ready(force=False)
-            return ", ".join(self.skills.list_names())
+            if not isinstance(args, dict) or not any(key in args for key in ("query", "limit", "include_infrastructure", "metadata")):
+                return ", ".join(self.skills.list_names())
+            query = str(args.get("query", "") or "").strip()
+            limit = max(1, min(50, int(args.get("limit", 12) or 12)))
+            include_infra = _to_bool_like(args.get("include_infrastructure", False), default=False)
+            rows = self.skills.recall_metadata(query, limit=limit, include_infrastructure=include_infra) if query else self.skills.list_metadata()
+            rows = [row for row in rows if isinstance(row, dict) and str(row.get("id", "")) != "_warnings"]
+            if not include_infra:
+                rows = [row for row in rows if not bool(row.get("infrastructure_only", False))]
+            return json_dumps(rows[:limit], indent=2, ensure_ascii=False)
         if name == "load_skill":
             if self.skill_mode == "hard":
                 requested = str(args.get("name", "") or "").strip()
@@ -71304,6 +73368,10 @@ body{padding:18px}
                 return "Skill is already active from the legacy immutable application snapshot."
             source = f"manual:{role_key or 'single'}"
             return self._load_skill_with_cache(args["name"], load_source=source)
+        if name == "unload_skill":
+            if self.skill_mode == "hard":
+                return "Error: hard application mode rejects unload_skill for hard-bound skills"
+            return self._unload_skill(args.get("name", ""), source=f"manual:{role_key or 'single'}")
         if name == "list_skill_providers":
             if self.skill_mode == "hard":
                 return "Error: hard application mode does not expose the global skill provider catalog."
@@ -71433,6 +73501,10 @@ body{padding:18px}
             return str(payload.get("output", out_filtered or "(no output)"))
         if name == "check_background":
             return self._check_background_enhanced(args)
+        if name == "list_background_processes":
+            return self._list_background_processes_enhanced(args)
+        if name == "stop_background_process":
+            return self._stop_background_process(args, role_key)
         if name == "task_create":
             return self.tasks.create(args["subject"], args.get("description", ""))
         if name == "task_get":
@@ -76987,7 +79059,7 @@ body{padding:18px}
             self._inject_current_plan_step_execution_hints()
         except Exception:
             pass
-        # Pre-load skills explicitly mentioned in plan steps
+        # Record metadata candidates for plan diagnostics; do not load bodies.
         try:
             self._preload_skills_from_plan_steps(grouped_steps)
         except Exception:
@@ -76998,7 +79070,7 @@ body{padding:18px}
             pass
 
     def _preload_skills_from_plan_steps(self, steps: list):
-        """Scan plan step text for skill names and auto-load any that aren't already loaded."""
+        """Record plan-stage candidates without loading skill bodies."""
         if self.skill_mode == "hard":
             return
         if not steps or not isinstance(steps, list):
@@ -77007,30 +79079,16 @@ body{padding:18px}
         available = self.skills.list_metadata()
         if not available:
             return
-        # Build name → qualified_name lookup
-        name_map: dict[str, str] = {}
-        for s in available:
-            name = str(s.get("name", "")).strip().lower()
-            qname = str(s.get("qualified_name", name)).strip()
-            if name:
-                name_map[name] = qname
-                # Also map without hyphens/underscores for fuzzy match
-                name_map[name.replace("-", "")] = qname
-                name_map[name.replace("_", "")] = qname
-        already_loaded = set(
-            k.lower() for k in (self._ensure_blackboard().get("loaded_skills", {}) or {}).keys()
-        )
-        combined_text = " ".join(str(s or "") for s in steps).lower()
-        to_load: list[str] = []
-        for name_low, qname in name_map.items():
-            if len(name_low) < 3:
+        for index, step in enumerate(steps[:12]):
+            text = str(step or "").strip()
+            if not text:
                 continue
-            if name_low in combined_text and qname.lower() not in already_loaded:
-                if qname not in to_load:
-                    to_load.append(qname)
-        for skill_name in to_load[:4]:
             try:
-                self._load_skill_with_cache(skill_name, load_source="auto:plan-step-mention")
+                recalled = self.skills.recall_metadata(text, phase="plan-research", limit=12)
+                self._emit_skill_selection_event(
+                    {"focus": text, "step": text, "phase": "plan-research", "candidates": recalled, "selected": [], "selection_order": [], "filtered": [], "fallback_type": "plan-candidate-only"},
+                    trigger=f"plan-step-{index + 1}",
+                )
             except Exception:
                 pass
 
@@ -77145,6 +79203,13 @@ body{padding:18px}
                         )
                     },
                 )
+            # Select only for the execution focus that is now authoritative.
+            # Plan research remains metadata-only and never loads future-step
+            # skill bodies.
+            try:
+                self._refresh_loaded_skills_for_execution_focus(trigger="run-start")
+            except Exception as exc:
+                self._emit("status", {"summary": f"skill selection unavailable: {trim(str(exc), 160)}"})
             if self._is_multi_agent_mode():
                 self._seed_multi_agent_contexts_if_needed(self.runtime_reclassify_goal or "")
                 self._emit(
@@ -80324,6 +82389,7 @@ class SessionManager:
         collaboration_write_coordinator=None,
         shell_timeout_mode: str = DEFAULT_SHELL_TIMEOUT_MODE,
         shell_async_handoff_seconds: int = DEFAULT_SHELL_ASYNC_HANDOFF_SECONDS,
+        process_manager: UserProcessManager | None = None,
     ):
         self.root = root
         self.root.mkdir(parents=True, exist_ok=True)
@@ -80339,6 +82405,7 @@ class SessionManager:
         self.collaboration_context = dict(collaboration_context or {})
         self.collaboration_context_provider = collaboration_context_provider
         self.collaboration_write_coordinator = collaboration_write_coordinator
+        self.process_manager = process_manager
         self.thinking = False
         self.mcp_manager = mcp_manager
         self.default_llm_config = default_llm_config or {}
@@ -81016,6 +83083,7 @@ class SessionManager:
                 collaboration_write_coordinator=self.collaboration_write_coordinator,
                 shell_timeout_mode=self.shell_timeout_mode,
                 shell_async_handoff_seconds=self.shell_async_handoff_seconds,
+                process_manager=self.process_manager,
             )
         sess.set_telemetry_callback(self.telemetry_callback)
         desired_mode = normalize_execution_mode(self.execution_mode, default=EXECUTION_MODE_SYNC)
@@ -81131,6 +83199,7 @@ class SessionManager:
                 collaboration_write_coordinator=self.collaboration_write_coordinator,
                 shell_timeout_mode=self.shell_timeout_mode,
                 shell_async_handoff_seconds=self.shell_async_handoff_seconds,
+                process_manager=self.process_manager,
             )
             sess.set_telemetry_callback(self.telemetry_callback)
             self._apply_user_defaults_to_session(sess)
@@ -81845,6 +83914,11 @@ window.MathJax={
     <div id="todos"></div>
     <h3>Tasks</h3>
     <div id="tasks"></div>
+    <div class="runtime-section-head">
+      <h3>后台进程</h3>
+      <button id="refreshUserProcessesBtn" class="subtle runtime-mini-btn">刷新</button>
+    </div>
+    <div id="userProcesses"></div>
     <h3>Activity</h3>
     <div id="activity"></div>
     <h3>Commands</h3>
@@ -82292,8 +84366,9 @@ body[data-ui-style="trad"] .plan-proposal-card,body[data-ui-style="trad"] .plan-
 .render-canvas{display:block;width:100%;height:220px;background:#ffffff}
 .compact-toast{position:fixed;top:16px;right:16px;z-index:9999;max-width:320px;background:#0f1b2d;color:#fff;border-radius:12px;padding:10px 12px;box-shadow:0 10px 26px rgba(15,27,45,.28);opacity:0;transform:translateY(-8px);pointer-events:none;transition:opacity .2s ease,transform .2s ease}
 .compact-toast.show{opacity:1;transform:translateY(0)}
-#todos,#tasks,#activity,#commands,#diffs,#catalog,#fileExplorer{overflow:auto;border:1px solid var(--line);border-radius:10px;padding:8px;background:#fff;min-width:0}
+#todos,#tasks,#userProcesses,#activity,#commands,#diffs,#catalog,#fileExplorer{overflow:auto;border:1px solid var(--line);border-radius:10px;padding:8px;background:#fff;min-width:0}
 #todos,#tasks{height:220px;max-height:240px}
+#userProcesses{height:190px;max-height:230px}.user-process-list{display:flex;flex-direction:column;gap:7px}.user-process-row{padding:8px;border:1px solid #dfe7f2;border-radius:9px;background:#fbfdff}.user-process-head{display:flex;align-items:center;justify-content:space-between;gap:7px}.user-process-state{font-size:.7rem;font-weight:800;color:#475467}.user-process-state.running{color:#067647}.user-process-state.error,.user-process-state.terminated{color:#b42318}.user-process-command{margin:5px 0;font:11px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:normal;overflow-wrap:anywhere;color:#24364b}.user-process-meta{font-size:.68rem;color:var(--muted);overflow-wrap:anywhere}.user-process-actions{display:flex;gap:5px;margin-top:6px}.user-process-actions button{padding:4px 7px;border-radius:7px;font-size:.68rem}.user-process-output{margin-top:6px;padding:7px;border-radius:7px;background:#111827;color:#e5edf8;white-space:pre-wrap;overflow-wrap:anywhere;font:10px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;max-height:130px;overflow:auto}
 #activity,#commands,#diffs,#catalog{height:160px;max-height:160px}
 #fileExplorer{height:250px;max-height:280px;background:linear-gradient(180deg,#f7fbff 0%,#ffffff 100%);padding:8px}
 h3{font-size:.96rem;margin:10px 0 6px}
@@ -82434,6 +84509,7 @@ h3{font-size:.96rem;margin:10px 0 6px}
 
 APP_JS = """/* clouds-coder-app-store-v1 */
 const S={sessions:[],sessionTotal:0,sessionHasMore:false,sessionNextOffset:0,sessionLoadingMore:false,sessionLoadAllTimer:0,activeId:null,snap:null,es:null,esId:'',skills:[],tools:[],providers:[],protocols:[],config:null,models:[],modelOptions:[],previewBySession:{},fileExplorerBySession:{},commandPageState:{},previewNonce:0,refreshTimer:null,refreshInFlight:false,pendingSnapshot:false,pendingFullSnapshot:false,scheduledFullSnapshot:false,sessionPollTimer:null,renderStateInFlight:false,lastRenderStatePullAt:0,lastFeedSig:'',lastBoardsSig:'',lastSessionsSig:'',lastVisibilityState:document.visibilityState||'visible',staticMode:false,frozen:false,bootRendered:false,panelHtml:{},renderSigs:Object.create(null),deferredHtml:Object.create(null),deferredHtmlTimer:0,openPopup:'',follow:{chat:true,sessionList:false,todos:false,tasks:false,activity:true,commands:true,diffs:true,catalog:true,fileExplorer:false},lastEventSeq:0,lastDeltaTs:0,deltaGapCount:0,deltaWatchdogTimer:null,deltaWatchdogStalls:0,deltaWatchdogSeq:0,deltaRenderRaf:0,deltaRenderChat:false,deltaRenderBoards:false,deltaRenderSessions:false,chatRenderRaf:0,chatRenderPendingReason:'',mathObserver:null,mathRoot:null,mdWorker:null,mdWorkerUrl:'',mdReqSeq:0,mdPending:Object.create(null),diffCenterDisabled:Object.create(null),previewCenterDisabled:Object.create(null),diffCenteredDone:Object.create(null),previewCenteredDone:Object.create(null),deferredFullSnapshotTimer:0,deferredFileExplorerTimer:0,modelCatalogTimer:0,modelCatalogInFlight:false,catalogRefreshInFlight:false,fileExplorerDeferUntil:0};
+const USER_PROCESS_STATE={rows:[],counts:{},inFlight:false,lastLoadedAt:0,detailId:'',detail:null,timer:0};
 const APP_STORE={view:'sessions',scope:'personal',personal:[],shared:[],catalog:[],loaded:false,loading:false,editingId:'',selectedSkillIds:[]};
 const MD_CACHE=new Map();
 const MD_CACHE_MAX=280;
@@ -83307,7 +85383,7 @@ function _deltaApplyRuntimeEvent(evt){
     _deltaAppendActivity(typ,data,ts);
     if(typ==='tool_start'||typ==='tool_result'){
       const toolName=String(data.name||data.tool||'').trim();
-      const visibleTools=new Set(['agent_web_search','query_code_library','query_knowledge_library','tool_memory','context_recall','check_background','list_skills','list_skill_providers','list_skill_protocols']);
+      const visibleTools=new Set(['agent_web_search','query_code_library','query_knowledge_library','tool_memory','context_recall','check_background','list_background_processes','stop_background_process','list_skills','list_skill_providers','list_skill_protocols']);
       if(Boolean(data.conversation_visible!==false)&&visibleTools.has(toolName)){
         const row={role:'system',type:typ,ts:ts,text:_deltaConversationTextByType(typ,data),data:{...data}};
         const ar=_chatVirtAgentRoleKey(data.agent_role);
@@ -86565,7 +88641,11 @@ function renderCatalogPanel(){const sig=currentLang()+'|'+_safeJsonSig({p:S.prot
 function _fileOpsSig(ops){return _opsTailSignature((Array.isArray(ops)?ops:[]).filter(x=>x.type==='file_patch'||x.type==='upload'),12,e=>{const d=e?.data||{};return `${e.type}:${e.id||e.seq||e.ts||''}:${d.session_rel_path||d.path||d.workspace_path||''}:${d.size||''}:${d.parse_status||''}`})}
 function renderFilesPanelFromBoards(ops){const sid=String(S.activeId||'').trim();if(!sid){renderFileExplorer();return}const st=ensureFileExplorerState(sid);const fileSig=_fileOpsSig(ops);const refreshKey=`${sid}|${fileSig}`;const paintSig=`${sid}|${currentLang()}|${S.snap?.session_files_root||''}|${Number(st?.fetchedAt||0)}|${Number(st?.nodeCount||0)}|${String(st?.selected||'')}|${st?.inflight?1:0}`;if(S.renderSigs.filePaintSig!==paintSig){S.renderSigs.filePaintSig=paintSig;renderFileExplorer()}if(!st?.tree){if(Date.now()<Number(S.fileExplorerDeferUntil||0))return;refreshFileExplorer(false).catch(()=>{});return}if(fileSig&&S.renderSigs.fileRefreshSig!==refreshKey){S.renderSigs.fileRefreshSig=refreshKey;refreshFileExplorer(true).catch(()=>{})}}
 function renderDownloadLinks(){const sessionZip=S.activeId?('/api/sessions/'+S.activeId+'/export.zip'):'#';const sessionMd=S.activeId?('/api/sessions/'+S.activeId+'/export.md'):'#';const sessionPdf=S.activeId?('/api/sessions/'+S.activeId+'/export.pdf'):'#';const sessionPng=S.activeId?('/api/sessions/'+S.activeId+'/export.png'):'#';const sig=[sessionZip,sessionMd,sessionPdf,sessionPng].join('|');if(S.renderSigs.downloadLinksSig===sig)return;S.renderSigs.downloadLinksSig=sig;const dl1=E('downloadSessionBtn');const dlMd=E('exportMdBtn');const dlPdf=E('exportPdfBtn');const dlPng=E('exportPngBtn');if(dl1)dl1.href=sessionZip;if(dlMd)dlMd.href=sessionMd;if(dlPdf)dlPdf.href=sessionPdf;if(dlPng)dlPng.href=sessionPng}
-function renderBoardsOptimized(){const ops=S.snap?.operations||[];renderRuntimeStatus();renderAskUserCard();renderCtxLive(S.snap);renderPlanLevelControls();_renderBridgeSyncFromSnapshot(S.snap||{});renderTodoTaskPanels();renderActivityPanel();renderCommandsPanel(ops);renderDiffsPanel(ops);renderCatalogPanel();renderFilesPanelFromBoards(ops);renderUploadList();renderDownloadLinks();renderSkillsEntryLink()}
+function renderUserProcesses(){const host=E('userProcesses');if(!host)return;const rows=Array.isArray(USER_PROCESS_STATE.rows)?USER_PROCESS_STATE.rows:[];if(!rows.length){host.innerHTML='<div class="mono">暂无后台进程</div>';return}host.innerHTML='<div class="user-process-list">'+rows.map(row=>{const id=String(row.id||''),detail=USER_PROCESS_STATE.detailId===id?USER_PROCESS_STATE.detail:null;const output=detail?`<div class="user-process-output">${esc(detail.output_tail||detail.error||'(暂无输出)')}</div>`:'';return `<div class="user-process-row"><div class="user-process-head"><strong>${esc(id)}</strong><span class="user-process-state ${esc(row.status||'')}">${esc(row.status||'unknown')}</span></div><div class="user-process-command">${esc(row.command||'-')}</div><div class="user-process-meta">${esc(row.session_title||row.session_id||'-')} · PID ${esc(row.pid||'-')} · ${esc(row.source||'-')} · ${esc(Number(row.duration_seconds||0).toFixed(1))}s</div><div class="user-process-actions"><button class="subtle" data-user-process-detail="${esc(id)}">详情</button>${row.can_stop?`<button class="subtle danger" data-user-process-stop="${esc(id)}">停止</button>`:''}</div>${output}</div>`}).join('')+'</div>';for(const button of host.querySelectorAll('[data-user-process-detail]'))button.onclick=()=>loadUserProcessDetail(button.getAttribute('data-user-process-detail')).catch(err=>showError(err.message));for(const button of host.querySelectorAll('[data-user-process-stop]'))button.onclick=()=>stopUserProcess(button.getAttribute('data-user-process-stop')).catch(err=>showError(err.message))}
+async function refreshUserProcesses(force=false){if(USER_PROCESS_STATE.inFlight)return;if(!force&&Date.now()-Number(USER_PROCESS_STATE.lastLoadedAt||0)<1800)return;USER_PROCESS_STATE.inFlight=true;try{const out=await api('/api/processes?limit=100');USER_PROCESS_STATE.rows=Array.isArray(out.processes)?out.processes:[];USER_PROCESS_STATE.counts=out.counts||{};USER_PROCESS_STATE.lastLoadedAt=Date.now();if(USER_PROCESS_STATE.detailId&&!USER_PROCESS_STATE.rows.some(row=>String(row.id||'')===USER_PROCESS_STATE.detailId)){USER_PROCESS_STATE.detailId='';USER_PROCESS_STATE.detail=null}renderUserProcesses()}finally{USER_PROCESS_STATE.inFlight=false}}
+async function loadUserProcessDetail(id){const key=String(id||'');if(!key)return;if(USER_PROCESS_STATE.detailId===key){USER_PROCESS_STATE.detailId='';USER_PROCESS_STATE.detail=null;renderUserProcesses();return}const out=await api('/api/processes/'+encodeURIComponent(key));USER_PROCESS_STATE.detailId=key;USER_PROCESS_STATE.detail=out.process||null;renderUserProcesses()}
+async function stopUserProcess(id){const key=String(id||'');if(!key||!confirm('确定停止后台进程 '+key+' 吗？'))return;await api('/api/processes/'+encodeURIComponent(key)+'/stop',{method:'POST',body:JSON.stringify({reason:'user requested from process panel'})});await refreshUserProcesses(true)}
+function renderBoardsOptimized(){const ops=S.snap?.operations||[];renderRuntimeStatus();renderAskUserCard();renderCtxLive(S.snap);renderPlanLevelControls();_renderBridgeSyncFromSnapshot(S.snap||{});renderTodoTaskPanels();renderUserProcesses();refreshUserProcesses(false).catch(()=>{});renderActivityPanel();renderCommandsPanel(ops);renderDiffsPanel(ops);renderCatalogPanel();renderFilesPanelFromBoards(ops);renderUploadList();renderDownloadLinks();renderSkillsEntryLink()}
 function renderBoards(){renderBoardsOptimized();return;const uiState=S.staticMode?(S.frozen?'static':'live'):'live';const boolWord=v=>t(v?'state_on':'state_off');const activeRole=String(S.snap?.agent_active_role||'').trim();const activeRoleLabel=activeRole?_chatVirtAgentRoleLabel(activeRole):'-';const runtimeItems=[{label:t('rt_session'),value:S.snap?.id||'-',mono:true},{label:t('rt_model'),value:S.snap?.model||'-',mono:true},{label:t('rt_thinking'),value:boolWord(S.snap?.thinking)},{label:t('rt_thinking_stream'),value:boolWord(S.snap?.thinking_stream)},{label:t('rt_response_stream'),value:boolWord(S.snap?.response_stream)},{label:t('rt_mode'),value:S.snap?.execution_mode||S.config?.execution_mode||'sync'},{label:t('rt_active_agent'),value:activeRoleLabel},{label:t('rt_blackboard'),value:S.snap?.blackboard?.status||'-'},{label:t('rt_task'),value:S.snap?.blackboard?.task_profile?.task_type||'-'},{label:t('rt_complexity'),value:S.snap?.blackboard?.task_profile?.complexity||'-'},{label:t('rt_judgement'),value:S.snap?.blackboard?.manager_judgement?.progress||'-'},{label:t('rt_budget'),value:S.snap?.blackboard?.task_profile?.round_budget??'-'},{label:t('rt_remaining'),value:S.snap?.blackboard?.manager_judgement?.remaining_rounds??'-'},{label:t('rt_blackboard_cycles'),value:S.snap?.blackboard?.manager_cycles??'-'},{label:t('rt_round_limit'),value:S.snap?.max_agent_rounds||'-'},{label:t('rt_round'),value:S.snap?.agent_round_index??'-'},{label:t('rt_phase'),value:S.snap?.agent_phase||t('idle')},{label:t('rt_queued_inputs'),value:S.snap?.queued_user_inputs_count??0},{label:t('rt_run_timeout'),value:`${S.snap?.max_run_seconds??'-'}s`},{label:t('rt_ctx_used'),value:S.snap?.context_tokens_estimate??'-'},{label:t('rt_ctx_limit'),value:S.snap?.context_effective_token_limit||S.snap?.context_token_upper_bound||'-'},{label:t('rt_ctx_mode'),value:t(S.snap?.context_token_limit_locked?'rt_manual_lock':'rt_adaptive')},{label:t('rt_ctx_left'),value:formatContextLeft(S.snap)},{label:t('rt_truncation'),value:S.snap?.truncation_count||0},{label:t('rt_trunc_retry'),value:S.snap?.live_truncation_attempts||0},{label:t('rt_trunc_tokens'),value:S.snap?.live_truncation_tokens||0},{label:t('rt_archive'),value:S.snap?.compact_segments_count||0},{label:t('rt_last_compact'),value:fmtLastCompact(S.snap)},{label:t('rt_ollama'),value:S.snap?.ollama_base_url||'-',mono:true,wide:true},{label:t('rt_files'),value:S.snap?.session_files_root||'-',mono:true,wide:true},{label:t('rt_ui_mode'),value:uiState},{label:t('rt_state'),value:S.snap?.running?t('running'):t('idle'),tone:S.snap?.running?'state-running':'state-idle'}];E('status').innerHTML=runtimeItems.map(item=>_runtimePillHtml(item.label,item.value,item)).join('')+agentContextChipsHtml(S.snap);
 renderCtxLive(S.snap);
 const _pmBtn=E('planModeBtn');if(_pmBtn){const _pm=S.snap?.plan_mode_preference||'auto';_pmBtn.textContent='Plan: '+_pm.charAt(0).toUpperCase()+_pm.slice(1)}
@@ -87075,6 +89155,7 @@ async function refreshAll(forceProbe=false){
 }
 function bindClick(id,fn){const el=E(id);if(el)el.onclick=fn}
 window.addEventListener('DOMContentLoaded',()=>bindClick('programBtn',openProgram));
+window.addEventListener('DOMContentLoaded',()=>{bindClick('refreshUserProcessesBtn',()=>refreshUserProcesses(true).catch(err=>showError(err.message)));USER_PROCESS_STATE.timer=setInterval(()=>{if(document.visibilityState!=='hidden')refreshUserProcesses(false).catch(()=>{})},5000)});
 window.addEventListener('DOMContentLoaded',async()=>{for(const id of ['chat','sessionList','todos','tasks','activity','commands','diffs','fileExplorer','catalog']){bindPanelScrollState(id,E(id))}const drop=E('promptComposerShell');const fileInput=E('uploadInput');const promptPick=E('promptFilePick');const promptEl=E('prompt');if(promptPick&&fileInput){promptPick.onclick=(ev)=>{ev.preventDefault();fileInput.click()}}if(drop&&fileInput){let _dragC=0;drop.setAttribute('tabindex','0');drop.addEventListener('click',e=>{if(e.target===drop&&promptEl)promptEl.focus()});fileInput.onchange=()=>uploadFiles(fileInput.files).then(()=>{fileInput.value=''}).catch(err=>showError(err.message));for(const evt of ['dragenter','dragover']){drop.addEventListener(evt,e=>{e.preventDefault();if(evt==='dragenter')_dragC++;drop.classList.add('dragover')})}for(const evt of ['dragleave','dragend']){drop.addEventListener(evt,e=>{e.preventDefault();if(evt==='dragleave')_dragC--;if(_dragC<=0){_dragC=0;drop.classList.remove('dragover')}})}drop.addEventListener('drop',e=>{e.preventDefault();_dragC=0;drop.classList.remove('dragover');const files=e.dataTransfer?.files;if(files&&files.length)uploadFiles(files).catch(err=>showError(err.message))});drop.addEventListener('paste',e=>{const files=clipboardFilesFromEvent(e);if(!files.length)return;e.preventDefault();drop.classList.add('dragover');setTimeout(()=>drop.classList.remove('dragover'),220);uploadFiles(files).catch(err=>showError(err.message||String(err)))})}const configInput=E('configInput');if(configInput){configInput.onchange=()=>uploadLlmConfigFile(configInput.files&&configInput.files[0]).then(()=>{configInput.value=''}).catch(err=>showError(err.message||String(err)))}bindClick('newSessionBtn',createSession);bindClick('renameSessionBtn',renameSession);bindClick('deleteSessionBtn',deleteSession);bindClick('applyModelBtn',applyModel);bindClick('llmConfigBtn',openLlmConfigModal);bindClick('llmModalClose',()=>{E('llmConfigModal').style.display='none'});bindClick('llmConfigConfirm',submitLlmConfig);const llmProv=E('llmProvider');if(llmProv){llmProv.addEventListener('change',()=>renderLlmFields(llmProv.value))}const llmOverlay=E('llmConfigModal');if(llmOverlay){llmOverlay.addEventListener('click',e=>{if(e.target===llmOverlay)llmOverlay.style.display='none'})}bindClick('sendBtn',sendMessage);bindClick('interruptBtn',interruptRun);bindClick('clearStaleTodosBtn',clearStaleTodos);bindClick('planModeBtn',togglePlanMode);bindClick('refreshFilesBtn',()=>refreshFileExplorer(true));bindClick('previewReloadBtn',()=>renderActivePreview(true));bindClick('previewCopyBtn',()=>copyPreviewCode());bindPopupButton('toolsMenuBtn','toolsMenu');bindClick('compactAction',(e)=>{if(e)e.preventDefault();closePopups();compactNow()});bindClick('refreshAction',(e)=>{if(e)e.preventDefault();closePopups();refreshAll(true)});bindPopupButton('levelBtn','levelMenu',(menu)=>{for(const opt of menu.querySelectorAll('.level-option')){opt.addEventListener('click',e=>{e.preventDefault();const lvl=parseInt(opt.getAttribute('data-level')||'0',10);setTaskLevel(lvl);setPopupOpen('levelMenu',false)})}});bindPopupButton('exportMenuBtn','exportMenu',(menu)=>{for(const a of menu.querySelectorAll('.export-item')){a.addEventListener('click',()=>setPopupOpen('exportMenu',false))}});document.addEventListener('click',()=>closePopups());const langSel=E('langSelect');if(langSel){langSel.onchange=()=>setLanguage(langSel.value).then(()=>applyApplicationI18n()).catch(err=>showError(err.message||String(err)))}if(promptEl){promptEl.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter'){e.preventDefault();sendMessage()}})}bindApplicationStore();applyUiStyle();applyStaticUiClass();applyMainI18n();applyApplicationI18n();_bindPreviewCopyGuard();try{await refreshAll(false);if(!S.sessions.length){const bootCreate=()=>createSession({prompt:false}).catch(err=>showError(err.message||String(err)));if(typeof requestAnimationFrame==='function'){requestAnimationFrame(()=>setTimeout(bootCreate,0))}else{setTimeout(bootCreate,0)}}}catch(err){showError(err.message||String(err))}_deltaStartWatchdog();scheduleSessionPoll(false);document.addEventListener('visibilitychange',()=>{const next=document.visibilityState||'visible';if(next===S.lastVisibilityState)return;S.lastVisibilityState=next;if(next==='hidden'){if(S.deltaWatchdogTimer){clearTimeout(S.deltaWatchdogTimer);S.deltaWatchdogTimer=null}if(S.sessionPollTimer){clearTimeout(S.sessionPollTimer);S.sessionPollTimer=null}if(S.staticMode)freezeAutoUpdates();return}if(S.staticMode&&S.frozen)resumeAutoUpdates();_deltaStartWatchdog();scheduleSessionPoll(true);scheduleSnapshot({forceFull:false,delayMs:40,allowWhenFrozen:true})})})
 window.addEventListener('DOMContentLoaded',()=>{bindClick('memoryModeAction',(e)=>{closePopups();toggleUserMemoryMode(e)});bindClick('memoryExportAction',(e)=>{closePopups();exportUserMemory(e)});bindClick('memoryClearAction',(e)=>{closePopups();clearUserMemory(e)});renderMemoryModeAction()});
 """
@@ -87543,6 +89624,7 @@ ADMIN_INDEX_HTML = """<!doctype html>
 
   <nav class="admin-nav" aria-label="Admin sections">
     <button class="nav-tab active" data-view="metrics" type="button">运行统计</button>
+    <button class="nav-tab" data-view="processes" type="button">后台进程</button>
     <button class="nav-tab" data-view="config" type="button">启动参数</button>
     <button class="nav-tab" data-view="collaboration" type="button">协作空间</button>
     <button class="nav-tab" data-view="apps" type="button">应用管理</button>
@@ -87590,6 +89672,31 @@ ADMIN_INDEX_HTML = """<!doctype html>
       <div class="two-column metrics-tables">
         <article class="card"><div class="card-head"><h3>应用聚合</h3></div><div id="appMetrics" class="table-wrap"></div></article>
         <article class="card"><div class="card-head"><h3>事件统计</h3></div><div id="eventMetrics" class="table-wrap"></div></article>
+      </div>
+    </section>
+
+    <section id="processesView" class="admin-view">
+      <div class="section-head">
+        <div><h2>后台进程</h2><p>查看所有用户启动的受管后台进程；命令、路径和输出中的敏感信息会自动脱敏。</p></div>
+        <button id="refreshProcessesBtn" type="button">刷新</button>
+      </div>
+      <div class="process-summary" id="processSummary"></div>
+      <div class="process-toolbar">
+        <input id="processSearch" type="search" placeholder="进程 ID、会话或命令">
+        <select id="processStatus"><option value="">全部状态</option><option value="starting">starting</option><option value="running">running</option><option value="stopping">stopping</option><option value="completed">completed</option><option value="terminated">terminated</option><option value="error">error</option></select>
+        <input id="processUserHash" maxlength="64" placeholder="用户匿名标识">
+        <input id="processSessionId" maxlength="120" placeholder="会话 ID">
+        <button id="filterProcessesBtn" class="secondary" type="button">筛选</button>
+      </div>
+      <div class="process-bulk-bar">
+        <label class="process-select-all"><input id="selectAllProcesses" type="checkbox">选择当前页</label>
+        <span id="processSelectionCount">已选择 0 项</span>
+        <button id="stopSelectedProcessesBtn" class="danger" type="button" disabled>停止所选</button>
+        <button id="stopFilteredProcessesBtn" class="ghost" type="button">停止当前筛选的运行项</button>
+      </div>
+      <div class="process-layout">
+        <div id="processTable" class="card table-wrap process-table"></div>
+        <aside id="processDetail" class="card process-detail"><div class="empty">选择“详情”查看进程状态和脱敏输出</div></aside>
       </div>
     </section>
 
@@ -87842,6 +89949,10 @@ th{color:var(--muted);font-size:.72rem;text-transform:uppercase;letter-spacing:.
 .app-lifecycle strong{display:block;color:var(--text);margin-bottom:3px}
 .review-actions{display:flex;align-items:center;gap:7px;margin-top:10px;flex-wrap:wrap}
 .review-actions input{flex:1;min-width:180px}
+.process-summary{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}.process-summary .badge{border-radius:8px}
+.process-toolbar{display:grid;grid-template-columns:minmax(220px,1.5fr) 150px minmax(170px,1fr) minmax(170px,1fr) auto;gap:8px;margin-bottom:10px}
+.process-bulk-bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:10px 12px;margin-bottom:12px;background:#fff;border:1px solid var(--line);border-radius:10px}.process-select-all{display:flex;flex-direction:row;align-items:center;gap:7px}.process-select-all input,.process-row-check{width:16px;height:16px;margin:0}.process-bulk-bar span{color:var(--muted);font-size:.78rem;margin-right:auto}
+.process-layout{display:grid;grid-template-columns:minmax(0,1fr) minmax(280px,360px);gap:12px;align-items:start}.process-table{min-height:250px}.process-table table{min-width:980px}.process-table td{vertical-align:top}.process-command{display:block;max-width:360px;white-space:normal;overflow-wrap:anywhere;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.72rem}.process-cell-meta{display:block;color:var(--muted);font-size:.68rem;margin-top:3px}.process-row-actions{display:flex;gap:5px}.process-row-actions button{padding:5px 8px;font-size:.7rem}.process-detail{position:sticky;top:76px;padding:14px;min-height:250px}.process-detail h3{margin:0 0 8px}.process-detail-grid{display:grid;grid-template-columns:100px 1fr;gap:6px 9px;font-size:.76rem}.process-detail-grid dt{color:var(--muted)}.process-detail-grid dd{margin:0;overflow-wrap:anywhere}.process-output{margin:12px 0 0;max-height:360px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;background:#111827;color:#e5edf8;border-radius:8px;padding:10px;font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace}
 .login-overlay{position:fixed;inset:0;background:rgba(10,18,34,.66);display:flex;align-items:center;justify-content:center;z-index:100;backdrop-filter:blur(8px);padding:18px}
 .login-overlay.hidden{display:none}
 .login-card{width:min(440px,100%);background:#fff;border-radius:18px;padding:25px;box-shadow:0 28px 80px rgba(0,0,0,.28);display:flex;flex-direction:column;gap:14px}
@@ -87854,31 +89965,31 @@ th{color:var(--muted);font-size:.72rem;text-transform:uppercase;letter-spacing:.
 .toast{position:fixed;right:22px;bottom:22px;max-width:440px;background:#172033;color:#fff;border-radius:11px;padding:11px 14px;z-index:120;box-shadow:var(--shadow);white-space:pre-wrap}
 .toast.error{background:#912018}
 .collab-service-bar{display:flex;align-items:center;justify-content:space-between;gap:18px;padding:12px 0;margin-bottom:8px;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}.collab-service-copy>div{display:flex;align-items:center;gap:9px}.collab-service-copy strong{font-size:.92rem}.collab-service-copy p{margin:5px 0 0;color:var(--muted);font-size:.78rem}.collab-service-actions{justify-content:flex-end}.collab-service-bar+.notice{margin:0 0 12px}.collab-admin-layout{display:grid;grid-template-columns:minmax(310px,390px) minmax(0,1fr);gap:14px;align-items:start}.collab-project-column{display:flex;flex-direction:column;gap:10px}.collab-create-form{display:flex;flex-direction:column;gap:9px}.collab-create-form label{margin:0}.collab-filter-row,.collab-member-filter{display:grid;grid-template-columns:minmax(0,1fr) 130px;gap:8px}.collab-project-list,.collab-member-list,.collab-conflict-list{display:flex;flex-direction:column;gap:8px}.collab-project-row,.collab-member-row,.collab-conflict-row{background:#fff;border:1px solid var(--line);border-radius:10px;padding:11px}.collab-project-row{cursor:pointer}.collab-project-row.active{border-color:#8cb2f7;background:#f1f6ff}.collab-project-row h3,.collab-member-row h4,.collab-conflict-row h4,.collab-detail-head h3{margin:0}.collab-project-row p,.collab-member-row p,.collab-conflict-row p{margin:5px 0;color:var(--muted);font-size:.76rem}.collab-detail-head{display:flex;justify-content:space-between;gap:14px;align-items:flex-start;background:#fff;border:1px solid var(--line);border-radius:10px;padding:14px;margin-bottom:10px}.collab-member-filter{margin-bottom:10px}.collab-member-row-head,.collab-conflict-head{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}.collab-device-list{margin-top:8px;border-top:1px solid var(--line);padding-top:7px}.collab-device-row{display:flex;align-items:center;gap:8px;padding:5px 0;font-size:.75rem}.collab-device-row span:first-child{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.collab-device-row .inline-actions{margin-left:auto}.collab-conflict-row{border-color:#f3d39d;background:#fffaf0}.collab-conflict-row .conflict-meta{display:flex;gap:6px;flex-wrap:wrap;margin-top:7px}.collab-conflict-row .conflict-meta span{font-size:.69rem;background:#fff;border:1px solid #f3d39d;border-radius:999px;padding:3px 6px;color:#7a2e0e}.section-head.compact{margin-top:18px;padding-bottom:8px}.section-head.compact h3{margin:0}.section-head.compact p{font-size:.76rem}.collab-detail-column>.empty{margin:0}.collab-member-row .inline-actions button,.collab-conflict-row button,.collab-detail-head .inline-actions button{padding:5px 8px;font-size:.72rem}
-@media(max-width:1100px){.metric-grid{grid-template-columns:repeat(3,1fr)}.config-grid{grid-template-columns:repeat(2,minmax(220px,1fr))}.apps-layout,.collab-admin-layout{grid-template-columns:1fr}.app-builder{position:static}.focus-user-summary{grid-template-columns:repeat(3,minmax(0,1fr))}}
-@media(max-width:720px){.admin-shell{padding:14px}.admin-header,.section-head,.collab-detail-head,.collab-service-bar{flex-direction:column;align-items:stretch}.header-actions{justify-content:flex-start}.metric-grid{grid-template-columns:repeat(2,1fr)}.two-column,.chart-grid{grid-template-columns:1fr}.config-grid{grid-template-columns:1fr}.admin-nav{overflow:auto}.action-bar button{flex:1 1 145px}.user-tracking-head{align-items:stretch}.user-filter{align-items:stretch;flex-direction:column}.focus-user-summary{grid-template-columns:repeat(2,minmax(0,1fr))}.chart-host{min-height:215px}.collab-filter-row,.collab-member-filter{grid-template-columns:1fr}.collab-service-actions{justify-content:flex-start}.collab-service-actions>*{flex:1 1 180px;text-align:center}}
+@media(max-width:1100px){.metric-grid{grid-template-columns:repeat(3,1fr)}.config-grid{grid-template-columns:repeat(2,minmax(220px,1fr))}.apps-layout,.collab-admin-layout,.process-layout{grid-template-columns:1fr}.process-detail{position:static}.process-toolbar{grid-template-columns:repeat(2,minmax(0,1fr))}.app-builder{position:static}.focus-user-summary{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media(max-width:720px){.admin-shell{padding:14px}.admin-header,.section-head,.collab-detail-head,.collab-service-bar{flex-direction:column;align-items:stretch}.header-actions{justify-content:flex-start}.metric-grid{grid-template-columns:repeat(2,1fr)}.two-column,.chart-grid{grid-template-columns:1fr}.config-grid,.process-toolbar{grid-template-columns:1fr}.admin-nav{overflow:auto}.action-bar button{flex:1 1 145px}.user-tracking-head{align-items:stretch}.user-filter{align-items:stretch;flex-direction:column}.focus-user-summary{grid-template-columns:repeat(2,minmax(0,1fr))}.chart-host{min-height:215px}.collab-filter-row,.collab-member-filter{grid-template-columns:1fr}.collab-service-actions{justify-content:flex-start}.collab-service-actions>*{flex:1 1 180px;text-align:center}}
 """
 
 ADMIN_JS = r"""
-const A={token:sessionStorage.getItem('clouds_coder_admin_token')||'',config:null,metrics:null,metricUserHash:'',metricResizeTimer:0,apps:[],skills:[],reviewStatus:'pending',selectedSkills:[],toastTimer:0,serverErrors:[],bootId:'',restartNonce:'',collabProjects:[],collabProject:null,collabMembers:[],collabConflicts:[],collabAudit:[]};
+const A={token:sessionStorage.getItem('clouds_coder_admin_token')||'',config:null,metrics:null,metricUserHash:'',metricResizeTimer:0,apps:[],skills:[],reviewStatus:'pending',selectedSkills:[],toastTimer:0,serverErrors:[],bootId:'',restartNonce:'',collabProjects:[],collabProject:null,collabMembers:[],collabConflicts:[],collabAudit:[],processPayload:null,selectedProcesses:[],processDetailId:''};
 const E=id=>document.getElementById(id);
 const fmt=n=>new Intl.NumberFormat('zh-CN',{maximumFractionDigits:1}).format(Number(n||0));
 function toast(message,error=false){const el=E('toast');el.textContent=String(message||'');el.classList.toggle('error',!!error);el.classList.remove('hidden');clearTimeout(A.toastTimer);A.toastTimer=setTimeout(()=>el.classList.add('hidden'),4200)}
 function setAuthenticated(ok){E('loginOverlay').classList.toggle('hidden',!!ok);E('connectionBadge').textContent=ok?'已认证':'未认证';E('connectionBadge').className='badge '+(ok?'good':'muted')}
 async function request(path,opt={}){const headers={...(opt.headers||{})};if(opt.body!==undefined&&!headers['Content-Type'])headers['Content-Type']='application/json';const r=await fetch(path,{...opt,headers});const raw=await r.text();let body={};try{body=raw?JSON.parse(raw):{}}catch(_){body={error:raw||'请求失败'}}if(!r.ok){const details=Array.isArray(body.errors)?body.errors:[];const msg=[body.error||'请求失败',...details.map(x=>String(x.key||'参数')+': '+String(x.error||'无效'))].filter(Boolean).join('\n');const err=new Error(msg);err.status=r.status;err.code=String(body.code||'');err.details=details;err.body=body;throw err}return body}
 async function api(path,opt={}){const headers={...(opt.headers||{})};if(A.token)headers.Authorization='Bearer '+A.token;try{return await request(path,{...opt,headers})}catch(err){if(err.status===401){clearSession();setAuthenticated(false);E('loginError').textContent='登录会话已过期，请重新登录';loadAuthStatus().catch(()=>{});}throw err}}
-function clearSession(){sessionStorage.removeItem('clouds_coder_admin_token');A.token='';A.config=null;A.metrics=null;A.apps=[];A.skills=[];A.collabProjects=[];A.collabProject=null;A.collabMembers=[];A.collabConflicts=[];A.collabAudit=[]}
+function clearSession(){sessionStorage.removeItem('clouds_coder_admin_token');A.token='';A.config=null;A.metrics=null;A.apps=[];A.skills=[];A.collabProjects=[];A.collabProject=null;A.collabMembers=[];A.collabConflicts=[];A.collabAudit=[];A.processPayload=null;A.selectedProcesses=[];A.processDetailId=''}
 function setAuthBusy(form,busy){const btn=form?.querySelector('button[type="submit"]');if(btn)btn.disabled=!!busy}
 function authError(err){const retry=Number(err?.body?.retry_after||0);E('loginError').textContent=retry?String(err.message)+'（约 '+retry+' 秒后重试）':String(err?.message||err||'认证失败')}
 function renderAuthState(status){const setup=!!status?.setup_required;E('retryAuthBtn').classList.add('hidden');E('setupForm').classList.toggle('hidden',!setup);E('passwordLoginForm').classList.toggle('hidden',setup);E('tokenLoginDetails').classList.toggle('hidden',!status?.token_login_enabled);E('tokenLoginBtn').textContent=setup?'用此 Token 创建管理员':'使用 Token 进入';E('tokenLoginHelp').textContent=setup?'远程首次初始化：输入现有 Admin Token，然后在上方填写账号密码并点击“创建管理员”。本机首次运行无需填写 Token。':'验证后只保存换取的短期会话，不保存原始 Admin Token。';E('authTitle').textContent=setup?'创建管理员账号':'管理员登录';if(setup){E('authDescription').textContent=status?.local_setup_allowed?'这是首次运行。请创建唯一管理员账号，密码只以强哈希形式保存在本机。':'首次创建仅允许在本机完成；远程初始化请展开高级入口并使用 Admin Token。';setTimeout(()=>E('setupUsername').focus(),0)}else{E('authDescription').textContent='使用管理员账号和密码登录。登录成功后本标签页只保存短期会话。';setTimeout(()=>E('loginUsername').focus(),0)}}
 async function loadAuthStatus(){E('loginError').textContent='';try{const status=await request('/api/admin/auth/status');renderAuthState(status);return status}catch(err){E('setupForm').classList.add('hidden');E('passwordLoginForm').classList.add('hidden');E('tokenLoginDetails').classList.add('hidden');E('authTitle').textContent='认证服务不可用';E('authDescription').textContent='无法确认管理员是否已创建，请检查服务后重试。';E('retryAuthBtn').classList.remove('hidden');throw err}}
-async function acceptSession(token){A.token=String(token||'');sessionStorage.setItem('clouds_coder_admin_token',A.token);setAuthenticated(true);E('loginError').textContent='';for(const id of ['setupPassword','setupPasswordConfirm','loginPassword','tokenInput']){const el=E(id);if(el)el.value=''}const results=await Promise.allSettled([loadMetrics(),loadConfig(),loadApps(),loadCollaboration()]);const failed=results.filter(x=>x.status==='rejected');if(failed.length)toast('已登录，但部分控制台数据加载失败，请手动刷新。',true)}
+async function acceptSession(token){A.token=String(token||'');sessionStorage.setItem('clouds_coder_admin_token',A.token);setAuthenticated(true);E('loginError').textContent='';for(const id of ['setupPassword','setupPasswordConfirm','loginPassword','tokenInput']){const el=E(id);if(el)el.value=''}const results=await Promise.allSettled([loadMetrics(),loadConfig(),loadApps(),loadCollaboration(),loadProcesses()]);const failed=results.filter(x=>x.status==='rejected');if(failed.length)toast('已登录，但部分控制台数据加载失败，请手动刷新。',true)}
 async function registerAdmin(){const form=E('setupForm'),username=E('setupUsername').value.trim(),password=E('setupPassword').value,confirm=E('setupPasswordConfirm').value;if(password!==confirm){E('loginError').textContent='两次输入的密码不一致';E('setupPasswordConfirm').focus();return}setAuthBusy(form,true);E('loginError').textContent='';try{const headers={};const bootstrap=E('tokenInput').value.trim();if(bootstrap)headers.Authorization='Bearer '+bootstrap;const out=await request('/api/admin/auth/setup',{method:'POST',headers,body:JSON.stringify({username,password})});await acceptSession(out.access_token)}catch(err){authError(err);if(err.status===409)await loadAuthStatus().catch(()=>{})}finally{setAuthBusy(form,false)}}
 async function loginWithPassword(){const form=E('passwordLoginForm');setAuthBusy(form,true);E('loginError').textContent='';try{const out=await request('/api/admin/auth/login',{method:'POST',body:JSON.stringify({username:E('loginUsername').value.trim(),password:E('loginPassword').value})});await acceptSession(out.access_token)}catch(err){authError(err);E('loginPassword').value='';E('loginPassword').focus()}finally{setAuthBusy(form,false)}}
 async function loginWithToken(){if(!E('setupForm').classList.contains('hidden')){await registerAdmin();return}const form=E('tokenLoginForm'),candidate=E('tokenInput').value.trim();if(!candidate){E('loginError').textContent='请输入 Admin Token';return}setAuthBusy(form,true);E('loginError').textContent='';try{const out=await request('/api/admin/auth/token-login',{method:'POST',headers:{Authorization:'Bearer '+candidate},body:'{}'});await acceptSession(out.access_token)}catch(err){authError(err);E('tokenInput').value='';E('tokenInput').focus()}finally{setAuthBusy(form,false)}}
 async function logoutAdmin(){const token=A.token;try{if(token)await request('/api/admin/auth/logout',{method:'POST',headers:{Authorization:'Bearer '+token},body:'{}'})}catch(_){}finally{clearSession();setAuthenticated(false);await loadAuthStatus().catch(err=>authError(err))}}
 async function bootstrapAuth(){setAuthenticated(false);if(A.token){try{const state=await request('/api/admin/auth/session',{headers:{Authorization:'Bearer '+A.token}});if(state.auth_kind==='token'){const out=await request('/api/admin/auth/token-login',{method:'POST',headers:{Authorization:'Bearer '+A.token},body:'{}'});await acceptSession(out.access_token)}else await acceptSession(A.token);return}catch(err){if(err.status===401)clearSession();else{E('authTitle').textContent='认证服务不可用';E('authDescription').textContent='暂时无法验证已保存的会话，请重试。';authError(err);E('retryAuthBtn').classList.remove('hidden');return}}}await loadAuthStatus()}
 function node(tag,attrs={},text=''){const el=document.createElement(tag);for(const [k,v] of Object.entries(attrs||{})){if(k==='class')el.className=v;else if(k==='dataset')Object.assign(el.dataset,v);else if(k==='type')el.type=v;else el.setAttribute(k,String(v))}if(text!==undefined&&text!==null)el.textContent=String(text);return el}
-function switchView(name){document.querySelectorAll('.nav-tab').forEach(x=>x.classList.toggle('active',x.dataset.view===name));document.querySelectorAll('.admin-view').forEach(x=>x.classList.toggle('active',x.id===name+'View'));if(name==='metrics')loadMetrics().catch(err=>toast(err.message,true));if(name==='config'&&!A.config)loadConfig().catch(err=>toast(err.message,true));if(name==='apps')loadApps().catch(err=>toast(err.message,true));if(name==='collaboration')loadCollaboration().catch(err=>toast(err.message,true))}
+function switchView(name){document.querySelectorAll('.nav-tab').forEach(x=>x.classList.toggle('active',x.dataset.view===name));document.querySelectorAll('.admin-view').forEach(x=>x.classList.toggle('active',x.id===name+'View'));if(name==='metrics')loadMetrics().catch(err=>toast(err.message,true));if(name==='processes')loadProcesses().catch(err=>toast(err.message,true));if(name==='config'&&!A.config)loadConfig().catch(err=>toast(err.message,true));if(name==='apps')loadApps().catch(err=>toast(err.message,true));if(name==='collaboration')loadCollaboration().catch(err=>toast(err.message,true))}
 function table(headers,rows){if(!rows.length)return node('div',{class:'empty'},'暂无数据');const t=node('table');const thead=node('thead'),tr=node('tr');headers.forEach(h=>tr.appendChild(node('th',{},h[0])));thead.appendChild(tr);t.appendChild(thead);const tb=node('tbody');rows.forEach(row=>{const r=node('tr');headers.forEach(h=>r.appendChild(node('td',{},h[1](row))));tb.appendChild(r)});t.appendChild(tb);return t}
 const SVG_NS='http://www.w3.org/2000/svg',METRIC_COLORS=['series-1','series-2','series-3','series-4','series-danger','series-muted'];
 const num=v=>Number.isFinite(Number(v))?Number(v):0;
@@ -87930,6 +90041,20 @@ async function memberAccess(member,action){if(['block','revoke'].includes(action
 function renderCollabConflicts(){const host=E('collabConflictList'),rows=A.collabConflicts||[];host.innerHTML='';E('collabConflictSummary').textContent=rows.length?rows.length+' 个文件等待成员处理':'当前无未解决冲突';for(const conflict of rows){const row=node('article',{class:'collab-conflict-row'}),head=node('div',{class:'collab-conflict-head'}),title=node('div');title.append(node('h4',{},conflict.path||'未命名文件'),node('p',{},String(conflict.reason||'conflict')+' · '+new Date(Number(conflict.updated_at||conflict.created_at||0)*1000).toLocaleString('zh-CN')));const abort=collabActionButton('紧急中止',()=>abortCollabConflict(conflict),true);head.append(title,abort);const meta=node('div',{class:'conflict-meta'});for(const text of [String(conflict.status||'open'),'baseline '+Number(conflict.baseline_revision||0),Number((conflict.candidates||[]).length)+' candidates',Number((conflict.reviews||[]).length)+' reviews'])meta.appendChild(node('span',{},text));row.append(head,meta);host.appendChild(row)}if(!rows.length)host.appendChild(node('div',{class:'card empty'},'没有未解决冲突'))}
 async function abortCollabConflict(conflict){const projectId=String(A.collabProject?.project_id||'');if(!projectId)return;if(!confirm('紧急中止 '+String(conflict.path||'该冲突')+'？\n\n这只会恢复数据库中的当前基线并解除冻结，不会替成员选择或合并任何候选分支。'))return;await api('/api/admin/collaboration/projects/'+encodeURIComponent(projectId)+'/conflicts/'+encodeURIComponent(conflict.conflict_id)+'/abort',{method:'POST',body:'{}'});await loadCollabProjectDetail();toast('冲突已紧急中止并恢复基线')}
 function renderCollabAudit(chain){E('collabAuditChain').textContent=chain.ok?'哈希链验证通过 · '+Number(chain.count||0)+' 条':'审计链验证失败';const host=E('collabAuditList');host.innerHTML='';host.appendChild(table([['时间',x=>new Date(Number(x.created_at||0)*1000).toLocaleString('zh-CN')],['操作',x=>x.action],['操作者',x=>x.actor_kind+':'+x.actor_id],['目标',x=>x.target_kind+':'+x.target_id]],A.collabAudit))}
+function processFilters(){return{query:E('processSearch').value.trim(),status:E('processStatus').value,user_hash:E('processUserHash').value.trim(),session_id:E('processSessionId').value.trim()}}
+function processTime(ts){const value=Number(ts||0);return value?new Date(value*1000).toLocaleString('zh-CN'):'-'}
+function processDuration(row){const start=Number(row.started_at||0),end=Number(row.finished_at||0)||Date.now()/1000;return start?Math.max(0,end-start).toFixed(1)+'s':'-'}
+function processTone(status){const value=String(status||'');return['running','completed'].includes(value)?'good':(['starting','stopping'].includes(value)?'warn':(['error','terminated'].includes(value)?'muted':'muted'))}
+async function loadProcesses(){const query=new URLSearchParams({...processFilters(),limit:'200'});for(const [key,value] of [...query.entries()])if(!value)query.delete(key);A.processPayload=await api('/api/admin/processes?'+query.toString());const visible=new Set((A.processPayload.processes||[]).map(x=>String(x.id||'')));A.selectedProcesses=A.selectedProcesses.filter(id=>visible.has(id));renderProcesses()}
+function renderProcesses(){const payload=A.processPayload||{},rows=Array.isArray(payload.processes)?payload.processes:[],counts=payload.counts||{},summary=E('processSummary');summary.innerHTML='';summary.append(node('span',{class:'badge'},'总计 '+Number(payload.total||0)));for(const status of ['running','starting','stopping','completed','terminated','error']){const count=Number(counts[status]||0);if(count)summary.appendChild(node('span',{class:'badge '+processTone(status)},status+' '+count))}const host=E('processTable');host.innerHTML='';if(!rows.length){host.appendChild(node('div',{class:'empty'},'没有匹配的后台进程'));renderProcessSelection();return}const tableEl=node('table'),thead=node('thead'),head=node('tr');for(const label of ['','状态','用户 / 会话','PID / 来源','命令','运行时间','操作'])head.appendChild(node('th',{},label));thead.appendChild(head);tableEl.appendChild(thead);const body=node('tbody');for(const row of rows){const tr=node('tr'),checkCell=node('td'),check=node('input',{type:'checkbox',class:'process-row-check'});check.checked=A.selectedProcesses.includes(String(row.id));check.disabled=!row.can_stop;check.onchange=()=>toggleProcessSelection(String(row.id),check.checked);checkCell.appendChild(check);tr.appendChild(checkCell);const statusCell=node('td');statusCell.append(node('span',{class:'badge '+processTone(row.status)},row.status||'unknown'));if(row.exit_code!==null&&row.exit_code!==undefined)statusCell.appendChild(node('span',{class:'process-cell-meta'},'exit '+row.exit_code));tr.appendChild(statusCell);const owner=node('td');owner.append(node('span',{},row.user_hash||'-'),node('span',{class:'process-cell-meta'},(row.session_title||row.session_id||'-')+' · '+(row.session_id||'-')));tr.appendChild(owner);const runtime=node('td');runtime.append(node('span',{},row.pid||'-'),node('span',{class:'process-cell-meta'},(row.source||'-')+' · '+(row.workspace||'workspace')));tr.appendChild(runtime);const command=node('td');command.appendChild(node('code',{class:'process-command'},row.command||'-'));if(row.error)command.appendChild(node('span',{class:'process-cell-meta'},row.error));tr.appendChild(command);const duration=node('td');duration.append(node('span',{},processDuration(row)),node('span',{class:'process-cell-meta'},processTime(row.started_at)));tr.appendChild(duration);const actions=node('td'),actionWrap=node('div',{class:'process-row-actions'}),detail=node('button',{type:'button',class:'secondary'},'详情');detail.onclick=()=>loadProcessDetail(row.id).catch(err=>toast(err.message,true));actionWrap.appendChild(detail);if(row.can_stop){const stop=node('button',{type:'button',class:'danger'},'停止');stop.onclick=()=>stopProcess(row.id);actionWrap.appendChild(stop)}actions.appendChild(actionWrap);tr.appendChild(actions);body.appendChild(tr)}tableEl.appendChild(body);host.appendChild(tableEl);renderProcessSelection()}
+function toggleProcessSelection(id,checked){const set=new Set(A.selectedProcesses);if(checked)set.add(id);else set.delete(id);A.selectedProcesses=[...set];renderProcessSelection()}
+function renderProcessSelection(){const rows=Array.isArray(A.processPayload?.processes)?A.processPayload.processes:[],stoppable=rows.filter(row=>row.can_stop).map(row=>String(row.id));const picked=new Set(A.selectedProcesses);E('processSelectionCount').textContent='已选择 '+picked.size+' 项';E('stopSelectedProcessesBtn').disabled=picked.size===0;const all=stoppable.length>0&&stoppable.every(id=>picked.has(id));E('selectAllProcesses').checked=all;E('selectAllProcesses').indeterminate=!all&&stoppable.some(id=>picked.has(id))}
+async function loadProcessDetail(id){const out=await api('/api/admin/processes/'+encodeURIComponent(id));const row=out.process||{};A.processDetailId=String(row.id||id);const host=E('processDetail');host.innerHTML='';host.appendChild(node('h3',{},'进程详情'));const list=node('dl',{class:'process-detail-grid'});for(const [label,value] of [['ID',row.id],['状态',row.status],['用户',row.user_hash],['会话',(row.session_title||'-')+' / '+(row.session_id||'-')],['PID',row.pid||'-'],['来源',row.source||'-'],['工作区',row.workspace||'-'],['启动',processTime(row.started_at)],['结束',processTime(row.finished_at)],['运行时长',processDuration(row)],['退出码',row.exit_code??'-'],['输出字节',row.output_bytes||0],['终止操作',row.termination_actor||'-'],['终止原因',row.termination_reason||'-'],['错误',row.error||'-'],['命令',row.command||'-']]){list.append(node('dt',{},label),node('dd',{},value))}host.appendChild(list);host.appendChild(node('pre',{class:'process-output'},row.output_tail||'(暂无输出)'))}
+async function stopProcess(id){if(!confirm('确定停止后台进程 '+id+' 吗？'))return;await api('/api/admin/processes/'+encodeURIComponent(id)+'/stop',{method:'POST',body:JSON.stringify({reason:'admin targeted stop'})});A.selectedProcesses=A.selectedProcesses.filter(x=>x!==id);await loadProcesses();if(A.processDetailId===id)await loadProcessDetail(id).catch(()=>{});toast('停止请求已发送')}
+async function stopProcessIds(ids,label){const unique=[...new Set((ids||[]).filter(Boolean))];if(!unique.length){toast('当前没有可停止的进程',true);return}if(!confirm('确定停止'+label+'的 '+unique.length+' 个后台进程吗？'))return;const out=await api('/api/admin/processes/bulk-stop',{method:'POST',body:JSON.stringify({ids:unique,confirm:true,reason:'admin bulk stop'})});A.selectedProcesses=[];await loadProcesses();toast('已发送 '+Number(out.stopped?.length||0)+' 个停止请求'+(out.failed?.length?'，'+out.failed.length+' 个失败':''),!!out.failed?.length)}
+async function stopSelectedProcesses(){await stopProcessIds(A.selectedProcesses,'所选')}
+async function stopFilteredProcesses(){const rows=Array.isArray(A.processPayload?.processes)?A.processPayload.processes:[];await stopProcessIds(rows.filter(row=>row.can_stop).map(row=>row.id),'当前筛选结果中')}
+function bindProcesses(){E('refreshProcessesBtn').onclick=()=>loadProcesses().catch(err=>toast(err.message,true));E('filterProcessesBtn').onclick=()=>loadProcesses().catch(err=>toast(err.message,true));E('processSearch').onkeydown=ev=>{if(ev.key==='Enter')loadProcesses().catch(err=>toast(err.message,true))};E('processStatus').onchange=()=>loadProcesses().catch(err=>toast(err.message,true));E('selectAllProcesses').onchange=()=>{const rows=Array.isArray(A.processPayload?.processes)?A.processPayload.processes:[];A.selectedProcesses=E('selectAllProcesses').checked?rows.filter(row=>row.can_stop).map(row=>String(row.id)):[];renderProcesses()};E('stopSelectedProcessesBtn').onclick=()=>stopSelectedProcesses().catch(err=>toast(err.message,true));E('stopFilteredProcessesBtn').onclick=()=>stopFilteredProcesses().catch(err=>toast(err.message,true))}
 async function loadApps(){const [apps,skills]=await Promise.all([api('/api/admin/apps'),api('/api/apps/skills')]);A.apps=Array.isArray(apps)?apps:[];A.skills=Array.isArray(skills)?skills:[];renderSkillCatalog();renderAdminApps()}
 function renderSkillCatalog(){const q=String(E('adminSkillSearch').value||'').trim().toLowerCase(),host=E('adminSkillCatalog');host.innerHTML='';const selected=new Set(A.selectedSkills);const rows=A.skills.filter(s=>!q||[s.id,s.name,s.description].join(' ').toLowerCase().includes(q));if(!rows.length){host.appendChild(node('div',{class:'empty'},'没有匹配的 Skill'));return}rows.forEach(s=>{const label=node('label',{class:'skill-option'+(selected.has(s.id)?' selected':'')}),check=node('input',{type:'checkbox'});check.checked=selected.has(s.id);check.addEventListener('change',()=>toggleAdminSkill(s.id));const text=node('div');text.append(node('strong',{},s.name||s.id),node('span',{},s.id),node('span',{},s.description||''));label.append(check,text);host.appendChild(label)});renderSelectedSkills()}
 function toggleAdminSkill(id){const idx=A.selectedSkills.indexOf(id);if(idx>=0)A.selectedSkills.splice(idx,1);else{if(A.selectedSkills.length>=8){toast('一个应用最多关联 8 个 Skills',true);renderSkillCatalog();return}A.selectedSkills.push(id)}renderSkillCatalog()}
@@ -87939,7 +90064,7 @@ function renderAdminApps(){const host=E('adminAppList');host.innerHTML='';docume
 async function reviewApp(app,approve,note){await api('/api/admin/apps/'+encodeURIComponent(app.id)+'/'+(approve?'approve':'reject'),{method:'POST',body:JSON.stringify({note,revision:app.submitted_revision||app.revision})});await loadApps();toast(approve?'应用已发布':'应用已拒绝')}
 async function changePublication(app,publish,note){const label=publish?'重新上架':'下架';if(!confirm('确定'+label+'此共享应用吗？'))return;await api('/api/admin/apps/'+encodeURIComponent(app.id)+'/'+(publish?'republish':'unpublish'),{method:'POST',body:JSON.stringify({note,revision:app.submitted_revision||app.revision,lifecycle_revision:app.lifecycle_revision||0})});await loadApps();toast('应用已'+label)}
 function bind(){document.querySelectorAll('.nav-tab').forEach(x=>x.onclick=()=>switchView(x.dataset.view));document.querySelectorAll('.review-tab').forEach(x=>x.onclick=()=>{A.reviewStatus=x.dataset.status;renderAdminApps()});E('refreshMetricsBtn').onclick=()=>loadMetrics().catch(err=>toast(err.message,true));E('metricsHours').onchange=()=>{A.metricUserHash='';loadMetrics('').catch(err=>toast(err.message,true))};E('metricUserSelect').onchange=()=>{A.metricUserHash=E('metricUserSelect').value;loadMetrics(A.metricUserHash).catch(err=>toast(err.message,true))};E('saveConfigBtn').onclick=()=>saveConfig(false).catch(err=>{notice(err.message,true);toast(err.message,true)});E('syncActiveConfigBtn').onclick=()=>syncActiveConfig().catch(err=>toast(err.message,true));E('setDefaultBtn').onclick=()=>saveConfig(true).catch(err=>toast(err.message,true));E('restoreDefaultBtn').onclick=()=>resetConfig('default').catch(err=>toast(err.message,true));E('resetInitialBtn').onclick=()=>{if(confirm('确定重置为程序初始参数吗？'))resetConfig('initial').catch(err=>toast(err.message,true))};E('saveRestartBtn').onclick=()=>restartWithDraft().catch(err=>toast(err.message,true));E('exportConfigBtn').onclick=()=>downloadJson('clouds-coder-startup-config.json',{version:1,values:collectConfig()});E('importConfigBtn').onclick=()=>E('configFileInput').click();E('configFileInput').onchange=()=>{const f=E('configFileInput').files?.[0];if(f)importConfigFile(f).catch(err=>toast(err.message,true));E('configFileInput').value=''};E('refreshAppsBtn').onclick=()=>loadApps().catch(err=>toast(err.message,true));E('adminSkillSearch').oninput=renderSkillCatalog;E('createSharedAppBtn').onclick=()=>createSharedApp().catch(err=>toast(err.message,true));E('refreshCollaborationBtn').onclick=()=>loadCollaboration().catch(err=>toast(err.message,true));E('enableLanCollaborationBtn').onclick=()=>configureLanCollaboration(true).catch(err=>toast(err.message,true));E('disableLanCollaborationBtn').onclick=()=>configureLanCollaboration(false).catch(err=>toast(err.message,true));E('createCollabProjectForm').onsubmit=ev=>{ev.preventDefault();createCollabProject().catch(err=>toast(err.message,true))};E('collabProjectSearch').oninput=()=>loadCollaboration().catch(err=>toast(err.message,true));E('collabProjectStatus').onchange=()=>loadCollaboration().catch(err=>toast(err.message,true));E('collabMemberSearch').oninput=()=>{if(A.collabProject)loadCollabProjectDetail().catch(err=>toast(err.message,true))};E('collabMemberStatus').onchange=()=>{if(A.collabProject)loadCollabProjectDetail().catch(err=>toast(err.message,true))};E('logoutBtn').onclick=()=>logoutAdmin();E('setupForm').onsubmit=ev=>{ev.preventDefault();registerAdmin()};E('passwordLoginForm').onsubmit=ev=>{ev.preventDefault();loginWithPassword()};E('tokenLoginForm').onsubmit=ev=>{ev.preventDefault();loginWithToken()};E('retryAuthBtn').onclick=()=>bootstrapAuth();window.addEventListener('resize',()=>{clearTimeout(A.metricResizeTimer);A.metricResizeTimer=setTimeout(()=>{if(A.metrics&&E('metricsView').classList.contains('active'))renderMetricCharts(A.metrics)},160)})}
-window.addEventListener('DOMContentLoaded',async()=>{bind();await bootstrapAuth()});
+window.addEventListener('DOMContentLoaded',async()=>{bind();bindProcesses();await bootstrapAuth()});
 """
 
 RAG_TERM_GROUPS = (
@@ -94355,11 +96480,9 @@ class RAGContentParser:
         if not exe:
             return ""
         try:
-            r = subprocess.run(
+            r = run_subprocess_text(
                 [exe] + [str(x) for x in cmd[1:]],
                 capture_output=True,
-                text=True,
-                errors="ignore",
                 timeout=timeout,
             )
             if r.returncode == 0 and r.stdout.strip():
@@ -94418,10 +96541,9 @@ class RAGContentParser:
         tool = shutil.which("pdftotext")
         if tool:
             try:
-                r = subprocess.run(
+                r = run_subprocess_text(
                     [tool, "-layout", str(pdf_path), "-"],
                     capture_output=True,
-                    text=True,
                     timeout=max(60, int(RAG_PARSE_TIMEOUT_SECONDS)),
                 )
                 if r.returncode == 0 and r.stdout.strip():
@@ -94694,7 +96816,7 @@ class RAGContentParser:
             ffprobe = shutil.which("ffprobe")
             if ffprobe:
                 try:
-                    r = subprocess.run(
+                    r = run_subprocess_text(
                         [
                             ffprobe,
                             "-v",
@@ -94706,7 +96828,6 @@ class RAGContentParser:
                             str(fp),
                         ],
                         capture_output=True,
-                        text=True,
                         timeout=30,
                     )
                     payload = parse_json_object(r.stdout, {})
@@ -103215,6 +105336,7 @@ IDE_INDEX_HTML = """<!doctype html>
         <button class="activity-button" data-view="scm" title="Source Control" aria-label="Source Control"><span class="codicon codicon-source-control"></span><b id="scmBadge" class="activity-badge"></b></button>
         <button class="activity-button" data-view="run" title="Run and Debug" aria-label="Run and Debug"><span class="codicon codicon-debug-alt"></span></button>
         <button class="activity-button" data-view="extensions" title="Extensions" aria-label="Extensions"><span class="codicon codicon-extensions"></span></button>
+        <button class="activity-button" data-view="applications" title="Applications" aria-label="Applications"><span class="codicon codicon-library"></span></button>
         <button id="collaborationActivityBtn" class="activity-button collaboration-only" data-view="collaboration" title="Collaboration" aria-label="Collaboration"><span class="codicon codicon-organization"></span><b id="collaborationBadge" class="activity-badge"></b></button>
         <button id="agentActivityBtn" class="activity-button" title="Clouds Coder Agent" aria-label="Clouds Coder Agent"><span class="codicon codicon-sparkle"></span></button>
       </div>
@@ -103257,6 +105379,15 @@ IDE_INDEX_HTML = """<!doctype html>
         <header class="side-header"><span>Extensions</span><div class="header-actions"><button id="refreshExtensionsBtn" class="icon-button" title="Refresh Installed Extensions"><span class="codicon codicon-refresh"></span></button></div></header>
         <div class="extension-search"><input id="extensionSearchInput" placeholder="Search Open VSX"><button id="installVsixBtn" class="icon-button" title="Install from VSIX"><span class="codicon codicon-cloud-upload"></span></button><input id="vsixInput" type="file" accept=".vsix" hidden></div>
         <div id="extensionSummary" class="side-summary"></div><div id="extensionList" class="side-list"></div>
+      </section>
+      <section class="side-view applications-view" data-side-view="applications">
+        <header class="side-header"><span>Applications</span><div class="header-actions"><button id="refreshApplicationsBtn" class="icon-button" title="Refresh Applications" aria-label="Refresh Applications"><span class="codicon codicon-refresh"></span></button></div></header>
+        <div class="section-label"><span class="codicon codicon-chevron-down"></span><strong>Personal</strong><button id="newIdeApplicationBtn" class="icon-button section-download application-create-button" type="button" title="Create Personal Application" aria-label="Create Personal Application"><span class="application-create-glyph" aria-hidden="true">+</span></button></div>
+        <div id="applicationsPersonal" class="application-list"></div>
+        <div class="section-label"><span class="codicon codicon-chevron-down"></span><strong>Shared</strong></div>
+        <div id="applicationsShared" class="application-list"></div>
+        <div class="section-label"><span class="codicon codicon-chevron-down"></span><strong>Web Sessions</strong></div>
+        <div id="applicationsWebSessions" class="application-list"></div>
       </section>
       <section class="side-view collaboration-view" data-side-view="collaboration">
         <header class="side-header"><span id="collaborationProjectName">Collaboration</span><div class="header-actions"><button id="refreshCollaborationBtn" class="icon-button" title="Refresh Collaboration"><span class="codicon codicon-refresh"></span></button><button id="returnCollaborationLobbyBtn" class="icon-button" title="Return to Project Lobby" aria-label="Return to Project Lobby"><span class="codicon codicon-sign-out"></span></button></div></header>
@@ -103336,6 +105467,9 @@ input,select,textarea{border:1px solid transparent;border-radius:2px;background:
 .overlay{position:fixed;inset:0;z-index:500;background:rgba(0,0,0,.28)}.palette{width:min(700px,calc(100vw - 28px));margin:44px auto 0;background:#252526;border:1px solid #454545;box-shadow:0 10px 32px rgba(0,0,0,.52)}.palette-input-row{height:40px;display:grid;grid-template-columns:24px minmax(0,1fr);align-items:center;margin:6px;border:1px solid var(--focus);background:var(--input);padding:0 7px}.palette-input-row input{height:100%;border:0;background:transparent;font-size:14px}.palette-results{max-height:min(440px,65vh);overflow:auto;padding-bottom:5px}.palette-row{height:34px;display:flex;align-items:center;gap:8px;padding:0 10px;cursor:default}.palette-row.is-active,.palette-row:hover{background:#04395e}.palette-row .palette-label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.palette-row .keybinding{margin-left:auto;flex:none;color:#aaa}.palette-empty{padding:12px 14px;color:#999}.modal{width:min(620px,calc(100vw - 30px));max-height:calc(100vh - 80px);margin:48px auto;background:#252526;border:1px solid #454545;box-shadow:0 12px 40px rgba(0,0,0,.55);overflow:auto}.modal.is-wide{width:min(920px,calc(100vw - 30px))}.modal>header{height:42px;display:flex;align-items:center;justify-content:space-between;padding:0 10px 0 16px;border-bottom:1px solid var(--line)}.modal h2{margin:0;color:#ddd;font-size:15px;font-weight:500}.modal-form{display:grid;gap:8px;padding:14px}.modal-form input{height:30px;padding:5px 7px}.modal-actions{display:flex;justify-content:flex-end;gap:7px;margin-top:8px}.account-list{padding:8px}.account-row{min-height:38px;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:8px;padding:4px 7px;border-bottom:1px solid var(--line)}.account-row small{display:block;color:#999}.conflict-review{display:grid;gap:12px;padding:14px}.conflict-review-summary{display:flex;gap:7px;flex-wrap:wrap;color:#aaa;font-size:11px}.conflict-review-summary span{padding:3px 6px;border:1px solid #555;background:#2d2d2d}.conflict-candidates{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:7px}.conflict-candidate{display:grid;grid-template-columns:auto minmax(0,1fr);gap:7px;padding:8px;border:1px solid #454545;background:#1f1f1f;color:#ccc;cursor:pointer}.conflict-candidate.is-selected{border-color:var(--focus);background:#12344a}.conflict-candidate input{margin:2px 0 0}.conflict-candidate strong,.conflict-candidate small{display:block}.conflict-candidate small{margin-top:3px;color:#999;overflow-wrap:anywhere}.conflict-preview{min-height:130px;max-height:300px;margin:0;overflow:auto;padding:9px;border:1px solid #414141;background:#171717;color:#d4d4d4;font:11px/1.45 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere}.conflict-review-form{display:grid;grid-template-columns:160px minmax(0,1fr);gap:8px}.conflict-review-form select,.conflict-review-form input,.conflict-review-form textarea{width:100%;padding:6px 7px;border:1px solid #454545;background:#1e1e1e;color:#ddd}.conflict-review-form textarea{grid-column:1/-1;min-height:58px;resize:vertical}.conflict-review-status{min-height:18px;color:#aaa;font-size:11px}.conflict-review-status.is-error{color:#f48771}.conflict-decision-actions{display:flex;justify-content:flex-end;gap:7px;flex-wrap:wrap}.prompt-enhance-dialog{display:grid;grid-template-rows:auto minmax(0,1fr) auto;width:min(820px,calc(100vw - 28px));height:min(720px,calc(100vh - 48px));margin:24px auto;background:#252526;border:1px solid #4b4b4b;box-shadow:0 14px 44px rgba(0,0,0,.58)}.prompt-enhance-dialog>header{min-height:48px;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:7px 10px 7px 16px;border-bottom:1px solid var(--line)}.prompt-enhance-dialog h2{margin:0;color:#e5e5e5;font-size:15px;font-weight:500}.prompt-enhance-dialog header small{display:block;margin-top:2px;color:#8f8f8f}.prompt-enhance-body{min-height:0;overflow:auto;padding:14px 16px}.prompt-enhance-loading{display:none;height:100%;min-height:260px;place-content:center;justify-items:center;gap:9px;text-align:center;color:#bbb}.prompt-enhance-loading .codicon{font-size:34px;color:#e5c365;animation:prompt-pulse 1s ease-in-out infinite}.prompt-enhance-loading strong{color:#e5e5e5;font-size:14px}.prompt-enhance-loading p{max-width:520px;margin:0;line-height:1.5}.prompt-enhance-loading small{color:#8f8f8f}.prompt-editor-label{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin:0 0 7px;color:#ddd}.prompt-editor-label strong{font-size:12px}.prompt-editor-label small{color:#8f8f8f}.prompt-enhance-body textarea{box-sizing:border-box;width:100%;height:calc(100% - 48px);min-height:320px;resize:vertical;padding:10px 12px;background:#1e1e1e;color:#d4d4d4;border:1px solid #444;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}.prompt-enhance-body textarea:focus{border-color:var(--focus);outline:0}.prompt-enhance-note{min-height:18px;margin-top:6px;color:#999;font-size:11px}.prompt-enhance-dialog>footer{min-height:48px;display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;align-items:center;gap:7px;padding:7px 12px;border-top:1px solid var(--line)}.prompt-enhance-dialog>footer .button{min-height:29px}.prompt-enhance-dialog.is-busy .prompt-enhance-loading{display:grid}.prompt-enhance-dialog.is-busy .prompt-editor-label,.prompt-enhance-dialog.is-busy .prompt-enhance-body textarea,.prompt-enhance-dialog.is-busy .prompt-enhance-note{display:none}.prompt-enhance-dialog.is-busy>footer button{pointer-events:none;opacity:.62}@media(max-width:640px){.prompt-enhance-dialog{height:calc(100vh - 16px);margin:8px auto}.conflict-review-form{grid-template-columns:1fr}.conflict-review-form textarea{grid-column:auto}.prompt-editor-label{display:block}.prompt-editor-label small{display:block;margin-top:2px}.prompt-enhance-dialog>footer{grid-template-columns:1fr 1fr}.prompt-enhance-dialog>footer>span{display:none}.prompt-enhance-dialog>footer .button{width:100%}}
 .prompt-enhance-dialog{width:min(880px,calc(100vw - 28px));height:min(760px,calc(100vh - 48px))}.prompt-enhance-body{display:flex;flex-direction:column;gap:10px}.prompt-enhance-analysis{flex:none;padding:10px 12px;background:#202020;border:1px solid #3c3c3c}.prompt-analysis-heading{display:flex;align-items:baseline;justify-content:space-between;gap:12px;margin-bottom:6px;color:#ddd}.prompt-analysis-heading strong{font-size:12px}.prompt-analysis-heading small{color:#858585}.prompt-intent{margin:0 0 8px;color:#ddd;line-height:1.5}.prompt-enhance-details{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}.prompt-detail-group{min-width:0;padding:7px 8px;background:#262626;border-left:2px solid #4b86b4}.prompt-detail-group>strong{display:block;margin-bottom:4px;color:#bbb;font-size:11px;text-transform:uppercase}.prompt-detail-group ul{margin:0;padding-left:17px;color:#c8c8c8}.prompt-detail-group li{margin:2px 0;line-height:1.45}.prompt-detail-group.clarifications{grid-column:1/-1;border-left-color:#d7ba7d}.prompt-clarification{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:8px;padding:5px 0;border-top:1px solid #383838}.prompt-clarification:first-of-type{border-top:0}.prompt-clarification span{overflow-wrap:anywhere}.prompt-clarification .default-answer{color:#dcdcaa}.prompt-enhance-body textarea{flex:1 0 250px;height:auto;min-height:250px}.prompt-enhance-dialog.is-busy .prompt-enhance-analysis,.prompt-enhance-dialog.is-busy .prompt-editor-label,.prompt-enhance-dialog.is-busy .prompt-enhance-body textarea,.prompt-enhance-dialog.is-busy .prompt-enhance-note{display:none}@media(max-width:640px){.prompt-enhance-details{grid-template-columns:1fr}.prompt-clarification{grid-template-columns:1fr}.prompt-enhance-analysis{padding:8px}.prompt-enhance-body textarea{min-height:220px}}
 .prompt-detail-group.execution{grid-column:1/-1;border-left-color:#4ec9b0}.prompt-detail-group.skills{grid-column:1/-1;border-left-color:#c586c0}.prompt-step,.prompt-skill{display:grid;grid-template-columns:22px minmax(0,1fr);gap:7px;padding:5px 0;border-top:1px solid #383838}.prompt-step:first-of-type,.prompt-skill:first-of-type{border-top:0}.prompt-step-index{display:grid;place-items:center;width:19px;height:19px;border-radius:50%;background:#164f45;color:#d7fff8;font-size:10px}.prompt-step-content,.prompt-skill-content{display:grid;gap:2px;min-width:0}.prompt-step-content span,.prompt-skill-content span{color:#c8c8c8;line-height:1.4;overflow-wrap:anywhere}.prompt-step-content small,.prompt-skill-content small{color:#929292;line-height:1.35}.menu-popup{position:fixed;z-index:700;min-width:210px;padding:4px;background:#252526;border:1px solid #454545;box-shadow:0 8px 22px rgba(0,0,0,.5)}.menu-popup button{width:100%;height:27px;display:flex;align-items:center;gap:8px;padding:0 10px;border:0;background:transparent;color:#ddd;text-align:left;cursor:pointer}.menu-popup button:hover{background:#04395e}.menu-popup .separator{height:1px;margin:4px;background:#454545}.menu-popup .shortcut{margin-left:auto;color:#aaa}.toast-host{position:fixed;z-index:900;right:12px;bottom:34px;width:min(390px,calc(100vw - 24px));display:grid;gap:7px}.toast{display:grid;grid-template-columns:20px minmax(0,1fr) 22px;gap:7px;align-items:start;padding:10px;background:#252526;border:1px solid #454545;box-shadow:0 5px 18px rgba(0,0,0,.42)}.toast.error{border-left:3px solid var(--danger)}.toast.warning{border-left:3px solid var(--warning)}.toast.success{border-left:3px solid var(--success)}.toast button{border:0;background:transparent;color:#aaa;cursor:pointer}
+.side-view[data-side-view="applications"]{grid-template-rows:35px 22px minmax(72px,1fr) 22px minmax(72px,1fr) 22px minmax(72px,1fr)}.application-list{min-height:0;overflow:auto}.application-row{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:7px;min-height:52px;padding:7px 8px 7px 12px;border-bottom:1px solid #252525}.application-row:hover{background:var(--hover)}.application-info{min-width:0}.application-info strong,.application-info small{display:block;overflow:hidden;text-overflow:ellipsis}.application-info strong{color:#ddd;font-size:12px;font-weight:500;white-space:nowrap}.application-info small{margin-top:2px;color:#8f8f8f;font-size:10px;line-height:1.35;white-space:normal;overflow-wrap:anywhere}.application-row .button{min-width:58px;min-height:24px;padding:2px 7px;font-size:10px}.application-row-actions{display:flex;align-items:center;gap:2px}.application-row-action{width:24px;min-width:24px;height:24px;min-height:24px;padding:0}.application-row-action .codicon{font-size:13px}.application-row-action.is-danger:hover{background:#5a1d1d;color:#fff}.application-empty,.application-error{padding:9px 12px;color:#858585;font-size:11px;line-height:1.4}.application-error{color:#f48771}
+.collaboration-mode #newIdeApplicationBtn{display:none}.application-create-button{width:20px!important;height:20px!important;border:0!important;background:transparent!important;color:#c5c5c5!important}.application-create-button:hover{background:var(--hover)!important;color:var(--bright)!important}.application-create-glyph{display:block;font:400 17px/1 Arial,sans-serif;color:inherit}.ide-application-form{display:grid;grid-template-columns:minmax(220px,.7fr) minmax(300px,1.3fr);gap:12px;padding:14px;min-height:420px;max-height:min(72vh,680px)}.ide-application-fields,.ide-application-skills{display:flex;min-width:0;min-height:0;flex-direction:column;gap:9px}.ide-application-form label{display:grid;gap:5px;color:#bbb;font-size:11px}.ide-application-form input,.ide-application-form textarea{width:100%;border:1px solid #444;background:#1e1e1e;color:#ddd;padding:7px 8px;font:inherit}.ide-application-form textarea{min-height:110px;resize:vertical}.ide-application-form input:focus,.ide-application-form textarea:focus{border-color:var(--focus);outline:0}.ide-application-skill-heading{display:flex;align-items:center;justify-content:space-between;color:#bbb;font-size:11px}.ide-application-selected{display:flex;min-height:34px;max-height:132px;flex-direction:column;gap:3px;overflow:auto}.ide-application-selected-empty{padding:7px 8px;color:#858585;font-size:11px}.ide-application-selected-row{display:grid;grid-template-columns:minmax(0,1fr) repeat(3,24px);align-items:center;gap:2px;min-height:29px;padding-left:8px;background:#252526}.ide-application-selected-row span{overflow:hidden;color:#ddd;font-size:11px;text-overflow:ellipsis;white-space:nowrap}.ide-application-selected-row .icon-button{width:24px;min-width:24px;height:24px;min-height:24px}.ide-application-catalog{min-height:160px;flex:1;overflow:auto;border:1px solid #333}.ide-application-skill-row{display:grid;grid-template-columns:20px minmax(0,1fr);gap:5px;padding:7px 8px;border-bottom:1px solid #2c2c2c;cursor:pointer}.ide-application-skill-row:hover,.ide-application-skill-row.is-selected{background:#2a2d2e}.ide-application-skill-row input{width:auto;margin:2px 0 0}.ide-application-skill-row strong,.ide-application-skill-row small{display:block;overflow:hidden;text-overflow:ellipsis}.ide-application-skill-row strong{color:#ddd;font-size:11px;font-weight:500;white-space:nowrap}.ide-application-skill-row small{margin-top:2px;color:#888;font-size:10px;line-height:1.35;overflow-wrap:anywhere}.ide-application-error{min-height:18px;color:#f48771;font-size:11px;line-height:1.4}.ide-application-footer{grid-column:1/-1;display:flex;align-items:center;justify-content:flex-end;gap:7px;padding-top:4px;border-top:1px solid #333}.ide-application-footer .ide-application-error{margin-right:auto}.application-status-pending{color:#d7ba7d}.application-status-published{color:#89d185}.application-status-rejected{color:#f48771}@media(max-width:680px){.ide-application-form{grid-template-columns:1fr;min-height:0;max-height:calc(100vh - 110px);overflow:auto}.ide-application-footer{grid-column:auto}.ide-application-catalog{min-height:220px}}
+.modal.is-application-editor{display:grid;grid-template-rows:42px minmax(0,1fr);height:min(720px,calc(100vh - 48px));max-height:none;margin:24px auto;overflow:hidden}.modal.is-application-editor>#modalBody{min-height:0;overflow:hidden}.modal.is-application-editor .ide-application-form{height:100%;min-height:0;max-height:none;grid-template-rows:minmax(0,1fr) auto}.modal.is-application-editor .ide-application-fields{min-height:0;overflow:auto}.modal.is-application-editor .ide-application-skills{display:grid;grid-template-rows:auto minmax(34px,132px) 29px minmax(0,1fr);min-height:0}.modal.is-application-editor .ide-application-selected,.modal.is-application-editor .ide-application-catalog{min-height:0;scrollbar-width:thin;scrollbar-color:#686868 #1e1e1e}.modal.is-application-editor .ide-application-catalog{height:auto;overflow-y:scroll;overflow-x:hidden;scrollbar-gutter:stable}.modal.is-application-editor .ide-application-catalog::-webkit-scrollbar,.modal.is-application-editor .ide-application-selected::-webkit-scrollbar{width:10px}.modal.is-application-editor .ide-application-catalog::-webkit-scrollbar-track,.modal.is-application-editor .ide-application-selected::-webkit-scrollbar-track{background:#1e1e1e}.modal.is-application-editor .ide-application-catalog::-webkit-scrollbar-thumb,.modal.is-application-editor .ide-application-selected::-webkit-scrollbar-thumb{border:2px solid #1e1e1e;background:#686868}.modal.is-application-editor .ide-application-catalog::-webkit-scrollbar-thumb:hover,.modal.is-application-editor .ide-application-selected::-webkit-scrollbar-thumb:hover{background:#858585}@media(max-width:680px){.modal.is-application-editor{height:calc(100vh - 16px);margin:8px auto}.modal.is-application-editor>#modalBody{overflow:auto}.modal.is-application-editor .ide-application-form{height:auto;min-height:100%;grid-template-columns:1fr;grid-template-rows:auto minmax(360px,55vh) auto;overflow:visible}.modal.is-application-editor .ide-application-fields{overflow:visible}.modal.is-application-editor .ide-application-skills{min-height:360px}.modal.is-application-editor .ide-application-footer{grid-column:auto}}
 @media(max-width:1080px){:root{--sidebar-width:250px;--secondary-width:280px}.menu-bar button:nth-child(n+5){display:none}.status-right button:nth-child(-n+3){display:none}}
 @media(max-width:820px){:root{--sidebar-width:min(300px,calc(100vw - 48px));--secondary-width:min(320px,calc(100vw - 48px));--panel-height:190px}.title-bar{grid-template-columns:28px 25px 1fr auto}.menu-bar{display:none}.command-center{width:100%;min-width:0}.workbench-grid{position:relative;grid-template-columns:48px minmax(0,1fr)!important}.primary-sidebar,.secondary-sidebar{position:absolute;z-index:90;top:0;bottom:0;width:var(--sidebar-width);box-shadow:5px 0 18px rgba(0,0,0,.42)}.primary-sidebar{left:48px}.secondary-sidebar{right:0;width:var(--secondary-width);box-shadow:-5px 0 18px rgba(0,0,0,.42)}.primary-hidden .primary-sidebar,.secondary-hidden .secondary-sidebar{display:none}.editor-area{grid-column:2}.editor-grid.split{grid-template-columns:minmax(0,1fr)}.editor-grid.split .editor-group:not(.is-active){display:none}.layout-controls #togglePanelBtn{display:none}.empty-actions{grid-template-columns:auto}.status-right button{display:none!important}.status-right #accountStatus,.status-right #notificationsBtn{display:flex!important}.panel-tabs{gap:12px}.panel-tabs button{font-size:10px}.panel-header .header-actions .icon-button:nth-child(-n+2){display:none}}
 @media(max-width:480px){.title-bar{grid-template-columns:28px 22px minmax(0,1fr) auto;padding:0 3px}.layout-controls button:not(#toggleSecondaryBtn){display:none}.command-center span:last-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.activity-button{width:43px}.workbench-grid{grid-template-columns:44px minmax(0,1fr)!important}.primary-sidebar{left:44px}.status-left #syncStatus,.status-left #errorStatus{display:none}.panel-tabs{gap:9px}.panel-tabs button{max-width:62px;overflow:hidden;text-overflow:ellipsis}.auth-dialog{padding:28px 22px}.extension-row{grid-template-columns:36px minmax(0,1fr)}.extension-icon{width:36px;height:36px}.extension-row .button{grid-column:2;justify-self:start}}
@@ -103553,6 +105687,7 @@ const S={
   terminal:null,terminalStarting:false,terminalPromise:null,terminalWidget:null,terminalFit:null,terminalOffset:0,terminalPoll:null,terminalDecoder:null,terminalAnsiState:null,terminalPlainState:null,stateTimer:null,diagnosticTimer:null,paletteItems:[],paletteIndex:0,paletteMode:'commands',quickFiles:[],quickFilesLoading:false,quickFilesKey:'',quickFilesTruncated:false,
   debug:null,debugSeq:0,debugPoll:null,debugFile:null,
   agentPoll:null,agentPollDue:0,agentPollBusy:false,agentPollRequested:false,agentState:null,agentRendered:new Set(),agentToolCards:new Map(),agentPlanCards:new Map(),agentOperationSeq:0,agentEventSeq:0,agentWasBusy:false,agentSession:'',agentSubmitting:false,agentInterrupting:false,agentTreeTimer:null,agentFileRefresh:new Set(),agentAttachments:[],agentModelCatalog:null,agentTodoCollapsed:false,promptEnhanceEnabled:false,promptEnhancePersistent:false,promptEnhanceSkillsAware:false,promptEnhanceBudget:'medium',promptEnhancing:false,promptEnhanceDraft:null,promptEnhanceAbort:null,promptEnhanceStartedAt:0,promptEnhanceElapsedTimer:null,promptEnhanceLoadingLabel:'',workspaceRefreshBusy:false,workspaceRefreshSeq:0,workspaceClipboard:null,explorerSelection:null,sessionSwitchSeq:0,sessionSwitching:false,renderingAgentState:false,devicePoll:null,agentEvents:null,agentEventsConnected:false,agentEventReconnect:null,pendingUploadDest:'',pendingOpenUpload:false,pendingFolderUploadDest:'',
+  applications:null,applicationsLoading:false,applicationBusy:new Set(),applicationDraft:{id:'',selectedSkillIds:[],saving:false},
   collaborationMode:false,collaboration:null,collaborationWarning:'',collaborationEvents:null,collaborationEventCursor:0,collaborationRefreshTimer:null,collaborationPresenceTimer:null,collaborationPresenceHeartbeat:null,collaborationConflictNoticeSignature:'',collaborationConflictNoticeTimer:null,collaborationConflictReviewId:'',collaborationFlushes:new Map(),collaborationFlushTimers:new Map(),collaborationRemoteDecorations:new Map(),collaborationSessionRefresh:null
 };
 const HTML_ESCAPE={'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'};
@@ -103784,7 +105919,71 @@ async function runDiagnostics(file){const group=S.activeByGroup.findIndex(key=>k
 function renderProblems(){const host=E('problemsList');host.innerHTML='';for(const row of S.diagnostics){const div=document.createElement('div');div.className=`problem-row ${row.severity||'error'}`;div.innerHTML=`<span class="codicon codicon-${row.severity==='warning'?'warning':'error'}"></span><span>${escapeHtml(row.message)} <small>${escapeHtml(row.path)}</small></span><span>${row.line||1}:${row.column||1}</span>`;div.onclick=()=>openFile(row.path,{root_id:row.root_id,line:row.line,column:row.column}).catch(showError);host.appendChild(div)}E('problemCount').textContent=String(S.diagnostics.length)}
 function renderProblems(){const host=E('problemsList');host.innerHTML='';if(!S.diagnostics.length)host.innerHTML='<div class="panel-empty">No problems detected.</div>';for(const row of S.diagnostics){const div=document.createElement('div');div.className=`problem-row ${row.severity||'error'}`;div.innerHTML=`<span class="codicon codicon-${row.severity==='warning'?'warning':'error'}"></span><span>${escapeHtml(row.message)} <small>${escapeHtml(row.path)}</small></span><span>${row.line||1}:${row.column||1}</span>`;div.onclick=()=>openFile(row.path,{root_id:row.root_id,line:row.line,column:row.column}).catch(showError);host.appendChild(div)}E('problemCount').textContent=String(S.diagnostics.length)}
 function updateStatusBar(){const file=activeFile();E('fileSizeStatus').textContent=file?formatFileSize(file.size):'0 B';E('languageStatus').textContent=file?languageFor(file.path).replace(/^./,char=>char.toUpperCase()):'Plain Text';E('encodingStatus').textContent=file?String(file.encoding||'utf-8').toUpperCase():'UTF-8';E('accountName').textContent=S.account?.username||'';const errors=S.diagnostics.filter(row=>row.severity!=='warning').length;const warnings=S.diagnostics.length-errors;E('errorCount').textContent=errors;E('warningCount').textContent=warnings;E('errorStatus').title=`${errors} Errors, ${warnings} Warnings`;if(S.monaco&&S.editors[S.activeGroup]){const visibleDiff=!E(`diffEditor${S.activeGroup}`).classList.contains('is-hidden');const pos=(visibleDiff?S.diffEditors[S.activeGroup]?.getModifiedEditor():S.editors[S.activeGroup])?.getPosition();if(pos)E('indentStatus').textContent=`Ln ${pos.lineNumber}, Col ${pos.column}`}else E('indentStatus').textContent='Spaces: 2'}
-function showView(view){S.activeView=view;S.primaryVisible=true;E('ideShell').classList.remove('primary-hidden');document.querySelectorAll('.activity-button[data-view]').forEach(button=>button.classList.toggle('is-active',button.dataset.view===view));document.querySelectorAll('.side-view').forEach(section=>section.classList.toggle('is-active',section.dataset.sideView===view));if(view==='scm')refreshScm().catch(showError);if(view==='run')refreshTasks().catch(showError);if(view==='extensions')refreshExtensions().catch(showError);scheduleStateSave()}
+function applicationEmpty(host,message,error=false){host.innerHTML=`<div class="${error?'application-error':'application-empty'}">${escapeHtml(message)}</div>`}
+function applicationActionButton(label,icon,disabled,handler,title=''){
+  const button=document.createElement('button');button.type='button';button.className='button';button.disabled=!!disabled;button.title=title||label;button.innerHTML=`<span class="codicon codicon-${icon}"></span><span>${escapeHtml(label)}</span>`;if(handler)button.onclick=handler;return button
+}
+function applicationIconButton(icon,label,disabled,handler,danger=false){
+  const button=document.createElement('button');button.type='button';button.className=`icon-button application-row-action${danger?' is-danger':''}`;button.disabled=!!disabled;button.title=label;button.setAttribute('aria-label',label);button.innerHTML=`<span class="codicon codicon-${icon}"></span>`;if(handler)button.onclick=handler;return button
+}
+function appendApplicationRow(host,row,{meta,actionLabel,actionIcon='play',busyKey,disabled=false,disabledTitle='',action}={}){
+  const item=document.createElement('div');item.className='application-row';const info=document.createElement('div');info.className='application-info';const title=document.createElement('strong');title.textContent=row.name||row.title||row.id||'Application';const detail=document.createElement('small');detail.textContent=meta||row.description||'';info.append(title,detail);const busy=S.applicationBusy.has(busyKey);item.append(info,applicationActionButton(busy?'Working...':actionLabel,actionIcon,disabled||busy,busy?null:()=>action(row),disabledTitle));host.appendChild(item)
+}
+function appendPersonalApplicationRow(host,row){
+  const latest=row.latest_submission||{},current=Number(latest.submitted_revision||0)===Number(row.revision||0),status=current?String(latest.status||'pending'):'draft';
+  const labels={draft:'Draft',pending:'In review',published:'Published',rejected:'Rejected'},review=String(current?latest.review?.note||'':'').trim();
+  const item=document.createElement('div');item.className='application-row';const info=document.createElement('div');info.className='application-info';
+  const title=document.createElement('strong');title.textContent=(String(row.icon||'').trim()?`${String(row.icon).trim()} `:'')+(row.name||row.id||'Application');
+  const detail=document.createElement('small');detail.className=`application-status-${status}`;detail.textContent=`Personal · v${row.revision||1} · ${labels[status]||status}${review?` · ${review}`:''}`;info.append(title,detail);
+  const actions=document.createElement('div');actions.className='application-row-actions';const launching=S.applicationBusy.has(`launch:${row.id}`),submitting=S.applicationBusy.has(`submit:${row.id}`),deleting=S.applicationBusy.has(`delete:${row.id}`);
+  actions.append(
+    applicationIconButton('play',launching?'Launching...':'Launch',launching,launching?null:()=>launchIdeApplication(row)),
+    applicationIconButton('edit','Edit Personal Application',launching||submitting||deleting,()=>openIdeApplicationEditor(row)),
+    applicationIconButton('cloud-upload',current?`${labels[status]||status}: edit the application before submitting another revision`:(submitting?'Submitting...':'Submit for Shared Review'),current||submitting||deleting,()=>submitIdeApplication(row)),
+    applicationIconButton('trash',deleting?'Deleting...':'Delete Personal Application',launching||submitting||deleting,()=>deleteIdeApplication(row),true),
+  );
+  item.append(info,actions);host.appendChild(item)
+}
+function renderApplications(){
+  const personal=E('applicationsPersonal'),shared=E('applicationsShared'),sessions=E('applicationsWebSessions');if(!personal||!shared||!sessions)return;
+  personal.innerHTML='';shared.innerHTML='';sessions.innerHTML='';
+  if(S.applicationsLoading&&!S.applications){for(const host of [personal,shared,sessions])applicationEmpty(host,'Loading...');return}
+  const data=S.applications;if(!data){for(const host of [personal,shared,sessions])applicationEmpty(host,'Applications are unavailable.',true);return}
+  E('newIdeApplicationBtn').hidden=!!data.collaboration;
+  for(const row of data.personal||[])appendPersonalApplicationRow(personal,row);
+  for(const row of data.legacy_personal||[])appendApplicationRow(personal,row,{meta:`WebUI · v${row.revision||1}`,actionLabel:'Import',actionIcon:'cloud-download',busyKey:`import:${row.id}`,action:importLegacyApplication});
+  if(!(data.personal||[]).length&&!(data.legacy_personal||[]).length)applicationEmpty(personal,'No personal applications');
+  for(const row of data.shared||[])appendApplicationRow(shared,row,{meta:`Published · v${row.submitted_revision||row.revision||1}`,actionLabel:row.launchable===false?'Unavailable':'Launch',busyKey:`launch:${row.id}`,disabled:row.launchable===false,disabledTitle:'Shared launch is unavailable in this workspace.',action:launchIdeApplication});
+  if(!(data.shared||[]).length)applicationEmpty(shared,'No published applications');
+  for(const row of data.web_sessions||[]){const app=row.app_binding||{};appendApplicationRow(sessions,row,{meta:`${app.name||'Application'} · ${row.running?'Running':'Idle'}`,actionLabel:row.running?'Running':'Import Session',actionIcon:'cloud-download',busyKey:`session:${row.id}`,disabled:!!row.running,disabledTitle:'Stop the WebUI session before importing it.',action:importLegacyApplicationSession})}
+  if(!(data.web_sessions||[]).length)applicationEmpty(sessions,'No WebUI application sessions');
+}
+async function refreshApplications(){if(S.applicationsLoading)return;S.applicationsLoading=true;renderApplications();try{S.applications=await api('/api/ide/v2/applications')}catch(error){S.applications=null;renderApplications();throw error}finally{S.applicationsLoading=false;renderApplications()}}
+async function withApplicationBusy(key,work){if(S.applicationBusy.has(key))return;S.applicationBusy.add(key);renderApplications();try{return await work()}finally{S.applicationBusy.delete(key);renderApplications()}}
+async function launchIdeApplication(row){await withApplicationBusy(`launch:${row.id}`,async()=>{const out=await api(`/api/ide/v2/applications/${qs(row.id)}/launch`,{method:'POST',body:'{}'});await refreshSessionCatalog();await switchSession(out.id,true);await refreshApplications();toast(`Launched ${row.name||'application'}.`,'success')})}
+async function importLegacyApplication(row){await withApplicationBusy(`import:${row.id}`,async()=>{await api('/api/ide/v2/applications/import',{method:'POST',body:JSON.stringify({app_id:row.id})});await refreshApplications();toast(`Imported ${row.name||'application'}.`,'success')})}
+async function importLegacyApplicationSession(row){await withApplicationBusy(`session:${row.id}`,async()=>{const out=await api('/api/ide/v2/application-sessions/import',{method:'POST',body:JSON.stringify({session_id:row.id})});await refreshSessionCatalog();await switchSession(out.id,true);await refreshApplications();toast(`Imported ${row.title||'WebUI session'}.`,'success')})}
+function setIdeApplicationEditorError(message=''){const host=E('ideApplicationEditorError');if(host)host.textContent=String(message||'')}
+function openIdeApplicationEditor(row=null){
+  const draft=S.applicationDraft;draft.id=String(row?.id||'');draft.selectedSkillIds=[...(row?.skills||[])].sort((a,b)=>Number(a.order||0)-Number(b.order||0)).map(skill=>String(skill.id||'')).filter(Boolean);draft.saving=false;
+  openModal(draft.id?'Edit Personal Application':'Create Personal Application',`<form id="ideApplicationForm" class="ide-application-form"><section class="ide-application-fields"><label>Name<input id="ideApplicationName" maxlength="100" required value="${escapeHtml(row?.name||'')}" placeholder="Application name"></label><label>Icon<input id="ideApplicationIcon" maxlength="20" value="${escapeHtml(row?.icon||'')}" placeholder="Optional icon"></label><label>Description<textarea id="ideApplicationDescription" maxlength="1000" placeholder="Use cases and expected output">${escapeHtml(row?.description||'')}</textarea></label></section><section class="ide-application-skills"><div class="ide-application-skill-heading"><strong>Selected Skills</strong><span id="ideApplicationSkillCount">0 / 8</span></div><div id="ideApplicationSelected" class="ide-application-selected"></div><input id="ideApplicationSkillSearch" type="search" placeholder="Search Skills"><div id="ideApplicationCatalog" class="ide-application-catalog"></div></section><footer class="ide-application-footer"><div id="ideApplicationEditorError" class="ide-application-error" role="status"></div><button id="ideApplicationCancel" class="button" type="button">Cancel</button><button id="ideApplicationSave" class="button primary" type="submit">Save Personal App</button></footer></form>`,{wide:true,applicationEditor:true});
+  E('ideApplicationCancel').onclick=closeModal;E('ideApplicationSkillSearch').oninput=renderIdeApplicationSkillEditor;E('ideApplicationForm').onsubmit=event=>{event.preventDefault();saveIdeApplication().catch(error=>setIdeApplicationEditorError(error.message||String(error)))};renderIdeApplicationSkillEditor();setTimeout(()=>E('ideApplicationName')?.focus(),0)
+}
+function toggleIdeApplicationSkill(id){const selected=S.applicationDraft.selectedSkillIds,index=selected.indexOf(id);if(index>=0)selected.splice(index,1);else{if(selected.length>=8){setIdeApplicationEditorError('An application can bind at most 8 Skills.');return}selected.push(id)}setIdeApplicationEditorError();renderIdeApplicationSkillEditor()}
+function moveIdeApplicationSkill(index,delta){const selected=S.applicationDraft.selectedSkillIds,target=index+delta;if(target<0||target>=selected.length)return;[selected[index],selected[target]]=[selected[target],selected[index]];renderIdeApplicationSkillEditor()}
+function renderIdeApplicationSkillEditor(){
+  const selectedHost=E('ideApplicationSelected'),catalogHost=E('ideApplicationCatalog'),count=E('ideApplicationSkillCount');if(!selectedHost||!catalogHost||!count)return;const selected=S.applicationDraft.selectedSkillIds,catalog=S.applications?.skill_catalog||[],chosen=new Set(selected),query=String(E('ideApplicationSkillSearch')?.value||'').trim().toLowerCase();selectedHost.innerHTML='';catalogHost.innerHTML='';count.textContent=`${selected.length} / 8`;
+  if(!selected.length)selectedHost.innerHTML='<div class="ide-application-selected-empty">Select at least one Skill from the catalog.</div>';
+  selected.forEach((id,index)=>{const skill=catalog.find(item=>String(item.id||'')===id),entry=document.createElement('div');entry.className='ide-application-selected-row';const label=document.createElement('span');label.textContent=`${index+1}. ${skill?.name||id}`;label.title=id;entry.append(label,applicationIconButton('arrow-up','Move up',index===0,()=>moveIdeApplicationSkill(index,-1)),applicationIconButton('arrow-down','Move down',index===selected.length-1,()=>moveIdeApplicationSkill(index,1)),applicationIconButton('close','Remove Skill',false,()=>toggleIdeApplicationSkill(id)));selectedHost.appendChild(entry)});
+  const rows=catalog.filter(skill=>!query||[skill.id,skill.name,skill.description].join(' ').toLowerCase().includes(query));if(!rows.length){applicationEmpty(catalogHost,query?'No matching Skills':'No application Skills are available');return}
+  for(const skill of rows){const id=String(skill.id||''),entry=document.createElement('label');entry.className=`ide-application-skill-row${chosen.has(id)?' is-selected':''}`;const input=document.createElement('input');input.type='checkbox';input.checked=chosen.has(id);input.onchange=()=>toggleIdeApplicationSkill(id);const body=document.createElement('div'),name=document.createElement('strong'),key=document.createElement('small'),description=document.createElement('small');name.textContent=String(skill.name||id);key.textContent=id;description.textContent=String(skill.description||'');body.append(name,key,description);entry.append(input,body);catalogHost.appendChild(entry)}
+}
+async function saveIdeApplication(){
+  const draft=S.applicationDraft;if(draft.saving)return;const payload={name:E('ideApplicationName').value.trim(),icon:E('ideApplicationIcon').value.trim(),description:E('ideApplicationDescription').value.trim(),skills:[...draft.selectedSkillIds]};if(!payload.name){setIdeApplicationEditorError('Enter an application name.');return}if(!payload.skills.length){setIdeApplicationEditorError('Select at least one Skill.');return}draft.saving=true;E('ideApplicationSave').disabled=true;E('ideApplicationCancel').disabled=true;setIdeApplicationEditorError('Saving...');try{await api(draft.id?`/api/ide/v2/applications/${qs(draft.id)}`:'/api/ide/v2/applications',{method:draft.id?'PATCH':'POST',body:JSON.stringify(payload)});closeModal();await refreshApplications();toast('Personal application saved.','success')}finally{draft.saving=false}
+}
+async function submitIdeApplication(row){if(!confirm(`Submit ${row.name||'this application'} revision ${row.revision||1} for administrator review?`))return;await withApplicationBusy(`submit:${row.id}`,async()=>{const out=await api(`/api/ide/v2/applications/${qs(row.id)}/submit`,{method:'POST',body:'{}'});await refreshApplications();toast(out.status==='pending'?'Submitted for administrator review.':`Current revision is ${out.status||'already submitted'}.`,'success')})}
+async function deleteIdeApplication(row){if(!confirm(`Delete personal application ${row.name||row.id}?`))return;await withApplicationBusy(`delete:${row.id}`,async()=>{await api(`/api/ide/v2/applications/${qs(row.id)}`,{method:'DELETE'});await refreshApplications();toast('Personal application deleted.','success')})}
+function showView(view){S.activeView=view;S.primaryVisible=true;E('ideShell').classList.remove('primary-hidden');document.querySelectorAll('.activity-button[data-view]').forEach(button=>button.classList.toggle('is-active',button.dataset.view===view));document.querySelectorAll('.side-view').forEach(section=>section.classList.toggle('is-active',section.dataset.sideView===view));if(view==='scm')refreshScm().catch(showError);if(view==='run')refreshTasks().catch(showError);if(view==='extensions')refreshExtensions().catch(showError);if(view==='applications')refreshApplications().catch(showError);scheduleStateSave()}
 function showPanel(tab='terminal'){S.panel=tab;S.panelVisible=true;E('ideShell').classList.remove('panel-hidden');document.querySelectorAll('[data-panel-tab]').forEach(button=>button.classList.toggle('is-active',button.dataset.panelTab===tab));document.querySelectorAll('.panel-content').forEach(panel=>panel.classList.toggle('is-active',panel.id===`${tab}Panel`));if(tab==='terminal'){if(!S.terminal&&S.capabilities.terminal)newTerminal().catch(showError);else if(S.terminalFit)setTimeout(()=>S.terminalFit.fit(),30)}scheduleStateSave()}
 function togglePrimary(){S.primaryVisible=!S.primaryVisible;E('ideShell').classList.toggle('primary-hidden',!S.primaryVisible);scheduleStateSave()}
 function toggleSecondary(force){S.secondaryVisible=typeof force==='boolean'?force:!S.secondaryVisible;E('ideShell').classList.toggle('secondary-hidden',!S.secondaryVisible);scheduleStateSave()}
@@ -103996,8 +106195,8 @@ async function requestPromptEnhancement(draft,{regenerate=false}={}){if(S.prompt
 async function usePromptReview(original=false){const draft=S.promptEnhanceDraft;if(!draft)return;const message=original?draft.original:E('promptEnhanceEditor').value.trim();if(!message)return toast('Enhanced prompt is empty.','warning');S.promptEnhanceAbort=null;setPromptEnhanceBusy(false);E('promptEnhanceOverlay').classList.add('is-hidden');S.promptEnhanceDraft=null;await submitAgentDraft(draft,message)}
 async function regeneratePromptReview(){const draft=S.promptEnhanceDraft;if(!draft)return;await requestPromptEnhancement(draft,{regenerate:true})}
 async function sendAgent(){const input=E('agentPrompt'),message=input.value.trim(),pending=!S.agentState?.running&&S.agentState?.pending_user_question;if(pending)return answerAgentQuestion(message);if(!message||S.agentSubmitting||S.promptEnhancing)return;const file=activeFile(),draft={session_id:S.activeSession,session_seq:S.sessionSwitchSeq,root_id:S.activeRoot,active_path:file?.path||'',original:message,attachments:S.agentAttachments.map(item=>item.path),regeneration:0,result:null,budget:S.promptEnhanceBudget,skills_aware:S.promptEnhanceSkillsAware,enhance_requested:S.promptEnhanceEnabled};if(S.promptEnhanceEnabled)return requestPromptEnhancement(draft);return submitAgentDraft(draft,message)}
-function openModal(title,html,{wide=false}={}){E('modalTitle').textContent=title;E('modalBody').innerHTML=html;E('modal').classList.toggle('is-wide',!!wide);E('modalOverlay').classList.remove('is-hidden')}
-function closeModal(){S.collaborationConflictReviewId='';E('modal').classList.remove('is-wide');E('modalOverlay').classList.add('is-hidden');E('modalBody').innerHTML=''}
+function openModal(title,html,{wide=false,applicationEditor=false}={}){E('modalTitle').textContent=title;E('modalBody').innerHTML=html;E('modal').classList.toggle('is-wide',!!wide);E('modal').classList.toggle('is-application-editor',!!applicationEditor);E('modalOverlay').classList.remove('is-hidden')}
+function closeModal(){S.collaborationConflictReviewId='';E('modal').classList.remove('is-wide','is-application-editor');E('modalOverlay').classList.add('is-hidden');E('modalBody').innerHTML=''}
 async function showAccountModal(){let users=[],devices=[];if(S.capabilities.admin&&S.capabilities.local){try{[users,devices]=await Promise.all([api('/api/ide/v2/admin/users').then(x=>x.accounts||[]),api('/api/ide/v2/admin/devices').then(x=>x.devices||[])])}catch(error){logOutput(error.message)}}const userRows=users.map(row=>`<div class="account-row"><div><strong>${escapeHtml(row.username)}</strong><small>${escapeHtml(row.role)}${row.disabled?' / disabled':''}</small></div>${row.role==='admin'?'':`<button class="button" data-user="${escapeHtml(row.username)}" data-disabled="${row.disabled?'0':'1'}">${row.disabled?'Enable':'Disable'}</button>`}</div>`).join('');const deviceRows=devices.map(row=>`<div class="account-row"><div><strong>${escapeHtml(row.label||row.pairing_id)}</strong><small>${escapeHtml(row.pairing_id)} / ${escapeHtml(row.source_ip)} / ${escapeHtml(row.status)}</small></div><div>${row.status==='pending'?`<button class="button primary" data-device-approve="${escapeHtml(row.pairing_id)}">Approve</button>`:''}${row.status!=='revoked'?` <button class="button" data-device-revoke="${escapeHtml(row.pairing_id)}">Revoke</button>`:''}</div></div>`).join('');const passwordForm=S.config?.password_login_enabled?`<form id="resetPasswordForm" class="modal-form"><h3>Password Login</h3><input id="resetUsername" value="${escapeHtml(S.account.username)}" required><input id="resetPassword" type="password" placeholder="New password" required><div class="modal-actions"><button class="button primary">Set Password</button></div></form>`:'';openModal('Access',`<div class="account-list"><div class="account-row"><div><strong>${escapeHtml(S.account.username)}</strong><small>${escapeHtml(S.account.role)} / current</small></div><button id="logoutBtn" class="button">Sign Out</button></div>${userRows}</div>${S.capabilities.admin&&S.capabilities.local?`<div class="section-label"><strong>Web Devices</strong></div><div class="account-list">${deviceRows||'<div class="side-summary">No Web devices requested access.</div>'}</div>${passwordForm}`:''}`);E('logoutBtn').onclick=logout;document.querySelectorAll('[data-user]').forEach(button=>button.onclick=async()=>{await api('/api/ide/v2/admin/users',{method:'PATCH',body:JSON.stringify({username:button.dataset.user,disabled:button.dataset.disabled==='1'})});showAccountModal()});document.querySelectorAll('[data-device-approve]').forEach(button=>button.onclick=async()=>{await api('/api/ide/v2/admin/devices/approve',{method:'POST',body:JSON.stringify({pairing_id:button.dataset.deviceApprove})});showAccountModal()});document.querySelectorAll('[data-device-revoke]').forEach(button=>button.onclick=async()=>{await api('/api/ide/v2/admin/devices/revoke',{method:'POST',body:JSON.stringify({pairing_id:button.dataset.deviceRevoke})});showAccountModal()});if(E('resetPasswordForm'))E('resetPasswordForm').onsubmit=async event=>{event.preventDefault();await api('/api/ide/v2/admin/password-reset',{method:'POST',body:JSON.stringify({username:E('resetUsername').value,new_password:E('resetPassword').value})});location.reload()}}
 async function logout(){try{await api('/api/ide/v2/auth/logout',{method:'POST',body:'{}'})}finally{if(S.collaborationMode)sessionStorage.removeItem('clouds_collab_csrf');location.reload()}}
 function showMountModal(){const mounts=S.config?.mounts||[];openModal('Workspace Folders',`<div class="account-list">${mounts.map(row=>`<div class="account-row"><div><strong>${escapeHtml(row.label)}</strong><small>${escapeHtml(row.path)}</small></div><button class="button" data-mount="${escapeHtml(row.id)}">Remove</button></div>`).join('')||'<div class="side-summary">No external folders mounted.</div>'}</div><form id="mountForm" class="modal-form"><input id="mountPath" placeholder="/absolute/path/to/project" required><div class="modal-actions"><button class="button primary">Add Folder</button></div></form>`);document.querySelectorAll('[data-mount]').forEach(button=>button.onclick=async()=>{await api('/api/ide/mounts',{method:'DELETE',body:JSON.stringify({mount_id:button.dataset.mount})});await refreshConfig();showMountModal()});E('mountForm').onsubmit=async event=>{event.preventDefault();await api('/api/ide/mounts',{method:'POST',body:JSON.stringify({path:E('mountPath').value})});await refreshConfig();closeModal()}}
@@ -104106,7 +106305,7 @@ function bindUI(){
   document.querySelectorAll('.empty-actions [data-command]').forEach(button=>button.onclick=event=>{event.preventDefault();runCommandById(button.dataset.command)});
   E('newFileBtn').onclick=()=>newFile().catch(showError);E('newFolderBtn').onclick=()=>newFolder().catch(showError);E('refreshTreeBtn').onclick=()=>refreshWorkspaceSnapshot().catch(showError);E('explorerMoreBtn').onclick=event=>showMenu(event.currentTarget,['file.open','file.uploadFolder','file.downloadWorkspace','file.openFolder','session.new']);E('sessionSelect').onchange=()=>switchSession(E('sessionSelect').value).catch(showError);E('renameSessionBtn').onclick=()=>renameCurrentSession().catch(showError);E('rootSelect').onchange=async()=>{S.workspaceClipboard=null;S.explorerSelection=null;clearWorkspaceDropState();S.activeRoot=E('rootSelect').value;S.treeCache.clear();await loadTree('');updateAgentContext()};const workspaceLabel=E('workspaceSectionLabel'),tree=E('tree');workspaceLabel.onclick=event=>{if(event.target.closest('#downloadWorkspaceBtn'))return;setExplorerSelection(null);workspaceLabel.focus()};workspaceLabel.onkeydown=event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();const rect=workspaceLabel.getBoundingClientRect();showWorkspaceMenu(rect.left+8,rect.bottom)}};workspaceLabel.oncontextmenu=event=>{event.preventDefault();setExplorerSelection(null);workspaceLabel.focus();showWorkspaceMenu(event.clientX,event.clientY)};tree.onclick=event=>{if(event.target!==tree)return;setExplorerSelection(null);tree.focus()};tree.oncontextmenu=event=>{if(event.target.closest('.tree-row'))return;event.preventDefault();setExplorerSelection(null);tree.focus();showWorkspaceMenu(event.clientX,event.clientY)};bindWorkspaceDropZone(tree);bindWorkspaceDropZone(workspaceLabel,{rootOnly:true});window.addEventListener('dragover',event=>{if(workspaceDragHasFiles(event.dataTransfer))event.preventDefault()});window.addEventListener('drop',event=>{if(workspaceDragHasFiles(event.dataTransfer))event.preventDefault();clearWorkspaceDropState()});window.addEventListener('dragend',clearWorkspaceDropState);E('downloadWorkspaceBtn').onclick=event=>{event.preventDefault();event.stopPropagation();downloadWorkspacePath('')};
   E('fileInput').onchange=()=>{const input=E('fileInput'),files=[...(input.files||[])],dest=S.pendingUploadDest,openAfter=S.pendingOpenUpload,firstPath=files[0]?normalizeUploadPath(dest?`${dest}/${files[0].name}`:files[0].name):'';S.pendingUploadDest='';S.pendingOpenUpload=false;uploadFiles(files,dest).then(()=>openAfter&&firstPath?openFile(firstPath):null).catch(showError).finally(()=>{input.value=''})};E('folderInput').onchange=()=>{const input=E('folderInput'),dest=S.pendingFolderUploadDest,legacy=[...(input.webkitEntries||[])];S.pendingFolderUploadDest='';const task=legacy.length?scanLegacyDirectoryEntries(legacy).then(scanned=>uploadEntries(scanned.entries,scanned.directories,dest)):uploadFiles(input.files,dest);task.catch(showError).finally(()=>{input.value=''})};E('searchInput').oninput=debounce(()=>runSearch().catch(showError),300);E('includeInput').onchange=()=>runSearch().catch(showError);E('excludeInput').onchange=()=>runSearch().catch(showError);E('matchCaseBtn').onclick=()=>{E('matchCaseBtn').classList.toggle('is-active');runSearch().catch(showError)};E('regexBtn').onclick=()=>{E('regexBtn').classList.toggle('is-active');runSearch().catch(showError)};E('clearSearchBtn').onclick=()=>{E('searchInput').value='';S.searchResults=[];E('searchSummary').textContent='';renderSearch()};
-  E('refreshScmBtn').onclick=()=>refreshScm().catch(showError);E('refreshTasksBtn').onclick=()=>refreshTasks().catch(showError);E('runActiveBtn').onclick=()=>runActiveFile().catch(showError);E('debugActiveBtn').onclick=()=>debugActiveFile().catch(showError);E('newTerminalBtn').onclick=()=>newTerminal().catch(showError);E('killTerminalBtn').onclick=()=>killTerminal().catch(showError);E('refreshExtensionsBtn').onclick=()=>refreshExtensions(E('extensionSearchInput').value).catch(showError);E('extensionSearchInput').oninput=debounce(()=>refreshExtensions(E('extensionSearchInput').value).catch(showError),400);E('installVsixBtn').onclick=()=>E('vsixInput').click();E('vsixInput').onchange=()=>installVsix(E('vsixInput').files?.[0]).catch(showError);
+  E('refreshScmBtn').onclick=()=>refreshScm().catch(showError);E('refreshTasksBtn').onclick=()=>refreshTasks().catch(showError);E('runActiveBtn').onclick=()=>runActiveFile().catch(showError);E('debugActiveBtn').onclick=()=>debugActiveFile().catch(showError);E('newTerminalBtn').onclick=()=>newTerminal().catch(showError);E('killTerminalBtn').onclick=()=>killTerminal().catch(showError);E('refreshExtensionsBtn').onclick=()=>refreshExtensions(E('extensionSearchInput').value).catch(showError);E('extensionSearchInput').oninput=debounce(()=>refreshExtensions(E('extensionSearchInput').value).catch(showError),400);E('installVsixBtn').onclick=()=>E('vsixInput').click();E('vsixInput').onchange=()=>installVsix(E('vsixInput').files?.[0]).catch(showError);E('newIdeApplicationBtn').onclick=()=>openIdeApplicationEditor();E('refreshApplicationsBtn').onclick=()=>refreshApplications().catch(showError);
   E('sendAgentBtn').onclick=()=>sendAgent().catch(showError);E('stopAgentBtn').onclick=()=>stopAgent().catch(showError);E('agentPrompt').onkeydown=event=>{if((event.ctrlKey||event.metaKey)&&event.key==='Enter'){event.preventDefault();sendAgent().catch(showError)}};E('attachContextBtn').onclick=()=>E('agentAttachmentInput').click();E('promptEnhanceBtn').onclick=togglePromptEnhancement;E('agentAttachmentInput').onchange=()=>uploadAgentAttachments(E('agentAttachmentInput').files).catch(showError);const agentComposer=E('agentComposer'),agentPrompt=E('agentPrompt'),dropHint=E('agentDropHint');let agentDragDepth=0;for(const type of ['dragenter','dragover'])agentComposer.addEventListener(type,event=>{event.preventDefault();if(type==='dragenter')agentDragDepth++;agentComposer.classList.add('is-dragover');dropHint.classList.remove('is-hidden')});for(const type of ['dragleave','dragend'])agentComposer.addEventListener(type,event=>{event.preventDefault();if(type==='dragleave')agentDragDepth--;if(agentDragDepth<=0){agentDragDepth=0;agentComposer.classList.remove('is-dragover');dropHint.classList.add('is-hidden')}});agentComposer.addEventListener('drop',event=>{event.preventDefault();agentDragDepth=0;agentComposer.classList.remove('is-dragover');dropHint.classList.add('is-hidden');const files=event.dataTransfer?.files;if(files?.length)uploadAgentAttachments(files).catch(showError)});agentPrompt.addEventListener('paste',event=>{const files=agentClipboardFiles(event);if(!files.length)return;event.preventDefault();uploadAgentAttachments(files).catch(showError)});E('agentModelBtn').onclick=event=>{event.stopPropagation();showAgentModelMenu(event.currentTarget).catch(showError)};E('agentTodoToggle').onclick=()=>{S.agentTodoCollapsed=!S.agentTodoCollapsed;E('agentTodoPanel').classList.toggle('is-collapsed',S.agentTodoCollapsed);E('agentTodoToggle').setAttribute('aria-expanded',String(!S.agentTodoCollapsed));scheduleStateSave()};E('newAgentChatBtn').onclick=()=>createSession().catch(showError);E('promptEnhanceClose').onclick=()=>closePromptEnhanceReview();E('promptUseOriginal').onclick=()=>usePromptReview(true).catch(showError);E('promptRegenerate').onclick=()=>regeneratePromptReview().catch(showError);E('promptUseEnhanced').onclick=()=>usePromptReview(false).catch(showError);E('promptEnhanceEditor').onkeydown=event=>{if((event.ctrlKey||event.metaKey)&&event.key==='Enter'){event.preventDefault();usePromptReview(false).catch(showError)}};E('promptEnhanceOverlay').onclick=event=>{if(event.target===E('promptEnhanceOverlay'))closePromptEnhanceReview()};renderPromptEnhanceToggle();
   bindPromptEnhanceButton();
   E('accountsBtn').onclick=()=>showAccountModal().catch(showError);E('accountStatus').onclick=()=>showAccountModal().catch(showError);E('manageBtn').onclick=event=>showMenu(event.currentTarget,['accounts.manage','file.openFolder','workbench.action.showCommands']);E('notificationsBtn').onclick=()=>toast('No new notifications.','success',2500);E('gitStatus').onclick=()=>showView('scm');E('errorStatus').onclick=()=>showPanel('problems');
@@ -104698,7 +106897,7 @@ class SkillsStudioStore:
             else:
                 raise SkillsStudioError("isolation_unavailable", f"backend {name or 'unknown'} is not supported for Studio evaluation", 503)
             try:
-                completed = subprocess.run(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
+                completed = run_subprocess_text(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
                 passed = completed.returncode == 0; evidence = {"isolated": True, "passed": passed, "backend": name, "network": "disabled", "scripts": [x["path"] for x in scripts], "exit_code": completed.returncode, "stdout": trim(completed.stdout, 4000), "stderr": trim(completed.stderr, 4000), "evaluated_at": now_ts()}
             except subprocess.TimeoutExpired as exc:
                 evidence = {"isolated": True, "passed": False, "backend": name, "network": "disabled", "scripts": [x["path"] for x in scripts], "timeout": True, "stderr": trim(str(exc), 2000), "evaluated_at": now_ts()}
@@ -105141,6 +107340,7 @@ class AppContext:
         self.codes_root = (self.workspace / "Codes").resolve()
         self.codes_root.mkdir(parents=True, exist_ok=True)
         self.crypto = CryptoBox(self.codes_root)
+        self.process_manager = UserProcessManager()
         self._session_mgrs: dict[str, SessionManager] = {}
         self._lock = threading.RLock()
         self.max_user = max(0, int(max_user or 0))
@@ -105323,7 +107523,7 @@ class AppContext:
         feature: str = "processes",
     ) -> list[str]:
         if not remote:
-            return []
+            return sess._hard_snapshot_shell_prefix(cwd, feature=feature) if sess.skill_mode == "hard" else []
         sess.ide_remote_sandbox_required = True
         prefix = sess._workspace_sandbox_shell_prefix(cwd, feature=feature)
         if not prefix:
@@ -106138,6 +108338,269 @@ class AppContext:
             "active_session_id": latest_id,
             "session_creation_limit": quota,
         }
+
+    def _ide_legacy_source_user(self, client_ip: str) -> str:
+        return user_id_from_ip(_normalize_ip(client_ip))
+
+    def _ide_legacy_session_running(self, user_id: str, sess: SessionState) -> bool:
+        if bool(getattr(sess, "running", False)) or bool(getattr(sess, "scheduler_starting", False)):
+            return True
+        try:
+            if any(
+                str(row.get("status", "") or "") in {"starting", "running", "stopping"}
+                for row in sess.bg.list_objects()
+            ):
+                return True
+        except Exception:
+            pass
+        try:
+            processes = self.process_manager.list_processes(
+                owner_user_id=user_id,
+                session_id=sess.id,
+                limit=500,
+            ).get("processes", [])
+            if any(str(row.get("status", "") or "") in {"starting", "running", "stopping"} for row in processes):
+                return True
+        except Exception:
+            pass
+        with self.ide_terminal_lock:
+            for terminal in self.ide_terminals.values():
+                if (
+                    str(terminal.get("user_id", "") or "") == user_id
+                    and str(terminal.get("session_id", "") or "") == sess.id
+                    and terminal.get("process") is not None
+                    and terminal["process"].poll() is None
+                ):
+                    return True
+        with self.ide_debug_lock:
+            for debug in self.ide_debug_sessions.values():
+                if (
+                    str(debug.get("user_id", "") or "") == user_id
+                    and str(debug.get("session_id", "") or "") == sess.id
+                    and debug.get("process") is not None
+                    and debug["process"].poll() is None
+                ):
+                    return True
+        return False
+
+    def ide_applications_payload(
+        self,
+        user_id: str,
+        *,
+        client_ip: str,
+        collaboration: bool = False,
+    ) -> dict:
+        skill_catalog_fn = getattr(self.applications, "skill_catalog", None)
+        skill_catalog = list(skill_catalog_fn()) if callable(skill_catalog_fn) and not collaboration else []
+        shared = []
+        for row in self.applications.list_shared():
+            item = dict(row)
+            item.update({"origin": "shared", "launchable": not collaboration})
+            shared.append(item)
+        if collaboration:
+            return {
+                "ok": True,
+                "personal": [],
+                "shared": shared,
+                "legacy_personal": [],
+                "web_sessions": [],
+                "skill_catalog": [],
+                "collaboration": True,
+            }
+        personal = []
+        for row in self.applications.list_personal(user_id):
+            item = dict(row)
+            item.update({"origin": "ide", "launchable": True})
+            personal.append(item)
+        source_user = self._ide_legacy_source_user(client_ip)
+        legacy_personal: list[dict] = []
+        web_sessions: list[dict] = []
+        if source_user != user_id:
+            for row in self.applications.list_personal(source_user):
+                item = dict(row)
+                item.update({"origin": "web", "importable": True})
+                legacy_personal.append(item)
+            source_manager = self.manager_for_user(source_user)
+            listed = source_manager.list(limit=2000, offset=0)
+            summaries = listed.get("sessions", []) if isinstance(listed, dict) else listed
+            for summary in summaries:
+                source_session = source_manager.get(str(summary.get("id", "") or ""))
+                if source_session is None or source_session.skill_mode != "hard" or not source_session.app_binding:
+                    continue
+                running = self._ide_legacy_session_running(source_user, source_session)
+                web_sessions.append({
+                    "id": source_session.id,
+                    "title": source_session.title,
+                    "updated_at": float(source_session.updated_at or 0.0),
+                    "message_count": int(summary.get("message_count", 0) or 0),
+                    "running": running,
+                    "importable": not running,
+                    "app_binding": dict(source_session.app_binding),
+                })
+        return {
+            "ok": True,
+            "personal": personal,
+            "shared": shared,
+            "legacy_personal": legacy_personal,
+            "web_sessions": web_sessions,
+            "skill_catalog": skill_catalog,
+            "collaboration": False,
+        }
+
+    def ide_launch_application(
+        self,
+        user_id: str,
+        app_id: str,
+        *,
+        client_ip: str,
+        collaboration: bool = False,
+    ) -> dict:
+        if collaboration or str(user_id or "").startswith("collab:"):
+            raise IDECapabilityError(
+                "collaboration_application_launch_unavailable",
+                "Shared application launch is unavailable because collaboration sessions share one workspace.",
+                409,
+            )
+        return self.launch_application_for_user(user_id, app_id, client_ip=client_ip)
+
+    def ide_import_application(self, user_id: str, app_id: str, *, client_ip: str) -> dict:
+        if str(user_id or "").startswith("collab:"):
+            raise IDECapabilityError("collaboration_import_denied", "IP-private applications cannot be imported into collaboration.", 403)
+        source_user = self._ide_legacy_source_user(client_ip)
+        if source_user == user_id:
+            raise IDECapabilityError("application_already_available", "The application already belongs to this IDE identity.", 409)
+        out = self.applications.import_personal(source_user, user_id, app_id)
+        return {"ok": True, **out}
+
+    def _rollback_session_quota_reservation(self, user_id: str) -> None:
+        with self._lock:
+            state = self._load_session_daily_limit_state_locked(user_id)
+            state["used"] = max(0, int(state.get("used", 0) or 0) - 1)
+            self._save_session_daily_limit_state_locked(user_id, state)
+
+    def ide_import_application_session(
+        self,
+        user_id: str,
+        session_id: str,
+        *,
+        client_ip: str,
+    ) -> dict:
+        if str(user_id or "").startswith("collab:"):
+            raise IDECapabilityError("collaboration_import_denied", "IP-private sessions cannot be imported into collaboration.", 403)
+        source_user = self._ide_legacy_source_user(client_ip)
+        if source_user == user_id:
+            raise IDECapabilityError("session_already_available", "The session already belongs to this IDE identity.", 409)
+        source_manager = self.manager_for_user(source_user)
+        source = source_manager.get(str(session_id or "").strip())
+        if source is None or source.skill_mode != "hard" or not source.app_binding:
+            raise KeyError("importable application session not found")
+        if self._ide_legacy_session_running(source_user, source):
+            raise IDECapabilityError("source_session_running", "Stop the WebUI session and its processes before importing it.", 409)
+
+        imported_app_id = ""
+        created_session_id = ""
+        staging: Path | None = None
+        target_manager = self.manager_for_user(user_id)
+        quota_status: dict = {}
+        try:
+            source_binding = dict(source.app_binding)
+            source_app_id = str(source_binding.get("app_id", "") or "")
+            if str(source_binding.get("scope", "personal") or "personal") == "personal":
+                imported = self.applications.import_personal(source_user, user_id, source_app_id)
+                imported_app_id = str(imported.get("application", {}).get("id", "") or "")
+            else:
+                self.applications.resolve_launch(user_id, source_app_id)
+                imported_app_id = source_app_id
+
+            target, quota_status = self.create_session_for_user(
+                user_id,
+                source.title,
+                client_ip=client_ip,
+            )
+            created_session_id = target.id
+            target_root = target.root
+            staging = target_manager.root / f".{created_session_id}.{uuid.uuid4().hex}.import"
+            with source.lock:
+                if self._ide_legacy_session_running(source_user, source):
+                    raise IDECapabilityError("source_session_running", "The WebUI session started running during import.", 409)
+                integrity_error = source._verify_application_snapshot_integrity(restore=True)
+                if integrity_error:
+                    raise ValueError(integrity_error)
+                source._persist()
+                shutil.copytree(source.root, staging, symlinks=True)
+
+            with target_manager.lock:
+                target_manager.sessions.pop(created_session_id, None)
+                target_manager.session_index.pop(created_session_id, None)
+            shutil.rmtree(target_root, ignore_errors=True)
+
+            state_path = staging / "state.json"
+            state = self.crypto.read_json(state_path, {})
+            if not isinstance(state, dict):
+                raise ValueError("source session state is invalid")
+            state["id"] = created_session_id
+            binding = dict(state.get("app_binding", {}) or {})
+            binding["app_id"] = imported_app_id
+            if imported_app_id != source_app_id:
+                binding["source_app_id"] = source_app_id
+                binding["scope"] = "personal"
+            state["app_binding"] = binding
+            state["thinking"] = False
+            self.crypto.write_json(state_path, state)
+            shutil.copy2(state_path, state_path.with_name("state.json.bak"))
+
+            meta_path = staging / "meta.json"
+            meta = self.crypto.read_json(meta_path, {})
+            if not isinstance(meta, dict):
+                meta = {}
+            meta["id"] = created_session_id
+            self.crypto.write_json(meta_path, meta)
+            shutil.copy2(meta_path, meta_path.with_name("meta.json.bak"))
+
+            recovery_path = staging / ".application_snapshot_recovery.json"
+            if recovery_path.exists():
+                recovery = self.crypto.read_json(recovery_path, {})
+                if not isinstance(recovery, dict):
+                    raise ValueError("source application recovery package is invalid")
+                recovery["session_id"] = created_session_id
+                recovery["app_id"] = imported_app_id
+                self.crypto.write_json(recovery_path, recovery)
+                shutil.copy2(recovery_path, recovery_path.with_name(recovery_path.name + ".bak"))
+            os.replace(staging, target_root)
+            staging = None
+            imported_session = target_manager.get(created_session_id)
+            if imported_session is None:
+                raise RuntimeError("imported session could not be loaded")
+            integrity_error = imported_session._ensure_application_snapshot_recovery()
+            if integrity_error:
+                raise ValueError(integrity_error)
+            return {
+                "ok": True,
+                "id": imported_session.id,
+                "title": imported_session.title,
+                "ui_language": imported_session.ui_language,
+                "app_binding": dict(imported_session.app_binding),
+                "source_session_id": source.id,
+                "session_creation_limit": quota_status,
+            }
+        except Exception:
+            if staging is not None:
+                shutil.rmtree(staging, ignore_errors=True)
+            if created_session_id:
+                with target_manager.lock:
+                    target_manager.sessions.pop(created_session_id, None)
+                    target_manager.session_index.pop(created_session_id, None)
+                shutil.rmtree(target_manager.root / created_session_id, ignore_errors=True)
+                try:
+                    self._rollback_session_quota_reservation(user_id)
+                except Exception:
+                    pass
+            if imported_app_id and imported_app_id != str((source.app_binding or {}).get("app_id", "") or ""):
+                try:
+                    self.applications.remove_imported_copy(user_id, imported_app_id)
+                except Exception:
+                    pass
+            raise
 
     def ide_config(self, user_id: str, client_ip: str = "") -> dict:
         if str(client_ip or "").strip() and not str(user_id or "").startswith("collab:"):
@@ -107945,18 +110408,18 @@ document.addEventListener('DOMContentLoaded', function(){{
         body = payload if isinstance(payload, dict) else {}
         root_id = str(body.get("root_id", body.get("root", "session")) or "session")
         root, _, meta = self.ide_resolve_workspace(user_id, session_id, root_id, ".")
-        probe = subprocess.run(["git", "-C", str(root), "rev-parse", "--show-toplevel"], capture_output=True, text=True, timeout=8)
+        probe = run_subprocess_text(["git", "-C", str(root), "rev-parse", "--show-toplevel"], capture_output=True, timeout=8)
         if probe.returncode != 0:
             return {"ok": True, "repository": False, "root": meta, "changes": [], "branch": ""}
         repo_root = Path(probe.stdout.strip()).resolve()
         if repo_root != root.resolve() and not repo_root.is_relative_to(root.resolve()):
             return {"ok": True, "repository": False, "root": meta, "changes": [], "branch": ""}
-        status = subprocess.run(
+        status = run_subprocess_text(
             ["git", "-C", str(root), "status", "--porcelain=v1", "-z", "--branch"],
             capture_output=True,
             timeout=12,
         )
-        raw = status.stdout.decode("utf-8", errors="replace")
+        raw = status.stdout
         parts = raw.split("\0")
         branch = ""
         changes: list[dict] = []
@@ -107986,7 +110449,7 @@ document.addEventListener('DOMContentLoaded', function(){{
             command.append("--cached")
         if rel:
             command.extend(["--", rel])
-        proc = subprocess.run(command, capture_output=True, text=True, timeout=15)
+        proc = run_subprocess_text(command, capture_output=True, timeout=15)
         return {"ok": proc.returncode == 0, "root": meta, "path": rel, "diff": trim(proc.stdout, 400_000), "error": trim(proc.stderr, 4000)}
 
     def _ide_terminal_for_user(self, user_id: str, terminal_id: str) -> dict:
@@ -108036,6 +110499,10 @@ document.addEventListener('DOMContentLoaded', function(){{
                     terminal["closed"] = True
                     terminal["returncode"] = int(returncode)
             if returncode is not None and not chunk:
+                if not terminal.get("integrity_checked", False):
+                    sess = self._ide_session(str(terminal.get("user_id", "")), str(terminal.get("session_id", "")))
+                    terminal["integrity_error"] = sess._hard_snapshot_integrity_callback("after", "interactive terminal")
+                    terminal["integrity_checked"] = True
                 if mode == "pty" and fd is not None:
                     try:
                         os.close(int(fd))
@@ -108070,56 +110537,70 @@ document.addEventListener('DOMContentLoaded', function(){{
         cols = max(20, min(500, int(payload.get("cols", 100) or 100)))
         rows = max(5, min(200, int(payload.get("rows", 30) or 30)))
         sess = self._ide_session(user_id, session_id)
+        integrity_error = sess._hard_snapshot_integrity_callback("before", "interactive terminal")
+        if integrity_error:
+            raise PermissionError(integrity_error)
         prefix = self._ide_process_prefix(sess, remote=remote, cwd=cwd, feature="terminal")
         env = sess._shell_process_env()
         env.update({"TERM": "xterm-256color", "COLORTERM": "truecolor", "CLOUDS_CODER_IDE": "1"})
         master_fd: int | None = None
         mode = "pipe" if windows_pipe else "pty"
-        if mode == "pipe":
-            shell_name = Path(shell).name.lower()
-            if shell_name in {"powershell", "powershell.exe", "pwsh", "pwsh.exe"}:
-                process_command: object = [shell, "-NoLogo", "-NoProfile", "-NoExit", "-Command", "[Console]::InputEncoding=[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false)"]
+        try:
+            if mode == "pipe":
+                shell_name = Path(shell).name.lower()
+                if shell_name in {"powershell", "powershell.exe", "pwsh", "pwsh.exe"}:
+                    process_command: object = [shell, "-NoLogo", "-NoProfile", "-NoExit", "-Command", "[Console]::InputEncoding=[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false)"]
+                else:
+                    process_command = [shell, "/Q", "/K", "chcp 65001>nul"]
+                popen_kwargs = {
+                    "stdin": subprocess.PIPE,
+                    "stdout": subprocess.PIPE,
+                    "stderr": subprocess.STDOUT,
+                    "bufsize": 0,
+                }
+                if _is_windows_job_sandbox_prefix(prefix):
+                    process = _popen_windows_sandboxed(
+                        process_command,
+                        workspace_root=root,
+                        cwd=cwd,
+                        env=env,
+                        **popen_kwargs,
+                    )
+                else:
+                    process = subprocess.Popen(
+                        process_command,
+                        cwd=str(cwd),
+                        env=env,
+                        creationflags=int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) or 0),
+                        **popen_kwargs,
+                    )
             else:
-                process_command = [shell, "/Q", "/K", "chcp 65001>nul"]
-            popen_kwargs = {
-                "stdin": subprocess.PIPE,
-                "stdout": subprocess.PIPE,
-                "stderr": subprocess.STDOUT,
-                "bufsize": 0,
-            }
-            if _is_windows_job_sandbox_prefix(prefix):
-                process = _popen_windows_sandboxed(
-                    process_command,
-                    workspace_root=root,
-                    cwd=cwd,
-                    env=env,
-                    **popen_kwargs,
-                )
-            else:
-                process = subprocess.Popen(
-                    process_command,
-                    cwd=str(cwd),
-                    env=env,
-                    creationflags=int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) or 0),
-                    **popen_kwargs,
-                )
-        else:
-            master_fd, slave_fd = _pty.openpty()
-            self._ide_terminal_set_size(slave_fd, cols, rows)
-            process_command = [*prefix, shell, "-f"] if prefix else [shell, "-l"]
-            try:
-                process = subprocess.Popen(
-                    process_command,
-                    cwd=str(cwd),
-                    env=env,
-                    stdin=slave_fd,
-                    stdout=slave_fd,
-                    stderr=slave_fd,
-                    start_new_session=True,
-                    close_fds=True,
-                )
-            finally:
-                os.close(slave_fd)
+                master_fd, slave_fd = _pty.openpty()
+                self._ide_terminal_set_size(slave_fd, cols, rows)
+                process_command = [*prefix, shell, "-f"] if prefix else [shell, "-l"]
+                try:
+                    process = subprocess.Popen(
+                        process_command,
+                        cwd=str(cwd),
+                        env=env,
+                        stdin=slave_fd,
+                        stdout=slave_fd,
+                        stderr=slave_fd,
+                        start_new_session=True,
+                        close_fds=True,
+                    )
+                finally:
+                    os.close(slave_fd)
+        except Exception as exc:
+            if master_fd is not None:
+                try:
+                    os.close(master_fd)
+                except OSError:
+                    pass
+            integrity_error = sess._hard_snapshot_integrity_callback("after", "interactive terminal")
+            if integrity_error:
+                raise RuntimeError(f"{exc}; {integrity_error}") from exc
+            raise
         terminal_id = "term_" + uuid.uuid4().hex[:20]
         terminal = {
             "id": terminal_id,
@@ -108136,6 +110617,8 @@ document.addEventListener('DOMContentLoaded', function(){{
             "output_end": 0,
             "closed": False,
             "returncode": None,
+            "integrity_checked": False,
+            "integrity_error": "",
             "created_at": now_ts(),
             "last_activity": now_ts(),
             "lock": threading.RLock(),
@@ -108160,11 +110643,12 @@ document.addEventListener('DOMContentLoaded', function(){{
                 "offset": effective,
                 "next_offset": end,
                 "reset": requested < start,
-                "data": data.decode("utf-8", errors="replace"),
+                "data": decode_subprocess_bytes(data)[0],
                 "data_b64": base64.b64encode(data).decode("ascii"),
                 "encoding": "utf-8",
                 "closed": bool(terminal["closed"]),
                 "returncode": terminal["returncode"],
+                "integrity_error": str(terminal.get("integrity_error", "") or ""),
             }
 
     def ide_terminal_input(self, user_id: str, terminal_id: str, payload: dict) -> dict:
@@ -108218,7 +110702,12 @@ document.addEventListener('DOMContentLoaded', function(){{
         with terminal["lock"]:
             terminal["closed"] = True
             terminal["returncode"] = process.poll()
-        return {"ok": True, "terminal_id": terminal_id}
+            if not terminal.get("integrity_checked", False):
+                sess = self._ide_session(user_id, str(terminal.get("session_id", "")))
+                terminal["integrity_error"] = sess._hard_snapshot_integrity_callback("after", "interactive terminal")
+                terminal["integrity_checked"] = True
+            integrity_error = str(terminal.get("integrity_error", "") or "")
+        return {"ok": not bool(integrity_error), "terminal_id": terminal_id, "error": integrity_error}
 
     @staticmethod
     def _ide_parse_jsonc(text: str) -> dict:
@@ -108250,7 +110739,7 @@ document.addEventListener('DOMContentLoaded', function(){{
         task = next((row for row in listed["tasks"] if str(row.get("id", "")) == task_id), None)
         if not task:
             raise KeyError("task not found")
-        command = " ".join([shlex.quote(str(task["command"])), *[shlex.quote(str(x)) for x in task.get("args", [])]])
+        command = join_shell_task_command(task["command"], task.get("args", []))
         return self.ide_run_command(
             user_id,
             session_id,
@@ -108546,7 +111035,7 @@ document.addEventListener('DOMContentLoaded', function(){{
         except Exception:
             return ""
         if isinstance(raw, bytes):
-            return raw.decode("utf-8", errors="replace").strip()
+            return decode_subprocess_bytes(raw)[0].strip()
         return str(raw or "").strip()
 
     def _ide_debug_start_adapter(
@@ -108645,13 +111134,22 @@ document.addEventListener('DOMContentLoaded', function(){{
         root_id = str(payload.get("root_id", "session") or "session")
         root, _, meta = self.ide_resolve_workspace(user_id, session_id, root_id, ".")
         sess = self._ide_session(user_id, session_id)
+        integrity_error = sess._hard_snapshot_integrity_callback("before", "debug adapter")
+        if integrity_error:
+            raise PermissionError(integrity_error)
         prefix = self._ide_process_prefix(sess, remote=remote, cwd=root, feature="debug")
         process_env = sess._shell_process_env()
-        process, transport, reader, adapter_port = self._ide_debug_start_adapter(
-            root=root,
-            prefix=prefix,
-            process_env=process_env,
-        )
+        try:
+            process, transport, reader, adapter_port = self._ide_debug_start_adapter(
+                root=root,
+                prefix=prefix,
+                process_env=process_env,
+            )
+        except Exception as exc:
+            integrity_error = sess._hard_snapshot_integrity_callback("after", "debug adapter")
+            if integrity_error:
+                raise RuntimeError(f"{exc}; {integrity_error}") from exc
+            raise
         debug_id = "debug_" + uuid.uuid4().hex[:20]
         debug = {
             "id": debug_id,
@@ -108668,6 +111166,8 @@ document.addEventListener('DOMContentLoaded', function(){{
             "closed": False,
             "created_at": now_ts(),
             "last_activity": now_ts(),
+            "integrity_checked": False,
+            "integrity_error": "",
             "lock": threading.RLock(),
         }
         with self.ide_debug_lock:
@@ -108712,7 +111212,11 @@ document.addEventListener('DOMContentLoaded', function(){{
                     stderr = debug["process"].stderr.read(32_000)
                 except Exception:
                     pass
-            return {"ok": True, "messages": messages, "closed": bool(debug["closed"]), "stderr": stderr.decode("utf-8", errors="replace")}
+                if not debug.get("integrity_checked", False):
+                    sess = self._ide_session(user_id, str(debug.get("session_id", "")))
+                    debug["integrity_error"] = sess._hard_snapshot_integrity_callback("after", "debug adapter")
+                    debug["integrity_checked"] = True
+            return {"ok": not bool(debug.get("integrity_error")), "messages": messages, "closed": bool(debug["closed"]), "stderr": decode_subprocess_bytes(stderr)[0], "integrity_error": str(debug.get("integrity_error", "") or "")}
 
     def ide_debug_close(self, user_id: str, debug_id: str) -> dict:
         debug = self._ide_debug_for_user(user_id, debug_id)
@@ -108734,7 +111238,13 @@ document.addEventListener('DOMContentLoaded', function(){{
         except OSError:
             pass
         self._ide_debug_stop_process(process)
-        return {"ok": True, "debug_id": debug_id}
+        with debug["lock"]:
+            if not debug.get("integrity_checked", False):
+                sess = self._ide_session(user_id, str(debug.get("session_id", "")))
+                debug["integrity_error"] = sess._hard_snapshot_integrity_callback("after", "debug adapter")
+                debug["integrity_checked"] = True
+            integrity_error = str(debug.get("integrity_error", "") or "")
+        return {"ok": not bool(integrity_error), "debug_id": debug_id, "error": integrity_error}
 
     def ide_run_command(self, user_id: str, session_id: str, payload: dict, *, remote: bool = False) -> dict:
         command = str(payload.get("command", "") or "").strip()
@@ -108761,16 +111271,9 @@ document.addEventListener('DOMContentLoaded', function(){{
             shell_prefix = self._ide_process_prefix(sess, remote=remote, cwd=cwd)
             if not shell_prefix and sess.skill_mode == "hard":
                 shell_prefix = sess._hard_snapshot_shell_prefix(cwd)
-            if shell_prefix and remote:
+            if shell_prefix:
                 effective_command = sess._sandbox_virtualize_command(effective_command, cwd)
-            windows_job = _is_windows_job_sandbox_prefix(shell_prefix)
-            run_command: object = effective_command
-            run_shell = True
-            if os.name == "nt" and (not shell_prefix or windows_job):
-                run_command = f"chcp 65001>nul & {effective_command}"
-            if shell_prefix and not windows_job:
-                run_command = [*shell_prefix, "/bin/sh", "-c", effective_command]
-                run_shell = False
+            run_command, run_shell, windows_job = shell_process_invocation(effective_command, shell_prefix)
             process_env = sess._shell_process_env()
             if windows_job:
                 proc = _run_windows_sandboxed_command(
@@ -108781,13 +111284,10 @@ document.addEventListener('DOMContentLoaded', function(){{
                     timeout=timeout,
                 )
             else:
-                proc = subprocess.run(
+                proc = run_subprocess_text(
                     run_command,
                     cwd=str(cwd),
                     shell=run_shell,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
                     capture_output=True,
                     timeout=timeout,
                     env=process_env,
@@ -108803,6 +111303,14 @@ document.addEventListener('DOMContentLoaded', function(){{
                 "duration_ms": int((now_ts() - started) * 1000),
                 "timeout": timeout,
             }
+            integrity_error = sess._hard_snapshot_integrity_callback("after", command)
+            if integrity_error:
+                result.update({
+                    "ok": False,
+                    "returncode": -1,
+                    "stderr": trim(f"{result['stderr']}\n{integrity_error}".strip(), 120_000),
+                    "integrity_error": integrity_error,
+                })
             changed_files = workspace_revision_delta(before_files, workspace_file_revision_map(root))
             result["changed_files"] = changed_files
             if changed_files:
@@ -108827,6 +111335,10 @@ document.addEventListener('DOMContentLoaded', function(){{
                 "timeout": timeout,
                 "timed_out": True,
             }
+            integrity_error = sess._hard_snapshot_integrity_callback("after", command)
+            if integrity_error:
+                result["stderr"] = trim(f"{result['stderr']}\n{integrity_error}".strip(), 80_000)
+                result["integrity_error"] = integrity_error
             changed_files = workspace_revision_delta(before_files, workspace_file_revision_map(root))
             result["changed_files"] = changed_files
             if changed_files:
@@ -108838,6 +111350,20 @@ document.addEventListener('DOMContentLoaded', function(){{
                     paths=changed_files,
                 )
             return result
+        except Exception as exc:
+            integrity_error = sess._hard_snapshot_integrity_callback("after", command)
+            changed_files = workspace_revision_delta(before_files, workspace_file_revision_map(root))
+            if changed_files:
+                self._ide_emit_workspace_change(
+                    user_id,
+                    session_id,
+                    root_id=root_id,
+                    action="command",
+                    paths=changed_files,
+                )
+            if integrity_error:
+                raise RuntimeError(f"{exc}; {integrity_error}") from exc
+            raise
 
     def ide_agent_task(
         self,
@@ -108977,24 +111503,35 @@ document.addEventListener('DOMContentLoaded', function(){{
             },
         }
 
-    def _ide_prompt_skill_catalog(self) -> tuple[SkillStore, list[dict], bool]:
+    def _ide_prompt_skill_catalog(self, query: str = "") -> tuple[SkillStore, list[dict], bool]:
         store = self._ensure_skills_store(force=False)
         rows: list[dict] = []
-        for item in store.list_metadata():
+        source_rows = store.recall_metadata(query, limit=12) if str(query or "").strip() else store.list_metadata()
+        total_count = len([row for row in store.list_metadata() if isinstance(row, dict) and str(row.get("id", "")) != "_warnings"])
+        for item in source_rows:
             if not isinstance(item, dict) or str(item.get("id", "") or "") == "_warnings":
                 continue
             row = {
                 "id": str(item.get("id", "") or ""),
+                "canonical_id": str(item.get("canonical_id", item.get("id", "")) or ""),
                 "name": str(item.get("name", "") or ""),
                 "description": str(item.get("description", "") or ""),
                 "provider": str(item.get("provider_id", "") or ""),
                 "triggers": [str(value) for value in list(item.get("triggers", []) or [])],
+                "negative_triggers": [str(value) for value in list(item.get("negative_triggers", []) or [])],
+                "keywords": [str(value) for value in list(item.get("keywords", []) or [])],
+                "aliases": [str(value) for value in list(item.get("aliases", []) or [])],
+                "category": str(item.get("category", "") or ""),
+                "infrastructure_only": bool(item.get("infrastructure_only", False)),
+                "requires": [str(value) for value in list(item.get("requires", []) or [])],
+                "conflicts": [str(value) for value in list(item.get("conflicts", []) or [])],
                 "entrypoints": [str(value) for value in list(item.get("entrypoints", []) or [])],
+                "_selection_query": trim(str(query or ""), 1000),
             }
             if not row["id"]:
                 continue
             rows.append(row)
-        return store, rows, False
+        return store, rows, len(rows) < total_count
 
     @staticmethod
     def _ide_validate_selected_skills(
@@ -109027,17 +111564,45 @@ document.addEventListener('DOMContentLoaded', function(){{
             else:
                 continue
             canonical = requested if requested in catalog_by_id else ""
+            resolution = {}
             if not canonical and requested:
                 try:
-                    resolved, error = store._resolve_name(requested)
+                    resolution = store.canonicalize_id(requested)
+                    if resolution.get("ok") and resolution.get("canonical_id") in catalog_by_id:
+                        canonical = str(resolution.get("canonical_id"))
                 except Exception:
-                    resolved, error = None, "unavailable"
-                if not error and resolved in catalog_by_id:
-                    canonical = str(resolved)
+                    try:
+                        resolved, error = store._resolve_name(requested)
+                    except Exception:
+                        resolved, error = None, "unavailable"
+                    if not error and resolved in catalog_by_id:
+                        canonical = str(resolved)
             if not canonical or canonical in seen:
                 continue
             seen.add(canonical)
             meta = catalog_by_id[canonical]
+            if bool(meta.get("infrastructure_only", False)):
+                continue
+            # Negative triggers are hard filters shared with runtime selection.
+            # The IDE validator receives only the selected task, so callers can
+            # optionally provide it via the catalog row's private query marker.
+            negative_query = str(meta.get("_selection_query", "") or "").casefold()
+            if negative_query and any(str(value).casefold() in negative_query for value in meta.get("negative_triggers", []) or []):
+                continue
+            selected_ids = {str(row.get("id", "") or "").casefold() for row in selected}
+            selected_names = {str(row.get("name", "") or "").casefold() for row in selected}
+            declared_conflicts = {str(value).casefold() for value in meta.get("conflicts", []) or []}
+            if declared_conflicts & (selected_ids | selected_names):
+                continue
+            reverse_conflict = False
+            for previous in selected:
+                previous_meta = catalog_by_id.get(str(previous.get("id", "") or ""), {})
+                reverse = {str(value).casefold() for value in previous_meta.get("conflicts", []) or []}
+                if canonical.casefold() in reverse or str(meta.get("name", canonical)).casefold() in reverse:
+                    reverse_conflict = True
+                    break
+            if reverse_conflict:
+                continue
             selected.append(
                 {
                     "id": canonical,
@@ -109047,7 +111612,27 @@ document.addEventListener('DOMContentLoaded', function(){{
                     "order": len(selected) + 1,
                 }
             )
-        return selected
+        selected_ids = {str(row.get("id", "") or "") for row in selected}
+        selected_names = {str(row.get("name", "") or "") for row in selected}
+        dependency_valid: list[dict] = []
+        for row in selected:
+            meta = catalog_by_id.get(str(row.get("id", "") or ""), {})
+            missing = False
+            for requirement in meta.get("requires", []) or []:
+                required_id = str(requirement)
+                try:
+                    resolved = store.canonicalize_id(requirement)
+                    if resolved.get("ok"):
+                        required_id = str(resolved.get("canonical_id", required_id))
+                except Exception:
+                    pass
+                if required_id not in selected_ids and str(requirement) not in selected_names:
+                    missing = True
+                    break
+            if not missing:
+                row["order"] = len(dependency_valid) + 1
+                dependency_valid.append(row)
+        return dependency_valid
 
     @staticmethod
     def _ide_normalize_execution_steps(raw: object) -> list[dict]:
@@ -109548,9 +112133,23 @@ document.addEventListener('DOMContentLoaded', function(){{
         skill_catalog: list[dict] = []
         skill_catalog_truncated = False
         skill_catalog_warning = ""
+        skill_catalog_total = 0
         if skills_aware:
             try:
-                skill_store, skill_catalog, skill_catalog_truncated = self._ide_prompt_skill_catalog()
+                skill_query = " ".join(
+                    [original, active_path, *attachments, *[str(row.get("path", "") or "") for row in list(workspace_snapshot.get("entries", []) or [])[:30] if isinstance(row, dict)]]
+                )
+                try:
+                    skill_store, skill_catalog, skill_catalog_truncated = self._ide_prompt_skill_catalog(skill_query)
+                except TypeError:
+                    # Compatibility for integrations overriding the historical
+                    # no-argument catalog hook.
+                    skill_store, skill_catalog, skill_catalog_truncated = self._ide_prompt_skill_catalog()
+                skill_catalog_total = (
+                    len(skill_store.skills)
+                    if skill_store is not None and hasattr(skill_store, "skills")
+                    else len(skill_catalog)
+                )
             except Exception as exc:
                 skill_catalog_warning = trim(str(exc), 500)
         sess = self._ide_session(user_id, session_id)
@@ -109602,6 +112201,8 @@ document.addEventListener('DOMContentLoaded', function(){{
                 "enabled": skills_aware,
                 "selection_limit": int(budget_spec["max_skills"]),
                 "catalog": skill_catalog if skills_aware else [],
+                "total_count": skill_catalog_total,
+                "candidate_count": len(skill_catalog),
                 "catalog_truncated": bool(skill_catalog_truncated),
                 "catalog_warning": skill_catalog_warning,
             },
@@ -109612,9 +112213,9 @@ document.addEventListener('DOMContentLoaded', function(){{
             "previous_candidate": previous_prompt,
         }
         skill_selection_instruction = (
-            f"Skills awareness is enabled. Select between 1 and {int(budget_spec['max_skills'])} materially relevant skills from skills_awareness.catalog. "
+            f"Skills awareness is enabled. Select between 0 and {int(budget_spec['max_skills'])} materially relevant skills from skills_awareness.catalog. "
             "Use only exact catalog ids. Return them in selected_skills in intended execution order with a concise task-specific rationale. "
-            "Do not select redundant skills merely to reach the limit. The server will validate ids and provide full instructions for a refinement pass. "
+            "Return an empty array for simple or unmatched work. Do not select redundant skills merely to reach the limit. The server will validate ids and provide full instructions for a refinement pass. "
             if skills_aware and skill_catalog
             else "Skills awareness is disabled or no skill catalog is available. Return selected_skills as an empty array. "
         )
@@ -109750,8 +112351,8 @@ document.addEventListener('DOMContentLoaded', function(){{
                 selection_started = time.monotonic()
                 selection_system = (
                     "Select the most materially useful skills for the downstream Agent task. "
-                    f"Choose 1 to {int(budget_spec['max_skills'])} entries using only exact ids from SKILL_CATALOG. "
-                    "Prefer a small complementary set over redundant coverage. Do not perform the task. "
+                    f"Choose 0 to {int(budget_spec['max_skills'])} entries using only exact ids from SKILL_CATALOG. "
+                    "Return an empty array for simple or unmatched work. Prefer a small complementary set over redundant coverage. Do not perform the task. "
                     "Return JSON only as {\"selected_skills\":[{\"id\":\"exact-id\",\"rationale\":\"task-specific reason\"}]}. "
                     + model_language_instruction(language)
                 )
@@ -109991,6 +112592,8 @@ document.addEventListener('DOMContentLoaded', function(){{
             "regeneration": regeneration,
             "budget": budget,
             "skills_awareness": skills_aware,
+            "skills_catalog_total": skill_catalog_total if skills_aware else 0,
+            "skills_candidate_count": len(skill_catalog) if skills_aware else 0,
             "workspace_context": {
                 "awareness": "always_on",
                 "entry_count": int(workspace_snapshot.get("entry_count", 0) or 0),
@@ -112012,6 +114615,10 @@ document.addEventListener('DOMContentLoaded', function(){{
             pass
 
     def shutdown_services(self):
+        try:
+            self.process_manager.stop_all(actor="system", reason="service shutdown")
+        except Exception:
+            pass
         # Stop the single global MCP manager (and its health monitor) so we don't
         # orphan child subprocesses when the app exits. Sessions only reference it.
         try:
@@ -112277,6 +114884,7 @@ document.addEventListener('DOMContentLoaded', function(){{
                     if resources:
                         manifest = [{
                             "skill_id": str(x.get("skill_id", "") or ""), "skill_order": int(x.get("skill_order", 0) or 0),
+                            "kind": str(x.get("kind", "attachment") or "attachment"),
                             "path": str(x.get("path", "") or ""), "digest": str(x.get("digest", "") or ""), "size": int(x.get("size", 0) or 0),
                         } for x in resources]
                         manifest_path = snapshot_root / "MANIFEST.json"
@@ -112289,12 +114897,13 @@ document.addEventListener('DOMContentLoaded', function(){{
                         "app_id": str(app_row.get("id", "") or ""), "source_app_id": str(app_row.get("source_app_id", "") or ""),
                         "name": str(app_row.get("name", "") or ""), "scope": str(app_row.get("scope", "personal") or "personal"),
                         "revision": int(app_row.get("submitted_revision", app_row.get("revision", 1)) or 1), "capsule_digest": digest,
-                        "resources_digest": resources_digest, "resource_count": len(resources),
+                        "resources_digest": resources_digest, "resource_count": len(resources), "snapshot_version": snapshot_version,
                     }
                     sess.bound_skill_ids = [str(x.get("id", "") or "") for x in skills if str(x.get("id", "") or "")][:ADMIN_MAX_APP_SKILLS]
                     sess.bound_skill_capsule = trim(capsule, ADMIN_MAX_APP_CAPSULE_CHARS)
                     sess.skill_mode = "hard"
                     sess._restore_application_snapshot_permissions()
+                    sess._write_application_snapshot_recovery()
                     sess.updated_at = now_ts()
                     sess._persist()
                 run = None
@@ -112915,6 +115524,7 @@ document.addEventListener('DOMContentLoaded', function(){{
                 user_memory_setting_locked=self.user_memory_setting_locked,
                 shell_timeout_mode=self.shell_timeout_mode,
                 shell_async_handoff_seconds=self.shell_async_handoff_seconds,
+                process_manager=self.process_manager,
                 upload_callback=self._on_session_upload,
                 run_finished_callback=self._on_session_run_finished,
                 reference_prepare_callback=self._prepare_runtime_references,
@@ -113264,6 +115874,7 @@ document.addEventListener('DOMContentLoaded', function(){{
                 user_memory_setting_locked=True,
                 shell_timeout_mode=self.shell_timeout_mode,
                 shell_async_handoff_seconds=self.shell_async_handoff_seconds,
+                process_manager=self.process_manager,
                 upload_callback=self._on_session_upload,
                 run_finished_callback=self._on_session_run_finished,
                 reference_prepare_callback=self._prepare_runtime_references,
@@ -114791,6 +117402,8 @@ class ApplicationRegistry:
             "updated_at": float(row.get("updated_at", 0.0) or 0.0),
             "review": dict(row.get("review", {}) or {}),
             "snapshot_version": int(row.get("snapshot_version", 1) or 1),
+            "imported_from": dict(row.get("imported_from", {}) or {}),
+            "version_summary": dict(row.get("version_summary", {}) or {}),
         }
         if admin:
             out["owner_hash"] = hashlib.sha256(str(row.get("owner", "") or "").encode()).hexdigest()[:16]
@@ -115273,6 +117886,71 @@ class ApplicationRegistry:
             self._write_rows(path, rows)
         return self._public(row)
 
+    def import_personal(self, source_user_id: str, target_user_id: str, app_id: str) -> dict:
+        source_user = str(source_user_id or "").strip()
+        target_user = str(target_user_id or "").strip()
+        source_id = str(app_id or "").strip()
+        if not source_user or not target_user or not source_id:
+            raise ValueError("source, target, and application id are required")
+        now = now_ts()
+        with self.lock:
+            source_rows = self._read_rows(self._personal_path(source_user))
+            source = next(
+                (
+                    row for row in source_rows
+                    if str(row.get("id", "") or "") == source_id
+                    and str(row.get("owner", "") or "") == source_user
+                    and not row.get("deleted_at")
+                ),
+                None,
+            )
+            if source is None:
+                raise KeyError(source_id)
+            target_path = self._personal_path(target_user)
+            target_rows = self._read_rows(target_path)
+            copied = json.loads(json.dumps(source, ensure_ascii=False))
+            existing_ids = {str(row.get("id", "") or "") for row in target_rows}
+            new_id = make_id("app")
+            while new_id in existing_ids:
+                new_id = make_id("app")
+            source_revision = int(source.get("revision", 1) or 1)
+            copied.update({
+                "id": new_id,
+                "owner": target_user,
+                "scope": "personal",
+                "status": "draft",
+                "revision": 1,
+                "created_at": now,
+                "updated_at": now,
+                "imported_from": {
+                    "user_hash": hashlib.sha256(source_user.encode("utf-8")).hexdigest()[:16],
+                    "app_id": source_id,
+                    "revision": source_revision,
+                    "imported_at": now,
+                },
+                "version_summary": {
+                    "source_revision": source_revision,
+                    "capsule_digest": str(source.get("capsule_digest", "") or ""),
+                    "resources_digest": str(source.get("resources_digest", "") or ""),
+                    "snapshot_version": int(source.get("snapshot_version", 1) or 1),
+                },
+            })
+            for key in ("deleted_at", "latest_submission", "lifecycle_history", "lifecycle_revision", "submitted_revision", "submitted_at", "review"):
+                copied.pop(key, None)
+            target_rows.append(copied)
+            self._write_rows(target_path, target_rows)
+        return {"application": self._public(copied), "source_app_id": source_id}
+
+    def remove_imported_copy(self, user_id: str, app_id: str) -> bool:
+        with self.lock:
+            path = self._personal_path(user_id)
+            rows = self._read_rows(path)
+            kept = [row for row in rows if str(row.get("id", "") or "") != str(app_id or "")]
+            if len(kept) == len(rows):
+                return False
+            self._write_rows(path, kept)
+            return True
+
     def delete_personal(self, user_id: str, app_id: str) -> bool:
         with self.lock:
             path = self._personal_path(user_id)
@@ -115710,6 +118388,11 @@ class Handler(BaseHTTPRequestHandler):
                 "boot_id": str(getattr(self.app.telemetry, "boot_id", "") or ""),
                 "restart_verified": restart_verified,
                 "restart_rolled_back": restart_rolled_back,
+                "storage": {
+                    "ide_auth": self.app.ide_auth.storage_health(),
+                    "collaboration": self.app.collaboration.storage_health(),
+                },
+                "collaboration_watcher": collaboration_watcher_health(self.app),
             }, cors_origin="request" if requested_nonce or requested_from else "")
         if path == "/api/admin/auth/status":
             return self._send_json(
@@ -115726,10 +118409,56 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(self.app.applications.list_personal(self._user_id()))
         if path == "/api/apps/shared":
             return self._send_json(self.app.applications.list_shared())
+        if path == "/api/processes":
+            try:
+                return self._send_json(self.app.process_manager.list_processes(
+                    owner_user_id=self._user_id(),
+                    session_id=str((query.get("session_id", [""]) or [""])[0] or ""),
+                    status=str((query.get("status", [""]) or [""])[0] or ""),
+                    query=str((query.get("query", [""]) or [""])[0] or ""),
+                    limit=int((query.get("limit", ["100"]) or ["100"])[0] or 100),
+                    offset=int((query.get("offset", ["0"]) or ["0"])[0] or 0),
+                ))
+            except Exception as exc:
+                return self._send_json({"error": str(exc), "code": "invalid_process_query"}, status=400)
+        m_process = re.match(r"^/api/processes/([^/]+)$", path)
+        if m_process:
+            try:
+                return self._send_json({
+                    "process": self.app.process_manager.get_process(
+                        m_process.group(1), owner_user_id=self._user_id()
+                    )
+                })
+            except ProcessManagerError as exc:
+                return self._send_json({"error": str(exc), "code": exc.code}, status=exc.status)
         if path == "/api/admin/config":
             if not self._require_admin(query):
                 return
             return self._send_json(self.app.admin_config_payload())
+        if path == "/api/admin/processes":
+            if not self._require_admin(query):
+                return
+            try:
+                return self._send_json(self.app.process_manager.list_processes(
+                    user_hash=str((query.get("user_hash", [""]) or [""])[0] or ""),
+                    session_id=str((query.get("session_id", [""]) or [""])[0] or ""),
+                    status=str((query.get("status", [""]) or [""])[0] or ""),
+                    query=str((query.get("query", [""]) or [""])[0] or ""),
+                    limit=int((query.get("limit", ["200"]) or ["200"])[0] or 200),
+                    offset=int((query.get("offset", ["0"]) or ["0"])[0] or 0),
+                ))
+            except Exception as exc:
+                return self._send_json({"error": str(exc), "code": "invalid_process_query"}, status=400)
+        m_admin_process = re.match(r"^/api/admin/processes/([^/]+)$", path)
+        if m_admin_process:
+            if not self._require_admin(query):
+                return
+            try:
+                return self._send_json({
+                    "process": self.app.process_manager.get_process(m_admin_process.group(1))
+                })
+            except ProcessManagerError as exc:
+                return self._send_json({"error": str(exc), "code": exc.code}, status=exc.status)
         if path == "/api/admin/metrics":
             if not self._require_admin(query):
                 return
@@ -116335,6 +119064,50 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 return self._send_json({"error": "invalid authentication request", "code": "invalid_request"}, status=400)
         mgr = self._session_mgr()
+        m_process_stop = re.match(r"^/api/processes/([^/]+)/stop$", path)
+        if m_process_stop:
+            payload = self._read_json()
+            try:
+                return self._send_json(self.app.process_manager.stop_process(
+                    m_process_stop.group(1),
+                    owner_user_id=self._user_id(),
+                    actor="user:" + UserProcessManager._user_hash(self._user_id()),
+                    reason=trim(str(payload.get("reason", "user requested") or "user requested"), 200),
+                ))
+            except ProcessManagerError as exc:
+                return self._send_json({"error": str(exc), "code": exc.code}, status=exc.status)
+        if path == "/api/admin/processes/bulk-stop":
+            if not self._require_admin():
+                return
+            payload = self._read_json()
+            if not _to_bool_like(payload.get("confirm", False), default=False):
+                return self._send_json({"error": "bulk stop requires confirm=true", "code": "confirmation_required"}, status=400)
+            ids = payload.get("ids", [])
+            if ids is not None and not isinstance(ids, list):
+                return self._send_json({"error": "ids must be an array", "code": "invalid_process_ids"}, status=400)
+            try:
+                return self._send_json(self.app.process_manager.bulk_stop(
+                    actor="admin",
+                    ids=ids or [],
+                    user_hash=str(payload.get("user_hash", "") or ""),
+                    session_id=str(payload.get("session_id", "") or ""),
+                    reason=trim(str(payload.get("reason", "admin bulk stop") or "admin bulk stop"), 200),
+                ))
+            except ProcessManagerError as exc:
+                return self._send_json({"error": str(exc), "code": exc.code}, status=exc.status)
+        m_admin_process_stop = re.match(r"^/api/admin/processes/([^/]+)/stop$", path)
+        if m_admin_process_stop:
+            if not self._require_admin():
+                return
+            payload = self._read_json()
+            try:
+                return self._send_json(self.app.process_manager.stop_process(
+                    m_admin_process_stop.group(1),
+                    actor="admin",
+                    reason=trim(str(payload.get("reason", "admin requested") or "admin requested"), 200),
+                ))
+            except ProcessManagerError as exc:
+                return self._send_json({"error": str(exc), "code": exc.code}, status=exc.status)
         if path == "/api/apps/personal":
             try:
                 return self._send_json(self.app.applications.save_personal(self._user_id(), self._read_json()), status=201)
@@ -118342,6 +121115,14 @@ class IdeHandler(BaseHTTPRequestHandler):
             return self._send_json(payload, status=exc.status)
         if isinstance(exc, IDECapabilityError):
             return self._send_json({"error": str(exc), "code": exc.code}, status=exc.status)
+        if isinstance(exc, sqlite3.DatabaseError):
+            return self._send_json(
+                {
+                    "error": "IDE storage is temporarily unavailable.",
+                    "code": "ide_store_unavailable",
+                },
+                status=503,
+            )
         if isinstance(exc, IDEFileConflict):
             return self._send_json({"error": str(exc), "code": exc.code, "current": exc.current}, status=exc.status)
         if isinstance(exc, KeyError):
@@ -118371,6 +121152,19 @@ class IdeHandler(BaseHTTPRequestHandler):
             if not fp:
                 return self._send_json({"error": "Monaco worker asset not found"}, status=404)
             return self._send_inline_bytes(fp.read_bytes(), "application/javascript; charset=utf-8")
+        if path == "/api/ide/v2/applications":
+            try:
+                context = self._auth_context(required=True)
+                account = context["account"]
+                return self._send_json(
+                    self.app.ide_applications_payload(
+                        str(account.get("user_id", "") or ""),
+                        client_ip=self._client_ip(),
+                        collaboration=bool(account.get("collaboration_mode", False)),
+                    )
+                )
+            except Exception as exc:
+                return self._send_exception(exc)
         if path.startswith("/assets/js_lib/"):
             asset_ref = path[len("/assets/js_lib/"):]
             fp = self.app.rag_js_lib_asset_path(asset_ref)
@@ -118429,7 +121223,16 @@ class IdeHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 return self._send_exception(exc)
         if path == "/api/health":
-            return self._send_json({"ok": True, "app": "clouds-coder-ide", "version": APP_VERSION})
+            storage = self.app.ide_auth.storage_health()
+            return self._send_json(
+                {
+                    "ok": bool(storage.get("available", False)),
+                    "app": "clouds-coder-ide",
+                    "version": APP_VERSION,
+                    "storage": storage,
+                },
+                status=200 if storage.get("available", False) else 503,
+            )
         if path == "/api/ide/v2/auth/status":
             return self._send_json(self.app.ide_auth_status(local_setup_allowed=self._direct_loopback()))
         if path == "/api/ide/v2/auth/me":
@@ -118910,6 +121713,85 @@ class IdeHandler(BaseHTTPRequestHandler):
         if not context:
             return
         user_id = str(context["account"].get("user_id", "") or "")
+        if path == "/api/ide/v2/applications":
+            try:
+                if bool(context["account"].get("collaboration_mode", False)):
+                    raise IDECapabilityError(
+                        "collaboration_application_authoring_unavailable",
+                        "Personal application authoring is unavailable in collaboration workspaces.",
+                        403,
+                    )
+                return self._send_json(
+                    self.app.applications.save_personal(user_id, self._read_json()),
+                    status=201,
+                )
+            except Exception as exc:
+                return self._send_exception(exc)
+        m_application_submit = re.match(r"^/api/ide/v2/applications/([^/]+)/submit$", path)
+        if m_application_submit:
+            try:
+                if bool(context["account"].get("collaboration_mode", False)):
+                    raise IDECapabilityError(
+                        "collaboration_application_authoring_unavailable",
+                        "Personal application authoring is unavailable in collaboration workspaces.",
+                        403,
+                    )
+                return self._send_json(
+                    self.app.applications.submit(user_id, m_application_submit.group(1)),
+                    status=201,
+                )
+            except Exception as exc:
+                return self._send_exception(exc)
+        m_application_launch = re.match(r"^/api/ide/v2/applications/([^/]+)/launch$", path)
+        if m_application_launch:
+            try:
+                return self._send_json(
+                    self.app.ide_launch_application(
+                        user_id,
+                        m_application_launch.group(1),
+                        client_ip=self._client_ip(),
+                        collaboration=bool(context["account"].get("collaboration_mode", False)),
+                    ),
+                    status=201,
+                )
+            except SessionCreationLimitExceeded as exc:
+                return self._send_json(
+                    {"error": str(exc), "session_creation_limit": dict(exc.status or {})},
+                    status=429,
+                )
+            except Exception as exc:
+                return self._send_exception(exc)
+        if path == "/api/ide/v2/applications/import":
+            try:
+                payload = self._read_json()
+                return self._send_json(
+                    self.app.ide_import_application(
+                        user_id,
+                        str(payload.get("app_id", payload.get("id", "")) or ""),
+                        client_ip=self._client_ip(),
+                    ),
+                    status=201,
+                )
+            except Exception as exc:
+                return self._send_exception(exc)
+        if path == "/api/ide/v2/application-sessions/import":
+            try:
+                payload = self._read_json()
+                return self._send_json(
+                    self.app.ide_import_application_session(
+                        user_id,
+                        str(payload.get("session_id", payload.get("id", "")) or ""),
+                        client_ip=self._client_ip(),
+                    ),
+                    status=201,
+                )
+            except SessionCreationLimitExceeded as exc:
+                return self._send_json(
+                    {"error": str(exc), "session_creation_limit": dict(exc.status or {})},
+                    status=429,
+                )
+            except Exception as exc:
+                return self._send_exception(exc)
         if path == "/api/ide/v2/llm-config/shared":
             try:
                 payload = self._read_json()
@@ -119219,6 +122101,24 @@ class IdeHandler(BaseHTTPRequestHandler):
                 return self._send_json({"ok": True, "account": self.app.ide_auth.set_disabled(payload.get("username"), bool(payload.get("disabled", True)))})
             except Exception as exc:
                 return self._send_exception(exc)
+        m_application = re.match(r"^/api/ide/v2/applications/([^/]+)$", path)
+        if m_application:
+            try:
+                if bool(context["account"].get("collaboration_mode", False)):
+                    raise IDECapabilityError(
+                        "collaboration_application_authoring_unavailable",
+                        "Personal application authoring is unavailable in collaboration workspaces.",
+                        403,
+                    )
+                return self._send_json(
+                    self.app.applications.save_personal(
+                        str(context["account"].get("user_id", "") or ""),
+                        self._read_json(),
+                        app_id=m_application.group(1),
+                    )
+                )
+            except Exception as exc:
+                return self._send_exception(exc)
         m = re.match(r"^/api/ide/sessions/([^/]+)$", path)
         if m:
             try:
@@ -119247,6 +122147,21 @@ class IdeHandler(BaseHTTPRequestHandler):
                 self.app.ide_require_capability(context["capabilities"], "mounts")
                 payload = self._read_json()
                 return self._send_json(self.app.ide_remove_mount(user_id, str(payload.get("mount_id", "") or "")))
+            except Exception as exc:
+                return self._send_exception(exc)
+        m_application = re.match(r"^/api/ide/v2/applications/([^/]+)$", path)
+        if m_application:
+            try:
+                if bool(context["account"].get("collaboration_mode", False)):
+                    raise IDECapabilityError(
+                        "collaboration_application_authoring_unavailable",
+                        "Personal application authoring is unavailable in collaboration workspaces.",
+                        403,
+                    )
+                deleted = self.app.applications.delete_personal(user_id, m_application.group(1))
+                if not deleted:
+                    raise KeyError(m_application.group(1))
+                return self._send_json({"ok": True})
             except Exception as exc:
                 return self._send_exception(exc)
         m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/file$", path)
@@ -119479,6 +122394,14 @@ class CollaborationHandler(IdeHandler):
             return self._send_json(payload, status=exc.status)
         if isinstance(exc, KeyError):
             return self._send_json({"error": str(exc).strip("'") or "not found", "code": "not_found"}, status=404)
+        if isinstance(exc, sqlite3.DatabaseError):
+            return self._send_json(
+                {
+                    "error": "Collaboration storage is temporarily unavailable.",
+                    "code": "collaboration_store_unavailable",
+                },
+                status=503,
+            )
         if isinstance(exc, (ValueError, IsADirectoryError, NotADirectoryError)):
             return self._send_json({"error": str(exc), "code": "invalid_request"}, status=400)
         return self._send_json({"error": str(exc), "code": "internal_error"}, status=500)
@@ -119538,7 +122461,7 @@ class CollaborationHandler(IdeHandler):
                     self.wfile.write(safe_utf8_bytes(f"id: {cursor}\ndata: {json_dumps(public)}\n\n"))
                 self.wfile.flush()
             except Exception as exc:
-                if isinstance(exc, CollaborationError) or swallow_benign_socket_error(exc, "collaboration-handler.events.loop"):
+                if isinstance(exc, (CollaborationError, sqlite3.DatabaseError)) or swallow_benign_socket_error(exc, "collaboration-handler.events.loop"):
                     return
                 raise
 
@@ -119569,13 +122492,29 @@ class CollaborationHandler(IdeHandler):
                 return self._send_json({"error": "asset not found"}, status=404)
             return self._send_bytes(asset.read_bytes(), guess_mime_from_name(asset.name, "application/octet-stream"))
         if path == "/api/health":
-            return self._send_json({"ok": True, "app": "clouds-coder-collaboration", "version": APP_VERSION, "https": self._trusted_https(), "warning": self._warning()})
+            storage = self.app.collaboration.storage_health()
+            watcher = collaboration_watcher_health(self.app)
+            healthy = bool(storage.get("available", False)) and watcher.get("status") != "degraded"
+            return self._send_json(
+                {
+                    "ok": healthy,
+                    "app": "clouds-coder-collaboration",
+                    "version": APP_VERSION,
+                    "https": self._trusted_https(),
+                    "warning": self._warning(),
+                    "storage": storage,
+                    "file_watcher": watcher,
+                },
+                status=200 if healthy else 503,
+            )
         if path == "/api/collab/v1/status":
             try:
                 principal = self._auth()
                 return self._send_json({"ok": True, "authenticated": True, "csrf_token": principal.csrf_token, "expires_at": principal.expires_at, "snapshot": self.app.collaboration.snapshot(principal), "warning": self._warning()})
             except CollaborationError:
                 return self._send_json({"ok": True, "authenticated": False, "warning": self._warning()})
+            except Exception as exc:
+                return self._error(exc)
         try:
             principal = self._auth()
             user_id = f"collab:{principal.project_id}:{principal.member_id}"
@@ -119951,6 +122890,91 @@ class McpServiceHandler(BaseHTTPRequestHandler):
 
 # Bootstrap sequence: load configuration, initialize shared application state,
 # and expose the HTTP service plus background runtime workers.
+def collaboration_file_watcher_loop(
+    app,
+    stop_event,
+    *,
+    normal_interval: float = 1.0,
+    max_backoff: float = 30.0,
+    log=print,
+) -> None:
+    """Run the collaboration watcher with bounded retry and public health state."""
+    interval = max(0.05, float(normal_interval or 1.0))
+    backoff_cap = max(interval, float(max_backoff or 30.0))
+    retry_delay = interval
+    failures = 0
+    last_agent_reap = 0.0
+    app.collaboration_watcher_health = {
+        "status": "starting",
+        "consecutive_failures": 0,
+        "retry_in_seconds": interval,
+        "last_success_at": 0.0,
+        "last_error_at": 0.0,
+        "error_code": "",
+    }
+    while not stop_event.wait(retry_delay):
+        try:
+            app.collaboration.scan_external_writes()
+            if time.monotonic() - last_agent_reap >= 30.0:
+                app.collaboration.reap_stale_agents()
+                last_agent_reap = time.monotonic()
+            recovered = failures > 0
+            failures = 0
+            retry_delay = interval
+            app.collaboration_watcher_health = {
+                "status": "healthy",
+                "consecutive_failures": 0,
+                "retry_in_seconds": interval,
+                "last_success_at": now_ts(),
+                "last_error_at": 0.0,
+                "error_code": "",
+            }
+            if recovered:
+                log("[collaboration] file watcher recovered")
+        except Exception as exc:
+            failures += 1
+            retry_delay = min(backoff_cap, interval * (2 ** min(failures, 8)))
+            error_code = (
+                "database_unavailable"
+                if isinstance(exc, sqlite3.DatabaseError)
+                else "watcher_error"
+            )
+            app.collaboration_watcher_health = {
+                "status": "degraded",
+                "consecutive_failures": failures,
+                "retry_in_seconds": retry_delay,
+                "last_success_at": float(
+                    getattr(app, "collaboration_watcher_health", {}).get("last_success_at", 0.0)
+                    or 0.0
+                ),
+                "last_error_at": now_ts(),
+                "error_code": error_code,
+            }
+            if failures <= 2 or failures in {4, 8} or retry_delay >= backoff_cap:
+                log(
+                    "[collaboration] file watcher degraded: "
+                    f"{trim(str(exc), 240)}; failures={failures}; retry_in={retry_delay:.1f}s"
+                )
+
+
+def collaboration_watcher_health(app) -> dict:
+    state = getattr(app, "collaboration_watcher_health", {})
+    if not isinstance(state, dict):
+        return {"status": "unknown"}
+    return {
+        key: state.get(key)
+        for key in (
+            "status",
+            "consecutive_failures",
+            "retry_in_seconds",
+            "last_success_at",
+            "last_error_at",
+            "error_code",
+        )
+        if key in state
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Standalone Web Session Agent")
     parser.add_argument("--host", default="0.0.0.0")
@@ -121467,6 +124491,7 @@ def main():
     collaboration_thread = None
     collaboration_watch_stop = threading.Event()
     collaboration_watch_thread = None
+    setattr(app, "collaboration_watcher_health", {"status": "disabled"})
     _active_ports_for_collaboration = {int(args.port)}
     for running_server, running_port in (
         (skills_server, skills_port),
@@ -121517,15 +124542,7 @@ def main():
             collaboration_thread.start()
 
             def _collaboration_watch_loop():
-                last_agent_reap = 0.0
-                while not collaboration_watch_stop.wait(1.0):
-                    try:
-                        app.collaboration.scan_external_writes()
-                        if time.monotonic() - last_agent_reap >= 30.0:
-                            app.collaboration.reap_stale_agents()
-                            last_agent_reap = time.monotonic()
-                    except Exception as exc:
-                        print(f"[collaboration] file watcher error: {trim(str(exc), 240)}")
+                collaboration_file_watcher_loop(app, collaboration_watch_stop)
 
             collaboration_watch_thread = threading.Thread(
                 target=_collaboration_watch_loop,
@@ -121543,18 +124560,30 @@ def main():
         except Exception as exc:
             print(f"[collaboration] failed to start on {collab_host}:{collab_port}: {exc}")
     print(f"[web-agent] workspace={WORKDIR}")
+    print(f"[web-agent] storage_mode={_runtime_storage_mode()}")
     print(f"[admin] token_file={app.admin_token_path}")
     print(f"[web-agent] repo_root={REPO_ROOT}")
     print(f"[web-agent] codes_root={app.codes_root}")
     migration = getattr(app, "workspace_migration", {}) if hasattr(app, "workspace_migration") else {}
     if isinstance(migration, dict):
         moved = [str(x) for x in (migration.get("moved", []) or []) if str(x).strip()]
+        copied = [str(x) for x in (migration.get("copied", []) or []) if str(x).strip()]
         errors = [str(x) for x in (migration.get("errors", []) or []) if str(x).strip()]
         if moved:
             print(
                 "[web-agent] workspace_migration moved="
                 + ",".join(moved)
                 + f" from {migration.get('legacy_root', '')}"
+            )
+        imported_sessions = int(migration.get("imported_sessions", 0) or 0)
+        imported_users = int(migration.get("imported_users", 0) or 0)
+        if copied or imported_sessions:
+            print(
+                "[web-agent] workspace_migration copied="
+                + (",".join(copied) if copied else "merged")
+                + f" imported_users={imported_users}"
+                + f" imported_sessions={imported_sessions}"
+                + f" source_preserved={migration.get('installed_legacy_root', '')}"
             )
         if errors:
             print(
