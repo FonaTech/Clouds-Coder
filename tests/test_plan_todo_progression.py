@@ -46,10 +46,7 @@ class PlanTodoProgressionTests(unittest.TestCase):
             "ok": True,
             "exit_code": None,
             "command": "open http://127.0.0.1:8123",
-            "summary": (
-                "status 200; screenshot page.png; canvas webgl rendered visible; "
-                "image/png"
-            ),
+            "summary": "status 200; screenshot page.png; canvas webgl rendered visible; image/png",  # noqa: E501
         }
 
         for mode in ("single", "sync"):
@@ -147,13 +144,8 @@ class PlanTodoProgressionTests(unittest.TestCase):
                         "command": "grep index.html",
                         "summary": (
                             "=== 1.2+1.3 内容断言 === new THREE.Scene "
-                            "new THREE.PerspectiveCamera new THREE.WebGLRenderer "
-                            "new THREE.Fog OK"
-                        ),
-                    }
-                ]
-            }
-        }
+                            "new THREE.PerspectiveCamera new THREE.WebGLRenderer new THREE.Fog OK"),  # noqa: E501
+                    }]}}
 
         records = session._plan_subtask_evidence_records(
             step,
@@ -225,48 +217,39 @@ class PlanTodoProgressionTests(unittest.TestCase):
                         }
                     ],
                 )
-                rows = [
-                    {
-                        "key": step["key"],
-                        "content": step["content"],
-                        "status": "in_progress",
-                    },
-                    {
-                        "content": "1.1 创建目录",
-                        "status": "completed",
-                        "owner": "developer",
-                        "parent_step_id": step_id,
-                        "subtask_id": f"pst:{step_id}:a",
-                        "created_at": 10.0,
-                    },
-                    {
-                        "content": "1.2 创建 index.html",
-                        "status": "in_progress",
-                        "owner": "developer",
-                        "parent_step_id": step_id,
-                        "subtask_id": f"pst:{step_id}:b",
-                        "created_at": 10.0,
-                    },
-                    {
-                        "content": "1.3 初始化 WebGLRenderer",
-                        "status": "pending",
-                        "owner": "reviewer",
-                        "parent_step_id": step_id,
-                        "subtask_id": f"pst:{step_id}:c",
-                        "created_at": 10.0,
-                    },
-                    {
-                        "content": (
-                            "验收：在浏览器打开页面，画面可见且控制台无报错；"
-                            "证据：screenshot/canvas runtime evidence"
-                        ),
-                        "status": "pending",
-                        "owner": "reviewer",
-                        "parent_step_id": step_id,
-                        "subtask_id": f"pst:{step_id}:acceptance",
-                        "created_at": 10.0,
-                    },
-                ]
+                rows = [{"key": step["key"],
+                         "content": step["content"],
+                         "status": "in_progress",
+                         },
+                        {"content": "1.1 创建目录",
+                         "status": "completed",
+                         "owner": "developer",
+                         "parent_step_id": step_id,
+                         "subtask_id": f"pst:{step_id}:a",
+                         "created_at": 10.0,
+                         },
+                        {"content": "1.2 创建 index.html",
+                         "status": "in_progress",
+                         "owner": "developer",
+                         "parent_step_id": step_id,
+                         "subtask_id": f"pst:{step_id}:b",
+                         "created_at": 10.0,
+                         },
+                        {"content": "1.3 初始化 WebGLRenderer",
+                         "status": "pending",
+                         "owner": "reviewer",
+                         "parent_step_id": step_id,
+                         "subtask_id": f"pst:{step_id}:c",
+                         "created_at": 10.0,
+                         },
+                        {"content": "验收：在浏览器打开页面，画面可见且控制台无报错；证据：screenshot/canvas runtime evidence",  # noqa: E501
+                         "status": "pending",
+                         "owner": "reviewer",
+                         "parent_step_id": step_id,
+                         "subtask_id": f"pst:{step_id}:acceptance",
+                         "created_at": 10.0,
+                         },
+                        ]
                 session.todo.update(rows)
                 incoming = [
                     {
@@ -569,8 +552,7 @@ class PlanTodoProgressionTests(unittest.TestCase):
                     "actor": "reviewer",
                     "tool": "bash",
                     "content": (
-                        "tool_error bash: Error: shell mutation is not allowed for "
-                        "read-only agent role 'reviewer'"
+                        "tool_error bash: Error: shell mutation is not allowed for read-only agent role 'reviewer'"  # noqa: E501
                     ),
                 }
             )
@@ -709,18 +691,15 @@ class PlanTodoProgressionTests(unittest.TestCase):
             "id": "ev:browser",
             "step_id": step["id"],
             "subtask_id": session._stable_plan_worker_subtask_id(
-                step["id"], acceptance
-            ),
+                step["id"],
+                acceptance),
             "subtask_content": acceptance["content"],
             "kind": "runtime",
             "tool": "chrome",
             "ok": True,
             "exit_code": None,
             "command": "open http://127.0.0.1:8123",
-            "summary": (
-                "status 200; screenshot page.png; canvas webgl rendered visible; "
-                "image/png"
-            ),
+            "summary": "status 200; screenshot page.png; canvas webgl rendered visible; image/png",  # noqa: E501
             "ts": trusted["ts"] + 0.01,
         }
         session.blackboard["plan_step_evidence"][step["id"]].append(browser)
@@ -744,12 +723,9 @@ class PlanTodoProgressionTests(unittest.TestCase):
                 return {
                     "content": (
                         '{"decision":"pass","passed":true,"confidence":"high",'
-                        '"reason":"equivalent generated module satisfies the '
-                        'requested entry",'
+                        '"reason":"equivalent generated module satisfies the requested entry",'  # noqa: E501
                         '"evidence":"ev:equivalent created and syntax checked",'
-                        '"evidence_ids":["ev:equivalent"]}'
-                    )
-                }
+                        '"evidence_ids":["ev:equivalent"]}')}
 
         for mode in ("single", "sync"):
             with self.subTest(mode=mode):
@@ -777,23 +753,15 @@ class PlanTodoProgressionTests(unittest.TestCase):
                                 "id": "ev:equivalent",
                                 "step_id": step_id,
                                 "subtask_id": "pst:old-binding",
-                                "subtask_content": (
-                                    "create an equivalent generated entry"
-                                ),
+                                "subtask_content": "create an equivalent generated entry",  # noqa: E501
                                 "kind": "file",
                                 "tool": "write_file",
                                 "ok": True,
                                 "exit_code": None,
                                 "path": "src/generated-entry.js",
-                                "summary": (
-                                    "generated entry module created; "
-                                    "syntax check passed"
-                                ),
+                                "summary": "generated entry module created; syntax check passed",  # noqa: E501
                                 "ts": 20.0,
-                            }
-                        ]
-                    }
-                }
+                            }]}}
 
                 self.assertFalse(
                     session._plan_subtask_has_accumulated_evidence(
@@ -903,10 +871,7 @@ class PlanTodoProgressionTests(unittest.TestCase):
             "ok": True,
             "exit_code": 0,
             "command": "chrome --headless http://127.0.0.1:8765/index.html",
-            "summary": (
-                "CHROME_EXIT=0 canvas width=756 height=469 ERROR_COUNT=0 "
-                "ACCEPTANCE=PASS"
-            ),
+            "summary": "CHROME_EXIT=0 canvas width=756 height=469 ERROR_COUNT=0 ACCEPTANCE=PASS",  # noqa: E501
             "ts": 20.0,
         }
         role_policy_failure = {
@@ -917,10 +882,8 @@ class PlanTodoProgressionTests(unittest.TestCase):
             "exit_code": -1,
             "command": "chrome --headless index.html > probe.txt",
             "summary": (
-                "Error: shell mutation is not allowed for read-only agent role "
-                "'reviewer'. "
-                "Use read/search/validation commands only."
-            ),
+                "Error: shell mutation is not allowed for read-only agent role 'reviewer'. "  # noqa: E501
+                "Use read/search/validation commands only."),
             "ts": 21.0,
         }
 
@@ -1014,12 +977,9 @@ class PlanTodoProgressionTests(unittest.TestCase):
                 return {
                     "content": (
                         '{"decision":"pass","passed":true,"confidence":"high",'
-                        '"reason":"runtime metrics prove the requested state '
-                        'transition",'
+                        '"reason":"runtime metrics prove the requested state transition",'  # noqa: E501
                         '"missing":[],"next_actions":[],"evidence":'
-                        '["STATE_CHANGE_COUNT=11","RUNTIME_ERROR_COUNT=0"]}'
-                    )
-                }
+                        '["STATE_CHANGE_COUNT=11","RUNTIME_ERROR_COUNT=0"]}')}
 
         for mode in ("single", "sync"):
             with self.subTest(mode=mode):
@@ -1050,9 +1010,7 @@ class PlanTodoProgressionTests(unittest.TestCase):
                     "completed_at": 18.0,
                 }
                 acceptance_row = {
-                    "content": (
-                        "验收：在浏览器中目标组件呈现预期状态变化；运行时编译无错误"
-                    ),
+                    "content": "验收：在浏览器中目标组件呈现预期状态变化；运行时编译无错误",
                     "status": "in_progress",
                     "owner": "developer",
                     "parent_step_id": step_id,
@@ -1149,11 +1107,8 @@ class PlanTodoProgressionTests(unittest.TestCase):
                     "content": (
                         '{"decision":"verify","passed":false,"confidence":"high",'
                         '"reason":"one direct observation is still missing",'
-                        '"missing":["runtime behavior"],"next_actions":'
-                        '["run focused check"],'
-                        '"evidence":[]}'
-                    )
-                }
+                        '"missing":["runtime behavior"],"next_actions":["run focused check"],'  # noqa: E501
+                        '"evidence":[]}')}
 
         session = self.bare_session("single")
         session.ollama = VerifyOllama()
@@ -1163,9 +1118,7 @@ class PlanTodoProgressionTests(unittest.TestCase):
         step = {
             "id": step_id,
             "content": "1. Runtime behavior",
-            "full_content": (
-                "1. Runtime behavior\n1.1 build\n验收：runtime behavior is visible"
-            ),
+            "full_content": "1. Runtime behavior\n1.1 build\n验收：runtime behavior is visible",  # noqa: E501
             "category": "plan_step",
             "status": "in_progress",
             "plan_step_index": 0,
@@ -1184,8 +1137,7 @@ class PlanTodoProgressionTests(unittest.TestCase):
             "parent_step_id": step_id,
         }
         step["full_content"] = (
-            "1. Runtime behavior\n1.1 build\n"
-            "验收：在浏览器确认 runtime behavior is visible"
+            "1. Runtime behavior\n1.1 build\n验收：在浏览器确认 runtime behavior is visible"
         )
         session.todo.update([work, acceptance_row])
         session.blackboard = {
@@ -1238,10 +1190,7 @@ class PlanTodoProgressionTests(unittest.TestCase):
                     "id": step_id,
                     "key": "bb:proj:" + step_id,
                     "content": "1. Build runtime",
-                    "full_content": (
-                        "1. Build runtime\n1.1 build\n"
-                        "验收：运行 acceptance_test.py 返回 ACCEPTANCE=PASS"
-                    ),
+                    "full_content": "1. Build runtime\n1.1 build\n验收：运行 acceptance_test.py 返回 ACCEPTANCE=PASS",  # noqa: E501
                     "category": "plan_step",
                     "status": "in_progress",
                     "plan_step_index": 0,
@@ -1426,9 +1375,7 @@ class PlanTodoProgressionTests(unittest.TestCase):
                                 "ok": True,
                                 "exit_code": 0,
                                 "command": "node unrelated_probe.js",
-                                "summary": (
-                                    "probe completed; acceptance result not reported"
-                                ),
+                                "summary": "probe completed; acceptance result not reported",  # noqa: E501
                                 "ts": 20.0,
                             },
                             {

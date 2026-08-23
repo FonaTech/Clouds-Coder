@@ -1,6 +1,7 @@
 import json
 import types
 import unittest
+from unittest import mock
 
 import Clouds_Coder as cc
 
@@ -17,19 +18,16 @@ class FakeOllama:
     def chat(self, messages, **kwargs):
         self.calls.append({"messages": messages, "kwargs": kwargs})
         response = (
-            self.responses.pop(0)
-            if self.responses
-            else {
+            self.responses.pop(0) if self.responses else {
                 "decision": "reject",
                 "confidence": "high",
-                "reason": "The proposal has not demonstrated complete requirement coverage.",
+                "reason": "The proposal has not demonstrated complete requirement coverage.",  # noqa: E501
                 "removed_objectives": [],
                 "replacement_mapping": [],
                 "requirement_coverage": [],
                 "completion_risk": "high",
                 "evidence": [],
-            }
-        )
+            })
         if isinstance(response, str):
             return {"content": response}
         return {"content": json.dumps(response, ensure_ascii=False)}
@@ -48,9 +46,8 @@ class TodoTreeRevisionGuardTests(unittest.TestCase):
         session.runtime_plan_mode_needed = False
         session.runtime_reclassify_required = False
         session.runtime_authoritative_goal = (
-            "Build all ten ordered stages of the offline city game, including terrain, roads, "
-            "zoning, buildings, utilities, traffic, management, save/load, and final acceptance."
-        )
+            "Build all ten ordered stages of the offline city game, including terrain, roads, "  # noqa: E501
+            "zoning, buildings, utilities, traffic, management, save/load, and final acceptance.")  # noqa: E501
         session.run_generation = 1
         session.messages = []
         session.blackboard = {
@@ -279,6 +276,186 @@ class TodoTreeRevisionGuardTests(unittest.TestCase):
         self.assertEqual(stored[-1]["content"], "补充跨模块回归测试")
         self.assertEqual(len(session.ollama.calls), 0)
 
+    def test_root_todos_sharing_parent_group_keep_distinct_unique_ids(self):
+        session = self.bare_session("single")
+        rows = [
+            {
+                "content": "实现 3D 渲染引擎：WebGL 渲染器、相机、光照与着色器",
+                "status": "in_progress",
+                "parent_step_id": "renderer",
+            },
+            {
+                "content": "实现结构网格动态合并与动态渲染技术（LOD/合并策略）",
+                "status": "pending",
+                "parent_step_id": "renderer",
+            },
+        ]
+
+        session._dispatch_todo_update({"todos": rows}, role="developer")
+        stored = session._todo_route_rows("pure_single", role="developer")
+
+        self.assertEqual(len(stored), 2)
+        self.assertEqual(len({row["subtask_id"] for row in stored}), 2)
+        self.assertEqual({row.get("root_group_id") for row in stored}, {"renderer"})
+        self.assertTrue(all(not row.get("external_subtask_id") for row in stored))
+
+    def test_first_coordinator_todo_initializes_public_assignments(self):
+        session = self.bare_session("single")
+        session.id = "sess_coordinator"
+        coordinator = types.SimpleNamespace(
+            initialize_task_plan=mock.Mock(return_value={"ok": True, "recorded": True})
+        )
+        session.collaboration_write_coordinator = coordinator
+
+        session._dispatch_todo_update(
+            {
+                "todos": [
+                    {"content": "实现求解器核心", "status": "in_progress"},
+                    {"content": "实现渲染与交互", "status": "pending"},
+                    {"content": "运行集成验收", "status": "pending"},
+                ]
+            },
+            role="developer",
+        )
+
+        coordinator.initialize_task_plan.assert_called_once_with(
+            "sess_coordinator",
+            ["实现求解器核心", "实现渲染与交互", "运行集成验收"],
+        )
+
+    def test_repeated_root_snapshots_do_not_append_shared_group_rows(self):
+        session = self.bare_session("single")
+        rows = [
+            {
+                "content": "实现 3D 渲染引擎：WebGL 渲染器、相机、光照与着色器",
+                "status": "in_progress",
+                "parent_step_id": "renderer",
+            },
+            {
+                "content": "实现结构网格动态合并与动态渲染技术（LOD/合并策略）",
+                "status": "pending",
+                "parent_step_id": "renderer",
+            },
+            {
+                "content": "运行完整浏览器验收",
+                "status": "pending",
+                "parent_step_id": "acceptance",
+            },
+        ]
+        session._dispatch_todo_update({"todos": rows}, role="developer")
+        session._dispatch_todo_update(
+            {
+                "todos": [
+                    {**rows[0], "status": "completed"},
+                    {
+                        "content": "实现结构网格动态合并与动态渲染技术（动态 BufferGeometry 更新 + 降采样矢量）",
+                        "status": "completed",
+                        "parent_step_id": "renderer",
+                    },
+                    {**rows[2], "status": "in_progress"},
+                ]
+            },
+            role="developer",
+        )
+        session._dispatch_todo_update(
+            {
+                "todos": [
+                    {**rows[0], "status": "completed"},
+                    {
+                        "content": "实现结构网格动态合并与动态渲染技术（动态 BufferGeometry 更新 + 降采样矢量）",
+                        "status": "completed",
+                        "parent_step_id": "renderer",
+                    },
+                    {**rows[2], "status": "completed"},
+                ]
+            },
+            role="developer",
+        )
+
+        stored = session._todo_route_rows("pure_single", role="developer")
+        self.assertEqual(len(stored), 3)
+        self.assertEqual(len({row["subtask_id"] for row in stored}), 3)
+        self.assertEqual([row["status"] for row in stored], ["completed"] * 3)
+        self.assertIn("动态渲染技术", stored[1]["content"])
+
+    def test_loaded_legacy_root_duplicates_collapse_to_latest_completed_row(self):
+        session = self.bare_session("single")
+        shared_id = "rt:legacy-renderer-collision"
+        legacy = [
+            {
+                "content": "实现 3D 渲染引擎：WebGL 渲染器、相机与光照",
+                "status": "completed",
+                "owner": "developer",
+                "subtask_id": shared_id,
+                "external_subtask_id": "renderer",
+            },
+            {
+                "content": "实现结构网格动态合并与动态渲染技术（LOD/合并策略）",
+                "status": "pending",
+                "owner": "developer",
+                "subtask_id": shared_id,
+                "external_subtask_id": "renderer",
+                "updated_at": 10.0,
+            },
+            {
+                "content": "实现结构网格动态合并与动态渲染技术（动态 BufferGeometry 更新 + 降采样矢量）",
+                "status": "completed",
+                "owner": "developer",
+                "subtask_id": shared_id,
+                "external_subtask_id": "renderer",
+                "updated_at": 20.0,
+            },
+        ]
+
+        repaired = session._normalize_loaded_todo_rows(legacy, [])
+
+        self.assertEqual(len(repaired), 2)
+        self.assertEqual(len({row["subtask_id"] for row in repaired}), 2)
+        dynamic = next(
+            row for row in repaired if "动态 BufferGeometry" in row["content"]
+        )
+        self.assertEqual(dynamic["status"], "completed")
+        self.assertNotIn("external_subtask_id", dynamic)
+
+    def test_persist_snapshot_repairs_root_id_collisions_before_write(self):
+        session = self.bare_session("single")
+        shared_id = "rt:legacy-renderer-collision"
+        session.todo.items = [
+            {
+                "content": "实现 3D 渲染引擎：WebGL 渲染器、相机与光照",
+                "status": "completed",
+                "owner": "developer",
+                "subtask_id": shared_id,
+                "external_subtask_id": "renderer",
+            },
+            {
+                "content": "实现结构网格动态合并与动态渲染技术（LOD/合并策略）",
+                "status": "pending",
+                "owner": "developer",
+                "subtask_id": shared_id,
+                "external_subtask_id": "renderer",
+                "updated_at": 10.0,
+            },
+            {
+                "content": "实现结构网格动态合并与动态渲染技术（动态 BufferGeometry 更新 + 降采样矢量）",
+                "status": "completed",
+                "owner": "developer",
+                "subtask_id": shared_id,
+                "external_subtask_id": "renderer",
+                "updated_at": 20.0,
+            },
+        ]
+
+        persisted = session._todos_for_persist()
+
+        self.assertEqual(len(persisted), 2)
+        self.assertEqual(len({row["subtask_id"] for row in persisted}), 2)
+        self.assertEqual(session.todo.snapshot(), persisted)
+        dynamic = next(
+            row for row in persisted if "动态 BufferGeometry" in row["content"]
+        )
+        self.assertEqual(dynamic["status"], "completed")
+
     def test_stale_todo_transaction_cannot_overwrite_a_newer_tree(self):
         session = self.bare_session("single")
         session._dispatch_todo_update({"todos": self.stages(3)}, role="developer")
@@ -312,8 +489,10 @@ class TodoTreeRevisionGuardTests(unittest.TestCase):
         rejection = {
             "decision": "reject",
             "confidence": "high",
-            "reason": "Stages three and four still carry uncovered acceptance requirements.",
-            "removed_objectives": ["阶段3", "阶段4"],
+            "reason": "Stages three and four still carry uncovered acceptance requirements.",  # noqa: E501
+            "removed_objectives": [
+                "阶段3",
+                "阶段4"],
             "replacement_mapping": [],
             "requirement_coverage": ["Stages one and two remain covered"],
             "completion_risk": "high",
@@ -326,7 +505,7 @@ class TodoTreeRevisionGuardTests(unittest.TestCase):
             {
                 "todos": self.stages(2),
                 "update_mode": "revise_open",
-                "revision_reason": "Use a shorter execution tree after the latest implementation findings.",
+                "revision_reason": "Use a shorter execution tree after the latest implementation findings.",  # noqa: E501
                 "revision_evidence": [
                     "Only stages one and two have observable results"
                 ],
@@ -350,17 +529,17 @@ class TodoTreeRevisionGuardTests(unittest.TestCase):
         approval = {
             "decision": "approve",
             "confidence": "medium",
-            "reason": "The merged objective explicitly retains every implementation and acceptance obligation.",
+            "reason": "The merged objective explicitly retains every implementation and acceptance obligation.",  # noqa: E501
             "removed_objectives": ["stage two", "stage three", "stage four"],
             "replacement_mapping": [
                 {
                     "removed": "stages two through four",
                     "replacement": "combined implementation and acceptance objective",
-                    "reason": "The replacement preserves all three scopes and their checks.",
+                    "reason": "The replacement preserves all three scopes and their checks.",  # noqa: E501
                 }
             ],
             "requirement_coverage": [
-                "rendering, terrain, and roads -> combined implementation and acceptance objective"
+                "rendering, terrain, and roads -> combined implementation and acceptance objective"  # noqa: E501
             ],
             "completion_risk": "medium",
             "evidence": ["The replacement text carries the full obligations"],
@@ -384,7 +563,7 @@ class TodoTreeRevisionGuardTests(unittest.TestCase):
             {
                 "todos": proposal,
                 "update_mode": "revise_open",
-                "revision_reason": "Current module boundaries require one integrated implementation transaction.",
+                "revision_reason": "Current module boundaries require one integrated implementation transaction.",  # noqa: E501
                 "revision_evidence": [
                     "The modules now share one verified integration boundary"
                 ],
@@ -409,7 +588,7 @@ class TodoTreeRevisionGuardTests(unittest.TestCase):
             {
                 "todos": self.stages(1),
                 "update_mode": "revise_open",
-                "revision_reason": "Replace the remaining objectives based on a new execution shape.",
+                "revision_reason": "Replace the remaining objectives based on a new execution shape.",  # noqa: E501
             },
             role="developer",
         )
@@ -459,7 +638,7 @@ class TodoTreeRevisionGuardTests(unittest.TestCase):
         response = {
             "approved": True,
             "confidence": "low",
-            "reason": "The expanded current subtask preserves the parent step and its acceptance obligation.",
+            "reason": "The expanded current subtask preserves the parent step and its acceptance obligation.",  # noqa: E501
             "unsupported_changes": [],
         }
         session, step = self.plan_session("single", [response])

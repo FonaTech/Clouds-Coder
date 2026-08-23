@@ -39,9 +39,7 @@ class SyncRoutingScopeTests(unittest.TestCase):
                     "plan_step_index": 0,
                     "activated_at": 10.0,
                     "content": "1. 实现模块",
-                    "full_content": (
-                        "1. 实现模块\n1.1 创建模块文件\n验收：运行检查并记录证据"
-                    ),
+                    "full_content": "1. 实现模块\n1.1 创建模块文件\n验收：运行检查并记录证据",
                 }
             ],
             "plan_step_total": 1,
@@ -254,10 +252,7 @@ class SyncRoutingScopeTests(unittest.TestCase):
                 {
                     "function": {
                         "name": "route_to_next_agent",
-                        "arguments": (
-                            '{"target":"reviewer","instruction":"Verify current '
-                            'output."}'
-                        ),
+                        "arguments": '{"target":"reviewer","instruction":"Verify current output."}',  # noqa: E501
                     }
                 }
             ]

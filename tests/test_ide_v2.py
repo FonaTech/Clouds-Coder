@@ -4,6 +4,7 @@ import inspect
 import io
 import json
 import os
+import re
 import sqlite3
 import tempfile
 import threading
@@ -15,6 +16,172 @@ from pathlib import Path
 from unittest import mock
 
 import Clouds_Coder as cc
+
+
+class RuntimeWorkdirTests(unittest.TestCase):
+    def test_installed_module_uses_stable_clouds_coder_home(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            installed_root = root / "lib" / "python3.13" / "site-packages"
+            with (
+                mock.patch.object(cc, "SCRIPT_DIR", installed_root),
+                mock.patch.dict(
+                    os.environ,
+                    {"AGENT_WORKDIR": "", "CLOUDS_CODER_HOME": str(root / "runtime")},
+                ),
+            ):
+                self.assertEqual(
+                    cc._resolve_default_agent_workdir(),
+                    (root / "runtime" / "workspace").resolve(),
+                )
+
+    def test_direct_script_keeps_script_directory_as_default_workdir(self):
+        with tempfile.TemporaryDirectory() as temp:
+            script_root = Path(temp) / "source"
+            with (
+                mock.patch.object(cc, "SCRIPT_DIR", script_root),
+                mock.patch.dict(
+                    os.environ,
+                    {"AGENT_WORKDIR": "", "CLOUDS_CODER_HOME": str(
+                        Path(temp) / "runtime")},
+                ),
+            ):
+                self.assertEqual(cc._resolve_default_agent_workdir(), script_root)
+                self.assertEqual(cc._runtime_storage_mode(), "script-local")
+
+    def test_explicit_workdir_wins_for_installed_and_direct_runtimes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            explicit = root / "chosen"
+            for script_root in (
+                root / "source",
+                root / "lib" / "python3.13" / "site-packages",
+            ):
+                with (
+                    mock.patch.object(cc, "SCRIPT_DIR", script_root),
+                    mock.patch.dict(
+                        os.environ,
+                        {"AGENT_WORKDIR": str(explicit), "CLOUDS_CODER_HOME": str(
+                            root / "runtime")},
+                    ),
+                ):
+                    self.assertEqual(
+                        cc._resolve_default_agent_workdir(), explicit.resolve())
+                    self.assertEqual(cc._runtime_storage_mode(), "explicit-workdir")
+
+    def test_direct_runtime_does_not_import_from_stable_workspace(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            script_root = root / "source"
+            local_codes = script_root / "Codes"
+            local_crypto = cc.CryptoBox(local_codes)
+            local_state = local_codes / "user_local" / "sessions" / "sess_local" / "state.json"  # noqa: E501
+            local_crypto.write_json(local_state, {"title": "local history"})
+            source_state = local_state.read_bytes()
+            with (
+                mock.patch.object(cc, "SCRIPT_DIR", script_root),
+                mock.patch.dict(
+                    os.environ,
+                    {"AGENT_WORKDIR": "", "CLOUDS_CODER_HOME": str(root / "runtime")},
+                ),
+            ):
+                result = cc._migrate_legacy_runtime_roots(script_root)
+            self.assertEqual(result["storage_mode"], "script-local")
+            self.assertEqual(result["imported_sessions"], 0)
+            self.assertEqual(local_state.read_bytes(), source_state)
+            self.assertFalse((root / "runtime" / "workspace").exists())
+
+    def test_legacy_skills_runtime_copy_preserves_original_files(self):
+        with tempfile.TemporaryDirectory() as temp:
+            script_root = Path(temp) / "source"
+            legacy_file = script_root / "skills" / "Codes" / "legacy.txt"
+            legacy_file.parent.mkdir(parents=True)
+            legacy_file.write_text("preserve me", encoding="utf-8")
+            with (
+                mock.patch.object(cc, "SCRIPT_DIR", script_root),
+                mock.patch.dict(os.environ, {"AGENT_WORKDIR": ""}),
+            ):
+                result = cc._migrate_legacy_runtime_roots(script_root)
+            self.assertIn("skills:Codes", result["copied"])
+            self.assertEqual(legacy_file.read_text(encoding="utf-8"), "preserve me")
+            self.assertEqual(
+                (script_root / "Codes" / "legacy.txt").read_text(encoding="utf-8"),
+                "preserve me",
+            )
+
+    def test_installed_runtime_copies_legacy_history_without_removing_source(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            installed_root = root / "lib" / "python3.13" / "site-packages"
+            legacy_codes = installed_root / "Codes"
+            workspace = root / "stable" / "workspace"
+            session_dir = legacy_codes / "user_local" / "sessions" / "sess_legacy"
+            legacy_crypto = cc.CryptoBox(legacy_codes)
+            legacy_crypto.write_json(
+                session_dir / "state.json", {"title": "legacy", "messages": [{"role": "user", "content": "kept"}]})  # noqa: E501
+            legacy_crypto.write_json(session_dir / "meta.json",
+                                     {"title": "legacy", "message_count": 1})
+            source_state = (session_dir / "state.json").read_bytes()
+
+            with mock.patch.object(cc, "SCRIPT_DIR", installed_root):
+                result = cc._migrate_legacy_runtime_roots(workspace)
+
+            target_codes = workspace / "Codes"
+            target_state = target_codes / "user_local" / "sessions" / "sess_legacy" / "state.json"  # noqa: E501
+            self.assertIn("site-packages:Codes", result["copied"])
+            self.assertEqual(result["imported_sessions"], 1)
+            self.assertEqual((legacy_codes / ".encryption_key").read_bytes(),
+                             (target_codes / ".encryption_key").read_bytes())
+            self.assertEqual((session_dir / "state.json").read_bytes(), source_state)
+            self.assertEqual(cc.CryptoBox(target_codes).read_json(
+                target_state, {}).get("title"), "legacy")
+
+    def test_installed_runtime_merges_different_keys_without_overwriting_new_history(
+            self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            installed_root = root / "lib" / "python3.13" / "site-packages"
+            legacy_codes = installed_root / "Codes"
+            workspace = root / "stable" / "workspace"
+            target_codes = workspace / "Codes"
+            legacy_crypto = cc.CryptoBox(legacy_codes)
+            target_crypto = cc.CryptoBox(target_codes)
+            legacy_user = legacy_codes / "user_local" / "sessions"
+            target_user = target_codes / "user_local" / "sessions"
+            legacy_crypto.write_json(legacy_user / "sess_old" /
+                                     "state.json", {"title": "old history"})
+            legacy_crypto.write_json(legacy_user / "sess_same" /
+                                     "state.json", {"title": "legacy collision"})
+            target_crypto.write_json(target_user / "sess_new" /
+                                     "state.json", {"title": "new history"})
+            target_crypto.write_json(target_user / "sess_same" /
+                                     "state.json", {"title": "current collision"})
+            source_state = (legacy_user / "sess_old" / "state.json").read_bytes()
+
+            with mock.patch.object(cc, "SCRIPT_DIR", installed_root):
+                result = cc._migrate_legacy_runtime_roots(workspace)
+
+            imported = target_user / "sess_old" / "state.json"
+            self.assertEqual(result["imported_sessions"], 1)
+            self.assertEqual(result["skipped_sessions"], 1)
+            self.assertEqual(target_crypto.read_json(
+                imported, {}).get("title"), "old history")
+            self.assertEqual(
+                target_crypto.read_json(
+                    target_user /
+                    "sess_new" /
+                    "state.json",
+                    {}).get("title"),
+                "new history")
+            self.assertEqual(
+                target_crypto.read_json(
+                    target_user /
+                    "sess_same" /
+                    "state.json",
+                    {}).get("title"),
+                "current collision")
+            self.assertEqual((legacy_user / "sess_old" /
+                             "state.json").read_bytes(), source_state)
 
 
 class OfflineJSAssetTests(unittest.TestCase):
@@ -190,8 +357,17 @@ class IDESandboxBackendTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.files = Path(self.tmp.name) / "files"
         (self.files / "nested").mkdir(parents=True)
+        self.skills = Path(self.tmp.name) / "skills"
+        self.js_lib = Path(self.tmp.name) / "js_lib"
+        self.skills.mkdir()
+        self.js_lib.mkdir()
         self.session = cc.SessionState.__new__(cc.SessionState)
         self.session.files_root = self.files
+        self.session.skills = types.SimpleNamespace(
+            skills_root=self.skills,
+            shell_virtual_mappings=lambda: [],
+        )
+        self.session.js_lib_root = self.js_lib
         self.session._remote_runtime_read_roots = lambda: []
 
     def tearDown(self):
@@ -220,6 +396,11 @@ class IDESandboxBackendTests(unittest.TestCase):
         self.assertIn("--bind", prefix)
         self.assertIn(str(self.files.resolve()), prefix)
         self.assertIn("/workspace", prefix)
+        self.assertIn("--ro-bind", prefix)
+        self.assertIn(str(self.skills.resolve()), prefix)
+        self.assertIn(str(self.js_lib.resolve()), prefix)
+        self.assertIn("/clouds_shared/skills", prefix)
+        self.assertIn("/clouds_shared/js_lib", prefix)
         self.assertIn("/workspace/nested/input.txt", command)
         self.assertNotIn(str(self.files.resolve()), command)
 
@@ -244,6 +425,16 @@ class IDESandboxBackendTests(unittest.TestCase):
         self.assertIn("ALL", prefix)
         self.assertIn("no-new-privileges", prefix)
         self.assertIn("/workspace/nested", prefix)
+        self.assertIn(
+            f"type=bind,src={self.skills.resolve()},dst=/clouds_shared/skills,readonly",
+            prefix,
+        )
+        self.assertIn(
+            f"type=bind,src={self.js_lib.resolve()},dst=/clouds_shared/js_lib,readonly",
+            prefix,
+        )
+        self.assertIn("SKILLS_ROOT=/clouds_shared/skills", prefix)
+        self.assertIn("JS_LIB_ROOT=/clouds_shared/js_lib", prefix)
         self.assertEqual(terminal_prefix, [])
 
     def test_capabilities_follow_backend_feature_support(self):
@@ -336,6 +527,128 @@ class IDESandboxBackendTests(unittest.TestCase):
         self.assertTrue(cc._is_windows_job_sandbox_prefix(prefix))
         self.assertTrue(cc._is_windows_job_sandbox_prefix(terminal))
 
+    def test_remote_environment_exposes_shared_roots_read_only_by_contract(self):
+        self.session.ide_remote_sandbox_required = True
+        backend = {
+            "available": True,
+            "name": "windows-job",
+            "processes": True,
+            "terminal": True,
+            "debug": True,
+        }
+        with mock.patch.object(cc, "_detect_ide_sandbox_backend", return_value=backend):
+            env = self.session._shell_process_env()
+        self.assertEqual(env["SKILLS_ROOT"], str(self.skills.resolve()))
+        self.assertEqual(env["JS_LIB_ROOT"], str(self.js_lib.resolve()))
+
+    def test_windows_shell_virtual_paths_rewrite_to_host_shared_roots(self):
+        windows_workspace = Path("C:/Clouds Coder/session")
+        windows_skills = Path("C:/Clouds Coder/skills")
+        windows_js = Path("C:/Clouds Coder/js_lib")
+        session = cc.SessionState.__new__(cc.SessionState)
+        session.files_root = windows_workspace
+        session.skills = types.SimpleNamespace(
+            skills_root=windows_skills,
+            shell_virtual_mappings=lambda: [],
+        )
+        session.js_lib_root = windows_js
+        with (
+            mock.patch.object(cc.os, "name", "nt"),
+            mock.patch.object(cc.Path, "resolve", lambda value: value),
+        ):
+            rewritten = session._rewrite_shell_virtual_paths(
+                "type /skills/demo/SKILL.md & type /js_lib/marked.min.js & dir /workspace",  # noqa: E501
+                windows_workspace,
+            )
+        self.assertIn('"C:/Clouds Coder/skills"/demo/SKILL.md', rewritten)
+        self.assertIn('"C:/Clouds Coder/js_lib"/marked.min.js', rewritten)
+        self.assertIn('dir "C:/Clouds Coder/session"', rewritten)
+
+    def test_hard_background_command_is_virtualized_for_container_backend(self):
+        backend = {
+            "available": True,
+            "name": "bubblewrap",
+            "processes": True,
+            "terminal": True,
+            "debug": True,
+        }
+        host_file = self.files / "nested" / "input.txt"
+        with mock.patch.object(cc, "_detect_ide_sandbox_backend", return_value=backend):
+            prepared = self.session._background_shell_command(
+                f"cat {host_file}", self.files, ["/usr/bin/bwrap"]
+            )
+        self.assertIn("/workspace/nested/input.txt", prepared)
+        self.assertNotIn(str(self.files.resolve()), prepared)
+
+    def test_local_hard_ide_run_virtualizes_workspace_for_container_prefix(self):
+        app = cc.AppContext.__new__(cc.AppContext)
+        sess = types.SimpleNamespace(
+            skill_mode="hard",
+            _guard_shell_write_scope=lambda _command, _cwd: "",
+            _rewrite_shell_virtual_paths=lambda command, _cwd: command,
+            _sandbox_virtualize_command=lambda command, _cwd: command.replace(
+                str(self.files), "/workspace"
+            ).replace(str(self.files.resolve()), "/workspace"),
+            _shell_process_env=lambda: {},
+            _hard_snapshot_integrity_callback=lambda _phase, _command: "",
+        )
+        app.ide_resolve_workspace = lambda *_args: (
+            self.files,
+            self.files,
+            {"id": "session"},
+        )
+        app._ide_session = lambda *_args: sess
+        app._ide_process_prefix = mock.Mock(return_value=["/usr/bin/bwrap"])
+        app._ide_emit_workspace_change = mock.Mock()
+        completed = types.SimpleNamespace(returncode=0, stdout="ok", stderr="")
+        host_file = self.files / "nested" / "input.txt"
+        with mock.patch.object(cc, "run_subprocess_text", return_value=completed) as run:  # noqa: E501
+            result = app.ide_run_command(
+                "user-a",
+                "sess-a",
+                {"command": f"cat {host_file}", "root_id": "session"},
+                remote=False,
+            )
+        command = run.call_args.args[0]
+        self.assertEqual(command[-3:-1], ["/bin/sh", "-c"])
+        self.assertIn("/workspace/nested/input.txt", command[-1])
+        self.assertNotIn(str(self.files.resolve()), command[-1])
+        self.assertTrue(result["ok"])
+        app._ide_process_prefix.assert_called_once_with(
+            sess, remote=False, cwd=self.files
+        )
+
+    def test_remote_shell_guard_blocks_windows_shared_root_writes(self):
+        session = cc.SessionState.__new__(cc.SessionState)
+        session.root = Path("C:/Clouds Coder/session")
+        session.files_root = session.root
+        session.ide_remote_sandbox_required = True
+        session.skill_mode = "dynamic"
+        session.skills = types.SimpleNamespace(
+            skills_root=Path("C:/Clouds Coder/skills"),
+            shell_virtual_mappings=lambda: [],
+        )
+        session.js_lib_root = Path("C:/Clouds Coder/js_lib")
+        with (
+            mock.patch.object(cc.os, "name", "nt"),
+            mock.patch.object(cc.Path, "resolve", lambda value: value),
+            mock.patch.object(
+                session,
+                "_remote_shared_read_roots",
+                return_value=[session.skills.skills_root, session.js_lib_root],
+            ),
+        ):
+            skill_error = session._guard_shell_write_scope(
+                "echo escaped > C:/Clouds-Coder/skills/demo/SKILL.md",
+                session.files_root,
+            )
+            js_error = session._guard_shell_write_scope(
+                "python -c \"from pathlib import Path; Path('/js_lib/x.js').write_text('x')\"",  # noqa: E501
+                session.files_root,
+            )
+        self.assertIn("write blocked", skill_error)
+        self.assertIn("write blocked", js_error)
+
     def test_ide_contains_embedded_icon_fallback(self):
         self.assertIn('<body class="icons-fallback">', cc.IDE_INDEX_HTML)
         self.assertIn(".icons-fallback .codicon::before", cc.IDE_CSS)
@@ -366,6 +679,24 @@ class IDEAuthStoreTests(unittest.TestCase):
                 legacy_user_id="ide_second_admin",
             )
         self.assertEqual(caught.exception.code, "setup_already_completed")
+
+    def test_missing_initialized_database_fails_closed(self):
+        session = self.store.local_session(
+            legacy_user_id=cc.user_id_from_ip("127.0.0.1"),
+            client_ip="127.0.0.1",
+        )
+        self.store.path.unlink()
+
+        with self.assertRaises(cc.IDEAuthError) as caught:
+            self.store.verify_session(session["access_token"], "127.0.0.1")
+
+        self.assertEqual(caught.exception.code, "auth_store_unavailable")
+        self.assertEqual(caught.exception.status, 503)
+        self.assertFalse(self.store.path.exists())
+        self.assertEqual(
+            self.store.storage_health(),
+            {"available": False, "code": "ide_store_unavailable"},
+        )
 
     def test_change_password_revokes_sessions_without_leaking_verification_session(
         self,
@@ -461,15 +792,19 @@ class IDEAuthStoreTests(unittest.TestCase):
     def test_local_session_isolated_by_caller_identity(self):
         first_id = cc.user_id_from_ip("192.168.1.21")
         second_id = cc.user_id_from_ip("192.168.1.22")
-        first = self.store.local_session(legacy_user_id=first_id, client_ip="192.168.1.21")
-        second = self.store.local_session(legacy_user_id=second_id, client_ip="192.168.1.22")
+        first = self.store.local_session(
+            legacy_user_id=first_id, client_ip="192.168.1.21")
+        second = self.store.local_session(
+            legacy_user_id=second_id, client_ip="192.168.1.22")
 
         self.assertNotEqual(first["account"]["user_id"], second["account"]["user_id"])
         self.assertNotEqual(first["account"]["username"], second["account"]["username"])
         self.assertEqual(first["account"]["role"], "user")
         self.assertEqual(second["account"]["role"], "user")
-        self.assertIsNotNone(self.store.verify_session(first["access_token"], "192.168.1.21"))
-        self.assertIsNone(self.store.verify_session(first["access_token"], "192.168.1.22"))
+        self.assertIsNotNone(self.store.verify_session(
+            first["access_token"], "192.168.1.21"))
+        self.assertIsNone(self.store.verify_session(
+            first["access_token"], "192.168.1.22"))
 
         same_identity = self.store.local_session(
             legacy_user_id=first_id,
@@ -492,7 +827,8 @@ class IDEAuthStoreTests(unittest.TestCase):
                     token_digest TEXT PRIMARY KEY, username_key TEXT NOT NULL,
                     auth_version INTEGER NOT NULL, csrf_token TEXT NOT NULL,
                     created_at REAL NOT NULL, expires_at REAL NOT NULL,
-                    revoked_at REAL NOT NULL DEFAULT 0, last_ip TEXT NOT NULL DEFAULT '',
+                    revoked_at REAL NOT NULL DEFAULT 0,
+                    last_ip TEXT NOT NULL DEFAULT '',
                     device_digest TEXT NOT NULL DEFAULT ''
                 )"""
             )
@@ -500,14 +836,16 @@ class IDEAuthStoreTests(unittest.TestCase):
                 """INSERT INTO ide_sessions
                    (token_digest,username_key,auth_version,csrf_token,created_at,expires_at,
                     revoked_at,last_ip,device_digest)
-                   SELECT token_digest,username_key,auth_version,csrf_token,created_at,expires_at,
+                   SELECT token_digest,username_key,auth_version,csrf_token,
+                          created_at,expires_at,
                           revoked_at,last_ip,device_digest FROM ide_sessions_current"""
             )
             conn.execute("DROP TABLE ide_sessions_current")
         upgraded = cc.IDEAuthStore(self.store.path)
         self.assertIsNone(upgraded.verify_session(local["access_token"], "127.0.0.1"))
         with sqlite3.connect(str(self.store.path)) as conn:
-            columns = {row[1] for row in conn.execute("PRAGMA table_info(ide_sessions)")}
+            columns = {row[1]
+                       for row in conn.execute("PRAGMA table_info(ide_sessions)")}
             active = conn.execute(
                 "SELECT COUNT(*) FROM ide_sessions WHERE revoked_at=0"
             ).fetchone()[0]
@@ -1189,6 +1527,40 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             self.app.ide_preview_html("account-a", "session-a", rel="missing.csv")
 
+    def test_docx_and_pptx_preview_render_real_html(self):
+        try:
+            import docx
+            import pptx
+            from pptx.util import Inches
+        except ImportError:
+            self.skipTest("python-docx and python-pptx are required")
+
+        preview_session = cc.SessionState.__new__(cc.SessionState)
+        preview_session._module_cache = {}
+        self.app._ide_session = lambda user_id, session_id: preview_session
+
+        document = docx.Document()
+        document.add_heading("Rendered DOCX", 0)
+        document.add_paragraph("Office document body")
+        document.save(self.files / "report.docx")
+
+        presentation = pptx.Presentation()
+        slide = presentation.slides.add_slide(presentation.slide_layouts[5])
+        shape = slide.shapes.add_textbox(Inches(1), Inches(1), Inches(4), Inches(1))
+        shape.text = "Rendered PPTX"
+        presentation.save(self.files / "slides.pptx")
+
+        doc_html = self.app.ide_preview_html(
+            "account-a", "session-a", rel="report.docx"
+        )
+        ppt_html = self.app.ide_preview_html(
+            "account-a", "session-a", rel="slides.pptx"
+        )
+        self.assertIn("Rendered DOCX", doc_html)
+        self.assertIn("pv-doc-page", doc_html)
+        self.assertIn("Rendered PPTX", ppt_html)
+        self.assertIn("pv-slide-stage", ppt_html)
+
     def test_large_previewable_artifact_opens_readonly_without_loading_content(self):
         target = self.files / "large.pdf"
         target.write_bytes(b"%PDF-1.4\n" + b"0" * 32)
@@ -1578,7 +1950,7 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
         upload_id = "up_00112233445566778899aabbccddeeff"
         chunk_size = 512 * 1024
         for offset in range(0, len(raw), chunk_size):
-            chunk = raw[offset : offset + chunk_size]
+            chunk = raw[offset: offset + chunk_size]
             complete = offset + len(chunk) == len(raw)
             out = self.app.ide_upload_chunk(
                 "account-a",
@@ -1718,6 +2090,17 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
     def test_remote_workspace_sandbox_blocks_outside_read_and_write(self):
         session = cc.SessionState.__new__(cc.SessionState)
         session.files_root = self.files
+        shared_skills = self.root / "shared-skills"
+        shared_js = self.root / "shared-js"
+        shared_skills.mkdir()
+        shared_js.mkdir()
+        (shared_skills / "SKILL.md").write_text("shared skill", encoding="utf-8")
+        (shared_js / "library.js").write_text("shared library", encoding="utf-8")
+        session.skills = types.SimpleNamespace(
+            skills_root=shared_skills,
+            shell_virtual_mappings=lambda: [],
+        )
+        session.js_lib_root = shared_js
         (self.files / "inside.txt").write_text("inside", encoding="utf-8")
         outside = self.root / "outside.txt"
         outside.write_text("outside", encoding="utf-8")
@@ -1760,9 +2143,38 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
             capture_output=True,
             text=True,
         )
+        allowed_shared_read = cc.subprocess.run(
+            [
+                *prefix,
+                "/bin/sh",
+                "-c",
+                f"cat {cc.shlex.quote(str(shared_skills / 'SKILL.md'))} "
+                f"{cc.shlex.quote(str(shared_js / 'library.js'))}",
+            ],
+            cwd=self.files,
+            capture_output=True,
+            text=True,
+        )
+        blocked_shared_write = cc.subprocess.run(
+            [
+                *prefix,
+                "/bin/sh",
+                "-c",
+                f"echo escaped > {cc.shlex.quote(str(shared_skills / 'SKILL.md'))}",
+            ],
+            cwd=self.files,
+            capture_output=True,
+            text=True,
+        )
         self.assertNotEqual(blocked_read.returncode, 0)
         self.assertNotEqual(blocked_sibling_read.returncode, 0)
         self.assertNotEqual(blocked_write.returncode, 0)
+        self.assertEqual(allowed_shared_read.returncode, 0)
+        self.assertIn("shared skill", allowed_shared_read.stdout)
+        self.assertIn("shared library", allowed_shared_read.stdout)
+        self.assertNotEqual(blocked_shared_write.returncode, 0)
+        self.assertEqual(
+            (shared_skills / "SKILL.md").read_text(encoding="utf-8"), "shared skill")
         self.assertFalse(Path("/private/tmp/clouds-coder-sandbox-test").exists())
 
     def test_remote_process_environment_uses_workspace_private_temp(self):
@@ -1792,15 +2204,30 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
                     )
                 )
 
-    def test_remote_agent_file_tools_reject_external_virtual_roots(self):
+    def test_remote_agent_file_tools_read_shared_roots_but_reject_writes(self):
         session = cc.SessionState.__new__(cc.SessionState)
         session.files_root = self.files
         session.ide_remote_sandbox_required = True
         session.skill_mode = "dynamic"
+        session.skills = cc.SkillStore(self.root / "skills")
+        session.js_lib_root = self.root / "js_lib"
+        (self.root / "skills" / "private").mkdir(parents=True)
+        (self.root / "skills" / "private" / "SKILL.md").write_text("skill", encoding="utf-8")  # noqa: E501
+        (self.root / "js_lib" / "monaco" / "min" / "vs").mkdir(parents=True)
+        (self.root / "js_lib" / "monaco" / "min" / "vs" /
+         "loader.js").write_text("loader", encoding="utf-8")
+
+        for path, expected in (
+            ("/skills/private/SKILL.md", "skill"),
+            ("/js_lib/monaco/min/vs/loader.js", "loader"),
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(
+                    session._remote_agent_file_scope_error(path, "read"), "")
+                result = session._run_read(path)
+                self.assertIn(expected, result)
 
         for path in (
-            "/skills/private/SKILL.md",
-            "/js_lib/monaco/min/vs/loader.js",
             "file_buffer/long-output.txt",
             "[file_buffer:long-output]",
         ):
@@ -1808,7 +2235,8 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
                 result = session._dispatch_tool_inner(
                     "read_file", {"path": path}, "developer"
                 )
-                self.assertIn("limited to the isolated session workspace", result)
+                if "file_buffer" in path:
+                    self.assertIn("limited to the isolated session workspace", result)
 
         write_result = session._dispatch_tool_inner(
             "write_file",
@@ -1824,7 +2252,7 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
             },
             "developer",
         )
-        self.assertIn("limited to the isolated session workspace", write_result)
+        self.assertIn("cannot modify shared Skills", write_result)
         self.assertIn("limited to the isolated session workspace", edit_result)
 
     def test_remote_agent_file_scope_allows_workspace_paths_only(self):
@@ -1842,6 +2270,56 @@ class IDEWorkspaceServiceTests(unittest.TestCase):
         escaped = session._remote_agent_file_scope_error("../outside.txt", "read")
         self.assertIn("path escapes workspace", escaped)
 
+    def test_remote_agent_can_use_controlled_skills_libraries_and_ready_mcp(self):
+        session = cc.SessionState.__new__(cc.SessionState)
+        session.ide_remote_sandbox_required = True
+        session.skill_mode = "dynamic"
+        session.skills = types.SimpleNamespace(list_names=lambda: ["shared-skill"])
+        session._ensure_skills_ready = lambda force=False: None
+        session.query_code_library_callback = lambda _session, args: f"code:{args['query']}"  # noqa: E501
+        session.query_knowledge_library_callback = lambda _session, args: f"knowledge:{args['query']}"  # noqa: E501
+        session.rag_remember_callback = lambda _session, args: f"remembered:{args['text']}"  # noqa: E501
+        session._emit = lambda *_args, **_kwargs: None
+
+        class ReadyMcp:
+            @staticmethod
+            def is_mcp_tool(name):
+                return name == "mcp__shared__lookup"
+
+            @staticmethod
+            def call(name, args):
+                return f"mcp:{name}:{args['query']}"
+
+        session.mcp = ReadyMcp()
+        self.assertEqual(
+            session._dispatch_tool_inner("list_skills", {}, "developer"),
+            "shared-skill",
+        )
+        self.assertEqual(
+            session._dispatch_tool_inner("query_code_library", {
+                                         "query": "api"}, "developer"),
+            "code:api",
+        )
+        self.assertEqual(
+            session._dispatch_tool_inner("query_knowledge_library", {
+                                         "query": "paper"}, "developer"),
+            "knowledge:paper",
+        )
+        self.assertEqual(
+            session._dispatch_tool_inner("rag_remember", {"text": "fact"}, "developer"),
+            "remembered:fact",
+        )
+        self.assertIn(
+            "mcp:mcp__shared__lookup:value",
+            session._dispatch_tool_inner(
+                "mcp__shared__lookup", {"query": "value"}, "developer"
+            ),
+        )
+        self.assertIn(
+            "unavailable to remote Program sessions",
+            session._dispatch_tool_inner("write_skill", {}, "developer"),
+        )
+
 
 class IDEHTTPAuthTests(unittest.TestCase):
     class FakeApp:
@@ -1849,6 +2327,84 @@ class IDEHTTPAuthTests(unittest.TestCase):
             self.ide_auth = cc.IDEAuthStore(root / "auth.sqlite")
             self.ide_password_login_enabled = True
             self.saved = None
+            self.resource_skill_write = None
+            self.resource_mcp_action = None
+            self.application_calls = []
+
+            class Applications:
+                def __init__(applications_self, owner):
+                    applications_self.owner = owner
+                    applications_self.rows = {}
+                    applications_self.submissions = {}
+                    applications_self.next_id = 1
+
+                @staticmethod
+                def list_shared():
+                    return [{"id": "shared-app", "name": "Shared App", "status": "published"}]  # noqa: E501
+
+                @staticmethod
+                def skill_catalog():
+                    return [{"id": "shared-skill",
+                             "name": "Shared Skill", "description": "Test"}]
+
+                def list_personal(applications_self, user_id):
+                    return [
+                        dict(row) for row in applications_self.rows.get(
+                            user_id, {}).values()]
+
+                def save_personal(applications_self, user_id, payload, app_id=""):
+                    applications_self.owner.application_calls.append(
+                        ("save", user_id, app_id))
+                    rows = applications_self.rows.setdefault(user_id, {})
+                    if app_id and app_id not in rows:
+                        raise KeyError(app_id)
+                    old = rows.get(app_id, {})
+                    new_id = app_id or f"app-{applications_self.next_id}"
+                    if not app_id:
+                        applications_self.next_id += 1
+                    row = {
+                        "id": new_id,
+                        "name": str(payload.get("name", "")),
+                        "description": str(payload.get("description", "")),
+                        "icon": str(payload.get("icon", "")),
+                        "scope": "personal",
+                        "status": "draft",
+                        "revision": int(old.get("revision", 0)) + 1,
+                        "skills": [
+                            {"id": str(skill), "name": str(skill), "order": index}
+                            for index, skill in enumerate(payload.get("skills", []), 1)
+                        ],
+                    }
+                    rows[new_id] = row
+                    return dict(row)
+
+                def submit(applications_self, user_id, app_id):
+                    applications_self.owner.application_calls.append(
+                        ("submit", user_id, app_id))
+                    row = applications_self.rows.get(user_id, {}).get(app_id)
+                    if row is None:
+                        raise KeyError(app_id)
+                    key = (user_id, app_id, row["revision"])
+                    return applications_self.submissions.setdefault(
+                        key,
+                        {
+                            **row,
+                            "id": f"submission-{len(applications_self.submissions) + 1}",  # noqa: E501
+                            "scope": "shared",
+                            "status": "pending",
+                            "source_app_id": app_id,
+                            "submitted_revision": row["revision"],
+                        },
+                    )
+
+                def delete_personal(applications_self, user_id, app_id):
+                    applications_self.owner.application_calls.append(
+                        ("delete", user_id, app_id))
+                    return applications_self.rows.get(
+                        user_id, {}).pop(
+                        app_id, None) is not None
+
+            self.applications = Applications(self)
 
         ide_is_loopback_address = staticmethod(cc.AppContext.ide_is_loopback_address)
         ide_require_capability = staticmethod(cc.AppContext.ide_require_capability)
@@ -1897,6 +2453,87 @@ class IDEHTTPAuthTests(unittest.TestCase):
         def ide_save_workbench_state(self, user_id, payload):
             self.saved = (user_id, payload)
             return {"ok": True, "state": payload.get("state", {})}
+
+        def ide_applications_payload(self, user_id, *, client_ip, collaboration=False):
+            return {
+                "ok": True,
+                "personal": [] if collaboration else self.applications.list_personal(user_id),  # noqa: E501
+                "shared": self.applications.list_shared(),
+                "legacy_personal": [],
+                "web_sessions": [],
+                "skill_catalog": [] if collaboration else self.applications.skill_catalog(),  # noqa: E501
+                "collaboration": collaboration,
+            }
+
+        def ide_llm_config_status(self, user_id, *, client_ip=""):
+            return {
+                "ok": True,
+                "scope": "main_web_ui_user",
+                "source": "current_ip_user",
+                "profile_count": 1,
+                "independent": False,
+                "shared": True,
+                "active_profile": {"provider": "ollama", "model": "test"},
+                "server_side_credentials": True,
+            }
+
+        def ide_use_shared_llm_config(self, user_id, *, client_ip="", session_id=""):
+            self.llm_shared = (user_id, client_ip, session_id)
+            return self.ide_llm_config_status(user_id, client_ip=client_ip)
+
+        def shared_resource_manifest(self, user_id, *, collaboration=False):
+            return {
+                "skills": {
+                    "enabled": True, "count": 1, "read_only": True, "admin_write": True}, "js_libraries": {  # noqa: E501
+                    "enabled": True, "count": 2, "read_only": True}, "mcp": {
+                    "enabled": True, "ready": 1, "total": 1, "tool_count": 1}, "api_paths": {  # noqa: E501
+                    "resources": "/api/ide/v2/resources"}, "services": {}, }
+
+        @staticmethod
+        def skills_catalog():
+            return [{"id": "shared-skill", "name": "Shared Skill"}]
+
+        @staticmethod
+        def skill_providers_catalog():
+            return []
+
+        @staticmethod
+        def skill_protocols_catalog():
+            return []
+
+        @staticmethod
+        def skill_protocol_examples():
+            return {}
+
+        @staticmethod
+        def scan_skills():
+            return {"skills_count": 1, "skill_names": ["shared-skill"]}
+
+        @staticmethod
+        def skill_detail(skill_file):
+            return {"skill_file": skill_file, "content": "shared detail"}
+
+        @staticmethod
+        def shared_mcp_health():
+            return {
+                "enabled": True,
+                "ready": 1,
+                "total": 1,
+                "tool_count": 1,
+                "servers": [{"name": "shared", "state": "ready", "alive": True}],
+            }
+
+        @staticmethod
+        def shared_mcp_tools():
+            return {"count": 1, "names": ["mcp__shared__lookup"], "tools": []}
+
+        def write_skill_file(self, path, content, overwrite=False):
+            self.resource_skill_write = (path, content, overwrite)
+            return {"ok": True, "path": f"{path}/SKILL.md"}
+
+        def manage_shared_mcp(self, action, payload):
+            self.resource_mcp_action = (action, payload)
+            return {"ok": True, "action": action}
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -1964,6 +2601,266 @@ class IDEHTTPAuthTests(unittest.TestCase):
         self.assertEqual(saved["state"]["active_view"], "search")
         self.assertEqual(self.app.saved[0], setup["account"]["user_id"])
 
+    def test_application_authoring_routes_use_authenticated_account_and_pending_review(
+            self):
+        origin = f"http://127.0.0.1:{self.port}"
+        status, headers, setup = self.request(
+            "POST",
+            "/api/ide/v2/auth/setup",
+            {"username": "app-admin", "password": "Strong-Passphrase-42!"},
+            {"Origin": origin},
+        )
+        self.assertEqual(status, 201)
+        owner_id = setup["account"]["user_id"]
+        owner_headers = {
+            "Cookie": headers["Set-Cookie"].split(";", 1)[0],
+            "Origin": origin,
+            "X-CSRF-Token": setup["csrf_token"],
+        }
+
+        status, _, created = self.request(
+            "POST",
+            "/api/ide/v2/applications",
+            {"name": "IDE App", "description": "draft",
+                "icon": "A", "skills": ["shared-skill"]},
+            owner_headers,
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(created["revision"], 1)
+        app_id = created["id"]
+        self.assertIn(("save", owner_id, ""), self.app.application_calls)
+
+        status, _, catalog = self.request(
+            "GET",
+            "/api/ide/v2/applications",
+            headers={"Cookie": owner_headers["Cookie"]},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual([row["id"] for row in catalog["personal"]], [app_id])
+        self.assertEqual([row["id"]
+                         for row in catalog["skill_catalog"]], ["shared-skill"])
+
+        status, _, updated = self.request(
+            "PATCH",
+            f"/api/ide/v2/applications/{app_id}",
+            {"name": "IDE App v2", "description": "edited", "skills": ["shared-skill"]},
+            owner_headers,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(updated["revision"], 2)
+
+        status, _, first_submission = self.request(
+            "POST",
+            f"/api/ide/v2/applications/{app_id}/submit",
+            {},
+            owner_headers,
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(first_submission["scope"], "shared")
+        self.assertEqual(first_submission["status"], "pending")
+        self.assertEqual(first_submission["submitted_revision"], 2)
+        status, _, duplicate = self.request(
+            "POST",
+            f"/api/ide/v2/applications/{app_id}/submit",
+            {},
+            owner_headers,
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(duplicate["id"], first_submission["id"])
+
+        status, _, edited = self.request(
+            "PATCH",
+            f"/api/ide/v2/applications/{app_id}",
+            {"name": "IDE App v3", "description": "new revision",
+                "skills": ["shared-skill"]},
+            owner_headers,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(edited["revision"], 3)
+        status, _, next_submission = self.request(
+            "POST",
+            f"/api/ide/v2/applications/{app_id}/submit",
+            {},
+            owner_headers,
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(next_submission["status"], "pending")
+        self.assertNotEqual(next_submission["id"], first_submission["id"])
+
+        self.app.ide_auth.create_user(
+            "other-user", "Another-Passphrase-42!", must_change_password=False
+        )
+        status, other_headers, other = self.request(
+            "POST",
+            "/api/ide/v2/auth/login",
+            {"username": "other-user", "password": "Another-Passphrase-42!"},
+            {"Origin": origin},
+        )
+        self.assertEqual(status, 200)
+        other_write_headers = {
+            "Cookie": other_headers["Set-Cookie"].split(";", 1)[0],
+            "Origin": origin,
+            "X-CSRF-Token": other["csrf_token"],
+        }
+        for method, suffix, body in (
+            ("PATCH", "", {"name": "Stolen", "skills": ["shared-skill"]}),
+            ("POST", "/submit", {}),
+            ("DELETE", "", None),
+        ):
+            status, _, _ = self.request(
+                method,
+                f"/api/ide/v2/applications/{app_id}{suffix}",
+                body,
+                other_write_headers,
+            )
+            self.assertEqual(status, 404)
+
+        status, _, deleted = self.request(
+            "DELETE",
+            f"/api/ide/v2/applications/{app_id}",
+            None,
+            owner_headers,
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(deleted["ok"])
+
+    def test_auth_database_failure_returns_structured_503(self):
+        status, headers, setup = self.request(
+            "POST",
+            "/api/ide/v2/auth/setup",
+            {"username": "local-admin", "password": "Strong-Passphrase-42!"},
+            {"Origin": f"http://127.0.0.1:{self.port}"},
+        )
+        self.assertEqual(status, 201)
+        cookie = headers["Set-Cookie"].split(";", 1)[0]
+        with mock.patch.object(
+            self.app.ide_auth,
+            "_connect",
+            side_effect=sqlite3.OperationalError("storage unavailable"),
+        ):
+            status, _, error = self.request(
+                "POST",
+                "/api/ide/v2/workbench/state",
+                {"state": {"active_view": "search"}},
+                {
+                    "Cookie": cookie,
+                    "Origin": f"http://127.0.0.1:{self.port}",
+                    "X-CSRF-Token": setup["csrf_token"],
+                },
+            )
+
+        self.assertEqual(status, 503)
+        self.assertEqual(error["code"], "auth_store_unavailable")
+        self.assertNotIn("storage unavailable", error["error"])
+
+    def test_health_reports_missing_auth_database(self):
+        self.app.ide_auth.path.unlink()
+
+        status, _, payload = self.request("GET", "/api/health")
+
+        self.assertEqual(status, 503)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["storage"]["code"], "ide_store_unavailable")
+
+    def test_llm_config_status_is_authenticated_and_shared_reset_requires_csrf(self):
+        status, _, _ = self.request("GET", "/api/ide/v2/llm-config")
+        self.assertEqual(status, 401)
+        status, headers, setup = self.request(
+            "POST",
+            "/api/ide/v2/auth/setup",
+            {"username": "llm-admin", "password": "Strong-Passphrase-42!"},
+            {"Origin": f"http://127.0.0.1:{self.port}"},
+        )
+        self.assertEqual(status, 201)
+        cookie = headers["Set-Cookie"].split(";", 1)[0]
+        status, _, payload = self.request(
+            "GET", "/api/ide/v2/llm-config", headers={"Cookie": cookie}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["scope"], "main_web_ui_user")
+
+        write_headers = {
+            "Cookie": cookie,
+            "Origin": f"http://127.0.0.1:{self.port}",
+        }
+        status, _, error = self.request(
+            "POST",
+            "/api/ide/v2/llm-config/shared",
+            {"session_id": "sess-test"},
+            write_headers,
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(error["code"], "csrf_required")
+        write_headers["X-CSRF-Token"] = setup["csrf_token"]
+        status, _, payload = self.request(
+            "POST",
+            "/api/ide/v2/llm-config/shared",
+            {"session_id": "sess-test"},
+            write_headers,
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["shared"])
+        self.assertEqual(self.app.llm_shared[2], "sess-test")
+
+    def test_shared_resource_apis_are_consistent_and_admin_writes_require_csrf(self):
+        status, _, _ = self.request("GET", "/api/ide/v2/resources")
+        self.assertEqual(status, 401)
+        status, headers, setup = self.request(
+            "POST",
+            "/api/ide/v2/auth/setup",
+            {"username": "resource-admin", "password": "Strong-Passphrase-42!"},
+            {"Origin": f"http://127.0.0.1:{self.port}"},
+        )
+        self.assertEqual(status, 201)
+        cookie = headers["Set-Cookie"].split(";", 1)[0]
+        read_headers = {"Cookie": cookie}
+
+        status, _, resources = self.request(
+            "GET", "/api/ide/v2/resources", headers=read_headers)
+        self.assertEqual(status, 200)
+        self.assertTrue(resources["skills"]["can_write"])
+        self.assertEqual(resources["js_libraries"]["count"], 2)
+        status, _, skills = self.request("GET", "/api/skills", headers=read_headers)
+        self.assertEqual(status, 200)
+        self.assertEqual(skills[0]["id"], "shared-skill")
+        status, _, mcp = self.request(
+            "GET", "/api/ide/v2/resources/mcp/health", headers=read_headers
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(mcp["ready"], 1)
+
+        write_headers = {
+            "Cookie": cookie,
+            "Origin": f"http://127.0.0.1:{self.port}",
+        }
+        status, _, error = self.request(
+            "POST",
+            "/api/ide/v2/resources/skills",
+            {"path": "custom", "content": "body"},
+            write_headers,
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(error["code"], "csrf_required")
+        write_headers["X-CSRF-Token"] = setup["csrf_token"]
+        status, _, saved = self.request(
+            "POST",
+            "/api/ide/v2/resources/skills",
+            {"path": "custom", "content": "body", "overwrite": True},
+            write_headers,
+        )
+        self.assertEqual(status, 201)
+        self.assertTrue(saved["ok"])
+        self.assertEqual(self.app.resource_skill_write, ("custom", "body", True))
+        status, _, restarted = self.request(
+            "POST",
+            "/api/ide/v2/resources/mcp/restart",
+            {"server": "shared"},
+            write_headers,
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(restarted["ok"])
+        self.assertEqual(self.app.resource_mcp_action[0], "restart")
+
     def test_local_auto_login_isolates_clients_and_rejects_ip_reuse(self):
         previous = os.environ.get("CLOUDS_CODER_TRUST_PROXY")
         os.environ["CLOUDS_CODER_TRUST_PROXY"] = "1"
@@ -1985,7 +2882,8 @@ class IDEHTTPAuthTests(unittest.TestCase):
 
             cookie_a, auth_a = login("192.168.1.21")
             _cookie_b, auth_b = login("192.168.1.22")
-            self.assertNotEqual(auth_a["account"]["user_id"], auth_b["account"]["user_id"])
+            self.assertNotEqual(auth_a["account"]["user_id"],
+                                auth_b["account"]["user_id"])
             self.assertEqual(auth_a["account"]["role"], "user")
             self.assertEqual(auth_b["account"]["role"], "user")
 
@@ -2080,8 +2978,10 @@ class IDEHTTPAuthTests(unittest.TestCase):
 
 class IDEWorkbenchSourceTests(unittest.TestCase):
     def test_automatic_auth_is_identity_bound_and_csrf_can_resync(self):
-        self.assertIn("legacy_user_id=user_id_from_ip(client_ip)", inspect.getsource(cc.AppContext.local_ide_login))
-        self.assertIn("session_kind=\"local_auto\"", inspect.getsource(cc.IDEAuthStore.local_session))
+        self.assertIn("legacy_user_id=user_id_from_ip(client_ip)",
+                      inspect.getsource(cc.AppContext.local_ide_login))
+        self.assertIn("session_kind=\"local_auto\"",
+                      inspect.getsource(cc.IDEAuthStore.local_session))
         self.assertIn("if(res.status===403&&data.code==='csrf_required'", cc.IDE_JS)
         self.assertIn("async function refreshCsrfToken()", cc.IDE_JS)
         self.assertIn("await refreshCsrfToken();", cc.IDE_JS)
@@ -2467,6 +3367,9 @@ process.stdout.write(JSON.stringify({output,pending:state.pending}));
         self.assertIn("'markdown','text'].includes(kind)", cc.IDE_JS)
         self.assertIn("media.onerror=()=>showArtifactPreviewError", cc.IDE_JS)
         self.assertIn("frame.src=artifactUrl(file,'preview')", cc.IDE_JS)
+        self.assertIn("if(kind==='html')frame.sandbox='allow-scripts'", cc.IDE_JS)
+        self.assertIn("['html','pdf'].includes(file.previewKind)", cc.IDE_JS)
+        self.assertIn("else if(kind==='pdf'||kind==='html')", cc.IDE_JS)
         self.assertIn(
             ".artifact-stage img{display:block;width:100%;height:100%", cc.IDE_CSS
         )
@@ -2735,6 +3638,37 @@ class IDEAutoTitleTests(unittest.TestCase):
         self.assertEqual(session.last_auto_title_source, "fallback")
         self.assertFalse(session._is_low_quality_auto_title(session.title))
 
+    def test_application_session_title_keeps_app_name_prefix(self):
+        session, _ = self.make_session(title="Image Studio")
+        session.app_binding = {"app_id": "app_image", "name": "Image Studio"}
+        session.title_origin = "application"
+        self.assertTrue(session._maybe_auto_rename_session_title("application-start"))
+        self.assertEqual(session.title, "Image Studio-宝可梦精灵球绘制")
+        self.assertEqual(session.title_origin, "auto")
+        self.assertEqual(session.last_auto_title_source, "model")
+
+    def test_legacy_application_title_and_placeholder_suffix_are_replaceable(self):
+        exact, _ = self.make_session(title="Image Studio")
+        exact.app_binding = {"app_id": "app_image", "name": "Image Studio"}
+        exact.title_origin = "legacy"
+        self.assertTrue(exact._migrate_legacy_auto_title_on_load())
+        self.assertEqual(exact.title, "Image Studio-制作一个宝可梦精灵球的图片")
+        self.assertEqual(exact.title_origin, "auto")
+
+        placeholder, _ = self.make_session(title="Image Studio-IDE编程请求处理")
+        placeholder.app_binding = {"app_id": "app_image", "name": "Image Studio"}
+        placeholder.title_origin = "auto"
+        self.assertTrue(
+            placeholder._maybe_auto_rename_session_title("application-repair"))
+        self.assertEqual(placeholder.title, "Image Studio-宝可梦精灵球绘制")
+
+    def test_manual_application_session_title_is_never_overwritten(self):
+        session, _ = self.make_session(title="我的图片工作")
+        session.app_binding = {"app_id": "app_image", "name": "Image Studio"}
+        session.title_origin = "manual"
+        self.assertFalse(session._maybe_auto_rename_session_title("application-start"))
+        self.assertEqual(session.title, "我的图片工作")
+
     def test_continuation_message_does_not_replace_title_goal(self):
         session, _ = self.make_session(model_title="继续")
         session.messages.append(
@@ -2772,6 +3706,17 @@ class IDEAutoTitleTests(unittest.TestCase):
                 self.assertEqual(session.title_origin, "default")
                 self.assertTrue(session._maybe_auto_rename_session_title("test"))
                 self.assertEqual(session.title, "宝可梦精灵球绘制")
+
+    def test_shared_workspace_is_replaceable_and_legacy_sessions_are_migrated(self):
+        session, _ = self.make_session(title="Shared workspace")
+        self.assertEqual(session.title_origin, "default")
+        self.assertTrue(session._maybe_auto_rename_session_title("test"))
+        self.assertEqual(session.title, "宝可梦精灵球绘制")
+
+        legacy, _ = self.make_session(title="Shared workspace")
+        legacy.title_origin = "legacy"
+        self.assertTrue(legacy._migrate_legacy_auto_title_on_load())
+        self.assertEqual(legacy.title_origin, "auto")
 
     def test_manual_title_is_never_overwritten(self):
         session, _ = self.make_session(title="Program 12:34")
@@ -2816,6 +3761,80 @@ class IDEAutoTitleTests(unittest.TestCase):
 
 
 class IDEAgentStateTests(unittest.TestCase):
+    def test_collaboration_run_with_open_todos_is_blocked_not_completed(self):
+        todos = cc.TodoManager("zh-CN")
+        todos.update(
+            [
+                {"content": "实现核心模块", "status": "completed"},
+                {"content": "运行 QA 验证", "status": "in_progress"},
+                {"content": "发布验证证据", "status": "pending"},
+            ]
+        )
+        session = types.SimpleNamespace(
+            blackboard={},
+            todo=todos,
+            cancel_requested=False,
+            pending_user_question=None,
+            run_started_at=0.0,
+            operations=[],
+        )
+
+        status, summary = cc.AppContext._collaboration_run_outcome(session)
+
+        self.assertEqual(status, "blocked")
+        self.assertIn("Outstanding Todos: 2 of 3", summary)
+
+    def test_collaboration_tool_event_refreshes_agent_heartbeat_details(self):
+        coordinator = types.SimpleNamespace(
+            heartbeat=mock.Mock(return_value={"ok": True}))
+        session = cc.SessionState.__new__(cc.SessionState)
+        session.id = "sess_live"
+        session.running = True
+        session.current_tool_name = "edit_file"
+        session.collaboration_write_coordinator = coordinator
+        session.collaboration_agent_last_heartbeat = 0.0
+        session.collaboration_agent_current_file = ""
+
+        session._publish_collaboration_event_heartbeat(
+            "tool_start", {
+                "name": "edit_file", "path": "js/live.js", "summary": "tool start: edit_file"}, )  # noqa: E501
+
+        call = coordinator.heartbeat.call_args
+        self.assertEqual(call.args[0], "sess_live")
+        self.assertEqual(call.kwargs["status"], "running")
+        self.assertEqual(call.kwargs["current_file"], "js/live.js")
+        self.assertIn("edit_file", call.kwargs["tool_summary"])
+
+    def test_collaboration_agent_lifecycle_is_published(self):
+        app = cc.AppContext.__new__(cc.AppContext)
+        app.collaboration = types.SimpleNamespace(
+            update_agent=mock.Mock(return_value={"ok": True})
+        )
+        principal = cc.CollaborationPrincipal(
+            project_id="project-a",
+            member_id="member-a",
+            device_id="device-a",
+            session_digest="digest-a",
+            csrf_token="csrf-a",
+            nickname="Alice",
+            expires_at=999999.0,
+        )
+        session = types.SimpleNamespace(
+            id="sess_shared",
+            operations=[],
+            collaboration_write_coordinator=types.SimpleNamespace(principal=principal),
+        )
+
+        self.assertTrue(
+            app._publish_collaboration_agent_state(
+                session, "running", result_summary="Agent run started"
+            )
+        )
+        call = app.collaboration.update_agent.call_args
+        self.assertEqual(call.kwargs["status"], "running")
+        self.assertEqual(call.kwargs["session_id"], "sess_shared")
+        self.assertEqual(call.kwargs["agent_id"], "agent:sess_shared")
+
     def test_interrupt_agent_cancels_only_matching_queued_rows(self):
         app = cc.AppContext.__new__(cc.AppContext)
         app._lock = threading.RLock()
@@ -2948,6 +3967,25 @@ class IDEAgentStateTests(unittest.TestCase):
         self.assertIn("compact.textContent='Compact'", cc.IDE_JS)
         self.assertIn("context_effective_token_limit", cc.IDE_JS)
 
+    def test_agent_model_config_control_and_mode_aware_dialog_are_wired(self):
+        self.assertIn("agent-model-actions", cc.IDE_CSS)
+        self.assertIn("agent-model-config", cc.IDE_CSS)
+        self.assertIn("codicon-settings-gear", cc.IDE_JS)
+        self.assertIn("actions.append(compact,config)", cc.IDE_JS)
+        self.assertIn("async function showLlmConfigModal()", cc.IDE_JS)
+        self.assertIn("/api/ide/v2/llm-config", cc.IDE_JS)
+        self.assertIn("/llm-config`,{method:'POST'", cc.IDE_JS)
+        self.assertIn("Use Shared Config", cc.IDE_JS)
+        self.assertIn("Sync Main Config", cc.IDE_JS)
+        self.assertIn("accept=\".json,application/json\"", cc.IDE_JS)
+        self.assertIn("maximum 512 KB", cc.IDE_JS)
+        self.assertIn("Credentials remain server-side", cc.IDE_JS)
+        get_source = inspect.getsource(cc.IdeHandler.do_GET)
+        post_source = inspect.getsource(cc.IdeHandler.do_POST)
+        self.assertIn('path == "/api/ide/v2/llm-config"', get_source)
+        self.assertIn('path == "/api/ide/v2/llm-config/shared"', post_source)
+        self.assertIn('/llm-config$", path)', post_source)
+
     def test_workspace_drag_drop_clipboard_and_context_actions_are_wired(self):
         post_source = inspect.getsource(cc.IdeHandler.do_POST)
         self.assertIn('/workspace/copy$"', post_source)
@@ -2980,6 +4018,9 @@ class IDEAgentStateTests(unittest.TestCase):
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, cc.IDE_JS)
+        self.assertIn("fallbackEntries", cc.IDE_JS)
+        self.assertIn("handleTasks=items.map", cc.IDE_JS)
+        self.assertIn("replace(/^file:\\/+/i,'')", cc.IDE_JS)
 
         self.assertIn(
             "S.workspaceClipboard=null;S.explorerSelection=null;"
@@ -2989,6 +4030,17 @@ class IDEAgentStateTests(unittest.TestCase):
         self.assertIn("event.key==='Delete'||event.key==='Backspace'", cc.IDE_JS)
         self.assertIn(".tree-row.is-drop-target", cc.IDE_CSS)
         self.assertIn(".tree-row.is-cut", cc.IDE_CSS)
+
+    def test_html_preview_and_history_refresh_are_event_driven(self):
+        self.assertTrue(cc.is_code_preview_candidate("index.html"))
+        self.assertIn("kind==='code'||kind==='html'?'latest':''", cc.APP_JS)
+        self.assertIn("_refreshActivePreviewForPath", cc.APP_JS)
+        self.assertIn(
+            "if(typ==='file_patch')_refreshActivePreviewForPath", cc.APP_JS
+        )
+        self.assertIn("async function _renderHtmlPreviewTab", cc.APP_JS)
+        self.assertIn("frame.srcdoc=_htmlPreviewStageDocument", cc.APP_JS)
+        self.assertIn("file.previewKind==='html'", cc.IDE_JS)
 
     def test_program_session_creation_uses_server_default_title(self):
         self.assertIn(
@@ -3496,6 +4548,36 @@ class IDERegressionFixTests(unittest.TestCase):
             )
             self.assertEqual(session.code_preview_index["main.py"][0]["added"], 1)
 
+    def test_latest_code_preview_reads_authoritative_file_after_last_stage(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            session = cc.SessionState.__new__(cc.SessionState)
+            session.root = root
+            session.files_root = root / "files"
+            session.files_root.mkdir()
+            session.code_preview_dir = root / "code_preview"
+            session.code_preview_dir.mkdir()
+            session.code_preview_index = {}
+            session.lock = threading.RLock()
+            target = session.files_root / "index.html"
+            target.write_text("<h1>one</h1>\n", encoding="utf-8")
+            stage = session._record_code_preview_stage(
+                rel_path="index.html",
+                before_text="",
+                after_text="<h1>one</h1>\n",
+                change_type="added",
+                tool_name="test",
+                added=1,
+                deleted=0,
+            )
+            target.write_text("<h1>two</h1>\n", encoding="utf-8")
+
+            latest = session.code_preview_payload("index.html", "latest")
+            historical = session.code_preview_payload("index.html", stage["id"])
+
+            self.assertEqual(latest["full_text"], "<h1>two</h1>\n")
+            self.assertEqual(historical["full_text"], "<h1>one</h1>\n")
+
     def test_windows_low_integrity_access_denied_is_cached_as_optional_degradation(
         self,
     ):
@@ -3516,6 +4598,504 @@ class IDERegressionFixTests(unittest.TestCase):
                 self.assertIn(key, cc._WINDOWS_LOW_INTEGRITY_FAILED_ROOTS)
             finally:
                 cc._WINDOWS_LOW_INTEGRITY_FAILED_ROOTS.discard(key)
+
+
+class SubprocessTextSafetyTests(unittest.TestCase):
+    def test_shell_process_invocation_is_platform_correct(self):
+        with mock.patch.object(cc.os, "name", "nt"):
+            command, use_shell, windows_job = cc.shell_process_invocation("echo 中文")
+            self.assertEqual(command, "chcp 65001>nul & echo 中文")
+            self.assertTrue(use_shell)
+            self.assertFalse(windows_job)
+
+            command, use_shell, windows_job = cc.shell_process_invocation(
+                "echo ok", [cc.WINDOWS_JOB_SANDBOX_MARKER]
+            )
+            self.assertEqual(command, "chcp 65001>nul & echo ok")
+            self.assertTrue(use_shell)
+            self.assertTrue(windows_job)
+
+        with mock.patch.object(cc.os, "name", "posix"):
+            command, use_shell, windows_job = cc.shell_process_invocation("echo ok")
+            self.assertEqual(command, "echo ok")
+            self.assertTrue(use_shell)
+            self.assertFalse(windows_job)
+
+            command, use_shell, windows_job = cc.shell_process_invocation(
+                "echo ok", ["/usr/bin/bwrap", "--unshare-all"]
+            )
+            self.assertEqual(
+                command,
+                ["/usr/bin/bwrap", "--unshare-all", "/bin/sh", "-c", "echo ok"],
+            )
+            self.assertFalse(use_shell)
+            self.assertFalse(windows_job)
+
+    def test_task_command_uses_platform_specific_quoting(self):
+        with mock.patch.object(cc.os, "name", "nt"):
+            windows = cc.join_shell_task_command(
+                r"C:\Program Files\Python\python.exe", ["script name.py", "plain"]
+            )
+        self.assertEqual(
+            windows,
+            '"C:\\Program Files\\Python\\python.exe" "script name.py" plain',
+        )
+        with mock.patch.object(cc.os, "name", "posix"):
+            posix = cc.join_shell_task_command("python3", ["script name.py", "plain"])
+        self.assertEqual(posix, "python3 'script name.py' plain")
+
+    def test_decode_subprocess_bytes_never_raises_for_mixed_output(self):
+        raw = "Windows 中文输出".encode() + b"\xad"
+        with (
+            mock.patch.object(cc, "_windows_subprocess_encodings",
+                              return_value=["cp936"]),
+            mock.patch.object(cc.locale, "getpreferredencoding", return_value="gbk"),
+        ):
+            text, diagnostics = cc.decode_subprocess_bytes(raw)
+        self.assertIsInstance(text, str)
+        self.assertTrue(text)
+        self.assertIn("encoding", diagnostics)
+
+    def test_run_subprocess_text_preserves_exit_stderr_and_timeout_output(self):
+        completed = cc.run_subprocess_text(
+            [
+                cc.sys.executable,
+                "-c",
+                "import os,sys; os.write(1, '中文'.encode()); os.write(2, b'bad\\xad'); sys.exit(7)",  # noqa: E501
+            ],
+            capture_output=True,
+        )
+        self.assertEqual(completed.returncode, 7)
+        self.assertIn("中文", completed.stdout)
+        self.assertIsInstance(completed.stderr, str)
+        self.assertTrue(hasattr(completed, "decoding_diagnostics"))
+
+        with self.assertRaises(cc.subprocess.TimeoutExpired) as raised:
+            cc.run_subprocess_text(
+                [cc.sys.executable, "-c",
+                    "import os,time; os.write(1,b'partial\\xad'); time.sleep(2)"],
+                capture_output=True,
+                timeout=0.05,
+            )
+        self.assertIsInstance(raised.exception.stdout, str)
+        self.assertTrue(hasattr(raised.exception, "decoding_diagnostics"))
+
+    def test_captured_subprocesses_do_not_use_implicit_text_decoding(self):
+        source = Path(cc.__file__).read_text(encoding="utf-8")
+        pattern = re.compile(
+            r"subprocess\.run\([\s\S]{0,600}?(?:capture_output=True|stdout=subprocess\.PIPE)"  # noqa: E501
+            r"[\s\S]{0,300}?(?:text=True|universal_newlines=True)")
+        self.assertIsNone(pattern.search(source))
+
+
+class HardApplicationSnapshotIntegrityTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name) / "session"
+        self.files = self.root / "files"
+        self.snapshot = self.files / ".application_skills"
+        (self.snapshot / "01").mkdir(parents=True)
+        self.resource = self.snapshot / "01" / "SKILL.md"
+        self.resource.write_text("approved skill\n", encoding="utf-8")
+        digest = cc._sha256_file(self.resource)
+        (self.snapshot / "MANIFEST.json").write_text(
+            json.dumps(
+                {
+                    "resources": [
+                        {
+                            "skill_id": "demo",
+                            "skill_order": 1,
+                            "kind": "skill_source",
+                            "path": "SKILL.md",
+                            "digest": digest,
+                            "size": self.resource.stat().st_size,
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        session = cc.SessionState.__new__(cc.SessionState)
+        session.id = "sess_hard"
+        session.root = self.root
+        session.files_root = self.files
+        session.skill_mode = "hard"
+        session.app_binding = {
+            "app_id": "app_demo",
+            "capsule_digest": "capsule",
+            "resources_digest": "",
+            "resource_count": 1,
+        }
+        session.crypto = cc.CryptoBox(Path(self.tmp.name) / "Codes")
+        session._application_snapshot_integrity_lock = threading.RLock()
+        self.session = session
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_fallback_allows_workspace_and_restores_snapshot_tampering(self):
+        self.assertEqual(self.session._hard_snapshot_integrity_callback(
+            "before", "echo ok > normal.txt"), "")
+        (self.files / "normal.txt").write_text("workspace is writable", encoding="utf-8")  # noqa: E501
+        os.chmod(self.resource, 0o600)
+        self.resource.write_text("tampered", encoding="utf-8")
+        error = self.session._hard_snapshot_integrity_callback(
+            "after", "python mutate.py")
+        self.assertIn("restored", error)
+        self.assertEqual(self.resource.read_text(encoding="utf-8"), "approved skill\n")
+        self.assertEqual(
+            (self.files /
+             "normal.txt").read_text(
+                encoding="utf-8"),
+            "workspace is writable")
+
+    def test_explicit_snapshot_mutation_is_rejected_before_execution(self):
+        error = self.session._hard_snapshot_integrity_callback(
+            "before", "rm -rf .application_skills"
+        )
+        self.assertIn("read-only", error)
+        scripted = self.session._hard_snapshot_integrity_callback(
+            "before",
+            "python -c \"from pathlib import Path; Path('.application_skills/01/SKILL.md').unlink()\"",  # noqa: E501
+        )
+        self.assertIn("read-only", scripted)
+
+    def test_hard_bubblewrap_prefix_overlays_snapshot_readonly(self):
+        self.session.skills = types.SimpleNamespace(
+            skills_root=Path(self.tmp.name) / "skills",
+            shell_virtual_mappings=lambda: [],
+        )
+        self.session.skills.skills_root.mkdir()
+        self.session.js_lib_root = Path(self.tmp.name) / "js_lib"
+        self.session.js_lib_root.mkdir()
+        self.session._remote_runtime_read_roots = lambda: []
+        backend = {"available": True, "name": "bubblewrap", "processes": True}
+        with (
+            mock.patch.object(cc, "_detect_ide_sandbox_backend", return_value=backend),
+            mock.patch.object(cc.shutil, "which", return_value="/usr/bin/bwrap"),
+        ):
+            prefix = self.session._workspace_sandbox_shell_prefix(self.files)
+        overlay = ["--ro-bind", str(self.snapshot.resolve()),
+                   "/workspace/.application_skills"]
+        self.assertIn(" ".join(overlay), " ".join(prefix))
+
+
+class IDEApplicationBridgeTests(unittest.TestCase):
+    def test_application_launch_marks_default_title_for_prefixed_auto_rename(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            capsule = "{}"
+            app_row = {
+                "id": "app_demo",
+                "name": "Demo App",
+                "scope": "personal",
+                "revision": 1,
+                "capsule": capsule,
+                "capsule_digest": cc.hashlib.sha256(capsule.encode()).hexdigest(),
+                "skills": [{"id": "demo", "order": 1}],
+                "resources": [],
+                "resources_digest": cc.hashlib.sha256(b"").hexdigest(),
+                "snapshot_version": 1,
+            }
+
+            class FakeApplications:
+                resolve_launch = staticmethod(lambda _user_id, _app_id: dict(app_row))
+                _resources_digest = staticmethod(
+                    cc.ApplicationRegistry._resources_digest)
+                _verify_v2_runtime_contract_manifest = staticmethod(lambda *_args: None)
+
+            def fake_session(title):
+                session_root = root / f"session-{len(list(root.iterdir()))}"
+                files_root = session_root / "files"
+                files_root.mkdir(parents=True)
+                session = cc.SessionState.__new__(cc.SessionState)
+                session.id = session_root.name
+                session.root = session_root
+                session.files_root = files_root
+                session.title = title
+                session.title_origin = (
+                    "default"
+                    if session._is_default_session_title(title)
+                    else "legacy"
+                )
+                session.last_auto_title_source = ""
+                session.app_binding = {}
+                session.bound_skill_ids = []
+                session.bound_skill_capsule = ""
+                session.skill_mode = "dynamic"
+                session.updated_at = 0.0
+                session.ui_language = "zh-CN"
+                session.lock = threading.RLock()
+                session._persist = mock.Mock()
+                session._restore_application_snapshot_permissions = mock.Mock()
+                session._write_application_snapshot_recovery = mock.Mock()
+                return session
+
+            app = cc.AppContext.__new__(cc.AppContext)
+            app.applications = FakeApplications()
+            app.telemetry = types.SimpleNamespace(record=lambda *_args, **_kwargs: None)
+            sessions = []
+
+            def create(_user_id, title, client_ip=""):
+                session = fake_session(title)
+                sessions.append(session)
+                return session, {"remaining": 10}
+
+            app.create_session_for_user = create
+            automatic = app.launch_application_for_user("user-a", "app_demo")
+            self.assertEqual(automatic["title"], "Demo App")
+            self.assertEqual(sessions[-1].title_origin, "application")
+
+            explicit = app.launch_application_for_user(
+                "user-a", "app_demo", title="My Manual Session"
+            )
+            self.assertEqual(explicit["title"], "My Manual Session")
+            self.assertEqual(sessions[-1].title_origin, "manual")
+
+    def test_personal_application_submissions_remain_pending_and_revision_scoped(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+
+            class Store:
+                skills = {
+                    "demo": {
+                        "name": "Demo",
+                        "description": "Demo workflow",
+                        "protocol": "builtin",
+                        "meta": {},
+                        "body": "Always return a checked result.",
+                    }
+                }
+
+                @staticmethod
+                def _resolve_name(ref):
+                    return (ref, "") if ref == "demo" else (None, "unknown skill")
+
+                @staticmethod
+                def load(ref):
+                    return "---\nname: Demo\ndescription: Demo workflow\n---\nAlways return a checked result.\n" if ref == "demo" else ""  # noqa: E501
+
+                @staticmethod
+                def list_metadata():
+                    return [{"qualified_name": "demo", "name": "Demo",
+                             "description": "Demo workflow"}]
+
+                @staticmethod
+                def _skill_runtime_contract(_meta):
+                    return ""
+
+            fake_app = types.SimpleNamespace(
+                user_root=lambda user_id: root / user_id,
+                _ensure_skills_store=lambda force=False: Store(),
+                _lock=threading.RLock(),
+            )
+            registry = cc.ApplicationRegistry(fake_app, root / "system.json")
+            created = registry.save_personal(
+                "ide-owner",
+                {"name": "Review App", "description": "v1", "skills": ["demo"]},
+            )
+            first = registry.submit("ide-owner", created["id"])
+            duplicate = registry.submit("ide-owner", created["id"])
+            self.assertEqual(first["status"], "pending")
+            self.assertEqual(first["scope"], "shared")
+            self.assertEqual(first["id"], duplicate["id"])
+            self.assertEqual(registry.list_shared(), [])
+
+            edited = registry.save_personal(
+                "ide-owner",
+                {"name": "Review App", "description": "v2", "skills": ["demo"]},
+                app_id=created["id"],
+            )
+            second = registry.submit("ide-owner", created["id"])
+            self.assertEqual(edited["revision"], 2)
+            self.assertEqual(second["status"], "pending")
+            self.assertEqual(second["submitted_revision"], 2)
+            self.assertNotEqual(second["id"], first["id"])
+            self.assertEqual(registry.list_shared(), [])
+            with self.assertRaises(KeyError):
+                registry.submit("other-owner", created["id"])
+            self.assertFalse(registry.delete_personal("other-owner", created["id"]))
+
+    def test_personal_import_copies_owner_and_preserves_source(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            fake_app = types.SimpleNamespace(user_root=lambda user_id: root / user_id)
+            registry = cc.ApplicationRegistry(fake_app, root / "system.json")
+            source_path = registry._personal_path("source")
+            source = {
+                "id": "app_source",
+                "owner": "source",
+                "name": "Source App",
+                "scope": "personal",
+                "status": "draft",
+                "revision": 4,
+                "skills": [{"id": "demo"}],
+                "capsule": "{}",
+                "capsule_digest": "abc",
+                "resources": [],
+                "resources_digest": "def",
+                "snapshot_version": 2,
+                "created_at": 1.0,
+                "updated_at": 2.0,
+            }
+            registry._write_rows(source_path, [source])
+            result = registry.import_personal("source", "target", "app_source")
+            copied_id = result["application"]["id"]
+            self.assertNotEqual(copied_id, "app_source")
+            copied = registry._read_rows(registry._personal_path("target"))[0]
+            self.assertEqual(copied["owner"], "target")
+            self.assertEqual(copied["imported_from"]["app_id"], "app_source")
+            self.assertEqual(registry._read_rows(source_path), [source])
+
+    def test_application_listing_uses_authenticated_account_and_current_ip_only(self):
+        app = cc.AppContext.__new__(cc.AppContext)
+        source_user = cc.user_id_from_ip(cc._normalize_ip("10.0.0.8"))
+        app.applications = types.SimpleNamespace(
+            list_shared=lambda: [{"id": "shared"}],
+            list_personal=lambda uid: [{"id": "target"}] if uid == "ide_account" else (
+                [{"id": "legacy"}] if uid == source_user else [{"id": "wrong"}]),
+        )
+        app.manager_for_user = lambda uid: types.SimpleNamespace(
+            list=lambda **_kwargs: {"sessions": []})
+        payload = app.ide_applications_payload("ide_account", client_ip="10.0.0.8")
+        self.assertEqual([row["id"] for row in payload["personal"]], ["target"])
+        self.assertEqual([row["id"] for row in payload["legacy_personal"]], ["legacy"])
+        self.assertEqual([row["id"] for row in payload["shared"]], ["shared"])
+
+    def test_session_import_rewrites_encrypted_identity_and_preserves_source(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            codes = root / "Codes"
+            crypto = cc.CryptoBox(codes)
+            source_user = cc.user_id_from_ip(cc._normalize_ip("10.0.0.9"))
+            source_root = root / "source-session"
+            (source_root / "files").mkdir(parents=True)
+            (source_root / "files" / "work.txt").write_text("preserved", encoding="utf-8")  # noqa: E501
+            source_binding = {"app_id": "app_source",
+                              "name": "App", "scope": "personal"}
+            crypto.write_json(source_root / "state.json",
+                              {"id": "sess_source",
+                               "title": "Imported",
+                               "app_binding": source_binding,
+                               "bound_skill_ids": ["demo"],
+                                  "bound_skill_capsule": "{}"})
+            crypto.write_json(source_root / "meta.json",
+                              {"id": "sess_source",
+                               "title": "Imported",
+                               "message_count": 3})
+
+            class SourceSession:
+                id = "sess_source"
+                title = "Imported"
+                skill_mode = "hard"
+                app_binding = source_binding
+                root = source_root
+                lock = threading.RLock()
+
+                @staticmethod
+                def _verify_application_snapshot_integrity(restore=True):
+                    return ""
+
+                @staticmethod
+                def _persist():
+                    return None
+
+            class Manager:
+                def __init__(self, manager_root, source=None):
+                    self.root = manager_root
+                    self.root.mkdir(parents=True, exist_ok=True)
+                    self.source = source
+                    self.lock = threading.RLock()
+                    self.sessions = {}
+                    self.session_index = {}
+
+                def get(self, session_id):
+                    if self.source is not None:
+                        return self.source if session_id == self.source.id else None
+                    path = self.root / session_id / "state.json"
+                    if not path.exists():
+                        return None
+                    state = crypto.read_json(path, {})
+                    return types.SimpleNamespace(
+                        id=session_id,
+                        title=state.get("title", "Imported"),
+                        ui_language="zh-CN",
+                        app_binding=state.get("app_binding", {}),
+                        _ensure_application_snapshot_recovery=lambda: "",
+                    )
+
+            source_manager = Manager(root / "source-manager", SourceSession())
+            target_manager = Manager(root / "target-manager")
+            app = cc.AppContext.__new__(cc.AppContext)
+            app.crypto = crypto
+            app._lock = threading.RLock()
+            app.ide_terminal_lock = threading.RLock()
+            app.ide_terminals = {}
+            app.ide_debug_lock = threading.RLock()
+            app.ide_debug_sessions = {}
+            app.applications = types.SimpleNamespace(
+                import_personal=lambda *_args: {"application": {"id": "app_imported"}},
+                resolve_launch=lambda *_args: {},
+                remove_imported_copy=lambda *_args: True,
+            )
+            app.manager_for_user = lambda uid: source_manager if uid == source_user else target_manager  # noqa: E501
+            app._ide_legacy_session_running = lambda *_args: False
+            app._rollback_session_quota_reservation = lambda _uid: None
+
+            def create_target(_uid, title, client_ip=""):
+                target = types.SimpleNamespace(
+                    id="sess_target",
+                    title=title,
+                    root=target_manager.root /
+                    "sess_target")
+                target.root.mkdir(parents=True)
+                return target, {"remaining": 4}
+
+            app.create_session_for_user = create_target
+            result = app.ide_import_application_session(
+                "ide_account", "sess_source", client_ip="10.0.0.9")
+            copied_state = crypto.read_json(
+                target_manager.root / result["id"] / "state.json", {})
+            source_state = crypto.read_json(source_root / "state.json", {})
+            self.assertEqual(copied_state["id"], "sess_target")
+            self.assertEqual(copied_state["app_binding"]["app_id"], "app_imported")
+            self.assertEqual(
+                (target_manager.root /
+                 result["id"] /
+                    "files" /
+                    "work.txt").read_text(
+                    encoding="utf-8"),
+                "preserved")
+            self.assertEqual(source_state["id"], "sess_source")
+            self.assertEqual(source_state["app_binding"]["app_id"], "app_source")
+
+    def test_ide_assets_expose_applications_view_and_bridge_actions(self):
+        self.assertIn('data-view="applications"', cc.IDE_INDEX_HTML)
+        self.assertIn('data-side-view="applications"', cc.IDE_INDEX_HTML)
+        self.assertIn('id="newIdeApplicationBtn"', cc.IDE_INDEX_HTML)
+        self.assertRegex(
+            cc.IDE_INDEX_HTML,
+            r"<strong>Personal</strong><button id=\"newIdeApplicationBtn\"",
+        )
+        self.assertIn(
+            'class="application-create-glyph" aria-hidden="true">+</span>',
+            cc.IDE_INDEX_HTML)
+        self.assertIn(".application-create-button", cc.IDE_CSS)
+        self.assertIn("background:transparent!important", cc.IDE_CSS)
+        self.assertNotIn(".application-empty-create", cc.IDE_CSS)
+        self.assertIn(".modal.is-application-editor", cc.IDE_CSS)
+        self.assertIn("overflow-y:scroll", cc.IDE_CSS)
+        self.assertIn("scrollbar-gutter:stable", cc.IDE_CSS)
+        self.assertIn("applicationEditor:true", cc.IDE_JS)
+        self.assertIn('/api/ide/v2/applications', cc.IDE_JS)
+        self.assertIn('/api/ide/v2/application-sessions/import', cc.IDE_JS)
+        self.assertIn('function openIdeApplicationEditor(', cc.IDE_JS)
+        self.assertIn('function renderIdeApplicationSkillEditor(', cc.IDE_JS)
+        self.assertIn('function saveIdeApplication(', cc.IDE_JS)
+        self.assertIn('function submitIdeApplication(', cc.IDE_JS)
+        self.assertIn('function deleteIdeApplication(', cc.IDE_JS)
+        self.assertIn('Submit for Shared Review', cc.IDE_JS)
+        self.assertIn('switchSession(out.id,true)', cc.IDE_JS)
 
 
 if __name__ == "__main__":

@@ -264,8 +264,7 @@ class DynamicAgentLoopTests(unittest.TestCase):
         self.assertIn("_single_agent_todo_alignment_prompt_block", source)
         discipline = inspect.getsource(cc.SessionState._plan_todo_discipline_prompt)
         self.assertIn(
-            "Observable tool results provide completion evidence but do not close "
-            "ordinary work rows by themselves",
+            "Observable tool results provide completion evidence but do not close ordinary work rows by themselves",  # noqa: E501
             discipline,
         )
         self.assertIn("update them together in one call", discipline)

@@ -30,19 +30,12 @@ for line in sys.stdin:
         continue
     method = message.get('method')
     if method == 'initialize':
-        result = {
-            'protocolVersion': '2025-06-18',
-            'capabilities': {'tools': {}},
-            'serverInfo': {'name': 'test', 'version': '1'},
-        }
+        result = {'protocolVersion': '2025-06-18', 'capabilities': {'tools': {}}, 'serverInfo': {'name': 'test', 'version': '1'}}  # noqa: E501
     elif method == 'tools/list':
         result = {'tools': []}
     else:
         result = {}
-    print(
-        json.dumps({'jsonrpc': '2.0', 'id': message['id'], 'result': result}),
-        flush=True,
-    )
+    print(json.dumps({'jsonrpc': '2.0', 'id': message['id'], 'result': result}), flush=True)  # noqa: E501
 """,
             encoding="utf-8",
         )
@@ -133,13 +126,9 @@ for line in sys.stdin:
                     "command": sys.executable,
                     "args": [
                         "-c",
-                        (
-                            "from pathlib import Path; "
-                            f"Path({str(marker)!r}).write_text('executed\\n')"
-                        ),
+                        f"from pathlib import Path; Path({str(marker)!r}).write_text('executed\\n')",  # noqa: E501
                     ],
-                }
-            },
+                }},
         }
         self.config_path.write_text(json.dumps(config), encoding="utf-8")
         manager = self.make_manager(config)
