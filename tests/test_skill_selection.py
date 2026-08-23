@@ -111,20 +111,23 @@ class SkillSelectionTests(unittest.TestCase):
         ]
         self.assertEqual(once, repeated)
 
-    def test_cfd_metadata_recalls_shader_dev_without_loading_body(self):
-        store = cc.SkillStore(Path(__file__).resolve().parents[1] / "skills")
-
-        recalled = store.recall_metadata(
-            "IDE programming request.\n"
-            "Workspace root: IDE Workspace (session)\n"
-            "Writable path: /tmp/workspace\n"
-            "完成一个CFD流体力学仿真软件。",
-            limit=12,
+    def test_declared_entrypoint_is_recalled_without_loading_body(self):
+        _write_skill(
+            self.root,
+            "analysis-engine",
+            "name: analysis-engine\n"
+            "description: Domain analysis workflow\n"
+            "triggers: [simulation analysis]\n"
+            "entrypoints: [guides/analysis.md]",
+            body="The full workflow body is intentionally not loaded for recall.",
         )
+        store = cc.SkillStore(self.root)
 
-        self.assertEqual(recalled[0]["id"], "local:shader-dev")
+        recalled = store.recall_metadata("run a simulation analysis", limit=12)
+
+        self.assertEqual(recalled[0]["id"], "local:analysis-engine")
         self.assertGreaterEqual(recalled[0]["score"], 6.0)
-        self.assertIn("techniques/fluid-simulation.md", recalled[0]["entrypoints"])
+        self.assertIn("guides/analysis.md", recalled[0]["entrypoints"])
 
     def test_selector_rejects_malformed_and_unknown_llm_output(self):
         _write_skill(
