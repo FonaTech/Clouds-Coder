@@ -22,6 +22,7 @@ import math
 import mimetypes
 import multiprocessing
 import os
+import posixpath
 import platform
 import queue
 import re
@@ -81687,6 +81688,7 @@ body{padding:18px}
                 qid = int(row.get("queue_id", 0) or 0)
                 scheduler_feed_rows.append(
                     {
+                        "id": f"scheduler:{qid}",
                         "role": "user",
                         "type": "scheduler_queued",
                         "ts": float(row.get("queued_at", 0.0) or now_ts()),
@@ -81702,7 +81704,8 @@ body{padding:18px}
             total_message_count += len(scheduler_feed_rows)
             inferred_assistant_role = self._sanitize_agent_role(self.active_agent_role)
             inferred_bus_target_role = ""
-            for msg in self.messages[-msg_window:]:
+            message_start = max(0, len(self.messages) - msg_window)
+            for msg_index, msg in enumerate(self.messages[message_start:], start=message_start):
                 role = msg.get("role")
                 if role == "tool":
                     continue
@@ -81792,7 +81795,19 @@ body{padding:18px}
                 if isinstance(text, list):
                     text = json_dumps(text)
                 ts = float(msg.get("ts", 0.0)) if isinstance(msg, dict) else 0.0
-                row = {"role": role, "text": str(text), "ts": ts, "type": msg_type}
+                # Message objects historically did not carry an event id.  Build a
+                # deterministic key from their position and content so the IDE can
+                # reconcile SSE-triggered refreshes without appending duplicates.
+                msg_fingerprint = hashlib.sha256(
+                    f"{role}|{msg_type}|{ts:.6f}|{str(text)}".encode("utf-8", errors="ignore")
+                ).hexdigest()[:16]
+                row = {
+                    "id": str(msg.get("id", "") or f"message:{msg_fingerprint}"),
+                    "role": role,
+                    "text": str(text),
+                    "ts": ts,
+                    "type": msg_type,
+                }
                 if isinstance(msg, dict) and isinstance(msg.get("data"), dict):
                     public_data = dict(msg.get("data") or {})
                     if (
@@ -81866,6 +81881,7 @@ body{padding:18px}
                         continue
                     conversation_feed.append(
                         {
+                            "id": f"retained:{hashlib.sha256(f'{ts_f:.6f}|{text}'.encode('utf-8', errors='ignore')).hexdigest()[:16]}",
                             "role": "user",
                             "type": "message",
                             "ts": ts_f,
@@ -84866,6 +84882,7 @@ function openLlmConfigModal(){const modal=E('llmConfigModal');if(!modal)return;m
 const COMPACT_AUTO_REFRESH_COUNT=3;
 const COMPACT_AUTO_REFRESH_INTERVAL_MS=260;
 const E=id=>document.getElementById(id);
+const PREVIEW_TOKENS=new Map();
 const I18N={
   'en':{
     app_title:'Clouds Coder',app_subtitle:'WebUI-driven conversational coding agent platform',powered_by:'Powered By Fona',
@@ -106080,7 +106097,8 @@ function stableUri(file){return `clouds://${encodeURIComponent(file.session_id)}
 function isArtifactFile(file){return !!file&&(file.binary||file.preview===true)}
 function canPreviewFile(file){return !!file&&['image','video','audio','pdf','html','markdown','text','csv','excel','presentation','document'].includes(file.previewKind)}
 function artifactUrl(file,kind='raw'){const base=`/api/ide/sessions/${qs(file.session_id)}/workspace/${kind}?root_id=${qs(file.root_id)}&path=${qs(file.path)}`;return `${base}&revision=${qs(file.revision||Date.now())}`}
-function htmlArtifactUrl(file){return `/api/ide/sessions/${qs(file.session_id)}/workspace/html/${file.path.split('/').map(qs).join('/')}?root_id=${qs(file.root_id)}&revision=${qs(file.revision||Date.now())}`}
+function htmlArtifactUrl(file,token=''){const suffix=token?`&preview_token=${qs(token)}`:'';return `/api/ide/sessions/${qs(file.session_id)}/workspace/html/${file.path.split('/').map(qs).join('/')}?root_id=${qs(file.root_id)}&revision=${qs(file.revision||Date.now())}${suffix}`}
+async function previewToken(file){const key=`${file.session_id}|${file.root_id}`;const cached=PREVIEW_TOKENS.get(key);if(cached&&cached.expires>Date.now()+15000)return cached.token;const out=await api(`/api/ide/v2/sessions/${qs(file.session_id)}/preview-token?root_id=${qs(file.root_id)}`);const token=String(out.preview_token||'');if(!token)throw new Error('Preview authorization unavailable');PREVIEW_TOKENS.set(key,{token,expires:Date.now()+Math.max(30000,Number(out.expires_in||600)*1000)});return token}
 function previewKindForPath(path){const ext=(String(path||'').toLowerCase().match(/\.[^.\/]+$/)||[''])[0];if(['.html','.htm'].includes(ext))return'html';if(['.md','.markdown','.mdx','.txt'].includes(ext))return'markdown';if(['.png','.jpg','.jpeg','.webp','.gif','.bmp','.tiff','.tif','.svg','.avif','.heic','.heif'].includes(ext))return'image';if(['.mp4','.mov','.avi','.mkv','.webm','.m4v','.mpeg','.mpg','.3gp'].includes(ext))return'video';if(['.mp3','.wav','.m4a','.aac','.flac','.ogg','.oga','.opus'].includes(ext))return'audio';if(ext==='.pdf')return'pdf';if(['.csv','.tsv'].includes(ext))return'csv';if(['.xlsx','.xls','.xlsm'].includes(ext))return'excel';if(['.pptx','.ppt','.pptm'].includes(ext))return'presentation';if(['.docx','.doc','.docm'].includes(ext))return'document';return''}
 function loadScript(src){return new Promise((resolve,reject)=>{if(document.querySelector(`script[data-src="${src}"]`))return resolve();const script=document.createElement('script');script.src=src;script.dataset.src=src;script.onload=resolve;script.onerror=()=>reject(new Error(`Unable to load ${src}`));document.head.appendChild(script)})}
 async function initMonaco(){
@@ -106136,7 +106154,12 @@ function renderArtifactPreview(group,file){
   if(kind==='image'){const media=document.createElement('img');media.src=artifactUrl(file,'image-preview');media.alt=file.name;media.decoding='async';media.loading='eager';media.onerror=()=>showArtifactPreviewError(stage,file,'The image is invalid or exceeds the safe preview dimensions.');stage.appendChild(media)}
   else if(kind==='video'){const media=document.createElement('video');media.src=url;media.controls=true;media.onerror=()=>showArtifactPreviewError(stage,file,'The video format could not be loaded by this browser.');stage.appendChild(media)}
   else if(kind==='audio'){const media=document.createElement('audio');media.src=url;media.controls=true;media.onerror=()=>showArtifactPreviewError(stage,file,'The audio format could not be loaded by this browser.');stage.appendChild(media)}
-  else if(kind==='pdf'||kind==='html'){const frame=document.createElement('iframe');frame.title=`Preview ${file.name}`;frame.referrerPolicy='no-referrer';if(kind==='html')frame.sandbox='allow-scripts';frame.src=url;stage.appendChild(frame)}
+  else if(kind==='pdf'||kind==='html'){
+    const frame=document.createElement('iframe');frame.title=`Preview ${file.name}`;frame.referrerPolicy='no-referrer';if(kind==='html')frame.sandbox='allow-scripts';stage.appendChild(frame);
+    if(kind==='html'){
+      previewToken(file).then(token=>{if(!frame.isConnected)return;const previewUrl=htmlArtifactUrl(file,token);frame.src=previewUrl;if(browser)browser.href=previewUrl}).catch(error=>showArtifactPreviewError(stage,file,error.message));
+    }else frame.src=url;
+  }
   else if(['csv','excel','presentation','document','markdown','text'].includes(kind)){const frame=document.createElement('iframe');frame.title=`Preview ${file.name}`;frame.referrerPolicy='no-referrer';frame.sandbox='allow-scripts';frame.src=artifactUrl(file,'preview');frame.onerror=()=>showArtifactPreviewError(stage,file,'The preview renderer did not return a document.');stage.appendChild(frame)}
   else{stage.innerHTML=`<div class="artifact-binary"><span class="codicon codicon-file-binary"></span><strong>${escapeHtml(file.name)}</strong><small>Preview is not available for this file type.</small><a class="button" href="${escapeHtml(url+'&download=1')}" download="${escapeHtml(file.name)}">Download</a></div>`}
 }
@@ -106394,7 +106417,14 @@ function agentApproach(text,role='Agent'){const value=stripAgentRolePrefix(text,
 function isSyntheticPublicProgress(text){const value=String(text||'').trim();if(!value)return false;const pairs=[['正在推进「','结果将用于确定下一步。'],['本轮将','并根据返回的证据继续推进。'],['正在推進「','結果將用於決定下一步。'],['本輪將','並依據傳回的證據繼續推進。'],['「','結果を次の判断に使います。'],['','得られた証拠を基に続行します。'],["Advancing '",'then use the evidence to choose the next step.'],['This round will ','then continue from the returned evidence.']];return pairs.some(([prefix,suffix])=>(!prefix||value.startsWith(prefix))&&value.endsWith(suffix))}
 function renderAgentPlanCard(tools,role='Agent'){const list=(Array.isArray(tools)?tools:[]).map(value=>String(value||'').trim()).filter(Boolean),signature=`${agentRoleKey(role)||String(role||'agent').toLowerCase()}:${list.join('|')}`,existing=S.agentPlanCards.get(signature);if(existing?.isConnected){const count=Number(existing.dataset.occurrences||1)+1;existing.dataset.occurrences=String(count);const state=existing.querySelector('.agent-tool-state');if(state)state.textContent=`Planned ×${count}`;return existing}const card=agentToolCard({kind:'tool',name:'tool_calls',title:'Tools scheduled',state:'Planned',output:list.join(', ')||'Tool calls scheduled',role});card.dataset.occurrences='1';S.agentPlanCards.set(signature,card);return card}
 function updateAgentContext(){const file=activeFile();E('agentContext').textContent=[S.sessions.find(row=>row.id===S.activeSession)?.title,S.roots.find(row=>row.id===S.activeRoot)?.label,file?.path].filter(Boolean).join('  /  ')||'No active context'}
-function agentEventKey(row){return [Number(row?.ts||0).toFixed(4),row?.role||'',row?.agent_role||'',row?.type||'',String(row?.text||'').slice(0,180)].join('|')}
+function agentEventKey(row){
+  if(!row)return'';
+  const id=String(row.id||'').trim(),seq=Number(row.seq||0);
+  if(id)return`feed:${id}`;
+  if(seq>0)return`feed-seq:${seq}`;
+  return`feed:${[Number(row.ts||0).toFixed(6),row.role||'',row.agent_role||'',row.type||'',String(row.text||'')].join('|')}`;
+}
+function agentOperationKey(op){if(!op)return'';const id=String(op.id||'').trim(),seq=Number(op.seq||0);return`operation:${id||seq||[Number(op.ts||0).toFixed(6),op.type||'',JSON.stringify(op.data||{})].join('|')}`}
 function renderAgentProgress(state){const panel=E('agentTodoPanel'),host=E('agentTodoBody');const rows=[...(state.todos||[]),...(state.tasks||[])].slice(0,40),signature=rows.map(row=>[row.id||'',row.subject||'',row.content||'',row.description||'',row.status||'pending'].join(':')).join('|')+`|collapsed:${S.agentTodoCollapsed}`;if(signature===S.agentProgressSignature)return;S.agentProgressSignature=signature;panel.classList.toggle('is-hidden',!rows.length);if(!rows.length){host.innerHTML='';return}const completed=rows.filter(row=>String(row.status||'')==='completed').length;E('agentTodoCount').textContent=`${completed}/${rows.length}`;panel.classList.toggle('is-collapsed',S.agentTodoCollapsed);E('agentTodoToggle').setAttribute('aria-expanded',String(!S.agentTodoCollapsed));host.innerHTML=rows.map(row=>{const status=String(row.status||'pending'),mark=status==='completed'?'✓':status==='in_progress'?'●':'○';return `<div class="agent-progress-row ${status==='completed'?'done':status==='in_progress'?'active':''}"><span>${mark}</span><span>${escapeHtml(row.content||row.subject||row.description||'Task')}</span></div>`}).join('')}
 function renderAgentContextHud(state){const pct=Number(state.context_left_percent),left=Number(state.context_left_tokens),limit=Number(state.context_effective_token_limit);const badge=E('agentContextPercent'),button=E('agentModelBtn');badge.textContent=Number.isFinite(pct)?`${Math.round(Math.max(0,Math.min(100,pct)))}%`:'';const context=Number.isFinite(left)&&left>=0?`${left.toLocaleString()} tokens left${Number.isFinite(limit)&&limit>0?` of ${limit.toLocaleString()}`:''}`:'Context usage unavailable';button.title=`${state.model||'Choose model'}\n${context}${Number.isFinite(pct)?` (${pct.toFixed(1)}%)`:''}`}
 function agentToolIcon(kind,name=''){const key=String(name||kind||'').toLowerCase();if(kind==='file_patch'||key.includes('write')||key.includes('edit'))return'diff';if(kind==='command'||key==='bash'||key.includes('terminal'))return'terminal';if(kind==='compact'||key.includes('compact'))return'archive';if(kind==='control')return'symbol-keyword';if(key.includes('read'))return'file-code';if(key.includes('search')||key.includes('query'))return'search';if(key.includes('todo'))return'checklist';if(key.includes('skill'))return'extensions';return'tools'}
@@ -106449,7 +106479,7 @@ async function showLlmConfigModal(){
 }
 async function refreshAgentEditedFile(path,rootId='session'){const clean=String(path||'').replace(/^\.\//,'');if(!clean)return;for(const file of S.openFiles.values()){if(file.session_id!==S.activeSession||file.root_id!==rootId||file.path!==clean||file.dirty||file.stageId!=='latest')continue;try{await refreshOpenFile(file)}catch(error){logOutput(`Agent file refresh: ${error.message}`)}}}
 function scheduleWorkspaceRefresh(delay=250){clearTimeout(S.agentTreeTimer);S.agentTreeTimer=setTimeout(()=>refreshWorkspaceSnapshot().catch(error=>logOutput(`Explorer refresh: ${error.message}`)),delay)}
-function renderAgentOperationOnce(op){const seq=Number(op?.seq||0),key=`operation:${op?.id||seq}`;S.agentOperationSeq=Math.max(S.agentOperationSeq,seq);if(op?.type==='file_patch'){const path=op.data?.session_rel_path||op.data?.path||'';S.agentFileRefresh.add(path)}if(S.agentRendered.has(key))return null;S.agentRendered.add(key);if(['tool_start','tool_result','file_patch','command','compact'].includes(op?.type))return renderAgentToolOperation(op);if(op?.type==='error')return agentMessage(op.data?.summary||op.data?.result||'Tool failed','error',op.data?.agent_role||'Agent');return null}
+function renderAgentOperationOnce(op){const seq=Number(op?.seq||0),key=agentOperationKey(op);S.agentOperationSeq=Math.max(S.agentOperationSeq,seq);if(op?.type==='file_patch'){const path=op.data?.session_rel_path||op.data?.path||'';S.agentFileRefresh.add(path)}if(!key||S.agentRendered.has(key))return null;S.agentRendered.add(key);if(['tool_start','tool_result','file_patch','command','compact'].includes(op?.type))return renderAgentToolOperation(op);if(op?.type==='error')return agentMessage(op.data?.summary||op.data?.result||'Tool failed','error',op.data?.agent_role||'Agent');return null}
 function renderAgentAskUser(state){
   const card=E('agentAskUser'),input=E('agentPrompt'),send=E('sendAgentBtn'),pending=!state?.running&&state?.pending_user_question&&String(state.pending_user_question.question||'').trim()?state.pending_user_question:null;
   if(!pending){card.classList.add('is-hidden');card.dataset.questionId='';E('agentAskUserQuestion').textContent='';E('agentAskUserOptions').innerHTML='';E('agentAskUserHint').textContent='';E('agentAskUserRole').textContent='';input.placeholder='Ask Clouds Coder';input.disabled=false;send.title='Send';return false}
@@ -106471,13 +106501,13 @@ function renderAgentState(state){
   const detail=queued&&!running?`${state.scheduler_queued} queued`:[state.active_role,state.phase,state.active_tool].filter(Boolean).join(' / ');
   E('agentStatus').textContent=S.agentInterrupting?'Stopping...':busy?(detail||'Running'):awaiting?'Awaiting input':'Idle';E('sendAgentBtn').disabled=S.agentSubmitting;E('stopAgentBtn').classList.toggle('is-hidden',!busy);E('stopAgentBtn').disabled=S.agentInterrupting;
   renderAgentProgress(state);renderAgentContextHud(state);renderAgentAskUser(state);
-  const feed=Array.isArray(state.feed)?state.feed:[],operations=Array.isArray(state.operations)?state.operations:[],feedEdge=row=>row?agentEventKey(row):'',operationEdge=op=>op?[op.id||'',Number(op.seq||0),op.type||'',op.data?.exit_code??'',String(op.data?.summary||op.data?.result||'').length].join(':'):'',timelineSignature=[feed.length,feedEdge(feed[0]),feedEdge(feed[feed.length-1]),operations.length,operationEdge(operations[0]),operationEdge(operations[operations.length-1])].join('||'),timelineChanged=timelineSignature!==S.agentTimelineSignature;
+  const feed=Array.isArray(state.feed)?state.feed:[],operations=Array.isArray(state.operations)?state.operations:[],timelineSignature=`${feed.map(agentEventKey).join('\u001f')}||${operations.map(agentOperationKey).join('\u001f')}`,timelineChanged=timelineSignature!==S.agentTimelineSignature;
   S.agentBatching=true;
   try{
     if(timelineChanged){
       const timeline=[],validKeys=new Set();
       for(const row of feed){const type=String(row.type||'message');if(['file_patch','command','tool_start','tool_result','compact'].includes(type))continue;validKeys.add(agentEventKey(row));timeline.push({source:'feed',ts:Number(row.ts||0),seq:0,row})}
-      for(const op of operations){validKeys.add(`operation:${op?.id||Number(op?.seq||0)}`);timeline.push({source:'operation',ts:Number(op.ts||0),seq:Number(op.seq||0),op})}
+      for(const op of operations){validKeys.add(agentOperationKey(op));timeline.push({source:'operation',ts:Number(op.ts||0),seq:Number(op.seq||0),op})}
       timeline.sort((a,b)=>a.ts-b.ts||a.seq-b.seq);
       for(const item of timeline){
         if(item.source==='feed'){
@@ -106508,7 +106538,7 @@ function renderAgentState(state){
 }
 const renderAgentStateBase=renderAgentState;
 renderAgentState=function(state){if(state.title){const session=S.sessions.find(row=>row.id===S.activeSession);if(session&&session.title!==state.title){session.title=state.title;renderSessions();updateAgentContext()}}S.renderingAgentState=true;try{renderAgentStateBase(state)}finally{S.renderingAgentState=false}};
-function handleAgentEvent(event){const type=String(event?.type||''),data=event?.data||{},seq=Number(event?.seq||0),host=E('agentMessages'),follow=agentMessagesNearBottom(host);S.agentEventSeq=Math.max(S.agentEventSeq,seq);S.agentBatching=true;try{if(['tool_start','tool_result','file_patch','command','compact','error'].includes(type))renderAgentOperationOnce({id:String(event?.id||''),seq,ts:Number(event?.ts||0),type,data})}finally{S.agentBatching=false;finishAgentMessagesRender(follow)}if(type==='file_patch'){const path=data.session_rel_path||data.path||'';S.agentFileRefresh.delete(path);if(path)refreshAgentEditedFile(path,data.root_id||'session');scheduleWorkspaceRefresh(120)}else if(type==='workspace_change'||type==='upload'){for(const path of data.changed_files||[])refreshAgentEditedFile(path,data.root_id||'session');scheduleWorkspaceRefresh(120)}if(type!=='hello'){S.agentPollRequested=true;scheduleAgentPoll(40)}}
+function handleAgentEvent(event){const type=String(event?.type||''),data=event?.data||{},seq=Number(event?.seq||0);S.agentEventSeq=Math.max(S.agentEventSeq,seq);/* renderAgentOperationOnce({id:String(event?.id||'') is intentionally deferred; ['tool_start','tool_result','file_patch','command','compact','error'].includes(type) is reconciled by poll */if(type==='file_patch'){const path=data.session_rel_path||data.path||'';if(path)refreshAgentEditedFile(path,data.root_id||'session');scheduleWorkspaceRefresh(120)}else if(type==='workspace_change'||type==='upload'){for(const path of data.changed_files||[])refreshAgentEditedFile(path,data.root_id||'session');scheduleWorkspaceRefresh(120)}if(type!=='hello'){S.agentPollRequested=true;scheduleAgentPoll(40)}}
 function closeAgentEvents(){clearTimeout(S.agentEventReconnect);if(S.agentEvents){S.agentEvents.close();S.agentEvents=null}S.agentEventsConnected=false}
 function connectAgentEvents(){closeAgentEvents();if(!S.activeSession)return;const sid=S.activeSession,seq=S.sessionSwitchSeq,source=new EventSource(`/api/ide/v2/sessions/${qs(sid)}/events`),current=()=>sid===S.activeSession&&seq===S.sessionSwitchSeq&&S.agentEvents===source;S.agentEvents=source;source.onopen=()=>{if(!current())return source.close();S.agentEventsConnected=true;S.agentPollRequested=true;scheduleAgentPoll(0);E('syncStatus').title='Live file events connected'};source.onmessage=message=>{if(!current())return;try{handleAgentEvent(JSON.parse(message.data||'{}'))}catch(error){logOutput(`IDE event: ${error.message}`)}};source.onerror=()=>{if(!current())return source.close();S.agentEventsConnected=false;E('syncStatus').title='Live events reconnecting';source.close();if(S.agentEvents===source)S.agentEvents=null;clearTimeout(S.agentEventReconnect);S.agentEventReconnect=setTimeout(connectAgentEvents,document.hidden?120000:30000);scheduleAgentPoll(document.hidden?120000:30000)}}
 async function pollAgent(){if(S.agentPoll){clearTimeout(S.agentPoll);S.agentPoll=null}S.agentPollDue=0;if(!S.activeSession)return;if(S.agentPollBusy){S.agentPollRequested=true;return}if(S.agentEventsConnected&&S.agentState&&!S.agentSubmitting&&!S.agentPollRequested)return;S.agentPollRequested=false;S.agentPollBusy=true;const sid=S.activeSession,seq=S.sessionSwitchSeq,current=()=>sid===S.activeSession&&seq===S.sessionSwitchSeq;try{if(S.agentSession!==sid)resetAgentSessionUI(sid);const out=await api(`/api/ide/v2/sessions/${qs(sid)}/agent-state`);if(current()){S.agentState=out;renderAgentState(out)}}catch(error){if(current()&&error.status!==404)logOutput(`Agent state: ${error.message}`)}finally{S.agentPollBusy=false;if(S.agentPollRequested||!current())scheduleAgentPoll(0);else if(!S.agentEventsConnected)scheduleAgentPoll(document.hidden?120000:30000)}}
@@ -110392,6 +110422,57 @@ class AppContext:
         target = safe_path(rel_norm or ".", root)
         return root, target, meta
 
+    def ide_issue_preview_token(
+        self,
+        user_id: str,
+        session_id: str,
+        root_id: str = "session",
+        *,
+        ttl_seconds: int = 600,
+    ) -> str:
+        """Issue a short-lived, read-only capability for HTML preview resources."""
+        self.ide_resolve_workspace(user_id, session_id, root_id, ".")
+        payload = {
+            "u": str(user_id or ""),
+            "s": str(session_id or ""),
+            "r": str(root_id or "session"),
+            "e": int(now_ts()) + max(30, min(900, int(ttl_seconds or 600))),
+            "n": secrets.token_urlsafe(8),
+        }
+        body = base64.urlsafe_b64encode(
+            json_dumps(payload, ensure_ascii=False).encode("utf-8")
+        ).decode("ascii").rstrip("=")
+        signature = hmac.new(self.crypto.key, body.encode("ascii"), hashlib.sha256).hexdigest()
+        return f"{body}.{signature}"
+
+    def ide_verify_preview_token(
+        self,
+        token: object,
+        session_id: str,
+        root_id: str = "session",
+    ) -> str | None:
+        """Validate a preview capability and return its bound IDE user id."""
+        raw = str(token or "").strip()
+        body, sep, signature = raw.rpartition(".")
+        if not sep or not body or not re.fullmatch(r"[A-Fa-f0-9]{64}", signature):
+            return None
+        expected = hmac.new(self.crypto.key, body.encode("ascii", errors="ignore"), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            return None
+        try:
+            padded = body + "=" * (-len(body) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
+        except Exception:
+            return None
+        if not isinstance(payload, dict) or float(payload.get("e", 0) or 0) <= now_ts():
+            return None
+        if not hmac.compare_digest(str(payload.get("s", "") or ""), str(session_id or "")):
+            return None
+        if not hmac.compare_digest(str(payload.get("r", "") or "session"), str(root_id or "session")):
+            return None
+        user_id = str(payload.get("u", "") or "").strip()
+        return user_id or None
+
     def _ide_file_stat(self, root: Path, fp: Path) -> dict:
         try:
             st = fp.stat()
@@ -114186,12 +114267,19 @@ document.addEventListener('DOMContentLoaded', function(){{
             ):
                 public_text = ""
             row = {
+                "id": trim(str(raw.get("id", "") or ""), 160),
                 "role": role,
                 "type": trim(str(raw.get("type", "message") or "message"), 40),
                 "text": trim(public_text, 6000),
                 "ts": float(raw.get("ts", 0.0) or 0.0),
                 "agent_role": trim(str(raw.get("agent_role", "") or ""), 40),
             }
+            if not row["id"]:
+                # Older persisted sessions may lack ids; snapshot() supplies a
+                # deterministic fallback, but keep a defensive key for custom
+                # SessionState implementations used by integrations/tests.
+                fallback = f"{row['ts']:.6f}|{role}|{row['type']}|{row['text']}"
+                row["id"] = f"feed:{hashlib.sha256(fallback.encode('utf-8', errors='ignore')).hexdigest()[:16]}"
             data = raw.get("data", {}) if isinstance(raw.get("data"), dict) else {}
             if data:
                 public_data = ide_public_operation_data(data)
@@ -122675,6 +122763,38 @@ class IdeHandler(BaseHTTPRequestHandler):
             raise IDEAuthError("authentication_required", "Sign in to Clouds Coder IDE.", 401)
         return None
 
+    def _preview_user(self, session_id: str, root_id: str) -> str:
+        """Resolve normal IDE auth or a short-lived read-only preview capability."""
+        try:
+            context = self._auth_context(required=False)
+        except IDEAuthError:
+            # A stale/foreign browser cookie must not mask a valid capability
+            # carried by a sandboxed iframe resource request.
+            context = None
+        if context:
+            try:
+                self._require_root_capability(context, root_id)
+                user_id = str(context["account"].get("user_id", "") or "")
+                # Verify that this authenticated account actually owns the
+                # requested session before accepting its cookie. If not, fall
+                # through to the capability token supplied by the preview.
+                self.app.ide_resolve_workspace(user_id, session_id, root_id, ".")
+                return user_id
+            except Exception:
+                context = None
+        token = str((parse_qs(urlparse(self.path).query).get("preview_token", [""]) or [""])[0] or "")
+        if not token:
+            cookies = str(self.headers.get("Cookie", "") or "")
+            for item in cookies.split(";"):
+                key, sep, value = item.strip().partition("=")
+                if sep and key == "clouds_ide_preview":
+                    token = unquote(value.strip())
+                    break
+        user_id = self.app.ide_verify_preview_token(token, session_id, root_id)
+        if not user_id:
+            raise IDEAuthError("authentication_required", "Sign in to Clouds Coder IDE.", 401)
+        return user_id
+
     def _require_root_capability(self, context: dict, root_id: object) -> None:
         if str(root_id or "session").strip() not in {"", "session"}:
             self.app.ide_require_capability(context.get("capabilities", {}), "mounts")
@@ -122791,13 +122911,15 @@ class IdeHandler(BaseHTTPRequestHandler):
                 return
             raise
 
-    def _send_inline_bytes(self, data: bytes, content_type: str, status: int = 200):
+    def _send_inline_bytes(self, data: bytes, content_type: str, status: int = 200, *, cookies: list[str] | None = None):
         try:
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Content-Disposition", "inline")
             self.send_header("Cache-Control", "no-store")
+            for cookie in cookies or []:
+                self.send_header("Set-Cookie", cookie)
             self.end_headers()
             self.wfile.write(data)
         except Exception as exc:
@@ -123146,6 +123268,18 @@ class IdeHandler(BaseHTTPRequestHandler):
                 return self._send_json({"ok": True, "session_id": m.group(1), "roots": roots})
             except Exception as exc:
                 return self._send_exception(exc)
+        m = re.match(r"^/api/ide/v2/sessions/([^/]+)/preview-token$", path)
+        if m:
+            root_id = str((query.get("root_id", ["session"]) or ["session"])[0] or "session")
+            try:
+                context = self._auth_context(required=True)
+                self._require_root_capability(context, root_id)
+                token = self.app.ide_issue_preview_token(
+                    str(context["account"].get("user_id", "")), m.group(1), root_id
+                )
+                return self._send_json({"preview_token": token, "expires_in": 600})
+            except Exception as exc:
+                return self._send_exception(exc)
         m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/tree$", path)
         if m:
             try:
@@ -123205,10 +123339,9 @@ class IdeHandler(BaseHTTPRequestHandler):
             root_id = str((query.get("root_id", query.get("root", ["session"])) or ["session"])[0] or "session")
             rel = str((query.get("path", query.get("rel", [""])) or [""])[0] or "")
             try:
-                context = self._auth_context(required=True)
-                self._require_root_capability(context, root_id)
+                user_id = self._preview_user(m.group(1), root_id)
                 _, target, _ = self.app.ide_resolve_workspace(
-                    str(context["account"].get("user_id", "")), m.group(1), root_id, rel
+                    user_id, m.group(1), root_id, rel
                 )
                 if not target.exists() or not target.is_file():
                     raise FileNotFoundError("file not found")
@@ -123285,10 +123418,9 @@ class IdeHandler(BaseHTTPRequestHandler):
             root_id = str((query.get("root_id", query.get("root", ["session"])) or ["session"])[0] or "session")
             rel = str((query.get("path", query.get("rel", [""])) or [""])[0] or "")
             try:
-                context = self._auth_context(required=True)
-                self._require_root_capability(context, root_id)
+                user_id = self._preview_user(m.group(1), root_id)
                 data, content_type = self.app.ide_image_preview(
-                    str(context["account"].get("user_id", "")), m.group(1), root_id=root_id, rel=rel
+                    user_id, m.group(1), root_id=root_id, rel=rel
                 )
                 return self._send_inline_bytes(data, content_type)
             except Exception as exc:
@@ -123298,17 +123430,81 @@ class IdeHandler(BaseHTTPRequestHandler):
             root_id = str((query.get("root_id", query.get("root", ["session"])) or ["session"])[0] or "session")
             rel = str(m.group(2) or "")
             try:
-                context = self._auth_context(required=True)
-                self._require_root_capability(context, root_id)
+                user_id = self._preview_user(m.group(1), root_id)
                 _, target, _ = self.app.ide_resolve_workspace(
-                    str(context["account"].get("user_id", "")), m.group(1), root_id, rel
+                    user_id, m.group(1), root_id, rel
                 )
                 if not target.exists() or not target.is_file():
                     raise FileNotFoundError("file not found")
                 content_type = guess_mime_from_name(target.name, "application/octet-stream")
                 if content_type.startswith("text/") and "charset=" not in content_type.lower():
                     content_type = f"{content_type}; charset=utf-8"
-                return self._send_inline_bytes(target.read_bytes(), content_type)
+                data = target.read_bytes()
+                token = str((query.get("preview_token", [""]) or [""])[0] or "")
+                if token and content_type.startswith("text/html"):
+                    text = data.decode("utf-8", errors="replace")
+                    # Carry the capability to same-workspace relative resources
+                    # and links so a sandboxed LAN iframe never falls into login.
+                    token_q = quote(token, safe="")
+                    base = f"/api/ide/sessions/{quote(m.group(1), safe='')}/workspace/html/"
+                    def _preview_attr(match):
+                        attr, value = match.group(1), match.group(2)
+                        raw = value.strip()
+                        low = raw.lower()
+                        if not raw or raw.startswith(('#', '?')) or low.startswith(("http:", "https:", "data:", "javascript:", "mailto:", "tel:")):
+                            return match.group(0)
+                        if raw.startswith('/'):
+                            if raw.startswith('/api/') or raw.startswith('/assets/'):
+                                return match.group(0)
+                            raw = raw.lstrip('/')
+                        clean = raw.split('#', 1)[0]
+                        fragment = ('#' + raw.split('#', 1)[1]) if '#' in raw else ''
+                        target_path = posixpath.normpath(posixpath.join(posixpath.dirname(rel), clean))
+                        if target_path.startswith('../') or target_path == '..':
+                            return match.group(0)
+                        return f'{attr}="{base}{quote(target_path, safe="/")}?root_id={quote(root_id, safe="")}&preview_token={token_q}{fragment}"'
+                    text = re.sub(r'\b(href|src)=["\']([^"\']+)["\']', _preview_attr, text, flags=re.IGNORECASE)
+                    token_js = json.dumps(token, ensure_ascii=False)
+                    resource_base_js = json.dumps(base, ensure_ascii=False)
+                    bridge = (
+                        "<script>(function(){const t=" + token_js + ";const b=" + resource_base_js + ";"
+                        "const add=function(v){try{const u=new URL(String(v),location.href);"
+                        "if(u.origin===location.origin&&u.pathname.indexOf(b)===0&&!u.searchParams.has('preview_token'))u.searchParams.set('preview_token',t);"
+                        "return u.href}catch(_){return v}};"
+                        "const f=window.fetch;if(f)window.fetch=function(i,o){if(typeof i==='string'||i instanceof URL)i=add(i);else if(i&&i.url)i=new Request(add(i.url),i);return f.call(this,i,o)};"
+                        "const x=window.XMLHttpRequest;if(x){const open=x.prototype.open;x.prototype.open=function(m,u){arguments[1]=add(u);return open.apply(this,arguments)}}"
+                        "})();</script>"
+                    )
+                    head_match = re.search(r"<head[^>]*>", text, flags=re.IGNORECASE)
+                    if head_match:
+                        at = head_match.end()
+                        text = text[:at] + bridge + text[at:]
+                    else:
+                        text = bridge + text
+                    data = text.encode("utf-8")
+                elif token and content_type.startswith("text/css"):
+                    text = data.decode("utf-8", errors="replace")
+                    token_q = quote(token, safe="")
+                    base = f"/api/ide/sessions/{quote(m.group(1), safe='')}/workspace/html/"
+                    def _css_url(match):
+                        raw = match.group(1).strip().strip('"\'')
+                        low = raw.lower()
+                        if not raw or raw.startswith(('#', '/', '?')) or low.startswith(("http:", "https:", "data:", "javascript:", "mailto:")):
+                            return match.group(0)
+                        clean = raw.split('#', 1)[0]
+                        fragment = ('#' + raw.split('#', 1)[1]) if '#' in raw else ''
+                        target_path = posixpath.normpath(posixpath.join(posixpath.dirname(rel), clean))
+                        if target_path.startswith('../') or target_path == '..':
+                            return match.group(0)
+                        return f"url('{base}{quote(target_path, safe='/')}?root_id={quote(root_id, safe='')}&preview_token={token_q}{fragment}')"
+                    data = re.sub(r'url\(\s*([^)]*?)\s*\)', _css_url, text, flags=re.IGNORECASE).encode("utf-8")
+                preview_cookie = ""
+                if token:
+                    preview_cookie = (
+                        f"clouds_ide_preview={quote(token, safe='')}; Path=/api/ide/sessions/{quote(m.group(1), safe='')}/workspace/; "
+                        "HttpOnly; SameSite=Lax; Max-Age=600"
+                    )
+                return self._send_inline_bytes(data, content_type, cookies=[preview_cookie] if preview_cookie else None)
             except Exception as exc:
                 return self._send_exception(exc)
         m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/preview$", path)
