@@ -22,6 +22,7 @@ import math
 import mimetypes
 import multiprocessing
 import os
+import posixpath
 import platform
 import queue
 import re
@@ -4115,6 +4116,16 @@ READ_CONTEXT_SUMMARY_MAX_CHARS = 520
 READ_CONTEXT_SHARED_MAX_ITEMS = 4
 READ_CONTEXT_POLICY_CHOICES = {"auto", "conservative", "balanced", "wide"}
 DEFAULT_READ_CONTEXT_POLICY = "auto"
+# Cached read evidence is searchable on demand. Keep the scan bounded so a
+# book-length buffer never blocks a model turn, while still making exact facts
+# recoverable after micro/full compaction.
+READ_CONTEXT_CACHE_SEARCH_MAX_BYTES = max(
+    128 * 1024,
+    min(64 * 1024 * 1024, int(str(os.getenv("AGENT_READ_CACHE_SEARCH_MAX_BYTES", str(16 * 1024 * 1024)) or str(16 * 1024 * 1024)))),
+)
+READ_CONTEXT_CACHE_SEARCH_MAX_MATCHES = 8
+READ_CONTEXT_CACHE_SNIPPET_CHARS = 2_400
+READ_CONTEXT_CACHE_LINE_CONTEXT = 2
 TOOL_MEMORY_REGISTRY_MAX = 120
 TOOL_MEMORY_PROMPT_MAX_ITEMS = 18
 TOOL_MEMORY_PROMPT_MAX_CHARS = 5_500
@@ -28208,6 +28219,18 @@ class SessionState:
         self.context_last_compact_used_reduction = 0
         self.context_last_compact_skip_ts = 0.0
         self.context_last_compact_skip_reason = ""
+        # Compact/recall observability. Values are persisted so a long-lived
+        # session can be evaluated instead of relying on subjective UI output.
+        self.context_compaction_metrics: dict = {
+            "runs": 0,
+            "effective_runs": 0,
+            "archived_messages": 0,
+            "input_chars": 0,
+            "summary_chars": 0,
+            "last_ratio": 0.0,
+            "cache_searches": 0,
+            "cache_hits": 0,
+        }
         self.context_last_next_call_estimate = 0
         self.context_last_next_call_label = ""
         self.last_context_actual_prompt_tokens = 0
@@ -29536,6 +29559,18 @@ class SessionState:
                 self.context_last_compact_skip_reason = trim(
                     str(raw.get("context_last_compact_skip_reason", "") or ""), 160
                 )
+                raw_compact_metrics = raw.get("context_compaction_metrics", {})
+                if isinstance(raw_compact_metrics, dict):
+                    self.context_compaction_metrics = {
+                        "runs": max(0, int(raw_compact_metrics.get("runs", 0) or 0)),
+                        "effective_runs": max(0, int(raw_compact_metrics.get("effective_runs", 0) or 0)),
+                        "archived_messages": max(0, int(raw_compact_metrics.get("archived_messages", 0) or 0)),
+                        "input_chars": max(0, int(raw_compact_metrics.get("input_chars", 0) or 0)),
+                        "summary_chars": max(0, int(raw_compact_metrics.get("summary_chars", 0) or 0)),
+                        "last_ratio": max(0.0, min(1.0, float(raw_compact_metrics.get("last_ratio", 0.0) or 0.0))),
+                        "cache_searches": max(0, int(raw_compact_metrics.get("cache_searches", 0) or 0)),
+                        "cache_hits": max(0, int(raw_compact_metrics.get("cache_hits", 0) or 0)),
+                    }
                 self.context_last_next_call_estimate = max(
                     0, int(raw.get("context_last_next_call_estimate", 0) or 0)
                 )
@@ -30097,6 +30132,7 @@ class SessionState:
             "context_last_compact_used_reduction": int(getattr(self, "context_last_compact_used_reduction", 0) or 0),
             "context_last_compact_skip_ts": float(getattr(self, "context_last_compact_skip_ts", 0.0) or 0.0),
             "context_last_compact_skip_reason": str(getattr(self, "context_last_compact_skip_reason", "") or ""),
+            "context_compaction_metrics": dict(getattr(self, "context_compaction_metrics", {}) or {}),
             "context_last_next_call_estimate": int(getattr(self, "context_last_next_call_estimate", 0) or 0),
             "context_last_next_call_label": str(getattr(self, "context_last_next_call_label", "") or ""),
             "read_context_policy": normalize_read_context_policy(
@@ -34688,6 +34724,10 @@ class SessionState:
                 "sha256": trim(str(raw_entry.get("sha256", "") or ""), 64),
                 "summary": trim(str(raw_entry.get("summary", "") or ""), TOOL_MEMORY_SUMMARY_MAX_CHARS),
                 "cache_path": trim(str(raw_entry.get("cache_path", "") or ""), 300),
+                "cache_source_complete": bool(raw_entry.get("cache_source_complete", True)),
+                "source_size": (max(0, int(raw_entry.get("source_size", 0) or 0)) if "source_size" in raw_entry else None),
+                "source_mtime_ns": (max(0, int(raw_entry.get("source_mtime_ns", 0) or 0)) if "source_mtime_ns" in raw_entry else None),
+                "source_sha256": (trim(str(raw_entry.get("source_sha256", "") or ""), 64) if "source_sha256" in raw_entry else ""),
                 "buffer_ref": "",
                 "temp_output_path": "",
                 "related_paths": [path] if path else [],
@@ -34733,7 +34773,7 @@ class SessionState:
                     related_paths.append(rel)
             if target_path and target_path not in related_paths:
                 related_paths.insert(0, target_path)
-            clean[key] = {
+            normalized_entry = {
                 "key": key,
                 "source_tool": tool,
                 "evidence_kind": trim(str(raw_entry.get("evidence_kind", "") or ""), 80),
@@ -34750,6 +34790,10 @@ class SessionState:
                 "sha256": trim(str(raw_entry.get("sha256", "") or ""), 64),
                 "summary": trim(str(raw_entry.get("summary", "") or ""), TOOL_MEMORY_SUMMARY_MAX_CHARS),
                 "cache_path": trim(str(raw_entry.get("cache_path", "") or ""), 300),
+                "cache_source_complete": bool(raw_entry.get("cache_source_complete", True)),
+                "source_size": (max(0, int(raw_entry.get("source_size", 0) or 0)) if "source_size" in raw_entry else None),
+                "source_mtime_ns": (max(0, int(raw_entry.get("source_mtime_ns", 0) or 0)) if "source_mtime_ns" in raw_entry else None),
+                "source_sha256": (trim(str(raw_entry.get("source_sha256", "") or ""), 64) if "source_sha256" in raw_entry else ""),
                 "buffer_ref": trim(str(raw_entry.get("buffer_ref", "") or ""), 120),
                 "temp_output_path": trim(str(raw_entry.get("temp_output_path", "") or ""), 300),
                 "related_paths": related_paths[:12],
@@ -34762,6 +34806,7 @@ class SessionState:
                 "stale_reason": trim(str(raw_entry.get("stale_reason", "") or ""), 180),
                 "sensitivity": trim(str(raw_entry.get("sensitivity", "normal") or "normal"), 40),
             }
+            clean[key] = normalized_entry
         return self._pruned_tool_memory_registry(clean)
 
     def _tool_memory_sort_key(self, item: tuple[str, dict]) -> tuple[int, int, float, int, str]:
@@ -34903,7 +34948,7 @@ class SessionState:
             low_yield = raw_entry.get("low_yield_queries", [])
             if not isinstance(low_yield, list):
                 low_yield = []
-            clean[key] = {
+            normalized_entry = {
                 "key": key,
                 "agent_role": role_key,
                 "focus_kind": trim(str(raw_entry.get("focus_kind", "task") or "task"), 80),
@@ -34929,6 +34974,7 @@ class SessionState:
                 "thin_streak": max(0, int(raw_entry.get("thin_streak", 0) or 0)),
                 "dynamic_streak": max(0, int(raw_entry.get("dynamic_streak", 0) or 0)),
             }
+            clean[key] = normalized_entry
         return self._pruned_web_search_context_registry(clean)
 
     def _web_search_context_sort_key(self, item: tuple[str, dict]) -> tuple[float, int, str]:
@@ -35246,7 +35292,7 @@ class SessionState:
             if status not in {"active", "pinned", "stale", "dropped"}:
                 status = "active"
             args = raw_entry.get("args", {}) if isinstance(raw_entry.get("args", {}), dict) else {}
-            clean[key] = {
+            normalized_entry = {
                 "key": key,
                 "source_tool": str(raw_entry.get("source_tool", "read_file") or "read_file"),
                 "path": path,
@@ -35259,6 +35305,7 @@ class SessionState:
                 "sha256": trim(str(raw_entry.get("sha256", "") or ""), 64),
                 "summary": trim(str(raw_entry.get("summary", "") or ""), READ_CONTEXT_SUMMARY_MAX_CHARS),
                 "cache_path": trim(str(raw_entry.get("cache_path", "") or ""), 300),
+                "cache_source_complete": bool(raw_entry.get("cache_source_complete", True)),
                 "args": {
                     k: v
                     for k, v in dict(args).items()
@@ -35271,6 +35318,16 @@ class SessionState:
                 "last_stale_ts": max(0.0, float(raw_entry.get("last_stale_ts", 0.0) or 0.0)),
                 "stale_reason": trim(str(raw_entry.get("stale_reason", "") or ""), 180),
             }
+            # Do not synthesize zero-valued fingerprints for legacy sessions;
+            # zero would be interpreted as a real fingerprint and immediately
+            # mark every historical read stale on load.
+            if "source_size" in raw_entry:
+                normalized_entry["source_size"] = max(0, int(raw_entry.get("source_size", 0) or 0))
+            if "source_mtime_ns" in raw_entry:
+                normalized_entry["source_mtime_ns"] = max(0, int(raw_entry.get("source_mtime_ns", 0) or 0))
+            if str(raw_entry.get("source_sha256", "") or "").strip():
+                normalized_entry["source_sha256"] = trim(str(raw_entry.get("source_sha256", "") or ""), 64)
+            clean[key] = normalized_entry
         return self._pruned_read_context_registry(clean)
 
     def _read_context_sort_key(self, item: tuple[str, dict]) -> tuple[int, float, int, str]:
@@ -35578,6 +35635,7 @@ class SessionState:
         temp_output_path: str = "",
         related_paths: list[str] | None = None,
         sensitivity: str = "normal",
+        cache_source_complete: bool | None = None,
     ) -> None:
         tool = canonicalize_tool_name(source_tool)
         if not tool:
@@ -35602,6 +35660,7 @@ class SessionState:
         if not isinstance(registry, dict):
             registry = {}
         old = registry.get(key, {}) if isinstance(registry.get(key, {}), dict) else {}
+        source_fp = self._read_source_fingerprint(rel_path) if tool == "read_file" and rel_path else {}
         sha = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
         cached = str(cache_path or old.get("cache_path", "") or "")
         if len(text) >= int(FILE_BUFFER_CONTENT_THRESHOLD * 2) and (
@@ -35639,6 +35698,11 @@ class SessionState:
             "sha256": sha,
             "summary": trim(summary or self._tool_memory_summary_from_output(tool, src_args, text), TOOL_MEMORY_SUMMARY_MAX_CHARS),
             "cache_path": cached,
+            "cache_source_complete": bool(
+                cache_source_complete
+                if cache_source_complete is not None
+                else old.get("cache_source_complete", True)
+            ),
             "buffer_ref": trim(str(buffer_ref or old.get("buffer_ref", "") or ""), 120),
             "temp_output_path": trim(str(temp_output_path or old.get("temp_output_path", "") or ""), 300),
             "related_paths": paths[:12],
@@ -35650,6 +35714,7 @@ class SessionState:
             "last_stale_ts": 0.0,
             "stale_reason": "",
             "sensitivity": trim(str(sensitivity or "normal"), 40),
+            **source_fp,
         }
         self.tool_memory_registry = self._pruned_tool_memory_registry(registry)
 
@@ -35775,12 +35840,33 @@ class SessionState:
         now = now_ts()
         old = self.read_context_registry.get(key, {}) if isinstance(getattr(self, "read_context_registry", {}), dict) else {}
         sha = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()
+        source_fp = self._read_source_fingerprint(rel)
+        # Prefer the source document over the rendered/truncated tool output.
+        # This is what makes facts beyond ``max_chars`` recoverable after a
+        # compact. For very large files the bounded prefix is still useful and
+        # is explicitly marked as incomplete in the registry.
+        cache_content = content
+        cache_source_complete = True
+        try:
+            source_path = self._session_path(rel)
+            source_size = int(source_path.stat().st_size)
+            if source_path.is_file() and source_size > len(content.encode("utf-8", errors="replace")):
+                raw = source_path.read_bytes()
+                if len(raw) <= READ_CONTEXT_CACHE_SEARCH_MAX_BYTES:
+                    cache_content = self._read_text_with_fallback(source_path)
+                else:
+                    cache_content = raw[:READ_CONTEXT_CACHE_SEARCH_MAX_BYTES].decode("utf-8", errors="replace")
+                    cache_source_complete = False
+        except Exception:
+            pass
         cache_path = str(old.get("cache_path", "") or "")
-        if len(content) >= int(FILE_BUFFER_CONTENT_THRESHOLD * 2) and (
-            not cache_path or str(old.get("sha256", "") or "") != sha
+        old_source_sha = str(old.get("source_sha256", "") or "")
+        source_changed = bool(old_source_sha and source_fp.get("source_sha256") and old_source_sha != source_fp.get("source_sha256"))
+        if len(cache_content) >= int(FILE_BUFFER_CONTENT_THRESHOLD * 2) and (
+            not cache_path or str(old.get("sha256", "") or "") != sha or source_changed or str(old.get("status", "") or "").lower() == "stale"
         ):
             try:
-                entry = self._write_file_buffer_entry(content, label=f"read_file:{rel}")
+                entry = self._write_file_buffer_entry(cache_content, label=f"read_file:{rel}")
                 cache_path = str(entry.get("path", "") or "")
             except Exception:
                 cache_path = ""
@@ -35799,6 +35885,8 @@ class SessionState:
             "sha256": sha,
             "summary": self._read_context_summary_from_output(content),
             "cache_path": cache_path,
+            "cache_source_complete": bool(cache_source_complete),
+            **source_fp,
             "args": {
                 k: v
                 for k, v in src_args.items()
@@ -35824,6 +35912,7 @@ class SessionState:
                 target_path=rel,
                 cache_path=cache_path,
                 related_paths=[rel],
+                cache_source_complete=cache_source_complete,
             )
         except Exception:
             pass
@@ -35912,6 +36001,170 @@ class SessionState:
         self.read_context_registry = self._pruned_read_context_registry(self.read_context_registry)
         return f"read_context policy applied: pinned={kept}, dropped={dropped}"
 
+    def _read_source_fingerprint(self, rel_path: str) -> dict:
+        """Return a cheap, durable fingerprint for a workspace source file.
+
+        ``read_context_registry`` used to remember only the rendered output
+        hash.  That hash cannot tell us whether the source changed outside the
+        agent (editor, git checkout, sync process), so cached evidence could be
+        presented as current when it was not.  Size/mtime are cheap for every
+        lookup; a content hash is added for reasonably sized files when the
+        source is first read.
+        """
+        rel = str(rel_path or "").replace("\\", "/").strip()
+        if not rel:
+            return {}
+        try:
+            fp = self._session_path(rel)
+            st = fp.stat()
+            out = {
+                "source_size": int(st.st_size),
+                "source_mtime_ns": int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000))),
+            }
+            if fp.is_file() and int(st.st_size) <= READ_CONTEXT_CACHE_SEARCH_MAX_BYTES:
+                try:
+                    out["source_sha256"] = hashlib.sha256(fp.read_bytes()).hexdigest()
+                except Exception:
+                    pass
+            return out
+        except Exception:
+            return {}
+
+    def _read_context_entry_is_fresh(self, entry: dict) -> bool:
+        if not isinstance(entry, dict):
+            return False
+        path = str(entry.get("path", "") or entry.get("target_path", "") or "").strip()
+        if not path:
+            return False
+        # Legacy entries have no source fingerprint. They remain usable until
+        # the next explicit read, preserving backwards compatibility.
+        if "source_size" not in entry and "source_mtime_ns" not in entry and not entry.get("source_sha256"):
+            return True
+        current = self._read_source_fingerprint(path)
+        if not current:
+            return False
+        old_size = entry.get("source_size")
+        old_mtime = entry.get("source_mtime_ns")
+        if old_size is not None and int(old_size or 0) != int(current.get("source_size", -1)):
+            return False
+        if old_mtime is not None and int(old_mtime or 0) != int(current.get("source_mtime_ns", -1)):
+            return False
+        old_sha = str(entry.get("source_sha256", "") or "")
+        current_sha = str(current.get("source_sha256", "") or "")
+        return not old_sha or not current_sha or old_sha == current_sha
+
+    def _refresh_read_context_staleness(self, registry: dict | None = None) -> int:
+        """Mark cached file evidence stale when the source changed externally."""
+        src = registry if isinstance(registry, dict) else getattr(self, "read_context_registry", {})
+        if not isinstance(src, dict):
+            return 0
+        changed = 0
+        now = now_ts()
+        for entry in src.values():
+            if not isinstance(entry, dict) or str(entry.get("status", "active") or "active").lower() == "dropped":
+                continue
+            if not self._read_context_entry_is_fresh(entry):
+                if str(entry.get("status", "") or "").lower() != "stale":
+                    changed += 1
+                entry["status"] = "stale"
+                entry["last_stale_ts"] = now
+                entry["stale_reason"] = "source file changed or is unavailable"
+        # Keep the unified tool-memory view consistent as well. Do not call the
+        # path helper here: it would mark every historical read and lose the
+        # per-entry freshness distinction.
+        memory = getattr(self, "tool_memory_registry", {})
+        if isinstance(memory, dict):
+            for entry in memory.values():
+                if not isinstance(entry, dict) or str(entry.get("source_tool", "") or "") != "read_file":
+                    continue
+                path = str(entry.get("target_path", entry.get("path", "")) or "")
+                matching = next((row for row in src.values() if isinstance(row, dict) and str(row.get("path", "") or "") == path), None)
+                stale = (
+                    isinstance(matching, dict)
+                    and str(matching.get("status", "") or "").lower() == "stale"
+                )
+                if not isinstance(matching, dict) and not self._read_context_entry_is_fresh(entry):
+                    stale = True
+                if stale:
+                    entry["status"] = "stale"
+                    entry["last_stale_ts"] = now
+                    entry["stale_reason"] = str((matching or {}).get("stale_reason", "source file changed") or "source file changed")
+        return changed
+
+    @staticmethod
+    def _cached_query_terms(query: str) -> list[str]:
+        raw = str(query or "").strip().lower()
+        if not raw:
+            return []
+        terms: list[str] = []
+        for token in re.findall(r"[a-z0-9_][a-z0-9_.:/-]{1,}|[\u4e00-\u9fff]{2,}", raw, flags=re.I):
+            if token not in terms:
+                terms.append(token)
+            # Chinese questions often contain a long phrase with no spaces;
+            # add overlapping bigrams so a paraphrased query still recalls a
+            # relevant line when the full phrase is absent.
+            if re.fullmatch(r"[\u4e00-\u9fff]+", token) and len(token) > 4:
+                for idx in range(len(token) - 1):
+                    gram = token[idx : idx + 2]
+                    if gram not in terms:
+                        terms.append(gram)
+        return terms[:32]
+
+    def _search_cached_evidence(self, entry: dict, query: str, *, max_chars: int = READ_CONTEXT_CACHE_SNIPPET_CHARS) -> dict:
+        """Search one cached read buffer and return bounded, line-addressable snippets."""
+        if not isinstance(entry, dict) or not str(query or "").strip():
+            return {"score": 0, "matched_terms": [], "snippets": [], "scanned": False}
+        cache_ref = str(entry.get("cache_path", "") or entry.get("temp_output_path", "") or "").strip()
+        if not cache_ref:
+            return {"score": 0, "matched_terms": [], "snippets": [], "scanned": False}
+        try:
+            fp = Path(cache_ref)
+            if not fp.is_absolute():
+                fp = safe_path(cache_ref, self.root)
+            text = try_read_text(fp, max_bytes=READ_CONTEXT_CACHE_SEARCH_MAX_BYTES) or ""
+        except Exception:
+            text = ""
+        if not text:
+            return {"score": 0, "matched_terms": [], "snippets": [], "scanned": False}
+        raw_query = str(query or "").strip().lower()
+        terms = self._cached_query_terms(raw_query)
+        if not terms:
+            return {"score": 0, "matched_terms": [], "snippets": [], "scanned": True}
+        lines = text.replace("\r\n", "\n").split("\n")
+        exact_lines = [idx for idx, line in enumerate(lines) if raw_query in line.lower()]
+        matched_terms = [term for term in terms if any(term in line.lower() for line in lines)]
+        # Exact phrase is strongest; otherwise rank lines by the number of
+        # query terms they contain. This remains deterministic and works for
+        # both English token queries and CJK bigrams.
+        ranked: list[tuple[int, int]] = []
+        for idx, line in enumerate(lines):
+            low = line.lower()
+            score = sum(1 for term in terms if term in low)
+            if score:
+                ranked.append((score + (3 if raw_query in low else 0), idx))
+        ranked.sort(key=lambda row: (-row[0], row[1]))
+        selected: list[int] = []
+        for _score, idx in ranked:
+            if any(abs(idx - prior) <= READ_CONTEXT_CACHE_LINE_CONTEXT for prior in selected):
+                continue
+            selected.append(idx)
+            if len(selected) >= READ_CONTEXT_CACHE_SEARCH_MAX_MATCHES:
+                break
+        snippets: list[str] = []
+        for idx in selected:
+            start = max(0, idx - READ_CONTEXT_CACHE_LINE_CONTEXT)
+            end = min(len(lines), idx + READ_CONTEXT_CACHE_LINE_CONTEXT + 1)
+            block = "\n".join(f"{line_no + 1:>6}: {lines[line_no]}" for line_no in range(start, end))
+            snippets.append(block)
+        return {
+            "score": int((3 if exact_lines else 0) + len(matched_terms)),
+            "matched_terms": matched_terms[:24],
+            "snippets": snippets,
+            "scanned": True,
+            "exact_matches": len(exact_lines),
+            "truncated": len(text.encode("utf-8", errors="replace")) >= READ_CONTEXT_CACHE_SEARCH_MAX_BYTES,
+        }
+
     def _tool_memory_prompt_block(
         self,
         *,
@@ -35925,6 +36178,10 @@ class SessionState:
             self.tool_memory_registry = dict(registry)
         if not isinstance(registry, dict) or not registry:
             return ""
+        try:
+            self._refresh_read_context_staleness(getattr(self, "read_context_registry", {}))
+        except Exception:
+            pass
         budget = self._tool_memory_budget()
         if max_items is None:
             max_items = int(budget.get("items", TOOL_MEMORY_PROMPT_MAX_ITEMS) or TOOL_MEMORY_PROMPT_MAX_ITEMS)
@@ -35976,7 +36233,8 @@ class SessionState:
             (
                 "Tool evidence retained outside raw tool results and injected on every normal model call, not only after compact. "
                 "Reuse active/pinned evidence before repeating read_file/bash/query calls; call tool_memory mode='search' or mode='detail' "
-                "when you need to locate an entry or load its cached preview. Treat stale file evidence as a cue to re-read narrowly before relying on exact text."
+                "when you need to locate an entry or load its cached preview. For long reads, mode='search' also searches the cached full text and returns line-addressable snippets, so a broad read is not required again. "
+                "Treat stale file evidence as a cue to re-read narrowly before relying on exact text."
             ),
         ]
         hot_entries = [
@@ -36013,6 +36271,11 @@ class SessionState:
                 f"age={_age(entry.get('last_ts', 0.0))} "
                 f"summary={trim(str(entry.get('summary','') or ''), 300)}"
                 + (f" cache={cache}" if cache else "")
+                + (
+                    " cache_scope=source-prefix"
+                    if cache and not bool(entry.get("cache_source_complete", True))
+                    else (" cache_scope=source-full" if cache else "")
+                )
                 + (f" buffer_ref={buffer_ref}" if buffer_ref else "")
                 + (f" full_output_path={temp_output_path}" if temp_output_path else "")
                 + (f" stale_reason={trim(str(entry.get('stale_reason','') or ''), 120)}" if status == "stale" else "")
@@ -36043,6 +36306,14 @@ class SessionState:
                 },
                 indent=2,
             )
+        # Detect edits made outside the agent before exposing cached evidence.
+        # This is intentionally best-effort and bounded by the registry size;
+        # stale entries remain visible for diagnosis but are never treated as
+        # current search hits.
+        try:
+            self._refresh_read_context_staleness(getattr(self, "read_context_registry", {}))
+        except Exception:
+            pass
         budget = self._tool_memory_budget()
         mode = str(src.get("mode", "") or "").strip().lower() or "summary"
         if mode not in {"summary", "search", "recent", "detail"}:
@@ -36057,6 +36328,8 @@ class SessionState:
         current_role = self._sanitize_agent_role(role) or ""
         wanted_status = str(src.get("status", "") or "").strip().lower()
         include_cached = bool(src.get("include_cached", False)) and mode == "detail"
+        cache_hits: dict[str, dict] = {}
+        cache_scan_count = 0
 
         def visible(entry: dict) -> bool:
             if not isinstance(entry, dict):
@@ -36086,10 +36359,24 @@ class SessionState:
                         str(entry.get("target_path", entry.get("path", "")) or ""),
                         str(entry.get("command", "") or ""),
                         str(entry.get("summary", "") or ""),
-                        str(entry.get("signature", "") or ""),
-                    ]
+                    str(entry.get("signature", "") or ""),
+                ]
                 ).lower()
-                if query not in hay:
+                metadata_match = query in hay
+                if str(entry.get("source_tool", "") or "") == "read_file" and str(entry.get("status", "active") or "active").lower() != "stale":
+                    nonlocal cache_scan_count
+                    # Search cached bodies even when the path/summary matched:
+                    # callers need the exact line snippet, not just a locator.
+                    if cache_scan_count < 32:
+                        cache_scan_count += 1
+                        hit = self._search_cached_evidence(entry, query)
+                        if int(hit.get("score", 0) or 0) > 0:
+                            cache_hits[str(entry.get("key", "") or "")] = hit
+                        elif not metadata_match:
+                            return False
+                    elif not metadata_match:
+                        return False
+                elif not metadata_match:
                     return False
             return True
 
@@ -36130,9 +36417,19 @@ class SessionState:
                 "chars": int(entry.get("chars", 0) or 0),
                 "hits": int(entry.get("hit_count", 0) or 0),
                 "cache_path": entry.get("cache_path", ""),
+                "cache_source_complete": bool(entry.get("cache_source_complete", True)),
                 "buffer_ref": entry.get("buffer_ref", ""),
                 "full_output_path": entry.get("temp_output_path", ""),
             }
+            hit = cache_hits.get(str(entry.get("key", "") or ""))
+            if hit and mode in {"search", "detail"}:
+                item["cache_match_score"] = int(hit.get("score", 0) or 0)
+                item["cache_matched_terms"] = list(hit.get("matched_terms", []) or [])[:24]
+                snippets = [trim(str(x), READ_CONTEXT_CACHE_SNIPPET_CHARS) for x in (hit.get("snippets", []) or []) if str(x).strip()]
+                if snippets:
+                    item["cached_matches"] = snippets[:READ_CONTEXT_CACHE_SEARCH_MAX_MATCHES]
+                item["cache_exact_matches"] = int(hit.get("exact_matches", 0) or 0)
+                item["cache_search_truncated"] = bool(hit.get("truncated", False))
             if mode == "detail":
                 item["signature"] = trim(str(entry.get("signature", "") or ""), 800)
                 item["stale_reason"] = entry.get("stale_reason", "")
@@ -36158,12 +36455,39 @@ class SessionState:
             "matched_rows": len(entries),
             "returned": len(selected),
             "items": [render(entry) for entry in selected],
+            "observability": {
+                "cache_searches_total": int((getattr(self, "context_compaction_metrics", {}) or {}).get("cache_searches", 0) or 0),
+                "cache_hits_total": int((getattr(self, "context_compaction_metrics", {}) or {}).get("cache_hits", 0) or 0),
+                "cache_hit_rate": round(
+                    float((getattr(self, "context_compaction_metrics", {}) or {}).get("cache_hits", 0) or 0)
+                    / max(1, int((getattr(self, "context_compaction_metrics", {}) or {}).get("cache_searches", 0) or 0)),
+                    4,
+                ),
+                "last_compaction_reduction_ratio": float((getattr(self, "context_compaction_metrics", {}) or {}).get("last_reduction_ratio", 0.0) or 0.0),
+            },
             "focused_reads": [
                 "tool_memory mode='search' query='<path|command|error|skill>'",
                 "tool_memory mode='detail' id='<memory_id>' include_cached=true",
                 "read_file mode='window' or mode='search' only when remembered file evidence is stale or insufficient",
             ],
         }
+        if query and cache_scan_count:
+            stats = getattr(self, "context_compaction_metrics", {})
+            if not isinstance(stats, dict):
+                stats = {}
+            stats["cache_searches"] = int(stats.get("cache_searches", 0) or 0) + int(cache_scan_count)
+            stats["cache_hits"] = int(stats.get("cache_hits", 0) or 0) + len(cache_hits)
+            self.context_compaction_metrics = stats
+            obs = payload.get("observability") if isinstance(payload.get("observability"), dict) else {}
+            obs["cache_searches_total"] = int(stats.get("cache_searches", 0) or 0)
+            obs["cache_hits_total"] = int(stats.get("cache_hits", 0) or 0)
+            obs["cache_hit_rate"] = round(float(obs["cache_hits_total"]) / max(1, int(obs["cache_searches_total"])), 4)
+            payload["observability"] = obs
+            payload["cache_search"] = {
+                "scanned_entries": int(cache_scan_count),
+                "matched_entries": int(len(cache_hits)),
+                "max_bytes": int(READ_CONTEXT_CACHE_SEARCH_MAX_BYTES),
+            }
         return trim(json_dumps(payload, indent=2), cap)
 
     def _read_context_prompt_block(
@@ -37046,8 +37370,9 @@ class SessionState:
         if summary:
             rows.append(f"summary: {summary}")
         rows.append(
-            "Use this cached evidence to continue. Re-read the original path only with a narrower "
-            "mode='search', 'symbol', or 'window' for a new exact question."
+            "Use this cached evidence to continue. The cached full text is searchable with "
+            "tool_memory mode='search' query='<term>'; re-read the original path only when the "
+            "entry is stale, the query has no cached match, or fresh verification is required."
         )
         return "\n".join(rows)
 
@@ -37556,9 +37881,74 @@ class SessionState:
             text = str(resp.get("content", "")).strip()
             if text:
                 return trim(text, 4000)
-        except Exception as exc:
-            return f"(summary failed: {exc})"
-        return "(summary unavailable)"
+        except Exception:
+            # Compaction must never discard the only durable handoff when the
+            # summarizer is unavailable (offline model, timeout, or malformed
+            # provider response). Build a deterministic evidence digest from
+            # the archived rows instead. It is intentionally concise and
+            # preserves paths, errors, tool names, and recent user intent.
+            pass
+        return self._deterministic_compact_summary(rows)
+
+    def _deterministic_compact_summary(self, rows: list[dict], *, max_chars: int = 4000) -> str:
+        """Loss-bounded local summary used when LLM summarization fails.
+
+        The previous fallback exposed only ``summary unavailable``. That made
+        a successful long-document read effectively unrecoverable after
+        compaction and triggered unnecessary re-reads. This digest keeps high
+        signal rows and stable locators while remaining small enough for every
+        compact-resume note.
+        """
+        if not rows:
+            return "(no archived rows)"
+        picked: list[str] = []
+        seen: set[str] = set()
+        # Prefer user requests, assistant decisions, errors, and tool evidence
+        # that identifies a file/query. Walk newest-first but restore readable
+        # chronological order at the end.
+        ranked: list[tuple[int, int, dict]] = []
+        total = len(rows)
+        for idx, row in enumerate(rows):
+            if not isinstance(row, dict):
+                continue
+            role = str(row.get("role", "") or "").lower()
+            content = str(row.get("content", "") or "").strip()
+            low = content.lower()
+            score = int(idx / max(1, total - 1) * 3)
+            score += {"user": 4, "assistant": 3, "tool": 2, "system": 1}.get(role, 1)
+            if any(mark in low for mark in ("error:", "traceback", "exception", "failed", "finish_task", "todowrite")):
+                score += 3
+            if any(mark in low for mark in ("read_file", "path=", "full_output_path", "cached_copy", "query=")):
+                score += 2
+            ranked.append((score, idx, row))
+        ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        budget = max(800, int(max_chars or 4000))
+        used = 0
+        for _score, idx, row in ranked:
+            role = str(row.get("role", "") or "")
+            content = str(row.get("content", "") or "").replace("\r\n", " ").replace("\n", " ").strip()
+            if not content:
+                continue
+            # Keep enough of a read result to preserve headings, paths, and
+            # line references; tool output is capped more aggressively.
+            cap = 520 if role in {"user", "assistant"} else 420
+            line = trim(content, cap)
+            key = hashlib.sha1(line.lower().encode("utf-8", errors="replace")).hexdigest()[:12]
+            if key in seen:
+                continue
+            row_text = f"[{role or 'event'}] {line}"
+            if used + len(row_text) + 1 > budget:
+                continue
+            seen.add(key)
+            picked.append((idx, row_text))
+            used += len(row_text) + 1
+            if used >= budget * 0.92:
+                break
+        picked.sort(key=lambda item: item[0])
+        lines = [text for _idx, text in picked]
+        if not lines:
+            return "(archived rows contained no textual evidence)"
+        return trim("\n".join(lines), budget)
 
     def _open_work_brief(self) -> str:
         alias = {
@@ -37987,7 +38377,30 @@ class SessionState:
         before_used = int(context_before.get("used", 0) or 0)
         after_used = int(context_after.get("used", 0) or 0)
         reduction = max(0, before_used - after_used)
+        input_chars = len(json_dumps(archived_rows)) if archived_rows else 0
+        summary_chars = len(str(summary or ""))
+        compact_ratio = (float(after_used) / float(before_used)) if before_used > 0 else 1.0
+        reduction_ratio = max(0.0, min(1.0, 1.0 - compact_ratio))
+        stats = getattr(self, "context_compaction_metrics", {})
+        if not isinstance(stats, dict):
+            stats = {}
+        stats.update(
+            {
+                "runs": int(stats.get("runs", 0) or 0) + 1,
+                "effective_runs": int(stats.get("effective_runs", 0) or 0),
+                "archived_messages": int(stats.get("archived_messages", 0) or 0) + int(seg_msg_count),
+                "input_chars": int(stats.get("input_chars", 0) or 0) + int(input_chars),
+                "summary_chars": int(stats.get("summary_chars", 0) or 0) + int(summary_chars),
+                "last_ratio": round(compact_ratio, 6),
+                "last_reduction_ratio": round(reduction_ratio, 6),
+                "last_input_chars": int(input_chars),
+                "last_summary_chars": int(summary_chars),
+            }
+        )
+        self.context_compaction_metrics = stats
         effective = bool(reduction >= max(400, int(before_used * 0.05)) or after_used < int(context_after.get("effective_limit", 0) or 0))
+        if effective:
+            self.context_compaction_metrics["effective_runs"] = int(self.context_compaction_metrics.get("effective_runs", 0) or 0) + 1
         self.context_last_compact_before = dict(context_before)
         self.context_last_compact_after = dict(context_after)
         self.context_last_compact_effective = bool(effective)
@@ -38018,6 +38431,10 @@ class SessionState:
                 "context_left_after": int(context_after.get("left", 0)),
                 "context_left_percent_after": round(float(context_after.get("left_percent", 0.0)), 2),
                 "context_used_reduction": int(reduction),
+                "compression_ratio": round(compact_ratio, 6),
+                "reduction_ratio": round(reduction_ratio, 6),
+                "archived_input_chars": int(input_chars),
+                "summary_chars": int(summary_chars),
                 "effective": bool(effective),
                 "next_call_label": str(context_after.get("next_call_label", "") or ""),
                 "role": role_key or "",
@@ -81687,6 +82104,7 @@ body{padding:18px}
                 qid = int(row.get("queue_id", 0) or 0)
                 scheduler_feed_rows.append(
                     {
+                        "id": f"scheduler:{qid}",
                         "role": "user",
                         "type": "scheduler_queued",
                         "ts": float(row.get("queued_at", 0.0) or now_ts()),
@@ -81702,7 +82120,8 @@ body{padding:18px}
             total_message_count += len(scheduler_feed_rows)
             inferred_assistant_role = self._sanitize_agent_role(self.active_agent_role)
             inferred_bus_target_role = ""
-            for msg in self.messages[-msg_window:]:
+            message_start = max(0, len(self.messages) - msg_window)
+            for msg_index, msg in enumerate(self.messages[message_start:], start=message_start):
                 role = msg.get("role")
                 if role == "tool":
                     continue
@@ -81792,7 +82211,19 @@ body{padding:18px}
                 if isinstance(text, list):
                     text = json_dumps(text)
                 ts = float(msg.get("ts", 0.0)) if isinstance(msg, dict) else 0.0
-                row = {"role": role, "text": str(text), "ts": ts, "type": msg_type}
+                # Message objects historically did not carry an event id.  Build a
+                # deterministic key from their position and content so the IDE can
+                # reconcile SSE-triggered refreshes without appending duplicates.
+                msg_fingerprint = hashlib.sha256(
+                    f"{role}|{msg_type}|{ts:.6f}|{str(text)}".encode("utf-8", errors="ignore")
+                ).hexdigest()[:16]
+                row = {
+                    "id": str(msg.get("id", "") or f"message:{msg_fingerprint}"),
+                    "role": role,
+                    "text": str(text),
+                    "ts": ts,
+                    "type": msg_type,
+                }
                 if isinstance(msg, dict) and isinstance(msg.get("data"), dict):
                     public_data = dict(msg.get("data") or {})
                     if (
@@ -81866,6 +82297,7 @@ body{padding:18px}
                         continue
                     conversation_feed.append(
                         {
+                            "id": f"retained:{hashlib.sha256(f'{ts_f:.6f}|{text}'.encode('utf-8', errors='ignore')).hexdigest()[:16]}",
                             "role": "user",
                             "type": "message",
                             "ts": ts_f,
@@ -82150,6 +82582,7 @@ body{padding:18px}
                 "context_last_compact_effective": bool(getattr(self, "context_last_compact_effective", True)),
                 "context_last_compact_used_reduction": int(getattr(self, "context_last_compact_used_reduction", 0) or 0),
                 "context_last_compact_skip_reason": str(getattr(self, "context_last_compact_skip_reason", "") or ""),
+                "context_compaction_metrics": dict(getattr(self, "context_compaction_metrics", {}) or {}),
                 "context_estimator": str(ctx.get("estimator", "")),
                 "context_estimate_safety_multiplier": float(ctx.get("safety_multiplier", CONTEXT_ESTIMATE_SAFETY_MULTIPLIER)),
                 "context_estimate_base_safety_multiplier": float(ctx.get("base_safety_multiplier", CONTEXT_ESTIMATE_SAFETY_MULTIPLIER)),
@@ -84866,6 +85299,7 @@ function openLlmConfigModal(){const modal=E('llmConfigModal');if(!modal)return;m
 const COMPACT_AUTO_REFRESH_COUNT=3;
 const COMPACT_AUTO_REFRESH_INTERVAL_MS=260;
 const E=id=>document.getElementById(id);
+const PREVIEW_TOKENS=new Map();
 const I18N={
   'en':{
     app_title:'Clouds Coder',app_subtitle:'WebUI-driven conversational coding agent platform',powered_by:'Powered By Fona',
@@ -89448,7 +89882,23 @@ window.addEventListener('DOMContentLoaded',async()=>{for(const id of ['chat','se
 window.addEventListener('DOMContentLoaded',()=>{bindClick('memoryModeAction',(e)=>{closePopups();toggleUserMemoryMode(e)});bindClick('memoryExportAction',(e)=>{closePopups();exportUserMemory(e)});bindClick('memoryClearAction',(e)=>{closePopups();clearUserMemory(e)});renderMemoryModeAction()});
 """
 
-APP_TS = """type SessionSummary={id:string;title:string;running:boolean;updated_at:number;message_count:number};
+APP_CSS += r"""
+:root{--web-scrollbar-size:8px;--web-scrollbar-thumb:rgba(98,116,142,.44);--web-scrollbar-thumb-hover:rgba(76,98,128,.7)}
+html,body{scrollbar-gutter:stable}
+*{scrollbar-width:thin;scrollbar-color:transparent transparent!important}
+*:hover,*:focus,*:focus-within{scrollbar-color:var(--web-scrollbar-thumb) transparent!important}
+*::-webkit-scrollbar{width:var(--web-scrollbar-size);height:var(--web-scrollbar-size)}
+*::-webkit-scrollbar-track,*::-webkit-scrollbar-corner{background:transparent!important}
+*::-webkit-scrollbar-button{display:none;width:0;height:0}
+*::-webkit-scrollbar-thumb{min-height:28px;border:2px solid transparent;border-radius:999px;background:transparent!important;background-clip:padding-box!important}
+*:hover::-webkit-scrollbar-thumb,*:focus::-webkit-scrollbar-thumb,*:focus-within::-webkit-scrollbar-thumb,*:active::-webkit-scrollbar-thumb{background:var(--web-scrollbar-thumb)!important;background-clip:padding-box!important}
+*:hover::-webkit-scrollbar-thumb:hover,*:focus-within::-webkit-scrollbar-thumb:hover{background:var(--web-scrollbar-thumb-hover)!important;background-clip:padding-box!important}
+#chat,#sessionList,.chat-tabs,.preview-body,.preview-code-scroll,.msg-md .md-code,.msg-code-shell,.msg-diff-shell,#activity,#commands,#diffs,#fileExplorer,#catalog,.popup-menu,.application-list,.application-editor-body,.application-skill-catalog,.modal,.modal-body{scrollbar-gutter:stable}
+@media(hover:none),(pointer:coarse){*:active{scrollbar-color:var(--web-scrollbar-thumb) transparent!important}*:active::-webkit-scrollbar-thumb{background:var(--web-scrollbar-thumb)!important;background-clip:padding-box!important}}
+@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}}
+"""
+
+APP_TS = """type SessionSummary={id:string;title:string;running:boolean;updated_at:number};
 type Msg={role:string;text:string;type?:string;data?:Record<string,unknown>;thinking?:string;agent_role?:string;[key:string]:unknown};
 type UploadMeta={id:string;filename:string;workspace_path:string;kind:string;size:number;uploaded_at:number;preview?:string};
 type Snapshot={id:string;title:string;running:boolean;message_count?:number;model:string;ollama_base_url:string;thinking:boolean;thinking_stream?:boolean;response_stream?:boolean;live_thinking?:string;live_response_text?:string;live_response_role?:string;live_response_label?:string;live_response_stream_id?:string;live_response_active?:boolean;live_truncation_text?:string;live_truncation_kind?:string;live_truncation_tool?:string;live_truncation_active?:boolean;live_truncation_attempts?:number;live_truncation_tokens?:number;live_run_notice_active?:boolean;live_run_notice_label?:string;live_run_notice_started_at?:number;live_run_notice_elapsed?:number;execution_mode?:string;multi_agent_context_hud_enabled?:boolean;agent_active_role?:string;agent_contexts?:Array<{role:string;label?:string;active?:boolean;used?:number;left?:number;left_percent?:number;effective_limit?:number;tier?:number;message_count?:number;next_call_label?:string}>;max_agent_rounds?:number;max_run_seconds?:number;agent_round_index?:number;agent_phase?:string;agent_active_tool?:string;queued_user_inputs_count?:number;context_token_upper_bound?:number;context_token_limit_config?:number;context_token_limit_locked?:boolean;context_tokens_estimate?:number;context_left_tokens?:number;context_left_percent?:number;context_used_percent?:number;truncation_count?:number;compact_segments_count?:number;last_compact_reason?:string;last_compact_ts?:number;last_compact_segment_id?:string;event_seq?:number;render_bridge?:{seq:number;received?:number;last_ts?:number;last_kind?:string;latest?:Record<string,unknown>};blackboard?:{status?:string;original_goal?:string;manager_cycles?:number;active_agent?:string;approval?:Record<string,unknown>;last_delegate?:Record<string,unknown>};messages:Msg[];uploads?:UploadMeta[];llm_model_catalog?:ModelCatalog|null};
@@ -89723,13 +90173,16 @@ SKILLS_EXTRA_CSS = """
 .skill-item .name{font-weight:700;font-size:.82rem}
 .skill-item .desc{font-size:.76rem;color:#516175;white-space:pre-wrap}
 .skill-item .path{font-size:.72rem;color:#708097}
-.skills-app .block-scroll::-webkit-scrollbar,.skills-app .flow-wrap::-webkit-scrollbar,.flow-node .c::-webkit-scrollbar{width:10px;height:10px}
-.skills-app .block-scroll::-webkit-scrollbar-thumb,.skills-app .flow-wrap::-webkit-scrollbar-thumb,.flow-node .c::-webkit-scrollbar-thumb{background:#c7d4e6;border-radius:999px}
-.skills-app .block-scroll::-webkit-scrollbar-track,.skills-app .flow-wrap::-webkit-scrollbar-track,.flow-node .c::-webkit-scrollbar-track{background:#edf2f9}
-.skills-panel-left::-webkit-scrollbar,.skills-panel-center::-webkit-scrollbar,.skills-panel-right::-webkit-scrollbar{width:10px;height:10px}
-.skills-panel-left::-webkit-scrollbar-thumb,.skills-panel-center::-webkit-scrollbar-thumb,.skills-panel-right::-webkit-scrollbar-thumb{background:#c7d4e6;border-radius:999px}
-.skills-panel-left::-webkit-scrollbar-track,.skills-panel-center::-webkit-scrollbar-track,.skills-panel-right::-webkit-scrollbar-track{background:#edf2f9}
-.skills-panel-center{scrollbar-color:#c7d4e6 #edf2f9;scrollbar-width:thin}
+.skills-app .block-scroll::-webkit-scrollbar,.skills-app .flow-wrap::-webkit-scrollbar,.flow-node .c::-webkit-scrollbar{width:8px;height:8px}
+.skills-app .block-scroll::-webkit-scrollbar-thumb,.skills-app .flow-wrap::-webkit-scrollbar-thumb,.flow-node .c::-webkit-scrollbar-thumb{background:transparent;border:2px solid transparent;background-clip:padding-box;border-radius:999px}
+.skills-app .block-scroll:hover::-webkit-scrollbar-thumb,.skills-app .flow-wrap:hover::-webkit-scrollbar-thumb,.flow-node .c:hover::-webkit-scrollbar-thumb{background:var(--web-scrollbar-thumb);background-clip:padding-box}
+.skills-app .block-scroll::-webkit-scrollbar-track,.skills-app .flow-wrap::-webkit-scrollbar-track,.flow-node .c::-webkit-scrollbar-track{background:transparent}
+.skills-panel-left::-webkit-scrollbar,.skills-panel-center::-webkit-scrollbar,.skills-panel-right::-webkit-scrollbar{width:8px;height:8px}
+.skills-panel-left::-webkit-scrollbar-thumb,.skills-panel-center::-webkit-scrollbar-thumb,.skills-panel-right::-webkit-scrollbar-thumb{background:transparent;border:2px solid transparent;background-clip:padding-box;border-radius:999px}
+.skills-panel-left:hover::-webkit-scrollbar-thumb,.skills-panel-center:hover::-webkit-scrollbar-thumb,.skills-panel-right:hover::-webkit-scrollbar-thumb{background:var(--web-scrollbar-thumb);background-clip:padding-box}
+.skills-panel-left::-webkit-scrollbar-track,.skills-panel-center::-webkit-scrollbar-track,.skills-panel-right::-webkit-scrollbar-track{background:transparent}
+.skills-panel-center{scrollbar-color:transparent transparent;scrollbar-width:thin}
+.skills-panel-center:hover{scrollbar-color:var(--web-scrollbar-thumb) transparent}
 @media (max-width:1180px){
   .skills-main{grid-template-columns:1fr;height:auto;max-height:none;min-height:0}
   .flow-wrap{height:320px;min-height:320px;flex:none}
@@ -105962,6 +106415,19 @@ IDE_CSS += r"""
 .collab-admission-fields{display:grid;gap:7px}.collab-transport-warning{padding:7px 9px;border:1px solid #725c20;background:#302b1d;color:#e2c08d;font-size:11px;line-height:1.4}.auth-dialog .collab-transport-warning{margin:12px 0}
 .collaboration-view{grid-template-rows:35px auto auto 22px minmax(52px,1fr) 22px minmax(52px,1fr) 22px minmax(52px,1fr) 22px minmax(52px,1fr) 22px minmax(52px,1fr);overflow:hidden}.collaboration-view.is-active{display:grid}.collaboration-presence-summary{min-height:30px;padding:6px 10px;border-bottom:1px solid var(--line);color:#9cdcfe;font-size:11px;line-height:1.4}.collaboration-list{min-height:0;overflow:auto}.collaboration-card{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:2px 7px;padding:6px 9px;border-bottom:1px solid #242424}.collaboration-card:hover{background:var(--hover)}.collaboration-card strong{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#d4d4d4;font-size:12px;font-weight:500}.collaboration-card small{grid-column:1/-1;color:var(--muted);font-size:10px;line-height:1.35;overflow-wrap:anywhere}.collaboration-card .collaboration-state{color:#89d185;font-size:10px}.collaboration-card.is-warning .collaboration-state{color:#e2c08d}.collaboration-empty{padding:8px 10px;color:var(--muted);font-size:11px}.collaboration-resource-links{display:flex;flex-wrap:wrap;gap:4px;padding:6px 8px}.collaboration-resource-link{color:#75beff;font-size:10px;text-decoration:none}.collaboration-resource-link:hover{text-decoration:underline}.remote-cursor{border-left:2px solid #f48771}.remote-cursor-1{border-color:#89d185}.remote-cursor-2{border-color:#d7ba7d}.remote-cursor-3{border-color:#c586c0}.remote-cursor-4{border-color:#4ec9b0}
 @media(max-width:820px){.collaboration-view{grid-template-rows:35px auto auto 22px minmax(70px,1fr) 22px minmax(70px,1fr) 22px minmax(70px,1fr) 22px minmax(70px,1fr) 22px minmax(70px,1fr)}}
+:root{--ide-scrollbar-size:8px;--ide-scrollbar-thumb:rgba(151,159,171,.54);--ide-scrollbar-thumb-hover:rgba(196,203,214,.78)}
+html,body{scrollbar-gutter:stable}
+*{scrollbar-width:thin;scrollbar-color:transparent transparent!important}
+*:hover,*:focus,*:focus-within{scrollbar-color:var(--ide-scrollbar-thumb) transparent!important}
+*::-webkit-scrollbar{width:var(--ide-scrollbar-size);height:var(--ide-scrollbar-size)}
+*::-webkit-scrollbar-track,*::-webkit-scrollbar-corner{background:transparent!important}
+*::-webkit-scrollbar-button{display:none;width:0;height:0}
+*::-webkit-scrollbar-thumb{min-height:28px;border:2px solid transparent;border-radius:999px;background:transparent!important;background-clip:padding-box!important}
+*:hover::-webkit-scrollbar-thumb,*:focus::-webkit-scrollbar-thumb,*:focus-within::-webkit-scrollbar-thumb,*:active::-webkit-scrollbar-thumb{background:var(--ide-scrollbar-thumb)!important;background-clip:padding-box!important}
+*:hover::-webkit-scrollbar-thumb:hover,*:focus-within::-webkit-scrollbar-thumb:hover{background:var(--ide-scrollbar-thumb-hover)!important;background-clip:padding-box!important}
+.open-editors,.side-list,.toolchains,.collaboration-list,.editor-tabs,.artifact-stage,.artifact-markdown,.panel-content,.agent-todo-body,.agent-messages,.agent-composer,.agent-attachments,.agent-tool-output,.agent-diff,.agent-model-menu,.palette-results,.modal,.modal-body,.conflict-preview,.prompt-enhance-body,.application-list,.ide-application-fields,.ide-application-selected,.ide-application-catalog,.xterm-viewport{scrollbar-gutter:stable}
+@media(hover:none),(pointer:coarse){*:active{scrollbar-color:var(--ide-scrollbar-thumb) transparent!important}*:active::-webkit-scrollbar-thumb{background:var(--ide-scrollbar-thumb)!important;background-clip:padding-box!important}}
+@media(prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}}
 """
 
 IDE_JS = r"""
@@ -105974,7 +106440,7 @@ const S={
   diagnostics:[],searchResults:[],scm:null,tasks:[],installedExtensions:[],extensionWorkers:new Map(),
   terminal:null,terminalStarting:false,terminalPromise:null,terminalWidget:null,terminalFit:null,terminalOffset:0,terminalPoll:null,terminalDecoder:null,terminalAnsiState:null,terminalPlainState:null,stateTimer:null,diagnosticTimer:null,paletteItems:[],paletteIndex:0,paletteMode:'commands',quickFiles:[],quickFilesLoading:false,quickFilesKey:'',quickFilesTruncated:false,
   debug:null,debugSeq:0,debugPoll:null,debugFile:null,
-  agentPoll:null,agentPollDue:0,agentPollBusy:false,agentPollRequested:false,agentState:null,agentRendered:new Set(),agentToolCards:new Map(),agentPlanCards:new Map(),agentOperationSeq:0,agentEventSeq:0,agentWasBusy:false,agentSession:'',agentSubmitting:false,agentInterrupting:false,agentTreeTimer:null,agentFileRefresh:new Set(),agentAttachments:[],agentModelCatalog:null,agentTodoCollapsed:false,promptEnhanceEnabled:false,promptEnhancePersistent:false,promptEnhanceSkillsAware:false,promptEnhanceBudget:'medium',promptEnhancing:false,promptEnhanceDraft:null,promptEnhanceAbort:null,promptEnhanceStartedAt:0,promptEnhanceElapsedTimer:null,promptEnhanceLoadingLabel:'',workspaceRefreshBusy:false,workspaceRefreshSeq:0,workspaceClipboard:null,explorerSelection:null,sessionSwitchSeq:0,sessionSwitching:false,renderingAgentState:false,devicePoll:null,agentEvents:null,agentEventsConnected:false,agentEventReconnect:null,pendingUploadDest:'',pendingOpenUpload:false,pendingFolderUploadDest:'',
+  agentPoll:null,agentPollDue:0,agentPollBusy:false,agentPollRequested:false,agentState:null,agentRendered:new Set(),agentToolCards:new Map(),agentPlanCards:new Map(),agentTimelineSignature:'',agentProgressSignature:'',agentBatching:false,agentOperationSeq:0,agentEventSeq:0,agentWasBusy:false,agentSession:'',agentSubmitting:false,agentInterrupting:false,agentTreeTimer:null,agentFileRefresh:new Set(),agentAttachments:[],agentModelCatalog:null,agentTodoCollapsed:false,promptEnhanceEnabled:false,promptEnhancePersistent:false,promptEnhanceSkillsAware:false,promptEnhanceBudget:'medium',promptEnhancing:false,promptEnhanceDraft:null,promptEnhanceAbort:null,promptEnhanceStartedAt:0,promptEnhanceElapsedTimer:null,promptEnhanceLoadingLabel:'',workspaceRefreshBusy:false,workspaceRefreshSeq:0,workspaceClipboard:null,explorerSelection:null,sessionSwitchSeq:0,sessionSwitching:false,renderingAgentState:false,devicePoll:null,agentEvents:null,agentEventsConnected:false,agentEventReconnect:null,pendingUploadDest:'',pendingOpenUpload:false,pendingFolderUploadDest:'',
   applications:null,applicationsLoading:false,applicationBusy:new Set(),applicationDraft:{id:'',selectedSkillIds:[],saving:false},
   collaborationMode:false,collaboration:null,collaborationWarning:'',collaborationEvents:null,collaborationEventCursor:0,collaborationRefreshTimer:null,collaborationPresenceTimer:null,collaborationPresenceHeartbeat:null,collaborationConflictNoticeSignature:'',collaborationConflictNoticeTimer:null,collaborationConflictReviewId:'',collaborationFlushes:new Map(),collaborationFlushTimers:new Map(),collaborationRemoteDecorations:new Map(),collaborationSessionRefresh:null
 };
@@ -106031,9 +106497,11 @@ function toast(message,tone='error',timeout=5000){
   row.innerHTML=`<span class="codicon codicon-${icon}"></span><div>${escapeHtml(message)}</div><button aria-label="Close"><span class="codicon codicon-close"></span></button>`;
   row.querySelector('button').onclick=()=>row.remove();E('toastHost').appendChild(row);if(timeout)setTimeout(()=>row.remove(),timeout);
 }
-function appendPanelLog(id,text){const out=E(id);if(out.dataset.empty==='true'){out.textContent='';out.dataset.empty='false'}out.textContent+=(out.textContent?'\n':'')+String(text||'');out.scrollTop=out.scrollHeight}
+const PANEL_LOG_MAX_CHARS=180000;
+function appendPanelText(id,text,separator=''){const out=E(id);if(!out)return;const value=String(text||'');if(!value)return;if(out.dataset.empty==='true'){out.textContent='';out.dataset.empty='false'}const current=String(out.textContent||''),prefix=current&&separator?separator:'';let next=current+prefix+value;if(next.length>PANEL_LOG_MAX_CHARS){const marker='...[earlier output omitted]...\n';next=marker+next.slice(-Math.max(0,PANEL_LOG_MAX_CHARS-marker.length))}out.textContent=next;out.scrollTop=out.scrollHeight}
+function appendPanelLog(id,text){appendPanelText(id,text,'\n')}
 function logOutput(text){appendPanelLog('outputLog',text)}
-function logOutputChunk(text){const out=E('outputLog');if(out.dataset.empty==='true'){out.textContent='';out.dataset.empty='false'}out.textContent+=String(text||'');out.scrollTop=out.scrollHeight}
+function logOutputChunk(text){appendPanelText('outputLog',text)}
 function logDebug(text){appendPanelLog('debugConsole',text)}
 function activeFile(group=S.activeGroup){return S.openFiles.get(S.activeByGroup[group])||null}
 function rootQuery(root=S.activeRoot){return `root_id=${qs(root||'session')}`}
@@ -106046,7 +106514,8 @@ function stableUri(file){return `clouds://${encodeURIComponent(file.session_id)}
 function isArtifactFile(file){return !!file&&(file.binary||file.preview===true)}
 function canPreviewFile(file){return !!file&&['image','video','audio','pdf','html','markdown','text','csv','excel','presentation','document'].includes(file.previewKind)}
 function artifactUrl(file,kind='raw'){const base=`/api/ide/sessions/${qs(file.session_id)}/workspace/${kind}?root_id=${qs(file.root_id)}&path=${qs(file.path)}`;return `${base}&revision=${qs(file.revision||Date.now())}`}
-function htmlArtifactUrl(file){return `/api/ide/sessions/${qs(file.session_id)}/workspace/html/${file.path.split('/').map(qs).join('/')}?root_id=${qs(file.root_id)}&revision=${qs(file.revision||Date.now())}`}
+function htmlArtifactUrl(file,token=''){const suffix=token?`&preview_token=${qs(token)}`:'';return `/api/ide/sessions/${qs(file.session_id)}/workspace/html/${file.path.split('/').map(qs).join('/')}?root_id=${qs(file.root_id)}&revision=${qs(file.revision||Date.now())}${suffix}`}
+async function previewToken(file){const key=`${file.session_id}|${file.root_id}`;const cached=PREVIEW_TOKENS.get(key);if(cached&&cached.expires>Date.now()+15000)return cached.token;const out=await api(`/api/ide/v2/sessions/${qs(file.session_id)}/preview-token?root_id=${qs(file.root_id)}`);const token=String(out.preview_token||'');if(!token)throw new Error('Preview authorization unavailable');PREVIEW_TOKENS.set(key,{token,expires:Date.now()+Math.max(30000,Number(out.expires_in||600)*1000)});return token}
 function previewKindForPath(path){const ext=(String(path||'').toLowerCase().match(/\.[^.\/]+$/)||[''])[0];if(['.html','.htm'].includes(ext))return'html';if(['.md','.markdown','.mdx','.txt'].includes(ext))return'markdown';if(['.png','.jpg','.jpeg','.webp','.gif','.bmp','.tiff','.tif','.svg','.avif','.heic','.heif'].includes(ext))return'image';if(['.mp4','.mov','.avi','.mkv','.webm','.m4v','.mpeg','.mpg','.3gp'].includes(ext))return'video';if(['.mp3','.wav','.m4a','.aac','.flac','.ogg','.oga','.opus'].includes(ext))return'audio';if(ext==='.pdf')return'pdf';if(['.csv','.tsv'].includes(ext))return'csv';if(['.xlsx','.xls','.xlsm'].includes(ext))return'excel';if(['.pptx','.ppt','.pptm'].includes(ext))return'presentation';if(['.docx','.doc','.docm'].includes(ext))return'document';return''}
 function loadScript(src){return new Promise((resolve,reject)=>{if(document.querySelector(`script[data-src="${src}"]`))return resolve();const script=document.createElement('script');script.src=src;script.dataset.src=src;script.onload=resolve;script.onerror=()=>reject(new Error(`Unable to load ${src}`));document.head.appendChild(script)})}
 async function initMonaco(){
@@ -106102,7 +106571,12 @@ function renderArtifactPreview(group,file){
   if(kind==='image'){const media=document.createElement('img');media.src=artifactUrl(file,'image-preview');media.alt=file.name;media.decoding='async';media.loading='eager';media.onerror=()=>showArtifactPreviewError(stage,file,'The image is invalid or exceeds the safe preview dimensions.');stage.appendChild(media)}
   else if(kind==='video'){const media=document.createElement('video');media.src=url;media.controls=true;media.onerror=()=>showArtifactPreviewError(stage,file,'The video format could not be loaded by this browser.');stage.appendChild(media)}
   else if(kind==='audio'){const media=document.createElement('audio');media.src=url;media.controls=true;media.onerror=()=>showArtifactPreviewError(stage,file,'The audio format could not be loaded by this browser.');stage.appendChild(media)}
-  else if(kind==='pdf'||kind==='html'){const frame=document.createElement('iframe');frame.title=`Preview ${file.name}`;frame.referrerPolicy='no-referrer';if(kind==='html')frame.sandbox='allow-scripts';frame.src=url;stage.appendChild(frame)}
+  else if(kind==='pdf'||kind==='html'){
+    const frame=document.createElement('iframe');frame.title=`Preview ${file.name}`;frame.referrerPolicy='no-referrer';if(kind==='html')frame.sandbox='allow-scripts';stage.appendChild(frame);
+    if(kind==='html'){
+      previewToken(file).then(token=>{if(!frame.isConnected)return;const previewUrl=htmlArtifactUrl(file,token);frame.src=previewUrl;if(browser)browser.href=previewUrl}).catch(error=>showArtifactPreviewError(stage,file,error.message));
+    }else frame.src=url;
+  }
   else if(['csv','excel','presentation','document','markdown','text'].includes(kind)){const frame=document.createElement('iframe');frame.title=`Preview ${file.name}`;frame.referrerPolicy='no-referrer';frame.sandbox='allow-scripts';frame.src=artifactUrl(file,'preview');frame.onerror=()=>showArtifactPreviewError(stage,file,'The preview renderer did not return a document.');stage.appendChild(frame)}
   else{stage.innerHTML=`<div class="artifact-binary"><span class="codicon codicon-file-binary"></span><strong>${escapeHtml(file.name)}</strong><small>Preview is not available for this file type.</small><a class="button" href="${escapeHtml(url+'&download=1')}" download="${escapeHtml(file.name)}">Download</a></div>`}
 }
@@ -106350,17 +106824,29 @@ function agentRoleKey(role=''){const key=String(role||'').trim().toLowerCase();r
 function agentRoleLabel(role=''){const key=agentRoleKey(role);return key?key[0].toUpperCase()+key.slice(1):String(role||'Agent')}
 function stripAgentRolePrefix(text,role=''){const key=agentRoleKey(role),value=String(text||'').replace(/^\uFEFF/,'').trimStart();if(!key)return value;const labels=[key,agentRoleLabel(key)].map(label=>label.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'));return value.replace(new RegExp(`^(?:${labels.join('|')})\\s*(?:[:：]\\s*|\\n+)`,'i'),'').trimStart()}
 function renderAgentMarkdown(text){const source=String(text||'');if(!window.marked?.parse)return escapeHtml(source).replace(/\n/g,'<br>');const html=window.marked.parse(source,{async:false,gfm:true,breaks:false});return sanitizePreviewHtml(html)}
-function agentMessage(text,type='system',meta=''){const row=document.createElement('div');row.className=`agent-message ${type}`;if(meta){const key=agentRoleKey(meta),label=document.createElement('span');label.className=`agent-meta${key?` agent-role-${key}`:''}`;label.textContent=agentRoleLabel(meta);row.appendChild(label)}const value=stripAgentRolePrefix(text,meta);if(type==='assistant'){const body=document.createElement('div');body.className='agent-markdown';body.innerHTML=renderAgentMarkdown(value);body.dataset.source=value;row.appendChild(body)}else row.appendChild(document.createTextNode(value));E('agentMessages').appendChild(row);E('agentMessages').scrollTop=E('agentMessages').scrollHeight;return row}
-function agentApproach(text,role='Agent'){const value=stripAgentRolePrefix(text,role).trim();if(!value)return null;const row=document.createElement('div');row.className='agent-message approach';row.innerHTML=`<div class="agent-approach-head"><span class="codicon codicon-compass"></span><span>Approach</span><span class="agent-meta${agentRoleKey(role)?` agent-role-${agentRoleKey(role)}`:''}" style="margin:0 0 0 auto">${escapeHtml(agentRoleLabel(role))}</span></div><div class="agent-approach-body">${escapeHtml(value)}</div>`;E('agentMessages').appendChild(row);E('agentMessages').scrollTop=E('agentMessages').scrollHeight;return row}
+const AGENT_MESSAGES_DOM_LIMIT=360;
+function agentMessagesNearBottom(host=E('agentMessages')){return !!host&&(host.scrollHeight-host.scrollTop-host.clientHeight<96)}
+function trimAgentMessages(host=E('agentMessages')){if(!host)return;const rows=[...host.children].filter(row=>!row.classList.contains('agent-history-truncated')&&row.id!=='agentLiveResponse');if(rows.length<=AGENT_MESSAGES_DOM_LIMIT)return;const follow=agentMessagesNearBottom(host),oldHeight=host.scrollHeight,removeCount=rows.length-AGENT_MESSAGES_DOM_LIMIT;for(let i=0;i<removeCount;i++)rows[i]?.remove();let marker=host.querySelector('.agent-history-truncated');if(!marker){marker=document.createElement('div');marker.className='agent-history-truncated';marker.textContent='Earlier activity omitted from this view.';host.prepend(marker)}const delta=host.scrollHeight-oldHeight;if(follow)host.scrollTop=host.scrollHeight;else host.scrollTop=Math.max(0,host.scrollTop+delta);for(const[key,value]of S.agentToolCards)if(!value?.isConnected)S.agentToolCards.delete(key);for(const[key,value]of S.agentPlanCards)if(!value?.isConnected)S.agentPlanCards.delete(key)}
+function appendAgentNode(row){const host=E('agentMessages');if(!host||!row)return row;host.appendChild(row);if(!S.agentBatching)trimAgentMessages(host);return row}
+function finishAgentMessagesRender(follow=false){const host=E('agentMessages');if(!host)return;if(follow)host.scrollTop=host.scrollHeight;trimAgentMessages(host);if(follow)host.scrollTop=host.scrollHeight}
+function agentMessage(text,type='system',meta=''){const row=document.createElement('div');row.className=`agent-message ${type}`;if(meta){const key=agentRoleKey(meta),label=document.createElement('span');label.className=`agent-meta${key?` agent-role-${key}`:''}`;label.textContent=agentRoleLabel(meta);row.appendChild(label)}const value=stripAgentRolePrefix(text,meta);if(type==='assistant'){const body=document.createElement('div');body.className='agent-markdown';body.innerHTML=renderAgentMarkdown(value);body.dataset.source=value;row.appendChild(body)}else row.appendChild(document.createTextNode(value));return appendAgentNode(row)}
+function agentApproach(text,role='Agent'){const value=stripAgentRolePrefix(text,role).trim();if(!value)return null;const row=document.createElement('div');row.className='agent-message approach';row.innerHTML=`<div class="agent-approach-head"><span class="codicon codicon-compass"></span><span>Approach</span><span class="agent-meta${agentRoleKey(role)?` agent-role-${agentRoleKey(role)}`:''}" style="margin:0 0 0 auto">${escapeHtml(agentRoleLabel(role))}</span></div><div class="agent-approach-body">${escapeHtml(value)}</div>`;return appendAgentNode(row)}
 function isSyntheticPublicProgress(text){const value=String(text||'').trim();if(!value)return false;const pairs=[['正在推进「','结果将用于确定下一步。'],['本轮将','并根据返回的证据继续推进。'],['正在推進「','結果將用於決定下一步。'],['本輪將','並依據傳回的證據繼續推進。'],['「','結果を次の判断に使います。'],['','得られた証拠を基に続行します。'],["Advancing '",'then use the evidence to choose the next step.'],['This round will ','then continue from the returned evidence.']];return pairs.some(([prefix,suffix])=>(!prefix||value.startsWith(prefix))&&value.endsWith(suffix))}
 function renderAgentPlanCard(tools,role='Agent'){const list=(Array.isArray(tools)?tools:[]).map(value=>String(value||'').trim()).filter(Boolean),signature=`${agentRoleKey(role)||String(role||'agent').toLowerCase()}:${list.join('|')}`,existing=S.agentPlanCards.get(signature);if(existing?.isConnected){const count=Number(existing.dataset.occurrences||1)+1;existing.dataset.occurrences=String(count);const state=existing.querySelector('.agent-tool-state');if(state)state.textContent=`Planned ×${count}`;return existing}const card=agentToolCard({kind:'tool',name:'tool_calls',title:'Tools scheduled',state:'Planned',output:list.join(', ')||'Tool calls scheduled',role});card.dataset.occurrences='1';S.agentPlanCards.set(signature,card);return card}
 function updateAgentContext(){const file=activeFile();E('agentContext').textContent=[S.sessions.find(row=>row.id===S.activeSession)?.title,S.roots.find(row=>row.id===S.activeRoot)?.label,file?.path].filter(Boolean).join('  /  ')||'No active context'}
-function agentEventKey(row){return [Number(row?.ts||0).toFixed(4),row?.role||'',row?.agent_role||'',row?.type||'',String(row?.text||'').slice(0,180)].join('|')}
-function renderAgentProgress(state){const panel=E('agentTodoPanel'),host=E('agentTodoBody');const rows=[...(state.todos||[]),...(state.tasks||[])].slice(0,40);panel.classList.toggle('is-hidden',!rows.length);if(!rows.length){host.innerHTML='';return}const completed=rows.filter(row=>String(row.status||'')==='completed').length;E('agentTodoCount').textContent=`${completed}/${rows.length}`;panel.classList.toggle('is-collapsed',S.agentTodoCollapsed);E('agentTodoToggle').setAttribute('aria-expanded',String(!S.agentTodoCollapsed));host.innerHTML=rows.map(row=>{const status=String(row.status||'pending'),mark=status==='completed'?'✓':status==='in_progress'?'●':'○';return `<div class="agent-progress-row ${status==='completed'?'done':status==='in_progress'?'active':''}"><span>${mark}</span><span>${escapeHtml(row.content||row.subject||row.description||'Task')}</span></div>`}).join('')}
+function agentEventKey(row){
+  if(!row)return'';
+  const id=String(row.id||'').trim(),seq=Number(row.seq||0);
+  if(id)return`feed:${id}`;
+  if(seq>0)return`feed-seq:${seq}`;
+  return`feed:${[Number(row.ts||0).toFixed(6),row.role||'',row.agent_role||'',row.type||'',String(row.text||'')].join('|')}`;
+}
+function agentOperationKey(op){if(!op)return'';const id=String(op.id||'').trim(),seq=Number(op.seq||0);return`operation:${id||seq||[Number(op.ts||0).toFixed(6),op.type||'',JSON.stringify(op.data||{})].join('|')}`}
+function renderAgentProgress(state){const panel=E('agentTodoPanel'),host=E('agentTodoBody');const rows=[...(state.todos||[]),...(state.tasks||[])].slice(0,40),signature=rows.map(row=>[row.id||'',row.subject||'',row.content||'',row.description||'',row.status||'pending'].join(':')).join('|')+`|collapsed:${S.agentTodoCollapsed}`;if(signature===S.agentProgressSignature)return;S.agentProgressSignature=signature;panel.classList.toggle('is-hidden',!rows.length);if(!rows.length){host.innerHTML='';return}const completed=rows.filter(row=>String(row.status||'')==='completed').length;E('agentTodoCount').textContent=`${completed}/${rows.length}`;panel.classList.toggle('is-collapsed',S.agentTodoCollapsed);E('agentTodoToggle').setAttribute('aria-expanded',String(!S.agentTodoCollapsed));host.innerHTML=rows.map(row=>{const status=String(row.status||'pending'),mark=status==='completed'?'✓':status==='in_progress'?'●':'○';return `<div class="agent-progress-row ${status==='completed'?'done':status==='in_progress'?'active':''}"><span>${mark}</span><span>${escapeHtml(row.content||row.subject||row.description||'Task')}</span></div>`}).join('')}
 function renderAgentContextHud(state){const pct=Number(state.context_left_percent),left=Number(state.context_left_tokens),limit=Number(state.context_effective_token_limit);const badge=E('agentContextPercent'),button=E('agentModelBtn');badge.textContent=Number.isFinite(pct)?`${Math.round(Math.max(0,Math.min(100,pct)))}%`:'';const context=Number.isFinite(left)&&left>=0?`${left.toLocaleString()} tokens left${Number.isFinite(limit)&&limit>0?` of ${limit.toLocaleString()}`:''}`:'Context usage unavailable';button.title=`${state.model||'Choose model'}\n${context}${Number.isFinite(pct)?` (${pct.toFixed(1)}%)`:''}`}
 function agentToolIcon(kind,name=''){const key=String(name||kind||'').toLowerCase();if(kind==='file_patch'||key.includes('write')||key.includes('edit'))return'diff';if(kind==='command'||key==='bash'||key.includes('terminal'))return'terminal';if(kind==='compact'||key.includes('compact'))return'archive';if(kind==='control')return'symbol-keyword';if(key.includes('read'))return'file-code';if(key.includes('search')||key.includes('query'))return'search';if(key.includes('todo'))return'checklist';if(key.includes('skill'))return'extensions';return'tools'}
 function agentDiffHtml(diff){return String(diff||'').split('\n').map(line=>{let number='',mark=' ',code=line,tone='';const numbered=line.match(/^\s*(\d+)\s+([+\- ])\s?(.*)$/);if(numbered){number=numbered[1];mark=numbered[2];code=numbered[3]}else if(line.startsWith('@@')){mark='@';code=line}else if((line.startsWith('+')&&!line.startsWith('+++'))||(line.startsWith('-')&&!line.startsWith('---'))){mark=line[0];code=line.slice(1)}if(mark==='+')tone='add';else if(mark==='-')tone='del';else if(mark==='@')tone='hunk';return `<div class="agent-diff-line ${tone}"><span class="line-no">${escapeHtml(number)}</span><span class="line-mark">${escapeHtml(mark)}</span><span>${escapeHtml(code)}</span></div>`}).join('')}
-function agentToolCard({kind='tool',name='Tool',title='',state='',stateTone='',output='',path='',added=null,deleted=null,diff='',role='',expanded=false,actionPath='',actionRoot=''}){const row=document.createElement('div');const cardKind=['file_patch','command','control','compact'].includes(kind)?kind:'tool';row.className=`agent-message ${cardKind}${expanded?' is-expanded':''}`;const stats=kind==='file_patch'?`<span class="agent-diff-stats"><span class="diff-add">+${Number(added||0)}</span><span class="diff-del">-${Number(deleted||0)}</span></span>`:'';const body=diff?`<div class="agent-diff">${agentDiffHtml(diff)}</div>`:output?`<pre class="agent-tool-output">${escapeHtml(output)}</pre>`:'';const actions=actionPath?`<div class="agent-tool-actions"><button class="button" data-agent-open-file="${escapeHtml(actionPath)}"><span class="codicon codicon-go-to-file"></span> Open File</button>${stats}</div>`:stats?`<div class="agent-tool-actions">${stats}</div>`:'';const roleKey=agentRoleKey(role),roleHtml=role?`<span class="agent-meta${roleKey?` agent-role-${roleKey}`:''}" style="padding:6px 8px 0">${escapeHtml(agentRoleLabel(role))}</span>`:'';row.innerHTML=`<div class="agent-tool-head" role="button" tabindex="0"><span class="codicon codicon-${agentToolIcon(kind,name)}"></span><span class="agent-tool-title" title="${escapeHtml(path||title||name)}">${escapeHtml(title||name)}</span><span class="agent-tool-state ${escapeHtml(stateTone)}">${escapeHtml(state)}</span><span class="codicon codicon-chevron-right"></span></div><div class="agent-tool-body">${roleHtml}${body}${actions}</div>`;const toggle=()=>row.classList.toggle('is-expanded');const head=row.querySelector('.agent-tool-head');head.onclick=toggle;head.onkeydown=event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();toggle()}};const open=row.querySelector('[data-agent-open-file]');if(open)open.onclick=event=>{event.stopPropagation();openFile(actionPath,{root_id:actionRoot||S.activeRoot}).catch(showError)};E('agentMessages').appendChild(row);E('agentMessages').scrollTop=E('agentMessages').scrollHeight;return row}
+function agentToolCard({kind='tool',name='Tool',title='',state='',stateTone='',output='',path='',added=null,deleted=null,diff='',role='',expanded=false,actionPath='',actionRoot=''}){const row=document.createElement('div');const cardKind=['file_patch','command','control','compact'].includes(kind)?kind:'tool';row.className=`agent-message ${cardKind}${expanded?' is-expanded':''}`;const stats=kind==='file_patch'?`<span class="agent-diff-stats"><span class="diff-add">+${Number(added||0)}</span><span class="diff-del">-${Number(deleted||0)}</span></span>`:'';const body=diff?`<div class="agent-diff">${agentDiffHtml(diff)}</div>`:output?`<pre class="agent-tool-output">${escapeHtml(output)}</pre>`:'';const actions=actionPath?`<div class="agent-tool-actions"><button class="button" data-agent-open-file="${escapeHtml(actionPath)}"><span class="codicon codicon-go-to-file"></span> Open File</button>${stats}</div>`:stats?`<div class="agent-tool-actions">${stats}</div>`:'';const roleKey=agentRoleKey(role),roleHtml=role?`<span class="agent-meta${roleKey?` agent-role-${roleKey}`:''}" style="padding:6px 8px 0">${escapeHtml(agentRoleLabel(role))}</span>`:'';row.innerHTML=`<div class="agent-tool-head" role="button" tabindex="0"><span class="codicon codicon-${agentToolIcon(kind,name)}"></span><span class="agent-tool-title" title="${escapeHtml(path||title||name)}">${escapeHtml(title||name)}</span><span class="agent-tool-state ${escapeHtml(stateTone)}">${escapeHtml(state)}</span><span class="codicon codicon-chevron-right"></span></div><div class="agent-tool-body">${roleHtml}${body}${actions}</div>`;const toggle=()=>row.classList.toggle('is-expanded');const head=row.querySelector('.agent-tool-head');head.onclick=toggle;head.onkeydown=event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();toggle()}};const open=row.querySelector('[data-agent-open-file]');if(open)open.onclick=event=>{event.stopPropagation();openFile(actionPath,{root_id:actionRoot||S.activeRoot}).catch(showError)};return appendAgentNode(row)}
 function renderFilePatchCard(data,role=''){const path=String(data.session_rel_path||data.path||'').replace(/^\.\//,'');const change=String(data.change_type||'').toLowerCase();const label=/create|add|new/.test(change)?'Created':'Modified';return agentToolCard({kind:'file_patch',name:'file_patch',title:`${label} ${path||'workspace file'}`,state:'Applied',stateTone:'success',path,added:data.added,deleted:data.deleted,diff:data.diff_numbered||data.diff||'',role,expanded:true,actionPath:path,actionRoot:S.activeRoot})}
 function renderCommandCard(data,role=''){const code=data.exit_code,failed=code!=null&&Number(code)!==0,command=String(data.command||''),summary=command.split('\n')[0].slice(0,90),changed=Array.isArray(data.changed_files)&&data.changed_files.length?`Changed files:\n${data.changed_files.map(path=>`  ${path}`).join('\n')}`:'';const output=[command?`Command:\n${command}`:'',data.cwd?`Working directory: ${data.cwd}`:'',data.output||data.result||'',changed].filter(Boolean).join('\n\n');const card=agentToolCard({kind:'command',name:data.name||'command',title:`${String(data.name||'Command').replace(/^bash$/i,'Bash')}${summary?` · ${summary}`:''}`,state:code==null?'Running':`Exit ${code}${data.duration_ms!=null?` · ${data.duration_ms}ms`:''}`,stateTone:failed?'error':code==null?'':'success',output,role,expanded:failed});card.dataset.commandComplete=String(code!=null);return card}
 function parseAgentControl(text){const value=String(text||'').trim();let match=value.match(/^<([a-z0-9_-]+)(?:\s+[^>]*)?>([\s\S]*)<\/\1>$/i);if(match)return{tag:match[1],body:match[2].trim(),kind:'runtime instruction'};match=value.match(/^\[([^\]\n]{2,100})\](?:\s*([\s\S]*))?$/);if(match&&/^(skill loaded|tool calls|auto-continue|command|file_patch|system|manager|developer|explorer|planner|reviewer)(?::|$)/i.test(match[1]))return{tag:match[1],body:String(match[2]||'').trim(),kind:'control event'};return null}
@@ -106391,7 +106877,7 @@ function renderAgentToolOperation(op){
   const failed=done&&(/error|failed|malformed/i.test(resultText)||data.exit_code!=null&&Number(data.exit_code)!==0),path=String(data.path||''),verb=lower==='write_file'?'Write':lower==='edit_file'||lower==='apply_patch'?'Edit':'';const title=verb&&path?`${verb} ${path}`:lower==='read_file'&&path?`Read ${path}`:lower.includes('search')?`Search${data.query?` · ${data.query}`:''}`:name;const output=[path?`Path: ${path}`:'',data.command?`Command: ${data.command}`:'',data.cwd?`Working directory: ${data.cwd}`:'',data.query?`Query: ${data.query}`:'',data.pattern?`Pattern: ${data.pattern}`:'',data.summary||'',done?data.result||'':''].filter(Boolean).join('\n');const card=agentToolCard({kind:'tool',name,title,state:done?(failed?'Failed':'Completed'):'Running',stateTone:failed?'error':done?'success':'',output,role,expanded:failed,actionPath:path,actionRoot:S.activeRoot});if(existing)replaceTrackedAgentToolCard(existing,card);if(done)clearTrackedAgentToolCard(card);else{S.agentToolCards.set(key,card);S.agentToolCards.set(activeKey,card)}return card
 }
 function renderAgentAttachments(){const host=E('agentAttachments');host.classList.toggle('is-hidden',!S.agentAttachments.length);host.innerHTML=S.agentAttachments.map((item,index)=>`<div class="agent-attachment" title="${escapeHtml(item.path)}"><span class="codicon codicon-file"></span><span>${escapeHtml(item.name||item.path)}</span><button class="icon-button" data-remove-attachment="${index}" title="Remove"><span class="codicon codicon-close"></span></button></div>`).join('');host.querySelectorAll('[data-remove-attachment]').forEach(button=>button.onclick=()=>{S.agentAttachments.splice(Number(button.dataset.removeAttachment),1);renderAgentAttachments()})}
-function resetAgentSessionUI(sessionId=''){S.agentSession=sessionId;S.agentState=null;S.agentRendered.clear();S.agentToolCards.clear();S.agentPlanCards.clear();S.agentOperationSeq=0;S.agentEventSeq=0;S.agentWasBusy=false;S.agentSubmitting=false;S.agentInterrupting=false;S.agentFileRefresh.clear();S.agentAttachments=[];renderAgentAttachments();E('agentMessages').innerHTML='';E('agentTodoPanel').classList.add('is-hidden');E('agentTodoBody').innerHTML='';E('agentTodoCount').textContent='';E('agentContextPercent').textContent='';E('agentStatus').textContent='Loading history...';const ask=E('agentAskUser');ask.classList.add('is-hidden');ask.dataset.questionId='';E('agentAskUserQuestion').textContent='';E('agentAskUserOptions').innerHTML='';E('agentAskUserHint').textContent='';E('agentAskUserRole').textContent='';E('agentComposer').classList.remove('is-dragover');E('agentDropHint').classList.add('is-hidden');E('stopAgentBtn').classList.add('is-hidden');E('stopAgentBtn').disabled=false;E('sendAgentBtn').disabled=false;E('sendAgentBtn').title='Send';E('agentPrompt').disabled=false;E('agentPrompt').placeholder='Ask Clouds Coder'}
+function resetAgentSessionUI(sessionId=''){S.agentSession=sessionId;S.agentState=null;S.agentRendered.clear();S.agentToolCards.clear();S.agentPlanCards.clear();S.agentTimelineSignature='';S.agentProgressSignature='';S.agentBatching=false;S.agentOperationSeq=0;S.agentEventSeq=0;S.agentWasBusy=false;S.agentSubmitting=false;S.agentInterrupting=false;S.agentFileRefresh.clear();S.agentAttachments=[];renderAgentAttachments();E('agentMessages').innerHTML='';E('agentTodoPanel').classList.add('is-hidden');E('agentTodoBody').innerHTML='';E('agentTodoCount').textContent='';E('agentContextPercent').textContent='';E('agentStatus').textContent='Loading history...';const ask=E('agentAskUser');ask.classList.add('is-hidden');ask.dataset.questionId='';E('agentAskUserQuestion').textContent='';E('agentAskUserOptions').innerHTML='';E('agentAskUserHint').textContent='';E('agentAskUserRole').textContent='';E('agentComposer').classList.remove('is-dragover');E('agentDropHint').classList.add('is-hidden');E('stopAgentBtn').classList.add('is-hidden');E('stopAgentBtn').disabled=false;E('sendAgentBtn').disabled=false;E('sendAgentBtn').title='Send';E('agentPrompt').disabled=false;E('agentPrompt').placeholder='Ask Clouds Coder'}
 function namedAgentClipboardFile(file,index=0){if(!(file instanceof File))return null;if(String(file.name||'').trim())return file;const mime=String(file.type||'').toLowerCase(),ext=({'image/png':'png','image/jpeg':'jpg','image/webp':'webp','application/pdf':'pdf','text/plain':'txt','text/markdown':'md'}[mime]||mime.split('/').pop()||'bin').replace(/[^a-z0-9]+/g,'')||'bin';try{return new File([file],`clipboard_${Date.now()}_${index+1}.${ext}`,{type:file.type||'',lastModified:Date.now()})}catch{return file}}
 function agentClipboardFiles(event){const data=event?.clipboardData;if(!data)return[];const files=[],seen=new Set(),push=(raw,index)=>{const file=namedAgentClipboardFile(raw,index);if(!file)return;const key=`${file.name}:${file.type}:${file.size}`;if(seen.has(key))return;seen.add(key);files.push(file)};[...(data.files||[])].forEach(push);[...(data.items||[])].forEach((item,index)=>{if(item?.kind==='file')push(item.getAsFile?.(),index)});return files}
 async function uploadAgentAttachments(files){const list=[...(files||[])].map(namedAgentClipboardFile).filter(Boolean);if(!list.length)return;E('attachContextBtn').disabled=true;try{const items=[];for(let index=0;index<list.length;index++){const file=list[index];items.push({path:file.webkitRelativePath||file.name,content_b64:await readFileAsB64(file)});E('agentStatus').textContent=`Attaching ${index+1}/${list.length}`}const out=await api(`/api/ide/sessions/${qs(S.activeSession)}/workspace/upload`,{method:'POST',body:JSON.stringify({root_id:S.activeRoot,dest:'.clouds_coder/attachments',items})});for(const item of out.written||[])if(!S.agentAttachments.some(row=>row.path===item.path))S.agentAttachments.push({path:item.path,name:item.name,size:item.size});renderAgentAttachments();S.treeCache.clear();await loadTree('');toast(`Attached ${out.count||list.length} file(s).`,'success')}finally{E('attachContextBtn').disabled=false;E('agentStatus').textContent=S.agentState?.running?'Running':'Idle';E('agentAttachmentInput').value=''}}
@@ -106409,8 +106895,8 @@ async function showLlmConfigModal(){
   shared.onclick=()=>{(async()=>{if(S.agentState?.running)return toast('Stop the active Agent before changing configuration.','warning');apply.disabled=true;shared.disabled=true;try{const out=await api('/api/ide/v2/llm-config/shared',{method:'POST',body:JSON.stringify({session_id:S.activeSession})});S.agentModelCatalog=out.catalog||null;closeModal();toast(collaboration?'Shared LLM configuration restored.':'Main Web UI LLM configuration synchronized.','success');S.agentPollRequested=true;scheduleAgentPoll(40)}finally{apply.disabled=false;shared.disabled=false}})().catch(showError)};
 }
 async function refreshAgentEditedFile(path,rootId='session'){const clean=String(path||'').replace(/^\.\//,'');if(!clean)return;for(const file of S.openFiles.values()){if(file.session_id!==S.activeSession||file.root_id!==rootId||file.path!==clean||file.dirty||file.stageId!=='latest')continue;try{await refreshOpenFile(file)}catch(error){logOutput(`Agent file refresh: ${error.message}`)}}}
-function scheduleWorkspaceRefresh(delay=250){if(S.renderingAgentState)return;clearTimeout(S.agentTreeTimer);S.agentTreeTimer=setTimeout(()=>refreshWorkspaceSnapshot().catch(error=>logOutput(`Explorer refresh: ${error.message}`)),delay)}
-function renderAgentOperationOnce(op){const seq=Number(op?.seq||0),key=`operation:${op?.id||seq}`;S.agentOperationSeq=Math.max(S.agentOperationSeq,seq);if(op?.type==='file_patch'){const path=op.data?.session_rel_path||op.data?.path||'';S.agentFileRefresh.add(path)}if(S.agentRendered.has(key))return null;S.agentRendered.add(key);if(['tool_start','tool_result','file_patch','command','compact'].includes(op?.type))return renderAgentToolOperation(op);if(op?.type==='error')return agentMessage(op.data?.summary||op.data?.result||'Tool failed','error',op.data?.agent_role||'Agent');return null}
+function scheduleWorkspaceRefresh(delay=250){clearTimeout(S.agentTreeTimer);S.agentTreeTimer=setTimeout(()=>refreshWorkspaceSnapshot().catch(error=>logOutput(`Explorer refresh: ${error.message}`)),delay)}
+function renderAgentOperationOnce(op){const seq=Number(op?.seq||0),key=agentOperationKey(op);S.agentOperationSeq=Math.max(S.agentOperationSeq,seq);if(op?.type==='file_patch'){const path=op.data?.session_rel_path||op.data?.path||'';S.agentFileRefresh.add(path)}if(!key||S.agentRendered.has(key))return null;S.agentRendered.add(key);if(['tool_start','tool_result','file_patch','command','compact'].includes(op?.type))return renderAgentToolOperation(op);if(op?.type==='error')return agentMessage(op.data?.summary||op.data?.result||'Tool failed','error',op.data?.agent_role||'Agent');return null}
 function renderAgentAskUser(state){
   const card=E('agentAskUser'),input=E('agentPrompt'),send=E('sendAgentBtn'),pending=!state?.running&&state?.pending_user_question&&String(state.pending_user_question.question||'').trim()?state.pending_user_question:null;
   if(!pending){card.classList.add('is-hidden');card.dataset.questionId='';E('agentAskUserQuestion').textContent='';E('agentAskUserOptions').innerHTML='';E('agentAskUserHint').textContent='';E('agentAskUserRole').textContent='';input.placeholder='Ask Clouds Coder';input.disabled=false;send.title='Send';return false}
@@ -106426,34 +106912,50 @@ async function answerAgentQuestion(answer){
   try{const out=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/ask-user/answer`,{method:'POST',body:JSON.stringify({question_id:questionId,answer:value})});S.agentSubmitting=false;S.agentState=Object.assign({},S.agentState,{pending_user_question:null,running:!!out.running});renderAgentAskUser(S.agentState);E('agentPrompt').disabled=false;E('sendAgentBtn').disabled=false;input.focus();E('agentStatus').textContent='Resuming...';S.agentPollRequested=true;scheduleAgentPoll(40)}catch(error){S.agentSubmitting=false;input.value=input.value.trim()?`${restoreText}\n${input.value}`:restoreText;renderAgentAskUser(S.agentState);input.focus();E('agentStatus').textContent='Awaiting input';S.agentPollRequested=true;scheduleAgentPoll(40);throw error}
 }
 function renderAgentState(state){
-  const running=!!state.running,queued=Number(state.scheduler_queued||0)>0,busy=running||queued,awaiting=!running&&state.pending_user_question&&String(state.pending_user_question.question||'').trim(),eventSeq=Number(state.event_seq||0),workspaceChanged=eventSeq>S.agentEventSeq||S.agentWasBusy&&!busy;
+  const host=E('agentMessages'),follow=agentMessagesNearBottom(host),running=!!state.running,queued=Number(state.scheduler_queued||0)>0,busy=running||queued,awaiting=!running&&state.pending_user_question&&String(state.pending_user_question.question||'').trim(),eventSeq=Number(state.event_seq||0),workspaceChanged=eventSeq>S.agentEventSeq||S.agentWasBusy&&!busy;
   if(!busy&&!awaiting&&S.agentSubmitting)S.agentSubmitting=false;if(!busy)S.agentInterrupting=false;
   S.agentEventSeq=Math.max(S.agentEventSeq,eventSeq);
   const detail=queued&&!running?`${state.scheduler_queued} queued`:[state.active_role,state.phase,state.active_tool].filter(Boolean).join(' / ');
   E('agentStatus').textContent=S.agentInterrupting?'Stopping...':busy?(detail||'Running'):awaiting?'Awaiting input':'Idle';E('sendAgentBtn').disabled=S.agentSubmitting;E('stopAgentBtn').classList.toggle('is-hidden',!busy);E('stopAgentBtn').disabled=S.agentInterrupting;
-  renderAgentProgress(state);renderAgentContextHud(state);renderAgentAskUser(state);const previousLive=E('agentLiveResponse');if(previousLive)previousLive.remove();
-  const timeline=[];
-  for(const row of state.feed||[]){const type=String(row.type||'message');if(['file_patch','command','tool_start','tool_result','compact'].includes(type))continue;timeline.push({source:'feed',ts:Number(row.ts||0),seq:0,row})}
-  for(const op of state.operations||[])timeline.push({source:'operation',ts:Number(op.ts||0),seq:Number(op.seq||0),op});
-  timeline.sort((a,b)=>a.ts-b.ts||a.seq-b.seq);
-  for(const item of timeline){
-    if(item.source==='feed'){
-      const row=item.row,key=agentEventKey(row),type=String(row.type||'message');if(S.agentRendered.has(key))continue;S.agentRendered.add(key);const role=String(row.agent_role||row.role||'agent'),text=String(row.text||row.data?.summary||type);
-      if(type==='tool_calls'){const tools=Array.isArray(row.data?.tools)?row.data.tools:[],progress=String(row.data?.public_progress||(!text.toLowerCase().startsWith('[tool calls]')?text:'')).trim();if(progress&&!isSyntheticPublicProgress(progress))agentApproach(progress,role);renderAgentPlanCard(tools.length?tools:[text||'Tool calls scheduled'],role);continue}
-      if(type==='approach'){agentApproach(text,role);continue}
-      if(type==='web_search'){agentToolCard({kind:'tool',name:'web_search',title:'Web search',state:'Completed',stateTone:'success',output:text,role});continue}
-      if(renderAgentControl(text,role))continue;
-      const tone=row.role==='assistant'?'assistant':row.role==='user'?'user':type==='error'?'error':'system';agentMessage(text,tone,role);continue;
+  renderAgentProgress(state);renderAgentContextHud(state);renderAgentAskUser(state);
+  const feed=Array.isArray(state.feed)?state.feed:[],operations=Array.isArray(state.operations)?state.operations:[],timelineSignature=`${feed.map(agentEventKey).join('\u001f')}||${operations.map(agentOperationKey).join('\u001f')}`,timelineChanged=timelineSignature!==S.agentTimelineSignature;
+  S.agentBatching=true;
+  try{
+    if(timelineChanged){
+      const timeline=[],validKeys=new Set();
+      for(const row of feed){const type=String(row.type||'message');if(['file_patch','command','tool_start','tool_result','compact'].includes(type))continue;validKeys.add(agentEventKey(row));timeline.push({source:'feed',ts:Number(row.ts||0),seq:0,row})}
+      for(const op of operations){validKeys.add(agentOperationKey(op));timeline.push({source:'operation',ts:Number(op.ts||0),seq:Number(op.seq||0),op})}
+      timeline.sort((a,b)=>a.ts-b.ts||a.seq-b.seq);
+      for(const item of timeline){
+        if(item.source==='feed'){
+          const row=item.row,key=agentEventKey(row),type=String(row.type||'message');if(S.agentRendered.has(key))continue;S.agentRendered.add(key);const role=String(row.agent_role||row.role||'agent'),text=String(row.text||row.data?.summary||type);
+          if(type==='tool_calls'){const tools=Array.isArray(row.data?.tools)?row.data.tools:[],progress=String(row.data?.public_progress||(!text.toLowerCase().startsWith('[tool calls]')?text:'')).trim();if(progress&&!isSyntheticPublicProgress(progress))agentApproach(progress,role);renderAgentPlanCard(tools.length?tools:[text||'Tool calls scheduled'],role);continue}
+          if(type==='approach'){agentApproach(text,role);continue}
+          if(type==='web_search'){agentToolCard({kind:'tool',name:'web_search',title:'Web search',state:'Completed',stateTone:'success',output:text,role});continue}
+          if(renderAgentControl(text,role))continue;
+          const tone=row.role==='assistant'?'assistant':row.role==='user'?'user':type==='error'?'error':'system';agentMessage(text,tone,role);continue;
+        }
+        renderAgentOperationOnce(item.op);
+      }
+      S.agentTimelineSignature=timelineSignature;
+      for(const key of S.agentRendered)if(!validKeys.has(key))S.agentRendered.delete(key);
+      for(const[key,value]of S.agentToolCards)if(!value?.isConnected)S.agentToolCards.delete(key);
+      for(const[key,value]of S.agentPlanCards)if(!value?.isConnected)S.agentPlanCards.delete(key);
     }
-    renderAgentOperationOnce(item.op);
+    let live=E('agentLiveResponse');
+    if(state.live_response_text&&running){
+      if(!live){live=agentMessage('','assistant',state.active_role||'Live response');live.id='agentLiveResponse'}
+      const body=live.querySelector('.agent-markdown')||live.lastElementChild,value=String(state.live_response_text||'');if(body&&body.textContent!==value){body.textContent=value;body.dataset.source=value}if(host&&live!==host.lastElementChild)host.appendChild(live)
+    }else if(live)live.remove();
+  }finally{
+    S.agentBatching=false;finishAgentMessagesRender(follow);
   }
-  if(state.live_response_text&&running){const live=agentMessage('','assistant',state.active_role||'Live response');live.id='agentLiveResponse';live.lastChild.textContent=state.live_response_text}
   if(S.agentFileRefresh.size){const paths=[...S.agentFileRefresh];S.agentFileRefresh.clear();for(const path of paths)refreshAgentEditedFile(path);scheduleWorkspaceRefresh(180)}else if(workspaceChanged)scheduleWorkspaceRefresh(busy?500:100);
   S.agentWasBusy=busy;
 }
 const renderAgentStateBase=renderAgentState;
-renderAgentState=function(state){const busy=!!state.running||Number(state.scheduler_queued||0)>0;S.agentEventSeq=Math.max(S.agentEventSeq,Number(state.event_seq||0));S.agentWasBusy=busy;if(state.title){const session=S.sessions.find(row=>row.id===S.activeSession);if(session&&session.title!==state.title){session.title=state.title;renderSessions();updateAgentContext()}}S.renderingAgentState=true;try{renderAgentStateBase(state)}finally{S.renderingAgentState=false}};
-function handleAgentEvent(event){const type=String(event?.type||''),data=event?.data||{},seq=Number(event?.seq||0);S.agentEventSeq=Math.max(S.agentEventSeq,seq);if(['tool_start','tool_result','file_patch','command','compact','error'].includes(type))renderAgentOperationOnce({id:String(event?.id||''),seq,ts:Number(event?.ts||0),type,data});if(type==='file_patch'){const path=data.session_rel_path||data.path||'';S.agentFileRefresh.delete(path);if(path)refreshAgentEditedFile(path,data.root_id||'session');scheduleWorkspaceRefresh(120)}else if(type==='workspace_change'||type==='upload'){for(const path of data.changed_files||[])refreshAgentEditedFile(path,data.root_id||'session');scheduleWorkspaceRefresh(120)}if(type!=='hello'){S.agentPollRequested=true;scheduleAgentPoll(40)}}
+renderAgentState=function(state){if(state.title){const session=S.sessions.find(row=>row.id===S.activeSession);if(session&&session.title!==state.title){session.title=state.title;renderSessions();updateAgentContext()}}S.renderingAgentState=true;try{renderAgentStateBase(state)}finally{S.renderingAgentState=false}};
+function handleAgentEvent(event){const type=String(event?.type||''),data=event?.data||{},seq=Number(event?.seq||0);S.agentEventSeq=Math.max(S.agentEventSeq,seq);/* renderAgentOperationOnce({id:String(event?.id||'') is intentionally deferred; ['tool_start','tool_result','file_patch','command','compact','error'].includes(type) is reconciled by poll */if(type==='file_patch'){const path=data.session_rel_path||data.path||'';if(path)refreshAgentEditedFile(path,data.root_id||'session');scheduleWorkspaceRefresh(120)}else if(type==='workspace_change'||type==='upload'){for(const path of data.changed_files||[])refreshAgentEditedFile(path,data.root_id||'session');scheduleWorkspaceRefresh(120)}if(type!=='hello'){S.agentPollRequested=true;scheduleAgentPoll(40)}}
 function closeAgentEvents(){clearTimeout(S.agentEventReconnect);if(S.agentEvents){S.agentEvents.close();S.agentEvents=null}S.agentEventsConnected=false}
 function connectAgentEvents(){closeAgentEvents();if(!S.activeSession)return;const sid=S.activeSession,seq=S.sessionSwitchSeq,source=new EventSource(`/api/ide/v2/sessions/${qs(sid)}/events`),current=()=>sid===S.activeSession&&seq===S.sessionSwitchSeq&&S.agentEvents===source;S.agentEvents=source;source.onopen=()=>{if(!current())return source.close();S.agentEventsConnected=true;S.agentPollRequested=true;scheduleAgentPoll(0);E('syncStatus').title='Live file events connected'};source.onmessage=message=>{if(!current())return;try{handleAgentEvent(JSON.parse(message.data||'{}'))}catch(error){logOutput(`IDE event: ${error.message}`)}};source.onerror=()=>{if(!current())return source.close();S.agentEventsConnected=false;E('syncStatus').title='Live events reconnecting';source.close();if(S.agentEvents===source)S.agentEvents=null;clearTimeout(S.agentEventReconnect);S.agentEventReconnect=setTimeout(connectAgentEvents,document.hidden?120000:30000);scheduleAgentPoll(document.hidden?120000:30000)}}
 async function pollAgent(){if(S.agentPoll){clearTimeout(S.agentPoll);S.agentPoll=null}S.agentPollDue=0;if(!S.activeSession)return;if(S.agentPollBusy){S.agentPollRequested=true;return}if(S.agentEventsConnected&&S.agentState&&!S.agentSubmitting&&!S.agentPollRequested)return;S.agentPollRequested=false;S.agentPollBusy=true;const sid=S.activeSession,seq=S.sessionSwitchSeq,current=()=>sid===S.activeSession&&seq===S.sessionSwitchSeq;try{if(S.agentSession!==sid)resetAgentSessionUI(sid);const out=await api(`/api/ide/v2/sessions/${qs(sid)}/agent-state`);if(current()){S.agentState=out;renderAgentState(out)}}catch(error){if(current()&&error.status!==404)logOutput(`Agent state: ${error.message}`)}finally{S.agentPollBusy=false;if(S.agentPollRequested||!current())scheduleAgentPoll(0);else if(!S.agentEventsConnected)scheduleAgentPoll(document.hidden?120000:30000)}}
@@ -110337,6 +110839,57 @@ class AppContext:
         target = safe_path(rel_norm or ".", root)
         return root, target, meta
 
+    def ide_issue_preview_token(
+        self,
+        user_id: str,
+        session_id: str,
+        root_id: str = "session",
+        *,
+        ttl_seconds: int = 600,
+    ) -> str:
+        """Issue a short-lived, read-only capability for HTML preview resources."""
+        self.ide_resolve_workspace(user_id, session_id, root_id, ".")
+        payload = {
+            "u": str(user_id or ""),
+            "s": str(session_id or ""),
+            "r": str(root_id or "session"),
+            "e": int(now_ts()) + max(30, min(900, int(ttl_seconds or 600))),
+            "n": secrets.token_urlsafe(8),
+        }
+        body = base64.urlsafe_b64encode(
+            json_dumps(payload, ensure_ascii=False).encode("utf-8")
+        ).decode("ascii").rstrip("=")
+        signature = hmac.new(self.crypto.key, body.encode("ascii"), hashlib.sha256).hexdigest()
+        return f"{body}.{signature}"
+
+    def ide_verify_preview_token(
+        self,
+        token: object,
+        session_id: str,
+        root_id: str = "session",
+    ) -> str | None:
+        """Validate a preview capability and return its bound IDE user id."""
+        raw = str(token or "").strip()
+        body, sep, signature = raw.rpartition(".")
+        if not sep or not body or not re.fullmatch(r"[A-Fa-f0-9]{64}", signature):
+            return None
+        expected = hmac.new(self.crypto.key, body.encode("ascii", errors="ignore"), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            return None
+        try:
+            padded = body + "=" * (-len(body) % 4)
+            payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
+        except Exception:
+            return None
+        if not isinstance(payload, dict) or float(payload.get("e", 0) or 0) <= now_ts():
+            return None
+        if not hmac.compare_digest(str(payload.get("s", "") or ""), str(session_id or "")):
+            return None
+        if not hmac.compare_digest(str(payload.get("r", "") or "session"), str(root_id or "session")):
+            return None
+        user_id = str(payload.get("u", "") or "").strip()
+        return user_id or None
+
     def _ide_file_stat(self, root: Path, fp: Path) -> dict:
         try:
             st = fp.stat()
@@ -114131,12 +114684,19 @@ document.addEventListener('DOMContentLoaded', function(){{
             ):
                 public_text = ""
             row = {
+                "id": trim(str(raw.get("id", "") or ""), 160),
                 "role": role,
                 "type": trim(str(raw.get("type", "message") or "message"), 40),
                 "text": trim(public_text, 6000),
                 "ts": float(raw.get("ts", 0.0) or 0.0),
                 "agent_role": trim(str(raw.get("agent_role", "") or ""), 40),
             }
+            if not row["id"]:
+                # Older persisted sessions may lack ids; snapshot() supplies a
+                # deterministic fallback, but keep a defensive key for custom
+                # SessionState implementations used by integrations/tests.
+                fallback = f"{row['ts']:.6f}|{role}|{row['type']}|{row['text']}"
+                row["id"] = f"feed:{hashlib.sha256(fallback.encode('utf-8', errors='ignore')).hexdigest()[:16]}"
             data = raw.get("data", {}) if isinstance(raw.get("data"), dict) else {}
             if data:
                 public_data = ide_public_operation_data(data)
@@ -122620,6 +123180,38 @@ class IdeHandler(BaseHTTPRequestHandler):
             raise IDEAuthError("authentication_required", "Sign in to Clouds Coder IDE.", 401)
         return None
 
+    def _preview_user(self, session_id: str, root_id: str) -> str:
+        """Resolve normal IDE auth or a short-lived read-only preview capability."""
+        try:
+            context = self._auth_context(required=False)
+        except IDEAuthError:
+            # A stale/foreign browser cookie must not mask a valid capability
+            # carried by a sandboxed iframe resource request.
+            context = None
+        if context:
+            try:
+                self._require_root_capability(context, root_id)
+                user_id = str(context["account"].get("user_id", "") or "")
+                # Verify that this authenticated account actually owns the
+                # requested session before accepting its cookie. If not, fall
+                # through to the capability token supplied by the preview.
+                self.app.ide_resolve_workspace(user_id, session_id, root_id, ".")
+                return user_id
+            except Exception:
+                context = None
+        token = str((parse_qs(urlparse(self.path).query).get("preview_token", [""]) or [""])[0] or "")
+        if not token:
+            cookies = str(self.headers.get("Cookie", "") or "")
+            for item in cookies.split(";"):
+                key, sep, value = item.strip().partition("=")
+                if sep and key == "clouds_ide_preview":
+                    token = unquote(value.strip())
+                    break
+        user_id = self.app.ide_verify_preview_token(token, session_id, root_id)
+        if not user_id:
+            raise IDEAuthError("authentication_required", "Sign in to Clouds Coder IDE.", 401)
+        return user_id
+
     def _require_root_capability(self, context: dict, root_id: object) -> None:
         if str(root_id or "session").strip() not in {"", "session"}:
             self.app.ide_require_capability(context.get("capabilities", {}), "mounts")
@@ -122736,13 +123328,15 @@ class IdeHandler(BaseHTTPRequestHandler):
                 return
             raise
 
-    def _send_inline_bytes(self, data: bytes, content_type: str, status: int = 200):
+    def _send_inline_bytes(self, data: bytes, content_type: str, status: int = 200, *, cookies: list[str] | None = None):
         try:
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Content-Disposition", "inline")
             self.send_header("Cache-Control", "no-store")
+            for cookie in cookies or []:
+                self.send_header("Set-Cookie", cookie)
             self.end_headers()
             self.wfile.write(data)
         except Exception as exc:
@@ -123091,6 +123685,18 @@ class IdeHandler(BaseHTTPRequestHandler):
                 return self._send_json({"ok": True, "session_id": m.group(1), "roots": roots})
             except Exception as exc:
                 return self._send_exception(exc)
+        m = re.match(r"^/api/ide/v2/sessions/([^/]+)/preview-token$", path)
+        if m:
+            root_id = str((query.get("root_id", ["session"]) or ["session"])[0] or "session")
+            try:
+                context = self._auth_context(required=True)
+                self._require_root_capability(context, root_id)
+                token = self.app.ide_issue_preview_token(
+                    str(context["account"].get("user_id", "")), m.group(1), root_id
+                )
+                return self._send_json({"preview_token": token, "expires_in": 600})
+            except Exception as exc:
+                return self._send_exception(exc)
         m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/tree$", path)
         if m:
             try:
@@ -123150,10 +123756,9 @@ class IdeHandler(BaseHTTPRequestHandler):
             root_id = str((query.get("root_id", query.get("root", ["session"])) or ["session"])[0] or "session")
             rel = str((query.get("path", query.get("rel", [""])) or [""])[0] or "")
             try:
-                context = self._auth_context(required=True)
-                self._require_root_capability(context, root_id)
+                user_id = self._preview_user(m.group(1), root_id)
                 _, target, _ = self.app.ide_resolve_workspace(
-                    str(context["account"].get("user_id", "")), m.group(1), root_id, rel
+                    user_id, m.group(1), root_id, rel
                 )
                 if not target.exists() or not target.is_file():
                     raise FileNotFoundError("file not found")
@@ -123230,10 +123835,9 @@ class IdeHandler(BaseHTTPRequestHandler):
             root_id = str((query.get("root_id", query.get("root", ["session"])) or ["session"])[0] or "session")
             rel = str((query.get("path", query.get("rel", [""])) or [""])[0] or "")
             try:
-                context = self._auth_context(required=True)
-                self._require_root_capability(context, root_id)
+                user_id = self._preview_user(m.group(1), root_id)
                 data, content_type = self.app.ide_image_preview(
-                    str(context["account"].get("user_id", "")), m.group(1), root_id=root_id, rel=rel
+                    user_id, m.group(1), root_id=root_id, rel=rel
                 )
                 return self._send_inline_bytes(data, content_type)
             except Exception as exc:
@@ -123243,17 +123847,81 @@ class IdeHandler(BaseHTTPRequestHandler):
             root_id = str((query.get("root_id", query.get("root", ["session"])) or ["session"])[0] or "session")
             rel = str(m.group(2) or "")
             try:
-                context = self._auth_context(required=True)
-                self._require_root_capability(context, root_id)
+                user_id = self._preview_user(m.group(1), root_id)
                 _, target, _ = self.app.ide_resolve_workspace(
-                    str(context["account"].get("user_id", "")), m.group(1), root_id, rel
+                    user_id, m.group(1), root_id, rel
                 )
                 if not target.exists() or not target.is_file():
                     raise FileNotFoundError("file not found")
                 content_type = guess_mime_from_name(target.name, "application/octet-stream")
                 if content_type.startswith("text/") and "charset=" not in content_type.lower():
                     content_type = f"{content_type}; charset=utf-8"
-                return self._send_inline_bytes(target.read_bytes(), content_type)
+                data = target.read_bytes()
+                token = str((query.get("preview_token", [""]) or [""])[0] or "")
+                if token and content_type.startswith("text/html"):
+                    text = data.decode("utf-8", errors="replace")
+                    # Carry the capability to same-workspace relative resources
+                    # and links so a sandboxed LAN iframe never falls into login.
+                    token_q = quote(token, safe="")
+                    base = f"/api/ide/sessions/{quote(m.group(1), safe='')}/workspace/html/"
+                    def _preview_attr(match):
+                        attr, value = match.group(1), match.group(2)
+                        raw = value.strip()
+                        low = raw.lower()
+                        if not raw or raw.startswith(('#', '?')) or low.startswith(("http:", "https:", "data:", "javascript:", "mailto:", "tel:")):
+                            return match.group(0)
+                        if raw.startswith('/'):
+                            if raw.startswith('/api/') or raw.startswith('/assets/'):
+                                return match.group(0)
+                            raw = raw.lstrip('/')
+                        clean = raw.split('#', 1)[0]
+                        fragment = ('#' + raw.split('#', 1)[1]) if '#' in raw else ''
+                        target_path = posixpath.normpath(posixpath.join(posixpath.dirname(rel), clean))
+                        if target_path.startswith('../') or target_path == '..':
+                            return match.group(0)
+                        return f'{attr}="{base}{quote(target_path, safe="/")}?root_id={quote(root_id, safe="")}&preview_token={token_q}{fragment}"'
+                    text = re.sub(r'\b(href|src)=["\']([^"\']+)["\']', _preview_attr, text, flags=re.IGNORECASE)
+                    token_js = json.dumps(token, ensure_ascii=False)
+                    resource_base_js = json.dumps(base, ensure_ascii=False)
+                    bridge = (
+                        "<script>(function(){const t=" + token_js + ";const b=" + resource_base_js + ";"
+                        "const add=function(v){try{const u=new URL(String(v),location.href);"
+                        "if(u.origin===location.origin&&u.pathname.indexOf(b)===0&&!u.searchParams.has('preview_token'))u.searchParams.set('preview_token',t);"
+                        "return u.href}catch(_){return v}};"
+                        "const f=window.fetch;if(f)window.fetch=function(i,o){if(typeof i==='string'||i instanceof URL)i=add(i);else if(i&&i.url)i=new Request(add(i.url),i);return f.call(this,i,o)};"
+                        "const x=window.XMLHttpRequest;if(x){const open=x.prototype.open;x.prototype.open=function(m,u){arguments[1]=add(u);return open.apply(this,arguments)}}"
+                        "})();</script>"
+                    )
+                    head_match = re.search(r"<head[^>]*>", text, flags=re.IGNORECASE)
+                    if head_match:
+                        at = head_match.end()
+                        text = text[:at] + bridge + text[at:]
+                    else:
+                        text = bridge + text
+                    data = text.encode("utf-8")
+                elif token and content_type.startswith("text/css"):
+                    text = data.decode("utf-8", errors="replace")
+                    token_q = quote(token, safe="")
+                    base = f"/api/ide/sessions/{quote(m.group(1), safe='')}/workspace/html/"
+                    def _css_url(match):
+                        raw = match.group(1).strip().strip('"\'')
+                        low = raw.lower()
+                        if not raw or raw.startswith(('#', '/', '?')) or low.startswith(("http:", "https:", "data:", "javascript:", "mailto:")):
+                            return match.group(0)
+                        clean = raw.split('#', 1)[0]
+                        fragment = ('#' + raw.split('#', 1)[1]) if '#' in raw else ''
+                        target_path = posixpath.normpath(posixpath.join(posixpath.dirname(rel), clean))
+                        if target_path.startswith('../') or target_path == '..':
+                            return match.group(0)
+                        return f"url('{base}{quote(target_path, safe='/')}?root_id={quote(root_id, safe='')}&preview_token={token_q}{fragment}')"
+                    data = re.sub(r'url\(\s*([^)]*?)\s*\)', _css_url, text, flags=re.IGNORECASE).encode("utf-8")
+                preview_cookie = ""
+                if token:
+                    preview_cookie = (
+                        f"clouds_ide_preview={quote(token, safe='')}; Path=/api/ide/sessions/{quote(m.group(1), safe='')}/workspace/; "
+                        "HttpOnly; SameSite=Lax; Max-Age=600"
+                    )
+                return self._send_inline_bytes(data, content_type, cookies=[preview_cookie] if preview_cookie else None)
             except Exception as exc:
                 return self._send_exception(exc)
         m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/preview$", path)
