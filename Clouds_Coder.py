@@ -4445,12 +4445,53 @@ UI_HIDDEN_RUNTIME_CONTROL_PREFIXES = (
     "<intent-fusion",
     "<background-results>",
     "<inbox>",
+    "<reminder>",
+    "<todo-rescue>",
+    "<tool-retry>",
+    "<segmented-retry>",
+    "<forced-converge>",
+    "<no-tool-recovery>",
+    "<auto-context-recall>",
+    "<auto-continue>",
+    "<failure-recovery>",
+    "<arbiter-continue>",
+    "<truncate-rescue>",
+    "<thinking-empty-recovery>",
+    "<fault-prefill>",
+    "<single-no-plan-todo-bootstrap>",
+    "<single-no-plan-todo-bootstrap-retry>",
     "<compact-resume>",
     "<state_handoff>",
     "<toolcall-overflow-recovery>",
     "<read-loop-intervention>",
     "<finish-blocked>",
 )
+# Runtime controls are model-facing protocol messages.  A selected subset is
+# also useful to the user as an observable, structured event.  This list only
+# controls the UI projection of legacy rows that predate explicit metadata; it
+# never controls what evidence the model receives or when recall is performed.
+UI_PROJECTED_RUNTIME_CONTROL_TAGS = frozenset(
+    {
+        "auto-context-recall",
+        "auto-continue",
+        "arbiter-continue",
+        "failure-recovery",
+        "fault-prefill",
+        "forced-converge",
+        "no-tool-recovery",
+        "reminder",
+        "segmented-retry",
+        "single-no-plan-todo-bootstrap",
+        "single-no-plan-todo-bootstrap-retry",
+        "thinking-empty-recovery",
+        "todo-rescue",
+        "tool-retry",
+        "truncate-rescue",
+    }
+)
+# Legacy persisted controls that are useful as UI events.  New runtime rows do
+# not depend on this set: they carry an explicit ``_ui_project`` decision.
+UI_LEGACY_PROJECTED_RUNTIME_CONTROL_TAGS = frozenset({"auto-context-recall"})
 RETRY_RUNTIME_HINT_PREFIXES = (
     "<todo-rescue>",
     "<tool-retry>",
@@ -8367,7 +8408,8 @@ def ide_public_operation_data(data: object) -> dict:
         "output": 12000, "diff": 12000, "diff_numbered": 12000,
         "change_type": 80, "agent_role": 80, "mode": 80,
         "tool_call_id": 240, "query": 2000, "pattern": 2000, "url": 2000,
-        "reason": 240, "archive_segment": 240, "next_call_label": 240,
+        "reason": 600, "archive_segment": 240, "next_call_label": 240,
+        "control_tag": 120, "origin": 80, "title": 240, "details": 8000,
         "public_progress": 4000,
     }
     for key, limit in text_limits.items():
@@ -8385,12 +8427,14 @@ def ide_public_operation_data(data: object) -> dict:
         "round", "tier", "archived_messages", "context_limit_before",
         "context_used_before", "context_left_before", "context_left_percent_before",
         "context_used_after", "context_left_after", "context_left_percent_after",
-        "context_used_reduction",
+        "context_used_reduction", "matched_rows", "returned", "total_rows",
     ):
         if key in source:
             public[key] = source.get(key)
     if "effective" in source:
         public["effective"] = bool(source.get("effective"))
+    if "default_collapsed" in source:
+        public["default_collapsed"] = bool(source.get("default_collapsed"))
     for key in ("changed_files", "tools"):
         if isinstance(source.get(key), list):
             public[key] = [trim(str(value or ""), 1200) for value in source[key][:80]]
@@ -28548,7 +28592,7 @@ class SessionState:
             return False
         if str(row.get("role", "")).strip() != "user":
             return False
-        if bool(row.get("_ui_hidden", False)):
+        if bool(row.get("_ui_hidden", False)) or self._is_runtime_internal_message(row):
             return False
         content = str(row.get("content", "") or "").strip()
         if not content:
@@ -30401,22 +30445,9 @@ class SessionState:
                 return True
         return False
 
-    def _is_ui_hidden_runtime_message(self, message: object) -> bool:
-        """Return whether a persisted message is runtime plumbing, not chat.
-
-        Runtime recovery/context messages are intentionally kept in model history,
-        but must never be projected as ordinary user/assistant bubbles.  The
-        explicit metadata checks cover new writes; prefix checks keep older
-        sessions safe after an upgrade.  Deliberately do not classify every
-        ``<tag>`` block so legitimate HTML/XML user content remains visible.
-        """
+    def _runtime_message_text(self, message: object) -> str:
         if not isinstance(message, dict):
-            return False
-        if bool(message.get("_ui_hidden", False)) or bool(message.get("_runtime_internal", False)):
-            return True
-        msg_type = str(message.get("type", "") or "").strip().lower()
-        if msg_type in {"runtime_internal", "runtime_control", "internal"}:
-            return True
+            return ""
         content = message.get("content", "")
         if not content:
             content = message.get("text", "")
@@ -30427,19 +30458,144 @@ class SessionState:
                     value = block.get("text", block.get("content", ""))
                     if isinstance(value, str):
                         parts.append(value)
-            text = "\n".join(parts)
-        else:
-            text = str(content or "")
-        low = text.strip().lower()
+            return "\n".join(parts)
+        return str(content or "")
+
+    def _runtime_message_control_tag(self, message: object) -> str:
+        """Return a protocol tag, preferring durable metadata over legacy text."""
+        if not isinstance(message, dict):
+            return ""
+        explicit = trim(str(message.get("control_tag", "") or "").strip().lower(), 120)
+        if explicit:
+            return explicit
+        text = self._runtime_message_text(message).strip()
+        match = re.match(r"^<([a-z0-9_-]+)(?:\s+[^>]*)?>", text, flags=re.IGNORECASE)
+        return trim(str(match.group(1) if match else "").lower(), 120)
+
+    def _is_runtime_internal_message(self, message: object) -> bool:
+        """Identify runtime provenance without deciding how the UI renders it.
+
+        New rows use metadata.  Prefix recognition is intentionally limited to
+        known protocol envelopes and exists only to migrate older sessions; it
+        is not a task/content classifier.
+        """
+        if not isinstance(message, dict):
+            return False
+        if bool(message.get("_runtime_internal", False)):
+            return True
+        if str(message.get("origin", "") or "").strip().lower() == "runtime":
+            return True
+        msg_type = str(message.get("type", "") or "").strip().lower()
+        if msg_type in {"runtime_internal", "runtime_control", "internal"}:
+            return True
+        low = self._runtime_message_text(message).strip().lower()
         if not low:
             return False
-        return any(low.startswith(prefix) for prefix in UI_HIDDEN_RUNTIME_CONTROL_PREFIXES)
+        known_prefixes = tuple(dict.fromkeys(RUNTIME_CONTROL_HINT_PREFIXES + UI_HIDDEN_RUNTIME_CONTROL_PREFIXES))
+        return any(low.startswith(prefix) for prefix in known_prefixes)
+
+    def _runtime_message_ui_projection(self, message: object) -> dict | None:
+        """Project model-only runtime guidance into one safe structured UI row.
+
+        The original message is never changed or shortened, so provider/model
+        compatibility and reasoning evidence are unaffected.  New rows opt in
+        with ``_ui_project``; the tag set is only a migration fallback for old
+        persisted envelopes.
+        """
+        if not isinstance(message, dict) or not self._is_runtime_internal_message(message):
+            return None
+        tag = self._runtime_message_control_tag(message)
+        explicitly_projected = message.get("_ui_project")
+        if explicitly_projected is False:
+            return None
+        if explicitly_projected is not True and tag not in UI_LEGACY_PROJECTED_RUNTIME_CONTROL_TAGS:
+            return None
+        text = self._runtime_message_text(message).strip()
+        body = text
+        if tag:
+            match = re.match(
+                rf"^<{re.escape(tag)}(?:\s+[^>]*)?>\s*([\s\S]*?)\s*</{re.escape(tag)}>\s*$",
+                text,
+                flags=re.IGNORECASE,
+            )
+            if match:
+                body = str(match.group(1) or "").strip()
+        ui_data = dict(message.get("ui_data") or {}) if isinstance(message.get("ui_data"), dict) else {}
+        ui_data.update({"control_tag": tag or "runtime", "origin": "runtime"})
+        query_match = re.match(r"^<[^>]+\bquery=(\"(?:[^\"\\]|\\.)*\")", text, flags=re.IGNORECASE)
+        if query_match and not str(ui_data.get("query", "") or "").strip():
+            try:
+                ui_data["query"] = json.loads(query_match.group(1))
+            except Exception:
+                pass
+        payload = parse_json_object(body, {})
+        if isinstance(payload, dict) and payload:
+            for key in ("query", "matched_rows", "returned", "total_rows", "reason"):
+                if key in payload and key not in ui_data:
+                    ui_data[key] = payload.get(key)
+            segments = payload.get("segments_considered")
+            if isinstance(segments, list) and segments and isinstance(segments[0], dict):
+                ui_data.setdefault("archive_segment", segments[0].get("id", ""))
+        ui_data.setdefault("default_collapsed", True)
+        ui_data.setdefault("details", trim(body, 8000))
+        if tag == "auto-context-recall":
+            summary = "Archived context evidence was recalled for the active work."
+        else:
+            summary = trim(next((line.strip() for line in body.splitlines() if line.strip()), tag or "Runtime event"), 600)
+        row = {
+            "id": str(message.get("id", "") or ""),
+            "role": "system",
+            "type": "runtime_hint",
+            "text": summary,
+            "ts": float(message.get("ts", 0.0) or 0.0),
+            "data": ide_public_operation_data(ui_data),
+        }
+        if int(message.get("seq", 0) or 0) > 0:
+            row["seq"] = int(message.get("seq", 0) or 0)
+        return row
+
+    def _is_ui_hidden_runtime_message(self, message: object) -> bool:
+        """Return whether runtime plumbing has no public structured projection."""
+        if isinstance(message, dict) and bool(message.get("_ui_hidden", False)):
+            return True
+        return bool(
+            self._is_runtime_internal_message(message)
+            and self._runtime_message_ui_projection(message) is None
+        )
+
+    def _runtime_control_message(
+        self,
+        content: object,
+        *,
+        control_tag: str = "",
+        ui_data: dict | None = None,
+        ui_visible: bool = True,
+    ) -> dict:
+        """Build model-facing runtime guidance without claiming user authorship.
+
+        Some providers only accept the historical user/assistant wire roles for
+        mid-conversation guidance.  Keep that compatible envelope, but attach a
+        durable origin/type marker so snapshots, exports, archives and recalls
+        never project the row as genuine user input.
+        """
+        return {
+            "role": "user",
+            "content": str(content or ""),
+            "ts": now_ts(),
+            "type": "runtime_control",
+            "origin": "runtime",
+            "control_tag": trim(str(control_tag or "runtime"), 80),
+            "_runtime_internal": True,
+            "_ui_hidden": not bool(ui_visible),
+            "_ui_project": bool(ui_visible),
+            "ui_data": dict(ui_data or {}),
+        }
 
     def _has_prior_real_user_task_message(self) -> bool:
         for row in self.messages:
             if not isinstance(row, dict) or row.get("role") != "user":
                 continue
-            if bool(row.get("_ui_hidden", False)):
+            if bool(row.get("_ui_hidden", False)) or self._is_runtime_internal_message(row):
                 continue
             content = row.get("content", "")
             text = str(content or "").strip()
@@ -37563,15 +37719,39 @@ class SessionState:
         }
         if tool not in eligible:
             return "[cleared by microcompact]"
-        sig = self._tool_memory_signature_from_args(tool, args, result_status=("error" if content.startswith("Error:") else "ok"))
+        raw_result_status = str(msg.get("result_status", "") or "").strip().lower()
+        if not raw_result_status:
+            if msg.get("result_ok") is False:
+                raw_result_status = "error"
+            elif msg.get("result_ok") is True:
+                raw_result_status = "ok"
+            elif tool in {"bash", "background_run", "worktree_run"} and self._command_output_has_error_shape(content):
+                raw_result_status = "error"
+            else:
+                raw_result_status = "error" if content.startswith("Error:") else "ok"
+        sig = self._tool_memory_signature_from_args(tool, args, result_status=raw_result_status)
         registry_entry = None
         for entry in getattr(self, "tool_memory_registry", {}).values():
             if isinstance(entry, dict) and str(entry.get("signature", "") or "") == sig:
                 registry_entry = entry
                 break
+        # A repeated command may have both a failed and a later successful
+        # memory entry. Match the immutable output digest before falling back
+        # to signature so compaction preserves the result that occurred at this
+        # exact point in the timeline.
+        content_sha = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()
+        for entry in getattr(self, "tool_memory_registry", {}).values():
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("source_tool", "") or "") != tool:
+                continue
+            if str(entry.get("sha256", "") or "") == content_sha:
+                registry_entry = entry
+                sig = str(entry.get("signature", "") or sig)
+                break
         lines = [ln.strip() for ln in content.replace("\r\n", "\n").split("\n") if ln.strip()]
         summary = trim(str((registry_entry or {}).get("summary", "") or " ".join(lines[:6])), 700)
-        sha = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[:12]
+        sha = content_sha[:12]
         cached_path = str((registry_entry or {}).get("cache_path", "") or "")
         if len(content) >= FILE_BUFFER_CONTENT_THRESHOLD:
             try:
@@ -37587,10 +37767,54 @@ class SessionState:
         if registry_entry:
             rows.append(
                 f"memory_id: {registry_entry.get('key','')} status={registry_entry.get('status','active')} "
-                f"kind={registry_entry.get('evidence_kind','')} role={registry_entry.get('agent_role','')}"
+                f"kind={registry_entry.get('evidence_kind','')} role={registry_entry.get('agent_role','')} "
+                f"result={registry_entry.get('result_status','')}"
             )
         if cached_path:
             rows.append(f"cached_copy: {cached_path}")
+        if summary:
+            rows.append(f"summary: {summary}")
+        rows.append(
+            "Use tool-memory-registry to continue. Repeat the tool only for a narrower unanswered question, "
+            "fresh verification, or changed state."
+        )
+        return "\n".join(rows)
+
+    def _refresh_archived_tool_memory_placeholder(self, content: object) -> str:
+        """Resolve a compact placeholder by its immutable output digest.
+
+        This also repairs older archives whose placeholders were produced
+        before result metadata was persisted.  A later successful execution of
+        the same command must not rewrite an earlier failed execution.
+        """
+        text = str(content or "")
+        if not text.startswith("[tool_memory cached"):
+            return text
+        match = re.search(r"sha256=([0-9a-f]{12,64})", text, flags=re.IGNORECASE)
+        if not match:
+            return text
+        digest = match.group(1).lower()
+        matched = None
+        for entry in getattr(self, "tool_memory_registry", {}).values():
+            if not isinstance(entry, dict):
+                continue
+            entry_sha = str(entry.get("sha256", "") or "").lower()
+            if entry_sha.startswith(digest):
+                matched = entry
+                break
+        if not matched:
+            return text
+        first_line = text.splitlines()[0]
+        rows = [first_line, f"signature: {matched.get('signature', '')}"]
+        rows.append(
+            f"memory_id: {matched.get('key','')} status={matched.get('status','active')} "
+            f"kind={matched.get('evidence_kind','')} role={matched.get('agent_role','')} "
+            f"result={matched.get('result_status','')}"
+        )
+        cached_path = str(matched.get("cache_path", "") or "")
+        if cached_path:
+            rows.append(f"cached_copy: {cached_path}")
+        summary = str(matched.get("summary", "") or "").strip()
         if summary:
             rows.append(f"summary: {summary}")
         rows.append(
@@ -38440,7 +38664,14 @@ class SessionState:
             role = str(item.get("role", "") or "")
             content = str(item.get("content", "") or "")
             low = content.strip().lower()
-            if role == "user" and any(low.startswith(prefix) for prefix in RETRY_RUNTIME_HINT_PREFIXES):
+            is_live_user_adjustment = low.startswith("<live-user-adjustment")
+            if (
+                not is_live_user_adjustment
+                and (
+                    self._is_ui_hidden_runtime_message(item)
+                    or (role == "user" and self._is_runtime_control_hint(content))
+                )
+            ):
                 continue
             if "<compact-resume>" in low or "<state_handoff>" in low:
                 item["content"] = "[previous compact-resume archived; use context_recall for details]"
@@ -38474,7 +38705,18 @@ class SessionState:
         if len(tail) >= len(self.messages):
             tail = self._select_compact_tail(max(2200, int(tail_budget * 0.55)), min_count=4, max_count=20)
         archived_rows = self.messages[:-len(tail)] if tail else list(self.messages)
+        archived_rows = self._strip_archival_runtime_hints(archived_rows)
         tail = self._strip_archival_runtime_hints(tail)
+        # Compact placeholders can outlive the mutable registry view. Refresh
+        # them by immutable output digest before persisting or summarizing so a
+        # later execution of the same command cannot distort this archive.
+        stable_archived_rows: list[dict] = []
+        for row in archived_rows:
+            item = dict(row) if isinstance(row, dict) else {"role": "", "content": str(row or "")}
+            if str(item.get("role", "") or "") == "tool":
+                item["content"] = self._refresh_archived_tool_memory_placeholder(item.get("content", ""))
+            stable_archived_rows.append(item)
+        archived_rows = stable_archived_rows
         seg = self._archive_context_segment(archived_rows, reason) if archived_rows else {}
         summary = self._summarize_compact_rows(archived_rows)
         seg_id = str(seg.get("id", "")) if isinstance(seg, dict) else ""
@@ -55266,7 +55508,11 @@ body{padding:18px}
         for row in reversed(list(getattr(self, "messages", []) or [])):
             if not isinstance(row, dict) or str(row.get("role", "") or "") != "user":
                 continue
-            if bool(row.get("_ui_hidden", False)) or str(row.get("agent_role", "") or "").strip():
+            if (
+                bool(row.get("_ui_hidden", False))
+                or self._is_runtime_internal_message(row)
+                or str(row.get("agent_role", "") or "").strip()
+            ):
                 continue
             try:
                 msg_ts = float(row.get("ts", 0.0) or 0.0)
@@ -73767,32 +74013,159 @@ body{padding:18px}
                 )
         except Exception:
             pass
-        return False
+        # Recovery may need archived evidence, but only the generic evidence
+        # gate below can authorize it.  A failure by itself is never sufficient.
+        try:
+            return bool(self._auto_context_recall_for_recovery())
+        except Exception:
+            return False
 
-    def _auto_context_recall_for_recovery(self) -> bool:
+    def _auto_context_recall_for_recovery(self, evidence_gap: str = "") -> bool:
+        """Recall archived evidence for a dynamically established evidence gap.
+
+        The decision is based on active context, focus state and unresolved
+        evidence locators.  It deliberately has no document/code/task keyword
+        table.  A caller may supply a concrete gap, but recovery can also derive
+        one when the failure ledger references evidence no longer present in the
+        active model window.
+        """
         if not self.context_archives:
+            return False
+        gap = self._dynamic_context_evidence_gap(evidence_gap)
+        if not bool(gap.get("needed", False)):
+            return False
+        query = trim(str(gap.get("query", "") or "").strip(), 500)
+        if not query:
             return False
         recent = self.messages[-16:]
         for row in reversed(recent):
-            content = str(row.get("content", "") or "")
-            if "<auto-context-recall>" in content:
+            if (
+                self._runtime_message_control_tag(row) == "auto-context-recall"
+                and str((row.get("ui_data", {}) or {}).get("query", "") or "").strip().lower()
+                == query.lower()
+            ):
                 return False
         try:
-            recalled = self._context_recall({"recent_segments": 1, "max_messages": 24, "mode": "summary"})
+            recalled = self._context_recall(
+                {
+                    "recent_segments": 1,
+                    "max_messages": 12,
+                    "mode": "search",
+                    "query": query,
+                }
+            )
         except Exception:
             return False
         text = str(recalled or "").strip()
         if (not text) or text.startswith("Error:"):
             return False
+        payload = parse_json_object(text, {})
+        matched_rows = int(payload.get("matched_rows", payload.get("total_matches", 0)) or 0) if isinstance(payload, dict) else 0
+        returned = int(payload.get("returned", 0) or 0) if isinstance(payload, dict) else 0
+        if isinstance(payload, dict) and returned <= 0:
+            return False
+        archive_segment = ""
+        if isinstance(payload, dict) and isinstance(payload.get("segments_considered"), list):
+            first_segment = next(
+                (row for row in payload["segments_considered"] if isinstance(row, dict)),
+                {},
+            )
+            archive_segment = trim(str(first_segment.get("id", "") or ""), 240)
         self.messages.append(
-            {
-                "role": "user",
-                "content": f"<auto-context-recall>\n{trim(text, 7000)}\n</auto-context-recall>",
-                "ts": now_ts(),
-            }
+            self._runtime_control_message(
+                f"<auto-context-recall query={json.dumps(query, ensure_ascii=False)}>\n"
+                f"{trim(text, 5000)}\n</auto-context-recall>",
+                control_tag="auto-context-recall",
+                ui_data={
+                    "title": "Context recall",
+                    "query": query,
+                    "reason": trim(str(gap.get("reason", "") or ""), 600),
+                    "matched_rows": matched_rows,
+                    "returned": returned,
+                    "archive_segment": archive_segment,
+                    "default_collapsed": True,
+                },
+            )
         )
-        self._emit("status", {"summary": "auto context_recall injected for recovery"})
+        self._emit(
+            "status",
+            {
+                "summary": (
+                    "focused context_recall injected "
+                    f"({trim(str(gap.get('reason', '') or 'evidence-gap'), 120)})"
+                )
+            },
+        )
         return True
+
+    def _dynamic_context_evidence_gap(self, evidence_gap: str = "") -> dict:
+        """Describe a recall need from generic evidence state, never task type."""
+        if not self.context_archives:
+            return {"needed": False, "query": "", "reason": "no-archive", "confidence": 1.0}
+
+        explicit = trim(str(evidence_gap or "").strip(), 500)
+        if explicit:
+            return {
+                "needed": True,
+                "query": explicit,
+                "reason": "explicit-evidence-gap",
+                "confidence": 1.0,
+            }
+
+        active_text = "\n".join(
+            self._runtime_message_text(row)
+            for row in self.messages[-24:]
+            if isinstance(row, dict) and not self._is_runtime_internal_message(row)
+        ).lower()
+        board = self.blackboard if isinstance(getattr(self, "blackboard", None), dict) else {}
+        ledger = board.get("failure_ledger", {}) if isinstance(board.get("failure_ledger"), dict) else {}
+        candidates: list[tuple[str, str, float]] = []
+
+        for raw in reversed(list(ledger.get("errors", []) or []) + list(ledger.get("compilation_errors", []) or [])):
+            if not isinstance(raw, dict) or int(raw.get("count", 0) or 0) <= 0:
+                continue
+            locator = trim(str(raw.get("file", "") or "").strip(), 500)
+            error_text = trim(str(raw.get("error_msg", raw.get("error", "")) or "").strip(), 500)
+            for value in (locator, error_text):
+                query = self._focused_evidence_locator(value)
+                if query and query.lower() not in active_text:
+                    candidates.append((query, "unresolved-evidence-not-in-active-context", 0.86))
+                    break
+            if candidates:
+                break
+
+        if not candidates:
+            focus = self._blackboard_focus_identity(board) if board else {}
+            focus_id = trim(str(focus.get("id", "") or "").strip(), 500)
+            compacted = any(
+                self._runtime_message_control_tag(row) == "compact-resume"
+                for row in self.messages[-24:]
+                if isinstance(row, dict)
+            )
+            query = self._focused_evidence_locator(focus_id)
+            if compacted and query and query.lower() not in active_text:
+                candidates.append((query, "active-focus-locator-compacted", 0.72))
+
+        if not candidates:
+            return {"needed": False, "query": "", "reason": "active-evidence-sufficient", "confidence": 0.75}
+        query, reason, confidence = candidates[0]
+        return {"needed": True, "query": query, "reason": reason, "confidence": confidence}
+
+    def _focused_evidence_locator(self, value: object) -> str:
+        """Extract a stable search locator from arbitrary state text."""
+        text = " ".join(str(value or "").strip().split())
+        if not text:
+            return ""
+        path_match = re.search(r"(?:[A-Za-z]:)?[^\s:'\"<>|]+[/\\][^\s:'\"<>|]+", text)
+        if path_match:
+            return trim(path_match.group(0).rstrip(".,;)]}"), 240)
+        quoted = re.search(r"['\"]([^'\"]{3,180})['\"]", text)
+        if quoted:
+            return trim(quoted.group(1), 180)
+        identifier = re.search(r"\b[A-Za-z_][A-Za-z0-9_.:-]{3,160}\b", text)
+        if identifier:
+            return trim(identifier.group(0), 160)
+        return trim(text, 120)
 
     def _extract_text_items_from_raw_args(self, raw: object) -> list[str]:
         if isinstance(raw, dict):
@@ -73902,6 +74275,7 @@ body{padding:18px}
         max_messages = self._tool_int_arg(args.get("max_messages", 30), 30, 1, 120)
         offset = self._tool_int_arg(args.get("offset", 0), 0, 0, 100000)
         include_tools = bool(args.get("include_tools", True))
+        include_runtime = bool(args.get("include_runtime", False))
 
         segments: list[dict] = []
         if segment_id:
@@ -73921,6 +74295,11 @@ body{padding:18px}
             rows = self._load_context_archive_messages(seg)
             for idx, row in enumerate(rows):
                 role = str(row.get("role", ""))
+                if not include_runtime and (
+                    self._is_ui_hidden_runtime_message(row)
+                    or (role == "user" and self._is_runtime_control_hint(row.get("content", "")))
+                ):
+                    continue
                 if not include_tools and role == "tool":
                     continue
                 if role_filter and role_filter.lower() not in role.lower():
@@ -73928,7 +74307,7 @@ body{padding:18px}
                 name = str(row.get("name", "") or "")
                 if tool_filter and tool_filter.lower() not in name.lower():
                     continue
-                content = str(row.get("content", ""))
+                content = self._refresh_archived_tool_memory_placeholder(row.get("content", ""))
                 if query_low:
                     pool = f"{role}\n{name}\n{content}".lower()
                     if query_low not in pool:
@@ -76078,7 +76457,7 @@ body{padding:18px}
         # Never retain runtime orchestration blocks as user bubbles.  They are
         # model-facing context and would otherwise be reinserted after compaction
         # as if the user had sent them.
-        if self._is_ui_hidden_runtime_message({"role": "user", "content": text}):
+        if self._is_runtime_internal_message({"role": "user", "content": text}):
             return
         try:
             ts_f = float(ts or 0.0)
@@ -76619,7 +76998,7 @@ body{padding:18px}
                     output = "Error: runtime socket noise filtered"
                 else:
                     output = "(no output)"
-            self._append_agent_context_message(
+            context_tool_row = self._append_agent_context_message(
                 role_key,
                 {
                     "role": "tool",
@@ -76636,6 +77015,10 @@ body{padding:18px}
                 args if isinstance(args, dict) else {},
                 output,
             )
+            context_tool_row["result_ok"] = bool(item.get("ok", False))
+            context_tool_row["result_status"] = "ok" if item.get("ok", False) else "error"
+            if item.get("exit_code") is not None:
+                context_tool_row["exit_code"] = int(item.get("exit_code"))
             self._emit(
                 "tool_result",
                 {
@@ -82189,7 +82572,6 @@ body{padding:18px}
                         self._ensure_failure_recovery_todos(
                             f"no-tool streak {no_tool_rounds}: {', '.join(diagnosis.get('causes', []) or [])}"
                         )
-                        self._auto_context_recall_for_recovery()
                         if fault_counter >= 2:
                             self._inject_fault_prefill_hint(
                                 reason=f"no-tool idle streak={no_tool_rounds}",
@@ -82655,13 +83037,18 @@ body{padding:18px}
                         stop_due_to_ask_user_single = True
                     if dispatched_name in {"finish_task", "finish_current_task", "mark_done"} and result_item["ok"]:
                         stop_due_to_finish_task = True
-                    self.messages.append({
+                    tool_message = {
                         "role": "tool",
                         "tool_call_id": tc["id"],
                         "name": name,
                         "content": self._tool_result_context_content(name, args if isinstance(args, dict) else {}, output),
                         "ts": now_ts(),
-                    })
+                        "result_ok": bool(result_item.get("ok", False)),
+                        "result_status": "ok" if result_item.get("ok", False) else "error",
+                    }
+                    if result_item.get("exit_code") is not None:
+                        tool_message["exit_code"] = int(result_item.get("exit_code"))
+                    self.messages.append(tool_message)
                     single_round_tool_results.append(result_item)
                     is_finish_tool = (dispatched_name or name) in {"finish_task", "finish_current_task", "mark_done"}
                     # Update blackboard signals (step_files, execution_logs) for plan+single mode.
@@ -82986,7 +83373,6 @@ body{padding:18px}
                     self._ensure_failure_recovery_todos(
                         f"all tool calls failed in round ({', '.join(round_tool_names[:4])})"
                     )
-                    self._auto_context_recall_for_recovery()
                     if fault_counter >= 2:
                         self._inject_fault_prefill_hint(
                             reason=f"all tool calls failed: {', '.join(round_tool_names[:3])}",
@@ -82995,9 +83381,8 @@ body{padding:18px}
                     if not retry_requested_this_round:
                         self._prune_runtime_retry_hints()
                         self.messages.append(
-                            {
-                                "role": "user",
-                                "content": (
+                            self._runtime_control_message(
+                                (
                                     "<failure-recovery>"
                                     "All tool calls in the last round failed. "
                                     "Switch to strict step mode now: "
@@ -83007,8 +83392,8 @@ body{padding:18px}
                                     "4) if still failing, report blocker with exact error and stop."
                                     "</failure-recovery>"
                                 ),
-                                "ts": now_ts(),
-                            }
+                                control_tag="failure-recovery",
+                            )
                         )
                         # Auto-load debugging skill on code/compilation/test failures
                         _code_error_keywords = ("bash", "compile", "syntax", "test", "build", "traceback")
@@ -83228,15 +83613,14 @@ body{padding:18px}
                 if retry_requested_this_round and round_error_count > 0 and round_ok_count == 0:
                     self._prune_runtime_retry_hints()
                     self.messages.append(
-                        {
-                            "role": "user",
-                            "content": (
+                        self._runtime_control_message(
+                            (
                                 "<auto-continue>"
                                 "The last tool round failed completely. Retry one corrected tool call now."
                                 "</auto-continue>"
                             ),
-                            "ts": now_ts(),
-                        }
+                            control_tag="auto-continue",
+                        )
                     )
                 if stop_due_to_hard_break:
                     note = (
@@ -83531,10 +83915,15 @@ body{padding:18px}
             inferred_bus_target_role = ""
             message_start = max(0, len(self.messages) - msg_window)
             for msg_index, msg in enumerate(self.messages[message_start:], start=message_start):
+                if self._is_ui_hidden_runtime_message(msg):
+                    continue
+                runtime_projection = self._runtime_message_ui_projection(msg)
+                if self._is_runtime_internal_message(msg):
+                    if runtime_projection is None:
+                        continue
+                    msg = runtime_projection
                 role = msg.get("role")
                 if role == "tool":
-                    continue
-                if self._is_ui_hidden_runtime_message(msg):
                     continue
                 role_key = str(role or "").strip().lower()
                 msg_type = trim(str(msg.get("type", "message") or "").strip(), 40) if isinstance(msg, dict) else "message"
@@ -86382,6 +86771,9 @@ body[data-ui-style="trad"] .msg-event-cell{background:#fff}
 .msg-event-card-web{background:linear-gradient(180deg,#fbfffe 0%,#ebf8f5 100%);border-color:#bfe5dd}
 .msg-event-card-adjustment{background:linear-gradient(180deg,#fffefd 0%,#fff3e7 100%);border-color:#ffd1a5}
 .msg-event-card-feedback{background:linear-gradient(180deg,#fffaff 0%,#f5edff 100%);border-color:#dec7ff}
+.msg-event-card-runtime{background:var(--panel,#fff);border-color:#d8e1ec;box-shadow:none}
+.msg-event-card-runtime.warning{border-left:3px solid #d69a31}.msg-event-card-runtime.notice{border-left:3px solid #4f9b75}.msg-event-card-runtime.instruction{border-left:3px solid #8067bf}
+.msg-runtime-details{margin-top:7px;border-top:1px solid rgba(100,116,139,.18);padding-top:6px}.msg-runtime-details summary{cursor:pointer;color:#627790;font-size:.74rem;font-weight:700;user-select:none}.msg-runtime-details pre{max-height:320px;margin:7px 0 0;padding:8px;overflow:auto;border-radius:7px;background:rgba(15,23,42,.045);color:#40536b;font:11px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;overflow-wrap:anywhere}
 .plan-proposal-card{position:relative;border:1px solid #d8c3f4;border-radius:16px;background:linear-gradient(145deg,#fff 0%,#fff8f5 42%,#f6f1ff 100%);box-shadow:0 14px 34px rgba(73,42,116,.12);padding:14px;overflow:hidden}
 .plan-proposal-card::before{content:"";position:absolute;inset:0 0 auto;height:4px;background:linear-gradient(90deg,#f27b65,#b76de1,#4f87e8)}
 .plan-proposal-hero{display:flex;align-items:center;gap:10px;margin:2px 0 10px}
@@ -86958,7 +87350,7 @@ Object.assign(I18N['en'],{
   event_truncation_recovery:'Truncation Recovery',event_truncation_state:'Structured truncation recovery state',event_truncation_note:'Model output hit a truncation boundary and entered recovery mode.',
       event_live_model_call_title:'Agent Turn Model Call',event_live_model_call_note:'The active agent is in a model call. This timer updates live while generation is in progress.',
       event_scheduler_queued_title:'Queued Task',event_scheduler_queued_note:'This message is saved and waiting for an execution slot.',event_scheduler_queue_position:'queue position',event_scheduler_reason:'reason',event_scheduler_queued_hint:'queued',
-  event_auto_continue:'Auto Continue',event_arbiter_continue:'Arbiter Continue',event_continuation_briefing:'Continuation Briefing',event_reminder:'Reminder',event_todo_rescue:'Todo Rescue',event_tool_retry:'Tool Retry',event_segmented_retry:'Segmented Retry',event_forced_converge:'Forced Converge',event_no_tool_recovery:'No-Tool Recovery',event_context_recall:'Context Recall',event_failure_recovery:'Failure Recovery',event_truncate_rescue:'Truncation Rescue',event_thinking_recovery:'Thinking Recovery',event_fault_prefill:'Fault Prefill',event_edit_recovery:'Edit Recovery',event_todo_bootstrap_title:'Todo Initialization',event_todo_bootstrap_retry_title:'Todo Initialization Retry',event_todo_bootstrap_subtitle:'Planning state after read-only perception',event_todo_bootstrap_note:'The next Todo list is being shaped from observed evidence before execution resumes.',event_todo_bootstrap_retry_note:'The Todo writer did not complete; the bounded retry is being requested.',event_todo_bootstrap_perception:'perception complete',event_todo_bootstrap_item_count:'1-40 items · stage-aligned',event_todo_bootstrap_one_active:'exactly 1 active',event_reason:'reason',
+  event_auto_continue:'Auto Continue',event_arbiter_continue:'Arbiter Continue',event_continuation_briefing:'Continuation Briefing',event_reminder:'Reminder',event_todo_rescue:'Todo Rescue',event_tool_retry:'Tool Retry',event_segmented_retry:'Segmented Retry',event_forced_converge:'Forced Converge',event_no_tool_recovery:'No-Tool Recovery',event_context_recall:'Context Recall',event_failure_recovery:'Failure Recovery',event_truncate_rescue:'Truncation Rescue',event_thinking_recovery:'Thinking Recovery',event_fault_prefill:'Fault Prefill',event_edit_recovery:'Edit Recovery',event_todo_bootstrap_title:'Todo Initialization',event_todo_bootstrap_retry_title:'Todo Initialization Retry',event_todo_bootstrap_subtitle:'Planning state after read-only perception',event_todo_bootstrap_note:'The next Todo list is being shaped from observed evidence before execution resumes.',event_todo_bootstrap_retry_note:'The Todo writer did not complete; the bounded retry is being requested.',event_todo_bootstrap_perception:'perception complete',event_todo_bootstrap_item_count:'1-40 items · stage-aligned',event_todo_bootstrap_one_active:'exactly 1 active',event_reason:'reason',event_query:'query',event_archive:'archive',event_details:'Details',event_matches:'matches',event_returned:'returned',
   state_on:'on',state_off:'off',
   rt_session:'session',rt_model:'model',rt_thinking:'thinking',rt_thinking_stream:'thinking_stream',rt_response_stream:'response_stream',rt_mode:'mode',rt_active_agent:'active_agent',rt_blackboard:'bb',rt_task:'task',rt_complexity:'complexity',rt_judgement:'judgement',rt_budget:'budget',rt_remaining:'remaining',rt_blackboard_cycles:'bb_cycles',rt_round_limit:'round_limit',rt_round:'round',rt_phase:'phase',rt_queued_inputs:'queued_inputs',rt_run_timeout:'run_timeout',rt_ctx_used:'ctx_used',rt_ctx_limit:'ctx_limit',rt_ctx_mode:'ctx_mode',rt_manual_lock:'manual-lock',rt_adaptive:'adaptive',rt_ctx_left:'ctx_left',rt_ctx_left_for:'{label} left',rt_ctx_live_title:'Remaining context budget by active call',rt_truncation:'truncation',rt_trunc_retry:'trunc_retry',rt_trunc_tokens:'trunc_tokens~',rt_archive:'archive',rt_last_compact:'last_compact',compact_ago:'ago',compact_just_now:'just now',rt_ollama:'ollama',rt_files:'files',rt_ui_mode:'ui_mode',rt_state:'state',rt_awaiting_user:'awaiting user',ask_user_title:'Agent needs your input',ask_user_free_hint:'Pick an option above, or type your answer below and send.',ask_user_pick_hint:'Pick one of the options above to continue.',
   preview_download:'Download',preview_source:'Source',preview_rendered:'Preview',preview_copy_link:'Copy Link',preview_open:'Open in Browser',preview_link_copied:'Link Copied',
@@ -86987,7 +87379,7 @@ Object.assign(I18N['zh-CN'],{
   event_truncation_recovery:'截断恢复',event_truncation_state:'结构化截断恢复状态',event_truncation_note:'模型输出触发了截断边界，已进入恢复流程。',
       event_live_model_call_title:'Agent 轮次模型调用',event_live_model_call_note:'当前活跃 agent 正在进行模型调用。计时器会在生成期间实时更新。',
       event_scheduler_queued_title:'任务已排队',event_scheduler_queued_note:'这条消息已保存，正在等待后台执行名额。',event_scheduler_queue_position:'队列位置',event_scheduler_reason:'原因',event_scheduler_queued_hint:'已排队',
-  event_auto_continue:'自动继续',event_arbiter_continue:'裁决继续',event_continuation_briefing:'续跑简报',event_reminder:'提醒',event_todo_rescue:'待办救援',event_tool_retry:'工具重试',event_segmented_retry:'分段重试',event_forced_converge:'强制收敛',event_no_tool_recovery:'无工具恢复',event_context_recall:'上下文召回',event_failure_recovery:'故障恢复',event_truncate_rescue:'截断救援',event_thinking_recovery:'思考恢复',event_fault_prefill:'故障预填',event_edit_recovery:'编辑恢复',event_todo_bootstrap_title:'Todo 初始化',event_todo_bootstrap_retry_title:'Todo 初始化重试',event_todo_bootstrap_subtitle:'只读感知后的规划状态',event_todo_bootstrap_note:'系统正在根据已观察证据整理下一组 Todo，然后继续执行。',event_todo_bootstrap_retry_note:'Todo 写入未完成，系统正在进行有限次数的重试。',event_todo_bootstrap_perception:'感知已完成',event_todo_bootstrap_item_count:'1-40 项 · 对齐阶段',event_todo_bootstrap_one_active:'恰好 1 项进行中',event_reason:'原因',
+  event_auto_continue:'自动继续',event_arbiter_continue:'裁决继续',event_continuation_briefing:'续跑简报',event_reminder:'提醒',event_todo_rescue:'待办救援',event_tool_retry:'工具重试',event_segmented_retry:'分段重试',event_forced_converge:'强制收敛',event_no_tool_recovery:'无工具恢复',event_context_recall:'上下文召回',event_failure_recovery:'故障恢复',event_truncate_rescue:'截断救援',event_thinking_recovery:'思考恢复',event_fault_prefill:'故障预填',event_edit_recovery:'编辑恢复',event_todo_bootstrap_title:'Todo 初始化',event_todo_bootstrap_retry_title:'Todo 初始化重试',event_todo_bootstrap_subtitle:'只读感知后的规划状态',event_todo_bootstrap_note:'系统正在根据已观察证据整理下一组 Todo，然后继续执行。',event_todo_bootstrap_retry_note:'Todo 写入未完成，系统正在进行有限次数的重试。',event_todo_bootstrap_perception:'感知已完成',event_todo_bootstrap_item_count:'1-40 项 · 对齐阶段',event_todo_bootstrap_one_active:'恰好 1 项进行中',event_reason:'原因',event_query:'查询',event_archive:'归档',event_details:'详细内容',event_matches:'条匹配',event_returned:'条召回',
   state_on:'开',state_off:'关',
   rt_session:'会话',rt_model:'模型',rt_thinking:'思考',rt_thinking_stream:'思考流',rt_response_stream:'正文流',rt_mode:'模式',rt_active_agent:'活跃代理',rt_blackboard:'黑板',rt_task:'任务',rt_complexity:'复杂度',rt_judgement:'裁决',rt_budget:'预算',rt_remaining:'剩余',rt_blackboard_cycles:'黑板轮次',rt_round_limit:'轮次上限',rt_round:'轮次',rt_phase:'阶段',rt_queued_inputs:'排队输入',rt_run_timeout:'运行超时',rt_ctx_used:'上下文已用',rt_ctx_limit:'上下文上限',rt_ctx_mode:'上下文模式',rt_manual_lock:'手动锁定',rt_adaptive:'自适应',rt_ctx_left:'上下文剩余',rt_ctx_left_for:'{label}剩余',rt_ctx_live_title:'按真实调用显示上下文剩余',rt_truncation:'截断数',rt_trunc_retry:'截断重试',rt_trunc_tokens:'截断Token~',rt_archive:'归档',rt_last_compact:'最近压缩',compact_ago:'前',compact_just_now:'刚刚',rt_ollama:'Ollama',rt_files:'文件根目录',rt_ui_mode:'界面模式',rt_state:'状态',rt_awaiting_user:'等待用户',ask_user_title:'需要你的输入',ask_user_free_hint:'点击上方选项,或在下方输入答复后发送。',ask_user_pick_hint:'请选择上方其中一个选项以继续。',
   preview_download:'下载',preview_source:'源码',preview_rendered:'预览',preview_copy_link:'复制链接',preview_open:'浏览器打开',preview_link_copied:'已复制链接',
@@ -87019,7 +87411,7 @@ Object.assign(I18N['zh-TW'],{
   event_truncation_recovery:'截斷恢復',event_truncation_state:'結構化截斷恢復狀態',event_truncation_note:'模型輸出觸發截斷邊界，已進入恢復流程。',
       event_live_model_call_title:'Agent 輪次模型呼叫',event_live_model_call_note:'目前活躍 agent 正在進行模型呼叫。計時器會在生成期間即時更新。',
       event_scheduler_queued_title:'任務已排隊',event_scheduler_queued_note:'這則訊息已保存，正在等待背景執行名額。',event_scheduler_queue_position:'佇列位置',event_scheduler_reason:'原因',event_scheduler_queued_hint:'已排隊',
-  event_auto_continue:'自動繼續',event_arbiter_continue:'裁決繼續',event_continuation_briefing:'續跑簡報',event_reminder:'提醒',event_todo_rescue:'待辦救援',event_tool_retry:'工具重試',event_segmented_retry:'分段重試',event_forced_converge:'強制收斂',event_no_tool_recovery:'無工具恢復',event_context_recall:'上下文召回',event_failure_recovery:'故障恢復',event_truncate_rescue:'截斷救援',event_thinking_recovery:'思考恢復',event_fault_prefill:'故障預填',event_edit_recovery:'編輯恢復',event_todo_bootstrap_title:'Todo 初始化',event_todo_bootstrap_retry_title:'Todo 初始化重試',event_todo_bootstrap_subtitle:'唯讀感知後的規劃狀態',event_todo_bootstrap_note:'系統會根據已觀察證據整理下一組 Todo，再繼續執行。',event_todo_bootstrap_retry_note:'Todo 寫入未完成，系統正在進行有限次重試。',event_todo_bootstrap_perception:'感知已完成',event_todo_bootstrap_item_count:'1-40 項 · 對齊階段',event_todo_bootstrap_one_active:'恰好 1 項進行中',event_reason:'原因',
+  event_auto_continue:'自動繼續',event_arbiter_continue:'裁決繼續',event_continuation_briefing:'續跑簡報',event_reminder:'提醒',event_todo_rescue:'待辦救援',event_tool_retry:'工具重試',event_segmented_retry:'分段重試',event_forced_converge:'強制收斂',event_no_tool_recovery:'無工具恢復',event_context_recall:'上下文召回',event_failure_recovery:'故障恢復',event_truncate_rescue:'截斷救援',event_thinking_recovery:'思考恢復',event_fault_prefill:'故障預填',event_edit_recovery:'編輯恢復',event_todo_bootstrap_title:'Todo 初始化',event_todo_bootstrap_retry_title:'Todo 初始化重試',event_todo_bootstrap_subtitle:'唯讀感知後的規劃狀態',event_todo_bootstrap_note:'系統會根據已觀察證據整理下一組 Todo，再繼續執行。',event_todo_bootstrap_retry_note:'Todo 寫入未完成，系統正在進行有限次重試。',event_todo_bootstrap_perception:'感知已完成',event_todo_bootstrap_item_count:'1-40 項 · 對齊階段',event_todo_bootstrap_one_active:'恰好 1 項進行中',event_reason:'原因',event_query:'查詢',event_archive:'歸檔',event_details:'詳細內容',event_matches:'筆匹配',event_returned:'筆召回',
   state_on:'開',state_off:'關',
   rt_session:'會話',rt_model:'模型',rt_thinking:'思考',rt_thinking_stream:'思考流',rt_response_stream:'正文串流',rt_mode:'模式',rt_active_agent:'活躍代理',rt_blackboard:'黑板',rt_task:'任務',rt_complexity:'複雜度',rt_judgement:'裁決',rt_budget:'預算',rt_remaining:'剩餘',rt_blackboard_cycles:'黑板輪次',rt_round_limit:'輪次上限',rt_round:'輪次',rt_phase:'階段',rt_queued_inputs:'排隊輸入',rt_run_timeout:'執行逾時',rt_ctx_used:'上下文已用',rt_ctx_limit:'上下文上限',rt_ctx_mode:'上下文模式',rt_manual_lock:'手動鎖定',rt_adaptive:'自適應',rt_ctx_left:'上下文剩餘',rt_ctx_left_for:'{label}剩餘',rt_ctx_live_title:'依真實呼叫顯示上下文剩餘',rt_truncation:'截斷數',rt_trunc_retry:'截斷重試',rt_trunc_tokens:'截斷Token~',rt_archive:'封存',rt_last_compact:'最近壓縮',compact_ago:'前',compact_just_now:'剛剛',rt_ollama:'Ollama',rt_files:'檔案根目錄',rt_ui_mode:'介面模式',rt_state:'狀態',rt_awaiting_user:'等待使用者',ask_user_title:'需要你的輸入',ask_user_free_hint:'點擊上方選項,或在下方輸入答覆後送出。',ask_user_pick_hint:'請選擇上方其中一個選項以繼續。',
   preview_download:'下載',preview_source:'原始碼',preview_rendered:'預覽',preview_copy_link:'複製連結',preview_open:'瀏覽器開啟',preview_link_copied:'已複製連結',
@@ -87049,7 +87441,7 @@ Object.assign(I18N['ja'],{
   event_truncation_recovery:'切り詰め復旧',event_truncation_state:'構造化切り詰め復旧状態',event_truncation_note:'モデル出力が切り詰め境界に達したため、復旧フローに入りました。',
       event_live_model_call_title:'Agent ターンモデル呼び出し',event_live_model_call_note:'現在のアクティブ agent はモデル呼び出し中です。生成中はこのタイマーがリアルタイム更新されます。',
       event_scheduler_queued_title:'キュー済みタスク',event_scheduler_queued_note:'このメッセージは保存され、実行枠を待っています。',event_scheduler_queue_position:'キュー位置',event_scheduler_reason:'理由',event_scheduler_queued_hint:'キュー済み',
-  event_auto_continue:'自動継続',event_arbiter_continue:'判定継続',event_continuation_briefing:'継続ブリーフ',event_reminder:'リマインダー',event_todo_rescue:'Todo 救援',event_tool_retry:'ツール再試行',event_segmented_retry:'分割再試行',event_forced_converge:'強制収束',event_no_tool_recovery:'ツールなし復旧',event_context_recall:'コンテキスト再呼び出し',event_failure_recovery:'障害復旧',event_truncate_rescue:'切り詰め救援',event_thinking_recovery:'思考復旧',event_fault_prefill:'障害プリフィル',event_edit_recovery:'編集復旧',event_todo_bootstrap_title:'Todo 初期化',event_todo_bootstrap_retry_title:'Todo 初期化の再試行',event_todo_bootstrap_subtitle:'読み取り専用の認識後に行う計画状態',event_todo_bootstrap_note:'観測した証拠から次の Todo を整理してから実行を続けます。',event_todo_bootstrap_retry_note:'Todo の書き込みが完了せず、回数を制限した再試行を行います。',event_todo_bootstrap_perception:'認識完了',event_todo_bootstrap_item_count:'1-40 項目 · 段階整合',event_todo_bootstrap_one_active:'進行中は 1 項目のみ',event_reason:'理由',
+  event_auto_continue:'自動継続',event_arbiter_continue:'判定継続',event_continuation_briefing:'継続ブリーフ',event_reminder:'リマインダー',event_todo_rescue:'Todo 救援',event_tool_retry:'ツール再試行',event_segmented_retry:'分割再試行',event_forced_converge:'強制収束',event_no_tool_recovery:'ツールなし復旧',event_context_recall:'コンテキスト再呼び出し',event_failure_recovery:'障害復旧',event_truncate_rescue:'切り詰め救援',event_thinking_recovery:'思考復旧',event_fault_prefill:'障害プリフィル',event_edit_recovery:'編集復旧',event_todo_bootstrap_title:'Todo 初期化',event_todo_bootstrap_retry_title:'Todo 初期化の再試行',event_todo_bootstrap_subtitle:'読み取り専用の認識後に行う計画状態',event_todo_bootstrap_note:'観測した証拠から次の Todo を整理してから実行を続けます。',event_todo_bootstrap_retry_note:'Todo の書き込みが完了せず、回数を制限した再試行を行います。',event_todo_bootstrap_perception:'認識完了',event_todo_bootstrap_item_count:'1-40 項目 · 段階整合',event_todo_bootstrap_one_active:'進行中は 1 項目のみ',event_reason:'理由',event_query:'検索',event_archive:'アーカイブ',event_details:'詳細',event_matches:'件一致',event_returned:'件取得',
   state_on:'オン',state_off:'オフ',
   rt_session:'セッション',rt_model:'モデル',rt_thinking:'思考',rt_thinking_stream:'思考ストリーム',rt_response_stream:'レスポンスストリーム',rt_mode:'モード',rt_active_agent:'アクティブAgent',rt_blackboard:'黒板',rt_task:'タスク',rt_complexity:'複雑度',rt_judgement:'判定',rt_budget:'予算',rt_remaining:'残り',rt_blackboard_cycles:'黒板サイクル',rt_round_limit:'ラウンド上限',rt_round:'ラウンド',rt_phase:'フェーズ',rt_queued_inputs:'待機入力',rt_run_timeout:'実行タイムアウト',rt_ctx_used:'コンテキスト使用量',rt_ctx_limit:'コンテキスト上限',rt_ctx_mode:'コンテキストモード',rt_manual_lock:'手動固定',rt_adaptive:'適応',rt_ctx_left:'残りコンテキスト',rt_ctx_left_for:'{label}残り',rt_ctx_live_title:'実際の呼び出し別の残りコンテキスト',rt_truncation:'切り詰め数',rt_trunc_retry:'切り詰め再試行',rt_trunc_tokens:'切り詰めToken~',rt_archive:'アーカイブ',rt_last_compact:'直近 compact',compact_ago:'前',compact_just_now:'たった今',rt_ollama:'Ollama',rt_files:'ファイルルート',rt_ui_mode:'UIモード',rt_state:'状態',rt_awaiting_user:'ユーザー待ち',ask_user_title:'入力が必要です',ask_user_free_hint:'上のオプションを選ぶか、下に回答を入力して送信してください。',ask_user_pick_hint:'続行するには上のオプションを選んでください。',
   preview_download:'ダウンロード',preview_source:'ソース',preview_rendered:'プレビュー',preview_copy_link:'リンクをコピー',preview_open:'ブラウザで開く',preview_link_copied:'リンクをコピーしました',
@@ -89705,6 +90097,21 @@ function _chatVirtParseRuntimeHint(raw){
   const meta=RUNTIME_HINT_RENDER_META[name]||{labelKey:'event_reminder',tone:'notice'};
   return {name,body:String(m[2]||'').trim(),meta:{label:t(String(meta.labelKey||'event_reminder')),tone:String(meta.tone||'notice')}};
 }
+function _chatVirtRuntimeHintFromMessage(m){
+  const data=(m&&typeof m.data==='object')?m.data:{};
+  const structured=String(m?.type||'').toLowerCase()==='runtime_hint';
+  const name=String(data.control_tag||'').trim().toLowerCase();
+  if(structured){
+    const renderMeta=RUNTIME_HINT_RENDER_META[name]||{labelKey:'event_reminder',tone:'notice'};
+    return {
+      name:name||'runtime',
+      body:String(data.details||m?.text||'').trim(),
+      data,
+      meta:{label:String(data.title||t(String(renderMeta.labelKey||'event_reminder'))),tone:String(renderMeta.tone||'notice')},
+    };
+  }
+  return (m?.role==='user')?_chatVirtParseRuntimeHint(String(m?.text||'')):null;
+}
 function _chatVirtBuildMessageNode(m){
       let kind='assistant_text';
       const rawTextForKind=String(m?.text||'');
@@ -89716,7 +90123,7 @@ function _chatVirtBuildMessageNode(m){
       const parsedToolEventText=_chatVirtParseToolEventText(rawTextForKind);
       const parsedLiveUserAdjustment=_chatVirtParseLiveUserAdjustment(rawTextForKind);
       const parsedUserFeedbackMerge=_chatVirtParseUserFeedbackMerge(rawTextForKind);
-      const parsedRuntimeHint=(m.role==='user')?_chatVirtParseRuntimeHint(rawTextForKind):null;
+      const parsedRuntimeHint=_chatVirtRuntimeHintFromMessage(m);
       if(m.type==='manager_delegate')kind='manager_delegate';
       else if(m.type==='agent_bus')kind='agent_bus';
       else if(m.type==='tool_calls')kind='tool_calls';
@@ -90257,9 +90664,21 @@ function _chatVirtBuildMessageNode(m){
     const hintLabel=String(runtimeHint.meta?.label||'Runtime Hint');
     const hintTone=String(runtimeHint.meta?.tone||'notice');
     const bodyKey=`${textKey}:runtime-hint`;
-    const hintBody=runtimeHint.body||finalText;
-    const plainHtml=`<div class=\"msg-md\"><div class=\"md-callout ${esc(hintTone)}\"><div class=\"md-callout-head\">${esc(hintLabel)}</div><div class=\"md-callout-body\">${renderMarkdownCached(hintBody,bodyKey)}</div></div></div>`;
-    d.innerHTML=`${plainHtml}`;
+    const hintBody=String(runtimeHint.body||finalText||'').trim();
+    const info=(runtimeHint.data&&typeof runtimeHint.data==='object')?runtimeHint.data:{};
+    const pills=[
+      info.returned!==undefined?_chatVirtEventPillHtml(`${Number(info.returned)||0} ${t('event_returned')}`,'ok'):'',
+      info.matched_rows!==undefined?_chatVirtEventPillHtml(`${Number(info.matched_rows)||0} ${t('event_matches')}`,'info'):'',
+    ];
+    const grid=[
+      _chatVirtEventCellHtml(t('event_query'),String(info.query||''),{mono:true}),
+      _chatVirtEventCellHtml(t('event_reason'),String(info.reason||''),{}),
+      _chatVirtEventCellHtml(t('event_archive'),String(info.archive_segment||''),{mono:true}),
+    ];
+    const summary=String(m?.text||'').trim();
+    const details=hintBody?`<details class=\"msg-runtime-details\"${info.default_collapsed===false?' open':''}><summary>${esc(t('event_details'))}</summary><pre>${esc(hintBody)}</pre></details>`:'';
+    const bodyHtml=`<div class=\"msg-event-body\">${summary?`<div class=\"msg-event-note\">${esc(summary)}</div>`:''}${details}</div>`;
+    d.innerHTML=_chatVirtEventCardHtml(hintLabel,'',pills,grid,bodyHtml,`msg-event-card-runtime ${esc(hintTone)}`);
     d.setAttribute('data-math-request',bodyKey);
     return d;
   }
@@ -108340,6 +108759,7 @@ function renderFilePatchCard(data,role=''){const path=String(data.session_rel_pa
 function renderCommandCard(data,role=''){const code=data.exit_code,failed=code!=null&&Number(code)!==0,command=String(data.command||''),summary=command.split('\n')[0].slice(0,90),changed=Array.isArray(data.changed_files)&&data.changed_files.length?`Changed files:\n${data.changed_files.map(path=>`  ${path}`).join('\n')}`:'';const output=[command?`Command:\n${command}`:'',data.cwd?`Working directory: ${data.cwd}`:'',data.output||data.result||'',changed].filter(Boolean).join('\n\n');const card=agentToolCard({kind:'command',name:data.name||'command',title:`${String(data.name||'Command').replace(/^bash$/i,'Bash')}${summary?` · ${summary}`:''}`,state:code==null?'Running':`Exit ${code}${data.duration_ms!=null?` · ${data.duration_ms}ms`:''}`,stateTone:failed?'error':code==null?'':'success',output,role,expanded:failed});card.dataset.commandComplete=String(code!=null);return card}
 function parseAgentControl(text){const value=String(text||'').trim();let match=value.match(/^<([a-z0-9_-]+)(?:\s+[^>]*)?>([\s\S]*)<\/\1>$/i);if(match)return{tag:match[1],body:match[2].trim(),kind:'runtime instruction'};match=value.match(/^\[([^\]\n]{2,100})\](?:\s*([\s\S]*))?$/);if(match&&/^(skill loaded|tool calls|auto-continue|command|file_patch|system|manager|developer|explorer|planner|reviewer)(?::|$)/i.test(match[1]))return{tag:match[1],body:String(match[2]||'').trim(),kind:'control event'};return null}
 function renderAgentControl(text,role='User'){const parsed=parseAgentControl(text);if(!parsed)return null;const skill=parsed.tag.match(/^skill loaded:\s*(.*)$/i);return agentToolCard({kind:'control',name:skill?'skill':parsed.tag,title:skill?`Skill loaded · ${skill[1]}`:`${parsed.kind} · ${parsed.tag}`,state:'Structured',stateTone:'success',output:parsed.body,role,expanded:!!parsed.body})}
+function renderAgentRuntimeHint(row){const data=row&&typeof row.data==='object'?row.data:{},tag=String(data.control_tag||'runtime').trim(),labels={'auto-context-recall':'Context recall','auto-continue':'Auto continue','failure-recovery':'Failure recovery','thinking-empty-recovery':'Thinking recovery','single-no-plan-todo-bootstrap':'Todo initialization','single-no-plan-todo-bootstrap-retry':'Todo initialization retry'},title=String(data.title||labels[tag]||tag.replace(/-/g,' ')),parts=[];if(data.query)parts.push(`Query: ${data.query}`);if(data.returned!=null)parts.push(`Returned: ${data.returned}`);if(data.matched_rows!=null)parts.push(`Matches: ${data.matched_rows}`);if(data.archive_segment)parts.push(`Archive: ${data.archive_segment}`);if(data.reason)parts.push(`Reason: ${data.reason}`);const details=String(data.details||row.text||''),output=[parts.join('\n'),details].filter(Boolean).join('\n\n'),card=agentToolCard({kind:'control',name:tag,title,state:'Runtime',stateTone:'success',output,role:'System',expanded:data.default_collapsed===false});card.dataset.runtimeHint=tag;return card}
 function renderCompactCard(data){const before=Number(data.context_used_before||0),after=Number(data.context_used_after||0),reduction=Number(data.context_used_reduction||Math.max(0,before-after)),output=[data.reason?`Reason: ${data.reason}`:'',`Context used: ${before.toLocaleString()} → ${after.toLocaleString()}`,`Freed: ${reduction.toLocaleString()} tokens`,data.archived_messages!=null?`Archived messages: ${Number(data.archived_messages).toLocaleString()}`:'',data.archive_segment?`Archive: ${data.archive_segment}`:'',data.next_call_label?`Next: ${data.next_call_label}`:''].filter(Boolean).join('\n');return agentToolCard({kind:'compact',name:'compact',title:'Context compacted',state:data.effective===false?'Limited effect':'Completed',stateTone:data.effective===false?'':'success',output,role:data.agent_role||data.role||'System',expanded:false})}
 function replaceTrackedAgentToolCard(existing,card){if(existing?.isConnected)existing.replaceWith(card);for(const[key,value]of S.agentToolCards)if(value===existing)S.agentToolCards.set(key,card)}
 function clearTrackedAgentToolCard(card){for(const[key,value]of S.agentToolCards)if(value===card)S.agentToolCards.delete(key)}
@@ -108421,6 +108841,7 @@ function renderAgentState(state){
           if(type==='tool_calls'){const tools=Array.isArray(row.data?.tools)?row.data.tools:[],progress=String(row.data?.public_progress||(!text.toLowerCase().startsWith('[tool calls]')?text:'')).trim();if(progress&&!isSyntheticPublicProgress(progress))agentApproach(progress,role);renderAgentPlanCard(tools.length?tools:[text||'Tool calls scheduled'],role);continue}
           if(type==='approach'){agentApproach(text,role);continue}
           if(type==='web_search'){agentToolCard({kind:'tool',name:'web_search',title:'Web search',state:'Completed',stateTone:'success',output:text,role});continue}
+          if(type==='runtime_hint'){renderAgentRuntimeHint(row);continue}
           if(renderAgentControl(text,role))continue;
           const tone=row.role==='assistant'?'assistant':row.role==='user'?'user':type==='error'?'error':'system';agentMessage(text,tone,role);continue;
         }
@@ -116168,16 +116589,18 @@ document.addEventListener('DOMContentLoaded', function(){{
         for raw in snap.get("conversation_feed", []) if isinstance(snap, dict) else []:
             if not isinstance(raw, dict):
                 continue
-            is_hidden_runtime = getattr(sess, "_is_ui_hidden_runtime_message", None)
-            if callable(is_hidden_runtime):
-                hidden_runtime = bool(is_hidden_runtime(raw))
-            else:
-                raw_text = str(raw.get("text", raw.get("content", "")) or "").strip().lower()
-                hidden_runtime = any(
-                    raw_text.startswith(prefix) for prefix in UI_HIDDEN_RUNTIME_CONTROL_PREFIXES
-                )
-            if hidden_runtime:
+            is_hidden = getattr(sess, "_is_ui_hidden_runtime_message", None)
+            if callable(is_hidden) and bool(is_hidden(raw)):
                 continue
+            runtime_projection = None
+            project_runtime = getattr(sess, "_runtime_message_ui_projection", None)
+            is_runtime = getattr(sess, "_is_runtime_internal_message", None)
+            if callable(project_runtime):
+                runtime_projection = project_runtime(raw)
+            if callable(is_runtime) and bool(is_runtime(raw)):
+                if runtime_projection is None:
+                    continue
+                raw = runtime_projection
             role = str(raw.get("role", "system") or "system").strip().lower()
             public_text = str(raw.get("text", "") or "")
             if role == "user" and public_text.startswith("IDE programming request."):
@@ -116205,6 +116628,7 @@ document.addEventListener('DOMContentLoaded', function(){{
                 "plan_approved_handoff",
                 "step_verified",
                 "todo_focus",
+                "runtime_hint",
             }:
                 continue
             if not row["id"]:
