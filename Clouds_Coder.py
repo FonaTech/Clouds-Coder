@@ -4258,6 +4258,19 @@ WATCHDOG_MAX_DECOMPOSE_STEPS = 12
 WATCHDOG_STEP_MAX_ATTEMPTS = 2
 EMPTY_ACTION_MIN_CONTENT_CHARS = 5
 EMPTY_ACTION_WAKEUP_RETRY_LIMIT = 5
+# A completed response that contains reasoning but neither public content nor a
+# tool call is not itself a model failure.  Some reasoning models need several
+# turns to cross the reasoning/final boundary, especially behind compatibility
+# gateways that ignore ``think=False``.  Keep the ordinary path untouched until
+# a genuinely long consecutive streak is observed, then run one bounded,
+# provider-aware recovery ladder instead of accumulating near-identical hints.
+EMPTY_ACTION_INTERVENTION_THRESHOLD = 20
+# Todo bootstrap still needs a tool call, but reasoning models may require a
+# several completed thinking turns before they emit it.  Keep this grace
+# window separate from the generic empty-action threshold and do not synthesize
+# a Todo during it.
+EMPTY_ACTION_BOOTSTRAP_THINKING_GRACE_ROUNDS = 10
+EMPTY_ACTION_RECOVERY_MAX_TOKENS = 1600
 THINKING_BUDGET_FORCE_RATIO = 0.85
 # --- Tool timeout configuration ---
 _TOOL_TIMEOUT_MAP = {
@@ -4412,6 +4425,7 @@ RUNTIME_CONTROL_HINT_PREFIXES = (
     "<no-tool-recovery>",
     "<auto-context-recall>",
     "<live-user-adjustment",
+    "<user-feedback-merge",
     "<background-results>",
     "<inbox>",
     "<auto-continue>",
@@ -4422,6 +4436,20 @@ RUNTIME_CONTROL_HINT_PREFIXES = (
     "<fault-prefill>",
     "<single-no-plan-todo-bootstrap>",
     "<single-no-plan-todo-bootstrap-retry>",
+)
+# These blocks are runtime plumbing rather than user-visible conversation.  Keep
+# user-facing structured controls such as live-user-adjustment and
+# plan-approved-handoff available to the UI; only blocks that can leak model
+# orchestration/context transcripts are suppressed from the public feed.
+UI_HIDDEN_RUNTIME_CONTROL_PREFIXES = (
+    "<intent-fusion",
+    "<background-results>",
+    "<inbox>",
+    "<compact-resume>",
+    "<state_handoff>",
+    "<toolcall-overflow-recovery>",
+    "<read-loop-intervention>",
+    "<finish-blocked>",
 )
 RETRY_RUNTIME_HINT_PREFIXES = (
     "<todo-rescue>",
@@ -25156,7 +25184,11 @@ class OllamaClient:
             thinking_parts.append(thinking_inline)
         # Match the streaming path's 4-key coverage (some providers use
         # `thinking`/`thought` on the message object, not just reasoning*).
-        seen_thinking = set()
+        seen_thinking = {
+            str(item).strip()
+            for item in thinking_parts
+            if str(item).strip()
+        }
         for key in ("reasoning_content", "reasoning", "thinking", "thought"):
             extra_text = str(msg.get(key) or "").strip()
             if extra_text and extra_text not in seen_thinking:
@@ -25777,6 +25809,7 @@ class OllamaClient:
         req_messages: list[dict],
         *,
         tools: list[dict] | None = None,
+        tool_choice: str = "",
         max_tokens: int = 2000,
         temperature: float = 0.2,
         think: bool = False,
@@ -25797,6 +25830,12 @@ class OllamaClient:
         }
         if tools:
             payload["tools"] = tools
+        forced_tool_name = str(tool_choice or "").strip()
+        if tools and forced_tool_name:
+            payload["tool_choice"] = {
+                "type": "function",
+                "function": {"name": forced_tool_name},
+            }
         reasoning = reasoning or {}
         reasoning_fields = reasoning.get("payload") if isinstance(reasoning, dict) else None
         reasoning_strip = list(reasoning.get("strip_keys", []) or []) if isinstance(reasoning, dict) else []
@@ -25828,6 +25867,22 @@ class OllamaClient:
                     lines = self._iter_response_lines_url_with_retries(
                         endpoint,
                         fallback_payload,
+                        headers=self._render_headers(),
+                        max_attempts=http_retry_attempts,
+                        cancel_check=cancel_check,
+                        on_retry=on_http_retry,
+                    )
+                    return self._openai_stream_result_from_lines(lines, on_content_delta=on_content_delta)
+                # Tool choice is an optional compatibility optimization.  A
+                # number of otherwise OpenAI-compatible local gateways accept
+                # tools but reject this field; retry without it rather than
+                # turning a capability mismatch into a failed agent round.
+                if status_400 and "tool_choice" in payload:
+                    stripped = dict(payload)
+                    stripped.pop("tool_choice", None)
+                    lines = self._iter_response_lines_url_with_retries(
+                        endpoint,
+                        stripped,
                         headers=self._render_headers(),
                         max_attempts=http_retry_attempts,
                         cancel_check=cancel_check,
@@ -25874,6 +25929,18 @@ class OllamaClient:
                 raw = self._post_json_url_with_retries(
                     endpoint,
                     fallback_payload,
+                    headers=self._render_headers(),
+                    max_attempts=http_retry_attempts,
+                    cancel_check=cancel_check,
+                    on_retry=on_http_retry,
+                )
+            elif status_400 and "tool_choice" in payload:
+                stripped = dict(payload)
+                stripped.pop("tool_choice", None)
+                stripped["stream"] = False
+                raw = self._post_json_url_with_retries(
+                    endpoint,
+                    stripped,
                     headers=self._render_headers(),
                     max_attempts=http_retry_attempts,
                     cancel_check=cancel_check,
@@ -25987,6 +26054,7 @@ class OllamaClient:
         req_messages: list[dict],
         *,
         tools: list[dict] | None = None,
+        tool_choice: str = "",
         max_tokens: int = 2000,
         temperature: float = 0.2,
         think: bool = False,
@@ -26065,6 +26133,9 @@ class OllamaClient:
             payload["system"] = "\n\n".join(system_parts)
         if tools:
             payload["tools"] = self._convert_tools_to_anthropic(tools)
+            forced_tool_name = str(tool_choice or "").strip()
+            if forced_tool_name:
+                payload["tool_choice"] = {"type": "tool", "name": forced_tool_name}
         headers = {
             "x-api-key": self.api_key,
             "anthropic-version": "2023-06-01",
@@ -26079,11 +26150,23 @@ class OllamaClient:
                 raise
             except Exception as exc:
                 raise OllamaError(f"anthropic stream response failed: {exc}", url=endpoint) from exc
-        raw = self._post_json_url(endpoint, payload, headers=headers)
+        try:
+            raw = self._post_json_url(endpoint, payload, headers=headers)
+        except OllamaError as exc:
+            # Anthropic-compatible proxies do not all implement the optional
+            # tool_choice field.  Keep the native tool schema and retry once
+            # without the optimization before surfacing a provider error.
+            if int(getattr(exc, "status", 0) or 0) == 400 and "tool_choice" in payload:
+                fallback_payload = dict(payload)
+                fallback_payload.pop("tool_choice", None)
+                raw = self._post_json_url(endpoint, fallback_payload, headers=headers)
+            else:
+                raise
         # If the provider returned OpenAI-format (has 'choices'), it's an OpenAI-compat endpoint
         # that doesn't understand Anthropic tool schemas. Retry with OpenAI-format tools.
         if isinstance(raw.get("choices"), list) and tools:
             payload["tools"] = tools  # original OpenAI-format tools
+            payload.pop("tool_choice", None)
             raw = self._post_json_url(endpoint, payload, headers=headers)
         content, tool_calls, thinking_content = self._extract_anthropic_message(raw)
         return {"content": content, "thinking": thinking_content, "tool_calls": tool_calls, "raw": raw}
@@ -26116,7 +26199,7 @@ class OllamaClient:
                         "arguments": json_dumps(block.get("input", {})),
                     },
                 })
-        return "\n".join(text_parts), tool_calls, "\n".join(thinking_parts)
+        return "\n".join(text_parts), self._normalize_tool_calls(tool_calls), "\n".join(thinking_parts)
 
     def _anthropic_stream_result_from_lines(self, lines, *, on_content_delta=None) -> dict:
         text_parts: list[str] = []
@@ -26356,6 +26439,7 @@ class OllamaClient:
         messages: list[dict],
         *,
         tools: list[dict] | None = None,
+        tool_choice: str = "",
         system: str | None = None,
         max_tokens: int = 2000,
         temperature: float = 0.2,
@@ -26408,6 +26492,7 @@ class OllamaClient:
             return self._chat_openai_compat(
                 req_messages,
                 tools=tools,
+                tool_choice=tool_choice,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 think=False,
@@ -26422,6 +26507,7 @@ class OllamaClient:
             return self._chat_anthropic(
                 req_messages,
                 tools=tools,
+                tool_choice=tool_choice,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 think=False,
@@ -26494,8 +26580,12 @@ class OllamaClient:
             "stream": False,
             "options": {"temperature": temperature, "num_predict": effective_max_native},
         }
-        if think:
-            native_payload["think"] = True
+        # Ollama reasoning models (for example qwen3/deepseek-r1) may enable
+        # thinking by default when the field is omitted.  Send the explicit
+        # boolean for models that advertise the native switch so a bounded
+        # no-thinking compatibility turn can actually produce a tool call.
+        if model_reasoning_style(provider, self.model) == "ollama":
+            native_payload["think"] = bool(think)
         if tools:
             native_payload["tools"] = tools
         raw = self._post_json("/api/chat", native_payload)
@@ -26531,6 +26621,7 @@ class OllamaClient:
         messages: list[dict],
         *,
         tools: list[dict] | None = None,
+        tool_choice: str = "",
         system: str | None = None,
         max_tokens: int = 2000,
         temperature: float = 0.2,
@@ -26554,6 +26645,7 @@ class OllamaClient:
             response = self._chat_impl(
                 messages,
                 tools=tools,
+                tool_choice=tool_choice,
                 system=system,
                 max_tokens=max_tokens,
                 temperature=temperature,
@@ -26635,6 +26727,7 @@ TOOLS = [
         (
             "Update current todos. update_mode='status_update' is merge-only: omitted unfinished rows are preserved, "
             "so a partial progress payload can never shorten the task tree. In approved plan mode, use it for status-only progress. "
+            "Before changing todos, inspect the canonical rows supplied in the current context and decide whether each objective should be reused/updated, added as a genuinely independent item, or removed as obsolete. "
             "When new current-step tool evidence or reviewer findings prove the open subplan is no longer suitable, "
             "use update_mode='revise_open' with a concrete revision_reason and revision_evidence references; the runtime performs an atomic LLM audit "
             "against the authoritative goal, original Todo baseline, completed evidence, and remaining requirement coverage before replacing open rows. "
@@ -26671,12 +26764,17 @@ TOOLS = [
             "revision_reason": {"type": "string", "description": "Concrete new finding that justifies a structural rolling-plan revision."},
             "revision_evidence": {},
             "evidence": {},
+            "plan_updates": {
+                "type": "array",
+                "items": {},
+                "description": "Optional plan-step edits identified by step_id/id/key or plan_step_index. Single-step edits are applied directly; multi-step or structural edits receive an independent semantic/context review.",
+            },
         },
         [],
     ),
     tool_def(
         "TodoWriteRescue",
-        "Fallback todo writer using the same protected merge/replan transaction as TodoWrite. Omitted rows are preserved unless an explicit revise_open passes LLM review. Preferred format: objects with content/status/owner/parent_step_id. String fallback should use only '[ ] task', '[>] task', or '[x] task'.",
+        "Fallback todo writer using the same protected merge/replan transaction as TodoWrite. Inspect existing canonical rows first and choose reuse/update, independent add, or evidence-backed removal. Omitted rows are preserved unless an explicit revise_open passes LLM review. Preferred format: objects with content/status/owner/parent_step_id. String fallback should use only '[ ] task', '[>] task', or '[x] task'.",
         {
             "items": {"type": "array", "items": {}},
             "todos": {"type": "array", "items": {}},
@@ -26700,6 +26798,7 @@ TOOLS = [
             "revision_reason": {"type": "string"},
             "revision_evidence": {},
             "evidence": {},
+            "plan_updates": {"type": "array", "items": {}},
         },
         [],
     ),
@@ -26739,6 +26838,7 @@ TOOLS = [
             "evidence": {},
             "revision_reason": {"type": "string"},
             "revision_evidence": {"type": "array", "items": {"type": "string"}},
+            "plan_updates": {"type": "array", "items": {}},
         },
         [],
     ),
@@ -30300,6 +30400,40 @@ class SessionState:
             if txt.startswith(prefix):
                 return True
         return False
+
+    def _is_ui_hidden_runtime_message(self, message: object) -> bool:
+        """Return whether a persisted message is runtime plumbing, not chat.
+
+        Runtime recovery/context messages are intentionally kept in model history,
+        but must never be projected as ordinary user/assistant bubbles.  The
+        explicit metadata checks cover new writes; prefix checks keep older
+        sessions safe after an upgrade.  Deliberately do not classify every
+        ``<tag>`` block so legitimate HTML/XML user content remains visible.
+        """
+        if not isinstance(message, dict):
+            return False
+        if bool(message.get("_ui_hidden", False)) or bool(message.get("_runtime_internal", False)):
+            return True
+        msg_type = str(message.get("type", "") or "").strip().lower()
+        if msg_type in {"runtime_internal", "runtime_control", "internal"}:
+            return True
+        content = message.get("content", "")
+        if not content:
+            content = message.get("text", "")
+        if isinstance(content, list):
+            parts: list[str] = []
+            for block in content:
+                if isinstance(block, dict):
+                    value = block.get("text", block.get("content", ""))
+                    if isinstance(value, str):
+                        parts.append(value)
+            text = "\n".join(parts)
+        else:
+            text = str(content or "")
+        low = text.strip().lower()
+        if not low:
+            return False
+        return any(low.startswith(prefix) for prefix in UI_HIDDEN_RUNTIME_CONTROL_PREFIXES)
 
     def _has_prior_real_user_task_message(self) -> bool:
         for row in self.messages:
@@ -36892,6 +37026,27 @@ class SessionState:
             )
         else:
             rows.append("progress_signal=normal")
+        try:
+            canonical_rows = [
+                row for row in self.todo.snapshot()
+                if isinstance(row, dict) and self._todo_row_kind(row) != "system"
+            ]
+        except Exception:
+            canonical_rows = []
+        if canonical_rows:
+            rows.append(
+                "CURRENT CANONICAL TODO ROWS (inspect before any update):\n"
+                + "\n".join(
+                    f"- [{str(row.get('status', 'pending')).lower()}] "
+                    f"id={trim(str(row.get('subtask_id', '') or row.get('key', '') or ''), 80)} "
+                    f"{trim(str(row.get('content', '') or ''), 180)}"
+                    for row in canonical_rows[:24]
+                )
+            )
+            rows.append(
+                "Choose autonomously for each incoming objective: reuse/update an existing row, add an independent row, "
+                "or remove an obsolete open row only with evidence-backed revise_open. Completed rows and evidence are immutable."
+            )
         rows.append(
             "These are shared observations, not a phase, role, tool, or next-action selection. "
             "Choose autonomously from the objective, evidence, agent perspectives, and Todo state; "
@@ -36920,6 +37075,21 @@ class SessionState:
         pending = int(alignment.get("todo_pending", 0) or 0)
         in_progress = int(alignment.get("todo_in_progress", 0) or 0)
         all_completed = bool(alignment.get("all_todos_completed", False))
+        try:
+            canonical_rows = [
+                dict(row) for row in self.todo.snapshot()
+                if isinstance(row, dict)
+                and self._todo_row_kind(row) != "system"
+            ]
+        except Exception:
+            canonical_rows = []
+        canonical_text = "\n".join(
+            f"- [{str(row.get('status', 'pending')).lower()}] "
+            f"id={trim(str(row.get('subtask_id', '') or row.get('key', '') or ''), 100)} "
+            f"{trim(str(row.get('content', '') or ''), 360)}"
+            for row in canonical_rows[:40]
+            if str(row.get("content", "") or "").strip()
+        ) or "(none)"
         return trim(
             "\n".join(
                 [
@@ -36929,6 +37099,8 @@ class SessionState:
                     f"todo_progress={completed}/{total} pending={pending} in_progress={in_progress} "
                     f"all_completed={str(all_completed).lower()}",
                     "This block reports canonical Todo facts only. It does not choose a phase, tool, role, or next action; reason autonomously from the objective and evidence.",
+                    "Before modifying Todo state, inspect the complete canonical rows below and decide whether each incoming objective is an existing row to update, a genuinely new row to add, or an obsolete open row to remove. Preserve stable ids and completed evidence; use revise_open with concrete evidence for removals or structural changes.",
+                    "CURRENT CANONICAL TODO ROWS:\n" + canonical_text,
                     "When tool results have actually completed one or more Todo rows, call TodoWrite or TodoWriteRescue with update_mode='status_update' before doing work that belongs to another row. One call may mark every evidence-backed completed row and set exactly one remaining open row to in_progress; do not force one bookkeeping call per row. If every row is complete, leave none in_progress and proceed to objective-level acceptance or finish.",
                     "Do not advance Todo status from approach prose, intention, or an unverified claim alone.",
                     "</single-todo-alignment-state>",
@@ -43749,6 +43921,298 @@ body{padding:18px}
             return True
         return not body
 
+    def _response_action_parts(self, response: object) -> tuple[str, str, list]:
+        """Normalize public text, hidden reasoning, and tool calls for recovery.
+
+        All supported transports already return these three provider-neutral
+        fields.  Keeping the last normalization here prevents recovery code
+        from depending on whether the source was OpenAI, Anthropic, Ollama,
+        MLX/vLLM, or a custom compatible gateway.
+        """
+        row = response if isinstance(response, dict) else {}
+        text = str(row.get("content") or "")
+        thinking = str(row.get("thinking") or "").strip()
+        text_main, embedded = split_thinking_content(text)
+        if embedded:
+            thinking = trim(f"{thinking}\n\n{embedded}".strip(), 24_000)
+        calls = row.get("tool_calls", [])
+        return text_main, thinking, calls if isinstance(calls, list) else []
+
+    def _recover_inline_todo_tool_call(self, *sources: object) -> dict | None:
+        """Salvage a recognizable Todo call emitted as text or partial JSON.
+
+        Some compatible models print a function-call object in ``content`` or
+        finish the tool name while truncating its arguments.  This rescue is
+        deliberately limited to Todo writers: recovering arbitrary mutation
+        calls from prose would be unsafe.
+        """
+        for source in sources:
+            text = str(source or "").strip()
+            if not text or not re.search(r"TodoWrite(?:Rescue)?", text, re.IGNORECASE):
+                continue
+            candidates: list[object] = []
+            parsed, _ = parse_tool_arguments_with_error(text)
+            if parsed:
+                candidates.append(parsed)
+            first = text.find("{")
+            if first >= 0:
+                fragment = text[first:]
+                parsed_fragment, _ = parse_tool_arguments_with_error(fragment)
+                if parsed_fragment:
+                    candidates.append(parsed_fragment)
+                candidates.append(fragment)
+            candidates.append(text)
+            for candidate in candidates:
+                payload = candidate
+                if isinstance(candidate, dict):
+                    fn = candidate.get("function") if isinstance(candidate.get("function"), dict) else {}
+                    name = canonicalize_tool_name(
+                        fn.get("name")
+                        or candidate.get("name")
+                        or candidate.get("tool")
+                        or candidate.get("tool_name")
+                    )
+                    if name and name not in {"TodoWrite", "TodoWriteRescue"}:
+                        continue
+                    payload = (
+                        fn.get("arguments")
+                        if fn.get("arguments") not in (None, "")
+                        else candidate.get("arguments", candidate.get("input", candidate))
+                    )
+                items = self._todo_payload_items(payload, limit=40) if isinstance(payload, dict) else []
+                if not items:
+                    items = self._extract_text_items_from_raw_args(payload)
+                clean_items: list[object] = []
+                for item in items[:40]:
+                    if isinstance(item, dict):
+                        content = trim(str(item.get("content", "") or "").strip(), 500)
+                        if content:
+                            clean_items.append({**item, "content": content})
+                    else:
+                        content = trim(str(item or "").strip(), 500)
+                        if content:
+                            clean_items.append(content)
+                if clean_items:
+                    return {
+                        "id": make_id("tool"),
+                        "type": "function",
+                        "function": {
+                            "name": "TodoWriteRescue",
+                            "arguments": {"items": clean_items, "in_progress_index": 0},
+                        },
+                    }
+        return None
+
+    def _recover_inline_action_tool_call(self, *sources: object) -> dict | None:
+        """Recover one explicitly structured non-Todo tool call from text.
+
+        This path never guesses a command from prose.  It accepts only an
+        object carrying a recognizable ``name``/``function.name`` and an
+        ``arguments``/``input`` object, and only when that name is currently
+        exposed by the runtime tool catalog.
+        """
+        exposed: set[str] = set()
+        try:
+            for spec in self._available_tools():
+                fn = spec.get("function", {}) if isinstance(spec, dict) else {}
+                name = canonicalize_tool_name(fn.get("name", ""))
+                if name:
+                    exposed.add(name)
+        except Exception:
+            exposed = set()
+        if not exposed:
+            return None
+        for source in sources:
+            text = str(source or "").strip()
+            if not text or "{" not in text:
+                continue
+            candidates: list[object] = []
+            parsed, _ = parse_tool_arguments_with_error(text)
+            if parsed:
+                candidates.append(parsed)
+            first = text.find("{")
+            fragment = text[first:] if first >= 0 else ""
+            if fragment:
+                parsed_fragment, _ = parse_tool_arguments_with_error(fragment)
+                if parsed_fragment:
+                    candidates.append(parsed_fragment)
+                candidates.append(fragment)
+            for candidate in candidates:
+                if not isinstance(candidate, dict):
+                    continue
+                fn = candidate.get("function") if isinstance(candidate.get("function"), dict) else {}
+                name = canonicalize_tool_name(
+                    fn.get("name")
+                    or candidate.get("name")
+                    or candidate.get("tool")
+                    or candidate.get("tool_name")
+                )
+                if not name or name not in exposed or name in {"TodoWrite", "TodoWriteRescue"}:
+                    continue
+                raw_args = (
+                    fn.get("arguments")
+                    if fn.get("arguments") not in (None, "")
+                    else candidate.get("arguments", candidate.get("input", {}))
+                )
+                args, _ = parse_tool_arguments_with_error(raw_args)
+                if not isinstance(args, dict):
+                    repaired = repair_truncated_json_object(raw_args)
+                    args, _ = parse_tool_arguments_with_error(repaired)
+                if not isinstance(args, dict):
+                    continue
+                return {
+                    "id": make_id("tool"),
+                    "type": "function",
+                    "function": {"name": name, "arguments": args},
+                }
+        return None
+
+    def _provider_supports_native_tool_choice(self) -> bool:
+        provider = str(getattr(getattr(self, "ollama", None), "provider", "") or "").strip().lower()
+        return bool(provider == "anthropic" or is_openai_compat_provider(provider))
+
+    def _recover_thinking_only_response(
+        self,
+        original_response: object,
+        *,
+        bootstrap: bool,
+        tools: list,
+        pinned_selection: str,
+    ) -> dict:
+        """Run the four-stage, bounded compatibility ladder after a long streak."""
+        max_tokens = min(
+            int(getattr(self, "max_output_tokens", EMPTY_ACTION_RECOVERY_MAX_TOKENS) or EMPTY_ACTION_RECOVERY_MAX_TOKENS),
+            int(EMPTY_ACTION_RECOVERY_MAX_TOKENS),
+        )
+        short_instruction = (
+            "The previous completed responses contained reasoning but no final action. "
+            "Use the existing reasoning and return the required TodoWrite/TodoWriteRescue call now. "
+            "Do not repeat analysis."
+            if bootstrap
+            else
+            "The previous completed responses contained reasoning but no final action. "
+            "Use the existing reasoning and return one concise final answer or one concrete tool call now. "
+            "Do not repeat analysis."
+        )
+        _original_row = original_response if isinstance(original_response, dict) else {}
+        _prior_signal = trim(
+            str(_original_row.get("thinking") or "").strip(),
+            1200,
+        )
+        if _prior_signal:
+            short_instruction += (
+                "\nPrior internal reasoning signal (use it silently; do not quote or expand it): "
+                f"{_prior_signal}"
+            )
+        first: dict = {}
+        second: dict = {}
+        try:
+            first = self._chat_with_same_model_retry(
+                list(self.messages) + [{"role": "user", "content": short_instruction, "ts": now_ts()}],
+                tools=tools,
+                system=self._system_prompt(),
+                max_tokens=max_tokens,
+                # Preserve a small reasoning budget for the first continuation;
+                # the second stage below is the explicit no-thinking fallback.
+                think=True,
+                stream_thinking=False,
+                pinned_selection=pinned_selection,
+                context_label="thinking-only short recovery",
+                retries=0,
+                media_inputs=None,
+                effort=EFFORT_LOW,
+            )
+        except OllamaError as exc:
+            if self.cancel_requested or int(getattr(exc, "status", 0) or 0) == 499:
+                raise
+        text1, thinking1, calls1 = self._response_action_parts(first)
+        if bootstrap and not calls1:
+            repaired = self._recover_inline_todo_tool_call(text1)
+            if repaired:
+                calls1 = [repaired]
+        if bootstrap:
+            calls1 = [
+                call for call in calls1
+                if canonicalize_tool_name(
+                    (call.get("function", {}) if isinstance(call, dict) else {}).get("name", "")
+                ) in {"TodoWrite", "TodoWriteRescue"}
+            ]
+        if calls1 or (text1.strip() and not bootstrap):
+            return {"ok": True, "response": {"content": text1, "thinking": thinking1, "tool_calls": calls1}, "stage": "short"}
+
+        forced_name = "TodoWrite" if bootstrap and self._provider_supports_native_tool_choice() else ""
+        second_instruction = (
+            "/no_think\nThinking is disabled for this compatibility retry. "
+            "Call TodoWrite now with 1-40 evidence-based items and exactly one in_progress item. "
+            "Output no prose."
+            if bootstrap
+            else
+            "/no_think\nThinking is disabled for this compatibility retry. "
+            "Return one concise final answer or one concrete tool call. Output no analysis."
+        )
+        try:
+            forced_kwargs = {
+                "tools": (self._single_no_plan_todo_bootstrap_tools() if bootstrap else tools),
+                "system": self._system_prompt(),
+                "max_tokens": max_tokens,
+                "think": False,
+                "stream_thinking": False,
+                "pinned_selection": pinned_selection,
+                "context_label": "thinking-only forced action recovery",
+                "retries": 0,
+                "media_inputs": None,
+                "effort": EFFORT_OFF,
+            }
+            if forced_name:
+                forced_kwargs["tool_choice"] = forced_name
+            second = self._chat_with_same_model_retry(
+                list(self.messages) + [{"role": "user", "content": second_instruction, "ts": now_ts()}],
+                **forced_kwargs,
+            )
+        except OllamaError as exc:
+            if self.cancel_requested or int(getattr(exc, "status", 0) or 0) == 499:
+                raise
+        text2, thinking2, calls2 = self._response_action_parts(second)
+        if bootstrap and not calls2:
+            repaired = self._recover_inline_todo_tool_call(text2)
+            if repaired:
+                calls2 = [repaired]
+        if bootstrap:
+            calls2 = [
+                call for call in calls2
+                if canonicalize_tool_name(
+                    (call.get("function", {}) if isinstance(call, dict) else {}).get("name", "")
+                ) in {"TodoWrite", "TodoWriteRescue"}
+            ]
+        if calls2 or (text2.strip() and not bootstrap):
+            return {"ok": True, "response": {"content": text2, "thinking": thinking2, "tool_calls": calls2}, "stage": "forced"}
+
+        # Stage three also considers hidden reasoning and the original response,
+        # but only for the explicitly named Todo writers.
+        if bootstrap:
+            original_text, original_thinking, _ = self._response_action_parts(original_response)
+            repaired = self._recover_inline_todo_tool_call(
+                text2, thinking2, text1, thinking1, original_text, original_thinking
+            )
+            if repaired:
+                return {
+                    "ok": True,
+                    "response": {"content": "", "thinking": "", "tool_calls": [repaired]},
+                    "stage": "repair",
+                }
+        else:
+            original_text, original_thinking, _ = self._response_action_parts(original_response)
+            repaired = self._recover_inline_action_tool_call(
+                text2, thinking2, text1, thinking1, original_text, original_thinking
+            )
+            if repaired:
+                return {
+                    "ok": True,
+                    "response": {"content": "", "thinking": "", "tool_calls": [repaired]},
+                    "stage": "repair",
+                }
+        return {"ok": False, "response": {}, "stage": "exhausted"}
+
     def _is_thinking_budget_exhausted(
         self,
         text: str,
@@ -44809,6 +45273,7 @@ body{padding:18px}
         messages: list[dict],
         *,
         tools: list | None = None,
+        tool_choice: str = "",
         system: str = "",
         max_tokens: int | None = None,
         think: bool | None = None,
@@ -44903,9 +45368,14 @@ body{padding:18px}
                     lambda: self.ollama.chat(
                         messages,
                         tools=tools,
+                        **(
+                            {"tool_choice": str(tool_choice).strip()}
+                            if str(tool_choice or "").strip()
+                            else {}
+                        ),
                         system=system,
                         max_tokens=max_tokens,
-                        think=False,
+                        think=bool(think) if think is not None else False,
                         stream_thinking=bool(stream_thinking),
                         on_thinking_chunk=on_thinking_chunk,
                         response_stream=response_stream_enabled,
@@ -45021,9 +45491,14 @@ body{padding:18px}
                             lambda: self.ollama.chat(
                                 fallback_messages,
                                 tools=tools,
+                                **(
+                                    {"tool_choice": str(tool_choice).strip()}
+                                    if str(tool_choice or "").strip()
+                                    else {}
+                                ),
                                 system=system,
                                 max_tokens=max_tokens,
-                                think=False,
+                                think=bool(think) if think is not None else False,
                                 stream_thinking=bool(stream_thinking),
                                 on_thinking_chunk=on_thinking_chunk,
                                 response_stream=response_stream_enabled,
@@ -58095,6 +58570,385 @@ body{padding:18px}
             current = stripped
         return {form for form in forms if len(form) >= 2}
 
+    @staticmethod
+    def _plan_update_rows(value: object) -> list[dict]:
+        """Normalize the optional model-authored plan-step edit envelope."""
+        if isinstance(value, dict):
+            for key in ("updates", "steps", "items", "rows"):
+                nested = value.get(key)
+                if isinstance(nested, list):
+                    value = nested
+                    break
+            else:
+                # A compact provider payload may use {step_id: new_content}.
+                value = [
+                    {"step_id": key, "content": content}
+                    for key, content in value.items()
+                    if str(key or "").strip()
+                ]
+        if not isinstance(value, list):
+            return []
+        rows: list[dict] = []
+        for raw in value[:40]:
+            if isinstance(raw, str):
+                continue
+            if not isinstance(raw, dict):
+                continue
+            row = dict(raw)
+            # Accept the common camelCase aliases without guessing a target
+            # from prose. A plan row must be addressed by its stable identity.
+            for source, target in (
+                ("stepId", "step_id"),
+                ("planStepId", "step_id"),
+                ("plan_step_key", "key"),
+                ("stepIndex", "plan_step_index"),
+                ("fullContent", "full_content"),
+            ):
+                if target not in row and source in row:
+                    row[target] = row.get(source)
+            rows.append(row)
+        return rows
+
+    def _plan_step_revision_context(self, board: dict | None = None) -> str:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        plan_rows = [
+            row for row in (bb.get("project_todos", []) if isinstance(bb.get("project_todos"), list) else [])
+            if isinstance(row, dict) and str(row.get("category", "") or "") == "plan_step"
+        ]
+        lines = [
+            f"- step {int(row.get('plan_step_index', 0) or 0) + 1} [{row.get('status', 'pending')}]: "
+            f"{trim(str(row.get('full_content', '') or row.get('content', '') or ''), 900)}"
+            for row in plan_rows
+        ]
+        evidence = self._root_todo_revision_evidence([], board=bb)
+        workers = self.todo.snapshot() if hasattr(self, "todo") else []
+        worker_lines = [
+            f"- [{row.get('status', 'pending')}] {trim(str(row.get('content', '') or ''), 360)}"
+            for row in workers
+            if isinstance(row, dict) and self._todo_row_kind(row) == "plan_worker"
+        ][-16:]
+        return (
+            "CURRENT PLAN:\n" + ("\n".join(lines) or "(none)")
+            + "\n\nCURRENT WORKER TODOs:\n" + ("\n".join(worker_lines) or "(none)")
+            + "\n\nRECENT PROGRESS EVIDENCE:\n" + ("\n".join(f"- {item}" for item in evidence[-16:]) or "(none)")
+        )
+
+    def _semantic_audit_plan_step_updates(
+        self,
+        current_rows: list[dict],
+        proposed_rows: list[dict],
+        changed_ids: list[str],
+        *,
+        reason: str = "",
+        evidence: object = None,
+        board: dict | None = None,
+    ) -> dict:
+        """Review multi-step plan edits against the goal and live progress."""
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        goal = str(
+            self._authoritative_user_goal_for_model()
+            or bb.get("original_goal", "")
+            or ""
+        ).strip()
+
+        def _render(rows: list[dict]) -> str:
+            return "\n".join(
+                f"- {int(row.get('plan_step_index', 0) or 0) + 1} [{row.get('status', 'pending')}]: "
+                f"{trim(str(row.get('full_content', '') or row.get('content', '') or ''), 900)}"
+                for row in rows
+                if isinstance(row, dict)
+            ) or "(none)"
+
+        prompt = (
+            "/no_think\n"
+            "You are an independent reviewer for a model-proposed execution-plan edit. "
+            "The model may refine wording when new progress justifies it, but the authoritative user goal, "
+            "ordered dependencies, completed evidence, and unfinished obligations must remain covered. "
+            "Approve only when the proposed edits are justified by the supplied progress and do not silently "
+            "drop, duplicate, or reorder work. Return JSON only: "
+            "{\"decision\":\"approve|reject\",\"confidence\":\"high|medium|low\","
+            "\"reason\":\"...\",\"completion_risk\":\"low|medium|high\","
+            "\"requirement_coverage\":[\"...\"],\"evidence\":[\"...\"]}.\n\n"
+            f"AUTHORITATIVE USER GOAL:\n{goal or '(unavailable)'}\n\n"
+            f"EDITED STEP IDS: {', '.join(changed_ids) or '(none)'}\n"
+            f"PROPOSER REASON:\n{trim(str(reason or ''), 1200) or '(none)'}\n"
+            f"PROPOSER EVIDENCE:\n{trim(json.dumps(evidence, ensure_ascii=False), 1600) if evidence not in (None, '', []) else '(none)'}\n\n"
+            "BEFORE:\n" + _render(current_rows) + "\n\n"
+            "AFTER:\n" + _render(proposed_rows) + "\n\n"
+            + self._plan_step_revision_context(bb)
+        )
+        try:
+            response = self.ollama.chat(
+                [{"role": "user", "content": prompt}],
+                system=self._inject_runtime_environment_context(
+                    "/no_think\nYou audit multi-step execution-plan edits. Reply only valid JSON."
+                ),
+                max_tokens=900,
+                temperature=0.1,
+                think=False,
+            )
+            raw = str(response.get("content", "") or response.get("text", "") or "").strip()
+            payload = extract_json_object_from_text(raw, {})
+            if not isinstance(payload, dict) or not payload:
+                return {"available": False, "approved": False, "reason": "plan-step review returned invalid JSON"}
+            decision = str(payload.get("decision", "") or "").strip().lower()
+            confidence = str(payload.get("confidence", "low") or "low").strip().lower()
+            risk = str(payload.get("completion_risk", "high") or "high").strip().lower()
+            review_reason = trim(str(payload.get("reason", "") or "").strip(), 1200)
+            coverage = payload.get("requirement_coverage", [])
+            review_evidence = payload.get("evidence", [])
+            if (
+                decision not in {"approve", "reject"}
+                or confidence not in {"high", "medium", "low"}
+                or risk not in {"low", "medium", "high"}
+                or len(review_reason) < 6
+                or not isinstance(coverage, list)
+                or not isinstance(review_evidence, list)
+            ):
+                return {"available": False, "approved": False, "reason": "plan-step review omitted required fields"}
+            return {
+                "available": True,
+                "approved": decision == "approve",
+                "decision": decision,
+                "confidence": confidence,
+                "completion_risk": risk,
+                "reason": review_reason,
+                "requirement_coverage": [trim(str(item or ""), 700) for item in coverage[:40] if str(item or "").strip()],
+                "evidence": [trim(str(item or ""), 700) for item in review_evidence[:20] if str(item or "").strip()],
+            }
+        except Exception as exc:
+            return {"available": False, "approved": False, "reason": f"plan-step review unavailable: {trim(str(exc), 240)}"}
+
+    def _record_plan_step_revision(
+        self,
+        *,
+        status: str,
+        mode: str,
+        changed_ids: list[str],
+        reason: str,
+        review: dict | None = None,
+        board: dict | None = None,
+    ) -> None:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        rows = list(bb.get("plan_step_revisions", []) if isinstance(bb.get("plan_step_revisions"), list) else [])
+        review = review if isinstance(review, dict) else {}
+        rows.append({
+            "status": trim(str(status or ""), 24),
+            "mode": trim(str(mode or ""), 32),
+            "changed_step_ids": [trim(str(item or ""), 60) for item in changed_ids[:40] if str(item or "").strip()],
+            "reason": trim(str(reason or ""), 1200),
+            "review_reason": trim(str(review.get("reason", "") or ""), 1200),
+            "completion_risk": trim(str(review.get("completion_risk", "") or ""), 24),
+            "requirement_coverage": list(review.get("requirement_coverage", []) or [])[:40],
+            "evidence": list(review.get("evidence", []) or [])[:20],
+            "ts": float(now_ts()),
+        })
+        bb["plan_step_revisions"] = rows[-40:]
+        bb["updated_at"] = float(now_ts())
+        self.blackboard = bb
+
+    def _apply_plan_step_updates(
+        self,
+        updates: object,
+        *,
+        board: dict | None = None,
+        reason: str = "",
+        evidence: object = None,
+        update_mode: str = "status_update",
+    ) -> str:
+        """Apply explicit model-authored plan edits with scope-based review."""
+        rows = self._plan_update_rows(updates)
+        if not rows:
+            return ""
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        current = [
+            dict(row) for row in (bb.get("project_todos", []) if isinstance(bb.get("project_todos"), list) else [])
+            if isinstance(row, dict)
+        ]
+        plan_rows = [row for row in current if str(row.get("category", "") or "") == "plan_step"]
+        if not plan_rows:
+            return self._plan_control_feedback("plan_update_rejected", "No canonical plan steps exist to update.")
+        by_id: dict[str, dict] = {}
+        for row in plan_rows:
+            rid = trim(str(row.get("id", "") or ""), 60)
+            key = trim(str(row.get("key", "") or ""), 120)
+            if rid:
+                by_id[rid] = row
+            if key:
+                by_id[key] = row
+                by_id[key.removeprefix("bb:proj:")] = row
+        proposed = [dict(row) for row in current]
+        proposed_by_id = {
+            trim(str(row.get("id", "") or ""), 60): row
+            for row in proposed
+            if str(row.get("category", "") or "") == "plan_step" and str(row.get("id", "") or "").strip()
+        }
+        changed_ids: list[str] = []
+        rejected_targets: list[str] = []
+        remove_ids: set[str] = set()
+        mode = str(update_mode or "status_update").strip().lower().replace("-", "_")
+        for update in rows:
+            target_ref = trim(str(
+                update.get("step_id", update.get("id", update.get("key", ""))) or ""
+            ), 120)
+            target = by_id.get(target_ref)
+            if target is None and update.get("plan_step_index") not in (None, ""):
+                try:
+                    target = next(
+                        row for row in plan_rows
+                        if int(row.get("plan_step_index", -1) or -1) == int(update.get("plan_step_index"))
+                    )
+                except Exception:
+                    target = None
+            if target is None:
+                rejected_targets.append(target_ref or "(missing step identity)")
+                continue
+            target_id = trim(str(target.get("id", "") or ""), 60)
+            proposal = proposed_by_id.get(target_id)
+            if not isinstance(proposal, dict):
+                continue
+            old_status = self._normalize_todo_status_value(proposal.get("status", ""), "pending")
+            action = str(update.get("action", update.get("operation", "update")) or "update").strip().lower().replace("-", "_")
+            if action in {"remove", "delete", "drop", "retire"}:
+                if old_status == "completed":
+                    rejected_targets.append(target_id or target_ref)
+                else:
+                    remove_ids.add(target_id)
+                    changed_ids.append(target_id)
+                continue
+            if old_status == "completed":
+                # Completion records are immutable. A failed/reviewed rework must
+                # use the existing worker rework flow, not silently rewrite history.
+                content_candidate = update.get("full_content", update.get("content", update.get("title", None)))
+                if content_candidate not in (None, ""):
+                    rejected_targets.append(target_id or target_ref)
+                continue
+            new_full = update.get("full_content", update.get("content", update.get("title", None)))
+            if new_full not in (None, ""):
+                full_text = normalize_embedded_newlines(str(new_full or "")).strip()
+                if full_text:
+                    proposal["full_content"] = trim(full_text, PLAN_STEP_FULL_CONTENT_MAX_CHARS)
+                    proposal["content"] = trim(full_text.split("\n", 1)[0], 500)
+            requested_status = self._normalize_todo_status_value(update.get("status", ""), old_status)
+            if requested_status == "completed":
+                rejected_targets.append(target_id or target_ref)
+            elif requested_status in {"pending", "in_progress"}:
+                proposal["status"] = requested_status
+            if (
+                normalize_embedded_newlines(str(proposal.get("content", "") or ""))
+                != normalize_embedded_newlines(str(target.get("content", "") or ""))
+                or proposal.get("status") != target.get("status")
+            ):
+                changed_ids.append(target_id)
+                proposal["updated_at"] = float(now_ts())
+        changed_ids = list(dict.fromkeys(value for value in changed_ids if value))
+        if rejected_targets:
+            return self._plan_control_feedback(
+                "plan_update_rejected",
+                "Completed plan steps or unresolved identities cannot be rewritten: "
+                + ", ".join(dict.fromkeys(rejected_targets))
+                + ". Preserve their evidence and address open steps by stable step_id/id/key.",
+            )
+        if not changed_ids:
+            return self._plan_control_feedback("plan_update_no_changes", "The supplied plan updates made no safe changes.")
+
+        if remove_ids:
+            proposed = [
+                row for row in proposed
+                if not (
+                    str(row.get("category", "") or "") == "plan_step"
+                    and trim(str(row.get("id", "") or ""), 60) in remove_ids
+                )
+            ]
+        review: dict = {"available": False, "approved": True, "reason": "single open plan step update"}
+        # Deletion always requires review. Updating two or more steps also
+        # requires review because ordering/coverage can change even when each
+        # individual edit looks harmless.
+        requires_review = bool(remove_ids or len(changed_ids) > 1)
+        if requires_review:
+            review = self._semantic_audit_plan_step_updates(
+                plan_rows,
+                [row for row in proposed if str(row.get("category", "") or "") == "plan_step"],
+                changed_ids,
+                reason=reason,
+                evidence=evidence,
+                board=bb,
+            )
+            if not bool(review.get("available", False)) or not bool(review.get("approved", False)):
+                self._record_plan_step_revision(
+                    status="rejected",
+                    mode="multi_step_review",
+                    changed_ids=changed_ids,
+                    reason=reason,
+                    review=review,
+                    board=bb,
+                )
+                return self._plan_control_feedback(
+                    "plan_update_rejected",
+                    f"Multi-step plan update rejected: {review.get('reason', 'independent review did not approve the edit')}",
+                )
+            revision_mode = "semantic_review"
+        else:
+            revision_mode = "single_step_update"
+        # Reindex the surviving plan rows while keeping every row's stable id,
+        # completion state, and evidence intact.
+        next_index = 0
+        for row in proposed:
+            if str(row.get("category", "") or "") != "plan_step":
+                continue
+            row["plan_step_index"] = next_index
+            next_index += 1
+        bb["project_todos"] = proposed
+        if remove_ids and hasattr(self, "todo"):
+            archived = list(
+                bb.get("plan_worker_todo_archive", [])
+                if isinstance(bb.get("plan_worker_todo_archive"), list)
+                else []
+            )
+            live_rows: list[dict] = []
+            for raw_worker in self.todo.snapshot():
+                if not isinstance(raw_worker, dict):
+                    continue
+                parent_id = trim(str(raw_worker.get("parent_step_id", "") or ""), 60)
+                if parent_id in remove_ids and self._todo_row_kind(raw_worker) == "plan_worker":
+                    archived.append({**dict(raw_worker), "archived_reason": "plan-step-deleted", "archived_at": float(now_ts())})
+                else:
+                    live_rows.append(dict(raw_worker))
+            if len(live_rows) != len(self.todo.snapshot()):
+                with self.todo.lock:
+                    self.todo.items = live_rows
+            bb["plan_worker_todo_archive"] = archived[-120:]
+            mirror = dict(bb.get("plan_worker_todos", {}) if isinstance(bb.get("plan_worker_todos"), dict) else {})
+            for removed_id in remove_ids:
+                mirror.pop(removed_id, None)
+            bb["plan_worker_todos"] = mirror
+        plan = dict(bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {})
+        plan["steps"] = [
+            str(row.get("full_content", "") or row.get("content", "") or "")
+            for row in proposed
+            if str(row.get("category", "") or "") == "plan_step"
+        ]
+        bb["plan"] = plan
+        self._normalize_plan_step_progress(bb)
+        self.blackboard = bb
+        self._record_plan_step_revision(
+            status="accepted",
+            mode=revision_mode,
+            changed_ids=changed_ids,
+            reason=reason,
+            review=review,
+            board=bb,
+        )
+        try:
+            self._blackboard_touch()
+            self._update_plan_file_step_status()
+        except Exception:
+            pass
+        return (
+            f"Plan step update accepted ({revision_mode}; changed={len(changed_ids)}). "
+            "Canonical step identities and completed evidence were preserved."
+        )
+
     def _plan_worker_row_duplicates_parent_step(self, row: dict | None, plan_step: dict | None) -> bool:
         if not isinstance(row, dict) or not isinstance(plan_step, dict):
             return False
@@ -58132,6 +58986,187 @@ body{padding:18px}
             if row_major > 0 and row_major == step_index and marker_title_forms.intersection(step_forms):
                 return True
         return False
+
+    def _classify_plan_worker_parent_update(
+        self,
+        row: dict | None,
+        plan_step: dict | None,
+        *,
+        board: dict | None = None,
+    ) -> dict:
+        """Ask the active model whether an unscoped Todo is a parent edit.
+
+        This deliberately does not classify by keywords. Explicit N.M rows or
+        caller-supplied parent_step_id values remain worker subtasks; only an
+        inferred-parent, unnumbered row is ambiguous enough to ask the model.
+        """
+        if not isinstance(row, dict) or not isinstance(plan_step, dict):
+            return {}
+        if not bool(row.get("_parent_step_inferred", False)):
+            return {}
+        content = normalize_embedded_newlines(str(row.get("content", "") or "")).strip()
+        if not content or self._is_plan_step_acceptance_subtask(content):
+            return {}
+        head = next((line.strip() for line in content.splitlines() if line.strip()), content)
+        marker = self._plan_line_marker(head)
+        if isinstance(marker, dict) and marker.get("kind") == "sub":
+            return {}
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        step_id = trim(str(plan_step.get("id", "") or ""), 60)
+        prompt = (
+            "/no_think\n"
+            "Decide the intent of one unscoped TodoWrite row inside the active execution-plan step. "
+            "Return JSON only: {\"intent\":\"parent_update|worker_subtask|ambiguous\","
+            "\"confidence\":\"high|medium|low\",\"reason\":\"...\","
+            "\"parent_content\":\"...\"}. A parent_update means the row is a revised description of "
+            "the active plan step itself, not an additional child task. Use worker_subtask when it is a "
+            "concrete independently executable child. Use ambiguous when evidence is insufficient. "
+            "Do not infer from a shared verb alone; consider the whole goal, current step, and existing subtasks.\n\n"
+            f"AUTHORITATIVE GOAL:\n{str(bb.get('original_goal', '') or '').strip() or '(unavailable)'}\n\n"
+            f"ACTIVE PLAN STEP ({step_id}):\n{trim(str(plan_step.get('full_content', '') or plan_step.get('content', '') or ''), 1800)}\n\n"
+            f"INCOMING TODO:\n{trim(content, 900)}\n\n"
+            "EXISTING CURRENT-STEP SUBTASKS:\n"
+            + ("\n".join(
+                f"- [{r.get('status', 'pending')}] {trim(str(r.get('content', '') or ''), 500)}"
+                for r in self._active_plan_worker_todo_rows(step_id, role="")
+                if isinstance(r, dict)
+            ) or "(none)")
+            + "\n\n"
+            + self._plan_step_revision_context(bb)
+        )
+        try:
+            response = self.ollama.chat(
+                [{"role": "user", "content": prompt}],
+                system=self._inject_runtime_environment_context(
+                    "/no_think\nClassify Todo intent. Reply only valid JSON."
+                ),
+                max_tokens=420,
+                temperature=0.1,
+                think=False,
+            )
+            payload = extract_json_object_from_text(
+                str(response.get("content", "") or response.get("text", "") or ""),
+                {},
+            )
+            if not isinstance(payload, dict):
+                return {}
+            intent = str(payload.get("intent", "") or "").strip().lower().replace("-", "_")
+            confidence = str(payload.get("confidence", "low") or "low").strip().lower()
+            if intent not in {"parent_update", "worker_subtask", "ambiguous"}:
+                return {}
+            if confidence not in {"high", "medium", "low"}:
+                confidence = "low"
+            parent_content = trim(str(payload.get("parent_content", "") or "").strip(), 1200)
+            return {
+                "intent": intent,
+                "confidence": confidence,
+                "reason": trim(str(payload.get("reason", "") or ""), 900),
+                "parent_content": parent_content or content,
+            }
+        except Exception:
+            # A provider that cannot support this optional classifier must not
+            # lose a legitimate child Todo; the conservative fallback is to keep it.
+            return {}
+
+    def _apply_classified_parent_update(
+        self,
+        classification: dict,
+        plan_step: dict,
+        *,
+        board: dict | None = None,
+    ) -> bool:
+        if not isinstance(classification, dict) or classification.get("intent") != "parent_update":
+            return False
+        if classification.get("confidence") not in {"high", "medium"}:
+            return False
+        step_id = trim(str(plan_step.get("id", "") or ""), 60)
+        if not step_id:
+            return False
+        result = self._apply_plan_step_updates(
+            [{"step_id": step_id, "content": classification.get("parent_content", "")}],
+            board=board,
+            reason=str(classification.get("reason", "") or "model classified an active-step description update"),
+            update_mode="status_update",
+        )
+        return "accepted" in str(result or "").lower()
+
+    def _classify_root_todo_intent(
+        self,
+        incoming: dict | None,
+        existing_rows: list[dict],
+        *,
+        board: dict | None = None,
+    ) -> dict:
+        """Let the model resolve an unaddressed root Todo against live rows."""
+        if not isinstance(incoming, dict) or not isinstance(existing_rows, list) or not existing_rows:
+            return {}
+        if any(
+            str(incoming.get(field, "") or "").strip()
+            for field in ("key", "root_group_id", "external_subtask_id", "subtask_id", "external_id", "todo_id", "task_id", "item_id", "row_id")
+        ):
+            return {}
+        content = trim(str(incoming.get("content", "") or "").strip(), 900)
+        if not content:
+            return {}
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        rows_text = "\n".join(
+            f"- id={trim(str(row.get('subtask_id', '') or row.get('key', '') or ''), 100)} "
+            f"[{str(row.get('status', 'pending')).lower()}] {trim(str(row.get('content', '') or ''), 500)}"
+            for row in existing_rows[:40]
+            if isinstance(row, dict)
+        ) or "(none)"
+        prompt = (
+            "/no_think\n"
+            "Resolve one unaddressed TodoWrite objective against the existing canonical root Todo rows. "
+            "Return JSON only: {\"intent\":\"update_existing|add_new|ambiguous\","
+            "\"confidence\":\"high|medium|low\",\"existing_id\":\"...\",\"reason\":\"...\"}. "
+            "Choose update_existing only when the incoming objective is the same work with a clearer/current description. "
+            "Choose add_new for a genuinely independent objective. Never delete a completed row. Do not use shared verbs alone; "
+            "consider the authoritative goal, current statuses, and the whole objective.\n\n"
+            f"AUTHORITATIVE GOAL:\n{str(bb.get('original_goal', '') or '').strip() or '(unavailable)'}\n\n"
+            f"INCOMING OBJECTIVE:\n{content}\n\n"
+            f"EXISTING CANONICAL ROOT TODOS:\n{rows_text}"
+        )
+        try:
+            response = self.ollama.chat(
+                [{"role": "user", "content": prompt}],
+                system=self._inject_runtime_environment_context(
+                    "/no_think\nResolve Todo identity from the supplied canonical rows. Reply only valid JSON."
+                ),
+                max_tokens=360,
+                temperature=0.1,
+                think=False,
+            )
+            payload = extract_json_object_from_text(
+                str(response.get("content", "") or response.get("text", "") or ""),
+                {},
+            )
+            if not isinstance(payload, dict):
+                return {}
+            intent = str(payload.get("intent", "") or "").strip().lower().replace("-", "_")
+            confidence = str(payload.get("confidence", "low") or "low").strip().lower()
+            existing_id = trim(str(payload.get("existing_id", "") or ""), 120)
+            valid_ids = {
+                trim(str(row.get("subtask_id", "") or row.get("key", "") or ""), 120)
+                for row in existing_rows
+                if isinstance(row, dict)
+            }
+            if intent not in {"update_existing", "add_new", "ambiguous"}:
+                return {}
+            if confidence not in {"high", "medium", "low"}:
+                confidence = "low"
+            if intent == "update_existing" and (
+                confidence not in {"high", "medium"} or not existing_id or existing_id not in valid_ids
+            ):
+                return {"intent": "ambiguous", "confidence": "low"}
+            return {
+                "intent": intent,
+                "confidence": confidence,
+                "existing_id": existing_id,
+                "reason": trim(str(payload.get("reason", "") or ""), 900),
+            }
+        except Exception:
+            return {}
 
     def _plan_worker_row_is_foreign_plan_step(
         self,
@@ -59751,6 +60786,8 @@ body{padding:18px}
             "status": status,
             "owner": owner,
         }
+        if bool(raw.get("_parent_step_inferred", False)):
+            row["_parent_step_inferred"] = True
         if key:
             row["key"] = key
         if parent_step_id:
@@ -60748,6 +61785,21 @@ body{padding:18px}
                 continue
             if role_key in {"manager", "explorer", "developer", "reviewer"}:
                 row["owner"] = role_key
+            root_intent = (
+                self._classify_root_todo_intent(row, existing_scope, board=bb)
+                if mode == "status_update"
+                else {}
+            )
+            if (
+                root_intent.get("intent") == "update_existing"
+                and root_intent.get("confidence") in {"high", "medium"}
+            ):
+                existing_id = str(root_intent.get("existing_id", "") or "")
+                if existing_id.startswith("rt:"):
+                    row["subtask_id"] = existing_id
+                else:
+                    row["external_subtask_id"] = existing_id
+                row["_root_model_content_update"] = True
             row["subtask_id"] = self._stable_root_todo_id(row)
             normalized.append(row)
         normalized = self._dedupe_root_todo_rows(normalized)
@@ -60854,6 +61906,8 @@ body{padding:18px}
                         incoming_status = "completed"
                     merged["status"] = incoming_status
                     merged["updated_at"] = float(now_ts())
+                    if incoming.get("_root_model_content_update") and prior_status != "completed":
+                        merged["content"] = incoming.get("content", merged.get("content", ""))
                     for meta_key in ("evidence", "evidence_binding", "evidence_ids", "completed_at", "completed_by", "started_at"):
                         if incoming.get(meta_key) not in (None, "", []):
                             merged[meta_key] = incoming.get(meta_key)
@@ -61095,7 +62149,22 @@ body{padding:18px}
             parent_step_id = trim(str(raw.get("parent_step_id", "") or ""), 20)
             if not parent_step_id:
                 raw["parent_step_id"] = step_id
-            if self._plan_worker_row_is_foreign_plan_step(raw, active_step, bb):
+            # An unnumbered row whose parent was inferred by the runtime may be
+            # a revised description of the active plan step rather than a new
+            # child. Let the active model decide; an uncertain/unsupported
+            # provider result conservatively remains a worker subtask.
+            classification = self._classify_plan_worker_parent_update(
+                raw,
+                active_step,
+                board=bb,
+            )
+            if self._apply_classified_parent_update(classification, active_step, board=bb):
+                raw["_plan_parent_update"] = True
+                # _apply_plan_step_updates replaces the board rows with copies;
+                # refresh the local active-step reference before building the
+                # acceptance contract for this same TodoWrite transaction.
+                active_step = self._get_active_plan_step(bb) or active_step
+            if not raw.get("_plan_parent_update") and self._plan_worker_row_is_foreign_plan_step(raw, active_step, bb):
                 canonical = self._render_plan_worker_todo_canonical(step_id, target_rows)
                 return self._plan_control_feedback(
                     "preserve_current_subplan",
@@ -61104,7 +62173,7 @@ body{padding:18px}
                     "the entire current subplan was preserved atomically."
                     + (f"\n\n{canonical}" if canonical else "")
                 )
-            if self._plan_worker_row_duplicates_parent_step(raw, active_step):
+            if not raw.get("_plan_parent_update") and self._plan_worker_row_duplicates_parent_step(raw, active_step):
                 continue
             incoming_normalized.append(raw)
 
@@ -61283,6 +62352,8 @@ body{padding:18px}
         elif mode == "status_update":
             structural_changes: list[dict] = []
             for row in incoming_worker_rows:
+                if row.get("_plan_parent_update"):
+                    continue
                 _subtask_id, prior = _existing_match(row)
                 if prior is None:
                     if not self._is_plan_step_acceptance_subtask(row.get("content", "")):
@@ -61897,6 +62968,28 @@ body{padding:18px}
                 "then submit the complete revised open snapshot with update_mode='revise_open', revision_reason, and exact revision_evidence references. "
                 "The runtime audits structural changes atomically and preserves completed history. Use update_mode='rework_completed' only with cited failure/reviewer evidence. "
             )
+        existing_todo_decision = (
+            "Before sending any TodoWrite update, use the canonical rows above as the source of truth and decide explicitly: "
+            "reuse/update a row when it is the same objective, add only an independent objective, and remove an obsolete open row only "
+            "through a complete revise_open snapshot with concrete evidence. Never delete or reopen completed rows. "
+            "If the plan-step title itself is inaccurate, include plan_updates with its stable step_id/id/key; one open step edit is direct, "
+            "while edits to multiple steps or structural plan changes require independent semantic/context review. "
+        )
+        canonical_rows = "\n".join(
+            f"- [{str(row.get('status', 'pending')).lower()}] {trim(str(row.get('content', '') or ''), 360)}"
+            for row in rows
+            if isinstance(row, dict) and str(row.get("content", "") or "").strip()
+        ) or "(none)"
+        plan_rows = [
+            row for row in (self._ensure_blackboard().get("project_todos", []) if isinstance(self._ensure_blackboard().get("project_todos"), list) else [])
+            if isinstance(row, dict) and str(row.get("category", "") or "") == "plan_step"
+        ]
+        plan_state = "\n".join(
+            f"- [{str(row.get('status', 'pending')).lower()}] step_id={trim(str(row.get('id', '') or ''), 60)} "
+            f"{trim(str(row.get('content', '') or ''), 360)}"
+            for row in plan_rows
+        ) or "(none)"
+        existing_todo_decision += f"\nCURRENT CANONICAL WORKER TODOs:\n{canonical_rows}\nCURRENT CANONICAL PLAN STEPS:\n{plan_state}\n"
         if for_manager:
             return (
                 f"PLAN/TODO DISCIPLINE: `{PLAN_FILE_RELATIVE_PATH}` is a read-only runtime mirror of the authoritative execution path. "
@@ -61907,6 +63000,7 @@ body{padding:18px}
                 f"{continuity_note}"
                 f"{subtasks_exist_ban}"
                 f"{todo_state}"
+                f"{existing_todo_decision}"
                 f"{acceptance_hint}"
                 "Treat worker subtasks as the live execution state for the current plan step. "
                 "Tell the owner to use status_update for normal progress and revise_open only after collecting concrete revision evidence. "
@@ -61925,6 +63019,7 @@ body{padding:18px}
             f"{continuity_note}"
             f"{subtasks_exist_ban}"
             f"{todo_state}"
+            f"{existing_todo_decision}"
             f"{acceptance_hint}"
             f"{tracking_rule}"
             "Do not call finish_current_task for a subtask or a single plan step; use it only when the overall user task is truly complete."
@@ -62804,7 +63899,12 @@ body{padding:18px}
         owner_key = self._sanitize_agent_role(owner) or self._current_plan_worker_owner()
         work_rows: list[dict] = []
         acceptance_rows: list[dict] = []
-        isolated_rows = self._filter_parent_step_duplicate_worker_rows(rows or [], plan_step)
+        # Rows classified as a parent-step description update have already been
+        # applied to the canonical plan row and must not become a child as well.
+        isolated_rows = self._filter_parent_step_duplicate_worker_rows(
+            [row for row in (rows or []) if isinstance(row, dict) and not row.get("_plan_parent_update")],
+            plan_step,
+        )
         isolated_expected_rows = self._filter_parent_step_duplicate_worker_rows(
             [{"content": str(item or "")} for item in (expected or [])],
             plan_step,
@@ -70160,13 +71260,17 @@ body{padding:18px}
             "list_teammates", "worktree_list", "worktree_status", "worktree_events",
             "query_code_library", "query_knowledge_library", "agent_web_search",
             "list_skills", "list_skill_providers", "list_skill_protocols", "scan_skills", "load_skill", "unload_skill",
+            # Shell remains available for discovery, but each concrete command
+            # is re-checked by _single_no_plan_todo_bash_is_read_only before it
+            # can be dispatched during the bootstrap phase.
+            "bash",
         }
         tools: list[dict] = []
         for spec in self._available_tools():
             fn = spec.get("function", {}) if isinstance(spec, dict) else {}
             name = str(fn.get("name", "") or "").strip()
             canonical = canonicalize_tool_name(name)
-            if canonical == "TodoWrite" or canonical in read_names:
+            if canonical in {"TodoWrite", "TodoWriteRescue"} or canonical in read_names:
                 tools.append(spec)
                 continue
             # Keep this capability check generic for dynamically mounted MCP
@@ -70410,7 +71514,16 @@ body{padding:18px}
                     return True
         return False
 
-    def _single_no_plan_todo_bootstrap_tools(self) -> list[dict]:
+    def _single_no_plan_todo_bootstrap_tools(self, *, include_perception: bool = False) -> list[dict]:
+        """Return the tools available while establishing the first Todo graph.
+
+        The default remains the narrow writer bundle for compatibility callers.
+        The live agent bootstrap also keeps read-only tools visible so the model
+        can decide for itself whether the preceding evidence is sufficient; the
+        runtime blocks only calls classified as side effects.
+        """
+        if include_perception:
+            return self._single_no_plan_todo_perception_tools()
         allowed = {"TodoWrite", "TodoWriteRescue"}
         tools: list[dict] = []
         for spec in self._available_tools():
@@ -70422,6 +71535,67 @@ body{padding:18px}
             if name in allowed:
                 tools.append(spec)
         return tools
+
+    def _deterministic_bootstrap_todo_call(self) -> dict | None:
+        """Build the smallest safe Todo call from the authoritative user goal.
+
+        This is a last-resort protocol bridge, not another planner.  Explicitly
+        numbered user stages are preserved in order; otherwise one goal-bound
+        item is enough.  Returning a normal synthetic tool call lets the main
+        dispatcher perform the same validation, persistence, UI refresh, and
+        later status updates as a model-emitted TodoWrite call.
+        """
+        goal = str(
+            self._authoritative_user_goal_for_model()
+            or self._latest_user_goal_text()
+            or ""
+        ).strip()
+        if not goal or goal.casefold() == "current task":
+            return None
+        normalized = normalize_embedded_newlines(goal)
+        numbered: list[tuple[int, str]] = []
+        stage_pattern = re.compile(
+            r"(?:^|\n|(?<=\s))(\d{1,2})[\.\)、:]\s*"
+            r"(.+?)(?=(?:\n|\s)+(?:\d{1,2})[\.\)、:]\s*|$)",
+            flags=re.DOTALL,
+        )
+        for match in stage_pattern.finditer(normalized):
+            try:
+                order = int(match.group(1))
+            except Exception:
+                continue
+            content = trim(re.sub(r"\s+", " ", str(match.group(2) or "")).strip(" -;；"), 500)
+            if content:
+                numbered.append((order, content))
+        items: list[dict] = []
+        if numbered:
+            # Preserve appearance order rather than sorting: users sometimes
+            # intentionally repeat or restart numbering in nested stages.
+            seen: set[str] = set()
+            for _, content in numbered[:40]:
+                identity = content.casefold()
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                items.append({"content": content, "status": "pending"})
+        if not items:
+            concise_goal = trim(re.sub(r"\s+", " ", normalized).strip(), 500)
+            if not concise_goal:
+                return None
+            items = [{"content": concise_goal, "status": "pending"}]
+        items[0]["status"] = "in_progress"
+        return {
+            "id": make_id("tool"),
+            "type": "function",
+            "function": {
+                "name": "TodoWriteRescue",
+                "arguments": {
+                    "items": items,
+                    "in_progress_index": 0,
+                    "revision_reason": "runtime compatibility fallback after bounded thinking-only recovery",
+                },
+            },
+        }
 
     def _single_no_plan_todo_remove_bootstrap_hints(self) -> None:
         if not isinstance(getattr(self, "messages", None), list):
@@ -70452,10 +71626,11 @@ body{padding:18px}
                 "content": (
                     "<single-no-plan-todo-bootstrap>\n"
                     f"{trim(prompt, 6000)}\n\n"
-                    "This is a planning-only turn after real read-only perception. "
-                    "Use the preceding tool result as evidence. Call exactly one "
-                    "TodoWrite or TodoWriteRescue tool now; do not call implementation "
-                    "tools or finish_task.\n"
+                    "This is the planning phase after read-only perception. Use the "
+                    "preceding evidence and the read-only tools available in this phase "
+                    "to fill any material gaps. Once you have enough evidence, return "
+                    "exactly one TodoWrite or TodoWriteRescue call with 1-40 next actions. "
+                    "Do not call implementation tools or finish_task.\n"
                     "</single-no-plan-todo-bootstrap>"
                 ),
                 "ts": now_ts(),
@@ -71419,7 +72594,7 @@ body{padding:18px}
             "resume", "continue", "resumeexisting", "inprogressindex", "activeindex",
             "currentindex", "nextindex", "updatemode", "mode", "operation", "update",
             "action", "revisionreason", "reason", "changereason", "why",
-            "revisionevidence", "references", "options", "meta", "control",
+            "revisionevidence", "references", "planupdates", "options", "meta", "control",
         }
 
         def _decode_json_container(value: object) -> object:
@@ -71546,6 +72721,7 @@ body{padding:18px}
                 row = _canonicalize_row(item)
                 if default_parent_step_id and not str(row.get("parent_step_id", "") or "").strip():
                     row["parent_step_id"] = default_parent_step_id
+                    row["_parent_step_inferred"] = True
                 raw_content = row.get("content")
                 if isinstance(raw_content, str) and raw_content.strip():
                     parsed_rows = extract_todo_rows_from_text(
@@ -71935,12 +73111,33 @@ body{padding:18px}
             default_parent_step_id=active_step_id,
             limit=40,
         )
+        plan_updates = source.get("plan_updates", source.get("planUpdates", []))
+        plan_update_result = self._apply_plan_step_updates(
+            plan_updates,
+            board=bb,
+            reason=str(source.get("revision_reason", source.get("reason", "")) or ""),
+            evidence=source.get("revision_evidence", source.get("evidence", [])),
+            update_mode=str(source.get("update_mode", source.get("mode", "status_update")) or "status_update"),
+        ) if plan_updates not in (None, "", [], {}) else ""
+        if plan_update_result and "accepted" in plan_update_result.lower():
+            bb = self._ensure_blackboard()
+            active_step = self._get_active_plan_step(bb)
+            active_step_id = trim(str((active_step or {}).get("id", "") or ""), 40)
         is_resume = resume or _to_bool_like(
             source.get("resume", source.get("continue", source.get("resume_existing", False))),
             default=False,
         )
         if not items and is_resume:
             items = self._todo_resume_current_rows(role_key)
+        if not items and plan_update_result:
+            try:
+                self._sync_todos_from_blackboard(
+                    reason="plan-step-update",
+                    board=self._ensure_blackboard(),
+                )
+            except Exception:
+                pass
+            return plan_update_result
         if not items:
             raise ValueError("no valid todo item text; provide items/todos/subtasks/rows or content")
         items = self._apply_todo_payload_in_progress_index(items, source)
@@ -71954,9 +73151,18 @@ body{padding:18px}
                     row["owner"] = role_key
                     if active_step_id and not str(row.get("parent_step_id", "") or "").strip():
                         row["parent_step_id"] = active_step_id
+                        row["_parent_step_inferred"] = True
                 normalized_items.append(row)
             else:
-                normalized_items.append(item)
+                normalized_items.append(
+                    {
+                        "content": item,
+                        "parent_step_id": active_step_id,
+                        "_parent_step_inferred": bool(active_step_id),
+                    }
+                    if active_step_id
+                    else item
+                )
         mode, reason, revision_evidence = self._todo_payload_controls(source, resume=is_resume)
         route_kind = self._todo_route_kind(role=role_key, board=bb)
         if route_kind in {"plan_single", "plan_sync"}:
@@ -71993,6 +73199,8 @@ body{padding:18px}
                 self._refresh_loaded_skills_for_execution_focus(trigger="todo-focus-transition")
         except Exception:
             pass
+        if plan_update_result:
+            return f"{plan_update_result}\n{result}"
         return result
 
     def _initialize_collaboration_plan_from_todos(self, items: list[object]) -> None:
@@ -74866,6 +76074,11 @@ body{padding:18px}
         no effect on LLM context, compaction, or planning. Deduplicates on (ts)."""
         text = str(content or "").strip()
         if not text:
+            return
+        # Never retain runtime orchestration blocks as user bubbles.  They are
+        # model-facing context and would otherwise be reinserted after compaction
+        # as if the user had sent them.
+        if self._is_ui_hidden_runtime_message({"role": "user", "content": text}):
             return
         try:
             ts_f = float(ts or 0.0)
@@ -79961,6 +81174,12 @@ body{padding:18px}
             recovery_retry_rounds = 0
             tool_error_streaks: dict[str, int] = {}
             recovery_progress_fp = self._active_plan_recovery_progress_fingerprint()
+            # Bootstrap reasoning is intentionally not persisted as a public
+            # assistant message.  Keep only a small, in-memory signal so a
+            # provider that returns a thinking-only response can continue from
+            # the prior attempt instead of receiving an identical request ten
+            # times in a row.
+            bootstrap_thinking_signal = ""
             with self.lock:
                 self.current_phase = "run-loop"
                 self.current_tool_name = ""
@@ -80140,7 +81359,7 @@ body{padding:18px}
                         {"summary": "stale single/no-plan Todo bootstrap discarded; normal tools restored"},
                     )
                 model_tools = (
-                    self._single_no_plan_todo_bootstrap_tools()
+                    self._single_no_plan_todo_bootstrap_tools(include_perception=True)
                     if bootstrap_waiting_for_turn
                     else (
                         self._single_no_plan_todo_perception_tools()
@@ -80148,8 +81367,27 @@ body{padding:18px}
                         else self._available_tools()
                     )
                 )
+                model_messages = self.messages
+                if bootstrap_waiting_for_turn and consecutive_empty_action_rounds > 0:
+                    continuation = (
+                        "<single-no-plan-todo-bootstrap-continuation>\n"
+                        f"This is continuation {consecutive_empty_action_rounds + 1} of "
+                        f"{EMPTY_ACTION_BOOTSTRAP_THINKING_GRACE_ROUNDS} before compatibility recovery. "
+                        "The prior response completed internal reasoning but emitted no TodoWrite action. "
+                        "Do not restart perception or describe the analysis; convert the existing reasoning "
+                        "and observed evidence into exactly one TodoWrite or TodoWriteRescue call now."
+                    )
+                    if bootstrap_thinking_signal:
+                        continuation += (
+                            "\nPrior reasoning signal (use silently, do not quote): "
+                            + trim(bootstrap_thinking_signal, 900)
+                        )
+                    continuation += "\n</single-no-plan-todo-bootstrap-continuation>"
+                    model_messages = list(self.messages) + [
+                        {"role": "user", "content": continuation, "ts": now_ts()}
+                    ]
                 response = self._chat_with_same_model_retry(
-                    self.messages,
+                    model_messages,
                     tools=model_tools,
                     system=self._system_prompt(),
                     max_tokens=self.max_output_tokens,
@@ -80179,10 +81417,26 @@ body{padding:18px}
                     raw_bootstrap_calls = tool_calls if isinstance(tool_calls, list) else []
                     valid_bootstrap_calls = []
                     invalid_bootstrap_calls = []
+                    todo_seen = False
                     for call in raw_bootstrap_calls:
                         fn = call.get("function", {}) if isinstance(call, dict) else {}
                         call_name = canonicalize_tool_name(fn.get("name", ""))
                         if call_name in {"TodoWrite", "TodoWriteRescue"}:
+                            if not todo_seen:
+                                valid_bootstrap_calls.append(call)
+                                todo_seen = True
+                            continue
+                        raw_args = fn.get("arguments", {}) if isinstance(fn, dict) else {}
+                        parsed_args = raw_args
+                        if not isinstance(parsed_args, dict):
+                            parsed_args = parse_tool_arguments(raw_args)
+                        if self._single_no_plan_todo_is_perception_result(
+                            {"name": call_name, "args": parsed_args, "ok": True}
+                        ):
+                            # Read-only calls are deliberately allowed during
+                            # the adaptive bootstrap.  This lets the model
+                            # gather missing evidence instead of being trapped
+                            # by a shallow first directory probe.
                             valid_bootstrap_calls.append(call)
                         else:
                             invalid_bootstrap_calls.append(call_name or "unknown-tool")
@@ -80190,9 +81444,7 @@ body{padding:18px}
                         bootstrap_invalid_tool_call = True
                         tool_calls = []
                     else:
-                        # One planning call is enough; duplicate Todo calls in
-                        # the same response only create ambiguous status.
-                        tool_calls = valid_bootstrap_calls[:1]
+                        tool_calls = valid_bootstrap_calls
                     if not tool_calls and not str(text or "").strip() and not str(thinking_text or "").strip():
                         text = "Todo bootstrap turn produced no TodoWrite action."
                 if force_single_tool_rounds > 0 and isinstance(tool_calls, list) and len(tool_calls) > 1:
@@ -80247,57 +81499,199 @@ body{padding:18px}
                     tool_calls=tool_calls,
                     output_tokens=output_tokens,
                 )
-                try:
-                    if self._is_empty_action_turn(text, thinking_text, tool_calls):
-                        raise EmptyActionError("assistant returned empty action after stripping thinking")
-                except EmptyActionError:
-                    if self._single_no_plan_todo_initial_gate_active() and self._start_single_no_plan_todo_bootstrap():
-                        self._emit(
-                            "status",
-                            {"summary": "L2 empty action replaced with mandatory Todo bootstrap"},
-                        )
-                        continue
+                empty_action = self._is_empty_action_turn(text, thinking_text, tool_calls)
+                recovery_applied = False
+                # A writer-only Todo bootstrap is a protocol turn, not an
+                # ordinary reasoning turn.  Let reasoning-capable providers
+                # complete a short grace window first; after that, use the
+                # bounded compatibility recovery instead of letting the
+                # generic 20-response window silently loop (the old path
+                # never reached bootstrap retry accounting because it
+                # continued here first).
+                if empty_action and bootstrap_waiting_for_turn:
                     consecutive_empty_action_rounds += 1
-                    fault_counter += 1
-                    last_fault_reason = "empty-action"
                     no_tool_rounds = 0
                     last_tool_fp = ""
                     repeated_tool_rounds = 0
-                    self._inject_thinking_empty_recovery_hint(
-                        streak=consecutive_empty_action_rounds,
-                        budget_forced=budget_forced,
-                    )
-                    if fault_counter >= 2:
-                        self._inject_fault_prefill_hint(
-                            reason=(
-                                "thinking-only output without actionable content"
-                                if not budget_forced
-                                else "thinking-only output near token budget"
-                            ),
-                            fault_counter=fault_counter,
-                        )
-                    if (
-                        consecutive_empty_action_rounds <= int(EMPTY_ACTION_WAKEUP_RETRY_LIMIT)
-                        and fault_counter < int(FUSED_FAULT_BREAK_THRESHOLD)
-                        and auto_continue_budget > 0
-                    ):
-                        auto_continue_budget -= 1
+                    if consecutive_empty_action_rounds <= int(EMPTY_ACTION_BOOTSTRAP_THINKING_GRACE_ROUNDS):
+                        bootstrap_thinking_signal = trim(thinking_text, 900)
                         self._emit(
                             "status",
                             {
                                 "summary": (
-                                    "empty-action wake-up retry scheduled "
-                                    f"(streak={consecutive_empty_action_rounds}, "
-                                    f"fault_counter={fault_counter}, remaining={auto_continue_budget})"
+                                    "Todo bootstrap thinking retained; waiting for model action "
+                                    f"(streak={consecutive_empty_action_rounds}/"
+                                    f"{EMPTY_ACTION_BOOTSTRAP_THINKING_GRACE_ROUNDS})"
                                 )
                             },
                         )
                         continue
-                    stop_note = (
-                        "模型连续多轮仅输出思考而无动作，自动执行已熔断停止（fault_counter>=15）。"
-                        "请尝试拆分任务，或切换更强的推理模型后继续。"
+                    bootstrap_recovery = self._recover_thinking_only_response(
+                        response,
+                        bootstrap=True,
+                        tools=model_tools,
+                        pinned_selection=pinned_selection,
                     )
-                    raise CircuitBreakerTriggered(stop_note)
+                    if bool(bootstrap_recovery.get("ok", False)):
+                        text, thinking_text, tool_calls = self._response_action_parts(
+                            bootstrap_recovery.get("response", {})
+                        )
+                        bootstrap_thinking_signal = ""
+                        recovery_applied = True
+                        empty_action = False
+                        self._emit(
+                            "status",
+                            {
+                                "summary": (
+                                    "Todo bootstrap recovered after thinking-only response "
+                                    f"(stage={bootstrap_recovery.get('stage', 'unknown')})"
+                                )
+                            },
+                        )
+                    else:
+                        deterministic = self._deterministic_bootstrap_todo_call()
+                        if deterministic:
+                            text = ""
+                            thinking_text = ""
+                            tool_calls = [deterministic]
+                            bootstrap_thinking_signal = ""
+                            recovery_applied = True
+                            empty_action = False
+                            self._emit(
+                                "status",
+                                {"summary": "Todo bootstrap created from authoritative user goal after thinking-only response"},
+                            )
+                        else:
+                            bootstrap_failure_state = self._single_no_plan_todo_bootstrap_failure(
+                                "model returned thinking without TodoWrite/TodoWriteRescue"
+                            )
+                            if bootstrap_failure_state == "blocked":
+                                self._emit(
+                                    "status",
+                                    {"summary": "run paused: mandatory L2 Todo list could not be established"},
+                                )
+                                break
+                            continue
+                if empty_action:
+                    consecutive_empty_action_rounds += 1
+                    no_tool_rounds = 0
+                    last_tool_fp = ""
+                    repeated_tool_rounds = 0
+                    # If the mandatory L2 perception gate has not yet opened
+                    # its writer-only turn, transition to that bootstrap now.
+                    # This is a state change, not an empty-action retry, and
+                    # prevents the 20-turn compatibility window from delaying
+                    # Todo initialization after a read-only probe.
+                    if (
+                        self._single_no_plan_todo_initial_gate_active()
+                        and self._start_single_no_plan_todo_bootstrap()
+                    ):
+                        self._emit(
+                            "status",
+                            {"summary": "L2 empty action replaced with mandatory Todo bootstrap"},
+                        )
+                        consecutive_empty_action_rounds = 0
+                        continue
+                    # Thinking-only is a valid intermediate response for many
+                    # providers.  Do not poison the fused fault counter or
+                    # inject repetitive user-visible hints while the model is
+                    # still within the generous 20-turn compatibility window.
+                    if consecutive_empty_action_rounds < int(EMPTY_ACTION_INTERVENTION_THRESHOLD):
+                        # This counter is intentionally independent from the
+                        # broader auto-continue budget: unrelated recoveries in
+                        # the same run must not make the 20-response contract
+                        # fire early.
+                        if auto_continue_budget > 0:
+                            auto_continue_budget -= 1
+                        if consecutive_empty_action_rounds in {1, 5, 10, 15, 19}:
+                            self._emit(
+                                "status",
+                                {
+                                    "summary": (
+                                        "thinking-only response retained; waiting for an actionable turn "
+                                        f"(streak={consecutive_empty_action_rounds}/"
+                                        f"{EMPTY_ACTION_INTERVENTION_THRESHOLD})"
+                                    )
+                                },
+                            )
+                        continue
+
+                    # At the intervention threshold run a bounded, provider-
+                    # aware ladder.  The ladder itself owns all retries and
+                    # never feeds another generic fault-prefill loop.
+                    last_fault_reason = "thinking-only output after bounded compatibility window"
+                    recovery = self._recover_thinking_only_response(
+                        response,
+                        bootstrap=bool(bootstrap_waiting_for_turn),
+                        tools=model_tools,
+                        pinned_selection=pinned_selection,
+                    )
+                    if bool(recovery.get("ok", False)):
+                        text, thinking_text, tool_calls = self._response_action_parts(
+                            recovery.get("response", {})
+                        )
+                        recovery_applied = True
+                        self._emit(
+                            "status",
+                            {
+                                "summary": (
+                                    "thinking-only compatibility recovery succeeded "
+                                    f"(stage={recovery.get('stage', 'unknown')})"
+                                )
+                            },
+                        )
+                    elif bootstrap_waiting_for_turn:
+                        # Last resort for the mandatory L2 gate: synthesize a
+                        # goal-bound Todo call and send it through the regular
+                        # dispatcher so persistence/UI/plan refresh semantics
+                        # are identical to a model-emitted TodoWrite call.
+                        deterministic = self._deterministic_bootstrap_todo_call()
+                        if deterministic:
+                            text = ""
+                            thinking_text = ""
+                            tool_calls = [deterministic]
+                            recovery_applied = True
+                            self._emit(
+                                "status",
+                                {
+                                    "summary": (
+                                        "thinking-only recovery exhausted; deterministic Todo created "
+                                        "from authoritative user goal"
+                                    )
+                                },
+                            )
+                        else:
+                            bootstrap_failure_state = self._single_no_plan_todo_bootstrap_failure(
+                                "model compatibility recovery exhausted and no authoritative goal was available"
+                            )
+                            if bootstrap_failure_state == "blocked":
+                                self._emit(
+                                    "status",
+                                    {"summary": "run paused: mandatory L2 Todo list could not be established"},
+                                )
+                                break
+                            continue
+                    else:
+                        self._emit(
+                            "status",
+                            {
+                                "summary": (
+                                    "thinking-only compatibility recovery exhausted; "
+                                    "pausing instead of repeating fault-prefill"
+                                )
+                            },
+                        )
+                        raise CircuitBreakerTriggered(
+                            "模型连续 20 次仅输出思考且未产生可执行动作。"
+                            "已完成一次兼容性恢复（短重试、关闭 thinking、工具调用修复），"
+                            "仍未得到有效输出；请切换模型或继续发送明确指令。"
+                        )
+                if recovery_applied:
+                    # A recovered response is processed by the normal
+                    # assistant/tool path below.  Reset the fused counters now;
+                    # the recovered tool/content is an actionable turn.
+                    fault_counter = 0
+                    last_fault_reason = ""
                 consecutive_empty_action_rounds = 0
                 if tool_calls and not text.strip():
                     text = self._public_tool_progress_summary(tool_calls, role=single_role)
@@ -80353,7 +81747,9 @@ body{padding:18px}
                         pass
                     continue
                 if not tool_calls:
-                    if self._single_no_plan_todo_initial_gate_active():
+                    if (
+                        self._single_no_plan_todo_initial_gate_active()
+                    ):
                         # A level-2 run may not silently finish an orientation
                         # turn without establishing its mandatory Todo graph.
                         # Start the bounded writer-only turn now; it is still
@@ -81365,6 +82761,17 @@ body{padding:18px}
                 if bootstrap_waiting_for_turn:
                     if bootstrap_todo_success:
                         self._single_no_plan_todo_bootstrap_succeeded()
+                    elif single_round_has_perception and not single_round_has_mutation:
+                        # The adaptive bootstrap may legitimately contain one
+                        # or more read-only calls before the writer call. Keep
+                        # the gate active and let the model choose the next
+                        # observation or emit TodoWrite on the following turn.
+                        consecutive_empty_action_rounds = 0
+                        bootstrap_thinking_signal = ""
+                        self._emit(
+                            "status",
+                            {"summary": "Todo bootstrap perception continued; awaiting model TodoWrite action"},
+                        )
                     else:
                         bootstrap_failure_state = self._single_no_plan_todo_bootstrap_failure(
                             bootstrap_todo_failure_reason
@@ -82093,6 +83500,8 @@ body{padding:18px}
             for msg in self.messages:
                 if str((msg or {}).get("role", "")).strip() == "tool":
                     continue
+                if self._is_ui_hidden_runtime_message(msg):
+                    continue
                 total_message_count += 1
             scheduler_feed_rows: list[dict] = []
             for row in self.scheduler_visible_inputs[-SESSION_DEFERRED_START_QUEUE_MAX:]:
@@ -82125,7 +83534,7 @@ body{padding:18px}
                 role = msg.get("role")
                 if role == "tool":
                     continue
-                if isinstance(msg, dict) and bool(msg.get("_ui_hidden", False)):
+                if self._is_ui_hidden_runtime_message(msg):
                     continue
                 role_key = str(role or "").strip().lower()
                 msg_type = trim(str(msg.get("type", "message") or "").strip(), 40) if isinstance(msg, dict) else "message"
@@ -82224,6 +83633,8 @@ body{padding:18px}
                     "ts": ts,
                     "type": msg_type,
                 }
+                if isinstance(msg, dict) and int(msg.get("seq", 0) or 0) > 0:
+                    row["seq"] = int(msg.get("seq", 0) or 0)
                 if isinstance(msg, dict) and isinstance(msg.get("data"), dict):
                     public_data = dict(msg.get("data") or {})
                     if (
@@ -82305,6 +83716,20 @@ body{padding:18px}
                             "retained": True,
                         }
                     )
+            def operation_feed_id(op: dict) -> str:
+                raw_id = str(op.get("id", "") or "").strip()
+                if raw_id:
+                    return raw_id
+                seq = int(op.get("seq", 0) or 0)
+                if seq > 0:
+                    return f"operation:{seq}"
+                digest = hashlib.sha256(
+                    f"{op.get('ts', 0)}|{op.get('type', '')}|{json_dumps(op.get('data', {}))}".encode(
+                        "utf-8", errors="ignore"
+                    )
+                ).hexdigest()[:16]
+                return f"operation:{digest}"
+
             for op in self.operations[-op_feed_window:]:
                 t = op.get("type")
                 if t == "command":
@@ -82324,7 +83749,15 @@ body{padding:18px}
                         f"{out_text}"
                     )
                     conversation_feed.append(
-                        {"role": "system", "type": "command", "ts": op.get("ts", 0), "text": text, "data": d_view}
+                        {
+                            "id": operation_feed_id(op),
+                            "seq": int(op.get("seq", 0) or 0),
+                            "role": "system",
+                            "type": "command",
+                            "ts": op.get("ts", 0),
+                            "text": text,
+                            "data": d_view,
+                        }
                     )
                 elif t == "file_patch":
                     d = op.get("data", {})
@@ -82344,7 +83777,15 @@ body{padding:18px}
                         f"{patch_text}"
                     )
                     conversation_feed.append(
-                        {"role": "system", "type": "file_patch", "ts": op.get("ts", 0), "text": text, "data": d_view}
+                        {
+                            "id": operation_feed_id(op),
+                            "seq": int(op.get("seq", 0) or 0),
+                            "role": "system",
+                            "type": "file_patch",
+                            "ts": op.get("ts", 0),
+                            "text": text,
+                            "data": d_view,
+                        }
                     )
                 elif t == "upload":
                     d = op.get("data", {})
@@ -82361,7 +83802,15 @@ body{padding:18px}
                         f"{preview}"
                     )
                     conversation_feed.append(
-                        {"role": "system", "type": "upload", "ts": op.get("ts", 0), "text": text, "data": d_view}
+                        {
+                            "id": operation_feed_id(op),
+                            "seq": int(op.get("seq", 0) or 0),
+                            "role": "system",
+                            "type": "upload",
+                            "ts": op.get("ts", 0),
+                            "text": text,
+                            "data": d_view,
+                        }
                     )
                 elif t == "web_search":
                     d = op.get("data", {})
@@ -82386,6 +83835,8 @@ body{padding:18px}
                         f"{d.get('summary', '')}"
                     )
                     row = {
+                        "id": operation_feed_id(op),
+                        "seq": int(op.get("seq", 0) or 0),
                         "role": "system",
                         "type": "web_search",
                         "ts": op.get("ts", 0),
@@ -82415,13 +83866,41 @@ body{padding:18px}
                         f"{str(d.get('summary', '') or '').strip()}\n"
                         f"{result}"
                     ).strip()
-                    row = {"role": "system", "type": t, "ts": op.get("ts", 0), "text": text, "data": d_view}
+                    row = {
+                        "id": operation_feed_id(op),
+                        "seq": int(op.get("seq", 0) or 0),
+                        "role": "system",
+                        "type": t,
+                        "ts": op.get("ts", 0),
+                        "text": text,
+                        "data": d_view,
+                    }
                     agent_role = self._sanitize_agent_bubble_role(d.get("agent_role", ""))
                     if agent_role:
                         row["agent_role"] = agent_role
                     conversation_feed.append(row)
             conversation_feed.extend(scheduler_feed_rows)
             conversation_feed.sort(key=lambda x: float(x.get("ts", 0.0)))
+            # Reconciliation is ID based.  A single event can be present in both
+            # a persisted message window and an operation projection; keep the
+            # first stable occurrence so refreshes cannot append it twice.
+            deduped_feed: list[dict] = []
+            seen_feed_ids: set[str] = set()
+            for row in conversation_feed:
+                if not isinstance(row, dict):
+                    continue
+                identity = str(row.get("id", "") or "").strip()
+                if not identity:
+                    identity = hashlib.sha256(
+                        f"{row.get('ts', 0)}|{row.get('role', '')}|{row.get('type', '')}|{row.get('text', '')}".encode(
+                            "utf-8", errors="ignore"
+                        )
+                    ).hexdigest()[:20]
+                if identity in seen_feed_ids:
+                    continue
+                seen_feed_ids.add(identity)
+                deduped_feed.append(row)
+            conversation_feed = deduped_feed
             upload_view = []
             for item in self.uploads[-upload_window:]:
                 upload_view.append(
@@ -86164,7 +87643,7 @@ function _deltaStartWatchdog(){
 function renderSkillsEntryLink(){const link=E('downloadBtn');if(!link)return;const host=location.hostname||'127.0.0.1';const enabled=Boolean(S.config?.skills_ui_enabled);const fromConfig=String(S.config?.skills_ui_url||'').trim();const skillsPort=Number(S.config?.skills_port||0);let href='#';if(enabled){if(fromConfig){href=fromConfig}else if(Number.isFinite(skillsPort)&&skillsPort>0){const currentPort=Number(location.port||0);if(!(currentPort&&skillsPort===currentPort)){href=`${location.protocol}//${host}:${skillsPort}`}}}const offline=(href==='#');link.href=href;link.classList.toggle('disabled',offline);link.textContent=offline?t('skills_offline'):t('open_skills')}
 function openProgram(){const port=Number(S.config?.ide_port||0);if(!S.config?.ide_enabled||!Number.isFinite(port)||port<=0){showError('Program IDE is disabled.');return}location.href=`${location.protocol}//${location.hostname||'127.0.0.1'}:${port}/`}
 function tailSig(rows,count,mapper){const arr=Array.isArray(rows)?rows:[];if(!arr.length)return'';return arr.slice(Math.max(0,arr.length-count)).map(mapper).join('|')}
-function feedSignature(snap){const feed=Array.isArray(snap?.conversation_feed)?snap.conversation_feed:(Array.isArray(snap?.messages)?snap.messages:[]);const sig=tailSig(feed,8,row=>`${Number(row?.ts||0)}:${String(row?.role||'')}:${String(row?.agent_role||'')}:${String(row?.type||'')}:${String(row?.text||'').length}:${String(row?.thinking||'').length}:${String(row?.text||'').slice(-12)}:${String(row?.thinking||'').slice(-12)}`);const live=String(snap?.live_thinking||'');const liveResp=String(snap?.live_response_text||'');const liveRespId=String(snap?.live_response_stream_id||'');const liveRespActive=snap?.live_response_active?1:0;const runActive=snap?.live_run_notice_active?1:0;const runLabel=String(snap?.live_run_notice_label||'');const runStart=Number(snap?.live_run_notice_started_at||0);const truncText=String(snap?.live_truncation_text||'');const truncKind=String(snap?.live_truncation_kind||'');const truncTool=String(snap?.live_truncation_tool||'');const truncAttempts=Number(snap?.live_truncation_attempts||0);const truncTokens=Number(snap?.live_truncation_tokens||0);const truncActive=snap?.live_truncation_active?1:0;return `${feed.length}|${sig}|lt=${live.length}:${live.slice(-12)}|lr=${liveRespActive}:${liveRespId}:${liveResp.length}:${liveResp.slice(-12)}|rn=${runActive}:${runStart}:${runLabel.slice(-12)}|tr=${truncActive}:${truncAttempts}:${truncTokens}:${truncKind.slice(-12)}:${truncTool.slice(-12)}:${truncText.length}`}
+function feedSignature(snap){const feed=Array.isArray(snap?.conversation_feed)?snap.conversation_feed:(Array.isArray(snap?.messages)?snap.messages:[]);const sig=tailSig(feed,8,row=>`${String(row?.id||'')}:${Number(row?.seq||0)}:${Number(row?.ts||0)}:${String(row?.role||'')}:${String(row?.agent_role||'')}:${String(row?.type||'')}:${String(row?.text||'').length}:${String(row?.thinking||'').length}:${String(row?.text||'').slice(-12)}:${String(row?.thinking||'').slice(-12)}`);const live=String(snap?.live_thinking||'');const liveResp=String(snap?.live_response_text||'');const liveRespId=String(snap?.live_response_stream_id||'');const liveRespActive=snap?.live_response_active?1:0;const runActive=snap?.live_run_notice_active?1:0;const runLabel=String(snap?.live_run_notice_label||'');const runStart=Number(snap?.live_run_notice_started_at||0);const truncText=String(snap?.live_truncation_text||'');const truncKind=String(snap?.live_truncation_kind||'');const truncTool=String(snap?.live_truncation_tool||'');const truncAttempts=Number(snap?.live_truncation_attempts||0);const truncTokens=Number(snap?.live_truncation_tokens||0);const truncActive=snap?.live_truncation_active?1:0;return `${feed.length}|${sig}|lt=${live.length}:${live.slice(-12)}|lr=${liveRespActive}:${liveRespId}:${liveResp.length}:${liveResp.slice(-12)}|rn=${runActive}:${runStart}:${runLabel.slice(-12)}|tr=${truncActive}:${truncAttempts}:${truncTokens}:${truncKind.slice(-12)}:${truncTool.slice(-12)}:${truncText.length}`}
 function boardsSignature(snap){const agentCtx=(Array.isArray(snap?.agent_contexts)?snap.agent_contexts:[]).map(r=>`${r.role}:${r.left}:${r.left_percent}:${r.tier}:${r.active?1:0}`).join(',');const scope=snap?.todo_task_scope||{};const todoRows=Array.isArray(snap?.todos)?snap.todos:[];const taskRows=Array.isArray(snap?.tasks)?snap.tasks:[];const todoSig=todoRows.map(row=>`${String(row?.key||row?.plan_step_id||'')}:${String(row?.status||'')}:${String(row?.content||'')}`).join('~');const taskSig=taskRows.map(row=>`${String(row?.subtask_id||row?.id||'')}:${String(row?.status||'')}:${String(row?.subject||'')}`).join('~');return [snap?.running?1:0,snap?.agent_phase||'',Number(snap?.agent_round_index||0),Number(snap?.queued_user_inputs_count||0),Number(snap?.truncation_count||0),Number(snap?.live_truncation_attempts||0),Number(snap?.live_truncation_tokens||0),snap?.live_truncation_active?1:0,Number(snap?.context_tokens_estimate||0),Number(snap?.context_left_tokens||0),Number(snap?.context_left_percent||0),agentCtx,Number(snap?.render_bridge?.seq||0),String(snap?.plan_mode_preference||'auto'),Number(snap?.user_task_level||0),String(scope.kind||'default'),String(scope.task_epoch||''),String(scope.plan_epoch||''),String(scope.parent_step_id||''),todoSig,taskSig,(snap?.activity||[]).length,(snap?.operations||[]).length,(snap?.uploads||[]).length].join('|')}
 function sessionsSignature(list){const rows=Array.isArray(list)?list:[];const sig=tailSig(rows,6,row=>`${String(row?.id||'')}:${row?.running?1:0}:${Number(row?.message_count||0)}:${Number(row?.updated_at||0)}`);const aid=String(S.activeId||'').trim();let activeSig='-';if(aid){const activeRow=rows.find(row=>String(row?.id||'')===aid);if(activeRow){activeSig=`${aid}:${activeRow?.running?1:0}:${Number(activeRow?.message_count||0)}:${Number(activeRow?.updated_at||0)}`}else{activeSig=`missing:${aid}`}}return `${rows.length}|active=${activeSig}|${sig}`}
 function mergeSessionRows(base,incoming){const map=new Map();for(const row of Array.isArray(base)?base:[]){const id=String(row?.id||'').trim();if(id)map.set(id,{...row})}for(const row of Array.isArray(incoming)?incoming:[]){const id=String(row?.id||'').trim();if(id)map.set(id,{...(map.get(id)||{}),...row})}return Array.from(map.values()).sort((a,b)=>Number(b?.updated_at||0)-Number(a?.updated_at||0))}
@@ -87572,7 +89051,7 @@ function renderActivePreview(forceReload=false){
   body.setAttribute('data-preview-ticket',ticket);
   fetch(url,{cache:'no-store'}).then(async r=>{if(!r.ok){throw new Error(await r.text())}return await r.text()}).then(txt=>{if(body.getAttribute('data-preview-ticket')!==ticket)return;body.innerHTML=`<article class=\"preview-md msg-md\">${renderMarkdownCached(txt,`pv:${key}:${txt.length}`)}</article>`;const article=body.querySelector('article.preview-md');if(article){_mathTypeset(article,`pv:${key}:${txt.length}`)}}).catch(err=>{if(body.getAttribute('data-preview-ticket')!==ticket)return;body.innerHTML=`<div class=\"preview-md msg-md\"><p>${esc(err.message||String(err))}</p></div>`})
 }
-function _chatVirtRowKey(row,idx){const r=row||{};const txt=String(r.text||'');const th=String(r.thinking||'');return `${Number(r.ts||0)}:${String(r.role||'')}:${String(r.agent_role||'')}:${String(r.type||'')}:${txt.length}:${th.length}:${txt.slice(-16)}:${th.slice(-16)}:${idx}`}
+function _chatVirtRowKey(row,idx){const r=row||{};const id=String(r.id||'').trim(),seq=Number(r.seq||r.event_seq||0);if(id)return`id:${id}`;if(seq>0)return`seq:${seq}`;const txt=String(r.text||''),th=String(r.thinking||'');const fingerprint=`${Number(r.ts||0).toFixed(6)}:${String(r.role||'')}:${String(r.agent_role||'')}:${String(r.type||'')}:${txt}:${th}`;return`fp:${fingerprint}`}
 function _chatVirtFormatElapsed(seconds){const sec=Math.max(0,Math.floor(Number(seconds)||0));const h=Math.floor(sec/3600);const m=Math.floor((sec%3600)/60);const s=sec%60;if(h>0)return `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;return `${m}:${String(s).padStart(2,'0')}`}
 function _chatVirtLiveRunText(label,elapsed){return `${t('running')} · ${_chatVirtFormatElapsed(elapsed)}`}
 const CHAT_EVENT_CARD_KINDS=new Set(['tool_calls','tool_start','tool_result','file_patch','upload','command','web_search','live_truncation','live_run_notice','skill_loaded','plan_notice','plan_proposal','plan_approved_handoff','step_verified','todo_focus','live_user_adjustment','user_feedback_merge','runtime_hint']);
@@ -87981,14 +89460,17 @@ function _chatVirtSyncRunTicker(chatEl){if(!chatEl)return;const hasRun=!!chatEl.
 function isSyntheticPublicProgress(text){const value=String(text||'').trim();if(!value)return false;const pairs=[['正在推进「','结果将用于确定下一步。'],['本轮将','并根据返回的证据继续推进。'],['正在推進「','結果將用於決定下一步。'],['本輪將','並依據傳回的證據繼續推進。'],['「','結果を次の判断に使います。'],['','得られた証拠を基に続行します。'],["Advancing '",'then use the evidence to choose the next step.'],['This round will ','then continue from the returned evidence.']];return pairs.some(([prefix,suffix])=>(!prefix||value.startsWith(prefix))&&value.endsWith(suffix))}
 function _chatVirtCollectRows(){
   const feed=Array.isArray(S.snap?.conversation_feed)?S.snap.conversation_feed:(Array.isArray(S.snap?.messages)?S.snap.messages:[]);
-  const rows=[];
+  const rows=[],seen=new Set();
   for(let i=0;i<feed.length;i++){
     const r=feed[i]||{};
     const txt=String(r.text||'').trim();
     if(/^\\[SKILL EXECUTION GUIDE:\\s*[^\\]]+\\]/i.test(txt))continue;
     const syntheticText=isSyntheticPublicProgress(txt),syntheticData=isSyntheticPublicProgress(r.data?.public_progress);
     if((syntheticText||syntheticData)&&String(r.type||'message')!=='tool_calls')continue;
-    const clean={...r,_vk:_chatVirtRowKey(r,i)};
+    const key=_chatVirtRowKey(r,i);
+    if(seen.has(key))continue;
+    seen.add(key);
+    const clean={...r,_vk:key};
     if(syntheticText)clean.text='';
     if(syntheticData){clean.data={...(r.data||{})};delete clean.data.public_progress}
     rows.push(clean);
@@ -89578,10 +91060,15 @@ async function refreshSnapshot(opt={}){
     return;
   }
   S.refreshInFlight=true;
+  const requestedSessionId=String(S.activeId||'');
   try{
-    ensurePreviewState(S.activeId);
+    ensurePreviewState(requestedSessionId);
     const q=forceFull?'?lite=0':'?lite=1';
-    S.snap=await api('/api/sessions/'+S.activeId+q);
+    const nextSnapshot=await api('/api/sessions/'+requestedSessionId+q);
+    // A session switch can happen while the network request is in flight.  Do
+    // not let the old response overwrite the newly selected session's state.
+    if(String(S.activeId||'')!==requestedSessionId)return;
+    S.snap=nextSnapshot;
     if(S.deltaRenderRaf){cancelAnimationFrame(S.deltaRenderRaf);S.deltaRenderRaf=0}
     S.deltaRenderChat=false;S.deltaRenderBoards=false;S.deltaRenderSessions=false;
     const snapSeq=Number(S.snap?.event_seq||0);
@@ -106433,6 +107920,8 @@ html,body{scrollbar-gutter:stable}
 IDE_JS = r"""
 const E=id=>document.getElementById(id);
 class ApiError extends Error{constructor(message,status,code,data){super(message);this.status=status;this.code=code||'';this.data=data||{}}}
+// Keep preview-token state local to the IDE bundle; the WebUI shell is not loaded here.
+const PREVIEW_TOKENS=new Map();
 const S={
   csrf:'',config:null,account:null,capabilities:{},sessions:[],roots:[],activeSession:'',activeRoot:'session',autoLogin:false,authRefreshPromise:null,csrfRefreshPromise:null,
   treeCache:new Map(),openFiles:new Map(),activeByGroup:['',''],activeGroup:0,monaco:null,editors:[],diffEditors:[],models:new Map(),historyOriginalModels:new Map(),historyDecorations:new Map(),viewStates:new Map(),suppressEditorChange:false,codeHistoryMode:'all',
@@ -106922,9 +108411,9 @@ function renderAgentState(state){
   S.agentBatching=true;
   try{
     if(timelineChanged){
-      const timeline=[],validKeys=new Set();
-      for(const row of feed){const type=String(row.type||'message');if(['file_patch','command','tool_start','tool_result','compact'].includes(type))continue;validKeys.add(agentEventKey(row));timeline.push({source:'feed',ts:Number(row.ts||0),seq:0,row})}
-      for(const op of operations){validKeys.add(agentOperationKey(op));timeline.push({source:'operation',ts:Number(op.ts||0),seq:Number(op.seq||0),op})}
+      const timeline=[],validKeys=new Set(),seenTimelineKeys=new Set();
+      for(const row of feed){const type=String(row.type||'message');if(['file_patch','command','tool_start','tool_result','compact'].includes(type))continue;const key=agentEventKey(row);if(!key||seenTimelineKeys.has(key))continue;seenTimelineKeys.add(key);validKeys.add(key);timeline.push({source:'feed',ts:Number(row.ts||0),seq:Number(row.seq||0),row})}
+      for(const op of operations){const key=agentOperationKey(op);if(!key||seenTimelineKeys.has(key))continue;seenTimelineKeys.add(key);validKeys.add(key);timeline.push({source:'operation',ts:Number(op.ts||0),seq:Number(op.seq||0),op})}
       timeline.sort((a,b)=>a.ts-b.ts||a.seq-b.seq);
       for(const item of timeline){
         if(item.source==='feed'){
@@ -106938,7 +108427,11 @@ function renderAgentState(state){
         renderAgentOperationOnce(item.op);
       }
       S.agentTimelineSignature=timelineSignature;
-      for(const key of S.agentRendered)if(!validKeys.has(key))S.agentRendered.delete(key);
+      // Keep rendered identities across polling windows.  The backend exposes a
+      // tail window, so a temporary lite/degraded response may omit older rows;
+      // deleting their keys here would cause the same events to be appended again
+      // when the full snapshot returns.  Session switches call resetAgentSessionUI
+      // and clear the set explicitly.
       for(const[key,value]of S.agentToolCards)if(!value?.isConnected)S.agentToolCards.delete(key);
       for(const[key,value]of S.agentPlanCards)if(!value?.isConnected)S.agentPlanCards.delete(key);
     }
@@ -114671,8 +116164,19 @@ document.addEventListener('DOMContentLoaded', function(){{
                 sess.lock.release()
 
         feed: list[dict] = []
+        seen_feed_ids: set[str] = set()
         for raw in snap.get("conversation_feed", []) if isinstance(snap, dict) else []:
             if not isinstance(raw, dict):
+                continue
+            is_hidden_runtime = getattr(sess, "_is_ui_hidden_runtime_message", None)
+            if callable(is_hidden_runtime):
+                hidden_runtime = bool(is_hidden_runtime(raw))
+            else:
+                raw_text = str(raw.get("text", raw.get("content", "")) or "").strip().lower()
+                hidden_runtime = any(
+                    raw_text.startswith(prefix) for prefix in UI_HIDDEN_RUNTIME_CONTROL_PREFIXES
+                )
+            if hidden_runtime:
                 continue
             role = str(raw.get("role", "system") or "system").strip().lower()
             public_text = str(raw.get("text", "") or "")
@@ -114691,12 +116195,27 @@ document.addEventListener('DOMContentLoaded', function(){{
                 "ts": float(raw.get("ts", 0.0) or 0.0),
                 "agent_role": trim(str(raw.get("agent_role", "") or ""), 40),
             }
+            # Thinking-only assistant turns are private reasoning, not a public
+            # message.  Keep structured tool/plan rows even when their text is
+            # intentionally empty.
+            if role == "assistant" and not row["text"].strip() and row["type"] not in {
+                "tool_calls",
+                "plan_notice",
+                "plan_proposal",
+                "plan_approved_handoff",
+                "step_verified",
+                "todo_focus",
+            }:
+                continue
             if not row["id"]:
                 # Older persisted sessions may lack ids; snapshot() supplies a
                 # deterministic fallback, but keep a defensive key for custom
                 # SessionState implementations used by integrations/tests.
                 fallback = f"{row['ts']:.6f}|{role}|{row['type']}|{row['text']}"
                 row["id"] = f"feed:{hashlib.sha256(fallback.encode('utf-8', errors='ignore')).hexdigest()[:16]}"
+            if row["id"] in seen_feed_ids:
+                continue
+            seen_feed_ids.add(row["id"])
             data = raw.get("data", {}) if isinstance(raw.get("data"), dict) else {}
             if data:
                 public_data = ide_public_operation_data(data)
@@ -114712,10 +116231,21 @@ document.addEventListener('DOMContentLoaded', function(){{
                 continue
             data = raw.get("data", {}) if isinstance(raw.get("data"), dict) else {}
             public_data = ide_public_operation_data(data)
+            operation_id = str(raw.get("id", "") or "").strip()
+            operation_seq = int(raw.get("seq", 0) or 0)
+            if not operation_id:
+                if operation_seq > 0:
+                    operation_id = f"operation:{operation_seq}"
+                else:
+                    operation_id = "operation:" + hashlib.sha256(
+                        f"{raw.get('ts', 0)}|{kind}|{json_dumps(public_data)}".encode(
+                            "utf-8", errors="ignore"
+                        )
+                    ).hexdigest()[:16]
             operations.append(
                 {
-                    "id": str(raw.get("id", "") or ""),
-                    "seq": int(raw.get("seq", 0) or 0),
+                    "id": operation_id,
+                    "seq": operation_seq,
                     "ts": float(raw.get("ts", 0.0) or 0.0),
                     "type": kind,
                     "data": public_data,
