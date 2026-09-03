@@ -4193,9 +4193,8 @@ LONG_CONTENT_SEMANTIC_MAX_DEFINITIONS = 8
 LONG_CONTENT_SEMANTIC_MAX_RELATIONS = 8
 LONG_CONTENT_SEMANTIC_MAX_UNCERTAINTIES = 6
 LONG_CONTENT_SEMANTIC_MAX_EVIDENCE = 12
+LONG_CONTENT_SEMANTIC_MAX_NEXT_SEGMENTS = 8
 LONG_CONTENT_SEMANTIC_MAX_REFRESHES = 3
-LONG_CONTENT_SEMANTIC_REFRESH_SEGMENTS = 3
-LONG_CONTENT_SEMANTIC_REFRESH_COVERAGE = 0.22
 LONG_CONTENT_TEXT_EXTS = {
     ".txt", ".md", ".mdx", ".rst", ".org", ".adoc", ".tex", ".bib",
 }
@@ -42813,6 +42812,8 @@ body{padding:18px}
                 "semantic_last_seen_count": max(0, int(value.get("semantic_last_seen_count", 0) or 0)),
                 "semantic_started_at": float(value.get("semantic_started_at", 0.0) or 0.0),
                 "semantic_retry_at": float(value.get("semantic_retry_at", 0.0) or 0.0),
+                "semantic_next_segments": [trim(str(x), 120) for x in (value.get("semantic_next_segments", []) or [])[:LONG_CONTENT_SEMANTIC_MAX_NEXT_SEGMENTS] if str(x).strip()],
+                "semantic_refresh_due": bool(value.get("semantic_refresh_due", False)),
                 "semantic": self._normalize_long_content_semantic(value.get("semantic", {})),
                 "updated_at": float(value.get("updated_at", 0.0) or 0.0),
             }
@@ -42873,6 +42874,7 @@ body{padding:18px}
             "relations": _items_from_value(relations, LONG_CONTENT_SEMANTIC_MAX_RELATIONS),
             "uncertainties": _items("uncertainties", LONG_CONTENT_SEMANTIC_MAX_UNCERTAINTIES),
             "evidence": _items("evidence", LONG_CONTENT_SEMANTIC_MAX_EVIDENCE, 220),
+            "next_segments": _items("next_segments", LONG_CONTENT_SEMANTIC_MAX_NEXT_SEGMENTS, 120),
         }
 
     def _long_content_identity(self, rel: str, fp: Path) -> tuple[str, dict]:
@@ -43028,6 +43030,11 @@ body{padding:18px}
             f"EXISTING_CARDS:\n{card_hint}\n"
             f"FOCUSED_SEGMENTS:\n" + "\n\n".join(rows)
         )
+        previous = self._normalize_long_content_semantic(memory.get("semantic", {}))
+        if previous and (previous.get("summary") or previous.get("key_points")):
+            payload += "\nPREVIOUS_SEMANTIC_CARD_TO_UPDATE:\n" + trim(
+                json_dumps(previous, ensure_ascii=False), 2200
+            )
         return trim(payload, LONG_CONTENT_SEMANTIC_MAX_INPUT_CHARS)
 
     def _maybe_enrich_long_content_semantic(
@@ -43054,16 +43061,8 @@ body{padding:18px}
             status = "failed"
             memory["semantic_retry_at"] = 0.0
         if status == "ready":
-            coverage = float(memory.get("coverage", 0.0) or 0.0)
-            previous_coverage = float(memory.get("semantic_last_coverage", 0.0) or 0.0)
-            seen_count = len(memory.get("seen_segments", []) or [])
-            previous_seen = int(memory.get("semantic_last_seen_count", 0) or 0)
             refreshes = int(memory.get("semantic_refreshes", 0) or 0)
-            if (
-                refreshes >= LONG_CONTENT_SEMANTIC_MAX_REFRESHES
-                or coverage - previous_coverage < LONG_CONTENT_SEMANTIC_REFRESH_COVERAGE
-                or seen_count - previous_seen < LONG_CONTENT_SEMANTIC_REFRESH_SEGMENTS
-            ):
+            if refreshes >= LONG_CONTENT_SEMANTIC_MAX_REFRESHES or not bool(memory.pop("semantic_refresh_due", False)):
                 return
         retry_at = float(memory.get("semantic_retry_at", 0.0) or 0.0)
         if status == "failed" and retry_at > now_ts():
@@ -43091,8 +43090,10 @@ body{padding:18px}
                     system=(
                         "Understand the supplied source semantically, independent of domain. "
                         "Return strict JSON only with keys summary, key_points, definitions, "
-                        "relations, uncertainties, evidence. Keep each item concise; evidence "
+                        "relations, uncertainties, evidence, next_segments. Keep each item concise; evidence "
                         "must cite the provided segment id or line range. Do not invent facts."
+                        " next_segments must contain only segment ids whose unread/fresh evidence is most "
+                        "likely to materially update this understanding; use an empty list if none."
                     ),
                     max_tokens=int(LONG_CONTENT_SEMANTIC_MAX_OUTPUT_TOKENS),
                     temperature=0.1,
@@ -43128,6 +43129,16 @@ body{padding:18px}
         memory["semantic_updated_at"] = now_ts()
         memory["semantic_last_coverage"] = float(memory.get("coverage", 0.0) or 0.0)
         memory["semantic_last_seen_count"] = len(memory.get("seen_segments", []) or [])
+        next_ids = {
+            str(x).strip() for x in (semantic.get("next_segments", []) or []) if str(x).strip()
+        }
+        unread = {
+            str(seg.get("id", "")).strip()
+            for seg in (memory.get("segments", []) or [])
+            if isinstance(seg, dict) and str(seg.get("id", "")).strip()
+            and str(seg.get("id", "")) not in set(memory.get("seen_segments", []) or [])
+        }
+        memory["semantic_next_segments"] = list(next_ids & unread)[:LONG_CONTENT_SEMANTIC_MAX_NEXT_SEGMENTS]
         memory["semantic_retry_at"] = 0.0
         memory["semantic_started_at"] = 0.0
         memory.pop("semantic_error", None)
@@ -43158,19 +43169,12 @@ body{padding:18px}
             if started and now_ts() - started <= max(30.0, LONG_CONTENT_SEMANTIC_TIMEOUT_SECONDS * 3):
                 return
         if status == "ready":
-            coverage = float(memory.get("coverage", 0.0) or 0.0)
-            previous_coverage = float(memory.get("semantic_last_coverage", 0.0) or 0.0)
-            seen_count = len(memory.get("seen_segments", []) or [])
-            previous_seen = int(memory.get("semantic_last_seen_count", 0) or 0)
             refreshes = int(memory.get("semantic_refreshes", 0) or 0)
-            if (
-                refreshes >= LONG_CONTENT_SEMANTIC_MAX_REFRESHES
-                or coverage - previous_coverage < LONG_CONTENT_SEMANTIC_REFRESH_COVERAGE
-                or seen_count - previous_seen < LONG_CONTENT_SEMANTIC_REFRESH_SEGMENTS
-            ):
+            if refreshes >= LONG_CONTENT_SEMANTIC_MAX_REFRESHES or not bool(memory.get("semantic_refresh_due", False)):
                 return
         memory["semantic_status"] = "pending"
         memory["semantic_started_at"] = now_ts()
+        memory.pop("semantic_refresh_due", None)
         self.long_content_memory[memory.get("content_id", "")] = memory
         self._schedule_persist()
         worker = threading.Thread(
@@ -43384,6 +43388,14 @@ body{padding:18px}
             memory["seen_segments"] = list(seen)[-LONG_CONTENT_MEMORY_MAX_SEGMENTS:]
             read_line_count = sum(max(0, int(end) - int(start) + 1) for start, end in merged_ranges)
             memory["coverage"] = round(min(1.0, read_line_count / max(1, len(lines))), 4)
+            # Let the semantic card guide the next reading frontier without
+            # hard-coding document domains.  New evidence explicitly selected
+            # by the model marks a future refresh; otherwise the card remains
+            # stable and no extra completion is spent.
+            if str(memory.get("semantic_status", "") or "").lower() == "ready":
+                next_ids = set(str(x) for x in (memory.get("semantic_next_segments", []) or []))
+                if next_ids.intersection(set(touched)):
+                    memory["semantic_refresh_due"] = True
             memory["updated_at"] = stamp
             self.long_content_memory[memory["content_id"]] = memory
             self._schedule_persist()
