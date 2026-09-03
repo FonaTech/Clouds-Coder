@@ -42782,7 +42782,10 @@ body{padding:18px}
                 source_paths.insert(0, path)
             clean[content_id] = {
                 "content_id": content_id,
-                "version": int(value.get("version", LONG_CONTENT_MEMORY_VERSION) or LONG_CONTENT_MEMORY_VERSION),
+                "version": max(
+                    LONG_CONTENT_MEMORY_VERSION,
+                    int(value.get("version", LONG_CONTENT_MEMORY_VERSION) or LONG_CONTENT_MEMORY_VERSION),
+                ),
                 "source_path": path,
                 "source_paths": source_paths[:24],
                 "source_sha256": trim(str(value.get("source_sha256", "") or ""), 100),
@@ -42799,7 +42802,7 @@ body{padding:18px}
                 "coverage": max(0.0, min(1.0, float(value.get("coverage", 0.0) or 0.0))),
                 "seen_segments": seen_segments,
                 "read_ranges": read_ranges[-LONG_CONTENT_MEMORY_MAX_SEGMENTS:],
-                    "unresolved_items": [trim(str(x), 240) for x in (value.get("unresolved_items", []) or [])[-24:] if str(x).strip()],
+                "unresolved_items": [trim(str(x), 240) for x in (value.get("unresolved_items", []) or [])[-24:] if str(x).strip()],
                 # Optional semantic card produced by the active LLM.  Missing
                 # fields are normal for legacy sessions and intentionally stay
                 # empty rather than forcing a rebuild or a model call.
@@ -43041,10 +43044,10 @@ body{padding:18px}
         self, memory: dict, rel: str, lines: list[str], touched_segments: set[str] | None = None,
         *, allow_pending: bool = False,
     ) -> None:
-        """Best-effort one-shot semantic understanding for a source version.
+        """Best-effort, bounded semantic understanding for a source version.
 
-        ``semantic_status`` is persisted as ready/failed, making retries
-        version-scoped rather than segment-scoped.  Any provider, timeout, or
+        ``semantic_status`` and refresh counters are persisted, making calls
+        version-scoped rather than segment-scoped. Any provider, timeout, or
         JSON failure leaves the deterministic cards intact.
         """
         if not LONG_CONTENT_SEMANTIC_ENABLED or not isinstance(memory, dict):
@@ -43491,6 +43494,9 @@ body{padding:18px}
                 relations = [trim(str(x), 160) for x in (semantic.get("relations", []) or [])[:2] if str(x).strip()]
                 if relations:
                     parts.append("  semantic_relations: " + " | ".join(relations))
+            next_segments = [trim(str(x), 80) for x in (row.get("semantic_next_segments", []) or [])[:4] if str(x).strip()]
+            if next_segments:
+                parts.append("  semantic_next_segments: " + ", ".join(next_segments))
         parts.append("Prefer these cards for continuity; recall the cited source window only when a claim or exact code/text is needed.")
         return trim("\n".join(parts), max_chars)
 
