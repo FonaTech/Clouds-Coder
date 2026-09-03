@@ -42811,6 +42811,7 @@ body{padding:18px}
                 "semantic_refreshes": max(0, int(value.get("semantic_refreshes", 0) or 0)),
                 "semantic_last_coverage": max(0.0, min(1.0, float(value.get("semantic_last_coverage", 0.0) or 0.0))),
                 "semantic_last_seen_count": max(0, int(value.get("semantic_last_seen_count", 0) or 0)),
+                "semantic_started_at": float(value.get("semantic_started_at", 0.0) or 0.0),
                 "semantic_retry_at": float(value.get("semantic_retry_at", 0.0) or 0.0),
                 "semantic": self._normalize_long_content_semantic(value.get("semantic", {})),
                 "updated_at": float(value.get("updated_at", 0.0) or 0.0),
@@ -43030,7 +43031,8 @@ body{padding:18px}
         return trim(payload, LONG_CONTENT_SEMANTIC_MAX_INPUT_CHARS)
 
     def _maybe_enrich_long_content_semantic(
-        self, memory: dict, rel: str, lines: list[str], touched_segments: set[str] | None = None
+        self, memory: dict, rel: str, lines: list[str], touched_segments: set[str] | None = None,
+        *, allow_pending: bool = False,
     ) -> None:
         """Best-effort one-shot semantic understanding for a source version.
 
@@ -43043,6 +43045,14 @@ body{padding:18px}
         status = str(memory.get("semantic_status", "") or "").strip().lower()
         if status == "disabled":
             return
+        if status == "pending" and not allow_pending:
+            started = float(memory.get("semantic_started_at", 0.0) or 0.0)
+            if started and now_ts() - started <= max(30.0, LONG_CONTENT_SEMANTIC_TIMEOUT_SECONDS * 3):
+                return
+            # A process may have exited while a background call was running.
+            # Do not leave a permanently pending card after restart.
+            status = "failed"
+            memory["semantic_retry_at"] = 0.0
         if status == "ready":
             coverage = float(memory.get("coverage", 0.0) or 0.0)
             previous_coverage = float(memory.get("semantic_last_coverage", 0.0) or 0.0)
@@ -43066,6 +43076,7 @@ body{padding:18px}
             return
         memory["semantic_status"] = "pending"
         memory["semantic_attempts"] = int(memory.get("semantic_attempts", 0) or 0) + 1
+        memory["semantic_started_at"] = now_ts()
         prompt = self._long_content_semantic_input(memory, lines, touched_segments)
         if not prompt.strip():
             memory["semantic_status"] = "failed"
@@ -43118,12 +43129,60 @@ body{padding:18px}
         memory["semantic_last_coverage"] = float(memory.get("coverage", 0.0) or 0.0)
         memory["semantic_last_seen_count"] = len(memory.get("seen_segments", []) or [])
         memory["semantic_retry_at"] = 0.0
+        memory["semantic_started_at"] = 0.0
         memory.pop("semantic_error", None)
         memory["updated_at"] = now_ts()
         self.long_content_memory[memory["content_id"]] = self._normalize_long_content_memory(
             self.long_content_memory
         ).get(memory["content_id"], memory)
         self._schedule_persist()
+
+    def _start_long_content_semantic_enrichment(
+        self, memory: dict, rel: str, lines: list[str], touched_segments: set[str] | None = None
+    ) -> None:
+        """Start semantic enrichment without putting file reads on the LLM path.
+
+        A tiny join window lets very fast/local providers complete inline (and
+        keeps deterministic callers observable), while normal network/model
+        latency continues in the background.  The source card is marked
+        ``pending`` before spawning so adjacent segment reads cannot fan out
+        duplicate completions.
+        """
+        if not isinstance(memory, dict):
+            return
+        status = str(memory.get("semantic_status", "") or "").strip().lower()
+        if status == "disabled":
+            return
+        if status == "pending":
+            started = float(memory.get("semantic_started_at", 0.0) or 0.0)
+            if started and now_ts() - started <= max(30.0, LONG_CONTENT_SEMANTIC_TIMEOUT_SECONDS * 3):
+                return
+        if status == "ready":
+            coverage = float(memory.get("coverage", 0.0) or 0.0)
+            previous_coverage = float(memory.get("semantic_last_coverage", 0.0) or 0.0)
+            seen_count = len(memory.get("seen_segments", []) or [])
+            previous_seen = int(memory.get("semantic_last_seen_count", 0) or 0)
+            refreshes = int(memory.get("semantic_refreshes", 0) or 0)
+            if (
+                refreshes >= LONG_CONTENT_SEMANTIC_MAX_REFRESHES
+                or coverage - previous_coverage < LONG_CONTENT_SEMANTIC_REFRESH_COVERAGE
+                or seen_count - previous_seen < LONG_CONTENT_SEMANTIC_REFRESH_SEGMENTS
+            ):
+                return
+        memory["semantic_status"] = "pending"
+        memory["semantic_started_at"] = now_ts()
+        self.long_content_memory[memory.get("content_id", "")] = memory
+        self._schedule_persist()
+        worker = threading.Thread(
+            target=self._maybe_enrich_long_content_semantic,
+            args=(memory, rel, lines, touched_segments),
+            kwargs={"allow_pending": True},
+            daemon=True,
+        )
+        worker.start()
+        # Never make read_file wait for the model; only harvest a very fast
+        # response so unit/local mock providers remain deterministic.
+        worker.join(timeout=0.08)
 
     def _long_content_segments(self, fp: Path, lines: list[str], code_data: dict | None = None) -> tuple[list[dict], str, str]:
         data = code_data if isinstance(code_data, dict) else {}
@@ -43332,7 +43391,7 @@ body{padding:18px}
             # Trigger only after an actual evidence read; a cheap structure
             # request should never block on an LLM completion.
             if observed_ranges:
-                self._maybe_enrich_long_content_semantic(memory, rel, lines, touched)
+                self._start_long_content_semantic_enrichment(memory, rel, lines, touched)
         except Exception:
             return
 
