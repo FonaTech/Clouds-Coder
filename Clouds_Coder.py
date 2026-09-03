@@ -3899,6 +3899,16 @@ RAG_MAX_DOCUMENT_CHARS = max(
 CODE_CHUNK_CHARS = 1800
 CODE_CHUNK_OVERLAP = 120
 CODE_MAX_CHUNKS_PER_DOC = 260
+# Code parsing keeps prompt/RAG chunks bounded separately from the structural
+# source index.  The latter is allowed to inspect substantially larger files
+# so symbol lookup remains complete for generated or monolithic codebases.
+CODE_SOURCE_ANALYSIS_MAX_CHARS = max(
+    300_000,
+    min(
+        40_000_000,
+        int(str(os.getenv("AGENT_CODE_SOURCE_ANALYSIS_MAX_CHARS", str(12_000_000)) or str(12_000_000))),
+    ),
+)
 RAG_MAX_QUERY_RESULTS = 64
 RAG_HIGH_RECALL_POOL_MULTIPLIER = 4
 RAG_HIGH_RECALL_MIN_POOL = 64
@@ -3922,7 +3932,7 @@ RAG_SYMBOL_EXACT_BOOST = 0.5
 # Index snapshot format tag. Bumping this invalidates older on-disk snapshots that lack
 # BM25 fields (raw-tf postings + chunk_lengths), forcing a one-time rebuild from the
 # persisted documents/chunks (the real source of truth) instead of scoring incorrectly.
-RAG_INDEX_SNAPSHOT_FORMAT = "bm25-v1"
+RAG_INDEX_SNAPSHOT_FORMAT = "bm25-v2-structured-memory"
 RAG_GRAPH_MAX_NODES = 2000
 RAG_TASK_HISTORY_LIMIT = 400
 RAG_MODEL_MEDIA_MAX_BYTES = 8 * 1024 * 1024
@@ -4126,6 +4136,21 @@ READ_CONTEXT_CACHE_SEARCH_MAX_BYTES = max(
 READ_CONTEXT_CACHE_SEARCH_MAX_MATCHES = 8
 READ_CONTEXT_CACHE_SNIPPET_CHARS = 2_400
 READ_CONTEXT_CACHE_LINE_CONTEXT = 2
+# Source decode cache is process-local only (never persisted into prompts or
+# session state). It avoids rereading/decoding multi-megabyte sources for every
+# focused lookup while remaining bounded for IDE workspaces.
+LONG_CONTENT_SOURCE_CACHE_MAX_BYTES = max(
+    8 * 1024 * 1024,
+    min(256 * 1024 * 1024, int(str(os.getenv("AGENT_LONG_CONTENT_SOURCE_CACHE_MAX_BYTES", str(64 * 1024 * 1024)) or str(64 * 1024 * 1024)))),
+)
+LONG_CONTENT_SOURCE_CACHE_MAX_FILES = max(
+    1,
+    min(16, int(str(os.getenv("AGENT_LONG_CONTENT_SOURCE_CACHE_MAX_FILES", "4") or "4"))),
+)
+LONG_CONTENT_SYMBOL_MEMORY_MAX = max(
+    256,
+    min(100_000, int(str(os.getenv("AGENT_LONG_CONTENT_SYMBOL_MEMORY_MAX", "20000") or "20000"))),
+)
 TOOL_MEMORY_REGISTRY_MAX = 120
 TOOL_MEMORY_PROMPT_MAX_ITEMS = 18
 TOOL_MEMORY_PROMPT_MAX_CHARS = 5_500
@@ -4135,6 +4160,77 @@ TOOL_MEMORY_COMPACT_PIN_DISTINCT = 10
 TOOL_MEMORY_COMPACT_PIN_MAX_CHARS = 10_000
 TOOL_MEMORY_POLICY_CHOICES = READ_CONTEXT_POLICY_CHOICES
 DEFAULT_TOOL_MEMORY_POLICY = DEFAULT_READ_CONTEXT_POLICY
+# Unified long-content reading memory.  This is deliberately separate from the
+# conversation/tool registries: those retain evidence, while this index retains
+# the durable understanding of a long text/file/code source.  Cards are small
+# and source-addressable, so compaction can discard them from the prompt without
+# losing the ability to rehydrate the same understanding later.
+# Version 3 adds a task-aware semantic frontier and range-aware read reuse.
+# The loader deliberately accepts older rows (and future rows with extra
+# fields), so existing sessions/RAG evidence remain readable without a
+# migration step.
+LONG_CONTENT_MEMORY_VERSION = 3
+LONG_CONTENT_MEMORY_MAX_ITEMS = max(
+    8,
+    min(160, int(str(os.getenv("AGENT_LONG_CONTENT_MEMORY_MAX_ITEMS", "80") or "80"))),
+)
+LONG_CONTENT_MEMORY_MAX_SEGMENTS = max(
+    8,
+    min(16384, int(str(os.getenv("AGENT_LONG_CONTENT_MEMORY_MAX_SEGMENTS", "4096") or "4096"))),
+)
+LONG_CONTENT_TEXT_SEGMENT_LINES = max(
+    40,
+    min(600, int(str(os.getenv("AGENT_LONG_CONTENT_TEXT_SEGMENT_LINES", "180") or "180"))),
+)
+LONG_CONTENT_CODE_SEGMENT_LINES = max(
+    80,
+    min(1200, int(str(os.getenv("AGENT_LONG_CONTENT_CODE_SEGMENT_LINES", "360") or "360"))),
+)
+LONG_CONTENT_CARD_CHARS = max(
+    180,
+    min(1800, int(str(os.getenv("AGENT_LONG_CONTENT_CARD_CHARS", "720") or "720"))),
+)
+LONG_CONTENT_STRUCTURE_MAX_CHARS = max(
+    1800,
+    min(12000, int(str(os.getenv("AGENT_LONG_CONTENT_STRUCTURE_MAX_CHARS", "6000") or "6000"))),
+)
+# Semantic enrichment is intentionally bounded and best-effort.  It runs at
+# most once per source version after a real focused read; structure/overview
+# reads remain local and immediate.  This keeps long-file navigation cheap
+# while allowing the active LLM to build a domain-neutral understanding card.
+LONG_CONTENT_SEMANTIC_ENABLED = (
+    str(os.getenv("AGENT_LONG_CONTENT_SEMANTIC_ENABLED", "true") or "true").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+LONG_CONTENT_SEMANTIC_TIMEOUT_SECONDS = max(
+    0.5,
+    min(20.0, float(str(os.getenv("AGENT_LONG_CONTENT_SEMANTIC_TIMEOUT_SECONDS", "4") or "4"))),
+)
+LONG_CONTENT_SEMANTIC_MAX_INPUT_CHARS = max(
+    2400,
+    min(24000, int(str(os.getenv("AGENT_LONG_CONTENT_SEMANTIC_MAX_INPUT_CHARS", "12000") or "12000"))),
+)
+LONG_CONTENT_SEMANTIC_MAX_OUTPUT_TOKENS = max(
+    160,
+    min(1200, int(str(os.getenv("AGENT_LONG_CONTENT_SEMANTIC_MAX_OUTPUT_TOKENS", "520") or "520"))),
+)
+LONG_CONTENT_SEMANTIC_MAX_KEY_POINTS = 8
+LONG_CONTENT_SEMANTIC_MAX_DEFINITIONS = 8
+LONG_CONTENT_SEMANTIC_MAX_RELATIONS = 8
+LONG_CONTENT_SEMANTIC_MAX_UNCERTAINTIES = 6
+LONG_CONTENT_SEMANTIC_MAX_EVIDENCE = 12
+LONG_CONTENT_SEMANTIC_MAX_NEXT_SEGMENTS = 8
+LONG_CONTENT_SEMANTIC_MAX_COVERED = 12
+LONG_CONTENT_SEMANTIC_MAX_OPEN_QUESTIONS = 10
+LONG_CONTENT_SEMANTIC_MAX_REFRESHES = 3
+LONG_CONTENT_TEXT_EXTS = {
+    ".txt", ".md", ".mdx", ".rst", ".org", ".adoc", ".tex", ".bib",
+}
+LONG_CONTENT_DATA_EXTS = {
+    ".json", ".jsonl", ".jsonc", ".yaml", ".yml", ".toml", ".ini",
+    ".cfg", ".conf", ".env", ".properties", ".csv", ".tsv", ".xml",
+    ".xsd", ".xsl",
+}
 DEFAULT_AUTO_TASK_LEVEL_CEILING = 2  # Applies only to automatic L1-L5 classification; 0 = no cap.
 HARD_BREAK_TOOL_ERROR_THRESHOLD = 20
 # Normal debugging often needs several corrected tool attempts before any
@@ -26743,17 +26839,19 @@ TOOLS = [
             "app.py line 240 -> mode='window' line=240 context=5; "
             "run.txt E123 -> mode='search' query='E123'. "
             "Use mode='auto' by default; use mode='symbol', 'search', or 'window' for focused reads, "
-            "and mode='full' when complete content is explicitly needed. Successful reads are remembered in "
+            "and mode='full' when complete content is explicitly needed. Use mode='structure' or mode='segment' "
+            "to resume a long-file reading pass from compact understanding cards. Successful reads are remembered in "
             "the tool-memory registry; use that evidence instead of repeating identical broad reads."
         ),
         {
             "path": {"type": "string"},
             "mode": {
                 "type": "string",
-                "enum": ["auto", "full", "overview", "window", "symbol", "search", "directory"],
-                "description": "Reading strategy. Use symbol with target for a function/class; search with query for known text/errors; window with line/context for a line range. Avoid full for large logs when a query is known.",
+                "enum": ["auto", "full", "overview", "structure", "segment", "window", "symbol", "search", "directory"],
+                "description": "Reading strategy. Use structure/overview to inspect a long source memory, segment with target/query to read one remembered section, symbol with target for a function/class; search with query for known text/errors; window with line/context for a line range. Avoid full for large logs when a query is known.",
             },
             "target": {"type": "string", "description": "Symbol name for mode='symbol', for example 'ClassName.method' or 'func_42'."},
+            "segment_id": {"type": "string", "description": "Long-content memory segment id returned by mode='structure', for example 's0001'."},
             "query": {"type": "string", "description": "Search text or regex for mode='search'; can also be used when target is unknown."},
             "line": {"type": "integer", "description": "1-based center line for mode='window'."},
             "context": {"type": "integer", "description": "Number of surrounding lines for mode='window' or mode='search'."},
@@ -26761,6 +26859,7 @@ TOOLS = [
             "max_chars": {"type": "integer", "description": "Maximum characters to return for broad reads; use only when wider context is needed."},
             "limit": {"type": "integer", "description": "Legacy line count for compatibility; prefer mode/context for new calls."},
             "offset": {"type": "integer", "description": "0-based character offset for mode='full'; legacy 0-based line/entry offset for mode='window' or mode='directory'. Prefer mode='window' with line/context for line-oriented reads."},
+            "fresh": {"type": "boolean", "description": "Force exact source reread even when long-content memory already covers the requested range; use for freshness/verification."},
         },
         ["path"],
     ),
@@ -28295,6 +28394,21 @@ class SessionState:
         self.agent_loop_progress_state: dict[str, dict] = {}
         self.read_context_registry: dict[str, dict] = {}
         self.tool_memory_registry: dict[str, dict] = {}
+        # Transient stat-keyed fingerprints avoid re-hashing a large source in
+        # read-context, tool-memory and long-content bookkeeping during the
+        # same or later focused reads. Durable registries still store the hash.
+        self._source_fingerprint_cache: dict[str, dict] = {}
+        # Decoded line arrays are an ephemeral LRU.  They are keyed by the
+        # source fingerprint, so external edits automatically bypass them;
+        # keeping them out of persistence preserves small snapshots.
+        self._long_content_source_cache: dict[str, dict] = {}
+        self._long_content_structure_cache: dict[str, dict] = {}
+        # Durable, source-addressable understanding for long text/files/code.
+        # ``read_context_registry`` keeps raw tool evidence; this registry keeps
+        # compact structure/cards so a later turn can resume comprehension
+        # without asking the model to reread the whole source.
+        self.long_content_memory: dict[str, dict] = {}
+        self.long_content_memory_version = LONG_CONTENT_MEMORY_VERSION
         self.web_search_context_registry: dict[str, dict] = {}
         self.tool_memory_policy = DEFAULT_TOOL_MEMORY_POLICY
         self.stall_severity_score = 0
@@ -29781,6 +29895,9 @@ class SessionState:
                 self.tool_memory_registry = self._normalize_tool_memory_registry(
                     raw.get("tool_memory_registry", {})
                 )
+                self.long_content_memory = self._normalize_long_content_memory(
+                    raw.get("long_content_memory", {})
+                )
                 if not self.tool_memory_registry and self.read_context_registry:
                     self.tool_memory_registry = self._tool_memory_from_read_context_registry(self.read_context_registry)
                 self.web_search_context_registry = self._normalize_web_search_context_registry(
@@ -30306,6 +30423,9 @@ class SessionState:
             ),
             "tool_memory_registry": self._normalize_tool_memory_registry(
                 getattr(self, "tool_memory_registry", {})
+            ),
+            "long_content_memory": self._normalize_long_content_memory(
+                getattr(self, "long_content_memory", {})
             ),
             "web_search_context_registry": self._normalize_web_search_context_registry(
                 getattr(self, "web_search_context_registry", {})
@@ -33149,6 +33269,7 @@ class SessionState:
         engineering_hint = self._engineering_execution_boost_instruction()
         code_ref_block = self._runtime_code_reference_prompt_block()
         knowledge_ref_block = self._runtime_knowledge_reference_prompt_block()
+        long_content_memory_block = self._long_content_memory_prompt_block()
         runtime_level = int(self.runtime_task_level or 0)
         runtime_mode = self._effective_execution_mode()
         budget = int(self.runtime_round_budget or 0)
@@ -33158,6 +33279,7 @@ class SessionState:
         code_hint_block = f"{code_hint}\n\n" if code_hint else ""
         engineering_block = f"{engineering_hint}\n\n" if engineering_hint else ""
         knowledge_ref_block_text = f"{knowledge_ref_block}\n\n" if knowledge_ref_block else ""
+        long_content_memory_text = f"{long_content_memory_block}\n\n" if long_content_memory_block else ""
         code_block = f"{code_ref_block}\n\n" if code_ref_block else ""
         read_context_block = self._read_context_prompt_block()
         read_context_text = f"{read_context_block}\n\n" if read_context_block else ""
@@ -33238,7 +33360,7 @@ class SessionState:
                 f"{self._public_progress_prompt_instruction()}"
                 "Use tools to inspect, edit, and execute. "
                 "If you say you will create, write, build, copy, modify, or verify an artifact, the same turn must include the concrete tool call that does it; do not stop at a promise to act. "
-            "When reading files, choose the shape that matches the question: mode='window' for file:line, mode='symbol' for named code, mode='search' for keywords/errors, mode='overview' for structure, and mode='full' only when exact broad context is required. "
+            "When reading files, choose the shape that matches the question: mode='window' for file:line, mode='symbol' for named code, mode='search' for keywords/errors, mode='overview' or mode='structure' for structure and long-content memory, mode='segment' with a segment_id to continue a remembered section, and mode='full' only when exact broad context is required. "
             "When inspecting collections or memory, use focused modes too: tool_memory/context_recall/read_from_blackboard/task_list/check_background/list_background_processes/read_inbox/worktree_events support focused query/status/detail filters where applicable. `check_background` is session-local; `list_background_processes` sees only the authenticated user's processes across sessions, and `stop_background_process` requires an exact visible process_id. Prefer filters over repeatedly listing recent items. "
             "Before repeating the same successful read_file/bash/query over the same target, check the injected tool-memory-registry or call tool_memory with mode='search' or mode='detail'. "
                 f"{web_search_instruction}"
@@ -33264,6 +33386,7 @@ class SessionState:
             f"{web_search_context_text}"
             f"{read_context_text}"
             f"{knowledge_ref_block_text}"
+            f"{long_content_memory_text}"
             f"{code_block}"
             f"{model_language_instruction(self.ui_language)}\n\n"
             f"Uploads:\n{uploads_ctx}\n\n"
@@ -34928,10 +35051,12 @@ class SessionState:
         path = trim(str(src.get("path", "") or "").replace("\\", "/"), 240)
         mode = str(src.get("mode", "") or "auto").strip().lower() or "auto"
         parts = [f"path={path}", f"mode={mode}"]
-        for key in ("target", "query", "line", "context", "offset", "limit", "regex", "max_chars"):
+        for key in ("target", "query", "line", "context", "offset", "limit", "regex", "max_chars", "segment_id"):
             value = src.get(key)
             if value not in (None, ""):
                 parts.append(f"{key}={trim(str(value), 120)}")
+        if bool(src.get("fresh", False)):
+            parts.append("fresh=true")
         return "|".join(parts)
 
     def _tool_memory_key(self, role: str, signature: str) -> str:
@@ -35599,7 +35724,7 @@ class SessionState:
                 "args": {
                     k: v
                     for k, v in dict(args).items()
-                    if k in {"mode", "target", "query", "line", "context", "offset", "limit", "regex", "max_chars"}
+                    if k in {"mode", "target", "query", "line", "context", "offset", "limit", "regex", "max_chars", "segment_id", "fresh"}
                 },
                 "hit_count": max(1, int(raw_entry.get("hit_count", 1) or 1)),
                 "first_read_ts": max(0.0, float(raw_entry.get("first_read_ts", 0.0) or 0.0)),
@@ -36114,8 +36239,23 @@ class SessionState:
         self.tool_memory_registry = self._pruned_tool_memory_registry(registry)
         return f"tool_memory policy applied: pinned={kept}, dropped={dropped}"
 
-    def _record_read_context(self, rel_path: str, args: dict, output: str, role: str = "") -> None:
+    def _record_read_context(
+        self,
+        rel_path: str,
+        args: dict,
+        output: str,
+        role: str = "",
+        *,
+        source_text: str | None = None,
+        source_fp: dict | None = None,
+    ) -> None:
         if str(output or "").startswith("Error:"):
+            return
+        # A range already covered by long-content memory is represented by a
+        # tiny reuse marker. Do not overwrite the prior exact cached evidence
+        # with that marker; otherwise a later semantic search would lose the
+        # source text it is meant to reuse.
+        if str(output or "").lstrip().startswith("[read_file reused"):
             return
         rel = trim(str(rel_path or "").replace("\\", "/"), 300)
         if not rel:
@@ -36130,7 +36270,7 @@ class SessionState:
         now = now_ts()
         old = self.read_context_registry.get(key, {}) if isinstance(getattr(self, "read_context_registry", {}), dict) else {}
         sha = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()
-        source_fp = self._read_source_fingerprint(rel)
+        source_fp = dict(source_fp) if isinstance(source_fp, dict) else self._read_source_fingerprint(rel)
         # Prefer the source document over the rendered/truncated tool output.
         # This is what makes facts beyond ``max_chars`` recoverable after a
         # compact. For very large files the bounded prefix is still useful and
@@ -36141,12 +36281,18 @@ class SessionState:
             source_path = self._session_path(rel)
             source_size = int(source_path.stat().st_size)
             if source_path.is_file() and source_size > len(content.encode("utf-8", errors="replace")):
-                raw = source_path.read_bytes()
-                if len(raw) <= READ_CONTEXT_CACHE_SEARCH_MAX_BYTES:
-                    cache_content = self._read_text_with_fallback(source_path)
-                else:
-                    cache_content = raw[:READ_CONTEXT_CACHE_SEARCH_MAX_BYTES].decode("utf-8", errors="replace")
+                if source_text is not None and source_size <= READ_CONTEXT_CACHE_SEARCH_MAX_BYTES:
+                    cache_content = str(source_text)
+                elif source_text is not None:
+                    cache_content = str(source_text)[:READ_CONTEXT_CACHE_SEARCH_MAX_BYTES]
                     cache_source_complete = False
+                else:
+                    raw = source_path.read_bytes()
+                    if len(raw) <= READ_CONTEXT_CACHE_SEARCH_MAX_BYTES:
+                        cache_content = self._decode_text_bytes(raw)
+                    else:
+                        cache_content = self._decode_text_bytes(raw[:READ_CONTEXT_CACHE_SEARCH_MAX_BYTES])
+                        cache_source_complete = False
         except Exception:
             pass
         cache_path = str(old.get("cache_path", "") or "")
@@ -36180,7 +36326,7 @@ class SessionState:
             "args": {
                 k: v
                 for k, v in src_args.items()
-                if k in {"mode", "target", "query", "line", "context", "offset", "limit", "regex", "max_chars"}
+                if k in {"mode", "target", "query", "line", "context", "offset", "limit", "regex", "max_chars", "segment_id", "fresh"}
             },
             "hit_count": int(old.get("hit_count", 0) or 0) + 1,
             "first_read_ts": float(old.get("first_read_ts", now) or now),
@@ -36311,11 +36457,24 @@ class SessionState:
                 "source_size": int(st.st_size),
                 "source_mtime_ns": int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000))),
             }
+            cache = getattr(self, "_source_fingerprint_cache", {})
+            if not isinstance(cache, dict):
+                cache = {}
+                self._source_fingerprint_cache = cache
+            cached = cache.get(rel, {}) if isinstance(cache.get(rel, {}), dict) else {}
+            if (
+                int(cached.get("source_size", -1) or -1) == out["source_size"]
+                and int(cached.get("source_mtime_ns", -1) or -1) == out["source_mtime_ns"]
+            ):
+                if str(cached.get("source_sha256", "") or "").strip():
+                    out["source_sha256"] = str(cached.get("source_sha256", ""))
+                return out
             if fp.is_file() and int(st.st_size) <= READ_CONTEXT_CACHE_SEARCH_MAX_BYTES:
                 try:
                     out["source_sha256"] = hashlib.sha256(fp.read_bytes()).hexdigest()
                 except Exception:
                     pass
+            cache[rel] = dict(out)
             return out
         except Exception:
             return {}
@@ -42480,6 +42639,20 @@ body{padding:18px}
         return trim(json_dumps(payload, indent=2), cap)
 
     def _read_file_code_data(self, fp: Path, lines: list[str]) -> dict:
+        cache = getattr(self, "_long_content_structure_cache", {})
+        if not isinstance(cache, dict):
+            cache = {}
+            self._long_content_structure_cache = cache
+        try:
+            st = fp.stat()
+            cache_key = f"{fp.resolve()}|{int(st.st_size)}|{int(getattr(st, 'st_mtime_ns', int(st.st_mtime * 1_000_000_000)))}"
+        except Exception:
+            cache_key = ""
+        if cache_key:
+            cached = cache.get(cache_key)
+            if isinstance(cached, dict):
+                cached["last_used"] = now_ts()
+                return dict(cached.get("data", {}) or {})
         text = "\n".join(lines)
         language = ""
         imports: list[str] = []
@@ -42523,7 +42696,18 @@ body{padding:18px}
                 }
             )
         clean.sort(key=lambda r: (int(r.get("line_start", 0) or 0), str(r.get("name", ""))))
-        return {"language": language or "text", "imports": imports[:64], "symbols": clean[:240]}
+        # Keep the complete symbol table in the durable long-content index;
+        # presentation layers may cap what they print, but lookup must remain
+        # logarithmic/precise for repositories with tens of thousands of
+        # declarations.  The normalizer applies the global memory bound.
+        data = {"language": language or "text", "imports": imports[:256], "symbols": clean[:LONG_CONTENT_SYMBOL_MEMORY_MAX]}
+        if cache_key:
+            cache[cache_key] = {"data": data, "last_used": now_ts()}
+            # Structure parsing can be expensive for large repositories; keep
+            # a small LRU independent of the source-text cache.
+            rows = sorted(cache.items(), key=lambda item: float(item[1].get("last_used", 0.0) or 0.0))
+            self._long_content_structure_cache = dict(rows[-LONG_CONTENT_SOURCE_CACHE_MAX_FILES:])
+        return data
 
     def _read_file_fallback_symbols(self, fp: Path, lines: list[str], language: str = "") -> list[dict]:
         symbols: list[dict] = []
@@ -42564,13 +42748,1205 @@ body{padding:18px}
                     }
                 )
                 break
-            if len(symbols) >= 240:
+            if len(symbols) >= LONG_CONTENT_SYMBOL_MEMORY_MAX:
                 break
         for pos, row in enumerate(symbols):
             start = int(row.get("line_start", 1) or 1)
             next_start = int(symbols[pos + 1].get("line_start", 0) or 0) if pos + 1 < len(symbols) else 0
             row["line_end"] = max(start, (next_start - 1) if next_start > start else min(len(lines), start + 120))
         return symbols
+
+    # ---- Unified long-content understanding ---------------------------------
+    # ``read_context_registry`` is an evidence cache.  These helpers build a
+    # second, deliberately small index of structure and durable reading cards
+    # for long text, logs, data files and source code. Structure extraction is
+    # deterministic and cheap; an optional, once-per-source LLM semantic card
+    # is added only after a focused evidence read. Full source remains
+    # recoverable via read_file/context_recall and is never copied wholesale
+    # into the prompt block.
+    def _normalize_long_content_memory(self, raw: object) -> dict[str, dict]:
+        if not isinstance(raw, dict):
+            return {}
+        clean: dict[str, dict] = {}
+        for key, value in list(raw.items())[-LONG_CONTENT_MEMORY_MAX_ITEMS * 2:]:
+            if not isinstance(value, dict):
+                continue
+            content_id = str(value.get("content_id", key) or key).strip()[:180]
+            path = str(value.get("source_path", "") or "").replace("\\", "/").strip()[:400]
+            if not content_id or not path:
+                continue
+            segments: list[dict] = []
+            for item in value.get("segments", []) if isinstance(value.get("segments", []), list) else []:
+                if not isinstance(item, dict):
+                    continue
+                sid = str(item.get("id", "") or "").strip()[:120]
+                if not sid:
+                    continue
+                segments.append({
+                    "id": sid,
+                    "title": trim(str(item.get("title", "") or ""), 180),
+                    "kind": trim(str(item.get("kind", "text") or "text"), 40),
+                    "start_line": max(1, int(item.get("start_line", 1) or 1)),
+                    "end_line": max(1, int(item.get("end_line", item.get("start_line", 1)) or 1)),
+                    "summary": trim(str(item.get("summary", "") or ""), LONG_CONTENT_CARD_CHARS),
+                    "key_terms": [trim(str(x), 100) for x in (item.get("key_terms", []) or [])[:16] if str(x).strip()],
+                    "symbols": [trim(str(x), 120) for x in (item.get("symbols", []) or [])[:24] if str(x).strip()],
+                    "evidence": [trim(str(x), 180) for x in (item.get("evidence", []) or [])[:12] if str(x).strip()],
+                    "status": str(item.get("status", "unseen") or "unseen")[:24],
+                    "last_seen": float(item.get("last_seen", 0.0) or 0.0),
+                })
+            cards: list[dict] = []
+            for item in value.get("cards", []) if isinstance(value.get("cards", []), list) else []:
+                if not isinstance(item, dict):
+                    continue
+                card_id = str(item.get("id", "") or "").strip()[:120]
+                if not card_id:
+                    continue
+                cards.append({
+                    "id": card_id,
+                    "type": trim(str(item.get("type", "structure") or "structure"), 40),
+                    "title": trim(str(item.get("title", "") or ""), 180),
+                    "segment_id": trim(str(item.get("segment_id", "") or ""), 120),
+                    "text": trim(str(item.get("text", "") or ""), LONG_CONTENT_CARD_CHARS),
+                    "key_terms": [trim(str(x), 100) for x in (item.get("key_terms", []) or [])[:16] if str(x).strip()],
+                    "evidence": [trim(str(x), 180) for x in (item.get("evidence", []) or [])[:12] if str(x).strip()],
+                    "status": trim(str(item.get("status", "derived") or "derived"), 24),
+                    "updated_at": float(item.get("updated_at", 0.0) or 0.0),
+                })
+            seen_segments = [
+                str(x)[:120]
+                for x in (value.get("seen_segments", []) or [])[-LONG_CONTENT_MEMORY_MAX_SEGMENTS:]
+                if str(x).strip()
+            ]
+            read_ranges: list[list[int]] = []
+            for item in value.get("read_ranges", []) if isinstance(value.get("read_ranges", []), list) else []:
+                if not isinstance(item, (list, tuple)) or len(item) < 2:
+                    continue
+                try:
+                    start = max(1, int(item[0] or 1))
+                    end = max(start, int(item[1] or start))
+                except Exception:
+                    continue
+                read_ranges.append([start, end])
+            if not read_ranges and seen_segments:
+                seen_set = set(seen_segments)
+                read_ranges = [
+                    [int(item.get("start_line", 1) or 1), int(item.get("end_line", 1) or 1)]
+                    for item in segments
+                    if str(item.get("id", "") or "") in seen_set
+                ]
+            raw_source_paths = value.get("source_paths", [])
+            if isinstance(raw_source_paths, str):
+                raw_source_paths = [raw_source_paths]
+            elif not isinstance(raw_source_paths, (list, tuple, set)):
+                raw_source_paths = []
+            source_paths = [
+                str(x).replace("\\", "/").strip()[:400]
+                for x in raw_source_paths
+                if str(x).strip()
+            ]
+            if path and path not in source_paths:
+                source_paths.insert(0, path)
+            clean[content_id] = {
+                "content_id": content_id,
+                "version": max(
+                    LONG_CONTENT_MEMORY_VERSION,
+                    int(value.get("version", LONG_CONTENT_MEMORY_VERSION) or LONG_CONTENT_MEMORY_VERSION),
+                ),
+                "source_path": path,
+                "source_paths": source_paths[:24],
+                "source_sha256": trim(str(value.get("source_sha256", "") or ""), 100),
+                "source_size": max(0, int(value.get("source_size", 0) or 0)),
+                "source_mtime_ns": max(0, int(value.get("source_mtime_ns", 0) or 0)),
+                "stale": bool(value.get("stale", False)),
+                "content_type": trim(str(value.get("content_type", "text") or "text"), 40),
+                "language": trim(str(value.get("language", "text") or "text"), 40),
+                "total_lines": max(0, int(value.get("total_lines", 0) or 0)),
+                "outline_ready": bool(value.get("outline_ready", False)),
+                "outline": trim(str(value.get("outline", "") or ""), LONG_CONTENT_STRUCTURE_MAX_CHARS),
+                "segments": segments[-LONG_CONTENT_MEMORY_MAX_SEGMENTS:],
+                "cards": cards[-LONG_CONTENT_MEMORY_MAX_SEGMENTS:],
+                "coverage": max(0.0, min(1.0, float(value.get("coverage", 0.0) or 0.0))),
+                "seen_segments": seen_segments,
+                "read_ranges": read_ranges[-LONG_CONTENT_MEMORY_MAX_SEGMENTS:],
+                "unresolved_items": [trim(str(x), 240) for x in (value.get("unresolved_items", []) or [])[-24:] if str(x).strip()],
+                # Optional semantic card produced by the active LLM.  Missing
+                # fields are normal for legacy sessions and intentionally stay
+                # empty rather than forcing a rebuild or a model call.
+                "semantic_status": trim(str(value.get("semantic_status", "") or ""), 24),
+                "semantic_version": trim(str(value.get("semantic_version", "") or ""), 120),
+                "semantic_updated_at": float(value.get("semantic_updated_at", 0.0) or 0.0),
+                "semantic_attempts": max(0, int(value.get("semantic_attempts", 0) or 0)),
+                "semantic_refreshes": max(0, int(value.get("semantic_refreshes", 0) or 0)),
+                "semantic_last_coverage": max(0.0, min(1.0, float(value.get("semantic_last_coverage", 0.0) or 0.0))),
+                "semantic_last_seen_count": max(0, int(value.get("semantic_last_seen_count", 0) or 0)),
+                "semantic_started_at": float(value.get("semantic_started_at", 0.0) or 0.0),
+                "semantic_retry_at": float(value.get("semantic_retry_at", 0.0) or 0.0),
+                "semantic_next_segments": [trim(str(x), 120) for x in (value.get("semantic_next_segments", []) or [])[:LONG_CONTENT_SEMANTIC_MAX_NEXT_SEGMENTS] if str(x).strip()],
+                "semantic_refresh_due": bool(value.get("semantic_refresh_due", False)),
+                # Task-aware frontier.  These fields are optional and bounded
+                # so v1/v2 sessions load unchanged while new reads can be
+                # selected against the active objective rather than recency.
+                "objective_signature": trim(str(value.get("objective_signature", "") or ""), 160),
+                "objective_text": trim(str(value.get("objective_text", "") or ""), 900),
+                "objective_gaps": [trim(str(x), 260) for x in (value.get("objective_gaps", []) or [])[:LONG_CONTENT_SEMANTIC_MAX_OPEN_QUESTIONS] if str(x).strip()],
+                "objective_covered": [trim(str(x), 260) for x in (value.get("objective_covered", []) or [])[:LONG_CONTENT_SEMANTIC_MAX_COVERED] if str(x).strip()],
+                "frontier_segments": [trim(str(x), 120) for x in (value.get("frontier_segments", []) or [])[:LONG_CONTENT_SEMANTIC_MAX_NEXT_SEGMENTS] if str(x).strip()],
+                "read_events": max(0, int(value.get("read_events", 0) or 0)),
+                "reuse_events": max(0, int(value.get("reuse_events", 0) or 0)),
+                "semantic": self._normalize_long_content_semantic(value.get("semantic", {})),
+                "updated_at": float(value.get("updated_at", 0.0) or 0.0),
+            }
+        return dict(list(clean.items())[-LONG_CONTENT_MEMORY_MAX_ITEMS:])
+
+    def _normalize_long_content_semantic(self, raw: object) -> dict:
+        """Normalize an optional model-produced understanding card.
+
+        This is deliberately schema-tolerant: old sessions have no card and
+        providers occasionally return a partial JSON object.  All values are
+        bounded before they can enter durable state or a prompt.
+        """
+        if not isinstance(raw, dict):
+            return {}
+        def _items_from_value(val: object, limit: int, chars: int = 420) -> list[str]:
+            if isinstance(val, str):
+                val = [val]
+            if not isinstance(val, (list, tuple)):
+                return []
+            out: list[str] = []
+            seen: set[str] = set()
+            for item in val:
+                text = trim(str(item or "").strip(), chars)
+                if not text or text.casefold() in seen:
+                    continue
+                seen.add(text.casefold())
+                out.append(text)
+                if len(out) >= limit:
+                    break
+            return out
+        def _items(key: str, limit: int, chars: int = 420) -> list[str]:
+            val = raw.get(key, [])
+            if isinstance(val, str):
+                val = [val]
+            if not isinstance(val, (list, tuple)):
+                return []
+            out: list[str] = []
+            seen: set[str] = set()
+            for item in val:
+                text = trim(str(item or "").strip(), chars)
+                if not text or text.casefold() in seen:
+                    continue
+                seen.add(text.casefold())
+                out.append(text)
+                if len(out) >= limit:
+                    break
+            return out
+        definitions = raw.get("definitions", [])
+        if isinstance(definitions, dict):
+            definitions = [f"{k}: {v}" for k, v in definitions.items()]
+        relations = raw.get("relations", [])
+        if isinstance(relations, dict):
+            relations = [f"{k} -> {v}" for k, v in relations.items()]
+        return {
+            "summary": trim(str(raw.get("summary", "") or ""), 900),
+            "key_points": _items("key_points", LONG_CONTENT_SEMANTIC_MAX_KEY_POINTS),
+            "definitions": _items_from_value(definitions, LONG_CONTENT_SEMANTIC_MAX_DEFINITIONS),
+            "relations": _items_from_value(relations, LONG_CONTENT_SEMANTIC_MAX_RELATIONS),
+            "uncertainties": _items("uncertainties", LONG_CONTENT_SEMANTIC_MAX_UNCERTAINTIES),
+            "evidence": _items("evidence", LONG_CONTENT_SEMANTIC_MAX_EVIDENCE, 220),
+            "covered": _items("covered", LONG_CONTENT_SEMANTIC_MAX_COVERED, 260),
+            "open_questions": _items("open_questions", LONG_CONTENT_SEMANTIC_MAX_OPEN_QUESTIONS, 260),
+            "next_segments": _items("next_segments", LONG_CONTENT_SEMANTIC_MAX_NEXT_SEGMENTS, 120),
+        }
+
+    def _long_content_identity(self, rel: str, fp: Path) -> tuple[str, dict]:
+        rel_clean = str(rel or "").replace("\\", "/").strip()
+        source_fp = self._read_source_fingerprint(rel_clean)
+        # Content identity is content-first whenever a bounded source hash is
+        # available.  That lets the same long document/code be opened through
+        # different workspace aliases without rebuilding its understanding.
+        # For very large files where hashing is intentionally skipped, retain a
+        # path+stat fallback so unrelated files cannot collide.
+        source_hash = str(source_fp.get("source_sha256", "") or "").strip()
+        if source_hash:
+            identity = f"sha256:{source_hash}"
+        else:
+            identity = (
+                f"path:{rel_clean}|size:{source_fp.get('source_size', 0)}"
+                f"|mtime:{source_fp.get('source_mtime_ns', 0)}"
+            )
+        content_id = hashlib.sha1(identity.encode("utf-8", errors="replace")).hexdigest()[:20]
+        return content_id, source_fp
+
+    def _long_content_kind(self, fp: Path, language: str = "") -> str:
+        ext = fp.suffix.lower()
+        if ext in {".log", ".out", ".err", ".trace"}:
+            return "log"
+        if ext in LONG_CONTENT_DATA_EXTS:
+            return "data"
+        if ext in LONG_CONTENT_TEXT_EXTS:
+            return "text"
+        if language and language != "text":
+            return "code"
+        return "text"
+
+    def _long_content_extract_card(
+        self,
+        lines: list[str],
+        start: int,
+        end: int,
+        *,
+        title: str = "",
+        kind: str = "text",
+    ) -> tuple[str, list[str]]:
+        """Build a domain-neutral fallback card from the whole segment.
+
+        Selecting evidence across the segment avoids the old first-page bias
+        without paying for an extra model completion. Exact line ranges remain
+        the authority and can be rehydrated with mode='segment'.
+        """
+        start_idx = max(0, int(start or 1) - 1)
+        end_idx = min(len(lines), max(start_idx + 1, int(end or start_idx + 1)))
+        candidates: list[tuple[float, int, str]] = []
+        span = max(1, end_idx - start_idx)
+        sample_positions = {
+            start_idx,
+            min(end_idx - 1, start_idx + span // 4),
+            min(end_idx - 1, start_idx + span // 2),
+            min(end_idx - 1, start_idx + (span * 3) // 4),
+            end_idx - 1,
+        }
+        for idx in range(start_idx, end_idx):
+            clean = re.sub(r"\s+", " ", str(lines[idx] or "").strip())
+            if not clean or clean in {"```", "~~~"}:
+                continue
+            score = 0.0
+            if idx == start_idx:
+                score += 5.0
+            if idx in sample_positions:
+                score += 1.6
+            # Structural prominence, not a domain/task vocabulary, drives the
+            # fallback. The semantic LLM card added after a focused read is the
+            # authority for concepts and relations.
+            if re.match(r"^(?:#{1,6}\s+|[-*+]\s+|\d+[.)]\s+)", clean):
+                score += 2.2
+            if re.search(r"(?:\b\d+(?:\.\d+)?\b|[=:]\s*[-+]?\w)", clean):
+                score += 1.4
+            if re.match(r"^[A-Z][A-Z0-9 _-]{2,48}:\s*\S", clean):
+                score += 2.2
+            if kind == "code" and re.search(r"(?:\([^)]*\)\s*(?:->\s*[^:{]+)?[:{]|^\s*[A-Za-z_$][\w$]*\s*=)", clean):
+                score += 2.2
+            if re.match(r"^#{1,6}\s+", clean):
+                score += 4.0
+            if 20 <= len(clean) <= 260:
+                score += 0.8
+            candidates.append((score, idx, trim(clean, 280)))
+        ranked = sorted(candidates, key=lambda row: (-row[0], row[1]))
+        picked: list[tuple[int, str]] = []
+        seen: set[str] = set()
+        for _score, idx, clean in ranked:
+            key = clean.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            picked.append((idx, clean))
+            if len(picked) >= 7 or len(" ".join(x[1] for x in picked)) >= LONG_CONTENT_CARD_CHARS:
+                break
+        picked.sort(key=lambda row: row[0])
+        summary = trim(" | ".join(text for _idx, text in picked), LONG_CONTENT_CARD_CHARS)
+        term_source = "\n".join(str(lines[idx] or "") for idx in range(start_idx, min(end_idx, start_idx + 500)))
+        try:
+            key_terms = _rag_extract_entities(term_source[:40_000], limit=12)
+        except Exception:
+            key_terms = []
+        if title and title.casefold() not in summary.casefold():
+            summary = trim(f"{title}: {summary}" if summary else title, LONG_CONTENT_CARD_CHARS)
+        return summary, [trim(str(x), 100) for x in key_terms if str(x).strip()][:12]
+
+    def _long_content_semantic_input(
+        self, memory: dict, lines: list[str], touched_segments: set[str] | None = None
+    ) -> str:
+        """Build a bounded, source-addressable semantic prompt.
+
+        The model sees the outline, compact local cards, and a few exact line
+        windows.  It never receives the whole document, so semantic enrichment
+        cannot turn into context growth.  Segment ids/line ranges make every
+        claim rehydratable from ``read_file`` when precision is needed.
+        """
+        touched = {str(x) for x in (touched_segments or set()) if str(x).strip()}
+        objective = self._long_content_objective()
+        frontier = self._long_content_select_frontier(memory, query=objective)
+        segments = [x for x in (memory.get("segments", []) or []) if isinstance(x, dict)]
+        cards = [x for x in (memory.get("cards", []) or []) if isinstance(x, dict)]
+        selected: list[dict] = []
+        for seg in segments:
+            if str(seg.get("id", "")) in touched:
+                selected.append(seg)
+        if not selected:
+            selected = segments[:2]
+        # Add representative positions to reduce first-page bias while keeping
+        # the request small for book-sized sources.
+        for seg in (segments[:1] + segments[len(segments) // 2 : len(segments) // 2 + 1] + segments[-1:]):
+            if seg and seg not in selected:
+                selected.append(seg)
+        for seg in frontier:
+            if seg not in selected:
+                selected.append(seg)
+        selected = selected[:8]
+        rows: list[str] = []
+        for seg in selected:
+            sid = str(seg.get("id", "") or "")
+            start = max(1, int(seg.get("start_line", 1) or 1))
+            end = min(len(lines), int(seg.get("end_line", start) or start))
+            excerpt = "\n".join(f"{i}: {lines[i - 1]}" for i in range(start, min(end, start + 22) + 1))
+            rows.append(
+                f"SEGMENT {sid} lines={start}-{end} title={trim(str(seg.get('title','') or ''), 160)}\n"
+                f"CARD: {trim(str(seg.get('summary','') or ''), 520)}\n"
+                f"EXCERPT:\n{trim(excerpt, 1500)}"
+            )
+        outline = trim(str(memory.get("outline", "") or ""), 2600)
+        card_hint = "\n".join(
+            f"{c.get('segment_id','')}: {trim(str(c.get('text','') or ''), 280)}"
+            for c in cards[:8]
+            if str(c.get("text", "") or "").strip()
+        )
+        payload = (
+            f"SOURCE path={memory.get('source_path','')} type={memory.get('content_type','text')} "
+            f"language={memory.get('language','text')} total_lines={memory.get('total_lines',0)}\n"
+            f"ACTIVE_OBJECTIVE:\n{trim(objective, 1200)}\n"
+            f"OBJECTIVE_GAPS:\n{' | '.join(str(x) for x in (memory.get('objective_gaps', []) or [])[:8])}\n"
+            f"OUTLINE:\n{outline}\n"
+            f"EXISTING_CARDS:\n{card_hint}\n"
+            f"FOCUSED_SEGMENTS:\n" + "\n\n".join(rows)
+        )
+        previous = self._normalize_long_content_semantic(memory.get("semantic", {}))
+        if previous and (previous.get("summary") or previous.get("key_points")):
+            payload += "\nPREVIOUS_SEMANTIC_CARD_TO_UPDATE:\n" + trim(
+                json_dumps(previous, ensure_ascii=False), 2200
+            )
+        return trim(payload, LONG_CONTENT_SEMANTIC_MAX_INPUT_CHARS)
+
+    def _long_content_objective(self) -> str:
+        """Return the unsummarized active objective when available.
+
+        The objective is deliberately supplied by runtime state, not by a
+        domain-specific keyword list.  It lets the same reader plan evidence
+        for a paper, a codebase, a log or a configuration tree.
+        """
+        for value in (
+            getattr(self, "runtime_authoritative_goal", ""),
+            getattr(self, "runtime_direct_objective", ""),
+            getattr(self, "runtime_reclassify_goal", ""),
+        ):
+            text = str(value or "").strip()
+            if text:
+                return trim(text, 1200)
+        try:
+            text = str(self._latest_user_goal_text() or "").strip()
+            if text:
+                return trim(text, 1200)
+        except Exception:
+            pass
+        return ""
+
+    def _long_content_objective_signature(self, objective: str) -> str:
+        raw = re.sub(r"\s+", " ", str(objective or "").strip().casefold())
+        return hashlib.sha1(raw.encode("utf-8", errors="replace")).hexdigest()[:20] if raw else ""
+
+    def _long_content_range_is_covered(self, memory: dict, start: int, end: int) -> bool:
+        """Whether a requested range is already covered by a remembered read.
+
+        This is an exact range check, not a heuristic refusal: callers can set
+        ``fresh=true`` (or use a changed source) to force verification.
+        """
+        try:
+            a, b = int(start), int(end)
+        except Exception:
+            return False
+        if a < 1 or b < a:
+            return False
+        ranges = []
+        for item in memory.get("read_ranges", []) if isinstance(memory, dict) else []:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                try:
+                    ranges.append((int(item[0]), int(item[1])))
+                except Exception:
+                    continue
+        return any(x <= a and y >= b for x, y in ranges)
+
+    def _long_content_select_frontier(self, memory: dict, *, query: str = "", target: str = "") -> list[dict]:
+        """Rank unread segments by semantic relevance and information gain.
+
+        No document vocabulary is embedded here.  Existing semantic next
+        segments are preferred, followed by query/target matches and then the
+        least-covered segments.  The result is a bounded plan for the model.
+        """
+        segments = [x for x in (memory.get("segments", []) if isinstance(memory, dict) else []) if isinstance(x, dict)]
+        seen = {str(x) for x in (memory.get("seen_segments", []) or [])}
+        q = re.sub(r"\s+", " ", f"{query} {target}".strip().casefold())
+        terms = [x for x in self._cached_query_terms(q) if len(x) >= 2][:24]
+        hinted = {str(x) for x in (memory.get("semantic_next_segments", []) or [])}
+        ranked: list[tuple[float, dict]] = []
+        total = max(1, int(memory.get("total_lines", 0) or 1))
+        for seg in segments:
+            sid = str(seg.get("id", "") or "")
+            if not sid or sid in seen:
+                continue
+            text = " ".join(str(seg.get(k, "") or "") for k in ("title", "summary", "key_terms", "symbols")).casefold()
+            lexical = sum(1 for term in terms if term in text)
+            try:
+                span = max(1, int(seg.get("end_line", 0) or 0) - int(seg.get("start_line", 1) or 1) + 1)
+                position = float(seg.get("start_line", 1) or 1) / total
+            except Exception:
+                span, position = 1, 0.0
+            # Prefer semantic hints and query matches, then large unread spans;
+            # a tiny deterministic position tie-breaker prevents starvation.
+            score = (100.0 if sid in hinted else 0.0) + lexical * 18.0 + min(12.0, span / 80.0) + (1.0 - position)
+            ranked.append((score, seg))
+        ranked.sort(key=lambda row: (-row[0], int(row[1].get("start_line", 0) or 0)))
+        return [seg for _score, seg in ranked[:LONG_CONTENT_SEMANTIC_MAX_NEXT_SEGMENTS]]
+
+    def _long_content_reuse_hint(self, rel: str, memory: dict, args: dict) -> str:
+        """Return a compact cache hit instead of replaying an old window."""
+        mode = str((args or {}).get("mode", "") or "auto").strip().lower()
+        if bool((args or {}).get("fresh", False)) or mode in {"media"}:
+            return ""
+        if mode == "full":
+            # A repeated full-page request is still bounded by max_chars. Once
+            # that page's source line range is covered, return a marker rather
+            # than replaying tens of thousands of characters. ``fresh=true``
+            # remains the explicit exact-reread escape hatch.
+            try:
+                offset = max(0, int((args or {}).get("offset", 0) or 0))
+                cap = self._read_file_max_chars((args or {}).get("max_chars"))
+                text_path = self._session_path(rel)
+                source_text, _ = self._read_text_and_fingerprint(text_path, rel)
+                if offset >= len(source_text):
+                    return f"[read_file reused path={rel} mode=full chars=0]\n[end_of_file]"
+                start_line = source_text.count("\n", 0, offset) + 1
+                end_char = min(len(source_text), offset + cap)
+                end_line = source_text.count("\n", 0, end_char) + 1
+                if self._long_content_range_is_covered(memory, start_line, max(start_line, end_line)):
+                    return (
+                        f"[read_file reused path={rel} mode=full chars={offset + 1}-{end_char} "
+                        f"lines={start_line}-{end_line}]\n"
+                        "Requested full page is already in long-content memory; use fresh=true for exact source verification."
+                    )
+            except Exception:
+                pass
+        query = str((args or {}).get("query", "") or "").strip()
+        target = str((args or {}).get("target", "") or "").strip()
+        # A segment request is served from the durable card only when that
+        # segment was previously read; exact source lines remain available via
+        # fresh=true, preserving the edit/verification contract.
+        wanted = str((args or {}).get("segment_id", "") or target).strip()
+        if mode == "segment" and wanted:
+            seen = {str(x) for x in (memory.get("seen_segments", []) or [])}
+            if wanted in seen:
+                for seg in memory.get("segments", []) or []:
+                    if isinstance(seg, dict) and str(seg.get("id", "")) == wanted:
+                        return (
+                            f"[read_file reused path={rel} segment_id={wanted} "
+                            f"coverage={float(memory.get('coverage', 0.0) or 0.0):.0%}]\n"
+                            f"Card: {trim(str(seg.get('summary', '') or ''), 720)}\n"
+                            f"Evidence: {', '.join(seg.get('evidence', [])[:3])}\n"
+                            "Cached evidence reused; use fresh=true for exact source verification."
+                        )
+        # Query/target reads can reuse a remembered semantic card if it
+        # contains the requested terms.  Do not claim an exact match when only
+        # the source card is relevant; return a navigation plan instead.
+        if query or target:
+            frontier = self._long_content_select_frontier(memory, query=query, target=target)
+            if not frontier and float(memory.get("coverage", 0.0) or 0.0) > 0:
+                semantic = memory.get("semantic", {}) if isinstance(memory.get("semantic", {}), dict) else {}
+                if semantic:
+                    return (
+                        f"[read_file reused path={rel} semantic_card=true]\n"
+                        f"Summary: {trim(str(semantic.get('summary', '') or ''), 900)}\n"
+                        f"Key points: {' | '.join(str(x) for x in (semantic.get('key_points', []) or [])[:6])}\n"
+                        "Cached semantic evidence reused; use fresh=true or a narrower source read for exact text."
+                    )
+        return ""
+
+    def _long_content_delta_window(
+        self, rel: str, lines: list[str], memory: dict, args: dict
+    ) -> str:
+        """Render only the not-yet-covered part of a line-oriented request.
+
+        Adjacent model windows commonly overlap by a few dozen lines.  Feeding
+        that overlap back to the model is pure context cost, so preserve the
+        source line numbers while returning only the uncovered intervals.  A
+        caller can opt out with ``fresh=true`` when a complete window is needed
+        for verification.
+        """
+        src = args if isinstance(args, dict) else {}
+        if bool(src.get("fresh", False)):
+            return ""
+        mode = str(src.get("mode", "") or "auto").strip().lower()
+        if mode not in {"window", "auto"}:
+            return ""
+        if src.get("line") not in (None, ""):
+            try:
+                center = int(src.get("line"))
+            except Exception:
+                return ""
+            try:
+                context = max(0, min(2000, int(src.get("context", 60) or 60)))
+            except Exception:
+                context = 60
+            start, end = max(1, center - context), min(len(lines), center + context)
+        elif src.get("offset") not in (None, "") or src.get("limit") not in (None, ""):
+            try:
+                start = max(1, int(src.get("offset", 0) or 0) + 1)
+                limit = max(1, min(4000, int(src.get("limit", LONG_OUTPUT_READ_PAGE_LINES) or LONG_OUTPUT_READ_PAGE_LINES)))
+            except Exception:
+                return ""
+            end = min(len(lines), start + limit - 1)
+        else:
+            return ""
+        if self._long_content_range_is_covered(memory, start, end):
+            return (
+                f"[read_file reused path={rel} lines={start}-{end} "
+                f"coverage={float(memory.get('coverage', 0.0) or 0.0):.0%}]\n"
+                "Requested range is already in long-content memory; use fresh=true for exact source verification."
+            )
+        # Compute uncovered intervals against the union of remembered ranges.
+        covered = []
+        for item in memory.get("read_ranges", []) if isinstance(memory, dict) else []:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                try:
+                    covered.append((max(start, int(item[0])), min(end, int(item[1]))))
+                except Exception:
+                    continue
+        covered = [(a, b) for a, b in covered if a <= b]
+        if not covered:
+            return ""
+        covered.sort()
+        gaps: list[tuple[int, int]] = []
+        cursor = start
+        for a, b in covered:
+            if a > cursor:
+                gaps.append((cursor, a - 1))
+            cursor = max(cursor, b + 1)
+        if cursor <= end:
+            gaps.append((cursor, end))
+        if not gaps:
+            return (
+                f"[read_file reused path={rel} lines={start}-{end} "
+                f"coverage={float(memory.get('coverage', 0.0) or 0.0):.0%}]\n"
+                "Requested range is already in long-content memory; use fresh=true for exact source verification."
+            )
+        body = "\n\n".join(
+            "@@ lines %d-%d @@\n%s" % (a, b, "\n".join(f"{i}: {lines[i - 1]}" for i in range(a, b + 1)))
+            for a, b in gaps
+        )
+        return self._clip_read_file_output(
+            f"[read_file delta path={rel} requested_lines={start}-{end} "
+            f"uncovered_lines={','.join(f'{a}-{b}' for a,b in gaps)}]\n{body}",
+            self._read_file_max_chars(src.get("max_chars")),
+        )
+
+    def _maybe_enrich_long_content_semantic(
+        self, memory: dict, rel: str, lines: list[str], touched_segments: set[str] | None = None,
+        *, allow_pending: bool = False,
+    ) -> None:
+        """Best-effort, bounded semantic understanding for a source version.
+
+        ``semantic_status`` and refresh counters are persisted, making calls
+        version-scoped rather than segment-scoped. Any provider, timeout, or
+        JSON failure leaves the deterministic cards intact.
+        """
+        if not LONG_CONTENT_SEMANTIC_ENABLED or not isinstance(memory, dict):
+            return
+        objective = self._long_content_objective()
+        objective_sig = self._long_content_objective_signature(objective)
+        previous_objective_sig = str(memory.get("objective_signature", "") or "")
+        if objective_sig and previous_objective_sig and previous_objective_sig != objective_sig:
+            memory["objective_signature"] = objective_sig
+            memory["objective_text"] = objective
+            memory["objective_gaps"] = []
+            memory["objective_covered"] = []
+            memory["semantic_refresh_due"] = True
+            if str(memory.get("semantic_status", "") or "").lower() == "ready":
+                memory["semantic_status"] = ""
+        status = str(memory.get("semantic_status", "") or "").strip().lower()
+        if status == "disabled":
+            return
+        if status == "pending" and not allow_pending:
+            started = float(memory.get("semantic_started_at", 0.0) or 0.0)
+            if started and now_ts() - started <= max(30.0, LONG_CONTENT_SEMANTIC_TIMEOUT_SECONDS * 3):
+                return
+            # A process may have exited while a background call was running.
+            # Do not leave a permanently pending card after restart.
+            status = "failed"
+            memory["semantic_retry_at"] = 0.0
+        if status == "ready":
+            refreshes = int(memory.get("semantic_refreshes", 0) or 0)
+            if refreshes >= LONG_CONTENT_SEMANTIC_MAX_REFRESHES or not bool(memory.pop("semantic_refresh_due", False)):
+                return
+        retry_at = float(memory.get("semantic_retry_at", 0.0) or 0.0)
+        if status == "failed" and retry_at > now_ts():
+            return
+        client = getattr(self, "ollama", None)
+        if client is None or not callable(getattr(client, "chat", None)):
+            memory["semantic_status"] = "failed"
+            memory["semantic_retry_at"] = now_ts() + 60.0
+            self._schedule_persist()
+            return
+        memory["semantic_status"] = "pending"
+        memory["semantic_attempts"] = int(memory.get("semantic_attempts", 0) or 0) + 1
+        memory["semantic_started_at"] = now_ts()
+        prompt = self._long_content_semantic_input(memory, lines, touched_segments)
+        if not prompt.strip():
+            memory["semantic_status"] = "failed"
+            memory["semantic_retry_at"] = now_ts() + 60.0
+            self._schedule_persist()
+            return
+        box: dict[str, object] = {}
+        def _runner():
+            try:
+                box["response"] = client.chat(
+                    [{"role": "user", "content": prompt}],
+                    system=(
+                        "Understand the supplied source semantically, independent of domain. "
+                        "Return strict JSON only with keys summary, key_points, definitions, "
+                        "relations, uncertainties, evidence, covered, open_questions, next_segments. Keep each item concise; evidence "
+                        "must cite the provided segment id or line range. Do not invent facts."
+                        " next_segments must contain only segment ids whose unread/fresh evidence is most "
+                        "likely to materially update this understanding; use an empty list if none. "
+                        "covered should state which active-objective information is now supported; open_questions "
+                        "should state which objective-relevant information is still missing."
+                    ),
+                    max_tokens=int(LONG_CONTENT_SEMANTIC_MAX_OUTPUT_TOKENS),
+                    temperature=0.1,
+                    think=False,
+                )
+            except Exception as exc:
+                box["error"] = exc
+        worker = threading.Thread(target=_runner, daemon=True)
+        worker.start()
+        worker.join(timeout=LONG_CONTENT_SEMANTIC_TIMEOUT_SECONDS)
+        if worker.is_alive():
+            memory["semantic_status"] = "failed"
+            memory["semantic_error"] = "timeout"
+            memory["semantic_retry_at"] = now_ts() + 60.0
+            self._schedule_persist()
+            return
+        response = box.get("response", {})
+        raw = response.get("content", "") if isinstance(response, dict) else response
+        semantic = self._normalize_long_content_semantic(
+            extract_json_object_from_text(str(raw or ""), {})
+        )
+        if not semantic or not (semantic.get("summary") or semantic.get("key_points")):
+            memory["semantic_status"] = "failed"
+            memory["semantic_error"] = trim(str(box.get("error", "invalid JSON") or "invalid JSON"), 180)
+            memory["semantic_retry_at"] = now_ts() + 60.0
+            self._schedule_persist()
+            return
+        memory["semantic"] = semantic
+        memory["semantic_status"] = "ready"
+        if int(memory.get("semantic_attempts", 0) or 0) > 1:
+            memory["semantic_refreshes"] = int(memory.get("semantic_refreshes", 0) or 0) + 1
+        memory["semantic_version"] = str(memory.get("source_sha256", "") or memory.get("content_id", ""))[:120]
+        memory["semantic_updated_at"] = now_ts()
+        memory["semantic_last_coverage"] = float(memory.get("coverage", 0.0) or 0.0)
+        memory["semantic_last_seen_count"] = len(memory.get("seen_segments", []) or [])
+        memory["objective_signature"] = objective_sig or str(memory.get("objective_signature", "") or "")
+        memory["objective_text"] = objective
+        memory["objective_gaps"] = list(semantic.get("open_questions", []) or [])[:LONG_CONTENT_SEMANTIC_MAX_OPEN_QUESTIONS]
+        memory["objective_covered"] = list(semantic.get("covered", []) or [])[:LONG_CONTENT_SEMANTIC_MAX_COVERED]
+        next_ids = {
+            str(x).strip() for x in (semantic.get("next_segments", []) or []) if str(x).strip()
+        }
+        unread = {
+            str(seg.get("id", "")).strip()
+            for seg in (memory.get("segments", []) or [])
+            if isinstance(seg, dict) and str(seg.get("id", "")).strip()
+            and str(seg.get("id", "")) not in set(memory.get("seen_segments", []) or [])
+        }
+        memory["semantic_next_segments"] = list(next_ids & unread)[:LONG_CONTENT_SEMANTIC_MAX_NEXT_SEGMENTS]
+        memory["semantic_retry_at"] = 0.0
+        memory["semantic_started_at"] = 0.0
+        memory.pop("semantic_error", None)
+        memory["updated_at"] = now_ts()
+        self.long_content_memory[memory["content_id"]] = self._normalize_long_content_memory(
+            self.long_content_memory
+        ).get(memory["content_id"], memory)
+        self._schedule_persist()
+
+    def _start_long_content_semantic_enrichment(
+        self, memory: dict, rel: str, lines: list[str], touched_segments: set[str] | None = None
+    ) -> None:
+        """Start semantic enrichment without putting file reads on the LLM path.
+
+        A tiny join window lets very fast/local providers complete inline (and
+        keeps deterministic callers observable), while normal network/model
+        latency continues in the background.  The source card is marked
+        ``pending`` before spawning so adjacent segment reads cannot fan out
+        duplicate completions.
+        """
+        if not isinstance(memory, dict):
+            return
+        status = str(memory.get("semantic_status", "") or "").strip().lower()
+        if status == "disabled":
+            return
+        if status == "pending":
+            started = float(memory.get("semantic_started_at", 0.0) or 0.0)
+            if started and now_ts() - started <= max(30.0, LONG_CONTENT_SEMANTIC_TIMEOUT_SECONDS * 3):
+                return
+        if status == "ready":
+            refreshes = int(memory.get("semantic_refreshes", 0) or 0)
+            if refreshes >= LONG_CONTENT_SEMANTIC_MAX_REFRESHES or not bool(memory.get("semantic_refresh_due", False)):
+                return
+        memory["semantic_status"] = "pending"
+        memory["semantic_started_at"] = now_ts()
+        memory.pop("semantic_refresh_due", None)
+        self.long_content_memory[memory.get("content_id", "")] = memory
+        self._schedule_persist()
+        worker = threading.Thread(
+            target=self._maybe_enrich_long_content_semantic,
+            args=(memory, rel, lines, touched_segments),
+            kwargs={"allow_pending": True},
+            daemon=True,
+        )
+        worker.start()
+        # Never make read_file wait for the model; only harvest a very fast
+        # response so unit/local mock providers remain deterministic.
+        worker.join(timeout=0.08)
+
+    def _long_content_segments(self, fp: Path, lines: list[str], code_data: dict | None = None) -> tuple[list[dict], str, str]:
+        data = code_data if isinstance(code_data, dict) else {}
+        language = str(data.get("language", "") or "text")
+        kind = self._long_content_kind(fp, language)
+        limit = LONG_CONTENT_CODE_SEGMENT_LINES if kind == "code" else LONG_CONTENT_TEXT_SEGMENT_LINES
+        symbols = [x for x in (data.get("symbols", []) or []) if isinstance(x, dict)]
+        segments: list[dict] = []
+        if kind == "code" and symbols:
+            # Include a small module prelude, then one segment per symbol.  The
+            # gaps between symbols are grouped into bounded implementation blocks.
+            cursor = 1
+            for row in symbols[:LONG_CONTENT_MEMORY_MAX_SEGMENTS]:
+                start = max(1, int(row.get("line_start", cursor) or cursor))
+                end = min(len(lines), max(start, int(row.get("line_end", start) or start)))
+                if start > cursor:
+                    for block_start in range(cursor, min(start, len(lines) + 1), limit):
+                        block_end = min(start - 1, block_start + limit - 1)
+                        if block_end >= block_start:
+                            segments.append((block_start, block_end, "implementation", []))
+                name = str(row.get("name", "") or "symbol").strip()
+                segments.append((start, end, name, [name]))
+                cursor = max(cursor, end + 1)
+            if cursor <= len(lines):
+                for block_start in range(cursor, len(lines) + 1, limit):
+                    segments.append((block_start, min(len(lines), block_start + limit - 1), "implementation", []))
+        else:
+            # Heading-aware blocks for prose/log/data.  A heading starts a new
+            # section; otherwise fixed line windows bound pathological files.
+            start = 1
+            title = ""
+            for idx, line in enumerate(lines, 1):
+                stripped = str(line or "").strip()
+                heading = re.match(r"^(#{1,6})\s+(.+?)\s*$", stripped)
+                if heading and idx > start:
+                    segments.append((start, idx - 1, title or f"lines {start}-{idx - 1}", []))
+                    start, title = idx, heading.group(2).strip()
+                elif idx - start + 1 >= limit:
+                    segments.append((start, idx, title or f"lines {start}-{idx}", []))
+                    start, title = idx + 1, ""
+            if start <= len(lines):
+                segments.append((start, len(lines), title or f"lines {start}-{len(lines)}", []))
+        out: list[dict] = []
+        for idx, item in enumerate(segments[:LONG_CONTENT_MEMORY_MAX_SEGMENTS], 1):
+            start, end, title, names = item
+            summary, key_terms = self._long_content_extract_card(
+                lines, start, end, title=str(title or ""), kind=kind
+            )
+            evidence = [f"{fp.name}:{start}-{end}"]
+            out.append({
+                "id": f"s{idx:04d}", "title": trim(title, 180),
+                "kind": "symbol" if kind == "code" and names else kind,
+                "start_line": start, "end_line": end,
+                "summary": summary, "key_terms": key_terms,
+                "symbols": names[:24], "evidence": evidence,
+                "status": "unseen", "last_seen": 0.0,
+            })
+        return out, language, kind
+
+    def _ensure_long_content_memory(self, rel: str, fp: Path, lines: list[str], *, force: bool = False) -> dict:
+        try:
+            source_bytes = int(fp.stat().st_size or 0) if fp.is_file() else 0
+        except Exception:
+            source_bytes = 0
+        if not fp.is_file() or (
+            len(lines) < LONG_CONTENT_TEXT_SEGMENT_LINES
+            and source_bytes < LARGE_FILE_AUTO_PAGE_BYTES
+        ):
+            return {}
+        content_id, source_fp = self._long_content_identity(rel, fp)
+        registry = getattr(self, "long_content_memory", {})
+        if not isinstance(registry, dict):
+            registry = {}
+            self.long_content_memory = registry
+        old = registry.get(content_id, {}) if isinstance(registry, dict) else {}
+        if old and not force and not bool(old.get("stale", False)) and int(old.get("total_lines", 0) or 0) == len(lines):
+            # Same content may be reachable through an upload alias, IDE
+            # checkout, or a role-specific path. Reuse the cards and remember
+            # the alias instead of reparsing the whole source.
+            aliases = []
+            for item in [old.get("source_path", "")] + list(old.get("source_paths", []) or []):
+                value = str(item).replace("\\", "/").strip()
+                if value and value not in aliases:
+                    aliases.append(value)
+            if str(rel) not in aliases:
+                aliases.append(str(rel))
+                old["source_paths"] = aliases[-24:]
+                old["updated_at"] = now_ts()
+                self.long_content_memory[content_id] = old
+                self._schedule_persist()
+            return old
+        ext = fp.suffix.lower()
+        code_like = ext in CODE_LIBRARY_LANGUAGE_BY_EXT and ext not in LONG_CONTENT_TEXT_EXTS and ext not in LONG_CONTENT_DATA_EXTS
+        code_data = self._read_file_code_data(fp, lines) if code_like else {}
+        segments, language, kind = self._long_content_segments(fp, lines, code_data)
+        outline = "\n".join(
+            f"{s['id']} L{s['start_line']}-{s['end_line']} {s['title']}"
+            for s in segments[:160]
+        )
+        cards = [
+            {
+                "id": f"{content_id}:{s['id']}", "type": "symbol" if s.get("kind") == "symbol" else "segment",
+                "title": s.get("title", ""), "segment_id": s.get("id", ""),
+                "text": s.get("summary", ""), "key_terms": list(s.get("key_terms", []) or []),
+                "evidence": list(s.get("evidence", []) or []), "updated_at": now_ts(),
+                "status": "derived",
+            }
+            for s in segments
+        ]
+        memory = {
+            "content_id": content_id, "version": LONG_CONTENT_MEMORY_VERSION,
+            "source_path": str(rel), "source_paths": [str(rel)],
+            "source_sha256": str(source_fp.get("source_sha256", "") or ""),
+            "source_size": int(source_fp.get("source_size", 0) or 0),
+            "source_mtime_ns": int(source_fp.get("source_mtime_ns", 0) or 0),
+            "content_type": kind, "language": language, "total_lines": len(lines),
+            "outline": trim(outline, LONG_CONTENT_STRUCTURE_MAX_CHARS),
+            "segments": segments, "cards": cards, "coverage": 0.0,
+            "seen_segments": [], "read_ranges": [],
+            "unresolved_items": [], "updated_at": now_ts(),
+            "stale": False,
+        }
+        if isinstance(old, dict) and old.get("total_lines") == len(lines):
+            memory["seen_segments"] = list(old.get("seen_segments", []) or [])
+            memory["read_ranges"] = list(old.get("read_ranges", []) or [])
+            memory["coverage"] = float(old.get("coverage", 0.0) or 0.0)
+            for field in ("semantic_status", "semantic_version", "semantic_updated_at", "semantic_attempts", "semantic_refreshes", "semantic_last_coverage", "semantic_last_seen_count", "semantic_started_at", "semantic_retry_at", "semantic_next_segments", "semantic_refresh_due", "semantic", "objective_signature", "objective_text", "objective_gaps", "objective_covered", "frontier_segments", "read_events", "reuse_events"):
+                if field in old:
+                    memory[field] = old[field]
+            memory["outline_ready"] = bool(old.get("outline_ready", False))
+            old_paths = [
+                str(x).replace("\\", "/").strip()
+                for x in ([old.get("source_path", "")] + list(old.get("source_paths", []) or []))
+                if str(x).strip()
+            ]
+            memory["source_paths"] = list(dict.fromkeys(old_paths + [str(rel)]))[-24:]
+        self.long_content_memory[content_id] = memory
+        self.long_content_memory = self._normalize_long_content_memory(self.long_content_memory)
+        return memory
+
+    def _mark_long_content_read(self, rel: str, fp: Path, lines: list[str], args: dict, output: str) -> None:
+        try:
+            memory = self._ensure_long_content_memory(rel, fp, lines)
+            if not memory:
+                return
+            raw_mode = str((args or {}).get("mode", "") or "auto").lower()
+            mode = raw_mode
+            # ``read_file`` resolves auto to a concrete strategy before
+            # rendering. Mirror that resolution while recording evidence so
+            # default calls (line/offset/query/target) participate in range
+            # reuse instead of being mistaken for outline-only reads.
+            if mode == "auto":
+                if str((args or {}).get("segment_id", "") or "").strip():
+                    mode = "segment"
+                elif str((args or {}).get("target", "") or "").strip():
+                    mode = "symbol"
+                elif str((args or {}).get("query", "") or "").strip():
+                    mode = "search"
+                elif (
+                    (args or {}).get("line") not in (None, "")
+                    or (args or {}).get("offset") not in (None, "")
+                    or (args or {}).get("limit") not in (None, "")
+                ):
+                    mode = "window"
+                else:
+                    mode = "overview"
+            # Structure/overview establishes navigation only.  Do not treat the
+            # line ranges printed in the outline as semantically read; otherwise
+            # one cheap overview would falsely report 100% comprehension.
+            if mode in {"overview", "structure"} and not str((args or {}).get("segment_id", "") or "").strip():
+                memory["outline_ready"] = True
+                memory["updated_at"] = now_ts()
+                self.long_content_memory[memory["content_id"]] = memory
+                self._schedule_persist()
+                return
+            observed_ranges: list[tuple[int, int]] = []
+            for output_line in str(output or "").splitlines():
+                marker = output_line.strip()
+                if not (marker.startswith("[read_file") or marker.startswith("@@ lines")):
+                    continue
+                # Delta responses carry the requested span for navigation and
+                # an explicit uncovered span for coverage accounting.  Only
+                # the latter is new evidence; recording the whole requested
+                # window would falsely claim that overlapping lines were read.
+                uncovered = re.search(r"\buncovered_lines\s*=\s*([0-9]+(?:\s*-\s*[0-9]+)?(?:\s*,\s*[0-9]+(?:\s*-\s*[0-9]+)?)*)", marker, re.I)
+                if uncovered:
+                    for part in str(uncovered.group(1) or "").split(","):
+                        nums = re.findall(r"\d+", part)
+                        if nums:
+                            a, b = int(nums[0]), int(nums[-1])
+                            observed_ranges.append((max(1, a), min(len(lines), max(a, b))))
+                    continue
+                for match in re.finditer(r"(?<![A-Za-z_])(?:lines?|L)\s*=?\s*(\d+)(?:\s*-\s*(\d+))?", marker, re.I):
+                    a, b = int(match.group(1)), int(match.group(2) or match.group(1))
+                    observed_ranges.append((max(1, a), min(len(lines), max(a, b))))
+            if mode == "full" and not observed_ranges:
+                full_text = "\n".join(lines)
+                offset = self._read_file_int_arg((args or {}).get("offset", 0), 0, 0, max(0, len(full_text)))
+                cap = self._read_file_max_chars((args or {}).get("max_chars"))
+                end_char = min(len(full_text), offset + cap)
+                start_line = full_text.count("\n", 0, offset) + 1
+                end_line = full_text.count("\n", 0, end_char) + 1
+                observed_ranges.append((start_line, min(len(lines), max(start_line, end_line))))
+            existing_ranges = []
+            for item in memory.get("read_ranges", []) or []:
+                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                    existing_ranges.append((max(1, int(item[0])), min(len(lines), max(int(item[0]), int(item[1])))))
+            merged_ranges: list[list[int]] = []
+            for a, b in sorted(existing_ranges + observed_ranges):
+                if merged_ranges and a <= merged_ranges[-1][1] + 1:
+                    merged_ranges[-1][1] = max(merged_ranges[-1][1], b)
+                else:
+                    merged_ranges.append([a, b])
+            memory["read_ranges"] = merged_ranges[-LONG_CONTENT_MEMORY_MAX_SEGMENTS:]
+            memory["read_events"] = int(memory.get("read_events", 0) or 0) + 1
+            touched: set[str] = set()
+            for a, b in observed_ranges:
+                for seg in memory.get("segments", []):
+                    if int(seg.get("end_line", 0) or 0) >= a and int(seg.get("start_line", 0) or 0) <= b:
+                        touched.add(str(seg.get("id", "")))
+            if mode in {"overview", "structure"}:
+                # An overview establishes the outline, not full semantic coverage.
+                memory["outline_ready"] = True
+            seen = set(str(x) for x in (memory.get("seen_segments", []) or []))
+            seen.update(x for x in touched if x)
+            stamp = now_ts()
+            for seg in memory.get("segments", []):
+                if isinstance(seg, dict) and str(seg.get("id", "")) in touched:
+                    seg["status"] = "read"
+                    seg["last_seen"] = stamp
+            for card in memory.get("cards", []):
+                if isinstance(card, dict) and str(card.get("segment_id", "")) in touched:
+                    card["status"] = "read"
+                    card["updated_at"] = stamp
+            memory["seen_segments"] = list(seen)[-LONG_CONTENT_MEMORY_MAX_SEGMENTS:]
+            read_line_count = sum(max(0, int(end) - int(start) + 1) for start, end in merged_ranges)
+            memory["coverage"] = round(min(1.0, read_line_count / max(1, len(lines))), 4)
+            # Let the semantic card guide the next reading frontier without
+            # hard-coding document domains.  New evidence explicitly selected
+            # by the model marks a future refresh; otherwise the card remains
+            # stable and no extra completion is spent.
+            if str(memory.get("semantic_status", "") or "").lower() == "ready":
+                next_ids = set(str(x) for x in (memory.get("semantic_next_segments", []) or []))
+                if next_ids.intersection(set(touched)):
+                    memory["semantic_refresh_due"] = True
+            memory["updated_at"] = stamp
+            self.long_content_memory[memory["content_id"]] = memory
+            self._schedule_persist()
+            # Semantic enrichment is source-version scoped and best-effort.
+            # Trigger only after an actual evidence read; a cheap structure
+            # request should never block on an LLM completion.
+            if observed_ranges:
+                self._start_long_content_semantic_enrichment(memory, rel, lines, touched)
+        except Exception:
+            return
+
+    def _invalidate_long_content_memory_path(self, rel: str, reason: str = "source changed") -> int:
+        """Drop cards for a changed source while keeping unrelated memories intact."""
+        target = str(rel or "").replace("\\", "/").strip()
+        if not target or not isinstance(getattr(self, "long_content_memory", {}), dict):
+            return 0
+        removed = 0
+        for key, row in list(self.long_content_memory.items()):
+            if not isinstance(row, dict):
+                continue
+            source_paths = [
+                str(x).replace("\\", "/").strip()
+                for x in ([row.get("source_path", "")] + list(row.get("source_paths", []) or []))
+                if str(x).strip()
+            ]
+            if target not in source_paths:
+                continue
+            remaining_paths = [path for path in source_paths if path != target]
+            if remaining_paths:
+                # A content-hash identity can be shared by copied/uploaded
+                # aliases. Editing one alias must not discard valid memory for
+                # the untouched aliases.
+                row["source_paths"] = remaining_paths[-24:]
+                row["source_path"] = remaining_paths[0]
+                row["updated_at"] = now_ts()
+                self.long_content_memory[key] = row
+                continue
+            # Keep a tiny tombstone so a stale card cannot be injected while a
+            # subsequent read is rebuilding the new source version.
+            row["coverage"] = 0.0
+            row["semantic_status"] = ""
+            row["semantic"] = {}
+            row["semantic_version"] = ""
+            row["semantic_retry_at"] = 0.0
+            row["unresolved_items"] = [trim(str(reason or "source changed"), 240)]
+            row["updated_at"] = now_ts()
+            row["stale"] = True
+            self.long_content_memory[key] = row
+            removed += 1
+        cache = getattr(self, "_source_fingerprint_cache", {})
+        if isinstance(cache, dict):
+            cache.pop(target, None)
+        if removed:
+            self._schedule_persist()
+        return removed
+
+    def _long_content_memory_prompt_block(self, *, max_chars: int = 3200) -> str:
+        registry = getattr(self, "long_content_memory", {})
+        rows = [
+            x for x in (registry if isinstance(registry, dict) else {}).values()
+            if isinstance(x, dict) and not bool(x.get("stale", False))
+        ]
+        if not rows:
+            return ""
+        rows.sort(key=lambda x: float(x.get("updated_at", 0.0) or 0.0), reverse=True)
+        parts = ["LONG-CONTENT UNDERSTANDING MEMORY (source-addressable; use read_file for exact evidence):"]
+        for row in rows[:4]:
+            parts.append(
+                f"- {row.get('source_path','')} type={row.get('content_type','text')} "
+                f"coverage={float(row.get('coverage', 0.0) or 0.0):.0%} "
+                f"lines={int(row.get('total_lines', 0) or 0)}"
+            )
+            outline = str(row.get("outline", "") or "").splitlines()
+            if outline:
+                parts.append("  outline: " + " | ".join(outline[:6]))
+            cards = row.get("cards", []) if isinstance(row.get("cards", []), list) else []
+            seen = {str(x) for x in (row.get("seen_segments", []) or []) if str(x).strip()}
+            remembered_cards = [
+                card for card in cards
+                if isinstance(card, dict) and str(card.get("segment_id", "")) in seen
+            ]
+            for card in remembered_cards[:3]:
+                if isinstance(card, dict) and str(card.get("text", "") or "").strip():
+                    parts.append(f"  read_card {card.get('title','')}: {trim(card.get('text',''), 260)} [{','.join(card.get('evidence', [])[:2])}]")
+            semantic = row.get("semantic", {}) if isinstance(row.get("semantic", {}), dict) else {}
+            if str(row.get("semantic_status", "") or "").lower() == "ready" and semantic:
+                summary = trim(str(semantic.get("summary", "") or ""), 420)
+                if summary:
+                    parts.append(f"  semantic_summary: {summary}")
+                points = [trim(str(x), 180) for x in (semantic.get("key_points", []) or [])[:3] if str(x).strip()]
+                if points:
+                    parts.append("  semantic_points: " + " | ".join(points))
+                relations = [trim(str(x), 160) for x in (semantic.get("relations", []) or [])[:2] if str(x).strip()]
+                if relations:
+                    parts.append("  semantic_relations: " + " | ".join(relations))
+            next_segments = [trim(str(x), 80) for x in (row.get("semantic_next_segments", []) or [])[:4] if str(x).strip()]
+            if next_segments:
+                parts.append("  semantic_next_segments: " + ", ".join(next_segments))
+            gaps = [trim(str(x), 180) for x in (row.get("objective_gaps", []) or [])[:3] if str(x).strip()]
+            if gaps:
+                parts.append("  objective_open_questions: " + " | ".join(gaps))
+            covered = [trim(str(x), 180) for x in (row.get("objective_covered", []) or [])[:3] if str(x).strip()]
+            if covered:
+                parts.append("  objective_covered: " + " | ".join(covered))
+        parts.append("Prefer these cards for continuity; recall the cited source window only when a claim or exact code/text is needed.")
+        return trim("\n".join(parts), max_chars)
+
+    def _render_long_content_structure(self, rel: str, fp: Path, lines: list[str], *, max_chars: object = None) -> str:
+        memory = self._ensure_long_content_memory(rel, fp, lines)
+        if not memory:
+            return self._render_text_overview(fp, rel, lines, max_chars=max_chars)
+        cards = memory.get("cards", []) if isinstance(memory.get("cards", []), list) else []
+        out = [
+            f"[read_file structure path={rel} content_id={memory.get('content_id','')} "
+            f"type={memory.get('content_type','text')} lines={len(lines)} coverage={float(memory.get('coverage', 0.0) or 0.0):.0%}]",
+            "Structure is persisted as compact cards. Use mode='segment' with segment_id or query to continue reading one section.",
+        ]
+        outline = str(memory.get("outline", "") or "").strip()
+        if outline:
+            out.append("\nOutline:\n" + outline)
+        if cards:
+            out.append("\nCards:")
+            for card in cards[:24]:
+                if not isinstance(card, dict):
+                    continue
+                out.append(
+                    f"- {card.get('id','')} {card.get('title','')} :: "
+                    f"{trim(card.get('text',''), 220)} [{','.join(card.get('evidence', [])[:2])}]"
+                )
+        out.append("\nFocused read: read_file path=\"%s\" mode=\"segment\" segment_id=\"s0001\"" % rel)
+        return self._clip_read_file_output("\n".join(out), self._read_file_max_chars(max_chars))
+
+    def _render_long_content_segment(self, rel: str, fp: Path, lines: list[str], *, segment_id: object = "", query: object = "", max_chars: object = None) -> str:
+        memory = self._ensure_long_content_memory(rel, fp, lines)
+        if not memory:
+            return self._render_window_text_read(rel, lines, max_chars=max_chars)
+        wanted_id = str(segment_id or "").strip()
+        wanted_query = str(query or "").strip().lower()
+        segments = memory.get("segments", []) if isinstance(memory.get("segments", []), list) else []
+        match = None
+        for seg in segments:
+            if not isinstance(seg, dict):
+                continue
+            if wanted_id and str(seg.get("id", "")) == wanted_id:
+                match = seg
+                break
+            if wanted_query and wanted_query in (str(seg.get("title", "")) + " " + str(seg.get("summary", ""))).lower():
+                match = seg
+                break
+        if match is None:
+            return (
+                f"[read_file segment path={rel} matches=0]\n"
+                "Use mode='structure' first, then provide segment_id (for example s0001) or a narrow query."
+            )
+        start = max(1, int(match.get("start_line", 1) or 1))
+        end = min(len(lines), int(match.get("end_line", start) or start))
+        context = 8
+        body_start, body_end = max(1, start - context), min(len(lines), end + context)
+        body = "\n".join(f"{i}: {lines[i - 1]}" for i in range(body_start, body_end + 1))
+        seen = set(str(x) for x in (memory.get("seen_segments", []) or []))
+        seen.add(str(match.get("id", "")))
+        memory["seen_segments"] = list(seen)[-LONG_CONTENT_MEMORY_MAX_SEGMENTS:]
+        ranges: list[list[int]] = []
+        for item in memory.get("read_ranges", []) or []:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                try:
+                    ranges.append([max(1, int(item[0])), min(len(lines), max(int(item[0]), int(item[1])))])
+                except Exception:
+                    continue
+        ranges.append([body_start, body_end])
+        merged: list[list[int]] = []
+        for a, b in sorted(ranges):
+            if merged and a <= merged[-1][1] + 1:
+                merged[-1][1] = max(merged[-1][1], b)
+            else:
+                merged.append([a, b])
+        memory["read_ranges"] = merged[-LONG_CONTENT_MEMORY_MAX_SEGMENTS:]
+        covered_lines = sum(max(0, int(b) - int(a) + 1) for a, b in merged)
+        memory["coverage"] = round(min(1.0, covered_lines / max(1, len(lines))), 4)
+        match["status"] = "read"
+        match["last_seen"] = now_ts()
+        memory["updated_at"] = now_ts()
+        self.long_content_memory[memory["content_id"]] = memory
+        return self._clip_read_file_output(
+            f"[read_file segment path={rel} segment_id={match.get('id')} title={match.get('title','')} "
+            f"lines={start}-{end} coverage={float(memory.get('coverage', 0.0) or 0.0):.0%}]\n"
+            f"Card: {match.get('summary','')}\nEvidence window:\n{body}",
+            self._read_file_max_chars(max_chars),
+        )
 
     def _render_text_overview(
         self,
@@ -42627,6 +44003,22 @@ body{padding:18px}
         out.append(f"- read_file path=\"{rel}\" mode=\"full\" max_chars={min(cap, READ_FILE_DEFAULT_MAX_CHARS)}")
         if not is_code:
             out.append("- For long logs or command output, start with mode=\"search\" for the error, warning, filename, or keyword.")
+        # Keep the legacy overview shape, but expose the durable long-content
+        # navigation whenever this is a large source.  The model can opt into
+        # structure/segment reads without paying for all source lines here.
+        if total_lines >= LONG_CONTENT_TEXT_SEGMENT_LINES or size >= LARGE_FILE_AUTO_PAGE_BYTES:
+            try:
+                memory = self._ensure_long_content_memory(rel, fp, lines)
+                if memory:
+                    out.append(
+                        f"\nLong-content memory: content_id={memory.get('content_id','')} "
+                        f"segments={len(memory.get('segments', []) or [])} "
+                        f"coverage={float(memory.get('coverage', 0.0) or 0.0):.0%}."
+                    )
+                    out.append(f"- read_file path=\"{rel}\" mode=\"structure\"")
+                    out.append(f"- read_file path=\"{rel}\" mode=\"segment\" segment_id=\"s0001\"")
+            except Exception:
+                pass
         return self._clip_read_file_output("\n".join(out), cap)
 
     def _large_text_file_overview(self, fp: Path, rel: str, lines: list[str]) -> str:
@@ -47550,6 +48942,69 @@ body{padding:18px}
                 continue
         return fp.read_text(encoding="utf-8", errors="replace")
 
+    def _read_text_and_fingerprint(self, fp: Path, rel: str) -> tuple[str, dict]:
+        """Read a text source once and derive its durable fingerprint in memory."""
+        rel_key = str(rel or "").replace("\\", "/").strip()
+        st = fp.stat()
+        stat_size = int(st.st_size)
+        stat_mtime = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000)))
+        source_cache = getattr(self, "_long_content_source_cache", {})
+        if not isinstance(source_cache, dict):
+            source_cache = {}
+            self._long_content_source_cache = source_cache
+        cached = source_cache.get(rel_key)
+        if (
+            isinstance(cached, dict)
+            and int(cached.get("source_size", -1) or -1) == stat_size
+            and int(cached.get("source_mtime_ns", -1) or -1) == stat_mtime
+            and isinstance(cached.get("text"), str)
+        ):
+            fingerprint = {
+                "source_size": stat_size,
+                "source_mtime_ns": stat_mtime,
+            }
+            if cached.get("source_sha256"):
+                fingerprint["source_sha256"] = str(cached["source_sha256"])
+            cached["last_used"] = now_ts()
+            return str(cached["text"]), fingerprint
+        raw = fp.read_bytes()
+        text = ""
+        tried: list[str] = []
+        for enc in ("utf-8", "utf-8-sig", locale.getpreferredencoding(False) or "utf-8", "gb18030"):
+            enc_norm = str(enc or "").strip() or "utf-8"
+            if enc_norm in tried:
+                continue
+            tried.append(enc_norm)
+            try:
+                text = raw.decode(enc_norm)
+                break
+            except UnicodeDecodeError:
+                continue
+        if not text and raw:
+            text = raw.decode("utf-8", errors="replace")
+        fingerprint = {
+            "source_size": stat_size,
+            "source_mtime_ns": stat_mtime,
+        }
+        if len(raw) <= READ_CONTEXT_CACHE_SEARCH_MAX_BYTES:
+            fingerprint["source_sha256"] = hashlib.sha256(raw).hexdigest()
+        cache = getattr(self, "_source_fingerprint_cache", {})
+        if not isinstance(cache, dict):
+            cache = {}
+            self._source_fingerprint_cache = cache
+        cache[str(rel or "").replace("\\", "/").strip()] = dict(fingerprint)
+        if stat_size <= LONG_CONTENT_SOURCE_CACHE_MAX_BYTES:
+            source_cache[rel_key] = {
+                "text": text,
+                **fingerprint,
+                "last_used": now_ts(),
+            }
+            # Evict by least-recently-used access; this cache is intentionally
+            # process-local and does not affect compatibility or persistence.
+            rows = sorted(source_cache.items(), key=lambda item: float(item[1].get("last_used", 0.0) or 0.0), reverse=True)
+            self._long_content_source_cache = dict(rows[:LONG_CONTENT_SOURCE_CACHE_MAX_FILES])
+        return text, fingerprint
+
     def _render_missing_read_hint(self, rel: str) -> str:
         fb_ref = self._file_buffer_ref_from_text(rel)
         if fb_ref:
@@ -47768,6 +49223,9 @@ body{padding:18px}
         context: object = None,
         regex: object = False,
         max_chars: object = None,
+        segment_id: object = None,
+        fresh: object = False,
+        _source_lines: list[str] | None = None,
     ) -> str:
         try:
             rel = self._normalize_tool_path_text(path)
@@ -47787,7 +49245,7 @@ body{padding:18px}
                 return self._run_read_media(fp, rel, "audio")
             if ext in VIDEO_EXTS:
                 return self._run_read_media(fp, rel, "video")
-            lines = self._read_text_with_fallback(fp).splitlines()
+            lines = list(_source_lines) if isinstance(_source_lines, list) else self._read_text_with_fallback(fp).splitlines()
             total_lines = len(lines)
             if total_lines == 0:
                 return ""
@@ -47796,19 +49254,60 @@ body{padding:18px}
             except Exception:
                 file_size = 0
             mode_text = str(mode or "auto").strip().lower() or "auto"
-            if mode_text not in {"auto", "full", "overview", "window", "symbol", "search", "directory"}:
+            if mode_text not in {"auto", "full", "overview", "structure", "segment", "window", "symbol", "search", "directory"}:
                 mode_text = "auto"
             if mode_text == "auto":
                 if str(target or "").strip():
                     mode_text = "symbol"
                 elif str(query or "").strip():
                     mode_text = "search"
-                elif line not in (None, ""):
+                elif line not in (None, "") or offset not in (None, "") or limit is not None:
                     mode_text = "window"
+                elif total_lines >= LONG_CONTENT_TEXT_SEGMENT_LINES or file_size >= LARGE_FILE_AUTO_PAGE_BYTES:
+                    mode_text = "structure"
             if mode_text == "directory":
                 return f"Error: path is a file, not a directory: {rel}"
-            if mode_text == "overview":
+            # Reuse the source-level understanding before rendering another
+            # overlapping window/segment. This is deliberately generic: the
+            # memory is keyed by content identity and only the active query or
+            # requested range influences selection. ``fresh`` is an explicit
+            # escape hatch for exact verification after external changes.
+            memory = self._ensure_long_content_memory(rel, fp, lines)
+            read_args = {
+                "mode": mode_text,
+                "target": target,
+                "query": query,
+                "line": line,
+                "context": context,
+                "offset": offset,
+                "limit": limit,
+                "segment_id": segment_id,
+                "max_chars": max_chars,
+                "fresh": bool(fresh),
+            }
+            if memory and not bool(fresh):
+                if mode_text in {"segment", "full"}:
+                    reused = self._long_content_reuse_hint(rel, memory, read_args)
+                    if reused:
+                        memory["reuse_events"] = int(memory.get("reuse_events", 0) or 0) + 1
+                        memory["updated_at"] = now_ts()
+                        self.long_content_memory[memory.get("content_id", "")] = memory
+                        self._schedule_persist()
+                        return reused
+                if mode_text in {"window", "auto"}:
+                    delta = self._long_content_delta_window(rel, lines, memory, read_args)
+                    if delta:
+                        memory["reuse_events"] = int(memory.get("reuse_events", 0) or 0) + 1
+                        memory["updated_at"] = now_ts()
+                        self.long_content_memory[memory.get("content_id", "")] = memory
+                        self._schedule_persist()
+                        return delta
+            if mode_text in {"overview", "structure"}:
+                if mode_text == "structure":
+                    return self._render_long_content_structure(rel, fp, lines, max_chars=max_chars)
                 return self._render_text_overview(fp, rel, lines, max_chars=max_chars)
+            if mode_text == "segment":
+                return self._render_long_content_segment(rel, fp, lines, segment_id=segment_id or target, query=query, max_chars=max_chars)
             if mode_text == "full":
                 return self._render_full_text_read(rel, lines, offset=offset, max_chars=max_chars)
             if mode_text == "search":
@@ -72600,6 +74099,7 @@ body{padding:18px}
             else "agent_web_search is disabled by startup/config. Do not request web search; use local files, uploaded documents, RAG/code libraries, or ask the user for source material when current open-web evidence is required. "
         )
         task_memory_note = self._blackboard_memory_context_markdown(for_role=role_key, max_chars=2800)
+        long_content_memory_note = self._long_content_memory_prompt_block(max_chars=3200)
         background_processes_note = self._background_processes_prompt_block()
         base = (
             f"You are {self._agent_display_name(role_key)} in a multi-agent coding system. "
@@ -72615,7 +74115,7 @@ body{padding:18px}
             "Use blackboard for shared state, ask_colleague for inter-agent communication. "
             "Keep outputs concise and action-oriented. "
             f"{self._public_progress_prompt_instruction()}"
-            "When reading files, choose the shape that matches the question: mode='window' for file:line, mode='symbol' for named code, mode='search' for keywords/errors, mode='overview' for structure, and mode='full' only when exact broad context is required. "
+            "When reading files, choose the shape that matches the question: mode='window' for file:line, mode='symbol' for named code, mode='search' for keywords/errors, mode='overview' or mode='structure' for structure and long-content memory, mode='segment' with a segment_id to continue a remembered section, and mode='full' only when exact broad context is required. "
             "When inspecting collections or memory, use focused modes too: tool_memory/context_recall/read_from_blackboard/task_list/check_background/list_background_processes/read_inbox/worktree_events support focused query/status/detail filters where applicable. `check_background` is session-local; `list_background_processes` sees only the authenticated user's processes across sessions, and `stop_background_process` requires an exact visible process_id. Prefer filters over repeatedly listing recent items. "
             "Before repeating the same successful read_file/bash/query over the same target, check the injected tool-memory-registry or call tool_memory with mode='search' or mode='detail'. "
             f"{web_search_instruction}"
@@ -72638,6 +74138,8 @@ body{padding:18px}
             base = base + web_search_context_note + " "
         if task_memory_note:
             base = base + task_memory_note + " "
+        if long_content_memory_note:
+            base = base + long_content_memory_note + " "
         if plan_todo_note:
             base = base + plan_todo_note + " "
         if todo_contract_note:
@@ -75291,6 +76793,21 @@ body{padding:18px}
                 rel = self._session_rel(fp)
             except Exception as exc:
                 return f"Error: {type(exc).__name__}: {exc}"
+            # Read the text source once and hand the same line array to both
+            # rendering and long-content coverage accounting. Previously the
+            # dispatcher reread every successful file after _run_read, which
+            # doubled I/O and decoding cost for book-sized sources.
+            source_lines: list[str] | None = None
+            source_text: str | None = None
+            source_fp: dict | None = None
+            if fp.is_file() and fp.suffix.lower() not in IMAGE_EXTS | AUDIO_EXTS | VIDEO_EXTS:
+                try:
+                    source_text, source_fp = self._read_text_and_fingerprint(fp, rel)
+                    source_lines = source_text.splitlines()
+                except Exception:
+                    source_lines = None
+                    source_text = None
+                    source_fp = None
             out = self._run_read(
                 rel,
                 args.get("limit"),
@@ -75302,6 +76819,9 @@ body{padding:18px}
                 context=args.get("context"),
                 regex=args.get("regex"),
                 max_chars=args.get("max_chars"),
+                segment_id=args.get("segment_id"),
+                fresh=args.get("fresh", False),
+                _source_lines=source_lines,
             )
             coordinator = getattr(self, "collaboration_write_coordinator", None)
             if coordinator is not None and not str(out).startswith("Error"):
@@ -75313,7 +76833,19 @@ body{padding:18px}
                     self.collaboration_revisions[rel] = int(document.get("revision", 0) or 0)
                 except Exception:
                     pass
-            self._record_read_context(rel, args, out, role=role_key)
+            self._record_read_context(
+                rel,
+                args,
+                out,
+                role=role_key,
+                source_text=source_text,
+                source_fp=source_fp,
+            )
+            try:
+                if source_lines is not None and not str(out).startswith("Error"):
+                    self._mark_long_content_read(rel, fp, source_lines, args, out)
+            except Exception:
+                pass
             limit_val = self._read_file_int_arg(args.get("limit", 0), 0, 0, 1_000_000) if args.get("limit") is not None else 0
             offset_val = self._read_file_int_arg(args.get("offset", 0), 0, 0, 1_000_000) if args.get("offset") is not None else 0
             mode_val = str(args.get("mode", "") or "").strip()
@@ -75414,6 +76946,7 @@ body{padding:18px}
                 out = self._run_write(rel, args["content"])
             if not out.startswith("Error"):
                 self._mark_read_context_stale(rel, reason="write_file changed file after previous read")
+                self._invalidate_long_content_memory_path(rel, reason="write_file changed source")
                 offline_result = (
                     {"summary": ""}
                     if coordinator is not None
@@ -75518,6 +77051,7 @@ body{padding:18px}
                 out = self._run_edit(rel, args["old_text"], args["new_text"])
             if not out.startswith("Error"):
                 self._mark_read_context_stale(rel, reason="edit_file changed file after previous read")
+                self._invalidate_long_content_memory_path(rel, reason="edit_file changed source")
                 offline_result = (
                     {"summary": ""}
                     if coordinator is not None
@@ -98313,6 +99847,45 @@ def _rag_boundary_split(body: str, *, max_chars: int, overlap: int) -> list[str]
     return pieces
 
 
+def _rag_structure_outline(text: str, *, max_items: int = 64, max_chars: int = 3600) -> list[str]:
+    """Return a bounded, deterministic outline for durable long-source memory.
+
+    This intentionally uses no completion call: ingestion can seed navigation
+    immediately, while exact claims remain recoverable from source chunks.
+    Markdown headings are preferred; numbered/labelled section lines are used
+    as a fallback for plain technical documents.
+    """
+    rows: list[str] = []
+    seen: set[str] = set()
+    for raw in str(text or "").splitlines():
+        line = str(raw or "").strip()
+        if not line:
+            continue
+        match = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
+        if match:
+            item = f"{'  ' * (len(match.group(1)) - 1)}{match.group(2).strip()}"
+        elif re.match(r"^(?:\d+(?:\.\d+)*[.)]|(?:chapter|section|part)\s+\w+)\s+.+", line, re.I):
+            item = line
+        else:
+            continue
+        item = trim(item, 180)
+        key = item.casefold()
+        if item and key not in seen:
+            seen.add(key)
+            if rows and len("\n".join(rows)) + len(item) + 1 > max(240, int(max_chars or 3600)):
+                break
+            rows.append(item)
+            if len(rows) >= max(1, int(max_items or 64)):
+                break
+    if not rows:
+        first = [trim(str(x).strip(), 180) for x in str(text or "").splitlines() if str(x).strip()][:4]
+        for item in first:
+            if rows and len("\n".join(rows)) + len(item) + 1 > max(240, int(max_chars or 3600)):
+                break
+            rows.append(item)
+    return [trim(x, 180) for x in rows if x][: max(1, int(max_items or 64))]
+
+
 def _rag_chunk_text(text: str, *, max_chars: int = RAG_CHUNK_CHARS, overlap: int = RAG_CHUNK_OVERLAP) -> list[dict]:
     """Semantic-boundary-aware text chunking.
 
@@ -98328,6 +99901,7 @@ def _rag_chunk_text(text: str, *, max_chars: int = RAG_CHUNK_CHARS, overlap: int
     current_text = ""
     current_heading = ""
     current_depth = 0
+    heading_stack: dict[int, str] = {}
 
     def _flush(txt: str, heading: str, depth: int, is_code: bool = False) -> None:
         txt = txt.strip()
@@ -98337,12 +99911,15 @@ def _rag_chunk_text(text: str, *, max_chars: int = RAG_CHUNK_CHARS, overlap: int
         preview = trim(first_line, 120)
         if heading:
             preview = f"[{heading}] {preview}"
+        section_path = [heading_stack[level] for level in sorted(heading_stack) if level <= max(1, depth)]
         chunks.append({
             "text": txt,
             "anchor": preview,
             "parent_heading": heading,
+            "section_path": section_path,
             "is_code_block": is_code,
             "section_depth": depth,
+            "segment_id": f"s{len(chunks) + 1:04d}",
         })
 
     for seg_type, seg_depth, seg_heading, seg_body in segments:
@@ -98355,6 +99932,9 @@ def _rag_chunk_text(text: str, *, max_chars: int = RAG_CHUNK_CHARS, overlap: int
                 current_text = ""
             current_heading = seg_heading
             current_depth = seg_depth
+            heading_stack[seg_depth] = seg_heading
+            for level in [level for level in heading_stack if level > seg_depth]:
+                heading_stack.pop(level, None)
         elif seg_type == "code_block":
             # Flush prose buffer, then emit code/table atomically (up to 2500 chars)
             if current_text:
@@ -98750,6 +100330,21 @@ class CodeContentParser:
             end = int(getattr(node, "end_lineno", start) or start)
             if start < 1 or end < start:
                 return
+            if len(out) >= CODE_MAX_CHUNKS_PER_DOC:
+                # Preserve the locator entry without materializing the full
+                # body or running call/algorithm extraction for every later
+                # declaration in a huge AST.
+                signature = str(lines[start - 1] or "").strip() if start <= len(lines) else symbol
+                symbols.append(
+                    {
+                        "name": symbol,
+                        "kind": kind,
+                        "line_start": start,
+                        "line_end": end,
+                        "signature": trim(signature, 180),
+                    }
+                )
+                return
             chunk_lines = lines[start - 1 : end]
             if not chunk_lines:
                 return
@@ -98835,7 +100430,9 @@ class CodeContentParser:
                         walk(child, name, depth + 1)
 
         walk(tree, "", 0)
-        return out[:CODE_MAX_CHUNKS_PER_DOC], symbols[:160]
+        # Keep prompt chunks bounded while retaining a complete locator index
+        # for symbols near the end of very large source files.
+        return out[:CODE_MAX_CHUNKS_PER_DOC], symbols[:LONG_CONTENT_SYMBOL_MEMORY_MAX]
 
     def _decl_matchers(self, language: str) -> list[tuple[re.Pattern[str], str]]:
         common = [
@@ -98912,6 +100509,19 @@ class CodeContentParser:
                 break
         out: list[dict] = []
         symbols: list[dict] = []
+        # Compute declaration boundaries in one monotonic stack pass. The
+        # previous per-candidate suffix scan was O(n^2) on large files.
+        end_indices: list[int] = [len(lines) - 1] * len(candidates)
+        active: list[int] = []
+        for idx, cand in enumerate(candidates):
+            depth = int(cand.get("depth", 0) or 0)
+            while active and depth <= int(candidates[active[-1]].get("depth", 0) or 0):
+                previous = active.pop()
+                end_indices[previous] = max(
+                    int(candidates[previous].get("index", 0) or 0),
+                    int(cand.get("index", 0) or 0) - 1,
+                )
+            active.append(idx)
         if candidates and candidates[0]["index"] > 0:
             prelude = "\n".join(lines[: int(candidates[0]["index"])]).strip()
             if prelude:
@@ -98928,17 +100538,29 @@ class CodeContentParser:
                 )
         for pos, cand in enumerate(candidates):
             start_idx = int(cand["index"] or 0)
-            end_idx = len(lines) - 1
-            for nxt in candidates[pos + 1 :]:
-                if int(nxt["depth"] or 0) <= int(cand["depth"] or 0):
-                    end_idx = max(start_idx, int(nxt["index"] or 0) - 1)
-                    break
+            end_idx = max(start_idx, int(end_indices[pos] or start_idx))
+            line_start = start_idx + 1
+            line_end = end_idx + 1
+            # Once the prompt chunk budget is full, avoid materializing each
+            # remaining function body. Its locator only needs the declaration
+            # line and computed boundary; this keeps indexing near O(file size)
+            # in both time and temporary memory.
+            if len(out) >= CODE_MAX_CHUNKS_PER_DOC:
+                signature = str(lines[start_idx] or "").strip() if 0 <= start_idx < len(lines) else str(cand.get("name", ""))
+                symbols.append(
+                    {
+                        "name": str(cand.get("name", "") or ""),
+                        "kind": str(cand.get("kind", "") or ""),
+                        "line_start": line_start,
+                        "line_end": line_end,
+                        "signature": trim(signature, 180),
+                    }
+                )
+                continue
             chunk_lines = lines[start_idx : end_idx + 1]
             chunk_text = "\n".join(chunk_lines).strip()
             if not chunk_text:
                 continue
-            line_start = start_idx + 1
-            line_end = end_idx + 1
             symbols.append(
                 {
                     "name": str(cand.get("name", "") or ""),
@@ -98948,6 +100570,11 @@ class CodeContentParser:
                     "signature": trim(next((ln.strip() for ln in chunk_lines if ln.strip()), str(cand.get("name", ""))), 180),
                 }
             )
+            # Chunk text is prompt/RAG-facing and capped independently from
+            # the complete symbol locator table. Avoid constructing more
+            # chunks once the budget is full, while still retaining symbols.
+            if len(out) >= CODE_MAX_CHUNKS_PER_DOC:
+                continue
             if len(chunk_text) <= CODE_CHUNK_CHARS:
                 out.append(
                     {
@@ -98968,9 +100595,9 @@ class CodeContentParser:
                         kind=str(cand.get("kind", "") or "symbol"),
                     )
                 )
-            if len(out) >= CODE_MAX_CHUNKS_PER_DOC:
-                break
-        return out[:CODE_MAX_CHUNKS_PER_DOC], symbols[:200]
+            # Continue collecting declarations after the prompt chunk budget
+            # is reached; symbols form the source-addressable locator index.
+        return out[:CODE_MAX_CHUNKS_PER_DOC], symbols[:LONG_CONTENT_SYMBOL_MEMORY_MAX]
 
     def _fallback_chunks(self, text: str) -> list[dict]:
         rows = _rag_chunk_text(text, max_chars=CODE_CHUNK_CHARS, overlap=CODE_CHUNK_OVERLAP)
@@ -99010,14 +100637,14 @@ class CodeContentParser:
         return trim(" ".join(x for x in picked if x), 320)
 
     def parse_file(self, fp: Path, *, mime: str = "", text_override: str = "") -> dict:
-        raw_text = trim(str(text_override or ""), 300_000)
+        raw_text = trim(str(text_override or ""), CODE_SOURCE_ANALYSIS_MAX_CHARS)
         raw_bytes: bytes | None = None
         if not raw_text:
             try:
                 raw_bytes = fp.read_bytes()
             except Exception:
                 raw_bytes = None
-            raw_text = trim(self._decode_text_bytes(raw_bytes or b""), 300_000)
+            raw_text = trim(self._decode_text_bytes(raw_bytes or b""), CODE_SOURCE_ANALYSIS_MAX_CHARS)
         language = self.detect_language(fp, text=raw_text)
         imports = self._extract_imports(raw_text, language)
         if language == "python":
@@ -99075,6 +100702,16 @@ class CodeContentParser:
             "text": raw_text,
             "text_chars": len(raw_text),
             "summary": trim(" | ".join(bit for bit in summary_bits if bit), 1600),
+            "understanding_outline": [
+                trim(
+                    f"{row.get('kind', 'symbol')} {row.get('name', '')} "
+                    f"L{int(row.get('line_start', 0) or 0)}-{int(row.get('line_end', 0) or 0)}",
+                    180,
+                )
+                for row in symbols[:64]
+                if str(row.get("name", "") or "").strip()
+            ],
+            "understanding_version": LONG_CONTENT_MEMORY_VERSION,
             "entities": entities,
             "category": "code",
             "labels": sorted({str(x).strip() for x in labels if str(x).strip()}),
@@ -99083,7 +100720,7 @@ class CodeContentParser:
                 "symbol_count": len(symbols),
                 "import_count": len(imports),
             },
-            "symbols": symbols[:200],
+            "symbols": symbols[:LONG_CONTENT_SYMBOL_MEMORY_MAX],
             "imports": imports[:64],
             "exports": exports[:64],
             "chunks": chunks[:CODE_MAX_CHUNKS_PER_DOC],
@@ -99578,6 +101215,14 @@ class RAGContentParser:
             allow_filename_entities=self.include_filename_entities,
             limit=32,
         )
+        outline = _rag_structure_outline(text)
+        lead_parts = [str(x).strip() for x in text.splitlines() if str(x).strip()]
+        lead = " ".join(lead_parts[:8])
+        summary_parts = []
+        if outline:
+            summary_parts.append("Structure: " + " > ".join(outline[:8]))
+        if lead:
+            summary_parts.append(lead)
         return {
             "filename": fp.name,
             "path": str(fp),
@@ -99588,7 +101233,9 @@ class RAGContentParser:
             "language": lang,
             "text": text,
             "text_chars": len(text),
-            "summary": trim(text, 1200),
+            "summary": trim(" | ".join(summary_parts) or text, 1600),
+            "understanding_outline": outline,
+            "understanding_version": LONG_CONTENT_MEMORY_VERSION,
             "entities": entities,
             "category": str(cls.get("category", "document")),
             "labels": list(cls.get("labels", [])),
@@ -99983,6 +101630,12 @@ class TFGraphIDFIndex:
                 "category": category,
                 "language": language,
                 "summary": str(doc.get("summary", "") or ""),
+                "understanding_outline": [
+                    trim(str(x), 180)
+                    for x in (doc.get("understanding_outline", []) or [])[:64]
+                    if str(x).strip()
+                ],
+                "understanding_version": int(doc.get("understanding_version", 0) or 0),
                 "entities": entities[:32],
                 "community": community,
                 "source_rel_path": source_rel_path,
@@ -100027,6 +101680,15 @@ class TFGraphIDFIndex:
                 "seq": int(chunk.get("seq", 0) or 0),
                 "text": text,
                 "anchor": str(chunk.get("anchor", "") or ""),
+                "segment_id": str(chunk.get("segment_id", "") or ""),
+                "parent_heading": str(chunk.get("parent_heading", "") or ""),
+                "section_path": [
+                    trim(str(x), 180)
+                    for x in (chunk.get("section_path", []) or [])[:12]
+                    if str(x).strip()
+                ],
+                "section_depth": int(chunk.get("section_depth", 0) or 0),
+                "is_code_block": bool(chunk.get("is_code_block", False)),
                 "entities": entities[:24],
                 # Persist the defining symbol so query-time symbol-exact boosting can match
                 # an identifier query to the chunk that defines it (code recall lever).
@@ -100537,6 +102199,9 @@ class TFGraphIDFIndex:
                     "community": str(doc.get("community", "")),
                     "language": str(doc.get("language", "")),
                     "anchor": str(chunk.get("anchor", "")),
+                    "segment_id": str(chunk.get("segment_id", "") or ""),
+                    "parent_heading": str(chunk.get("parent_heading", "") or ""),
+                    "section_path": list(chunk.get("section_path", []) or [])[:12],
                     "symbol": str(chunk.get("symbol", "")),
                     "text": _rag_focused_excerpt(
                         str(chunk.get("text", "")),
@@ -101348,6 +103013,31 @@ class RAGLibraryStore:
         self.content_updated_at = float(
             raw.get("content_updated_at", raw.get("updated_at", self.content_updated_at)) or self.content_updated_at
         )
+        # Older library shards predate structure metadata. Populate only the
+        # bounded navigation fields in-place; raw source/chunk text remains the
+        # durable evidence and is never duplicated here.
+        changed = False
+        for row in self.documents.values():
+            if not isinstance(row, dict):
+                continue
+            try:
+                understanding_version = int(row.get("understanding_version", 0) or 0)
+            except Exception:
+                understanding_version = 0
+            # Upgrade missing/older structure metadata in-place.  The raw
+            # document/chunk evidence remains untouched, so this is safe for
+            # every legacy RAG database format.
+            if understanding_version >= LONG_CONTENT_MEMORY_VERSION and row.get("understanding_outline") is not None:
+                continue
+            outline = _rag_structure_outline(str(row.get("summary", "") or ""), max_items=32)
+            row["understanding_outline"] = outline
+            row["understanding_version"] = LONG_CONTENT_MEMORY_VERSION
+            changed = True
+        if changed:
+            try:
+                self._save_locked(write_chunks=False, write_tasks=False)
+            except Exception:
+                pass
 
     def _save_locked(
         self,
@@ -101781,6 +103471,11 @@ class RAGLibraryStore:
             "",
         )
         chunks = _rag_chunk_text(semantic_text)
+        understanding_outline = [
+            trim(str(x), 180)
+            for x in (parse_result.get("understanding_outline", []) or [])[:64]
+            if str(x).strip()
+        ] or _rag_structure_outline(semantic_text)
         chunk_ids: list[str] = []
         with self.lock:
             stamp = now_ts()
@@ -101792,6 +103487,15 @@ class RAGLibraryStore:
                     "doc_id": doc_id,
                     "seq": chunk_idx,
                     "anchor": str(chunk.get("anchor", "") or ""),
+                    "segment_id": str(chunk.get("segment_id", "") or f"s{chunk_idx:04d}"),
+                    "parent_heading": str(chunk.get("parent_heading", "") or ""),
+                    "section_path": [
+                        trim(str(x), 180)
+                        for x in (chunk.get("section_path", []) or [])[:12]
+                        if str(x).strip()
+                    ],
+                    "section_depth": int(chunk.get("section_depth", 0) or 0),
+                    "is_code_block": bool(chunk.get("is_code_block", False)),
                     "text": chunk_text,
                     "entities": _rag_apply_filename_entity_policy(
                         _rag_extract_entities(chunk_text),
@@ -101820,6 +103524,11 @@ class RAGLibraryStore:
                 "backup_path": self._rel(backup_path),
                 "parsed_text_path": self._rel(parsed_path),
                 "summary": trim(mm_summary or str(parse_result.get("summary", "") or semantic_text), 1600),
+                "understanding_outline": understanding_outline,
+                "understanding_version": int(
+                    parse_result.get("understanding_version", LONG_CONTENT_MEMORY_VERSION)
+                    or LONG_CONTENT_MEMORY_VERSION
+                ),
                 "entities": combined_entities,
                 "community": community,
                 "chunk_count": len(chunk_ids),
@@ -102035,8 +103744,32 @@ class WikiStore:
         if summary:
             parts.append("\n## Summary\n\n" + summary + "\n")
         if chunks:
+            outline = [
+                trim(str(x), 180)
+                for x in (doc.get("understanding_outline", []) or [])[:64]
+                if str(x).strip()
+            ]
+            if not outline:
+                for chunk in chunks:
+                    anchor = trim(str(chunk.get("anchor", "") or ""), 180)
+                    if anchor and anchor not in outline:
+                        outline.append(anchor)
+                    if len(outline) >= 64:
+                        break
+            if outline:
+                parts.append("\n## Structure Map\n\n")
+                parts.extend(f"- {item}\n" for item in outline)
             parts.append("\n## Evidence Excerpts\n\n")
-            for chunk in chunks[:10]:
+            # Sample across the entire source instead of permanently remembering
+            # only its first ten chunks. The complete structure map above stays
+            # compact; these excerpts remain direct evidence, bounded to 12.
+            sample_count = min(12, len(chunks))
+            if len(chunks) <= sample_count:
+                sampled = chunks
+            else:
+                indexes = sorted({round(i * (len(chunks) - 1) / (sample_count - 1)) for i in range(sample_count)})
+                sampled = [chunks[idx] for idx in indexes]
+            for chunk in sampled:
                 anchor = trim(str(chunk.get("anchor", "") or f"chunk {chunk.get('seq', '')}"), 120)
                 text = trim(str(chunk.get("text", "") or ""), 900)
                 if text:
@@ -104619,7 +106352,7 @@ class CodeGraphIndex(TFGraphIDFIndex):
                     "imports": imports[:64],
                     "exports": exports[:64],
                     "labels": labels[:24],
-                    "symbols": symbols[:200],
+                    "symbols": symbols[:LONG_CONTENT_SYMBOL_MEMORY_MAX],
                     "line_count": int(src.get("line_count", src.get("metadata", {}).get("line_count", 0)) or 0)
                     if isinstance(src.get("metadata", {}), dict)
                     else int(src.get("line_count", 0) or 0),
@@ -104826,6 +106559,9 @@ class CodeGraphIndex(TFGraphIDFIndex):
                     "community": str(doc.get("community", "")),
                     "language": str(doc.get("language", "")),
                     "anchor": str(chunk.get("anchor", "") or chunk.get("symbol", "") or ""),
+                    "segment_id": str(chunk.get("segment_id", "") or ""),
+                    "parent_heading": str(chunk.get("parent_heading", "") or ""),
+                    "section_path": list(chunk.get("section_path", []) or [])[:12],
                     "text": trim(str(chunk.get("text", "")), 1800),
                     "entities": list(chunk.get("entities", []) or [])[:12],
                     "symbol": str(chunk.get("symbol", "") or ""),
@@ -105116,6 +106852,11 @@ class CodeLibraryStore(RAGLibraryStore):
         language = str(parse_result.get("language", "unknown") or "unknown")
         module_name = _code_module_name(rel_path_clean or safe_name, language)
         community = _code_choose_community(rel_path_clean or safe_name, language, labels)
+        understanding_outline = [
+            trim(str(x), 180)
+            for x in (parse_result.get("understanding_outline", []) or [])[:64]
+            if str(x).strip()
+        ]
         entity_candidates = list(parse_result.get("entities", []) or [])
         entity_candidates.extend(str(row.get("name", "") or "") for row in symbols[:24])
         entity_candidates.extend(imports[:24])
@@ -105160,6 +106901,15 @@ class CodeLibraryStore(RAGLibraryStore):
                     "doc_id": doc_id,
                     "seq": chunk_idx,
                     "anchor": str(chunk.get("anchor", "") or symbol or f"chunk {chunk_idx}"),
+                    "segment_id": str(chunk.get("segment_id", "") or f"s{chunk_idx:04d}"),
+                    "parent_heading": str(chunk.get("parent_heading", "") or ""),
+                    "section_path": [
+                        trim(str(x), 180)
+                        for x in (chunk.get("section_path", []) or [])[:12]
+                        if str(x).strip()
+                    ],
+                    "section_depth": int(chunk.get("section_depth", 0) or 0),
+                    "is_code_block": bool(chunk.get("is_code_block", False)),
                     "text": chunk_text,
                     "entities": chunk_entities,
                     "line_start": int(chunk.get("line_start", 0) or 0),
@@ -105189,11 +106939,16 @@ class CodeLibraryStore(RAGLibraryStore):
                 "backup_path": self._rel(backup_path),
                 "parsed_text_path": self._rel(parsed_path),
                 "summary": summary,
+                "understanding_outline": understanding_outline,
+                "understanding_version": int(
+                    parse_result.get("understanding_version", LONG_CONTENT_MEMORY_VERSION)
+                    or LONG_CONTENT_MEMORY_VERSION
+                ),
                 "entities": combined_entities,
                 "community": community,
                 "chunk_count": len(chunk_ids),
                 "chunk_ids": chunk_ids,
-                "symbols": symbols[:200],
+                "symbols": symbols[:LONG_CONTENT_SYMBOL_MEMORY_MAX],
                 "imports": imports[:64],
                 "exports": exports[:64],
                 "line_count": int(parse_result.get("metadata", {}).get("line_count", 0) or 0)
