@@ -3922,7 +3922,7 @@ RAG_SYMBOL_EXACT_BOOST = 0.5
 # Index snapshot format tag. Bumping this invalidates older on-disk snapshots that lack
 # BM25 fields (raw-tf postings + chunk_lengths), forcing a one-time rebuild from the
 # persisted documents/chunks (the real source of truth) instead of scoring incorrectly.
-RAG_INDEX_SNAPSHOT_FORMAT = "bm25-v1"
+RAG_INDEX_SNAPSHOT_FORMAT = "bm25-v2-structured-memory"
 RAG_GRAPH_MAX_NODES = 2000
 RAG_TASK_HISTORY_LIMIT = 400
 RAG_MODEL_MEDIA_MAX_BYTES = 8 * 1024 * 1024
@@ -4116,6 +4116,16 @@ READ_CONTEXT_SUMMARY_MAX_CHARS = 520
 READ_CONTEXT_SHARED_MAX_ITEMS = 4
 READ_CONTEXT_POLICY_CHOICES = {"auto", "conservative", "balanced", "wide"}
 DEFAULT_READ_CONTEXT_POLICY = "auto"
+# Cached read evidence is searchable on demand. Keep the scan bounded so a
+# book-length buffer never blocks a model turn, while still making exact facts
+# recoverable after micro/full compaction.
+READ_CONTEXT_CACHE_SEARCH_MAX_BYTES = max(
+    128 * 1024,
+    min(64 * 1024 * 1024, int(str(os.getenv("AGENT_READ_CACHE_SEARCH_MAX_BYTES", str(16 * 1024 * 1024)) or str(16 * 1024 * 1024)))),
+)
+READ_CONTEXT_CACHE_SEARCH_MAX_MATCHES = 8
+READ_CONTEXT_CACHE_SNIPPET_CHARS = 2_400
+READ_CONTEXT_CACHE_LINE_CONTEXT = 2
 TOOL_MEMORY_REGISTRY_MAX = 120
 TOOL_MEMORY_PROMPT_MAX_ITEMS = 18
 TOOL_MEMORY_PROMPT_MAX_CHARS = 5_500
@@ -4125,6 +4135,75 @@ TOOL_MEMORY_COMPACT_PIN_DISTINCT = 10
 TOOL_MEMORY_COMPACT_PIN_MAX_CHARS = 10_000
 TOOL_MEMORY_POLICY_CHOICES = READ_CONTEXT_POLICY_CHOICES
 DEFAULT_TOOL_MEMORY_POLICY = DEFAULT_READ_CONTEXT_POLICY
+# Unified long-content reading memory.  This is deliberately separate from the
+# conversation/tool registries: those retain evidence, while this index retains
+# the durable understanding of a long text/file/code source.  Cards are small
+# and source-addressable, so compaction can discard them from the prompt without
+# losing the ability to rehydrate the same understanding later.
+# Version 2 adds an optional, source-addressable semantic card.  The loader
+# deliberately accepts version 1 rows (and any future rows with extra fields),
+# so sessions written by older binaries remain readable without migration.
+LONG_CONTENT_MEMORY_VERSION = 2
+LONG_CONTENT_MEMORY_MAX_ITEMS = max(
+    8,
+    min(160, int(str(os.getenv("AGENT_LONG_CONTENT_MEMORY_MAX_ITEMS", "80") or "80"))),
+)
+LONG_CONTENT_MEMORY_MAX_SEGMENTS = max(
+    8,
+    min(320, int(str(os.getenv("AGENT_LONG_CONTENT_MEMORY_MAX_SEGMENTS", "160") or "160"))),
+)
+LONG_CONTENT_TEXT_SEGMENT_LINES = max(
+    40,
+    min(600, int(str(os.getenv("AGENT_LONG_CONTENT_TEXT_SEGMENT_LINES", "180") or "180"))),
+)
+LONG_CONTENT_CODE_SEGMENT_LINES = max(
+    80,
+    min(1200, int(str(os.getenv("AGENT_LONG_CONTENT_CODE_SEGMENT_LINES", "360") or "360"))),
+)
+LONG_CONTENT_CARD_CHARS = max(
+    180,
+    min(1800, int(str(os.getenv("AGENT_LONG_CONTENT_CARD_CHARS", "720") or "720"))),
+)
+LONG_CONTENT_STRUCTURE_MAX_CHARS = max(
+    1800,
+    min(12000, int(str(os.getenv("AGENT_LONG_CONTENT_STRUCTURE_MAX_CHARS", "6000") or "6000"))),
+)
+# Semantic enrichment is intentionally bounded and best-effort.  It runs at
+# most once per source version after a real focused read; structure/overview
+# reads remain local and immediate.  This keeps long-file navigation cheap
+# while allowing the active LLM to build a domain-neutral understanding card.
+LONG_CONTENT_SEMANTIC_ENABLED = (
+    str(os.getenv("AGENT_LONG_CONTENT_SEMANTIC_ENABLED", "true") or "true").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+LONG_CONTENT_SEMANTIC_TIMEOUT_SECONDS = max(
+    0.5,
+    min(20.0, float(str(os.getenv("AGENT_LONG_CONTENT_SEMANTIC_TIMEOUT_SECONDS", "4") or "4"))),
+)
+LONG_CONTENT_SEMANTIC_MAX_INPUT_CHARS = max(
+    2400,
+    min(24000, int(str(os.getenv("AGENT_LONG_CONTENT_SEMANTIC_MAX_INPUT_CHARS", "12000") or "12000"))),
+)
+LONG_CONTENT_SEMANTIC_MAX_OUTPUT_TOKENS = max(
+    160,
+    min(1200, int(str(os.getenv("AGENT_LONG_CONTENT_SEMANTIC_MAX_OUTPUT_TOKENS", "520") or "520"))),
+)
+LONG_CONTENT_SEMANTIC_MAX_KEY_POINTS = 8
+LONG_CONTENT_SEMANTIC_MAX_DEFINITIONS = 8
+LONG_CONTENT_SEMANTIC_MAX_RELATIONS = 8
+LONG_CONTENT_SEMANTIC_MAX_UNCERTAINTIES = 6
+LONG_CONTENT_SEMANTIC_MAX_EVIDENCE = 12
+LONG_CONTENT_SEMANTIC_MAX_REFRESHES = 3
+LONG_CONTENT_SEMANTIC_REFRESH_SEGMENTS = 3
+LONG_CONTENT_SEMANTIC_REFRESH_COVERAGE = 0.22
+LONG_CONTENT_TEXT_EXTS = {
+    ".txt", ".md", ".mdx", ".rst", ".org", ".adoc", ".tex", ".bib",
+}
+LONG_CONTENT_DATA_EXTS = {
+    ".json", ".jsonl", ".jsonc", ".yaml", ".yml", ".toml", ".ini",
+    ".cfg", ".conf", ".env", ".properties", ".csv", ".tsv", ".xml",
+    ".xsd", ".xsl",
+}
 DEFAULT_AUTO_TASK_LEVEL_CEILING = 2  # Applies only to automatic L1-L5 classification; 0 = no cap.
 HARD_BREAK_TOOL_ERROR_THRESHOLD = 20
 # Normal debugging often needs several corrected tool attempts before any
@@ -4248,6 +4327,19 @@ WATCHDOG_MAX_DECOMPOSE_STEPS = 12
 WATCHDOG_STEP_MAX_ATTEMPTS = 2
 EMPTY_ACTION_MIN_CONTENT_CHARS = 5
 EMPTY_ACTION_WAKEUP_RETRY_LIMIT = 5
+# A completed response that contains reasoning but neither public content nor a
+# tool call is not itself a model failure.  Some reasoning models need several
+# turns to cross the reasoning/final boundary, especially behind compatibility
+# gateways that ignore ``think=False``.  Keep the ordinary path untouched until
+# a genuinely long consecutive streak is observed, then run one bounded,
+# provider-aware recovery ladder instead of accumulating near-identical hints.
+EMPTY_ACTION_INTERVENTION_THRESHOLD = 20
+# Todo bootstrap still needs a tool call, but reasoning models may require a
+# several completed thinking turns before they emit it.  Keep this grace
+# window separate from the generic empty-action threshold and do not synthesize
+# a Todo during it.
+EMPTY_ACTION_BOOTSTRAP_THINKING_GRACE_ROUNDS = 10
+EMPTY_ACTION_RECOVERY_MAX_TOKENS = 1600
 THINKING_BUDGET_FORCE_RATIO = 0.85
 # --- Tool timeout configuration ---
 _TOOL_TIMEOUT_MAP = {
@@ -4402,6 +4494,7 @@ RUNTIME_CONTROL_HINT_PREFIXES = (
     "<no-tool-recovery>",
     "<auto-context-recall>",
     "<live-user-adjustment",
+    "<user-feedback-merge",
     "<background-results>",
     "<inbox>",
     "<auto-continue>",
@@ -4413,6 +4506,61 @@ RUNTIME_CONTROL_HINT_PREFIXES = (
     "<single-no-plan-todo-bootstrap>",
     "<single-no-plan-todo-bootstrap-retry>",
 )
+# These blocks are runtime plumbing rather than user-visible conversation.  Keep
+# user-facing structured controls such as live-user-adjustment and
+# plan-approved-handoff available to the UI; only blocks that can leak model
+# orchestration/context transcripts are suppressed from the public feed.
+UI_HIDDEN_RUNTIME_CONTROL_PREFIXES = (
+    "<intent-fusion",
+    "<background-results>",
+    "<inbox>",
+    "<reminder>",
+    "<todo-rescue>",
+    "<tool-retry>",
+    "<segmented-retry>",
+    "<forced-converge>",
+    "<no-tool-recovery>",
+    "<auto-context-recall>",
+    "<auto-continue>",
+    "<failure-recovery>",
+    "<arbiter-continue>",
+    "<truncate-rescue>",
+    "<thinking-empty-recovery>",
+    "<fault-prefill>",
+    "<single-no-plan-todo-bootstrap>",
+    "<single-no-plan-todo-bootstrap-retry>",
+    "<compact-resume>",
+    "<state_handoff>",
+    "<toolcall-overflow-recovery>",
+    "<read-loop-intervention>",
+    "<finish-blocked>",
+)
+# Runtime controls are model-facing protocol messages.  A selected subset is
+# also useful to the user as an observable, structured event.  This list only
+# controls the UI projection of legacy rows that predate explicit metadata; it
+# never controls what evidence the model receives or when recall is performed.
+UI_PROJECTED_RUNTIME_CONTROL_TAGS = frozenset(
+    {
+        "auto-context-recall",
+        "auto-continue",
+        "arbiter-continue",
+        "failure-recovery",
+        "fault-prefill",
+        "forced-converge",
+        "no-tool-recovery",
+        "reminder",
+        "segmented-retry",
+        "single-no-plan-todo-bootstrap",
+        "single-no-plan-todo-bootstrap-retry",
+        "thinking-empty-recovery",
+        "todo-rescue",
+        "tool-retry",
+        "truncate-rescue",
+    }
+)
+# Legacy persisted controls that are useful as UI events.  New runtime rows do
+# not depend on this set: they carry an explicit ``_ui_project`` decision.
+UI_LEGACY_PROJECTED_RUNTIME_CONTROL_TAGS = frozenset({"auto-context-recall"})
 RETRY_RUNTIME_HINT_PREFIXES = (
     "<todo-rescue>",
     "<tool-retry>",
@@ -8329,7 +8477,8 @@ def ide_public_operation_data(data: object) -> dict:
         "output": 12000, "diff": 12000, "diff_numbered": 12000,
         "change_type": 80, "agent_role": 80, "mode": 80,
         "tool_call_id": 240, "query": 2000, "pattern": 2000, "url": 2000,
-        "reason": 240, "archive_segment": 240, "next_call_label": 240,
+        "reason": 600, "archive_segment": 240, "next_call_label": 240,
+        "control_tag": 120, "origin": 80, "title": 240, "details": 8000,
         "public_progress": 4000,
     }
     for key, limit in text_limits.items():
@@ -8347,12 +8496,14 @@ def ide_public_operation_data(data: object) -> dict:
         "round", "tier", "archived_messages", "context_limit_before",
         "context_used_before", "context_left_before", "context_left_percent_before",
         "context_used_after", "context_left_after", "context_left_percent_after",
-        "context_used_reduction",
+        "context_used_reduction", "matched_rows", "returned", "total_rows",
     ):
         if key in source:
             public[key] = source.get(key)
     if "effective" in source:
         public["effective"] = bool(source.get("effective"))
+    if "default_collapsed" in source:
+        public["default_collapsed"] = bool(source.get("default_collapsed"))
     for key in ("changed_files", "tools"):
         if isinstance(source.get(key), list):
             public[key] = [trim(str(value or ""), 1200) for value in source[key][:80]]
@@ -25146,7 +25297,11 @@ class OllamaClient:
             thinking_parts.append(thinking_inline)
         # Match the streaming path's 4-key coverage (some providers use
         # `thinking`/`thought` on the message object, not just reasoning*).
-        seen_thinking = set()
+        seen_thinking = {
+            str(item).strip()
+            for item in thinking_parts
+            if str(item).strip()
+        }
         for key in ("reasoning_content", "reasoning", "thinking", "thought"):
             extra_text = str(msg.get(key) or "").strip()
             if extra_text and extra_text not in seen_thinking:
@@ -25767,6 +25922,7 @@ class OllamaClient:
         req_messages: list[dict],
         *,
         tools: list[dict] | None = None,
+        tool_choice: str = "",
         max_tokens: int = 2000,
         temperature: float = 0.2,
         think: bool = False,
@@ -25787,6 +25943,12 @@ class OllamaClient:
         }
         if tools:
             payload["tools"] = tools
+        forced_tool_name = str(tool_choice or "").strip()
+        if tools and forced_tool_name:
+            payload["tool_choice"] = {
+                "type": "function",
+                "function": {"name": forced_tool_name},
+            }
         reasoning = reasoning or {}
         reasoning_fields = reasoning.get("payload") if isinstance(reasoning, dict) else None
         reasoning_strip = list(reasoning.get("strip_keys", []) or []) if isinstance(reasoning, dict) else []
@@ -25818,6 +25980,22 @@ class OllamaClient:
                     lines = self._iter_response_lines_url_with_retries(
                         endpoint,
                         fallback_payload,
+                        headers=self._render_headers(),
+                        max_attempts=http_retry_attempts,
+                        cancel_check=cancel_check,
+                        on_retry=on_http_retry,
+                    )
+                    return self._openai_stream_result_from_lines(lines, on_content_delta=on_content_delta)
+                # Tool choice is an optional compatibility optimization.  A
+                # number of otherwise OpenAI-compatible local gateways accept
+                # tools but reject this field; retry without it rather than
+                # turning a capability mismatch into a failed agent round.
+                if status_400 and "tool_choice" in payload:
+                    stripped = dict(payload)
+                    stripped.pop("tool_choice", None)
+                    lines = self._iter_response_lines_url_with_retries(
+                        endpoint,
+                        stripped,
                         headers=self._render_headers(),
                         max_attempts=http_retry_attempts,
                         cancel_check=cancel_check,
@@ -25864,6 +26042,18 @@ class OllamaClient:
                 raw = self._post_json_url_with_retries(
                     endpoint,
                     fallback_payload,
+                    headers=self._render_headers(),
+                    max_attempts=http_retry_attempts,
+                    cancel_check=cancel_check,
+                    on_retry=on_http_retry,
+                )
+            elif status_400 and "tool_choice" in payload:
+                stripped = dict(payload)
+                stripped.pop("tool_choice", None)
+                stripped["stream"] = False
+                raw = self._post_json_url_with_retries(
+                    endpoint,
+                    stripped,
                     headers=self._render_headers(),
                     max_attempts=http_retry_attempts,
                     cancel_check=cancel_check,
@@ -25977,6 +26167,7 @@ class OllamaClient:
         req_messages: list[dict],
         *,
         tools: list[dict] | None = None,
+        tool_choice: str = "",
         max_tokens: int = 2000,
         temperature: float = 0.2,
         think: bool = False,
@@ -26055,6 +26246,9 @@ class OllamaClient:
             payload["system"] = "\n\n".join(system_parts)
         if tools:
             payload["tools"] = self._convert_tools_to_anthropic(tools)
+            forced_tool_name = str(tool_choice or "").strip()
+            if forced_tool_name:
+                payload["tool_choice"] = {"type": "tool", "name": forced_tool_name}
         headers = {
             "x-api-key": self.api_key,
             "anthropic-version": "2023-06-01",
@@ -26069,11 +26263,23 @@ class OllamaClient:
                 raise
             except Exception as exc:
                 raise OllamaError(f"anthropic stream response failed: {exc}", url=endpoint) from exc
-        raw = self._post_json_url(endpoint, payload, headers=headers)
+        try:
+            raw = self._post_json_url(endpoint, payload, headers=headers)
+        except OllamaError as exc:
+            # Anthropic-compatible proxies do not all implement the optional
+            # tool_choice field.  Keep the native tool schema and retry once
+            # without the optimization before surfacing a provider error.
+            if int(getattr(exc, "status", 0) or 0) == 400 and "tool_choice" in payload:
+                fallback_payload = dict(payload)
+                fallback_payload.pop("tool_choice", None)
+                raw = self._post_json_url(endpoint, fallback_payload, headers=headers)
+            else:
+                raise
         # If the provider returned OpenAI-format (has 'choices'), it's an OpenAI-compat endpoint
         # that doesn't understand Anthropic tool schemas. Retry with OpenAI-format tools.
         if isinstance(raw.get("choices"), list) and tools:
             payload["tools"] = tools  # original OpenAI-format tools
+            payload.pop("tool_choice", None)
             raw = self._post_json_url(endpoint, payload, headers=headers)
         content, tool_calls, thinking_content = self._extract_anthropic_message(raw)
         return {"content": content, "thinking": thinking_content, "tool_calls": tool_calls, "raw": raw}
@@ -26106,7 +26312,7 @@ class OllamaClient:
                         "arguments": json_dumps(block.get("input", {})),
                     },
                 })
-        return "\n".join(text_parts), tool_calls, "\n".join(thinking_parts)
+        return "\n".join(text_parts), self._normalize_tool_calls(tool_calls), "\n".join(thinking_parts)
 
     def _anthropic_stream_result_from_lines(self, lines, *, on_content_delta=None) -> dict:
         text_parts: list[str] = []
@@ -26346,6 +26552,7 @@ class OllamaClient:
         messages: list[dict],
         *,
         tools: list[dict] | None = None,
+        tool_choice: str = "",
         system: str | None = None,
         max_tokens: int = 2000,
         temperature: float = 0.2,
@@ -26398,6 +26605,7 @@ class OllamaClient:
             return self._chat_openai_compat(
                 req_messages,
                 tools=tools,
+                tool_choice=tool_choice,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 think=False,
@@ -26412,6 +26620,7 @@ class OllamaClient:
             return self._chat_anthropic(
                 req_messages,
                 tools=tools,
+                tool_choice=tool_choice,
                 max_tokens=max_tokens,
                 temperature=temperature,
                 think=False,
@@ -26484,8 +26693,12 @@ class OllamaClient:
             "stream": False,
             "options": {"temperature": temperature, "num_predict": effective_max_native},
         }
-        if think:
-            native_payload["think"] = True
+        # Ollama reasoning models (for example qwen3/deepseek-r1) may enable
+        # thinking by default when the field is omitted.  Send the explicit
+        # boolean for models that advertise the native switch so a bounded
+        # no-thinking compatibility turn can actually produce a tool call.
+        if model_reasoning_style(provider, self.model) == "ollama":
+            native_payload["think"] = bool(think)
         if tools:
             native_payload["tools"] = tools
         raw = self._post_json("/api/chat", native_payload)
@@ -26521,6 +26734,7 @@ class OllamaClient:
         messages: list[dict],
         *,
         tools: list[dict] | None = None,
+        tool_choice: str = "",
         system: str | None = None,
         max_tokens: int = 2000,
         temperature: float = 0.2,
@@ -26544,6 +26758,7 @@ class OllamaClient:
             response = self._chat_impl(
                 messages,
                 tools=tools,
+                tool_choice=tool_choice,
                 system=system,
                 max_tokens=max_tokens,
                 temperature=temperature,
@@ -26597,17 +26812,19 @@ TOOLS = [
             "app.py line 240 -> mode='window' line=240 context=5; "
             "run.txt E123 -> mode='search' query='E123'. "
             "Use mode='auto' by default; use mode='symbol', 'search', or 'window' for focused reads, "
-            "and mode='full' when complete content is explicitly needed. Successful reads are remembered in "
+            "and mode='full' when complete content is explicitly needed. Use mode='structure' or mode='segment' "
+            "to resume a long-file reading pass from compact understanding cards. Successful reads are remembered in "
             "the tool-memory registry; use that evidence instead of repeating identical broad reads."
         ),
         {
             "path": {"type": "string"},
             "mode": {
                 "type": "string",
-                "enum": ["auto", "full", "overview", "window", "symbol", "search", "directory"],
-                "description": "Reading strategy. Use symbol with target for a function/class; search with query for known text/errors; window with line/context for a line range. Avoid full for large logs when a query is known.",
+                "enum": ["auto", "full", "overview", "structure", "segment", "window", "symbol", "search", "directory"],
+                "description": "Reading strategy. Use structure/overview to inspect a long source memory, segment with target/query to read one remembered section, symbol with target for a function/class; search with query for known text/errors; window with line/context for a line range. Avoid full for large logs when a query is known.",
             },
             "target": {"type": "string", "description": "Symbol name for mode='symbol', for example 'ClassName.method' or 'func_42'."},
+            "segment_id": {"type": "string", "description": "Long-content memory segment id returned by mode='structure', for example 's0001'."},
             "query": {"type": "string", "description": "Search text or regex for mode='search'; can also be used when target is unknown."},
             "line": {"type": "integer", "description": "1-based center line for mode='window'."},
             "context": {"type": "integer", "description": "Number of surrounding lines for mode='window' or mode='search'."},
@@ -26625,6 +26842,7 @@ TOOLS = [
         (
             "Update current todos. update_mode='status_update' is merge-only: omitted unfinished rows are preserved, "
             "so a partial progress payload can never shorten the task tree. In approved plan mode, use it for status-only progress. "
+            "Before changing todos, inspect the canonical rows supplied in the current context and decide whether each objective should be reused/updated, added as a genuinely independent item, or removed as obsolete. "
             "When new current-step tool evidence or reviewer findings prove the open subplan is no longer suitable, "
             "use update_mode='revise_open' with a concrete revision_reason and revision_evidence references; the runtime performs an atomic LLM audit "
             "against the authoritative goal, original Todo baseline, completed evidence, and remaining requirement coverage before replacing open rows. "
@@ -26661,12 +26879,17 @@ TOOLS = [
             "revision_reason": {"type": "string", "description": "Concrete new finding that justifies a structural rolling-plan revision."},
             "revision_evidence": {},
             "evidence": {},
+            "plan_updates": {
+                "type": "array",
+                "items": {},
+                "description": "Optional plan-step edits identified by step_id/id/key or plan_step_index. Single-step edits are applied directly; multi-step or structural edits receive an independent semantic/context review.",
+            },
         },
         [],
     ),
     tool_def(
         "TodoWriteRescue",
-        "Fallback todo writer using the same protected merge/replan transaction as TodoWrite. Omitted rows are preserved unless an explicit revise_open passes LLM review. Preferred format: objects with content/status/owner/parent_step_id. String fallback should use only '[ ] task', '[>] task', or '[x] task'.",
+        "Fallback todo writer using the same protected merge/replan transaction as TodoWrite. Inspect existing canonical rows first and choose reuse/update, independent add, or evidence-backed removal. Omitted rows are preserved unless an explicit revise_open passes LLM review. Preferred format: objects with content/status/owner/parent_step_id. String fallback should use only '[ ] task', '[>] task', or '[x] task'.",
         {
             "items": {"type": "array", "items": {}},
             "todos": {"type": "array", "items": {}},
@@ -26690,6 +26913,7 @@ TOOLS = [
             "revision_reason": {"type": "string"},
             "revision_evidence": {},
             "evidence": {},
+            "plan_updates": {"type": "array", "items": {}},
         },
         [],
     ),
@@ -26729,6 +26953,7 @@ TOOLS = [
             "evidence": {},
             "revision_reason": {"type": "string"},
             "revision_evidence": {"type": "array", "items": {"type": "string"}},
+            "plan_updates": {"type": "array", "items": {}},
         },
         [],
     ),
@@ -28141,6 +28366,16 @@ class SessionState:
         self.agent_loop_progress_state: dict[str, dict] = {}
         self.read_context_registry: dict[str, dict] = {}
         self.tool_memory_registry: dict[str, dict] = {}
+        # Transient stat-keyed fingerprints avoid re-hashing a large source in
+        # read-context, tool-memory and long-content bookkeeping during the
+        # same or later focused reads. Durable registries still store the hash.
+        self._source_fingerprint_cache: dict[str, dict] = {}
+        # Durable, source-addressable understanding for long text/files/code.
+        # ``read_context_registry`` keeps raw tool evidence; this registry keeps
+        # compact structure/cards so a later turn can resume comprehension
+        # without asking the model to reread the whole source.
+        self.long_content_memory: dict[str, dict] = {}
+        self.long_content_memory_version = LONG_CONTENT_MEMORY_VERSION
         self.web_search_context_registry: dict[str, dict] = {}
         self.tool_memory_policy = DEFAULT_TOOL_MEMORY_POLICY
         self.stall_severity_score = 0
@@ -28209,6 +28444,18 @@ class SessionState:
         self.context_last_compact_used_reduction = 0
         self.context_last_compact_skip_ts = 0.0
         self.context_last_compact_skip_reason = ""
+        # Compact/recall observability. Values are persisted so a long-lived
+        # session can be evaluated instead of relying on subjective UI output.
+        self.context_compaction_metrics: dict = {
+            "runs": 0,
+            "effective_runs": 0,
+            "archived_messages": 0,
+            "input_chars": 0,
+            "summary_chars": 0,
+            "last_ratio": 0.0,
+            "cache_searches": 0,
+            "cache_hits": 0,
+        }
         self.context_last_next_call_estimate = 0
         self.context_last_next_call_label = ""
         self.last_context_actual_prompt_tokens = 0
@@ -28426,7 +28673,7 @@ class SessionState:
             return False
         if str(row.get("role", "")).strip() != "user":
             return False
-        if bool(row.get("_ui_hidden", False)):
+        if bool(row.get("_ui_hidden", False)) or self._is_runtime_internal_message(row):
             return False
         content = str(row.get("content", "") or "").strip()
         if not content:
@@ -29537,6 +29784,18 @@ class SessionState:
                 self.context_last_compact_skip_reason = trim(
                     str(raw.get("context_last_compact_skip_reason", "") or ""), 160
                 )
+                raw_compact_metrics = raw.get("context_compaction_metrics", {})
+                if isinstance(raw_compact_metrics, dict):
+                    self.context_compaction_metrics = {
+                        "runs": max(0, int(raw_compact_metrics.get("runs", 0) or 0)),
+                        "effective_runs": max(0, int(raw_compact_metrics.get("effective_runs", 0) or 0)),
+                        "archived_messages": max(0, int(raw_compact_metrics.get("archived_messages", 0) or 0)),
+                        "input_chars": max(0, int(raw_compact_metrics.get("input_chars", 0) or 0)),
+                        "summary_chars": max(0, int(raw_compact_metrics.get("summary_chars", 0) or 0)),
+                        "last_ratio": max(0.0, min(1.0, float(raw_compact_metrics.get("last_ratio", 0.0) or 0.0))),
+                        "cache_searches": max(0, int(raw_compact_metrics.get("cache_searches", 0) or 0)),
+                        "cache_hits": max(0, int(raw_compact_metrics.get("cache_hits", 0) or 0)),
+                    }
                 self.context_last_next_call_estimate = max(
                     0, int(raw.get("context_last_next_call_estimate", 0) or 0)
                 )
@@ -29602,6 +29861,9 @@ class SessionState:
                 )
                 self.tool_memory_registry = self._normalize_tool_memory_registry(
                     raw.get("tool_memory_registry", {})
+                )
+                self.long_content_memory = self._normalize_long_content_memory(
+                    raw.get("long_content_memory", {})
                 )
                 if not self.tool_memory_registry and self.read_context_registry:
                     self.tool_memory_registry = self._tool_memory_from_read_context_registry(self.read_context_registry)
@@ -30098,6 +30360,7 @@ class SessionState:
             "context_last_compact_used_reduction": int(getattr(self, "context_last_compact_used_reduction", 0) or 0),
             "context_last_compact_skip_ts": float(getattr(self, "context_last_compact_skip_ts", 0.0) or 0.0),
             "context_last_compact_skip_reason": str(getattr(self, "context_last_compact_skip_reason", "") or ""),
+            "context_compaction_metrics": dict(getattr(self, "context_compaction_metrics", {}) or {}),
             "context_last_next_call_estimate": int(getattr(self, "context_last_next_call_estimate", 0) or 0),
             "context_last_next_call_label": str(getattr(self, "context_last_next_call_label", "") or ""),
             "read_context_policy": normalize_read_context_policy(
@@ -30127,6 +30390,9 @@ class SessionState:
             ),
             "tool_memory_registry": self._normalize_tool_memory_registry(
                 getattr(self, "tool_memory_registry", {})
+            ),
+            "long_content_memory": self._normalize_long_content_memory(
+                getattr(self, "long_content_memory", {})
             ),
             "web_search_context_registry": self._normalize_web_search_context_registry(
                 getattr(self, "web_search_context_registry", {})
@@ -30266,11 +30532,157 @@ class SessionState:
                 return True
         return False
 
+    def _runtime_message_text(self, message: object) -> str:
+        if not isinstance(message, dict):
+            return ""
+        content = message.get("content", "")
+        if not content:
+            content = message.get("text", "")
+        if isinstance(content, list):
+            parts: list[str] = []
+            for block in content:
+                if isinstance(block, dict):
+                    value = block.get("text", block.get("content", ""))
+                    if isinstance(value, str):
+                        parts.append(value)
+            return "\n".join(parts)
+        return str(content or "")
+
+    def _runtime_message_control_tag(self, message: object) -> str:
+        """Return a protocol tag, preferring durable metadata over legacy text."""
+        if not isinstance(message, dict):
+            return ""
+        explicit = trim(str(message.get("control_tag", "") or "").strip().lower(), 120)
+        if explicit:
+            return explicit
+        text = self._runtime_message_text(message).strip()
+        match = re.match(r"^<([a-z0-9_-]+)(?:\s+[^>]*)?>", text, flags=re.IGNORECASE)
+        return trim(str(match.group(1) if match else "").lower(), 120)
+
+    def _is_runtime_internal_message(self, message: object) -> bool:
+        """Identify runtime provenance without deciding how the UI renders it.
+
+        New rows use metadata.  Prefix recognition is intentionally limited to
+        known protocol envelopes and exists only to migrate older sessions; it
+        is not a task/content classifier.
+        """
+        if not isinstance(message, dict):
+            return False
+        if bool(message.get("_runtime_internal", False)):
+            return True
+        if str(message.get("origin", "") or "").strip().lower() == "runtime":
+            return True
+        msg_type = str(message.get("type", "") or "").strip().lower()
+        if msg_type in {"runtime_internal", "runtime_control", "internal"}:
+            return True
+        low = self._runtime_message_text(message).strip().lower()
+        if not low:
+            return False
+        known_prefixes = tuple(dict.fromkeys(RUNTIME_CONTROL_HINT_PREFIXES + UI_HIDDEN_RUNTIME_CONTROL_PREFIXES))
+        return any(low.startswith(prefix) for prefix in known_prefixes)
+
+    def _runtime_message_ui_projection(self, message: object) -> dict | None:
+        """Project model-only runtime guidance into one safe structured UI row.
+
+        The original message is never changed or shortened, so provider/model
+        compatibility and reasoning evidence are unaffected.  New rows opt in
+        with ``_ui_project``; the tag set is only a migration fallback for old
+        persisted envelopes.
+        """
+        if not isinstance(message, dict) or not self._is_runtime_internal_message(message):
+            return None
+        tag = self._runtime_message_control_tag(message)
+        explicitly_projected = message.get("_ui_project")
+        if explicitly_projected is False:
+            return None
+        if explicitly_projected is not True and tag not in UI_LEGACY_PROJECTED_RUNTIME_CONTROL_TAGS:
+            return None
+        text = self._runtime_message_text(message).strip()
+        body = text
+        if tag:
+            match = re.match(
+                rf"^<{re.escape(tag)}(?:\s+[^>]*)?>\s*([\s\S]*?)\s*</{re.escape(tag)}>\s*$",
+                text,
+                flags=re.IGNORECASE,
+            )
+            if match:
+                body = str(match.group(1) or "").strip()
+        ui_data = dict(message.get("ui_data") or {}) if isinstance(message.get("ui_data"), dict) else {}
+        ui_data.update({"control_tag": tag or "runtime", "origin": "runtime"})
+        query_match = re.match(r"^<[^>]+\bquery=(\"(?:[^\"\\]|\\.)*\")", text, flags=re.IGNORECASE)
+        if query_match and not str(ui_data.get("query", "") or "").strip():
+            try:
+                ui_data["query"] = json.loads(query_match.group(1))
+            except Exception:
+                pass
+        payload = parse_json_object(body, {})
+        if isinstance(payload, dict) and payload:
+            for key in ("query", "matched_rows", "returned", "total_rows", "reason"):
+                if key in payload and key not in ui_data:
+                    ui_data[key] = payload.get(key)
+            segments = payload.get("segments_considered")
+            if isinstance(segments, list) and segments and isinstance(segments[0], dict):
+                ui_data.setdefault("archive_segment", segments[0].get("id", ""))
+        ui_data.setdefault("default_collapsed", True)
+        ui_data.setdefault("details", trim(body, 8000))
+        if tag == "auto-context-recall":
+            summary = "Archived context evidence was recalled for the active work."
+        else:
+            summary = trim(next((line.strip() for line in body.splitlines() if line.strip()), tag or "Runtime event"), 600)
+        row = {
+            "id": str(message.get("id", "") or ""),
+            "role": "system",
+            "type": "runtime_hint",
+            "text": summary,
+            "ts": float(message.get("ts", 0.0) or 0.0),
+            "data": ide_public_operation_data(ui_data),
+        }
+        if int(message.get("seq", 0) or 0) > 0:
+            row["seq"] = int(message.get("seq", 0) or 0)
+        return row
+
+    def _is_ui_hidden_runtime_message(self, message: object) -> bool:
+        """Return whether runtime plumbing has no public structured projection."""
+        if isinstance(message, dict) and bool(message.get("_ui_hidden", False)):
+            return True
+        return bool(
+            self._is_runtime_internal_message(message)
+            and self._runtime_message_ui_projection(message) is None
+        )
+
+    def _runtime_control_message(
+        self,
+        content: object,
+        *,
+        control_tag: str = "",
+        ui_data: dict | None = None,
+        ui_visible: bool = True,
+    ) -> dict:
+        """Build model-facing runtime guidance without claiming user authorship.
+
+        Some providers only accept the historical user/assistant wire roles for
+        mid-conversation guidance.  Keep that compatible envelope, but attach a
+        durable origin/type marker so snapshots, exports, archives and recalls
+        never project the row as genuine user input.
+        """
+        return {
+            "role": "user",
+            "content": str(content or ""),
+            "ts": now_ts(),
+            "type": "runtime_control",
+            "origin": "runtime",
+            "control_tag": trim(str(control_tag or "runtime"), 80),
+            "_runtime_internal": True,
+            "_ui_hidden": not bool(ui_visible),
+            "_ui_project": bool(ui_visible),
+            "ui_data": dict(ui_data or {}),
+        }
+
     def _has_prior_real_user_task_message(self) -> bool:
         for row in self.messages:
             if not isinstance(row, dict) or row.get("role") != "user":
                 continue
-            if bool(row.get("_ui_hidden", False)):
+            if bool(row.get("_ui_hidden", False)) or self._is_runtime_internal_message(row):
                 continue
             content = row.get("content", "")
             text = str(content or "").strip()
@@ -32824,6 +33236,7 @@ class SessionState:
         engineering_hint = self._engineering_execution_boost_instruction()
         code_ref_block = self._runtime_code_reference_prompt_block()
         knowledge_ref_block = self._runtime_knowledge_reference_prompt_block()
+        long_content_memory_block = self._long_content_memory_prompt_block()
         runtime_level = int(self.runtime_task_level or 0)
         runtime_mode = self._effective_execution_mode()
         budget = int(self.runtime_round_budget or 0)
@@ -32833,6 +33246,7 @@ class SessionState:
         code_hint_block = f"{code_hint}\n\n" if code_hint else ""
         engineering_block = f"{engineering_hint}\n\n" if engineering_hint else ""
         knowledge_ref_block_text = f"{knowledge_ref_block}\n\n" if knowledge_ref_block else ""
+        long_content_memory_text = f"{long_content_memory_block}\n\n" if long_content_memory_block else ""
         code_block = f"{code_ref_block}\n\n" if code_ref_block else ""
         read_context_block = self._read_context_prompt_block()
         read_context_text = f"{read_context_block}\n\n" if read_context_block else ""
@@ -32913,7 +33327,7 @@ class SessionState:
                 f"{self._public_progress_prompt_instruction()}"
                 "Use tools to inspect, edit, and execute. "
                 "If you say you will create, write, build, copy, modify, or verify an artifact, the same turn must include the concrete tool call that does it; do not stop at a promise to act. "
-            "When reading files, choose the shape that matches the question: mode='window' for file:line, mode='symbol' for named code, mode='search' for keywords/errors, mode='overview' for structure, and mode='full' only when exact broad context is required. "
+            "When reading files, choose the shape that matches the question: mode='window' for file:line, mode='symbol' for named code, mode='search' for keywords/errors, mode='overview' or mode='structure' for structure and long-content memory, mode='segment' with a segment_id to continue a remembered section, and mode='full' only when exact broad context is required. "
             "When inspecting collections or memory, use focused modes too: tool_memory/context_recall/read_from_blackboard/task_list/check_background/list_background_processes/read_inbox/worktree_events support focused query/status/detail filters where applicable. `check_background` is session-local; `list_background_processes` sees only the authenticated user's processes across sessions, and `stop_background_process` requires an exact visible process_id. Prefer filters over repeatedly listing recent items. "
             "Before repeating the same successful read_file/bash/query over the same target, check the injected tool-memory-registry or call tool_memory with mode='search' or mode='detail'. "
                 f"{web_search_instruction}"
@@ -32939,6 +33353,7 @@ class SessionState:
             f"{web_search_context_text}"
             f"{read_context_text}"
             f"{knowledge_ref_block_text}"
+            f"{long_content_memory_text}"
             f"{code_block}"
             f"{model_language_instruction(self.ui_language)}\n\n"
             f"Uploads:\n{uploads_ctx}\n\n"
@@ -34603,7 +35018,7 @@ class SessionState:
         path = trim(str(src.get("path", "") or "").replace("\\", "/"), 240)
         mode = str(src.get("mode", "") or "auto").strip().lower() or "auto"
         parts = [f"path={path}", f"mode={mode}"]
-        for key in ("target", "query", "line", "context", "offset", "limit", "regex", "max_chars"):
+        for key in ("target", "query", "line", "context", "offset", "limit", "regex", "max_chars", "segment_id"):
             value = src.get(key)
             if value not in (None, ""):
                 parts.append(f"{key}={trim(str(value), 120)}")
@@ -34689,6 +35104,10 @@ class SessionState:
                 "sha256": trim(str(raw_entry.get("sha256", "") or ""), 64),
                 "summary": trim(str(raw_entry.get("summary", "") or ""), TOOL_MEMORY_SUMMARY_MAX_CHARS),
                 "cache_path": trim(str(raw_entry.get("cache_path", "") or ""), 300),
+                "cache_source_complete": bool(raw_entry.get("cache_source_complete", True)),
+                "source_size": (max(0, int(raw_entry.get("source_size", 0) or 0)) if "source_size" in raw_entry else None),
+                "source_mtime_ns": (max(0, int(raw_entry.get("source_mtime_ns", 0) or 0)) if "source_mtime_ns" in raw_entry else None),
+                "source_sha256": (trim(str(raw_entry.get("source_sha256", "") or ""), 64) if "source_sha256" in raw_entry else ""),
                 "buffer_ref": "",
                 "temp_output_path": "",
                 "related_paths": [path] if path else [],
@@ -34734,7 +35153,7 @@ class SessionState:
                     related_paths.append(rel)
             if target_path and target_path not in related_paths:
                 related_paths.insert(0, target_path)
-            clean[key] = {
+            normalized_entry = {
                 "key": key,
                 "source_tool": tool,
                 "evidence_kind": trim(str(raw_entry.get("evidence_kind", "") or ""), 80),
@@ -34751,6 +35170,10 @@ class SessionState:
                 "sha256": trim(str(raw_entry.get("sha256", "") or ""), 64),
                 "summary": trim(str(raw_entry.get("summary", "") or ""), TOOL_MEMORY_SUMMARY_MAX_CHARS),
                 "cache_path": trim(str(raw_entry.get("cache_path", "") or ""), 300),
+                "cache_source_complete": bool(raw_entry.get("cache_source_complete", True)),
+                "source_size": (max(0, int(raw_entry.get("source_size", 0) or 0)) if "source_size" in raw_entry else None),
+                "source_mtime_ns": (max(0, int(raw_entry.get("source_mtime_ns", 0) or 0)) if "source_mtime_ns" in raw_entry else None),
+                "source_sha256": (trim(str(raw_entry.get("source_sha256", "") or ""), 64) if "source_sha256" in raw_entry else ""),
                 "buffer_ref": trim(str(raw_entry.get("buffer_ref", "") or ""), 120),
                 "temp_output_path": trim(str(raw_entry.get("temp_output_path", "") or ""), 300),
                 "related_paths": related_paths[:12],
@@ -34763,6 +35186,7 @@ class SessionState:
                 "stale_reason": trim(str(raw_entry.get("stale_reason", "") or ""), 180),
                 "sensitivity": trim(str(raw_entry.get("sensitivity", "normal") or "normal"), 40),
             }
+            clean[key] = normalized_entry
         return self._pruned_tool_memory_registry(clean)
 
     def _tool_memory_sort_key(self, item: tuple[str, dict]) -> tuple[int, int, float, int, str]:
@@ -34904,7 +35328,7 @@ class SessionState:
             low_yield = raw_entry.get("low_yield_queries", [])
             if not isinstance(low_yield, list):
                 low_yield = []
-            clean[key] = {
+            normalized_entry = {
                 "key": key,
                 "agent_role": role_key,
                 "focus_kind": trim(str(raw_entry.get("focus_kind", "task") or "task"), 80),
@@ -34930,6 +35354,7 @@ class SessionState:
                 "thin_streak": max(0, int(raw_entry.get("thin_streak", 0) or 0)),
                 "dynamic_streak": max(0, int(raw_entry.get("dynamic_streak", 0) or 0)),
             }
+            clean[key] = normalized_entry
         return self._pruned_web_search_context_registry(clean)
 
     def _web_search_context_sort_key(self, item: tuple[str, dict]) -> tuple[float, int, str]:
@@ -35247,7 +35672,7 @@ class SessionState:
             if status not in {"active", "pinned", "stale", "dropped"}:
                 status = "active"
             args = raw_entry.get("args", {}) if isinstance(raw_entry.get("args", {}), dict) else {}
-            clean[key] = {
+            normalized_entry = {
                 "key": key,
                 "source_tool": str(raw_entry.get("source_tool", "read_file") or "read_file"),
                 "path": path,
@@ -35260,10 +35685,11 @@ class SessionState:
                 "sha256": trim(str(raw_entry.get("sha256", "") or ""), 64),
                 "summary": trim(str(raw_entry.get("summary", "") or ""), READ_CONTEXT_SUMMARY_MAX_CHARS),
                 "cache_path": trim(str(raw_entry.get("cache_path", "") or ""), 300),
+                "cache_source_complete": bool(raw_entry.get("cache_source_complete", True)),
                 "args": {
                     k: v
                     for k, v in dict(args).items()
-                    if k in {"mode", "target", "query", "line", "context", "offset", "limit", "regex", "max_chars"}
+                    if k in {"mode", "target", "query", "line", "context", "offset", "limit", "regex", "max_chars", "segment_id"}
                 },
                 "hit_count": max(1, int(raw_entry.get("hit_count", 1) or 1)),
                 "first_read_ts": max(0.0, float(raw_entry.get("first_read_ts", 0.0) or 0.0)),
@@ -35272,6 +35698,16 @@ class SessionState:
                 "last_stale_ts": max(0.0, float(raw_entry.get("last_stale_ts", 0.0) or 0.0)),
                 "stale_reason": trim(str(raw_entry.get("stale_reason", "") or ""), 180),
             }
+            # Do not synthesize zero-valued fingerprints for legacy sessions;
+            # zero would be interpreted as a real fingerprint and immediately
+            # mark every historical read stale on load.
+            if "source_size" in raw_entry:
+                normalized_entry["source_size"] = max(0, int(raw_entry.get("source_size", 0) or 0))
+            if "source_mtime_ns" in raw_entry:
+                normalized_entry["source_mtime_ns"] = max(0, int(raw_entry.get("source_mtime_ns", 0) or 0))
+            if str(raw_entry.get("source_sha256", "") or "").strip():
+                normalized_entry["source_sha256"] = trim(str(raw_entry.get("source_sha256", "") or ""), 64)
+            clean[key] = normalized_entry
         return self._pruned_read_context_registry(clean)
 
     def _read_context_sort_key(self, item: tuple[str, dict]) -> tuple[int, float, int, str]:
@@ -35579,6 +36015,7 @@ class SessionState:
         temp_output_path: str = "",
         related_paths: list[str] | None = None,
         sensitivity: str = "normal",
+        cache_source_complete: bool | None = None,
     ) -> None:
         tool = canonicalize_tool_name(source_tool)
         if not tool:
@@ -35603,6 +36040,7 @@ class SessionState:
         if not isinstance(registry, dict):
             registry = {}
         old = registry.get(key, {}) if isinstance(registry.get(key, {}), dict) else {}
+        source_fp = self._read_source_fingerprint(rel_path) if tool == "read_file" and rel_path else {}
         sha = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
         cached = str(cache_path or old.get("cache_path", "") or "")
         if len(text) >= int(FILE_BUFFER_CONTENT_THRESHOLD * 2) and (
@@ -35640,6 +36078,11 @@ class SessionState:
             "sha256": sha,
             "summary": trim(summary or self._tool_memory_summary_from_output(tool, src_args, text), TOOL_MEMORY_SUMMARY_MAX_CHARS),
             "cache_path": cached,
+            "cache_source_complete": bool(
+                cache_source_complete
+                if cache_source_complete is not None
+                else old.get("cache_source_complete", True)
+            ),
             "buffer_ref": trim(str(buffer_ref or old.get("buffer_ref", "") or ""), 120),
             "temp_output_path": trim(str(temp_output_path or old.get("temp_output_path", "") or ""), 300),
             "related_paths": paths[:12],
@@ -35651,6 +36094,7 @@ class SessionState:
             "last_stale_ts": 0.0,
             "stale_reason": "",
             "sensitivity": trim(str(sensitivity or "normal"), 40),
+            **source_fp,
         }
         self.tool_memory_registry = self._pruned_tool_memory_registry(registry)
 
@@ -35760,7 +36204,16 @@ class SessionState:
         self.tool_memory_registry = self._pruned_tool_memory_registry(registry)
         return f"tool_memory policy applied: pinned={kept}, dropped={dropped}"
 
-    def _record_read_context(self, rel_path: str, args: dict, output: str, role: str = "") -> None:
+    def _record_read_context(
+        self,
+        rel_path: str,
+        args: dict,
+        output: str,
+        role: str = "",
+        *,
+        source_text: str | None = None,
+        source_fp: dict | None = None,
+    ) -> None:
         if str(output or "").startswith("Error:"):
             return
         rel = trim(str(rel_path or "").replace("\\", "/"), 300)
@@ -35776,12 +36229,39 @@ class SessionState:
         now = now_ts()
         old = self.read_context_registry.get(key, {}) if isinstance(getattr(self, "read_context_registry", {}), dict) else {}
         sha = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()
+        source_fp = dict(source_fp) if isinstance(source_fp, dict) else self._read_source_fingerprint(rel)
+        # Prefer the source document over the rendered/truncated tool output.
+        # This is what makes facts beyond ``max_chars`` recoverable after a
+        # compact. For very large files the bounded prefix is still useful and
+        # is explicitly marked as incomplete in the registry.
+        cache_content = content
+        cache_source_complete = True
+        try:
+            source_path = self._session_path(rel)
+            source_size = int(source_path.stat().st_size)
+            if source_path.is_file() and source_size > len(content.encode("utf-8", errors="replace")):
+                if source_text is not None and source_size <= READ_CONTEXT_CACHE_SEARCH_MAX_BYTES:
+                    cache_content = str(source_text)
+                elif source_text is not None:
+                    cache_content = str(source_text)[:READ_CONTEXT_CACHE_SEARCH_MAX_BYTES]
+                    cache_source_complete = False
+                else:
+                    raw = source_path.read_bytes()
+                    if len(raw) <= READ_CONTEXT_CACHE_SEARCH_MAX_BYTES:
+                        cache_content = self._decode_text_bytes(raw)
+                    else:
+                        cache_content = self._decode_text_bytes(raw[:READ_CONTEXT_CACHE_SEARCH_MAX_BYTES])
+                        cache_source_complete = False
+        except Exception:
+            pass
         cache_path = str(old.get("cache_path", "") or "")
-        if len(content) >= int(FILE_BUFFER_CONTENT_THRESHOLD * 2) and (
-            not cache_path or str(old.get("sha256", "") or "") != sha
+        old_source_sha = str(old.get("source_sha256", "") or "")
+        source_changed = bool(old_source_sha and source_fp.get("source_sha256") and old_source_sha != source_fp.get("source_sha256"))
+        if len(cache_content) >= int(FILE_BUFFER_CONTENT_THRESHOLD * 2) and (
+            not cache_path or str(old.get("sha256", "") or "") != sha or source_changed or str(old.get("status", "") or "").lower() == "stale"
         ):
             try:
-                entry = self._write_file_buffer_entry(content, label=f"read_file:{rel}")
+                entry = self._write_file_buffer_entry(cache_content, label=f"read_file:{rel}")
                 cache_path = str(entry.get("path", "") or "")
             except Exception:
                 cache_path = ""
@@ -35800,10 +36280,12 @@ class SessionState:
             "sha256": sha,
             "summary": self._read_context_summary_from_output(content),
             "cache_path": cache_path,
+            "cache_source_complete": bool(cache_source_complete),
+            **source_fp,
             "args": {
                 k: v
                 for k, v in src_args.items()
-                if k in {"mode", "target", "query", "line", "context", "offset", "limit", "regex", "max_chars"}
+                if k in {"mode", "target", "query", "line", "context", "offset", "limit", "regex", "max_chars", "segment_id"}
             },
             "hit_count": int(old.get("hit_count", 0) or 0) + 1,
             "first_read_ts": float(old.get("first_read_ts", now) or now),
@@ -35825,6 +36307,7 @@ class SessionState:
                 target_path=rel,
                 cache_path=cache_path,
                 related_paths=[rel],
+                cache_source_complete=cache_source_complete,
             )
         except Exception:
             pass
@@ -35913,6 +36396,183 @@ class SessionState:
         self.read_context_registry = self._pruned_read_context_registry(self.read_context_registry)
         return f"read_context policy applied: pinned={kept}, dropped={dropped}"
 
+    def _read_source_fingerprint(self, rel_path: str) -> dict:
+        """Return a cheap, durable fingerprint for a workspace source file.
+
+        ``read_context_registry`` used to remember only the rendered output
+        hash.  That hash cannot tell us whether the source changed outside the
+        agent (editor, git checkout, sync process), so cached evidence could be
+        presented as current when it was not.  Size/mtime are cheap for every
+        lookup; a content hash is added for reasonably sized files when the
+        source is first read.
+        """
+        rel = str(rel_path or "").replace("\\", "/").strip()
+        if not rel:
+            return {}
+        try:
+            fp = self._session_path(rel)
+            st = fp.stat()
+            out = {
+                "source_size": int(st.st_size),
+                "source_mtime_ns": int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000))),
+            }
+            cache = getattr(self, "_source_fingerprint_cache", {})
+            if not isinstance(cache, dict):
+                cache = {}
+                self._source_fingerprint_cache = cache
+            cached = cache.get(rel, {}) if isinstance(cache.get(rel, {}), dict) else {}
+            if (
+                int(cached.get("source_size", -1) or -1) == out["source_size"]
+                and int(cached.get("source_mtime_ns", -1) or -1) == out["source_mtime_ns"]
+            ):
+                if str(cached.get("source_sha256", "") or "").strip():
+                    out["source_sha256"] = str(cached.get("source_sha256", ""))
+                return out
+            if fp.is_file() and int(st.st_size) <= READ_CONTEXT_CACHE_SEARCH_MAX_BYTES:
+                try:
+                    out["source_sha256"] = hashlib.sha256(fp.read_bytes()).hexdigest()
+                except Exception:
+                    pass
+            cache[rel] = dict(out)
+            return out
+        except Exception:
+            return {}
+
+    def _read_context_entry_is_fresh(self, entry: dict) -> bool:
+        if not isinstance(entry, dict):
+            return False
+        path = str(entry.get("path", "") or entry.get("target_path", "") or "").strip()
+        if not path:
+            return False
+        # Legacy entries have no source fingerprint. They remain usable until
+        # the next explicit read, preserving backwards compatibility.
+        if "source_size" not in entry and "source_mtime_ns" not in entry and not entry.get("source_sha256"):
+            return True
+        current = self._read_source_fingerprint(path)
+        if not current:
+            return False
+        old_size = entry.get("source_size")
+        old_mtime = entry.get("source_mtime_ns")
+        if old_size is not None and int(old_size or 0) != int(current.get("source_size", -1)):
+            return False
+        if old_mtime is not None and int(old_mtime or 0) != int(current.get("source_mtime_ns", -1)):
+            return False
+        old_sha = str(entry.get("source_sha256", "") or "")
+        current_sha = str(current.get("source_sha256", "") or "")
+        return not old_sha or not current_sha or old_sha == current_sha
+
+    def _refresh_read_context_staleness(self, registry: dict | None = None) -> int:
+        """Mark cached file evidence stale when the source changed externally."""
+        src = registry if isinstance(registry, dict) else getattr(self, "read_context_registry", {})
+        if not isinstance(src, dict):
+            return 0
+        changed = 0
+        now = now_ts()
+        for entry in src.values():
+            if not isinstance(entry, dict) or str(entry.get("status", "active") or "active").lower() == "dropped":
+                continue
+            if not self._read_context_entry_is_fresh(entry):
+                if str(entry.get("status", "") or "").lower() != "stale":
+                    changed += 1
+                entry["status"] = "stale"
+                entry["last_stale_ts"] = now
+                entry["stale_reason"] = "source file changed or is unavailable"
+        # Keep the unified tool-memory view consistent as well. Do not call the
+        # path helper here: it would mark every historical read and lose the
+        # per-entry freshness distinction.
+        memory = getattr(self, "tool_memory_registry", {})
+        if isinstance(memory, dict):
+            for entry in memory.values():
+                if not isinstance(entry, dict) or str(entry.get("source_tool", "") or "") != "read_file":
+                    continue
+                path = str(entry.get("target_path", entry.get("path", "")) or "")
+                matching = next((row for row in src.values() if isinstance(row, dict) and str(row.get("path", "") or "") == path), None)
+                stale = (
+                    isinstance(matching, dict)
+                    and str(matching.get("status", "") or "").lower() == "stale"
+                )
+                if not isinstance(matching, dict) and not self._read_context_entry_is_fresh(entry):
+                    stale = True
+                if stale:
+                    entry["status"] = "stale"
+                    entry["last_stale_ts"] = now
+                    entry["stale_reason"] = str((matching or {}).get("stale_reason", "source file changed") or "source file changed")
+        return changed
+
+    @staticmethod
+    def _cached_query_terms(query: str) -> list[str]:
+        raw = str(query or "").strip().lower()
+        if not raw:
+            return []
+        terms: list[str] = []
+        for token in re.findall(r"[a-z0-9_][a-z0-9_.:/-]{1,}|[\u4e00-\u9fff]{2,}", raw, flags=re.I):
+            if token not in terms:
+                terms.append(token)
+            # Chinese questions often contain a long phrase with no spaces;
+            # add overlapping bigrams so a paraphrased query still recalls a
+            # relevant line when the full phrase is absent.
+            if re.fullmatch(r"[\u4e00-\u9fff]+", token) and len(token) > 4:
+                for idx in range(len(token) - 1):
+                    gram = token[idx : idx + 2]
+                    if gram not in terms:
+                        terms.append(gram)
+        return terms[:32]
+
+    def _search_cached_evidence(self, entry: dict, query: str, *, max_chars: int = READ_CONTEXT_CACHE_SNIPPET_CHARS) -> dict:
+        """Search one cached read buffer and return bounded, line-addressable snippets."""
+        if not isinstance(entry, dict) or not str(query or "").strip():
+            return {"score": 0, "matched_terms": [], "snippets": [], "scanned": False}
+        cache_ref = str(entry.get("cache_path", "") or entry.get("temp_output_path", "") or "").strip()
+        if not cache_ref:
+            return {"score": 0, "matched_terms": [], "snippets": [], "scanned": False}
+        try:
+            fp = Path(cache_ref)
+            if not fp.is_absolute():
+                fp = safe_path(cache_ref, self.root)
+            text = try_read_text(fp, max_bytes=READ_CONTEXT_CACHE_SEARCH_MAX_BYTES) or ""
+        except Exception:
+            text = ""
+        if not text:
+            return {"score": 0, "matched_terms": [], "snippets": [], "scanned": False}
+        raw_query = str(query or "").strip().lower()
+        terms = self._cached_query_terms(raw_query)
+        if not terms:
+            return {"score": 0, "matched_terms": [], "snippets": [], "scanned": True}
+        lines = text.replace("\r\n", "\n").split("\n")
+        exact_lines = [idx for idx, line in enumerate(lines) if raw_query in line.lower()]
+        matched_terms = [term for term in terms if any(term in line.lower() for line in lines)]
+        # Exact phrase is strongest; otherwise rank lines by the number of
+        # query terms they contain. This remains deterministic and works for
+        # both English token queries and CJK bigrams.
+        ranked: list[tuple[int, int]] = []
+        for idx, line in enumerate(lines):
+            low = line.lower()
+            score = sum(1 for term in terms if term in low)
+            if score:
+                ranked.append((score + (3 if raw_query in low else 0), idx))
+        ranked.sort(key=lambda row: (-row[0], row[1]))
+        selected: list[int] = []
+        for _score, idx in ranked:
+            if any(abs(idx - prior) <= READ_CONTEXT_CACHE_LINE_CONTEXT for prior in selected):
+                continue
+            selected.append(idx)
+            if len(selected) >= READ_CONTEXT_CACHE_SEARCH_MAX_MATCHES:
+                break
+        snippets: list[str] = []
+        for idx in selected:
+            start = max(0, idx - READ_CONTEXT_CACHE_LINE_CONTEXT)
+            end = min(len(lines), idx + READ_CONTEXT_CACHE_LINE_CONTEXT + 1)
+            block = "\n".join(f"{line_no + 1:>6}: {lines[line_no]}" for line_no in range(start, end))
+            snippets.append(block)
+        return {
+            "score": int((3 if exact_lines else 0) + len(matched_terms)),
+            "matched_terms": matched_terms[:24],
+            "snippets": snippets,
+            "scanned": True,
+            "exact_matches": len(exact_lines),
+            "truncated": len(text.encode("utf-8", errors="replace")) >= READ_CONTEXT_CACHE_SEARCH_MAX_BYTES,
+        }
+
     def _tool_memory_prompt_block(
         self,
         *,
@@ -35926,6 +36586,10 @@ class SessionState:
             self.tool_memory_registry = dict(registry)
         if not isinstance(registry, dict) or not registry:
             return ""
+        try:
+            self._refresh_read_context_staleness(getattr(self, "read_context_registry", {}))
+        except Exception:
+            pass
         budget = self._tool_memory_budget()
         if max_items is None:
             max_items = int(budget.get("items", TOOL_MEMORY_PROMPT_MAX_ITEMS) or TOOL_MEMORY_PROMPT_MAX_ITEMS)
@@ -35977,7 +36641,8 @@ class SessionState:
             (
                 "Tool evidence retained outside raw tool results and injected on every normal model call, not only after compact. "
                 "Reuse active/pinned evidence before repeating read_file/bash/query calls; call tool_memory mode='search' or mode='detail' "
-                "when you need to locate an entry or load its cached preview. Treat stale file evidence as a cue to re-read narrowly before relying on exact text."
+                "when you need to locate an entry or load its cached preview. For long reads, mode='search' also searches the cached full text and returns line-addressable snippets, so a broad read is not required again. "
+                "Treat stale file evidence as a cue to re-read narrowly before relying on exact text."
             ),
         ]
         hot_entries = [
@@ -36014,6 +36679,11 @@ class SessionState:
                 f"age={_age(entry.get('last_ts', 0.0))} "
                 f"summary={trim(str(entry.get('summary','') or ''), 300)}"
                 + (f" cache={cache}" if cache else "")
+                + (
+                    " cache_scope=source-prefix"
+                    if cache and not bool(entry.get("cache_source_complete", True))
+                    else (" cache_scope=source-full" if cache else "")
+                )
                 + (f" buffer_ref={buffer_ref}" if buffer_ref else "")
                 + (f" full_output_path={temp_output_path}" if temp_output_path else "")
                 + (f" stale_reason={trim(str(entry.get('stale_reason','') or ''), 120)}" if status == "stale" else "")
@@ -36044,6 +36714,14 @@ class SessionState:
                 },
                 indent=2,
             )
+        # Detect edits made outside the agent before exposing cached evidence.
+        # This is intentionally best-effort and bounded by the registry size;
+        # stale entries remain visible for diagnosis but are never treated as
+        # current search hits.
+        try:
+            self._refresh_read_context_staleness(getattr(self, "read_context_registry", {}))
+        except Exception:
+            pass
         budget = self._tool_memory_budget()
         mode = str(src.get("mode", "") or "").strip().lower() or "summary"
         if mode not in {"summary", "search", "recent", "detail"}:
@@ -36058,6 +36736,8 @@ class SessionState:
         current_role = self._sanitize_agent_role(role) or ""
         wanted_status = str(src.get("status", "") or "").strip().lower()
         include_cached = bool(src.get("include_cached", False)) and mode == "detail"
+        cache_hits: dict[str, dict] = {}
+        cache_scan_count = 0
 
         def visible(entry: dict) -> bool:
             if not isinstance(entry, dict):
@@ -36087,10 +36767,24 @@ class SessionState:
                         str(entry.get("target_path", entry.get("path", "")) or ""),
                         str(entry.get("command", "") or ""),
                         str(entry.get("summary", "") or ""),
-                        str(entry.get("signature", "") or ""),
-                    ]
+                    str(entry.get("signature", "") or ""),
+                ]
                 ).lower()
-                if query not in hay:
+                metadata_match = query in hay
+                if str(entry.get("source_tool", "") or "") == "read_file" and str(entry.get("status", "active") or "active").lower() != "stale":
+                    nonlocal cache_scan_count
+                    # Search cached bodies even when the path/summary matched:
+                    # callers need the exact line snippet, not just a locator.
+                    if cache_scan_count < 32:
+                        cache_scan_count += 1
+                        hit = self._search_cached_evidence(entry, query)
+                        if int(hit.get("score", 0) or 0) > 0:
+                            cache_hits[str(entry.get("key", "") or "")] = hit
+                        elif not metadata_match:
+                            return False
+                    elif not metadata_match:
+                        return False
+                elif not metadata_match:
                     return False
             return True
 
@@ -36131,9 +36825,19 @@ class SessionState:
                 "chars": int(entry.get("chars", 0) or 0),
                 "hits": int(entry.get("hit_count", 0) or 0),
                 "cache_path": entry.get("cache_path", ""),
+                "cache_source_complete": bool(entry.get("cache_source_complete", True)),
                 "buffer_ref": entry.get("buffer_ref", ""),
                 "full_output_path": entry.get("temp_output_path", ""),
             }
+            hit = cache_hits.get(str(entry.get("key", "") or ""))
+            if hit and mode in {"search", "detail"}:
+                item["cache_match_score"] = int(hit.get("score", 0) or 0)
+                item["cache_matched_terms"] = list(hit.get("matched_terms", []) or [])[:24]
+                snippets = [trim(str(x), READ_CONTEXT_CACHE_SNIPPET_CHARS) for x in (hit.get("snippets", []) or []) if str(x).strip()]
+                if snippets:
+                    item["cached_matches"] = snippets[:READ_CONTEXT_CACHE_SEARCH_MAX_MATCHES]
+                item["cache_exact_matches"] = int(hit.get("exact_matches", 0) or 0)
+                item["cache_search_truncated"] = bool(hit.get("truncated", False))
             if mode == "detail":
                 item["signature"] = trim(str(entry.get("signature", "") or ""), 800)
                 item["stale_reason"] = entry.get("stale_reason", "")
@@ -36159,12 +36863,39 @@ class SessionState:
             "matched_rows": len(entries),
             "returned": len(selected),
             "items": [render(entry) for entry in selected],
+            "observability": {
+                "cache_searches_total": int((getattr(self, "context_compaction_metrics", {}) or {}).get("cache_searches", 0) or 0),
+                "cache_hits_total": int((getattr(self, "context_compaction_metrics", {}) or {}).get("cache_hits", 0) or 0),
+                "cache_hit_rate": round(
+                    float((getattr(self, "context_compaction_metrics", {}) or {}).get("cache_hits", 0) or 0)
+                    / max(1, int((getattr(self, "context_compaction_metrics", {}) or {}).get("cache_searches", 0) or 0)),
+                    4,
+                ),
+                "last_compaction_reduction_ratio": float((getattr(self, "context_compaction_metrics", {}) or {}).get("last_reduction_ratio", 0.0) or 0.0),
+            },
             "focused_reads": [
                 "tool_memory mode='search' query='<path|command|error|skill>'",
                 "tool_memory mode='detail' id='<memory_id>' include_cached=true",
                 "read_file mode='window' or mode='search' only when remembered file evidence is stale or insufficient",
             ],
         }
+        if query and cache_scan_count:
+            stats = getattr(self, "context_compaction_metrics", {})
+            if not isinstance(stats, dict):
+                stats = {}
+            stats["cache_searches"] = int(stats.get("cache_searches", 0) or 0) + int(cache_scan_count)
+            stats["cache_hits"] = int(stats.get("cache_hits", 0) or 0) + len(cache_hits)
+            self.context_compaction_metrics = stats
+            obs = payload.get("observability") if isinstance(payload.get("observability"), dict) else {}
+            obs["cache_searches_total"] = int(stats.get("cache_searches", 0) or 0)
+            obs["cache_hits_total"] = int(stats.get("cache_hits", 0) or 0)
+            obs["cache_hit_rate"] = round(float(obs["cache_hits_total"]) / max(1, int(obs["cache_searches_total"])), 4)
+            payload["observability"] = obs
+            payload["cache_search"] = {
+                "scanned_entries": int(cache_scan_count),
+                "matched_entries": int(len(cache_hits)),
+                "max_bytes": int(READ_CONTEXT_CACHE_SEARCH_MAX_BYTES),
+            }
         return trim(json_dumps(payload, indent=2), cap)
 
     def _read_context_prompt_block(
@@ -36569,6 +37300,27 @@ class SessionState:
             )
         else:
             rows.append("progress_signal=normal")
+        try:
+            canonical_rows = [
+                row for row in self.todo.snapshot()
+                if isinstance(row, dict) and self._todo_row_kind(row) != "system"
+            ]
+        except Exception:
+            canonical_rows = []
+        if canonical_rows:
+            rows.append(
+                "CURRENT CANONICAL TODO ROWS (inspect before any update):\n"
+                + "\n".join(
+                    f"- [{str(row.get('status', 'pending')).lower()}] "
+                    f"id={trim(str(row.get('subtask_id', '') or row.get('key', '') or ''), 80)} "
+                    f"{trim(str(row.get('content', '') or ''), 180)}"
+                    for row in canonical_rows[:24]
+                )
+            )
+            rows.append(
+                "Choose autonomously for each incoming objective: reuse/update an existing row, add an independent row, "
+                "or remove an obsolete open row only with evidence-backed revise_open. Completed rows and evidence are immutable."
+            )
         rows.append(
             "These are shared observations, not a phase, role, tool, or next-action selection. "
             "Choose autonomously from the objective, evidence, agent perspectives, and Todo state; "
@@ -36597,6 +37349,21 @@ class SessionState:
         pending = int(alignment.get("todo_pending", 0) or 0)
         in_progress = int(alignment.get("todo_in_progress", 0) or 0)
         all_completed = bool(alignment.get("all_todos_completed", False))
+        try:
+            canonical_rows = [
+                dict(row) for row in self.todo.snapshot()
+                if isinstance(row, dict)
+                and self._todo_row_kind(row) != "system"
+            ]
+        except Exception:
+            canonical_rows = []
+        canonical_text = "\n".join(
+            f"- [{str(row.get('status', 'pending')).lower()}] "
+            f"id={trim(str(row.get('subtask_id', '') or row.get('key', '') or ''), 100)} "
+            f"{trim(str(row.get('content', '') or ''), 360)}"
+            for row in canonical_rows[:40]
+            if str(row.get("content", "") or "").strip()
+        ) or "(none)"
         return trim(
             "\n".join(
                 [
@@ -36606,6 +37373,8 @@ class SessionState:
                     f"todo_progress={completed}/{total} pending={pending} in_progress={in_progress} "
                     f"all_completed={str(all_completed).lower()}",
                     "This block reports canonical Todo facts only. It does not choose a phase, tool, role, or next action; reason autonomously from the objective and evidence.",
+                    "Before modifying Todo state, inspect the complete canonical rows below and decide whether each incoming objective is an existing row to update, a genuinely new row to add, or an obsolete open row to remove. Preserve stable ids and completed evidence; use revise_open with concrete evidence for removals or structural changes.",
+                    "CURRENT CANONICAL TODO ROWS:\n" + canonical_text,
                     "When tool results have actually completed one or more Todo rows, call TodoWrite or TodoWriteRescue with update_mode='status_update' before doing work that belongs to another row. One call may mark every evidence-backed completed row and set exactly one remaining open row to in_progress; do not force one bookkeeping call per row. If every row is complete, leave none in_progress and proceed to objective-level acceptance or finish.",
                     "Do not advance Todo status from approach prose, intention, or an unverified claim alone.",
                     "</single-todo-alignment-state>",
@@ -37047,8 +37816,9 @@ class SessionState:
         if summary:
             rows.append(f"summary: {summary}")
         rows.append(
-            "Use this cached evidence to continue. Re-read the original path only with a narrower "
-            "mode='search', 'symbol', or 'window' for a new exact question."
+            "Use this cached evidence to continue. The cached full text is searchable with "
+            "tool_memory mode='search' query='<term>'; re-read the original path only when the "
+            "entry is stale, the query has no cached match, or fresh verification is required."
         )
         return "\n".join(rows)
 
@@ -37067,15 +37837,39 @@ class SessionState:
         }
         if tool not in eligible:
             return "[cleared by microcompact]"
-        sig = self._tool_memory_signature_from_args(tool, args, result_status=("error" if content.startswith("Error:") else "ok"))
+        raw_result_status = str(msg.get("result_status", "") or "").strip().lower()
+        if not raw_result_status:
+            if msg.get("result_ok") is False:
+                raw_result_status = "error"
+            elif msg.get("result_ok") is True:
+                raw_result_status = "ok"
+            elif tool in {"bash", "background_run", "worktree_run"} and self._command_output_has_error_shape(content):
+                raw_result_status = "error"
+            else:
+                raw_result_status = "error" if content.startswith("Error:") else "ok"
+        sig = self._tool_memory_signature_from_args(tool, args, result_status=raw_result_status)
         registry_entry = None
         for entry in getattr(self, "tool_memory_registry", {}).values():
             if isinstance(entry, dict) and str(entry.get("signature", "") or "") == sig:
                 registry_entry = entry
                 break
+        # A repeated command may have both a failed and a later successful
+        # memory entry. Match the immutable output digest before falling back
+        # to signature so compaction preserves the result that occurred at this
+        # exact point in the timeline.
+        content_sha = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()
+        for entry in getattr(self, "tool_memory_registry", {}).values():
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("source_tool", "") or "") != tool:
+                continue
+            if str(entry.get("sha256", "") or "") == content_sha:
+                registry_entry = entry
+                sig = str(entry.get("signature", "") or sig)
+                break
         lines = [ln.strip() for ln in content.replace("\r\n", "\n").split("\n") if ln.strip()]
         summary = trim(str((registry_entry or {}).get("summary", "") or " ".join(lines[:6])), 700)
-        sha = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[:12]
+        sha = content_sha[:12]
         cached_path = str((registry_entry or {}).get("cache_path", "") or "")
         if len(content) >= FILE_BUFFER_CONTENT_THRESHOLD:
             try:
@@ -37091,10 +37885,54 @@ class SessionState:
         if registry_entry:
             rows.append(
                 f"memory_id: {registry_entry.get('key','')} status={registry_entry.get('status','active')} "
-                f"kind={registry_entry.get('evidence_kind','')} role={registry_entry.get('agent_role','')}"
+                f"kind={registry_entry.get('evidence_kind','')} role={registry_entry.get('agent_role','')} "
+                f"result={registry_entry.get('result_status','')}"
             )
         if cached_path:
             rows.append(f"cached_copy: {cached_path}")
+        if summary:
+            rows.append(f"summary: {summary}")
+        rows.append(
+            "Use tool-memory-registry to continue. Repeat the tool only for a narrower unanswered question, "
+            "fresh verification, or changed state."
+        )
+        return "\n".join(rows)
+
+    def _refresh_archived_tool_memory_placeholder(self, content: object) -> str:
+        """Resolve a compact placeholder by its immutable output digest.
+
+        This also repairs older archives whose placeholders were produced
+        before result metadata was persisted.  A later successful execution of
+        the same command must not rewrite an earlier failed execution.
+        """
+        text = str(content or "")
+        if not text.startswith("[tool_memory cached"):
+            return text
+        match = re.search(r"sha256=([0-9a-f]{12,64})", text, flags=re.IGNORECASE)
+        if not match:
+            return text
+        digest = match.group(1).lower()
+        matched = None
+        for entry in getattr(self, "tool_memory_registry", {}).values():
+            if not isinstance(entry, dict):
+                continue
+            entry_sha = str(entry.get("sha256", "") or "").lower()
+            if entry_sha.startswith(digest):
+                matched = entry
+                break
+        if not matched:
+            return text
+        first_line = text.splitlines()[0]
+        rows = [first_line, f"signature: {matched.get('signature', '')}"]
+        rows.append(
+            f"memory_id: {matched.get('key','')} status={matched.get('status','active')} "
+            f"kind={matched.get('evidence_kind','')} role={matched.get('agent_role','')} "
+            f"result={matched.get('result_status','')}"
+        )
+        cached_path = str(matched.get("cache_path", "") or "")
+        if cached_path:
+            rows.append(f"cached_copy: {cached_path}")
+        summary = str(matched.get("summary", "") or "").strip()
         if summary:
             rows.append(f"summary: {summary}")
         rows.append(
@@ -37557,9 +38395,74 @@ class SessionState:
             text = str(resp.get("content", "")).strip()
             if text:
                 return trim(text, 4000)
-        except Exception as exc:
-            return f"(summary failed: {exc})"
-        return "(summary unavailable)"
+        except Exception:
+            # Compaction must never discard the only durable handoff when the
+            # summarizer is unavailable (offline model, timeout, or malformed
+            # provider response). Build a deterministic evidence digest from
+            # the archived rows instead. It is intentionally concise and
+            # preserves paths, errors, tool names, and recent user intent.
+            pass
+        return self._deterministic_compact_summary(rows)
+
+    def _deterministic_compact_summary(self, rows: list[dict], *, max_chars: int = 4000) -> str:
+        """Loss-bounded local summary used when LLM summarization fails.
+
+        The previous fallback exposed only ``summary unavailable``. That made
+        a successful long-document read effectively unrecoverable after
+        compaction and triggered unnecessary re-reads. This digest keeps high
+        signal rows and stable locators while remaining small enough for every
+        compact-resume note.
+        """
+        if not rows:
+            return "(no archived rows)"
+        picked: list[str] = []
+        seen: set[str] = set()
+        # Prefer user requests, assistant decisions, errors, and tool evidence
+        # that identifies a file/query. Walk newest-first but restore readable
+        # chronological order at the end.
+        ranked: list[tuple[int, int, dict]] = []
+        total = len(rows)
+        for idx, row in enumerate(rows):
+            if not isinstance(row, dict):
+                continue
+            role = str(row.get("role", "") or "").lower()
+            content = str(row.get("content", "") or "").strip()
+            low = content.lower()
+            score = int(idx / max(1, total - 1) * 3)
+            score += {"user": 4, "assistant": 3, "tool": 2, "system": 1}.get(role, 1)
+            if any(mark in low for mark in ("error:", "traceback", "exception", "failed", "finish_task", "todowrite")):
+                score += 3
+            if any(mark in low for mark in ("read_file", "path=", "full_output_path", "cached_copy", "query=")):
+                score += 2
+            ranked.append((score, idx, row))
+        ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        budget = max(800, int(max_chars or 4000))
+        used = 0
+        for _score, idx, row in ranked:
+            role = str(row.get("role", "") or "")
+            content = str(row.get("content", "") or "").replace("\r\n", " ").replace("\n", " ").strip()
+            if not content:
+                continue
+            # Keep enough of a read result to preserve headings, paths, and
+            # line references; tool output is capped more aggressively.
+            cap = 520 if role in {"user", "assistant"} else 420
+            line = trim(content, cap)
+            key = hashlib.sha1(line.lower().encode("utf-8", errors="replace")).hexdigest()[:12]
+            if key in seen:
+                continue
+            row_text = f"[{role or 'event'}] {line}"
+            if used + len(row_text) + 1 > budget:
+                continue
+            seen.add(key)
+            picked.append((idx, row_text))
+            used += len(row_text) + 1
+            if used >= budget * 0.92:
+                break
+        picked.sort(key=lambda item: item[0])
+        lines = [text for _idx, text in picked]
+        if not lines:
+            return "(archived rows contained no textual evidence)"
+        return trim("\n".join(lines), budget)
 
     def _open_work_brief(self) -> str:
         alias = {
@@ -37879,7 +38782,14 @@ class SessionState:
             role = str(item.get("role", "") or "")
             content = str(item.get("content", "") or "")
             low = content.strip().lower()
-            if role == "user" and any(low.startswith(prefix) for prefix in RETRY_RUNTIME_HINT_PREFIXES):
+            is_live_user_adjustment = low.startswith("<live-user-adjustment")
+            if (
+                not is_live_user_adjustment
+                and (
+                    self._is_ui_hidden_runtime_message(item)
+                    or (role == "user" and self._is_runtime_control_hint(content))
+                )
+            ):
                 continue
             if "<compact-resume>" in low or "<state_handoff>" in low:
                 item["content"] = "[previous compact-resume archived; use context_recall for details]"
@@ -37913,7 +38823,18 @@ class SessionState:
         if len(tail) >= len(self.messages):
             tail = self._select_compact_tail(max(2200, int(tail_budget * 0.55)), min_count=4, max_count=20)
         archived_rows = self.messages[:-len(tail)] if tail else list(self.messages)
+        archived_rows = self._strip_archival_runtime_hints(archived_rows)
         tail = self._strip_archival_runtime_hints(tail)
+        # Compact placeholders can outlive the mutable registry view. Refresh
+        # them by immutable output digest before persisting or summarizing so a
+        # later execution of the same command cannot distort this archive.
+        stable_archived_rows: list[dict] = []
+        for row in archived_rows:
+            item = dict(row) if isinstance(row, dict) else {"role": "", "content": str(row or "")}
+            if str(item.get("role", "") or "") == "tool":
+                item["content"] = self._refresh_archived_tool_memory_placeholder(item.get("content", ""))
+            stable_archived_rows.append(item)
+        archived_rows = stable_archived_rows
         seg = self._archive_context_segment(archived_rows, reason) if archived_rows else {}
         summary = self._summarize_compact_rows(archived_rows)
         seg_id = str(seg.get("id", "")) if isinstance(seg, dict) else ""
@@ -37988,7 +38909,30 @@ class SessionState:
         before_used = int(context_before.get("used", 0) or 0)
         after_used = int(context_after.get("used", 0) or 0)
         reduction = max(0, before_used - after_used)
+        input_chars = len(json_dumps(archived_rows)) if archived_rows else 0
+        summary_chars = len(str(summary or ""))
+        compact_ratio = (float(after_used) / float(before_used)) if before_used > 0 else 1.0
+        reduction_ratio = max(0.0, min(1.0, 1.0 - compact_ratio))
+        stats = getattr(self, "context_compaction_metrics", {})
+        if not isinstance(stats, dict):
+            stats = {}
+        stats.update(
+            {
+                "runs": int(stats.get("runs", 0) or 0) + 1,
+                "effective_runs": int(stats.get("effective_runs", 0) or 0),
+                "archived_messages": int(stats.get("archived_messages", 0) or 0) + int(seg_msg_count),
+                "input_chars": int(stats.get("input_chars", 0) or 0) + int(input_chars),
+                "summary_chars": int(stats.get("summary_chars", 0) or 0) + int(summary_chars),
+                "last_ratio": round(compact_ratio, 6),
+                "last_reduction_ratio": round(reduction_ratio, 6),
+                "last_input_chars": int(input_chars),
+                "last_summary_chars": int(summary_chars),
+            }
+        )
+        self.context_compaction_metrics = stats
         effective = bool(reduction >= max(400, int(before_used * 0.05)) or after_used < int(context_after.get("effective_limit", 0) or 0))
+        if effective:
+            self.context_compaction_metrics["effective_runs"] = int(self.context_compaction_metrics.get("effective_runs", 0) or 0) + 1
         self.context_last_compact_before = dict(context_before)
         self.context_last_compact_after = dict(context_after)
         self.context_last_compact_effective = bool(effective)
@@ -38019,6 +38963,10 @@ class SessionState:
                 "context_left_after": int(context_after.get("left", 0)),
                 "context_left_percent_after": round(float(context_after.get("left_percent", 0.0)), 2),
                 "context_used_reduction": int(reduction),
+                "compression_ratio": round(compact_ratio, 6),
+                "reduction_ratio": round(reduction_ratio, 6),
+                "archived_input_chars": int(input_chars),
+                "summary_chars": int(summary_chars),
                 "effective": bool(effective),
                 "next_call_label": str(context_after.get("next_call_label", "") or ""),
                 "role": role_key or "",
@@ -41742,6 +42690,822 @@ body{padding:18px}
             row["line_end"] = max(start, (next_start - 1) if next_start > start else min(len(lines), start + 120))
         return symbols
 
+    # ---- Unified long-content understanding ---------------------------------
+    # ``read_context_registry`` is an evidence cache.  These helpers build a
+    # second, deliberately small index of structure and durable reading cards
+    # for long text, logs, data files and source code. Structure extraction is
+    # deterministic and cheap; an optional, once-per-source LLM semantic card
+    # is added only after a focused evidence read. Full source remains
+    # recoverable via read_file/context_recall and is never copied wholesale
+    # into the prompt block.
+    def _normalize_long_content_memory(self, raw: object) -> dict[str, dict]:
+        if not isinstance(raw, dict):
+            return {}
+        clean: dict[str, dict] = {}
+        for key, value in list(raw.items())[-LONG_CONTENT_MEMORY_MAX_ITEMS * 2:]:
+            if not isinstance(value, dict):
+                continue
+            content_id = str(value.get("content_id", key) or key).strip()[:180]
+            path = str(value.get("source_path", "") or "").replace("\\", "/").strip()[:400]
+            if not content_id or not path:
+                continue
+            segments: list[dict] = []
+            for item in value.get("segments", []) if isinstance(value.get("segments", []), list) else []:
+                if not isinstance(item, dict):
+                    continue
+                sid = str(item.get("id", "") or "").strip()[:120]
+                if not sid:
+                    continue
+                segments.append({
+                    "id": sid,
+                    "title": trim(str(item.get("title", "") or ""), 180),
+                    "kind": trim(str(item.get("kind", "text") or "text"), 40),
+                    "start_line": max(1, int(item.get("start_line", 1) or 1)),
+                    "end_line": max(1, int(item.get("end_line", item.get("start_line", 1)) or 1)),
+                    "summary": trim(str(item.get("summary", "") or ""), LONG_CONTENT_CARD_CHARS),
+                    "key_terms": [trim(str(x), 100) for x in (item.get("key_terms", []) or [])[:16] if str(x).strip()],
+                    "symbols": [trim(str(x), 120) for x in (item.get("symbols", []) or [])[:24] if str(x).strip()],
+                    "evidence": [trim(str(x), 180) for x in (item.get("evidence", []) or [])[:12] if str(x).strip()],
+                    "status": str(item.get("status", "unseen") or "unseen")[:24],
+                    "last_seen": float(item.get("last_seen", 0.0) or 0.0),
+                })
+            cards: list[dict] = []
+            for item in value.get("cards", []) if isinstance(value.get("cards", []), list) else []:
+                if not isinstance(item, dict):
+                    continue
+                card_id = str(item.get("id", "") or "").strip()[:120]
+                if not card_id:
+                    continue
+                cards.append({
+                    "id": card_id,
+                    "type": trim(str(item.get("type", "structure") or "structure"), 40),
+                    "title": trim(str(item.get("title", "") or ""), 180),
+                    "segment_id": trim(str(item.get("segment_id", "") or ""), 120),
+                    "text": trim(str(item.get("text", "") or ""), LONG_CONTENT_CARD_CHARS),
+                    "key_terms": [trim(str(x), 100) for x in (item.get("key_terms", []) or [])[:16] if str(x).strip()],
+                    "evidence": [trim(str(x), 180) for x in (item.get("evidence", []) or [])[:12] if str(x).strip()],
+                    "status": trim(str(item.get("status", "derived") or "derived"), 24),
+                    "updated_at": float(item.get("updated_at", 0.0) or 0.0),
+                })
+            seen_segments = [
+                str(x)[:120]
+                for x in (value.get("seen_segments", []) or [])[-LONG_CONTENT_MEMORY_MAX_SEGMENTS:]
+                if str(x).strip()
+            ]
+            read_ranges: list[list[int]] = []
+            for item in value.get("read_ranges", []) if isinstance(value.get("read_ranges", []), list) else []:
+                if not isinstance(item, (list, tuple)) or len(item) < 2:
+                    continue
+                try:
+                    start = max(1, int(item[0] or 1))
+                    end = max(start, int(item[1] or start))
+                except Exception:
+                    continue
+                read_ranges.append([start, end])
+            if not read_ranges and seen_segments:
+                seen_set = set(seen_segments)
+                read_ranges = [
+                    [int(item.get("start_line", 1) or 1), int(item.get("end_line", 1) or 1)]
+                    for item in segments
+                    if str(item.get("id", "") or "") in seen_set
+                ]
+            raw_source_paths = value.get("source_paths", [])
+            if isinstance(raw_source_paths, str):
+                raw_source_paths = [raw_source_paths]
+            elif not isinstance(raw_source_paths, (list, tuple, set)):
+                raw_source_paths = []
+            source_paths = [
+                str(x).replace("\\", "/").strip()[:400]
+                for x in raw_source_paths
+                if str(x).strip()
+            ]
+            if path and path not in source_paths:
+                source_paths.insert(0, path)
+            clean[content_id] = {
+                "content_id": content_id,
+                "version": int(value.get("version", LONG_CONTENT_MEMORY_VERSION) or LONG_CONTENT_MEMORY_VERSION),
+                "source_path": path,
+                "source_paths": source_paths[:24],
+                "source_sha256": trim(str(value.get("source_sha256", "") or ""), 100),
+                "source_size": max(0, int(value.get("source_size", 0) or 0)),
+                "source_mtime_ns": max(0, int(value.get("source_mtime_ns", 0) or 0)),
+                "stale": bool(value.get("stale", False)),
+                "content_type": trim(str(value.get("content_type", "text") or "text"), 40),
+                "language": trim(str(value.get("language", "text") or "text"), 40),
+                "total_lines": max(0, int(value.get("total_lines", 0) or 0)),
+                "outline_ready": bool(value.get("outline_ready", False)),
+                "outline": trim(str(value.get("outline", "") or ""), LONG_CONTENT_STRUCTURE_MAX_CHARS),
+                "segments": segments[-LONG_CONTENT_MEMORY_MAX_SEGMENTS:],
+                "cards": cards[-LONG_CONTENT_MEMORY_MAX_SEGMENTS:],
+                "coverage": max(0.0, min(1.0, float(value.get("coverage", 0.0) or 0.0))),
+                "seen_segments": seen_segments,
+                "read_ranges": read_ranges[-LONG_CONTENT_MEMORY_MAX_SEGMENTS:],
+                    "unresolved_items": [trim(str(x), 240) for x in (value.get("unresolved_items", []) or [])[-24:] if str(x).strip()],
+                # Optional semantic card produced by the active LLM.  Missing
+                # fields are normal for legacy sessions and intentionally stay
+                # empty rather than forcing a rebuild or a model call.
+                "semantic_status": trim(str(value.get("semantic_status", "") or ""), 24),
+                "semantic_version": trim(str(value.get("semantic_version", "") or ""), 120),
+                "semantic_updated_at": float(value.get("semantic_updated_at", 0.0) or 0.0),
+                "semantic_attempts": max(0, int(value.get("semantic_attempts", 0) or 0)),
+                "semantic_refreshes": max(0, int(value.get("semantic_refreshes", 0) or 0)),
+                "semantic_last_coverage": max(0.0, min(1.0, float(value.get("semantic_last_coverage", 0.0) or 0.0))),
+                "semantic_last_seen_count": max(0, int(value.get("semantic_last_seen_count", 0) or 0)),
+                "semantic_retry_at": float(value.get("semantic_retry_at", 0.0) or 0.0),
+                "semantic": self._normalize_long_content_semantic(value.get("semantic", {})),
+                "updated_at": float(value.get("updated_at", 0.0) or 0.0),
+            }
+        return dict(list(clean.items())[-LONG_CONTENT_MEMORY_MAX_ITEMS:])
+
+    def _normalize_long_content_semantic(self, raw: object) -> dict:
+        """Normalize an optional model-produced understanding card.
+
+        This is deliberately schema-tolerant: old sessions have no card and
+        providers occasionally return a partial JSON object.  All values are
+        bounded before they can enter durable state or a prompt.
+        """
+        if not isinstance(raw, dict):
+            return {}
+        def _items_from_value(val: object, limit: int, chars: int = 420) -> list[str]:
+            if isinstance(val, str):
+                val = [val]
+            if not isinstance(val, (list, tuple)):
+                return []
+            out: list[str] = []
+            seen: set[str] = set()
+            for item in val:
+                text = trim(str(item or "").strip(), chars)
+                if not text or text.casefold() in seen:
+                    continue
+                seen.add(text.casefold())
+                out.append(text)
+                if len(out) >= limit:
+                    break
+            return out
+        def _items(key: str, limit: int, chars: int = 420) -> list[str]:
+            val = raw.get(key, [])
+            if isinstance(val, str):
+                val = [val]
+            if not isinstance(val, (list, tuple)):
+                return []
+            out: list[str] = []
+            seen: set[str] = set()
+            for item in val:
+                text = trim(str(item or "").strip(), chars)
+                if not text or text.casefold() in seen:
+                    continue
+                seen.add(text.casefold())
+                out.append(text)
+                if len(out) >= limit:
+                    break
+            return out
+        definitions = raw.get("definitions", [])
+        if isinstance(definitions, dict):
+            definitions = [f"{k}: {v}" for k, v in definitions.items()]
+        relations = raw.get("relations", [])
+        if isinstance(relations, dict):
+            relations = [f"{k} -> {v}" for k, v in relations.items()]
+        return {
+            "summary": trim(str(raw.get("summary", "") or ""), 900),
+            "key_points": _items("key_points", LONG_CONTENT_SEMANTIC_MAX_KEY_POINTS),
+            "definitions": _items_from_value(definitions, LONG_CONTENT_SEMANTIC_MAX_DEFINITIONS),
+            "relations": _items_from_value(relations, LONG_CONTENT_SEMANTIC_MAX_RELATIONS),
+            "uncertainties": _items("uncertainties", LONG_CONTENT_SEMANTIC_MAX_UNCERTAINTIES),
+            "evidence": _items("evidence", LONG_CONTENT_SEMANTIC_MAX_EVIDENCE, 220),
+        }
+
+    def _long_content_identity(self, rel: str, fp: Path) -> tuple[str, dict]:
+        rel_clean = str(rel or "").replace("\\", "/").strip()
+        source_fp = self._read_source_fingerprint(rel_clean)
+        # Content identity is content-first whenever a bounded source hash is
+        # available.  That lets the same long document/code be opened through
+        # different workspace aliases without rebuilding its understanding.
+        # For very large files where hashing is intentionally skipped, retain a
+        # path+stat fallback so unrelated files cannot collide.
+        source_hash = str(source_fp.get("source_sha256", "") or "").strip()
+        if source_hash:
+            identity = f"sha256:{source_hash}"
+        else:
+            identity = (
+                f"path:{rel_clean}|size:{source_fp.get('source_size', 0)}"
+                f"|mtime:{source_fp.get('source_mtime_ns', 0)}"
+            )
+        content_id = hashlib.sha1(identity.encode("utf-8", errors="replace")).hexdigest()[:20]
+        return content_id, source_fp
+
+    def _long_content_kind(self, fp: Path, language: str = "") -> str:
+        ext = fp.suffix.lower()
+        if ext in {".log", ".out", ".err", ".trace"}:
+            return "log"
+        if ext in LONG_CONTENT_DATA_EXTS:
+            return "data"
+        if ext in LONG_CONTENT_TEXT_EXTS:
+            return "text"
+        if language and language != "text":
+            return "code"
+        return "text"
+
+    def _long_content_extract_card(
+        self,
+        lines: list[str],
+        start: int,
+        end: int,
+        *,
+        title: str = "",
+        kind: str = "text",
+    ) -> tuple[str, list[str]]:
+        """Build a domain-neutral fallback card from the whole segment.
+
+        Selecting evidence across the segment avoids the old first-page bias
+        without paying for an extra model completion. Exact line ranges remain
+        the authority and can be rehydrated with mode='segment'.
+        """
+        start_idx = max(0, int(start or 1) - 1)
+        end_idx = min(len(lines), max(start_idx + 1, int(end or start_idx + 1)))
+        candidates: list[tuple[float, int, str]] = []
+        span = max(1, end_idx - start_idx)
+        sample_positions = {
+            start_idx,
+            min(end_idx - 1, start_idx + span // 4),
+            min(end_idx - 1, start_idx + span // 2),
+            min(end_idx - 1, start_idx + (span * 3) // 4),
+            end_idx - 1,
+        }
+        for idx in range(start_idx, end_idx):
+            clean = re.sub(r"\s+", " ", str(lines[idx] or "").strip())
+            if not clean or clean in {"```", "~~~"}:
+                continue
+            score = 0.0
+            if idx == start_idx:
+                score += 5.0
+            if idx in sample_positions:
+                score += 1.6
+            # Structural prominence, not a domain/task vocabulary, drives the
+            # fallback. The semantic LLM card added after a focused read is the
+            # authority for concepts and relations.
+            if re.match(r"^(?:#{1,6}\s+|[-*+]\s+|\d+[.)]\s+)", clean):
+                score += 2.2
+            if re.search(r"(?:\b\d+(?:\.\d+)?\b|[=:]\s*[-+]?\w)", clean):
+                score += 1.4
+            if re.match(r"^[A-Z][A-Z0-9 _-]{2,48}:\s*\S", clean):
+                score += 2.2
+            if kind == "code" and re.search(r"(?:\([^)]*\)\s*(?:->\s*[^:{]+)?[:{]|^\s*[A-Za-z_$][\w$]*\s*=)", clean):
+                score += 2.2
+            if re.match(r"^#{1,6}\s+", clean):
+                score += 4.0
+            if 20 <= len(clean) <= 260:
+                score += 0.8
+            candidates.append((score, idx, trim(clean, 280)))
+        ranked = sorted(candidates, key=lambda row: (-row[0], row[1]))
+        picked: list[tuple[int, str]] = []
+        seen: set[str] = set()
+        for _score, idx, clean in ranked:
+            key = clean.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            picked.append((idx, clean))
+            if len(picked) >= 7 or len(" ".join(x[1] for x in picked)) >= LONG_CONTENT_CARD_CHARS:
+                break
+        picked.sort(key=lambda row: row[0])
+        summary = trim(" | ".join(text for _idx, text in picked), LONG_CONTENT_CARD_CHARS)
+        term_source = "\n".join(str(lines[idx] or "") for idx in range(start_idx, min(end_idx, start_idx + 500)))
+        try:
+            key_terms = _rag_extract_entities(term_source[:40_000], limit=12)
+        except Exception:
+            key_terms = []
+        if title and title.casefold() not in summary.casefold():
+            summary = trim(f"{title}: {summary}" if summary else title, LONG_CONTENT_CARD_CHARS)
+        return summary, [trim(str(x), 100) for x in key_terms if str(x).strip()][:12]
+
+    def _long_content_semantic_input(
+        self, memory: dict, lines: list[str], touched_segments: set[str] | None = None
+    ) -> str:
+        """Build a bounded, source-addressable semantic prompt.
+
+        The model sees the outline, compact local cards, and a few exact line
+        windows.  It never receives the whole document, so semantic enrichment
+        cannot turn into context growth.  Segment ids/line ranges make every
+        claim rehydratable from ``read_file`` when precision is needed.
+        """
+        touched = {str(x) for x in (touched_segments or set()) if str(x).strip()}
+        segments = [x for x in (memory.get("segments", []) or []) if isinstance(x, dict)]
+        cards = [x for x in (memory.get("cards", []) or []) if isinstance(x, dict)]
+        selected: list[dict] = []
+        for seg in segments:
+            if str(seg.get("id", "")) in touched:
+                selected.append(seg)
+        if not selected:
+            selected = segments[:2]
+        # Add representative positions to reduce first-page bias while keeping
+        # the request small for book-sized sources.
+        for seg in (segments[:1] + segments[len(segments) // 2 : len(segments) // 2 + 1] + segments[-1:]):
+            if seg and seg not in selected:
+                selected.append(seg)
+        selected = selected[:8]
+        rows: list[str] = []
+        for seg in selected:
+            sid = str(seg.get("id", "") or "")
+            start = max(1, int(seg.get("start_line", 1) or 1))
+            end = min(len(lines), int(seg.get("end_line", start) or start))
+            excerpt = "\n".join(f"{i}: {lines[i - 1]}" for i in range(start, min(end, start + 22) + 1))
+            rows.append(
+                f"SEGMENT {sid} lines={start}-{end} title={trim(str(seg.get('title','') or ''), 160)}\n"
+                f"CARD: {trim(str(seg.get('summary','') or ''), 520)}\n"
+                f"EXCERPT:\n{trim(excerpt, 1500)}"
+            )
+        outline = trim(str(memory.get("outline", "") or ""), 2600)
+        card_hint = "\n".join(
+            f"{c.get('segment_id','')}: {trim(str(c.get('text','') or ''), 280)}"
+            for c in cards[:8]
+            if str(c.get("text", "") or "").strip()
+        )
+        payload = (
+            f"SOURCE path={memory.get('source_path','')} type={memory.get('content_type','text')} "
+            f"language={memory.get('language','text')} total_lines={memory.get('total_lines',0)}\n"
+            f"OUTLINE:\n{outline}\n"
+            f"EXISTING_CARDS:\n{card_hint}\n"
+            f"FOCUSED_SEGMENTS:\n" + "\n\n".join(rows)
+        )
+        return trim(payload, LONG_CONTENT_SEMANTIC_MAX_INPUT_CHARS)
+
+    def _maybe_enrich_long_content_semantic(
+        self, memory: dict, rel: str, lines: list[str], touched_segments: set[str] | None = None
+    ) -> None:
+        """Best-effort one-shot semantic understanding for a source version.
+
+        ``semantic_status`` is persisted as ready/failed, making retries
+        version-scoped rather than segment-scoped.  Any provider, timeout, or
+        JSON failure leaves the deterministic cards intact.
+        """
+        if not LONG_CONTENT_SEMANTIC_ENABLED or not isinstance(memory, dict):
+            return
+        status = str(memory.get("semantic_status", "") or "").strip().lower()
+        if status == "disabled":
+            return
+        if status == "ready":
+            coverage = float(memory.get("coverage", 0.0) or 0.0)
+            previous_coverage = float(memory.get("semantic_last_coverage", 0.0) or 0.0)
+            seen_count = len(memory.get("seen_segments", []) or [])
+            previous_seen = int(memory.get("semantic_last_seen_count", 0) or 0)
+            refreshes = int(memory.get("semantic_refreshes", 0) or 0)
+            if (
+                refreshes >= LONG_CONTENT_SEMANTIC_MAX_REFRESHES
+                or coverage - previous_coverage < LONG_CONTENT_SEMANTIC_REFRESH_COVERAGE
+                or seen_count - previous_seen < LONG_CONTENT_SEMANTIC_REFRESH_SEGMENTS
+            ):
+                return
+        retry_at = float(memory.get("semantic_retry_at", 0.0) or 0.0)
+        if status == "failed" and retry_at > now_ts():
+            return
+        client = getattr(self, "ollama", None)
+        if client is None or not callable(getattr(client, "chat", None)):
+            memory["semantic_status"] = "failed"
+            memory["semantic_retry_at"] = now_ts() + 60.0
+            self._schedule_persist()
+            return
+        memory["semantic_status"] = "pending"
+        memory["semantic_attempts"] = int(memory.get("semantic_attempts", 0) or 0) + 1
+        prompt = self._long_content_semantic_input(memory, lines, touched_segments)
+        if not prompt.strip():
+            memory["semantic_status"] = "failed"
+            memory["semantic_retry_at"] = now_ts() + 60.0
+            self._schedule_persist()
+            return
+        box: dict[str, object] = {}
+        def _runner():
+            try:
+                box["response"] = client.chat(
+                    [{"role": "user", "content": prompt}],
+                    system=(
+                        "Understand the supplied source semantically, independent of domain. "
+                        "Return strict JSON only with keys summary, key_points, definitions, "
+                        "relations, uncertainties, evidence. Keep each item concise; evidence "
+                        "must cite the provided segment id or line range. Do not invent facts."
+                    ),
+                    max_tokens=int(LONG_CONTENT_SEMANTIC_MAX_OUTPUT_TOKENS),
+                    temperature=0.1,
+                    think=False,
+                )
+            except Exception as exc:
+                box["error"] = exc
+        worker = threading.Thread(target=_runner, daemon=True)
+        worker.start()
+        worker.join(timeout=LONG_CONTENT_SEMANTIC_TIMEOUT_SECONDS)
+        if worker.is_alive():
+            memory["semantic_status"] = "failed"
+            memory["semantic_error"] = "timeout"
+            memory["semantic_retry_at"] = now_ts() + 60.0
+            self._schedule_persist()
+            return
+        response = box.get("response", {})
+        raw = response.get("content", "") if isinstance(response, dict) else response
+        semantic = self._normalize_long_content_semantic(
+            extract_json_object_from_text(str(raw or ""), {})
+        )
+        if not semantic or not (semantic.get("summary") or semantic.get("key_points")):
+            memory["semantic_status"] = "failed"
+            memory["semantic_error"] = trim(str(box.get("error", "invalid JSON") or "invalid JSON"), 180)
+            memory["semantic_retry_at"] = now_ts() + 60.0
+            self._schedule_persist()
+            return
+        memory["semantic"] = semantic
+        memory["semantic_status"] = "ready"
+        if int(memory.get("semantic_attempts", 0) or 0) > 1:
+            memory["semantic_refreshes"] = int(memory.get("semantic_refreshes", 0) or 0) + 1
+        memory["semantic_version"] = str(memory.get("source_sha256", "") or memory.get("content_id", ""))[:120]
+        memory["semantic_updated_at"] = now_ts()
+        memory["semantic_last_coverage"] = float(memory.get("coverage", 0.0) or 0.0)
+        memory["semantic_last_seen_count"] = len(memory.get("seen_segments", []) or [])
+        memory["semantic_retry_at"] = 0.0
+        memory.pop("semantic_error", None)
+        memory["updated_at"] = now_ts()
+        self.long_content_memory[memory["content_id"]] = self._normalize_long_content_memory(
+            self.long_content_memory
+        ).get(memory["content_id"], memory)
+        self._schedule_persist()
+
+    def _long_content_segments(self, fp: Path, lines: list[str], code_data: dict | None = None) -> tuple[list[dict], str, str]:
+        data = code_data if isinstance(code_data, dict) else {}
+        language = str(data.get("language", "") or "text")
+        kind = self._long_content_kind(fp, language)
+        limit = LONG_CONTENT_CODE_SEGMENT_LINES if kind == "code" else LONG_CONTENT_TEXT_SEGMENT_LINES
+        symbols = [x for x in (data.get("symbols", []) or []) if isinstance(x, dict)]
+        segments: list[dict] = []
+        if kind == "code" and symbols:
+            # Include a small module prelude, then one segment per symbol.  The
+            # gaps between symbols are grouped into bounded implementation blocks.
+            cursor = 1
+            for row in symbols[:LONG_CONTENT_MEMORY_MAX_SEGMENTS]:
+                start = max(1, int(row.get("line_start", cursor) or cursor))
+                end = min(len(lines), max(start, int(row.get("line_end", start) or start)))
+                if start > cursor:
+                    for block_start in range(cursor, min(start, len(lines) + 1), limit):
+                        block_end = min(start - 1, block_start + limit - 1)
+                        if block_end >= block_start:
+                            segments.append((block_start, block_end, "implementation", []))
+                name = str(row.get("name", "") or "symbol").strip()
+                segments.append((start, end, name, [name]))
+                cursor = max(cursor, end + 1)
+            if cursor <= len(lines):
+                for block_start in range(cursor, len(lines) + 1, limit):
+                    segments.append((block_start, min(len(lines), block_start + limit - 1), "implementation", []))
+        else:
+            # Heading-aware blocks for prose/log/data.  A heading starts a new
+            # section; otherwise fixed line windows bound pathological files.
+            start = 1
+            title = ""
+            for idx, line in enumerate(lines, 1):
+                stripped = str(line or "").strip()
+                heading = re.match(r"^(#{1,6})\s+(.+?)\s*$", stripped)
+                if heading and idx > start:
+                    segments.append((start, idx - 1, title or f"lines {start}-{idx - 1}", []))
+                    start, title = idx, heading.group(2).strip()
+                elif idx - start + 1 >= limit:
+                    segments.append((start, idx, title or f"lines {start}-{idx}", []))
+                    start, title = idx + 1, ""
+            if start <= len(lines):
+                segments.append((start, len(lines), title or f"lines {start}-{len(lines)}", []))
+        out: list[dict] = []
+        for idx, item in enumerate(segments[:LONG_CONTENT_MEMORY_MAX_SEGMENTS], 1):
+            start, end, title, names = item
+            summary, key_terms = self._long_content_extract_card(
+                lines, start, end, title=str(title or ""), kind=kind
+            )
+            evidence = [f"{fp.name}:{start}-{end}"]
+            out.append({
+                "id": f"s{idx:04d}", "title": trim(title, 180),
+                "kind": "symbol" if kind == "code" and names else kind,
+                "start_line": start, "end_line": end,
+                "summary": summary, "key_terms": key_terms,
+                "symbols": names[:24], "evidence": evidence,
+                "status": "unseen", "last_seen": 0.0,
+            })
+        return out, language, kind
+
+    def _ensure_long_content_memory(self, rel: str, fp: Path, lines: list[str], *, force: bool = False) -> dict:
+        try:
+            source_bytes = int(fp.stat().st_size or 0) if fp.is_file() else 0
+        except Exception:
+            source_bytes = 0
+        if not fp.is_file() or (
+            len(lines) < LONG_CONTENT_TEXT_SEGMENT_LINES
+            and source_bytes < LARGE_FILE_AUTO_PAGE_BYTES
+        ):
+            return {}
+        content_id, source_fp = self._long_content_identity(rel, fp)
+        registry = getattr(self, "long_content_memory", {})
+        if not isinstance(registry, dict):
+            registry = {}
+            self.long_content_memory = registry
+        old = registry.get(content_id, {}) if isinstance(registry, dict) else {}
+        if old and not force and not bool(old.get("stale", False)) and int(old.get("total_lines", 0) or 0) == len(lines):
+            # Same content may be reachable through an upload alias, IDE
+            # checkout, or a role-specific path. Reuse the cards and remember
+            # the alias instead of reparsing the whole source.
+            aliases = []
+            for item in [old.get("source_path", "")] + list(old.get("source_paths", []) or []):
+                value = str(item).replace("\\", "/").strip()
+                if value and value not in aliases:
+                    aliases.append(value)
+            if str(rel) not in aliases:
+                aliases.append(str(rel))
+                old["source_paths"] = aliases[-24:]
+                old["updated_at"] = now_ts()
+                self.long_content_memory[content_id] = old
+                self._schedule_persist()
+            return old
+        ext = fp.suffix.lower()
+        code_like = ext in CODE_LIBRARY_LANGUAGE_BY_EXT and ext not in LONG_CONTENT_TEXT_EXTS and ext not in LONG_CONTENT_DATA_EXTS
+        code_data = self._read_file_code_data(fp, lines) if code_like else {}
+        segments, language, kind = self._long_content_segments(fp, lines, code_data)
+        outline = "\n".join(
+            f"{s['id']} L{s['start_line']}-{s['end_line']} {s['title']}"
+            for s in segments[:160]
+        )
+        cards = [
+            {
+                "id": f"{content_id}:{s['id']}", "type": "symbol" if s.get("kind") == "symbol" else "segment",
+                "title": s.get("title", ""), "segment_id": s.get("id", ""),
+                "text": s.get("summary", ""), "key_terms": list(s.get("key_terms", []) or []),
+                "evidence": list(s.get("evidence", []) or []), "updated_at": now_ts(),
+                "status": "derived",
+            }
+            for s in segments
+        ]
+        memory = {
+            "content_id": content_id, "version": LONG_CONTENT_MEMORY_VERSION,
+            "source_path": str(rel), "source_paths": [str(rel)],
+            "source_sha256": str(source_fp.get("source_sha256", "") or ""),
+            "source_size": int(source_fp.get("source_size", 0) or 0),
+            "source_mtime_ns": int(source_fp.get("source_mtime_ns", 0) or 0),
+            "content_type": kind, "language": language, "total_lines": len(lines),
+            "outline": trim(outline, LONG_CONTENT_STRUCTURE_MAX_CHARS),
+            "segments": segments, "cards": cards, "coverage": 0.0,
+            "seen_segments": [], "read_ranges": [],
+            "unresolved_items": [], "updated_at": now_ts(),
+            "stale": False,
+        }
+        if isinstance(old, dict) and old.get("total_lines") == len(lines):
+            memory["seen_segments"] = list(old.get("seen_segments", []) or [])
+            memory["read_ranges"] = list(old.get("read_ranges", []) or [])
+            memory["coverage"] = float(old.get("coverage", 0.0) or 0.0)
+            memory["outline_ready"] = bool(old.get("outline_ready", False))
+            old_paths = [
+                str(x).replace("\\", "/").strip()
+                for x in ([old.get("source_path", "")] + list(old.get("source_paths", []) or []))
+                if str(x).strip()
+            ]
+            memory["source_paths"] = list(dict.fromkeys(old_paths + [str(rel)]))[-24:]
+        self.long_content_memory[content_id] = memory
+        self.long_content_memory = self._normalize_long_content_memory(self.long_content_memory)
+        return memory
+
+    def _mark_long_content_read(self, rel: str, fp: Path, lines: list[str], args: dict, output: str) -> None:
+        try:
+            memory = self._ensure_long_content_memory(rel, fp, lines)
+            if not memory:
+                return
+            mode = str((args or {}).get("mode", "") or "auto").lower()
+            # Structure/overview establishes navigation only.  Do not treat the
+            # line ranges printed in the outline as semantically read; otherwise
+            # one cheap overview would falsely report 100% comprehension.
+            if mode in {"overview", "structure", "auto"} and not str((args or {}).get("segment_id", "") or "").strip():
+                memory["outline_ready"] = True
+                memory["updated_at"] = now_ts()
+                self.long_content_memory[memory["content_id"]] = memory
+                self._schedule_persist()
+                return
+            observed_ranges: list[tuple[int, int]] = []
+            for output_line in str(output or "").splitlines():
+                marker = output_line.strip()
+                if not (marker.startswith("[read_file") or marker.startswith("@@ lines")):
+                    continue
+                for match in re.finditer(r"(?<![A-Za-z_])(?:lines?|L)\s*=?\s*(\d+)(?:\s*-\s*(\d+))?", marker, re.I):
+                    a, b = int(match.group(1)), int(match.group(2) or match.group(1))
+                    observed_ranges.append((max(1, a), min(len(lines), max(a, b))))
+            if mode == "full" and not observed_ranges:
+                full_text = "\n".join(lines)
+                offset = self._read_file_int_arg((args or {}).get("offset", 0), 0, 0, max(0, len(full_text)))
+                cap = self._read_file_max_chars((args or {}).get("max_chars"))
+                end_char = min(len(full_text), offset + cap)
+                start_line = full_text.count("\n", 0, offset) + 1
+                end_line = full_text.count("\n", 0, end_char) + 1
+                observed_ranges.append((start_line, min(len(lines), max(start_line, end_line))))
+            existing_ranges = []
+            for item in memory.get("read_ranges", []) or []:
+                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                    existing_ranges.append((max(1, int(item[0])), min(len(lines), max(int(item[0]), int(item[1])))))
+            merged_ranges: list[list[int]] = []
+            for a, b in sorted(existing_ranges + observed_ranges):
+                if merged_ranges and a <= merged_ranges[-1][1] + 1:
+                    merged_ranges[-1][1] = max(merged_ranges[-1][1], b)
+                else:
+                    merged_ranges.append([a, b])
+            memory["read_ranges"] = merged_ranges[-LONG_CONTENT_MEMORY_MAX_SEGMENTS:]
+            touched: set[str] = set()
+            for a, b in observed_ranges:
+                for seg in memory.get("segments", []):
+                    if int(seg.get("end_line", 0) or 0) >= a and int(seg.get("start_line", 0) or 0) <= b:
+                        touched.add(str(seg.get("id", "")))
+            if mode in {"overview", "structure"}:
+                # An overview establishes the outline, not full semantic coverage.
+                memory["outline_ready"] = True
+            seen = set(str(x) for x in (memory.get("seen_segments", []) or []))
+            seen.update(x for x in touched if x)
+            stamp = now_ts()
+            for seg in memory.get("segments", []):
+                if isinstance(seg, dict) and str(seg.get("id", "")) in touched:
+                    seg["status"] = "read"
+                    seg["last_seen"] = stamp
+            for card in memory.get("cards", []):
+                if isinstance(card, dict) and str(card.get("segment_id", "")) in touched:
+                    card["status"] = "read"
+                    card["updated_at"] = stamp
+            memory["seen_segments"] = list(seen)[-LONG_CONTENT_MEMORY_MAX_SEGMENTS:]
+            read_line_count = sum(max(0, int(end) - int(start) + 1) for start, end in merged_ranges)
+            memory["coverage"] = round(min(1.0, read_line_count / max(1, len(lines))), 4)
+            memory["updated_at"] = stamp
+            self.long_content_memory[memory["content_id"]] = memory
+            self._schedule_persist()
+            # Semantic enrichment is source-version scoped and best-effort.
+            # Trigger only after an actual evidence read; a cheap structure
+            # request should never block on an LLM completion.
+            if observed_ranges:
+                self._maybe_enrich_long_content_semantic(memory, rel, lines, touched)
+        except Exception:
+            return
+
+    def _invalidate_long_content_memory_path(self, rel: str, reason: str = "source changed") -> int:
+        """Drop cards for a changed source while keeping unrelated memories intact."""
+        target = str(rel or "").replace("\\", "/").strip()
+        if not target or not isinstance(getattr(self, "long_content_memory", {}), dict):
+            return 0
+        removed = 0
+        for key, row in list(self.long_content_memory.items()):
+            if not isinstance(row, dict):
+                continue
+            source_paths = [
+                str(x).replace("\\", "/").strip()
+                for x in ([row.get("source_path", "")] + list(row.get("source_paths", []) or []))
+                if str(x).strip()
+            ]
+            if target not in source_paths:
+                continue
+            remaining_paths = [path for path in source_paths if path != target]
+            if remaining_paths:
+                # A content-hash identity can be shared by copied/uploaded
+                # aliases. Editing one alias must not discard valid memory for
+                # the untouched aliases.
+                row["source_paths"] = remaining_paths[-24:]
+                row["source_path"] = remaining_paths[0]
+                row["updated_at"] = now_ts()
+                self.long_content_memory[key] = row
+                continue
+            # Keep a tiny tombstone so a stale card cannot be injected while a
+            # subsequent read is rebuilding the new source version.
+            row["coverage"] = 0.0
+            row["semantic_status"] = ""
+            row["semantic"] = {}
+            row["semantic_version"] = ""
+            row["semantic_retry_at"] = 0.0
+            row["unresolved_items"] = [trim(str(reason or "source changed"), 240)]
+            row["updated_at"] = now_ts()
+            row["stale"] = True
+            self.long_content_memory[key] = row
+            removed += 1
+        cache = getattr(self, "_source_fingerprint_cache", {})
+        if isinstance(cache, dict):
+            cache.pop(target, None)
+        if removed:
+            self._schedule_persist()
+        return removed
+
+    def _long_content_memory_prompt_block(self, *, max_chars: int = 3200) -> str:
+        registry = getattr(self, "long_content_memory", {})
+        rows = [
+            x for x in (registry if isinstance(registry, dict) else {}).values()
+            if isinstance(x, dict) and not bool(x.get("stale", False))
+        ]
+        if not rows:
+            return ""
+        rows.sort(key=lambda x: float(x.get("updated_at", 0.0) or 0.0), reverse=True)
+        parts = ["LONG-CONTENT UNDERSTANDING MEMORY (source-addressable; use read_file for exact evidence):"]
+        for row in rows[:4]:
+            parts.append(
+                f"- {row.get('source_path','')} type={row.get('content_type','text')} "
+                f"coverage={float(row.get('coverage', 0.0) or 0.0):.0%} "
+                f"lines={int(row.get('total_lines', 0) or 0)}"
+            )
+            outline = str(row.get("outline", "") or "").splitlines()
+            if outline:
+                parts.append("  outline: " + " | ".join(outline[:6]))
+            cards = row.get("cards", []) if isinstance(row.get("cards", []), list) else []
+            seen = {str(x) for x in (row.get("seen_segments", []) or []) if str(x).strip()}
+            remembered_cards = [
+                card for card in cards
+                if isinstance(card, dict) and str(card.get("segment_id", "")) in seen
+            ]
+            for card in remembered_cards[:3]:
+                if isinstance(card, dict) and str(card.get("text", "") or "").strip():
+                    parts.append(f"  read_card {card.get('title','')}: {trim(card.get('text',''), 260)} [{','.join(card.get('evidence', [])[:2])}]")
+            semantic = row.get("semantic", {}) if isinstance(row.get("semantic", {}), dict) else {}
+            if str(row.get("semantic_status", "") or "").lower() == "ready" and semantic:
+                summary = trim(str(semantic.get("summary", "") or ""), 420)
+                if summary:
+                    parts.append(f"  semantic_summary: {summary}")
+                points = [trim(str(x), 180) for x in (semantic.get("key_points", []) or [])[:3] if str(x).strip()]
+                if points:
+                    parts.append("  semantic_points: " + " | ".join(points))
+                relations = [trim(str(x), 160) for x in (semantic.get("relations", []) or [])[:2] if str(x).strip()]
+                if relations:
+                    parts.append("  semantic_relations: " + " | ".join(relations))
+        parts.append("Prefer these cards for continuity; recall the cited source window only when a claim or exact code/text is needed.")
+        return trim("\n".join(parts), max_chars)
+
+    def _render_long_content_structure(self, rel: str, fp: Path, lines: list[str], *, max_chars: object = None) -> str:
+        memory = self._ensure_long_content_memory(rel, fp, lines)
+        if not memory:
+            return self._render_text_overview(fp, rel, lines, max_chars=max_chars)
+        cards = memory.get("cards", []) if isinstance(memory.get("cards", []), list) else []
+        out = [
+            f"[read_file structure path={rel} content_id={memory.get('content_id','')} "
+            f"type={memory.get('content_type','text')} lines={len(lines)} coverage={float(memory.get('coverage', 0.0) or 0.0):.0%}]",
+            "Structure is persisted as compact cards. Use mode='segment' with segment_id or query to continue reading one section.",
+        ]
+        outline = str(memory.get("outline", "") or "").strip()
+        if outline:
+            out.append("\nOutline:\n" + outline)
+        if cards:
+            out.append("\nCards:")
+            for card in cards[:24]:
+                if not isinstance(card, dict):
+                    continue
+                out.append(
+                    f"- {card.get('id','')} {card.get('title','')} :: "
+                    f"{trim(card.get('text',''), 220)} [{','.join(card.get('evidence', [])[:2])}]"
+                )
+        out.append("\nFocused read: read_file path=\"%s\" mode=\"segment\" segment_id=\"s0001\"" % rel)
+        return self._clip_read_file_output("\n".join(out), self._read_file_max_chars(max_chars))
+
+    def _render_long_content_segment(self, rel: str, fp: Path, lines: list[str], *, segment_id: object = "", query: object = "", max_chars: object = None) -> str:
+        memory = self._ensure_long_content_memory(rel, fp, lines)
+        if not memory:
+            return self._render_window_text_read(rel, lines, max_chars=max_chars)
+        wanted_id = str(segment_id or "").strip()
+        wanted_query = str(query or "").strip().lower()
+        segments = memory.get("segments", []) if isinstance(memory.get("segments", []), list) else []
+        match = None
+        for seg in segments:
+            if not isinstance(seg, dict):
+                continue
+            if wanted_id and str(seg.get("id", "")) == wanted_id:
+                match = seg
+                break
+            if wanted_query and wanted_query in (str(seg.get("title", "")) + " " + str(seg.get("summary", ""))).lower():
+                match = seg
+                break
+        if match is None:
+            return (
+                f"[read_file segment path={rel} matches=0]\n"
+                "Use mode='structure' first, then provide segment_id (for example s0001) or a narrow query."
+            )
+        start = max(1, int(match.get("start_line", 1) or 1))
+        end = min(len(lines), int(match.get("end_line", start) or start))
+        context = 8
+        body_start, body_end = max(1, start - context), min(len(lines), end + context)
+        body = "\n".join(f"{i}: {lines[i - 1]}" for i in range(body_start, body_end + 1))
+        seen = set(str(x) for x in (memory.get("seen_segments", []) or []))
+        seen.add(str(match.get("id", "")))
+        memory["seen_segments"] = list(seen)[-LONG_CONTENT_MEMORY_MAX_SEGMENTS:]
+        ranges: list[list[int]] = []
+        for item in memory.get("read_ranges", []) or []:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                try:
+                    ranges.append([max(1, int(item[0])), min(len(lines), max(int(item[0]), int(item[1])))])
+                except Exception:
+                    continue
+        ranges.append([body_start, body_end])
+        merged: list[list[int]] = []
+        for a, b in sorted(ranges):
+            if merged and a <= merged[-1][1] + 1:
+                merged[-1][1] = max(merged[-1][1], b)
+            else:
+                merged.append([a, b])
+        memory["read_ranges"] = merged[-LONG_CONTENT_MEMORY_MAX_SEGMENTS:]
+        covered_lines = sum(max(0, int(b) - int(a) + 1) for a, b in merged)
+        memory["coverage"] = round(min(1.0, covered_lines / max(1, len(lines))), 4)
+        match["status"] = "read"
+        match["last_seen"] = now_ts()
+        memory["updated_at"] = now_ts()
+        self.long_content_memory[memory["content_id"]] = memory
+        return self._clip_read_file_output(
+            f"[read_file segment path={rel} segment_id={match.get('id')} title={match.get('title','')} "
+            f"lines={start}-{end} coverage={float(memory.get('coverage', 0.0) or 0.0):.0%}]\n"
+            f"Card: {match.get('summary','')}\nEvidence window:\n{body}",
+            self._read_file_max_chars(max_chars),
+        )
+
     def _render_text_overview(
         self,
         fp: Path,
@@ -41797,6 +43561,22 @@ body{padding:18px}
         out.append(f"- read_file path=\"{rel}\" mode=\"full\" max_chars={min(cap, READ_FILE_DEFAULT_MAX_CHARS)}")
         if not is_code:
             out.append("- For long logs or command output, start with mode=\"search\" for the error, warning, filename, or keyword.")
+        # Keep the legacy overview shape, but expose the durable long-content
+        # navigation whenever this is a large source.  The model can opt into
+        # structure/segment reads without paying for all source lines here.
+        if total_lines >= LONG_CONTENT_TEXT_SEGMENT_LINES or size >= LARGE_FILE_AUTO_PAGE_BYTES:
+            try:
+                memory = self._ensure_long_content_memory(rel, fp, lines)
+                if memory:
+                    out.append(
+                        f"\nLong-content memory: content_id={memory.get('content_id','')} "
+                        f"segments={len(memory.get('segments', []) or [])} "
+                        f"coverage={float(memory.get('coverage', 0.0) or 0.0):.0%}."
+                    )
+                    out.append(f"- read_file path=\"{rel}\" mode=\"structure\"")
+                    out.append(f"- read_file path=\"{rel}\" mode=\"segment\" segment_id=\"s0001\"")
+            except Exception:
+                pass
         return self._clip_read_file_output("\n".join(out), cap)
 
     def _large_text_file_overview(self, fp: Path, rel: str, lines: list[str]) -> str:
@@ -43333,6 +45113,298 @@ body{padding:18px}
             return True
         return not body
 
+    def _response_action_parts(self, response: object) -> tuple[str, str, list]:
+        """Normalize public text, hidden reasoning, and tool calls for recovery.
+
+        All supported transports already return these three provider-neutral
+        fields.  Keeping the last normalization here prevents recovery code
+        from depending on whether the source was OpenAI, Anthropic, Ollama,
+        MLX/vLLM, or a custom compatible gateway.
+        """
+        row = response if isinstance(response, dict) else {}
+        text = str(row.get("content") or "")
+        thinking = str(row.get("thinking") or "").strip()
+        text_main, embedded = split_thinking_content(text)
+        if embedded:
+            thinking = trim(f"{thinking}\n\n{embedded}".strip(), 24_000)
+        calls = row.get("tool_calls", [])
+        return text_main, thinking, calls if isinstance(calls, list) else []
+
+    def _recover_inline_todo_tool_call(self, *sources: object) -> dict | None:
+        """Salvage a recognizable Todo call emitted as text or partial JSON.
+
+        Some compatible models print a function-call object in ``content`` or
+        finish the tool name while truncating its arguments.  This rescue is
+        deliberately limited to Todo writers: recovering arbitrary mutation
+        calls from prose would be unsafe.
+        """
+        for source in sources:
+            text = str(source or "").strip()
+            if not text or not re.search(r"TodoWrite(?:Rescue)?", text, re.IGNORECASE):
+                continue
+            candidates: list[object] = []
+            parsed, _ = parse_tool_arguments_with_error(text)
+            if parsed:
+                candidates.append(parsed)
+            first = text.find("{")
+            if first >= 0:
+                fragment = text[first:]
+                parsed_fragment, _ = parse_tool_arguments_with_error(fragment)
+                if parsed_fragment:
+                    candidates.append(parsed_fragment)
+                candidates.append(fragment)
+            candidates.append(text)
+            for candidate in candidates:
+                payload = candidate
+                if isinstance(candidate, dict):
+                    fn = candidate.get("function") if isinstance(candidate.get("function"), dict) else {}
+                    name = canonicalize_tool_name(
+                        fn.get("name")
+                        or candidate.get("name")
+                        or candidate.get("tool")
+                        or candidate.get("tool_name")
+                    )
+                    if name and name not in {"TodoWrite", "TodoWriteRescue"}:
+                        continue
+                    payload = (
+                        fn.get("arguments")
+                        if fn.get("arguments") not in (None, "")
+                        else candidate.get("arguments", candidate.get("input", candidate))
+                    )
+                items = self._todo_payload_items(payload, limit=40) if isinstance(payload, dict) else []
+                if not items:
+                    items = self._extract_text_items_from_raw_args(payload)
+                clean_items: list[object] = []
+                for item in items[:40]:
+                    if isinstance(item, dict):
+                        content = trim(str(item.get("content", "") or "").strip(), 500)
+                        if content:
+                            clean_items.append({**item, "content": content})
+                    else:
+                        content = trim(str(item or "").strip(), 500)
+                        if content:
+                            clean_items.append(content)
+                if clean_items:
+                    return {
+                        "id": make_id("tool"),
+                        "type": "function",
+                        "function": {
+                            "name": "TodoWriteRescue",
+                            "arguments": {"items": clean_items, "in_progress_index": 0},
+                        },
+                    }
+        return None
+
+    def _recover_inline_action_tool_call(self, *sources: object) -> dict | None:
+        """Recover one explicitly structured non-Todo tool call from text.
+
+        This path never guesses a command from prose.  It accepts only an
+        object carrying a recognizable ``name``/``function.name`` and an
+        ``arguments``/``input`` object, and only when that name is currently
+        exposed by the runtime tool catalog.
+        """
+        exposed: set[str] = set()
+        try:
+            for spec in self._available_tools():
+                fn = spec.get("function", {}) if isinstance(spec, dict) else {}
+                name = canonicalize_tool_name(fn.get("name", ""))
+                if name:
+                    exposed.add(name)
+        except Exception:
+            exposed = set()
+        if not exposed:
+            return None
+        for source in sources:
+            text = str(source or "").strip()
+            if not text or "{" not in text:
+                continue
+            candidates: list[object] = []
+            parsed, _ = parse_tool_arguments_with_error(text)
+            if parsed:
+                candidates.append(parsed)
+            first = text.find("{")
+            fragment = text[first:] if first >= 0 else ""
+            if fragment:
+                parsed_fragment, _ = parse_tool_arguments_with_error(fragment)
+                if parsed_fragment:
+                    candidates.append(parsed_fragment)
+                candidates.append(fragment)
+            for candidate in candidates:
+                if not isinstance(candidate, dict):
+                    continue
+                fn = candidate.get("function") if isinstance(candidate.get("function"), dict) else {}
+                name = canonicalize_tool_name(
+                    fn.get("name")
+                    or candidate.get("name")
+                    or candidate.get("tool")
+                    or candidate.get("tool_name")
+                )
+                if not name or name not in exposed or name in {"TodoWrite", "TodoWriteRescue"}:
+                    continue
+                raw_args = (
+                    fn.get("arguments")
+                    if fn.get("arguments") not in (None, "")
+                    else candidate.get("arguments", candidate.get("input", {}))
+                )
+                args, _ = parse_tool_arguments_with_error(raw_args)
+                if not isinstance(args, dict):
+                    repaired = repair_truncated_json_object(raw_args)
+                    args, _ = parse_tool_arguments_with_error(repaired)
+                if not isinstance(args, dict):
+                    continue
+                return {
+                    "id": make_id("tool"),
+                    "type": "function",
+                    "function": {"name": name, "arguments": args},
+                }
+        return None
+
+    def _provider_supports_native_tool_choice(self) -> bool:
+        provider = str(getattr(getattr(self, "ollama", None), "provider", "") or "").strip().lower()
+        return bool(provider == "anthropic" or is_openai_compat_provider(provider))
+
+    def _recover_thinking_only_response(
+        self,
+        original_response: object,
+        *,
+        bootstrap: bool,
+        tools: list,
+        pinned_selection: str,
+    ) -> dict:
+        """Run the four-stage, bounded compatibility ladder after a long streak."""
+        max_tokens = min(
+            int(getattr(self, "max_output_tokens", EMPTY_ACTION_RECOVERY_MAX_TOKENS) or EMPTY_ACTION_RECOVERY_MAX_TOKENS),
+            int(EMPTY_ACTION_RECOVERY_MAX_TOKENS),
+        )
+        short_instruction = (
+            "The previous completed responses contained reasoning but no final action. "
+            "Use the existing reasoning and return the required TodoWrite/TodoWriteRescue call now. "
+            "Do not repeat analysis."
+            if bootstrap
+            else
+            "The previous completed responses contained reasoning but no final action. "
+            "Use the existing reasoning and return one concise final answer or one concrete tool call now. "
+            "Do not repeat analysis."
+        )
+        _original_row = original_response if isinstance(original_response, dict) else {}
+        _prior_signal = trim(
+            str(_original_row.get("thinking") or "").strip(),
+            1200,
+        )
+        if _prior_signal:
+            short_instruction += (
+                "\nPrior internal reasoning signal (use it silently; do not quote or expand it): "
+                f"{_prior_signal}"
+            )
+        first: dict = {}
+        second: dict = {}
+        try:
+            first = self._chat_with_same_model_retry(
+                list(self.messages) + [{"role": "user", "content": short_instruction, "ts": now_ts()}],
+                tools=tools,
+                system=self._system_prompt(),
+                max_tokens=max_tokens,
+                # Preserve a small reasoning budget for the first continuation;
+                # the second stage below is the explicit no-thinking fallback.
+                think=True,
+                stream_thinking=False,
+                pinned_selection=pinned_selection,
+                context_label="thinking-only short recovery",
+                retries=0,
+                media_inputs=None,
+                effort=EFFORT_LOW,
+            )
+        except OllamaError as exc:
+            if self.cancel_requested or int(getattr(exc, "status", 0) or 0) == 499:
+                raise
+        text1, thinking1, calls1 = self._response_action_parts(first)
+        if bootstrap and not calls1:
+            repaired = self._recover_inline_todo_tool_call(text1)
+            if repaired:
+                calls1 = [repaired]
+        if bootstrap:
+            calls1 = [
+                call for call in calls1
+                if canonicalize_tool_name(
+                    (call.get("function", {}) if isinstance(call, dict) else {}).get("name", "")
+                ) in {"TodoWrite", "TodoWriteRescue"}
+            ]
+        if calls1 or (text1.strip() and not bootstrap):
+            return {"ok": True, "response": {"content": text1, "thinking": thinking1, "tool_calls": calls1}, "stage": "short"}
+
+        forced_name = "TodoWrite" if bootstrap and self._provider_supports_native_tool_choice() else ""
+        second_instruction = (
+            "/no_think\nThinking is disabled for this compatibility retry. "
+            "Call TodoWrite now with 1-40 evidence-based items and exactly one in_progress item. "
+            "Output no prose."
+            if bootstrap
+            else
+            "/no_think\nThinking is disabled for this compatibility retry. "
+            "Return one concise final answer or one concrete tool call. Output no analysis."
+        )
+        try:
+            forced_kwargs = {
+                "tools": (self._single_no_plan_todo_bootstrap_tools() if bootstrap else tools),
+                "system": self._system_prompt(),
+                "max_tokens": max_tokens,
+                "think": False,
+                "stream_thinking": False,
+                "pinned_selection": pinned_selection,
+                "context_label": "thinking-only forced action recovery",
+                "retries": 0,
+                "media_inputs": None,
+                "effort": EFFORT_OFF,
+            }
+            if forced_name:
+                forced_kwargs["tool_choice"] = forced_name
+            second = self._chat_with_same_model_retry(
+                list(self.messages) + [{"role": "user", "content": second_instruction, "ts": now_ts()}],
+                **forced_kwargs,
+            )
+        except OllamaError as exc:
+            if self.cancel_requested or int(getattr(exc, "status", 0) or 0) == 499:
+                raise
+        text2, thinking2, calls2 = self._response_action_parts(second)
+        if bootstrap and not calls2:
+            repaired = self._recover_inline_todo_tool_call(text2)
+            if repaired:
+                calls2 = [repaired]
+        if bootstrap:
+            calls2 = [
+                call for call in calls2
+                if canonicalize_tool_name(
+                    (call.get("function", {}) if isinstance(call, dict) else {}).get("name", "")
+                ) in {"TodoWrite", "TodoWriteRescue"}
+            ]
+        if calls2 or (text2.strip() and not bootstrap):
+            return {"ok": True, "response": {"content": text2, "thinking": thinking2, "tool_calls": calls2}, "stage": "forced"}
+
+        # Stage three also considers hidden reasoning and the original response,
+        # but only for the explicitly named Todo writers.
+        if bootstrap:
+            original_text, original_thinking, _ = self._response_action_parts(original_response)
+            repaired = self._recover_inline_todo_tool_call(
+                text2, thinking2, text1, thinking1, original_text, original_thinking
+            )
+            if repaired:
+                return {
+                    "ok": True,
+                    "response": {"content": "", "thinking": "", "tool_calls": [repaired]},
+                    "stage": "repair",
+                }
+        else:
+            original_text, original_thinking, _ = self._response_action_parts(original_response)
+            repaired = self._recover_inline_action_tool_call(
+                text2, thinking2, text1, thinking1, original_text, original_thinking
+            )
+            if repaired:
+                return {
+                    "ok": True,
+                    "response": {"content": "", "thinking": "", "tool_calls": [repaired]},
+                    "stage": "repair",
+                }
+        return {"ok": False, "response": {}, "stage": "exhausted"}
+
     def _is_thinking_budget_exhausted(
         self,
         text: str,
@@ -44393,6 +46465,7 @@ body{padding:18px}
         messages: list[dict],
         *,
         tools: list | None = None,
+        tool_choice: str = "",
         system: str = "",
         max_tokens: int | None = None,
         think: bool | None = None,
@@ -44487,9 +46560,14 @@ body{padding:18px}
                     lambda: self.ollama.chat(
                         messages,
                         tools=tools,
+                        **(
+                            {"tool_choice": str(tool_choice).strip()}
+                            if str(tool_choice or "").strip()
+                            else {}
+                        ),
                         system=system,
                         max_tokens=max_tokens,
-                        think=False,
+                        think=bool(think) if think is not None else False,
                         stream_thinking=bool(stream_thinking),
                         on_thinking_chunk=on_thinking_chunk,
                         response_stream=response_stream_enabled,
@@ -44605,9 +46683,14 @@ body{padding:18px}
                             lambda: self.ollama.chat(
                                 fallback_messages,
                                 tools=tools,
+                                **(
+                                    {"tool_choice": str(tool_choice).strip()}
+                                    if str(tool_choice or "").strip()
+                                    else {}
+                                ),
                                 system=system,
                                 max_tokens=max_tokens,
-                                think=False,
+                                think=bool(think) if think is not None else False,
                                 stream_thinking=bool(stream_thinking),
                                 on_thinking_chunk=on_thinking_chunk,
                                 response_stream=response_stream_enabled,
@@ -46417,6 +48500,37 @@ body{padding:18px}
                 continue
         return fp.read_text(encoding="utf-8", errors="replace")
 
+    def _read_text_and_fingerprint(self, fp: Path, rel: str) -> tuple[str, dict]:
+        """Read a text source once and derive its durable fingerprint in memory."""
+        raw = fp.read_bytes()
+        text = ""
+        tried: list[str] = []
+        for enc in ("utf-8", "utf-8-sig", locale.getpreferredencoding(False) or "utf-8", "gb18030"):
+            enc_norm = str(enc or "").strip() or "utf-8"
+            if enc_norm in tried:
+                continue
+            tried.append(enc_norm)
+            try:
+                text = raw.decode(enc_norm)
+                break
+            except UnicodeDecodeError:
+                continue
+        if not text and raw:
+            text = raw.decode("utf-8", errors="replace")
+        st = fp.stat()
+        fingerprint = {
+            "source_size": int(st.st_size),
+            "source_mtime_ns": int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000))),
+        }
+        if len(raw) <= READ_CONTEXT_CACHE_SEARCH_MAX_BYTES:
+            fingerprint["source_sha256"] = hashlib.sha256(raw).hexdigest()
+        cache = getattr(self, "_source_fingerprint_cache", {})
+        if not isinstance(cache, dict):
+            cache = {}
+            self._source_fingerprint_cache = cache
+        cache[str(rel or "").replace("\\", "/").strip()] = dict(fingerprint)
+        return text, fingerprint
+
     def _render_missing_read_hint(self, rel: str) -> str:
         fb_ref = self._file_buffer_ref_from_text(rel)
         if fb_ref:
@@ -46635,6 +48749,8 @@ body{padding:18px}
         context: object = None,
         regex: object = False,
         max_chars: object = None,
+        segment_id: object = None,
+        _source_lines: list[str] | None = None,
     ) -> str:
         try:
             rel = self._normalize_tool_path_text(path)
@@ -46654,7 +48770,7 @@ body{padding:18px}
                 return self._run_read_media(fp, rel, "audio")
             if ext in VIDEO_EXTS:
                 return self._run_read_media(fp, rel, "video")
-            lines = self._read_text_with_fallback(fp).splitlines()
+            lines = list(_source_lines) if isinstance(_source_lines, list) else self._read_text_with_fallback(fp).splitlines()
             total_lines = len(lines)
             if total_lines == 0:
                 return ""
@@ -46663,7 +48779,7 @@ body{padding:18px}
             except Exception:
                 file_size = 0
             mode_text = str(mode or "auto").strip().lower() or "auto"
-            if mode_text not in {"auto", "full", "overview", "window", "symbol", "search", "directory"}:
+            if mode_text not in {"auto", "full", "overview", "structure", "segment", "window", "symbol", "search", "directory"}:
                 mode_text = "auto"
             if mode_text == "auto":
                 if str(target or "").strip():
@@ -46672,10 +48788,16 @@ body{padding:18px}
                     mode_text = "search"
                 elif line not in (None, ""):
                     mode_text = "window"
+                elif total_lines >= LONG_CONTENT_TEXT_SEGMENT_LINES or file_size >= LARGE_FILE_AUTO_PAGE_BYTES:
+                    mode_text = "structure"
             if mode_text == "directory":
                 return f"Error: path is a file, not a directory: {rel}"
-            if mode_text == "overview":
+            if mode_text in {"overview", "structure"}:
+                if mode_text == "structure":
+                    return self._render_long_content_structure(rel, fp, lines, max_chars=max_chars)
                 return self._render_text_overview(fp, rel, lines, max_chars=max_chars)
+            if mode_text == "segment":
+                return self._render_long_content_segment(rel, fp, lines, segment_id=segment_id or target, query=query, max_chars=max_chars)
             if mode_text == "full":
                 return self._render_full_text_read(rel, lines, offset=offset, max_chars=max_chars)
             if mode_text == "search":
@@ -54375,7 +56497,11 @@ body{padding:18px}
         for row in reversed(list(getattr(self, "messages", []) or [])):
             if not isinstance(row, dict) or str(row.get("role", "") or "") != "user":
                 continue
-            if bool(row.get("_ui_hidden", False)) or str(row.get("agent_role", "") or "").strip():
+            if (
+                bool(row.get("_ui_hidden", False))
+                or self._is_runtime_internal_message(row)
+                or str(row.get("agent_role", "") or "").strip()
+            ):
                 continue
             try:
                 msg_ts = float(row.get("ts", 0.0) or 0.0)
@@ -57679,6 +59805,385 @@ body{padding:18px}
             current = stripped
         return {form for form in forms if len(form) >= 2}
 
+    @staticmethod
+    def _plan_update_rows(value: object) -> list[dict]:
+        """Normalize the optional model-authored plan-step edit envelope."""
+        if isinstance(value, dict):
+            for key in ("updates", "steps", "items", "rows"):
+                nested = value.get(key)
+                if isinstance(nested, list):
+                    value = nested
+                    break
+            else:
+                # A compact provider payload may use {step_id: new_content}.
+                value = [
+                    {"step_id": key, "content": content}
+                    for key, content in value.items()
+                    if str(key or "").strip()
+                ]
+        if not isinstance(value, list):
+            return []
+        rows: list[dict] = []
+        for raw in value[:40]:
+            if isinstance(raw, str):
+                continue
+            if not isinstance(raw, dict):
+                continue
+            row = dict(raw)
+            # Accept the common camelCase aliases without guessing a target
+            # from prose. A plan row must be addressed by its stable identity.
+            for source, target in (
+                ("stepId", "step_id"),
+                ("planStepId", "step_id"),
+                ("plan_step_key", "key"),
+                ("stepIndex", "plan_step_index"),
+                ("fullContent", "full_content"),
+            ):
+                if target not in row and source in row:
+                    row[target] = row.get(source)
+            rows.append(row)
+        return rows
+
+    def _plan_step_revision_context(self, board: dict | None = None) -> str:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        plan_rows = [
+            row for row in (bb.get("project_todos", []) if isinstance(bb.get("project_todos"), list) else [])
+            if isinstance(row, dict) and str(row.get("category", "") or "") == "plan_step"
+        ]
+        lines = [
+            f"- step {int(row.get('plan_step_index', 0) or 0) + 1} [{row.get('status', 'pending')}]: "
+            f"{trim(str(row.get('full_content', '') or row.get('content', '') or ''), 900)}"
+            for row in plan_rows
+        ]
+        evidence = self._root_todo_revision_evidence([], board=bb)
+        workers = self.todo.snapshot() if hasattr(self, "todo") else []
+        worker_lines = [
+            f"- [{row.get('status', 'pending')}] {trim(str(row.get('content', '') or ''), 360)}"
+            for row in workers
+            if isinstance(row, dict) and self._todo_row_kind(row) == "plan_worker"
+        ][-16:]
+        return (
+            "CURRENT PLAN:\n" + ("\n".join(lines) or "(none)")
+            + "\n\nCURRENT WORKER TODOs:\n" + ("\n".join(worker_lines) or "(none)")
+            + "\n\nRECENT PROGRESS EVIDENCE:\n" + ("\n".join(f"- {item}" for item in evidence[-16:]) or "(none)")
+        )
+
+    def _semantic_audit_plan_step_updates(
+        self,
+        current_rows: list[dict],
+        proposed_rows: list[dict],
+        changed_ids: list[str],
+        *,
+        reason: str = "",
+        evidence: object = None,
+        board: dict | None = None,
+    ) -> dict:
+        """Review multi-step plan edits against the goal and live progress."""
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        goal = str(
+            self._authoritative_user_goal_for_model()
+            or bb.get("original_goal", "")
+            or ""
+        ).strip()
+
+        def _render(rows: list[dict]) -> str:
+            return "\n".join(
+                f"- {int(row.get('plan_step_index', 0) or 0) + 1} [{row.get('status', 'pending')}]: "
+                f"{trim(str(row.get('full_content', '') or row.get('content', '') or ''), 900)}"
+                for row in rows
+                if isinstance(row, dict)
+            ) or "(none)"
+
+        prompt = (
+            "/no_think\n"
+            "You are an independent reviewer for a model-proposed execution-plan edit. "
+            "The model may refine wording when new progress justifies it, but the authoritative user goal, "
+            "ordered dependencies, completed evidence, and unfinished obligations must remain covered. "
+            "Approve only when the proposed edits are justified by the supplied progress and do not silently "
+            "drop, duplicate, or reorder work. Return JSON only: "
+            "{\"decision\":\"approve|reject\",\"confidence\":\"high|medium|low\","
+            "\"reason\":\"...\",\"completion_risk\":\"low|medium|high\","
+            "\"requirement_coverage\":[\"...\"],\"evidence\":[\"...\"]}.\n\n"
+            f"AUTHORITATIVE USER GOAL:\n{goal or '(unavailable)'}\n\n"
+            f"EDITED STEP IDS: {', '.join(changed_ids) or '(none)'}\n"
+            f"PROPOSER REASON:\n{trim(str(reason or ''), 1200) or '(none)'}\n"
+            f"PROPOSER EVIDENCE:\n{trim(json.dumps(evidence, ensure_ascii=False), 1600) if evidence not in (None, '', []) else '(none)'}\n\n"
+            "BEFORE:\n" + _render(current_rows) + "\n\n"
+            "AFTER:\n" + _render(proposed_rows) + "\n\n"
+            + self._plan_step_revision_context(bb)
+        )
+        try:
+            response = self.ollama.chat(
+                [{"role": "user", "content": prompt}],
+                system=self._inject_runtime_environment_context(
+                    "/no_think\nYou audit multi-step execution-plan edits. Reply only valid JSON."
+                ),
+                max_tokens=900,
+                temperature=0.1,
+                think=False,
+            )
+            raw = str(response.get("content", "") or response.get("text", "") or "").strip()
+            payload = extract_json_object_from_text(raw, {})
+            if not isinstance(payload, dict) or not payload:
+                return {"available": False, "approved": False, "reason": "plan-step review returned invalid JSON"}
+            decision = str(payload.get("decision", "") or "").strip().lower()
+            confidence = str(payload.get("confidence", "low") or "low").strip().lower()
+            risk = str(payload.get("completion_risk", "high") or "high").strip().lower()
+            review_reason = trim(str(payload.get("reason", "") or "").strip(), 1200)
+            coverage = payload.get("requirement_coverage", [])
+            review_evidence = payload.get("evidence", [])
+            if (
+                decision not in {"approve", "reject"}
+                or confidence not in {"high", "medium", "low"}
+                or risk not in {"low", "medium", "high"}
+                or len(review_reason) < 6
+                or not isinstance(coverage, list)
+                or not isinstance(review_evidence, list)
+            ):
+                return {"available": False, "approved": False, "reason": "plan-step review omitted required fields"}
+            return {
+                "available": True,
+                "approved": decision == "approve",
+                "decision": decision,
+                "confidence": confidence,
+                "completion_risk": risk,
+                "reason": review_reason,
+                "requirement_coverage": [trim(str(item or ""), 700) for item in coverage[:40] if str(item or "").strip()],
+                "evidence": [trim(str(item or ""), 700) for item in review_evidence[:20] if str(item or "").strip()],
+            }
+        except Exception as exc:
+            return {"available": False, "approved": False, "reason": f"plan-step review unavailable: {trim(str(exc), 240)}"}
+
+    def _record_plan_step_revision(
+        self,
+        *,
+        status: str,
+        mode: str,
+        changed_ids: list[str],
+        reason: str,
+        review: dict | None = None,
+        board: dict | None = None,
+    ) -> None:
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        rows = list(bb.get("plan_step_revisions", []) if isinstance(bb.get("plan_step_revisions"), list) else [])
+        review = review if isinstance(review, dict) else {}
+        rows.append({
+            "status": trim(str(status or ""), 24),
+            "mode": trim(str(mode or ""), 32),
+            "changed_step_ids": [trim(str(item or ""), 60) for item in changed_ids[:40] if str(item or "").strip()],
+            "reason": trim(str(reason or ""), 1200),
+            "review_reason": trim(str(review.get("reason", "") or ""), 1200),
+            "completion_risk": trim(str(review.get("completion_risk", "") or ""), 24),
+            "requirement_coverage": list(review.get("requirement_coverage", []) or [])[:40],
+            "evidence": list(review.get("evidence", []) or [])[:20],
+            "ts": float(now_ts()),
+        })
+        bb["plan_step_revisions"] = rows[-40:]
+        bb["updated_at"] = float(now_ts())
+        self.blackboard = bb
+
+    def _apply_plan_step_updates(
+        self,
+        updates: object,
+        *,
+        board: dict | None = None,
+        reason: str = "",
+        evidence: object = None,
+        update_mode: str = "status_update",
+    ) -> str:
+        """Apply explicit model-authored plan edits with scope-based review."""
+        rows = self._plan_update_rows(updates)
+        if not rows:
+            return ""
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        current = [
+            dict(row) for row in (bb.get("project_todos", []) if isinstance(bb.get("project_todos"), list) else [])
+            if isinstance(row, dict)
+        ]
+        plan_rows = [row for row in current if str(row.get("category", "") or "") == "plan_step"]
+        if not plan_rows:
+            return self._plan_control_feedback("plan_update_rejected", "No canonical plan steps exist to update.")
+        by_id: dict[str, dict] = {}
+        for row in plan_rows:
+            rid = trim(str(row.get("id", "") or ""), 60)
+            key = trim(str(row.get("key", "") or ""), 120)
+            if rid:
+                by_id[rid] = row
+            if key:
+                by_id[key] = row
+                by_id[key.removeprefix("bb:proj:")] = row
+        proposed = [dict(row) for row in current]
+        proposed_by_id = {
+            trim(str(row.get("id", "") or ""), 60): row
+            for row in proposed
+            if str(row.get("category", "") or "") == "plan_step" and str(row.get("id", "") or "").strip()
+        }
+        changed_ids: list[str] = []
+        rejected_targets: list[str] = []
+        remove_ids: set[str] = set()
+        mode = str(update_mode or "status_update").strip().lower().replace("-", "_")
+        for update in rows:
+            target_ref = trim(str(
+                update.get("step_id", update.get("id", update.get("key", ""))) or ""
+            ), 120)
+            target = by_id.get(target_ref)
+            if target is None and update.get("plan_step_index") not in (None, ""):
+                try:
+                    target = next(
+                        row for row in plan_rows
+                        if int(row.get("plan_step_index", -1) or -1) == int(update.get("plan_step_index"))
+                    )
+                except Exception:
+                    target = None
+            if target is None:
+                rejected_targets.append(target_ref or "(missing step identity)")
+                continue
+            target_id = trim(str(target.get("id", "") or ""), 60)
+            proposal = proposed_by_id.get(target_id)
+            if not isinstance(proposal, dict):
+                continue
+            old_status = self._normalize_todo_status_value(proposal.get("status", ""), "pending")
+            action = str(update.get("action", update.get("operation", "update")) or "update").strip().lower().replace("-", "_")
+            if action in {"remove", "delete", "drop", "retire"}:
+                if old_status == "completed":
+                    rejected_targets.append(target_id or target_ref)
+                else:
+                    remove_ids.add(target_id)
+                    changed_ids.append(target_id)
+                continue
+            if old_status == "completed":
+                # Completion records are immutable. A failed/reviewed rework must
+                # use the existing worker rework flow, not silently rewrite history.
+                content_candidate = update.get("full_content", update.get("content", update.get("title", None)))
+                if content_candidate not in (None, ""):
+                    rejected_targets.append(target_id or target_ref)
+                continue
+            new_full = update.get("full_content", update.get("content", update.get("title", None)))
+            if new_full not in (None, ""):
+                full_text = normalize_embedded_newlines(str(new_full or "")).strip()
+                if full_text:
+                    proposal["full_content"] = trim(full_text, PLAN_STEP_FULL_CONTENT_MAX_CHARS)
+                    proposal["content"] = trim(full_text.split("\n", 1)[0], 500)
+            requested_status = self._normalize_todo_status_value(update.get("status", ""), old_status)
+            if requested_status == "completed":
+                rejected_targets.append(target_id or target_ref)
+            elif requested_status in {"pending", "in_progress"}:
+                proposal["status"] = requested_status
+            if (
+                normalize_embedded_newlines(str(proposal.get("content", "") or ""))
+                != normalize_embedded_newlines(str(target.get("content", "") or ""))
+                or proposal.get("status") != target.get("status")
+            ):
+                changed_ids.append(target_id)
+                proposal["updated_at"] = float(now_ts())
+        changed_ids = list(dict.fromkeys(value for value in changed_ids if value))
+        if rejected_targets:
+            return self._plan_control_feedback(
+                "plan_update_rejected",
+                "Completed plan steps or unresolved identities cannot be rewritten: "
+                + ", ".join(dict.fromkeys(rejected_targets))
+                + ". Preserve their evidence and address open steps by stable step_id/id/key.",
+            )
+        if not changed_ids:
+            return self._plan_control_feedback("plan_update_no_changes", "The supplied plan updates made no safe changes.")
+
+        if remove_ids:
+            proposed = [
+                row for row in proposed
+                if not (
+                    str(row.get("category", "") or "") == "plan_step"
+                    and trim(str(row.get("id", "") or ""), 60) in remove_ids
+                )
+            ]
+        review: dict = {"available": False, "approved": True, "reason": "single open plan step update"}
+        # Deletion always requires review. Updating two or more steps also
+        # requires review because ordering/coverage can change even when each
+        # individual edit looks harmless.
+        requires_review = bool(remove_ids or len(changed_ids) > 1)
+        if requires_review:
+            review = self._semantic_audit_plan_step_updates(
+                plan_rows,
+                [row for row in proposed if str(row.get("category", "") or "") == "plan_step"],
+                changed_ids,
+                reason=reason,
+                evidence=evidence,
+                board=bb,
+            )
+            if not bool(review.get("available", False)) or not bool(review.get("approved", False)):
+                self._record_plan_step_revision(
+                    status="rejected",
+                    mode="multi_step_review",
+                    changed_ids=changed_ids,
+                    reason=reason,
+                    review=review,
+                    board=bb,
+                )
+                return self._plan_control_feedback(
+                    "plan_update_rejected",
+                    f"Multi-step plan update rejected: {review.get('reason', 'independent review did not approve the edit')}",
+                )
+            revision_mode = "semantic_review"
+        else:
+            revision_mode = "single_step_update"
+        # Reindex the surviving plan rows while keeping every row's stable id,
+        # completion state, and evidence intact.
+        next_index = 0
+        for row in proposed:
+            if str(row.get("category", "") or "") != "plan_step":
+                continue
+            row["plan_step_index"] = next_index
+            next_index += 1
+        bb["project_todos"] = proposed
+        if remove_ids and hasattr(self, "todo"):
+            archived = list(
+                bb.get("plan_worker_todo_archive", [])
+                if isinstance(bb.get("plan_worker_todo_archive"), list)
+                else []
+            )
+            live_rows: list[dict] = []
+            for raw_worker in self.todo.snapshot():
+                if not isinstance(raw_worker, dict):
+                    continue
+                parent_id = trim(str(raw_worker.get("parent_step_id", "") or ""), 60)
+                if parent_id in remove_ids and self._todo_row_kind(raw_worker) == "plan_worker":
+                    archived.append({**dict(raw_worker), "archived_reason": "plan-step-deleted", "archived_at": float(now_ts())})
+                else:
+                    live_rows.append(dict(raw_worker))
+            if len(live_rows) != len(self.todo.snapshot()):
+                with self.todo.lock:
+                    self.todo.items = live_rows
+            bb["plan_worker_todo_archive"] = archived[-120:]
+            mirror = dict(bb.get("plan_worker_todos", {}) if isinstance(bb.get("plan_worker_todos"), dict) else {})
+            for removed_id in remove_ids:
+                mirror.pop(removed_id, None)
+            bb["plan_worker_todos"] = mirror
+        plan = dict(bb.get("plan", {}) if isinstance(bb.get("plan"), dict) else {})
+        plan["steps"] = [
+            str(row.get("full_content", "") or row.get("content", "") or "")
+            for row in proposed
+            if str(row.get("category", "") or "") == "plan_step"
+        ]
+        bb["plan"] = plan
+        self._normalize_plan_step_progress(bb)
+        self.blackboard = bb
+        self._record_plan_step_revision(
+            status="accepted",
+            mode=revision_mode,
+            changed_ids=changed_ids,
+            reason=reason,
+            review=review,
+            board=bb,
+        )
+        try:
+            self._blackboard_touch()
+            self._update_plan_file_step_status()
+        except Exception:
+            pass
+        return (
+            f"Plan step update accepted ({revision_mode}; changed={len(changed_ids)}). "
+            "Canonical step identities and completed evidence were preserved."
+        )
+
     def _plan_worker_row_duplicates_parent_step(self, row: dict | None, plan_step: dict | None) -> bool:
         if not isinstance(row, dict) or not isinstance(plan_step, dict):
             return False
@@ -57716,6 +60221,187 @@ body{padding:18px}
             if row_major > 0 and row_major == step_index and marker_title_forms.intersection(step_forms):
                 return True
         return False
+
+    def _classify_plan_worker_parent_update(
+        self,
+        row: dict | None,
+        plan_step: dict | None,
+        *,
+        board: dict | None = None,
+    ) -> dict:
+        """Ask the active model whether an unscoped Todo is a parent edit.
+
+        This deliberately does not classify by keywords. Explicit N.M rows or
+        caller-supplied parent_step_id values remain worker subtasks; only an
+        inferred-parent, unnumbered row is ambiguous enough to ask the model.
+        """
+        if not isinstance(row, dict) or not isinstance(plan_step, dict):
+            return {}
+        if not bool(row.get("_parent_step_inferred", False)):
+            return {}
+        content = normalize_embedded_newlines(str(row.get("content", "") or "")).strip()
+        if not content or self._is_plan_step_acceptance_subtask(content):
+            return {}
+        head = next((line.strip() for line in content.splitlines() if line.strip()), content)
+        marker = self._plan_line_marker(head)
+        if isinstance(marker, dict) and marker.get("kind") == "sub":
+            return {}
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        step_id = trim(str(plan_step.get("id", "") or ""), 60)
+        prompt = (
+            "/no_think\n"
+            "Decide the intent of one unscoped TodoWrite row inside the active execution-plan step. "
+            "Return JSON only: {\"intent\":\"parent_update|worker_subtask|ambiguous\","
+            "\"confidence\":\"high|medium|low\",\"reason\":\"...\","
+            "\"parent_content\":\"...\"}. A parent_update means the row is a revised description of "
+            "the active plan step itself, not an additional child task. Use worker_subtask when it is a "
+            "concrete independently executable child. Use ambiguous when evidence is insufficient. "
+            "Do not infer from a shared verb alone; consider the whole goal, current step, and existing subtasks.\n\n"
+            f"AUTHORITATIVE GOAL:\n{str(bb.get('original_goal', '') or '').strip() or '(unavailable)'}\n\n"
+            f"ACTIVE PLAN STEP ({step_id}):\n{trim(str(plan_step.get('full_content', '') or plan_step.get('content', '') or ''), 1800)}\n\n"
+            f"INCOMING TODO:\n{trim(content, 900)}\n\n"
+            "EXISTING CURRENT-STEP SUBTASKS:\n"
+            + ("\n".join(
+                f"- [{r.get('status', 'pending')}] {trim(str(r.get('content', '') or ''), 500)}"
+                for r in self._active_plan_worker_todo_rows(step_id, role="")
+                if isinstance(r, dict)
+            ) or "(none)")
+            + "\n\n"
+            + self._plan_step_revision_context(bb)
+        )
+        try:
+            response = self.ollama.chat(
+                [{"role": "user", "content": prompt}],
+                system=self._inject_runtime_environment_context(
+                    "/no_think\nClassify Todo intent. Reply only valid JSON."
+                ),
+                max_tokens=420,
+                temperature=0.1,
+                think=False,
+            )
+            payload = extract_json_object_from_text(
+                str(response.get("content", "") or response.get("text", "") or ""),
+                {},
+            )
+            if not isinstance(payload, dict):
+                return {}
+            intent = str(payload.get("intent", "") or "").strip().lower().replace("-", "_")
+            confidence = str(payload.get("confidence", "low") or "low").strip().lower()
+            if intent not in {"parent_update", "worker_subtask", "ambiguous"}:
+                return {}
+            if confidence not in {"high", "medium", "low"}:
+                confidence = "low"
+            parent_content = trim(str(payload.get("parent_content", "") or "").strip(), 1200)
+            return {
+                "intent": intent,
+                "confidence": confidence,
+                "reason": trim(str(payload.get("reason", "") or ""), 900),
+                "parent_content": parent_content or content,
+            }
+        except Exception:
+            # A provider that cannot support this optional classifier must not
+            # lose a legitimate child Todo; the conservative fallback is to keep it.
+            return {}
+
+    def _apply_classified_parent_update(
+        self,
+        classification: dict,
+        plan_step: dict,
+        *,
+        board: dict | None = None,
+    ) -> bool:
+        if not isinstance(classification, dict) or classification.get("intent") != "parent_update":
+            return False
+        if classification.get("confidence") not in {"high", "medium"}:
+            return False
+        step_id = trim(str(plan_step.get("id", "") or ""), 60)
+        if not step_id:
+            return False
+        result = self._apply_plan_step_updates(
+            [{"step_id": step_id, "content": classification.get("parent_content", "")}],
+            board=board,
+            reason=str(classification.get("reason", "") or "model classified an active-step description update"),
+            update_mode="status_update",
+        )
+        return "accepted" in str(result or "").lower()
+
+    def _classify_root_todo_intent(
+        self,
+        incoming: dict | None,
+        existing_rows: list[dict],
+        *,
+        board: dict | None = None,
+    ) -> dict:
+        """Let the model resolve an unaddressed root Todo against live rows."""
+        if not isinstance(incoming, dict) or not isinstance(existing_rows, list) or not existing_rows:
+            return {}
+        if any(
+            str(incoming.get(field, "") or "").strip()
+            for field in ("key", "root_group_id", "external_subtask_id", "subtask_id", "external_id", "todo_id", "task_id", "item_id", "row_id")
+        ):
+            return {}
+        content = trim(str(incoming.get("content", "") or "").strip(), 900)
+        if not content:
+            return {}
+        bb = board if isinstance(board, dict) else self._ensure_blackboard()
+        rows_text = "\n".join(
+            f"- id={trim(str(row.get('subtask_id', '') or row.get('key', '') or ''), 100)} "
+            f"[{str(row.get('status', 'pending')).lower()}] {trim(str(row.get('content', '') or ''), 500)}"
+            for row in existing_rows[:40]
+            if isinstance(row, dict)
+        ) or "(none)"
+        prompt = (
+            "/no_think\n"
+            "Resolve one unaddressed TodoWrite objective against the existing canonical root Todo rows. "
+            "Return JSON only: {\"intent\":\"update_existing|add_new|ambiguous\","
+            "\"confidence\":\"high|medium|low\",\"existing_id\":\"...\",\"reason\":\"...\"}. "
+            "Choose update_existing only when the incoming objective is the same work with a clearer/current description. "
+            "Choose add_new for a genuinely independent objective. Never delete a completed row. Do not use shared verbs alone; "
+            "consider the authoritative goal, current statuses, and the whole objective.\n\n"
+            f"AUTHORITATIVE GOAL:\n{str(bb.get('original_goal', '') or '').strip() or '(unavailable)'}\n\n"
+            f"INCOMING OBJECTIVE:\n{content}\n\n"
+            f"EXISTING CANONICAL ROOT TODOS:\n{rows_text}"
+        )
+        try:
+            response = self.ollama.chat(
+                [{"role": "user", "content": prompt}],
+                system=self._inject_runtime_environment_context(
+                    "/no_think\nResolve Todo identity from the supplied canonical rows. Reply only valid JSON."
+                ),
+                max_tokens=360,
+                temperature=0.1,
+                think=False,
+            )
+            payload = extract_json_object_from_text(
+                str(response.get("content", "") or response.get("text", "") or ""),
+                {},
+            )
+            if not isinstance(payload, dict):
+                return {}
+            intent = str(payload.get("intent", "") or "").strip().lower().replace("-", "_")
+            confidence = str(payload.get("confidence", "low") or "low").strip().lower()
+            existing_id = trim(str(payload.get("existing_id", "") or ""), 120)
+            valid_ids = {
+                trim(str(row.get("subtask_id", "") or row.get("key", "") or ""), 120)
+                for row in existing_rows
+                if isinstance(row, dict)
+            }
+            if intent not in {"update_existing", "add_new", "ambiguous"}:
+                return {}
+            if confidence not in {"high", "medium", "low"}:
+                confidence = "low"
+            if intent == "update_existing" and (
+                confidence not in {"high", "medium"} or not existing_id or existing_id not in valid_ids
+            ):
+                return {"intent": "ambiguous", "confidence": "low"}
+            return {
+                "intent": intent,
+                "confidence": confidence,
+                "existing_id": existing_id,
+                "reason": trim(str(payload.get("reason", "") or ""), 900),
+            }
+        except Exception:
+            return {}
 
     def _plan_worker_row_is_foreign_plan_step(
         self,
@@ -59335,6 +62021,8 @@ body{padding:18px}
             "status": status,
             "owner": owner,
         }
+        if bool(raw.get("_parent_step_inferred", False)):
+            row["_parent_step_inferred"] = True
         if key:
             row["key"] = key
         if parent_step_id:
@@ -60332,6 +63020,21 @@ body{padding:18px}
                 continue
             if role_key in {"manager", "explorer", "developer", "reviewer"}:
                 row["owner"] = role_key
+            root_intent = (
+                self._classify_root_todo_intent(row, existing_scope, board=bb)
+                if mode == "status_update"
+                else {}
+            )
+            if (
+                root_intent.get("intent") == "update_existing"
+                and root_intent.get("confidence") in {"high", "medium"}
+            ):
+                existing_id = str(root_intent.get("existing_id", "") or "")
+                if existing_id.startswith("rt:"):
+                    row["subtask_id"] = existing_id
+                else:
+                    row["external_subtask_id"] = existing_id
+                row["_root_model_content_update"] = True
             row["subtask_id"] = self._stable_root_todo_id(row)
             normalized.append(row)
         normalized = self._dedupe_root_todo_rows(normalized)
@@ -60438,6 +63141,8 @@ body{padding:18px}
                         incoming_status = "completed"
                     merged["status"] = incoming_status
                     merged["updated_at"] = float(now_ts())
+                    if incoming.get("_root_model_content_update") and prior_status != "completed":
+                        merged["content"] = incoming.get("content", merged.get("content", ""))
                     for meta_key in ("evidence", "evidence_binding", "evidence_ids", "completed_at", "completed_by", "started_at"):
                         if incoming.get(meta_key) not in (None, "", []):
                             merged[meta_key] = incoming.get(meta_key)
@@ -60679,7 +63384,22 @@ body{padding:18px}
             parent_step_id = trim(str(raw.get("parent_step_id", "") or ""), 20)
             if not parent_step_id:
                 raw["parent_step_id"] = step_id
-            if self._plan_worker_row_is_foreign_plan_step(raw, active_step, bb):
+            # An unnumbered row whose parent was inferred by the runtime may be
+            # a revised description of the active plan step rather than a new
+            # child. Let the active model decide; an uncertain/unsupported
+            # provider result conservatively remains a worker subtask.
+            classification = self._classify_plan_worker_parent_update(
+                raw,
+                active_step,
+                board=bb,
+            )
+            if self._apply_classified_parent_update(classification, active_step, board=bb):
+                raw["_plan_parent_update"] = True
+                # _apply_plan_step_updates replaces the board rows with copies;
+                # refresh the local active-step reference before building the
+                # acceptance contract for this same TodoWrite transaction.
+                active_step = self._get_active_plan_step(bb) or active_step
+            if not raw.get("_plan_parent_update") and self._plan_worker_row_is_foreign_plan_step(raw, active_step, bb):
                 canonical = self._render_plan_worker_todo_canonical(step_id, target_rows)
                 return self._plan_control_feedback(
                     "preserve_current_subplan",
@@ -60688,7 +63408,7 @@ body{padding:18px}
                     "the entire current subplan was preserved atomically."
                     + (f"\n\n{canonical}" if canonical else "")
                 )
-            if self._plan_worker_row_duplicates_parent_step(raw, active_step):
+            if not raw.get("_plan_parent_update") and self._plan_worker_row_duplicates_parent_step(raw, active_step):
                 continue
             incoming_normalized.append(raw)
 
@@ -60867,6 +63587,8 @@ body{padding:18px}
         elif mode == "status_update":
             structural_changes: list[dict] = []
             for row in incoming_worker_rows:
+                if row.get("_plan_parent_update"):
+                    continue
                 _subtask_id, prior = _existing_match(row)
                 if prior is None:
                     if not self._is_plan_step_acceptance_subtask(row.get("content", "")):
@@ -61481,6 +64203,28 @@ body{padding:18px}
                 "then submit the complete revised open snapshot with update_mode='revise_open', revision_reason, and exact revision_evidence references. "
                 "The runtime audits structural changes atomically and preserves completed history. Use update_mode='rework_completed' only with cited failure/reviewer evidence. "
             )
+        existing_todo_decision = (
+            "Before sending any TodoWrite update, use the canonical rows above as the source of truth and decide explicitly: "
+            "reuse/update a row when it is the same objective, add only an independent objective, and remove an obsolete open row only "
+            "through a complete revise_open snapshot with concrete evidence. Never delete or reopen completed rows. "
+            "If the plan-step title itself is inaccurate, include plan_updates with its stable step_id/id/key; one open step edit is direct, "
+            "while edits to multiple steps or structural plan changes require independent semantic/context review. "
+        )
+        canonical_rows = "\n".join(
+            f"- [{str(row.get('status', 'pending')).lower()}] {trim(str(row.get('content', '') or ''), 360)}"
+            for row in rows
+            if isinstance(row, dict) and str(row.get("content", "") or "").strip()
+        ) or "(none)"
+        plan_rows = [
+            row for row in (self._ensure_blackboard().get("project_todos", []) if isinstance(self._ensure_blackboard().get("project_todos"), list) else [])
+            if isinstance(row, dict) and str(row.get("category", "") or "") == "plan_step"
+        ]
+        plan_state = "\n".join(
+            f"- [{str(row.get('status', 'pending')).lower()}] step_id={trim(str(row.get('id', '') or ''), 60)} "
+            f"{trim(str(row.get('content', '') or ''), 360)}"
+            for row in plan_rows
+        ) or "(none)"
+        existing_todo_decision += f"\nCURRENT CANONICAL WORKER TODOs:\n{canonical_rows}\nCURRENT CANONICAL PLAN STEPS:\n{plan_state}\n"
         if for_manager:
             return (
                 f"PLAN/TODO DISCIPLINE: `{PLAN_FILE_RELATIVE_PATH}` is a read-only runtime mirror of the authoritative execution path. "
@@ -61491,6 +64235,7 @@ body{padding:18px}
                 f"{continuity_note}"
                 f"{subtasks_exist_ban}"
                 f"{todo_state}"
+                f"{existing_todo_decision}"
                 f"{acceptance_hint}"
                 "Treat worker subtasks as the live execution state for the current plan step. "
                 "Tell the owner to use status_update for normal progress and revise_open only after collecting concrete revision evidence. "
@@ -61509,6 +64254,7 @@ body{padding:18px}
             f"{continuity_note}"
             f"{subtasks_exist_ban}"
             f"{todo_state}"
+            f"{existing_todo_decision}"
             f"{acceptance_hint}"
             f"{tracking_rule}"
             "Do not call finish_current_task for a subtask or a single plan step; use it only when the overall user task is truly complete."
@@ -62388,7 +65134,12 @@ body{padding:18px}
         owner_key = self._sanitize_agent_role(owner) or self._current_plan_worker_owner()
         work_rows: list[dict] = []
         acceptance_rows: list[dict] = []
-        isolated_rows = self._filter_parent_step_duplicate_worker_rows(rows or [], plan_step)
+        # Rows classified as a parent-step description update have already been
+        # applied to the canonical plan row and must not become a child as well.
+        isolated_rows = self._filter_parent_step_duplicate_worker_rows(
+            [row for row in (rows or []) if isinstance(row, dict) and not row.get("_plan_parent_update")],
+            plan_step,
+        )
         isolated_expected_rows = self._filter_parent_step_duplicate_worker_rows(
             [{"content": str(item or "")} for item in (expected or [])],
             plan_step,
@@ -69744,13 +72495,17 @@ body{padding:18px}
             "list_teammates", "worktree_list", "worktree_status", "worktree_events",
             "query_code_library", "query_knowledge_library", "agent_web_search",
             "list_skills", "list_skill_providers", "list_skill_protocols", "scan_skills", "load_skill", "unload_skill",
+            # Shell remains available for discovery, but each concrete command
+            # is re-checked by _single_no_plan_todo_bash_is_read_only before it
+            # can be dispatched during the bootstrap phase.
+            "bash",
         }
         tools: list[dict] = []
         for spec in self._available_tools():
             fn = spec.get("function", {}) if isinstance(spec, dict) else {}
             name = str(fn.get("name", "") or "").strip()
             canonical = canonicalize_tool_name(name)
-            if canonical == "TodoWrite" or canonical in read_names:
+            if canonical in {"TodoWrite", "TodoWriteRescue"} or canonical in read_names:
                 tools.append(spec)
                 continue
             # Keep this capability check generic for dynamically mounted MCP
@@ -69994,7 +72749,16 @@ body{padding:18px}
                     return True
         return False
 
-    def _single_no_plan_todo_bootstrap_tools(self) -> list[dict]:
+    def _single_no_plan_todo_bootstrap_tools(self, *, include_perception: bool = False) -> list[dict]:
+        """Return the tools available while establishing the first Todo graph.
+
+        The default remains the narrow writer bundle for compatibility callers.
+        The live agent bootstrap also keeps read-only tools visible so the model
+        can decide for itself whether the preceding evidence is sufficient; the
+        runtime blocks only calls classified as side effects.
+        """
+        if include_perception:
+            return self._single_no_plan_todo_perception_tools()
         allowed = {"TodoWrite", "TodoWriteRescue"}
         tools: list[dict] = []
         for spec in self._available_tools():
@@ -70006,6 +72770,67 @@ body{padding:18px}
             if name in allowed:
                 tools.append(spec)
         return tools
+
+    def _deterministic_bootstrap_todo_call(self) -> dict | None:
+        """Build the smallest safe Todo call from the authoritative user goal.
+
+        This is a last-resort protocol bridge, not another planner.  Explicitly
+        numbered user stages are preserved in order; otherwise one goal-bound
+        item is enough.  Returning a normal synthetic tool call lets the main
+        dispatcher perform the same validation, persistence, UI refresh, and
+        later status updates as a model-emitted TodoWrite call.
+        """
+        goal = str(
+            self._authoritative_user_goal_for_model()
+            or self._latest_user_goal_text()
+            or ""
+        ).strip()
+        if not goal or goal.casefold() == "current task":
+            return None
+        normalized = normalize_embedded_newlines(goal)
+        numbered: list[tuple[int, str]] = []
+        stage_pattern = re.compile(
+            r"(?:^|\n|(?<=\s))(\d{1,2})[\.\)、:]\s*"
+            r"(.+?)(?=(?:\n|\s)+(?:\d{1,2})[\.\)、:]\s*|$)",
+            flags=re.DOTALL,
+        )
+        for match in stage_pattern.finditer(normalized):
+            try:
+                order = int(match.group(1))
+            except Exception:
+                continue
+            content = trim(re.sub(r"\s+", " ", str(match.group(2) or "")).strip(" -;；"), 500)
+            if content:
+                numbered.append((order, content))
+        items: list[dict] = []
+        if numbered:
+            # Preserve appearance order rather than sorting: users sometimes
+            # intentionally repeat or restart numbering in nested stages.
+            seen: set[str] = set()
+            for _, content in numbered[:40]:
+                identity = content.casefold()
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                items.append({"content": content, "status": "pending"})
+        if not items:
+            concise_goal = trim(re.sub(r"\s+", " ", normalized).strip(), 500)
+            if not concise_goal:
+                return None
+            items = [{"content": concise_goal, "status": "pending"}]
+        items[0]["status"] = "in_progress"
+        return {
+            "id": make_id("tool"),
+            "type": "function",
+            "function": {
+                "name": "TodoWriteRescue",
+                "arguments": {
+                    "items": items,
+                    "in_progress_index": 0,
+                    "revision_reason": "runtime compatibility fallback after bounded thinking-only recovery",
+                },
+            },
+        }
 
     def _single_no_plan_todo_remove_bootstrap_hints(self) -> None:
         if not isinstance(getattr(self, "messages", None), list):
@@ -70036,10 +72861,11 @@ body{padding:18px}
                 "content": (
                     "<single-no-plan-todo-bootstrap>\n"
                     f"{trim(prompt, 6000)}\n\n"
-                    "This is a planning-only turn after real read-only perception. "
-                    "Use the preceding tool result as evidence. Call exactly one "
-                    "TodoWrite or TodoWriteRescue tool now; do not call implementation "
-                    "tools or finish_task.\n"
+                    "This is the planning phase after read-only perception. Use the "
+                    "preceding evidence and the read-only tools available in this phase "
+                    "to fill any material gaps. Once you have enough evidence, return "
+                    "exactly one TodoWrite or TodoWriteRescue call with 1-40 next actions. "
+                    "Do not call implementation tools or finish_task.\n"
                     "</single-no-plan-todo-bootstrap>"
                 ),
                 "ts": now_ts(),
@@ -70763,6 +73589,7 @@ body{padding:18px}
             else "agent_web_search is disabled by startup/config. Do not request web search; use local files, uploaded documents, RAG/code libraries, or ask the user for source material when current open-web evidence is required. "
         )
         task_memory_note = self._blackboard_memory_context_markdown(for_role=role_key, max_chars=2800)
+        long_content_memory_note = self._long_content_memory_prompt_block(max_chars=3200)
         background_processes_note = self._background_processes_prompt_block()
         base = (
             f"You are {self._agent_display_name(role_key)} in a multi-agent coding system. "
@@ -70778,7 +73605,7 @@ body{padding:18px}
             "Use blackboard for shared state, ask_colleague for inter-agent communication. "
             "Keep outputs concise and action-oriented. "
             f"{self._public_progress_prompt_instruction()}"
-            "When reading files, choose the shape that matches the question: mode='window' for file:line, mode='symbol' for named code, mode='search' for keywords/errors, mode='overview' for structure, and mode='full' only when exact broad context is required. "
+            "When reading files, choose the shape that matches the question: mode='window' for file:line, mode='symbol' for named code, mode='search' for keywords/errors, mode='overview' or mode='structure' for structure and long-content memory, mode='segment' with a segment_id to continue a remembered section, and mode='full' only when exact broad context is required. "
             "When inspecting collections or memory, use focused modes too: tool_memory/context_recall/read_from_blackboard/task_list/check_background/list_background_processes/read_inbox/worktree_events support focused query/status/detail filters where applicable. `check_background` is session-local; `list_background_processes` sees only the authenticated user's processes across sessions, and `stop_background_process` requires an exact visible process_id. Prefer filters over repeatedly listing recent items. "
             "Before repeating the same successful read_file/bash/query over the same target, check the injected tool-memory-registry or call tool_memory with mode='search' or mode='detail'. "
             f"{web_search_instruction}"
@@ -70801,6 +73628,8 @@ body{padding:18px}
             base = base + web_search_context_note + " "
         if task_memory_note:
             base = base + task_memory_note + " "
+        if long_content_memory_note:
+            base = base + long_content_memory_note + " "
         if plan_todo_note:
             base = base + plan_todo_note + " "
         if todo_contract_note:
@@ -71003,7 +73832,7 @@ body{padding:18px}
             "resume", "continue", "resumeexisting", "inprogressindex", "activeindex",
             "currentindex", "nextindex", "updatemode", "mode", "operation", "update",
             "action", "revisionreason", "reason", "changereason", "why",
-            "revisionevidence", "references", "options", "meta", "control",
+            "revisionevidence", "references", "planupdates", "options", "meta", "control",
         }
 
         def _decode_json_container(value: object) -> object:
@@ -71130,6 +73959,7 @@ body{padding:18px}
                 row = _canonicalize_row(item)
                 if default_parent_step_id and not str(row.get("parent_step_id", "") or "").strip():
                     row["parent_step_id"] = default_parent_step_id
+                    row["_parent_step_inferred"] = True
                 raw_content = row.get("content")
                 if isinstance(raw_content, str) and raw_content.strip():
                     parsed_rows = extract_todo_rows_from_text(
@@ -71519,12 +74349,33 @@ body{padding:18px}
             default_parent_step_id=active_step_id,
             limit=40,
         )
+        plan_updates = source.get("plan_updates", source.get("planUpdates", []))
+        plan_update_result = self._apply_plan_step_updates(
+            plan_updates,
+            board=bb,
+            reason=str(source.get("revision_reason", source.get("reason", "")) or ""),
+            evidence=source.get("revision_evidence", source.get("evidence", [])),
+            update_mode=str(source.get("update_mode", source.get("mode", "status_update")) or "status_update"),
+        ) if plan_updates not in (None, "", [], {}) else ""
+        if plan_update_result and "accepted" in plan_update_result.lower():
+            bb = self._ensure_blackboard()
+            active_step = self._get_active_plan_step(bb)
+            active_step_id = trim(str((active_step or {}).get("id", "") or ""), 40)
         is_resume = resume or _to_bool_like(
             source.get("resume", source.get("continue", source.get("resume_existing", False))),
             default=False,
         )
         if not items and is_resume:
             items = self._todo_resume_current_rows(role_key)
+        if not items and plan_update_result:
+            try:
+                self._sync_todos_from_blackboard(
+                    reason="plan-step-update",
+                    board=self._ensure_blackboard(),
+                )
+            except Exception:
+                pass
+            return plan_update_result
         if not items:
             raise ValueError("no valid todo item text; provide items/todos/subtasks/rows or content")
         items = self._apply_todo_payload_in_progress_index(items, source)
@@ -71538,9 +74389,18 @@ body{padding:18px}
                     row["owner"] = role_key
                     if active_step_id and not str(row.get("parent_step_id", "") or "").strip():
                         row["parent_step_id"] = active_step_id
+                        row["_parent_step_inferred"] = True
                 normalized_items.append(row)
             else:
-                normalized_items.append(item)
+                normalized_items.append(
+                    {
+                        "content": item,
+                        "parent_step_id": active_step_id,
+                        "_parent_step_inferred": bool(active_step_id),
+                    }
+                    if active_step_id
+                    else item
+                )
         mode, reason, revision_evidence = self._todo_payload_controls(source, resume=is_resume)
         route_kind = self._todo_route_kind(role=role_key, board=bb)
         if route_kind in {"plan_single", "plan_sync"}:
@@ -71577,6 +74437,8 @@ body{padding:18px}
                 self._refresh_loaded_skills_for_execution_focus(trigger="todo-focus-transition")
         except Exception:
             pass
+        if plan_update_result:
+            return f"{plan_update_result}\n{result}"
         return result
 
     def _initialize_collaboration_plan_from_todos(self, items: list[object]) -> None:
@@ -72143,32 +75005,159 @@ body{padding:18px}
                 )
         except Exception:
             pass
-        return False
+        # Recovery may need archived evidence, but only the generic evidence
+        # gate below can authorize it.  A failure by itself is never sufficient.
+        try:
+            return bool(self._auto_context_recall_for_recovery())
+        except Exception:
+            return False
 
-    def _auto_context_recall_for_recovery(self) -> bool:
+    def _auto_context_recall_for_recovery(self, evidence_gap: str = "") -> bool:
+        """Recall archived evidence for a dynamically established evidence gap.
+
+        The decision is based on active context, focus state and unresolved
+        evidence locators.  It deliberately has no document/code/task keyword
+        table.  A caller may supply a concrete gap, but recovery can also derive
+        one when the failure ledger references evidence no longer present in the
+        active model window.
+        """
         if not self.context_archives:
+            return False
+        gap = self._dynamic_context_evidence_gap(evidence_gap)
+        if not bool(gap.get("needed", False)):
+            return False
+        query = trim(str(gap.get("query", "") or "").strip(), 500)
+        if not query:
             return False
         recent = self.messages[-16:]
         for row in reversed(recent):
-            content = str(row.get("content", "") or "")
-            if "<auto-context-recall>" in content:
+            if (
+                self._runtime_message_control_tag(row) == "auto-context-recall"
+                and str((row.get("ui_data", {}) or {}).get("query", "") or "").strip().lower()
+                == query.lower()
+            ):
                 return False
         try:
-            recalled = self._context_recall({"recent_segments": 1, "max_messages": 24, "mode": "summary"})
+            recalled = self._context_recall(
+                {
+                    "recent_segments": 1,
+                    "max_messages": 12,
+                    "mode": "search",
+                    "query": query,
+                }
+            )
         except Exception:
             return False
         text = str(recalled or "").strip()
         if (not text) or text.startswith("Error:"):
             return False
+        payload = parse_json_object(text, {})
+        matched_rows = int(payload.get("matched_rows", payload.get("total_matches", 0)) or 0) if isinstance(payload, dict) else 0
+        returned = int(payload.get("returned", 0) or 0) if isinstance(payload, dict) else 0
+        if isinstance(payload, dict) and returned <= 0:
+            return False
+        archive_segment = ""
+        if isinstance(payload, dict) and isinstance(payload.get("segments_considered"), list):
+            first_segment = next(
+                (row for row in payload["segments_considered"] if isinstance(row, dict)),
+                {},
+            )
+            archive_segment = trim(str(first_segment.get("id", "") or ""), 240)
         self.messages.append(
-            {
-                "role": "user",
-                "content": f"<auto-context-recall>\n{trim(text, 7000)}\n</auto-context-recall>",
-                "ts": now_ts(),
-            }
+            self._runtime_control_message(
+                f"<auto-context-recall query={json.dumps(query, ensure_ascii=False)}>\n"
+                f"{trim(text, 5000)}\n</auto-context-recall>",
+                control_tag="auto-context-recall",
+                ui_data={
+                    "title": "Context recall",
+                    "query": query,
+                    "reason": trim(str(gap.get("reason", "") or ""), 600),
+                    "matched_rows": matched_rows,
+                    "returned": returned,
+                    "archive_segment": archive_segment,
+                    "default_collapsed": True,
+                },
+            )
         )
-        self._emit("status", {"summary": "auto context_recall injected for recovery"})
+        self._emit(
+            "status",
+            {
+                "summary": (
+                    "focused context_recall injected "
+                    f"({trim(str(gap.get('reason', '') or 'evidence-gap'), 120)})"
+                )
+            },
+        )
         return True
+
+    def _dynamic_context_evidence_gap(self, evidence_gap: str = "") -> dict:
+        """Describe a recall need from generic evidence state, never task type."""
+        if not self.context_archives:
+            return {"needed": False, "query": "", "reason": "no-archive", "confidence": 1.0}
+
+        explicit = trim(str(evidence_gap or "").strip(), 500)
+        if explicit:
+            return {
+                "needed": True,
+                "query": explicit,
+                "reason": "explicit-evidence-gap",
+                "confidence": 1.0,
+            }
+
+        active_text = "\n".join(
+            self._runtime_message_text(row)
+            for row in self.messages[-24:]
+            if isinstance(row, dict) and not self._is_runtime_internal_message(row)
+        ).lower()
+        board = self.blackboard if isinstance(getattr(self, "blackboard", None), dict) else {}
+        ledger = board.get("failure_ledger", {}) if isinstance(board.get("failure_ledger"), dict) else {}
+        candidates: list[tuple[str, str, float]] = []
+
+        for raw in reversed(list(ledger.get("errors", []) or []) + list(ledger.get("compilation_errors", []) or [])):
+            if not isinstance(raw, dict) or int(raw.get("count", 0) or 0) <= 0:
+                continue
+            locator = trim(str(raw.get("file", "") or "").strip(), 500)
+            error_text = trim(str(raw.get("error_msg", raw.get("error", "")) or "").strip(), 500)
+            for value in (locator, error_text):
+                query = self._focused_evidence_locator(value)
+                if query and query.lower() not in active_text:
+                    candidates.append((query, "unresolved-evidence-not-in-active-context", 0.86))
+                    break
+            if candidates:
+                break
+
+        if not candidates:
+            focus = self._blackboard_focus_identity(board) if board else {}
+            focus_id = trim(str(focus.get("id", "") or "").strip(), 500)
+            compacted = any(
+                self._runtime_message_control_tag(row) == "compact-resume"
+                for row in self.messages[-24:]
+                if isinstance(row, dict)
+            )
+            query = self._focused_evidence_locator(focus_id)
+            if compacted and query and query.lower() not in active_text:
+                candidates.append((query, "active-focus-locator-compacted", 0.72))
+
+        if not candidates:
+            return {"needed": False, "query": "", "reason": "active-evidence-sufficient", "confidence": 0.75}
+        query, reason, confidence = candidates[0]
+        return {"needed": True, "query": query, "reason": reason, "confidence": confidence}
+
+    def _focused_evidence_locator(self, value: object) -> str:
+        """Extract a stable search locator from arbitrary state text."""
+        text = " ".join(str(value or "").strip().split())
+        if not text:
+            return ""
+        path_match = re.search(r"(?:[A-Za-z]:)?[^\s:'\"<>|]+[/\\][^\s:'\"<>|]+", text)
+        if path_match:
+            return trim(path_match.group(0).rstrip(".,;)]}"), 240)
+        quoted = re.search(r"['\"]([^'\"]{3,180})['\"]", text)
+        if quoted:
+            return trim(quoted.group(1), 180)
+        identifier = re.search(r"\b[A-Za-z_][A-Za-z0-9_.:-]{3,160}\b", text)
+        if identifier:
+            return trim(identifier.group(0), 160)
+        return trim(text, 120)
 
     def _extract_text_items_from_raw_args(self, raw: object) -> list[str]:
         if isinstance(raw, dict):
@@ -72278,6 +75267,7 @@ body{padding:18px}
         max_messages = self._tool_int_arg(args.get("max_messages", 30), 30, 1, 120)
         offset = self._tool_int_arg(args.get("offset", 0), 0, 0, 100000)
         include_tools = bool(args.get("include_tools", True))
+        include_runtime = bool(args.get("include_runtime", False))
 
         segments: list[dict] = []
         if segment_id:
@@ -72297,6 +75287,11 @@ body{padding:18px}
             rows = self._load_context_archive_messages(seg)
             for idx, row in enumerate(rows):
                 role = str(row.get("role", ""))
+                if not include_runtime and (
+                    self._is_ui_hidden_runtime_message(row)
+                    or (role == "user" and self._is_runtime_control_hint(row.get("content", "")))
+                ):
+                    continue
                 if not include_tools and role == "tool":
                     continue
                 if role_filter and role_filter.lower() not in role.lower():
@@ -72304,7 +75299,7 @@ body{padding:18px}
                 name = str(row.get("name", "") or "")
                 if tool_filter and tool_filter.lower() not in name.lower():
                     continue
-                content = str(row.get("content", ""))
+                content = self._refresh_archived_tool_memory_placeholder(row.get("content", ""))
                 if query_low:
                     pool = f"{role}\n{name}\n{content}".lower()
                     if query_low not in pool:
@@ -73288,6 +76283,21 @@ body{padding:18px}
                 rel = self._session_rel(fp)
             except Exception as exc:
                 return f"Error: {type(exc).__name__}: {exc}"
+            # Read the text source once and hand the same line array to both
+            # rendering and long-content coverage accounting. Previously the
+            # dispatcher reread every successful file after _run_read, which
+            # doubled I/O and decoding cost for book-sized sources.
+            source_lines: list[str] | None = None
+            source_text: str | None = None
+            source_fp: dict | None = None
+            if fp.is_file() and fp.suffix.lower() not in IMAGE_EXTS | AUDIO_EXTS | VIDEO_EXTS:
+                try:
+                    source_text, source_fp = self._read_text_and_fingerprint(fp, rel)
+                    source_lines = source_text.splitlines()
+                except Exception:
+                    source_lines = None
+                    source_text = None
+                    source_fp = None
             out = self._run_read(
                 rel,
                 args.get("limit"),
@@ -73299,6 +76309,8 @@ body{padding:18px}
                 context=args.get("context"),
                 regex=args.get("regex"),
                 max_chars=args.get("max_chars"),
+                segment_id=args.get("segment_id"),
+                _source_lines=source_lines,
             )
             coordinator = getattr(self, "collaboration_write_coordinator", None)
             if coordinator is not None and not str(out).startswith("Error"):
@@ -73310,7 +76322,19 @@ body{padding:18px}
                     self.collaboration_revisions[rel] = int(document.get("revision", 0) or 0)
                 except Exception:
                     pass
-            self._record_read_context(rel, args, out, role=role_key)
+            self._record_read_context(
+                rel,
+                args,
+                out,
+                role=role_key,
+                source_text=source_text,
+                source_fp=source_fp,
+            )
+            try:
+                if source_lines is not None and not str(out).startswith("Error"):
+                    self._mark_long_content_read(rel, fp, source_lines, args, out)
+            except Exception:
+                pass
             limit_val = self._read_file_int_arg(args.get("limit", 0), 0, 0, 1_000_000) if args.get("limit") is not None else 0
             offset_val = self._read_file_int_arg(args.get("offset", 0), 0, 0, 1_000_000) if args.get("offset") is not None else 0
             mode_val = str(args.get("mode", "") or "").strip()
@@ -73411,6 +76435,7 @@ body{padding:18px}
                 out = self._run_write(rel, args["content"])
             if not out.startswith("Error"):
                 self._mark_read_context_stale(rel, reason="write_file changed file after previous read")
+                self._invalidate_long_content_memory_path(rel, reason="write_file changed source")
                 offline_result = (
                     {"summary": ""}
                     if coordinator is not None
@@ -73515,6 +76540,7 @@ body{padding:18px}
                 out = self._run_edit(rel, args["old_text"], args["new_text"])
             if not out.startswith("Error"):
                 self._mark_read_context_stale(rel, reason="edit_file changed file after previous read")
+                self._invalidate_long_content_memory_path(rel, reason="edit_file changed source")
                 offline_result = (
                     {"summary": ""}
                     if coordinator is not None
@@ -74451,6 +77477,11 @@ body{padding:18px}
         text = str(content or "").strip()
         if not text:
             return
+        # Never retain runtime orchestration blocks as user bubbles.  They are
+        # model-facing context and would otherwise be reinserted after compaction
+        # as if the user had sent them.
+        if self._is_runtime_internal_message({"role": "user", "content": text}):
+            return
         try:
             ts_f = float(ts or 0.0)
         except Exception:
@@ -74990,7 +78021,7 @@ body{padding:18px}
                     output = "Error: runtime socket noise filtered"
                 else:
                     output = "(no output)"
-            self._append_agent_context_message(
+            context_tool_row = self._append_agent_context_message(
                 role_key,
                 {
                     "role": "tool",
@@ -75007,6 +78038,10 @@ body{padding:18px}
                 args if isinstance(args, dict) else {},
                 output,
             )
+            context_tool_row["result_ok"] = bool(item.get("ok", False))
+            context_tool_row["result_status"] = "ok" if item.get("ok", False) else "error"
+            if item.get("exit_code") is not None:
+                context_tool_row["exit_code"] = int(item.get("exit_code"))
             self._emit(
                 "tool_result",
                 {
@@ -79545,6 +82580,12 @@ body{padding:18px}
             recovery_retry_rounds = 0
             tool_error_streaks: dict[str, int] = {}
             recovery_progress_fp = self._active_plan_recovery_progress_fingerprint()
+            # Bootstrap reasoning is intentionally not persisted as a public
+            # assistant message.  Keep only a small, in-memory signal so a
+            # provider that returns a thinking-only response can continue from
+            # the prior attempt instead of receiving an identical request ten
+            # times in a row.
+            bootstrap_thinking_signal = ""
             with self.lock:
                 self.current_phase = "run-loop"
                 self.current_tool_name = ""
@@ -79724,7 +82765,7 @@ body{padding:18px}
                         {"summary": "stale single/no-plan Todo bootstrap discarded; normal tools restored"},
                     )
                 model_tools = (
-                    self._single_no_plan_todo_bootstrap_tools()
+                    self._single_no_plan_todo_bootstrap_tools(include_perception=True)
                     if bootstrap_waiting_for_turn
                     else (
                         self._single_no_plan_todo_perception_tools()
@@ -79732,8 +82773,27 @@ body{padding:18px}
                         else self._available_tools()
                     )
                 )
+                model_messages = self.messages
+                if bootstrap_waiting_for_turn and consecutive_empty_action_rounds > 0:
+                    continuation = (
+                        "<single-no-plan-todo-bootstrap-continuation>\n"
+                        f"This is continuation {consecutive_empty_action_rounds + 1} of "
+                        f"{EMPTY_ACTION_BOOTSTRAP_THINKING_GRACE_ROUNDS} before compatibility recovery. "
+                        "The prior response completed internal reasoning but emitted no TodoWrite action. "
+                        "Do not restart perception or describe the analysis; convert the existing reasoning "
+                        "and observed evidence into exactly one TodoWrite or TodoWriteRescue call now."
+                    )
+                    if bootstrap_thinking_signal:
+                        continuation += (
+                            "\nPrior reasoning signal (use silently, do not quote): "
+                            + trim(bootstrap_thinking_signal, 900)
+                        )
+                    continuation += "\n</single-no-plan-todo-bootstrap-continuation>"
+                    model_messages = list(self.messages) + [
+                        {"role": "user", "content": continuation, "ts": now_ts()}
+                    ]
                 response = self._chat_with_same_model_retry(
-                    self.messages,
+                    model_messages,
                     tools=model_tools,
                     system=self._system_prompt(),
                     max_tokens=self.max_output_tokens,
@@ -79763,10 +82823,26 @@ body{padding:18px}
                     raw_bootstrap_calls = tool_calls if isinstance(tool_calls, list) else []
                     valid_bootstrap_calls = []
                     invalid_bootstrap_calls = []
+                    todo_seen = False
                     for call in raw_bootstrap_calls:
                         fn = call.get("function", {}) if isinstance(call, dict) else {}
                         call_name = canonicalize_tool_name(fn.get("name", ""))
                         if call_name in {"TodoWrite", "TodoWriteRescue"}:
+                            if not todo_seen:
+                                valid_bootstrap_calls.append(call)
+                                todo_seen = True
+                            continue
+                        raw_args = fn.get("arguments", {}) if isinstance(fn, dict) else {}
+                        parsed_args = raw_args
+                        if not isinstance(parsed_args, dict):
+                            parsed_args = parse_tool_arguments(raw_args)
+                        if self._single_no_plan_todo_is_perception_result(
+                            {"name": call_name, "args": parsed_args, "ok": True}
+                        ):
+                            # Read-only calls are deliberately allowed during
+                            # the adaptive bootstrap.  This lets the model
+                            # gather missing evidence instead of being trapped
+                            # by a shallow first directory probe.
                             valid_bootstrap_calls.append(call)
                         else:
                             invalid_bootstrap_calls.append(call_name or "unknown-tool")
@@ -79774,9 +82850,7 @@ body{padding:18px}
                         bootstrap_invalid_tool_call = True
                         tool_calls = []
                     else:
-                        # One planning call is enough; duplicate Todo calls in
-                        # the same response only create ambiguous status.
-                        tool_calls = valid_bootstrap_calls[:1]
+                        tool_calls = valid_bootstrap_calls
                     if not tool_calls and not str(text or "").strip() and not str(thinking_text or "").strip():
                         text = "Todo bootstrap turn produced no TodoWrite action."
                 if force_single_tool_rounds > 0 and isinstance(tool_calls, list) and len(tool_calls) > 1:
@@ -79831,57 +82905,199 @@ body{padding:18px}
                     tool_calls=tool_calls,
                     output_tokens=output_tokens,
                 )
-                try:
-                    if self._is_empty_action_turn(text, thinking_text, tool_calls):
-                        raise EmptyActionError("assistant returned empty action after stripping thinking")
-                except EmptyActionError:
-                    if self._single_no_plan_todo_initial_gate_active() and self._start_single_no_plan_todo_bootstrap():
-                        self._emit(
-                            "status",
-                            {"summary": "L2 empty action replaced with mandatory Todo bootstrap"},
-                        )
-                        continue
+                empty_action = self._is_empty_action_turn(text, thinking_text, tool_calls)
+                recovery_applied = False
+                # A writer-only Todo bootstrap is a protocol turn, not an
+                # ordinary reasoning turn.  Let reasoning-capable providers
+                # complete a short grace window first; after that, use the
+                # bounded compatibility recovery instead of letting the
+                # generic 20-response window silently loop (the old path
+                # never reached bootstrap retry accounting because it
+                # continued here first).
+                if empty_action and bootstrap_waiting_for_turn:
                     consecutive_empty_action_rounds += 1
-                    fault_counter += 1
-                    last_fault_reason = "empty-action"
                     no_tool_rounds = 0
                     last_tool_fp = ""
                     repeated_tool_rounds = 0
-                    self._inject_thinking_empty_recovery_hint(
-                        streak=consecutive_empty_action_rounds,
-                        budget_forced=budget_forced,
-                    )
-                    if fault_counter >= 2:
-                        self._inject_fault_prefill_hint(
-                            reason=(
-                                "thinking-only output without actionable content"
-                                if not budget_forced
-                                else "thinking-only output near token budget"
-                            ),
-                            fault_counter=fault_counter,
-                        )
-                    if (
-                        consecutive_empty_action_rounds <= int(EMPTY_ACTION_WAKEUP_RETRY_LIMIT)
-                        and fault_counter < int(FUSED_FAULT_BREAK_THRESHOLD)
-                        and auto_continue_budget > 0
-                    ):
-                        auto_continue_budget -= 1
+                    if consecutive_empty_action_rounds <= int(EMPTY_ACTION_BOOTSTRAP_THINKING_GRACE_ROUNDS):
+                        bootstrap_thinking_signal = trim(thinking_text, 900)
                         self._emit(
                             "status",
                             {
                                 "summary": (
-                                    "empty-action wake-up retry scheduled "
-                                    f"(streak={consecutive_empty_action_rounds}, "
-                                    f"fault_counter={fault_counter}, remaining={auto_continue_budget})"
+                                    "Todo bootstrap thinking retained; waiting for model action "
+                                    f"(streak={consecutive_empty_action_rounds}/"
+                                    f"{EMPTY_ACTION_BOOTSTRAP_THINKING_GRACE_ROUNDS})"
                                 )
                             },
                         )
                         continue
-                    stop_note = (
-                        "模型连续多轮仅输出思考而无动作，自动执行已熔断停止（fault_counter>=15）。"
-                        "请尝试拆分任务，或切换更强的推理模型后继续。"
+                    bootstrap_recovery = self._recover_thinking_only_response(
+                        response,
+                        bootstrap=True,
+                        tools=model_tools,
+                        pinned_selection=pinned_selection,
                     )
-                    raise CircuitBreakerTriggered(stop_note)
+                    if bool(bootstrap_recovery.get("ok", False)):
+                        text, thinking_text, tool_calls = self._response_action_parts(
+                            bootstrap_recovery.get("response", {})
+                        )
+                        bootstrap_thinking_signal = ""
+                        recovery_applied = True
+                        empty_action = False
+                        self._emit(
+                            "status",
+                            {
+                                "summary": (
+                                    "Todo bootstrap recovered after thinking-only response "
+                                    f"(stage={bootstrap_recovery.get('stage', 'unknown')})"
+                                )
+                            },
+                        )
+                    else:
+                        deterministic = self._deterministic_bootstrap_todo_call()
+                        if deterministic:
+                            text = ""
+                            thinking_text = ""
+                            tool_calls = [deterministic]
+                            bootstrap_thinking_signal = ""
+                            recovery_applied = True
+                            empty_action = False
+                            self._emit(
+                                "status",
+                                {"summary": "Todo bootstrap created from authoritative user goal after thinking-only response"},
+                            )
+                        else:
+                            bootstrap_failure_state = self._single_no_plan_todo_bootstrap_failure(
+                                "model returned thinking without TodoWrite/TodoWriteRescue"
+                            )
+                            if bootstrap_failure_state == "blocked":
+                                self._emit(
+                                    "status",
+                                    {"summary": "run paused: mandatory L2 Todo list could not be established"},
+                                )
+                                break
+                            continue
+                if empty_action:
+                    consecutive_empty_action_rounds += 1
+                    no_tool_rounds = 0
+                    last_tool_fp = ""
+                    repeated_tool_rounds = 0
+                    # If the mandatory L2 perception gate has not yet opened
+                    # its writer-only turn, transition to that bootstrap now.
+                    # This is a state change, not an empty-action retry, and
+                    # prevents the 20-turn compatibility window from delaying
+                    # Todo initialization after a read-only probe.
+                    if (
+                        self._single_no_plan_todo_initial_gate_active()
+                        and self._start_single_no_plan_todo_bootstrap()
+                    ):
+                        self._emit(
+                            "status",
+                            {"summary": "L2 empty action replaced with mandatory Todo bootstrap"},
+                        )
+                        consecutive_empty_action_rounds = 0
+                        continue
+                    # Thinking-only is a valid intermediate response for many
+                    # providers.  Do not poison the fused fault counter or
+                    # inject repetitive user-visible hints while the model is
+                    # still within the generous 20-turn compatibility window.
+                    if consecutive_empty_action_rounds < int(EMPTY_ACTION_INTERVENTION_THRESHOLD):
+                        # This counter is intentionally independent from the
+                        # broader auto-continue budget: unrelated recoveries in
+                        # the same run must not make the 20-response contract
+                        # fire early.
+                        if auto_continue_budget > 0:
+                            auto_continue_budget -= 1
+                        if consecutive_empty_action_rounds in {1, 5, 10, 15, 19}:
+                            self._emit(
+                                "status",
+                                {
+                                    "summary": (
+                                        "thinking-only response retained; waiting for an actionable turn "
+                                        f"(streak={consecutive_empty_action_rounds}/"
+                                        f"{EMPTY_ACTION_INTERVENTION_THRESHOLD})"
+                                    )
+                                },
+                            )
+                        continue
+
+                    # At the intervention threshold run a bounded, provider-
+                    # aware ladder.  The ladder itself owns all retries and
+                    # never feeds another generic fault-prefill loop.
+                    last_fault_reason = "thinking-only output after bounded compatibility window"
+                    recovery = self._recover_thinking_only_response(
+                        response,
+                        bootstrap=bool(bootstrap_waiting_for_turn),
+                        tools=model_tools,
+                        pinned_selection=pinned_selection,
+                    )
+                    if bool(recovery.get("ok", False)):
+                        text, thinking_text, tool_calls = self._response_action_parts(
+                            recovery.get("response", {})
+                        )
+                        recovery_applied = True
+                        self._emit(
+                            "status",
+                            {
+                                "summary": (
+                                    "thinking-only compatibility recovery succeeded "
+                                    f"(stage={recovery.get('stage', 'unknown')})"
+                                )
+                            },
+                        )
+                    elif bootstrap_waiting_for_turn:
+                        # Last resort for the mandatory L2 gate: synthesize a
+                        # goal-bound Todo call and send it through the regular
+                        # dispatcher so persistence/UI/plan refresh semantics
+                        # are identical to a model-emitted TodoWrite call.
+                        deterministic = self._deterministic_bootstrap_todo_call()
+                        if deterministic:
+                            text = ""
+                            thinking_text = ""
+                            tool_calls = [deterministic]
+                            recovery_applied = True
+                            self._emit(
+                                "status",
+                                {
+                                    "summary": (
+                                        "thinking-only recovery exhausted; deterministic Todo created "
+                                        "from authoritative user goal"
+                                    )
+                                },
+                            )
+                        else:
+                            bootstrap_failure_state = self._single_no_plan_todo_bootstrap_failure(
+                                "model compatibility recovery exhausted and no authoritative goal was available"
+                            )
+                            if bootstrap_failure_state == "blocked":
+                                self._emit(
+                                    "status",
+                                    {"summary": "run paused: mandatory L2 Todo list could not be established"},
+                                )
+                                break
+                            continue
+                    else:
+                        self._emit(
+                            "status",
+                            {
+                                "summary": (
+                                    "thinking-only compatibility recovery exhausted; "
+                                    "pausing instead of repeating fault-prefill"
+                                )
+                            },
+                        )
+                        raise CircuitBreakerTriggered(
+                            "模型连续 20 次仅输出思考且未产生可执行动作。"
+                            "已完成一次兼容性恢复（短重试、关闭 thinking、工具调用修复），"
+                            "仍未得到有效输出；请切换模型或继续发送明确指令。"
+                        )
+                if recovery_applied:
+                    # A recovered response is processed by the normal
+                    # assistant/tool path below.  Reset the fused counters now;
+                    # the recovered tool/content is an actionable turn.
+                    fault_counter = 0
+                    last_fault_reason = ""
                 consecutive_empty_action_rounds = 0
                 if tool_calls and not text.strip():
                     text = self._public_tool_progress_summary(tool_calls, role=single_role)
@@ -79937,7 +83153,9 @@ body{padding:18px}
                         pass
                     continue
                 if not tool_calls:
-                    if self._single_no_plan_todo_initial_gate_active():
+                    if (
+                        self._single_no_plan_todo_initial_gate_active()
+                    ):
                         # A level-2 run may not silently finish an orientation
                         # turn without establishing its mandatory Todo graph.
                         # Start the bounded writer-only turn now; it is still
@@ -80377,7 +83595,6 @@ body{padding:18px}
                         self._ensure_failure_recovery_todos(
                             f"no-tool streak {no_tool_rounds}: {', '.join(diagnosis.get('causes', []) or [])}"
                         )
-                        self._auto_context_recall_for_recovery()
                         if fault_counter >= 2:
                             self._inject_fault_prefill_hint(
                                 reason=f"no-tool idle streak={no_tool_rounds}",
@@ -80843,13 +84060,18 @@ body{padding:18px}
                         stop_due_to_ask_user_single = True
                     if dispatched_name in {"finish_task", "finish_current_task", "mark_done"} and result_item["ok"]:
                         stop_due_to_finish_task = True
-                    self.messages.append({
+                    tool_message = {
                         "role": "tool",
                         "tool_call_id": tc["id"],
                         "name": name,
                         "content": self._tool_result_context_content(name, args if isinstance(args, dict) else {}, output),
                         "ts": now_ts(),
-                    })
+                        "result_ok": bool(result_item.get("ok", False)),
+                        "result_status": "ok" if result_item.get("ok", False) else "error",
+                    }
+                    if result_item.get("exit_code") is not None:
+                        tool_message["exit_code"] = int(result_item.get("exit_code"))
+                    self.messages.append(tool_message)
                     single_round_tool_results.append(result_item)
                     is_finish_tool = (dispatched_name or name) in {"finish_task", "finish_current_task", "mark_done"}
                     # Update blackboard signals (step_files, execution_logs) for plan+single mode.
@@ -80949,6 +84171,17 @@ body{padding:18px}
                 if bootstrap_waiting_for_turn:
                     if bootstrap_todo_success:
                         self._single_no_plan_todo_bootstrap_succeeded()
+                    elif single_round_has_perception and not single_round_has_mutation:
+                        # The adaptive bootstrap may legitimately contain one
+                        # or more read-only calls before the writer call. Keep
+                        # the gate active and let the model choose the next
+                        # observation or emit TodoWrite on the following turn.
+                        consecutive_empty_action_rounds = 0
+                        bootstrap_thinking_signal = ""
+                        self._emit(
+                            "status",
+                            {"summary": "Todo bootstrap perception continued; awaiting model TodoWrite action"},
+                        )
                     else:
                         bootstrap_failure_state = self._single_no_plan_todo_bootstrap_failure(
                             bootstrap_todo_failure_reason
@@ -81163,7 +84396,6 @@ body{padding:18px}
                     self._ensure_failure_recovery_todos(
                         f"all tool calls failed in round ({', '.join(round_tool_names[:4])})"
                     )
-                    self._auto_context_recall_for_recovery()
                     if fault_counter >= 2:
                         self._inject_fault_prefill_hint(
                             reason=f"all tool calls failed: {', '.join(round_tool_names[:3])}",
@@ -81172,9 +84404,8 @@ body{padding:18px}
                     if not retry_requested_this_round:
                         self._prune_runtime_retry_hints()
                         self.messages.append(
-                            {
-                                "role": "user",
-                                "content": (
+                            self._runtime_control_message(
+                                (
                                     "<failure-recovery>"
                                     "All tool calls in the last round failed. "
                                     "Switch to strict step mode now: "
@@ -81184,8 +84415,8 @@ body{padding:18px}
                                     "4) if still failing, report blocker with exact error and stop."
                                     "</failure-recovery>"
                                 ),
-                                "ts": now_ts(),
-                            }
+                                control_tag="failure-recovery",
+                            )
                         )
                         # Auto-load debugging skill on code/compilation/test failures
                         _code_error_keywords = ("bash", "compile", "syntax", "test", "build", "traceback")
@@ -81405,15 +84636,14 @@ body{padding:18px}
                 if retry_requested_this_round and round_error_count > 0 and round_ok_count == 0:
                     self._prune_runtime_retry_hints()
                     self.messages.append(
-                        {
-                            "role": "user",
-                            "content": (
+                        self._runtime_control_message(
+                            (
                                 "<auto-continue>"
                                 "The last tool round failed completely. Retry one corrected tool call now."
                                 "</auto-continue>"
                             ),
-                            "ts": now_ts(),
-                        }
+                            control_tag="auto-continue",
+                        )
                     )
                 if stop_due_to_hard_break:
                     note = (
@@ -81677,6 +84907,8 @@ body{padding:18px}
             for msg in self.messages:
                 if str((msg or {}).get("role", "")).strip() == "tool":
                     continue
+                if self._is_ui_hidden_runtime_message(msg):
+                    continue
                 total_message_count += 1
             scheduler_feed_rows: list[dict] = []
             for row in self.scheduler_visible_inputs[-SESSION_DEFERRED_START_QUEUE_MAX:]:
@@ -81706,10 +84938,15 @@ body{padding:18px}
             inferred_bus_target_role = ""
             message_start = max(0, len(self.messages) - msg_window)
             for msg_index, msg in enumerate(self.messages[message_start:], start=message_start):
+                if self._is_ui_hidden_runtime_message(msg):
+                    continue
+                runtime_projection = self._runtime_message_ui_projection(msg)
+                if self._is_runtime_internal_message(msg):
+                    if runtime_projection is None:
+                        continue
+                    msg = runtime_projection
                 role = msg.get("role")
                 if role == "tool":
-                    continue
-                if isinstance(msg, dict) and bool(msg.get("_ui_hidden", False)):
                     continue
                 role_key = str(role or "").strip().lower()
                 msg_type = trim(str(msg.get("type", "message") or "").strip(), 40) if isinstance(msg, dict) else "message"
@@ -81808,6 +85045,8 @@ body{padding:18px}
                     "ts": ts,
                     "type": msg_type,
                 }
+                if isinstance(msg, dict) and int(msg.get("seq", 0) or 0) > 0:
+                    row["seq"] = int(msg.get("seq", 0) or 0)
                 if isinstance(msg, dict) and isinstance(msg.get("data"), dict):
                     public_data = dict(msg.get("data") or {})
                     if (
@@ -81889,6 +85128,20 @@ body{padding:18px}
                             "retained": True,
                         }
                     )
+            def operation_feed_id(op: dict) -> str:
+                raw_id = str(op.get("id", "") or "").strip()
+                if raw_id:
+                    return raw_id
+                seq = int(op.get("seq", 0) or 0)
+                if seq > 0:
+                    return f"operation:{seq}"
+                digest = hashlib.sha256(
+                    f"{op.get('ts', 0)}|{op.get('type', '')}|{json_dumps(op.get('data', {}))}".encode(
+                        "utf-8", errors="ignore"
+                    )
+                ).hexdigest()[:16]
+                return f"operation:{digest}"
+
             for op in self.operations[-op_feed_window:]:
                 t = op.get("type")
                 if t == "command":
@@ -81908,7 +85161,15 @@ body{padding:18px}
                         f"{out_text}"
                     )
                     conversation_feed.append(
-                        {"role": "system", "type": "command", "ts": op.get("ts", 0), "text": text, "data": d_view}
+                        {
+                            "id": operation_feed_id(op),
+                            "seq": int(op.get("seq", 0) or 0),
+                            "role": "system",
+                            "type": "command",
+                            "ts": op.get("ts", 0),
+                            "text": text,
+                            "data": d_view,
+                        }
                     )
                 elif t == "file_patch":
                     d = op.get("data", {})
@@ -81928,7 +85189,15 @@ body{padding:18px}
                         f"{patch_text}"
                     )
                     conversation_feed.append(
-                        {"role": "system", "type": "file_patch", "ts": op.get("ts", 0), "text": text, "data": d_view}
+                        {
+                            "id": operation_feed_id(op),
+                            "seq": int(op.get("seq", 0) or 0),
+                            "role": "system",
+                            "type": "file_patch",
+                            "ts": op.get("ts", 0),
+                            "text": text,
+                            "data": d_view,
+                        }
                     )
                 elif t == "upload":
                     d = op.get("data", {})
@@ -81945,7 +85214,15 @@ body{padding:18px}
                         f"{preview}"
                     )
                     conversation_feed.append(
-                        {"role": "system", "type": "upload", "ts": op.get("ts", 0), "text": text, "data": d_view}
+                        {
+                            "id": operation_feed_id(op),
+                            "seq": int(op.get("seq", 0) or 0),
+                            "role": "system",
+                            "type": "upload",
+                            "ts": op.get("ts", 0),
+                            "text": text,
+                            "data": d_view,
+                        }
                     )
                 elif t == "web_search":
                     d = op.get("data", {})
@@ -81970,6 +85247,8 @@ body{padding:18px}
                         f"{d.get('summary', '')}"
                     )
                     row = {
+                        "id": operation_feed_id(op),
+                        "seq": int(op.get("seq", 0) or 0),
                         "role": "system",
                         "type": "web_search",
                         "ts": op.get("ts", 0),
@@ -81999,13 +85278,41 @@ body{padding:18px}
                         f"{str(d.get('summary', '') or '').strip()}\n"
                         f"{result}"
                     ).strip()
-                    row = {"role": "system", "type": t, "ts": op.get("ts", 0), "text": text, "data": d_view}
+                    row = {
+                        "id": operation_feed_id(op),
+                        "seq": int(op.get("seq", 0) or 0),
+                        "role": "system",
+                        "type": t,
+                        "ts": op.get("ts", 0),
+                        "text": text,
+                        "data": d_view,
+                    }
                     agent_role = self._sanitize_agent_bubble_role(d.get("agent_role", ""))
                     if agent_role:
                         row["agent_role"] = agent_role
                     conversation_feed.append(row)
             conversation_feed.extend(scheduler_feed_rows)
             conversation_feed.sort(key=lambda x: float(x.get("ts", 0.0)))
+            # Reconciliation is ID based.  A single event can be present in both
+            # a persisted message window and an operation projection; keep the
+            # first stable occurrence so refreshes cannot append it twice.
+            deduped_feed: list[dict] = []
+            seen_feed_ids: set[str] = set()
+            for row in conversation_feed:
+                if not isinstance(row, dict):
+                    continue
+                identity = str(row.get("id", "") or "").strip()
+                if not identity:
+                    identity = hashlib.sha256(
+                        f"{row.get('ts', 0)}|{row.get('role', '')}|{row.get('type', '')}|{row.get('text', '')}".encode(
+                            "utf-8", errors="ignore"
+                        )
+                    ).hexdigest()[:20]
+                if identity in seen_feed_ids:
+                    continue
+                seen_feed_ids.add(identity)
+                deduped_feed.append(row)
+            conversation_feed = deduped_feed
             upload_view = []
             for item in self.uploads[-upload_window:]:
                 upload_view.append(
@@ -82166,6 +85473,7 @@ body{padding:18px}
                 "context_last_compact_effective": bool(getattr(self, "context_last_compact_effective", True)),
                 "context_last_compact_used_reduction": int(getattr(self, "context_last_compact_used_reduction", 0) or 0),
                 "context_last_compact_skip_reason": str(getattr(self, "context_last_compact_skip_reason", "") or ""),
+                "context_compaction_metrics": dict(getattr(self, "context_compaction_metrics", {}) or {}),
                 "context_estimator": str(ctx.get("estimator", "")),
                 "context_estimate_safety_multiplier": float(ctx.get("safety_multiplier", CONTEXT_ESTIMATE_SAFETY_MULTIPLIER)),
                 "context_estimate_base_safety_multiplier": float(ctx.get("base_safety_multiplier", CONTEXT_ESTIMATE_SAFETY_MULTIPLIER)),
@@ -84486,6 +87794,9 @@ body[data-ui-style="trad"] .msg-event-cell{background:#fff}
 .msg-event-card-web{background:linear-gradient(180deg,#fbfffe 0%,#ebf8f5 100%);border-color:#bfe5dd}
 .msg-event-card-adjustment{background:linear-gradient(180deg,#fffefd 0%,#fff3e7 100%);border-color:#ffd1a5}
 .msg-event-card-feedback{background:linear-gradient(180deg,#fffaff 0%,#f5edff 100%);border-color:#dec7ff}
+.msg-event-card-runtime{background:var(--panel,#fff);border-color:#d8e1ec;box-shadow:none}
+.msg-event-card-runtime.warning{border-left:3px solid #d69a31}.msg-event-card-runtime.notice{border-left:3px solid #4f9b75}.msg-event-card-runtime.instruction{border-left:3px solid #8067bf}
+.msg-runtime-details{margin-top:7px;border-top:1px solid rgba(100,116,139,.18);padding-top:6px}.msg-runtime-details summary{cursor:pointer;color:#627790;font-size:.74rem;font-weight:700;user-select:none}.msg-runtime-details pre{max-height:320px;margin:7px 0 0;padding:8px;overflow:auto;border-radius:7px;background:rgba(15,23,42,.045);color:#40536b;font:11px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;overflow-wrap:anywhere}
 .plan-proposal-card{position:relative;border:1px solid #d8c3f4;border-radius:16px;background:linear-gradient(145deg,#fff 0%,#fff8f5 42%,#f6f1ff 100%);box-shadow:0 14px 34px rgba(73,42,116,.12);padding:14px;overflow:hidden}
 .plan-proposal-card::before{content:"";position:absolute;inset:0 0 auto;height:4px;background:linear-gradient(90deg,#f27b65,#b76de1,#4f87e8)}
 .plan-proposal-hero{display:flex;align-items:center;gap:10px;margin:2px 0 10px}
@@ -85062,7 +88373,7 @@ Object.assign(I18N['en'],{
   event_truncation_recovery:'Truncation Recovery',event_truncation_state:'Structured truncation recovery state',event_truncation_note:'Model output hit a truncation boundary and entered recovery mode.',
       event_live_model_call_title:'Agent Turn Model Call',event_live_model_call_note:'The active agent is in a model call. This timer updates live while generation is in progress.',
       event_scheduler_queued_title:'Queued Task',event_scheduler_queued_note:'This message is saved and waiting for an execution slot.',event_scheduler_queue_position:'queue position',event_scheduler_reason:'reason',event_scheduler_queued_hint:'queued',
-  event_auto_continue:'Auto Continue',event_arbiter_continue:'Arbiter Continue',event_continuation_briefing:'Continuation Briefing',event_reminder:'Reminder',event_todo_rescue:'Todo Rescue',event_tool_retry:'Tool Retry',event_segmented_retry:'Segmented Retry',event_forced_converge:'Forced Converge',event_no_tool_recovery:'No-Tool Recovery',event_context_recall:'Context Recall',event_failure_recovery:'Failure Recovery',event_truncate_rescue:'Truncation Rescue',event_thinking_recovery:'Thinking Recovery',event_fault_prefill:'Fault Prefill',event_edit_recovery:'Edit Recovery',event_todo_bootstrap_title:'Todo Initialization',event_todo_bootstrap_retry_title:'Todo Initialization Retry',event_todo_bootstrap_subtitle:'Planning state after read-only perception',event_todo_bootstrap_note:'The next Todo list is being shaped from observed evidence before execution resumes.',event_todo_bootstrap_retry_note:'The Todo writer did not complete; the bounded retry is being requested.',event_todo_bootstrap_perception:'perception complete',event_todo_bootstrap_item_count:'1-40 items · stage-aligned',event_todo_bootstrap_one_active:'exactly 1 active',event_reason:'reason',
+  event_auto_continue:'Auto Continue',event_arbiter_continue:'Arbiter Continue',event_continuation_briefing:'Continuation Briefing',event_reminder:'Reminder',event_todo_rescue:'Todo Rescue',event_tool_retry:'Tool Retry',event_segmented_retry:'Segmented Retry',event_forced_converge:'Forced Converge',event_no_tool_recovery:'No-Tool Recovery',event_context_recall:'Context Recall',event_failure_recovery:'Failure Recovery',event_truncate_rescue:'Truncation Rescue',event_thinking_recovery:'Thinking Recovery',event_fault_prefill:'Fault Prefill',event_edit_recovery:'Edit Recovery',event_todo_bootstrap_title:'Todo Initialization',event_todo_bootstrap_retry_title:'Todo Initialization Retry',event_todo_bootstrap_subtitle:'Planning state after read-only perception',event_todo_bootstrap_note:'The next Todo list is being shaped from observed evidence before execution resumes.',event_todo_bootstrap_retry_note:'The Todo writer did not complete; the bounded retry is being requested.',event_todo_bootstrap_perception:'perception complete',event_todo_bootstrap_item_count:'1-40 items · stage-aligned',event_todo_bootstrap_one_active:'exactly 1 active',event_reason:'reason',event_query:'query',event_archive:'archive',event_details:'Details',event_matches:'matches',event_returned:'returned',
   state_on:'on',state_off:'off',
   rt_session:'session',rt_model:'model',rt_thinking:'thinking',rt_thinking_stream:'thinking_stream',rt_response_stream:'response_stream',rt_mode:'mode',rt_active_agent:'active_agent',rt_blackboard:'bb',rt_task:'task',rt_complexity:'complexity',rt_judgement:'judgement',rt_budget:'budget',rt_remaining:'remaining',rt_blackboard_cycles:'bb_cycles',rt_round_limit:'round_limit',rt_round:'round',rt_phase:'phase',rt_queued_inputs:'queued_inputs',rt_run_timeout:'run_timeout',rt_ctx_used:'ctx_used',rt_ctx_limit:'ctx_limit',rt_ctx_mode:'ctx_mode',rt_manual_lock:'manual-lock',rt_adaptive:'adaptive',rt_ctx_left:'ctx_left',rt_ctx_left_for:'{label} left',rt_ctx_live_title:'Remaining context budget by active call',rt_truncation:'truncation',rt_trunc_retry:'trunc_retry',rt_trunc_tokens:'trunc_tokens~',rt_archive:'archive',rt_last_compact:'last_compact',compact_ago:'ago',compact_just_now:'just now',rt_ollama:'ollama',rt_files:'files',rt_ui_mode:'ui_mode',rt_state:'state',rt_awaiting_user:'awaiting user',ask_user_title:'Agent needs your input',ask_user_free_hint:'Pick an option above, or type your answer below and send.',ask_user_pick_hint:'Pick one of the options above to continue.',
   preview_download:'Download',preview_source:'Source',preview_rendered:'Preview',preview_copy_link:'Copy Link',preview_open:'Open in Browser',preview_link_copied:'Link Copied',
@@ -85091,7 +88402,7 @@ Object.assign(I18N['zh-CN'],{
   event_truncation_recovery:'截断恢复',event_truncation_state:'结构化截断恢复状态',event_truncation_note:'模型输出触发了截断边界，已进入恢复流程。',
       event_live_model_call_title:'Agent 轮次模型调用',event_live_model_call_note:'当前活跃 agent 正在进行模型调用。计时器会在生成期间实时更新。',
       event_scheduler_queued_title:'任务已排队',event_scheduler_queued_note:'这条消息已保存，正在等待后台执行名额。',event_scheduler_queue_position:'队列位置',event_scheduler_reason:'原因',event_scheduler_queued_hint:'已排队',
-  event_auto_continue:'自动继续',event_arbiter_continue:'裁决继续',event_continuation_briefing:'续跑简报',event_reminder:'提醒',event_todo_rescue:'待办救援',event_tool_retry:'工具重试',event_segmented_retry:'分段重试',event_forced_converge:'强制收敛',event_no_tool_recovery:'无工具恢复',event_context_recall:'上下文召回',event_failure_recovery:'故障恢复',event_truncate_rescue:'截断救援',event_thinking_recovery:'思考恢复',event_fault_prefill:'故障预填',event_edit_recovery:'编辑恢复',event_todo_bootstrap_title:'Todo 初始化',event_todo_bootstrap_retry_title:'Todo 初始化重试',event_todo_bootstrap_subtitle:'只读感知后的规划状态',event_todo_bootstrap_note:'系统正在根据已观察证据整理下一组 Todo，然后继续执行。',event_todo_bootstrap_retry_note:'Todo 写入未完成，系统正在进行有限次数的重试。',event_todo_bootstrap_perception:'感知已完成',event_todo_bootstrap_item_count:'1-40 项 · 对齐阶段',event_todo_bootstrap_one_active:'恰好 1 项进行中',event_reason:'原因',
+  event_auto_continue:'自动继续',event_arbiter_continue:'裁决继续',event_continuation_briefing:'续跑简报',event_reminder:'提醒',event_todo_rescue:'待办救援',event_tool_retry:'工具重试',event_segmented_retry:'分段重试',event_forced_converge:'强制收敛',event_no_tool_recovery:'无工具恢复',event_context_recall:'上下文召回',event_failure_recovery:'故障恢复',event_truncate_rescue:'截断救援',event_thinking_recovery:'思考恢复',event_fault_prefill:'故障预填',event_edit_recovery:'编辑恢复',event_todo_bootstrap_title:'Todo 初始化',event_todo_bootstrap_retry_title:'Todo 初始化重试',event_todo_bootstrap_subtitle:'只读感知后的规划状态',event_todo_bootstrap_note:'系统正在根据已观察证据整理下一组 Todo，然后继续执行。',event_todo_bootstrap_retry_note:'Todo 写入未完成，系统正在进行有限次数的重试。',event_todo_bootstrap_perception:'感知已完成',event_todo_bootstrap_item_count:'1-40 项 · 对齐阶段',event_todo_bootstrap_one_active:'恰好 1 项进行中',event_reason:'原因',event_query:'查询',event_archive:'归档',event_details:'详细内容',event_matches:'条匹配',event_returned:'条召回',
   state_on:'开',state_off:'关',
   rt_session:'会话',rt_model:'模型',rt_thinking:'思考',rt_thinking_stream:'思考流',rt_response_stream:'正文流',rt_mode:'模式',rt_active_agent:'活跃代理',rt_blackboard:'黑板',rt_task:'任务',rt_complexity:'复杂度',rt_judgement:'裁决',rt_budget:'预算',rt_remaining:'剩余',rt_blackboard_cycles:'黑板轮次',rt_round_limit:'轮次上限',rt_round:'轮次',rt_phase:'阶段',rt_queued_inputs:'排队输入',rt_run_timeout:'运行超时',rt_ctx_used:'上下文已用',rt_ctx_limit:'上下文上限',rt_ctx_mode:'上下文模式',rt_manual_lock:'手动锁定',rt_adaptive:'自适应',rt_ctx_left:'上下文剩余',rt_ctx_left_for:'{label}剩余',rt_ctx_live_title:'按真实调用显示上下文剩余',rt_truncation:'截断数',rt_trunc_retry:'截断重试',rt_trunc_tokens:'截断Token~',rt_archive:'归档',rt_last_compact:'最近压缩',compact_ago:'前',compact_just_now:'刚刚',rt_ollama:'Ollama',rt_files:'文件根目录',rt_ui_mode:'界面模式',rt_state:'状态',rt_awaiting_user:'等待用户',ask_user_title:'需要你的输入',ask_user_free_hint:'点击上方选项,或在下方输入答复后发送。',ask_user_pick_hint:'请选择上方其中一个选项以继续。',
   preview_download:'下载',preview_source:'源码',preview_rendered:'预览',preview_copy_link:'复制链接',preview_open:'浏览器打开',preview_link_copied:'已复制链接',
@@ -85123,7 +88434,7 @@ Object.assign(I18N['zh-TW'],{
   event_truncation_recovery:'截斷恢復',event_truncation_state:'結構化截斷恢復狀態',event_truncation_note:'模型輸出觸發截斷邊界，已進入恢復流程。',
       event_live_model_call_title:'Agent 輪次模型呼叫',event_live_model_call_note:'目前活躍 agent 正在進行模型呼叫。計時器會在生成期間即時更新。',
       event_scheduler_queued_title:'任務已排隊',event_scheduler_queued_note:'這則訊息已保存，正在等待背景執行名額。',event_scheduler_queue_position:'佇列位置',event_scheduler_reason:'原因',event_scheduler_queued_hint:'已排隊',
-  event_auto_continue:'自動繼續',event_arbiter_continue:'裁決繼續',event_continuation_briefing:'續跑簡報',event_reminder:'提醒',event_todo_rescue:'待辦救援',event_tool_retry:'工具重試',event_segmented_retry:'分段重試',event_forced_converge:'強制收斂',event_no_tool_recovery:'無工具恢復',event_context_recall:'上下文召回',event_failure_recovery:'故障恢復',event_truncate_rescue:'截斷救援',event_thinking_recovery:'思考恢復',event_fault_prefill:'故障預填',event_edit_recovery:'編輯恢復',event_todo_bootstrap_title:'Todo 初始化',event_todo_bootstrap_retry_title:'Todo 初始化重試',event_todo_bootstrap_subtitle:'唯讀感知後的規劃狀態',event_todo_bootstrap_note:'系統會根據已觀察證據整理下一組 Todo，再繼續執行。',event_todo_bootstrap_retry_note:'Todo 寫入未完成，系統正在進行有限次重試。',event_todo_bootstrap_perception:'感知已完成',event_todo_bootstrap_item_count:'1-40 項 · 對齊階段',event_todo_bootstrap_one_active:'恰好 1 項進行中',event_reason:'原因',
+  event_auto_continue:'自動繼續',event_arbiter_continue:'裁決繼續',event_continuation_briefing:'續跑簡報',event_reminder:'提醒',event_todo_rescue:'待辦救援',event_tool_retry:'工具重試',event_segmented_retry:'分段重試',event_forced_converge:'強制收斂',event_no_tool_recovery:'無工具恢復',event_context_recall:'上下文召回',event_failure_recovery:'故障恢復',event_truncate_rescue:'截斷救援',event_thinking_recovery:'思考恢復',event_fault_prefill:'故障預填',event_edit_recovery:'編輯恢復',event_todo_bootstrap_title:'Todo 初始化',event_todo_bootstrap_retry_title:'Todo 初始化重試',event_todo_bootstrap_subtitle:'唯讀感知後的規劃狀態',event_todo_bootstrap_note:'系統會根據已觀察證據整理下一組 Todo，再繼續執行。',event_todo_bootstrap_retry_note:'Todo 寫入未完成，系統正在進行有限次重試。',event_todo_bootstrap_perception:'感知已完成',event_todo_bootstrap_item_count:'1-40 項 · 對齊階段',event_todo_bootstrap_one_active:'恰好 1 項進行中',event_reason:'原因',event_query:'查詢',event_archive:'歸檔',event_details:'詳細內容',event_matches:'筆匹配',event_returned:'筆召回',
   state_on:'開',state_off:'關',
   rt_session:'會話',rt_model:'模型',rt_thinking:'思考',rt_thinking_stream:'思考流',rt_response_stream:'正文串流',rt_mode:'模式',rt_active_agent:'活躍代理',rt_blackboard:'黑板',rt_task:'任務',rt_complexity:'複雜度',rt_judgement:'裁決',rt_budget:'預算',rt_remaining:'剩餘',rt_blackboard_cycles:'黑板輪次',rt_round_limit:'輪次上限',rt_round:'輪次',rt_phase:'階段',rt_queued_inputs:'排隊輸入',rt_run_timeout:'執行逾時',rt_ctx_used:'上下文已用',rt_ctx_limit:'上下文上限',rt_ctx_mode:'上下文模式',rt_manual_lock:'手動鎖定',rt_adaptive:'自適應',rt_ctx_left:'上下文剩餘',rt_ctx_left_for:'{label}剩餘',rt_ctx_live_title:'依真實呼叫顯示上下文剩餘',rt_truncation:'截斷數',rt_trunc_retry:'截斷重試',rt_trunc_tokens:'截斷Token~',rt_archive:'封存',rt_last_compact:'最近壓縮',compact_ago:'前',compact_just_now:'剛剛',rt_ollama:'Ollama',rt_files:'檔案根目錄',rt_ui_mode:'介面模式',rt_state:'狀態',rt_awaiting_user:'等待使用者',ask_user_title:'需要你的輸入',ask_user_free_hint:'點擊上方選項,或在下方輸入答覆後送出。',ask_user_pick_hint:'請選擇上方其中一個選項以繼續。',
   preview_download:'下載',preview_source:'原始碼',preview_rendered:'預覽',preview_copy_link:'複製連結',preview_open:'瀏覽器開啟',preview_link_copied:'已複製連結',
@@ -85153,7 +88464,7 @@ Object.assign(I18N['ja'],{
   event_truncation_recovery:'切り詰め復旧',event_truncation_state:'構造化切り詰め復旧状態',event_truncation_note:'モデル出力が切り詰め境界に達したため、復旧フローに入りました。',
       event_live_model_call_title:'Agent ターンモデル呼び出し',event_live_model_call_note:'現在のアクティブ agent はモデル呼び出し中です。生成中はこのタイマーがリアルタイム更新されます。',
       event_scheduler_queued_title:'キュー済みタスク',event_scheduler_queued_note:'このメッセージは保存され、実行枠を待っています。',event_scheduler_queue_position:'キュー位置',event_scheduler_reason:'理由',event_scheduler_queued_hint:'キュー済み',
-  event_auto_continue:'自動継続',event_arbiter_continue:'判定継続',event_continuation_briefing:'継続ブリーフ',event_reminder:'リマインダー',event_todo_rescue:'Todo 救援',event_tool_retry:'ツール再試行',event_segmented_retry:'分割再試行',event_forced_converge:'強制収束',event_no_tool_recovery:'ツールなし復旧',event_context_recall:'コンテキスト再呼び出し',event_failure_recovery:'障害復旧',event_truncate_rescue:'切り詰め救援',event_thinking_recovery:'思考復旧',event_fault_prefill:'障害プリフィル',event_edit_recovery:'編集復旧',event_todo_bootstrap_title:'Todo 初期化',event_todo_bootstrap_retry_title:'Todo 初期化の再試行',event_todo_bootstrap_subtitle:'読み取り専用の認識後に行う計画状態',event_todo_bootstrap_note:'観測した証拠から次の Todo を整理してから実行を続けます。',event_todo_bootstrap_retry_note:'Todo の書き込みが完了せず、回数を制限した再試行を行います。',event_todo_bootstrap_perception:'認識完了',event_todo_bootstrap_item_count:'1-40 項目 · 段階整合',event_todo_bootstrap_one_active:'進行中は 1 項目のみ',event_reason:'理由',
+  event_auto_continue:'自動継続',event_arbiter_continue:'判定継続',event_continuation_briefing:'継続ブリーフ',event_reminder:'リマインダー',event_todo_rescue:'Todo 救援',event_tool_retry:'ツール再試行',event_segmented_retry:'分割再試行',event_forced_converge:'強制収束',event_no_tool_recovery:'ツールなし復旧',event_context_recall:'コンテキスト再呼び出し',event_failure_recovery:'障害復旧',event_truncate_rescue:'切り詰め救援',event_thinking_recovery:'思考復旧',event_fault_prefill:'障害プリフィル',event_edit_recovery:'編集復旧',event_todo_bootstrap_title:'Todo 初期化',event_todo_bootstrap_retry_title:'Todo 初期化の再試行',event_todo_bootstrap_subtitle:'読み取り専用の認識後に行う計画状態',event_todo_bootstrap_note:'観測した証拠から次の Todo を整理してから実行を続けます。',event_todo_bootstrap_retry_note:'Todo の書き込みが完了せず、回数を制限した再試行を行います。',event_todo_bootstrap_perception:'認識完了',event_todo_bootstrap_item_count:'1-40 項目 · 段階整合',event_todo_bootstrap_one_active:'進行中は 1 項目のみ',event_reason:'理由',event_query:'検索',event_archive:'アーカイブ',event_details:'詳細',event_matches:'件一致',event_returned:'件取得',
   state_on:'オン',state_off:'オフ',
   rt_session:'セッション',rt_model:'モデル',rt_thinking:'思考',rt_thinking_stream:'思考ストリーム',rt_response_stream:'レスポンスストリーム',rt_mode:'モード',rt_active_agent:'アクティブAgent',rt_blackboard:'黒板',rt_task:'タスク',rt_complexity:'複雑度',rt_judgement:'判定',rt_budget:'予算',rt_remaining:'残り',rt_blackboard_cycles:'黒板サイクル',rt_round_limit:'ラウンド上限',rt_round:'ラウンド',rt_phase:'フェーズ',rt_queued_inputs:'待機入力',rt_run_timeout:'実行タイムアウト',rt_ctx_used:'コンテキスト使用量',rt_ctx_limit:'コンテキスト上限',rt_ctx_mode:'コンテキストモード',rt_manual_lock:'手動固定',rt_adaptive:'適応',rt_ctx_left:'残りコンテキスト',rt_ctx_left_for:'{label}残り',rt_ctx_live_title:'実際の呼び出し別の残りコンテキスト',rt_truncation:'切り詰め数',rt_trunc_retry:'切り詰め再試行',rt_trunc_tokens:'切り詰めToken~',rt_archive:'アーカイブ',rt_last_compact:'直近 compact',compact_ago:'前',compact_just_now:'たった今',rt_ollama:'Ollama',rt_files:'ファイルルート',rt_ui_mode:'UIモード',rt_state:'状態',rt_awaiting_user:'ユーザー待ち',ask_user_title:'入力が必要です',ask_user_free_hint:'上のオプションを選ぶか、下に回答を入力して送信してください。',ask_user_pick_hint:'続行するには上のオプションを選んでください。',
   preview_download:'ダウンロード',preview_source:'ソース',preview_rendered:'プレビュー',preview_copy_link:'リンクをコピー',preview_open:'ブラウザで開く',preview_link_copied:'リンクをコピーしました',
@@ -85747,7 +89058,7 @@ function _deltaStartWatchdog(){
 function renderSkillsEntryLink(){const link=E('downloadBtn');if(!link)return;const host=location.hostname||'127.0.0.1';const enabled=Boolean(S.config?.skills_ui_enabled);const fromConfig=String(S.config?.skills_ui_url||'').trim();const skillsPort=Number(S.config?.skills_port||0);let href='#';if(enabled){if(fromConfig){href=fromConfig}else if(Number.isFinite(skillsPort)&&skillsPort>0){const currentPort=Number(location.port||0);if(!(currentPort&&skillsPort===currentPort)){href=`${location.protocol}//${host}:${skillsPort}`}}}const offline=(href==='#');link.href=href;link.classList.toggle('disabled',offline);link.textContent=offline?t('skills_offline'):t('open_skills')}
 function openProgram(){const port=Number(S.config?.ide_port||0);if(!S.config?.ide_enabled||!Number.isFinite(port)||port<=0){showError('Program IDE is disabled.');return}location.href=`${location.protocol}//${location.hostname||'127.0.0.1'}:${port}/`}
 function tailSig(rows,count,mapper){const arr=Array.isArray(rows)?rows:[];if(!arr.length)return'';return arr.slice(Math.max(0,arr.length-count)).map(mapper).join('|')}
-function feedSignature(snap){const feed=Array.isArray(snap?.conversation_feed)?snap.conversation_feed:(Array.isArray(snap?.messages)?snap.messages:[]);const sig=tailSig(feed,8,row=>`${Number(row?.ts||0)}:${String(row?.role||'')}:${String(row?.agent_role||'')}:${String(row?.type||'')}:${String(row?.text||'').length}:${String(row?.thinking||'').length}:${String(row?.text||'').slice(-12)}:${String(row?.thinking||'').slice(-12)}`);const live=String(snap?.live_thinking||'');const liveResp=String(snap?.live_response_text||'');const liveRespId=String(snap?.live_response_stream_id||'');const liveRespActive=snap?.live_response_active?1:0;const runActive=snap?.live_run_notice_active?1:0;const runLabel=String(snap?.live_run_notice_label||'');const runStart=Number(snap?.live_run_notice_started_at||0);const truncText=String(snap?.live_truncation_text||'');const truncKind=String(snap?.live_truncation_kind||'');const truncTool=String(snap?.live_truncation_tool||'');const truncAttempts=Number(snap?.live_truncation_attempts||0);const truncTokens=Number(snap?.live_truncation_tokens||0);const truncActive=snap?.live_truncation_active?1:0;return `${feed.length}|${sig}|lt=${live.length}:${live.slice(-12)}|lr=${liveRespActive}:${liveRespId}:${liveResp.length}:${liveResp.slice(-12)}|rn=${runActive}:${runStart}:${runLabel.slice(-12)}|tr=${truncActive}:${truncAttempts}:${truncTokens}:${truncKind.slice(-12)}:${truncTool.slice(-12)}:${truncText.length}`}
+function feedSignature(snap){const feed=Array.isArray(snap?.conversation_feed)?snap.conversation_feed:(Array.isArray(snap?.messages)?snap.messages:[]);const sig=tailSig(feed,8,row=>`${String(row?.id||'')}:${Number(row?.seq||0)}:${Number(row?.ts||0)}:${String(row?.role||'')}:${String(row?.agent_role||'')}:${String(row?.type||'')}:${String(row?.text||'').length}:${String(row?.thinking||'').length}:${String(row?.text||'').slice(-12)}:${String(row?.thinking||'').slice(-12)}`);const live=String(snap?.live_thinking||'');const liveResp=String(snap?.live_response_text||'');const liveRespId=String(snap?.live_response_stream_id||'');const liveRespActive=snap?.live_response_active?1:0;const runActive=snap?.live_run_notice_active?1:0;const runLabel=String(snap?.live_run_notice_label||'');const runStart=Number(snap?.live_run_notice_started_at||0);const truncText=String(snap?.live_truncation_text||'');const truncKind=String(snap?.live_truncation_kind||'');const truncTool=String(snap?.live_truncation_tool||'');const truncAttempts=Number(snap?.live_truncation_attempts||0);const truncTokens=Number(snap?.live_truncation_tokens||0);const truncActive=snap?.live_truncation_active?1:0;return `${feed.length}|${sig}|lt=${live.length}:${live.slice(-12)}|lr=${liveRespActive}:${liveRespId}:${liveResp.length}:${liveResp.slice(-12)}|rn=${runActive}:${runStart}:${runLabel.slice(-12)}|tr=${truncActive}:${truncAttempts}:${truncTokens}:${truncKind.slice(-12)}:${truncTool.slice(-12)}:${truncText.length}`}
 function boardsSignature(snap){const agentCtx=(Array.isArray(snap?.agent_contexts)?snap.agent_contexts:[]).map(r=>`${r.role}:${r.left}:${r.left_percent}:${r.tier}:${r.active?1:0}`).join(',');const scope=snap?.todo_task_scope||{};const todoRows=Array.isArray(snap?.todos)?snap.todos:[];const taskRows=Array.isArray(snap?.tasks)?snap.tasks:[];const todoSig=todoRows.map(row=>`${String(row?.key||row?.plan_step_id||'')}:${String(row?.status||'')}:${String(row?.content||'')}`).join('~');const taskSig=taskRows.map(row=>`${String(row?.subtask_id||row?.id||'')}:${String(row?.status||'')}:${String(row?.subject||'')}`).join('~');return [snap?.running?1:0,snap?.agent_phase||'',Number(snap?.agent_round_index||0),Number(snap?.queued_user_inputs_count||0),Number(snap?.truncation_count||0),Number(snap?.live_truncation_attempts||0),Number(snap?.live_truncation_tokens||0),snap?.live_truncation_active?1:0,Number(snap?.context_tokens_estimate||0),Number(snap?.context_left_tokens||0),Number(snap?.context_left_percent||0),agentCtx,Number(snap?.render_bridge?.seq||0),String(snap?.plan_mode_preference||'auto'),Number(snap?.user_task_level||0),String(scope.kind||'default'),String(scope.task_epoch||''),String(scope.plan_epoch||''),String(scope.parent_step_id||''),todoSig,taskSig,(snap?.activity||[]).length,(snap?.operations||[]).length,(snap?.uploads||[]).length].join('|')}
 function sessionsSignature(list){const rows=Array.isArray(list)?list:[];const sig=tailSig(rows,6,row=>`${String(row?.id||'')}:${row?.running?1:0}:${Number(row?.message_count||0)}:${Number(row?.updated_at||0)}`);const aid=String(S.activeId||'').trim();let activeSig='-';if(aid){const activeRow=rows.find(row=>String(row?.id||'')===aid);if(activeRow){activeSig=`${aid}:${activeRow?.running?1:0}:${Number(activeRow?.message_count||0)}:${Number(activeRow?.updated_at||0)}`}else{activeSig=`missing:${aid}`}}return `${rows.length}|active=${activeSig}|${sig}`}
 function mergeSessionRows(base,incoming){const map=new Map();for(const row of Array.isArray(base)?base:[]){const id=String(row?.id||'').trim();if(id)map.set(id,{...row})}for(const row of Array.isArray(incoming)?incoming:[]){const id=String(row?.id||'').trim();if(id)map.set(id,{...(map.get(id)||{}),...row})}return Array.from(map.values()).sort((a,b)=>Number(b?.updated_at||0)-Number(a?.updated_at||0))}
@@ -87155,7 +90466,7 @@ function renderActivePreview(forceReload=false){
   body.setAttribute('data-preview-ticket',ticket);
   fetch(url,{cache:'no-store'}).then(async r=>{if(!r.ok){throw new Error(await r.text())}return await r.text()}).then(txt=>{if(body.getAttribute('data-preview-ticket')!==ticket)return;body.innerHTML=`<article class=\"preview-md msg-md\">${renderMarkdownCached(txt,`pv:${key}:${txt.length}`)}</article>`;const article=body.querySelector('article.preview-md');if(article){_mathTypeset(article,`pv:${key}:${txt.length}`)}}).catch(err=>{if(body.getAttribute('data-preview-ticket')!==ticket)return;body.innerHTML=`<div class=\"preview-md msg-md\"><p>${esc(err.message||String(err))}</p></div>`})
 }
-function _chatVirtRowKey(row,idx){const r=row||{};const txt=String(r.text||'');const th=String(r.thinking||'');return `${Number(r.ts||0)}:${String(r.role||'')}:${String(r.agent_role||'')}:${String(r.type||'')}:${txt.length}:${th.length}:${txt.slice(-16)}:${th.slice(-16)}:${idx}`}
+function _chatVirtRowKey(row,idx){const r=row||{};const id=String(r.id||'').trim(),seq=Number(r.seq||r.event_seq||0);if(id)return`id:${id}`;if(seq>0)return`seq:${seq}`;const txt=String(r.text||''),th=String(r.thinking||'');const fingerprint=`${Number(r.ts||0).toFixed(6)}:${String(r.role||'')}:${String(r.agent_role||'')}:${String(r.type||'')}:${txt}:${th}`;return`fp:${fingerprint}`}
 function _chatVirtFormatElapsed(seconds){const sec=Math.max(0,Math.floor(Number(seconds)||0));const h=Math.floor(sec/3600);const m=Math.floor((sec%3600)/60);const s=sec%60;if(h>0)return `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;return `${m}:${String(s).padStart(2,'0')}`}
 function _chatVirtLiveRunText(label,elapsed){return `${t('running')} · ${_chatVirtFormatElapsed(elapsed)}`}
 const CHAT_EVENT_CARD_KINDS=new Set(['tool_calls','tool_start','tool_result','file_patch','upload','command','web_search','live_truncation','live_run_notice','skill_loaded','plan_notice','plan_proposal','plan_approved_handoff','step_verified','todo_focus','live_user_adjustment','user_feedback_merge','runtime_hint']);
@@ -87564,14 +90875,17 @@ function _chatVirtSyncRunTicker(chatEl){if(!chatEl)return;const hasRun=!!chatEl.
 function isSyntheticPublicProgress(text){const value=String(text||'').trim();if(!value)return false;const pairs=[['正在推进「','结果将用于确定下一步。'],['本轮将','并根据返回的证据继续推进。'],['正在推進「','結果將用於決定下一步。'],['本輪將','並依據傳回的證據繼續推進。'],['「','結果を次の判断に使います。'],['','得られた証拠を基に続行します。'],["Advancing '",'then use the evidence to choose the next step.'],['This round will ','then continue from the returned evidence.']];return pairs.some(([prefix,suffix])=>(!prefix||value.startsWith(prefix))&&value.endsWith(suffix))}
 function _chatVirtCollectRows(){
   const feed=Array.isArray(S.snap?.conversation_feed)?S.snap.conversation_feed:(Array.isArray(S.snap?.messages)?S.snap.messages:[]);
-  const rows=[];
+  const rows=[],seen=new Set();
   for(let i=0;i<feed.length;i++){
     const r=feed[i]||{};
     const txt=String(r.text||'').trim();
     if(/^\\[SKILL EXECUTION GUIDE:\\s*[^\\]]+\\]/i.test(txt))continue;
     const syntheticText=isSyntheticPublicProgress(txt),syntheticData=isSyntheticPublicProgress(r.data?.public_progress);
     if((syntheticText||syntheticData)&&String(r.type||'message')!=='tool_calls')continue;
-    const clean={...r,_vk:_chatVirtRowKey(r,i)};
+    const key=_chatVirtRowKey(r,i);
+    if(seen.has(key))continue;
+    seen.add(key);
+    const clean={...r,_vk:key};
     if(syntheticText)clean.text='';
     if(syntheticData){clean.data={...(r.data||{})};delete clean.data.public_progress}
     rows.push(clean);
@@ -87806,6 +91120,21 @@ function _chatVirtParseRuntimeHint(raw){
   const meta=RUNTIME_HINT_RENDER_META[name]||{labelKey:'event_reminder',tone:'notice'};
   return {name,body:String(m[2]||'').trim(),meta:{label:t(String(meta.labelKey||'event_reminder')),tone:String(meta.tone||'notice')}};
 }
+function _chatVirtRuntimeHintFromMessage(m){
+  const data=(m&&typeof m.data==='object')?m.data:{};
+  const structured=String(m?.type||'').toLowerCase()==='runtime_hint';
+  const name=String(data.control_tag||'').trim().toLowerCase();
+  if(structured){
+    const renderMeta=RUNTIME_HINT_RENDER_META[name]||{labelKey:'event_reminder',tone:'notice'};
+    return {
+      name:name||'runtime',
+      body:String(data.details||m?.text||'').trim(),
+      data,
+      meta:{label:String(data.title||t(String(renderMeta.labelKey||'event_reminder'))),tone:String(renderMeta.tone||'notice')},
+    };
+  }
+  return (m?.role==='user')?_chatVirtParseRuntimeHint(String(m?.text||'')):null;
+}
 function _chatVirtBuildMessageNode(m){
       let kind='assistant_text';
       const rawTextForKind=String(m?.text||'');
@@ -87817,7 +91146,7 @@ function _chatVirtBuildMessageNode(m){
       const parsedToolEventText=_chatVirtParseToolEventText(rawTextForKind);
       const parsedLiveUserAdjustment=_chatVirtParseLiveUserAdjustment(rawTextForKind);
       const parsedUserFeedbackMerge=_chatVirtParseUserFeedbackMerge(rawTextForKind);
-      const parsedRuntimeHint=(m.role==='user')?_chatVirtParseRuntimeHint(rawTextForKind):null;
+      const parsedRuntimeHint=_chatVirtRuntimeHintFromMessage(m);
       if(m.type==='manager_delegate')kind='manager_delegate';
       else if(m.type==='agent_bus')kind='agent_bus';
       else if(m.type==='tool_calls')kind='tool_calls';
@@ -88358,9 +91687,21 @@ function _chatVirtBuildMessageNode(m){
     const hintLabel=String(runtimeHint.meta?.label||'Runtime Hint');
     const hintTone=String(runtimeHint.meta?.tone||'notice');
     const bodyKey=`${textKey}:runtime-hint`;
-    const hintBody=runtimeHint.body||finalText;
-    const plainHtml=`<div class=\"msg-md\"><div class=\"md-callout ${esc(hintTone)}\"><div class=\"md-callout-head\">${esc(hintLabel)}</div><div class=\"md-callout-body\">${renderMarkdownCached(hintBody,bodyKey)}</div></div></div>`;
-    d.innerHTML=`${plainHtml}`;
+    const hintBody=String(runtimeHint.body||finalText||'').trim();
+    const info=(runtimeHint.data&&typeof runtimeHint.data==='object')?runtimeHint.data:{};
+    const pills=[
+      info.returned!==undefined?_chatVirtEventPillHtml(`${Number(info.returned)||0} ${t('event_returned')}`,'ok'):'',
+      info.matched_rows!==undefined?_chatVirtEventPillHtml(`${Number(info.matched_rows)||0} ${t('event_matches')}`,'info'):'',
+    ];
+    const grid=[
+      _chatVirtEventCellHtml(t('event_query'),String(info.query||''),{mono:true}),
+      _chatVirtEventCellHtml(t('event_reason'),String(info.reason||''),{}),
+      _chatVirtEventCellHtml(t('event_archive'),String(info.archive_segment||''),{mono:true}),
+    ];
+    const summary=String(m?.text||'').trim();
+    const details=hintBody?`<details class=\"msg-runtime-details\"${info.default_collapsed===false?' open':''}><summary>${esc(t('event_details'))}</summary><pre>${esc(hintBody)}</pre></details>`:'';
+    const bodyHtml=`<div class=\"msg-event-body\">${summary?`<div class=\"msg-event-note\">${esc(summary)}</div>`:''}${details}</div>`;
+    d.innerHTML=_chatVirtEventCardHtml(hintLabel,'',pills,grid,bodyHtml,`msg-event-card-runtime ${esc(hintTone)}`);
     d.setAttribute('data-math-request',bodyKey);
     return d;
   }
@@ -89161,10 +92502,15 @@ async function refreshSnapshot(opt={}){
     return;
   }
   S.refreshInFlight=true;
+  const requestedSessionId=String(S.activeId||'');
   try{
-    ensurePreviewState(S.activeId);
+    ensurePreviewState(requestedSessionId);
     const q=forceFull?'?lite=0':'?lite=1';
-    S.snap=await api('/api/sessions/'+S.activeId+q);
+    const nextSnapshot=await api('/api/sessions/'+requestedSessionId+q);
+    // A session switch can happen while the network request is in flight.  Do
+    // not let the old response overwrite the newly selected session's state.
+    if(String(S.activeId||'')!==requestedSessionId)return;
+    S.snap=nextSnapshot;
     if(S.deltaRenderRaf){cancelAnimationFrame(S.deltaRenderRaf);S.deltaRenderRaf=0}
     S.deltaRenderChat=false;S.deltaRenderBoards=false;S.deltaRenderSessions=false;
     const snapSeq=Number(S.snap?.event_seq||0);
@@ -95990,6 +99336,45 @@ def _rag_boundary_split(body: str, *, max_chars: int, overlap: int) -> list[str]
     return pieces
 
 
+def _rag_structure_outline(text: str, *, max_items: int = 64, max_chars: int = 3600) -> list[str]:
+    """Return a bounded, deterministic outline for durable long-source memory.
+
+    This intentionally uses no completion call: ingestion can seed navigation
+    immediately, while exact claims remain recoverable from source chunks.
+    Markdown headings are preferred; numbered/labelled section lines are used
+    as a fallback for plain technical documents.
+    """
+    rows: list[str] = []
+    seen: set[str] = set()
+    for raw in str(text or "").splitlines():
+        line = str(raw or "").strip()
+        if not line:
+            continue
+        match = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
+        if match:
+            item = f"{'  ' * (len(match.group(1)) - 1)}{match.group(2).strip()}"
+        elif re.match(r"^(?:\d+(?:\.\d+)*[.)]|(?:chapter|section|part)\s+\w+)\s+.+", line, re.I):
+            item = line
+        else:
+            continue
+        item = trim(item, 180)
+        key = item.casefold()
+        if item and key not in seen:
+            seen.add(key)
+            if rows and len("\n".join(rows)) + len(item) + 1 > max(240, int(max_chars or 3600)):
+                break
+            rows.append(item)
+            if len(rows) >= max(1, int(max_items or 64)):
+                break
+    if not rows:
+        first = [trim(str(x).strip(), 180) for x in str(text or "").splitlines() if str(x).strip()][:4]
+        for item in first:
+            if rows and len("\n".join(rows)) + len(item) + 1 > max(240, int(max_chars or 3600)):
+                break
+            rows.append(item)
+    return [trim(x, 180) for x in rows if x][: max(1, int(max_items or 64))]
+
+
 def _rag_chunk_text(text: str, *, max_chars: int = RAG_CHUNK_CHARS, overlap: int = RAG_CHUNK_OVERLAP) -> list[dict]:
     """Semantic-boundary-aware text chunking.
 
@@ -96005,6 +99390,7 @@ def _rag_chunk_text(text: str, *, max_chars: int = RAG_CHUNK_CHARS, overlap: int
     current_text = ""
     current_heading = ""
     current_depth = 0
+    heading_stack: dict[int, str] = {}
 
     def _flush(txt: str, heading: str, depth: int, is_code: bool = False) -> None:
         txt = txt.strip()
@@ -96014,12 +99400,15 @@ def _rag_chunk_text(text: str, *, max_chars: int = RAG_CHUNK_CHARS, overlap: int
         preview = trim(first_line, 120)
         if heading:
             preview = f"[{heading}] {preview}"
+        section_path = [heading_stack[level] for level in sorted(heading_stack) if level <= max(1, depth)]
         chunks.append({
             "text": txt,
             "anchor": preview,
             "parent_heading": heading,
+            "section_path": section_path,
             "is_code_block": is_code,
             "section_depth": depth,
+            "segment_id": f"s{len(chunks) + 1:04d}",
         })
 
     for seg_type, seg_depth, seg_heading, seg_body in segments:
@@ -96032,6 +99421,9 @@ def _rag_chunk_text(text: str, *, max_chars: int = RAG_CHUNK_CHARS, overlap: int
                 current_text = ""
             current_heading = seg_heading
             current_depth = seg_depth
+            heading_stack[seg_depth] = seg_heading
+            for level in [level for level in heading_stack if level > seg_depth]:
+                heading_stack.pop(level, None)
         elif seg_type == "code_block":
             # Flush prose buffer, then emit code/table atomically (up to 2500 chars)
             if current_text:
@@ -96752,6 +100144,16 @@ class CodeContentParser:
             "text": raw_text,
             "text_chars": len(raw_text),
             "summary": trim(" | ".join(bit for bit in summary_bits if bit), 1600),
+            "understanding_outline": [
+                trim(
+                    f"{row.get('kind', 'symbol')} {row.get('name', '')} "
+                    f"L{int(row.get('line_start', 0) or 0)}-{int(row.get('line_end', 0) or 0)}",
+                    180,
+                )
+                for row in symbols[:64]
+                if str(row.get("name", "") or "").strip()
+            ],
+            "understanding_version": LONG_CONTENT_MEMORY_VERSION,
             "entities": entities,
             "category": "code",
             "labels": sorted({str(x).strip() for x in labels if str(x).strip()}),
@@ -97255,6 +100657,14 @@ class RAGContentParser:
             allow_filename_entities=self.include_filename_entities,
             limit=32,
         )
+        outline = _rag_structure_outline(text)
+        lead_parts = [str(x).strip() for x in text.splitlines() if str(x).strip()]
+        lead = " ".join(lead_parts[:8])
+        summary_parts = []
+        if outline:
+            summary_parts.append("Structure: " + " > ".join(outline[:8]))
+        if lead:
+            summary_parts.append(lead)
         return {
             "filename": fp.name,
             "path": str(fp),
@@ -97265,7 +100675,9 @@ class RAGContentParser:
             "language": lang,
             "text": text,
             "text_chars": len(text),
-            "summary": trim(text, 1200),
+            "summary": trim(" | ".join(summary_parts) or text, 1600),
+            "understanding_outline": outline,
+            "understanding_version": LONG_CONTENT_MEMORY_VERSION,
             "entities": entities,
             "category": str(cls.get("category", "document")),
             "labels": list(cls.get("labels", [])),
@@ -97660,6 +101072,12 @@ class TFGraphIDFIndex:
                 "category": category,
                 "language": language,
                 "summary": str(doc.get("summary", "") or ""),
+                "understanding_outline": [
+                    trim(str(x), 180)
+                    for x in (doc.get("understanding_outline", []) or [])[:64]
+                    if str(x).strip()
+                ],
+                "understanding_version": int(doc.get("understanding_version", 0) or 0),
                 "entities": entities[:32],
                 "community": community,
                 "source_rel_path": source_rel_path,
@@ -97704,6 +101122,15 @@ class TFGraphIDFIndex:
                 "seq": int(chunk.get("seq", 0) or 0),
                 "text": text,
                 "anchor": str(chunk.get("anchor", "") or ""),
+                "segment_id": str(chunk.get("segment_id", "") or ""),
+                "parent_heading": str(chunk.get("parent_heading", "") or ""),
+                "section_path": [
+                    trim(str(x), 180)
+                    for x in (chunk.get("section_path", []) or [])[:12]
+                    if str(x).strip()
+                ],
+                "section_depth": int(chunk.get("section_depth", 0) or 0),
+                "is_code_block": bool(chunk.get("is_code_block", False)),
                 "entities": entities[:24],
                 # Persist the defining symbol so query-time symbol-exact boosting can match
                 # an identifier query to the chunk that defines it (code recall lever).
@@ -98214,6 +101641,9 @@ class TFGraphIDFIndex:
                     "community": str(doc.get("community", "")),
                     "language": str(doc.get("language", "")),
                     "anchor": str(chunk.get("anchor", "")),
+                    "segment_id": str(chunk.get("segment_id", "") or ""),
+                    "parent_heading": str(chunk.get("parent_heading", "") or ""),
+                    "section_path": list(chunk.get("section_path", []) or [])[:12],
                     "symbol": str(chunk.get("symbol", "")),
                     "text": _rag_focused_excerpt(
                         str(chunk.get("text", "")),
@@ -99025,6 +102455,31 @@ class RAGLibraryStore:
         self.content_updated_at = float(
             raw.get("content_updated_at", raw.get("updated_at", self.content_updated_at)) or self.content_updated_at
         )
+        # Older library shards predate structure metadata. Populate only the
+        # bounded navigation fields in-place; raw source/chunk text remains the
+        # durable evidence and is never duplicated here.
+        changed = False
+        for row in self.documents.values():
+            if not isinstance(row, dict):
+                continue
+            try:
+                understanding_version = int(row.get("understanding_version", 0) or 0)
+            except Exception:
+                understanding_version = 0
+            # Upgrade missing/older structure metadata in-place.  The raw
+            # document/chunk evidence remains untouched, so this is safe for
+            # every legacy RAG database format.
+            if understanding_version >= LONG_CONTENT_MEMORY_VERSION and row.get("understanding_outline") is not None:
+                continue
+            outline = _rag_structure_outline(str(row.get("summary", "") or ""), max_items=32)
+            row["understanding_outline"] = outline
+            row["understanding_version"] = LONG_CONTENT_MEMORY_VERSION
+            changed = True
+        if changed:
+            try:
+                self._save_locked(write_chunks=False, write_tasks=False)
+            except Exception:
+                pass
 
     def _save_locked(
         self,
@@ -99458,6 +102913,11 @@ class RAGLibraryStore:
             "",
         )
         chunks = _rag_chunk_text(semantic_text)
+        understanding_outline = [
+            trim(str(x), 180)
+            for x in (parse_result.get("understanding_outline", []) or [])[:64]
+            if str(x).strip()
+        ] or _rag_structure_outline(semantic_text)
         chunk_ids: list[str] = []
         with self.lock:
             stamp = now_ts()
@@ -99469,6 +102929,15 @@ class RAGLibraryStore:
                     "doc_id": doc_id,
                     "seq": chunk_idx,
                     "anchor": str(chunk.get("anchor", "") or ""),
+                    "segment_id": str(chunk.get("segment_id", "") or f"s{chunk_idx:04d}"),
+                    "parent_heading": str(chunk.get("parent_heading", "") or ""),
+                    "section_path": [
+                        trim(str(x), 180)
+                        for x in (chunk.get("section_path", []) or [])[:12]
+                        if str(x).strip()
+                    ],
+                    "section_depth": int(chunk.get("section_depth", 0) or 0),
+                    "is_code_block": bool(chunk.get("is_code_block", False)),
                     "text": chunk_text,
                     "entities": _rag_apply_filename_entity_policy(
                         _rag_extract_entities(chunk_text),
@@ -99497,6 +102966,11 @@ class RAGLibraryStore:
                 "backup_path": self._rel(backup_path),
                 "parsed_text_path": self._rel(parsed_path),
                 "summary": trim(mm_summary or str(parse_result.get("summary", "") or semantic_text), 1600),
+                "understanding_outline": understanding_outline,
+                "understanding_version": int(
+                    parse_result.get("understanding_version", LONG_CONTENT_MEMORY_VERSION)
+                    or LONG_CONTENT_MEMORY_VERSION
+                ),
                 "entities": combined_entities,
                 "community": community,
                 "chunk_count": len(chunk_ids),
@@ -99712,8 +103186,32 @@ class WikiStore:
         if summary:
             parts.append("\n## Summary\n\n" + summary + "\n")
         if chunks:
+            outline = [
+                trim(str(x), 180)
+                for x in (doc.get("understanding_outline", []) or [])[:64]
+                if str(x).strip()
+            ]
+            if not outline:
+                for chunk in chunks:
+                    anchor = trim(str(chunk.get("anchor", "") or ""), 180)
+                    if anchor and anchor not in outline:
+                        outline.append(anchor)
+                    if len(outline) >= 64:
+                        break
+            if outline:
+                parts.append("\n## Structure Map\n\n")
+                parts.extend(f"- {item}\n" for item in outline)
             parts.append("\n## Evidence Excerpts\n\n")
-            for chunk in chunks[:10]:
+            # Sample across the entire source instead of permanently remembering
+            # only its first ten chunks. The complete structure map above stays
+            # compact; these excerpts remain direct evidence, bounded to 12.
+            sample_count = min(12, len(chunks))
+            if len(chunks) <= sample_count:
+                sampled = chunks
+            else:
+                indexes = sorted({round(i * (len(chunks) - 1) / (sample_count - 1)) for i in range(sample_count)})
+                sampled = [chunks[idx] for idx in indexes]
+            for chunk in sampled:
                 anchor = trim(str(chunk.get("anchor", "") or f"chunk {chunk.get('seq', '')}"), 120)
                 text = trim(str(chunk.get("text", "") or ""), 900)
                 if text:
@@ -102503,6 +106001,9 @@ class CodeGraphIndex(TFGraphIDFIndex):
                     "community": str(doc.get("community", "")),
                     "language": str(doc.get("language", "")),
                     "anchor": str(chunk.get("anchor", "") or chunk.get("symbol", "") or ""),
+                    "segment_id": str(chunk.get("segment_id", "") or ""),
+                    "parent_heading": str(chunk.get("parent_heading", "") or ""),
+                    "section_path": list(chunk.get("section_path", []) or [])[:12],
                     "text": trim(str(chunk.get("text", "")), 1800),
                     "entities": list(chunk.get("entities", []) or [])[:12],
                     "symbol": str(chunk.get("symbol", "") or ""),
@@ -102793,6 +106294,11 @@ class CodeLibraryStore(RAGLibraryStore):
         language = str(parse_result.get("language", "unknown") or "unknown")
         module_name = _code_module_name(rel_path_clean or safe_name, language)
         community = _code_choose_community(rel_path_clean or safe_name, language, labels)
+        understanding_outline = [
+            trim(str(x), 180)
+            for x in (parse_result.get("understanding_outline", []) or [])[:64]
+            if str(x).strip()
+        ]
         entity_candidates = list(parse_result.get("entities", []) or [])
         entity_candidates.extend(str(row.get("name", "") or "") for row in symbols[:24])
         entity_candidates.extend(imports[:24])
@@ -102837,6 +106343,15 @@ class CodeLibraryStore(RAGLibraryStore):
                     "doc_id": doc_id,
                     "seq": chunk_idx,
                     "anchor": str(chunk.get("anchor", "") or symbol or f"chunk {chunk_idx}"),
+                    "segment_id": str(chunk.get("segment_id", "") or f"s{chunk_idx:04d}"),
+                    "parent_heading": str(chunk.get("parent_heading", "") or ""),
+                    "section_path": [
+                        trim(str(x), 180)
+                        for x in (chunk.get("section_path", []) or [])[:12]
+                        if str(x).strip()
+                    ],
+                    "section_depth": int(chunk.get("section_depth", 0) or 0),
+                    "is_code_block": bool(chunk.get("is_code_block", False)),
                     "text": chunk_text,
                     "entities": chunk_entities,
                     "line_start": int(chunk.get("line_start", 0) or 0),
@@ -102866,6 +106381,11 @@ class CodeLibraryStore(RAGLibraryStore):
                 "backup_path": self._rel(backup_path),
                 "parsed_text_path": self._rel(parsed_path),
                 "summary": summary,
+                "understanding_outline": understanding_outline,
+                "understanding_version": int(
+                    parse_result.get("understanding_version", LONG_CONTENT_MEMORY_VERSION)
+                    or LONG_CONTENT_MEMORY_VERSION
+                ),
                 "entities": combined_entities,
                 "community": community,
                 "chunk_count": len(chunk_ids),
@@ -106016,6 +109536,8 @@ html,body{scrollbar-gutter:stable}
 IDE_JS = r"""
 const E=id=>document.getElementById(id);
 class ApiError extends Error{constructor(message,status,code,data){super(message);this.status=status;this.code=code||'';this.data=data||{}}}
+// Keep preview-token state local to the IDE bundle; the WebUI shell is not loaded here.
+const PREVIEW_TOKENS=new Map();
 const S={
   csrf:'',config:null,account:null,capabilities:{},sessions:[],roots:[],activeSession:'',activeRoot:'session',autoLogin:false,authRefreshPromise:null,csrfRefreshPromise:null,
   treeCache:new Map(),openFiles:new Map(),activeByGroup:['',''],activeGroup:0,monaco:null,editors:[],diffEditors:[],models:new Map(),historyOriginalModels:new Map(),historyDecorations:new Map(),viewStates:new Map(),suppressEditorChange:false,codeHistoryMode:'all',
@@ -106434,6 +109956,7 @@ function renderFilePatchCard(data,role=''){const path=String(data.session_rel_pa
 function renderCommandCard(data,role=''){const code=data.exit_code,failed=code!=null&&Number(code)!==0,command=String(data.command||''),summary=command.split('\n')[0].slice(0,90),changed=Array.isArray(data.changed_files)&&data.changed_files.length?`Changed files:\n${data.changed_files.map(path=>`  ${path}`).join('\n')}`:'';const output=[command?`Command:\n${command}`:'',data.cwd?`Working directory: ${data.cwd}`:'',data.output||data.result||'',changed].filter(Boolean).join('\n\n');const card=agentToolCard({kind:'command',name:data.name||'command',title:`${String(data.name||'Command').replace(/^bash$/i,'Bash')}${summary?` · ${summary}`:''}`,state:code==null?'Running':`Exit ${code}${data.duration_ms!=null?` · ${data.duration_ms}ms`:''}`,stateTone:failed?'error':code==null?'':'success',output,role,expanded:failed});card.dataset.commandComplete=String(code!=null);return card}
 function parseAgentControl(text){const value=String(text||'').trim();let match=value.match(/^<([a-z0-9_-]+)(?:\s+[^>]*)?>([\s\S]*)<\/\1>$/i);if(match)return{tag:match[1],body:match[2].trim(),kind:'runtime instruction'};match=value.match(/^\[([^\]\n]{2,100})\](?:\s*([\s\S]*))?$/);if(match&&/^(skill loaded|tool calls|auto-continue|command|file_patch|system|manager|developer|explorer|planner|reviewer)(?::|$)/i.test(match[1]))return{tag:match[1],body:String(match[2]||'').trim(),kind:'control event'};return null}
 function renderAgentControl(text,role='User'){const parsed=parseAgentControl(text);if(!parsed)return null;const skill=parsed.tag.match(/^skill loaded:\s*(.*)$/i);return agentToolCard({kind:'control',name:skill?'skill':parsed.tag,title:skill?`Skill loaded · ${skill[1]}`:`${parsed.kind} · ${parsed.tag}`,state:'Structured',stateTone:'success',output:parsed.body,role,expanded:!!parsed.body})}
+function renderAgentRuntimeHint(row){const data=row&&typeof row.data==='object'?row.data:{},tag=String(data.control_tag||'runtime').trim(),labels={'auto-context-recall':'Context recall','auto-continue':'Auto continue','failure-recovery':'Failure recovery','thinking-empty-recovery':'Thinking recovery','single-no-plan-todo-bootstrap':'Todo initialization','single-no-plan-todo-bootstrap-retry':'Todo initialization retry'},title=String(data.title||labels[tag]||tag.replace(/-/g,' ')),parts=[];if(data.query)parts.push(`Query: ${data.query}`);if(data.returned!=null)parts.push(`Returned: ${data.returned}`);if(data.matched_rows!=null)parts.push(`Matches: ${data.matched_rows}`);if(data.archive_segment)parts.push(`Archive: ${data.archive_segment}`);if(data.reason)parts.push(`Reason: ${data.reason}`);const details=String(data.details||row.text||''),output=[parts.join('\n'),details].filter(Boolean).join('\n\n'),card=agentToolCard({kind:'control',name:tag,title,state:'Runtime',stateTone:'success',output,role:'System',expanded:data.default_collapsed===false});card.dataset.runtimeHint=tag;return card}
 function renderCompactCard(data){const before=Number(data.context_used_before||0),after=Number(data.context_used_after||0),reduction=Number(data.context_used_reduction||Math.max(0,before-after)),output=[data.reason?`Reason: ${data.reason}`:'',`Context used: ${before.toLocaleString()} → ${after.toLocaleString()}`,`Freed: ${reduction.toLocaleString()} tokens`,data.archived_messages!=null?`Archived messages: ${Number(data.archived_messages).toLocaleString()}`:'',data.archive_segment?`Archive: ${data.archive_segment}`:'',data.next_call_label?`Next: ${data.next_call_label}`:''].filter(Boolean).join('\n');return agentToolCard({kind:'compact',name:'compact',title:'Context compacted',state:data.effective===false?'Limited effect':'Completed',stateTone:data.effective===false?'':'success',output,role:data.agent_role||data.role||'System',expanded:false})}
 function replaceTrackedAgentToolCard(existing,card){if(existing?.isConnected)existing.replaceWith(card);for(const[key,value]of S.agentToolCards)if(value===existing)S.agentToolCards.set(key,card)}
 function clearTrackedAgentToolCard(card){for(const[key,value]of S.agentToolCards)if(value===card)S.agentToolCards.delete(key)}
@@ -106505,9 +110028,9 @@ function renderAgentState(state){
   S.agentBatching=true;
   try{
     if(timelineChanged){
-      const timeline=[],validKeys=new Set();
-      for(const row of feed){const type=String(row.type||'message');if(['file_patch','command','tool_start','tool_result','compact'].includes(type))continue;validKeys.add(agentEventKey(row));timeline.push({source:'feed',ts:Number(row.ts||0),seq:0,row})}
-      for(const op of operations){validKeys.add(agentOperationKey(op));timeline.push({source:'operation',ts:Number(op.ts||0),seq:Number(op.seq||0),op})}
+      const timeline=[],validKeys=new Set(),seenTimelineKeys=new Set();
+      for(const row of feed){const type=String(row.type||'message');if(['file_patch','command','tool_start','tool_result','compact'].includes(type))continue;const key=agentEventKey(row);if(!key||seenTimelineKeys.has(key))continue;seenTimelineKeys.add(key);validKeys.add(key);timeline.push({source:'feed',ts:Number(row.ts||0),seq:Number(row.seq||0),row})}
+      for(const op of operations){const key=agentOperationKey(op);if(!key||seenTimelineKeys.has(key))continue;seenTimelineKeys.add(key);validKeys.add(key);timeline.push({source:'operation',ts:Number(op.ts||0),seq:Number(op.seq||0),op})}
       timeline.sort((a,b)=>a.ts-b.ts||a.seq-b.seq);
       for(const item of timeline){
         if(item.source==='feed'){
@@ -106515,13 +110038,18 @@ function renderAgentState(state){
           if(type==='tool_calls'){const tools=Array.isArray(row.data?.tools)?row.data.tools:[],progress=String(row.data?.public_progress||(!text.toLowerCase().startsWith('[tool calls]')?text:'')).trim();if(progress&&!isSyntheticPublicProgress(progress))agentApproach(progress,role);renderAgentPlanCard(tools.length?tools:[text||'Tool calls scheduled'],role);continue}
           if(type==='approach'){agentApproach(text,role);continue}
           if(type==='web_search'){agentToolCard({kind:'tool',name:'web_search',title:'Web search',state:'Completed',stateTone:'success',output:text,role});continue}
+          if(type==='runtime_hint'){renderAgentRuntimeHint(row);continue}
           if(renderAgentControl(text,role))continue;
           const tone=row.role==='assistant'?'assistant':row.role==='user'?'user':type==='error'?'error':'system';agentMessage(text,tone,role);continue;
         }
         renderAgentOperationOnce(item.op);
       }
       S.agentTimelineSignature=timelineSignature;
-      for(const key of S.agentRendered)if(!validKeys.has(key))S.agentRendered.delete(key);
+      // Keep rendered identities across polling windows.  The backend exposes a
+      // tail window, so a temporary lite/degraded response may omit older rows;
+      // deleting their keys here would cause the same events to be appended again
+      // when the full snapshot returns.  Session switches call resetAgentSessionUI
+      // and clear the set explicitly.
       for(const[key,value]of S.agentToolCards)if(!value?.isConnected)S.agentToolCards.delete(key);
       for(const[key,value]of S.agentPlanCards)if(!value?.isConnected)S.agentPlanCards.delete(key);
     }
@@ -114254,9 +117782,22 @@ document.addEventListener('DOMContentLoaded', function(){{
                 sess.lock.release()
 
         feed: list[dict] = []
+        seen_feed_ids: set[str] = set()
         for raw in snap.get("conversation_feed", []) if isinstance(snap, dict) else []:
             if not isinstance(raw, dict):
                 continue
+            is_hidden = getattr(sess, "_is_ui_hidden_runtime_message", None)
+            if callable(is_hidden) and bool(is_hidden(raw)):
+                continue
+            runtime_projection = None
+            project_runtime = getattr(sess, "_runtime_message_ui_projection", None)
+            is_runtime = getattr(sess, "_is_runtime_internal_message", None)
+            if callable(project_runtime):
+                runtime_projection = project_runtime(raw)
+            if callable(is_runtime) and bool(is_runtime(raw)):
+                if runtime_projection is None:
+                    continue
+                raw = runtime_projection
             role = str(raw.get("role", "system") or "system").strip().lower()
             public_text = str(raw.get("text", "") or "")
             if role == "user" and public_text.startswith("IDE programming request."):
@@ -114274,12 +117815,28 @@ document.addEventListener('DOMContentLoaded', function(){{
                 "ts": float(raw.get("ts", 0.0) or 0.0),
                 "agent_role": trim(str(raw.get("agent_role", "") or ""), 40),
             }
+            # Thinking-only assistant turns are private reasoning, not a public
+            # message.  Keep structured tool/plan rows even when their text is
+            # intentionally empty.
+            if role == "assistant" and not row["text"].strip() and row["type"] not in {
+                "tool_calls",
+                "plan_notice",
+                "plan_proposal",
+                "plan_approved_handoff",
+                "step_verified",
+                "todo_focus",
+                "runtime_hint",
+            }:
+                continue
             if not row["id"]:
                 # Older persisted sessions may lack ids; snapshot() supplies a
                 # deterministic fallback, but keep a defensive key for custom
                 # SessionState implementations used by integrations/tests.
                 fallback = f"{row['ts']:.6f}|{role}|{row['type']}|{row['text']}"
                 row["id"] = f"feed:{hashlib.sha256(fallback.encode('utf-8', errors='ignore')).hexdigest()[:16]}"
+            if row["id"] in seen_feed_ids:
+                continue
+            seen_feed_ids.add(row["id"])
             data = raw.get("data", {}) if isinstance(raw.get("data"), dict) else {}
             if data:
                 public_data = ide_public_operation_data(data)
@@ -114295,10 +117852,21 @@ document.addEventListener('DOMContentLoaded', function(){{
                 continue
             data = raw.get("data", {}) if isinstance(raw.get("data"), dict) else {}
             public_data = ide_public_operation_data(data)
+            operation_id = str(raw.get("id", "") or "").strip()
+            operation_seq = int(raw.get("seq", 0) or 0)
+            if not operation_id:
+                if operation_seq > 0:
+                    operation_id = f"operation:{operation_seq}"
+                else:
+                    operation_id = "operation:" + hashlib.sha256(
+                        f"{raw.get('ts', 0)}|{kind}|{json_dumps(public_data)}".encode(
+                            "utf-8", errors="ignore"
+                        )
+                    ).hexdigest()[:16]
             operations.append(
                 {
-                    "id": str(raw.get("id", "") or ""),
-                    "seq": int(raw.get("seq", 0) or 0),
+                    "id": operation_id,
+                    "seq": operation_seq,
                     "ts": float(raw.get("ts", 0.0) or 0.0),
                     "type": kind,
                     "data": public_data,
