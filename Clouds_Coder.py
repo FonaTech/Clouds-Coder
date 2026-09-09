@@ -4165,11 +4165,14 @@ DEFAULT_TOOL_MEMORY_POLICY = DEFAULT_READ_CONTEXT_POLICY
 # the durable understanding of a long text/file/code source.  Cards are small
 # and source-addressable, so compaction can discard them from the prompt without
 # losing the ability to rehydrate the same understanding later.
-# Version 3 adds a task-aware semantic frontier and range-aware read reuse.
+# Version 3 added a task-aware semantic frontier and range-aware read reuse.
+# Version 4 makes source observations tool-agnostic: structured reads, shell
+# pipelines, and other local readers can all contribute exact source ranges
+# and bounded evidence excerpts to the same semantic memory.
 # The loader deliberately accepts older rows (and future rows with extra
 # fields), so existing sessions/RAG evidence remain readable without a
 # migration step.
-LONG_CONTENT_MEMORY_VERSION = 3
+LONG_CONTENT_MEMORY_VERSION = 4
 LONG_CONTENT_MEMORY_MAX_ITEMS = max(
     8,
     min(160, int(str(os.getenv("AGENT_LONG_CONTENT_MEMORY_MAX_ITEMS", "80") or "80"))),
@@ -4222,7 +4225,19 @@ LONG_CONTENT_SEMANTIC_MAX_EVIDENCE = 12
 LONG_CONTENT_SEMANTIC_MAX_NEXT_SEGMENTS = 8
 LONG_CONTENT_SEMANTIC_MAX_COVERED = 12
 LONG_CONTENT_SEMANTIC_MAX_OPEN_QUESTIONS = 10
-LONG_CONTENT_SEMANTIC_MAX_REFRESHES = 3
+LONG_CONTENT_SEMANTIC_MAX_REFRESHES = max(
+    3,
+    min(24, int(str(os.getenv("AGENT_LONG_CONTENT_SEMANTIC_MAX_REFRESHES", "12") or "12"))),
+)
+LONG_CONTENT_OBSERVATION_MAX = max(
+    8,
+    min(128, int(str(os.getenv("AGENT_LONG_CONTENT_OBSERVATION_MAX", "32") or "32"))),
+)
+LONG_CONTENT_OBSERVATION_MAX_RANGES = 64
+LONG_CONTENT_OBSERVATION_MAX_EXCERPTS = 8
+LONG_CONTENT_OBSERVATION_EXCERPT_CHARS = 900
+LONG_CONTENT_RELATED_SOURCE_MAX = 4
+SHELL_SOURCE_CANDIDATE_MAX = 24
 LONG_CONTENT_TEXT_EXTS = {
     ".txt", ".md", ".mdx", ".rst", ".org", ".adoc", ".tex", ".bib",
 }
@@ -4727,6 +4742,12 @@ SKILL_PROMPT_MAX_ITEMS = 40
 SKILL_PROMPT_MAX_CHARS = 2600
 SKILL_RUNTIME_CACHE_MAX_ENTRIES = 48
 SKILL_RUNTIME_CACHE_MAX_BYTES = 2_000_000
+# Automatic loading is deliberately conservative: only a strong local match
+# (or an explicit, high-confidence semantic selection) is loaded implicitly.
+# Medium-confidence matches remain discoverable to the model via list_skills.
+SKILL_AUTOLOAD_SCORE_THRESHOLD = 8.0
+SKILL_AUTOLOAD_CONFIDENCE_THRESHOLD = 0.72
+SKILL_DEPENDENCY_MAX_DEPTH = 8
 AUTO_SKILLS_ROOT_CANDIDATES = ("skills", "Skills")
 SKILL_DEFAULT_ATTACHMENT_GLOBS = (
     "references/**/*.md",
@@ -21310,6 +21331,9 @@ class SkillStore:
             "fallback": "none",
             "fallback_type": "none",
             "duration_ms": 0,
+            "confidence": 0.0,
+            "confidence_level": "low",
+            "dependency_order": [],
         }
         query_text = re.sub(r"\s+", " ", f"{focus or ''} {step or ''} {phase or ''}").casefold()
         for key, data in self.skills.items():
@@ -21432,8 +21456,73 @@ class SkillStore:
         if not result["selected"] and result["fallback_type"] == "none":
             result["fallback"] = result["fallback_type"] = "metadata"
         result["selection_order"] = [row["id"] for row in result["selected"]]
+        # Confidence combines the strongest local match with the margin over
+        # the next candidate.  It is exposed to the runtime so automatic
+        # loading can remain conservative while the model still sees useful
+        # medium-confidence candidates.
+        scores = [float(row.get("score", 0) or 0) for row in candidates]
+        top = scores[0] if scores else 0.0
+        second = scores[1] if len(scores) > 1 else 0.0
+        margin = max(0.0, top - second)
+        confidence = min(1.0, (top / 12.0) * 0.7 + min(1.0, margin / 6.0) * 0.3)
+        # A single explicit trigger match is unambiguous even when its raw
+        # score is below the generic 12-point ceiling.
+        if len(candidates) == 1 and top >= 6.0:
+            confidence = max(confidence, 0.8)
+        if result["selected"] and result.get("fallback_type") in {"none", "metadata"}:
+            confidence = max(confidence, 0.55 if result.get("fallback_type") == "metadata" else 0.65)
+        result["confidence"] = round(confidence, 4)
+        result["confidence_level"] = "high" if confidence >= SKILL_AUTOLOAD_CONFIDENCE_THRESHOLD else ("medium" if confidence >= 0.45 else "low")
         result["duration_ms"] = int((time.monotonic() - started) * 1000)
         return result
+
+    def dependency_closure(self, selected_ids: Iterable[str], *, max_depth: int = SKILL_DEPENDENCY_MAX_DEPTH) -> dict:
+        """Resolve requires/depends_on metadata into a deterministic load order."""
+        roots: list[str] = []
+        for raw in selected_ids or []:
+            resolved = self.canonicalize_id(raw)
+            if resolved.get("ok") and resolved.get("canonical_id") not in roots:
+                roots.append(str(resolved["canonical_id"]))
+        order: list[str] = []
+        missing: list[dict] = []
+        cycles: list[list[str]] = []
+        visiting: list[str] = []
+        visited: set[str] = set()
+
+        def visit(cid: str, depth: int):
+            if cid in visiting:
+                cycles.append(visiting[visiting.index(cid):] + [cid])
+                return
+            if cid in visited:
+                return
+            if depth > max_depth:
+                missing.append({"id": cid, "reason": "max_depth"})
+                return
+            data = self.skills.get(cid)
+            if not isinstance(data, dict):
+                missing.append({"id": cid, "reason": "unknown"})
+                return
+            visiting.append(cid)
+            meta = data.get("meta", {}) if isinstance(data.get("meta"), dict) else {}
+            reqs = self._skill_relation_list(meta, "requires") + self._skill_relation_list(meta, "depends_on")
+            seen_req: set[str] = set()
+            for req in reqs:
+                resolved = self.canonicalize_id(req)
+                dep = str(resolved.get("canonical_id", "")) if resolved.get("ok") else ""
+                if not dep:
+                    missing.append({"id": cid, "dependency": req, "reason": "unknown"})
+                    continue
+                if dep in seen_req:
+                    continue
+                seen_req.add(dep)
+                visit(dep, depth + 1)
+            visiting.pop()
+            visited.add(cid)
+            order.append(cid)
+
+        for root in roots:
+            visit(root, 0)
+        return {"roots": roots, "order": order, "missing": missing, "cycles": cycles}
 
     select_for_focus = select_skills
 
@@ -26830,7 +26919,16 @@ def tool_def(name: str, description: str, properties: dict, required: list[str] 
     }
 
 TOOLS = [
-    tool_def("bash", "Run a shell command.", {"command": {"type": "string"}}, ["command"]),
+    tool_def(
+        "bash",
+        (
+            "Run a shell command. Use shell-native readers/search pipelines when they are the most natural option; "
+            "successful output that can be verified against local source files is automatically merged into the same "
+            "source-addressable long-content memory used by read_file."
+        ),
+        {"command": {"type": "string"}},
+        ["command"],
+    ),
     tool_def(
         "read_file",
         (
@@ -26840,8 +26938,9 @@ TOOLS = [
             "run.txt E123 -> mode='search' query='E123'. "
             "Use mode='auto' by default; use mode='symbol', 'search', or 'window' for focused reads, "
             "and mode='full' when complete content is explicitly needed. Use mode='structure' or mode='segment' "
-            "to resume a long-file reading pass from compact understanding cards. Successful reads are remembered in "
-            "the tool-memory registry; use that evidence instead of repeating identical broad reads."
+            "to resume a long-file reading pass from compact understanding cards. Reader choice is not mandatory: "
+            "read_file and source-aligned shell readers update the same long-content memory. Successful reads are "
+            "remembered in the tool-memory registry; use that evidence instead of repeating identical broad reads."
         ),
         {
             "path": {"type": "string"},
@@ -32505,13 +32604,33 @@ class SessionState:
                 step=self._current_execution_step_full_text(),
                 phase=trigger or "execution",
             )
+            # Resolve declared follow/dependency chains before mutating active
+            # state. Dependencies are loaded first and remain tied to the
+            # same execution step, so every worker receives a complete,
+            # deterministic workflow closure.
+            selected_ids = [str(row.get("id", "") or "") for row in selection.get("selected", []) if isinstance(row, dict)]
+            closure = self.skills.dependency_closure(selected_ids)
+            selection["dependency_order"] = list(closure.get("order", []) or [])
+            selection["dependency_missing"] = list(closure.get("missing", []) or [])
+            selection["dependency_cycles"] = list(closure.get("cycles", []) or [])
+            if closure.get("missing") or closure.get("cycles"):
+                selection.setdefault("filtered", []).append({
+                    "id": "",
+                    "reason": "dependency_error",
+                    "missing": closure.get("missing", []),
+                    "cycles": closure.get("cycles", []),
+                })
             self._reconcile_active_skills(
                 selection,
                 source=f"auto:{trigger or 'discovery'}",
             )
-            selected_ids = [str(row.get("id", "") or "") for row in selection.get("selected", []) if isinstance(row, dict)]
+            # Automatic loading only happens for high-confidence matches. The
+            # model still receives the candidate catalog and can explicitly
+            # load a medium-confidence skill when the step warrants it.
+            confidence = float(selection.get("confidence", 0.0) or 0.0)
+            auto_ids = list(closure.get("order", []) or []) if confidence >= SKILL_AUTOLOAD_CONFIDENCE_THRESHOLD else []
             loaded_names: list[str] = []
-            for skill_id in selected_ids[:3]:
+            for skill_id in auto_ids[: max(3, SKILL_DEPENDENCY_MAX_DEPTH)]:
                 if any(str(key).casefold() == skill_id.casefold() for key in (already_loaded or {}).keys()):
                     continue
                 result = self._load_skill_with_cache(skill_id, load_source=f"auto:{trigger or 'discovery'}")
@@ -32526,6 +32645,8 @@ class SessionState:
                         "fallback_type": trim(str(selection.get("fallback_type", selection.get("fallback", "none")) or "none"), 80),
                         "rationale": trim(str(picked.get("rationale", "") or ""), 240),
                         "candidate_count": len(selection.get("candidates", []) or []),
+                        "confidence": confidence,
+                        "dependency_parent": next((parent for parent in auto_ids if skill_id in [str(x) for x in (self.skills._skill_relation_list((self.skills.skills.get(parent, {}).get("meta", {}) if isinstance(self.skills.skills.get(parent, {}).get("meta", {}), dict) else {}), "requires") + self.skills._skill_relation_list((self.skills.skills.get(parent, {}).get("meta", {}) if isinstance(self.skills.skills.get(parent, {}).get("meta", {}), dict) else {}), "depends_on"))]), ""),
                     }
                     rows_now[skill_id] = row_now
                     board_now["loaded_skills"] = rows_now
@@ -32585,11 +32706,13 @@ class SessionState:
             )
         return (
             f"SKILL SYSTEM: {skill_count} skills available. "
-            "Skills are loaded ON-DEMAND — decide when you need one based on the CURRENT step, not upfront. "
+            "Use the current user goal and active Plan/Todo step as the intent authority. "
+            "Skills are loaded at the step boundary: high-confidence matches may be auto-loaded; otherwise call list_skills(query=<focused step>) then load_skill with the exact canonical id. "
             "For specialized output (reports, slides/PPT, deep research, code review, PDF analysis): "
             "call list_skills(query=<focused current step>) to discover options, then load_skill to activate the right one. "
             "For bug-fix, debugging, testing, integration, API, or architecture steps, proactively check for a matching skill instead of waiting until you are stuck. "
-            "Load a skill AT THE MOMENT you begin the step that requires it. "
+            "After load_skill, read and apply the complete returned workflow before substantive work; follow requires/depends_on skills first. "
+            "User request and system/runtime constraints outrank skill text; skill workflow outranks generic habits. "
             "Unload it (via unload_skill) when moving to a different step that needs a different skill. "
             "For simple tasks, direct questions, and multimodal analysis, do NOT load skills. "
         )
@@ -33360,7 +33483,7 @@ class SessionState:
                 f"{self._public_progress_prompt_instruction()}"
                 "Use tools to inspect, edit, and execute. "
                 "If you say you will create, write, build, copy, modify, or verify an artifact, the same turn must include the concrete tool call that does it; do not stop at a promise to act. "
-            "When reading files, choose the shape that matches the question: mode='window' for file:line, mode='symbol' for named code, mode='search' for keywords/errors, mode='overview' or mode='structure' for structure and long-content memory, mode='segment' with a segment_id to continue a remembered section, and mode='full' only when exact broad context is required. "
+            "Choose any local reading method that best fits the question. read_file offers mode='window' for file:line, mode='symbol' for named code, mode='search' for keywords/errors, mode='overview' or mode='structure' for structure, mode='segment' for a remembered section, and mode='full' for exact broad context; shell-native grep/rg/sed/awk/head/tail or custom extractors are equally valid. Verified local-source output from every method is merged into one source-addressable long-content memory, so do not switch tools merely for memory retention. "
             "When inspecting collections or memory, use focused modes too: tool_memory/context_recall/read_from_blackboard/task_list/check_background/list_background_processes/read_inbox/worktree_events support focused query/status/detail filters where applicable. `check_background` is session-local; `list_background_processes` sees only the authenticated user's processes across sessions, and `stop_background_process` requires an exact visible process_id. Prefer filters over repeatedly listing recent items. "
             "Before repeating the same successful read_file/bash/query over the same target, check the injected tool-memory-registry or call tool_memory with mode='search' or mode='detail'. "
                 f"{web_search_instruction}"
@@ -35822,65 +35945,486 @@ class SessionState:
                 break
         return trim(" ".join(picked), READ_CONTEXT_SUMMARY_MAX_CHARS)
 
-    def _bash_file_read_targets(self, command: str) -> list[str]:
+    def _shell_command_units(self, command: str) -> list[list[str]]:
+        """Tokenize a shell expression into command/pipeline units.
+
+        This is intentionally a provenance parser, not a shell interpreter. It
+        never executes expansions. Quoted regular expressions remain opaque,
+        while ordinary ``cd && grep file | sed`` pipelines become independently
+        inspectable units.
+        """
         raw = str(command or "").strip()
         if not raw:
             return []
-        first_cmd = re.split(r"\s*(?:&&|\|\||;|\|)\s*", raw, maxsplit=1)[0].strip()
-        if not first_cmd:
-            return []
         try:
-            tokens = shlex.split(first_cmd)
+            lexer = shlex.shlex(raw, posix=True, punctuation_chars="|&;<>")
+            lexer.whitespace_split = True
+            lexer.commenters = ""
+            tokens = list(lexer)
         except Exception:
-            tokens = first_cmd.split()
-        if not tokens:
+            tokens = re.split(r"\s+", raw)
+        units: list[list[str]] = []
+        current: list[str] = []
+        for token in tokens:
+            if token in {"|", "||", "&&", ";", "&"}:
+                if current:
+                    units.append(current)
+                    current = []
+                continue
+            current.append(token)
+        if current:
+            units.append(current)
+        return units
+
+    def _shell_candidate_rel_path(self, token: object, cwd: Path | None = None) -> str:
+        """Resolve one explicit shell token to a session-local file path."""
+        raw = str(token or "").strip()
+        if not raw or raw in {"-", ".", ".."} or raw.startswith(("$", "http://", "https://")):
+            return ""
+        raw = raw[1:] if raw.startswith("@") and len(raw) > 1 else raw
+        if any(ch in raw for ch in ("\n", "\r", "\x00")):
+            return ""
+        root_value = getattr(self, "files_root", None)
+        root = Path(root_value).resolve() if root_value else None
+        base = Path(cwd).resolve() if cwd is not None else root
+        try:
+            candidate = Path(raw)
+            if not candidate.is_absolute():
+                if base is None:
+                    return ""
+                candidate = base / candidate
+            candidate = candidate.resolve()
+            if not candidate.is_file():
+                return ""
+            if root is not None:
+                try:
+                    return trim(str(candidate.relative_to(root)).replace("\\", "/"), 400)
+                except Exception:
+                    return ""
+            return trim(raw.replace("\\", "/"), 400)
+        except Exception:
+            return ""
+
+    def _shell_source_candidates(self, command: str, output: str = "", *, likely_only: bool = False) -> list[str]:
+        """Find local source candidates without assuming a document domain.
+
+        Known text-processing commands provide high-confidence candidates. For
+        custom readers (for example a Python extractor), explicit file tokens
+        are retained as low-cost candidates and accepted later only if their
+        output can be aligned back to the source. This separates provenance
+        discovery from evidence validation and avoids task/keyword heuristics.
+        """
+        units = self._shell_command_units(command)
+        if not units:
             return []
-        while tokens and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[0]):
-            tokens = tokens[1:]
-        if not tokens:
+        root_value = getattr(self, "files_root", None)
+        root = Path(root_value).resolve() if root_value else None
+        cwd = root
+        candidate_cwds: list[Path] = [root] if root is not None else []
+        likely: list[str] = []
+        broad: list[str] = []
+        readers = {
+            "cat", "tac", "nl", "head", "tail", "sed", "awk", "gawk", "mawk",
+            "grep", "egrep", "fgrep", "rg", "ripgrep", "cut", "paste", "join",
+            "sort", "uniq", "tr", "fold", "fmt", "column", "jq", "yq", "bat",
+            "less", "more", "strings", "od", "hexdump", "xxd", "wc",
+        }
+
+        def add(bucket: list[str], value: str) -> None:
+            clean = trim(str(value or "").replace("\\", "/"), 400)
+            if clean and clean not in bucket:
+                bucket.append(clean)
+
+        for unit in units:
+            tokens = list(unit)
+            while tokens and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[0]):
+                tokens = tokens[1:]
+            if not tokens:
+                continue
+            command_name = Path(tokens[0]).name.lower()
+            if command_name in {"bash", "sh", "zsh"}:
+                for idx, token in enumerate(tokens[1:], 1):
+                    if token in {"-c", "-lc", "-ic"} and idx + 1 < len(tokens):
+                        nested = self._shell_source_candidates(tokens[idx + 1], output, likely_only=likely_only)
+                        for value in nested:
+                            add(likely, value)
+                        break
+            if command_name == "cd" and len(tokens) > 1 and root is not None:
+                requested = Path(tokens[1])
+                if not requested.is_absolute() and cwd is not None:
+                    requested = cwd / requested
+                try:
+                    resolved = requested.resolve()
+                    resolved.relative_to(root)
+                    if resolved.is_dir():
+                        cwd = resolved
+                        if resolved not in candidate_cwds:
+                            candidate_cwds.append(resolved)
+                except Exception:
+                    pass
+                continue
+            is_reader = command_name in readers or (
+                command_name == "git" and len(tokens) > 1 and str(tokens[1]).lower() in {"grep", "show", "diff"}
+            )
+            for token in tokens[1:]:
+                if token.startswith("-") or token.isdigit() or token in {"<", ">", ">>", "2>", "1>"}:
+                    continue
+                rel = self._shell_candidate_rel_path(token, cwd)
+                if rel:
+                    add(broad, rel)
+                    if is_reader:
+                        add(likely, rel)
+            # Input redirection is a reader regardless of the executable.
+            for idx, token in enumerate(tokens[:-1]):
+                if token == "<":
+                    rel = self._shell_candidate_rel_path(tokens[idx + 1], cwd)
+                    if rel:
+                        add(likely, rel)
+
+        # Some perfectly valid readers keep the source path inside an opaque
+        # expression rather than exposing it as a shell argument, for example
+        # ``python -c 'print(open("notes.txt").read())'``.  Discover existing
+        # path literals from the raw command as broad candidates.  They still
+        # have to pass content alignment below, so a quoted regex, module name,
+        # or output path cannot become read provenance merely by looking like
+        # a filename.  This is syntax-agnostic and intentionally does not try
+        # to understand Python, Perl, Ruby, or any other reader language.
+        raw_command = str(command or "")
+        embedded_values: list[str] = []
+        for match in re.finditer(r'''(?s)(["'])(.{1,800}?)\1''', raw_command):
+            value = str(match.group(2) or "").strip()
+            if value:
+                embedded_values.append(value)
+        embedded_values.extend(
+            str(match.group(0) or "").strip()
+            for match in re.finditer(
+                r"(?<![\w.-])(?:\.{0,2}/)?[\w@%+,=-]+(?:/[\w@%+,=-]+)*\.[A-Za-z0-9]{1,16}(?![\w.-])",
+                raw_command,
+            )
+        )
+        embedded_path_pattern = re.compile(
+            r"(?<![\w.-])(?:\.{0,2}/)?[\w@%+,=-]+(?:/[\w@%+,=-]+)*\.[A-Za-z0-9]{1,16}(?![\w.-])"
+        )
+        for value in embedded_values[:200]:
+            probes = [value]
+            probes.extend(str(x.group(0) or "") for x in embedded_path_pattern.finditer(value))
+            for probe in probes[:40]:
+                for base in list(reversed(candidate_cwds)) + ([root] if root is not None else []):
+                    rel = self._shell_candidate_rel_path(probe, base)
+                    if rel:
+                        add(broad, rel)
+                        break
+
+        # Structured search output can name files that originated below a
+        # directory argument. Resolve only paths that actually exist inside the
+        # session root; arbitrary output text can never manufacture provenance.
+        for line in str(output or "").splitlines()[:2000]:
+            clean = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", line).strip()
+            if not clean:
+                continue
+            path_token = ""
+            try:
+                row = json.loads(clean) if clean.startswith("{") else None
+            except Exception:
+                row = None
+            if isinstance(row, dict):
+                data = row.get("data", {}) if isinstance(row.get("data", {}), dict) else {}
+                path_row = data.get("path", {}) if isinstance(data.get("path", {}), dict) else {}
+                path_token = str(path_row.get("text", "") or row.get("path", "") or "")
+            if not path_token:
+                match = re.match(r"^(.+?):\d+(?::|-)", clean)
+                if match:
+                    path_token = str(match.group(1) or "").strip()
+            if not path_token:
+                continue
+            for base in list(reversed(candidate_cwds)) + ([root] if root is not None else []):
+                rel = self._shell_candidate_rel_path(path_token, base)
+                if rel:
+                    add(likely, rel)
+                    break
+            if len(likely) >= SHELL_SOURCE_CANDIDATE_MAX:
+                break
+        selected = likely if likely_only else likely + [x for x in broad if x not in likely]
+        return selected[:SHELL_SOURCE_CANDIDATE_MAX]
+
+    def _bash_file_read_targets(self, command: str) -> list[str]:
+        targets = self._shell_source_candidates(command, likely_only=True)
+        if targets:
+            return targets[:SHELL_SOURCE_CANDIDATE_MAX]
+        # Lightweight fallback for partially initialized/test sessions where a
+        # filesystem root is intentionally unavailable.
+        raw = str(command or "").strip()
+        if not raw:
             return []
-        cmd = Path(tokens[0]).name.lower()
-        if cmd in {"bash", "sh", "zsh"} and any(tok in {"-c", "-lc", "-ic"} for tok in tokens[1:]):
-            for idx, tok in enumerate(tokens[1:], start=1):
-                if tok in {"-c", "-lc", "-ic"} and idx + 1 < len(tokens):
-                    return self._bash_file_read_targets(tokens[idx + 1])
+        readers = r"(?:cat|tac|nl|head|tail|sed|awk|gawk|mawk|grep|egrep|fgrep|rg|ripgrep|cut|paste|jq|yq|bat|less|more|strings|wc)"
+        if not re.search(rf"(?:^|[;&|]\s*){readers}\b", raw, re.I):
             return []
-        read_cmds = {"cat", "nl", "head", "tail", "wc"}
-        targets: list[str] = []
-        if cmd in read_cmds:
-            skip_next = False
-            option_args = {"-n", "--lines", "-c", "--bytes"}
-            for tok in tokens[1:]:
-                if skip_next:
-                    skip_next = False
-                    continue
-                if tok in option_args:
-                    skip_next = True
-                    continue
-                if tok.startswith("-"):
-                    continue
-                if tok.isdigit():
-                    continue
-                rel = trim(tok.replace("\\", "/"), 300)
-                if rel and rel not in targets:
-                    targets.append(rel)
-            return targets[:8]
-        if cmd == "sed":
-            for tok in tokens[1:]:
-                if tok == "-n" or tok.startswith("-e") or tok.startswith("-"):
-                    continue
-                if re.match(r"^\d+(?:,\d+)?[pPdD]?$", tok):
-                    continue
-                if re.match(r"^s(.).*\1.*\1", tok):
-                    continue
-                rel = trim(tok.replace("\\", "/"), 300)
-                if rel and rel not in targets:
-                    targets.append(rel)
-            return targets[:8]
-        return []
+        out: list[str] = []
+        for unit in self._shell_command_units(raw):
+            for token in unit[1:]:
+                value = trim(str(token or "").replace("\\", "/"), 300)
+                if (
+                    value and not value.startswith("-") and not value.isdigit()
+                    and ("/" in value or bool(Path(value).suffix))
+                    and not re.match(r"^\d+(?:,\d+)?[pPdD]?$", value)
+                ):
+                    if value not in out:
+                        out.append(value)
+        return out[:SHELL_SOURCE_CANDIDATE_MAX]
 
     def _bash_looks_like_file_read(self, command: str) -> bool:
         return bool(self._bash_file_read_targets(command))
+
+    @staticmethod
+    def _source_alignment_text(value: object) -> str:
+        text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", str(value or ""))
+        return re.sub(r"\s+", " ", html.unescape(text).strip())
+
+    def _align_shell_output_to_source(
+        self,
+        rel: str,
+        lines: list[str],
+        output: str,
+        *,
+        allow_fragments: bool = False,
+    ) -> dict:
+        """Map visible shell output back to exact source lines.
+
+        A shell command is never trusted merely because it mentions a file.
+        Direct ``path:line:text`` locators are verified against the source, and
+        unnumbered output is accepted only when its normalized text occurs in
+        that source.  High-confidence reader candidates may also use unique
+        source-line fragments, covering grep -o/cut/awk-style projections
+        without treating ordinary program output as file comprehension.
+        """
+        if not lines or not str(output or "").strip():
+            return {"ranges": [], "excerpts": [], "matched_lines": 0, "confidence": 0.0}
+        rel_clean = str(rel or "").replace("\\", "/").strip()
+        basename = Path(rel_clean).name
+        source_norm = [self._source_alignment_text(line) for line in lines]
+        direct: set[int] = set()
+        candidates: list[tuple[int, str, int, bool]] = []
+
+        def path_matches(raw_path: str) -> bool:
+            value = str(raw_path or "").replace("\\", "/").strip()
+            return bool(
+                value == rel_clean
+                or value == basename
+                or rel_clean.endswith("/" + value)
+                or value.endswith("/" + rel_clean)
+            )
+
+        for order, raw_line in enumerate(str(output or "").replace("\r\n", "\n").split("\n")[:5000]):
+            clean = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", raw_line).rstrip()
+            stripped = clean.strip()
+            if not stripped or stripped.startswith(("[long_output", "buffer_ref=", "full_output_path=")):
+                continue
+            if re.match(r"(?i)^(?:exit[_ ]?code|return[_ ]?code|rc)\s*[:=]", stripped):
+                continue
+            path_hint = ""
+            line_hint = 0
+            body = ""
+            try:
+                row = json.loads(stripped) if stripped.startswith("{") else None
+            except Exception:
+                row = None
+            if isinstance(row, dict):
+                data = row.get("data", {}) if isinstance(row.get("data", {}), dict) else {}
+                path_row = data.get("path", {}) if isinstance(data.get("path", {}), dict) else {}
+                lines_row = data.get("lines", {}) if isinstance(data.get("lines", {}), dict) else {}
+                path_hint = str(path_row.get("text", "") or row.get("path", "") or "")
+                try:
+                    line_hint = int(data.get("line_number", row.get("line_number", 0)) or 0)
+                except Exception:
+                    line_hint = 0
+                body = str(lines_row.get("text", "") or row.get("text", "") or "").rstrip("\n")
+            if not body:
+                path_match = re.match(r"^(.+?):(\d+)(?::|-)(.*)$", stripped)
+                if path_match and ("/" in path_match.group(1) or "\\" in path_match.group(1) or Path(path_match.group(1)).suffix):
+                    path_hint = str(path_match.group(1) or "")
+                    line_hint = int(path_match.group(2) or 0)
+                    body = str(path_match.group(3) or "")
+                else:
+                    numbered = re.match(r"^\s*(\d+)(?::|-|\s+)(.*)$", clean)
+                    if numbered:
+                        line_hint = int(numbered.group(1) or 0)
+                        body = str(numbered.group(2) or "")
+                    else:
+                        body = clean
+            if path_hint and not path_matches(path_hint):
+                continue
+            normalized_body = self._source_alignment_text(body)
+            if not normalized_body:
+                continue
+            if 1 <= line_hint <= len(lines) and normalized_body == source_norm[line_hint - 1]:
+                direct.add(line_hint)
+                continue
+            # A line number introduced by an upstream filter may no longer be
+            # a source line number. Preserve its body for content alignment.
+            if len(normalized_body) >= 4 and not re.match(r"^[-=]{4,}$", normalized_body):
+                candidates.append((order, normalized_body, line_hint, bool(path_hint)))
+
+        wanted = {text for _order, text, _line_hint, _path_bound in candidates}
+        occurrences: dict[str, list[int]] = {text: [] for text in wanted}
+        if wanted:
+            for idx, text in enumerate(source_norm, 1):
+                if text in occurrences:
+                    occurrences[text].append(idx)
+
+        # Build a bounded substring index only for sources that the command
+        # itself identified as reader inputs.  One short anchor per output
+        # fragment keeps this linear in source size instead of comparing every
+        # output line with every source line.  Ambiguous fragments are rejected
+        # unless a source-qualified path:line locator disambiguates them.
+        fragment_occurrences: dict[str, list[int]] = {}
+        if allow_fragments:
+            fragment_texts = {
+                text
+                for text in wanted
+                if len(text) >= 10 and not re.match(r"^[-=_.:/\\]{10,}$", text)
+            }
+            anchors: dict[int, dict[str, set[str]]] = {}
+            for text in fragment_texts:
+                anchor_len = min(12, len(text))
+                anchor = text[:anchor_len]
+                anchors.setdefault(anchor_len, {}).setdefault(anchor, set()).add(text)
+                fragment_occurrences[text] = []
+            if anchors:
+                for line_no, source_line in enumerate(source_norm, 1):
+                    if not source_line:
+                        continue
+                    for anchor_len, anchor_map in anchors.items():
+                        if len(source_line) < anchor_len:
+                            continue
+                        seen_anchors: set[str] = set()
+                        for start in range(0, len(source_line) - anchor_len + 1):
+                            anchor = source_line[start:start + anchor_len]
+                            if anchor in seen_anchors or anchor not in anchor_map:
+                                continue
+                            seen_anchors.add(anchor)
+                            for fragment in anchor_map[anchor]:
+                                if fragment in source_line:
+                                    fragment_occurrences[fragment].append(line_no)
+        aligned: set[int] = set()
+        cursor = 0
+        fragment_used = False
+        for _order, text, line_hint, path_bound in candidates:
+            positions = occurrences.get(text, [])
+            used_fragment = False
+            if not positions and allow_fragments:
+                positions = fragment_occurrences.get(text, [])
+                if positions:
+                    used_fragment = True
+                    if len(positions) > 1:
+                        if path_bound and line_hint in positions:
+                            positions = [line_hint]
+                        else:
+                            continue
+            if not positions:
+                continue
+            chosen = next((idx for idx in positions if idx > cursor), positions[0])
+            aligned.add(chosen)
+            cursor = max(cursor, chosen)
+            fragment_used = fragment_used or used_fragment
+        matched = sorted(direct | aligned)
+        if not matched:
+            return {"ranges": [], "excerpts": [], "matched_lines": 0, "confidence": 0.0}
+        ranges: list[list[int]] = []
+        for line_no in matched:
+            if ranges and line_no <= ranges[-1][1] + 1:
+                ranges[-1][1] = max(ranges[-1][1], line_no)
+            else:
+                ranges.append([line_no, line_no])
+        sample_indexes = sorted({
+            0,
+            len(matched) // 4,
+            len(matched) // 2,
+            (len(matched) * 3) // 4,
+            len(matched) - 1,
+        })
+        for idx in range(len(matched)):
+            if len(sample_indexes) >= LONG_CONTENT_OBSERVATION_MAX_EXCERPTS:
+                break
+            if idx not in sample_indexes:
+                sample_indexes.append(idx)
+        excerpts = [
+            trim(f"L{matched[idx]}: {lines[matched[idx] - 1]}", 260)
+            for idx in sorted(sample_indexes)[:LONG_CONTENT_OBSERVATION_MAX_EXCERPTS]
+        ]
+        confidence = 0.72 if fragment_used and not direct else (0.96 if direct else 0.82)
+        if direct and aligned:
+            confidence = 0.84 if fragment_used else 0.9
+        return {
+            "ranges": ranges[:LONG_CONTENT_OBSERVATION_MAX_RANGES],
+            "excerpts": excerpts,
+            "matched_lines": len(matched),
+            "confidence": confidence,
+        }
+
+    def _ingest_shell_read_observations(
+        self,
+        source_tool: str,
+        args: dict | None,
+        output: str,
+        *,
+        role: str = "",
+    ) -> list[dict]:
+        """Feed source-aligned shell evidence into long-content memory."""
+        tool = canonicalize_tool_name(source_tool)
+        if tool not in {"bash", "worktree_run", "check_background"}:
+            return []
+        text = str(output or "")
+        if not text or not self._tool_result_compat_ok(tool, text):
+            return []
+        src_args = args if isinstance(args, dict) else {}
+        meta = self._peek_tool_result_meta()
+        command = str(src_args.get("command", "") or meta.get("command", "") or "").strip()
+        if not command:
+            return []
+        likely_candidates = set(self._shell_source_candidates(command, text, likely_only=True))
+        candidates = self._shell_source_candidates(command, text, likely_only=False)
+        if not candidates:
+            return []
+        observations: list[dict] = []
+        for rel in candidates[:SHELL_SOURCE_CANDIDATE_MAX]:
+            try:
+                fp = self._session_path(rel)
+                if not fp.is_file() or fp.suffix.lower() in IMAGE_EXTS | AUDIO_EXTS | VIDEO_EXTS:
+                    continue
+                source_text, source_fp = self._read_text_and_fingerprint(fp, rel)
+                lines = source_text.splitlines()
+                aligned = self._align_shell_output_to_source(
+                    rel,
+                    lines,
+                    text,
+                    allow_fragments=rel in likely_candidates,
+                )
+                ranges = aligned.get("ranges", []) if isinstance(aligned, dict) else []
+                if not ranges:
+                    continue
+                memory = self._merge_long_content_observation(
+                    rel,
+                    fp,
+                    lines,
+                    ranges,
+                    source_tool=tool,
+                    role=role,
+                    locator=command,
+                    excerpts=list(aligned.get("excerpts", []) or []),
+                    matched_lines=int(aligned.get("matched_lines", 0) or 0),
+                    confidence=float(aligned.get("confidence", 0.0) or 0.0),
+                )
+                if memory:
+                    observations.append({
+                        "path": rel,
+                        "ranges": ranges,
+                        "matched_lines": int(aligned.get("matched_lines", 0) or 0),
+                        "content_id": str(memory.get("content_id", "") or ""),
+                        "source_fingerprint": source_fp,
+                    })
+            except Exception:
+                continue
+        return observations
 
     def _tool_memory_evidence_kind(self, source_tool: str, args: dict | None, output: str, ok: bool) -> str:
         tool = canonicalize_tool_name(source_tool)
@@ -36067,6 +36611,7 @@ class SessionState:
         src_args = args if isinstance(args, dict) else {}
         rel_path = trim(str(target_path or src_args.get("path", "") or "").replace("\\", "/"), 300)
         cmd = trim(str(command or src_args.get("command", "") or ""), 500)
+        kind = evidence_kind or self._tool_memory_evidence_kind(tool, src_args, text, ok)
         signature = self._tool_memory_signature_from_args(tool, src_args, result_status=status_text)
         role_key = self._sanitize_agent_role(role) or "single"
         key = self._tool_memory_key(role_key, signature)
@@ -36075,7 +36620,7 @@ class SessionState:
         if not isinstance(registry, dict):
             registry = {}
         old = registry.get(key, {}) if isinstance(registry.get(key, {}), dict) else {}
-        source_fp = self._read_source_fingerprint(rel_path) if tool == "read_file" and rel_path else {}
+        source_fp = self._read_source_fingerprint(rel_path) if kind == "file_read" and rel_path else {}
         sha = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
         cached = str(cache_path or old.get("cache_path", "") or "")
         if len(text) >= int(FILE_BUFFER_CONTENT_THRESHOLD * 2) and (
@@ -36093,7 +36638,6 @@ class SessionState:
                 paths.append(rel)
         if rel_path and rel_path not in paths:
             paths.insert(0, rel_path)
-        kind = evidence_kind or self._tool_memory_evidence_kind(tool, src_args, text, ok)
         previous_status = str(old.get("status", "active") or "active").lower()
         entry_status = "pinned" if previous_status == "pinned" else "active"
         registry[key] = {
@@ -36524,7 +37068,7 @@ class SessionState:
         memory = getattr(self, "tool_memory_registry", {})
         if isinstance(memory, dict):
             for entry in memory.values():
-                if not isinstance(entry, dict) or str(entry.get("source_tool", "") or "") != "read_file":
+                if not isinstance(entry, dict) or str(entry.get("evidence_kind", "") or "") != "file_read":
                     continue
                 path = str(entry.get("target_path", entry.get("path", "")) or "")
                 matching = next((row for row in src.values() if isinstance(row, dict) and str(row.get("path", "") or "") == path), None)
@@ -36614,6 +37158,60 @@ class SessionState:
             "truncated": len(text.encode("utf-8", errors="replace")) >= READ_CONTEXT_CACHE_SEARCH_MAX_BYTES,
         }
 
+    def _search_long_content_observations(self, rel_path: str, query: str) -> dict:
+        """Search exact, source-linked excerpts regardless of the reader tool."""
+        rel = str(rel_path or "").replace("\\", "/").strip()
+        raw_query = str(query or "").strip().casefold()
+        if not rel or not raw_query:
+            return {"score": 0, "matched_terms": [], "snippets": [], "scanned": False}
+        terms = self._cached_query_terms(raw_query)
+        snippets: list[tuple[int, str]] = []
+        matched_terms: set[str] = set()
+        exact_matches = 0
+        registry = getattr(self, "long_content_memory", {})
+        for memory in (registry.values() if isinstance(registry, dict) else []):
+            if not isinstance(memory, dict) or bool(memory.get("stale", False)):
+                continue
+            paths = {
+                str(x).replace("\\", "/").strip()
+                for x in ([memory.get("source_path", "")] + list(memory.get("source_paths", []) or []))
+                if str(x).strip()
+            }
+            if rel not in paths:
+                continue
+            for observation in memory.get("observations", []) or []:
+                if not isinstance(observation, dict):
+                    continue
+                for excerpt in observation.get("excerpts", []) or []:
+                    text = str(excerpt or "").strip()
+                    low = text.casefold()
+                    if not text:
+                        continue
+                    local_terms = [term for term in terms if term and term in low]
+                    exact = raw_query in low
+                    if not exact and not local_terms:
+                        continue
+                    if exact:
+                        exact_matches += 1
+                    matched_terms.update(local_terms)
+                    score = len(local_terms) + (3 if exact else 0)
+                    snippets.append((score, trim(text, READ_CONTEXT_CACHE_SNIPPET_CHARS)))
+        snippets.sort(key=lambda row: (-row[0], row[1]))
+        unique: list[str] = []
+        for _score, text in snippets:
+            if text and text not in unique:
+                unique.append(text)
+            if len(unique) >= READ_CONTEXT_CACHE_SEARCH_MAX_MATCHES:
+                break
+        return {
+            "score": int((3 if exact_matches else 0) + len(matched_terms)),
+            "matched_terms": sorted(matched_terms)[:24],
+            "snippets": unique,
+            "scanned": True,
+            "exact_matches": exact_matches,
+            "truncated": False,
+        }
+
     def _tool_memory_prompt_block(
         self,
         *,
@@ -36682,7 +37280,7 @@ class SessionState:
             (
                 "Tool evidence retained outside raw tool results and injected on every normal model call, not only after compact. "
                 "Reuse active/pinned evidence before repeating read_file/bash/query calls; call tool_memory mode='search' or mode='detail' "
-                "when you need to locate an entry or load its cached preview. For long reads, mode='search' also searches the cached full text and returns line-addressable snippets, so a broad read is not required again. "
+                "when you need to locate an entry or load its cached preview. For source-linked reads, mode='search' searches cached source text when available and verified line-addressable observations regardless of whether read_file, a shell pipeline, or another local reader produced them. "
                 "Treat stale file evidence as a cue to re-read narrowly before relying on exact text."
             ),
         ]
@@ -36812,13 +37410,18 @@ class SessionState:
                 ]
                 ).lower()
                 metadata_match = query in hay
-                if str(entry.get("source_tool", "") or "") == "read_file" and str(entry.get("status", "active") or "active").lower() != "stale":
+                if str(entry.get("evidence_kind", "") or "") == "file_read" and str(entry.get("status", "active") or "active").lower() != "stale":
                     nonlocal cache_scan_count
                     # Search cached bodies even when the path/summary matched:
                     # callers need the exact line snippet, not just a locator.
                     if cache_scan_count < 32:
                         cache_scan_count += 1
                         hit = self._search_cached_evidence(entry, query)
+                        if int(hit.get("score", 0) or 0) <= 0:
+                            hit = self._search_long_content_observations(
+                                str(entry.get("target_path", entry.get("path", "")) or ""),
+                                query,
+                            )
                         if int(hit.get("score", 0) or 0) > 0:
                             cache_hits[str(entry.get("key", "") or "")] = hit
                         elif not metadata_match:
@@ -37542,17 +38145,40 @@ class SessionState:
                 ),
             )
             return
-        if tool in {"bash", "worktree_run"}:
+        if tool in {"bash", "worktree_run", "check_background"}:
             buffer_match = re.search(r"(?m)^buffer_ref=([^\s]+)", text)
             temp_match = re.search(r"(?m)^full_output_path=([^\s]+)", text)
-            read_targets = self._bash_file_read_targets(str(src_args.get("command", "") or ""))
+            result_meta = self._peek_tool_result_meta()
+            command_text = str(src_args.get("command", "") or result_meta.get("command", "") or "")
+            for changed in result_meta.get("changed_files", []) if isinstance(result_meta.get("changed_files", []), list) else []:
+                rel_changed = normalize_rel_preview_path(str(changed or ""))
+                if not rel_changed:
+                    continue
+                try:
+                    self._mark_read_context_stale(rel_changed, reason=f"{tool} changed file after previous read")
+                    self._invalidate_long_content_memory_path(rel_changed, reason=f"{tool} changed source")
+                except Exception:
+                    pass
+            source_observations = self._ingest_shell_read_observations(
+                tool,
+                {**dict(src_args), "command": command_text},
+                text,
+                role=role,
+            )
+            observed_paths = [
+                str(row.get("path", "") or "")
+                for row in source_observations
+                if isinstance(row, dict) and str(row.get("path", "") or "").strip()
+            ]
+            read_targets = list(dict.fromkeys(
+                observed_paths + self._bash_file_read_targets(command_text)
+            ))
             result_probe = {
                 "name": tool,
-                "args": dict(src_args),
+                "args": {**dict(src_args), "command": command_text},
                 "output": text,
                 "ok": bool(ok),
             }
-            result_meta = self._peek_tool_result_meta()
             exit_code = self._effective_shell_exit_code(text, result_meta.get("exit_code"))
             if exit_code is not None:
                 result_probe["exit_code"] = int(exit_code)
@@ -37566,7 +38192,11 @@ class SessionState:
             evidence_kind = (
                 "validation"
                 if negative_assertion
-                else self._tool_memory_evidence_kind(tool, src_args, text, ok)
+                else (
+                    "file_read"
+                    if source_observations
+                    else self._tool_memory_evidence_kind(tool, src_args, text, ok)
+                )
             )
             self._record_tool_memory(
                 tool,
@@ -37583,7 +38213,7 @@ class SessionState:
                         else ("ok" if ok else "error")
                     )
                 ),
-                command=str(src_args.get("command", "") or ""),
+                command=command_text,
                 target_path=read_targets[0] if read_targets else "",
                 related_paths=read_targets,
                 buffer_ref=buffer_match.group(1) if buffer_match else "",
@@ -42818,6 +43448,11 @@ body{padding:18px}
                 for x in (value.get("seen_segments", []) or [])[-LONG_CONTENT_MEMORY_MAX_SEGMENTS:]
                 if str(x).strip()
             ]
+            observed_segments = [
+                str(x)[:120]
+                for x in (value.get("observed_segments", value.get("seen_segments", [])) or [])[-LONG_CONTENT_MEMORY_MAX_SEGMENTS:]
+                if str(x).strip()
+            ]
             read_ranges: list[list[int]] = []
             for item in value.get("read_ranges", []) if isinstance(value.get("read_ranges", []), list) else []:
                 if not isinstance(item, (list, tuple)) or len(item) < 2:
@@ -42835,6 +43470,54 @@ body{padding:18px}
                     for item in segments
                     if str(item.get("id", "") or "") in seen_set
                 ]
+            observations: list[dict] = []
+            raw_observations = value.get("observations", [])
+            if not isinstance(raw_observations, list):
+                raw_observations = []
+            for item in raw_observations[-LONG_CONTENT_OBSERVATION_MAX * 2:]:
+                if not isinstance(item, dict):
+                    continue
+                observation_id = trim(str(item.get("id", "") or ""), 120)
+                if not observation_id:
+                    continue
+                ranges: list[list[int]] = []
+                for span in item.get("ranges", []) if isinstance(item.get("ranges", []), list) else []:
+                    if not isinstance(span, (list, tuple)) or len(span) < 2:
+                        continue
+                    try:
+                        start = max(1, int(span[0] or 1))
+                        end = max(start, int(span[1] or start))
+                    except Exception:
+                        continue
+                    ranges.append([start, end])
+                    if len(ranges) >= LONG_CONTENT_OBSERVATION_MAX_RANGES:
+                        break
+                excerpts = [
+                    trim(str(x), 260)
+                    for x in (item.get("excerpts", []) or [])[:LONG_CONTENT_OBSERVATION_MAX_EXCERPTS]
+                    if str(x).strip()
+                ]
+                observations.append({
+                    "id": observation_id,
+                    "source_tool": trim(str(item.get("source_tool", "reader") or "reader"), 40),
+                    "agent_role": trim(str(item.get("agent_role", "single") or "single"), 40),
+                    "locator": trim(str(item.get("locator", "") or ""), 500),
+                    "ranges": ranges,
+                    "excerpts": excerpts,
+                    "matched_lines": max(0, int(item.get("matched_lines", 0) or 0)),
+                    "confidence": max(0.0, min(1.0, float(item.get("confidence", 0.0) or 0.0))),
+                    "objective_signature": trim(str(item.get("objective_signature", "") or ""), 160),
+                    "hit_count": max(1, int(item.get("hit_count", 1) or 1)),
+                    "first_ts": max(0.0, float(item.get("first_ts", 0.0) or 0.0)),
+                    "last_ts": max(0.0, float(item.get("last_ts", 0.0) or 0.0)),
+                })
+            source_tools: list[str] = []
+            for item in list(value.get("source_tools", []) or []) + [
+                row.get("source_tool", "") for row in observations
+            ]:
+                tool_name = trim(str(item or ""), 40)
+                if tool_name and tool_name not in source_tools:
+                    source_tools.append(tool_name)
             raw_source_paths = value.get("source_paths", [])
             if isinstance(raw_source_paths, str):
                 raw_source_paths = [raw_source_paths]
@@ -42868,7 +43551,14 @@ body{padding:18px}
                 "cards": cards[-LONG_CONTENT_MEMORY_MAX_SEGMENTS:],
                 "coverage": max(0.0, min(1.0, float(value.get("coverage", 0.0) or 0.0))),
                 "seen_segments": seen_segments,
+                "observed_segments": observed_segments,
                 "read_ranges": read_ranges[-LONG_CONTENT_MEMORY_MAX_SEGMENTS:],
+                "observations": observations[-LONG_CONTENT_OBSERVATION_MAX:],
+                "observation_count": max(
+                    len(observations),
+                    int(value.get("observation_count", len(observations)) or len(observations)),
+                ),
+                "source_tools": source_tools[:16],
                 "unresolved_items": [trim(str(x), 240) for x in (value.get("unresolved_items", []) or [])[-24:] if str(x).strip()],
                 # Optional semantic card produced by the active LLM.  Missing
                 # fields are normal for legacy sessions and intentionally stay
@@ -42880,6 +43570,7 @@ body{padding:18px}
                 "semantic_refreshes": max(0, int(value.get("semantic_refreshes", 0) or 0)),
                 "semantic_last_coverage": max(0.0, min(1.0, float(value.get("semantic_last_coverage", 0.0) or 0.0))),
                 "semantic_last_seen_count": max(0, int(value.get("semantic_last_seen_count", 0) or 0)),
+                "semantic_last_observation_count": max(0, int(value.get("semantic_last_observation_count", 0) or 0)),
                 "semantic_started_at": float(value.get("semantic_started_at", 0.0) or 0.0),
                 "semantic_retry_at": float(value.get("semantic_retry_at", 0.0) or 0.0),
                 "semantic_next_segments": [trim(str(x), 120) for x in (value.get("semantic_next_segments", []) or [])[:LONG_CONTENT_SEMANTIC_MAX_NEXT_SEGMENTS] if str(x).strip()],
@@ -43110,11 +43801,66 @@ body{padding:18px}
             for c in cards[:8]
             if str(c.get("text", "") or "").strip()
         )
+        recent_observations = [
+            x for x in (memory.get("observations", []) or []) if isinstance(x, dict)
+        ][-8:]
+        observation_hint = "\n".join(
+            (
+                f"OBS {row.get('id','')} tool={row.get('source_tool','reader')} "
+                f"ranges={','.join(f'L{span[0]}-{span[1]}' for span in (row.get('ranges', []) or [])[:8] if isinstance(span, (list, tuple)) and len(span) >= 2)} "
+                f"locator={trim(str(row.get('locator','') or ''), 220)}\n"
+                + "\n".join(str(x) for x in (row.get("excerpts", []) or [])[:LONG_CONTENT_OBSERVATION_MAX_EXCERPTS])
+            )
+            for row in recent_observations
+        )
+        objective_terms = self._cached_query_terms(objective)
+        current_terms = {
+            str(term).casefold()
+            for card in cards[:16]
+            for term in (card.get("key_terms", []) or [])
+            if str(term).strip()
+        }
+        relation_terms = set(objective_terms) | current_terms
+        related_candidates: list[tuple[int, float, dict]] = []
+        registry = getattr(self, "long_content_memory", {})
+        for row in (registry.values() if isinstance(registry, dict) else []):
+            if not isinstance(row, dict) or bool(row.get("stale", False)):
+                continue
+            if str(row.get("content_id", "") or "") == str(memory.get("content_id", "") or ""):
+                continue
+            semantic_row = row.get("semantic", {}) if isinstance(row.get("semantic", {}), dict) else {}
+            hay = " ".join([
+                str(row.get("source_path", "") or ""),
+                str(row.get("outline", "") or ""),
+                str(semantic_row.get("summary", "") or ""),
+                " ".join(str(x) for x in (semantic_row.get("key_points", []) or [])),
+                " ".join(str(x) for x in (semantic_row.get("relations", []) or [])),
+            ]).casefold()
+            overlap = sum(1 for term in relation_terms if term and term in hay)
+            related_candidates.append((overlap, float(row.get("updated_at", 0.0) or 0.0), row))
+        related_candidates.sort(key=lambda item: (-item[0], -item[1]))
+        related_hint_rows: list[str] = []
+        for _overlap, _updated, row in related_candidates[:LONG_CONTENT_RELATED_SOURCE_MAX]:
+            semantic_row = row.get("semantic", {}) if isinstance(row.get("semantic", {}), dict) else {}
+            summary = trim(str(semantic_row.get("summary", "") or ""), 420)
+            if not summary:
+                row_cards = [x for x in (row.get("cards", []) or []) if isinstance(x, dict)]
+                summary = " | ".join(trim(str(x.get("text", "") or ""), 180) for x in row_cards[:3])
+            relations = " | ".join(
+                trim(str(x), 180) for x in (semantic_row.get("relations", []) or [])[:3] if str(x).strip()
+            )
+            related_hint_rows.append(
+                f"RELATED path={row.get('source_path','')} content_id={row.get('content_id','')} summary={summary}"
+                + (f" relations={relations}" if relations else "")
+            )
+        related_hint = "\n".join(related_hint_rows)
         payload = (
             f"SOURCE path={memory.get('source_path','')} type={memory.get('content_type','text')} "
             f"language={memory.get('language','text')} total_lines={memory.get('total_lines',0)}\n"
             f"ACTIVE_OBJECTIVE:\n{trim(objective, 1200)}\n"
             f"OBJECTIVE_GAPS:\n{' | '.join(str(x) for x in (memory.get('objective_gaps', []) or [])[:8])}\n"
+            f"VERIFIED_READ_OBSERVATIONS:\n{observation_hint}\n"
+            f"RELATED_SOURCE_CARDS:\n{related_hint}\n"
             f"OUTLINE:\n{outline}\n"
             f"EXISTING_CARDS:\n{card_hint}\n"
             f"FOCUSED_SEGMENTS:\n" + "\n\n".join(rows)
@@ -43409,6 +44155,8 @@ body{padding:18px}
                     [{"role": "user", "content": prompt}],
                     system=(
                         "Understand the supplied source semantically, independent of domain. "
+                        "Consolidate all verified read observations into one evolving understanding, and connect them to "
+                        "related source cards when the supplied evidence supports a cross-source relationship. "
                         "Return strict JSON only with keys summary, key_points, definitions, "
                         "relations, uncertainties, evidence, covered, open_questions, next_segments. Keep each item concise; evidence "
                         "must cite the provided segment id or line range. Do not invent facts."
@@ -43451,6 +44199,7 @@ body{padding:18px}
         memory["semantic_updated_at"] = now_ts()
         memory["semantic_last_coverage"] = float(memory.get("coverage", 0.0) or 0.0)
         memory["semantic_last_seen_count"] = len(memory.get("seen_segments", []) or [])
+        memory["semantic_last_observation_count"] = int(memory.get("observation_count", 0) or 0)
         memory["objective_signature"] = objective_sig or str(memory.get("objective_signature", "") or "")
         memory["objective_text"] = objective
         memory["objective_gaps"] = list(semantic.get("open_questions", []) or [])[:LONG_CONTENT_SEMANTIC_MAX_OPEN_QUESTIONS]
@@ -43485,7 +44234,7 @@ body{padding:18px}
         ``pending`` before spawning so adjacent segment reads cannot fan out
         duplicate completions.
         """
-        if not isinstance(memory, dict):
+        if not LONG_CONTENT_SEMANTIC_ENABLED or not isinstance(memory, dict):
             return
         status = str(memory.get("semantic_status", "") or "").strip().lower()
         if status == "disabled":
@@ -43631,15 +44380,17 @@ body{padding:18px}
             "content_type": kind, "language": language, "total_lines": len(lines),
             "outline": trim(outline, LONG_CONTENT_STRUCTURE_MAX_CHARS),
             "segments": segments, "cards": cards, "coverage": 0.0,
-            "seen_segments": [], "read_ranges": [],
+            "seen_segments": [], "observed_segments": [], "read_ranges": [],
+            "observations": [], "observation_count": 0, "source_tools": [],
             "unresolved_items": [], "updated_at": now_ts(),
             "stale": False,
         }
         if isinstance(old, dict) and old.get("total_lines") == len(lines):
             memory["seen_segments"] = list(old.get("seen_segments", []) or [])
+            memory["observed_segments"] = list(old.get("observed_segments", old.get("seen_segments", [])) or [])
             memory["read_ranges"] = list(old.get("read_ranges", []) or [])
             memory["coverage"] = float(old.get("coverage", 0.0) or 0.0)
-            for field in ("semantic_status", "semantic_version", "semantic_updated_at", "semantic_attempts", "semantic_refreshes", "semantic_last_coverage", "semantic_last_seen_count", "semantic_started_at", "semantic_retry_at", "semantic_next_segments", "semantic_refresh_due", "semantic", "objective_signature", "objective_text", "objective_gaps", "objective_covered", "frontier_segments", "read_events", "reuse_events"):
+            for field in ("observations", "observation_count", "source_tools", "semantic_status", "semantic_version", "semantic_updated_at", "semantic_attempts", "semantic_refreshes", "semantic_last_coverage", "semantic_last_seen_count", "semantic_last_observation_count", "semantic_started_at", "semantic_retry_at", "semantic_next_segments", "semantic_refresh_due", "semantic", "objective_signature", "objective_text", "objective_gaps", "objective_covered", "frontier_segments", "read_events", "reuse_events"):
                 if field in old:
                     memory[field] = old[field]
             memory["outline_ready"] = bool(old.get("outline_ready", False))
@@ -43653,10 +44404,195 @@ body{padding:18px}
         self.long_content_memory = self._normalize_long_content_memory(self.long_content_memory)
         return memory
 
-    def _mark_long_content_read(self, rel: str, fp: Path, lines: list[str], args: dict, output: str) -> None:
+    def _merge_long_content_observation(
+        self,
+        rel: str,
+        fp: Path,
+        lines: list[str],
+        observed_ranges: list[object],
+        *,
+        source_tool: str = "reader",
+        role: str = "",
+        locator: str = "",
+        excerpts: list[str] | None = None,
+        matched_lines: int = 0,
+        confidence: float = 1.0,
+    ) -> dict:
+        """Merge one verified read into the durable source understanding.
+
+        The caller supplies provenance and exact source ranges; the rest of the
+        state transition is shared by read_file, shell pipelines, and future
+        local readers. Prompt size stays fixed because observations are bounded
+        and the semantic card replaces, rather than appends to, prior meaning.
+        """
+        memory = self._ensure_long_content_memory(rel, fp, lines)
+        if not memory:
+            return {}
+        clean_ranges: list[tuple[int, int]] = []
+        for item in observed_ranges or []:
+            if not isinstance(item, (list, tuple)) or len(item) < 2:
+                continue
+            try:
+                start = max(1, int(item[0] or 1))
+                end = min(len(lines), max(start, int(item[1] or start)))
+            except Exception:
+                continue
+            if start <= end:
+                clean_ranges.append((start, end))
+        if not clean_ranges:
+            return memory
+        existing_ranges: list[tuple[int, int]] = []
+        for item in memory.get("read_ranges", []) or []:
+            if not isinstance(item, (list, tuple)) or len(item) < 2:
+                continue
+            try:
+                start = max(1, int(item[0] or 1))
+                end = min(len(lines), max(start, int(item[1] or start)))
+            except Exception:
+                continue
+            existing_ranges.append((start, end))
+        merged_ranges: list[list[int]] = []
+        for start, end in sorted(existing_ranges + clean_ranges):
+            if merged_ranges and start <= merged_ranges[-1][1] + 1:
+                merged_ranges[-1][1] = max(merged_ranges[-1][1], end)
+            else:
+                merged_ranges.append([start, end])
+        memory["read_ranges"] = merged_ranges[-LONG_CONTENT_MEMORY_MAX_SEGMENTS:]
+        memory["read_events"] = int(memory.get("read_events", 0) or 0) + 1
+
+        touched: set[str] = set()
+        fully_read: set[str] = set()
+        for seg in memory.get("segments", []) or []:
+            if not isinstance(seg, dict):
+                continue
+            sid = str(seg.get("id", "") or "")
+            start = int(seg.get("start_line", 1) or 1)
+            end = int(seg.get("end_line", start) or start)
+            if any(b >= start and a <= end for a, b in clean_ranges):
+                touched.add(sid)
+            if sid and self._long_content_range_is_covered(memory, start, end):
+                fully_read.add(sid)
+        observed = set(str(x) for x in (memory.get("observed_segments", []) or []))
+        observed.update(x for x in touched if x)
+        seen = set(str(x) for x in (memory.get("seen_segments", []) or []))
+        seen.update(x for x in fully_read if x)
+        stamp = now_ts()
+        for seg in memory.get("segments", []) or []:
+            if not isinstance(seg, dict):
+                continue
+            sid = str(seg.get("id", "") or "")
+            if sid in fully_read:
+                seg["status"] = "read"
+                seg["last_seen"] = stamp
+            elif sid in touched and str(seg.get("status", "") or "") != "read":
+                seg["status"] = "partial"
+                seg["last_seen"] = stamp
+        for card in memory.get("cards", []) or []:
+            if not isinstance(card, dict):
+                continue
+            sid = str(card.get("segment_id", "") or "")
+            if sid in fully_read:
+                card["status"] = "read"
+                card["updated_at"] = stamp
+            elif sid in touched and str(card.get("status", "") or "") != "read":
+                card["status"] = "partial"
+                card["updated_at"] = stamp
+        memory["observed_segments"] = list(observed)[-LONG_CONTENT_MEMORY_MAX_SEGMENTS:]
+        memory["seen_segments"] = list(seen)[-LONG_CONTENT_MEMORY_MAX_SEGMENTS:]
+        read_line_count = sum(max(0, int(end) - int(start) + 1) for start, end in merged_ranges)
+        previous_coverage = float(memory.get("coverage", 0.0) or 0.0)
+        memory["coverage"] = round(min(1.0, read_line_count / max(1, len(lines))), 4)
+
+        evidence = [trim(str(x), 260) for x in (excerpts or []) if str(x).strip()]
+        if not evidence:
+            line_numbers: list[int] = []
+            for start, end in clean_ranges:
+                line_numbers.extend([start, start + (end - start) // 2, end])
+            for line_no in sorted(set(x for x in line_numbers if 1 <= x <= len(lines))):
+                evidence.append(trim(f"L{line_no}: {lines[line_no - 1]}", 260))
+                if len(evidence) >= LONG_CONTENT_OBSERVATION_MAX_EXCERPTS:
+                    break
+        total_excerpt_chars = 0
+        bounded_evidence: list[str] = []
+        for item in evidence[:LONG_CONTENT_OBSERVATION_MAX_EXCERPTS]:
+            if total_excerpt_chars >= LONG_CONTENT_OBSERVATION_EXCERPT_CHARS:
+                break
+            clipped = trim(item, min(260, LONG_CONTENT_OBSERVATION_EXCERPT_CHARS - total_excerpt_chars))
+            if clipped:
+                bounded_evidence.append(clipped)
+                total_excerpt_chars += len(clipped)
+        tool_name = canonicalize_tool_name(source_tool) or trim(str(source_tool or "reader"), 40)
+        role_key = self._sanitize_agent_role(role) or "single"
+        objective_sig = self._long_content_objective_signature(self._long_content_objective())
+        observation_basis = json_dumps({
+            "tool": tool_name,
+            "locator": trim(str(locator or ""), 500),
+            "ranges": clean_ranges,
+            "evidence": bounded_evidence,
+            "objective": objective_sig,
+        })
+        observation_id = hashlib.sha1(observation_basis.encode("utf-8", errors="replace")).hexdigest()[:20]
+        observations = [dict(x) for x in (memory.get("observations", []) or []) if isinstance(x, dict)]
+        old_observation = next((row for row in observations if str(row.get("id", "") or "") == observation_id), None)
+        if old_observation is not None:
+            old_observation["hit_count"] = int(old_observation.get("hit_count", 1) or 1) + 1
+            old_observation["last_ts"] = stamp
+        else:
+            observations.append({
+                "id": observation_id,
+                "source_tool": tool_name,
+                "agent_role": role_key,
+                "locator": trim(str(locator or ""), 500),
+                "ranges": [[a, b] for a, b in clean_ranges[:LONG_CONTENT_OBSERVATION_MAX_RANGES]],
+                "excerpts": bounded_evidence,
+                "matched_lines": max(int(matched_lines or 0), sum(b - a + 1 for a, b in clean_ranges)),
+                "confidence": max(0.0, min(1.0, float(confidence or 0.0))),
+                "objective_signature": objective_sig,
+                "hit_count": 1,
+                "first_ts": stamp,
+                "last_ts": stamp,
+            })
+            memory["observation_count"] = int(memory.get("observation_count", 0) or 0) + 1
+        memory["observations"] = observations[-LONG_CONTENT_OBSERVATION_MAX:]
+        source_tools = [str(x) for x in (memory.get("source_tools", []) or []) if str(x).strip()]
+        if tool_name and tool_name not in source_tools:
+            source_tools.append(tool_name)
+        memory["source_tools"] = source_tools[-16:]
+
+        status = str(memory.get("semantic_status", "") or "").lower()
+        last_observation_count = int(memory.get("semantic_last_observation_count", 0) or 0)
+        pending_observations = max(0, int(memory.get("observation_count", 0) or 0) - last_observation_count)
+        refreshes = int(memory.get("semantic_refreshes", 0) or 0)
+        required_batch = min(8, 2 ** min(3, refreshes + 1))
+        next_ids = {str(x) for x in (memory.get("semantic_next_segments", []) or [])}
+        coverage_gain = max(0.0, float(memory.get("coverage", 0.0) or 0.0) - float(memory.get("semantic_last_coverage", 0.0) or 0.0))
+        segment_count = max(1, len(memory.get("segments", []) or []))
+        coverage_refresh = coverage_gain >= max(0.01, min(0.12, 1.0 / math.sqrt(segment_count)))
+        if status != "ready" or next_ids.intersection(touched) or pending_observations >= required_batch or coverage_refresh:
+            memory["semantic_refresh_due"] = True
+        memory["updated_at"] = stamp
+        self.long_content_memory[memory["content_id"]] = memory
+        self.long_content_memory = self._normalize_long_content_memory(self.long_content_memory)
+        memory = self.long_content_memory.get(memory["content_id"], memory)
+        self._schedule_persist()
+        if bool(memory.get("semantic_refresh_due", False)):
+            self._start_long_content_semantic_enrichment(memory, rel, lines, touched)
+        return memory
+
+    def _mark_long_content_read(
+        self,
+        rel: str,
+        fp: Path,
+        lines: list[str],
+        args: dict,
+        output: str,
+        role: str = "",
+    ) -> None:
         try:
             memory = self._ensure_long_content_memory(rel, fp, lines)
             if not memory:
+                return
+            if str(output or "").lstrip().startswith("[read_file reused"):
                 return
             raw_mode = str((args or {}).get("mode", "") or "auto").lower()
             mode = raw_mode
@@ -43705,7 +44641,13 @@ body{padding:18px}
                             a, b = int(nums[0]), int(nums[-1])
                             observed_ranges.append((max(1, a), min(len(lines), max(a, b))))
                     continue
-                for match in re.finditer(r"(?<![A-Za-z_])(?:lines?|L)\s*=?\s*(\d+)(?:\s*-\s*(\d+))?", marker, re.I):
+                window_marker = re.search(r"^@@\s*lines\s+(\d+)(?:\s*-\s*(\d+))?", marker, re.I)
+                if window_marker:
+                    a = int(window_marker.group(1))
+                    b = int(window_marker.group(2) or window_marker.group(1))
+                    observed_ranges.append((max(1, a), min(len(lines), max(a, b))))
+                    continue
+                for match in re.finditer(r"(?:^|\s)(?:lines?|L)\s*=\s*(\d+)(?:\s*-\s*(\d+))?", marker, re.I):
                     a, b = int(match.group(1)), int(match.group(2) or match.group(1))
                     observed_ranges.append((max(1, a), min(len(lines), max(a, b))))
             if mode == "full" and not observed_ranges:
@@ -43716,56 +44658,17 @@ body{padding:18px}
                 start_line = full_text.count("\n", 0, offset) + 1
                 end_line = full_text.count("\n", 0, end_char) + 1
                 observed_ranges.append((start_line, min(len(lines), max(start_line, end_line))))
-            existing_ranges = []
-            for item in memory.get("read_ranges", []) or []:
-                if isinstance(item, (list, tuple)) and len(item) >= 2:
-                    existing_ranges.append((max(1, int(item[0])), min(len(lines), max(int(item[0]), int(item[1])))))
-            merged_ranges: list[list[int]] = []
-            for a, b in sorted(existing_ranges + observed_ranges):
-                if merged_ranges and a <= merged_ranges[-1][1] + 1:
-                    merged_ranges[-1][1] = max(merged_ranges[-1][1], b)
-                else:
-                    merged_ranges.append([a, b])
-            memory["read_ranges"] = merged_ranges[-LONG_CONTENT_MEMORY_MAX_SEGMENTS:]
-            memory["read_events"] = int(memory.get("read_events", 0) or 0) + 1
-            touched: set[str] = set()
-            for a, b in observed_ranges:
-                for seg in memory.get("segments", []):
-                    if int(seg.get("end_line", 0) or 0) >= a and int(seg.get("start_line", 0) or 0) <= b:
-                        touched.add(str(seg.get("id", "")))
-            if mode in {"overview", "structure"}:
-                # An overview establishes the outline, not full semantic coverage.
-                memory["outline_ready"] = True
-            seen = set(str(x) for x in (memory.get("seen_segments", []) or []))
-            seen.update(x for x in touched if x)
-            stamp = now_ts()
-            for seg in memory.get("segments", []):
-                if isinstance(seg, dict) and str(seg.get("id", "")) in touched:
-                    seg["status"] = "read"
-                    seg["last_seen"] = stamp
-            for card in memory.get("cards", []):
-                if isinstance(card, dict) and str(card.get("segment_id", "")) in touched:
-                    card["status"] = "read"
-                    card["updated_at"] = stamp
-            memory["seen_segments"] = list(seen)[-LONG_CONTENT_MEMORY_MAX_SEGMENTS:]
-            read_line_count = sum(max(0, int(end) - int(start) + 1) for start, end in merged_ranges)
-            memory["coverage"] = round(min(1.0, read_line_count / max(1, len(lines))), 4)
-            # Let the semantic card guide the next reading frontier without
-            # hard-coding document domains.  New evidence explicitly selected
-            # by the model marks a future refresh; otherwise the card remains
-            # stable and no extra completion is spent.
-            if str(memory.get("semantic_status", "") or "").lower() == "ready":
-                next_ids = set(str(x) for x in (memory.get("semantic_next_segments", []) or []))
-                if next_ids.intersection(set(touched)):
-                    memory["semantic_refresh_due"] = True
-            memory["updated_at"] = stamp
-            self.long_content_memory[memory["content_id"]] = memory
-            self._schedule_persist()
-            # Semantic enrichment is source-version scoped and best-effort.
-            # Trigger only after an actual evidence read; a cheap structure
-            # request should never block on an LLM completion.
             if observed_ranges:
-                self._start_long_content_semantic_enrichment(memory, rel, lines, touched)
+                self._merge_long_content_observation(
+                    rel,
+                    fp,
+                    lines,
+                    observed_ranges,
+                    source_tool="read_file",
+                    role=role,
+                    locator=self._read_file_signature_from_args({**dict(args or {}), "path": rel}),
+                    confidence=1.0,
+                )
         except Exception:
             return
 
@@ -43823,12 +44726,17 @@ body{padding:18px}
         if not rows:
             return ""
         rows.sort(key=lambda x: float(x.get("updated_at", 0.0) or 0.0), reverse=True)
-        parts = ["LONG-CONTENT UNDERSTANDING MEMORY (source-addressable; use read_file for exact evidence):"]
+        parts = [
+            "LONG-CONTENT UNDERSTANDING MEMORY (source-addressable; evidence from read_file, shell pipelines, and other verified local readers is unified):"
+        ]
         for row in rows[:4]:
+            source_tools = ",".join(str(x) for x in (row.get("source_tools", []) or [])[:6] if str(x).strip())
             parts.append(
                 f"- {row.get('source_path','')} type={row.get('content_type','text')} "
                 f"coverage={float(row.get('coverage', 0.0) or 0.0):.0%} "
-                f"lines={int(row.get('total_lines', 0) or 0)}"
+                f"lines={int(row.get('total_lines', 0) or 0)} "
+                f"observations={int(row.get('observation_count', 0) or 0)}"
+                + (f" readers={source_tools}" if source_tools else "")
             )
             outline = str(row.get("outline", "") or "").splitlines()
             if outline:
@@ -43842,6 +44750,19 @@ body{padding:18px}
             for card in remembered_cards[:3]:
                 if isinstance(card, dict) and str(card.get("text", "") or "").strip():
                     parts.append(f"  read_card {card.get('title','')}: {trim(card.get('text',''), 260)} [{','.join(card.get('evidence', [])[:2])}]")
+            observations = [x for x in (row.get("observations", []) or []) if isinstance(x, dict)]
+            for observation in observations[-2:]:
+                refs = ",".join(
+                    f"L{span[0]}-{span[1]}"
+                    for span in (observation.get("ranges", []) or [])[:5]
+                    if isinstance(span, (list, tuple)) and len(span) >= 2
+                )
+                evidence = " | ".join(
+                    trim(str(x), 150) for x in (observation.get("excerpts", []) or [])[:3] if str(x).strip()
+                )
+                parts.append(
+                    f"  verified_observation tool={observation.get('source_tool','reader')} refs={refs}: {evidence}"
+                )
             semantic = row.get("semantic", {}) if isinstance(row.get("semantic", {}), dict) else {}
             if str(row.get("semantic_status", "") or "").lower() == "ready" and semantic:
                 summary = trim(str(semantic.get("summary", "") or ""), 420)
@@ -43862,7 +44783,9 @@ body{padding:18px}
             covered = [trim(str(x), 180) for x in (row.get("objective_covered", []) or [])[:3] if str(x).strip()]
             if covered:
                 parts.append("  objective_covered: " + " | ".join(covered))
-        parts.append("Prefer these cards for continuity; recall the cited source window only when a claim or exact code/text is needed.")
+        parts.append(
+            "Prefer these cards for continuity. Use whichever reader best fits the next question; exact evidence may be recalled with read_file or another source-aligned local reader, and every verified result will update this same memory."
+        )
         return trim("\n".join(parts), max_chars)
 
     def _render_long_content_structure(self, rel: str, fp: Path, lines: list[str], *, max_chars: object = None) -> str:
@@ -74115,7 +75038,7 @@ body{padding:18px}
             "Use blackboard for shared state, ask_colleague for inter-agent communication. "
             "Keep outputs concise and action-oriented. "
             f"{self._public_progress_prompt_instruction()}"
-            "When reading files, choose the shape that matches the question: mode='window' for file:line, mode='symbol' for named code, mode='search' for keywords/errors, mode='overview' or mode='structure' for structure and long-content memory, mode='segment' with a segment_id to continue a remembered section, and mode='full' only when exact broad context is required. "
+            "Choose any local reading method that best fits the question. read_file offers mode='window' for file:line, mode='symbol' for named code, mode='search' for keywords/errors, mode='overview' or mode='structure' for structure, mode='segment' for a remembered section, and mode='full' for exact broad context; shell-native grep/rg/sed/awk/head/tail or custom extractors are equally valid. Verified local-source output from every method is merged into one source-addressable long-content memory, so do not switch tools merely for memory retention. "
             "When inspecting collections or memory, use focused modes too: tool_memory/context_recall/read_from_blackboard/task_list/check_background/list_background_processes/read_inbox/worktree_events support focused query/status/detail filters where applicable. `check_background` is session-local; `list_background_processes` sees only the authenticated user's processes across sessions, and `stop_background_process` requires an exact visible process_id. Prefer filters over repeatedly listing recent items. "
             "Before repeating the same successful read_file/bash/query over the same target, check the injected tool-memory-registry or call tool_memory with mode='search' or mode='detail'. "
             f"{web_search_instruction}"
@@ -76843,7 +77766,7 @@ body{padding:18px}
             )
             try:
                 if source_lines is not None and not str(out).startswith("Error"):
-                    self._mark_long_content_read(rel, fp, source_lines, args, out)
+                    self._mark_long_content_read(rel, fp, source_lines, args, out, role=role_key)
             except Exception:
                 pass
             limit_val = self._read_file_int_arg(args.get("limit", 0), 0, 0, 1_000_000) if args.get("limit") is not None else 0
@@ -79623,9 +80546,12 @@ body{padding:18px}
         bb["plan"] = {"phase": "research", "findings": []}
         self.blackboard = bb
 
-        # Auto-discover and load relevant skills before research
+        # Perform one bounded, high-confidence discovery pass before research
+        # so the Explorer starts with the workflow constraints that shape the
+        # plan. Medium/low-confidence candidates remain available on demand.
         try:
-            pass  # Skills are loaded on-demand by the model via load_skill
+            research_focus = self._authoritative_user_goal_for_model() or self._latest_user_goal_text()
+            self._auto_discover_and_load_skills(research_focus, trigger="plan-research")
         except Exception:
             pass
 
@@ -85897,6 +86823,29 @@ body{padding:18px}
                 if lite
                 else blackboard
             )
+            long_registry = getattr(self, "long_content_memory", {})
+            long_rows = [
+                row for row in (long_registry.values() if isinstance(long_registry, dict) else [])
+                if isinstance(row, dict) and not bool(row.get("stale", False))
+            ]
+            reader_counts: Counter = Counter()
+            for row in long_rows:
+                for reader in row.get("source_tools", []) or []:
+                    if str(reader).strip():
+                        reader_counts[str(reader).strip()] += 1
+            long_content_stats = {
+                "version": LONG_CONTENT_MEMORY_VERSION,
+                "sources": len(long_rows),
+                "observations": sum(int(row.get("observation_count", 0) or 0) for row in long_rows),
+                "semantic_ready": sum(
+                    1 for row in long_rows if str(row.get("semantic_status", "") or "").lower() == "ready"
+                ),
+                "average_coverage": round(
+                    sum(float(row.get("coverage", 0.0) or 0.0) for row in long_rows) / max(1, len(long_rows)),
+                    4,
+                ),
+                "readers": dict(reader_counts.most_common(12)),
+            }
             return {
                 "id": self.id,
                 "title": self.title,
@@ -85979,6 +86928,7 @@ body{padding:18px}
                 "read_context_registry_count": len(getattr(self, "read_context_registry", {}) or {}),
                 "tool_memory_budget": self._tool_memory_budget(),
                 "tool_memory_registry_count": len(getattr(self, "tool_memory_registry", {}) or {}),
+                "long_content_memory": long_content_stats,
                 "context_next_call_estimate": int(getattr(self, "context_last_next_call_estimate", 0) or 0),
                 "context_next_call_label": str(getattr(self, "context_last_next_call_label", "") or ""),
                 "context_last_compact_effective": bool(getattr(self, "context_last_compact_effective", True)),
