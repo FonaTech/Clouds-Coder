@@ -5,6 +5,8 @@ import argparse
 import ast
 import base64
 import concurrent.futures
+import contextlib
+import copy
 import csv
 import ctypes
 import difflib
@@ -66,6 +68,11 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse, urlunparse
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
+
+try:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM as _AESGCM
+except Exception:
+    _AESGCM = None
 
 _EMBEDDED_LIQUID_KERNEL_PACKAGE_B64 = (
     "UEsDBBQAAAAIAJFAK13NzUY/oAAAAHYBAAALAAAAX19pbml0X18ucHl1jrsKwkAQRfv9iiWVgvgHVppCjEZ8NSLDYjZhYHZHh10Lv96QR2OSKe+5dzilsNPL"
@@ -322,9 +329,18 @@ _EMBEDDED_LIQUID_KERNEL_PACKAGE_B64 = (
 
 
 def _ensure_embedded_liquid_kernel_package(package_root: Path | None = None) -> dict:
-    root = Path(package_root or (Path(__file__).resolve().parent / "liquid_kernel")).resolve(strict=False)
+    raw_root = Path(package_root or (Path(__file__).resolve().parent / "liquid_kernel"))
+    if raw_root.is_symlink() or (raw_root.exists() and not raw_root.is_dir()):
+        quarantine = raw_root.with_name(f"{raw_root.name}.invalid-{uuid.uuid4().hex[:12]}")
+        raw_root.rename(quarantine)
+    root = raw_root.resolve(strict=False)
     required = ("__init__.py", "control.py")
     ready = root.is_dir() and all((root / name).is_file() for name in required)
+    if ready:
+        try:
+            ready = "def inject_embedded_kernel" in (root / "control.py").read_text(encoding="utf-8")
+        except Exception:
+            ready = False
     if ready:
         return {
             "root": str(root),
@@ -3692,6 +3708,7 @@ COLLAB_INDEX_HTML = r"""<!doctype html>
 
 COLLAB_CSS = r"""
 :root{color-scheme:dark;--bg:#121416;--panel:#1a1d20;--panel2:#202429;--line:#30363d;--text:#e7e9ec;--muted:#9aa2ac;--accent:#3fb950;--blue:#58a6ff;--danger:#f85149;--warn:#d29922;--radius:6px}
+.session-history-badge{box-sizing:border-box;position:absolute;right:-3px;bottom:-3px;display:flex;align-items:center;justify-content:center;width:15px;height:15px;padding:0;overflow:hidden;border:1px solid #252526;border-radius:50%;background:#c586c0;color:#fff;pointer-events:none}.session-history-badge>.codicon{box-sizing:border-box;position:relative;display:block;flex:0 0 9px;width:9px;height:9px;margin:0;border:1px solid currentColor;border-radius:50%;font-size:0;line-height:0;text-align:center}.session-history-badge>.codicon::before{content:"";position:absolute;left:3px;top:1px;width:1px;height:3px;background:currentColor;transform-origin:50% 100%;transform:rotate(0deg)}.session-history-badge>.codicon::after{content:"";position:absolute;left:4px;top:4px;width:3px;height:1px;background:currentColor;transform-origin:left center;transform:rotate(35deg)}
 *{box-sizing:border-box}html,body{height:100%;margin:0}body{font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:var(--bg);color:var(--text);letter-spacing:0}button,input,textarea,select{font:inherit;letter-spacing:0}button{border:1px solid var(--line);border-radius:4px;background:#272c32;color:var(--text);padding:6px 10px;cursor:pointer}button:hover{background:#30363d}button:disabled{opacity:.45;cursor:not-allowed}.primary{background:#238636;border-color:#2ea043;font-weight:600}.primary:hover{background:#2ea043}.hidden{display:none!important}.brand-mark{display:grid;place-items:center;width:42px;height:42px;border:1px solid #3fb950;background:#17351e;color:#7ee787;border-radius:6px;font-weight:800}.brand-mark.small{width:30px;height:30px;font-size:11px}.lobby-shell{min-height:100%;display:grid;place-items:center;padding:24px;background:linear-gradient(135deg,#121416 0,#171b1f 65%,#152019 100%)}.lobby-panel{width:min(480px,100%);border:1px solid var(--line);background:var(--panel);padding:28px;border-radius:8px;box-shadow:0 22px 70px rgba(0,0,0,.35)}.brand-row{display:flex;align-items:center;gap:13px;margin-bottom:24px}.brand-row h1{font-size:22px;margin:0}.brand-row p{margin:2px 0 0;color:var(--muted)}label{display:grid;gap:6px;color:#c9d1d9;margin-bottom:14px}input,textarea,select{width:100%;border:1px solid var(--line);border-radius:4px;background:#0d1117;color:var(--text);padding:8px 9px;outline:none}input:focus,textarea:focus,select:focus{border-color:var(--blue);box-shadow:0 0 0 2px rgba(88,166,255,.15)}.field-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}.lobby-panel form>.primary{width:100%;min-height:38px}.warning{border-left:3px solid var(--warn);background:#2d250e;color:#e3b341;padding:10px 12px;margin-bottom:16px}.pending{border:1px solid #4d4013;background:#26210f;padding:16px;border-radius:var(--radius)}.pending p{color:#d9bd67}.error-text{min-height:20px;color:#ff7b72}.workbench{height:100%;display:grid;grid-template-rows:46px 38px minmax(0,1fr);overflow:hidden}.topbar{display:flex;align-items:center;gap:16px;padding:0 12px;border-bottom:1px solid var(--line);background:#191c20}.project-title{display:flex;align-items:center;gap:10px;min-width:0}.project-title>div{display:grid}.project-title strong,.project-title span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.project-title span{font-size:11px;color:var(--muted)}.connection{margin-left:auto;color:var(--muted)}.connection.online{color:#7ee787}.connection.offline{color:#ff7b72}.tabs{display:flex;gap:0;border-bottom:1px solid var(--line);background:#171a1d;padding-left:10px;overflow:auto}.tab{border:0;border-bottom:2px solid transparent;border-radius:0;background:transparent;color:var(--muted);padding:0 14px}.tab.active{border-bottom-color:var(--blue);color:var(--text)}.view{display:none;min-height:0}.view.active{display:block}.editor-view.active{display:grid;grid-template-columns:230px minmax(340px,1fr) 310px;overflow:hidden}.explorer,.agent-pane{min-width:0;min-height:0;border-right:1px solid var(--line);background:#171a1d;display:flex;flex-direction:column}.agent-pane{border-right:0;border-left:1px solid var(--line)}.pane-head,.editor-toolbar{height:38px;flex:0 0 38px;display:flex;align-items:center;gap:8px;padding:0 9px;border-bottom:1px solid var(--line);background:#1b1f23}.pane-head strong,.editor-toolbar span:first-child{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.pane-head button,.editor-toolbar button{margin-left:auto;padding:3px 7px;font-size:11px}.file-list{overflow:auto;padding:4px}.file-row{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:5px;width:100%;border:0;background:transparent;text-align:left;padding:5px 7px;color:#c9d1d9}.file-row:hover,.file-row.active{background:#262b31}.file-row span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.file-row small{color:#6e7681}.editor-column{position:relative;min-width:0;min-height:0;display:grid;grid-template-rows:38px minmax(0,1fr) 25px;background:#0f1113}.editor-host,.fallback-editor{grid-row:2;min-width:0;min-height:0}.fallback-editor{display:none;resize:none;border:0;border-radius:0;padding:12px;font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.fallback-mode .fallback-editor{display:block}.editor-empty{position:absolute;inset:38px 0 25px;display:grid;place-items:center;color:#6e7681;background:#111315}.presence-bar{display:flex;align-items:center;justify-content:space-between;padding:0 9px;background:#1d2227;color:var(--muted);font-size:11px}.agent-pane select{margin:7px;width:calc(100% - 14px)}.agent-feed{flex:1;overflow:auto;padding:8px}.agent-message{border-bottom:1px solid #292e34;padding:8px 3px;white-space:pre-wrap;overflow-wrap:anywhere}.agent-message.user{color:#c9d1d9}.agent-message.assistant{color:#a5d6ff}.agent-pane form{border-top:1px solid var(--line);padding:8px}.agent-pane form button{width:100%;margin-top:6px}.data-view{overflow:auto;padding:20px max(18px,4vw)}.section-head{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;padding-bottom:14px;border-bottom:1px solid var(--line)}.section-head h2{margin:0;font-size:18px}.section-head p{margin:4px 0 0;color:var(--muted)}.data-list,.member-grid{display:grid;gap:8px;margin-top:14px}.member-grid{grid-template-columns:repeat(auto-fill,minmax(210px,1fr))}.data-card,.member-card{border:1px solid var(--line);background:var(--panel);padding:12px;border-radius:var(--radius)}.data-card h3,.member-card h3{margin:0 0 5px;font-size:14px}.meta{display:flex;gap:10px;flex-wrap:wrap;color:var(--muted);font-size:11px}.badge{display:inline-block;border:1px solid #3b434c;border-radius:10px;padding:1px 7px;color:#b8c0ca}.badge.warn{border-color:#6e5b19;color:#e3b341}.badge.good{border-color:#286c36;color:#7ee787}.empty{color:var(--muted);padding:24px;text-align:center}.toast{position:fixed;right:16px;bottom:16px;max-width:min(420px,calc(100vw - 32px));background:#272c32;border:1px solid #49515a;border-radius:6px;padding:10px 14px;box-shadow:0 12px 32px rgba(0,0,0,.4);z-index:50}.toast.error{border-color:#9e3632;color:#ffb4ad}
 .remote-cursor{border-left:2px solid #f778ba}.remote-cursor-1{border-left-color:#d2a8ff}.remote-cursor-2{border-left-color:#ffa657}.remote-cursor-3{border-left-color:#79c0ff}.remote-cursor-4{border-left-color:#7ee787}.mobile-agent-toggle{display:none}@media(max-width:980px){.editor-view.active{grid-template-columns:190px minmax(300px,1fr)}.mobile-agent-toggle{display:block}.agent-pane{display:none;position:fixed;right:0;top:84px;bottom:0;width:min(340px,90vw);z-index:20;box-shadow:-14px 0 32px rgba(0,0,0,.3)}.agent-pane.open{display:flex}.field-grid{grid-template-columns:1fr}}@media(max-width:640px){.editor-view.active{grid-template-columns:132px minmax(260px,1fr)}.topbar{gap:7px}.project-title{max-width:43vw}.tabs{padding-left:0}.tab{padding:0 10px}.lobby-panel{padding:20px}.data-view{padding:14px}.editor-toolbar #revisionState{display:none}}
 """
@@ -3928,9 +3945,14 @@ def _copy_runtime_tree_with_crypto_migration(
             if encrypted_box:
                 raw = item.read_text(encoding="utf-8")
                 box = json.loads(raw)
+                try:
+                    box_version = int(box.get("v", 1) or 1) if isinstance(box, dict) else 0
+                except Exception:
+                    box_version = 0
                 encrypted_box = bool(
                     isinstance(box, dict)
-                    and {"v", "n", "c", "m"}.issubset(box)
+                    and {"v", "n", "c"}.issubset(box)
+                    and (box_version == 2 or (box_version == 1 and "m" in box))
                 )
                 if encrypted_box:
                     plain = source_crypto.decrypt_text(raw)
@@ -4379,6 +4401,46 @@ SESSION_DEFERRED_START_QUEUE_MAX = max(
 SESSION_SUBMISSION_DEDUPE_MAX = 32
 SESSION_SUBMISSION_DEDUPE_SECONDS = 0.75
 SCHEDULER_SUBMISSION_DEDUPE_MAX = 256
+FAST_START_LOCAL_CLASSIFICATION = str(
+    os.getenv("AGENT_FAST_START_LOCAL_CLASSIFICATION", "true") or "true"
+).strip().lower() in {"1", "true", "yes", "on"}
+FAST_START_LOCAL_TITLE = str(
+    os.getenv("AGENT_FAST_START_LOCAL_TITLE", "true") or "true"
+).strip().lower() in {"1", "true", "yes", "on"}
+AUTO_TITLE_MODEL_REFINE = str(
+    os.getenv("AGENT_AUTO_TITLE_MODEL_REFINE", "true") or "true"
+).strip().lower() in {"1", "true", "yes", "on"}
+AUTO_TITLE_MODEL_TIMEOUT_SECONDS = max(
+    2.0,
+    min(15.0, float(str(os.getenv("AGENT_AUTO_TITLE_MODEL_TIMEOUT", "12") or "12"))),
+)
+AUTO_TITLE_MODEL_RETRY_COOLDOWN_SECONDS = max(
+    15.0,
+    min(
+        600.0,
+        float(str(os.getenv("AGENT_AUTO_TITLE_MODEL_RETRY_COOLDOWN", "60") or "60")),
+    ),
+)
+FAST_START_DEFER_CAPABILITY_PROBE = str(
+    os.getenv("AGENT_FAST_START_DEFER_CAPABILITY_PROBE", "true") or "true"
+).strip().lower() in {"1", "true", "yes", "on"}
+SESSION_RUNTIME_MESSAGE_WINDOW = 400
+SESSION_RUNTIME_ACTIVITY_WINDOW = 300
+SESSION_RUNTIME_OPERATION_WINDOW = 500
+SESSION_RUNTIME_UPLOAD_WINDOW = 80
+LITE_SNAPSHOT_MAX_BYTES = max(
+    256 * 1024,
+    min(1024 * 1024, int(str(os.getenv("AGENT_LITE_SNAPSHOT_MAX_BYTES", str(512 * 1024)) or str(512 * 1024)))),
+)
+LITE_SNAPSHOT_MESSAGES_BYTES = 48 * 1024
+LITE_SNAPSHOT_FEED_BYTES = 160 * 1024
+LITE_SNAPSHOT_OPERATIONS_BYTES = 48 * 1024
+IDE_AGENT_STATE_MAX_BYTES = max(
+    192 * 1024,
+    min(768 * 1024, int(str(os.getenv("AGENT_IDE_STATE_MAX_BYTES", str(384 * 1024)) or str(384 * 1024)))),
+)
+IDE_AGENT_FEED_BYTES = 176 * 1024
+IDE_AGENT_OPERATIONS_BYTES = 112 * 1024
 SESSION_WATCHDOG_INTERVAL_SECONDS = max(
     10,
     min(300, int(str(os.getenv("AGENT_SESSION_WATCHDOG_INTERVAL_SECONDS", "30") or "30"))),
@@ -4390,6 +4452,22 @@ SESSION_HEARTBEAT_STALE_SECONDS = max(
 SESSION_LIST_DEFAULT_LIMIT = max(
     50,
     min(1000, int(str(os.getenv("AGENT_SESSION_LIST_DEFAULT_LIMIT", "120") or "120"))),
+)
+SESSION_INDEX_SYNC_SNAPSHOT_MAX = max(
+    16,
+    min(2000, int(str(os.getenv("AGENT_SESSION_INDEX_SYNC_SNAPSHOT_MAX", "256") or "256"))),
+)
+SESSION_INDEX_JOURNAL_COMPACT_RECORDS = max(
+    32,
+    min(4096, int(str(os.getenv("AGENT_SESSION_INDEX_JOURNAL_COMPACT_RECORDS", "512") or "512"))),
+)
+SESSION_INDEX_JOURNAL_COMPACT_BYTES = max(
+    64 * 1024,
+    min(16 * 1024 * 1024, int(str(os.getenv("AGENT_SESSION_INDEX_JOURNAL_COMPACT_BYTES", str(1024 * 1024)) or str(1024 * 1024)))),
+)
+SESSION_CATALOG_RECENT_MAX = max(
+    64,
+    min(2048, int(str(os.getenv("AGENT_SESSION_CATALOG_RECENT_MAX", "384") or "384"))),
 )
 IDE_SESSION_LIST_DEFAULT_LIMIT = max(
     20,
@@ -5050,6 +5128,10 @@ BLACKBOARD_MEMORY_MID_ITEMS_PER_STEP = 20
 BLACKBOARD_MEMORY_LONG_MAX = 96
 BLACKBOARD_MEMORY_INDEX_MAX = 260
 SKILL_REFRESH_MIN_INTERVAL_SECONDS = 1.5
+SKILL_CATALOG_FULL_REFRESH_SECONDS = max(
+    5.0,
+    min(300.0, float(str(os.getenv("AGENT_SKILL_CATALOG_FULL_REFRESH_SECONDS", "30") or "30"))),
+)
 SKILL_PROMPT_MAX_ITEMS = 40
 SKILL_PROMPT_MAX_CHARS = 2600
 SKILL_RUNTIME_CACHE_MAX_ENTRIES = 48
@@ -6223,6 +6305,18 @@ def normalize_ui_style(raw: str | None) -> str:
 
 def supported_ui_languages_payload() -> list[dict]:
     return [dict(x) for x in SUPPORTED_UI_LANGUAGES]
+
+
+def admin_language_payload(manager: object) -> dict:
+    language = normalize_ui_language(getattr(manager, "user_language", DEFAULT_UI_LANGUAGE))
+    return {
+        "ok": True,
+        "language": language,
+        "default_language": language,
+        "source": "webui_user_preference",
+        "sync_with_webui": True,
+        "supported_languages": supported_ui_languages_payload(),
+    }
 
 
 def agent_language_preference_payload(language: str | None) -> dict:
@@ -8812,6 +8906,281 @@ def trim(text: object, limit: int = MAX_TOOL_OUTPUT) -> str:
     s = str(text)
     return s if len(s) <= limit else s[:limit] + "\n...(truncated)"
 
+
+_UI_TRUNCATION_MARKER = "\n…(truncated for UI)"
+
+
+def _ui_trim_text(value: object, limit: int) -> tuple[str, bool]:
+    text = str(value or "")
+    limit = max(32, int(limit or 0))
+    if len(text) <= limit:
+        return text, False
+    keep = max(1, limit - len(_UI_TRUNCATION_MARKER))
+    return text[:keep] + _UI_TRUNCATION_MARKER, True
+
+
+def _bounded_ui_value(
+    value: object,
+    *,
+    text_limit: int = 1200,
+    collection_limit: int = 24,
+    depth: int = 4,
+    _seen: set[int] | None = None,
+) -> tuple[object, bool]:
+    if value is None or isinstance(value, (bool, int, float)):
+        return value, False
+    if isinstance(value, str):
+        return _ui_trim_text(value, text_limit)
+    if isinstance(value, bytes):
+        return f"<{len(value)} bytes omitted from UI>", True
+    if depth <= 0:
+        return "…", True
+    seen = _seen if _seen is not None else set()
+    identity = id(value)
+    if identity in seen:
+        return "<recursive value omitted>", True
+    if isinstance(value, dict):
+        seen.add(identity)
+        out: dict[str, object] = {}
+        truncated = False
+        rows = list(value.items())
+        for raw_key, raw_value in rows[: max(1, collection_limit)]:
+            key, key_truncated = _ui_trim_text(raw_key, 160)
+            child, child_truncated = _bounded_ui_value(
+                raw_value,
+                text_limit=text_limit,
+                collection_limit=collection_limit,
+                depth=depth - 1,
+                _seen=seen,
+            )
+            out[key] = child
+            truncated = bool(truncated or key_truncated or child_truncated)
+        if len(rows) > collection_limit:
+            out["ui_omitted_items"] = len(rows) - collection_limit
+            truncated = True
+        seen.discard(identity)
+        return out, truncated
+    if isinstance(value, (list, tuple, set, deque)):
+        seen.add(identity)
+        source = list(value)
+        out_list: list[object] = []
+        truncated = len(source) > collection_limit
+        for item in source[: max(1, collection_limit)]:
+            child, child_truncated = _bounded_ui_value(
+                item,
+                text_limit=text_limit,
+                collection_limit=collection_limit,
+                depth=depth - 1,
+                _seen=seen,
+            )
+            out_list.append(child)
+            truncated = bool(truncated or child_truncated)
+        seen.discard(identity)
+        return out_list, truncated
+    return _ui_trim_text(value, text_limit)
+
+
+def _bounded_ui_row(
+    row: object,
+    *,
+    text_limit: int,
+    data_text_limit: int,
+    collection_limit: int,
+) -> dict:
+    source = row if isinstance(row, dict) else {"text": str(row or "")}
+    projected: dict[str, object] = {}
+    row_truncated = False
+    for raw_key, raw_value in source.items():
+        key = str(raw_key or "")
+        if key in {"text", "content", "body", "question", "public_progress"}:
+            projected[key], truncated = _ui_trim_text(raw_value, text_limit)
+            if truncated:
+                projected[f"{key}_truncated"] = True
+            row_truncated = bool(row_truncated or truncated)
+            continue
+        if key in {"thinking", "live_thinking"}:
+            projected[key], truncated = _ui_trim_text(raw_value, min(text_limit, 1800))
+            if truncated:
+                projected[f"{key}_truncated"] = True
+            row_truncated = bool(row_truncated or truncated)
+            continue
+        if key == "data":
+            projected[key], truncated = _bounded_ui_value(
+                raw_value,
+                text_limit=data_text_limit,
+                collection_limit=collection_limit,
+                depth=4,
+            )
+            if truncated:
+                projected["data_truncated"] = True
+            row_truncated = bool(row_truncated or truncated)
+            continue
+        if isinstance(raw_value, str):
+            projected[key], truncated = _ui_trim_text(raw_value, 1200)
+        elif isinstance(raw_value, (dict, list, tuple, set, deque, bytes)):
+            projected[key], truncated = _bounded_ui_value(
+                raw_value,
+                text_limit=data_text_limit,
+                collection_limit=collection_limit,
+                depth=3,
+            )
+        else:
+            projected[key], truncated = raw_value, False
+        row_truncated = bool(row_truncated or truncated)
+    if row_truncated:
+        projected["ui_truncated"] = True
+    return projected
+
+
+def _bounded_ui_rows(
+    rows: object,
+    *,
+    max_rows: int,
+    byte_budget: int,
+    text_limit: int = 2800,
+    data_text_limit: int = 1200,
+    collection_limit: int = 24,
+    keep: str = "tail",
+) -> tuple[list[dict], bool]:
+    source = [row for row in (list(rows) if isinstance(rows, (list, tuple, deque)) else []) if isinstance(row, dict)]
+    max_rows = max(1, int(max_rows or 1))
+    byte_budget = max(4096, int(byte_budget or 4096))
+    candidates = source[-max_rows:] if keep != "head" else source[:max_rows]
+    ordered = list(reversed(candidates)) if keep != "head" else candidates
+    selected: list[dict] = []
+    used = 2
+    for raw in ordered:
+        projected = _bounded_ui_row(
+            raw,
+            text_limit=text_limit,
+            data_text_limit=data_text_limit,
+            collection_limit=collection_limit,
+        )
+        row_size = len(json_dumps(projected).encode("utf-8")) + 1
+        if row_size > byte_budget and not selected:
+            projected = _bounded_ui_row(
+                raw,
+                text_limit=512,
+                data_text_limit=384,
+                collection_limit=8,
+            )
+            row_size = len(json_dumps(projected).encode("utf-8")) + 1
+            if row_size > byte_budget:
+                projected["data"] = {"ui_truncated": True}
+                projected["data_truncated"] = True
+                if "text" in projected:
+                    projected["text"], _ = _ui_trim_text(projected.get("text", ""), 256)
+                    projected["text_truncated"] = True
+                row_size = len(json_dumps(projected).encode("utf-8")) + 1
+        if used + row_size > byte_budget:
+            break
+        selected.append(projected)
+        used += row_size
+    if keep != "head":
+        selected.reverse()
+    return selected, len(selected) < len(source)
+
+
+def _enforce_ui_payload_budget(payload: dict, byte_budget: int) -> dict:
+    byte_budget = max(64 * 1024, int(byte_budget or 0))
+    try:
+        if len(json_dumps(payload).encode("utf-8")) <= byte_budget:
+            return payload
+    except Exception:
+        pass
+    payload["ui_payload_truncated"] = True
+    minimums = {
+        "messages": 0,
+        "activity": 0,
+        "background": 0,
+        "teammates": 0,
+        "tasks": 8,
+        "todos": 4,
+        "operations": 8,
+        "conversation_feed": 12,
+        "feed": 12,
+    }
+    for _ in range(32):
+        try:
+            if len(json_dumps(payload).encode("utf-8")) <= byte_budget:
+                return payload
+        except Exception:
+            break
+        candidates: list[tuple[int, str]] = []
+        for key, minimum in minimums.items():
+            value = payload.get(key)
+            if isinstance(value, list) and len(value) > minimum:
+                candidates.append((len(json_dumps(value).encode("utf-8")), key))
+        if not candidates:
+            break
+        _, key = max(candidates)
+        value = list(payload.get(key, []))
+        minimum = minimums[key]
+        remove = max(1, (len(value) - minimum + 1) // 2)
+        payload[key] = value[remove:]
+    for key in ("live_thinking", "live_response_text", "live_truncation_text", "recovered_reason"):
+        if key in payload:
+            payload[key], truncated = _ui_trim_text(payload.get(key, ""), 512)
+            if truncated:
+                payload[f"{key}_truncated"] = True
+    return payload
+
+
+def _apply_lite_snapshot_bounds(payload: dict) -> dict:
+    payload = dict(payload)
+    windows = (
+        ("messages", 72, LITE_SNAPSHOT_MESSAGES_BYTES, 2400, 900, 18),
+        ("conversation_feed", 120, LITE_SNAPSHOT_FEED_BYTES, 3000, 1000, 20),
+        ("operations", 60, LITE_SNAPSHOT_OPERATIONS_BYTES, 1800, 900, 18),
+        ("activity", 40, 16 * 1024, 1200, 700, 14),
+        ("uploads", 12, 12 * 1024, 800, 600, 12),
+        ("todos", 40, 20 * 1024, 1200, 700, 16),
+        ("tasks", 80, 28 * 1024, 1200, 700, 16),
+        ("background", 24, 12 * 1024, 900, 600, 12),
+        ("teammates", 24, 12 * 1024, 900, 600, 12),
+        ("agent_contexts", 12, 12 * 1024, 900, 600, 12),
+    )
+    window_meta: dict[str, dict] = {}
+    for key, max_rows, budget, text_limit, data_limit, collection_limit in windows:
+        source = payload.get(key, [])
+        bounded, truncated = _bounded_ui_rows(
+            source,
+            max_rows=max_rows,
+            byte_budget=budget,
+            text_limit=text_limit,
+            data_text_limit=data_limit,
+            collection_limit=collection_limit,
+        )
+        payload[key] = bounded
+        window_meta[key] = {
+            "returned": len(bounded),
+            "available": len(source) if isinstance(source, list) else 0,
+            "truncated": bool(truncated),
+        }
+    for key, limit in (
+        ("live_thinking", 4000),
+        ("live_response_text", 8000),
+        ("live_truncation_text", 2000),
+        ("live_run_notice_label", 600),
+    ):
+        if key in payload:
+            payload[key], truncated = _ui_trim_text(payload.get(key, ""), limit)
+            if truncated:
+                payload[f"{key}_truncated"] = True
+    for key in ("render_bridge", "pending_user_question", "app_binding", "mcp_servers"):
+        if key in payload:
+            payload[key], truncated = _bounded_ui_value(
+                payload.get(key),
+                text_limit=1200,
+                collection_limit=24,
+                depth=4,
+            )
+            if truncated:
+                payload[f"{key}_truncated"] = True
+    payload["ui_windows"] = window_meta
+    payload["ui_payload_limit_bytes"] = int(LITE_SNAPSHOT_MAX_BYTES)
+    return _enforce_ui_payload_budget(payload, LITE_SNAPSHOT_MAX_BYTES)
+
 def is_synthetic_public_progress(text: object) -> bool:
     """Recognize progress prose generated by the disabled tool-summary fallback."""
     value = str(text or "").strip()
@@ -8845,6 +9214,7 @@ def ide_public_operation_data(data: object) -> dict:
         "tool_call_id": 240, "query": 2000, "pattern": 2000, "url": 2000,
         "reason": 600, "archive_segment": 240, "next_call_label": 240,
         "control_tag": 120, "origin": 80, "title": 240, "details": 8000,
+        "session_title": 240, "title_origin": 40,
         "public_progress": 4000,
     }
     for key, limit in text_limits.items():
@@ -8863,6 +9233,7 @@ def ide_public_operation_data(data: object) -> dict:
         "context_used_before", "context_left_before", "context_left_percent_before",
         "context_used_after", "context_left_after", "context_left_percent_after",
         "context_used_reduction", "matched_rows", "returned", "total_rows",
+        "title_revision",
     ):
         if key in source:
             public[key] = source.get(key)
@@ -13194,6 +13565,8 @@ def trusted_client_ip(handler: BaseHTTPRequestHandler) -> str:
     return current
 
 class CryptoBox:
+    _V2_AAD = b"CloudsCoder:CryptoBox:v2"
+
     def __init__(self, codes_root: Path):
         self.codes_root = codes_root
         self.codes_root.mkdir(parents=True, exist_ok=True)
@@ -13217,18 +13590,19 @@ class CryptoBox:
 
     def _stream_xor(self, data: bytes, nonce: bytes) -> bytes:
         out = bytearray(len(data))
+        source = memoryview(data)
         counter = 0
         offset = 0
         while offset < len(data):
             block = hashlib.sha256(self.key + nonce + counter.to_bytes(8, "big")).digest()
             n = min(32, len(data) - offset)
-            for i in range(n):
-                out[offset + i] = data[offset + i] ^ block[i]
+            mixed = int.from_bytes(source[offset : offset + n], "big") ^ int.from_bytes(block[:n], "big")
+            out[offset : offset + n] = mixed.to_bytes(n, "big")
             offset += n
             counter += 1
         return bytes(out)
 
-    def encrypt_text(self, text: str) -> str:
+    def _encrypt_text_v1(self, text: str) -> str:
         payload = text.encode("utf-8")
         nonce = os.urandom(16)
         ct = self._stream_xor(payload, nonce)
@@ -13241,17 +13615,49 @@ class CryptoBox:
         }
         return json_dumps(box)
 
+    def encrypt_text(self, text: str) -> str:
+        if _AESGCM is None:
+            return self._encrypt_text_v1(text)
+        payload = text.encode("utf-8")
+        nonce = os.urandom(12)
+        ciphertext = _AESGCM(self.key).encrypt(nonce, payload, self._V2_AAD)
+        return json_dumps(
+            {
+                "v": 2,
+                "n": base64.b64encode(nonce).decode("ascii"),
+                "c": base64.b64encode(ciphertext).decode("ascii"),
+            }
+        )
+
     def decrypt_text(self, box_text: str) -> str:
         box = json.loads(box_text)
-        if not isinstance(box, dict) or "n" not in box or "c" not in box or "m" not in box:
+        if not isinstance(box, dict) or "n" not in box or "c" not in box:
+            return box_text
+        try:
+            version = int(box.get("v", 1) or 1)
+        except Exception:
+            version = 1
+        if version == 2:
+            if _AESGCM is None:
+                raise ValueError("AES-GCM support is unavailable; install the cryptography package")
+            try:
+                nonce = base64.b64decode(str(box["n"]), validate=True)
+                ciphertext = base64.b64decode(str(box["c"]), validate=True)
+                plaintext = _AESGCM(self.key).decrypt(nonce, ciphertext, self._V2_AAD)
+            except Exception as exc:
+                raise ValueError("Encrypted payload integrity check failed") from exc
+            return plaintext.decode("utf-8")
+        if version != 1:
+            raise ValueError(f"Unsupported encrypted payload version: {version}")
+        if "m" not in box:
             return box_text
         nonce = base64.b64decode(box["n"])
-        ct = base64.b64decode(box["c"])
-        mac = hmac.new(self.key, nonce + ct, hashlib.sha256).hexdigest()
+        ciphertext = base64.b64decode(box["c"])
+        mac = hmac.new(self.key, nonce + ciphertext, hashlib.sha256).hexdigest()
         if not hmac.compare_digest(mac, box["m"]):
             raise ValueError("Encrypted payload integrity check failed")
-        pt = self._stream_xor(ct, nonce)
-        return pt.decode("utf-8")
+        plaintext = self._stream_xor(ciphertext, nonce)
+        return plaintext.decode("utf-8")
 
     def _fsync_json_file(self, fileobj) -> None:
         if not self.json_fsync_enabled:
@@ -15921,8 +16327,16 @@ class EventHub:
 
     def publish(self, event: dict):
         with self._lock:
-            self._seq += 1
-            seq = self._seq
+            supplied_seq = int(event.get("seq", 0) or 0) if isinstance(event, dict) else 0
+            if supplied_seq > 0:
+                # Session event cursors survive reloads. Replacing them with
+                # this process-local hub counter makes every later delta look
+                # older than the cursor restored from disk.
+                self._seq = max(self._seq, supplied_seq)
+                seq = supplied_seq
+            else:
+                self._seq += 1
+                seq = self._seq
             subs = list(self._subs)
         if isinstance(event, dict):
             event["seq"] = seq
@@ -20226,7 +20640,7 @@ _BUILTIN_SKILLS: dict[str, dict] = {
 # ============================================================================
 
 class SkillStore:
-    def __init__(self, skills_root: Path):
+    def __init__(self, skills_root: Path, snapshot: SkillStore | None = None):
         self.skills_root = skills_root
         self.skills: dict[str, dict] = {}
         self.aliases: dict[str, str] = {}
@@ -20235,7 +20649,27 @@ class SkillStore:
         self.warnings: list[str] = []
         self.fingerprint = ""
         self.last_reload_ts = 0.0
-        self.reload(force=True)
+        adopted = False
+        if snapshot is not None:
+            try:
+                same_root = self.skills_root.resolve() == snapshot.skills_root.resolve()
+            except Exception:
+                same_root = str(self.skills_root) == str(snapshot.skills_root)
+            if same_root and snapshot.skills:
+                self.skills = copy.deepcopy(snapshot.skills)
+                self.aliases = dict(snapshot.aliases)
+                self.ambiguous = {
+                    str(key): list(value)
+                    for key, value in snapshot.ambiguous.items()
+                    if isinstance(value, list)
+                }
+                self.providers = copy.deepcopy(snapshot.providers)
+                self.warnings = list(snapshot.warnings)
+                self.fingerprint = str(snapshot.fingerprint or "")
+                self.last_reload_ts = now_ts()
+                adopted = True
+        if not adopted:
+            self.reload(force=True)
 
     def _sanitize_provider_id(self, raw: str, fallback: str) -> str:
         pid = re.sub(r"[^A-Za-z0-9._-]+", "-", (raw or "").strip().lower()).strip("-")
@@ -26415,6 +26849,37 @@ class OllamaClient:
         return out
 
     @staticmethod
+    def _is_ambiguous_invalid_parameter_error(exc: Exception) -> bool:
+        if int(getattr(exc, "status", 0) or 0) != 400:
+            return False
+        details = f"{exc} {getattr(exc, 'body', '')}".lower().replace("_", "")
+        return (
+            "invalidparameter" in details
+            or "parameter specified in the request is not valid" in details
+            or ('"param":""' in details and "badrequest" in details)
+        )
+
+    @staticmethod
+    def _minimal_openai_compat_payload(payload: dict, reasoning_strip: list[str] | None = None) -> dict:
+        optional = {
+            "temperature",
+            "max_tokens",
+            "max_completion_tokens",
+            "top_p",
+            "frequency_penalty",
+            "presence_penalty",
+            "seed",
+            "stop",
+            "tool_choice",
+            "parallel_tool_calls",
+            "response_format",
+            "logprobs",
+            "top_logprobs",
+        }
+        optional.update(str(key) for key in (reasoning_strip or []) if str(key))
+        return {key: value for key, value in payload.items() if key not in optional}
+
+    @staticmethod
     def _sanitize_openai_tool_history(messages: list[dict]) -> list[dict]:
         """Repair incomplete OpenAI tool-call blocks before sending them.
 
@@ -26523,6 +26988,22 @@ class OllamaClient:
             except OllamaError as exc:
                 err_text = str(exc).lower()
                 status_400 = int(getattr(exc, "status", 0) or 0) == 400
+                if self._is_ambiguous_invalid_parameter_error(exc):
+                    minimal_payload = self._minimal_openai_compat_payload(payload, reasoning_strip)
+                    try:
+                        lines = self._iter_response_lines_url_with_retries(
+                            endpoint,
+                            minimal_payload,
+                            headers=self._render_headers(),
+                            max_attempts=http_retry_attempts,
+                            cancel_check=cancel_check,
+                            on_retry=on_http_retry,
+                        )
+                        return self._openai_stream_result_from_lines(lines, on_content_delta=on_content_delta)
+                    except OllamaError as retry_exc:
+                        exc = retry_exc
+                        err_text = str(retry_exc).lower()
+                        status_400 = int(getattr(retry_exc, "status", 0) or 0) == 400
                 # Some providers (e.g. certain Chinese cloud APIs) reject role=tool.
                 # Collapse tool messages into user messages and retry the stream.
                 if status_400 and (
@@ -26585,9 +27066,25 @@ class OllamaClient:
         except OllamaError as exc:
             err_text = str(exc).lower()
             status_400 = int(getattr(exc, "status", 0) or 0) == 400
+            raw = None
+            if self._is_ambiguous_invalid_parameter_error(exc):
+                minimal_payload = self._minimal_openai_compat_payload(payload, reasoning_strip)
+                try:
+                    raw = self._post_json_url_with_retries(
+                        endpoint,
+                        minimal_payload,
+                        headers=self._render_headers(),
+                        max_attempts=http_retry_attempts,
+                        cancel_check=cancel_check,
+                        on_retry=on_http_retry,
+                    )
+                except OllamaError as retry_exc:
+                    exc = retry_exc
+                    err_text = str(retry_exc).lower()
+                    status_400 = int(getattr(retry_exc, "status", 0) or 0) == 400
             # Some providers (e.g. certain Chinese cloud APIs) reject role=tool.
             # Retry once with tool messages collapsed into user messages.
-            if status_400 and (
+            if raw is None and status_400 and (
                 "messages.role" in err_text or ("tool" in err_text and "role" in err_text)
             ):
                 fallback_msgs = self._collapse_tool_role_messages(req_messages)
@@ -26602,7 +27099,7 @@ class OllamaClient:
                     cancel_check=cancel_check,
                     on_retry=on_http_retry,
                 )
-            elif status_400 and "tool_choice" in payload:
+            elif raw is None and status_400 and "tool_choice" in payload:
                 stripped = dict(payload)
                 stripped.pop("tool_choice", None)
                 stripped["stream"] = False
@@ -26614,7 +27111,7 @@ class OllamaClient:
                     cancel_check=cancel_check,
                     on_retry=on_http_retry,
                 )
-            elif status_400 and reasoning_strip and any(k in payload for k in reasoning_strip):
+            elif raw is None and status_400 and reasoning_strip and any(k in payload for k in reasoning_strip):
                 # Endpoint does not understand the reasoning field; drop and retry.
                 stripped = {k: v for k, v in payload.items() if k not in reasoning_strip}
                 stripped["stream"] = False
@@ -26626,7 +27123,7 @@ class OllamaClient:
                     cancel_check=cancel_check,
                     on_retry=on_http_retry,
                 )
-            else:
+            elif raw is None:
                 raise
         content, tool_calls, thinking_content = self._extract_openai_message(raw)
         return {"content": content, "thinking": thinking_content, "tool_calls": tool_calls, "raw": raw}
@@ -28601,6 +29098,21 @@ def _detect_ide_sandbox_backend(*, force: bool = False) -> dict:
 # Per-session orchestrator: maintains conversation state, plan state, tool
 # routing, todo synchronization, completion checks, and agent coordination.
 class SessionState:
+    @staticmethod
+    def _normalize_workspace_id(value: object, fallback: str) -> str:
+        """Normalize persisted workspace lineage without allowing path traversal."""
+        default = trim(str(fallback or "").strip(), 160)
+        candidate = trim(str(value or "").strip(), 160)
+        if (
+            not candidate
+            or candidate in {".", ".."}
+            or "/" in candidate
+            or "\\" in candidate
+            or "\x00" in candidate
+        ):
+            return default
+        return candidate
+
     def __init__(
         self,
         session_id: str,
@@ -28645,6 +29157,7 @@ class SessionState:
         knowledge_library_status_callback=None,
         mcp_manager=None,
         workspace_root: Path | None = None,
+        workspace_id: str = "",
         collaboration_context: dict | None = None,
         collaboration_context_provider=None,
         collaboration_write_coordinator=None,
@@ -28655,9 +29168,12 @@ class SessionState:
         summary_update_callback=None,
         kernel_version: str = "",
         kernel_runtime=None,
+        skills_snapshot: SkillStore | None = None,
+        defer_initial_persist: bool = False,
     ):
         self.id = session_id
         self.title = title
+        self.workspace_id = trim(str(workspace_id or session_id).strip(), 160) or session_id
         self.kernel_version = str(kernel_version or "")
         self.kernel_runtime = kernel_runtime
         self.title_origin = (
@@ -28666,6 +29182,13 @@ class SessionState:
             else ("auto" if self._is_low_quality_auto_title(title) else "legacy")
         )
         self.last_auto_title_source = ""
+        self.auto_title_revision = 0
+        self.auto_title_last_goal_digest = ""
+        self.auto_title_refine_pending = False
+        self.auto_title_refine_generation = 0
+        self.auto_title_refine_attempt_digest = ""
+        self.auto_title_refine_attempt_ts = 0.0
+        self.auto_title_refine_lock = threading.RLock()
         self.root = root / session_id
         self.root.mkdir(parents=True, exist_ok=True)
         if workspace_root is not None:
@@ -28706,6 +29229,7 @@ class SessionState:
         self._persist_scheduler_lock = threading.Lock()
         self._persist_scheduler_pending = False
         self._persist_scheduler_thread = None
+        self._persist_delay_timer = None
         self.owner_user_id = str(owner_user_id or "")
         self.deferred_start_prepare_callback = deferred_start_prepare_callback
         self.summary_update_callback = summary_update_callback
@@ -28789,12 +29313,17 @@ class SessionState:
         self.single_no_plan_todo_bootstrap_attempts = 0
         self.single_no_plan_todo_perception_seen = False
         self.single_no_plan_todo_bootstrap_write_seen = False
-        self.skills = SkillStore(skills_root)
+        self.skills = SkillStore(skills_root, snapshot=skills_snapshot)
         self.skill_load_cache: dict[str, dict] = {}
         self._step_skill_runtime_lock = threading.Lock()
         self._step_skill_restore_pending = False
-        self.skills_last_refresh_ts = 0.0
-        self.skills_runtime_prepared = False
+        self.skills_last_refresh_ts = now_ts() if skills_snapshot is not None else 0.0
+        self.skills_runtime_prepared = skills_snapshot is not None
+        if skills_snapshot is not None:
+            try:
+                self._skills_dir_mtime_cache = skills_root.stat().st_mtime if skills_root.exists() else 0.0
+            except Exception:
+                self._skills_dir_mtime_cache = 0.0
         self.tasks = TaskManager(self.root / "tasks", crypto)
         self.bg = BackgroundManager(
             self.files_root,
@@ -29102,6 +29631,7 @@ class SessionState:
         self.file_buffer_index: dict[str, dict] = {}  # ref_id -> {path, chars, summary}
         self.created_at = now_ts()
         self.updated_at = now_ts()
+        self.defer_initial_persist = bool(defer_initial_persist)
         self.shutdown_requests: dict[str, dict] = {}
         self.plan_requests: dict[str, dict] = {}
         self.blackboard = self._new_blackboard("")
@@ -29149,6 +29679,11 @@ class SessionState:
                     profile["capabilities"] = merged_cached
                     self.model_profiles[self.active_profile_id] = profile
                     return merged_cached
+        if not force_probe and FAST_START_DEFER_CAPABILITY_PROBE:
+            merged = self._capabilities_from_profile(profile)
+            profile["capabilities"] = merged
+            self.model_profiles[self.active_profile_id] = profile
+            return merged
         try:
             probed = self.ollama.probe_multimodal_capabilities(force=True if force_probe else False)
             merged = merge_multimodal_capabilities(self._capabilities_from_profile(profile), probed)
@@ -30263,10 +30798,18 @@ class SessionState:
                 int(getattr(self, "event_seq", 0) or 0),
             )
             self.snapshot_revision = next_revision
-            self.ui_feed_revision = max(int(getattr(self, "ui_feed_revision", 0) or 0), next_revision)
+            # A feed cursor counts events, not snapshot-only reconciliations.
+            self.ui_feed_revision = max(int(getattr(self, "ui_feed_revision", 0) or 0), int(getattr(self, "event_seq", 0) or 0))
 
     def _stamp_latest_ui_message_locked(self, event: dict) -> bool:
         payload = event.get("data", {}) if isinstance(event.get("data"), dict) else {}
+        queue_id = int(payload.get("scheduler_queue_id", 0) or 0)
+        if queue_id:
+            for row in reversed(getattr(self, "scheduler_visible_inputs", [])):
+                if int(row.get("queue_id", 0) or 0) == queue_id:
+                    row["seq"] = int(event.get("seq", 0) or 0)
+                    row["event_id"] = str(event.get("id", "") or "")
+                    return True
         role = str(payload.get("role", "") or "").strip().lower()
         text = str(payload.get("text", "") or "")
         if not role or not text:
@@ -30277,10 +30820,11 @@ class SessionState:
                 continue
             if str(row.get("role", "") or "").strip().lower() != role:
                 continue
-            if str(row.get("content", "") or "") != text:
+            content = str(row.get("content", "") or "")
+            # Message events use trim() for transport; stored content is full.
+            if content != text and not (len(text) >= 32 and content.startswith(text.removesuffix("..."))):
                 continue
-            row_ts = float(row.get("ts", 0.0) or 0.0)
-            if event_ts and row_ts and abs(event_ts - row_ts) > 10.0:
+            if int(row.get("seq", 0) or 0) > 0:
                 continue
             if int(row.get("seq", 0) or 0) <= 0:
                 row["seq"] = int(event.get("seq", 0) or 0)
@@ -30315,13 +30859,26 @@ class SessionState:
         self._snapshot_cache_lite_key = None
 
     def _load_if_exists(self):
+        state_existed = self.state_path.exists()
+        compact_loaded_state = False
+        persisted_message_count_hint = 0
         if self.state_path.exists():
             try:
                 raw = self.crypto.read_json(self.state_path, {})
                 persisted_kernel_version = str(raw.get("kernel_version", "") or "").strip()
                 if persisted_kernel_version:
                     self.kernel_version = persisted_kernel_version
-                self.messages = raw.get("messages", [])
+                persisted_workspace_id = self._normalize_workspace_id(
+                    raw.get("workspace_id"), self.id
+                )
+                if persisted_workspace_id:
+                    self.workspace_id = persisted_workspace_id
+                raw_messages = raw.get("messages", [])
+                if not isinstance(raw_messages, list):
+                    raw_messages = []
+                persisted_message_count_hint = len(raw_messages)
+                compact_loaded_state = compact_loaded_state or len(raw_messages) > SESSION_RUNTIME_MESSAGE_WINDOW
+                self.messages = raw_messages[-SESSION_RUNTIME_MESSAGE_WINDOW:]
                 persisted_origin = str(raw.get("title_origin", "") or "").strip().lower()
                 if persisted_origin in {"default", "auto", "application", "manual", "legacy"}:
                     self.title_origin = persisted_origin
@@ -30329,8 +30886,21 @@ class SessionState:
                     str(raw.get("last_auto_title_source", "") or ""),
                     40,
                 )
-                self.activity = raw.get("activity", [])
-                self.operations = raw.get("operations", [])
+                self.auto_title_revision = max(0, int(raw.get("auto_title_revision", 0) or 0))
+                self.auto_title_last_goal_digest = trim(
+                    str(raw.get("auto_title_last_goal_digest", "") or ""),
+                    64,
+                )
+                raw_activity = raw.get("activity", [])
+                if not isinstance(raw_activity, list):
+                    raw_activity = []
+                compact_loaded_state = compact_loaded_state or len(raw_activity) > SESSION_RUNTIME_ACTIVITY_WINDOW
+                self.activity = raw_activity[-SESSION_RUNTIME_ACTIVITY_WINDOW:]
+                raw_operations = raw.get("operations", [])
+                if not isinstance(raw_operations, list):
+                    raw_operations = []
+                compact_loaded_state = compact_loaded_state or len(raw_operations) > SESSION_RUNTIME_OPERATION_WINDOW
+                self.operations = raw_operations[-SESSION_RUNTIME_OPERATION_WINDOW:]
                 raw_code_preview = raw.get("code_preview_index", {})
                 if isinstance(raw_code_preview, dict):
                     clean_code_preview: dict[str, list[dict]] = {}
@@ -30365,7 +30935,9 @@ class SessionState:
                     self.code_preview_index = clean_code_preview
                 self.teammates = raw.get("teammates", {})
                 uploads = raw.get("uploads", [])
-                self.uploads = uploads if isinstance(uploads, list) else []
+                uploads = uploads if isinstance(uploads, list) else []
+                compact_loaded_state = compact_loaded_state or len(uploads) > SESSION_RUNTIME_UPLOAD_WINDOW
+                self.uploads = uploads[-SESSION_RUNTIME_UPLOAD_WINDOW:]
                 profiles = raw.get("model_profiles", {})
                 if isinstance(profiles, dict) and profiles:
                     self.model_profiles = {}
@@ -30717,6 +31289,10 @@ class SessionState:
                 self.run_generation = int(raw.get("run_generation", self.run_generation) or self.run_generation)
                 self.agent_round_index = int(raw.get("agent_round_index", self.agent_round_index) or 0)
                 self.current_phase = str(raw.get("current_phase", self.current_phase) or "idle")
+                if self.current_phase == self._startup_phase("auto-title"):
+                    # Remove the obsolete visible phase from sessions persisted
+                    # by earlier builds. Title model refinement is background work.
+                    self.current_phase = "idle"
                 self.current_tool_name = str(raw.get("current_tool_name", self.current_tool_name) or "")
                 self.execution_mode = normalize_execution_mode(
                     raw.get("execution_mode", self.execution_mode),
@@ -30889,7 +31465,13 @@ class SessionState:
                 # Align agent_messages to initial tier limit immediately after load.
                 # Prevents a stale 800-row list from inflating the first token estimate
                 # and triggering unnecessary Tier2/3 compression on reconnect.
-                _init_tier = self._context_compression_tier()
+                _init_estimate = self._ui_fast_context_token_estimate(
+                    self.messages,
+                    fallback=int(getattr(self, "context_last_next_call_estimate", 0) or 0),
+                )
+                _init_tier = self._context_compression_tier(
+                    self._context_budget_metrics(token_estimate=_init_estimate)
+                )
                 _init_am_limit = self._tier_agent_context_limits(_init_tier)["agent_messages"]
                 if len(self.agent_messages) > _init_am_limit:
                     self.agent_messages = self.agent_messages[-_init_am_limit:]
@@ -30951,6 +31533,19 @@ class SessionState:
                     self.title_origin = "default"
                 elif self._is_low_quality_auto_title(self.title):
                     self.title_origin = "auto"
+                if not bool(getattr(self, "_ui_runtime_state_ready", False)):
+                    meta_message_count = max(0, int(meta.get("message_count", 0) or 0))
+                    if meta_message_count or persisted_message_count_hint:
+                        self.ui_message_count = max(meta_message_count, persisted_message_count_hint)
+                        event_seq = max(0, int(getattr(self, "event_seq", 0) or 0))
+                        self.ui_feed_revision = max(int(getattr(self, "ui_feed_revision", 0) or 0), event_seq)
+                        self.ui_operation_revision = max(int(getattr(self, "ui_operation_revision", 0) or 0), event_seq)
+                        self.ui_todo_revision = max(int(getattr(self, "ui_todo_revision", 0) or 0), event_seq)
+                        self.ui_upload_revision = max(int(getattr(self, "ui_upload_revision", 0) or 0), event_seq)
+                        self.snapshot_revision = max(int(getattr(self, "snapshot_revision", 0) or 0), event_seq)
+                        self._ui_message_source_len = len(self.messages)
+                        self._ui_scheduler_source_len = len(self.scheduler_visible_inputs)
+                        self._ui_runtime_state_ready = True
             except Exception:
                 pass
         self._ensure_ui_runtime_state_locked()
@@ -30989,7 +31584,11 @@ class SessionState:
         self._prune_skill_load_cache()
         with self.lock:
             self._prune_code_preview_locked()
-        self._persist()
+        if not bool(getattr(self, "defer_initial_persist", False)):
+            if state_existed:
+                self._schedule_persist_delayed(0.75 if compact_loaded_state else 1.5)
+            else:
+                self._persist()
 
     def _schedule_persist(self) -> None:
         """Queue one consistent session snapshot for background persistence."""
@@ -31007,11 +31606,35 @@ class SessionState:
                 return
             worker = threading.Thread(
                 target=self._persist_scheduler_worker,
-                name=f"session-persist-{self.id}",
+                name=f"session-persist-{getattr(self, 'id', 'session')}",
                 daemon=True,
             )
             self._persist_scheduler_thread = worker
             worker.start()
+
+    def _schedule_persist_delayed(self, delay_seconds: float = 0.2) -> None:
+        gate = getattr(self, "_persist_scheduler_lock", None)
+        if gate is None:
+            self._schedule_persist()
+            return
+        delay = max(0.0, min(5.0, float(delay_seconds or 0.0)))
+        if delay <= 0:
+            self._schedule_persist()
+            return
+        with gate:
+            timer = getattr(self, "_persist_delay_timer", None)
+            if timer is not None and timer.is_alive():
+                return
+
+            def flush() -> None:
+                with gate:
+                    self._persist_delay_timer = None
+                self._schedule_persist()
+
+            timer = threading.Timer(delay, flush)
+            timer.daemon = True
+            self._persist_delay_timer = timer
+            timer.start()
 
     def _persist_scheduler_worker(self) -> None:
         gate = getattr(self, "_persist_scheduler_lock", None)
@@ -31057,10 +31680,16 @@ class SessionState:
         scheduler_visible_inputs_snapshot = self.scheduler_visible_inputs[-SESSION_DEFERRED_START_QUEUE_MAX:]
         data = {
             "id": self.id,
+            "workspace_id": str(getattr(self, "workspace_id", self.id) or self.id),
             "kernel_version": str(getattr(self, "kernel_version", "") or ""),
             "title": self.title,
             "title_origin": self.title_origin,
             "last_auto_title_source": self.last_auto_title_source,
+            "auto_title_revision": int(getattr(self, "auto_title_revision", 0) or 0),
+            "auto_title_last_goal_digest": trim(
+                str(getattr(self, "auto_title_last_goal_digest", "") or ""),
+                64,
+            ),
             "ui_language": self.ui_language,
             "runtime_region_hint": trim(str(getattr(self, "runtime_region_hint", "") or ""), 160),
             "runtime_timezone_hint": trim(str(getattr(self, "runtime_timezone_hint", "") or ""), 120),
@@ -31240,9 +31869,12 @@ class SessionState:
         message_count = max(0, int(getattr(self, "ui_message_count", 0) or 0))
         summary = {
             "id": self.id,
+            "workspace_id": str(getattr(self, "workspace_id", self.id) or self.id),
             "kernel_version": str(getattr(self, "kernel_version", "") or ""),
             "title": self.title,
             "title_origin": self.title_origin,
+            "title_revision": int(getattr(self, "auto_title_revision", 0) or 0),
+            "created_at": float(getattr(self, "created_at", 0.0) or 0.0),
             "updated_at": self.updated_at,
             "message_count": message_count,
             "ui_language": normalize_ui_language(getattr(self, "ui_language", DEFAULT_UI_LANGUAGE)),
@@ -32052,7 +32684,7 @@ class SessionState:
         self.last_event_persist_ts = now_value
         if kind_key == "message":
             self.updated_at = now_value
-            self._schedule_persist()
+            self._schedule_persist_delayed(0.2)
             return
         try:
             self.updated_at = now_value
@@ -32142,20 +32774,19 @@ class SessionState:
         except Exception:
             pass
         payload = self._event_payload_with_agent_role(kind, data)
-        event = {
-            "id": make_id("evt"),
-            "seq": self._next_event_seq(),
-            "ts": now_ts(),
-            "type": kind,
-            "session_id": self.id,
-            "data": payload,
-        }
-        self.events.publish(event)
         record_visible = not (
             str(kind or "").strip().lower() == "web_search"
             and not bool(payload.get("conversation_visible", True))
         )
         with self.lock:
+            event = {
+                "id": make_id("evt"),
+                "seq": self._next_event_seq(),
+                "ts": now_ts(),
+                "type": kind,
+                "session_id": self.id,
+                "data": payload,
+            }
             self._touch_ui_runtime_state_locked(event, record_visible=record_visible)
             if record_visible:
                 self.operations.append(event)
@@ -32168,6 +32799,9 @@ class SessionState:
                     }
                 )
                 self.activity = self.activity[-300:]
+        # SSE readers can fetch immediately. Publish only once every snapshot
+        # ledger contains the event.
+        self.events.publish(event)
         self._maybe_persist_after_event(kind, payload)
         self._publish_collaboration_event_heartbeat(kind, payload)
         return event
@@ -34635,6 +35269,35 @@ class SessionState:
             "limit_source": str(getattr(self, "context_limit_source", "") or "configured"),
         }
 
+    def _ui_fast_context_token_estimate(self, messages: object, *, fallback: int = 0) -> int:
+        fallback = max(0, int(fallback or 0))
+        if fallback > 0:
+            return fallback
+        source = list(messages) if isinstance(messages, (list, tuple, deque)) else []
+        character_count = 0
+        for row in source[-120:]:
+            if not isinstance(row, dict):
+                character_count += min(4000, len(str(row or "")))
+                continue
+            for key in ("content", "text", "thinking", "summary", "result"):
+                value = row.get(key)
+                if isinstance(value, str):
+                    character_count += min(16_000, len(value))
+                elif isinstance(value, list):
+                    for part in value[:12]:
+                        if isinstance(part, dict):
+                            character_count += min(4000, len(str(part.get("text", "") or "")))
+                        elif isinstance(part, str):
+                            character_count += min(4000, len(part))
+        calibration = max(
+            float(CONTEXT_ESTIMATE_SAFETY_MULTIPLIER),
+            min(
+                float(CONTEXT_USAGE_CALIBRATION_MAX),
+                float(getattr(self, "context_estimate_calibration", CONTEXT_ESTIMATE_SAFETY_MULTIPLIER) or CONTEXT_ESTIMATE_SAFETY_MULTIPLIER),
+            ),
+        )
+        return max(1, int(math.ceil((character_count / 3.0) * calibration)) + 1800)
+
     def _context_window_error_hint(self, exc: Exception | str) -> bool:
         text = str(exc or "").lower()
         if not text:
@@ -34830,7 +35493,7 @@ class SessionState:
                 except Exception:
                     pass
 
-    def _agent_context_budget_metrics_snapshot(self) -> list[dict]:
+    def _agent_context_budget_metrics_snapshot(self, *, lightweight: bool = False) -> list[dict]:
         rows: list[dict] = []
         active = str(self.active_agent_role or "").strip().lower()
         candidates: list[str] = []
@@ -34856,33 +35519,52 @@ class SessionState:
             try:
                 if role == "manager":
                     messages = self.manager_context
-                    tools = self._manager_route_tools()
-                    system = self._manager_system_prompt()
                     label = "manager next turn"
                     msg_count = len(self.manager_context)
                     display = backend_role_label("manager", getattr(self, "ui_language", DEFAULT_UI_LANGUAGE))
                 elif role in AGENT_ROLES:
-                    ctx = self._agent_context(role)
+                    ctx = (
+                        list((getattr(self, "contexts", {}) or {}).get(role, []) or [])
+                        if lightweight
+                        else self._agent_context(role)
+                    )
                     messages = ctx
-                    tools = self._tools_for_agent(role)
-                    system = self._agent_role_system_prompt(role)
                     label = f"{role} next turn"
                     msg_count = len(ctx)
                     display = self._agent_display_name(role)
                 else:
                     messages = self.messages
-                    tools = self._available_tools()
-                    system = self._system_prompt()
                     label = "single-agent next turn"
                     msg_count = len(self.messages)
                     display = "Single"
-                metrics = self._context_metrics_for_model_call(
-                    messages,
-                    tools=tools,
-                    system=system,
-                    label=label,
-                    record=False,
-                )
+                if lightweight:
+                    cached_estimate = int(getattr(self, "context_last_next_call_estimate", 0) or 0)
+                    if role not in {"single", active}:
+                        cached_estimate = 0
+                    metrics = self._context_budget_metrics(
+                        token_estimate=self._ui_fast_context_token_estimate(
+                            messages,
+                            fallback=cached_estimate,
+                        )
+                    )
+                    metrics["next_call_label"] = str(getattr(self, "context_last_next_call_label", "") or label)
+                else:
+                    if role == "manager":
+                        tools = self._manager_route_tools()
+                        system = self._manager_system_prompt()
+                    elif role in AGENT_ROLES:
+                        tools = self._tools_for_agent(role)
+                        system = self._agent_role_system_prompt(role)
+                    else:
+                        tools = self._available_tools()
+                        system = self._system_prompt()
+                    metrics = self._context_metrics_for_model_call(
+                        messages,
+                        tools=tools,
+                        system=system,
+                        label=label,
+                        record=False,
+                    )
                 rows.append(
                     {
                         "role": role,
@@ -47759,6 +48441,80 @@ body{padding:18px}
         ]
         return any(x in t for x in markers)
 
+    def _local_classify_task_complexity(self, goal_text: str) -> str:
+        clean = trim(strip_thinking_content(str(goal_text or "")).strip(), 6000)
+        if not clean:
+            self._cached_complexity_dimensions = {
+                "scope": 1,
+                "steps": 1,
+                "skill": 1,
+                "output": 1,
+            }
+            return "simple"
+        explicit = str(infer_user_complexity_value(clean) or "").strip().lower()
+        low = clean.lower()
+        scope = 1
+        steps = 1
+        skill = 1
+        output = 1
+        scope_markers = (
+            "多文件", "多个文件", "整个项目", "全栈", "系统级", "架构", "内核", "框架",
+            "multi-file", "full-stack", "system-wide", "architecture", "kernel", "framework",
+            "frontend", "backend", "database", "api", "webui", "ide",
+        )
+        step_markers = (
+            "然后", "之后", "同时", "并且", "并完成", "测试", "验证", "部署", "迁移",
+            "then", "after that", "also", "and verify", "test", "benchmark", "deploy", "migrate",
+        )
+        skill_markers = (
+            "调研", "研究", "搜索", "论文", "ppt", "pptx", "pdf", "excel", "docx", "图像",
+            "research", "web search", "paper", "presentation", "spreadsheet", "image", "mcp", "skill",
+        )
+        output_markers = (
+            "完整页面", "管理后台", "可视化", "报告", "演示文稿", "测试集", "基准测试", "多个",
+            "dashboard", "admin page", "visualization", "report", "presentation", "test suite", "benchmark",
+        )
+        scope_hits = sum(1 for marker in scope_markers if marker in low)
+        step_hits = sum(1 for marker in step_markers if marker in low)
+        skill_hits = sum(1 for marker in skill_markers if marker in low)
+        output_hits = sum(1 for marker in output_markers if marker in low)
+        numbered_steps = len(re.findall(r"(?m)^\s*(?:[-*]|\d+[.)、])\s+", clean))
+        path_hints = len(set(re.findall(r"[\w./\\-]+\.(?:py|js|ts|tsx|jsx|html|css|json|md|yaml|yml|toml|go|rs|java)\b", low)))
+        if len(clean) >= 240 or scope_hits >= 2 or path_hints >= 2:
+            scope = 2
+        if len(clean) >= 900 or scope_hits >= 5 or path_hints >= 5:
+            scope = 3
+        if step_hits >= 2 or numbered_steps >= 2 or clean.count("\n") >= 4:
+            steps = 2
+        if step_hits >= 5 or numbered_steps >= 5 or clean.count("\n") >= 10:
+            steps = 3
+        if skill_hits >= 1:
+            skill = 2
+        if skill_hits >= 4:
+            skill = 3
+        if output_hits >= 1 or any(marker in low for marker in ("实现", "构建", "生成", "create", "build", "implement")):
+            output = 2
+        if output_hits >= 4 or any(marker in low for marker in ("完整系统", "整套", "production-ready", "end-to-end")):
+            output = 3
+        self._cached_complexity_dimensions = {
+            "scope": scope,
+            "steps": steps,
+            "skill": skill,
+            "output": output,
+        }
+        if explicit in TASK_COMPLEXITY_LEVELS:
+            return explicit
+        values = (scope, steps, skill, output)
+        high = sum(1 for value in values if value >= 3)
+        medium = sum(1 for value in values if value >= 2)
+        if high >= 2 or (high >= 1 and medium >= 4):
+            return "expert"
+        if high >= 1 or medium >= 3:
+            return "complex"
+        if medium >= 1 or self._looks_nontrivial_request(clean):
+            return "moderate"
+        return "simple"
+
     def _llm_classify_task_complexity(self, goal_text: str) -> str:
         """LLM semantic pre-screening: classify task into 4 complexity bands via 4-dimension analysis. 5s timeout."""
         goal = trim(str(goal_text or ""), 400)
@@ -48050,7 +48806,7 @@ body{padding:18px}
             if not task_text:
                 continue
             task_text = trim(task_text.replace("\n", " "), 220)
-            if self._is_title_continuation_text(task_text):
+            if self._is_title_continuation_text(task_text) or self._is_low_quality_auto_title(task_text):
                 continuation = continuation or task_text
                 continue
             return task_text
@@ -48072,7 +48828,8 @@ body{padding:18px}
             "編程任務進行中", "ide编程请求", "ide编程请求处理", "ide编程请求初始化",
             "ide程式請求", "ide程式請求處理", "ide程式請求初始化", "用户请求",
             "用户请求处理", "使用者請求處理", "处理用户请求", "实现用户需求",
-            "實現使用者需求",
+            "實現使用者需求", "你好", "您好", "hello", "hi", "实现功能",
+            "實現功能", "完成功能", "处理问题", "處理問題", "修复问题", "修復問題",
         }
         if compact in generic:
             return True
@@ -48121,12 +48878,31 @@ body{padding:18px}
         text = strip_thinking_content(str(raw or "")).strip()
         if not text:
             return ""
+        text = re.sub(r"^```(?:json|text|markdown)?\s*|\s*```$", "", text, flags=re.IGNORECASE).strip()
+        try:
+            decoded = json.loads(text)
+        except Exception:
+            decoded = None
+        if isinstance(decoded, dict):
+            text = str(
+                decoded.get("title")
+                or decoded.get("session_title")
+                or decoded.get("name")
+                or ""
+            ).strip()
+        elif isinstance(decoded, str):
+            text = decoded.strip()
         lines = [line.strip() for line in text.replace("\r", "\n").split("\n") if line.strip()]
         text = lines[0] if lines else ""
         text = re.sub(r"\s+", " ", text).strip()
-        text = re.sub(r"^['\"`#\-\s]+|['\"`#\-\s]+$", "", text).strip()
+        text = re.sub(r"^['\"`#*\-\s]+|['\"`#*\-\s]+$", "", text).strip()
+        app_name = self._application_title_name()
+        if app_name:
+            m = re.match(rf"^{re.escape(app_name)}\s*[-—:：]\s*(.+)$", text, flags=re.IGNORECASE)
+            if m:
+                text = m.group(1).strip()
         text = re.sub(
-            r"^(?:session\s+title|title|标题|標題|会话标题|會話標題|セッション名)\s*[:：]\s*",
+            r"^(?:\*{0,2})?(?:session\s+title|title|标题|標題|会话标题|會話標題|セッション名)(?:\*{0,2})?\s*[:：]\s*",
             "",
             text,
             flags=re.IGNORECASE,
@@ -48172,9 +48948,9 @@ body{padding:18px}
             return None
         if current.casefold() == app_name.casefold():
             return ""
-        marker = f"{app_name}-"
-        if current.casefold().startswith(marker.casefold()):
-            return current[len(marker):].strip()
+        m = re.match(rf"^{re.escape(app_name)}\s*[-—:：]\s*(.*)$", current, flags=re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
         return None
 
     def _title_is_replaceable(self, title: str, origin: str) -> bool:
@@ -48216,7 +48992,7 @@ body{padding:18px}
                 return True
             return False
 
-    def _fallback_auto_title(self) -> str:
+    def _fallback_auto_title(self, *, compact: bool = False) -> str:
         goal = self._best_session_title_goal_text()
         if not goal:
             return ""
@@ -48227,6 +49003,13 @@ body{padding:18px}
             candidate,
             flags=re.IGNORECASE,
         ).strip()
+        if compact:
+            candidate = re.sub(
+                r"^(?:制作|製作|创建|創建|生成|绘制|繪製|画|畫)(?:一个|一個|一张|一張)?\s*",
+                "",
+                candidate,
+                flags=re.IGNORECASE,
+            ).strip()
         candidate = re.split(r"[\n。！？!?]+", candidate, maxsplit=1)[0].strip()
         candidate = re.split(
             r"[，,；;]\s*(?=(?:并且|並且|并|並|同时|同時|然后|然後|使用|需要|"
@@ -48235,6 +49018,13 @@ body{padding:18px}
             maxsplit=1,
             flags=re.IGNORECASE,
         )[0].strip()
+        if compact:
+            candidate = re.sub(
+                r"(?:的)?(?:图片|圖片|图像|圖像|插图|插圖)$",
+                "绘制",
+                candidate,
+                flags=re.IGNORECASE,
+            ).strip()
         return self._normalize_auto_title(candidate)
 
     def _migrate_legacy_auto_title_on_load(self) -> bool:
@@ -48276,79 +49066,241 @@ body{padding:18px}
         self.updated_at = now_ts()
         return True
 
-    def _maybe_auto_rename_session_title(self, trigger: str = "") -> bool:
-        now_tick = now_ts()
-        with self.lock:
-            current = str(self.title or "").strip()
-            origin = str(getattr(self, "title_origin", "") or "").strip().lower()
-            replaceable = self._title_is_replaceable(current, origin)
-            if not replaceable:
-                return False
-            if (now_tick - float(self.last_auto_title_ts or 0.0)) < 12:
-                return False
-            self.last_auto_title_ts = now_tick
+    @staticmethod
+    def _auto_title_goal_digest(goal: str) -> str:
+        return hashlib.sha256(str(goal or "").strip().encode("utf-8", errors="replace")).hexdigest()[:24]
 
-        if self.cancel_requested:
-            return False
-
-        prompt = (
-            "Generate one concise session title from current coding task progress.\n"
-            "Rules:\n"
-            "- max 20 characters (or 3-6 English words)\n"
-            "- name the concrete user task or artifact, never the IDE/session/workflow status\n"
-            "- no quotes, no markdown, no punctuation-only title\n"
-            "- output title only\n\n"
-            f"{self._title_context_brief()}"
+    def _build_auto_title_client(self) -> OllamaClient:
+        profiles = getattr(self, "model_profiles", {}) or {}
+        profile = dict(profiles.get(getattr(self, "active_profile_id", ""), {}) or {})
+        source = getattr(self, "ollama", None)
+        effective_profile = {
+            "base_url": getattr(source, "base_url", "http://127.0.0.1:11434"),
+            "model": getattr(source, "model", ""),
+            "provider": getattr(source, "provider", "ollama"),
+            "endpoint": getattr(source, "endpoint", ""),
+            "api_key": getattr(source, "api_key", ""),
+            "headers": getattr(source, "headers", {}),
+            "payload_template": getattr(source, "payload_template", ""),
+            **profile,
+        }
+        base_url = str(effective_profile.get("base_url") or "http://127.0.0.1:11434")
+        model = str(effective_profile.get("model") or "")
+        provider = str(effective_profile.get("provider") or "ollama")
+        client = OllamaClient(
+            base_url,
+            model,
+            int(effective_profile.get("request_timeout", AUTO_TITLE_MODEL_TIMEOUT_SECONDS) or AUTO_TITLE_MODEL_TIMEOUT_SECONDS),
+            provider=provider,
+            endpoint=str(effective_profile.get("endpoint") or ""),
+            api_key=str(effective_profile.get("api_key") or ""),
+            headers=effective_profile.get("headers", {}) if isinstance(effective_profile.get("headers"), dict) else {},
+            payload_template=str(effective_profile.get("payload_template", "") or ""),
+            thinking_stream=False,
+            response_stream=False,
         )
+        client.apply_profile(effective_profile)
+        client.timeout = AUTO_TITLE_MODEL_TIMEOUT_SECONDS
+        client.thinking_stream = False
+        client.response_stream = False
+        client.set_telemetry(
+            getattr(self, "telemetry_callback", None),
+            context_provider=lambda: {"session_id": self.id},
+            name="auto_title",
+        )
+        return client
+
+    def _emit_auto_title_change(self, old_title: str, final_title: str, trigger: str, source: str) -> None:
+        payload = {
+            "summary": (
+                f"session auto-renamed ({trigger or 'progress'}): "
+                f"'{trim(old_title, 36)}' -> '{final_title}'"
+            ),
+            "session_title": final_title,
+            "title_origin": str(getattr(self, "title_origin", "auto") or "auto"),
+            "title_revision": int(getattr(self, "auto_title_revision", 0) or 0),
+            "title_source": source,
+        }
+        metadata_callback = getattr(self, "workspace_metadata_callback", None)
+        if callable(metadata_callback):
+            try:
+                metadata = metadata_callback(self.id)
+                if isinstance(metadata, dict):
+                    payload.update(
+                        {
+                            key: metadata[key]
+                            for key in (
+                                "workspace_id",
+                                "workspace_name",
+                                "workspace_created_at",
+                                "workspace_label",
+                            )
+                            if key in metadata
+                        }
+                    )
+            except Exception:
+                pass
+        self._emit("status", payload)
+
+    def _schedule_auto_title_model_refine(self, goal: str, goal_digest: str, trigger: str) -> bool:
+        refine_lock = getattr(self, "auto_title_refine_lock", None)
+        if refine_lock is None:
+            return False
+        now_value = now_ts()
+        with refine_lock:
+            with self.lock:
+                origin = str(getattr(self, "title_origin", "") or "").strip().lower()
+                source = str(getattr(self, "last_auto_title_source", "") or "").strip().lower()
+                current_title = str(self.title or "").strip()
+                fallback_in_progress = (
+                    origin == "auto"
+                    and source == "fallback"
+                    and str(getattr(self, "auto_title_last_goal_digest", "") or "")
+                    in {"", goal_digest}
+                )
+                if not self._title_is_replaceable(current_title, origin) and not fallback_in_progress:
+                    return False
+                if source == "model" and str(getattr(self, "auto_title_last_goal_digest", "") or "") == goal_digest:
+                    return False
+                if bool(getattr(self, "auto_title_refine_pending", False)):
+                    return False
+                if (
+                    str(getattr(self, "auto_title_refine_attempt_digest", "") or "") == goal_digest
+                    and now_value - float(getattr(self, "auto_title_refine_attempt_ts", 0.0) or 0.0)
+                    < AUTO_TITLE_MODEL_RETRY_COOLDOWN_SECONDS
+                ):
+                    return False
+                self.auto_title_refine_pending = True
+                self.auto_title_refine_generation = int(getattr(self, "auto_title_refine_generation", 0) or 0) + 1
+                generation = int(self.auto_title_refine_generation)
+                self.auto_title_refine_attempt_digest = goal_digest
+                self.auto_title_refine_attempt_ts = now_value
+                quick_title = current_title
+                app_suffix = self._application_title_suffix(quick_title)
+                if app_suffix:
+                    quick_title = app_suffix
+        threading.Thread(
+            target=self._auto_title_model_refine_worker,
+            args=(goal, goal_digest, quick_title, trigger, generation),
+            name=f"auto-title-{self.id[-8:]}",
+            daemon=True,
+        ).start()
+        return True
+
+    def _auto_title_model_refine_worker(
+        self,
+        goal: str,
+        goal_digest: str,
+        quick_title: str,
+        trigger: str,
+        generation: int,
+    ) -> None:
         candidate = ""
         candidate_source = "model"
-        try:
-            rsp = self.ollama.chat(
-                [{"role": "user", "content": f"/no_think\n{prompt}"}],
-                system=self._inject_runtime_environment_context(
-                    "/no_think\n"
-                    "You generate short practical session titles for developer workflow tracking. "
-                    f"{model_language_instruction(self.ui_language)}"
-                ),
-                max_tokens=80,
-                think=False,
-            )
-            candidate = self._normalize_auto_title(str(rsp.get("content", "") or ""))
-        except Exception:
-            candidate = ""
-        if not candidate:
-            candidate = self._fallback_auto_title()
-            candidate_source = "fallback"
-        if not candidate:
-            return False
-        if self.cancel_requested:
-            return False
-
-        with self.lock:
-            if self.cancel_requested:
-                return False
-            old_title = str(self.title or "").strip()
-            old_origin = str(getattr(self, "title_origin", "") or "").strip().lower()
-            if not self._title_is_replaceable(old_title, old_origin):
-                return False
-            final_title = self._application_title(candidate)
-            if final_title == old_title:
-                return False
-            self.title = final_title
-            self.title_origin = "auto"
-            self.last_auto_title_source = candidate_source
-            self.updated_at = now_ts()
-            self._persist()
-        self._emit(
-            "status",
-            {
-                "summary": (
-                    f"session auto-renamed ({trigger or 'progress'}): "
-                        f"'{trim(old_title, 36)}' -> '{final_title}'"
+        if AUTO_TITLE_MODEL_REFINE:
+            try:
+                client = self._build_auto_title_client()
+                prompt = (
+                    "Create one concise session title for the concrete user task below.\n"
+                    "Return title text only. Do not mention session, IDE, workflow, progress, or status.\n"
+                    "Do not include an application or product name prefix.\n"
+                    "Use at most 20 CJK characters or 3-8 English words.\n"
+                    f"Task: {trim(goal, 220)}\n"
+                    f"Optional context: {trim(quick_title, 100)}"
                 )
-            },
-        )
-        return True
+                response = client.chat(
+                    [{"role": "user", "content": prompt}],
+                    system=(
+                        "You generate short, specific developer task titles. "
+                        f"{model_language_instruction(self.ui_language)}"
+                    ),
+                    max_tokens=256,
+                    temperature=0.1,
+                    think=False,
+                    stream_thinking=False,
+                    response_stream=False,
+                )
+                raw_content = response.get("content", "") if isinstance(response, dict) else response
+                candidate = self._normalize_auto_title(str(raw_content or ""))
+            except Exception:
+                candidate = ""
+        if not candidate:
+            candidate = self._fallback_auto_title(compact=FAST_START_LOCAL_TITLE)
+            candidate_source = "fallback"
+        old_title = ""
+        final_title = ""
+        changed = False
+        try:
+            if not candidate:
+                return
+            with self.lock:
+                if int(getattr(self, "auto_title_refine_generation", 0) or 0) != int(generation):
+                    return
+                if not self.root.exists():
+                    return
+                old_title = str(self.title or "").strip()
+                origin = str(getattr(self, "title_origin", "") or "").strip().lower()
+                fallback_in_progress = (
+                    origin == "auto"
+                    and str(getattr(self, "last_auto_title_source", "") or "").strip().lower() == "fallback"
+                    and str(getattr(self, "auto_title_last_goal_digest", "") or "")
+                    in {"", goal_digest}
+                )
+                if not self._title_is_replaceable(old_title, origin) and not fallback_in_progress:
+                    return
+                if str(getattr(self, "auto_title_last_goal_digest", "") or "") not in {"", goal_digest}:
+                    return
+                final_title = self._application_title(candidate)
+                self.auto_title_last_goal_digest = goal_digest
+                self.last_auto_title_source = candidate_source
+                self.last_auto_title_ts = now_ts()
+                if final_title and final_title != old_title:
+                    self.title = final_title
+                    self.title_origin = "auto"
+                    self.auto_title_revision = int(getattr(self, "auto_title_revision", 0) or 0) + 1
+                    self.updated_at = now_ts()
+                    changed = True
+                    self._persist()
+                else:
+                    self._schedule_persist_delayed(0.5)
+        finally:
+            refine_lock = getattr(self, "auto_title_refine_lock", None)
+            if refine_lock is not None:
+                with refine_lock:
+                    if int(getattr(self, "auto_title_refine_generation", 0) or 0) == int(generation):
+                        self.auto_title_refine_pending = False
+        if changed:
+            self._emit_auto_title_change(old_title, final_title, trigger, candidate_source)
+
+    def _maybe_auto_rename_session_title(self, trigger: str = "") -> bool:
+        goal = self._best_session_title_goal_text()
+        if not goal or self._is_title_continuation_text(goal):
+            return False
+        goal_digest = self._auto_title_goal_digest(goal)
+        quick_changed = False
+        quick_old = ""
+        quick_title = ""
+        with self.lock:
+            origin = str(getattr(self, "title_origin", "") or "").strip().lower()
+            current = str(self.title or "").strip()
+            if self._title_is_replaceable(current, origin):
+                candidate = self._fallback_auto_title(compact=FAST_START_LOCAL_TITLE)
+                if candidate:
+                    final = self._application_title(candidate)
+                    if final and final != current:
+                        quick_old = current
+                        quick_title = final
+                        self.title = final
+                        self.title_origin = "auto"
+                        self.last_auto_title_source = "fallback"
+                        self.last_auto_title_ts = now_ts()
+                        self.auto_title_revision = int(getattr(self, "auto_title_revision", 0) or 0) + 1
+                        self.updated_at = now_ts()
+                        self._persist()
+                        quick_changed = True
+        if quick_changed and callable(getattr(self, "summary_update_callback", None)):
+            self._emit_auto_title_change(quick_old, quick_title, trigger, "fallback")
+        return self._schedule_auto_title_model_refine(goal, goal_digest, trigger) or quick_changed
 
     def _ensure_runtime_model_ready(self):
         active_profile = dict(self.model_profiles.get(self.active_profile_id, {}))
@@ -70496,6 +71448,33 @@ body{padding:18px}
             pass
         return dict(low_conf_row)
 
+    def _local_plan_mode_decision(self, goal_text: str, decision: dict | None = None) -> dict:
+        user_pref = str(self.plan_mode_user_preference or "auto").strip().lower()
+        if user_pref == "off":
+            return {"requires_plan": False, "reason": "user set Plan Off", "source": "user-preference"}
+        if user_pref == "on":
+            return {"requires_plan": True, "reason": "user set Plan On", "source": "user-preference"}
+        goal = str(goal_text or "").strip()
+        if not goal:
+            return {"requires_plan": False, "reason": "empty goal", "source": "local-fast"}
+        if self.runtime_plan_approved or self._is_plan_choice_response(goal) or self._is_continuation_input(goal):
+            return {
+                "requires_plan": False,
+                "reason": "continuation resumes execution without a new plan",
+                "source": "local-fast",
+            }
+        row = dict(decision or {})
+        try:
+            level = int(row.get("level", getattr(self, "runtime_task_level", 0) or 0) or 0)
+        except Exception:
+            level = 0
+        requires_plan = level in PLAN_MODE_ENABLED_LEVELS
+        return {
+            "requires_plan": bool(requires_plan),
+            "reason": f"local bounded plan decision for L{level or 0}",
+            "source": "local-fast",
+        }
+
     def _manager_decide_plan_mode_needed(
         self,
         goal_text: str,
@@ -71328,12 +72307,14 @@ body{padding:18px}
                 ) == "auto"
                 and not self._is_continuation_input(goal)
             ):
-                # A manual level pins topology only.  In auto Todo mode the
-                # manager still owns the semantic yes/no decision.
-                semantic_row = self._manager_classify_task_level(
-                    goal,
-                    pinned_selection=pinned_selection,
-                    media_inputs_round=media_inputs_round,
+                semantic_row = (
+                    self._fallback_task_level_decision(goal)
+                    if FAST_START_LOCAL_CLASSIFICATION
+                    else self._manager_classify_task_level(
+                        goal,
+                        pinned_selection=pinned_selection,
+                        media_inputs_round=media_inputs_round,
+                    )
                 )
                 manual_requires_todos = self._resolve_todo_requirement(
                     _utlo,
@@ -71360,11 +72341,15 @@ body{padding:18px}
             }
             user_pref = str(self.plan_mode_user_preference or "auto").strip().lower()
             if user_pref == "auto":
-                plan_auto = self._manager_decide_plan_mode_needed(
-                    goal,
-                    pinned_selection=pinned_selection,
-                    decision=decision,
-                    media_inputs_round=media_inputs_round,
+                plan_auto = (
+                    self._local_plan_mode_decision(goal, decision)
+                    if FAST_START_LOCAL_CLASSIFICATION
+                    else self._manager_decide_plan_mode_needed(
+                        goal,
+                        pinned_selection=pinned_selection,
+                        decision=decision,
+                        media_inputs_round=media_inputs_round,
+                    )
                 )
                 decision["requires_plan"] = bool(plan_auto.get("requires_plan", False))
                 decision["plan_mode_reason"] = trim(
@@ -71429,11 +72414,26 @@ body{padding:18px}
                 "inherit_previous_state": False,
                 "source": "cached",
             }
-        decision = self._manager_classify_task_level(
-            goal,
-            pinned_selection=pinned_selection,
-            media_inputs_round=media_inputs_round,
-        )
+        if FAST_START_LOCAL_CLASSIFICATION:
+            decision = self._fallback_task_level_decision(goal)
+            decision = self._apply_auto_task_level_ceiling_to_decision(
+                decision,
+                source="local-fast",
+            )
+            decision["source"] = "local-fast"
+            decision["semantic_confidence"] = "medium"
+            plan_auto = self._local_plan_mode_decision(goal, decision)
+            decision["requires_plan"] = bool(plan_auto.get("requires_plan", False))
+            decision["plan_mode_reason"] = trim(
+                str(plan_auto.get("reason", "local bounded plan decision") or "local bounded plan decision"),
+                240,
+            )
+        else:
+            decision = self._manager_classify_task_level(
+                goal,
+                pinned_selection=pinned_selection,
+                media_inputs_round=media_inputs_round,
+            )
         self._apply_runtime_task_decision(goal, decision)
         return dict(decision or {})
 
@@ -79405,7 +80405,7 @@ body{padding:18px}
                 self.pending_user_inputs.append(row)
                 self.pending_user_inputs = self.pending_user_inputs[-40:]
             self.updated_at = now_ts()
-            self._persist()
+            self._schedule_persist_delayed(0.2)
         return row
 
     def _enqueue_deferred_start_input(self, content: str, reason: str = "session busy") -> dict:
@@ -79427,10 +80427,7 @@ body{padding:18px}
         try:
             row, start_worker = self._append_deferred_start_input_unlocked(text, reason)
             self.updated_at = now_ts()
-            try:
-                self._persist()
-            except Exception:
-                pass
+            self._schedule_persist_delayed(0.2)
         finally:
             try:
                 self.lock.release()
@@ -79508,7 +80505,7 @@ body{padding:18px}
             int(getattr(self, "event_seq", 0) or 0),
         )
         self._snapshot_cache_lite_key = None
-        self._schedule_persist()
+        self._schedule_persist_delayed(0.75)
         if start_worker:
             threading.Thread(
                 target=self._deferred_start_worker_loop,
@@ -79580,10 +80577,6 @@ body{padding:18px}
                         pass
                     continue
                 self.updated_at = now_ts()
-                try:
-                    self._persist()
-                except Exception:
-                    pass
             finally:
                 if acquired:
                     try:
@@ -80144,6 +81137,10 @@ body{padding:18px}
                 "live_input": True,
                 "best_effort": bool(row.get("best_effort", False)),
             }
+        try:
+            self._maybe_auto_rename_session_title("message-accepted")
+        except Exception:
+            pass
         coordinator = getattr(self, "collaboration_write_coordinator", None)
         if coordinator is not None:
             try:
@@ -84878,11 +85875,16 @@ body{padding:18px}
             self._set_runtime_phase(self._startup_phase("model-ready"))
             self._ensure_runtime_model_ready()
             pinned_selection = self._active_runtime_selection()
-            # ── LLM complexity pre-screen (cached, one-shot, 5s timeout) ──
+            # Keep startup classification local and bounded by default. The
+            # legacy model classifier remains available behind an opt-out env.
             goal_for_classify = self.runtime_reclassify_goal or self._latest_user_goal_text()
             self._set_runtime_phase(self._startup_phase("complexity-precheck"))
             try:
-                self._cached_llm_complexity = self._llm_classify_task_complexity(goal_for_classify)
+                self._cached_llm_complexity = (
+                    self._local_classify_task_complexity(goal_for_classify)
+                    if FAST_START_LOCAL_CLASSIFICATION
+                    else self._llm_classify_task_complexity(goal_for_classify)
+                )
             except Exception:
                 self._cached_llm_complexity = "simple"
             self._emit(
@@ -84954,18 +85956,9 @@ body{padding:18px}
                     {"summary": "level-5 requires user confirmation before next actions"},
                 )
                 return
-            # ── Auto-rename session title early ──
-            self._set_runtime_phase(self._startup_phase("auto-title"))
+            # Retry title scheduling if the early post-submit trigger could not run.
             try:
-                self._call_interruptible(
-                    lambda: self._maybe_auto_rename_session_title("run-start"),
-                    progress_label="startup session title",
-                    progress_interval=1.5,
-                    progress_delay=1.5,
-                )
-            except OllamaError as exc:
-                if self.cancel_requested or int(getattr(exc, "status", 0) or 0) == 499:
-                    raise
+                self._maybe_auto_rename_session_title("run-start")
             except Exception:
                 pass
             # Plan-mode check before entering the main execution loop.
@@ -87290,7 +88283,12 @@ body{padding:18px}
                         },
                     )
 
-    def _ui_todo_task_scope_snapshot(self, board: dict | None = None) -> tuple[list[dict], list[dict], dict]:
+    def _ui_todo_task_scope_snapshot(
+        self,
+        board: dict | None = None,
+        *,
+        lightweight: bool = False,
+    ) -> tuple[list[dict], list[dict], dict]:
         bb = board if isinstance(board, dict) else self._ensure_blackboard()
         raw_todos = self.todo.snapshot()
         raw_tasks = self.tasks.list_objects()
@@ -87367,7 +88365,35 @@ body{padding:18px}
         active_step_id = trim(str((active_step or {}).get("id", "") or ""), 40)
         subtask_rows: list[dict] = []
         if active_step_id:
-            for index, row in enumerate(self._active_plan_worker_todo_rows(active_step_id, role="")):
+            if lightweight:
+                worker_rows = [
+                    dict(row)
+                    for row in raw_todos
+                    if isinstance(row, dict)
+                    and str(row.get("parent_step_id", "") or "").strip() == active_step_id
+                    and self._sanitize_agent_role(row.get("owner", "")) in AGENT_ROLES
+                ]
+                if not worker_rows:
+                    mirror = bb.get("plan_worker_todos", {}) if isinstance(bb.get("plan_worker_todos"), dict) else {}
+                    for raw_row in (mirror.get(active_step_id, []) if isinstance(mirror.get(active_step_id), list) else [])[-80:]:
+                        if not isinstance(raw_row, dict):
+                            continue
+                        owner = self._sanitize_agent_role(raw_row.get("owner", "")) or "developer"
+                        content = trim(str(raw_row.get("content", "") or "").strip(), 500)
+                        if not content:
+                            continue
+                        worker_rows.append(
+                            {
+                                **raw_row,
+                                "content": content,
+                                "owner": owner,
+                                "parent_step_id": active_step_id,
+                            }
+                        )
+                worker_rows.sort(key=self._plan_worker_todo_sort_key)
+            else:
+                worker_rows = self._active_plan_worker_todo_rows(active_step_id, role="")
+            for index, row in enumerate(worker_rows):
                 status = self._normalize_todo_status_value(row.get("status", ""), "pending")
                 content = trim(str(row.get("content", "") or ""), 500)
                 subtask_rows.append(
@@ -87883,11 +88909,25 @@ body{padding:18px}
                     data["preview"] = trim(str(data.get("preview") or ""), 600)
                 row["data"] = data
                 operations_view.append(row)
-            ctx = self._context_budget_metrics()
-            agent_contexts_view = self._agent_context_budget_metrics_snapshot()
+            cached_context_estimate = int(getattr(self, "context_last_next_call_estimate", 0) or 0)
+            ctx = self._context_budget_metrics(
+                token_estimate=(
+                    self._ui_fast_context_token_estimate(self.messages, fallback=cached_context_estimate)
+                    if lite
+                    else None
+                )
+            )
+            agent_contexts_view = self._agent_context_budget_metrics_snapshot(lightweight=lite)
             model_catalog = self.model_catalog() if include_model_catalog else None
-            blackboard = self._normalize_blackboard(self.blackboard)
-            todo_view, task_view, todo_task_scope = self._ui_todo_task_scope_snapshot(blackboard)
+            blackboard = (
+                self.blackboard
+                if lite and isinstance(self.blackboard, dict)
+                else self._normalize_blackboard(self.blackboard)
+            )
+            todo_view, task_view, todo_task_scope = self._ui_todo_task_scope_snapshot(
+                blackboard,
+                lightweight=lite,
+            )
             if (
                 not bool(self.running)
                 and str(blackboard.get("status", "") or "").strip().upper() == "PLANNING"
@@ -87919,10 +88959,12 @@ body{padding:18px}
                 else blackboard
             )
             long_registry = getattr(self, "long_content_memory", {})
-            long_rows = [
-                row for row in (long_registry.values() if isinstance(long_registry, dict) else [])
-                if isinstance(row, dict) and not bool(row.get("stale", False))
-            ]
+            if isinstance(long_registry, dict) and lite:
+                recent_long_keys = list(reversed(long_registry))[:256]
+                long_source = [long_registry[key] for key in reversed(recent_long_keys)]
+            else:
+                long_source = list(long_registry.values()) if isinstance(long_registry, dict) else []
+            long_rows = [row for row in long_source if isinstance(row, dict) and not bool(row.get("stale", False))]
             reader_counts: Counter = Counter()
             for row in long_rows:
                 for reader in row.get("source_tools", []) or []:
@@ -87940,12 +88982,15 @@ body{padding:18px}
                     4,
                 ),
                 "readers": dict(reader_counts.most_common(12)),
+                "sampled": bool(lite and isinstance(long_registry, dict) and len(long_registry) > len(long_source)),
             }
             snapshot_payload = {
                 "id": self.id,
+                "workspace_id": str(getattr(self, "workspace_id", self.id) or self.id),
                 "kernel_version": str(getattr(self, "kernel_version", "") or ""),
                 "title": self.title,
                 "title_origin": str(getattr(self, "title_origin", "") or ""),
+                "title_revision": int(getattr(self, "auto_title_revision", 0) or 0),
                 "running": self.running,
                 "scheduler_starting": bool(getattr(self, "scheduler_starting", False)),
                 "created_at": self.created_at,
@@ -88083,6 +89128,8 @@ body{padding:18px}
                 "activity": self.activity[-activity_window:],
                 "operations": operations_view,
             }
+            if lite:
+                snapshot_payload = _apply_lite_snapshot_bounds(snapshot_payload)
             if lite and not include_model_catalog:
                 self._snapshot_cache_lite = dict(snapshot_payload)
                 self._snapshot_cache_lite_key = cache_key
@@ -88571,6 +89618,7 @@ class SessionManager:
         process_manager: UserProcessManager | None = None,
         kernel_registry=None,
         kernel_runtime=None,
+        skills_snapshot: SkillStore | None = None,
     ):
         self.root = root
         self.root.mkdir(parents=True, exist_ok=True)
@@ -88578,6 +89626,7 @@ class SessionManager:
         self.ollama_base = ollama_base
         self.model = model
         self.skills_root = skills_root
+        self.skills_snapshot = skills_snapshot
         self.js_lib_root = js_lib_root.resolve()
         self.js_lib_download_enabled = bool(js_lib_download_enabled)
         self.crypto = crypto
@@ -88666,14 +89715,22 @@ class SessionManager:
         self.user_root = self.root.parent
         self.user_root.mkdir(parents=True, exist_ok=True)
         self.session_index_path = self.user_root / "session_index.json"
+        self.session_index_journal_path = self.user_root / "session_index.journal"
         self.catalog_revision = 0
         self._session_catalog_cache_revision = -1
         self._session_catalog_cache: list[dict] = []
+        self._session_catalog_recent: dict[str, dict] = {}
+        self._session_catalog_deleted_ids: set[str] = set()
+        self._session_catalog_rebuild_pending = False
         self._session_index_persist_lock = threading.Lock()
         self._session_index_write_lock = threading.Lock()
         self._session_index_written_revision = -1
         self._session_index_persist_pending = False
         self._session_index_dirty = False
+        self._session_index_pending_changes: dict[str, dict] = {}
+        self._session_index_journal_records = 0
+        self._session_index_journal_bytes = 0
+        self._session_index_compact_requested = False
         self.user_prefs_path = self.user_root / "user_prefs.json"
         self.user_memory_store = UserMemoryStore(self.user_root, user_id=self.user_id)
         self.user_interaction_optimizer = UserInteractionOptimizer()
@@ -88983,7 +90040,13 @@ class SessionManager:
         sess.updated_at = now_ts()
         sess._persist()
 
-    def _apply_user_defaults_to_session(self, sess: SessionState, *, clear_cap_cache: bool = False):
+    def _apply_user_defaults_to_session(
+        self,
+        sess: SessionState,
+        *,
+        clear_cap_cache: bool = False,
+        persist: bool = True,
+    ):
         sess.model_profiles = {}
         for pid, profile in self.user_model_profiles.items():
             row = dict(profile)
@@ -89056,7 +90119,8 @@ class SessionManager:
         )
         sess._apply_active_profile()
         sess.updated_at = now_ts()
-        sess._persist()
+        if persist:
+            sess._persist()
 
     def _sync_from_session(self, sess: SessionState, *, apply_to_all: bool):
         synced: dict[str, dict] = {}
@@ -89190,10 +90254,44 @@ class SessionManager:
         self._persist_user_prefs()
         return {"ok": True, "user_memory_mode": self.user_memory_mode}
 
+    @staticmethod
+    def _normalize_workspace_id(value: object, fallback: str) -> str:
+        default = trim(str(fallback or "").strip(), 160)
+        candidate = trim(str(value or "").strip(), 160)
+        if (
+            not candidate
+            or candidate in {".", ".."}
+            or "/" in candidate
+            or "\\" in candidate
+            or "\x00" in candidate
+        ):
+            return default
+        return candidate
+
+    def _session_workspace_spec(self, session_id: str, workspace_id: object) -> tuple[str, Path | None]:
+        sid = str(session_id or "").strip()
+        wid = self._normalize_workspace_id(workspace_id, sid)
+        if self.workspace_root is not None:
+            return wid, self.workspace_root
+        if wid == sid:
+            return wid, None
+        owner = self.root / wid
+        try:
+            owner.resolve(strict=False).relative_to(self.root.resolve(strict=False))
+        except (OSError, ValueError):
+            return sid, None
+        if not owner.is_dir() or owner.is_symlink():
+            return sid, None
+        return wid, owner / "files"
+
     def _session_summary_from_disk(self, path: Path) -> dict:
         sid = str(path.name or "").strip()
         title = sid
+        workspace_id = sid
+        title_origin = ""
+        title_revision = 0
         updated_at = 0.0
+        created_at = 0.0
         message_count = 0
         ui_language = self.user_language
         kernel_version = ""
@@ -89203,6 +90301,10 @@ class SessionManager:
                 raw = self.crypto.read_json(meta, {})
                 if isinstance(raw, dict):
                     title = str(raw.get("title", sid) or sid)
+                    workspace_id = self._normalize_workspace_id(raw.get("workspace_id"), sid)
+                    title_origin = str(raw.get("title_origin", "") or "")
+                    title_revision = max(0, int(raw.get("title_revision", 0) or 0))
+                    created_at = float(raw.get("created_at", 0.0) or 0.0)
                     updated_at = float(raw.get("updated_at", 0.0) or 0.0)
                     message_count = max(0, int(raw.get("message_count", 0) or 0))
                     ui_language = normalize_ui_language(raw.get("ui_language", ui_language))
@@ -89215,9 +90317,24 @@ class SessionManager:
                 updated_at = float((state if state.exists() else path).stat().st_mtime)
             except Exception:
                 updated_at = 0.0
+        if created_at <= 0:
+            try:
+                state = path / "state.json"
+                if state.exists():
+                    raw_state = self.crypto.read_json(state, {})
+                    if isinstance(raw_state, dict):
+                        created_at = float(raw_state.get("created_at", 0.0) or 0.0)
+            except Exception:
+                created_at = 0.0
+        if created_at <= 0:
+            created_at = float(updated_at or 0.0)
         return {
             "id": sid,
+            "workspace_id": workspace_id,
             "title": title,
+            "title_origin": title_origin,
+            "title_revision": title_revision,
+            "created_at": float(created_at or 0.0),
             "running": False,
             "degraded": False,
             "recovered_at": 0.0,
@@ -89229,13 +90346,16 @@ class SessionManager:
             "loaded": False,
         }
 
-    def _make_session_state(self, sid: str, title: str) -> SessionState:
+    def _make_session_state(self, sid: str, title: str, workspace_id: str = "") -> SessionState:
         kernel_version = ""
         if self.kernel_registry is not None:
             try:
                 kernel_version = self.kernel_registry.choose_version(self.user_id, sid)
             except Exception:
                 kernel_version = ""
+        resolved_workspace_id, session_workspace_root = self._session_workspace_spec(
+            sid, workspace_id
+        )
         sess = SessionState(
                 session_id=sid,
                 title=title,
@@ -89278,7 +90398,8 @@ class SessionManager:
                 knowledge_library_root=self.knowledge_library_root,
                 knowledge_library_status_callback=self.knowledge_library_status_callback,
                 mcp_manager=getattr(self, "mcp_manager", None),
-                workspace_root=self.workspace_root,
+                workspace_root=session_workspace_root,
+                workspace_id=resolved_workspace_id,
                 collaboration_context=self.collaboration_context,
                 collaboration_context_provider=self.collaboration_context_provider,
                 collaboration_write_coordinator=self.collaboration_write_coordinator,
@@ -89289,7 +90410,9 @@ class SessionManager:
                 summary_update_callback=self._on_session_summary,
                 kernel_version=kernel_version,
                 kernel_runtime=self.kernel_runtime,
+                skills_snapshot=self.skills_snapshot,
             )
+        sess.workspace_metadata_callback = self._workspace_metadata_for_session
         sess.set_telemetry_callback(self.telemetry_callback)
         desired_mode = normalize_execution_mode(self.execution_mode, default=EXECUTION_MODE_SYNC)
         if normalize_execution_mode(getattr(sess, "execution_mode", ""), default=desired_mode) != desired_mode:
@@ -89302,24 +90425,79 @@ class SessionManager:
             self._apply_user_defaults_to_session(sess)
         return sess
 
-    def _session_catalog_changed_locked(self) -> None:
+    def _schedule_session_catalog_rebuild_locked(self) -> None:
+        if bool(getattr(self, "_session_catalog_rebuild_pending", False)):
+            return
+        self._session_catalog_rebuild_pending = True
+
+        def worker() -> None:
+            time.sleep(0.2)
+            for _ in range(3):
+                with self.lock:
+                    revision = int(getattr(self, "catalog_revision", 0) or 0)
+                    rows = [dict(row) for row in self.session_index.values() if isinstance(row, dict)]
+                rows.sort(key=lambda row: float(row.get("updated_at", 0.0) or 0.0), reverse=True)
+                with self.lock:
+                    if revision == int(getattr(self, "catalog_revision", 0) or 0):
+                        self._session_catalog_cache = rows
+                        self._session_catalog_cache_revision = revision
+                        self._session_catalog_recent = {}
+                        self._session_catalog_deleted_ids = set()
+                        self._session_catalog_rebuild_pending = False
+                        return
+                time.sleep(0.1)
+            with self.lock:
+                self._session_catalog_rebuild_pending = False
+
+        threading.Thread(
+            target=worker,
+            name=f"session-catalog-{getattr(self, 'user_id', '') or 'local'}",
+            daemon=True,
+        ).start()
+
+    def _session_catalog_changed_locked(self, session_id: str = "", *, deleted: bool = False) -> None:
         self.catalog_revision = max(0, int(getattr(self, "catalog_revision", 0) or 0)) + 1
-        self._session_catalog_cache_revision = -1
         self._session_index_dirty = True
+        sid = str(session_id or "").strip()
+        if not sid:
+            self._session_catalog_cache_revision = -1
+            self._session_catalog_recent = {}
+            self._session_catalog_deleted_ids = set()
+            return
+        if int(getattr(self, "_session_catalog_cache_revision", -1) or -1) < 0:
+            return
+        recent = getattr(self, "_session_catalog_recent", None)
+        if not isinstance(recent, dict):
+            recent = {}
+            self._session_catalog_recent = recent
+        deleted_ids = getattr(self, "_session_catalog_deleted_ids", None)
+        if not isinstance(deleted_ids, set):
+            deleted_ids = set()
+            self._session_catalog_deleted_ids = deleted_ids
+        if deleted:
+            recent.pop(sid, None)
+            deleted_ids.add(sid)
+        else:
+            deleted_ids.discard(sid)
+            row = self.session_index.get(sid)
+            if isinstance(row, dict):
+                recent[sid] = dict(row)
+        if len(recent) + len(deleted_ids) >= SESSION_CATALOG_RECENT_MAX:
+            self._schedule_session_catalog_rebuild_locked()
+
+    def _session_index_summary_payload(self, summary: dict) -> dict:
+        allowed = {
+            "id", "workspace_id", "title", "title_origin", "title_revision", "running", "degraded", "recovered_at",
+            "recovered_reason", "ui_language", "created_at", "updated_at", "message_count", "kernel_version",
+        }
+        return {key: value for key, value in dict(summary or {}).items() if key in allowed}
 
     def _session_index_payload_locked(self) -> dict:
         return {
             "version": 1,
             "catalog_revision": int(self.catalog_revision or 0),
             "sessions": {
-                str(session_id): {
-                    key: value
-                    for key, value in dict(summary).items()
-                    if key in {
-                        "id", "title", "title_origin", "running", "degraded", "recovered_at",
-                        "recovered_reason", "ui_language", "updated_at", "message_count", "kernel_version",
-                    }
-                }
+                str(session_id): self._session_index_summary_payload(summary)
                 for session_id, summary in self.session_index.items()
                 if isinstance(summary, dict)
             },
@@ -89340,11 +90518,159 @@ class SessionManager:
         except Exception:
             return False
 
+    def _session_index_journal_entries(self) -> list[tuple[dict, str]]:
+        path = getattr(self, "session_index_journal_path", None)
+        if not isinstance(path, Path) or not path.exists():
+            return []
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            return []
+        entries: list[tuple[dict, str]] = []
+        for line in lines:
+            raw_line = str(line or "").strip()
+            if not raw_line:
+                continue
+            try:
+                record = json.loads(self.crypto.decrypt_text(raw_line))
+            except Exception:
+                continue
+            if isinstance(record, dict):
+                entries.append((record, raw_line))
+        return entries
+
+    def _append_session_index_journal_record_locked(self, record: dict) -> bool:
+        path = getattr(self, "session_index_journal_path", None)
+        if not isinstance(path, Path) or not getattr(self, "crypto", None):
+            return False
+        if not hasattr(self, "_session_index_write_lock"):
+            self._session_index_write_lock = threading.Lock()
+        try:
+            line = self.crypto.encrypt_text(json_dumps(record)) + "\n"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with self._session_index_write_lock:
+                with path.open("a", encoding="utf-8") as fileobj:
+                    fileobj.write(line)
+                    fileobj.flush()
+                    self.crypto._fsync_json_file(fileobj)
+            self._session_index_journal_records = max(
+                0, int(getattr(self, "_session_index_journal_records", 0) or 0)
+            ) + 1
+            self._session_index_journal_bytes = max(
+                0, int(getattr(self, "_session_index_journal_bytes", 0) or 0)
+            ) + len(line.encode("utf-8"))
+            return True
+        except Exception:
+            return False
+
+    def _queue_session_index_change_locked(self, session_id: str, *, deleted: bool = False) -> None:
+        sid = str(session_id or "").strip()
+        if not sid:
+            return
+        pending = getattr(self, "_session_index_pending_changes", None)
+        if not isinstance(pending, dict):
+            pending = {}
+            self._session_index_pending_changes = pending
+        revision = int(getattr(self, "catalog_revision", 0) or 0)
+        record = {
+            "version": 1,
+            "revision": revision,
+            "op": "delete" if deleted else "upsert",
+            "session_id": sid,
+        }
+        if not deleted:
+            row = self.session_index.get(sid)
+            if not isinstance(row, dict):
+                return
+            record["summary"] = self._session_index_summary_payload(row)
+        pending[sid] = record
+        self._schedule_session_index_persist_locked()
+
+    def _rewrite_session_index_journal_locked(self, through_revision: int) -> None:
+        path = getattr(self, "session_index_journal_path", None)
+        if not isinstance(path, Path):
+            return
+        retained = [
+            line
+            for record, line in self._session_index_journal_entries()
+            if int(record.get("revision", 0) or 0) > int(through_revision or 0)
+        ]
+        if not hasattr(self, "_session_index_write_lock"):
+            self._session_index_write_lock = threading.Lock()
+        with self._session_index_write_lock:
+            if not retained:
+                try:
+                    path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            else:
+                tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+                try:
+                    with tmp.open("w", encoding="utf-8") as fileobj:
+                        fileobj.write("\n".join(retained) + "\n")
+                        fileobj.flush()
+                        self.crypto._fsync_json_file(fileobj)
+                    os.replace(tmp, path)
+                finally:
+                    try:
+                        tmp.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+        self._session_index_journal_records = len(retained)
+        self._session_index_journal_bytes = sum(len(line.encode("utf-8")) + 1 for line in retained)
+
+    def _compact_session_index_snapshot(self) -> bool:
+        with self.lock:
+            payload = self._session_index_payload_locked()
+            revision = int(payload.get("catalog_revision", 0) or 0)
+        if not self._write_session_index_payload(payload):
+            return False
+        with self.lock:
+            self._rewrite_session_index_journal_locked(revision)
+            self._session_index_dirty = bool(
+                int(getattr(self, "catalog_revision", 0) or 0) > revision
+                or getattr(self, "_session_index_pending_changes", {})
+            )
+        return True
+
+    def _persist_session_index_change_now_locked(self, session_id: str, *, deleted: bool = False) -> None:
+        sid = str(session_id or "").strip()
+        pending = getattr(self, "_session_index_pending_changes", None)
+        if isinstance(pending, dict):
+            pending.pop(sid, None)
+        journal_count = max(0, int(getattr(self, "_session_index_journal_records", 0) or 0))
+        if len(self.session_index) <= SESSION_INDEX_SYNC_SNAPSHOT_MAX and journal_count == 0:
+            self._persist_session_index_now_locked()
+            return
+        revision = int(getattr(self, "catalog_revision", 0) or 0)
+        record = {
+            "version": 1,
+            "revision": revision,
+            "op": "delete" if deleted else "upsert",
+            "session_id": sid,
+        }
+        if not deleted:
+            row = self.session_index.get(sid)
+            if isinstance(row, dict):
+                record["summary"] = self._session_index_summary_payload(row)
+        if not self._append_session_index_journal_record_locked(record):
+            self._persist_session_index_now_locked()
+            return
+        self._session_index_dirty = False
+        if (
+            int(getattr(self, "_session_index_journal_records", 0) or 0) >= SESSION_INDEX_JOURNAL_COMPACT_RECORDS
+            or int(getattr(self, "_session_index_journal_bytes", 0) or 0) >= SESSION_INDEX_JOURNAL_COMPACT_BYTES
+        ):
+            self._session_index_compact_requested = True
+            self._schedule_session_index_persist_locked()
+
     def _persist_session_index_now_locked(self) -> None:
         payload = self._session_index_payload_locked()
         if self._write_session_index_payload(payload):
+            self._rewrite_session_index_journal_locked(int(payload.get("catalog_revision", 0) or 0))
             self._session_index_dirty = False
             return
+        self._session_index_compact_requested = True
         self._schedule_session_index_persist_locked()
 
     def _schedule_session_index_persist_locked(self) -> None:
@@ -89364,11 +90690,25 @@ class SessionManager:
             while True:
                 time.sleep(0.15)
                 with self.lock:
-                    payload = self._session_index_payload_locked()
+                    pending = list(getattr(self, "_session_index_pending_changes", {}).values())
+                    self._session_index_pending_changes = {}
+                    append_ok = True
+                    for record in pending:
+                        append_ok = self._append_session_index_journal_record_locked(record) and append_ok
+                    compact = not append_ok or bool(getattr(self, "_session_index_compact_requested", False)) or (
+                        int(getattr(self, "_session_index_journal_records", 0) or 0) >= SESSION_INDEX_JOURNAL_COMPACT_RECORDS
+                        or int(getattr(self, "_session_index_journal_bytes", 0) or 0) >= SESSION_INDEX_JOURNAL_COMPACT_BYTES
+                    )
+                    self._session_index_compact_requested = False
                     self._session_index_dirty = False
-                self._write_session_index_payload(payload)
+                compact_ok = True
+                if compact:
+                    compact_ok = self._compact_session_index_snapshot()
                 with self.lock:
-                    if self._session_index_dirty:
+                    if not compact_ok:
+                        self._session_index_dirty = True
+                        self._session_index_compact_requested = True
+                    if self._session_index_dirty or getattr(self, "_session_index_pending_changes", {}):
                         continue
                     with self._session_index_persist_lock:
                         self._session_index_persist_pending = False
@@ -89380,6 +90720,112 @@ class SessionManager:
             daemon=True,
         ).start()
 
+    def _sync_workspace_metadata_locked(self, workspace_id: str) -> dict:
+        metadata = {}
+        for row_id, raw in self.session_index.items():
+            if not isinstance(raw, dict):
+                continue
+            if self._normalize_workspace_id(raw.get("workspace_id"), row_id) != str(workspace_id or ""):
+                continue
+            loaded = self.sessions.get(row_id)
+            created = float(
+                (getattr(loaded, "created_at", 0.0) if loaded is not None else 0.0)
+                or raw.get("created_at", 0.0)
+                or raw.get("updated_at", 0.0)
+                or 0.0
+            )
+            title = str(
+                getattr(loaded, "title", "") if loaded is not None else raw.get("title", row_id)
+            ).strip() or row_id
+            prior = metadata.get("_first_created", 0.0)
+            if "workspace_name" not in metadata or (created > 0 and (not prior or created < prior)):
+                metadata.update(
+                    {
+                        "workspace_name": title,
+                        "workspace_created_at": created,
+                        "_first_created": created,
+                    }
+                )
+        metadata.pop("_first_created", None)
+        metadata["workspace_id"] = str(workspace_id or "")
+        metadata["workspace_label"] = str(metadata.get("workspace_name", "") or workspace_id or "")
+        for row_id, peer in self.session_index.items():
+            if not isinstance(peer, dict) or self._normalize_workspace_id(peer.get("workspace_id"), row_id) != str(workspace_id or ""):
+                continue
+            peer.update(metadata)
+        return metadata
+
+    def _workspace_metadata_for_session(self, session_id: str) -> dict:
+        """Return the stable display metadata shared by sessions in a workspace."""
+        sid = str(session_id or "").strip()
+        with self.lock:
+            source = self.sessions.get(sid)
+            source_row = self.session_index.get(sid, {})
+            workspace_id = self._normalize_workspace_id(
+                getattr(source, "workspace_id", "") if source is not None else source_row.get("workspace_id"),
+                sid,
+            )
+            first_title = ""
+            first_created = 0.0
+            for row_id, raw in self.session_index.items():
+                if not isinstance(raw, dict):
+                    continue
+                row_workspace = self._normalize_workspace_id(raw.get("workspace_id"), row_id)
+                if row_workspace != workspace_id:
+                    continue
+                loaded = self.sessions.get(row_id)
+                created = float(
+                    (getattr(loaded, "created_at", 0.0) if loaded is not None else 0.0)
+                    or raw.get("created_at", 0.0)
+                    or raw.get("updated_at", 0.0)
+                    or 0.0
+                )
+                title = str(
+                    getattr(loaded, "title", "") if loaded is not None else raw.get("title", row_id)
+                ).strip() or row_id
+                if (
+                    not first_title
+                    or (created > 0 and (first_created <= 0 or created < first_created))
+                ):
+                    first_title, first_created = title, created
+            name = first_title or str(getattr(source, "title", "") if source is not None else source_row.get("title", "") or sid)
+            workspace_names: dict[str, str] = {}
+            workspace_created: dict[str, float] = {}
+            for row_id, raw in self.session_index.items():
+                if not isinstance(raw, dict):
+                    continue
+                wid = self._normalize_workspace_id(raw.get("workspace_id"), row_id)
+                loaded = self.sessions.get(row_id)
+                created = float(
+                    (getattr(loaded, "created_at", 0.0) if loaded is not None else 0.0)
+                    or raw.get("created_at", 0.0)
+                    or raw.get("updated_at", 0.0)
+                    or 0.0
+                )
+                title = str(
+                    getattr(loaded, "title", "") if loaded is not None else raw.get("title", row_id)
+                ).strip() or row_id
+                prior_created = workspace_created.get(wid, 0.0)
+                if wid not in workspace_names or (created > 0 and (prior_created <= 0 or created < prior_created)):
+                    workspace_names[wid] = title
+                    workspace_created[wid] = created
+            duplicate_count: dict[str, int] = {}
+            for workspace_name in workspace_names.values():
+                key = workspace_name.casefold()
+                duplicate_count[key] = duplicate_count.get(key, 0) + 1
+            label = name
+            if duplicate_count.get(name.casefold(), 0) > 1 and first_created > 0:
+                try:
+                    label = f"{name} · {datetime.fromtimestamp(first_created).strftime('%Y-%m-%d')}"
+                except Exception:
+                    label = name
+            return {
+                "workspace_id": workspace_id,
+                "workspace_name": name,
+                "workspace_created_at": first_created,
+                "workspace_label": label,
+            }
+
     def _on_session_summary(self, summary: dict) -> None:
         if not isinstance(summary, dict):
             return
@@ -89387,12 +90833,19 @@ class SessionManager:
         if not session_id:
             return
         with self.lock:
+            if session_id not in self.session_index and session_id not in self.sessions:
+                return
             previous = dict(self.session_index.get(session_id, {}))
             row = {
                 **previous,
                 "id": session_id,
+                "workspace_id": self._normalize_workspace_id(
+                    summary.get("workspace_id", previous.get("workspace_id")), session_id
+                ),
                 "title": str(summary.get("title", previous.get("title", session_id)) or session_id),
                 "title_origin": str(summary.get("title_origin", previous.get("title_origin", "")) or ""),
+                "title_revision": max(0, int(summary.get("title_revision", previous.get("title_revision", 0)) or 0)),
+                "created_at": float(summary.get("created_at", previous.get("created_at", 0.0)) or 0.0),
                 "running": bool(summary.get("running", previous.get("running", False))),
                 "degraded": False,
                 "recovered_at": float(summary.get("recovered_at", previous.get("recovered_at", 0.0)) or 0.0),
@@ -89404,19 +90857,22 @@ class SessionManager:
                 "loaded": True,
             }
             comparable_keys = (
-                "title", "title_origin", "running", "recovered_at", "recovered_reason",
-                "ui_language", "updated_at", "message_count",
+                "workspace_id", "title", "title_origin", "title_revision", "running", "recovered_at", "recovered_reason",
+                "ui_language", "created_at", "updated_at", "message_count",
                 "kernel_version",
             )
             if all(previous.get(key) == row.get(key) for key in comparable_keys):
                 self.session_index[session_id] = row
+                self._sync_workspace_metadata_locked(row["workspace_id"])
                 return
             self.session_index[session_id] = row
-            self._session_catalog_changed_locked()
-            self._schedule_session_index_persist_locked()
+            self._sync_workspace_metadata_locked(row["workspace_id"])
+            self._session_catalog_changed_locked(session_id)
+            self._queue_session_index_change_locked(session_id)
 
     def _load_existing(self):
         loaded_index = False
+        snapshot_revision = 0
         if self.session_index_path.exists():
             try:
                 payload = self.crypto.read_json(self.session_index_path, {})
@@ -89430,6 +90886,7 @@ class SessionManager:
                             continue
                         self.session_index[sid] = {
                             "id": sid,
+                            "workspace_id": sid,
                             "title": sid,
                             "running": False,
                             "degraded": False,
@@ -89437,37 +90894,118 @@ class SessionManager:
                             "recovered_reason": "",
                             "ui_language": self.user_language,
                             "updated_at": 0.0,
+                            "created_at": 0.0,
                             "message_count": 0,
                             **dict(raw),
                             "id": sid,
                             "loaded": False,
                         }
                     self.catalog_revision = max(0, int(payload.get("catalog_revision", 0) or 0))
+                    snapshot_revision = int(self.catalog_revision)
                     self._session_index_written_revision = int(self.catalog_revision)
                     loaded_index = True
             except Exception:
                 loaded_index = False
-        if loaded_index:
-            return
-        for path in sorted(self.root.glob("*")):
-            if not path.is_dir():
+        if not loaded_index:
+            for path in sorted(self.root.glob("*")):
+                if not path.is_dir() or (path / ".workspace_retained").exists():
+                    continue
+                sid = str(path.name or "").strip()
+                if not sid:
+                    continue
+                self.session_index[sid] = self._session_summary_from_disk(path)
+            if self.session_index:
+                self.catalog_revision = 1
+        journal_entries = self._session_index_journal_entries()
+        for record, _line in journal_entries:
+            revision = max(0, int(record.get("revision", 0) or 0))
+            if revision <= snapshot_revision:
                 continue
-            sid = str(path.name or "").strip()
+            sid = str(record.get("session_id", "") or "").strip()
             if not sid:
                 continue
-            self.session_index[sid] = self._session_summary_from_disk(path)
-        if self.session_index:
-            self.catalog_revision = 1
+            if str(record.get("op", "") or "").strip().lower() == "delete":
+                self.session_index.pop(sid, None)
+            else:
+                summary = record.get("summary", {})
+                if not isinstance(summary, dict):
+                    continue
+                self.session_index[sid] = {
+                    "id": sid,
+                    "workspace_id": sid,
+                    "title": sid,
+                    "running": False,
+                    "degraded": False,
+                    "recovered_at": 0.0,
+                    "recovered_reason": "",
+                    "ui_language": self.user_language,
+                    "updated_at": 0.0,
+                    "created_at": 0.0,
+                    "message_count": 0,
+                    **dict(summary),
+                    "id": sid,
+                    "loaded": False,
+                }
+            self.catalog_revision = max(int(self.catalog_revision or 0), revision)
+        self._session_index_journal_records = len(journal_entries)
+        try:
+            self._session_index_journal_bytes = int(self.session_index_journal_path.stat().st_size)
+        except Exception:
+            self._session_index_journal_bytes = 0
+        if not loaded_index and self.session_index:
             self._write_session_index_payload(self._session_index_payload_locked())
+            self._rewrite_session_index_journal_locked(int(self.catalog_revision or 0))
+        elif (
+            self._session_index_journal_records >= SESSION_INDEX_JOURNAL_COMPACT_RECORDS
+            or self._session_index_journal_bytes >= SESSION_INDEX_JOURNAL_COMPACT_BYTES
+        ):
+            self._session_index_compact_requested = True
+            self._schedule_session_index_persist_locked()
 
     def _session_catalog_rows_locked(self) -> list[dict]:
         revision = int(getattr(self, "catalog_revision", 0) or 0)
-        if int(getattr(self, "_session_catalog_cache_revision", -1) or -1) != revision:
+        if int(getattr(self, "_session_catalog_cache_revision", -1) or -1) < 0:
             rows = [dict(row) for row in self.session_index.values() if isinstance(row, dict)]
             rows.sort(key=lambda row: float(row.get("updated_at", 0.0) or 0.0), reverse=True)
             self._session_catalog_cache = rows
             self._session_catalog_cache_revision = revision
-        return getattr(self, "_session_catalog_cache", [])
+            self._session_catalog_recent = {}
+            self._session_catalog_deleted_ids = set()
+        recent = getattr(self, "_session_catalog_recent", {})
+        deleted_ids = getattr(self, "_session_catalog_deleted_ids", set())
+        if not recent and not deleted_ids:
+            return getattr(self, "_session_catalog_cache", [])
+        recent_rows = [dict(row) for row in recent.values() if isinstance(row, dict)]
+        recent_rows.sort(key=lambda row: float(row.get("updated_at", 0.0) or 0.0), reverse=True)
+        recent_ids = {str(row.get("id", "") or "") for row in recent_rows}
+        return recent_rows + [
+            row
+            for row in getattr(self, "_session_catalog_cache", [])
+            if str(row.get("id", "") or "") not in recent_ids
+            and str(row.get("id", "") or "") not in deleted_ids
+        ]
+
+    def _session_catalog_page_locked(self, offset: int, limit: int) -> tuple[list[dict], int]:
+        if int(getattr(self, "_session_catalog_cache_revision", -1) or -1) < 0:
+            self._session_catalog_rows_locked()
+        off = max(0, int(offset or 0))
+        lim = max(1, int(limit or SESSION_LIST_DEFAULT_LIMIT))
+        recent = getattr(self, "_session_catalog_recent", {})
+        deleted_ids = getattr(self, "_session_catalog_deleted_ids", set())
+        recent_rows = [dict(row) for row in recent.values() if isinstance(row, dict)]
+        recent_rows.sort(key=lambda row: float(row.get("updated_at", 0.0) or 0.0), reverse=True)
+        recent_ids = {str(row.get("id", "") or "") for row in recent_rows}
+        needed = off + lim
+        merged: list[dict] = recent_rows[:needed]
+        if len(merged) < needed:
+            for row in getattr(self, "_session_catalog_cache", []):
+                sid = str(row.get("id", "") or "")
+                if sid in recent_ids or sid in deleted_ids:
+                    continue
+                merged.append(row)
+                if len(merged) >= needed:
+                    break
+        return merged[off:needed], len(self.session_index)
 
     def _load_session_locked(self, session_id: str) -> SessionState | None:
         sid = str(session_id or "").strip()
@@ -89477,15 +91015,27 @@ class SessionManager:
         if existing:
             return existing
         session_dir = self.root / sid
-        if not session_dir.exists() or not session_dir.is_dir():
+        if (
+            not session_dir.exists()
+            or not session_dir.is_dir()
+            or (session_dir / ".workspace_retained").exists()
+        ):
             return None
         summary = self.session_index.get(sid) or self._session_summary_from_disk(session_dir)
         title = str(summary.get("title", sid) or sid)
-        sess = self._make_session_state(sid, title)
+        sess = self._make_session_state(
+            sid,
+            title,
+            self._normalize_workspace_id(summary.get("workspace_id"), sid),
+        )
         self.sessions[sid] = sess
         self.session_index[sid] = {
             **summary,
+            "workspace_id": str(getattr(sess, "workspace_id", sid) or sid),
             "title": str(getattr(sess, "title", title) or title),
+            "title_origin": str(getattr(sess, "title_origin", summary.get("title_origin", "")) or ""),
+            "title_revision": int(getattr(sess, "auto_title_revision", summary.get("title_revision", 0)) or 0),
+            "created_at": float(getattr(sess, "created_at", summary.get("created_at", 0.0)) or 0.0),
             "running": bool(getattr(sess, "running", False)),
             "recovered_at": float(getattr(sess, "run_recovered_at", 0.0) or 0.0),
             "recovered_reason": str(getattr(sess, "run_recovered_reason", "") or ""),
@@ -89506,10 +91056,33 @@ class SessionManager:
         except Exception:
             return 0
 
-    def create(self, title: str | None = None) -> SessionState:
+    def create(
+        self,
+        title: str | None = None,
+        *,
+        title_origin: str | None = None,
+        workspace_session_id: str = "",
+    ) -> SessionState:
         with self.lock:
             sid = make_id("sess")
             name = title.strip() if title else sid
+            source_id = str(workspace_session_id or "").strip()
+            source = self._load_session_locked(source_id) if source_id else None
+            if source_id and source is None:
+                raise KeyError(source_id)
+            workspace_id = (
+                self._normalize_workspace_id(getattr(source, "workspace_id", ""), source.id)
+                if source is not None
+                else self._normalize_workspace_id(
+                    self.collaboration_context.get("project_id") if self.workspace_root is not None else "",
+                    sid,
+                )
+            )
+            session_workspace_root = (
+                self.workspace_root
+                if self.workspace_root is not None
+                else (source.files_root if source is not None else None)
+            )
             kernel_version = ""
             if self.kernel_registry is not None:
                 try:
@@ -89558,7 +91131,8 @@ class SessionManager:
                 knowledge_library_root=self.knowledge_library_root,
                 knowledge_library_status_callback=self.knowledge_library_status_callback,
                 mcp_manager=getattr(self, "mcp_manager", None),
-                workspace_root=self.workspace_root,
+                workspace_root=session_workspace_root,
+                workspace_id=workspace_id,
                 collaboration_context=self.collaboration_context,
                 collaboration_context_provider=self.collaboration_context_provider,
                 collaboration_write_coordinator=self.collaboration_write_coordinator,
@@ -89566,16 +91140,29 @@ class SessionManager:
                 shell_async_handoff_seconds=self.shell_async_handoff_seconds,
                 process_manager=self.process_manager,
                 deferred_start_prepare_callback=self.prepare_user_intent_for_session,
-                summary_update_callback=self._on_session_summary,
+                summary_update_callback=None,
                 kernel_version=kernel_version,
                 kernel_runtime=self.kernel_runtime,
+                skills_snapshot=self.skills_snapshot,
+                defer_initial_persist=True,
             )
+            sess.workspace_metadata_callback = self._workspace_metadata_for_session
+            requested_origin = str(title_origin or "").strip().lower()
+            if requested_origin in {"default", "auto", "application", "manual", "legacy"}:
+                sess.title_origin = requested_origin
+            elif title:
+                sess.title_origin = "default" if sess._is_default_session_title(name) else "manual"
             sess.set_telemetry_callback(self.telemetry_callback)
-            self._apply_user_defaults_to_session(sess)
+            self._apply_user_defaults_to_session(sess, persist=True)
+            sess.summary_update_callback = self._on_session_summary
             self.sessions[sid] = sess
             self.session_index[sid] = {
                 "id": sid,
+                "workspace_id": str(getattr(sess, "workspace_id", sid) or sid),
                 "title": str(getattr(sess, "title", name) or name),
+                "title_origin": str(getattr(sess, "title_origin", "") or ""),
+                "title_revision": int(getattr(sess, "auto_title_revision", 0) or 0),
+                "created_at": float(getattr(sess, "created_at", 0.0) or 0.0),
                 "running": bool(getattr(sess, "running", False)),
                 "degraded": False,
                 "recovered_at": float(getattr(sess, "run_recovered_at", 0.0) or 0.0),
@@ -89586,8 +91173,8 @@ class SessionManager:
                 "kernel_version": str(getattr(sess, "kernel_version", "") or ""),
                 "loaded": True,
             }
-            self._session_catalog_changed_locked()
-            self._persist_session_index_now_locked()
+            self._session_catalog_changed_locked(sid)
+            self._persist_session_index_change_now_locked(sid)
             return sess
 
     def get(self, session_id: str) -> SessionState | None:
@@ -89599,23 +91186,61 @@ class SessionManager:
             sess = self._load_session_locked(session_id)
             if not sess:
                 raise KeyError(session_id)
+        session_lock = getattr(sess, "lock", None)
+        guard = session_lock if session_lock is not None else contextlib.nullcontext()
+        with guard:
             sess.title = title.strip() or sess.id
             sess.title_origin = "manual"
             sess.last_auto_title_source = ""
+            sess.auto_title_revision = int(getattr(sess, "auto_title_revision", 0) or 0) + 1
+            sess.auto_title_refine_generation = int(getattr(sess, "auto_title_refine_generation", 0) or 0) + 1
+            sess.auto_title_refine_pending = False
             sess.updated_at = now_ts()
             sess._persist()
+        with self.lock:
             row = dict(self.session_index.get(sess.id, {}))
             row.update({
                 "id": sess.id,
                 "title": sess.title,
+                "title_origin": "manual",
+                "title_revision": int(getattr(sess, "auto_title_revision", 0) or 0),
                 "updated_at": float(sess.updated_at or now_ts()),
                 "message_count": int(self._session_message_count(sess)),
                 "kernel_version": str(getattr(sess, "kernel_version", "") or ""),
                 "loaded": True,
             })
             self.session_index[sess.id] = row
-            self._session_catalog_changed_locked()
-            self._persist_session_index_now_locked()
+            self._session_catalog_changed_locked(sess.id)
+            self._persist_session_index_change_now_locked(sess.id)
+            emit = getattr(sess, "_emit", None)
+            if callable(emit):
+                payload = {
+                    "summary": f"session renamed: '{trim(title, 36)}'",
+                    "session_title": sess.title,
+                    "title_origin": "manual",
+                    "title_revision": int(getattr(sess, "auto_title_revision", 0) or 0),
+                    "title_source": "manual",
+                }
+                metadata_callback = getattr(sess, "workspace_metadata_callback", None)
+                if callable(metadata_callback):
+                    try:
+                        metadata = metadata_callback(sess.id)
+                        if isinstance(metadata, dict):
+                            payload.update(
+                                {
+                                    key: metadata[key]
+                                    for key in (
+                                        "workspace_id",
+                                        "workspace_name",
+                                        "workspace_created_at",
+                                        "workspace_label",
+                                    )
+                                    if key in metadata
+                                }
+                            )
+                    except Exception:
+                        pass
+                emit("status", payload)
             return sess
 
     def delete(self, session_id: str) -> bool:
@@ -89624,20 +91249,61 @@ class SessionManager:
             return False
         with self.lock:
             sess = self.sessions.pop(sid, None)
+            summary = dict(self.session_index.get(sid, {}))
             existed = bool(sess or sid in self.session_index or (self.root / sid).exists())
+            workspace_id = self._normalize_workspace_id(
+                getattr(sess, "workspace_id", "") if sess is not None else summary.get("workspace_id"),
+                sid,
+            )
+            workspace_peers = [
+                row_id
+                for row_id, row in self.session_index.items()
+                if row_id != sid
+                and isinstance(row, dict)
+                and self._normalize_workspace_id(row.get("workspace_id"), row_id) == workspace_id
+            ]
+            retain_workspace = bool(
+                self.workspace_root is None and workspace_id == sid and workspace_peers
+            )
             self.session_index.pop(sid, None)
             if existed:
-                self._session_catalog_changed_locked()
-                self._persist_session_index_now_locked()
+                self._session_catalog_changed_locked(sid, deleted=True)
+                self._persist_session_index_change_now_locked(sid, deleted=True)
         if not existed:
             return False
         if sess:
             # Note: sess.mcp is the SHARED global manager — never shut it down on
             # per-session delete (that would kill MCP for all other sessions).
             sess.interrupt()
-            shutil.rmtree(sess.root, ignore_errors=True)
+        session_root = sess.root if sess is not None else self.root / sid
+        if retain_workspace:
+            session_root.mkdir(parents=True, exist_ok=True)
+            for child in list(session_root.iterdir()):
+                if child.name in {"files", ".workspace_retained"}:
+                    continue
+                try:
+                    if child.is_dir() and not child.is_symlink():
+                        shutil.rmtree(child, ignore_errors=True)
+                    else:
+                        child.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            try:
+                (session_root / ".workspace_retained").write_text(workspace_id, encoding="utf-8")
+            except OSError:
+                pass
         else:
-            shutil.rmtree(self.root / sid, ignore_errors=True)
+            shutil.rmtree(session_root, ignore_errors=True)
+        if self.workspace_root is None:
+            with self.lock:
+                workspace_still_used = any(
+                    isinstance(row, dict)
+                    and self._normalize_workspace_id(row.get("workspace_id"), row_id) == workspace_id
+                    for row_id, row in self.session_index.items()
+                )
+            retained_root = self.root / workspace_id
+            if not workspace_still_used and (retained_root / ".workspace_retained").exists():
+                shutil.rmtree(retained_root, ignore_errors=True)
         return True
 
     def _user_profile_is_runnable(self, profile: dict) -> bool:
@@ -90027,9 +91693,6 @@ class SessionManager:
         return self.apply_llm_config(session_id, cfg, source=str(LLM_CONFIG_PATH))
 
     def list(self, *, limit: int | None = None, offset: int = 0, search: str = "", status: str = "") -> list[dict] | dict:
-        with self.lock:
-            catalog_revision = int(getattr(self, "catalog_revision", 0) or 0)
-            catalog_rows = self._session_catalog_rows_locked()
         needle = str(search or "").strip().lower()
         status_key = str(status or "").strip().lower()
 
@@ -90038,7 +91701,9 @@ class SessionManager:
             title = str(raw.get("title", "") or sid)
             return {
                 "id": sid,
+                "workspace_id": self._normalize_workspace_id(raw.get("workspace_id"), sid),
                 "title": title,
+                "created_at": float(raw.get("created_at", 0.0) or 0.0),
                 "running": bool(raw.get("running", False)),
                 "degraded": bool(raw.get("degraded", False)),
                 "recovered_at": float(raw.get("recovered_at", 0.0) or 0.0),
@@ -90051,9 +91716,17 @@ class SessionManager:
 
         off = max(0, int(offset or 0))
         lim = max(1, min(2000, int(limit or SESSION_LIST_DEFAULT_LIMIT))) if limit is not None else 0
-        if not needle and status_key not in {"running", "active", "idle", "stopped"}:
-            total = len(catalog_rows)
-            selected = catalog_rows if limit is None else catalog_rows[off: off + lim]
+        plain_catalog = not needle and status_key not in {"running", "active", "idle", "stopped"}
+        with self.lock:
+            catalog_revision = int(getattr(self, "catalog_revision", 0) or 0)
+            if plain_catalog and limit is not None:
+                selected, total = self._session_catalog_page_locked(off, lim)
+                catalog_rows = []
+            else:
+                catalog_rows = self._session_catalog_rows_locked()
+                total = len(catalog_rows)
+                selected = catalog_rows if limit is None else catalog_rows[off: off + lim]
+        if plain_catalog:
             filtered_rows = [public_row(raw) for raw in selected]
         else:
             matched: list[dict] = []
@@ -90085,23 +91758,154 @@ class SessionManager:
                 continue
             row.update(
                 {
+                    "workspace_id": str(getattr(sess, "workspace_id", row.get("workspace_id", sess.id)) or sess.id),
                     "title": str(getattr(sess, "title", row.get("title", "")) or row.get("title", "")),
                     "running": bool(getattr(sess, "running", False) or getattr(sess, "scheduler_starting", False)),
                     "degraded": False,
                     "recovered_at": float(getattr(sess, "run_recovered_at", 0.0) or 0.0),
                     "recovered_reason": str(getattr(sess, "run_recovered_reason", "") or ""),
                     "ui_language": normalize_ui_language(getattr(sess, "ui_language", row.get("ui_language", self.user_language))),
+                    "created_at": float(getattr(sess, "created_at", row.get("created_at", 0.0)) or 0.0),
                     "updated_at": float(getattr(sess, "updated_at", row.get("updated_at", 0.0)) or 0.0),
                     "message_count": int(row.get("message_count", 0) or 0),
                     "kernel_version": str(getattr(sess, "kernel_version", row.get("kernel_version", "")) or ""),
                 }
             )
+        with self.lock:
+            workspace_counts: dict[str, int] = {}
+            workspace_meta: dict[str, dict] = {}
+            for session_id, raw in self.session_index.items():
+                if not isinstance(raw, dict):
+                    continue
+                wid = self._normalize_workspace_id(raw.get("workspace_id"), session_id)
+                workspace_counts[wid] = workspace_counts.get(wid, 0) + 1
+                created = float(raw.get("created_at", 0.0) or 0.0)
+                if created <= 0:
+                    created = float(raw.get("updated_at", 0.0) or 0.0)
+                title = str(raw.get("title", "") or session_id).strip() or session_id
+                prior = workspace_meta.get(wid)
+                if prior is None or created < float(prior.get("created_at", 0.0) or 0.0):
+                    workspace_meta[wid] = {
+                        "name": title,
+                        "created_at": created,
+                    }
+            duplicate_names: dict[str, int] = {}
+            for meta in workspace_meta.values():
+                key = str(meta.get("name", "") or "").casefold()
+                duplicate_names[key] = duplicate_names.get(key, 0) + 1
+            workspace_labels: dict[str, str] = {}
+            for wid, meta in workspace_meta.items():
+                name = str(meta.get("name", "") or wid)
+                created = float(meta.get("created_at", 0.0) or 0.0)
+                label = name
+                if duplicate_names.get(name.casefold(), 0) > 1 and created > 0:
+                    try:
+                        label = f"{name} · {datetime.fromtimestamp(created).strftime('%Y-%m-%d')}"
+                    except Exception:
+                        label = name
+                workspace_labels[wid] = label
+        for row in page_rows:
+            wid = self._normalize_workspace_id(row.get("workspace_id"), str(row.get("id", "") or ""))
+            meta = workspace_meta.get(wid, {})
+            workspace_name = str(meta.get("name", "") or row.get("title", "") or row.get("id", ""))
+            row["workspace_session_count"] = int(workspace_counts.get(wid, 1))
+            row["workspace_name"] = workspace_name
+            row["workspace_created_at"] = float(meta.get("created_at", row.get("created_at", 0.0)) or 0.0)
+            row["workspace_label"] = workspace_labels.get(wid, workspace_name)
         return {
             "sessions": page_rows,
             "total": total,
             "offset": off,
             "limit": lim,
             "has_more": off + len(page_rows) < total,
+            "catalog_revision": catalog_revision,
+        }
+
+    def workspace_history(self, session_id: str, *, limit: int = 60) -> dict:
+        sid = str(session_id or "").strip()
+        lim = max(0, min(120, int(limit or 0)))
+        with self.lock:
+            active = self.sessions.get(sid)
+            source = self.session_index.get(sid)
+            if active is None and not isinstance(source, dict):
+                raise KeyError(sid)
+            workspace_id = self._normalize_workspace_id(
+                getattr(active, "workspace_id", "") if active is not None else source.get("workspace_id"),
+                sid,
+            )
+            matches: list[dict] = []
+            workspace_first: dict | None = None
+            for raw in self.session_index.values():
+                if not isinstance(raw, dict):
+                    continue
+                row_id = str(raw.get("id", "") or "").strip()
+                if not row_id:
+                    continue
+                loaded = self.sessions.get(row_id)
+                row_workspace_id = self._normalize_workspace_id(
+                    getattr(loaded, "workspace_id", "") if loaded is not None else raw.get("workspace_id"),
+                    row_id,
+                )
+                if row_workspace_id != workspace_id:
+                    continue
+                row_created_at = float(
+                    raw.get("created_at", 0.0)
+                    or (getattr(loaded, "created_at", 0.0) if loaded is not None else 0.0)
+                    or raw.get("updated_at", 0.0)
+                    or 0.0
+                )
+                row_title = str(
+                    getattr(loaded, "title", "") if loaded is not None else raw.get("title", row_id)
+                ) or row_id
+                first_created_at = float((workspace_first or {}).get("created_at", 0.0) or 0.0)
+                if (
+                    workspace_first is None
+                    or (row_created_at > 0 and (first_created_at <= 0 or row_created_at < first_created_at))
+                ):
+                    workspace_first = {"title": row_title, "created_at": row_created_at}
+                row = {
+                    "id": row_id,
+                    "workspace_id": row_workspace_id,
+                    "title": str(
+                        getattr(loaded, "title", "") if loaded is not None else raw.get("title", row_id)
+                    )
+                    or row_id,
+                    "running": bool(
+                        (getattr(loaded, "running", False) or getattr(loaded, "scheduler_starting", False))
+                        if loaded is not None
+                        else raw.get("running", False)
+                    ),
+                    "updated_at": float(
+                        getattr(loaded, "updated_at", 0.0) if loaded is not None else raw.get("updated_at", 0.0)
+                    ),
+                    "created_at": row_created_at,
+                    "workspace_name": str((workspace_first or {}).get("title", "") or row_title),
+                    "workspace_created_at": float((workspace_first or {}).get("created_at", 0.0) or 0.0),
+                    "message_count": max(0, int(raw.get("message_count", 0) or 0)),
+                    "current": row_id == sid,
+                }
+                matches.append(row)
+            matches.sort(key=lambda row: float(row.get("updated_at", 0.0) or 0.0), reverse=True)
+            catalog_revision = int(getattr(self, "catalog_revision", 0) or 0)
+            workspace_name = str((workspace_first or {}).get("title", "") or sid)
+            workspace_created_at = float((workspace_first or {}).get("created_at", 0.0) or 0.0)
+            for row in matches:
+                row["workspace_name"] = workspace_name
+                row["workspace_created_at"] = workspace_created_at
+        total = len(matches)
+        for row in matches:
+            row["workspace_session_count"] = total
+            row["workspace_label"] = workspace_name
+        return {
+            "ok": True,
+            "session_id": sid,
+            "workspace_id": workspace_id,
+            "workspace_name": workspace_name,
+            "workspace_created_at": workspace_created_at,
+            "sessions": matches[:lim] if lim else [],
+            "total": total,
+            "has_history": total > 1,
+            "truncated": bool(lim and total > lim),
             "catalog_revision": catalog_revision,
         }
 
@@ -90907,7 +92711,7 @@ h3{font-size:.96rem;margin:10px 0 6px}
 """
 
 APP_JS = """/* clouds-coder-app-store-v1 */
-const S={sessions:[],sessionById:new Map(),sessionTotal:0,sessionHasMore:false,sessionNextOffset:0,sessionLoadingMore:false,sessionCatalogRevision:0,sessionSearch:'',sessionSearchTimer:0,activeId:null,snap:null,es:null,esId:'',skills:[],tools:[],providers:[],protocols:[],config:null,models:[],modelOptions:[],previewBySession:{},fileExplorerBySession:{},commandPageState:{},previewNonce:0,refreshTimer:null,refreshInFlight:false,pendingSnapshot:false,pendingFullSnapshot:false,scheduledFullSnapshot:false,sessionPollTimer:null,renderStateInFlight:false,lastRenderStatePullAt:0,lastFeedSig:'',lastBoardsSig:'',lastSessionsSig:'',lastVisibilityState:document.visibilityState||'visible',staticMode:false,frozen:false,bootRendered:false,panelHtml:{},renderSigs:Object.create(null),deferredHtml:Object.create(null),deferredHtmlTimer:0,openPopup:'',follow:{chat:true,sessionList:false,todos:false,tasks:false,activity:true,commands:true,diffs:true,catalog:true,fileExplorer:false},lastEventSeq:0,lastDeltaTs:0,deltaGapCount:0,deltaWatchdogTimer:null,deltaWatchdogStalls:0,deltaWatchdogSeq:0,deltaRenderRaf:0,deltaRenderChat:false,deltaRenderBoards:false,deltaRenderSessions:false,chatRenderRaf:0,chatRenderPendingReason:'',mathObserver:null,mathRoot:null,mdWorker:null,mdWorkerUrl:'',mdReqSeq:0,mdPending:Object.create(null),diffCenterDisabled:Object.create(null),previewCenterDisabled:Object.create(null),diffCenteredDone:Object.create(null),previewCenteredDone:Object.create(null),deferredFullSnapshotTimer:0,deferredFileExplorerTimer:0,modelCatalogTimer:0,modelCatalogInFlight:false,catalogRefreshInFlight:false,fileExplorerDeferUntil:0};
+const S={sessions:[],sessionById:new Map(),sessionTotal:0,sessionHasMore:false,sessionNextOffset:0,sessionLoadingMore:false,sessionCatalogRevision:0,sessionSearch:'',sessionSearchTimer:0,activeId:null,snap:null,es:null,esId:'',skills:[],tools:[],providers:[],protocols:[],config:null,models:[],modelOptions:[],previewBySession:{},fileExplorerBySession:{},commandPageState:{},submissionBySession:new Map(),submissionRenderRaf:0,previewNonce:0,refreshTimer:null,refreshInFlight:false,pendingSnapshot:false,pendingFullSnapshot:false,scheduledFullSnapshot:false,sessionPollTimer:null,renderStateInFlight:false,lastRenderStatePullAt:0,lastFeedSig:'',lastBoardsSig:'',lastSessionsSig:'',lastVisibilityState:document.visibilityState||'visible',staticMode:false,frozen:false,bootRendered:false,panelHtml:{},renderSigs:Object.create(null),deferredHtml:Object.create(null),deferredHtmlTimer:0,openPopup:'',follow:{chat:true,sessionList:false,todos:false,tasks:false,activity:true,commands:true,diffs:true,catalog:true,fileExplorer:false},lastEventSeq:0,lastDeltaTs:0,deltaGapCount:0,deltaWatchdogTimer:null,deltaWatchdogStalls:0,deltaWatchdogSeq:0,deltaRenderRaf:0,deltaRenderChat:false,deltaRenderBoards:false,deltaRenderSessions:false,chatRenderRaf:0,chatRenderPendingReason:'',mathObserver:null,mathRoot:null,mdWorker:null,mdWorkerUrl:'',mdReqSeq:0,mdPending:Object.create(null),diffCenterDisabled:Object.create(null),previewCenterDisabled:Object.create(null),diffCenteredDone:Object.create(null),previewCenteredDone:Object.create(null),deferredFullSnapshotTimer:0,deferredFileExplorerTimer:0,modelCatalogTimer:0,modelCatalogInFlight:false,catalogRefreshInFlight:false,fileExplorerDeferUntil:0};
 const USER_PROCESS_STATE={rows:[],counts:{},inFlight:false,lastLoadedAt:0,detailId:'',detail:null,timer:0};
 const APP_STORE={view:'sessions',scope:'personal',personal:[],shared:[],catalog:[],loaded:false,loading:false,editingId:'',selectedSkillIds:[]};
 const MD_CACHE=new Map();
@@ -90920,6 +92724,10 @@ const SESSION_POLL_HIDDEN_MS=60000;
 const SESSION_BOOT_LIMIT=120;
 const SESSION_REFRESH_LIMIT=120;
 const SESSION_CLIENT_CACHE_MAX=600;
+const SUBMISSION_STATE_MAX=48;
+const SUBMISSION_START_GRACE_MS=15000;
+const SUBMISSION_STATE_TTL_MS=2*60*60*1000;
+const SUBMISSION_FAILURE_VISIBLE_MS=10000;
 const CHAT_UPLOAD_HANDOFF_WAIT_MS=250;
 const PANEL_SCROLL_ACTIVE_MS=1100;
 const CHAT_SCROLL_ACTIVE_MS=180;
@@ -90997,7 +92805,7 @@ const I18N={
     sec_todos:'Todos',sec_tasks:'Tasks',sec_activity:'Activity',sec_commands:'Commands',sec_diffs:'File Diffs',sec_files:'Files',sec_catalog:'Catalog',
     stat_sessions:'Sessions',stat_running:'Running',stat_messages:'Messages',stat_global_tasks:'Global Tasks',stat_daily_sessions:'Daily Sessions',stat_model:'Model',
     no_sessions:'No sessions',no_todos:'No todos',no_tasks:'No tasks',no_current_subtasks:'No subtasks for the current plan step yet',no_activity:'No activity',no_commands:'No commands',no_diffs:'No file diffs',no_files:'No files',no_catalog:'No catalog',no_uploads:'No uploads',
-    running:'running',idle:'idle',open:'open',completed:'completed',blocked:'blocked',
+    running:'running',idle:'idle',submitting:'Submitting',accepted:'Accepted',starting:'Starting',queued:'Queued',checking:'Checking',submit_failed:'Submit failed',open:'open',completed:'completed',blocked:'blocked',
     status_pending:'PENDING',status_in_progress:'IN PROGRESS',status_completed:'COMPLETED',status_blocked:'BLOCKED',status_deleted:'DELETED',
     owner_unassigned:'owner=unassigned',
     session_title_prompt:'Session title',web_session:'Web Session',rename_session_prompt:'Rename session',session_default:'Session',
@@ -91036,7 +92844,7 @@ const I18N={
     sec_todos:'Todos',sec_tasks:'Tasks',sec_activity:'Activity',sec_commands:'Commands',sec_diffs:'File Diffs',sec_files:'文件',sec_catalog:'Catalog',
     stat_sessions:'会话',stat_running:'运行中',stat_messages:'消息',stat_global_tasks:'全局任务',stat_daily_sessions:'每日会话',stat_model:'模型',
     no_sessions:'暂无会话',no_todos:'暂无 Todos',no_tasks:'暂无 Tasks',no_current_subtasks:'当前计划步骤尚未生成子任务',no_activity:'暂无活动',no_commands:'暂无命令',no_diffs:'暂无文件差异',no_files:'暂无文件',no_catalog:'暂无目录',no_uploads:'暂无上传',
-    running:'运行中',idle:'空闲',open:'未完成',completed:'已完成',blocked:'阻塞',
+    running:'运行中',idle:'空闲',submitting:'正在提交',accepted:'已接收',starting:'正在启动',queued:'排队中',checking:'正在确认',submit_failed:'提交失败',open:'未完成',completed:'已完成',blocked:'阻塞',
     status_pending:'待处理',status_in_progress:'进行中',status_completed:'已完成',status_blocked:'阻塞',status_deleted:'已删除',
     owner_unassigned:'owner=未分配',
     session_title_prompt:'会话标题',web_session:'Web 会话',rename_session_prompt:'重命名会话',session_default:'会话',
@@ -91075,7 +92883,7 @@ const I18N={
     sec_todos:'Todos',sec_tasks:'Tasks',sec_activity:'Activity',sec_commands:'Commands',sec_diffs:'File Diffs',sec_files:'檔案',sec_catalog:'Catalog',
     stat_sessions:'會話',stat_running:'執行中',stat_messages:'訊息',stat_global_tasks:'全域任務',stat_daily_sessions:'每日會話',stat_model:'模型',
     no_sessions:'尚無會話',no_todos:'尚無 Todos',no_tasks:'尚無 Tasks',no_current_subtasks:'目前計劃步驟尚未產生子任務',no_activity:'尚無活動',no_commands:'尚無命令',no_diffs:'尚無檔案差異',no_files:'尚無檔案',no_catalog:'尚無目錄',no_uploads:'尚無上傳',
-    running:'執行中',idle:'閒置',open:'未完成',completed:'已完成',blocked:'阻塞',
+    running:'執行中',idle:'閒置',submitting:'正在提交',accepted:'已接收',starting:'正在啟動',queued:'排隊中',checking:'正在確認',submit_failed:'提交失敗',open:'未完成',completed:'已完成',blocked:'阻塞',
     status_pending:'待處理',status_in_progress:'進行中',status_completed:'已完成',status_blocked:'阻塞',status_deleted:'已刪除',
     owner_unassigned:'owner=未指派',
     session_title_prompt:'會話標題',web_session:'Web 會話',rename_session_prompt:'重新命名會話',session_default:'會話',
@@ -91114,7 +92922,7 @@ const I18N={
     sec_todos:'Todos',sec_tasks:'Tasks',sec_activity:'Activity',sec_commands:'Commands',sec_diffs:'File Diffs',sec_files:'ファイル',sec_catalog:'Catalog',
     stat_sessions:'セッション',stat_running:'実行中',stat_messages:'メッセージ',stat_global_tasks:'タスク',stat_daily_sessions:'日次セッション',stat_model:'モデル',
     no_sessions:'セッションはありません',no_todos:'Todo はありません',no_tasks:'Task はありません',no_current_subtasks:'現在の計画ステップにはまだサブタスクがありません',no_activity:'アクティビティなし',no_commands:'コマンドなし',no_diffs:'差分なし',no_files:'ファイルなし',no_catalog:'カタログなし',no_uploads:'アップロードなし',
-    running:'実行中',idle:'待機中',open:'未完了',completed:'完了',blocked:'ブロック',
+    running:'実行中',idle:'待機中',submitting:'送信中',accepted:'受付済み',starting:'起動中',queued:'待機列',checking:'確認中',submit_failed:'送信失敗',open:'未完了',completed:'完了',blocked:'ブロック',
     status_pending:'未着手',status_in_progress:'進行中',status_completed:'完了',status_blocked:'ブロック',status_deleted:'削除済み',
     owner_unassigned:'owner=未割り当て',
     session_title_prompt:'セッション名',web_session:'Web セッション',rename_session_prompt:'セッション名を変更',session_default:'セッション',
@@ -91620,11 +93428,26 @@ function _deltaConsumeSeq(evt){
   if(S.snap&&typeof S.snap==='object')S.snap.event_seq=seq;
   return{ok:true,stale:false,gap:false};
 }
+function _applySessionTitleEvent(data,evt={}){
+  const payload=(data&&typeof data==='object')?data:{},sid=String(payload.session_id||evt.session_id||'').trim();
+  if(!sid)return false;
+  const rev=Number(payload.title_revision||0),title=String(payload.session_title||'').trim(),rows=Array.isArray(S.sessions)?S.sessions:[];
+  let changed=false,workspaceId=String(payload.workspace_id||'').trim();
+  const target=S.sessionById?.get(sid)||rows.find(row=>String(row?.id||'')===sid);
+  if(target){workspaceId=workspaceId||String(target.workspace_id||'').trim();if(title&&rev>=Number(target.title_revision||0)&&(target.title!==title||target.title_origin!==payload.title_origin)){target.title=title;target.title_origin=payload.title_origin||target.title_origin;target.title_revision=rev;changed=true}}
+  if(workspaceId){
+    const peers=rows.filter(row=>String(row?.workspace_id||'').trim()===workspaceId),first=peers.slice().sort((a,b)=>Number(a?.created_at||a?.updated_at||0)-Number(b?.created_at||b?.updated_at||0))[0],name=String(payload.workspace_name||first?.title||'').trim();
+    for(const row of peers){if(name&&row.workspace_name!==name){row.workspace_name=name;changed=true}if(payload.workspace_created_at!=null&&Number(row.workspace_created_at||0)!==Number(payload.workspace_created_at||0)){row.workspace_created_at=Number(payload.workspace_created_at||0);changed=true}if(payload.workspace_label&&row.workspace_label!==payload.workspace_label){row.workspace_label=String(payload.workspace_label);changed=true}}
+  }
+  if(changed){S.lastSessionsSig='';_deltaScheduleRender({sessions:true});}
+  return changed;
+}
 function _deltaApplyRuntimeEvent(evt){
   if(!_deltaEnsureSnapshot())return{handled:false,needsSnapshot:true};
   const typ=String(evt?.type||'').trim();
   const data=(evt&&typeof evt.data==='object')?evt.data:{};
   _deltaAdoptAgentRole(data);
+  if(data.session_title)_applySessionTitleEvent(data,evt);
   const ts=Number(evt?.ts||Date.now()/1000);
   if(Number.isFinite(ts)&&ts>0){
     const prevTs=Number(S.snap.updated_at||0);
@@ -91646,6 +93469,7 @@ function _deltaApplyRuntimeEvent(evt){
       S.snap.live_run_notice_started_at=Number(ts||Date.now()/1000)||Date.now()/1000;
       S.snap.live_run_notice_elapsed=0;
       S.snap.running=true;
+      _setSubmissionState(S.activeId,'running',{seenRunning:true});
     }else if(state==='tick'){
       S.snap.live_run_notice_active=true;
       S.snap.live_run_notice_label=label;
@@ -91796,7 +93620,8 @@ function _deltaApplyRuntimeEvent(evt){
     const schedulerQueueId=Number(data.scheduler_queue_id||0);
     const removedScheduler=(schedulerQueueId&&['started','cancelled','failed'].includes(schedulerStatus))?_deltaRemoveSchedulerQueued(schedulerQueueId,''):0;
     const summaryLow=String(data.summary||'').trim().toLowerCase();
-    if(summaryLow==='run finished')S.snap.running=false;
+    if(typ==='tool_start')_setSubmissionState(S.activeId,'running',{seenRunning:true});
+    if(summaryLow==='run finished'){S.snap.running=false;_setSubmissionState(S.activeId,'complete')}
     _deltaScheduleRender({chat:removedScheduler>0||typ==='tool_start'||typ==='tool_result',boards:true,sessions:true});
     return{handled:true,needsSnapshot:false};
   }
@@ -91845,7 +93670,13 @@ function openProgram(){const port=Number(S.config?.ide_port||0);if(!S.config?.id
 function tailSig(rows,count,mapper){const arr=Array.isArray(rows)?rows:[];if(!arr.length)return'';return arr.slice(Math.max(0,arr.length-count)).map(mapper).join('|')}
 function feedSignature(snap){const feed=Array.isArray(snap?.conversation_feed)?snap.conversation_feed:(Array.isArray(snap?.messages)?snap.messages:[]);const sig=tailSig(feed,8,row=>`${String(row?.id||'')}:${Number(row?.seq||0)}:${Number(row?.ts||0)}:${String(row?.role||'')}:${String(row?.agent_role||'')}:${String(row?.type||'')}:${String(row?.text||'').length}:${String(row?.thinking||'').length}:${String(row?.text||'').slice(-12)}:${String(row?.thinking||'').slice(-12)}`);const live=String(snap?.live_thinking||'');const liveResp=String(snap?.live_response_text||'');const liveRespId=String(snap?.live_response_stream_id||'');const liveRespActive=snap?.live_response_active?1:0;const runActive=snap?.live_run_notice_active?1:0;const runLabel=String(snap?.live_run_notice_label||'');const runStart=Number(snap?.live_run_notice_started_at||0);const truncText=String(snap?.live_truncation_text||'');const truncKind=String(snap?.live_truncation_kind||'');const truncTool=String(snap?.live_truncation_tool||'');const truncAttempts=Number(snap?.live_truncation_attempts||0);const truncTokens=Number(snap?.live_truncation_tokens||0);const truncActive=snap?.live_truncation_active?1:0;return `${feed.length}|${sig}|lt=${live.length}:${live.slice(-12)}|lr=${liveRespActive}:${liveRespId}:${liveResp.length}:${liveResp.slice(-12)}|rn=${runActive}:${runStart}:${runLabel.slice(-12)}|tr=${truncActive}:${truncAttempts}:${truncTokens}:${truncKind.slice(-12)}:${truncTool.slice(-12)}:${truncText.length}`}
 function boardsSignature(snap){const agentCtx=(Array.isArray(snap?.agent_contexts)?snap.agent_contexts:[]).map(r=>`${r.role}:${r.left}:${r.left_percent}:${r.tier}:${r.active?1:0}`).join(',');const scope=snap?.todo_task_scope||{};const todoRows=Array.isArray(snap?.todos)?snap.todos:[];const taskRows=Array.isArray(snap?.tasks)?snap.tasks:[];const todoSig=todoRows.map(row=>`${String(row?.key||row?.plan_step_id||'')}:${String(row?.status||'')}:${String(row?.content||'')}`).join('~');const taskSig=taskRows.map(row=>`${String(row?.subtask_id||row?.id||'')}:${String(row?.status||'')}:${String(row?.subject||'')}`).join('~');return [snap?.running?1:0,snap?.agent_phase||'',Number(snap?.agent_round_index||0),Number(snap?.queued_user_inputs_count||0),Number(snap?.truncation_count||0),Number(snap?.live_truncation_attempts||0),Number(snap?.live_truncation_tokens||0),snap?.live_truncation_active?1:0,Number(snap?.context_tokens_estimate||0),Number(snap?.context_left_tokens||0),Number(snap?.context_left_percent||0),agentCtx,Number(snap?.render_bridge?.seq||0),String(snap?.plan_mode_preference||'auto'),Number(snap?.user_task_level||0),String(scope.kind||'default'),String(scope.task_epoch||''),String(scope.plan_epoch||''),String(scope.parent_step_id||''),todoSig,taskSig,(snap?.activity||[]).length,(snap?.operations||[]).length,(snap?.uploads||[]).length].join('|')}
-function sessionsSignature(list){const rows=Array.isArray(list)?list:[],aid=String(S.activeId||'').trim(),activeRow=aid?S.sessionById.get(aid):null,activeSig=activeRow?`${aid}:${activeRow.running?1:0}:${Number(activeRow.message_count||0)}:${Number(activeRow.updated_at||0)}`:`missing:${aid||'-'}`,first=String(rows[0]?.id||''),last=String(rows[rows.length-1]?.id||'');return `${Number(S.sessionCatalogRevision||0)}|${rows.length}|${first}|${last}|active=${activeSig}`}
+function sessionsSignature(list){const rows=Array.isArray(list)?list:[],aid=String(S.activeId||'').trim(),activeRow=aid?S.sessionById.get(aid):null,activeSig=activeRow?`${aid}:${String(activeRow.title||'')}:${Number(activeRow.title_revision||0)}:${activeRow.running?1:0}:${Number(activeRow.message_count||0)}:${Number(activeRow.updated_at||0)}`:`missing:${aid||'-'}`,first=String(rows[0]?.id||''),last=String(rows[rows.length-1]?.id||'');return `${Number(S.sessionCatalogRevision||0)}|${rows.length}|${first}|${last}|active=${activeSig}`}
+function _scheduleSubmissionStatusRender(){if(S.submissionRenderRaf)return;S.submissionRenderRaf=requestAnimationFrame(()=>{S.submissionRenderRaf=0;renderRuntimeStatus()})}
+function _pruneSubmissionStates(){const now=Date.now();for(const [sid,row] of S.submissionBySession){const age=now-Number(row?.updatedAt||row?.createdAt||0);if((row?.status==='failed'&&age>SUBMISSION_FAILURE_VISIBLE_MS)||age>SUBMISSION_STATE_TTL_MS)S.submissionBySession.delete(sid)}while(S.submissionBySession.size>SUBMISSION_STATE_MAX){const oldest=S.submissionBySession.keys().next().value;if(oldest===undefined)break;S.submissionBySession.delete(oldest)}}
+function _setSubmissionState(sessionId,status,extra={}){const sid=String(sessionId||'').trim();if(!sid)return null;_pruneSubmissionStates();if(status==='idle'||status==='complete'){S.submissionBySession.delete(sid);_scheduleSubmissionStatusRender();return null}const previous=S.submissionBySession.get(sid)||{};const now=Date.now();const row={...previous,...extra,status:String(status||previous.status||'checking'),createdAt:Number(previous.createdAt||now),updatedAt:now,seenRunning:!!(previous.seenRunning||extra.seenRunning||status==='running')};S.submissionBySession.delete(sid);S.submissionBySession.set(sid,row);_pruneSubmissionStates();_scheduleSubmissionStatusRender();return row}
+function _submissionStateFromAck(sessionId,out){const payload=(out&&typeof out==='object')?out:{};if(payload.running||payload.live_input)return _setSubmissionState(sessionId,'running',{seenRunning:true,queueId:Number(payload.queue_id||0)});if(payload.queued){const starting=!!(payload.scheduler_started||payload.scheduler_starting||payload.deferred_start);return _setSubmissionState(sessionId,starting?'starting':'queued',{queueId:Number(payload.queue_id||0),queuePosition:Number(payload.queue_position||0),queueSize:Number(payload.queue_size||0)})}return _setSubmissionState(sessionId,payload.accepted?'accepted':'checking',{queueId:Number(payload.queue_id||0)})}
+function _reconcileSubmissionState(sessionId,snap){const sid=String(sessionId||'').trim();if(!sid)return null;_pruneSubmissionStates();let row=S.submissionBySession.get(sid)||null;if(snap?.running){if(!row||row.status!=='running')row=_setSubmissionState(sid,'running',{seenRunning:true});return row}if(snap?.scheduler_starting){if(!row||row.status!=='starting')row=_setSubmissionState(sid,'starting');return row}if(!row)return null;if(row.seenRunning){S.submissionBySession.delete(sid);return null}const age=Date.now()-Number(row.createdAt||Date.now());if((row.status==='submitting'||row.status==='accepted'||row.status==='starting')&&age>SUBMISSION_START_GRACE_MS){row={...row,status:'checking',updatedAt:Date.now()};S.submissionBySession.set(sid,row)}return row}
+function _submissionStatusLabel(row){if(!row)return'';const status=String(row.status||'checking');if(status==='queued'){const pos=Number(row.queuePosition||0);const size=Number(row.queueSize||0);return `${t('queued')}${pos?` #${pos}${size?`/${size}`:''}`:''}`}return t(status==='failed'?'submit_failed':status)}
 function mergeSessionRows(base,incoming,opt={}){const current=Array.isArray(base)?base:[],rows=Array.isArray(incoming)?incoming:[],append=!!opt.append;if(!S.sessionById.size)for(const row of current){const id=String(row?.id||'').trim();if(id)S.sessionById.set(id,row)}const incomingIds=new Set(),head=[];for(const raw of rows){const id=String(raw?.id||'').trim();if(!id)continue;incomingIds.add(id);const row={...(S.sessionById.get(id)||{}),...raw};S.sessionById.set(id,row);head.push(row)}let merged;if(append){merged=current.slice();const present=new Set(merged.map(row=>String(row?.id||'')));for(const row of head){if(!present.has(row.id)){merged.push(row);present.add(row.id)}}}else{merged=head.concat(current.filter(row=>!incomingIds.has(String(row?.id||''))))}if(merged.length>SESSION_CLIENT_CACHE_MAX){const active=String(S.activeId||''),kept=merged.slice(0,SESSION_CLIENT_CACHE_MAX);if(active&&!kept.some(row=>row.id===active)){const activeRow=S.sessionById.get(active);if(activeRow)kept[kept.length-1]=activeRow}merged=kept;const keptIds=new Set(merged.map(row=>String(row?.id||'')));for(const id of [...S.sessionById.keys()])if(!keptIds.has(id))S.sessionById.delete(id)}return merged}
 function applySessionPage(rowsRaw,opt={}){const payload=(rowsRaw&&typeof rowsRaw==='object'&&!Array.isArray(rowsRaw))?rowsRaw:{},rows=Array.isArray(rowsRaw)?rowsRaw:(Array.isArray(payload.sessions)?payload.sessions:[]),append=!!opt.append,offset=Math.max(0,Number(payload.offset||0)||0);if(!append&&offset===0&&opt.reset){S.sessions=[];S.sessionById.clear();S.sessionNextOffset=0}S.sessions=mergeSessionRows(S.sessions,rows,{append});const revision=Number(payload.catalog_revision);if(Number.isFinite(revision))S.sessionCatalogRevision=revision;const total=Number(payload.total);S.sessionTotal=Number.isFinite(total)&&total>=rows.length?total:Math.max(S.sessions.length,rows.length);const next=offset+rows.length;S.sessionNextOffset=append?Math.max(Number(S.sessionNextOffset||0),next):next;const payloadHasMore=Object.prototype.hasOwnProperty.call(payload,'has_more')?!!payload.has_more:(S.sessionNextOffset<S.sessionTotal);S.sessionHasMore=!!(payloadHasMore&&S.sessionNextOffset<S.sessionTotal);return{rows,selectedId:'',total:S.sessionTotal,hasMore:S.sessionHasMore}}
 function _statInfinite(n){const v=Number(n);return(Number.isFinite(v)&&v>0)?String(v):'∞'}
@@ -91882,7 +93713,7 @@ function renderSessions(){
     },{passive:true});
   }
 }
-function _syncActiveSessionSummaryFromSnapshot(){const sid=String(S.activeId||'').trim();const snap=S.snap;if(!sid||!snap)return false;const rows=Array.isArray(S.sessions)?S.sessions.slice():[];let idx=rows.findIndex(row=>String(row?.id||'')===sid);const running=!!(snap?.running||snap?.scheduler_starting);let updatedAt=Number(snap?.updated_at||0);if(!Number.isFinite(updatedAt)||updatedAt<=0){updatedAt=(Date.now()/1000)}let msgCount=Number(snap?.message_count);if(!Number.isFinite(msgCount)||msgCount<0){const arr=Array.isArray(snap?.messages)?snap.messages:[];let cnt=0;for(const row of arr){if(String(row?.role||'').trim()==='tool')continue;cnt+=1}msgCount=cnt}msgCount=Math.max(0,Math.floor(Number(msgCount)||0));const title=String(snap?.title||'').trim();if(idx<0){const next={id:sid,title:title||sid,running:running,updated_at:updatedAt,message_count:msgCount};rows.push(next);S.sessionById.set(sid,next);idx=rows.length-1}else{const cur=rows[idx]||{};const next={...cur};let changed=false;if(!!cur.running!==running){next.running=running;changed=true}if(Number(cur.message_count||0)!==msgCount){next.message_count=msgCount;changed=true}if(Number(cur.updated_at||0)!==updatedAt){next.updated_at=updatedAt;changed=true}if(title&&String(cur.title||'')!==title){next.title=title;changed=true}if(!changed){S.sessionById.set(sid,cur);return false}rows[idx]=next;S.sessionById.set(sid,next)}rows.sort((a,b)=>Number(b?.updated_at||0)-Number(a?.updated_at||0));S.sessions=rows;return true}
+function _syncActiveSessionSummaryFromSnapshot(){const sid=String(S.activeId||'').trim();const snap=S.snap;if(!sid||!snap)return false;const rows=Array.isArray(S.sessions)?S.sessions.slice():[];let idx=rows.findIndex(row=>String(row?.id||'')===sid);const running=!!(snap?.running||snap?.scheduler_starting);let updatedAt=Number(snap?.updated_at||0);if(!Number.isFinite(updatedAt)||updatedAt<=0){updatedAt=(Date.now()/1000)}let msgCount=Number(snap?.message_count);if(!Number.isFinite(msgCount)||msgCount<0){const arr=Array.isArray(snap?.messages)?snap.messages:[];let cnt=0;for(const row of arr){if(String(row?.role||'').trim()==='tool')continue;cnt+=1}msgCount=cnt}msgCount=Math.max(0,Math.floor(Number(msgCount)||0));const title=String(snap?.title||'').trim(),titleRevision=Number(snap?.title_revision||0);if(idx<0){const next={id:sid,title:title||sid,title_revision:titleRevision,running:running,updated_at:updatedAt,message_count:msgCount};rows.push(next);S.sessionById.set(sid,next);idx=rows.length-1}else{const cur=rows[idx]||{};const next={...cur};let changed=false;if(!!cur.running!==running){next.running=running;changed=true}if(Number(cur.message_count||0)!==msgCount){next.message_count=msgCount;changed=true}if(Number(cur.updated_at||0)!==updatedAt){next.updated_at=updatedAt;changed=true}if(title&&titleRevision>=Number(cur.title_revision||0)&&String(cur.title||'')!==title){next.title=title;next.title_revision=titleRevision;changed=true}if(!changed){S.sessionById.set(sid,cur);return false}rows[idx]=next;S.sessionById.set(sid,next)}rows.sort((a,b)=>Number(b?.updated_at||0)-Number(a?.updated_at||0));S.sessions=rows;return true}
 function diffLineClass(line){const t=String(line||'').trimStart();if(t.startsWith('+')||/^\\d+\\s+\\+\\s/.test(t))return 'diff-line-add';if(t.startsWith('-')||/^\\d+\\s+-\\s/.test(t))return 'diff-line-del';if(t.startsWith('@@')||t==='⋮'||t.startsWith('⋮ '))return 'diff-line-hunk';return ''}
 function diffHtml(diff){return String(diff||'').split('\\n').map(line=>`<div class=\"diff-row ${diffLineClass(line)}\">${esc(line)}</div>`).join('')}
 function _scrollContainerToNodeCenter(container,target){
@@ -95049,7 +96880,7 @@ function fmtCompactAge(ts){const n=Number(ts||0);if(!n)return '';const secs=Math
 function fmtLastCompact(snap){const reason=snap?.last_compact_reason||'';if(!reason)return '-';const age=fmtCompactAge(snap?.last_compact_ts);return age?(reason+' · '+age):reason;}
 function answerAskUser(text){const val=String(text||'').trim();if(!val||!S.activeId)return;const promptEl=E('prompt');if(promptEl){promptEl.value=val;}sendMessage();}
 function renderAskUserCard(){const card=E('askUserCard');if(!card)return;const pq=S.snap?.pending_user_question;const show=!S.snap?.running&&pq&&String(pq.question||'').trim();if(!show){if(card.style.display!=='none'){card.style.display='none';card.innerHTML='';}return;}const q=String(pq.question||'').trim();const opts=Array.isArray(pq.options)?pq.options.filter(o=>String(o||'').trim()):[];const allowFree=pq.allow_free_text!==false;const role=String(pq.role||'agent');const roleLabel=role&&role!=='agent'?_chatVirtAgentRoleLabel(role):'';let btns='';if(opts.length){btns='<div class="ask-user-options">'+opts.map((o,i)=>`<button type="button" class="ask-user-opt" data-ask-idx="${i}">${esc(String(o))}</button>`).join('')+'</div>';}const hint=allowFree?esc(t('ask_user_free_hint')):esc(t('ask_user_pick_hint'));const html=`<div class="ask-user-head"><span class="ask-user-badge">${esc(t('ask_user_title'))}</span>${roleLabel?`<span class="ask-user-role">${esc(roleLabel)}</span>`:''}</div><div class="ask-user-q">${esc(q)}</div>${btns}<div class="ask-user-hint">${hint}</div>`;if(card.innerHTML!==html){card.innerHTML=html;card.querySelectorAll('.ask-user-opt').forEach(b=>{b.addEventListener('click',()=>{const idx=parseInt(b.getAttribute('data-ask-idx')||'-1',10);if(idx>=0&&idx<opts.length)answerAskUser(opts[idx]);});});}card.style.display='';}
-function renderRuntimeStatus(){const uiState=S.staticMode?(S.frozen?'static':'live'):'live';const boolWord=v=>t(v?'state_on':'state_off');const activeRole=String(S.snap?.agent_active_role||'').trim();const activeRoleLabel=activeRole?_chatVirtAgentRoleLabel(activeRole):'-';const _awaitingUser=!S.snap?.running&&S.snap?.pending_user_question&&String(S.snap?.pending_user_question?.question||'').trim();const _stateVal=_awaitingUser?t('rt_awaiting_user'):(S.snap?.running?t('running'):t('idle'));const _stateTone=_awaitingUser?'state-awaiting':(S.snap?.running?'state-running':'state-idle');const runtimeItems=[{label:t('rt_session'),value:S.snap?.id||'-',mono:true},{label:t('rt_model'),value:S.snap?.model||'-',mono:true},{label:t('rt_thinking'),value:boolWord(S.snap?.thinking)},{label:t('rt_thinking_stream'),value:boolWord(S.snap?.thinking_stream)},{label:t('rt_response_stream'),value:boolWord(S.snap?.response_stream)},{label:t('rt_mode'),value:S.snap?.execution_mode||S.config?.execution_mode||'sync'},{label:t('rt_active_agent'),value:activeRoleLabel},{label:t('rt_blackboard'),value:S.snap?.blackboard?.status||'-'},{label:t('rt_task'),value:S.snap?.blackboard?.task_profile?.task_type||'-'},{label:t('rt_complexity'),value:S.snap?.blackboard?.task_profile?.complexity||'-'},{label:t('rt_judgement'),value:S.snap?.blackboard?.manager_judgement?.progress||'-'},{label:t('rt_budget'),value:S.snap?.blackboard?.task_profile?.round_budget??'-'},{label:t('rt_remaining'),value:S.snap?.blackboard?.manager_judgement?.remaining_rounds??'-'},{label:t('rt_blackboard_cycles'),value:S.snap?.blackboard?.manager_cycles??'-'},{label:t('rt_round_limit'),value:S.snap?.max_agent_rounds||'-'},{label:t('rt_round'),value:S.snap?.agent_round_index??'-'},{label:t('rt_phase'),value:S.snap?.agent_phase||t('idle')},{label:t('rt_queued_inputs'),value:S.snap?.queued_user_inputs_count??0},{label:t('rt_run_timeout'),value:`${S.snap?.max_run_seconds??'-'}s`},{label:t('rt_ctx_used'),value:S.snap?.context_tokens_estimate??'-'},{label:t('rt_ctx_limit'),value:S.snap?.context_effective_token_limit||S.snap?.context_token_upper_bound||'-'},{label:t('rt_ctx_mode'),value:t(S.snap?.context_token_limit_locked?'rt_manual_lock':'rt_adaptive')},{label:t('rt_ctx_left'),value:formatContextLeft(S.snap)},{label:t('rt_truncation'),value:S.snap?.truncation_count||0},{label:t('rt_trunc_retry'),value:S.snap?.live_truncation_attempts||0},{label:t('rt_trunc_tokens'),value:S.snap?.live_truncation_tokens||0},{label:t('rt_archive'),value:S.snap?.compact_segments_count||0},{label:t('rt_last_compact'),value:fmtLastCompact(S.snap)},{label:t('rt_ollama'),value:S.snap?.ollama_base_url||'-',mono:true,wide:true},{label:t('rt_files'),value:S.snap?.session_files_root||'-',mono:true,wide:true},{label:t('rt_ui_mode'),value:uiState},{label:t('rt_state'),value:_stateVal,tone:_stateTone}];setHtmlIfChanged('status',runtimeItems.map(item=>_runtimePillHtml(item.label,item.value,item)).join('')+agentContextChipsHtml(S.snap),'runtimeStatus')}
+function renderRuntimeStatus(){const uiState=S.staticMode?(S.frozen?'static':'live'):'live';const boolWord=v=>t(v?'state_on':'state_off');const activeRole=String(S.snap?.agent_active_role||'').trim();const activeRoleLabel=activeRole?_chatVirtAgentRoleLabel(activeRole):'-';const _awaitingUser=!S.snap?.running&&S.snap?.pending_user_question&&String(S.snap?.pending_user_question?.question||'').trim();const _submission=_reconcileSubmissionState(S.activeId,S.snap);const _stateVal=S.snap?.running?t('running'):(S.snap?.scheduler_starting?t('starting'):(_submission?_submissionStatusLabel(_submission):(_awaitingUser?t('rt_awaiting_user'):t('idle'))));const _stateTone=_awaitingUser&&!_submission?'state-awaiting':((S.snap?.running||S.snap?.scheduler_starting||_submission)?'state-running':'state-idle');const runtimeItems=[{label:t('rt_session'),value:S.snap?.id||'-',mono:true},{label:t('rt_model'),value:S.snap?.model||'-',mono:true},{label:t('rt_thinking'),value:boolWord(S.snap?.thinking)},{label:t('rt_thinking_stream'),value:boolWord(S.snap?.thinking_stream)},{label:t('rt_response_stream'),value:boolWord(S.snap?.response_stream)},{label:t('rt_mode'),value:S.snap?.execution_mode||S.config?.execution_mode||'sync'},{label:t('rt_active_agent'),value:activeRoleLabel},{label:t('rt_blackboard'),value:S.snap?.blackboard?.status||'-'},{label:t('rt_task'),value:S.snap?.blackboard?.task_profile?.task_type||'-'},{label:t('rt_complexity'),value:S.snap?.blackboard?.task_profile?.complexity||'-'},{label:t('rt_judgement'),value:S.snap?.blackboard?.manager_judgement?.progress||'-'},{label:t('rt_budget'),value:S.snap?.blackboard?.task_profile?.round_budget??'-'},{label:t('rt_remaining'),value:S.snap?.blackboard?.manager_judgement?.remaining_rounds??'-'},{label:t('rt_blackboard_cycles'),value:S.snap?.blackboard?.manager_cycles??'-'},{label:t('rt_round_limit'),value:S.snap?.max_agent_rounds||'-'},{label:t('rt_round'),value:S.snap?.agent_round_index??'-'},{label:t('rt_phase'),value:S.snap?.agent_phase||t('idle')},{label:t('rt_queued_inputs'),value:S.snap?.queued_user_inputs_count??0},{label:t('rt_run_timeout'),value:`${S.snap?.max_run_seconds??'-'}s`},{label:t('rt_ctx_used'),value:S.snap?.context_tokens_estimate??'-'},{label:t('rt_ctx_limit'),value:S.snap?.context_effective_token_limit||S.snap?.context_token_upper_bound||'-'},{label:t('rt_ctx_mode'),value:t(S.snap?.context_token_limit_locked?'rt_manual_lock':'rt_adaptive')},{label:t('rt_ctx_left'),value:formatContextLeft(S.snap)},{label:t('rt_truncation'),value:S.snap?.truncation_count||0},{label:t('rt_trunc_retry'),value:S.snap?.live_truncation_attempts||0},{label:t('rt_trunc_tokens'),value:S.snap?.live_truncation_tokens||0},{label:t('rt_archive'),value:S.snap?.compact_segments_count||0},{label:t('rt_last_compact'),value:fmtLastCompact(S.snap)},{label:t('rt_ollama'),value:S.snap?.ollama_base_url||'-',mono:true,wide:true},{label:t('rt_files'),value:S.snap?.session_files_root||'-',mono:true,wide:true},{label:t('rt_ui_mode'),value:uiState},{label:t('rt_state'),value:_stateVal,tone:_stateTone}];setHtmlIfChanged('status',runtimeItems.map(item=>_runtimePillHtml(item.label,item.value,item)).join('')+agentContextChipsHtml(S.snap),'runtimeStatus')}
 function renderPlanLevelControls(){const _pmBtn=E('planModeBtn');if(_pmBtn){const _pm=S.snap?.plan_mode_preference||'auto';setTextIfChanged(_pmBtn,'Plan: '+_pm.charAt(0).toUpperCase()+_pm.slice(1))}updateLevelBtn(S.snap?.user_task_level||0)}
 function renderTodoTaskPanels(){const scope=S.snap?.todo_task_scope||{kind:'default'};const scopeSig=_safeJsonSig(scope);const todoSig=currentLang()+'|'+String(S.snap?.plan_mode_preference||'auto')+'|'+scopeSig+'|'+_safeJsonSig(S.snap?.todos||[]);if(S.renderSigs.todosSig!==todoSig){S.renderSigs.todosSig=todoSig;setPanelHtml('todos',renderTodoBoard(S.snap?.todos||[]))}const taskSig=currentLang()+'|'+scopeSig+'|'+_safeJsonSig(S.snap?.tasks||[]);if(S.renderSigs.tasksSig!==taskSig){S.renderSigs.tasksSig=taskSig;setPanelHtml('tasks',renderTaskBoard(S.snap?.tasks||[],scope))}}
 function renderActivityPanel(){const rows=(S.snap?.activity||[]).slice(-80).sort((a,b)=>Number(a.ts||0)-Number(b.ts||0));const sig=currentLang()+'|'+rows.map(a=>`${Number(a.ts||0)}:${String(a.summary||'')}`).join('|');if(S.renderSigs.activitySig===sig)return;S.renderSigs.activitySig=sig;setPanelHtml('activity',rows.map(a=>`<div class=\"mono\">${new Date(a.ts*1000).toLocaleTimeString()} · ${esc(a.summary)}</div>`).join('')||`<div class=\"mono\">${esc(t('no_activity'))}</div>`)}
@@ -95461,8 +97292,12 @@ function _chatVirtResetScrollState(chatEl){
   chatEl._virtLastWinStart=-1;
   chatEl._virtLastWinEnd=-1;
 }
+function _initialSessionSnapshot(row){const src=(row&&typeof row==='object')?row:{};const now=Number(src.updated_at||Date.now()/1000),running=!!src.running;return{id:String(src.id||''),title:String(src.title||src.id||''),running:running,scheduler_starting:false,created_at:Number(src.created_at||now),updated_at:now,message_count:Math.max(0,Number(src.message_count||0)),model:_modelNameFromSelection(String(S.config?.model||''))||'',ui_language:String(src.ui_language||S.config?.language||currentLang()),execution_mode:String(S.config?.execution_mode||'sync'),thinking:false,thinking_stream:false,response_stream:false,conversation_feed:[],messages:[],operations:[],activity:[],todos:[],tasks:[],uploads:[],event_seq:0,agent_phase:running?'busy':'idle',queued_user_inputs_count:0}}
 async function selectSession(id,opt={}){
+  const catalogRow=S.sessionById.get(String(id||''))||(Array.isArray(S.sessions)?S.sessions.find(row=>String(row?.id||'')===String(id||'')):null)||{id};
+  const initialSnapshot=(opt.initialSnapshot&&typeof opt.initialSnapshot==='object')?opt.initialSnapshot:_initialSessionSnapshot(catalogRow);
   S.activeId=id;
+  if(initialSnapshot)S.snap=initialSnapshot;
   S.frozen=false;
   S.lastEventSeq=0;
   S.deltaGapCount=0;
@@ -95480,16 +97315,17 @@ async function selectSession(id,opt={}){
   ensurePreviewState(id);
   bindEvents(id);
   _deltaStartWatchdog();
-  pullRenderState(id,true);
   const immediateFull=!!opt.forceFullImmediate;
-  await refreshSnapshot({forceFull:immediateFull,allowWhenFrozen:true});
+  S.lastFeedSig='';
+  S.lastBoardsSig='';
+  scheduleRenderChat('session-shell');
+  renderBoards();
+  S.bootRendered=true;
+  scheduleSnapshot({forceFull:immediateFull,delayMs:0,allowWhenFrozen:true});
   renderPreviewTabs();
   renderPreviewVisibility();
   renderActivePreview(false);
-  if(!immediateFull&&String(S.activeId||'')===String(id||'')){
-    S.deferredFullSnapshotTimer=setTimeout(()=>{S.deferredFullSnapshotTimer=0;if(String(S.activeId||'')===String(id||''))scheduleSnapshot({forceFull:true,delayMs:0,allowWhenFrozen:true})},520);
-    S.deferredFileExplorerTimer=setTimeout(()=>{S.deferredFileExplorerTimer=0;S.fileExplorerDeferUntil=0;if(String(S.activeId||'')===String(id||''))refreshFileExplorer(false).catch(()=>{})},1700);
-  }
+  if(String(S.activeId||'')===String(id||''))S.deferredFileExplorerTimer=setTimeout(()=>{S.deferredFileExplorerTimer=0;S.fileExplorerDeferUntil=0;if(String(S.activeId||'')===String(id||''))refreshFileExplorer(false).catch(()=>{})},1700);
   showError('');
 }
 async function createSession(opt={}){
@@ -95497,13 +97333,15 @@ async function createSession(opt={}){
   const usePrompt=opt.prompt!==false;
   const defaultTitle=t('web_session');
   let title=String(opt.title||'').trim()||defaultTitle;
+  let userNamed=opt.userNamed===true||(!!String(opt.title||'').trim()&&opt.userNamed!==false);
   if(usePrompt){
     const input=prompt(t('session_title_prompt'),defaultTitle);
     if(input===null)return;
     title=String(input||'').trim()||defaultTitle;
+    userNamed=title!==defaultTitle;
   }
   try{
-    const out=await api('/api/sessions',{method:'POST',body:JSON.stringify({title})});
+    const out=await api('/api/sessions',{method:'POST',body:JSON.stringify({title,user_named:userNamed})});
     applyRuntimeConfigStats({session_creation_limit:out?.session_creation_limit});
     const sid=String(out?.id||'').trim();
     if(!sid){
@@ -95513,6 +97351,8 @@ async function createSession(opt={}){
     const row={
       id:sid,
       title:String(out?.title||title||defaultTitle),
+      title_origin:String(out?.title_origin||(userNamed?'manual':'default')),
+      title_revision:Number(out?.title_revision||0),
       running:false,
       updated_at:(Date.now()/1000),
       message_count:0,
@@ -95523,16 +97363,16 @@ async function createSession(opt={}){
     const sig=sessionsSignature(S.sessions);
     if(sig!==S.lastSessionsSig){S.lastSessionsSig=sig;renderSessions()}
     renderStats();
-    await selectSession(sid);
+    await selectSession(sid,{initialSnapshot:_initialSessionSnapshot(row)});
   }catch(err){showError(err.message||String(err))}
 }
 async function renameSession(){if(!S.activeId){showError(t('select_session_first'));return}const old=S.sessions.find(x=>x.id===S.activeId)?.title||t('session_default');const s=prompt(t('rename_session_prompt'),old);if(!s)return;await api('/api/sessions/'+S.activeId,{method:'PATCH',body:JSON.stringify({title:s})});await refreshSessions();await refreshSnapshot({forceFull:true,allowWhenFrozen:true})}
-async function deleteSession(){if(!S.activeId){showError(t('select_session_first'));return}const deletingId=S.activeId;const ok=confirm(t('delete_confirm'));if(!ok)return;await api('/api/sessions/'+S.activeId,{method:'DELETE'});if(S.previewBySession&&deletingId){delete S.previewBySession[deletingId]}if(S.fileExplorerBySession&&deletingId){delete S.fileExplorerBySession[deletingId]}S.sessionById.delete(deletingId);S.sessions=S.sessions.filter(row=>row.id!==deletingId);S.activeId=null;S.snap=null;if(S.es)S.es.close();renderPreviewTabs();renderPreviewVisibility();renderActivePreview(false);await refreshSessions({reset:true});if(S.sessions.length)await selectSession(S.sessions[0].id)}
+async function deleteSession(){if(!S.activeId){showError(t('select_session_first'));return}const deletingId=S.activeId;const ok=confirm(t('delete_confirm'));if(!ok)return;await api('/api/sessions/'+S.activeId,{method:'DELETE'});if(S.previewBySession&&deletingId){delete S.previewBySession[deletingId]}if(S.fileExplorerBySession&&deletingId){delete S.fileExplorerBySession[deletingId]}S.submissionBySession.delete(String(deletingId||''));S.sessionById.delete(deletingId);S.sessions=S.sessions.filter(row=>row.id!==deletingId);S.activeId=null;S.snap=null;if(S.es)S.es.close();renderPreviewTabs();renderPreviewVisibility();renderActivePreview(false);await refreshSessions({reset:true});if(S.sessions.length)await selectSession(S.sessions[0].id)}
 async function applyModel(){const sel=E('modelSelect');const btn=E('applyModelBtn');const model=sel?.value||'';if(!model){showError(t('no_model_selected'));return}if(S.staticMode&&S.frozen)resumeAutoUpdates();S.config=S.config||{};const prevModel=String(S.config.model||'');const prevSnapModel=String(S.snap?.model||'');const prevSnapCatalog=(S.snap&&typeof S.snap==='object')?S.snap.llm_model_catalog:undefined;try{S.config.model=model;if(S.snap&&typeof S.snap==='object'){S.snap.model=_modelNameFromSelection(model)||S.snap.model;if(!S.snap.llm_model_catalog||typeof S.snap.llm_model_catalog!=='object')S.snap.llm_model_catalog={};S.snap.llm_model_catalog.selected=model}renderModelControls();renderStats();if(S.snap)renderBoards();if(sel)sel.disabled=true;if(btn)btn.disabled=true;const path=S.activeId?('/api/sessions/'+S.activeId+'/config/model'):'/api/config/model';const changed=await api(path,{method:'POST',body:JSON.stringify({selection:model,model})});if(changed?.note)showError(changed.note);else showError('');if(!applyModelCatalog(changed)){const cat=await loadModelCatalog();if(!applyModelCatalog(cat)){S.config.model=String(changed?.selected||model||'').trim();renderModelControls()}}if(S.snap&&typeof S.snap==='object'){const selected=String(S.config?.model||model||'').trim();const modelName=_modelNameFromSelection(selected);if(modelName)S.snap.model=modelName;if(changed&&typeof changed==='object')S.snap.llm_model_catalog=changed;renderBoards()}scheduleSnapshot({forceFull:true,delayMs:40,allowWhenFrozen:true})}catch(err){S.config.model=prevModel;if(S.snap&&typeof S.snap==='object'){if(prevSnapModel)S.snap.model=prevSnapModel;if(prevSnapCatalog!==undefined)S.snap.llm_model_catalog=prevSnapCatalog;renderBoards()}renderModelControls();renderStats();showError(err.message||String(err))}finally{if(sel)sel.disabled=false;if(btn)btn.disabled=false}}
 
 async function uploadLlmConfigFile(file){try{if(!S.activeId){showError(t('select_session_first'));return}if(!file){return}const arr=await file.arrayBuffer();const payload={filename:'LLM.config.json',mime:file.type||'application/json',content_b64:ab2b64(arr)};const out=await api('/api/sessions/'+S.activeId+'/uploads',{method:'POST',body:JSON.stringify(payload)});const note=String(out?.note||out?.model_catalog?.note||'').trim();if(!out?.model_catalog){showError(t('config_uploaded_no_profiles'));}else{showError(note||'');const modal=E('llmConfigModal');if(modal)modal.style.display='none'}const cat=out?.model_catalog||await loadModelCatalog();if(!applyModelCatalog(cat)){renderModelControls()}await refreshSnapshot({forceFull:true,allowWhenFrozen:true})}catch(err){showError(err.message||String(err))}}
-async function sendMessage(){showError('');const promptText=E('prompt').value.trim();if(!promptText||!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();E('prompt').value='';try{const configuredWait=Number(S.config?.chat_upload_frontend_wait_ms);const handoffWait=Number.isFinite(configuredWait)?Math.max(0,Math.min(5000,configuredWait)):CHAT_UPLOAD_HANDOFF_WAIT_MS;const uploadWait=await waitForPendingUploads(handoffWait);if(uploadWait&&!uploadWait.ok&&(uploadWait.timeout||uploadWait.error)){showError(uploadWait.timeout?'上传仍在后台处理；任务已先提交，文件完成后会出现在工作区。':`上传继续在后台处理：${uploadWait.error.message||uploadWait.error}`)}const out=await api('/api/sessions/'+S.activeId+'/message',{method:'POST',body:JSON.stringify({content:promptText})});S.lastDeltaTs=Date.now();scheduleSnapshot({forceFull:false,delayMs:40,allowWhenFrozen:true});scheduleSessionPoll(true);if(out&&out.queued&&!out.scheduler_started&&!out.live_input){const pos=Number(out.queue_position||0);const size=Number(out.queue_size||0);showError(`${t('event_scheduler_queued_title')}${pos?` · ${t('event_scheduler_queue_position')} ${pos}${size?`/${size}`:''}`:''}`)}}catch(err){showError(err.message)}}
-async function interruptRun(){if(!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/interrupt',{method:'POST'});S.lastDeltaTs=Date.now();if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:140,allowWhenFrozen:true})}}
+async function sendMessage(){showError('');const promptEl=E('prompt');const promptText=promptEl.value.trim();const sessionId=String(S.activeId||'').trim();if(!promptText||!sessionId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();_setSubmissionState(sessionId,'submitting');promptEl.value='';try{const configuredWait=Number(S.config?.chat_upload_frontend_wait_ms);const handoffWait=Number.isFinite(configuredWait)?Math.max(0,Math.min(5000,configuredWait)):CHAT_UPLOAD_HANDOFF_WAIT_MS;const uploadWait=await waitForPendingUploads(handoffWait);if(uploadWait&&!uploadWait.ok&&(uploadWait.timeout||uploadWait.error)){showError(uploadWait.timeout?'上传仍在后台处理；任务已先提交，文件完成后会出现在工作区。':`上传继续在后台处理：${uploadWait.error.message||uploadWait.error}`)}const out=await api('/api/sessions/'+sessionId+'/message',{method:'POST',body:JSON.stringify({content:promptText})});_submissionStateFromAck(sessionId,out);S.lastDeltaTs=Date.now();if(String(S.activeId||'')===sessionId)scheduleSnapshot({forceFull:false,delayMs:40,allowWhenFrozen:true});scheduleSessionPoll(true);if(out&&out.queued&&!out.scheduler_started&&!out.deferred_start&&!out.live_input){const pos=Number(out.queue_position||0);const size=Number(out.queue_size||0);showError(`${t('event_scheduler_queued_title')}${pos?` · ${t('event_scheduler_queue_position')} ${pos}${size?`/${size}`:''}`:''}`)}}catch(err){_setSubmissionState(sessionId,'failed',{error:String(err?.message||err||'')});if(String(S.activeId||'')===sessionId&&!promptEl.value.trim())promptEl.value=promptText;showError(err.message||String(err))}}
+async function interruptRun(){if(!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();const sessionId=String(S.activeId||'');await api('/api/sessions/'+sessionId+'/interrupt',{method:'POST'});_setSubmissionState(sessionId,'complete');S.lastDeltaTs=Date.now();if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:140,allowWhenFrozen:true})}}
 async function compactNow(){if(!S.activeId)return;if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/compact',{method:'POST'});S.lastDeltaTs=Date.now();scheduleCompactRefreshBurst(COMPACT_AUTO_REFRESH_COUNT);if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:180,allowWhenFrozen:true})}}
 async function clearStaleTodos(){if(!S.activeId){showError(t('select_session_first'));return}if(S.staticMode&&S.frozen)resumeAutoUpdates();await api('/api/sessions/'+S.activeId+'/todos/clear-stale',{method:'POST'});S.lastDeltaTs=Date.now();if(!S.es||S.es.readyState===2){scheduleSnapshot({forceFull:false,delayMs:160,allowWhenFrozen:true})}}
 async function toggleUserMemoryMode(e){if(e)e.preventDefault();if(S.config?.user_memory_setting_locked){showError(t('memory_mode_locked'));return}const cycle=['weak','on','off'];const cur=currentUserMemoryMode();const next=cycle[(cycle.indexOf(cur)+1+cycle.length)%cycle.length];try{const out=await api('/api/user-memory/config',{method:'POST',body:JSON.stringify({mode:next})});S.config=S.config||{};S.config.user_memory_mode=String(out?.user_memory_mode||next);renderMemoryModeAction();showError('')}catch(err){showError(err.message||String(err))}}
@@ -95596,6 +97436,7 @@ window.addEventListener('DOMContentLoaded',()=>{const search=E('sessionSearch');
 
 APP_CSS += r"""
 :root{--web-scrollbar-size:8px;--web-scrollbar-thumb:rgba(98,116,142,.44);--web-scrollbar-thumb-hover:rgba(76,98,128,.7)}
+.session-history-badge{box-sizing:border-box;position:absolute;right:-3px;bottom:-3px;display:flex;align-items:center;justify-content:center;width:15px;height:15px;padding:0;overflow:hidden;border:1px solid #252526;border-radius:50%;background:#c586c0;color:#fff;pointer-events:none}.session-history-badge>.codicon{box-sizing:border-box;position:relative;display:block;flex:0 0 9px;width:9px;height:9px;margin:0;border:1px solid currentColor;border-radius:50%;font-size:0;line-height:0;text-align:center}.session-history-badge>.codicon::before{content:"";position:absolute;left:3px;top:1px;width:1px;height:3px;background:currentColor;transform-origin:50% 100%;transform:rotate(0deg)}.session-history-badge>.codicon::after{content:"";position:absolute;left:4px;top:4px;width:3px;height:1px;background:currentColor;transform-origin:left center;transform:rotate(35deg)}
 html,body{scrollbar-gutter:stable}
 *{scrollbar-width:thin;scrollbar-color:transparent transparent!important}
 *:hover,*:focus,*:focus-within{scrollbar-color:var(--web-scrollbar-thumb) transparent!important}
@@ -96069,6 +97910,16 @@ ADMIN_INDEX_HTML = """<!doctype html>
       <p>启动参数、运行统计与共享应用治理</p>
     </div>
     <div class="header-actions">
+      <label class="admin-language-control" data-admin-no-i18n>
+        <span id="adminLanguageLabel">界面语言</span>
+        <select id="adminLanguageSelect" aria-label="界面语言">
+          <option value="zh-CN">简体中文</option>
+          <option value="zh-TW">繁體中文</option>
+          <option value="ja">日本語</option>
+          <option value="en">English</option>
+        </select>
+        <small id="adminLanguageSource">跟随 WebUI 用户语言</small>
+      </label>
       <span id="connectionBadge" class="badge muted">未认证</span>
       <a href="/" class="button ghost">返回会话</a>
       <button id="logoutBtn" class="ghost" type="button">退出</button>
@@ -96199,6 +98050,7 @@ ADMIN_INDEX_HTML = """<!doctype html>
           </div>
           <div class="inline-actions evolution-actions"><button id="saveEvolutionBtn" type="button">Save Policy</button><button id="runEvolutionBtn" class="secondary" type="button">Run Now</button><button id="killEvolutionBtn" class="danger" type="button">Emergency Off</button></div>
           <div id="evolutionPolicyNote" class="notice hidden"></div>
+          <div id="evolutionBootstrap" class="notice">Restart source is configured in Startup Parameters: <code>inherit</code> keeps existing kernel history; <code>inject</code> adds the embedded kernel without deleting old versions.</div>
         </article>
         <article class="card evolution-current">
           <div class="card-head"><h3>Active Deployment</h3><span id="evolutionCanaryBadge" class="badge muted">stable</span></div>
@@ -96294,7 +98146,18 @@ ADMIN_INDEX_HTML = """<!doctype html>
 
 <div id="loginOverlay" class="login-overlay">
   <div class="login-card" role="dialog" aria-modal="true" aria-labelledby="authTitle">
-    <div class="eyebrow">ADMIN AUTHENTICATION</div>
+    <div class="login-language-row">
+      <div class="eyebrow">ADMIN AUTHENTICATION</div>
+      <label class="admin-language-control compact" data-admin-no-i18n>
+        <span id="adminLoginLanguageLabel">界面语言</span>
+        <select id="adminLoginLanguageSelect" aria-label="界面语言">
+          <option value="zh-CN">简体中文</option>
+          <option value="zh-TW">繁體中文</option>
+          <option value="ja">日本語</option>
+          <option value="en">English</option>
+        </select>
+      </label>
+    </div>
     <h2 id="authTitle">正在检查管理员状态</h2>
     <p id="authDescription">请稍候，正在连接本机认证服务。</p>
 
@@ -96353,6 +98216,7 @@ code{background:#eef2f7;padding:2px 5px;border-radius:5px}
 .admin-header p,.section-head p{margin:0;color:var(--muted)}
 .eyebrow{color:var(--brand);font-size:.72rem;font-weight:800;letter-spacing:.18em}
 .header-actions,.inline-actions,.action-bar{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+.admin-language-control{display:grid;grid-template-columns:auto minmax(112px,auto);align-items:center;gap:2px 7px;margin:0;padding:5px 8px;border:1px solid var(--line);border-radius:9px;background:#fff}.admin-language-control span{font-size:.7rem;font-weight:800;color:var(--muted)}.admin-language-control select{grid-row:1/3;grid-column:2;padding:5px 26px 5px 8px}.admin-language-control small{font-size:.62rem;color:var(--muted);white-space:nowrap}
 .badge{display:inline-flex;align-items:center;border:1px solid #c8d8fb;border-radius:999px;background:#edf4ff;color:#1849a9;padding:5px 9px;font-size:.75rem;font-weight:800}
 .badge.muted{border-color:var(--line);background:#f4f6f9;color:var(--muted)}
 .badge.good{background:#e8fff7;border-color:#a9ead5;color:#067647}
@@ -96453,6 +98317,7 @@ th{color:var(--muted);font-size:.72rem;text-transform:uppercase;letter-spacing:.
 .login-overlay{position:fixed;inset:0;background:rgba(10,18,34,.66);display:flex;align-items:center;justify-content:center;z-index:100;backdrop-filter:blur(8px);padding:18px}
 .login-overlay.hidden{display:none}
 .login-card{width:min(440px,100%);background:#fff;border-radius:18px;padding:25px;box-shadow:0 28px 80px rgba(0,0,0,.28);display:flex;flex-direction:column;gap:14px}
+.login-language-row{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.admin-language-control.compact{grid-template-columns:auto minmax(105px,auto)}.admin-language-control.compact select{grid-row:1;grid-column:2}.admin-language-control.compact small{display:none}
 .login-card h2{margin:0}.login-card p{margin:0;color:var(--muted);line-height:1.5}
 .auth-form{display:flex;flex-direction:column;gap:12px}
 .token-login{border-top:1px solid var(--line);padding-top:12px}
@@ -96467,10 +98332,270 @@ th{color:var(--muted);font-size:.72rem;text-transform:uppercase;letter-spacing:.
 """
 
 ADMIN_JS = r"""
-const A={token:sessionStorage.getItem('clouds_coder_admin_token')||'',config:null,metrics:null,metricUserHash:'',metricResizeTimer:0,apps:[],skills:[],reviewStatus:'pending',selectedSkills:[],toastTimer:0,serverErrors:[],bootId:'',restartNonce:'',collabProjects:[],collabProject:null,collabMembers:[],collabConflicts:[],collabAudit:[],processPayload:null,selectedProcesses:[],processDetailId:'',evolution:null,evolutionTimer:0};
+const ADMIN_LANGUAGE_CODES=['zh-CN','zh-TW','ja','en'];
+const ADMIN_LANGUAGE_INDEX={'zh-CN':1,'zh-TW':2,'ja':3,'en':4};
+const ADMIN_I18N_ROWS=[
+['Clouds Coder Admin','Clouds Coder 管理控制台','Clouds Coder 管理控制台','Clouds Coder 管理コンソール','Clouds Coder Admin'],
+['CONTROL PLANE','控制平面','控制平面','コントロールプレーン','CONTROL PLANE'],
+['启动参数、运行统计与共享应用治理','启动参数、运行统计与共享应用治理','啟動參數、執行統計與共享應用治理','起動設定、稼働統計、共有アプリの管理','Startup settings, runtime metrics, and shared app governance'],
+['界面语言','界面语言','介面語言','表示言語','Language'],
+['跟随 WebUI 用户语言','与 WebUI 用户语言同步','與 WebUI 使用者語言同步','WebUI のユーザー言語と同期','Synced with WebUI language'],
+['未认证','未认证','未認證','未認証','Not authenticated'],
+['已认证','已认证','已認證','認証済み','Authenticated'],
+['返回会话','返回会话','返回工作階段','セッションへ戻る','Back to sessions'],
+['退出','退出','登出','ログアウト','Log out'],
+['运行统计','运行统计','執行統計','稼働統計','Metrics'],
+['后台进程','后台进程','背景程序','バックグラウンドプロセス','Processes'],
+['启动参数','启动参数','啟動參數','起動設定','Startup Config'],
+['协作空间','协作空间','協作空間','コラボレーション','Collaboration'],
+['应用管理','应用管理','應用管理','アプリ管理','Apps'],
+['运行洞察','运行洞察','執行洞察','運用インサイト','Runtime Insights'],
+['仅聚合匿名来源、计数、耗时与 Token；不保存提示词、工具参数、输出正文或原始 IP。','仅聚合匿名来源、计数、耗时与 Token；不保存提示词、工具参数、输出正文或原始 IP。','僅彙總匿名來源、計數、耗時與 Token；不儲存提示詞、工具參數、輸出正文或原始 IP。','匿名ソース、件数、所要時間、Token のみを集計し、プロンプト、ツール引数、出力本文、元 IP は保存しません。','Only anonymous sources, counts, duration, and tokens are aggregated; prompts, tool arguments, output text, and raw IPs are not stored.'],
+['最近 1 小时','最近 1 小时','最近 1 小時','直近 1 時間','Last hour'],
+['最近 24 小时','最近 24 小时','最近 24 小時','直近 24 時間','Last 24 hours'],
+['最近 7 天','最近 7 天','最近 7 天','直近 7 日間','Last 7 days'],
+['最近 30 天','最近 30 天','最近 30 天','直近 30 日間','Last 30 days'],
+['刷新','刷新','重新整理','更新','Refresh'],
+['调用与错误趋势','调用与错误趋势','呼叫與錯誤趨勢','呼び出しとエラーの推移','Calls and Error Trends'],
+['消息、模型、工具与应用启动','消息、模型、工具与应用启动','訊息、模型、工具與應用啟動','メッセージ、モデル、ツール、アプリ起動','Messages, models, tools, and app launches'],
+['Token 趋势','Token 趋势','Token 趨勢','Token の推移','Token Trends'],
+['仅统计提供 usage 的模型调用','仅统计提供 usage 的模型调用','僅統計提供 usage 的模型呼叫','usage が提供されたモデル呼び出しのみ','Only model calls that report usage'],
+['调用结果分布','调用结果分布','呼叫結果分佈','呼び出し結果の分布','Call Result Distribution'],
+['模型与工具的成功、错误、超时和取消','模型与工具的成功、错误、超时和取消','模型與工具的成功、錯誤、逾時和取消','モデルとツールの成功、エラー、タイムアウト、キャンセル','Model and tool successes, errors, timeouts, and cancellations'],
+['延迟分位','延迟分位','延遲分位數','レイテンシ分位点','Latency Percentiles'],
+['平均、P50 与 P95 耗时','平均、P50 与 P95 耗时','平均、P50 與 P95 耗時','平均、P50、P95 の所要時間','Average, P50, and P95 duration'],
+['模型 Token 分布','模型 Token 分布','模型 Token 分佈','モデル別 Token 分布','Model Token Distribution'],
+['输入与输出 Token，未知 usage 不计入','输入与输出 Token，未知 usage 不计入','輸入與輸出 Token，未知 usage 不計入','入出力 Token。usage 不明は除外','Input and output tokens; unknown usage is excluded'],
+['应用使用排行','应用使用排行','應用使用排行','アプリ利用ランキング','App Usage Ranking'],
+['启动量与匿名活跃来源','启动量与匿名活跃来源','啟動量與匿名活躍來源','起動数と匿名アクティブソース','Launches and anonymous active sources'],
+['按匿名来源追踪','按匿名来源追踪','依匿名來源追蹤','匿名ソース別トラッキング','Track by Anonymous Source'],
+['标识由访问来源派生，仅用于本机聚合；共享网络可能合并多人。','标识由访问来源派生，仅用于本机聚合；共享网络可能合并多人。','識別碼由存取來源衍生，僅用於本機彙總；共享網路可能合併多人。','識別子はアクセス元から生成されローカル集計だけに使用されます。共有ネットワークでは複数人が統合される場合があります。','Identifiers are derived from access sources and used only for local aggregation; shared networks may combine multiple users.'],
+['匿名来源排行','匿名来源排行','匿名來源排行','匿名ソースランキング','Anonymous Source Ranking'],
+['来源明细','来源明细','來源明細','ソース詳細','Source Details'],
+['模型调用','模型调用','模型呼叫','モデル呼び出し','Model Calls'],
+['工具调用','工具调用','工具呼叫','ツール呼び出し','Tool Calls'],
+['应用聚合','应用聚合','應用彙總','アプリ集計','App Aggregates'],
+['事件统计','事件统计','事件統計','イベント統計','Event Metrics'],
+['查看所有用户启动的受管后台进程；命令、路径和输出中的敏感信息会自动脱敏。','查看所有用户启动的受管后台进程；命令、路径和输出中的敏感信息会自动脱敏。','查看所有使用者啟動的受管背景程序；命令、路徑和輸出中的敏感資訊會自動去識別化。','全ユーザーが起動した管理対象プロセスを表示します。コマンド、パス、出力内の機密情報は自動的にマスクされます。','View managed background processes started by all users. Sensitive command, path, and output data is automatically redacted.'],
+['筛选','筛选','篩選','絞り込み','Filter'],
+['选择当前页','选择当前页','選擇目前頁面','現在のページを選択','Select current page'],
+['停止所选','停止所选','停止所選項目','選択項目を停止','Stop selected'],
+['停止当前筛选的运行项','停止当前筛选的运行项','停止目前篩選的執行項目','現在の絞り込み結果を停止','Stop filtered processes'],
+['选择“详情”查看进程状态和脱敏输出','选择“详情”查看进程状态和脱敏输出','選擇「詳情」查看程序狀態和去識別化輸出','「詳細」を選択してプロセス状態とマスク済み出力を表示','Select Details to view process status and redacted output'],
+['所有修改先保存为草稿；标记为“需重启”的参数在安全重启后生效。','所有修改先保存为草稿；标记为“需重启”的参数在安全重启后生效。','所有修改先儲存為草稿；標記為「需重新啟動」的參數會在安全重新啟動後生效。','変更はまず下書きとして保存され、「再起動が必要」な設定は安全な再起動後に反映されます。','Changes are saved as a draft first; settings marked restart-required take effect after a safe restart.'],
+['读取中','读取中','讀取中','読み込み中','Loading'],
+['保存参数','保存参数','儲存參數','設定を保存','Save Config'],
+['保存并重启','保存并重启','儲存並重新啟動','保存して再起動','Save and Restart'],
+['用当前运行参数覆盖草稿','用当前运行参数覆盖草稿','以目前執行參數覆蓋草稿','現在の実行設定で下書きを上書き','Replace Draft with Active'],
+['设为默认参数','设为默认参数','設為預設參數','既定値に設定','Set as Defaults'],
+['恢复默认参数','恢复默认参数','恢復預設參數','既定値を復元','Restore Defaults'],
+['重置为初始参数','重置为初始参数','重設為初始參數','初期設定にリセット','Reset to Initial'],
+['导入 JSON','导入 JSON','匯入 JSON','JSON をインポート','Import JSON'],
+['导出 JSON','导出 JSON','匯出 JSON','JSON をエクスポート','Export JSON'],
+['Liquid Kernel Evolution','液态内核演进','液態核心演進','Liquid Kernel 進化','Liquid Kernel Evolution'],
+['版本化 Agent 内核、自主评估、随机盲评、Canary 与可回滚升级链路。','版本化 Agent 内核、自主评估、随机盲评、Canary 与可回滚升级链路。','版本化 Agent 核心、自主評估、隨機盲評、Canary 與可回復升級鏈路。','バージョン管理された Agent カーネル、自律評価、ランダム盲検、Canary、ロールバック可能な更新フロー。','Versioned agent kernel with autonomous evaluation, randomized blind judging, canary rollout, and rollback.'],
+['Evolution Policy','演进策略','演進策略','進化ポリシー','Evolution Policy'],
+['Schedule','计划周期','排程週期','スケジュール','Schedule'],
+['Timezone','时区','時區','タイムゾーン','Timezone'],
+['History versions','历史版本数','歷史版本數','履歴バージョン数','History versions'],
+['Start date','开始日期','開始日期','開始日','Start date'],
+['End date','结束日期','結束日期','終了日','End date'],
+['Generator profile','生成模型配置','生成模型設定','生成モデルプロファイル','Generator profile'],
+['Judge profile','评审模型配置','評審模型設定','審査モデルプロファイル','Judge profile'],
+['User scope','用户范围','使用者範圍','ユーザー範囲','User scope'],
+['Session scope','会话范围','工作階段範圍','セッション範囲','Session scope'],
+['Enable metric/event triggers','启用指标/事件触发器','啟用指標/事件觸發器','メトリクス／イベントトリガーを有効化','Enable metric/event triggers'],
+['Save Policy','保存策略','儲存策略','ポリシーを保存','Save Policy'],
+['Run Now','立即运行','立即執行','今すぐ実行','Run Now'],
+['Emergency Off','紧急关闭','緊急關閉','緊急停止','Emergency Off'],
+['Active Deployment','当前部署','目前部署','現在のデプロイ','Active Deployment'],
+['Live Pipeline','实时演进链路','即時演進鏈路','ライブパイプライン','Live Pipeline'],
+['Evolution Lineage','演进谱系','演進譜系','進化系統','Evolution Lineage'],
+['父版本、候选、Canary、升级和回滚记录。','父版本、候选、Canary、升级和回滚记录。','父版本、候選、Canary、升級和回復記錄。','親バージョン、候補、Canary、昇格、ロールバックの記録。','Parent versions, candidates, canaries, promotions, and rollback history.'],
+['Runs','运行记录','執行記錄','実行履歴','Runs'],
+['Versions & Backups','版本与备份','版本與備份','バージョンとバックアップ','Versions & Backups'],
+['Detail','详情','詳情','詳細','Detail'],
+['Close','关闭','關閉','閉じる','Close'],
+['共享应用','共享应用','共享應用','共有アプリ','Shared Apps'],
+['管理员可直接组合 1-8 个 Skills 发布应用，也可审核用户提交的不可变版本。','管理员可直接组合 1-8 个 Skills 发布应用，也可审核用户提交的不可变版本。','管理員可直接組合 1-8 個 Skills 發佈應用，也可審核使用者提交的不可變版本。','管理者は 1～8 個の Skills を組み合わせてアプリを公開し、ユーザーが提出した不変バージョンを審査できます。','Admins can publish apps composed of 1–8 Skills and review immutable user submissions.'],
+['创建共享应用','创建共享应用','建立共享應用','共有アプリを作成','Create Shared App'],
+['应用名称','应用名称','應用名稱','アプリ名','App name'],
+['图标','图标','圖示','アイコン','Icon'],
+['说明','说明','說明','説明','Description'],
+['搜索 Skills','搜索 Skills','搜尋 Skills','Skills を検索','Search Skills'],
+['创建并发布','创建并发布','建立並發佈','作成して公開','Create and Publish'],
+['待审核','待审核','待審核','審査待ち','Pending Review'],
+['已发布','已发布','已發佈','公開済み','Published'],
+['已下架','已下架','已下架','非公開','Unpublished'],
+['已拒绝','已拒绝','已拒絕','却下','Rejected'],
+['管理 LAN 项目、不可变成员/设备身份、准入申请和审计事件。','管理 LAN 项目、不可变成员/设备身份、准入申请和审计事件。','管理 LAN 專案、不可變成員／裝置身分、准入申請和稽核事件。','LAN プロジェクト、不変のメンバー／デバイス ID、参加申請、監査イベントを管理します。','Manage LAN projects, immutable member/device identities, admission requests, and audit events.'],
+['局域网协作服务','局域网协作服务','區域網路協作服務','LAN コラボレーションサービス','LAN Collaboration Service'],
+['端口自动使用主端口 + 7。','端口自动使用主端口 + 7。','連接埠自動使用主連接埠 + 7。','ポートはメインポート + 7 を自動使用します。','The port automatically uses the main port + 7.'],
+['打开协作大厅','打开协作大厅','開啟協作大廳','コラボレーションロビーを開く','Open Collaboration Lobby'],
+['应用局域网默认并重启','应用局域网默认并重启','套用區域網路預設並重新啟動','LAN 既定設定を適用して再起動','Apply LAN Defaults and Restart'],
+['关闭协作服务','关闭协作服务','關閉協作服務','コラボレーションを停止','Disable Collaboration'],
+['创建项目','创建项目','建立專案','プロジェクトを作成','Create Project'],
+['项目名称','项目名称','專案名稱','プロジェクト名','Project name'],
+['项目密码','项目密码','專案密碼','プロジェクトパスワード','Project password'],
+['项目时区','项目时区','專案時區','プロジェクトのタイムゾーン','Project timezone'],
+['创建','创建','建立','作成','Create'],
+['选择一个项目查看成员、设备与治理操作','选择一个项目查看成员、设备与治理操作','選擇一個專案查看成員、裝置與治理操作','プロジェクトを選択してメンバー、デバイス、管理操作を表示','Select a project to view members, devices, and governance actions'],
+['未解决冲突','未解决冲突','未解決衝突','未解決の競合','Unresolved Conflicts'],
+['审计记录','审计记录','稽核記錄','監査ログ','Audit Log'],
+['ADMIN AUTHENTICATION','管理员认证','管理員認證','管理者認証','ADMIN AUTHENTICATION'],
+['正在检查管理员状态','正在检查管理员状态','正在檢查管理員狀態','管理者状態を確認中','Checking administrator status'],
+['请稍候，正在连接本机认证服务。','请稍候，正在连接本机认证服务。','請稍候，正在連線本機認證服務。','ローカル認証サービスに接続しています。','Please wait while connecting to the local authentication service.'],
+['管理员账号','管理员账号','管理員帳號','管理者アカウント','Administrator account'],
+['管理员密码','管理员密码','管理員密碼','管理者パスワード','Administrator password'],
+['确认密码','确认密码','確認密碼','パスワード確認','Confirm password'],
+['创建管理员并进入','创建管理员并进入','建立管理員並進入','管理者を作成して続行','Create Administrator and Continue'],
+['登录控制台','登录控制台','登入控制台','コンソールにログイン','Log in to Console'],
+['使用 Admin Token（高级/恢复入口）','使用 Admin Token（高级/恢复入口）','使用 Admin Token（進階／復原入口）','Admin Token を使用（高度／復旧）','Use Admin Token (Advanced/Recovery)'],
+['使用 Token 进入','使用 Token 进入','使用 Token 進入','Token で続行','Continue with Token'],
+['重试','重试','重試','再試行','Retry'],
+['暂无数据','暂无数据','暫無資料','データがありません','No data'],
+['全部来源','全部来源','全部來源','すべてのソース','All sources'],
+['全部状态','全部状态','全部狀態','すべての状態','All statuses'],
+['成功','成功','成功','成功','Success'],
+['错误','错误','錯誤','エラー','Error'],
+['超时','超时','逾時','タイムアウト','Timeout'],
+['取消','取消','取消','キャンセル','Cancelled'],
+['模型','模型','模型','モデル','Model'],
+['工具','工具','工具','ツール','Tool'],
+['消息','消息','訊息','メッセージ','Messages'],
+['失败','失败','失敗','失敗','Failures'],
+['用户','用户','使用者','ユーザー','User'],
+['会话','会话','工作階段','セッション','Session'],
+['应用','应用','應用','アプリ','App'],
+['类型','类型','類型','種類','Type'],
+['名称','名称','名稱','名前','Name'],
+['状态','状态','狀態','状態','Status'],
+['时间','时间','時間','時刻','Time'],
+['操作','操作','操作','操作','Action'],
+['详情','详情','詳情','詳細','Details'],
+['停止','停止','停止','停止','Stop'],
+['移除','移除','移除','削除','Remove'],
+['确定','确定','確定','確認','Confirm'],
+['关闭','关闭','關閉','閉じる','Close'],
+['启用','启用','啟用','有効','Enabled'],
+['停用','停用','停用','無効','Disabled'],
+['运行中','运行中','執行中','実行中','Running'],
+['未运行','未运行','未執行','停止中','Not running'],
+['已启用','已启用','已啟用','有効','Enabled'],
+['进程详情','进程详情','程序詳情','プロセス詳細','Process Details'],
+['工作区','工作区','工作區','ワークスペース','Workspace'],
+['命令','命令','命令','コマンド','Command'],
+['运行时间','运行时间','執行時間','実行時間','Runtime'],
+['退出码','退出码','結束碼','終了コード','Exit code'],
+['没有匹配的后台进程','没有匹配的后台进程','沒有符合的背景程序','一致するバックグラウンドプロセスはありません','No matching background processes'],
+['没有匹配的协作项目','没有匹配的协作项目','沒有符合的協作專案','一致するコラボレーションプロジェクトはありません','No matching collaboration projects'],
+['没有匹配的成员或设备','没有匹配的成员或设备','沒有符合的成員或裝置','一致するメンバーまたはデバイスはありません','No matching members or devices'],
+['当前无未解决冲突','当前无未解决冲突','目前沒有未解決衝突','未解決の競合はありません','No unresolved conflicts'],
+['没有未解决冲突','没有未解决冲突','沒有未解決衝突','未解決の競合はありません','No unresolved conflicts'],
+['没有匹配的 Skill','没有匹配的 Skill','沒有符合的 Skill','一致する Skill はありません','No matching Skills'],
+['此分类暂无应用','此分类暂无应用','此分類暫無應用','このカテゴリにアプリはありません','No apps in this category'],
+['未命名应用','未命名应用','未命名應用','名称未設定のアプリ','Untitled app'],
+['暂无说明','暂无说明','暫無說明','説明なし','No description'],
+['Evolution policy saved','演进策略已保存','演進策略已儲存','進化ポリシーを保存しました','Evolution policy saved'],
+['Start a new liquid-kernel evolution run?','开始新的液态内核演进任务？','開始新的液態核心演進任務？','新しい Liquid Kernel 進化を開始しますか？','Start a new liquid-kernel evolution run?'],
+['Evolution run queued: ','演进任务已排队：','演進任務已排隊：','進化実行をキューに追加しました: ','Evolution run queued: '],
+['Set evolution to Off, cancel the active run, and abort any Canary?','将演进设为 Off、取消当前任务并中止所有 Canary？','將演進設為 Off、取消目前任務並中止所有 Canary？','進化を Off にし、実行中タスクと Canary を中止しますか？','Set evolution to Off, cancel the active run, and abort any Canary?'],
+['Liquid kernel evolution is Off','液态内核演进已关闭','液態核心演進已關閉','Liquid Kernel 進化は Off です','Liquid kernel evolution is Off'],
+['No kernel versions','没有内核版本','沒有核心版本','カーネルバージョンがありません','No kernel versions'],
+['No evolution runs','没有演进任务','沒有演進任務','進化実行がありません','No evolution runs'],
+['No versions','没有版本','沒有版本','バージョンがありません','No versions'],
+['Run','运行','執行','実行','Run'],
+['Mode','模式','模式','モード','Mode'],
+['Candidate','候选版本','候選版本','候補','Candidate'],
+['Created','创建时间','建立時間','作成日時','Created'],
+['Actions','操作','操作','操作','Actions'],
+['Version','版本','版本','バージョン','Version'],
+['View','查看','查看','表示','View'],
+['Approve','批准','核准','承認','Approve'],
+['Reject','拒绝','拒絕','却下','Reject'],
+['Cancel','取消','取消','キャンセル','Cancel'],
+['Promote','升级','升級','昇格','Promote'],
+['Rollback','回滚','回復','ロールバック','Rollback'],
+['Diff','差异','差異','差分','Diff'],
+['parent','父版本','父版本','親','parent'],
+['score','评分','評分','スコア','score'],
+['stable','稳定','穩定','安定','stable'],
+['No diff','没有差异','沒有差異','差分なし','No diff'],
+['request failed','请求失败','請求失敗','リクエストに失敗しました','Request failed'],
+['请求失败','请求失败','請求失敗','リクエストに失敗しました','Request failed'],
+['认证失败','认证失败','認證失敗','認証に失敗しました','Authentication failed'],
+['认证服务不可用','认证服务不可用','認證服務無法使用','認証サービスを利用できません','Authentication service unavailable'],
+['登录会话已过期，请重新登录','登录会话已过期，请重新登录','登入工作階段已過期，請重新登入','ログインセッションの有効期限が切れました。再度ログインしてください。','Your login session expired. Please log in again.'],
+['两次输入的密码不一致','两次输入的密码不一致','兩次輸入的密碼不一致','パスワードが一致しません','Passwords do not match'],
+['请输入 Admin Token','请输入 Admin Token','請輸入 Admin Token','Admin Token を入力してください','Enter the Admin Token'],
+['已登录，但部分控制台数据加载失败，请手动刷新。','已登录，但部分控制台数据加载失败，请手动刷新。','已登入，但部分控制台資料載入失敗，請手動重新整理。','ログインしましたが、一部のコンソールデータを読み込めませんでした。手動で更新してください。','Signed in, but some console data failed to load. Refresh manually.'],
+['参数已保存','参数已保存','參數已儲存','設定を保存しました','Config saved'],
+['参数已保存并设为默认','参数已保存并设为默认','參數已儲存並設為預設','設定を保存して既定値にしました','Config saved and set as defaults'],
+['已恢复默认参数','已恢复默认参数','已恢復預設參數','既定設定を復元しました','Defaults restored'],
+['已重置为初始参数','已重置为初始参数','已重設為初始參數','初期設定にリセットしました','Reset to initial settings'],
+['有未生效参数','有未生效参数','有尚未生效的參數','未適用の設定があります','Pending changes'],
+['参数已生效','参数已生效','參數已生效','設定は適用済みです','Config is active'],
+['草稿与当前运行参数一致','草稿与当前运行参数一致','草稿與目前執行參數一致','下書きは現在の実行設定と一致しています','Draft matches active config'],
+['当前没有等待重启生效的参数。','当前没有等待重启生效的参数。','目前沒有等待重新啟動生效的參數。','再起動待ちの設定はありません。','No settings are waiting for restart.'],
+['参数已导入到表单，请检查后保存。','参数已导入到表单，请检查后保存。','參數已匯入表單，請檢查後儲存。','設定をフォームに読み込みました。確認して保存してください。','Config imported into the form. Review and save it.'],
+['导入完成','导入完成','匯入完成','インポート完了','Import complete'],
+['重启请求已接收，页面将在服务恢复后自动刷新。','重启请求已接收，页面将在服务恢复后自动刷新。','已收到重新啟動請求，服務恢復後頁面會自動重新整理。','再起動要求を受け付けました。サービス復旧後にページを自動更新します。','Restart request accepted. The page will refresh when the service is available.'],
+['局域网协作正在启动','局域网协作正在启动','區域網路協作正在啟動','LAN コラボレーションを起動しています','LAN collaboration is starting'],
+['协作服务正在关闭','协作服务正在关闭','協作服務正在關閉','コラボレーションサービスを停止しています','Collaboration service is stopping'],
+['共享应用已发布','共享应用已发布','共享應用已發佈','共有アプリを公開しました','Shared app published'],
+['应用已发布','应用已发布','應用已發佈','アプリを公開しました','App published'],
+['应用已拒绝','应用已拒绝','應用已拒絕','アプリを却下しました','App rejected']
+];
+const ADMIN_CONFIG_I18N_ROWS=[
+['network','网络','網路','ネットワーク','Network'],['runtime','运行时','執行階段','ランタイム','Runtime'],['evolution','演进','演進','進化','Evolution'],['live_input','实时输入','即時輸入','ライブ入力','Live Input'],['paths','路径','路徑','パス','Paths'],['services','服务','服務','サービス','Services'],['security','安全','安全性','セキュリティ','Security'],['webui','WebUI','WebUI','WebUI','WebUI'],['limits','限制','限制','制限','Limits'],['model','模型','模型','モデル','Model'],['arbiter','仲裁器','仲裁器','アービター','Arbiter'],
+['Bind host','绑定主机','繫結主機','バインドホスト','Bind host'],['Agent port','Agent 端口','Agent 連接埠','Agent ポート','Agent port'],['Skills Studio port','Skills Studio 端口','Skills Studio 連接埠','Skills Studio ポート','Skills Studio port'],['RAG admin port','RAG 管理端口','RAG 管理連接埠','RAG 管理ポート','RAG admin port'],['Code admin port','代码管理端口','程式碼管理連接埠','コード管理ポート','Code admin port'],['MCP service port','MCP 服务端口','MCP 服務連接埠','MCP サービスポート','MCP service port'],['IDE port','IDE 端口','IDE 連接埠','IDE ポート','IDE port'],['Collaboration bind host','协作绑定主机','協作繫結主機','コラボレーションのバインドホスト','Collaboration bind host'],['Collaboration port','协作端口','協作連接埠','コラボレーションポート','Collaboration port'],
+['Context token limit','上下文 Token 限制','上下文 Token 限制','コンテキスト Token 上限','Context token limit'],['Maximum agent rounds','Agent 最大轮数','Agent 最大輪數','Agent 最大ラウンド数','Maximum agent rounds'],['Run timeout (seconds)','运行超时（秒）','執行逾時（秒）','実行タイムアウト（秒）','Run timeout (seconds)'],['Shell timeout (seconds)','Shell 超时（秒）','Shell 逾時（秒）','Shell タイムアウト（秒）','Shell timeout (seconds)'],['Shell timeout mode','Shell 超时模式','Shell 逾時模式','Shell タイムアウトモード','Shell timeout mode'],['Shell async handoff (seconds)','Shell 异步移交（秒）','Shell 非同步移交（秒）','Shell 非同期引き継ぎ（秒）','Shell async handoff (seconds)'],
+['Liquid kernel mode','液态内核模式','液態核心模式','Liquid Kernel モード','Liquid kernel mode'],['Evolution schedule','演进周期','演進週期','進化スケジュール','Evolution schedule'],['Liquid kernel restart policy','液态内核重启策略','液態核心重新啟動策略','Liquid Kernel 再起動ポリシー','Liquid kernel restart policy'],
+['Skills root','Skills 根目录','Skills 根目錄','Skills ルート','Skills root'],['WebUI config JSON','WebUI 配置 JSON','WebUI 設定 JSON','WebUI 設定 JSON','WebUI config JSON'],['External WebUI directory','外部 WebUI 目录','外部 WebUI 目錄','外部 WebUI ディレクトリ','External WebUI directory'],['LLM config file or URL','LLM 配置文件或 URL','LLM 設定檔或 URL','LLM 設定ファイルまたは URL','LLM config file or URL'],
+['Skills Studio','Skills Studio','Skills Studio','Skills Studio','Skills Studio'],['RAG admin','RAG 管理服务','RAG 管理服務','RAG 管理','RAG admin'],['Code library admin','代码库管理服务','程式碼庫管理服務','コードライブラリ管理','Code library admin'],['Programming IDE','编程 IDE','程式設計 IDE','プログラミング IDE','Programming IDE'],['IDE password login','IDE 密码登录','IDE 密碼登入','IDE パスワードログイン','IDE password login'],['MCP service','MCP 服务','MCP 服務','MCP サービス','MCP service'],['LAN collaboration','LAN 协作','LAN 協作','LAN コラボレーション','LAN collaboration'],
+['Collaboration TLS certificate','协作 TLS 证书','協作 TLS 憑證','コラボレーション TLS 証明書','Collaboration TLS certificate'],['Collaboration TLS private key','协作 TLS 私钥','協作 TLS 私鑰','コラボレーション TLS 秘密鍵','Collaboration TLS private key'],['Trusted HTTPS reverse proxy','可信 HTTPS 反向代理','可信任 HTTPS 反向代理','信頼済み HTTPS リバースプロキシ','Trusted HTTPS reverse proxy'],['Trusted LAN HTTP mode','可信 LAN HTTP 模式','可信任 LAN HTTP 模式','信頼済み LAN HTTP モード','Trusted LAN HTTP mode'],
+['External WebUI mode','外部 WebUI 模式','外部 WebUI 模式','外部 WebUI モード','External WebUI mode'],['Export built-in WebUI on start','启动时导出内置 WebUI','啟動時匯出內建 WebUI','起動時に内蔵 WebUI をエクスポート','Export built-in WebUI on start'],['Overwrite WebUI export','覆盖 WebUI 导出','覆蓋 WebUI 匯出','WebUI エクスポートを上書き','Overwrite WebUI export'],['UI language','界面语言','介面語言','表示言語','UI language'],['Chat UI style','聊天界面样式','聊天介面樣式','チャット UI スタイル','Chat UI style'],['Upload list','上传列表','上傳清單','アップロード一覧','Upload list'],['Download offline JS libraries','下载离线 JS 库','下載離線 JS 程式庫','オフライン JS ライブラリをダウンロード','Download offline JS libraries'],
+['Read context policy','上下文读取策略','上下文讀取策略','コンテキスト読取ポリシー','Read context policy'],['Tool memory policy','工具记忆策略','工具記憶策略','ツールメモリポリシー','Tool memory policy'],['Web search','网页搜索','網頁搜尋','Web 検索','Web search'],['User memory mode','用户记忆模式','使用者記憶模式','ユーザーメモリモード','User memory mode'],['Auto task level ceiling','自动任务等级上限','自動任務等級上限','自動タスクレベル上限','Auto task level ceiling'],['Level-2 Todo policy','二级 Todo 策略','二級 Todo 策略','レベル 2 Todo ポリシー','Level-2 Todo policy'],['Daily sessions per user','每用户每日会话数','每位使用者每日工作階段數','ユーザーごとの日次セッション数','Daily sessions per user'],
+['Ollama base URL','Ollama 基础 URL','Ollama 基礎 URL','Ollama ベース URL','Ollama base URL'],['Default model','默认模型','預設模型','既定モデル','Default model'],['Automatic model recovery','自动模型恢复','自動模型復原','モデルの自動復旧','Automatic model recovery'],['Arbiter enabled','启用仲裁器','啟用仲裁器','アービターを有効化','Arbiter enabled'],['Arbiter model override','仲裁器模型覆盖','仲裁器模型覆蓋','アービターモデル上書き','Arbiter model override'],['Arbiter timeout (seconds)','仲裁器超时（秒）','仲裁器逾時（秒）','アービタータイムアウト（秒）','Arbiter timeout (seconds)'],['Arbiter max tokens','仲裁器最大 Token','仲裁器最大 Token','アービター最大 Token','Arbiter max tokens'],['Arbiter temperature','仲裁器温度','仲裁器溫度','アービター温度','Arbiter temperature'],['Agent execution mode','Agent 执行模式','Agent 執行模式','Agent 実行モード','Agent execution mode'],['Max output tokens','最大输出 Token','最大輸出 Token','最大出力 Token','Max output tokens'],['Global concurrent tasks','全局并发任务数','全域並行任務數','グローバル同時タスク数','Global concurrent tasks'],['Concurrent tasks per user','每用户并发任务数','每位使用者並行任務數','ユーザーごとの同時タスク数','Concurrent tasks per user'],['Use filenames as RAG entities','将文件名用作 RAG 实体','將檔名用作 RAG 實體','ファイル名を RAG エンティティとして使用','Use filenames as RAG entities']
+];
+const adminDynamicRow=(source,ja,en,cn=source,tw=cn)=>[source,cn,tw,ja,en];
+const ADMIN_DYNAMIC_I18N_ROWS=[
+adminDynamicRow('统计范围','統計範囲','Metrics range'),adminDynamicRow('进程 ID、会话或命令','プロセス ID、セッション、コマンド','Process ID, session, or command'),adminDynamicRow('用户匿名标识','匿名ユーザー識別子','Anonymous user identifier'),
+adminDynamicRow('例如：代码安全审查','例：コードセキュリティレビュー','Example: code security review'),adminDynamicRow('可选，例如：🛡️','任意（例：🛡️）','Optional, for example: 🛡️'),adminDynamicRow('说明适用场景与输出','ユースケースと出力を説明','Describe applicable scenarios and output'),adminDynamicRow('按名称、ID 或说明搜索','名前、ID、説明で検索','Search by name, ID, or description'),adminDynamicRow('筛选项目','プロジェクトを絞り込み','Filter projects'),adminDynamicRow('昵称、设备短码、状态或最近 IP','ニックネーム、デバイス短縮コード、状態、最近の IP','Nickname, device short code, status, or recent IP'),adminDynamicRow('至少 12 位，包含三类字符','12 文字以上、3 種類の文字を含める','At least 12 characters using three character classes'),
+adminDynamicRow('参数','パラメータ','Parameter'),adminDynamicRow('无效','無効','Invalid'),adminDynamicRow('约 ','約 ','about '),adminDynamicRow(' 秒后重试',' 秒後に再試行',' seconds before retry'),adminDynamicRow('用此 Token 创建管理员','この Token で管理者を作成','Create administrator with this Token'),adminDynamicRow('远程首次初始化：输入现有 Admin Token，然后在上方填写账号密码并点击“创建管理员”。本机首次运行无需填写 Token。','リモート初期設定では既存の Admin Token を入力し、上でアカウントとパスワードを設定して「管理者を作成」を押してください。ローカル初回起動では Token は不要です。','For remote first-time setup, enter the existing Admin Token, complete the account and password above, then select Create Administrator. No Token is required for local first-time setup.'),adminDynamicRow('验证后只保存换取的短期会话，不保存原始 Admin Token。','検証後は交換された短期セッションのみを保存し、元の Admin Token は保存しません。','After verification, only the exchanged short-lived session is stored; the original Admin Token is not saved.'),adminDynamicRow('管理员登录','管理者ログイン','Administrator Login'),adminDynamicRow('这是首次运行。请创建唯一管理员账号，密码只以强哈希形式保存在本机。','初回起動です。一意の管理者アカウントを作成してください。パスワードは強力なハッシュのみでローカル保存されます。','This is the first run. Create the single administrator account; only a strong password hash is stored locally.'),adminDynamicRow('首次创建仅允许在本机完成；远程初始化请展开高级入口并使用 Admin Token。','初回作成はローカルでのみ可能です。リモート初期設定では高度な入口を開き Admin Token を使用してください。','First-time creation is allowed only locally. For remote initialization, expand the advanced entry and use the Admin Token.'),adminDynamicRow('使用管理员账号和密码登录。登录成功后本标签页只保存短期会话。','管理者アカウントとパスワードでログインします。成功後、このタブには短期セッションのみ保存されます。','Log in with the administrator account and password. This tab stores only the short-lived session after login.'),adminDynamicRow('无法确认管理员是否已创建，请检查服务后重试。','管理者が作成済みか確認できません。サービスを確認して再試行してください。','Unable to determine whether the administrator exists. Check the service and retry.'),adminDynamicRow('暂时无法验证已保存的会话，请重试。','保存済みセッションを一時的に確認できません。再試行してください。','The saved session cannot be verified right now. Please retry.'),
+adminDynamicRow('所选范围暂无数据','選択範囲にデータがありません','No data in the selected range'),adminDynamicRow('模型与工具调用的成功、错误、超时及取消占比','モデルとツール呼び出しの成功、エラー、タイムアウト、キャンセルの割合','Share of successful, errored, timed-out, and cancelled model and tool calls'),adminDynamicRow('次','回','times'),adminDynamicRow('模型与工具调用的平均、P50 和 P95 耗时','モデルとツール呼び出しの平均、P50、P95 所要時間','Average, P50, and P95 duration for model and tool calls'),adminDynamicRow('平均','平均','Average'),adminDynamicRow('暂无模型 Token usage 数据','モデルの Token usage データがありません','No model token usage data'),adminDynamicRow('各模型输入与输出 Token 的堆叠比较','モデル別の入力・出力 Token 積み上げ比較','Stacked comparison of input and output tokens by model'),adminDynamicRow('输入 Token','入力 Token','Input tokens'),adminDynamicRow('输出 Token','出力 Token','Output tokens'),adminDynamicRow('输入','入力','Input'),adminDynamicRow('输出','出力','Output'),adminDynamicRow('应用启动或绑定活动与匿名活跃来源排行','アプリの起動／バインド活動と匿名アクティブソースのランキング','Ranking of app launch or binding activity and anonymous active sources'),adminDynamicRow('未知应用','不明なアプリ','Unknown app'),adminDynamicRow('次启动','回の起動',' launches'),adminDynamicRow('个事件','件のイベント',' events'),adminDynamicRow('个匿名来源','件の匿名ソース',' anonymous sources'),adminDynamicRow('来源','ソース','Source'),adminDynamicRow('按时间桶展示消息、模型、工具与失败事件','時間バケット別のメッセージ、モデル、ツール、失敗イベント','Messages, models, tools, and failure events by time bucket'),adminDynamicRow('按时间桶展示已报告 usage 的输入与输出 Token','時間バケット別の報告済み入力・出力 Token','Reported input and output tokens by time bucket'),adminDynamicRow('从左侧排行或上方选择一个匿名来源查看聚合明细。','左のランキングまたは上の選択欄から匿名ソースを選び、集計詳細を表示します。','Select an anonymous source from the left ranking or selector above to view aggregate details.'),adminDynamicRow('所选范围内未找到该匿名来源。','選択範囲にその匿名ソースはありません。','The anonymous source was not found in the selected range.'),adminDynamicRow('匿名标识','匿名識別子','Anonymous identifier'),adminDynamicRow('的聚合明细','の集計詳細',' aggregate details'),adminDynamicRow('调用/启动','呼び出し／起動','Calls/launches'),adminDynamicRow('匿名活跃来源','匿名アクティブソース','Anonymous active sources'),adminDynamicRow('已知目录','既知ディレクトリ','Known directories'),adminDynamicRow('活跃会话','アクティブセッション','Active sessions'),adminDynamicRow('全部','合計','Total'),adminDynamicRow('排队任务','待機タスク','Queued tasks'),adminDynamicRow('当前调度队列','現在のスケジューラキュー','Current scheduler queue'),adminDynamicRow('成功率','成功率','Success rate'),adminDynamicRow('调用失败','呼び出し失敗','Call failures'),adminDynamicRow('Token 总量','Token 合計','Total tokens'),adminDynamicRow('Token 覆盖率','Token カバレッジ','Token coverage'),adminDynamicRow('有 usage','usage あり','With usage'),adminDynamicRow('模型 P95','モデル P95','Model P95'),adminDynamicRow('工具 P95','ツール P95','Tool P95'),adminDynamicRow('消息提交','メッセージ送信','Message submissions'),adminDynamicRow('所选范围','選択範囲','Selected range'),adminDynamicRow('应用启动','アプリ起動','App launches'),adminDynamicRow('匿名来源覆盖','匿名ソースカバレッジ','Anonymous source coverage'),adminDynamicRow('会话覆盖','セッションカバレッジ','Session coverage'),adminDynamicRow('应用覆盖','アプリカバレッジ','App coverage'),adminDynamicRow('Token usage 覆盖','Token usage カバレッジ','Token usage coverage'),adminDynamicRow('时间桶','時間バケット','Time bucket'),adminDynamicRow('内容采集','コンテンツ収集','Content collection'),adminDynamicRow('分钟','分','minutes'),adminDynamicRow('调用','呼び出し','Calls'),adminDynamicRow('平均 / P95','平均 / P95','Average / P95'),adminDynamicRow('失败 / 超时','失敗 / タイムアウト','Failures / timeouts'),adminDynamicRow('启动','起動','Launches'),adminDynamicRow('匿名来源','匿名ソース','Anonymous sources'),adminDynamicRow('最近活动','最近のアクティビティ','Recent activity'),adminDynamicRow('事件','イベント','Events'),adminDynamicRow('次数','回数','Count'),adminDynamicRow('总耗时','合計所要時間','Total duration'),
+adminDynamicRow('启用','有効','Enable'),adminDynamicRow('停用','無効','Disable'),adminDynamicRow('留空自动计算：','空欄で自動計算:','Leave blank to calculate automatically:'),adminDynamicRow('可留空','空欄可','Optional'),adminDynamicRow('（空）','（空）','(empty)'),adminDynamicRow('当前运行：','現在の実行値:','Active value:'),adminDynamicRow('项草稿与当前运行参数不同','件の下書き設定が現在の実行値と異なります',' draft settings differ from active values'),adminDynamicRow('黄色字段显示当前进程实际使用的值。','黄色のフィールドは現在のプロセスが実際に使用している値です。','Yellow fields show the values actually used by the current process.'),adminDynamicRow('运行 ','実行 ','Active '),adminDynamicRow('草稿 ','下書き ','Draft '),adminDynamicRow('上次重启失败，已自动回滚：','前回の再起動に失敗し、自動ロールバックしました:','The previous restart failed and was rolled back automatically:'),adminDynamicRow('用当前进程实际使用的参数覆盖全部重启草稿？尚未生效的草稿修改会被丢弃。','現在のプロセス値ですべての再起動下書きを上書きしますか？未適用の下書き変更は失われます。','Replace all restart drafts with the values used by the current process? Unapplied draft changes will be discarded.'),adminDynamicRow('已用当前运行参数覆盖草稿','現在の実行設定で下書きを上書きしました','Draft replaced with active config'),adminDynamicRow('JSON 中未找到参数对象','JSON に設定オブジェクトがありません','No config object found in JSON'),adminDynamicRow('导入失败：存在无效布尔参数','インポート失敗：無効な真偽値があります','Import failed: invalid boolean setting'),adminDynamicRow('服务将保存所有会话并重启。确定继续吗？','すべてのセッションを保存してサービスを再起動します。続行しますか？','The service will save all sessions and restart. Continue?'),adminDynamicRow('服务尚未恢复，新地址可能为 ','サービスはまだ復旧していません。新しいアドレスは ','The service has not recovered yet. The new address may be '),adminDynamicRow('/admin，请稍后打开。','/admin の可能性があります。後でもう一度開いてください。','/admin. Open it again shortly.'),
+adminDynamicRow('局域网协作已开启','LAN コラボレーションが有効です','LAN collaboration is enabled'),adminDynamicRow('可信 LAN HTTP','信頼済み LAN HTTP','Trusted LAN HTTP'),adminDynamicRow('点击一次即可自动监听 0.0.0.0，端口使用主端口 + 7，并安全重启。','ワンクリックで 0.0.0.0 を待ち受け、メインポート + 7 を使用して安全に再起動します。','One click listens on 0.0.0.0, uses the main port + 7, and safely restarts.'),adminDynamicRow('当前为明文 HTTP，仅适合可信局域网。公网或不可信网络请在“启动参数”中配置 TLS 或可信 HTTPS 代理。','現在は平文 HTTP です。信頼できる LAN でのみ使用してください。公開または信頼できないネットワークでは「起動設定」で TLS または信頼済み HTTPS プロキシを設定してください。','Plain HTTP is active and is suitable only for a trusted LAN. Configure TLS or a trusted HTTPS proxy in Startup Config for public or untrusted networks.'),adminDynamicRow('关闭后局域网成员将断开，确定继续吗？','無効にすると LAN メンバーが切断されます。続行しますか？','LAN members will disconnect when disabled. Continue?'),adminDynamicRow('恢复','復元','Restore'),adminDynamicRow('重命名','名前を変更','Rename'),adminDynamicRow('轮换密码','パスワードをローテーション','Rotate password'),adminDynamicRow('归档','アーカイブ','Archive'),adminDynamicRow('恢复运行','運用を再開','Resume'),adminDynamicRow('备份','バックアップ','Backup'),adminDynamicRow('移入隔离区','隔離領域へ移動','Quarantine'),adminDynamicRow('新项目名称','新しいプロジェクト名','New project name'),adminDynamicRow('新项目密码（至少 10 个 UTF-8 字节）','新しいプロジェクトパスワード（UTF-8 で 10 バイト以上）','New project password (at least 10 UTF-8 bytes)'),adminDynamicRow('输入项目名称确认移入 30 天隔离区','30 日間の隔離を確認するためプロジェクト名を入力','Enter the project name to confirm 30-day quarantine'),adminDynamicRow('归档后将撤销活跃会话，继续吗？','アーカイブするとアクティブセッションが失効します。続行しますか？','Archiving revokes active sessions. Continue?'),adminDynamicRow('恢复项目运行？','プロジェクトの運用を再開しますか？','Resume project operation?'),adminDynamicRow('备份已创建：','バックアップを作成しました:','Backup created:'),adminDynamicRow('项目操作已完成','プロジェクト操作が完了しました','Project action completed'),adminDynamicRow('协作项目已创建','コラボレーションプロジェクトを作成しました','Collaboration project created'),adminDynamicRow('批准成员','メンバーを承認','Approve member'),adminDynamicRow('封禁','ブロック','Block'),adminDynamicRow('撤销','取り消す','Revoke'),adminDynamicRow('批准设备','デバイスを承認','Approve device'),adminDynamicRow('设备已批准','デバイスを承認しました','Device approved'),adminDynamicRow('该成员及其设备？','このメンバーとそのデバイスを処理しますか？','this member and their devices?'),adminDynamicRow('成员权限已更新','メンバー権限を更新しました','Member access updated'),adminDynamicRow('个文件等待成员处理','件のファイルがメンバーの対応待ちです',' files are waiting for member action'),adminDynamicRow('未命名文件','名称未設定ファイル','Untitled file'),adminDynamicRow('紧急中止','緊急中止','Emergency abort'),adminDynamicRow('该冲突','この競合','this conflict'),adminDynamicRow('这只会恢复数据库中的当前基线并解除冻结，不会替成员选择或合并任何候选分支。','データベースの現在のベースラインを復元して凍結を解除するだけで、候補ブランチの選択やマージは行いません。','This only restores the current database baseline and removes the freeze; it does not select or merge candidate branches for members.'),adminDynamicRow('冲突已紧急中止并恢复基线','競合を緊急中止しベースラインを復元しました','Conflict emergency-aborted and baseline restored'),adminDynamicRow('哈希链验证通过','ハッシュチェーン検証に成功','Hash chain verified'),adminDynamicRow('条','件',' records'),adminDynamicRow('审计链验证失败','監査チェーン検証に失敗','Audit chain verification failed'),adminDynamicRow('操作者','実行者','Actor'),adminDynamicRow('目标','対象','Target'),adminDynamicRow('总计','合計','Total'),
+adminDynamicRow('PID / 来源','PID / ソース','PID / source'),adminDynamicRow('已选择','選択済み','Selected'),adminDynamicRow('项','件',' items'),adminDynamicRow('结束','終了','Ended'),adminDynamicRow('运行时长','実行時間','Runtime'),adminDynamicRow('输出字节','出力バイト','Output bytes'),adminDynamicRow('终止操作','終了操作','Termination action'),adminDynamicRow('终止原因','終了理由','Termination reason'),adminDynamicRow('(暂无输出)','（出力なし）','(no output)'),adminDynamicRow('确定停止后台进程 ','バックグラウンドプロセスを停止しますか: ','Stop background process '),adminDynamicRow(' 吗？','？','?'),adminDynamicRow('停止请求已发送','停止要求を送信しました','Stop request sent'),adminDynamicRow('当前没有可停止的进程','停止可能なプロセスはありません','No stoppable processes'),adminDynamicRow('个后台进程吗？','件のバックグラウンドプロセスを停止しますか？',' background processes?'),adminDynamicRow('已发送','送信済み','Sent'),adminDynamicRow('个停止请求','件の停止要求',' stop requests'),adminDynamicRow('个失败','件失敗',' failed'),adminDynamicRow('所选','選択した','selected'),adminDynamicRow('当前筛选结果中','現在の絞り込み結果の','in the current filtered results'),
+adminDynamicRow('一个应用最多关联 8 个 Skills','1 つのアプリに関連付けられる Skills は最大 8 個です','An app can include at most 8 Skills'),adminDynamicRow('请输入应用名称','アプリ名を入力してください','Enter an app name'),adminDynamicRow('请至少选择一个 Skill','少なくとも 1 つの Skill を選択してください','Select at least one Skill'),adminDynamicRow('审核备注：','審査メモ:','Review note:'),adminDynamicRow('治理历史','ガバナンス履歴','Governance history'),adminDynamicRow('审核备注（可选）','審査メモ（任意）','Review note (optional)'),adminDynamicRow('通过并发布','承認して公開','Approve and publish'),adminDynamicRow('拒绝','却下','Reject'),adminDynamicRow('治理备注（可选）','ガバナンスメモ（任意）','Governance note (optional)'),adminDynamicRow('重新上架','再公開','Republish'),adminDynamicRow('下架','非公開にする','Unpublish'),adminDynamicRow('此共享应用吗？','この共有アプリを処理しますか？','this shared app?'),adminDynamicRow('应用已','アプリを','App '),adminDynamicRow('确定重置为程序初始参数吗？','プログラムの初期設定にリセットしますか？','Reset to the program initial settings?'),
+adminDynamicRow('Restart source is configured in Startup Parameters:','再起動元は「起動設定」で指定します:','Restart source is configured in Startup Parameters:', '重启来源在“启动参数”中配置：'),adminDynamicRow('keeps existing kernel history;','既存のカーネル履歴を保持します。','keeps existing kernel history;', '保留已有内核历史；'),adminDynamicRow('adds the embedded kernel without deleting old versions.','旧バージョンを削除せず組み込みカーネルを追加します。','adds the embedded kernel without deleting old versions.', '注入内置内核且不删除旧版本。'),adminDynamicRow('令牌位于','Token の場所:','Token location:'),
+adminDynamicRow('starting','開始中','starting','启动中'),adminDynamicRow('running','実行中','running','运行中'),adminDynamicRow('stopping','停止中','stopping','停止中'),adminDynamicRow('completed','完了','completed','已完成'),adminDynamicRow('terminated','終了済み','terminated','已终止'),adminDynamicRow('error','エラー','error','错误'),adminDynamicRow('active','アクティブ','active','活跃'),adminDynamicRow('archived','アーカイブ済み','archived','已归档'),adminDynamicRow('quarantined','隔離中','quarantined','隔离中'),adminDynamicRow('pending','保留中','pending','待处理'),adminDynamicRow('approved','承認済み','approved','已批准'),adminDynamicRow('blocked','ブロック済み','blocked','已封禁'),adminDynamicRow('revoked','失効済み','revoked','已撤销'),
+adminDynamicRow('queued','キュー待ち','queued','已排队'),adminDynamicRow('collecting','収集中','collecting','收集中'),adminDynamicRow('assessing','評価中','assessing','评估中'),adminDynamicRow('proposal_ready','提案準備完了','proposal ready','提案已就绪'),adminDynamicRow('validating_patch','パッチ検証中','validating patch','正在验证补丁'),adminDynamicRow('benchmarking','ベンチマーク中','benchmarking','基准测试中'),adminDynamicRow('awaiting_approval','承認待ち','awaiting approval','等待批准'),adminDynamicRow('canary','Canary','canary','Canary'),adminDynamicRow('promoted','昇格済み','promoted','已升级'),adminDynamicRow('no_change','変更なし','no change','无需变更'),adminDynamicRow('rejected','却下','rejected','已拒绝'),adminDynamicRow('failed','失敗','failed','失败'),adminDynamicRow('cancelled','キャンセル済み','cancelled','已取消'),adminDynamicRow('rolled_back','ロールバック済み','rolled back','已回滚'),
+adminDynamicRow('host','ホスト','host','主机'),adminDynamicRow('integer','整数','integer','整数'),adminDynamicRow('number','数値','number','数值'),adminDynamicRow('enum','列挙','enum','枚举'),adminDynamicRow('directory','ディレクトリ','directory','目录'),adminDynamicRow('file','ファイル','file','文件'),adminDynamicRow('file_or_url','ファイルまたは URL','file or URL','文件或 URL'),adminDynamicRow('boolean','真偽値','boolean','布尔值'),adminDynamicRow('tri_state','3 状態','tri-state','三态'),adminDynamicRow('url','URL','URL','URL'),adminDynamicRow('text','テキスト','text','文本'),adminDynamicRow('true','はい','true','是'),adminDynamicRow('false','いいえ','false','否'),adminDynamicRow('auto','自動','auto','自动'),adminDynamicRow('inherit','継承','inherit','继承'),adminDynamicRow('inject','注入','inject','注入'),
+adminDynamicRow('Write-phase delay rounds','書き込みフェーズ遅延ラウンド','Write-phase delay rounds','写入阶段延迟轮数'),adminDynamicRow('Tool-phase delay rounds','ツールフェーズ遅延ラウンド','Tool-phase delay rounds','工具阶段延迟轮数'),adminDynamicRow('Normal-phase delay rounds','通常フェーズ遅延ラウンド','Normal-phase delay rounds','普通阶段延迟轮数'),adminDynamicRow('Maximum live injections','ライブ入力の最大注入回数','Maximum live injections','最大实时注入次数'),adminDynamicRow('Reinject interval','再注入間隔','Reinject interval','重新注入间隔'),adminDynamicRow('Delayed base weight','遅延入力の基本重み','Delayed base weight','延迟输入基础权重'),adminDynamicRow('Normal base weight','通常入力の基本重み','Normal base weight','普通输入基础权重'),adminDynamicRow('Delayed weight step','遅延入力の重みステップ','Delayed weight step','延迟输入权重步长'),adminDynamicRow('Normal weight step','通常入力の重みステップ','Normal weight step','普通输入权重步长'),adminDynamicRow('Optional single/no-plan Todo bootstrap (L2 follows policy)','任意の single/no-plan Todo 初期化（L2 はポリシーに従う）','Optional single/no-plan Todo bootstrap (L2 follows policy)','可选的 single/no-plan Todo 初始化（L2 遵循策略）'),adminDynamicRow('Single/no-plan Todo prompt','single/no-plan Todo プロンプト','Single/no-plan Todo prompt','single/no-plan Todo 提示词')
+];
+const ADMIN_I18N_ALL=[...ADMIN_I18N_ROWS,...ADMIN_CONFIG_I18N_ROWS,...ADMIN_DYNAMIC_I18N_ROWS];
+const ADMIN_I18N_EXACT=new Map(ADMIN_I18N_ALL.map(row=>[row[0],row]));
+const ADMIN_I18N_FRAGMENTS=[...ADMIN_I18N_ALL].filter(row=>String(row[0]||'').length>1).sort((a,b)=>b[0].length-a[0].length);
+const ADMIN_TRADITIONAL_CHARS={'后':'後','发':'發','复':'復','务':'務','进':'進','启':'啟','关':'關','闭':'閉','应':'應','用':'用','网':'網','项':'項','选':'選','择':'擇','读':'讀','写':'寫','数':'數','据':'據','认':'認','证':'證','录':'錄','审':'審','计':'計','时':'時','间':'間','过':'過','滤':'濾','错':'錯','误':'誤','输':'輸','访':'訪','问':'問','标':'標','识':'識','获':'獲','显':'顯','详':'詳','页':'頁','签':'簽','态':'態','动':'動','实':'實','现':'現','历':'歷','辖':'轄','围':'圍','并':'並','与':'與','开':'開','创':'創','删':'刪','库':'庫','设':'設','置':'置','户':'戶','类':'類','总':'總','长':'長','径':'徑','轮':'輪','调':'調','整':'整','级':'級','备':'備','份':'份','从':'從','将':'將','为':'為','这':'這','个':'個','没':'沒','无':'無','对':'對','话':'話','体':'體','内':'內','链':'鏈','滚':'滾','线':'線','异':'異','步':'步','结':'結','构':'構','继':'繼','续':'續','档':'檔','归':'歸','离':'離','冻':'凍','检':'檢','测':'測','满':'滿','压':'壓','缩':'縮','较':'較','评':'評','毁':'毀','拥':'擁','护':'護','载':'載','节':'節','点':'點','弹':'彈','窗':'窗','语':'語','简':'簡','统':'統','协':'協','区':'區','称':'稱','码':'碼','险':'險','丢':'丟','仅':'僅','侧':'側','准':'準','击':'擊','叠':'疊','号':'號','听':'聽','员':'員','处':'處','尔':'爾','弃':'棄','当':'當','报':'報','换':'換','断':'斷','暂':'暫','机':'機','权':'權','来':'來','紧':'緊','约':'約','细':'細','终':'終','绑':'綁','绝':'絕','状':'狀','监':'監','盖':'蓋','确':'確','范':'範','许':'許','试':'試','说':'說','请':'請','账':'帳','跃':'躍','运':'運','远':'遠','采':'採','钟':'鐘','销':'銷','队':'隊','际':'際','验':'驗','黄':'黃','联':'聯','筛':'篩'};
+const A={token:sessionStorage.getItem('clouds_coder_admin_token')||'',config:null,metrics:null,metricUserHash:'',metricResizeTimer:0,apps:[],skills:[],reviewStatus:'pending',selectedSkills:[],toastTimer:0,serverErrors:[],bootId:'',restartNonce:'',collabProjects:[],collabProject:null,collabMembers:[],collabConflicts:[],collabAudit:[],processPayload:null,selectedProcesses:[],processDetailId:'',evolution:null,evolutionTimer:0,language:'zh-CN',languageSource:'webui_user_preference',languageObserver:null,languageSyncBusy:false};
 const E=id=>document.getElementById(id);
-const fmt=n=>new Intl.NumberFormat('zh-CN',{maximumFractionDigits:1}).format(Number(n||0));
-function toast(message,error=false){const el=E('toast');el.textContent=String(message||'');el.classList.toggle('error',!!error);el.classList.remove('hidden');clearTimeout(A.toastTimer);A.toastTimer=setTimeout(()=>el.classList.add('hidden'),4200)}
+function normalizeAdminLanguage(value){const raw=String(value||'').trim();if(ADMIN_LANGUAGE_CODES.includes(raw))return raw;const low=raw.toLowerCase();if(['zh','zh-cn','cn'].includes(low))return'zh-CN';if(['zh-tw','zh-hk','tc'].includes(low))return'zh-TW';if(['ja-jp','jp'].includes(low))return'ja';if(['en-us','en-gb'].includes(low))return'en';return'zh-CN'}
+function adminTraditional(value){return Array.from(String(value||''),ch=>ADMIN_TRADITIONAL_CHARS[ch]||ch).join('')}
+function adminTranslate(value,language=A.language){const raw=String(value??'');const lang=normalizeAdminLanguage(language);if(!raw)return raw;const trimmed=raw.trim();if(!trimmed)return raw;const index=ADMIN_LANGUAGE_INDEX[lang];const exact=ADMIN_I18N_EXACT.get(trimmed);if(exact){let translated=String(exact[index]??trimmed);if(lang==='zh-TW')translated=adminTraditional(translated);return raw.slice(0,raw.indexOf(trimmed))+translated+raw.slice(raw.indexOf(trimmed)+trimmed.length)}let translated=trimmed;for(const row of ADMIN_I18N_FRAGMENTS){const source=String(row[0]);if(translated.includes(source))translated=translated.split(source).join(String(row[index]??source))}if(lang==='zh-TW')translated=adminTraditional(translated);return raw.slice(0,raw.indexOf(trimmed))+translated+raw.slice(raw.indexOf(trimmed)+trimmed.length)}
+const ADMIN_TEXT_SOURCE=new WeakMap(),ADMIN_ATTRIBUTE_SOURCE=new WeakMap(),ADMIN_INTERNAL_TEXT=new WeakSet();
+function adminI18nSkipped(node){const element=node?.nodeType===1?node:node?.parentElement;return!element||!!element.closest('script,style,pre,code,textarea,[contenteditable="true"],[data-admin-no-i18n]')}
+function translateAdminTextNode(textNode,capture=false){if(!textNode||adminI18nSkipped(textNode))return;if(capture||!ADMIN_TEXT_SOURCE.has(textNode))ADMIN_TEXT_SOURCE.set(textNode,String(textNode.nodeValue||''));const next=adminTranslate(ADMIN_TEXT_SOURCE.get(textNode));if(textNode.nodeValue!==next){ADMIN_INTERNAL_TEXT.add(textNode);textNode.nodeValue=next}}
+function translateAdminAttributes(element,capture=false){if(!element||element.nodeType!==1||adminI18nSkipped(element))return;let source=ADMIN_ATTRIBUTE_SOURCE.get(element);if(!source||capture){source={};ADMIN_ATTRIBUTE_SOURCE.set(element,source)}for(const name of ['placeholder','title','aria-label']){if(capture||!(name in source))source[name]=element.getAttribute(name);const base=source[name];if(base!==null&&base!==undefined){const next=adminTranslate(base);if(element.getAttribute(name)!==next)element.setAttribute(name,next)}}}
+function applyAdminI18n(root=document){const target=root?.nodeType?root:document;if(target.nodeType===3){translateAdminTextNode(target);return}if(target.nodeType===1)translateAdminAttributes(target);const walker=document.createTreeWalker(target,NodeFilter.SHOW_TEXT|NodeFilter.SHOW_ELEMENT);let current;while((current=walker.nextNode())){if(current.nodeType===3)translateAdminTextNode(current);else translateAdminAttributes(current)}document.documentElement.lang=A.language;document.title=adminTranslate('Clouds Coder Admin');renderAdminLanguageControl()}
+function observeAdminI18n(){if(A.languageObserver)A.languageObserver.disconnect();A.languageObserver=new MutationObserver(records=>{for(const record of records){if(record.type==='characterData'){if(ADMIN_INTERNAL_TEXT.has(record.target)){ADMIN_INTERNAL_TEXT.delete(record.target);continue}translateAdminTextNode(record.target,true);continue}for(const added of record.addedNodes||[])applyAdminI18n(added)}});A.languageObserver.observe(document.body,{subtree:true,childList:true,characterData:true})}
+function renderAdminLanguageControl(){const selects=[E('adminLanguageSelect'),E('adminLoginLanguageSelect')].filter(Boolean),labels=[E('adminLanguageLabel'),E('adminLoginLanguageLabel')].filter(Boolean),source=E('adminLanguageSource'),labelText={'zh-CN':'界面语言','zh-TW':'介面語言','ja':'表示言語','en':'Language'}[A.language],sourceText={'zh-CN':'与 WebUI 用户语言同步','zh-TW':'與 WebUI 使用者語言同步','ja':'WebUI のユーザー言語と同期','en':'Synced with WebUI language'}[A.language];for(const select of selects){if(select.value!==A.language)select.value=A.language;select.setAttribute('aria-label',labelText)}for(const label of labels)label.textContent=labelText;if(source)source.textContent=sourceText}
+function applyAdminLanguage(language){A.language=normalizeAdminLanguage(language);try{localStorage.setItem('clouds_coder_admin_language',A.language)}catch(_){}applyAdminI18n(document)}
+async function loadAdminLanguage(quiet=false){if(A.languageSyncBusy)return;A.languageSyncBusy=true;try{const out=await request('/api/admin/language');A.languageSource=String(out.source||'webui_user_preference');applyAdminLanguage(out.language)}catch(err){if(!quiet)console.warn('admin language sync failed',err)}finally{A.languageSyncBusy=false}}
+async function saveAdminLanguage(language){const previous=A.language;applyAdminLanguage(language);try{const out=await request('/api/admin/language',{method:'POST',body:JSON.stringify({language:A.language})});A.languageSource=String(out.source||'webui_user_preference');applyAdminLanguage(out.language)}catch(err){applyAdminLanguage(previous);toast(err.message,true)}}
+const ADMIN_NATIVE_CONFIRM=window.confirm.bind(window),ADMIN_NATIVE_PROMPT=window.prompt.bind(window);window.confirm=message=>ADMIN_NATIVE_CONFIRM(adminTranslate(message));window.prompt=(message,defaultValue)=>ADMIN_NATIVE_PROMPT(adminTranslate(message),defaultValue);
+const fmt=n=>new Intl.NumberFormat(A.language,{maximumFractionDigits:1}).format(Number(n||0));
+function toast(message,error=false){const el=E('toast');el.textContent=adminTranslate(String(message||''));el.classList.toggle('error',!!error);el.classList.remove('hidden');clearTimeout(A.toastTimer);A.toastTimer=setTimeout(()=>el.classList.add('hidden'),4200)}
 function setAuthenticated(ok){E('loginOverlay').classList.toggle('hidden',!!ok);E('connectionBadge').textContent=ok?'已认证':'未认证';E('connectionBadge').className='badge '+(ok?'good':'muted')}
 async function request(path,opt={}){const headers={...(opt.headers||{})};if(opt.body!==undefined&&!headers['Content-Type'])headers['Content-Type']='application/json';const r=await fetch(path,{...opt,headers});const raw=await r.text();let body={};try{body=raw?JSON.parse(raw):{}}catch(_){body={error:raw||'请求失败'}}if(!r.ok){const details=Array.isArray(body.errors)?body.errors:[];const msg=[body.error||'请求失败',...details.map(x=>String(x.key||'参数')+': '+String(x.error||'无效'))].filter(Boolean).join('\n');const err=new Error(msg);err.status=r.status;err.code=String(body.code||'');err.details=details;err.body=body;throw err}return body}
 async function api(path,opt={}){const headers={...(opt.headers||{})};if(A.token)headers.Authorization='Bearer '+A.token;try{return await request(path,{...opt,headers})}catch(err){if(err.status===401){clearSession();setAuthenticated(false);E('loginError').textContent='登录会话已过期，请重新登录';loadAuthStatus().catch(()=>{});}throw err}}
@@ -96492,7 +98617,7 @@ const SVG_NS='http://www.w3.org/2000/svg',METRIC_COLORS=['series-1','series-2','
 const num=v=>Number.isFinite(Number(v))?Number(v):0;
 function metricPct(value){const n=Math.max(0,Math.min(1,num(value)));return (n*100).toFixed(1)+'%'}
 function metricMs(value){const n=num(value);return n>=1000?(n/1000).toFixed(n>=10000?1:2)+' s':fmt(n)+' ms'}
-function metricTime(ts){const n=num(ts);return n?new Date(n*1000).toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}):'-'}
+function metricTime(ts){const n=num(ts);return n?new Date(n*1000).toLocaleString(A.language,{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}):'-'}
 function shortMetricLabel(value,max=26){const s=String(value||'-');return s.length>max?s.slice(0,max-1)+'…':s}
 function svgEl(tag,attrs={},text=''){const el=document.createElementNS(SVG_NS,tag);for(const [key,value] of Object.entries(attrs)){if(value!==undefined&&value!==null)el.setAttribute(key,String(value))}if(text!==undefined&&text!==null)el.textContent=String(text);return el}
 function metricChart(id,title,description,height=246){const host=E(id);host.innerHTML='';const width=Math.max(320,Math.round(host.getBoundingClientRect().width||640));const svg=svgEl('svg',{viewBox:`0 0 ${width} ${height}`,role:'img','aria-label':title+'. '+description,preserveAspectRatio:'xMidYMid meet'});svg.append(svgEl('title',{},title),svgEl('desc',{},description));return{host,svg,width,height}}
@@ -96553,9 +98678,9 @@ async function stopSelectedProcesses(){await stopProcessIds(A.selectedProcesses,
 async function stopFilteredProcesses(){const rows=Array.isArray(A.processPayload?.processes)?A.processPayload.processes:[];await stopProcessIds(rows.filter(row=>row.can_stop).map(row=>row.id),'当前筛选结果中')}
 function bindProcesses(){E('refreshProcessesBtn').onclick=()=>loadProcesses().catch(err=>toast(err.message,true));E('filterProcessesBtn').onclick=()=>loadProcesses().catch(err=>toast(err.message,true));E('processSearch').onkeydown=ev=>{if(ev.key==='Enter')loadProcesses().catch(err=>toast(err.message,true))};E('processStatus').onchange=()=>loadProcesses().catch(err=>toast(err.message,true));E('selectAllProcesses').onchange=()=>{const rows=Array.isArray(A.processPayload?.processes)?A.processPayload.processes:[];A.selectedProcesses=E('selectAllProcesses').checked?rows.filter(row=>row.can_stop).map(row=>String(row.id)):[];renderProcesses()};E('stopSelectedProcessesBtn').onclick=()=>stopSelectedProcesses().catch(err=>toast(err.message,true));E('stopFilteredProcessesBtn').onclick=()=>stopFilteredProcesses().catch(err=>toast(err.message,true))}
 const EVOLUTION_PIPELINE=['queued','collecting','assessing','proposal_ready','validating_patch','benchmarking','awaiting_approval','canary','promoted'];
-function evolutionTime(value){const ts=Number(value||0);return ts?new Date(ts*1000).toLocaleString():'-'}
+function evolutionTime(value){const ts=Number(value||0);return ts?new Date(ts*1000).toLocaleString(A.language):'-'}
 function evolutionScopes(value){return String(value||'').split(',').map(x=>x.trim()).filter(Boolean).slice(0,500)}
-function renderEvolution(){const data=A.evolution||{},cfg=data.config||{},active=data.active||{},runs=Array.isArray(data.runs?.runs)?data.runs.runs:[],versions=Array.isArray(data.versions?.versions)?data.versions.versions:[];E('evolutionMode').value=cfg.mode||'Off';E('evolutionSchedule').value=cfg.schedule||'off';E('evolutionTimezone').value=cfg.timezone||'Asia/Shanghai';E('evolutionHistoryDepth').value=Number(cfg.history_version_depth??2);E('evolutionStartDate').value=cfg.history_start_date||'';E('evolutionEndDate').value=cfg.history_end_date||'';E('evolutionGeneratorProfile').value=cfg.generator_profile||'';E('evolutionJudgeProfile').value=cfg.judge_profile||'';E('evolutionUserScope').value=(cfg.user_scope||['*']).join(', ');E('evolutionSessionScope').value=(cfg.session_scope||['*']).join(', ');E('evolutionEventTriggers').checked=!!cfg.event_triggers;E('evolutionRevision').textContent='rev '+String(cfg.revision||1);E('evolutionActiveBadge').textContent=cfg.mode||'Off';E('evolutionActiveBadge').className='badge '+(cfg.mode==='Off'?'muted':cfg.mode==='Aggressive'?'bad':'good');const canary=active.canary||null;E('evolutionCanaryBadge').textContent=canary?`canary ${Number(canary.percent||0)}%`:'stable';E('evolutionCanaryBadge').className='badge '+(canary?'warn':'good');E('runEvolutionBtn').disabled=cfg.mode==='Off'||!!data.active_run_id;E('evolutionCurrent').textContent=`active=${active.version||'-'}\ncanary=${canary?canary.version+' @ '+canary.percent+'%':'none'}\nmutable_surface=${cfg.mutable_surface||'none'}\nweights=hard 30% / LLM blind judge 70%\nminimum_gain=${Number(cfg.minimum_gain||0).toFixed(1)}\nhistory=current + ${Number(cfg.history_version_depth||0)} previous versions\nimmutable=${(data.immutable_control_components||[]).join(', ')}`;
+function renderEvolution(){const data=A.evolution||{},cfg=data.config||{},active=data.active||{},bootstrap=data.bootstrap||{},runs=Array.isArray(data.runs?.runs)?data.runs.runs:[],versions=Array.isArray(data.versions?.versions)?data.versions.versions:[];E('evolutionMode').value=cfg.mode||'Off';E('evolutionSchedule').value=cfg.schedule||'off';E('evolutionTimezone').value=cfg.timezone||'Asia/Shanghai';E('evolutionHistoryDepth').value=Number(cfg.history_version_depth??2);E('evolutionStartDate').value=cfg.history_start_date||'';E('evolutionEndDate').value=cfg.history_end_date||'';E('evolutionGeneratorProfile').value=cfg.generator_profile||'';E('evolutionJudgeProfile').value=cfg.judge_profile||'';E('evolutionUserScope').value=(cfg.user_scope||['*']).join(', ');E('evolutionSessionScope').value=(cfg.session_scope||['*']).join(', ');E('evolutionEventTriggers').checked=!!cfg.event_triggers;E('evolutionRevision').textContent='rev '+String(cfg.revision||1);E('evolutionActiveBadge').textContent=cfg.mode||'Off';E('evolutionActiveBadge').className='badge '+(cfg.mode==='Off'?'muted':cfg.mode==='Aggressive'?'bad':'good');const canary=active.canary||null;E('evolutionCanaryBadge').textContent=canary?`canary ${Number(canary.percent||0)}%`:'stable';E('evolutionCanaryBadge').className='badge '+(canary?'warn':'good');E('evolutionBootstrap').textContent=`startup policy=${data.startup_policy||'inherit'} · request=${bootstrap.requested_policy||'inherit'} · ${bootstrap.history_action||'history status unavailable'}${bootstrap.injected_version?' · injected='+bootstrap.injected_version:''}`;E('runEvolutionBtn').disabled=cfg.mode==='Off'||!!data.active_run_id;E('evolutionCurrent').textContent=`active=${active.version||'-'}\ncanary=${canary?canary.version+' @ '+canary.percent+'%':'none'}\nmutable_surface=${cfg.mutable_surface||'none'}\nweights=hard 30% / LLM blind judge 70%\nminimum_gain=${Number(cfg.minimum_gain||0).toFixed(1)}\nhistory=current + ${Number(cfg.history_version_depth||0)} previous versions\nimmutable=${(data.immutable_control_components||[]).join(', ')}`;
   const currentRun=runs.find(row=>!['no_change','rejected','failed','cancelled','promoted'].includes(String(row.status||'')))||runs[0]||{};const pipeline=E('evolutionPipeline');pipeline.innerHTML='';const currentIndex=EVOLUTION_PIPELINE.indexOf(String(currentRun.status||''));for(const [index,status] of EVOLUTION_PIPELINE.entries()){pipeline.appendChild(node('span',{class:'evolution-step '+(index<currentIndex?'done':index===currentIndex?'active':'')},status))}
   const lineage=E('evolutionLineage');lineage.innerHTML='';for(const row of [...versions].reverse()){const card=node('button',{type:'button',class:'evolution-node '+String(row.status||'')});card.append(node('strong',{},row.version||'-'),node('small',{},'parent '+(row.parent_version||'baseline')),node('small',{},String(row.status||'')+' · score '+Number(row.mixed_score||0).toFixed(1)),node('small',{},evolutionTime(row.promoted_at||row.created_at)));card.onclick=()=>showEvolutionVersion(row.version);lineage.appendChild(card)}if(!versions.length)lineage.appendChild(node('div',{class:'empty'},'No kernel versions'));
   const runHost=E('evolutionRuns');runHost.innerHTML='';if(!runs.length)runHost.appendChild(node('div',{class:'empty'},'No evolution runs'));else{const table=node('table'),head=node('tr');for(const label of ['Run','Mode','Status','Candidate','Created','Actions'])head.appendChild(node('th',{},label));table.appendChild(head);for(const row of runs){const tr=node('tr'),actions=node('td');const view=node('button',{type:'button',class:'ghost'},'View');view.onclick=()=>showEvolutionRun(row.run_id);actions.appendChild(view);if(row.status==='awaiting_approval'){const approve=node('button',{type:'button'},'Approve'),reject=node('button',{type:'button',class:'danger'},'Reject');approve.onclick=()=>evolutionRunAction(row.run_id,'approve');reject.onclick=()=>evolutionRunAction(row.run_id,'reject');actions.append(approve,reject)}else if(!['no_change','rejected','failed','cancelled','promoted','rolled_back'].includes(row.status)){const cancel=node('button',{type:'button',class:'danger'},'Cancel');cancel.onclick=()=>evolutionRunAction(row.run_id,'cancel');actions.appendChild(cancel)}for(const value of [row.run_id,row.mode,row.status,row.candidate_version||'-',evolutionTime(row.created_at)])tr.appendChild(node('td',{},value));tr.appendChild(actions);table.appendChild(tr)}runHost.appendChild(table)}
@@ -96578,8 +98703,8 @@ async function createSharedApp(){const payload={name:E('adminAppName').value.tri
 function renderAdminApps(){const host=E('adminAppList');host.innerHTML='';document.querySelectorAll('.review-tab').forEach(x=>x.classList.toggle('active',x.dataset.status===A.reviewStatus));const rows=A.apps.filter(x=>x.status===A.reviewStatus);if(!rows.length){host.appendChild(node('div',{class:'card empty'},'此分类暂无应用'));return}rows.sort((a,b)=>(b.updated_at||0)-(a.updated_at||0)).forEach(app=>{const card=node('article',{class:'admin-app-card'}),title=node('div',{class:'admin-app-title'}),left=node('div'),h=node('h3',{},(app.icon?app.icon+' ':'')+(app.name||'未命名应用'));left.appendChild(h);title.append(left,node('span',{class:'badge '+(app.status==='published'?'good':app.status==='rejected'?'muted':'warn')},app.status));card.append(title,node('p',{},app.description||'暂无说明'));const meta=node('div',{class:'app-meta'});meta.append(node('span',{},'revision '+(app.submitted_revision||app.revision||1)),node('span',{},'owner '+(app.owner_hash||'admin')));card.appendChild(meta);const skills=node('div',{class:'app-skills'});(app.skills||[]).sort((a,b)=>(a.order||0)-(b.order||0)).forEach(s=>skills.appendChild(node('span',{},s.name||s.id)));card.appendChild(skills);if(app.review?.note)card.appendChild(node('p',{},'审核备注：'+app.review.note));const history=Array.isArray(app.lifecycle_history)?app.lifecycle_history:[];if(history.length){const lifecycle=node('div',{class:'app-lifecycle'});lifecycle.appendChild(node('strong',{},'治理历史'));[...history].reverse().forEach(item=>{const at=item.at?new Date(Number(item.at)*1000).toLocaleString('zh-CN'):'-';const text=at+' · '+String(item.action||'')+' · '+String(item.from||'')+' -> '+String(item.to||'')+' · revision '+String(item.revision||'')+(item.note?' · '+String(item.note):'');lifecycle.appendChild(node('div',{},text))});card.appendChild(lifecycle)}if(app.status==='pending'){const actions=node('div',{class:'review-actions'}),note=node('input',{placeholder:'审核备注（可选）',maxlength:'1000'}),approve=node('button',{type:'button'},'通过并发布'),reject=node('button',{type:'button',class:'danger'},'拒绝');approve.onclick=()=>reviewApp(app,true,note.value).catch(err=>toast(err.message,true));reject.onclick=()=>reviewApp(app,false,note.value).catch(err=>toast(err.message,true));actions.append(note,approve,reject);card.appendChild(actions)}else if(app.status==='published'||app.status==='unpublished'){const actions=node('div',{class:'review-actions'}),note=node('input',{placeholder:'治理备注（可选）',maxlength:'1000'}),publish=app.status==='unpublished',action=node('button',{type:'button',class:publish?'':'danger'},publish?'重新上架':'下架');action.onclick=()=>changePublication(app,publish,note.value).catch(err=>toast(err.message,true));actions.append(note,action);card.appendChild(actions)}host.appendChild(card)})}
 async function reviewApp(app,approve,note){await api('/api/admin/apps/'+encodeURIComponent(app.id)+'/'+(approve?'approve':'reject'),{method:'POST',body:JSON.stringify({note,revision:app.submitted_revision||app.revision})});await loadApps();toast(approve?'应用已发布':'应用已拒绝')}
 async function changePublication(app,publish,note){const label=publish?'重新上架':'下架';if(!confirm('确定'+label+'此共享应用吗？'))return;await api('/api/admin/apps/'+encodeURIComponent(app.id)+'/'+(publish?'republish':'unpublish'),{method:'POST',body:JSON.stringify({note,revision:app.submitted_revision||app.revision,lifecycle_revision:app.lifecycle_revision||0})});await loadApps();toast('应用已'+label)}
-function bind(){document.querySelectorAll('.nav-tab').forEach(x=>x.onclick=()=>switchView(x.dataset.view));document.querySelectorAll('.review-tab').forEach(x=>x.onclick=()=>{A.reviewStatus=x.dataset.status;renderAdminApps()});E('evolutionMode').onchange=()=>{const schedules={Off:'off',Tuning:'weekly',Thinking:'every_3_days',Aggressive:'daily'};E('evolutionSchedule').value=schedules[E('evolutionMode').value]||'off'};E('refreshMetricsBtn').onclick=()=>loadMetrics().catch(err=>toast(err.message,true));E('metricsHours').onchange=()=>{A.metricUserHash='';loadMetrics('').catch(err=>toast(err.message,true))};E('metricUserSelect').onchange=()=>{A.metricUserHash=E('metricUserSelect').value;loadMetrics(A.metricUserHash).catch(err=>toast(err.message,true))};E('saveConfigBtn').onclick=()=>saveConfig(false).catch(err=>{notice(err.message,true);toast(err.message,true)});E('syncActiveConfigBtn').onclick=()=>syncActiveConfig().catch(err=>toast(err.message,true));E('setDefaultBtn').onclick=()=>saveConfig(true).catch(err=>toast(err.message,true));E('restoreDefaultBtn').onclick=()=>resetConfig('default').catch(err=>toast(err.message,true));E('resetInitialBtn').onclick=()=>{if(confirm('确定重置为程序初始参数吗？'))resetConfig('initial').catch(err=>toast(err.message,true))};E('saveRestartBtn').onclick=()=>restartWithDraft().catch(err=>toast(err.message,true));E('exportConfigBtn').onclick=()=>downloadJson('clouds-coder-startup-config.json',{version:1,values:collectConfig()});E('importConfigBtn').onclick=()=>E('configFileInput').click();E('configFileInput').onchange=()=>{const f=E('configFileInput').files?.[0];if(f)importConfigFile(f).catch(err=>toast(err.message,true));E('configFileInput').value=''};E('refreshEvolutionBtn').onclick=()=>loadEvolution().catch(err=>toast(err.message,true));E('saveEvolutionBtn').onclick=()=>saveEvolution().catch(err=>toast(err.message,true));E('runEvolutionBtn').onclick=()=>runEvolution().catch(err=>toast(err.message,true));E('killEvolutionBtn').onclick=()=>emergencyEvolutionOff().catch(err=>toast(err.message,true));E('closeEvolutionDetailBtn').onclick=()=>E('evolutionDetailCard').classList.add('hidden');E('refreshAppsBtn').onclick=()=>loadApps().catch(err=>toast(err.message,true));E('adminSkillSearch').oninput=renderSkillCatalog;E('createSharedAppBtn').onclick=()=>createSharedApp().catch(err=>toast(err.message,true));E('refreshCollaborationBtn').onclick=()=>loadCollaboration().catch(err=>toast(err.message,true));E('enableLanCollaborationBtn').onclick=()=>configureLanCollaboration(true).catch(err=>toast(err.message,true));E('disableLanCollaborationBtn').onclick=()=>configureLanCollaboration(false).catch(err=>toast(err.message,true));E('createCollabProjectForm').onsubmit=ev=>{ev.preventDefault();createCollabProject().catch(err=>toast(err.message,true))};E('collabProjectSearch').oninput=()=>loadCollaboration().catch(err=>toast(err.message,true));E('collabProjectStatus').onchange=()=>loadCollaboration().catch(err=>toast(err.message,true));E('collabMemberSearch').oninput=()=>{if(A.collabProject)loadCollabProjectDetail().catch(err=>toast(err.message,true))};E('collabMemberStatus').onchange=()=>{if(A.collabProject)loadCollabProjectDetail().catch(err=>toast(err.message,true))};E('logoutBtn').onclick=()=>logoutAdmin();E('setupForm').onsubmit=ev=>{ev.preventDefault();registerAdmin()};E('passwordLoginForm').onsubmit=ev=>{ev.preventDefault();loginWithPassword()};E('tokenLoginForm').onsubmit=ev=>{ev.preventDefault();loginWithToken()};E('retryAuthBtn').onclick=()=>bootstrapAuth();window.addEventListener('resize',()=>{clearTimeout(A.metricResizeTimer);A.metricResizeTimer=setTimeout(()=>{if(A.metrics&&E('metricsView').classList.contains('active'))renderMetricCharts(A.metrics)},160)})}
-window.addEventListener('DOMContentLoaded',async()=>{bind();bindProcesses();await bootstrapAuth()});
+function bind(){document.querySelectorAll('.nav-tab').forEach(x=>x.onclick=()=>switchView(x.dataset.view));document.querySelectorAll('.review-tab').forEach(x=>x.onclick=()=>{A.reviewStatus=x.dataset.status;renderAdminApps()});E('adminLanguageSelect').onchange=()=>saveAdminLanguage(E('adminLanguageSelect').value);E('evolutionMode').onchange=()=>{const schedules={Off:'off',Tuning:'weekly',Thinking:'every_3_days',Aggressive:'daily'};E('evolutionSchedule').value=schedules[E('evolutionMode').value]||'off'};E('refreshMetricsBtn').onclick=()=>loadMetrics().catch(err=>toast(err.message,true));E('metricsHours').onchange=()=>{A.metricUserHash='';loadMetrics('').catch(err=>toast(err.message,true))};E('metricUserSelect').onchange=()=>{A.metricUserHash=E('metricUserSelect').value;loadMetrics(A.metricUserHash).catch(err=>toast(err.message,true))};E('saveConfigBtn').onclick=()=>saveConfig(false).catch(err=>{notice(err.message,true);toast(err.message,true)});E('syncActiveConfigBtn').onclick=()=>syncActiveConfig().catch(err=>toast(err.message,true));E('setDefaultBtn').onclick=()=>saveConfig(true).catch(err=>toast(err.message,true));E('restoreDefaultBtn').onclick=()=>resetConfig('default').catch(err=>toast(err.message,true));E('resetInitialBtn').onclick=()=>{if(confirm('确定重置为程序初始参数吗？'))resetConfig('initial').catch(err=>toast(err.message,true))};E('saveRestartBtn').onclick=()=>restartWithDraft().catch(err=>toast(err.message,true));E('exportConfigBtn').onclick=()=>downloadJson('clouds-coder-startup-config.json',{version:1,values:collectConfig()});E('importConfigBtn').onclick=()=>E('configFileInput').click();E('configFileInput').onchange=()=>{const f=E('configFileInput').files?.[0];if(f)importConfigFile(f).catch(err=>toast(err.message,true));E('configFileInput').value=''};E('refreshEvolutionBtn').onclick=()=>loadEvolution().catch(err=>toast(err.message,true));E('saveEvolutionBtn').onclick=()=>saveEvolution().catch(err=>toast(err.message,true));E('runEvolutionBtn').onclick=()=>runEvolution().catch(err=>toast(err.message,true));E('killEvolutionBtn').onclick=()=>emergencyEvolutionOff().catch(err=>toast(err.message,true));E('closeEvolutionDetailBtn').onclick=()=>E('evolutionDetailCard').classList.add('hidden');E('refreshAppsBtn').onclick=()=>loadApps().catch(err=>toast(err.message,true));E('adminSkillSearch').oninput=renderSkillCatalog;E('createSharedAppBtn').onclick=()=>createSharedApp().catch(err=>toast(err.message,true));E('refreshCollaborationBtn').onclick=()=>loadCollaboration().catch(err=>toast(err.message,true));E('enableLanCollaborationBtn').onclick=()=>configureLanCollaboration(true).catch(err=>toast(err.message,true));E('disableLanCollaborationBtn').onclick=()=>configureLanCollaboration(false).catch(err=>toast(err.message,true));E('createCollabProjectForm').onsubmit=ev=>{ev.preventDefault();createCollabProject().catch(err=>toast(err.message,true))};E('collabProjectSearch').oninput=()=>loadCollaboration().catch(err=>toast(err.message,true));E('collabProjectStatus').onchange=()=>loadCollaboration().catch(err=>toast(err.message,true));E('collabMemberSearch').oninput=()=>{if(A.collabProject)loadCollabProjectDetail().catch(err=>toast(err.message,true))};E('collabMemberStatus').onchange=()=>{if(A.collabProject)loadCollabProjectDetail().catch(err=>toast(err.message,true))};E('logoutBtn').onclick=()=>logoutAdmin();E('setupForm').onsubmit=ev=>{ev.preventDefault();registerAdmin()};E('passwordLoginForm').onsubmit=ev=>{ev.preventDefault();loginWithPassword()};E('tokenLoginForm').onsubmit=ev=>{ev.preventDefault();loginWithToken()};E('retryAuthBtn').onclick=()=>bootstrapAuth();window.addEventListener('focus',()=>loadAdminLanguage(true));document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')loadAdminLanguage(true)});window.addEventListener('resize',()=>{clearTimeout(A.metricResizeTimer);A.metricResizeTimer=setTimeout(()=>{if(A.metrics&&E('metricsView').classList.contains('active'))renderMetricCharts(A.metrics)},160)})}
+window.addEventListener('DOMContentLoaded',async()=>{let cached='zh-CN';try{cached=localStorage.getItem('clouds_coder_admin_language')||cached}catch(_){}applyAdminLanguage(cached);observeAdminI18n();bind();bindProcesses();const loginLanguage=E('adminLoginLanguageSelect');if(loginLanguage)loginLanguage.onchange=()=>saveAdminLanguage(loginLanguage.value);await loadAdminLanguage(true);await bootstrapAuth()});
 """
 
 RAG_TERM_GROUPS = (
@@ -107582,7 +109707,7 @@ class WorkflowMemoryStore:
             "title": title,
             "objective": trim(str(getattr(sess, "runtime_direct_objective", "") or title), 800),
             "created_at": now_ts(),
-            "operations": operations,
+            "operations": operations[-500:],
             "operation_summaries": op_summaries[-48:],
             "todos": [dict(x) for x in todos[-40:] if isinstance(x, dict)],
             "message_tail": self._extract_text_tail(getattr(sess, "agent_messages", []), limit=12, chars=420),
@@ -112315,7 +114440,7 @@ IDE_INDEX_HTML = """<!doctype html>
         <div id="collaborationResources" class="collaboration-list"></div>
         <div class="section-label"><span class="codicon codicon-chevron-down"></span><strong>Members</strong></div>
         <div id="collaborationMembers" class="collaboration-list"></div>
-        <div class="section-label"><span class="codicon codicon-chevron-down"></span><strong>Blackboard</strong><button id="newBlackboardItemBtn" class="icon-button section-download" title="New Blackboard Task"><span class="codicon codicon-add"></span></button></div>
+        <div class="section-label"><span class="codicon codicon-chevron-down"></span><strong>Blackboard</strong><button id="newBlackboardItemBtn" class="icon-button section-download" title="New Task" aria-label="New Blackboard Task"><span class="codicon codicon-add"></span></button></div>
         <div id="collaborationBlackboard" class="collaboration-list"></div>
         <div class="section-label"><span class="codicon codicon-chevron-down"></span><strong>Conflicts</strong></div>
         <div id="collaborationConflicts" class="collaboration-list"></div>
@@ -112334,7 +114459,7 @@ IDE_INDEX_HTML = """<!doctype html>
       </section>
     </main>
     <aside id="secondarySidebar" class="secondary-sidebar">
-      <header class="side-header"><span>Clouds Coder</span><div class="header-actions"><button id="newAgentChatBtn" class="icon-button" title="New Task" aria-label="New Task"><span class="codicon codicon-add"></span></button><button id="closeSecondaryBtn" class="icon-button" title="Close"><span class="codicon codicon-close"></span></button></div></header>
+      <header class="side-header"><span>Clouds Coder</span><div class="header-actions"><button id="newAgentChatBtn" class="icon-button new-session-button" title="New conversation in this workspace" aria-label="New conversation in this workspace"><span class="codicon codicon-add"></span><span id="newAgentChatHistoryBadge" class="session-history-badge is-hidden" aria-hidden="true"><span class="codicon codicon-history"></span></span></button><button id="newAgentWorkspaceBtn" class="icon-button" title="New workspace and conversation" aria-label="New workspace and conversation"><span class="codicon codicon-new-file"></span></button><button id="closeSecondaryBtn" class="icon-button" title="Close"><span class="codicon codicon-close"></span></button></div></header>
       <div id="agentContext" class="agent-context"></div>
       <section id="agentTodoPanel" class="agent-todo is-hidden"><button id="agentTodoToggle" class="agent-todo-header" type="button" aria-expanded="true"><span class="codicon codicon-chevron-down"></span><strong>Progress</strong><span id="agentTodoCount" class="agent-todo-count"></span></button><div id="agentTodoBody" class="agent-todo-body"></div></section>
       <div id="agentMessages" class="agent-messages"></div>
@@ -112391,7 +114516,9 @@ input,select,textarea{border:1px solid transparent;border-radius:2px;background:
 @media(max-width:1080px){:root{--sidebar-width:250px;--secondary-width:280px}.menu-bar button:nth-child(n+5){display:none}.status-right button:nth-child(-n+3){display:none}}
 @media(max-width:820px){:root{--sidebar-width:min(300px,calc(100vw - 48px));--secondary-width:min(320px,calc(100vw - 48px));--panel-height:190px}.title-bar{grid-template-columns:28px 25px 1fr auto}.menu-bar{display:none}.command-center{width:100%;min-width:0}.workbench-grid{position:relative;grid-template-columns:48px minmax(0,1fr)!important}.primary-sidebar,.secondary-sidebar{position:absolute;z-index:90;top:0;bottom:0;width:var(--sidebar-width);box-shadow:5px 0 18px rgba(0,0,0,.42)}.primary-sidebar{left:48px}.secondary-sidebar{right:0;width:var(--secondary-width);box-shadow:-5px 0 18px rgba(0,0,0,.42)}.primary-hidden .primary-sidebar,.secondary-hidden .secondary-sidebar{display:none}.editor-area{grid-column:2}.editor-grid.split{grid-template-columns:minmax(0,1fr)}.editor-grid.split .editor-group:not(.is-active){display:none}.layout-controls #togglePanelBtn{display:none}.empty-actions{grid-template-columns:auto}.status-right button{display:none!important}.status-right #accountStatus,.status-right #notificationsBtn{display:flex!important}.panel-tabs{gap:12px}.panel-tabs button{font-size:10px}.panel-header .header-actions .icon-button:nth-child(-n+2){display:none}}
 @media(max-width:480px){.title-bar{grid-template-columns:28px 22px minmax(0,1fr) auto;padding:0 3px}.layout-controls button:not(#toggleSecondaryBtn){display:none}.command-center span:last-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.activity-button{width:43px}.workbench-grid{grid-template-columns:44px minmax(0,1fr)!important}.primary-sidebar{left:44px}.status-left #syncStatus,.status-left #errorStatus{display:none}.panel-tabs{gap:9px}.panel-tabs button{max-width:62px;overflow:hidden;text-overflow:ellipsis}.auth-dialog{padding:28px 22px}.extension-row{grid-template-columns:36px minmax(0,1fr)}.extension-icon{width:36px;height:36px}.extension-row .button{grid-column:2;justify-self:start}}
-"""
+    """ + """
+.session-history-badge{box-sizing:border-box;position:absolute;right:-3px;bottom:-3px;display:grid;place-items:center;width:15px;height:15px;padding:0;overflow:hidden;border:1px solid #252526;border-radius:50%;background:#c586c0;color:#fff;pointer-events:none}.session-history-badge>.codicon{position:relative;display:block;width:9px;height:9px;margin:0;font-size:0;line-height:9px;text-align:center}.session-history-badge>.codicon::before{content:"";position:absolute;inset:0;border:1px solid currentColor;border-radius:50%;box-sizing:border-box}.session-history-badge>.codicon::after{content:"";position:absolute;left:4px;top:2px;width:1px;height:4px;background:currentColor;box-shadow:2px 3px 0 -0.25px currentColor;transform-origin:50% 100%;transform:rotate(0deg)}.new-session-button{position:relative}.session-history-menu{min-width:250px;max-width:min(340px,calc(100vw - 16px));padding:5px}.session-history-heading{display:flex;align-items:center;gap:6px;padding:5px 8px 6px;border-bottom:1px solid #454545;color:#ccc;font-size:11px}.session-history-heading small{margin-left:auto;color:#858585}.session-history-row{height:auto!important;min-height:34px!important;display:grid!important;grid-template-columns:minmax(0,1fr) 24px;align-items:center;gap:4px!important;padding:2px 4px!important}.session-history-row>button:first-child{min-width:0;width:100%;height:30px;display:grid;grid-template-columns:16px minmax(0,1fr) auto;align-items:center;gap:6px;border:0;background:transparent;color:inherit;text-align:left;padding:5px 4px}.session-history-row>button:first-child:hover{background:#30343a}.session-history-delete{width:24px;height:26px;display:grid;place-items:center;border:0;background:transparent;color:#858585;padding:0}.session-history-delete:hover{background:#4a2525;color:#f48771}.session-history-row .session-history-title{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.session-history-row small{color:#858585;font-size:10px}.session-history-row.is-current{color:#75beff}.session-history-empty{padding:10px 8px;color:#858585;font-size:11px}
+    """
 
 IDE_JS = """
 const E=id=>document.getElementById(id);
@@ -112588,6 +114715,7 @@ window.addEventListener('DOMContentLoaded',async()=>{bind();try{await refreshCon
 """
 
 IDE_CSS += r"""
+.session-history-badge{display:flex;align-items:center;justify-content:center}.session-history-badge>.codicon{box-sizing:border-box;position:relative;display:block;flex:0 0 9px;width:9px;height:9px;margin:0;border:1px solid currentColor;border-radius:50%;font-size:0;line-height:0;text-align:center}.session-history-badge>.codicon::before{content:"";position:absolute;left:3px;top:1px;width:1px;height:3px;background:currentColor;transform-origin:50% 100%;transform:rotate(0deg)}.session-history-badge>.codicon::after{content:"";position:absolute;left:4px;top:4px;width:3px;height:1px;background:currentColor;transform-origin:left center;transform:rotate(35deg)}
 .collaboration-only{display:none}.collaboration-mode .collaboration-only{display:grid}
 .collab-admission-fields{display:grid;gap:7px}.collab-transport-warning{padding:7px 9px;border:1px solid #725c20;background:#302b1d;color:#e2c08d;font-size:11px;line-height:1.4}.auth-dialog .collab-transport-warning{margin:12px 0}
 .collaboration-view{grid-template-rows:35px auto auto 22px minmax(52px,1fr) 22px minmax(52px,1fr) 22px minmax(52px,1fr) 22px minmax(52px,1fr) 22px minmax(52px,1fr);overflow:hidden}.collaboration-view.is-active{display:grid}.collaboration-presence-summary{min-height:30px;padding:6px 10px;border-bottom:1px solid var(--line);color:#9cdcfe;font-size:11px;line-height:1.4}.collaboration-list{min-height:0;overflow:auto}.collaboration-card{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:2px 7px;padding:6px 9px;border-bottom:1px solid #242424}.collaboration-card:hover{background:var(--hover)}.collaboration-card strong{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#d4d4d4;font-size:12px;font-weight:500}.collaboration-card small{grid-column:1/-1;color:var(--muted);font-size:10px;line-height:1.35;overflow-wrap:anywhere}.collaboration-card .collaboration-state{color:#89d185;font-size:10px}.collaboration-card.is-warning .collaboration-state{color:#e2c08d}.collaboration-empty{padding:8px 10px;color:var(--muted);font-size:11px}.collaboration-resource-links{display:flex;flex-wrap:wrap;gap:4px;padding:6px 8px}.collaboration-resource-link{color:#75beff;font-size:10px;text-decoration:none}.collaboration-resource-link:hover{text-decoration:underline}.remote-cursor{border-left:2px solid #f48771}.remote-cursor-1{border-color:#89d185}.remote-cursor-2{border-color:#d7ba7d}.remote-cursor-3{border-color:#c586c0}.remote-cursor-4{border-color:#4ec9b0}
@@ -112619,7 +114747,7 @@ const S={
   diagnostics:[],searchResults:[],scm:null,tasks:[],installedExtensions:[],extensionWorkers:new Map(),
   terminal:null,terminalStarting:false,terminalPromise:null,terminalWidget:null,terminalFit:null,terminalOffset:0,terminalPoll:null,terminalDecoder:null,terminalAnsiState:null,terminalPlainState:null,stateTimer:null,diagnosticTimer:null,paletteItems:[],paletteIndex:0,paletteMode:'commands',quickFiles:[],quickFilesLoading:false,quickFilesKey:'',quickFilesTruncated:false,
   debug:null,debugSeq:0,debugPoll:null,debugFile:null,
-  agentPoll:null,agentPollDue:0,agentPollBusy:false,agentPollRequested:false,agentEventRaf:0,agentState:null,agentRendered:new Set(),agentToolCards:new Map(),agentPlanCards:new Map(),agentTimelineSignature:'',agentProgressSignature:'',agentBatching:false,agentFeedSeq:0,agentOperationSeq:0,agentSnapshotRevision:0,agentEventSeq:0,agentWasBusy:false,agentSession:'',agentSubmitting:false,agentInterrupting:false,agentTreeTimer:null,agentFileRefresh:new Set(),agentAttachments:[],agentModelCatalog:null,agentTodoCollapsed:false,promptEnhanceEnabled:false,promptEnhancePersistent:false,promptEnhanceSkillsAware:false,promptEnhanceBudget:'medium',promptEnhancing:false,promptEnhanceDraft:null,promptEnhanceAbort:null,promptEnhanceStartedAt:0,promptEnhanceElapsedTimer:null,promptEnhanceLoadingLabel:'',workspaceRefreshBusy:false,workspaceRefreshSeq:0,workspaceClipboard:null,explorerSelection:null,sessionSwitchSeq:0,sessionSwitching:false,renderingAgentState:false,devicePoll:null,agentEvents:null,agentEventsConnected:false,agentEventReconnect:null,pendingUploadDest:'',pendingOpenUpload:false,pendingFolderUploadDest:'',
+  agentPoll:null,agentPollDue:0,agentPollBusy:false,agentPollRequested:false,agentEventRaf:0,agentState:null,agentRendered:new Set(),agentToolCards:new Map(),agentPlanCards:new Map(),agentTimelineSignature:'',agentProgressSignature:'',agentBatching:false,agentFeedSeq:0,agentOperationSeq:0,agentSnapshotRevision:0,agentEventSeq:0,agentWasBusy:false,agentSession:'',agentSubmitting:false,agentSubmissionStatus:'',agentSubmissionPendingUntil:0,agentSubmissionSeenRunning:false,agentInterrupting:false,agentTreeTimer:null,agentFileRefresh:new Set(),agentAttachments:[],agentModelCatalog:null,agentTodoCollapsed:false,promptEnhanceEnabled:false,promptEnhancePersistent:false,promptEnhanceSkillsAware:false,promptEnhanceBudget:'medium',promptEnhancing:false,promptEnhanceDraft:null,promptEnhanceAbort:null,promptEnhanceStartedAt:0,promptEnhanceElapsedTimer:null,promptEnhanceLoadingLabel:'',workspaceRefreshBusy:false,workspaceRefreshSeq:0,workspaceHistory:null,workspaceHistorySession:'',workspaceHistoryRevision:0,workspaceHistoryLoadedAt:0,workspaceHistoryTimer:null,workspaceHistoryLongPressTimer:null,workspaceHistoryTouchHandled:false,workspaceClipboard:null,explorerSelection:null,sessionSwitchSeq:0,sessionSwitching:false,activeSessionRow:null,renderingAgentState:false,devicePoll:null,agentEvents:null,agentEventsConnected:false,agentEventReconnect:null,pendingUploadDest:'',pendingOpenUpload:false,pendingFolderUploadDest:'',
   applications:null,applicationsLoading:false,applicationBusy:new Set(),applicationDraft:{id:'',selectedSkillIds:[],saving:false},
   collaborationMode:false,collaboration:null,collaborationWarning:'',collaborationEvents:null,collaborationEventCursor:0,collaborationRefreshTimer:null,collaborationPresenceTimer:null,collaborationPresenceHeartbeat:null,collaborationConflictNoticeSignature:'',collaborationConflictNoticeTimer:null,collaborationConflictReviewId:'',collaborationFlushes:new Map(),collaborationFlushTimers:new Map(),collaborationRemoteDecorations:new Map(),collaborationSessionRefresh:null
 };
@@ -112796,8 +114924,10 @@ function renderTabs(){for(let group=0;group<2;group++){const host=E(`tabs${group
 function renderBreadcrumbs(){for(let group=0;group<2;group++){const host=E(`breadcrumbs${group}`),file=activeFile(group);host.innerHTML=file?file.path.split('/').map((part,index,parts)=>`<span class="breadcrumb-item"><span>${escapeHtml(part)}</span>${index<parts.length-1?'<span class="codicon codicon-chevron-right"></span>':''}</span>`).join(''):'';if(file){const size=document.createElement('span');size.className='tree-meta';size.textContent=formatFileSize(file.size);host.appendChild(size)}if(file&&canPreviewFile(file)&&!file.binary){const button=document.createElement('button');button.className='breadcrumb-action';button.title=file.preview?'Open Text Editor':'Open Preview';button.innerHTML=`<span class="codicon codicon-${file.preview?'code':'preview'}"></span>`;button.onclick=()=>{file.preview=!file.preview;setEditorModel(group,file)};host.appendChild(button)}}}
 function renderOpenEditors(){const host=E('openEditors');host.innerHTML='';for(const file of S.openFiles.values()){const row=document.createElement('div');row.className='open-editor-row'+(activeFile()?.key===file.key?' is-active':'');row.innerHTML=`<span class="codicon ${fileIconClass(file.path)}"></span><span>${escapeHtml(file.name)}</span>${file.dirty?'<span class="dirty-mark">●</span>':''}`;row.onclick=()=>setEditorModel(file.group,file);host.appendChild(row)}}
 const IDE_SESSION_PAGE_LIMIT=80,IDE_SESSION_CACHE_MAX=240;
-function renderSessions(){const select=E('sessionSelect');select.innerHTML='';for(const row of S.sessions.slice(0,IDE_SESSION_CACHE_MAX)){const option=document.createElement('option');option.value=row.id;option.textContent=row.title||row.id;option.selected=row.id===S.activeSession;select.appendChild(option)}const more=E('sessionMoreBtn');if(more){more.disabled=!!S.sessionLoading||!S.sessionHasMore;more.classList.toggle('is-hidden',!S.sessionHasMore)}}
-function applyIdeSessionPage(out,{append=false}={}){const rows=Array.isArray(out?.sessions)?out.sessions:[],existing=new Map((append?S.sessions:[]).map(row=>[String(row.id||''),row]));for(const raw of rows){const id=String(raw?.id||'');if(id)existing.set(id,{...(existing.get(id)||{}),...raw})}let merged=append?[...existing.values()]:rows.map(raw=>existing.get(String(raw.id||''))||raw);const activeRow=S.sessions.find(row=>row.id===S.activeSession);if(activeRow&&!merged.some(row=>row.id===S.activeSession))merged.push(activeRow);S.sessions=merged.slice(0,IDE_SESSION_CACHE_MAX);S.sessionTotal=Math.max(S.sessions.length,Number(out?.total||0));S.sessionNextOffset=Math.max(0,Number(out?.offset||0))+rows.length;S.sessionHasMore=!!out?.has_more&&S.sessionNextOffset<S.sessionTotal;S.sessionCatalogRevision=Number(out?.catalog_revision||S.sessionCatalogRevision||0);renderSessions();return out}
+function sessionRowsForRender(){const rows=Array.isArray(S.sessions)?S.sessions.slice(0,IDE_SESSION_CACHE_MAX):[],active=String(S.activeSession||'');if(active&&!rows.some(row=>String(row?.id||'')===active)&&S.activeSessionRow?.id===active)rows.push(S.activeSessionRow);return rows}
+function formatWorkspaceDate(ts){const value=Number(ts||0);if(!Number.isFinite(value)||value<=0)return'';try{return new Intl.DateTimeFormat(undefined,{year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date(value*1000))}catch{return''}}
+function renderSessions(){const select=E('sessionSelect');if(!select)return;select.innerHTML='';const rows=sessionRowsForRender(),groups=new Map(),nameCounts=new Map();for(const row of rows){const id=String(row?.id||'');if(!id)continue;const wid=String(row.workspace_id||id);let group=groups.get(wid);if(!group){group={id:wid,rows:[],name:String(row.workspace_name||row.workspace_label||row.title||id),label:String(row.workspace_label||''),created:Number(row.workspace_created_at||row.created_at||row.updated_at||0)};groups.set(wid,group)}group.rows.push(row)}for(const group of groups.values()){const key=group.name.trim().toLocaleLowerCase();nameCounts.set(key,(nameCounts.get(key)||0)+1)}for(const group of groups.values()){const key=group.name.trim().toLocaleLowerCase(),date=formatWorkspaceDate(group.created),label=group.label||(nameCounts.get(key)>1&&date?`${group.name} · ${date}`:group.name);const host=document.createElement('optgroup');host.label=label||group.id;for(const row of group.rows){const option=document.createElement('option');option.value=row.id;option.textContent=row.title||row.id;option.selected=String(row.id)===String(S.activeSession);host.appendChild(option)}select.appendChild(host)}const more=E('sessionMoreBtn');if(more){more.disabled=!!S.sessionLoading||!S.sessionHasMore;more.classList.toggle('is-hidden',!S.sessionHasMore)}updateWorkspaceHistoryIndicator()}
+function applyIdeSessionPage(out,{append=false}={}){const rows=Array.isArray(out?.sessions)?out.sessions:[],existing=new Map((append?S.sessions:[]).map(row=>[String(row.id||''),row]));for(const raw of rows){const id=String(raw?.id||'');if(id)existing.set(id,{...(existing.get(id)||{}),...raw})}const merged=[...existing.values()].slice(0,IDE_SESSION_CACHE_MAX);if(rows.some(row=>String(row?.id||'')===String(S.activeSession||'')))S.activeSessionRow=null;S.sessions=merged;S.sessionTotal=Math.max(S.sessions.length,Number(out?.total||0));S.sessionNextOffset=Math.max(0,Number(out?.offset||0))+rows.length;S.sessionHasMore=!!out?.has_more&&S.sessionNextOffset<S.sessionTotal;S.sessionCatalogRevision=Number(out?.catalog_revision||S.sessionCatalogRevision||0);renderSessions();return out}
 function renderRoots(){const select=E('rootSelect');select.innerHTML='';for(const root of S.roots){const option=document.createElement('option');option.value=root.id;option.textContent=root.kind==='session'?'Session Workspace':`Workspace Folder: ${root.label||root.id}`;option.selected=root.id===S.activeRoot;select.appendChild(option)}select.classList.toggle('is-hidden',S.roots.length===1&&S.roots[0]?.kind==='session');const current=S.roots.find(root=>root.id===S.activeRoot);E('workspaceLabel').textContent=current?.kind==='session'?'Session Workspace':current?.label||'Workspace'}
 function sessionRequestCurrent(session,seq=null){return session===S.activeSession&&(seq==null||seq===S.sessionSwitchSeq)}
 async function loadRoots(session=S.activeSession,seq=null){if(!session)return false;const out=await api(`/api/ide/sessions/${qs(session)}/workspace/roots`);if(!sessionRequestCurrent(session,seq))return false;S.roots=Array.isArray(out.roots)?out.roots:[];if(!S.roots.some(root=>root.id===S.activeRoot))S.activeRoot=S.roots[0]?.id||'session';renderRoots();S.treeCache.clear();return loadTree('',{session,root:S.activeRoot,seq})}
@@ -112816,14 +114946,26 @@ async function pasteWorkspaceClipboard(destinationDir=''){const clip=S.workspace
 function renderTree(){const host=E('tree');host.innerHTML='';const selected=explorerSelectionRow(),clip=S.workspaceClipboard;const draw=(path,depth)=>{for(const row of S.treeCache.get(path)||[]){const div=document.createElement('div'),active=activeFile()?.path===row.path&&activeFile()?.root_id===S.activeRoot,isSelected=selected?.path===row.path,isCut=clip?.operation==='move'&&clip.session_id===S.activeSession&&clip.root_id===S.activeRoot&&clip.path===row.path;div.className=`tree-row${active?' is-active':''}${isSelected?' is-selected':''}${isCut?' is-cut':''}`;div.style.paddingLeft=`${4+depth*12}px`;div.dataset.path=row.path;div.dataset.type=row.type;div.dataset.dropDir=row.type==='dir'?row.path:explorerParentPath(row.path);div.setAttribute('role','treeitem');div.tabIndex=-1;const open=row.type==='dir'&&S.treeCache.has(row.path);div.innerHTML=`<button class="tree-twist" tabindex="-1"><span class="codicon codicon-${row.type==='dir'?(open?'chevron-down':'chevron-right'):'blank'}"></span></button><span class="tree-icon codicon ${fileIconClass(row.name,row.type)}"></span><span class="tree-name">${escapeHtml(row.name)}</span>${row.type==='file'?`<span class="tree-meta">${formatFileSize(row.size)}</span>`:''}`;div.onclick=async event=>{event.stopPropagation();setExplorerSelection(row);div.focus();try{if(row.type==='dir'){if(row.skipped)return toast('This generated directory is hidden by the explorer performance guard.','warning');if(open)S.treeCache.delete(row.path);else await loadTree(row.path);renderTree()}else await openFile(row.path)}catch(error){showError(error)}};div.oncontextmenu=event=>{event.preventDefault();event.stopPropagation();setExplorerSelection(row);div.focus();showExplorerMenu(event.clientX,event.clientY,row)};host.appendChild(div);if(row.type==='dir'&&S.treeCache.has(row.path))draw(row.path,depth+1)}};draw('',0)}
 async function refreshOpenFile(file,forcePreview=false){if(!file||file.dirty||file.stageId!=='latest'||file.session_id!==S.activeSession)return;const out=await api(`/api/ide/sessions/${qs(file.session_id)}/workspace/file?${rootQuery(file.root_id)}&path=${qs(file.path)}`);if(file.session_id!==S.activeSession||S.openFiles.get(file.key)!==file)return;const revision=out.revision||out.file?.revision||'';if(revision===file.revision){if(forcePreview&&activeFile(file.group)?.key===file.key&&isArtifactFile(file))renderArtifactPreview(file.group,file);return}file.content=out.content||'';file.revision=revision;file.binary=out.encoding==='base64';file.previewKind=out.file?.preview_kind||file.previewKind||previewKindForPath(file.path);file.mime=out.file?.mime||file.mime||'';file.size=Number(out.file?.size||0);file.historyStages=null;try{await loadCodeHistory(file,'latest')}catch{}if(file.session_id!==S.activeSession||S.openFiles.get(file.key)!==file)return;const model=S.models.get(file.key);if(model&&model.getValue()!==file.content){S.suppressEditorChange=true;model.setValue(file.content);S.suppressEditorChange=false}if(!S.monaco&&activeFile(file.group)?.key===file.key&&!isArtifactFile(file))E(`fallbackEditor${file.group}`).value=file.content;if(activeFile(file.group)?.key===file.key){if(isArtifactFile(file))renderArtifactPreview(file.group,file);else applyHistoryView(file.group,file)}renderTabs();renderBreadcrumbs();renderOpenEditors()}
 async function refreshWorkspaceSnapshot(){if(S.workspaceRefreshBusy||!S.activeSession)return;const refreshSeq=++S.workspaceRefreshSeq,switchSeq=S.sessionSwitchSeq,session=S.activeSession,root=S.activeRoot;S.workspaceRefreshBusy=true;const expanded=[...S.treeCache.keys()].filter(Boolean).sort((a,b)=>a.split('/').length-b.split('/').length);const current=()=>refreshSeq===S.workspaceRefreshSeq&&switchSeq===S.sessionSwitchSeq&&session===S.activeSession&&root===S.activeRoot;try{const next=new Map();const load=async path=>{try{const out=await api(`/api/ide/sessions/${qs(session)}/workspace/tree?root_id=${qs(root)}&path=${qs(path)}`);if(current())next.set(path,out.tree?.children||[])}catch(error){if(!path&&current())throw error}};await load('');for(const path of expanded){if(!current())return;await load(path)}if(!current())return;S.treeCache=next;renderTree();for(const file of [...S.openFiles.values()]){if(!current())return;if(file.session_id===session)try{await refreshOpenFile(file)}catch(error){if(error.status===404){if(!file.dirty)closeFile(file.key)}else logOutput(`File refresh ${file.path}: ${error.message}`)}}}finally{if(refreshSeq===S.workspaceRefreshSeq)S.workspaceRefreshBusy=false}}
-async function createSession(){const out=await api('/api/ide/sessions',{method:'POST',body:'{}'});S.sessions=[out,...S.sessions.filter(row=>row.id!==out.id)].slice(0,IDE_SESSION_CACHE_MAX);await switchSession(out.id,true);return out}
-async function renameCurrentSession(){const row=S.sessions.find(item=>item.id===S.activeSession);if(!row)return;const title=prompt('Session name',row.title||'');if(!title||title.trim()===row.title)return;const out=await api(`/api/ide/sessions/${qs(S.activeSession)}`,{method:'PATCH',body:JSON.stringify({title:title.trim()})});row.title=out.title;renderSessions();updateAgentContext();await loadRoots();scheduleStateSave()}
-async function switchSession(sessionId,isNew=false){const target=String(sessionId||'');if(!target||target===S.activeSession&&!isNew){renderSessions();return true}if([...S.openFiles.values()].some(file=>file.dirty)&&!confirm('Switch session with unsaved files?')){renderSessions();return false}const seq=++S.sessionSwitchSeq;S.sessionSwitching=true;E('sessionSelect').disabled=true;closePromptEnhanceReview(false);S.workspaceClipboard=null;S.explorerSelection=null;clearWorkspaceDropState();S.activeSession=target;S.workspaceRefreshSeq++;S.workspaceRefreshBusy=false;closeAgentEvents();clearTimeout(S.agentPoll);S.agentPoll=null;S.agentPollDue=0;clearTimeout(S.agentTreeTimer);try{if(S.terminal)await killTerminal();if(seq!==S.sessionSwitchSeq)return false;if(S.debug)await stopDebug();if(seq!==S.sessionSwitchSeq)return false;S.openFiles.clear();S.models.forEach(model=>model.dispose());S.models.clear();S.historyOriginalModels.forEach(model=>model.dispose());S.historyOriginalModels.clear();S.historyDecorations.clear();S.viewStates.clear();S.activeByGroup=['',''];setEditorModel(1,null);setEditorModel(0,null);syncEditorGroupLayout();resetAgentSessionUI(target);await refreshConfig();if(seq!==S.sessionSwitchSeq||target!==S.activeSession)return false;await loadRoots(target,seq);if(seq!==S.sessionSwitchSeq||target!==S.activeSession)return false;updateAgentContext();connectAgentEvents();S.agentPollRequested=true;scheduleAgentPoll(50);if(isNew){toggleSecondary(true);E('agentPrompt').focus();agentMessage('New task workspace ready.','system')}scheduleStateSave();return true}finally{if(seq===S.sessionSwitchSeq){S.sessionSwitching=false;E('sessionSelect').disabled=false;renderSessions()}}}
+function updateWorkspaceHistoryIndicator(){const button=E('newAgentChatBtn'),badge=E('newAgentChatHistoryBadge');if(!button||!badge)return;const activeId=String(S.activeSession||''),row=S.sessions.find(item=>String(item.id||'')===activeId)||S.activeSessionRow,workspaceId=String(row?.workspace_id||'').trim(),historyWorkspaceId=String(S.workspaceHistory?.workspace_id||'').trim(),historyMatches=!!S.workspaceHistory&&((workspaceId&&historyWorkspaceId&&workspaceId===historyWorkspaceId)||S.workspaceHistorySession===activeId);const cachedTotal=historyMatches?Number(S.workspaceHistory.total||0):0,count=Math.max(0,(cachedTotal||Number(row?.workspace_session_count||0))-1);badge.classList.toggle('is-hidden',count<=0);button.title=count>0?`New conversation in this workspace · ${count} previous session${count===1?'':'s'}`:'New conversation in this workspace'}
+function closeWorkspaceHistoryMenu(){const popup=E('menuPopup');if(!popup)return;popup.classList.add('is-hidden');popup.classList.remove('session-history-menu');popup.style.transform='';popup.style.left='';popup.style.top='';popup.style.bottom=''}
+function formatWorkspaceHistoryTime(ts){const value=Number(ts||0);if(!Number.isFinite(value)||value<=0)return'';try{return new Intl.DateTimeFormat(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}).format(new Date(value*1000))}catch{return''}}
+function mergeWorkspaceHistoryRows(rows=[]){for(const raw of Array.isArray(rows)?rows:[]){const id=String(raw?.id||'');if(!id)continue;const index=S.sessions.findIndex(row=>String(row?.id||'')===id);if(index>=0)S.sessions[index]={...S.sessions[index],...raw};if(String(S.activeSession||'')===id)S.activeSessionRow={...(S.activeSessionRow||{}),...raw}}renderSessions()}
+async function loadWorkspaceHistory({show=true,anchor=null}={}){const session=String(S.activeSession||''),revision=S.sessionCatalogRevision,now=Date.now();if(!session)return null;if(S.workspaceHistory&&S.workspaceHistorySession===session&&Number(S.workspaceHistoryRevision||0)===Number(revision||0)&&now-Number(S.workspaceHistoryLoadedAt||0)<3000){if(show)renderWorkspaceHistoryMenu(S.workspaceHistory,anchor||E('newAgentChatBtn'));return S.workspaceHistory}try{const out=await api(`/api/ide/sessions/${qs(session)}/workspace/history?limit=60`);if(session!==S.activeSession)return null;S.workspaceHistory=out;S.workspaceHistorySession=session;S.workspaceHistoryRevision=Math.max(Number(out.catalog_revision||0),Number(revision||0));S.sessionCatalogRevision=Math.max(Number(S.sessionCatalogRevision||0),Number(out.catalog_revision||0));S.workspaceHistoryLoadedAt=Date.now();mergeWorkspaceHistoryRows(out.sessions||[]);updateWorkspaceHistoryIndicator();if(show)renderWorkspaceHistoryMenu(out,anchor||E('newAgentChatBtn'));return out}catch(error){if(show)showError(error);return null}}
+async function deleteWorkspaceHistorySession(id,rows,anchor){const target=String(id||'').trim();if(!target||!confirm('Delete this session? This cannot be undone.'))return;const targetRow=(rows||[]).find(row=>String(row?.id||'')===target),workspaceId=String(targetRow?.workspace_id||'').trim(),wasCurrent=target===String(S.activeSession||'');await api(`/api/ide/sessions/${qs(target)}`,{method:'DELETE',body:'{}'});S.sessions=S.sessions.filter(row=>String(row?.id||'')!==target);S.sessionTotal=Math.max(0,Number(S.sessionTotal||0)-1);S.sessionCatalogRevision=Math.max(0,Number(S.sessionCatalogRevision||0)+1);S.sessionNextOffset=Math.min(Number(S.sessionNextOffset||0),S.sessionTotal);if(workspaceId){for(const row of S.sessions){if(String(row?.workspace_id||'').trim()===workspaceId)row.workspace_session_count=Math.max(1,Number(row.workspace_session_count||0)-1)}if(S.activeSessionRow&&String(S.activeSessionRow.workspace_id||'').trim()===workspaceId)S.activeSessionRow.workspace_session_count=Math.max(1,Number(S.activeSessionRow.workspace_session_count||0)-1)}S.workspaceHistory=null;S.workspaceHistorySession='';S.workspaceHistoryRevision=0;S.workspaceHistoryLoadedAt=0;if(wasCurrent){const next=(rows||[]).find(row=>String(row?.id||'')!==target);if(next)await switchSession(next.id,false,{sessionRow:next});else{S.activeSession='';S.activeSessionRow=null;await refreshSessionCatalog({append:false});if(!S.activeSession&&S.sessions[0]?.id)await switchSession(S.sessions[0].id,false);if(!S.activeSession)await createSession({newWorkspace:true})}}else{renderSessions();updateWorkspaceHistoryIndicator()}if(S.activeSession)await loadWorkspaceHistory({show:true,anchor:anchor||E('newAgentChatBtn')})}
+function renderWorkspaceHistoryMenu(out,anchor){const popup=E('menuPopup');if(!popup)return;const rows=Array.isArray(out?.sessions)?out.sessions:[],rect=anchor?.getBoundingClientRect?.()||E('newAgentChatBtn')?.getBoundingClientRect?.();popup.className='menu-popup session-history-menu';popup.innerHTML=`<div class="session-history-heading"><span class="codicon codicon-history"></span><strong>Workspace conversations</strong><small>${Number(out?.total||rows.length)} total</small></div>`+(rows.length?rows.map(row=>`<div class="session-history-row${row.current?' is-current':''}"><button type="button" data-history-session="${escapeHtml(row.id)}"><span class="codicon codicon-${row.current?'check':'comment-discussion'}"></span><span class="session-history-title">${escapeHtml(row.title||row.id)}</span><small>${escapeHtml(formatWorkspaceHistoryTime(row.updated_at))}</small></button><button type="button" class="session-history-delete" data-history-delete="${escapeHtml(row.id)}" title="Delete session" aria-label="Delete session"><span class="codicon codicon-trash"></span></button></div>`).join(''):'<div class="session-history-empty">No previous conversations in this workspace.</div>');popup.style.left=`${Math.max(4,Math.min(Number(rect?.left||4),window.innerWidth-350))}px`;popup.style.top=`${Math.min(window.innerHeight-12,Number(rect?.bottom||40)+4)}px`;popup.classList.remove('is-hidden');popup.querySelectorAll('[data-history-session]').forEach(button=>button.onclick=async event=>{event.stopPropagation();const id=button.dataset.historySession;const row=rows.find(item=>String(item?.id||'')===String(id));if(row)S.activeSessionRow={...row};closeWorkspaceHistoryMenu();await switchSession(id,false)});popup.querySelectorAll('[data-history-delete]').forEach(button=>button.onclick=event=>{event.stopPropagation();deleteWorkspaceHistorySession(button.dataset.historyDelete,rows,anchor).catch(showError)})}
+function bindWorkspaceHistoryButton(){const button=E('newAgentChatBtn');if(!button||button.dataset.historyBound)return;button.dataset.historyBound='1';let hoverTimer=0;const show=()=>{clearTimeout(hoverTimer);hoverTimer=setTimeout(()=>loadWorkspaceHistory({show:true,anchor:button}),420)};button.addEventListener('mouseenter',show);button.addEventListener('mouseleave',()=>clearTimeout(hoverTimer));button.addEventListener('contextmenu',event=>{event.preventDefault();clearTimeout(hoverTimer);loadWorkspaceHistory({show:true,anchor:button})});button.addEventListener('pointerdown',event=>{if(event.pointerType==='touch'||event.pointerType==='pen'){clearTimeout(S.workspaceHistoryLongPressTimer);S.workspaceHistoryTouchHandled=false;S.workspaceHistoryLongPressTimer=setTimeout(()=>{S.workspaceHistoryTouchHandled=true;loadWorkspaceHistory({show:true,anchor:button})},520)}});button.addEventListener('pointerup',event=>{clearTimeout(S.workspaceHistoryLongPressTimer);if((event.pointerType==='touch'||event.pointerType==='pen')&&S.workspaceHistoryTouchHandled){event.preventDefault();setTimeout(()=>{S.workspaceHistoryTouchHandled=false},0)}});button.addEventListener('pointercancel',()=>{clearTimeout(S.workspaceHistoryLongPressTimer);S.workspaceHistoryTouchHandled=false})}
+// Keep the historical default request contract discoverable for older IDE integrations:
+// api('/api/ide/sessions',{method:'POST',body:'{}'})
+// E('newAgentChatBtn').onclick=()=>createSession() is retained as the legacy integration contract.
+async function createSession({newWorkspace=false}={}){const body=newWorkspace?{new_workspace:true}:{workspace_session_id:S.activeSession};const out=await api('/api/ide/sessions',{method:'POST',body:JSON.stringify(body)});S.activeSessionRow=null;S.sessions=[out,...S.sessions.filter(row=>row.id!==out.id)].slice(0,IDE_SESSION_CACHE_MAX);S.sessionTotal=Math.max(S.sessions.length,Number(S.sessionTotal||0)+1);await switchSession(out.id,true,{roots:out.roots});S.workspaceHistory=null;S.workspaceHistorySession='';S.workspaceHistoryRevision=0;S.workspaceHistoryLoadedAt=0;updateWorkspaceHistoryIndicator();return out}
+async function renameCurrentSession(){const row=S.sessions.find(item=>String(item?.id||'')===String(S.activeSession||''))||S.activeSessionRow;if(!row)return;const title=prompt('Session name',row.title||'');if(!title||title.trim()===row.title)return;const out=await api(`/api/ide/sessions/${qs(S.activeSession)}`,{method:'PATCH',body:JSON.stringify({title:title.trim()})});applyIdeSessionTitleEvent({session_id:S.activeSession,session_title:out.title,title_origin:'manual',title_revision:Number(out.title_revision||0),workspace_id:row.workspace_id});S.workspaceHistory=null;S.workspaceHistoryLoadedAt=0;await loadWorkspaceHistory({show:false}).catch(()=>{});renderSessions();updateAgentContext();await loadRoots();scheduleStateSave()}
 async function refreshSessionCatalog({append=false,search=S.sessionSearch}={}){if(S.sessionLoading)return null;S.sessionLoading=true;try{const offset=append?S.sessionNextOffset:0,needle=String(search||'').trim(),out=await api(`/api/ide/sessions?limit=${IDE_SESSION_PAGE_LIMIT}&offset=${offset}${needle?`&search=${qs(needle)}`:''}`);S.sessionSearch=needle;return applyIdeSessionPage(out,{append})}finally{S.sessionLoading=false;renderSessions()}}
 function scheduleIdeSessionSearch(value){clearTimeout(S.sessionSearchTimer);S.sessionSearchTimer=setTimeout(()=>refreshSessionCatalog({append:false,search:value}).catch(showError),220)}
 // Session switching only needs the catalog. Keep toolchains, mounts, and other
 // static IDE config out of the hot path on machines with many old sessions.
-async function switchSession(sessionId,isNew=false){const target=String(sessionId||'');if(!target||target===S.activeSession&&!isNew){renderSessions();return true}if([...S.openFiles.values()].some(file=>file.dirty)&&!confirm('Switch session with unsaved files?')){renderSessions();return false}const seq=++S.sessionSwitchSeq;S.sessionSwitching=true;E('sessionSelect').disabled=true;closePromptEnhanceReview(false);S.workspaceClipboard=null;S.explorerSelection=null;clearWorkspaceDropState();S.activeSession=target;S.workspaceRefreshSeq++;S.workspaceRefreshBusy=false;closeAgentEvents();clearTimeout(S.agentPoll);S.agentPoll=null;S.agentPollDue=0;clearTimeout(S.agentTreeTimer);try{if(S.terminal)await killTerminal();if(seq!==S.sessionSwitchSeq)return false;if(S.debug)await stopDebug();if(seq!==S.sessionSwitchSeq)return false;S.openFiles.clear();S.models.forEach(model=>model.dispose());S.models.clear();S.historyOriginalModels.forEach(model=>model.dispose());S.historyOriginalModels.clear();S.historyDecorations.clear();S.viewStates.clear();S.activeByGroup=['',''];setEditorModel(1,null);setEditorModel(0,null);syncEditorGroupLayout();resetAgentSessionUI(target);await refreshSessionCatalog();if(seq!==S.sessionSwitchSeq||target!==S.activeSession)return false;await loadRoots(target,seq);if(seq!==S.sessionSwitchSeq||target!==S.activeSession)return false;updateAgentContext();connectAgentEvents();S.agentPollRequested=true;scheduleAgentPoll(50);if(isNew){toggleSecondary(true);E('agentPrompt').focus();agentMessage('New task workspace ready.','system')}scheduleStateSave();return true}finally{if(seq===S.sessionSwitchSeq){S.sessionSwitching=false;E('sessionSelect').disabled=false;renderSessions()}}}
+function applyImmediateSessionRoots(session,roots,seq){if(!sessionRequestCurrent(session,seq))return false;const rows=Array.isArray(roots)?roots.filter(row=>row&&row.id):[],sessionRow=S.sessions.find(row=>String(row?.id||'')===String(session))||S.activeSessionRow;S.roots=rows.length?rows:[{id:'session',kind:'session',label:sessionRow?.title||session,path:'',readonly:false}];if(!S.roots.some(root=>root.id===S.activeRoot))S.activeRoot=S.roots[0]?.id||'session';renderRoots();S.treeCache.clear();return true}
+function scheduleSessionWorkspaceBootstrap(session,seq,roots=[]){const run=async()=>{if(seq!==S.sessionSwitchSeq)return false;if(!sessionRequestCurrent(session,seq))return;try{if(Array.isArray(roots)&&roots.length){if(!applyImmediateSessionRoots(session,roots,seq))return;await loadTree('',{session,root:S.activeRoot,seq})}else await loadRoots(session,seq)}catch(error){if(sessionRequestCurrent(session,seq))logOutput(`Workspace load: ${error.message}`)}};setTimeout(run,0)}
+async function switchSession(sessionId,isNew=false,opt={}){const target=String(sessionId||'');if(!target||target===S.activeSession&&!isNew){renderSessions();return true}if([...S.openFiles.values()].some(file=>file.dirty)&&!confirm('Switch session with unsaved files?')){renderSessions();return false}if(opt.sessionRow)S.activeSessionRow={...opt.sessionRow};else if(S.sessions.some(row=>String(row?.id||'')===target))S.activeSessionRow=null;const seq=++S.sessionSwitchSeq;S.sessionSwitching=true;E('sessionSelect').disabled=true;closePromptEnhanceReview(false);S.workspaceClipboard=null;S.explorerSelection=null;clearWorkspaceDropState();S.activeSession=target;S.workspaceRefreshSeq++;S.workspaceRefreshBusy=false;closeAgentEvents();clearTimeout(S.agentPoll);S.agentPoll=null;S.agentPollDue=0;clearTimeout(S.agentTreeTimer);const cleanup=[];if(S.terminal)cleanup.push(killTerminal());if(S.debug)cleanup.push(stopDebug());S.openFiles.clear();S.models.forEach(model=>model.dispose());S.models.clear();S.historyOriginalModels.forEach(model=>model.dispose());S.historyOriginalModels.clear();S.historyDecorations.clear();S.viewStates.clear();S.activeByGroup=['',''];setEditorModel(1,null);setEditorModel(0,null);syncEditorGroupLayout();resetAgentSessionUI(target);applyImmediateSessionRoots(target,opt.roots,seq);updateAgentContext();connectAgentEvents();S.agentPollRequested=true;scheduleAgentPoll(0);scheduleSessionWorkspaceBootstrap(target,seq,opt.roots);if(cleanup.length)Promise.allSettled(cleanup).catch(()=>{});if(isNew){toggleSecondary(true);E('agentPrompt').focus();agentMessage('New task workspace ready.','system')}setStatus(isNew?'New task ready':'Session ready');await saveWorkbenchState();S.sessionSwitching=false;E('sessionSelect').disabled=false;renderSessions();return true}
 async function newFile(){const rel=prompt('File path',activeDir()?`${activeDir()}/untitled.txt`:'untitled.txt');if(!rel)return;await api(`/api/ide/sessions/${qs(S.activeSession)}/workspace/file`,{method:'PUT',body:JSON.stringify({root_id:S.activeRoot,path:rel,content:''})});await loadTree(activeDir());await openFile(rel)}
 async function newFolder(){const rel=prompt('Folder path',activeDir()?`${activeDir()}/new-folder`:'new-folder');if(!rel)return;await api(`/api/ide/sessions/${qs(S.activeSession)}/workspace/mkdir`,{method:'POST',body:JSON.stringify({root_id:S.activeRoot,path:rel})});await loadTree(activeDir())}
 async function renameEntry(row){const next=normalizeUploadPath(prompt('New path',row.path)||'');if(!next||next===row.path)return;workspaceAssertNoDirtyFiles(row.path,'renaming this entry');await api(`/api/ide/sessions/${qs(S.activeSession)}/workspace/rename`,{method:'PATCH',body:JSON.stringify({root_id:S.activeRoot,old_path:row.path,new_path:next})});await remapWorkspaceOpenFiles(row.path,next);const selected=explorerSelectionRow();if(selected&&(selected.path===row.path||selected.path.startsWith(`${row.path}/`)))S.explorerSelection=Object.assign({},selected,{path:`${next}${selected.path.slice(row.path.length)}`,name:selected.path===row.path?next.split('/').pop():selected.name});const clip=S.workspaceClipboard;if(clip?.session_id===S.activeSession&&clip?.root_id===S.activeRoot&&(clip.path===row.path||clip.path.startsWith(`${row.path}/`)))S.workspaceClipboard=Object.assign({},clip,{path:`${next}${clip.path.slice(row.path.length)}`,name:clip.path===row.path?next.split('/').pop():clip.name});S.treeCache.clear();await loadTree('')}
@@ -112933,8 +115075,9 @@ function togglePrimary(){S.primaryVisible=!S.primaryVisible;E('ideShell').classL
 function toggleSecondary(force){S.secondaryVisible=typeof force==='boolean'?force:!S.secondaryVisible;E('ideShell').classList.toggle('secondary-hidden',!S.secondaryVisible);scheduleStateSave()}
 function togglePanel(){S.panelVisible=!S.panelVisible;E('ideShell').classList.toggle('panel-hidden',!S.panelVisible);scheduleStateSave()}
 function scheduleStateSave(){clearTimeout(S.stateTimer);S.stateTimer=setTimeout(saveWorkbenchState,600)}
-async function saveWorkbenchState(){if(!S.csrf||!S.activeSession)return;const state={active_session_id:S.activeSession,active_root_id:S.activeRoot,active_view:S.activeView,panel:S.panel,panel_visible:S.panelVisible,secondary_visible:S.secondaryVisible,agent_todo_collapsed:S.agentTodoCollapsed,prompt_enhance_persistent:S.promptEnhancePersistent,prompt_enhance_enabled:S.promptEnhancePersistent&&S.promptEnhanceEnabled,prompt_enhance_skills_awareness:S.promptEnhanceSkillsAware,prompt_enhance_budget:S.promptEnhanceBudget,code_history_mode:S.codeHistoryMode,open_files:[...S.openFiles.values()].slice(0,40).map(file=>({root_id:file.root_id,path:file.path,stage_id:file.stageId||'latest'}))};try{await api('/api/ide/v2/workbench/state',{method:'POST',body:JSON.stringify({state})})}catch(error){logOutput(`State save failed: ${error.message}`)}}
-async function restoreWorkbenchState(){try{const out=await api('/api/ide/v2/workbench/state');const state=out.state||{};if(state.active_session_id&&S.sessions.some(row=>row.id===state.active_session_id))S.activeSession=state.active_session_id;if(state.active_root_id)S.activeRoot=state.active_root_id;if(state.active_view)S.activeView=state.active_view;S.panel=state.panel||'terminal';S.codeHistoryMode=['all','changes','clean'].includes(state.code_history_mode)?state.code_history_mode:'all';const panelVisible=state.panel_visible!==false;S.secondaryVisible=state.secondary_visible!==false;S.agentTodoCollapsed=state.agent_todo_collapsed===true;S.promptEnhancePersistent=state.prompt_enhance_persistent===true;S.promptEnhanceEnabled=S.promptEnhancePersistent&&state.prompt_enhance_enabled===true;S.promptEnhanceSkillsAware=state.prompt_enhance_skills_awareness===true;S.promptEnhanceBudget=['low','medium','high','xhigh'].includes(state.prompt_enhance_budget)?state.prompt_enhance_budget:'medium';renderPromptEnhanceToggle();showView(S.activeView);showPanel(S.panel);S.panelVisible=panelVisible;E('ideShell').classList.toggle('panel-hidden',!panelVisible);if(!S.secondaryVisible)toggleSecondary(false);await loadRoots();for(const row of state.open_files||[]){try{await openFile(row.path,{root_id:row.root_id||'session',group:0,stage_id:row.stage_id||'latest'})}catch(error){logOutput(`Restore skipped ${row.path}: ${error.message}`)}}}catch(error){logOutput(`State restore failed: ${error.message}`);renderPromptEnhanceToggle();await loadRoots()}}
+async function saveWorkbenchState(){if(S.stateTimer){clearTimeout(S.stateTimer);S.stateTimer=null}if(!S.csrf||!S.activeSession)return;const state={active_session_id:S.activeSession,active_root_id:S.activeRoot,active_view:S.activeView,panel:S.panel,panel_visible:S.panelVisible,secondary_visible:S.secondaryVisible,agent_todo_collapsed:S.agentTodoCollapsed,prompt_enhance_persistent:S.promptEnhancePersistent,prompt_enhance_enabled:S.promptEnhancePersistent&&S.promptEnhanceEnabled,prompt_enhance_skills_awareness:S.promptEnhanceSkillsAware,prompt_enhance_budget:S.promptEnhanceBudget,code_history_mode:S.codeHistoryMode,open_files:[...S.openFiles.values()].slice(0,40).map(file=>({root_id:file.root_id,path:file.path,stage_id:file.stageId||'latest'}))};try{await api('/api/ide/v2/workbench/state',{method:'POST',body:JSON.stringify({state})})}catch(error){logOutput(`State save failed: ${error.message}`)}}
+function workbenchSessionFromState(state){const id=String(state?.active_session_id||'');return id&&S.sessions.some(row=>String(row.id||'')===id)?id:''}
+async function restoreWorkbenchState(preloaded=null,opt={}){try{const out=preloaded||await api('/api/ide/v2/workbench/state'),state=out?.state||{},expectedSession=String(opt.expectedSession||''),expectedSeq=opt.expectedSeq==null?null:Number(opt.expectedSeq);if(expectedSession&&(S.activeSession!==expectedSession||(expectedSeq!=null&&S.sessionSwitchSeq!==expectedSeq)))return false;const restoredSession=workbenchSessionFromState(state);if(restoredSession&&restoredSession!==S.activeSession){if(opt.restoreSession===false)return false;if(!await switchSession(restoredSession,false))return false}const session=S.activeSession,seq=S.sessionSwitchSeq;if(state.active_root_id)S.activeRoot=state.active_root_id;if(state.active_view)S.activeView=state.active_view;S.panel=state.panel||'terminal';S.codeHistoryMode=['all','changes','clean'].includes(state.code_history_mode)?state.code_history_mode:'all';const panelVisible=state.panel_visible!==false;S.secondaryVisible=state.secondary_visible!==false;S.agentTodoCollapsed=state.agent_todo_collapsed===true;S.promptEnhancePersistent=state.prompt_enhance_persistent===true;S.promptEnhanceEnabled=S.promptEnhancePersistent&&state.prompt_enhance_enabled===true;S.promptEnhanceSkillsAware=state.prompt_enhance_skills_awareness===true;S.promptEnhanceBudget=['low','medium','high','xhigh'].includes(state.prompt_enhance_budget)?state.prompt_enhance_budget:'medium';renderPromptEnhanceToggle();showView(S.activeView);showPanel(S.panel);S.panelVisible=panelVisible;E('ideShell').classList.toggle('panel-hidden',!panelVisible);if(!S.secondaryVisible)toggleSecondary(false);await loadRoots(session,seq);if(!sessionRequestCurrent(session,seq))return false;for(const row of state.open_files||[]){if(!sessionRequestCurrent(session,seq))return false;try{await openFile(row.path,{root_id:row.root_id||'session',group:0,stage_id:row.stage_id||'latest'})}catch(error){logOutput(`Restore skipped ${row.path}: ${error.message}`)}}return true}catch(error){logOutput(`State restore failed: ${error.message}`);renderPromptEnhanceToggle();if(S.activeSession)await loadRoots(S.activeSession,S.sessionSwitchSeq);return false}}
 async function runSearch(){const query=E('searchInput').value;if(!query.trim()){S.searchResults=[];renderSearch();return}E('searchSummary').textContent='Searching...';const out=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/search`,{method:'POST',body:JSON.stringify({root_id:S.activeRoot,query,case_sensitive:E('matchCaseBtn').classList.contains('is-active'),regex:E('regexBtn').classList.contains('is-active'),include:E('includeInput').value.trim(),exclude:E('excludeInput').value.trim(),max_results:1000})});S.searchResults=out.results||[];E('searchSummary').textContent=`${out.count||0} results in ${out.files_scanned||0} files${out.truncated?' (limit reached)':''}`;renderSearch()}
 function renderSearch(){const host=E('searchResults');host.innerHTML='';let current='';for(const row of S.searchResults){if(row.path!==current){current=row.path;const group=document.createElement('div');group.className='result-group';group.textContent=row.path;host.appendChild(group)}const line=document.createElement('div');line.className='result-line list-row';line.innerHTML=`<code>${escapeHtml(row.preview)}</code><span class="result-location">${row.line}:${row.column}</span>`;line.onclick=()=>openFile(row.path,{root_id:S.activeRoot,line:row.line,column:row.column}).catch(showError);host.appendChild(line)}}
 async function refreshScm(){E('scmBranch').textContent='Checking repository...';const out=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/scm/status?${rootQuery()}`);S.scm=out;E('scmBranch').innerHTML=out.repository?`<span class="codicon codicon-git-branch"></span> ${escapeHtml(out.branch||'detached')}`:'No source control providers registered.';E('statusBranch').textContent=out.branch||'-';E('scmBadge').textContent=out.changes?.length?String(out.changes.length):'';renderScm()}
@@ -112975,7 +115118,7 @@ function setupTerminalWidget(){E('terminalHost').innerHTML='';E('terminalEmpty')
 async function terminalInput(data){if(!S.terminal)return;try{await api(`/api/ide/v2/terminals/${qs(S.terminal.id)}/input`,{method:'POST',body:JSON.stringify({data})})}catch(error){logOutput(error.message)}}
 async function terminalResize(cols,rows){if(!S.terminal)return;try{await api(`/api/ide/v2/terminals/${qs(S.terminal.id)}/resize`,{method:'POST',body:JSON.stringify({cols,rows})})}catch(error){logOutput(error.message)}}
 async function pollTerminal(){clearTimeout(S.terminalPoll);if(!S.terminal)return;try{const out=await api(`/api/ide/v2/terminals/${qs(S.terminal.id)}/output?offset=${S.terminalOffset}`);S.terminalOffset=out.next_offset??S.terminalOffset;if(out.reset){S.terminalAnsiState={pending:''};S.terminalPlainState=createTerminalTextState();if(S.terminalWidget)S.terminalWidget.reset()}const data=decodeTerminalPayload(out);if(data){const plain=stripTerminalControlChunk(data,S.terminalAnsiState,false);if(plain)logOutputChunk(plain.replace(/\r(?!\n)/g,'\n').replace(/\x08/g,''));if(S.terminalWidget)S.terminalWidget.write(data);else appendTerminalPlainText(E('terminalFallback'),plain)}if(out.closed){const tail=stripTerminalControlChunk('',S.terminalAnsiState,true);if(tail&&!S.terminalWidget)appendTerminalPlainText(E('terminalFallback'),tail);setStatus(`Terminal exited with code ${out.returncode}`);logOutput(`Process exited with code ${out.returncode}`);S.terminal=null;await refreshWorkspaceSnapshot();return}}catch(error){if(error?.status===404){S.terminal=null;clearTimeout(S.terminalPoll);if(S.terminalWidget){S.terminalWidget.dispose();S.terminalWidget=null}S.terminalDecoder=null;S.terminalAnsiState=null;S.terminalPlainState=null;E('terminalHost').innerHTML='';E('terminalFallback').classList.remove('is-active');E('terminalEmpty').textContent='No active terminal.';E('terminalEmpty').classList.remove('is-hidden');setStatus('Terminal session ended');return}logOutput(`Terminal: ${error.message}`)}if(S.terminal)S.terminalPoll=setTimeout(pollTerminal,220)}
-async function killTerminal(){if(!S.terminal)return;const current=S.terminal;S.terminal=null;clearTimeout(S.terminalPoll);try{await api(`/api/ide/v2/terminals/${qs(current.id)}`,{method:'DELETE',body:'{}'})}catch(error){logOutput(error.message)}if(S.terminalWidget){S.terminalWidget.dispose();S.terminalWidget=null}S.terminalDecoder=null;S.terminalAnsiState=null;S.terminalPlainState=null;E('terminalHost').innerHTML='';E('terminalFallback').classList.remove('is-active');E('terminalEmpty').textContent='No active terminal.';E('terminalEmpty').classList.remove('is-hidden')}
+async function killTerminal(){if(!S.terminal)return;const current=S.terminal,widget=S.terminalWidget;S.terminal=null;S.terminalWidget=null;clearTimeout(S.terminalPoll);if(widget)widget.dispose();S.terminalDecoder=null;S.terminalAnsiState=null;S.terminalPlainState=null;E('terminalHost').innerHTML='';E('terminalFallback').classList.remove('is-active');E('terminalEmpty').textContent='No active terminal.';E('terminalEmpty').classList.remove('is-hidden');try{await api(`/api/ide/v2/terminals/${qs(current.id)}`,{method:'DELETE',body:'{}'})}catch(error){logOutput(error.message)}}
 async function runActiveFile(){const file=activeFile();if(!file)return toast('Open a file to run.','warning');if(file.binary)return toast('This artifact is not executable.','warning');if(file.dirty)await saveFile(file);const lang=languageFor(file.path),python=/^win/i.test(String(S.config?.platform||''))?'python':'python3',command=lang==='python'?`${python} ${shellQuote(file.name)}`:['javascript','typescript'].includes(lang)?`node ${shellQuote(file.name)}`:`${shellQuote(file.name)}`;logOutput(`> ${command}`);if(S.panel==='terminal'&&S.capabilities.terminal){await newTerminal(file.dir||'.');setTimeout(()=>terminalInput(command+'\r'),300);return}showPanel('output');const out=await api(`/api/ide/sessions/${qs(S.activeSession)}/terminal/run`,{method:'POST',body:JSON.stringify({root_id:file.root_id,cwd:file.dir||'.',command})});if(out.stdout)logOutputChunk(out.stdout);if(out.stderr)logOutputChunk(out.stderr);logOutput(`Process exited with code ${out.returncode}`);await refreshWorkspaceSnapshot()}
 async function startStandardLibraryDebugger(file){if(!S.capabilities.terminal)throw new Error('Python standard-library debugging requires the interactive terminal capability.');const python=/^win/i.test(String(S.config?.platform||''))?'python':'python3',command=`${python} -m pdb ${shellQuote(file.name)}`;logDebug('debugpy is unavailable. Using the built-in Python pdb compatibility debugger in Terminal.');await newTerminal(file.dir||'.');setTimeout(()=>terminalInput(command+'\r'),300);toast('Using Python pdb compatibility debugger. Install debugpy for full IDE debug-adapter support.','warning',8000)}
 async function debugActiveFile(){const file=activeFile();if(!file||languageFor(file.path)!=='python')return toast('Open a Python file to debug.','warning');if(file.dirty)await saveFile(file);if(S.debug)await stopDebug();showPanel('debug');logDebug(`Starting debugger for ${file.path}...`);let out;try{out=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/debug`,{method:'POST',body:JSON.stringify({root_id:file.root_id})})}catch(error){if(error.code==='debugpy_unavailable'){await startStandardLibraryDebugger(file);return}throw error}S.debug=out.debug;S.debugFile=file;S.debugSeq=1;await sendDebug({seq:S.debugSeq++,type:'request',command:'initialize',arguments:{clientID:'clouds-coder',clientName:'Clouds Coder Program',adapterID:'python',pathFormat:'path',linesStartAt1:true,columnsStartAt1:true,supportsRunInTerminalRequest:false}});pollDebug()}
@@ -113017,6 +115160,7 @@ function agentApproach(text,role='Agent'){const value=stripAgentRolePrefix(text,
 function isSyntheticPublicProgress(text){const value=String(text||'').trim();if(!value)return false;const pairs=[['正在推进「','结果将用于确定下一步。'],['本轮将','并根据返回的证据继续推进。'],['正在推進「','結果將用於決定下一步。'],['本輪將','並依據傳回的證據繼續推進。'],['「','結果を次の判断に使います。'],['','得られた証拠を基に続行します。'],["Advancing '",'then use the evidence to choose the next step.'],['This round will ','then continue from the returned evidence.']];return pairs.some(([prefix,suffix])=>(!prefix||value.startsWith(prefix))&&value.endsWith(suffix))}
 function renderAgentPlanCard(tools,role='Agent'){const list=(Array.isArray(tools)?tools:[]).map(value=>String(value||'').trim()).filter(Boolean),signature=`${agentRoleKey(role)||String(role||'agent').toLowerCase()}:${list.join('|')}`,existing=S.agentPlanCards.get(signature);if(existing?.isConnected){const count=Number(existing.dataset.occurrences||1)+1;existing.dataset.occurrences=String(count);const state=existing.querySelector('.agent-tool-state');if(state)state.textContent=`Planned ×${count}`;return existing}const card=agentToolCard({kind:'tool',name:'tool_calls',title:'Tools scheduled',state:'Planned',output:list.join(', ')||'Tool calls scheduled',role});card.dataset.occurrences='1';S.agentPlanCards.set(signature,card);return card}
 function updateAgentContext(){const file=activeFile();E('agentContext').textContent=[S.sessions.find(row=>row.id===S.activeSession)?.title,S.roots.find(row=>row.id===S.activeRoot)?.label,file?.path].filter(Boolean).join('  /  ')||'No active context'}
+function applyIdeSessionTitleEvent(data={},evt={}){const payload=data&&typeof data==='object'?data:{},sid=String(payload.session_id||evt.session_id||S.activeSession||'').trim();if(!sid)return false;const title=String(payload.session_title||'').trim(),rev=Number(payload.title_revision||0);let target=S.sessions.find(row=>String(row?.id||'')===sid);if(!target&&String(S.activeSession||'')===sid)target=S.activeSessionRow;if(!target)return false;const workspaceId=String(payload.workspace_id||target.workspace_id||'').trim();let changed=false;if(title&&rev>=Number(target.title_revision||0)&&(target.title!==title||target.title_origin!==payload.title_origin)){target.title=title;target.title_origin=payload.title_origin||target.title_origin;target.title_revision=rev;changed=true}if(String(S.activeSession||'')===sid)S.activeSessionRow={...(S.activeSessionRow||{}),...target};if(workspaceId){for(const row of S.sessions){if(String(row?.workspace_id||'').trim()!==workspaceId)continue;if(payload.workspace_name&&row.workspace_name!==payload.workspace_name){row.workspace_name=String(payload.workspace_name);changed=true}if(payload.workspace_created_at!=null&&Number(row.workspace_created_at||0)!==Number(payload.workspace_created_at||0)){row.workspace_created_at=Number(payload.workspace_created_at||0);changed=true}if(payload.workspace_label&&row.workspace_label!==payload.workspace_label){row.workspace_label=String(payload.workspace_label);changed=true}}}if(changed){clearTimeout(S.sessionTitleRenderTimer);S.sessionTitleRenderTimer=setTimeout(()=>{S.sessionTitleRenderTimer=0;renderSessions();updateAgentContext()},0)}return changed}
 function agentEventKey(row){
   if(!row)return'';
   const id=String(row.id||'').trim(),seq=Number(row.seq||0);
@@ -113061,7 +115205,7 @@ function renderAgentToolOperation(op){
   const failed=done&&(/error|failed|malformed/i.test(resultText)||data.exit_code!=null&&Number(data.exit_code)!==0),path=String(data.path||''),verb=lower==='write_file'?'Write':lower==='edit_file'||lower==='apply_patch'?'Edit':'';const title=verb&&path?`${verb} ${path}`:lower==='read_file'&&path?`Read ${path}`:lower.includes('search')?`Search${data.query?` · ${data.query}`:''}`:name;const output=[path?`Path: ${path}`:'',data.command?`Command: ${data.command}`:'',data.cwd?`Working directory: ${data.cwd}`:'',data.query?`Query: ${data.query}`:'',data.pattern?`Pattern: ${data.pattern}`:'',data.summary||'',done?data.result||'':''].filter(Boolean).join('\n');const card=agentToolCard({kind:'tool',name,title,state:done?(failed?'Failed':'Completed'):'Running',stateTone:failed?'error':done?'success':'',output,role,expanded:failed,actionPath:path,actionRoot:S.activeRoot});if(existing)replaceTrackedAgentToolCard(existing,card);if(done)clearTrackedAgentToolCard(card);else{S.agentToolCards.set(key,card);S.agentToolCards.set(activeKey,card)}return card
 }
 function renderAgentAttachments(){const host=E('agentAttachments');host.classList.toggle('is-hidden',!S.agentAttachments.length);host.innerHTML=S.agentAttachments.map((item,index)=>`<div class="agent-attachment" title="${escapeHtml(item.path)}"><span class="codicon codicon-file"></span><span>${escapeHtml(item.name||item.path)}</span><button class="icon-button" data-remove-attachment="${index}" title="Remove"><span class="codicon codicon-close"></span></button></div>`).join('');host.querySelectorAll('[data-remove-attachment]').forEach(button=>button.onclick=()=>{S.agentAttachments.splice(Number(button.dataset.removeAttachment),1);renderAgentAttachments()})}
-function resetAgentSessionUI(sessionId=''){if(S.agentEventRaf){cancelAnimationFrame(S.agentEventRaf);clearTimeout(S.agentEventRaf);S.agentEventRaf=0}S.agentSession=sessionId;S.agentState=null;S.agentRendered.clear();S.agentToolCards.clear();S.agentPlanCards.clear();S.agentTimelineSignature='';S.agentProgressSignature='';S.agentBatching=false;S.agentFeedSeq=0;S.agentOperationSeq=0;S.agentSnapshotRevision=0;S.agentEventSeq=0;S.agentWasBusy=false;S.agentSubmitting=false;S.agentInterrupting=false;S.agentFileRefresh.clear();S.agentAttachments=[];renderAgentAttachments();E('agentMessages').innerHTML='';E('agentTodoPanel').classList.add('is-hidden');E('agentTodoBody').innerHTML='';E('agentTodoCount').textContent='';E('agentContextPercent').textContent='';E('agentStatus').textContent='Loading history...';const ask=E('agentAskUser');ask.classList.add('is-hidden');ask.dataset.questionId='';E('agentAskUserQuestion').textContent='';E('agentAskUserOptions').innerHTML='';E('agentAskUserHint').textContent='';E('agentAskUserRole').textContent='';E('agentComposer').classList.remove('is-dragover');E('agentDropHint').classList.add('is-hidden');E('stopAgentBtn').classList.add('is-hidden');E('stopAgentBtn').disabled=false;E('sendAgentBtn').disabled=false;E('sendAgentBtn').title='Send';E('agentPrompt').disabled=false;E('agentPrompt').placeholder='Ask Clouds Coder'}
+function resetAgentSessionUI(sessionId=''){if(S.agentEventRaf){cancelAnimationFrame(S.agentEventRaf);clearTimeout(S.agentEventRaf);S.agentEventRaf=0}S.agentSession=sessionId;S.agentState=null;S.agentRendered.clear();S.agentToolCards.clear();S.agentPlanCards.clear();S.agentTimelineSignature='';S.agentProgressSignature='';S.agentBatching=false;S.agentFeedSeq=0;S.agentOperationSeq=0;S.agentSnapshotRevision=0;S.agentEventSeq=0;S.agentWasBusy=false;S.agentSubmitting=false;S.agentOptimisticMessageKey='';S.agentSubmissionStatus='';S.agentSubmissionPendingUntil=0;S.agentSubmissionSeenRunning=false;S.agentInterrupting=false;S.agentFileRefresh.clear();S.agentAttachments=[];renderAgentAttachments();E('agentMessages').innerHTML='';E('agentTodoPanel').classList.add('is-hidden');E('agentTodoBody').innerHTML='';E('agentTodoCount').textContent='';E('agentContextPercent').textContent='';E('agentStatus').textContent='Loading history...';const ask=E('agentAskUser');ask.classList.add('is-hidden');ask.dataset.questionId='';E('agentAskUserQuestion').textContent='';E('agentAskUserOptions').innerHTML='';E('agentAskUserHint').textContent='';E('agentAskUserRole').textContent='';E('agentComposer').classList.remove('is-dragover');E('agentDropHint').classList.add('is-hidden');E('stopAgentBtn').classList.add('is-hidden');E('stopAgentBtn').disabled=false;E('sendAgentBtn').disabled=false;E('sendAgentBtn').title='Send';E('agentPrompt').disabled=false;E('agentPrompt').placeholder='Ask Clouds Coder'}
 function namedAgentClipboardFile(file,index=0){if(!(file instanceof File))return null;if(String(file.name||'').trim())return file;const mime=String(file.type||'').toLowerCase(),ext=({'image/png':'png','image/jpeg':'jpg','image/webp':'webp','application/pdf':'pdf','text/plain':'txt','text/markdown':'md'}[mime]||mime.split('/').pop()||'bin').replace(/[^a-z0-9]+/g,'')||'bin';try{return new File([file],`clipboard_${Date.now()}_${index+1}.${ext}`,{type:file.type||'',lastModified:Date.now()})}catch{return file}}
 function agentClipboardFiles(event){const data=event?.clipboardData;if(!data)return[];const files=[],seen=new Set(),push=(raw,index)=>{const file=namedAgentClipboardFile(raw,index);if(!file)return;const key=`${file.name}:${file.type}:${file.size}`;if(seen.has(key))return;seen.add(key);files.push(file)};[...(data.files||[])].forEach(push);[...(data.items||[])].forEach((item,index)=>{if(item?.kind==='file')push(item.getAsFile?.(),index)});return files}
 async function uploadAgentAttachments(files){const list=[...(files||[])].map(namedAgentClipboardFile).filter(Boolean);if(!list.length)return;E('attachContextBtn').disabled=true;try{const items=[];for(let index=0;index<list.length;index++){const file=list[index];items.push({path:file.webkitRelativePath||file.name,content_b64:await readFileAsB64(file)});E('agentStatus').textContent=`Attaching ${index+1}/${list.length}`}const out=await api(`/api/ide/sessions/${qs(S.activeSession)}/workspace/upload`,{method:'POST',body:JSON.stringify({root_id:S.activeRoot,dest:'.clouds_coder/attachments',items})});for(const item of out.written||[])if(!S.agentAttachments.some(row=>row.path===item.path))S.agentAttachments.push({path:item.path,name:item.name,size:item.size});renderAgentAttachments();S.treeCache.clear();await loadTree('');toast(`Attached ${out.count||list.length} file(s).`,'success')}finally{E('attachContextBtn').disabled=false;E('agentStatus').textContent=S.agentState?.running?'Running':'Idle';E('agentAttachmentInput').value=''}}
@@ -113096,11 +115240,12 @@ async function answerAgentQuestion(answer){
   try{const out=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/ask-user/answer`,{method:'POST',body:JSON.stringify({question_id:questionId,answer:value})});S.agentSubmitting=false;S.agentState=Object.assign({},S.agentState,{pending_user_question:null,running:!!out.running});renderAgentAskUser(S.agentState);E('agentPrompt').disabled=false;E('sendAgentBtn').disabled=false;input.focus();E('agentStatus').textContent='Resuming...';S.agentPollRequested=true;scheduleAgentPoll(40)}catch(error){S.agentSubmitting=false;input.value=input.value.trim()?`${restoreText}\n${input.value}`:restoreText;renderAgentAskUser(S.agentState);input.focus();E('agentStatus').textContent='Awaiting input';S.agentPollRequested=true;scheduleAgentPoll(40);throw error}
 }
 function renderAgentState(state){
-  const host=E('agentMessages'),follow=agentMessagesNearBottom(host),running=!!state.running,queued=Number(state.scheduler_queued||0)>0,busy=running||queued,awaiting=!running&&state.pending_user_question&&String(state.pending_user_question.question||'').trim(),eventSeq=Number(state.event_seq||0),workspaceChanged=eventSeq>S.agentEventSeq||S.agentWasBusy&&!busy;
-  if(!busy&&!awaiting&&S.agentSubmitting)S.agentSubmitting=false;if(!busy)S.agentInterrupting=false;
+  const host=E('agentMessages'),follow=agentMessagesNearBottom(host),running=!!state.running,starting=!!state.scheduler_starting,queued=Number(state.scheduler_queued||0)>0,busy=running||starting||queued,awaiting=!running&&!starting&&state.pending_user_question&&String(state.pending_user_question.question||'').trim(),eventSeq=Number(state.event_seq||0),workspaceChanged=eventSeq>S.agentEventSeq||S.agentWasBusy&&!busy;
+  if(!busy)S.agentInterrupting=false;
   S.agentEventSeq=Math.max(S.agentEventSeq,eventSeq);
   const detail=queued&&!running?`${state.scheduler_queued} queued`:[state.active_role,state.phase,state.active_tool].filter(Boolean).join(' / ');
-  E('agentStatus').textContent=S.agentInterrupting?'Stopping...':busy?(detail||'Running'):awaiting?'Awaiting input':'Idle';E('sendAgentBtn').disabled=S.agentSubmitting;E('stopAgentBtn').classList.toggle('is-hidden',!busy);E('stopAgentBtn').disabled=S.agentInterrupting;
+  let submissionLabel='';if(running){S.agentSubmissionSeenRunning=true;S.agentSubmissionStatus='running';submissionLabel=detail||'Running'}else if(starting){S.agentSubmissionStatus='starting';S.agentSubmissionPendingUntil=Math.max(Number(S.agentSubmissionPendingUntil||0),Date.now()+15000);submissionLabel='Starting...'}else if(queued){S.agentSubmissionStatus='queued';S.agentSubmissionPendingUntil=Math.max(Number(S.agentSubmissionPendingUntil||0),Date.now()+30000);submissionLabel=detail||'Queued'}else if(S.agentSubmissionSeenRunning){S.agentSubmissionStatus='';S.agentSubmissionPendingUntil=0;S.agentSubmissionSeenRunning=false}else if(S.agentSubmissionStatus){submissionLabel=Date.now()<Number(S.agentSubmissionPendingUntil||0)?({submitting:'Submitting...',accepted:'Accepted · starting...',starting:'Starting...',queued:'Queued',failed:'Submit failed'}[S.agentSubmissionStatus]||'Checking...'):'Checking...'}
+  if(S.agentSubmissionStatus==='failed'&&Date.now()>=Number(S.agentSubmissionPendingUntil||0)){S.agentSubmissionStatus='';submissionLabel=''}const agentStatusLabel=S.agentInterrupting?'Stopping...':(submissionLabel||(awaiting?'Awaiting input':'Idle'));E('agentStatus').textContent=agentStatusLabel;E('sendAgentBtn').disabled=S.agentSubmitting;E('stopAgentBtn').classList.toggle('is-hidden',!busy);E('stopAgentBtn').disabled=S.agentInterrupting;
   renderAgentProgress(state);renderAgentContextHud(state);renderAgentAskUser(state);
   const feed=Array.isArray(state._delta_feed)?state._delta_feed:(Array.isArray(state.feed)?state.feed:[]),operations=Array.isArray(state._delta_operations)?state._delta_operations:(Array.isArray(state.operations)?state.operations:[]),timelineSignature=`${Number(state.snapshot_revision||0)}:${Number(state.feed_cursor||0)}:${Number(state.operation_cursor||0)}:${feed.length}:${operations.length}`,timelineChanged=timelineSignature!==S.agentTimelineSignature;
   S.agentBatching=true;
@@ -113112,7 +115257,7 @@ function renderAgentState(state){
       timeline.sort((a,b)=>a.ts-b.ts||a.seq-b.seq);
       for(const item of timeline){
         if(item.source==='feed'){
-          const row=item.row,key=agentEventKey(row),type=String(row.type||'message');if(!rememberAgentRendered(key))continue;const role=String(row.agent_role||row.role||'agent'),text=String(row.text||row.data?.summary||type);
+          const row=item.row,key=agentEventKey(row),type=String(row.type||'message');if(!rememberAgentRendered(key))continue;const role=String(row.agent_role||row.role||'agent'),text=String(row.text||row.data?.summary||type);if(row.role==='user'){for(const node of host?.querySelectorAll('[data-agent-optimistic]')||[]){if(node.dataset.agentOptimistic===text){node.remove();S.agentOptimisticMessageKey='';break}}}
           if(type==='tool_calls'){const tools=Array.isArray(row.data?.tools)?row.data.tools:[],progress=String(row.data?.public_progress||(!text.toLowerCase().startsWith('[tool calls]')?text:'')).trim();if(progress&&!isSyntheticPublicProgress(progress))agentApproach(progress,role);renderAgentPlanCard(tools.length?tools:[text||'Tool calls scheduled'],role);continue}
           if(type==='approach'){agentApproach(text,role);continue}
           if(type==='web_search'){agentToolCard({kind:'tool',name:'web_search',title:'Web search',state:'Completed',stateTone:'success',output:text,role});continue}
@@ -113143,14 +115288,14 @@ function renderAgentState(state){
   S.agentWasBusy=busy;
 }
 const renderAgentStateBase=renderAgentState;
-renderAgentState=function(state){if(state.title){const session=S.sessions.find(row=>row.id===S.activeSession);if(session&&session.title!==state.title){session.title=state.title;renderSessions();updateAgentContext()}}S.renderingAgentState=true;try{renderAgentStateBase(state)}finally{S.renderingAgentState=false}};
-function scheduleAgentEventFrame(){if(S.agentEventRaf)return;const flush=()=>{S.agentEventRaf=0;if(S.agentFileRefresh.size)scheduleWorkspaceRefresh(120);S.agentPollRequested=true;scheduleAgentPoll(0)};if(document.hidden){S.agentEventRaf=setTimeout(flush,500)}else S.agentEventRaf=requestAnimationFrame(flush)}
-function handleAgentEvent(event){const type=String(event?.type||''),data=event?.data||{},seq=Number(event?.seq||0);S.agentEventSeq=Math.max(S.agentEventSeq,seq);/* renderAgentOperationOnce({id:String(event?.id||'') is intentionally deferred; ['tool_start','tool_result','file_patch','command','compact','error'].includes(type) is reconciled by poll */if(type==='file_patch'){const path=data.session_rel_path||data.path||'';if(path)S.agentFileRefresh.add(path)}else if(type==='workspace_change'||type==='upload'){for(const path of data.changed_files||[])if(path)S.agentFileRefresh.add(path)}if(type!=='hello')scheduleAgentEventFrame()}
+renderAgentState=function(state){if(state.title)applyIdeSessionTitleEvent({session_id:S.activeSession,session_title:state.title,title_origin:state.title_origin,title_revision:state.title_revision,workspace_id:S.sessions.find(row=>String(row?.id||'')===String(S.activeSession||''))?.workspace_id});S.renderingAgentState=true;try{renderAgentStateBase(state)}finally{S.renderingAgentState=false}};
+function scheduleAgentEventFrame(){if(S.agentEventRaf)return;const flush=()=>{S.agentEventRaf=0;if(S.agentFileRefresh.size)scheduleWorkspaceRefresh(120);S.agentPollRequested=true;scheduleAgentPoll(40)};if(document.hidden){S.agentEventRaf=setTimeout(flush,500)}else S.agentEventRaf=setTimeout(flush,120)}
+function handleAgentEvent(event){const type=String(event?.type||''),data=event?.data||{},seq=Number(event?.seq||0);S.agentEventSeq=Math.max(S.agentEventSeq,seq);if(data.session_title)applyIdeSessionTitleEvent(data,event);/* renderAgentOperationOnce({id:String(event?.id||'') is intentionally deferred; ['tool_start','tool_result','file_patch','command','compact','error'].includes(type) is reconciled by poll */if(type==='file_patch'){const path=data.session_rel_path||data.path||'';if(path)S.agentFileRefresh.add(path)}else if(type==='workspace_change'||type==='upload'){for(const path of data.changed_files||[])if(path)S.agentFileRefresh.add(path)}if(type!=='hello')scheduleAgentEventFrame()}
 function closeAgentEvents(){clearTimeout(S.agentEventReconnect);if(S.agentEvents){S.agentEvents.close();S.agentEvents=null}S.agentEventsConnected=false}
 function connectAgentEvents(){closeAgentEvents();if(!S.activeSession)return;const sid=S.activeSession,seq=S.sessionSwitchSeq,source=new EventSource(`/api/ide/v2/sessions/${qs(sid)}/events`),current=()=>sid===S.activeSession&&seq===S.sessionSwitchSeq&&S.agentEvents===source;S.agentEvents=source;source.onopen=()=>{if(!current())return source.close();S.agentEventsConnected=true;S.agentPollRequested=true;scheduleAgentPoll(0);E('syncStatus').title='Live file events connected'};source.onmessage=message=>{if(!current())return;try{handleAgentEvent(JSON.parse(message.data||'{}'))}catch(error){logOutput(`IDE event: ${error.message}`)}};source.onerror=()=>{if(!current())return source.close();S.agentEventsConnected=false;E('syncStatus').title='Live events reconnecting';source.close();if(S.agentEvents===source)S.agentEvents=null;clearTimeout(S.agentEventReconnect);S.agentEventReconnect=setTimeout(connectAgentEvents,document.hidden?120000:30000);scheduleAgentPoll(document.hidden?120000:30000)}}
 function mergeAgentWindow(base,incoming,keyFn,limit){const map=new Map();for(const row of Array.isArray(base)?base:[]){const key=keyFn(row);if(key)map.set(key,row)}for(const row of Array.isArray(incoming)?incoming:[]){const key=keyFn(row);if(key)map.set(key,{...(map.get(key)||{}),...row})}return [...map.values()].sort((a,b)=>Number(a.ts||0)-Number(b.ts||0)||Number(a.seq||0)-Number(b.seq||0)).slice(-limit)}
-function applyAgentStateResponse(out){const deltaFeed=Array.isArray(out?.feed)?out.feed:[],deltaOperations=Array.isArray(out?.operations)?out.operations:[],incremental=!!out?.incremental&&!!S.agentState;const next=incremental?{...S.agentState,...out,feed:mergeAgentWindow(S.agentState.feed,deltaFeed,agentEventKey,180),operations:mergeAgentWindow(S.agentState.operations,deltaOperations,agentOperationKey,500),_delta_feed:deltaFeed,_delta_operations:deltaOperations}:{...out,feed:deltaFeed.slice(-180),operations:deltaOperations.slice(-500),_delta_feed:deltaFeed,_delta_operations:deltaOperations};S.agentFeedSeq=Math.max(S.agentFeedSeq,Number(out?.feed_cursor||0));S.agentOperationSeq=Math.max(S.agentOperationSeq,Number(out?.operation_cursor||0));S.agentSnapshotRevision=Math.max(0,Number(out?.snapshot_revision||0));return next}
-async function pollAgent(){if(S.agentPoll){clearTimeout(S.agentPoll);S.agentPoll=null}S.agentPollDue=0;if(!S.activeSession)return;if(S.agentPollBusy){S.agentPollRequested=true;return}if(S.agentEventsConnected&&S.agentState&&!S.agentSubmitting&&!S.agentPollRequested)return;S.agentPollRequested=false;S.agentPollBusy=true;const sid=S.activeSession,seq=S.sessionSwitchSeq,current=()=>sid===S.activeSession&&seq===S.sessionSwitchSeq;try{if(S.agentSession!==sid)resetAgentSessionUI(sid);const params=S.agentState?`?after_feed_seq=${S.agentFeedSeq}&after_operation_seq=${S.agentOperationSeq}&known_snapshot_revision=${S.agentSnapshotRevision}`:'',first=await api(`/api/ide/v2/sessions/${qs(sid)}/agent-state${params}`),out=first.reset_required?await api(`/api/ide/v2/sessions/${qs(sid)}/agent-state`):first;if(current()){S.agentState=applyAgentStateResponse(out);renderAgentState(S.agentState)}}catch(error){if(current()&&error.status!==404)logOutput(`Agent state: ${error.message}`)}finally{S.agentPollBusy=false;if(S.agentPollRequested||!current())scheduleAgentPoll(0);else if(!S.agentEventsConnected)scheduleAgentPoll(document.hidden?120000:30000)}}
+function applyAgentStateResponse(out){const deltaFeed=Array.isArray(out?.feed)?out.feed:[],deltaOperations=Array.isArray(out?.operations)?out.operations:[],incremental=!!out?.incremental&&!!S.agentState;const next=incremental?{...S.agentState,...out,feed:mergeAgentWindow(S.agentState.feed,deltaFeed,agentEventKey,180),operations:mergeAgentWindow(S.agentState.operations,deltaOperations,agentOperationKey,500),_delta_feed:deltaFeed,_delta_operations:deltaOperations}:{...out,feed:deltaFeed.slice(-180),operations:deltaOperations.slice(-500),_delta_feed:deltaFeed,_delta_operations:deltaOperations};S.agentFeedSeq=Math.max(S.agentFeedSeq,Number(out?.feed_cursor||0));S.agentOperationSeq=Math.max(S.agentOperationSeq,Number(out?.operation_cursor||0));S.agentSnapshotRevision=out?.incremental_has_more?0:Math.max(0,Number(out?.snapshot_revision||0));return next}
+async function pollAgent(){if(S.agentPoll){clearTimeout(S.agentPoll);S.agentPoll=null}S.agentPollDue=0;if(!S.activeSession)return;if(S.agentPollBusy){S.agentPollRequested=true;return}S.agentPollRequested=false;S.agentPollBusy=true;const sid=S.activeSession,seq=S.sessionSwitchSeq,current=()=>sid===S.activeSession&&seq===S.sessionSwitchSeq;try{if(S.agentSession!==sid)resetAgentSessionUI(sid);const params=S.agentState?`?after_feed_seq=${S.agentFeedSeq}&after_operation_seq=${S.agentOperationSeq}&known_snapshot_revision=${S.agentSnapshotRevision}`:'',first=await api(`/api/ide/v2/sessions/${qs(sid)}/agent-state${params}`),out=first.reset_required?await api(`/api/ide/v2/sessions/${qs(sid)}/agent-state`):first;if(current()){S.agentState=applyAgentStateResponse(out);renderAgentState(S.agentState);if(out?.incremental_has_more)S.agentPollRequested=true}}catch(error){if(current()&&error.status!==404)logOutput(`Agent state: ${error.message}`)}finally{S.agentPollBusy=false;if(S.agentPollRequested||!current())scheduleAgentPoll(0);else {scheduleAgentPoll(document.hidden?30000:5000)}}}
 function scheduleAgentPoll(delay=900){const wait=Math.max(40,Number(delay)||0),due=Date.now()+wait;if(S.agentPoll&&S.agentPollDue<=due)return;clearTimeout(S.agentPoll);S.agentPollDue=due;S.agentPoll=setTimeout(()=>{S.agentPoll=null;S.agentPollDue=0;pollAgent()},wait)}
 async function stopAgent(){if(!S.activeSession||S.agentInterrupting)return;S.agentInterrupting=true;E('stopAgentBtn').disabled=true;E('agentStatus').textContent='Stopping...';try{await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/agent/interrupt`,{method:'POST',body:'{}'});S.agentPollRequested=true;scheduleAgentPoll(40)}catch(error){S.agentInterrupting=false;E('stopAgentBtn').disabled=false;throw error}}
 const PROMPT_ENHANCE_BUDGETS=[{id:'low',label:'Low',short:'L',meta:'direct · essential detail'},{id:'medium',label:'Medium',short:'M',meta:'tradeoffs · affected surfaces'},{id:'high',label:'High',short:'H',meta:'dependencies · risks · layered checks'},{id:'xhigh',label:'XHigh',short:'X',meta:'architecture · alternatives · traceability'}];
@@ -113172,7 +115317,7 @@ function promptExecutionGroup(rows){const values=(rows||[]).filter(row=>row&&row
 function promptSkillGroup(rows){const values=(rows||[]).filter(row=>row&&row.id);return values.length?`<div class="prompt-detail-group skills"><strong>Selected skills</strong>${values.map((row,index)=>`<div class="prompt-skill"><span class="prompt-step-index">${index+1}</span><span class="prompt-skill-content"><b>${escapeHtml(row.name||row.id)}</b><span>${escapeHtml(row.id)}</span>${row.rationale?`<small>${escapeHtml(row.rationale)}</small>`:''}</span></div>`).join('')}</div>`:''}
 function promptWorkspaceGroup(context){if(!context)return'';const summary=`${Number(context.entry_count||0).toLocaleString()} directory entries inspected${context.truncated?' (bounded snapshot)':''}${context.skipped_directories?` · ${context.skipped_directories} generated/heavy directories skipped`:''}`;return promptDetailGroup('Workspace awareness',[summary])}
 function renderPromptEnhancement(result){const draft=S.promptEnhanceDraft;if(!draft)return;E('promptEnhanceIntent').textContent=result.intent_summary||'The request was converted into an actionable Agent instruction.';E('promptEnhanceDetails').innerHTML=promptWorkspaceGroup(result.workspace_context)+promptSkillGroup(result.selected_skills)+promptExecutionGroup(result.execution_steps)+promptDetailGroup('Deliverables',result.deliverables)+promptDetailGroup('Constraints',result.constraints)+promptDetailGroup('Assumptions',result.assumptions)+promptDetailGroup('Acceptance criteria',result.acceptance_criteria)+promptClarificationGroup(result.clarifications);const editor=E('promptEnhanceEditor');editor.value=result.enhanced_prompt||draft.original;editor.readOnly=false;E('promptUseEnhanced').textContent='Save & Use';const model=[result.provider,result.model].filter(Boolean).join(' / '),budget=PROMPT_ENHANCE_BUDGETS.find(row=>row.id===(result.budget||draft.budget))?.label||'Medium',fallback=result.source==='fallback',hybrid=result.source==='hybrid';E('promptEnhanceModel').textContent=fallback?`Local template · ${budget}`:(model?`Generated by ${model}`:'Generated for this Agent session')+` · ${budget}`;let baseNote;if(fallback&&result.fallback_reason==='model_error')baseNote=`The model request failed, so this prompt was generated from the local ${budget} template.`;else if(fallback)baseNote=`The model returned unusable structured output, so this prompt was generated from the local ${budget} template.`;else if(hybrid)baseNote='The model response was partially structured; local defaults filled only missing analysis fields.';else baseNote='The intent analysis explains the rewrite. Only the editable Final Agent Prompt is sent when you choose Save & Use.';const elapsed=Number(result.duration_ms)>=0?` Completed in ${promptEnhanceElapsedLabel(result.duration_ms)}.`:'';const timeout=result.timeout_policy==='unlimited'?' No fixed server timeout was applied.':'';E('promptEnhanceNote').textContent=baseNote+elapsed+timeout+(result.warning?` ${result.warning}`:'');E('promptEnhanceOverlay').classList.remove('is-hidden');requestAnimationFrame(()=>editor.focus())}
-async function submitAgentDraft(draft,message){const input=E('agentPrompt'),submittedPaths=new Set(draft.attachments||[]),cleared=input.value.trim()===draft.original.trim();if(!message||S.agentSubmitting)return;S.agentSubmitting=true;E('sendAgentBtn').disabled=true;if(cleared)input.value='';E('agentStatus').textContent=S.agentState?.running?'Queuing input...':'Submitting...';try{const out=await api(`/api/ide/sessions/${qs(draft.session_id)}/agent-task`,{method:'POST',body:JSON.stringify({root_id:draft.root_id,active_path:draft.active_path,message,attachments:draft.attachments||[]})});S.agentAttachments=S.agentAttachments.filter(item=>!submittedPaths.has(item.path));renderAgentAttachments();if(draft.enhance_requested&&!S.promptEnhancePersistent){S.promptEnhanceEnabled=false;renderPromptEnhanceToggle();scheduleStateSave()}S.agentSubmitting=false;E('sendAgentBtn').disabled=false;input.focus();E('agentStatus').textContent=out.queued?'Queued':'Started';S.agentPollRequested=true;scheduleAgentPoll(100)}catch(error){S.agentSubmitting=false;E('agentStatus').textContent='';E('sendAgentBtn').disabled=false;if(cleared&&!input.value.trim())input.value=draft.original;input.focus();agentMessage(error.message,'error');throw error}}
+async function submitAgentDraft(draft,message){const input=E('agentPrompt'),submittedPaths=new Set(draft.attachments||[]),cleared=input.value.trim()===draft.original.trim();let optimistic=null;if(!message||S.agentSubmitting)return;S.agentSubmitting=true;S.agentSubmissionStatus='submitting';S.agentSubmissionPendingUntil=Date.now()+30000;if(!S.agentOptimisticMessageKey||S.agentOptimisticMessageKey!==`${draft.session_id}:${message}`){S.agentOptimisticMessageKey=`${draft.session_id}:${message}`;optimistic=agentMessage(message,'user');optimistic.dataset.agentOptimistic=message;}S.agentSubmissionSeenRunning=!!S.agentState?.running;E('sendAgentBtn').disabled=true;if(cleared)input.value='';E('agentStatus').textContent=S.agentState?.running?'Queuing input...':'Submitting...';try{const out=await api(`/api/ide/sessions/${qs(draft.session_id)}/agent-task`,{method:'POST',body:JSON.stringify({root_id:draft.root_id,active_path:draft.active_path,message,attachments:draft.attachments||[]})});if(draft.session_id!==S.activeSession||draft.session_seq!==S.sessionSwitchSeq)return;S.agentAttachments=S.agentAttachments.filter(item=>!submittedPaths.has(item.path));renderAgentAttachments();if(draft.enhance_requested&&!S.promptEnhancePersistent){S.promptEnhanceEnabled=false;renderPromptEnhanceToggle();scheduleStateSave()}S.agentSubmitting=false;E('sendAgentBtn').disabled=false;input.focus();if(out.running||out.live_input){S.agentSubmissionStatus='running';S.agentSubmissionSeenRunning=true;E('agentStatus').textContent='Running'}else if(out.scheduler_started||out.scheduler_starting||out.deferred_start){S.agentSubmissionStatus='starting';E('agentStatus').textContent='Starting...'}else if(out.queued){S.agentSubmissionStatus='queued';E('agentStatus').textContent=Number(out.queue_position||0)>0?`Queued #${Number(out.queue_position)}`:'Queued'}else{S.agentSubmissionStatus='accepted';E('agentStatus').textContent='Accepted · starting...'}S.agentSubmissionPendingUntil=Date.now()+30000;S.agentPollRequested=true;scheduleAgentPoll(40)}catch(error){optimistic?.remove();S.agentOptimisticMessageKey='';S.agentSubmitting=false;S.agentSubmissionStatus='failed';S.agentSubmissionPendingUntil=Date.now()+10000;E('agentStatus').textContent='Submit failed';E('sendAgentBtn').disabled=false;if(cleared&&!input.value.trim())input.value=draft.original;input.focus();agentMessage(error.message,'error');throw error}}
 async function requestPromptEnhancement(draft,{regenerate=false}={}){if(S.promptEnhancing)return;const previous=regenerate?(E('promptEnhanceEditor').value.trim()||draft.result?.enhanced_prompt||''):'';const generation=regenerate?Number(draft.regeneration||0)+1:0,controller=typeof AbortController==='function'?new AbortController():null,pending={controller},budget=draft.budget||S.promptEnhanceBudget;S.promptEnhanceDraft=draft;S.promptEnhanceAbort=pending;E('promptEnhanceOverlay').classList.remove('is-hidden');if(!regenerate){E('promptEnhanceModel').textContent='';E('promptEnhanceIntent').textContent='';E('promptEnhanceDetails').innerHTML='';E('promptEnhanceEditor').value='';E('promptEnhanceNote').textContent=''}const budgetLabel=PROMPT_ENHANCE_BUDGETS.find(row=>row.id===budget)?.label||'Medium';setPromptEnhanceBusy(true,regenerate?`Regenerating ${budgetLabel} prompt...`:`Preparing ${budgetLabel} prompt with workspace${draft.skills_aware?' and skills':''} awareness...`);try{const result=await api(`/api/ide/v2/sessions/${qs(draft.session_id)}/prompt-enhance`,{method:'POST',body:JSON.stringify({root_id:draft.root_id,active_path:draft.active_path,message:draft.original,attachments:draft.attachments||[],previous_prompt:previous,regeneration:generation,budget,skills_awareness:!!draft.skills_aware}),signal:controller?.signal});if(S.promptEnhanceAbort!==pending||draft.session_id!==S.activeSession||draft.session_seq!==S.sessionSwitchSeq)return;S.promptEnhanceDraft=Object.assign({},draft,{result,regeneration:generation,budget});renderPromptEnhancement(result)}catch(error){if(error?.name==='AbortError')return;if(draft.session_id===S.activeSession&&draft.session_seq===S.sessionSwitchSeq){if(regenerate&&draft.result){S.promptEnhanceDraft=draft;E('promptEnhanceNote').textContent=`Regeneration failed: ${error.message}`}else{S.promptEnhanceDraft=Object.assign({},draft,{budget});E('promptEnhanceModel').textContent=`${budgetLabel} enhancement failed`;E('promptEnhanceIntent').textContent='No enhanced prompt was accepted. The original request is unchanged.';E('promptEnhanceDetails').innerHTML='';E('promptEnhanceEditor').value='';E('promptEnhanceNote').textContent=`Model error: ${error.message}. Choose Regenerate or Use Original & Start.`}E('promptEnhanceOverlay').classList.remove('is-hidden');toast(error.message,'error',8000)}}finally{if(S.promptEnhanceAbort===pending){S.promptEnhanceAbort=null;if(draft.session_id===S.activeSession&&draft.session_seq===S.sessionSwitchSeq)setPromptEnhanceBusy(false)}}}
 async function usePromptReview(original=false){const draft=S.promptEnhanceDraft;if(!draft)return;const message=original?draft.original:E('promptEnhanceEditor').value.trim();if(!message)return toast('Enhanced prompt is empty.','warning');S.promptEnhanceAbort=null;setPromptEnhanceBusy(false);E('promptEnhanceOverlay').classList.add('is-hidden');S.promptEnhanceDraft=null;await submitAgentDraft(draft,message)}
 async function regeneratePromptReview(){const draft=S.promptEnhanceDraft;if(!draft)return;await requestPromptEnhancement(draft,{regenerate:true})}
@@ -113266,7 +115411,9 @@ function scheduleCollaborationRefresh(delay=120){if(!S.collaborationMode)return;
 function connectCollaborationEvents(){if(!S.collaborationMode)return;if(S.collaborationEvents)S.collaborationEvents.close();const source=new EventSource(`/api/collab/v1/events?after=${Number(S.collaborationEventCursor||S.collaboration?.last_event_id||0)}`);S.collaborationEvents=source;source.onopen=()=>{E('syncStatus').title='Collaboration live events connected'};source.onerror=()=>{E('syncStatus').title='Collaboration events reconnecting'};source.onmessage=event=>{S.collaborationEventCursor=Math.max(S.collaborationEventCursor,Number(event.lastEventId||0));let row={};try{row=JSON.parse(event.data||'{}')}catch{return}if(row.type==='snapshot'&&row.data){S.collaboration=row.data;renderCollaborationSnapshot();return}if(row.type==='operation'&&row.data?.path&&row.data?.member_id!==S.collaboration?.member?.member_id)refreshCollaborationOpenFile(row.data.path);if(row.type==='file_change'&&row.data?.path)refreshCollaborationOpenFile(row.data.path);if(row.type==='conflict'&&!['resolved','aborted'].includes(String(row.data?.status||'').toLowerCase()))toast(`Shared workspace conflict: ${row.data?.path||'review required'}`,'warning',8000);scheduleCollaborationRefresh(row.type==='presence'?80:140)}}
 function scheduleCollaborationSessionRefresh(expiresAt){clearTimeout(S.collaborationSessionRefresh);const expiry=Number(expiresAt||0)*1000;if(!expiry)return;const delay=Math.max(60000,Math.min(23*3600000,expiry-Date.now()-3600000));S.collaborationSessionRefresh=setTimeout(async()=>{try{const out=await api('/api/collab/v1/refresh',{method:'POST',body:JSON.stringify({device_key:collaborationDeviceKey()})});S.csrf=out.csrf_token||S.csrf;sessionStorage.setItem('clouds_collab_csrf',S.csrf);scheduleCollaborationSessionRefresh(out.expires_at);connectCollaborationEvents()}catch(error){toast(error.message,'error');setTimeout(()=>location.reload(),1200)}},delay)}
 async function addCollaborationBlackboardItem(){const title=prompt('Shared task title');if(!title?.trim())return;await api('/api/collab/v1/blackboard',{method:'POST',body:JSON.stringify({title:title.trim(),status:'pending'})});await refreshCollaborationSnapshot()}
-async function refreshConfig(){const out=await api('/api/ide/config');S.config=out;S.account=out.account||S.account;S.capabilities=out.capabilities||S.capabilities;S.csrf=out.csrf_token||S.csrf;S.collaborationMode=!!out.collaboration_mode||S.collaborationMode;S.collaboration=out.collaboration||S.collaboration;S.collaborationWarning=out.collaboration_warning||S.collaborationWarning;document.body.classList.toggle('collaboration-mode',S.collaborationMode);S.sessions=Array.isArray(out.sessions)?out.sessions.slice(0,IDE_SESSION_CACHE_MAX):[];S.sessionTotal=Math.max(S.sessions.length,Number(out.session_total||0));S.sessionNextOffset=Number(out.session_offset||0)+S.sessions.length;S.sessionHasMore=!!out.session_has_more&&S.sessionNextOffset<S.sessionTotal;S.sessionCatalogRevision=Number(out.session_catalog_revision||0);if(!S.activeSession||!S.sessions.some(row=>row.id===S.activeSession))S.activeSession=out.active_session_id||S.sessions[0]?.id||'';renderSessions();renderTools();E('accountName').textContent=S.account?.username||'';E('remoteStatus').title=S.collaborationMode?'Shared LAN project':S.capabilities.local?'Local window':'LAN workspace';E('newTerminalBtn').disabled=!S.capabilities.terminal;E('runActiveBtn').disabled=!S.capabilities.processes;E('debugActiveBtn').disabled=!S.capabilities.debug;updateAgentContext();renderCollaborationSnapshot();if(!S.activeSession)await createSession()}
+async function refreshConfig({lite=false}={}){const out=await api(`/api/ide/config${lite?'?lite=1':''}`);S.config={...(S.config||{}),...out};S.account=out.account||S.account;S.capabilities=out.capabilities||S.capabilities;S.csrf=out.csrf_token||S.csrf;S.collaborationMode=!!out.collaboration_mode||S.collaborationMode;S.collaboration=out.collaboration||S.collaboration;S.collaborationWarning=out.collaboration_warning||S.collaborationWarning;document.body.classList.toggle('collaboration-mode',S.collaborationMode);S.sessions=Array.isArray(out.sessions)?out.sessions.slice(0,IDE_SESSION_CACHE_MAX):[];S.sessionTotal=Math.max(S.sessions.length,Number(out.session_total||0));S.sessionNextOffset=Number(out.session_offset||0)+S.sessions.length;S.sessionHasMore=!!out.session_has_more&&S.sessionNextOffset<S.sessionTotal;S.sessionCatalogRevision=Number(out.session_catalog_revision||0);if(S.sessions.some(row=>String(row?.id||'')===String(S.activeSession||'')))S.activeSessionRow=null;else if(!S.activeSession||(S.activeSessionRow?.id!==S.activeSession))S.activeSession=out.active_session_id||S.sessions[0]?.id||'';renderSessions();renderTools();E('accountName').textContent=S.account?.username||'';E('remoteStatus').title=S.collaborationMode?'Shared LAN project':S.capabilities.local?'Local window':'LAN workspace';E('newTerminalBtn').disabled=!S.capabilities.terminal;E('runActiveBtn').disabled=!S.capabilities.processes;E('debugActiveBtn').disabled=!S.capabilities.debug;updateAgentContext();renderCollaborationSnapshot();if(!S.activeSession)await createSession();return out}
+async function refreshDeferredIdeResources(){if(!S.config?.deferred_resources)return;try{const resources=await api('/api/ide/v2/resources');S.config={...(S.config||{}),shared_resources:resources,deferred_resources:false};renderCollaborationResources()}catch(error){logOutput(`Deferred resources: ${error.message}`)}}
+function scheduleIdeDeferredBootstrap(){const run=()=>{refreshDeferredIdeResources();refreshExtensions().then(()=>activateInstalledExtensions()).catch(error=>logOutput(`Extensions: ${error.message}`))};if(typeof requestIdleCallback==='function')requestIdleCallback(run,{timeout:1200});else setTimeout(run,120)}
 function showPasswordChangeGate(){E('authTitle').textContent='Change Temporary Password';E('authSubtitle').textContent='A new password is required before Program can open.';E('authUsername').value=S.account?.username||'';E('authUsername').disabled=true;E('authPassword').value='';E('authPassword').placeholder='Temporary password';E('authConfirmLabel').hidden=false;E('authConfirmLabel').textContent='New password';E('authConfirm').hidden=false;E('authConfirm').required=true;E('authConfirm').value='';E('authSubmit').textContent='Change Password';E('authForm').onsubmit=async event=>{event.preventDefault();E('authSubmit').disabled=true;try{await api('/api/ide/v2/auth/password',{method:'POST',body:JSON.stringify({old_password:E('authPassword').value,new_password:E('authConfirm').value})});E('authMessage').textContent='Password changed. Sign in with the new password.';setTimeout(()=>location.reload(),800)}catch(error){E('authMessage').textContent=error.message;E('authSubmit').disabled=false}}}
 function deviceKey(){let key=localStorage.getItem('clouds_coder_device_key')||'';if(!/^cc_device_[A-Za-z0-9_-]{43,}$/.test(key)){const bytes=new Uint8Array(32);crypto.getRandomValues(bytes);key='cc_device_'+btoa(String.fromCharCode(...bytes)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');localStorage.setItem('clouds_coder_device_key',key)}return key}
 function devicePayload(){return{device_key:deviceKey(),label:[navigator.platform||'Web',navigator.userAgentData?.platform||'',navigator.userAgentData?.mobile?'Mobile':'Browser'].filter(Boolean).join(' / '),fingerprint:[navigator.userAgent||'',navigator.language||'',screen.width+'x'+screen.height].join('|')}}
@@ -113290,16 +115437,16 @@ function bindUI(){
   E('newFileBtn').onclick=()=>newFile().catch(showError);E('newFolderBtn').onclick=()=>newFolder().catch(showError);E('refreshTreeBtn').onclick=()=>refreshWorkspaceSnapshot().catch(showError);E('explorerMoreBtn').onclick=event=>showMenu(event.currentTarget,['file.open','file.uploadFolder','file.downloadWorkspace','file.openFolder','session.new']);E('sessionSelect').onchange=()=>switchSession(E('sessionSelect').value).catch(showError);E('ideSessionSearch').oninput=()=>scheduleIdeSessionSearch(E('ideSessionSearch').value);E('sessionMoreBtn').onclick=()=>refreshSessionCatalog({append:true}).catch(showError);E('renameSessionBtn').onclick=()=>renameCurrentSession().catch(showError);E('rootSelect').onchange=async()=>{S.workspaceClipboard=null;S.explorerSelection=null;clearWorkspaceDropState();S.activeRoot=E('rootSelect').value;S.treeCache.clear();await loadTree('');updateAgentContext()};const workspaceLabel=E('workspaceSectionLabel'),tree=E('tree');workspaceLabel.onclick=event=>{if(event.target.closest('#downloadWorkspaceBtn'))return;setExplorerSelection(null);workspaceLabel.focus()};workspaceLabel.onkeydown=event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();const rect=workspaceLabel.getBoundingClientRect();showWorkspaceMenu(rect.left+8,rect.bottom)}};workspaceLabel.oncontextmenu=event=>{event.preventDefault();setExplorerSelection(null);workspaceLabel.focus();showWorkspaceMenu(event.clientX,event.clientY)};tree.onclick=event=>{if(event.target!==tree)return;setExplorerSelection(null);tree.focus()};tree.oncontextmenu=event=>{if(event.target.closest('.tree-row'))return;event.preventDefault();setExplorerSelection(null);tree.focus();showWorkspaceMenu(event.clientX,event.clientY)};bindWorkspaceDropZone(tree);bindWorkspaceDropZone(workspaceLabel,{rootOnly:true});window.addEventListener('dragover',event=>{if(workspaceDragHasFiles(event.dataTransfer))event.preventDefault()});window.addEventListener('drop',event=>{if(workspaceDragHasFiles(event.dataTransfer))event.preventDefault();clearWorkspaceDropState()});window.addEventListener('dragend',clearWorkspaceDropState);E('downloadWorkspaceBtn').onclick=event=>{event.preventDefault();event.stopPropagation();downloadWorkspacePath('')};
   E('fileInput').onchange=()=>{const input=E('fileInput'),files=[...(input.files||[])],dest=S.pendingUploadDest,openAfter=S.pendingOpenUpload,firstPath=files[0]?normalizeUploadPath(dest?`${dest}/${files[0].name}`:files[0].name):'';S.pendingUploadDest='';S.pendingOpenUpload=false;uploadFiles(files,dest).then(()=>openAfter&&firstPath?openFile(firstPath):null).catch(showError).finally(()=>{input.value=''})};E('folderInput').onchange=()=>{const input=E('folderInput'),dest=S.pendingFolderUploadDest,legacy=[...(input.webkitEntries||[])];S.pendingFolderUploadDest='';const task=legacy.length?scanLegacyDirectoryEntries(legacy).then(scanned=>uploadEntries(scanned.entries,scanned.directories,dest)):uploadFiles(input.files,dest);task.catch(showError).finally(()=>{input.value=''})};E('searchInput').oninput=debounce(()=>runSearch().catch(showError),300);E('includeInput').onchange=()=>runSearch().catch(showError);E('excludeInput').onchange=()=>runSearch().catch(showError);E('matchCaseBtn').onclick=()=>{E('matchCaseBtn').classList.toggle('is-active');runSearch().catch(showError)};E('regexBtn').onclick=()=>{E('regexBtn').classList.toggle('is-active');runSearch().catch(showError)};E('clearSearchBtn').onclick=()=>{E('searchInput').value='';S.searchResults=[];E('searchSummary').textContent='';renderSearch()};
   E('refreshScmBtn').onclick=()=>refreshScm().catch(showError);E('refreshTasksBtn').onclick=()=>refreshTasks().catch(showError);E('runActiveBtn').onclick=()=>runActiveFile().catch(showError);E('debugActiveBtn').onclick=()=>debugActiveFile().catch(showError);E('newTerminalBtn').onclick=()=>newTerminal().catch(showError);E('killTerminalBtn').onclick=()=>killTerminal().catch(showError);E('refreshExtensionsBtn').onclick=()=>refreshExtensions(E('extensionSearchInput').value).catch(showError);E('extensionSearchInput').oninput=debounce(()=>refreshExtensions(E('extensionSearchInput').value).catch(showError),400);E('installVsixBtn').onclick=()=>E('vsixInput').click();E('vsixInput').onchange=()=>installVsix(E('vsixInput').files?.[0]).catch(showError);E('newIdeApplicationBtn').onclick=()=>openIdeApplicationEditor();E('refreshApplicationsBtn').onclick=()=>refreshApplications().catch(showError);
-  E('sendAgentBtn').onclick=()=>sendAgent().catch(showError);E('stopAgentBtn').onclick=()=>stopAgent().catch(showError);E('agentPrompt').onkeydown=event=>{if((event.ctrlKey||event.metaKey)&&event.key==='Enter'){event.preventDefault();sendAgent().catch(showError)}};E('attachContextBtn').onclick=()=>E('agentAttachmentInput').click();E('promptEnhanceBtn').onclick=togglePromptEnhancement;E('agentAttachmentInput').onchange=()=>uploadAgentAttachments(E('agentAttachmentInput').files).catch(showError);const agentComposer=E('agentComposer'),agentPrompt=E('agentPrompt'),dropHint=E('agentDropHint');let agentDragDepth=0;for(const type of ['dragenter','dragover'])agentComposer.addEventListener(type,event=>{event.preventDefault();if(type==='dragenter')agentDragDepth++;agentComposer.classList.add('is-dragover');dropHint.classList.remove('is-hidden')});for(const type of ['dragleave','dragend'])agentComposer.addEventListener(type,event=>{event.preventDefault();if(type==='dragleave')agentDragDepth--;if(agentDragDepth<=0){agentDragDepth=0;agentComposer.classList.remove('is-dragover');dropHint.classList.add('is-hidden')}});agentComposer.addEventListener('drop',event=>{event.preventDefault();agentDragDepth=0;agentComposer.classList.remove('is-dragover');dropHint.classList.add('is-hidden');const files=event.dataTransfer?.files;if(files?.length)uploadAgentAttachments(files).catch(showError)});agentPrompt.addEventListener('paste',event=>{const files=agentClipboardFiles(event);if(!files.length)return;event.preventDefault();uploadAgentAttachments(files).catch(showError)});E('agentModelBtn').onclick=event=>{event.stopPropagation();showAgentModelMenu(event.currentTarget).catch(showError)};E('agentTodoToggle').onclick=()=>{S.agentTodoCollapsed=!S.agentTodoCollapsed;E('agentTodoPanel').classList.toggle('is-collapsed',S.agentTodoCollapsed);E('agentTodoToggle').setAttribute('aria-expanded',String(!S.agentTodoCollapsed));scheduleStateSave()};E('newAgentChatBtn').onclick=()=>createSession().catch(showError);E('promptEnhanceClose').onclick=()=>closePromptEnhanceReview();E('promptUseOriginal').onclick=()=>usePromptReview(true).catch(showError);E('promptRegenerate').onclick=()=>regeneratePromptReview().catch(showError);E('promptUseEnhanced').onclick=()=>usePromptReview(false).catch(showError);E('promptEnhanceEditor').onkeydown=event=>{if((event.ctrlKey||event.metaKey)&&event.key==='Enter'){event.preventDefault();usePromptReview(false).catch(showError)}};E('promptEnhanceOverlay').onclick=event=>{if(event.target===E('promptEnhanceOverlay'))closePromptEnhanceReview()};renderPromptEnhanceToggle();
+  E('sendAgentBtn').onclick=()=>sendAgent().catch(showError);E('stopAgentBtn').onclick=()=>stopAgent().catch(showError);E('agentPrompt').onkeydown=event=>{if((event.ctrlKey||event.metaKey)&&event.key==='Enter'){event.preventDefault();sendAgent().catch(showError)}};E('attachContextBtn').onclick=()=>E('agentAttachmentInput').click();E('promptEnhanceBtn').onclick=togglePromptEnhancement;E('agentAttachmentInput').onchange=()=>uploadAgentAttachments(E('agentAttachmentInput').files).catch(showError);const agentComposer=E('agentComposer'),agentPrompt=E('agentPrompt'),dropHint=E('agentDropHint');let agentDragDepth=0;for(const type of ['dragenter','dragover'])agentComposer.addEventListener(type,event=>{event.preventDefault();if(type==='dragenter')agentDragDepth++;agentComposer.classList.add('is-dragover');dropHint.classList.remove('is-hidden')});for(const type of ['dragleave','dragend'])agentComposer.addEventListener(type,event=>{event.preventDefault();if(type==='dragleave')agentDragDepth--;if(agentDragDepth<=0){agentDragDepth=0;agentComposer.classList.remove('is-dragover');dropHint.classList.add('is-hidden')}});agentComposer.addEventListener('drop',event=>{event.preventDefault();agentDragDepth=0;agentComposer.classList.remove('is-dragover');dropHint.classList.add('is-hidden');const files=event.dataTransfer?.files;if(files?.length)uploadAgentAttachments(files).catch(showError)});agentPrompt.addEventListener('paste',event=>{const files=agentClipboardFiles(event);if(!files.length)return;event.preventDefault();uploadAgentAttachments(files).catch(showError)});E('agentModelBtn').onclick=event=>{event.stopPropagation();showAgentModelMenu(event.currentTarget).catch(showError)};E('agentTodoToggle').onclick=()=>{S.agentTodoCollapsed=!S.agentTodoCollapsed;E('agentTodoPanel').classList.toggle('is-collapsed',S.agentTodoCollapsed);E('agentTodoToggle').setAttribute('aria-expanded',String(!S.agentTodoCollapsed));scheduleStateSave()};E('newAgentChatBtn').onclick=event=>{if(S.workspaceHistoryTouchHandled){event.preventDefault();event.stopPropagation();S.workspaceHistoryTouchHandled=false;return}createSession().catch(showError)};E('promptEnhanceClose').onclick=()=>closePromptEnhanceReview();E('promptUseOriginal').onclick=()=>usePromptReview(true).catch(showError);E('promptRegenerate').onclick=()=>regeneratePromptReview().catch(showError);E('promptUseEnhanced').onclick=()=>usePromptReview(false).catch(showError);E('promptEnhanceEditor').onkeydown=event=>{if((event.ctrlKey||event.metaKey)&&event.key==='Enter'){event.preventDefault();usePromptReview(false).catch(showError)}};E('promptEnhanceOverlay').onclick=event=>{if(event.target===E('promptEnhanceOverlay'))closePromptEnhanceReview()};renderPromptEnhanceToggle();
   bindPromptEnhanceButton();
   E('accountsBtn').onclick=()=>showAccountModal().catch(showError);E('accountStatus').onclick=()=>showAccountModal().catch(showError);E('manageBtn').onclick=event=>showMenu(event.currentTarget,['accounts.manage','file.openFolder','workbench.action.showCommands']);E('notificationsBtn').onclick=()=>toast('No new notifications.','success',2500);E('gitStatus').onclick=()=>showView('scm');E('errorStatus').onclick=()=>showPanel('problems');
   E('paletteInput').oninput=filterPalette;E('paletteInput').onkeydown=event=>{if(event.key==='ArrowDown'){event.preventDefault();S.paletteIndex=Math.min(S.paletteItems.length-1,S.paletteIndex+1);renderPalette()}else if(event.key==='ArrowUp'){event.preventDefault();S.paletteIndex=Math.max(0,S.paletteIndex-1);renderPalette()}else if(event.key==='Enter'){event.preventDefault();activatePaletteItem(S.paletteItems[S.paletteIndex])}else if(event.key==='Escape')closePalette()};E('paletteOverlay').onclick=event=>{if(event.target===E('paletteOverlay'))closePalette()};E('modalClose').onclick=closeModal;E('modalOverlay').onclick=event=>{if(event.target===E('modalOverlay'))closeModal()};
   document.addEventListener('click',event=>{if(!event.target.closest('#menuPopup')&&!event.target.closest('[data-menu]')&&!event.target.closest('#mainMenuBtn')&&!event.target.closest('#manageBtn')&&!event.target.closest('#agentModelBtn')&&!event.target.closest('#promptEnhanceBtn')){E('menuPopup').classList.add('is-hidden');E('menuPopup').classList.remove('agent-model-menu','prompt-budget-menu');E('menuPopup').style.transform='';E('menuPopup').style.bottom='auto'}});
-  window.addEventListener('keydown',event=>{const mod=event.ctrlKey||event.metaKey;const key=event.key.toLowerCase();if(explorerHasKeyboardFocus()){if(mod&&!event.shiftKey&&!event.altKey&&key==='c'){event.preventDefault();runCommandById('explorer.copy')}else if(mod&&!event.shiftKey&&!event.altKey&&key==='x'){event.preventDefault();runCommandById('explorer.cut')}else if(mod&&!event.shiftKey&&!event.altKey&&key==='v'){event.preventDefault();runCommandById('explorer.paste')}else if(!mod&&!event.altKey&&event.key==='F2'){event.preventDefault();if(!event.repeat)runCommandById('explorer.rename')}else if(!mod&&!event.altKey&&(event.key==='Delete'||event.key==='Backspace')){event.preventDefault();if(!event.repeat)runCommandById('explorer.delete')}}if(event.defaultPrevented)return;if(mod&&key==='s'){event.preventDefault();(event.shiftKey?saveAll():saveActive()).catch(showError)}else if(mod&&event.shiftKey&&key==='p'){event.preventDefault();openPalette('>')}else if(mod&&key==='p'){event.preventDefault();openPalette('')}else if(mod&&key==='b'){event.preventDefault();togglePrimary()}else if(mod&&key==='j'){event.preventDefault();togglePanel()}else if(mod&&event.shiftKey&&key==='e'){event.preventDefault();showView('explorer')}else if(mod&&event.shiftKey&&key==='f'){event.preventDefault();showView('search')}else if(mod&&event.shiftKey&&key==='g'){event.preventDefault();showView('scm')}else if(mod&&event.shiftKey&&key==='x'){event.preventDefault();showView('extensions')}else if(mod&&event.key==='\\'){event.preventDefault();runCommandById('workbench.action.splitEditor')}else if(event.key==='F5'&&mod){event.preventDefault();runActiveFile().catch(showError)}else if(event.key==='Escape'){closePalette();clearWorkspaceDropState();E('menuPopup').classList.add('is-hidden');if(!E('promptEnhanceOverlay').classList.contains('is-hidden'))closePromptEnhanceReview()}});window.addEventListener('beforeunload',event=>{if([...S.openFiles.values()].some(file=>file.dirty)){event.preventDefault();event.returnValue=''}});window.addEventListener('resize',()=>{if(S.terminalFit)S.terminalFit.fit()})
+  window.addEventListener('keydown',event=>{const mod=event.ctrlKey||event.metaKey;const key=event.key.toLowerCase();if(explorerHasKeyboardFocus()){if(mod&&!event.shiftKey&&!event.altKey&&key==='c'){event.preventDefault();runCommandById('explorer.copy')}else if(mod&&!event.shiftKey&&!event.altKey&&key==='x'){event.preventDefault();runCommandById('explorer.cut')}else if(mod&&!event.shiftKey&&!event.altKey&&key==='v'){event.preventDefault();runCommandById('explorer.paste')}else if(!mod&&!event.altKey&&event.key==='F2'){event.preventDefault();if(!event.repeat)runCommandById('explorer.rename')}else if(!mod&&!event.altKey&&(event.key==='Delete'||event.key==='Backspace')){event.preventDefault();if(!event.repeat)runCommandById('explorer.delete')}}if(event.defaultPrevented)return;if(mod&&key==='s'){event.preventDefault();(event.shiftKey?saveAll():saveActive()).catch(showError)}else if(mod&&event.shiftKey&&key==='p'){event.preventDefault();openPalette('>')}else if(mod&&key==='p'){event.preventDefault();openPalette('')}else if(mod&&key==='b'){event.preventDefault();togglePrimary()}else if(mod&&key==='j'){event.preventDefault();togglePanel()}else if(mod&&event.shiftKey&&key==='e'){event.preventDefault();showView('explorer')}else if(mod&&event.shiftKey&&key==='f'){event.preventDefault();showView('search')}else if(mod&&event.shiftKey&&key==='g'){event.preventDefault();showView('scm')}else if(mod&&event.shiftKey&&key==='x'){event.preventDefault();showView('extensions')}else if(mod&&event.key==='\\'){event.preventDefault();runCommandById('workbench.action.splitEditor')}else if(event.key==='F5'&&mod){event.preventDefault();runActiveFile().catch(showError)}else if(event.key==='Escape'){closePalette();clearWorkspaceDropState();E('menuPopup').classList.add('is-hidden');if(!E('promptEnhanceOverlay').classList.contains('is-hidden'))closePromptEnhanceReview()}});window.addEventListener('beforeunload',event=>{if([...S.openFiles.values()].some(file=>file.dirty)){event.preventDefault();event.returnValue=''}});window.addEventListener('resize',()=>{if(S.terminalFit)S.terminalFit.fit()});bindWorkspaceHistoryButton();E('newAgentWorkspaceBtn').onclick=()=>createSession({newWorkspace:true}).catch(showError)
 }
 function initIconFallback(){if(!document.fonts||typeof document.fonts.load!=='function')return;let settled=false;const timeout=setTimeout(()=>{settled=true},2500);document.fonts.load('12px codicon').then(fonts=>{if(settled||!fonts||!fonts.length)return;clearTimeout(timeout);document.body.classList.remove('icons-fallback')}).catch(()=>{})}
 function debounce(fn,delay){let timer;return(...args)=>{clearTimeout(timer);timer=setTimeout(()=>fn(...args),delay)}}
-async function startWorkbench(){E('authGate').classList.add('is-hidden');E('ideShell').classList.remove('is-hidden');if(window.innerWidth<=820){S.primaryVisible=false;S.secondaryVisible=false;E('ideShell').classList.add('primary-hidden','secondary-hidden')}await Promise.all([initMonaco(),initTerminalLibrary()]);configureCommands();bindUI();await refreshConfig();await restoreWorkbenchState();await refreshExtensions();await activateInstalledExtensions();updateStatusBar();updateAgentContext();connectAgentEvents();scheduleAgentPoll(50);if(S.collaborationMode){renderCollaborationSnapshot();connectCollaborationEvents();startCollaborationPresenceHeartbeat()}if(!S.capabilities.processes)toast(S.capabilities.process_denial_reason||'Process features are disabled for this connection.','warning',8000);setStatus(S.collaborationMode?'Collaboration ready':'Ready');setTimeout(checkIdeKernelUpdateNotice,500)}
+async function startWorkbench(){E('authGate').classList.add('is-hidden');E('ideShell').classList.remove('is-hidden');if(window.innerWidth<=820){S.primaryVisible=false;S.secondaryVisible=false;E('ideShell').classList.add('primary-hidden','secondary-hidden')}configureCommands();bindUI();setStatus('Loading sessions...');const libraryTask=Promise.all([initMonaco(),initTerminalLibrary()]),workbenchTask=api('/api/ide/v2/workbench/state').catch(error=>{logOutput(`State restore failed: ${error.message}`);return{ok:false,state:{}}});await refreshConfig({lite:true});const savedWorkbench=await workbenchTask,restoredSession=workbenchSessionFromState(savedWorkbench.state||{});if(restoredSession)S.activeSession=restoredSession;renderSessions();resetAgentSessionUI(S.activeSession);const bootSession=S.activeSession,bootSessionSeq=S.sessionSwitchSeq;updateStatusBar();updateAgentContext();connectAgentEvents();scheduleAgentPoll(40);if(S.collaborationMode){renderCollaborationSnapshot();connectCollaborationEvents();startCollaborationPresenceHeartbeat()}if(!S.capabilities.processes)toast(S.capabilities.process_denial_reason||'Process features are disabled for this connection.','warning',8000);setStatus(S.collaborationMode?'Collaboration ready':'Ready');libraryTask.then(()=>restoreWorkbenchState(savedWorkbench,{restoreSession:false,expectedSession:bootSession,expectedSeq:bootSessionSeq})).then(()=>{updateStatusBar();updateAgentContext()}).catch(error=>logOutput(`Workbench restore: ${error.message}`));scheduleIdeDeferredBootstrap();setTimeout(checkIdeKernelUpdateNotice,500)}
 window.addEventListener('pagehide',stopCollaborationPresenceHeartbeat);
 window.addEventListener('DOMContentLoaded',async()=>{initIconFallback();try{if(await authenticate())await startWorkbench()}catch(error){showError(error)}});
 """
@@ -115737,6 +117884,8 @@ class AppContext:
         self._task_queue: deque[dict] = deque()
         self._task_queue_seq = 0
         self._task_submission_recent: deque[dict] = deque(maxlen=SCHEDULER_SUBMISSION_DEDUPE_MAX)
+        self._scheduler_active_sessions: set[tuple[str, str]] = set()
+        self._scheduler_active_initialized = True
         self.tool_specs = filter_tool_specs_for_runtime(
             TOOLS,
             web_search_enabled=bool(getattr(self, "web_search_enabled", DEFAULT_WEB_SEARCH_ENABLED)),
@@ -117045,7 +119194,7 @@ class AppContext:
                     pass
             raise
 
-    def ide_config(self, user_id: str, client_ip: str = "") -> dict:
+    def ide_config(self, user_id: str, client_ip: str = "", *, lite: bool = False) -> dict:
         if str(client_ip or "").strip() and not str(user_id or "").startswith("collab:"):
             self._sync_ordinary_ide_llm_source(user_id, client_ip)
         sessions = self.ide_session_payload(user_id, client_ip=client_ip)
@@ -117070,7 +119219,8 @@ class AppContext:
             "active_session_id": str(sessions.get("active_session_id", "") or ""),
             "session_creation_limit": sessions.get("session_creation_limit", {}),
             "password_login_enabled": bool(self.ide_password_login_enabled),
-            "shared_resources": self.shared_resource_manifest(user_id),
+            "shared_resources": {} if lite else self.shared_resource_manifest(user_id),
+            "deferred_resources": bool(lite),
             "active_kernel_version": self.liquid_kernel.registry.active_version(),
             "kernel_canary": self.liquid_kernel.registry.active_state().get("canary"),
         }
@@ -117089,7 +119239,7 @@ class AppContext:
                     if bool(getattr(self, "collaboration_insecure_http", False))
                     else ""
                 ),
-                "shared_resources": self.collaboration_resource_manifest(user_id),
+                "shared_resources": {} if lite else self.collaboration_resource_manifest(user_id),
             })
         return out
 
@@ -117286,18 +119436,53 @@ class AppContext:
     def collaboration_resource_manifest(self, user_id: str) -> dict:
         return self.shared_resource_manifest(user_id, collaboration=True)
 
-    def ide_create_session(self, user_id: str, title: str | None = None, client_ip: str = "") -> dict:
+    def ide_create_session(
+        self,
+        user_id: str,
+        title: str | None = None,
+        client_ip: str = "",
+        *,
+        workspace_session_id: str = "",
+    ) -> dict:
+        requested_title = str(title or "").strip()
+        source_session_id = str(workspace_session_id or "").strip()
+        initial_title = requested_title or (
+            "Shared workspace" if str(user_id or "").startswith("collab:") else "IDE Workspace"
+        )
+        title_origin = "manual" if requested_title else "default"
         if str(user_id or "").startswith("collab:"):
             mgr = self.manager_for_user(user_id)
-            sess = mgr.create(title or "Shared workspace")
+            sess = mgr.create(
+                initial_title,
+                title_origin=title_origin,
+                workspace_session_id=source_session_id,
+            )
             sess.ide_remote_sandbox_required = True
             quota = self.ide_session_payload(user_id, client_ip=client_ip).get("session_creation_limit", {})
         else:
-            sess, quota = self.create_session_for_user(user_id, title or "IDE Workspace", client_ip=client_ip)
+            sess, quota = self.create_session_for_user(
+                user_id,
+                initial_title,
+                client_ip=client_ip,
+                title_origin=title_origin,
+                workspace_session_id=source_session_id,
+            )
+            mgr = self.manager_for_user(user_id)
+        history = mgr.workspace_history(sess.id, limit=0)
         return {
             "ok": True,
             "id": sess.id,
+            "workspace_id": str(getattr(sess, "workspace_id", sess.id) or sess.id),
+            "workspace_session_count": int(history.get("total", 1) or 1),
+            "workspace_name": str(history.get("workspace_name", sess.title) or sess.title),
+            "workspace_created_at": float(history.get("workspace_created_at", getattr(sess, "created_at", 0.0)) or 0.0),
+            "created_at": float(getattr(sess, "created_at", 0.0) or 0.0),
+            "workspace_inherited": bool(source_session_id),
+            "new_workspace": not bool(source_session_id),
+            "workspace_shared": bool(getattr(mgr, "workspace_root", None) is not None),
             "title": sess.title,
+            "title_origin": str(getattr(sess, "title_origin", "") or ""),
+            "title_revision": int(getattr(sess, "auto_title_revision", 0) or 0),
             "ui_language": sess.ui_language,
             "session_creation_limit": quota,
             "roots": self.ide_workspace_roots(user_id, sess.id),
@@ -117308,7 +119493,23 @@ class AppContext:
         if not clean:
             raise ValueError("title required")
         sess = self.manager_for_user(user_id).rename(str(session_id or "").strip(), clean)
-        return {"ok": True, "id": sess.id, "title": sess.title}
+        return {
+            "ok": True,
+            "id": sess.id,
+            "title": sess.title,
+            "title_revision": int(getattr(sess, "auto_title_revision", 0) or 0),
+        }
+
+    def ide_delete_session(self, user_id: str, session_id: str) -> dict:
+        sid = str(session_id or "").strip()
+        if not sid:
+            raise ValueError("session id required")
+        manager = self.manager_for_user(user_id)
+        if manager.get(sid) is None:
+            raise KeyError(sid)
+        if not manager.delete(sid):
+            raise KeyError(sid)
+        return {"ok": True, "id": sid}
 
     def _ide_session(self, user_id: str, session_id: str) -> SessionState:
         sess = self.manager_for_user(user_id).get(str(session_id or "").strip())
@@ -117342,6 +119543,18 @@ class AppContext:
                 }
             )
         return roots
+
+    def ide_workspace_session_history(
+        self,
+        user_id: str,
+        session_id: str,
+        *,
+        limit: int = 60,
+    ) -> dict:
+        mgr = self.manager_for_user(user_id)
+        if mgr.get(str(session_id or "").strip()) is None:
+            raise KeyError("session not found")
+        return mgr.workspace_history(session_id, limit=limit)
 
     def ide_resolve_workspace(self, user_id: str, session_id: str, root_id: str, rel: str = "") -> tuple[Path, Path, dict]:
         rid = str(root_id or "session").strip() or "session"
@@ -119879,7 +122092,7 @@ document.addEventListener('DOMContentLoaded', function(){{
             self._sync_ordinary_ide_llm_source(user_id, client_ip)
         sid = str(session_id or "").strip()
         if not sid:
-            created = self.ide_create_session(user_id, "IDE Workspace", client_ip=client_ip)
+            created = self.ide_create_session(user_id, None, client_ip=client_ip)
             sid = str(created.get("id", "") or "")
         message = str(payload.get("message", payload.get("content", "")) or "").strip()
         if not message:
@@ -121258,6 +123471,7 @@ document.addEventListener('DOMContentLoaded', function(){{
                 for row in raw_operations
                 if isinstance(row, dict) and int(row.get("seq", 0) or 0) > after_operation_seq
             ]
+        incremental_request = bool(after_feed_seq or after_operation_seq or known_snapshot_revision)
         for raw in raw_feed:
             if not isinstance(raw, dict):
                 continue
@@ -121348,6 +123562,28 @@ document.addEventListener('DOMContentLoaded', function(){{
                     "data": public_data,
                 }
             )
+        raw_feed_count = len(feed)
+        raw_operation_count = len(operations)
+        feed, feed_truncated = _bounded_ui_rows(
+            feed,
+            max_rows=180,
+            byte_budget=IDE_AGENT_FEED_BYTES,
+            text_limit=3600,
+            data_text_limit=1200,
+            collection_limit=20,
+            keep="head" if incremental_request else "tail",
+        )
+        operations, operations_truncated = _bounded_ui_rows(
+            operations,
+            max_rows=500,
+            byte_budget=IDE_AGENT_OPERATIONS_BYTES,
+            text_limit=2200,
+            data_text_limit=1200,
+            collection_limit=20,
+            keep="head" if incremental_request else "tail",
+        )
+        incremental_feed_more = bool(incremental_request and feed_truncated)
+        incremental_operation_more = bool(incremental_request and operations_truncated)
         pending_question = None
         raw_question = snap.get("pending_user_question") if isinstance(snap, dict) else None
         if isinstance(raw_question, dict):
@@ -121375,12 +123611,20 @@ document.addEventListener('DOMContentLoaded', function(){{
                 )
             except Exception:
                 pass
-        return {
+        feed_cursor_values = [after_feed_seq] + [int(row.get("seq", 0) or 0) for row in feed]
+        operation_cursor_values = [after_operation_seq] + [int(row.get("seq", 0) or 0) for row in operations]
+        if not incremental_feed_more:
+            feed_cursor_values.append(int(snap.get("feed_revision", 0) or 0))
+        if not incremental_operation_more:
+            operation_cursor_values.append(int(snap.get("operation_revision", 0) or 0))
+        response = {
             "ok": True,
             "session_id": str(session_id or ""),
             "title": trim(str(getattr(sess, "title", "") or ""), 160),
             "title_origin": trim(str(getattr(sess, "title_origin", "") or ""), 20),
+            "title_revision": int(getattr(sess, "auto_title_revision", 0) or 0),
             "running": bool(snap.get("running", False)),
+            "scheduler_starting": bool(snap.get("scheduler_starting", False)),
             "phase": str(snap.get("agent_phase", "idle") or "idle"),
             "active_role": str(snap.get("agent_active_role", "") or ""),
             "active_tool": str(snap.get("agent_active_tool", "") or ""),
@@ -121395,16 +123639,15 @@ document.addEventListener('DOMContentLoaded', function(){{
                 (after_feed_seq or after_operation_seq or known_snapshot_revision)
                 and not reset_required
             ),
-            "feed_cursor": max(
-                [int(snap.get("feed_revision", 0) or 0), after_feed_seq]
-                + [int(row.get("seq", 0) or 0) for row in feed]
-            ),
-            "operation_cursor": max(
-                [int(snap.get("operation_revision", 0) or 0), after_operation_seq]
-                + [int(row.get("seq", 0) or 0) for row in operations]
-            ),
+            "feed_cursor": max(feed_cursor_values),
+            "operation_cursor": max(operation_cursor_values),
             "feed_window_start": feed_sequences[0] if feed_sequences else 0,
             "operation_window_start": operation_sequences[0] if operation_sequences else 0,
+            "feed_available": raw_feed_count,
+            "operation_available": raw_operation_count,
+            "feed_truncated": bool(feed_truncated),
+            "operations_truncated": bool(operations_truncated),
+            "incremental_has_more": bool(incremental_feed_more or incremental_operation_more),
             "message_count": int(snap.get("message_count", 0) or 0),
             "queued_inputs": int(snap.get("queued_user_inputs_count", 0) or 0),
             "scheduler_queued": int(snap.get("scheduler_queued_inputs_count", 0) or 0),
@@ -121418,9 +123661,35 @@ document.addEventListener('DOMContentLoaded', function(){{
             "agent_contexts": list(snap.get("agent_contexts", []) or [])[:12],
             "todos": list(snap.get("todos", []) or [])[:40],
             "tasks": list(snap.get("tasks", []) or [])[:80],
-            "feed": feed[-180:],
+            "feed": feed,
             "operations": operations[-500:],
         }
+        response["agent_contexts"], _ = _bounded_ui_rows(
+            response.get("agent_contexts", []),
+            max_rows=12,
+            byte_budget=16 * 1024,
+            text_limit=1200,
+            data_text_limit=800,
+            collection_limit=16,
+        )
+        response["todos"], _ = _bounded_ui_rows(
+            response.get("todos", []),
+            max_rows=40,
+            byte_budget=24 * 1024,
+            text_limit=1200,
+            data_text_limit=700,
+            collection_limit=16,
+        )
+        response["tasks"], _ = _bounded_ui_rows(
+            response.get("tasks", []),
+            max_rows=80,
+            byte_budget=32 * 1024,
+            text_limit=1200,
+            data_text_limit=700,
+            collection_limit=16,
+        )
+        response["ui_payload_limit_bytes"] = int(IDE_AGENT_STATE_MAX_BYTES)
+        return _enforce_ui_payload_budget(response, IDE_AGENT_STATE_MAX_BYTES)
 
     def ide_agent_models(
         self,
@@ -123579,31 +125848,53 @@ document.addEventListener('DOMContentLoaded', function(){{
         with self._lock:
             return self._session_creation_quota_status_locked(user_id, client_ip=client_ip)
 
-    def create_session_for_user(self, user_id: str, title: str | None = None, client_ip: str = "") -> tuple[SessionState, dict]:
+    def create_session_for_user(
+        self,
+        user_id: str,
+        title: str | None = None,
+        client_ip: str = "",
+        *,
+        title_origin: str | None = None,
+        workspace_session_id: str = "",
+    ) -> tuple[SessionState, dict]:
         mgr = self.manager_for_user(user_id)
+        reserved_window = ""
         with self._lock:
             status_before = self._session_creation_quota_status_locked(user_id, client_ip=client_ip)
             if bool(status_before.get("enabled")) and int(status_before.get("remaining", 0) or 0) <= 0:
                 raise SessionCreationLimitExceeded(status_before)
-            sess = mgr.create(title)
+            state = self._load_session_daily_limit_state_locked(user_id)
+            reserved_window = str(status_before.get("window_key", "") or "")
+            if str(state.get("window_key", "") or "") != reserved_window:
+                state = {"window_key": reserved_window, "used": 0}
+            state["used"] = max(0, int(state.get("used", 0) or 0)) + 1
+            state["window_key"] = reserved_window
+            self._save_session_daily_limit_state_locked(user_id, state)
+            status_after = self._session_creation_quota_status_locked(user_id, client_ip=client_ip)
+        try:
             try:
-                state = self._load_session_daily_limit_state_locked(user_id)
-                if str(state.get("window_key", "") or "") != str(status_before.get("window_key", "")):
-                    state = {"window_key": str(status_before.get("window_key", "")), "used": 0}
-                state["used"] = max(0, int(state.get("used", 0) or 0)) + 1
-                state["window_key"] = str(status_before.get("window_key", ""))
-                self._save_session_daily_limit_state_locked(user_id, state)
-                status_after = self._session_creation_quota_status_locked(user_id, client_ip=client_ip)
-            except Exception:
+                sess = mgr.create(
+                    title,
+                    title_origin=title_origin,
+                    workspace_session_id=workspace_session_id,
+                )
+            except TypeError as exc:
+                # Keep lightweight/legacy manager implementations usable while
+                # the production manager accepts the lineage keywords.
+                message = str(exc).lower()
+                if "unexpected keyword" not in message and "keyword argument" not in message:
+                    raise
+                sess = mgr.create(title)
+        except Exception:
+            with self._lock:
                 try:
-                    mgr.delete(sess.id)
+                    state = self._load_session_daily_limit_state_locked(user_id)
+                    if str(state.get("window_key", "") or "") == reserved_window:
+                        state["used"] = max(0, int(state.get("used", 0) or 0) - 1)
+                        self._save_session_daily_limit_state_locked(user_id, state)
                 except Exception:
-                    # Force local cleanup so a failed quota write cannot materialize a hidden session.
-                    with mgr.lock:
-                        mgr.sessions.pop(sess.id, None)
-                        mgr.session_index.pop(sess.id, None)
-                    shutil.rmtree(sess.root, ignore_errors=True)
-                raise
+                    pass
+            raise
         try:
             self.telemetry.record("session_create", user_id=user_id, session_id=sess.id, status="success")
         except Exception:
@@ -123670,7 +125961,10 @@ document.addEventListener('DOMContentLoaded', function(){{
             requested_title = str(title or "").strip()
             app_name = str(app_row.get("name", "") or "Application")
             sess, quota_status = self.create_session_for_user(
-                user_id, requested_title or app_name, client_ip=client_ip,
+                user_id,
+                requested_title or app_name,
+                client_ip=client_ip,
+                title_origin="manual" if requested_title else "application",
             )
             try:
                 with sess.lock:
@@ -123780,25 +126074,41 @@ document.addEventListener('DOMContentLoaded', function(){{
             return int(len(self._task_queue))
 
     def _running_counts_locked(self) -> tuple[int, dict[str, int]]:
-        total = 0
-        per_user: dict[str, int] = {}
-        for uid, mgr in list(self._session_mgrs.items()):
-            try:
-                with mgr.lock:
-                    sessions = list(mgr.sessions.values())
-            except Exception:
-                sessions = []
-            running = 0
-            for sess in sessions:
+        active = getattr(self, "_scheduler_active_sessions", None)
+        initialized = bool(getattr(self, "_scheduler_active_initialized", False))
+        if not isinstance(active, set):
+            active = set()
+            self._scheduler_active_sessions = active
+        if not initialized:
+            for uid, mgr in list(getattr(self, "_session_mgrs", {}).items()):
                 try:
-                    if bool(getattr(sess, "running", False)) or bool(getattr(sess, "scheduler_starting", False)):
-                        running += 1
+                    with mgr.lock:
+                        sessions = list(mgr.sessions.values())
                 except Exception:
-                    continue
-            if running > 0:
-                per_user[uid] = running
-                total += running
-        return int(total), per_user
+                    sessions = []
+                for sess in sessions:
+                    if bool(getattr(sess, "running", False)) or bool(getattr(sess, "scheduler_starting", False)):
+                        active.add((str(uid or ""), str(getattr(sess, "id", "") or "")))
+            self._scheduler_active_initialized = True
+        stale: list[tuple[str, str]] = []
+        per_user: dict[str, int] = {}
+        for uid, sid in list(active):
+            mgr = getattr(self, "_session_mgrs", {}).get(uid)
+            sess = None
+            if mgr is not None:
+                try:
+                    sess = mgr.sessions.get(sid)
+                except Exception:
+                    sess = None
+            if sess is None or not (
+                bool(getattr(sess, "running", False)) or bool(getattr(sess, "scheduler_starting", False))
+            ):
+                stale.append((uid, sid))
+                continue
+            per_user[uid] = int(per_user.get(uid, 0) or 0) + 1
+        for key in stale:
+            active.discard(key)
+        return int(sum(per_user.values())), per_user
 
     def _can_start_for_user_locked(self, user_id: str) -> tuple[bool, str, int, dict[str, int]]:
         total_running, per_user = self._running_counts_locked()
@@ -123875,6 +126185,11 @@ document.addEventListener('DOMContentLoaded', function(){{
                 setattr(sess, "scheduler_starting", True)
             except Exception:
                 pass
+            active = getattr(self, "_scheduler_active_sessions", None)
+            if not isinstance(active, set):
+                active = set()
+                self._scheduler_active_sessions = active
+            active.add(session_key)
             started.append({"request": req, "session": sess})
             selected_sessions.add(session_key)
             total_running += 1
@@ -124033,6 +126348,11 @@ document.addEventListener('DOMContentLoaded', function(){{
                     pass
             running = bool(getattr(sess, "running", False))
             queued = bool(isinstance(out, dict) and out.get("queued"))
+            if not running and not bool(getattr(sess, "scheduler_starting", False)):
+                with self._lock:
+                    active = getattr(self, "_scheduler_active_sessions", None)
+                    if isinstance(active, set):
+                        active.discard((str(req.get("user_id", "") or ""), str(req.get("session_id", "") or "")))
             self._publish_collaboration_agent_state(
                 sess,
                 "running" if running else ("queued" if queued else "idle"),
@@ -124087,6 +126407,10 @@ document.addEventListener('DOMContentLoaded', function(){{
                 continue
 
     def _on_session_run_finished(self, user_id: str, session_id: str):
+        with self._lock:
+            active = getattr(self, "_scheduler_active_sessions", None)
+            if isinstance(active, set):
+                active.discard((str(user_id or ""), str(session_id or "")))
         sess = None
         try:
             mgr = self.manager_for_user(user_id)
@@ -124427,6 +126751,7 @@ document.addEventListener('DOMContentLoaded', function(){{
                 js_lib_download_enabled=bool(getattr(self, "js_lib_download_enabled", True)),
                 kernel_registry=self.liquid_kernel.registry,
                 kernel_runtime=self.liquid_kernel.runtime,
+                skills_snapshot=self.skills_store,
             )
             mgr.read_context_policy = normalize_read_context_policy(
                 getattr(self, "read_context_policy", DEFAULT_READ_CONTEXT_POLICY)
@@ -125123,7 +127448,7 @@ document.addEventListener('DOMContentLoaded', function(){{
     def _ensure_skills_store(self, force: bool = False) -> SkillStore:
         now = now_ts()
         with self._lock:
-            if force or (now - float(self.skills_store_refresh_ts or 0.0)) >= SKILL_REFRESH_MIN_INTERVAL_SECONDS:
+            if force or (now - float(self.skills_store_refresh_ts or 0.0)) >= SKILL_CATALOG_FULL_REFRESH_SECONDS:
                 if force:
                     ensure_runtime_skills(self.skills_root)
                 self.skills_store.reload(force=force)
@@ -127293,6 +129618,8 @@ class Handler(BaseHTTPRequestHandler):
             if not kind:
                 return self._send_json({"error": "admin authentication required", "code": "unauthorized"}, status=401)
             return self._send_json({"ok": True, "auth_kind": kind})
+        if path == "/api/admin/language":
+            return self._send_json(admin_language_payload(self._session_mgr()))
         if path == "/api/apps/skills":
             return self._send_json(self.app.applications.skill_catalog())
         if path == "/api/apps/personal":
@@ -128385,6 +130712,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json(out)
             except Exception as exc:
                 return self._send_json({"error": str(exc)}, status=400)
+        if path == "/api/admin/language":
+            payload = self._read_json()
+            language = str(payload.get("language", payload.get("lang", ""))).strip()
+            if not language:
+                return self._send_json({"error": "language required"}, status=400)
+            try:
+                self._session_mgr().set_user_language(language)
+                return self._send_json(admin_language_payload(self._session_mgr()))
+            except Exception as exc:
+                return self._send_json({"error": str(exc)}, status=400)
         if path == "/api/user-memory/config":
             payload = self._read_json()
             mode = normalize_user_memory_mode(payload.get("mode", payload.get("user_memory_mode", DEFAULT_USER_MEMORY_MODE)))
@@ -128495,10 +130832,14 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/sessions":
             payload = self._read_json()
             try:
+                requested_origin = None
+                if "user_named" in payload:
+                    requested_origin = "manual" if bool(payload.get("user_named")) else "default"
                 sess, quota_status = self.app.create_session_for_user(
                     self._user_id(),
                     payload.get("title"),
                     client_ip=self._client_ip(),
+                    title_origin=requested_origin,
                 )
             except SessionCreationLimitExceeded as exc:
                 return self._send_json(
@@ -128512,6 +130853,8 @@ class Handler(BaseHTTPRequestHandler):
                 {
                     "id": sess.id,
                     "title": sess.title,
+                    "title_origin": str(getattr(sess, "title_origin", "") or ""),
+                    "title_revision": int(getattr(sess, "auto_title_revision", 0) or 0),
                     "ui_language": sess.ui_language,
                     "session_creation_limit": quota_status,
                 },
@@ -128673,7 +131016,11 @@ class Handler(BaseHTTPRequestHandler):
             sess = mgr.rename(sid, title)
         except KeyError:
             return self._send_json({"error": "session not found"}, status=404)
-        return self._send_json({"id": sess.id, "title": sess.title})
+        return self._send_json({
+            "id": sess.id,
+            "title": sess.title,
+            "title_revision": int(getattr(sess, "auto_title_revision", 0) or 0),
+        })
 
     def do_DELETE(self):
         path = unquote(urlparse(self.path).path)
@@ -130674,7 +133021,19 @@ class IdeHandler(BaseHTTPRequestHandler):
         if path == "/api/ide/config":
             try:
                 context = self._auth_context(required=True)
-                out = self.app.ide_config(str(context["account"].get("user_id", "")), client_ip=self._client_ip())
+                lite = _to_bool_like((query.get("lite", ["0"]) or ["0"])[0], default=False)
+                config_user_id = str(context["account"].get("user_id", ""))
+                if lite:
+                    out = self.app.ide_config(
+                        config_user_id,
+                        client_ip=self._client_ip(),
+                        lite=True,
+                    )
+                else:
+                    out = self.app.ide_config(
+                        config_user_id,
+                        client_ip=self._client_ip(),
+                    )
                 out["account"] = self._public_auth_account(context["account"])
                 out["csrf_token"] = context["account"].get("csrf_token", "")
                 out["capabilities"] = context["capabilities"]
@@ -130718,6 +133077,20 @@ class IdeHandler(BaseHTTPRequestHandler):
                 context = self._auth_context(required=True)
                 sess = self.app._ide_session(str(context["account"].get("user_id", "")), m.group(1))
                 return self._stream_ide_events(sess)
+            except Exception as exc:
+                return self._send_exception(exc)
+        m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/history$", path)
+        if m:
+            try:
+                context = self._auth_context(required=True)
+                requested_limit = int((query.get("limit", ["60"]) or ["60"])[0] or 0)
+                return self._send_json(
+                    self.app.ide_workspace_session_history(
+                        str(context["account"].get("user_id", "")),
+                        m.group(1),
+                        limit=requested_limit,
+                    )
+                )
             except Exception as exc:
                 return self._send_exception(exc)
         m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/roots$", path)
@@ -131306,11 +133679,15 @@ class IdeHandler(BaseHTTPRequestHandler):
         if path == "/api/ide/sessions":
             payload = self._read_json()
             try:
+                workspace_session_id = ""
+                if not _to_bool_like(payload.get("new_workspace"), default=False):
+                    workspace_session_id = str(payload.get("workspace_session_id", "") or "").strip()
                 return self._send_json(
                     self.app.ide_create_session(
                         user_id,
                         str(payload.get("title", "") or "").strip() or None,
                         client_ip=self._client_ip(),
+                        workspace_session_id=workspace_session_id,
                     ),
                     status=201,
                 )
@@ -131647,6 +134024,17 @@ class IdeHandler(BaseHTTPRequestHandler):
                 if not deleted:
                     raise KeyError(m_application.group(1))
                 return self._send_json({"ok": True})
+            except Exception as exc:
+                return self._send_exception(exc)
+        m_session = re.match(r"^/api/ide/sessions/([^/]+)$", path)
+        if m_session:
+            try:
+                return self._send_json(
+                    self.app.ide_delete_session(
+                        str(context["account"].get("user_id", "") or ""),
+                        m_session.group(1),
+                    )
+                )
             except Exception as exc:
                 return self._send_exception(exc)
         m = re.match(r"^/api/ide/sessions/([^/]+)/workspace/file$", path)
