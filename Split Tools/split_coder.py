@@ -296,7 +296,7 @@ DEFAULT_LAYOUT: dict[str, list[str]] = {
     "rag/parsers.py": [
         "~^_rag_(?:safe|detect|cjk|is_noise|entity|filter|filename|apply|choose|tokenize|expand|extract|classify|chunk)",
         "~^_code_(?:language|is_test)", "_CallCollector", "_ALGO_COMPLEXITY_RE", "_ALGO_STEP_RE",
-        "_ALGO_MATH_VARS", "_ALGO_DOC_KEYWORDS", "_detect_algo_chunk",
+        "_ALGO_MATH_VARS", "_ALGO_DOC_KEYWORDS", "_detect_algo_chunk", "EvidenceRecord",
         "CodeContentParser", "RAGContentParser",
     ],
     "rag/index.py": ["TFGraphIDFIndex", "CodeGraphIndex", "~^_code_(?:module|choose|query)"],
@@ -310,7 +310,12 @@ DEFAULT_LAYOUT: dict[str, list[str]] = {
     ],
 
     "server/__init__.py": [],
-    "server/http.py": ["AgentHTTPServer", "Handler"],
+    "server/http.py": [
+        "AgentHTTPServer", "Handler", "admin_language_payload",
+        "_UI_TRUNCATION_MARKER", "_ui_trim_text", "_bounded_ui_value",
+        "_bounded_ui_row", "_bounded_ui_rows", "_enforce_ui_payload_budget",
+        "_apply_lite_snapshot_bounds",
+    ],
     "server/skills.py": ["SkillsHandler"],
     "server/rag_admin.py": ["_RagAdminAuthMixin", "RagAdminHandler", "CodeAdminHandler"],
 
@@ -318,6 +323,11 @@ DEFAULT_LAYOUT: dict[str, list[str]] = {
     "config/constants.py": [
         "~^[A-Z][A-Z0-9_]{2,}$", "_SHELL_AUTO_CONFIRM_PATTERNS", "_TOOL_TIMEOUT_MAP",
         "_DEFAULT_TOOL_TIMEOUT", "_DEFAULT_SHELL_TIMEOUT_MODE_RAW",
+    ],
+    "config/bootstrap.py": [
+        "_EMBEDDED_LIQUID_KERNEL_PACKAGE_B64", "_ensure_embedded_liquid_kernel_package",
+        "_liquid_kernel_history_present", "prepare_liquid_kernel_runtime",
+        "_persist_liquid_kernel_bootstrap",
     ],
     "_unclassified.py": [],
 }
@@ -544,6 +554,19 @@ class AutoLayoutGenerator:
             return "app/main.py"
         if name == "agent_language_preference_payload":
             return "config/settings.py"
+        if name in {
+            "_EMBEDDED_LIQUID_KERNEL_PACKAGE_B64", "_ensure_embedded_liquid_kernel_package",
+            "_liquid_kernel_history_present", "prepare_liquid_kernel_runtime",
+            "_persist_liquid_kernel_bootstrap",
+        }:
+            return "config/bootstrap.py"
+        if name == "admin_language_payload" or name.startswith("_bounded_ui_") or name in {
+            "_UI_TRUNCATION_MARKER", "_ui_trim_text", "_enforce_ui_payload_budget",
+            "_apply_lite_snapshot_bounds",
+        }:
+            return "server/http.py"
+        if name == "EvidenceRecord":
+            return "rag/parsers.py"
         if name == "is_synthetic_public_progress":
             return "utils/text.py"
         if name == "ide_public_operation_data":
@@ -767,6 +790,15 @@ from pathlib import Path
 
 _PACKAGE = __package__
 _PACKAGE_ROOT = Path(__file__).resolve().parent
+# Some legacy source fragments use absolute imports for support packages that
+# are relocated inside the generated package (for example
+# ``from liquid_kernel import ...``).  The monolith resolves these from its own
+# directory; make the generated package root an import location before
+# replaying the source statements so the same imports work when the package is
+# imported from its parent directory or copied into an isolated environment.
+_PACKAGE_ROOT_TEXT = str(_PACKAGE_ROOT)
+if _PACKAGE_ROOT_TEXT not in sys.path:
+    sys.path.insert(0, _PACKAGE_ROOT_TEXT)
 _SOURCE_FILENAME = __SOURCE_FILENAME__
 _PLAN = __PLAN__
 _LOCK = threading.RLock()

@@ -12,6 +12,7 @@
   <a href="https://pypi.org/project/clouds-coder/"><img src="https://img.shields.io/pypi/dm/clouds-coder.svg" alt="PyPI downloads" /></a>
 </p>
 <p align="center">
+  <a href="./log/CHANGELOG-2026-09-12.md">2026-09-12 Liquid Kernel & Scalable Session Runtime Changelog (EN/中文/日本語)</a> ·
   <a href="./log/CHANGELOG-2026-08-20.md">2026-08-20 Collaboration & Skills Studio 2.0 Changelog (EN/中文/日本語)</a> ·
   <a href="./log/CHANGELOG-2026-08-16.md">2026-08-16 IDE & Runtime Changelog (EN/中文/日本語)</a> ·
   <a href="./log/CHANGELOG-2026-08-10.md">2026-08-10 Feature Changelog (EN/中文/日本語)</a> ·
@@ -37,7 +38,7 @@ Clouds Coder is a local-first, general-purpose task agent platform centered on s
 
 Its primary problem framing is that CLI coding remains hard to learn and difficult to distribute consistently across users. Clouds Coder addresses this through backend/frontend separation (cloud-side CLI execution + Web-side interaction) to lower Vibe Coding onboarding cost, while timeout/truncation/context/anti-drift controls are treated as co-equal core capabilities that keep complex tasks executable, convergent, and trustworthy.
 
-Architecture changelog archive: [`CHANGELOG-2026-08-20.md`](./log/CHANGELOG-2026-08-20.md) | [`CHANGELOG-2026-08-16.md`](./log/CHANGELOG-2026-08-16.md) | [`CHANGELOG-2026-08-10.md`](./log/CHANGELOG-2026-08-10.md) | [`CHANGELOG-2026-06-22.md`](./log/CHANGELOG-2026-06-22.md) | [`CHANGELOG-2026-06-05.md`](./log/CHANGELOG-2026-06-05.md) | [`CHANGELOG-2026-05-28.md`](./log/CHANGELOG-2026-05-28.md) | [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md)
+Architecture changelog archive: [`CHANGELOG-2026-09-12.md`](./log/CHANGELOG-2026-09-12.md) | [`CHANGELOG-2026-08-20.md`](./log/CHANGELOG-2026-08-20.md) | [`CHANGELOG-2026-08-16.md`](./log/CHANGELOG-2026-08-16.md) | [`CHANGELOG-2026-08-10.md`](./log/CHANGELOG-2026-08-10.md) | [`CHANGELOG-2026-06-22.md`](./log/CHANGELOG-2026-06-22.md) | [`CHANGELOG-2026-06-05.md`](./log/CHANGELOG-2026-06-05.md) | [`CHANGELOG-2026-05-28.md`](./log/CHANGELOG-2026-05-28.md) | [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md)
 
 ## IDE Workspace
 
@@ -54,6 +55,24 @@ Clouds Coder includes a session-aware browser IDE that keeps the editor, runtime
 | Workspace security | Workspace-declared stdio MCP commands remain inert until an administrator approves the exact workspace, configuration, executable, arguments, environment keys, and referenced scripts. Any relevant change invalidates the approval. |
 
 See the [2026-08-16 changelog](./log/CHANGELOG-2026-08-16.md) for the complete IDE, Agent-loop, prompt-enhancement, transport-retry, compaction, and MCP trust update.
+
+### Liquid Kernel and bounded live state
+
+WebUI, IDE, and Collaboration IDE share a session-state runtime but keep their surface projections separate. Session catalogs are paginated (120 WebUI entries and 80 IDE entries on the first page), summaries come from an incremental journal, and snapshots are revisioned. IDE `agent-state` accepts feed/operation cursors and returns bounded recovery data when a cursor expires; normal updates are stable-ID SSE deltas. Frame-batched rendering, bounded chat/timeline DOM, deferred IDE resources, and lightweight submission ACKs keep real-time status visible without forcing full-workspace repaints.
+
+Liquid Kernel supplies versioned tool policy, prompt policy, and lifecycle hooks (`before_run`, `before_round`, `after_tool_results`) to each pinned session. Its immutable control plane owns the registry, signatures, evaluation, audit, sandbox, Canary rollout, and rollback. Startup defaults to `inherit`, preserving registry/history/session pins; `inject` is an explicit option for adding the embedded kernel as a new promoted version. See the [2026-09-12 architecture changelog](./log/CHANGELOG-2026-09-12.md) for the evolution pipeline and benchmark details.
+
+```mermaid
+flowchart TB
+  UI["WebUI / IDE / Collaboration IDE"] --> Runtime["Clouds Coder Runtime"]
+  Runtime --> Session["SessionState<br/>Pinned kernel version"]
+  Runtime --> Control["Immutable control plane"]
+  Session --> Artifact["Versioned policy + harness"]
+  Artifact --> Hooks["before_run / before_round / after_tool_results"]
+  Control --> Registry["Signed registry + SQLite audit"]
+  Control --> Canary["5% -> 25% -> 100% Canary"]
+  Canary --> Outcome["Promotion or rollback"]
+```
 
 ## Collaboration Mode: Human + Agent Shared Workspace
 

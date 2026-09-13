@@ -4,20 +4,22 @@ import time
 import unittest
 from pathlib import Path
 
+import Clouds_Coder as cc
 from liquid_kernel import (
     LiquidKernelControlPlane,
     LiquidKernelError,
     default_evolution_config,
 )
 
-import Clouds_Coder as cc
-
 
 def wait_for_run(plane: LiquidKernelControlPlane, run_id: str, timeout: float = 8.0) -> dict:
     deadline = time.monotonic() + timeout
     active = {"queued", "collecting", "assessing", "proposal_ready", "validating_patch", "benchmarking"}
     detail = plane.registry.run_detail(run_id)
-    while detail["status"] in active and time.monotonic() < deadline:
+    while (
+        (detail["status"] in active or bool(getattr(plane, "active_run_id", "")))
+        and time.monotonic() < deadline
+    ):
         time.sleep(0.02)
         detail = plane.registry.run_detail(run_id)
     return detail

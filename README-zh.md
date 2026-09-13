@@ -12,6 +12,7 @@
   <a href="https://pypi.org/project/clouds-coder/"><img src="https://img.shields.io/pypi/dm/clouds-coder.svg" alt="PyPI 下载量" /></a>
 </p>
 <p align="center">
+  <a href="./log/CHANGELOG-2026-09-12.md">2026-09-12 Liquid Kernel 与可扩展会话运行时更新日志（EN/中文/日本語）</a> ·
   <a href="./log/CHANGELOG-2026-08-20.md">2026-08-20 协作模式与 Skills Studio 2.0 更新日志（EN/中文/日本語）</a> ·
   <a href="./log/CHANGELOG-2026-08-16.md">2026-08-16 IDE 与运行时更新日志（EN/中文/日本語）</a> ·
   <a href="./log/CHANGELOG-2026-08-10.md">2026-08-10 功能更新日志（EN/中文/日本語）</a> ·
@@ -37,7 +38,7 @@ Clouds Coder 是一个以“CLI 执行层与 Web 用户层分离”为核心的�
 
 它的首要问题定义是：CLI 编程门槛高、环境分发困难、学习曲线陡。Clouds Coder 通过前后端分离（云端 CLI 执行 + Web 端交互控制）来降低 Vibe Coding 上手成本，同时把超时、截断、上下文预算、空想循环治理作为并列核心能力，保障复杂任务可执行、可收敛、可复盘。
 
-架构更新日志归档：[`CHANGELOG-2026-08-20.md`](./log/CHANGELOG-2026-08-20.md) | [`CHANGELOG-2026-08-16.md`](./log/CHANGELOG-2026-08-16.md) | [`CHANGELOG-2026-08-10.md`](./log/CHANGELOG-2026-08-10.md) | [`CHANGELOG-2026-06-22.md`](./log/CHANGELOG-2026-06-22.md) | [`CHANGELOG-2026-06-05.md`](./log/CHANGELOG-2026-06-05.md) | [`CHANGELOG-2026-05-28.md`](./log/CHANGELOG-2026-05-28.md) | [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md)
+架构更新日志归档：[`CHANGELOG-2026-09-12.md`](./log/CHANGELOG-2026-09-12.md) | [`CHANGELOG-2026-08-20.md`](./log/CHANGELOG-2026-08-20.md) | [`CHANGELOG-2026-08-16.md`](./log/CHANGELOG-2026-08-16.md) | [`CHANGELOG-2026-08-10.md`](./log/CHANGELOG-2026-08-10.md) | [`CHANGELOG-2026-06-22.md`](./log/CHANGELOG-2026-06-22.md) | [`CHANGELOG-2026-06-05.md`](./log/CHANGELOG-2026-06-05.md) | [`CHANGELOG-2026-05-28.md`](./log/CHANGELOG-2026-05-28.md) | [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md)
 
 ## IDE 工作区
 
@@ -54,6 +55,24 @@ Clouds Coder 内置面向会话的浏览器 IDE，把编辑器、运行工具、
 | 工作区安全 | 工作区声明的 stdio MCP 命令在管理员批准前保持禁用；批准绑定工作区、完整配置、可执行文件、参数、环境变量键和引用脚本，相关内容变化会自动使批准失效。 |
 
 完整的 IDE、Agent Loop、Prompt Enhancer、连接重试、上下文压缩与 MCP 信任更新见 [2026-08-16 更新日志](./log/CHANGELOG-2026-08-16.md)。
+
+### Liquid Kernel 与有界实时状态
+
+WebUI、IDE 和 Collaboration IDE 共用会话状态运行时，但保留各自的界面投影。会话目录分页加载（WebUI 首页 120 条、IDE 首页 80 条），摘要来自增量 journal，snapshot 带有 revision。IDE `agent-state` 支持 feed/operation 游标，游标过期只返回有界恢复数据；正常刷新使用稳定 ID 的 SSE delta。合帧渲染、有界聊天/时间线 DOM、IDE 重资源延迟加载和轻量提交 ACK 让状态保持实时，同时避免整页重绘。
+
+Liquid Kernel 为每个固定版本的 session 提供工具策略、提示词策略和 `before_run`、`before_round`、`after_tool_results` 生命周期钩子。不可变控制面负责注册表、签名、评估、审计、沙箱、Canary 发布与回滚。启动默认 `inherit`，保留已有 registry/history/session pin；`inject` 才会显式把内嵌 kernel 作为新的 promoted version 加入。详见 [2026-09-12 架构更新日志](./log/CHANGELOG-2026-09-12.md)。
+
+```mermaid
+flowchart TB
+  UI["WebUI / IDE / Collaboration IDE"] --> Runtime["Clouds Coder 运行时"]
+  Runtime --> Session["SessionState<br/>固定 kernel 版本"]
+  Runtime --> Control["不可变控制面"]
+  Session --> Artifact["版本化策略 + harness"]
+  Artifact --> Hooks["before_run / before_round / after_tool_results"]
+  Control --> Registry["签名注册表 + SQLite 审计"]
+  Control --> Canary["5% -> 25% -> 100% Canary"]
+  Canary --> Outcome["晋级或回滚"]
+```
 
 ## 协作模式：人类与 Agent 的共享工作区
 

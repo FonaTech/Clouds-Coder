@@ -12,6 +12,7 @@
   <a href="https://pypi.org/project/clouds-coder/"><img src="https://img.shields.io/pypi/dm/clouds-coder.svg" alt="PyPI ダウンロード数" /></a>
 </p>
 <p align="center">
+  <a href="./log/CHANGELOG-2026-09-12.md">2026-09-12 Liquid Kernel とスケーラブルなセッションランタイム（EN/中文/日本語）</a> ·
   <a href="./log/CHANGELOG-2026-08-20.md">2026-08-20 Collaboration Mode・Skills Studio 2.0 変更ログ（EN/中文/日本語）</a> ·
   <a href="./log/CHANGELOG-2026-08-16.md">2026-08-16 IDE・ランタイム変更ログ（EN/中文/日本語）</a> ·
   <a href="./log/CHANGELOG-2026-08-10.md">2026-08-10 機能変更ログ（EN/中文/日本語）</a> ·
@@ -39,7 +40,7 @@ Clouds Coder は、CLI 実行面と Web ユーザー面の分離を中核に据�
 
 主要な問題設定は、CLI コーディングが学習コスト高く、利用者ごとの環境配布が難しい点です。Clouds Coder はバックエンド/フロントエンド分離（クラウド側 CLI 実行 + Web 側操作）で Vibe Coding の導入コストを下げると同時に、timeout・切断回復・文脈予算・思考ループ抑制を並列の中核能力として扱い、複雑タスクの実行性・収束性・再検証性を担保します。
 
-アーキテクチャ changelog アーカイブ: [`CHANGELOG-2026-08-16.md`](./log/CHANGELOG-2026-08-16.md) | [`CHANGELOG-2026-08-10.md`](./log/CHANGELOG-2026-08-10.md) | [`CHANGELOG-2026-06-22.md`](./log/CHANGELOG-2026-06-22.md) | [`CHANGELOG-2026-06-05.md`](./log/CHANGELOG-2026-06-05.md) | [`CHANGELOG-2026-05-28.md`](./log/CHANGELOG-2026-05-28.md) | [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md)
+アーキテクチャ changelog アーカイブ: [`CHANGELOG-2026-09-12.md`](./log/CHANGELOG-2026-09-12.md) | [`CHANGELOG-2026-08-20.md`](./log/CHANGELOG-2026-08-20.md) | [`CHANGELOG-2026-08-16.md`](./log/CHANGELOG-2026-08-16.md) | [`CHANGELOG-2026-08-10.md`](./log/CHANGELOG-2026-08-10.md) | [`CHANGELOG-2026-06-22.md`](./log/CHANGELOG-2026-06-22.md) | [`CHANGELOG-2026-06-05.md`](./log/CHANGELOG-2026-06-05.md) | [`CHANGELOG-2026-05-28.md`](./log/CHANGELOG-2026-05-28.md) | [`CHANGELOG-2026-05-02.md`](./log/CHANGELOG-2026-05-02.md)
 
 ## IDE ワークスペース
 
@@ -55,6 +56,24 @@ Clouds Coder は、エディター、実行ツール、成果物プレビュー�
 | ワークスペース安全性 | ワークスペース定義の stdio MCP コマンドは、管理者がワークスペース、完全な設定、実行ファイル、引数、環境変数キー、参照スクリプトを承認するまで起動しません。関連内容が変わると承認は失効します。 |
 
 IDE、Agent Loop、Prompt Enhancer、接続再試行、コンテキスト圧縮、MCP 信頼制御の詳細は [2026-08-16 変更ログ](./log/CHANGELOG-2026-08-16.md) を参照してください。
+
+### Liquid Kernel と有界リアルタイム状態
+
+WebUI、IDE、Collaboration IDE はセッション状態ランタイムを共有し、画面ごとの投影は分離する。セッション一覧はページング（WebUI 120 件、IDE 80 件）、要約は増分 journal、snapshot は revision 付きで取得する。IDE `agent-state` は feed/operation cursor を受け、期限切れでも bounded recovery だけを返す。通常更新は安定 ID の SSE delta、フレーム単位の描画、チャット/タイムライン DOM 上限、IDE リソースの遅延ロード、高速 ACK を使い、全画面再描画なしで状態を更新する。
+
+Liquid Kernel は pinned session ごとに tool policy、prompt policy、`before_run`、`before_round`、`after_tool_results` hook を提供する。registry、署名、評価、監査、sandbox、Canary、rollback は不変 control plane が担当する。起動既定値は `inherit` で registry/history/session pin を維持し、`inject` は内蔵 kernel を新しい promoted version として追加する明示的な選択である。詳細は [2026-09-12 アーキテクチャ変更ログ](./log/CHANGELOG-2026-09-12.md) を参照。
+
+```mermaid
+flowchart TB
+  UI["WebUI / IDE / Collaboration IDE"] --> Runtime["Clouds Coder ランタイム"]
+  Runtime --> Session["SessionState<br/>固定 kernel version"]
+  Runtime --> Control["不変 control plane"]
+  Session --> Artifact["バージョン付き policy + harness"]
+  Artifact --> Hooks["before_run / before_round / after_tool_results"]
+  Control --> Registry["署名 registry + SQLite 監査"]
+  Control --> Canary["5% -> 25% -> 100% Canary"]
+  Canary --> Outcome["昇格または rollback"]
+```
 
 ## 1. プロジェクトの位置づけ
 
