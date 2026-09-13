@@ -24,9 +24,10 @@ import math
 import mimetypes
 import multiprocessing
 import os
-import posixpath
 import platform
+import posixpath
 import queue
+import random
 import re
 import secrets
 import select
@@ -54,7 +55,8 @@ import zipfile
 import zlib
 from collections import Counter, defaultdict, deque
 from collections.abc import Iterable
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
+from dataclasses import field as dataclass_field
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
@@ -376,7 +378,11 @@ def _ensure_embedded_liquid_kernel_package(package_root: Path | None = None) -> 
 
 LIQUID_KERNEL_PACKAGE_STATUS = _ensure_embedded_liquid_kernel_package()
 
-from liquid_kernel import EVOLUTION_MODES, LiquidKernelControlPlane, LiquidKernelError
+from liquid_kernel import (  # noqa: E402
+    EVOLUTION_MODES,
+    LiquidKernelControlPlane,
+    LiquidKernelError,
+)
 
 # BEGIN EMBEDDED COLLABORATION BACKEND
 COLLAB_DB_FILENAME = "collaboration.sqlite"
@@ -12110,6 +12116,64 @@ def probe_ollama_environment(base_url: str, timeout: int = 4) -> tuple[bool, lis
     except Exception as exc:
         return False, [], str(exc)
 
+
+def extract_ollama_model_capabilities(payload: object) -> dict:
+    """Translate Ollama ``/api/show`` metadata to provider-neutral hints."""
+    if not isinstance(payload, dict):
+        return {}
+    values: set[str] = set()
+    raw = payload.get("capabilities")
+    if isinstance(raw, dict):
+        values.update(str(key).strip().lower() for key, value in raw.items() if value)
+    elif isinstance(raw, (list, tuple, set)):
+        values.update(str(value).strip().lower() for value in raw)
+    elif isinstance(raw, str):
+        values.update(part.strip().lower() for part in re.split(r"[,\s]+", raw) if part.strip())
+    caps: dict[str, object] = {}
+    if any("think" in value or "reason" in value for value in values):
+        caps["reasoning_supported"] = True
+        caps["reasoning_style"] = "ollama"
+    if any("vision" in value or "image" in value for value in values):
+        caps["vision"] = True
+    if any("tool" in value or "function" in value for value in values):
+        caps["tools"] = True
+    return caps
+
+
+def probe_ollama_model_records(
+    base_url: str,
+    *,
+    timeout: float = 1.5,
+    max_models: int | None = None,
+) -> list[dict]:
+    """List Ollama models and inspect each advertised capability by default.
+
+    ``max_models`` remains available for callers that explicitly need a bound;
+    normal discovery must import the complete provider directory.
+    """
+    ok, tags, _ = probe_ollama_environment(base_url, timeout=max(0.5, float(timeout)))
+    if not ok:
+        return []
+    records = [{"id": name, "capabilities": {}} for name in tags]
+    names = tags if max_models is None else tags[: max(0, int(max_models))]
+    for index, name in enumerate(names):
+        try:
+            body = json.dumps({"name": name}).encode("utf-8")
+            req = Request(
+                f"{str(base_url or '').rstrip('/')}/api/show",
+                data=body,
+                method="POST",
+                headers={"Content-Type": "application/json", "Accept": "application/json"},
+            )
+            with urlopen(req, timeout=max(0.5, float(timeout))) as resp:
+                payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+            records[index]["capabilities"] = extract_ollama_model_capabilities(payload)
+            records[index]["raw"] = payload
+        except Exception:
+            continue
+    return records
+
+
 def list_ollama_models(base_url: str, timeout: int = 4) -> list[str]:
     ok, tags, _ = probe_ollama_environment(base_url, timeout=timeout)
     return tags if ok else []
@@ -12125,7 +12189,46 @@ class EmptyActionError(RuntimeError):
 class CircuitBreakerTriggered(RuntimeError):
     """Raised when fused fault counter reaches hard break threshold."""
 
-def list_ollama_models_cached(base_url: str, ttl_seconds: int = 30, force_refresh: bool = False) -> list[str]:
+def _fetch_ollama_models_cached(key: str, base_url: str, cached_tags: list[str]) -> None:
+    """Fetch Ollama tags and publish one cache snapshot.
+
+    The caller marks the cache row as fetching before starting this worker, so
+    concurrent catalog requests can keep returning the last snapshot while the
+    network request is in flight.
+    """
+    try:
+        ok, tags, _ = probe_ollama_environment(base_url)
+    except Exception:
+        ok, tags = False, []
+    finally:
+        with _OLLAMA_TAG_CACHE_LOCK:
+            if ok:
+                _OLLAMA_TAG_CACHE[key] = {"ts": time.time(), "tags": list(tags)}
+            else:
+                row_now = _OLLAMA_TAG_CACHE.get(key, {})
+                row_now.pop("_fetching", None)
+                if cached_tags:
+                    _OLLAMA_TAG_CACHE[key] = {
+                        "ts": time.time(),
+                        "tags": list(cached_tags),
+                    }
+                else:
+                    _OLLAMA_TAG_CACHE[key] = {"ts": time.time(), "tags": []}
+
+
+def list_ollama_models_cached(
+    base_url: str,
+    ttl_seconds: int = 30,
+    force_refresh: bool = False,
+    *,
+    background: bool = False,
+) -> list[str]:
+    """Return cached Ollama tags, optionally refreshing without blocking.
+
+    UI/catalog reads use ``background=True`` so an unavailable local daemon
+    cannot delay the first render. Explicit scan endpoints keep the historical
+    synchronous behaviour by leaving it false.
+    """
     key = str(base_url or "").rstrip("/")
     now = time.time()
     cached_tags: list[str] = []
@@ -12144,25 +12247,19 @@ def list_ollama_models_cached(base_url: str, ttl_seconds: int = 30, force_refres
             row = {"ts": 0.0, "tags": []}
         row["_fetching"] = True
         _OLLAMA_TAG_CACHE[key] = row
-    try:
-        ok, tags, _ = probe_ollama_environment(base_url)
-    except Exception:
-        ok, tags = False, []
-    finally:
-        with _OLLAMA_TAG_CACHE_LOCK:
-            if ok:
-                _OLLAMA_TAG_CACHE[key] = {"ts": time.time(), "tags": list(tags)}
-            else:
-                # Clear fetching flag, keep old cache if available
-                row_now = _OLLAMA_TAG_CACHE.get(key, {})
-                row_now.pop("_fetching", None)
-                if not cached_tags:
-                    _OLLAMA_TAG_CACHE[key] = {"ts": time.time(), "tags": []}
-    if ok:
-        return list(tags)
-    if cached_tags:
+    if background:
+        threading.Thread(
+            target=_fetch_ollama_models_cached,
+            args=(key, base_url, cached_tags),
+            name="ollama-model-probe",
+            daemon=True,
+        ).start()
         return list(cached_tags)
-    return []
+    _fetch_ollama_models_cached(key, base_url, cached_tags)
+    with _OLLAMA_TAG_CACHE_LOCK:
+        row = _OLLAMA_TAG_CACHE.get(key, {})
+        tags = row.get("tags", []) if isinstance(row, dict) else []
+    return list(tags) if isinstance(tags, list) else list(cached_tags)
 
 def resolve_ollama_model(base_url: str, preferred: str) -> str:
     models = list_ollama_models(base_url)
@@ -12577,39 +12674,45 @@ def clamp_effort(effort: str, *, ceiling: str = EFFORT_MAX, floor: str = EFFORT_
     return EFFORT_LEVELS[min(max(EFFORT_ORDER[e], lo), hi)]
 
 
-def model_reasoning_style(provider: str, model: str) -> str:
+def model_reasoning_style(
+    provider: str,
+    model: str,
+    capabilities: dict | None = None,
+    *,
+    capabilities_probed: bool = False,
+) -> str:
     """Return which reasoning dialect a (provider, model) pair speaks.
 
     One of: "anthropic" | "openai" | "deepseek" | "glm" | "ollama" | "none".
     Conservative: only models known to support reasoning return a non-"none"
     style, so unknown models are never sent reasoning fields.
     """
-    prov = normalize_openai_compat_provider_name(provider) if provider else ""
-    raw_prov = str(provider or "").strip().lower()
-    m = str(model or "").strip().lower()
-    if raw_prov == "anthropic":
-        # Extended thinking on Claude 3.7+ / 4.x families.
-        if any(tok in m for tok in ("claude-3-7", "claude-3.7", "claude-sonnet-4",
-                                    "claude-opus-4", "claude-haiku-4", "claude-4",
-                                    "-thinking", "claude-sonnet-5", "claude-opus-5")):
-            return "anthropic"
-        return "none"
-    if raw_prov == "ollama":
-        # Local reasoning models (qwen3, deepseek-r1, etc.) accept native think flag.
-        if any(tok in m for tok in ("r1", "qwen3", "deepseek", "thinking", "reasoner", "magistral")):
-            return "ollama"
-        return "none"
-    if prov in OPENAI_COMPAT_PROVIDER_NAMES or raw_prov == "custom_http":
-        if prov == "glm" or m.startswith("glm-") or "glm" in m:
-            # GLM 4.5/4.6/5.x + coding endpoints use {"thinking": {...}}.
-            return "glm"
-        if "deepseek" in m or m in ("deepseek-reasoner",):
-            return "deepseek"
-        # OpenAI o-series / gpt-5 reasoning, and openrouter slugs that wrap them.
-        if (m.startswith("o1") or m.startswith("o3") or m.startswith("o4")
-                or "gpt-5" in m or "/o1" in m or "/o3" in m or "/o4" in m
-                or "reasoning" in m):
+    # Probe metadata is authoritative.  A model name is never evidence of a
+    # reasoning API: providers may alias, fine-tune, or proxy models freely.
+    if isinstance(capabilities, dict):
+        explicit_style = str(
+            capabilities.get("reasoning_style")
+            or capabilities.get("reasoning_dialect")
+            or ""
+        ).strip().lower()
+        supported = capabilities.get("reasoning_supported")
+        if explicit_style in {"anthropic", "openai", "deepseek", "glm", "ollama", "none"}:
+            return explicit_style
+        if supported is False:
+            return "none"
+        if supported is True:
+            # A provider can advertise reasoning without a dialect; use its
+            # transport dialect rather than guessing from the model name.
+            raw_provider = str(provider or "").strip().lower()
+            if raw_provider == "anthropic":
+                return "anthropic"
+            if raw_provider == "ollama":
+                return "ollama"
+            if normalize_openai_compat_provider_name(provider) == "glm":
+                return "glm"
             return "openai"
+        if supported is None and not explicit_style:
+            return "none"
         return "none"
     return "none"
 
@@ -12620,6 +12723,7 @@ def resolve_reasoning_payload(
     effort: str,
     *,
     max_tokens: int = 2000,
+    capabilities: dict | None = None,
 ) -> dict:
     """Map (provider, model, effort) -> concrete request mutations.
 
@@ -12634,7 +12738,7 @@ def resolve_reasoning_payload(
     eff = str(effort or EFFORT_OFF).strip().lower()
     if eff not in EFFORT_ORDER or eff == EFFORT_OFF:
         return {}
-    style = model_reasoning_style(provider, model)
+    style = model_reasoning_style(provider, model, capabilities)
     if style == "none":
         return {}
     if style == "anthropic":
@@ -12665,13 +12769,19 @@ def resolve_reasoning_payload(
     return {}
 
 def openai_compat_probe_headers(provider: str, api_key: str = "") -> dict[str, str]:
+    raw_provider = str(provider or "").strip().lower().replace("-", "_")
     normalized = normalize_openai_compat_provider_name(provider)
     headers = {
         "Accept": "application/json",
         "User-Agent": "Clouds-Coder/1.0",
     }
     if str(api_key or "").strip():
-        headers["Authorization"] = f"Bearer {str(api_key).strip()}"
+        if raw_provider == "anthropic":
+            headers["x-api-key"] = str(api_key).strip()
+        else:
+            headers["Authorization"] = f"Bearer {str(api_key).strip()}"
+    if raw_provider == "anthropic":
+        headers["anthropic-version"] = "2023-06-01"
     if normalized == "openrouter":
         headers.setdefault("HTTP-Referer", "https://clouds-coder.local")
         headers.setdefault("X-Title", "Clouds Coder")
@@ -12711,6 +12821,21 @@ def openai_compat_model_list_urls(endpoint_or_base: str, provider: str = "") -> 
         out.append(url)
     return out
 
+
+def anthropic_model_list_url(endpoint_or_base: str) -> str:
+    """Return the Anthropic Models API URL for an API base or Messages URL."""
+    base = str(endpoint_or_base or "").strip().rstrip("/")
+    if not base:
+        return ""
+    low = base.lower()
+    for suffix in ("/v1/messages", "/messages"):
+        if low.endswith(suffix):
+            base = base[: -len(suffix)].rstrip("/")
+            break
+    if base.lower().endswith("/v1"):
+        return base + "/models"
+    return base + "/v1/models"
+
 def extract_openai_compat_model_ids(payload: object) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
@@ -12745,6 +12870,403 @@ def extract_openai_compat_model_ids(payload: object) -> list[str]:
             _add(node)
     _walk(payload, 0)
     return out
+
+
+def extract_openai_compat_model_records(payload: object) -> list[dict]:
+    """Extract model ids plus conservative capability hints from /models."""
+    records: list[dict] = []
+    seen: set[str] = set()
+
+    def capability_hints(node: dict) -> dict:
+        caps: dict = {}
+        for key in ("reasoning_supported", "supports_reasoning", "reasoning", "thinking"):
+            if key in node:
+                raw = node.get(key)
+                if isinstance(raw, bool):
+                    caps["reasoning_supported"] = raw
+                    break
+                if isinstance(raw, (list, tuple, set)):
+                    caps["reasoning_supported"] = bool(raw)
+                    break
+                if isinstance(raw, str) and raw.strip().lower() in {
+                    "true", "yes", "on", "enabled", "supported"
+                }:
+                    caps["reasoning_supported"] = True
+                    break
+        style = node.get("reasoning_style") or node.get("reasoning_dialect")
+        if isinstance(style, str) and style.strip():
+            normalized_style = style.strip().lower()
+            if normalized_style in {"reasoning_effort", "reasoning-effort", "reasoning"}:
+                normalized_style = "openai"
+            caps["reasoning_style"] = normalized_style
+            caps.setdefault("reasoning_supported", True)
+        for key in ("supported_parameters", "supported_features", "features"):
+            values = node.get(key)
+            if isinstance(values, dict):
+                values = values.keys()
+            if isinstance(values, (list, tuple, set)):
+                names = {str(value or "").strip().lower() for value in values}
+                if any(
+                    any(token in value for token in ("reasoning", "thinking"))
+                    for value in names
+                ):
+                    caps.setdefault("reasoning_supported", True)
+                    if any("reasoning_effort" in value for value in names):
+                        caps.setdefault("reasoning_style", "openai")
+                    break
+        raw_caps = node.get("capabilities")
+        if isinstance(raw_caps, dict):
+            nested = capability_hints(raw_caps)
+            caps.update(nested)
+        elif isinstance(raw_caps, (list, tuple, set)):
+            nested = capability_hints({"supported_features": raw_caps})
+            caps.update(nested)
+        return caps
+
+    def walk(node: object, depth: int = 0):
+        if depth > 5 or node is None:
+            return
+        if isinstance(node, list):
+            for item in node:
+                walk(item, depth + 1)
+            return
+        if not isinstance(node, dict):
+            return
+        model_id = ""
+        for key in ("id", "model", "name"):
+            value = node.get(key)
+            if isinstance(value, (str, int, float)) and str(value).strip():
+                model_id = trim(str(value).strip(), 240)
+                break
+        if model_id and model_id.lower() not in {"list", "model", "models", "object", "data"}:
+            low = model_id.lower()
+            if low not in seen:
+                seen.add(low)
+                caps = capability_hints(node)
+                records.append({"id": model_id, "capabilities": caps, "raw": node})
+        for key in ("data", "models", "items", "result", "results", "value"):
+            if key in node:
+                walk(node.get(key), depth + 1)
+
+    walk(payload)
+    return records
+
+
+_PROVIDER_MODEL_CACHE_LOCK = threading.Lock()
+_PROVIDER_MODEL_CACHE: dict[str, dict] = {}
+
+
+def _fetch_provider_models_cached(
+    key: str,
+    profile: dict,
+    cached_models: list[dict],
+) -> None:
+    """Fetch provider models and publish one cache snapshot."""
+    if not isinstance(profile, dict):
+        return
+    provider = str(profile.get("provider", "") or "").strip().lower()
+    base_url = str(profile.get("base_url", "") or "").strip().rstrip("/")
+    endpoint = str(profile.get("endpoint", "") or "").strip()
+    api_key = str(profile.get("api_key", "") or "").strip()
+    custom_headers = profile.get("headers", {})
+    custom_headers = (
+        {str(k): str(v) for k, v in custom_headers.items() if str(k).strip()}
+        if isinstance(custom_headers, dict)
+        else {}
+    )
+    records: list[dict] = []
+    try:
+        if provider == "ollama" and base_url:
+            records = probe_ollama_model_records(base_url, timeout=1.5)
+        elif provider == "anthropic":
+            models_url = anthropic_model_list_url(base_url or endpoint)
+            headers = openai_compat_probe_headers(provider, api_key)
+            headers.update(custom_headers)
+            seen: set[str] = set()
+            after_id = ""
+            for _page in range(20):
+                if not models_url:
+                    break
+                separator = "&" if "?" in models_url else "?"
+                page_url = f"{models_url}{separator}limit=1000"
+                if after_id:
+                    page_url += f"&after_id={quote(after_id, safe='')}"
+                req = Request(page_url, method="GET", headers=headers)
+                with urlopen(req, timeout=3) as resp:
+                    payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+                page_records = extract_openai_compat_model_records(payload)
+                for record in page_records:
+                    model_id = str(record.get("id", "") or "").strip()
+                    if model_id and model_id not in seen:
+                        seen.add(model_id)
+                        records.append(record)
+                if not isinstance(payload, dict) or not bool(payload.get("has_more")):
+                    break
+                next_after = str(payload.get("last_id", "") or "").strip()
+                if not next_after or next_after == after_id:
+                    break
+                after_id = next_after
+        elif is_openai_compat_provider(provider) or provider == "custom_http":
+            headers = openai_compat_probe_headers(provider, api_key)
+            headers.update(custom_headers)
+            for url in openai_compat_model_list_urls(base_url or endpoint, provider):
+                try:
+                    req = Request(url, method="GET", headers=headers)
+                    with urlopen(req, timeout=3) as resp:
+                        payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+                    records = extract_openai_compat_model_records(payload)
+                    if records:
+                        break
+                except Exception:
+                    continue
+    except Exception:
+        records = []
+    finally:
+        with _PROVIDER_MODEL_CACHE_LOCK:
+            previous = _PROVIDER_MODEL_CACHE.get(key, {})
+            _PROVIDER_MODEL_CACHE[key] = {
+                "ts": time.time(),
+                "models": records or previous.get("models", cached_models),
+            }
+
+
+def probe_provider_models(
+    profile: dict,
+    *,
+    force_refresh: bool = False,
+    ttl_seconds: int = 30,
+    background: bool = False,
+) -> list[dict]:
+    """Return cached provider models and optionally refresh them in the background.
+
+    Direct callers retain synchronous probing by default. Model catalog reads
+    pass ``background=True`` so a cold network cache never blocks a UI request.
+    """
+    if not isinstance(profile, dict):
+        return []
+    provider = str(profile.get("provider", "") or "").strip().lower()
+    base_url = str(profile.get("base_url", "") or "").strip().rstrip("/")
+    endpoint = str(profile.get("endpoint", "") or "").strip()
+    api_key = str(profile.get("api_key", "") or "").strip()
+    raw_headers = profile.get("headers", {})
+    header_secret = (
+        json.dumps(
+            {str(k): str(v) for k, v in raw_headers.items()},
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+        if isinstance(raw_headers, dict)
+        else ""
+    )
+    auth_material = f"{api_key}\0{header_secret}"
+    key_fingerprint = (
+        hashlib.sha256(auth_material.encode("utf-8")).hexdigest()[:12]
+        if api_key or header_secret
+        else "-"
+    )
+    key = hashlib.sha256(
+        f"{provider}|{base_url}|{endpoint}|{key_fingerprint}".encode()
+    ).hexdigest()[:24]
+    now = time.time()
+    with _PROVIDER_MODEL_CACHE_LOCK:
+        cached = _PROVIDER_MODEL_CACHE.get(key, {})
+        cached_models = [
+            dict(x) for x in cached.get("models", []) if isinstance(x, dict)
+        ]
+        if cached and not force_refresh and now - float(cached.get("ts", 0.0) or 0.0) <= ttl_seconds:
+            return cached_models
+        if cached.get("fetching"):
+            return cached_models
+        cached["fetching"] = True
+        _PROVIDER_MODEL_CACHE[key] = cached
+    profile_snapshot = dict(profile)
+    if background:
+        threading.Thread(
+            target=_fetch_provider_models_cached,
+            args=(key, profile_snapshot, cached_models),
+            name=f"model-probe-{provider or 'provider'}",
+            daemon=True,
+        ).start()
+        return cached_models
+    _fetch_provider_models_cached(key, profile_snapshot, cached_models)
+    with _PROVIDER_MODEL_CACHE_LOCK:
+        row = _PROVIDER_MODEL_CACHE.get(key, {})
+        models = row.get("models", []) if isinstance(row, dict) else []
+    return [dict(x) for x in models if isinstance(x, dict)]
+
+
+MODEL_RUNTIME_SETTING_KEYS = {
+    "effort", "max_effort", "thinking_stream", "response_stream",
+    "reasoning_supported", "reasoning_style", "temperature", "request_timeout",
+}
+
+
+def merge_probed_models_into_profile(
+    profile: dict,
+    records: object = None,
+    model_ids: object = None,
+) -> bool:
+    """Persist the provider's discovered model directory and per-model hints."""
+    if not isinstance(profile, dict):
+        return False
+    existing = [str(value).strip() for value in profile.get("models", []) if str(value).strip()]
+    ids = list(existing)
+    for raw in model_ids or []:
+        value = str(raw or "").strip()
+        if value and value not in ids:
+            ids.append(value)
+    settings = dict(profile.get("model_settings", {}) or {}) if isinstance(profile.get("model_settings"), dict) else {}
+    for record in records or []:
+        if not isinstance(record, dict):
+            continue
+        model_id = str(record.get("id") or record.get("model") or record.get("name") or "").strip()
+        if not model_id:
+            continue
+        if model_id not in ids:
+            ids.append(model_id)
+        caps = record.get("capabilities") if isinstance(record.get("capabilities"), dict) else {}
+        if not isinstance(caps, dict):
+            caps = {}
+        if caps.get("reasoning_style") is None and caps.get("reasoning_dialect"):
+            caps = dict(caps)
+            caps["reasoning_style"] = caps.get("reasoning_dialect")
+        normalized = normalize_model_runtime_settings(caps)
+        if normalized:
+            prior = normalize_model_runtime_settings(settings.get(model_id, {}))
+            settings[model_id] = {**prior, **normalized}
+    changed = ids != existing or settings != (profile.get("model_settings") if isinstance(profile.get("model_settings"), dict) else {})
+    if ids:
+        profile["models"] = ids
+        if not str(profile.get("model", "") or "").strip() or str(profile.get("model", "")).strip().lower() in {"auto", "custom-model"}:
+            profile["model"] = ids[0]
+        profile["selection"] = f"{profile.get('id', '')}::{profile.get('model', '')}"
+    if settings:
+        profile["model_settings"] = settings
+    return changed
+
+
+def probe_and_merge_model_profiles(
+    profiles: object,
+    *,
+    force_refresh: bool = True,
+) -> bool:
+    """Probe every configured provider and merge its complete model directory.
+
+    Import/reset paths use synchronous probing so a newly imported profile is
+    immediately usable with every model the provider exposes. Network errors
+    leave the explicitly configured models intact; the catalog can retry later.
+    """
+    if isinstance(profiles, dict):
+        rows = list(profiles.values())
+    elif isinstance(profiles, list):
+        rows = profiles
+    else:
+        return False
+    valid_rows = [profile for profile in rows if isinstance(profile, dict)]
+    if not valid_rows:
+        return False
+    records_by_index: dict[int, list[dict]] = {}
+
+    def _probe(profile: dict) -> list[dict]:
+        try:
+            return probe_provider_models(
+                profile,
+                force_refresh=bool(force_refresh),
+                background=False,
+            )
+        except Exception:
+            return []
+
+    # Providers are independent network services. Probe them concurrently so
+    # an unavailable vendor contributes one timeout instead of serially
+    # delaying every other imported profile.
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=min(8, len(valid_rows)),
+        thread_name_prefix="provider-model-import",
+    ) as executor:
+        future_map = {
+            executor.submit(_probe, profile): index
+            for index, profile in enumerate(valid_rows)
+        }
+        for future in concurrent.futures.as_completed(future_map):
+            index = future_map[future]
+            try:
+                records_by_index[index] = future.result()
+            except Exception:
+                records_by_index[index] = []
+
+    changed = False
+    for index, profile in enumerate(valid_rows):
+        changed = merge_probed_models_into_profile(
+            profile, records_by_index.get(index, [])
+        ) or changed
+    return changed
+
+
+def normalize_model_runtime_settings(raw: object) -> dict:
+    if not isinstance(raw, dict):
+        return {}
+    out: dict = {}
+    for key in MODEL_RUNTIME_SETTING_KEYS:
+        if key not in raw:
+            continue
+        value = raw.get(key)
+        if key in {"thinking_stream", "response_stream", "reasoning_supported"}:
+            if key == "reasoning_supported" and value is None:
+                continue
+            out[key] = _to_bool_like(value, default=False)
+        elif key in {"effort", "max_effort", "reasoning_style"}:
+            text = str(value or "").strip().lower()
+            if key == "reasoning_style" or text in EFFORT_ORDER or not text:
+                out[key] = text
+        elif key == "temperature":
+            try:
+                out[key] = max(0.0, min(2.0, float(value)))
+            except Exception:
+                continue
+        elif key == "request_timeout":
+            out[key] = normalize_timeout_seconds(value, minimum=MIN_TIMEOUT_SECONDS, maximum=MAX_TIMEOUT_SECONDS, fallback=DEFAULT_REQUEST_TIMEOUT)
+    return out
+
+
+def apply_model_runtime_settings(profile: dict, model: str, settings: object = None) -> dict:
+    row = dict(profile or {})
+    target = str(model or row.get("model", "") or "").strip()
+    per_model = row.get("model_settings")
+    if not isinstance(per_model, dict):
+        per_model = {}
+    merged = normalize_model_runtime_settings(per_model.get(target, {}))
+    merged.update(normalize_model_runtime_settings(settings))
+    if merged:
+        per_model[target] = dict(merged)
+        row["model_settings"] = per_model
+    row["model"] = target or str(row.get("model", "") or "")
+    row["selection"] = f"{row.get('id', '')}::{row.get('model', '')}"
+    return row
+
+
+def model_runtime_settings_for(profile: dict, model: str = "") -> dict:
+    """Return the effective settings for one model without exposing secrets."""
+    row = profile if isinstance(profile, dict) else {}
+    target = str(model or row.get("model", "") or "").strip()
+    out = normalize_model_runtime_settings(row)
+    per_model = row.get("model_settings")
+    if isinstance(per_model, dict):
+        out.update(normalize_model_runtime_settings(per_model.get(target, {})))
+    return out
+
+
+def apply_model_option_runtime_fields(option: dict, profile: dict, model: str = "") -> dict:
+    """Overlay per-model runtime settings on a public catalog option."""
+    target = str(model or option.get("model", "") or "").strip()
+    settings = model_runtime_settings_for(profile, target)
+    for key in MODEL_RUNTIME_SETTING_KEYS:
+        if key in settings:
+            option[key] = settings[key]
+    if isinstance(profile, dict):
+        option.setdefault("display_name", str(profile.get("display_name", profile.get("label", "")) or ""))
+        option.setdefault("title", str(profile.get("title", profile.get("label", "")) or ""))
+    return option
 
 # ============================================================================
 # Architecture / 架构 / アーキテクチャ
@@ -12820,6 +13342,19 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
         model_caps_map = parse_json_object(model_caps_map, {})
     if not isinstance(model_caps_map, dict):
         model_caps_map = {}
+
+    # Reasoning metadata is kept separate from multimodal capabilities.  The
+    # importer writes this map from provider model probes, and it must survive
+    # a config round-trip so model-specific effort controls remain available
+    # after restart.
+    raw_reasoning_map = config.get(
+        "model_reasoning_capabilities",
+        config.get("reasoning_capabilities", {}),
+    )
+    if isinstance(raw_reasoning_map, str):
+        raw_reasoning_map = parse_json_object(raw_reasoning_map, {})
+    if not isinstance(raw_reasoning_map, dict):
+        raw_reasoning_map = {}
 
     raw_global_caps = config.get("multimodal_capabilities", config.get("capabilities", {}))
     if isinstance(raw_global_caps, str):
@@ -12921,6 +13456,30 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
                 return {str(k): str(v) for k, v in parsed.items()}
         return {}
 
+    def parse_profile_model_settings(raw: object, model_ids: list[str] | None = None) -> dict:
+        """Normalize per-model runtime settings from config without secrets."""
+        if isinstance(raw, str):
+            raw = parse_json_object(raw, {})
+        if not isinstance(raw, dict):
+            return {}
+        settings: dict[str, dict] = {}
+        # A flat settings object applies to the profile's default model.
+        if any(key in MODEL_RUNTIME_SETTING_KEYS for key in raw):
+            target = str((model_ids or [""])[0] or "").strip()
+            if target:
+                normalized = normalize_model_runtime_settings(raw)
+                if normalized:
+                    settings[target] = normalized
+            return settings
+        for target, value in raw.items():
+            model_id = str(target or "").strip()
+            if not model_id or not isinstance(value, dict):
+                continue
+            normalized = normalize_model_runtime_settings(value)
+            if normalized:
+                settings[model_id] = normalized
+        return settings
+
     def add_profile(
         out: list[dict],
         *,
@@ -12928,6 +13487,9 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
         provider: str,
         label: str,
         model: str = "",
+        models: list[str] | None = None,
+        display_name: str = "",
+        title: str = "",
         base_url: str = "",
         endpoint: str = "",
         api_key: str = "",
@@ -12942,6 +13504,9 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
         source: str = "config",
         effort: str = "",
         max_effort: str = "",
+        reasoning_supported: bool | None = None,
+        reasoning_style: str = "",
+        model_settings: dict | None = None,
     ):
         out.append(
             {
@@ -12949,6 +13514,9 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
                 "provider": provider,
                 "label": label,
                 "model": (model or "").strip(),
+                "models": [str(x).strip() for x in (models or []) if str(x).strip()],
+                "display_name": str(display_name or label or "").strip(),
+                "title": str(title or label or "").strip(),
                 "base_url": (base_url or "").strip(),
                 "endpoint": (endpoint or "").strip(),
                 "api_key": (api_key or "").strip(),
@@ -12967,12 +13535,20 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
                 "media_endpoints": media_endpoints or {},
                 "effort": str(effort or "").strip().lower(),
                 "max_effort": str(max_effort or "").strip().lower(),
+                "reasoning_supported": reasoning_supported,
+                "reasoning_style": str(reasoning_style or "").strip().lower(),
+                "model_settings": {
+                    str(model_id).strip(): normalize_model_runtime_settings(values)
+                    for model_id, values in (model_settings or {}).items()
+                    if str(model_id).strip() and normalize_model_runtime_settings(values)
+                },
                 "source": source,
             }
         )
 
     profiles: list[dict] = []
-    provider = str(config.get("provider", "")).strip().lower()
+    config_provider = normalize_profile_provider(str(config.get("provider", "")))
+    provider = config_provider
     temp = float(config.get("temperature", 0.2) or 0.2)
     timeout = normalize_timeout_seconds(
         config.get("request_timeout", DEFAULT_REQUEST_TIMEOUT),
@@ -13056,6 +13632,12 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
         ).strip()
         if not provider and (base_hint or endpoint):
             provider = "openai_compat"
+        # Arbitrary provider names are transported through the custom HTTP
+        # adapter while preserving the user supplied name for display.
+        provider_name = str(provider_hint or "").strip()
+        if provider and provider not in {"ollama", "anthropic", "custom_http"} and not is_openai_like_provider(provider) and (base_hint or endpoint):
+            provider_name = provider_name or provider
+            provider = "custom_http"
         if not provider:
             continue
         profile_id = sanitize_profile_id(
@@ -13070,9 +13652,12 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
         )
         label = str(
             raw_profile.get("label")
+            or raw_profile.get("custom_name")
             or raw_profile.get("name")
             or raw_profile.get("title")
+            or raw_profile.get("custom_title")
             or raw_profile.get("display_name")
+            or provider_name
             or profile_id
         ).strip() or profile_id
         model = str(
@@ -13081,8 +13666,32 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             or raw_profile.get("default_model")
             or ""
         ).strip()
+        raw_models = raw_profile.get("models", raw_profile.get("model_ids", raw_profile.get("available_models", [])))
+        if isinstance(raw_models, str):
+            raw_models = [x.strip() for x in re.split(r"[,\n]", raw_models) if x.strip()]
+        if not isinstance(raw_models, list):
+            raw_models = []
+        model_settings: dict[str, dict] = {}
+        model_values: list[str] = []
+        for value in raw_models:
+            if isinstance(value, dict):
+                model_id = str(value.get("id") or value.get("model") or value.get("name") or "").strip()
+                if not model_id:
+                    continue
+                model_values.append(model_id)
+                inline_settings = normalize_model_runtime_settings(value)
+                if inline_settings:
+                    model_settings[model_id] = inline_settings
+            elif str(value).strip():
+                model_values.append(str(value).strip())
+        models = list(dict.fromkeys(model_values))
+        if model and model not in models:
+            models.insert(0, model)
         if not model:
-            model = default_model_for_provider(provider)
+            # A supplied model directory is already authoritative.  Do not
+            # prepend a synthetic provider default such as ``custom-model``.
+            model = models[0] if models else default_model_for_provider(provider)
+        model_settings.update(parse_profile_model_settings(raw_profile.get("model_settings"), [model] + models))
         base_url = extract_base_url(base_hint or endpoint)
         if provider == "ollama" and not base_url:
             base_url = extract_base_url(default_ollama_url)
@@ -13129,6 +13738,20 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             provider=provider,
             label=label,
             model=model,
+            models=models,
+            display_name=str(
+                raw_profile.get("display_name")
+                or raw_profile.get("provider_name")
+                or raw_profile.get("custom_name")
+                or (raw_profile.get("name") if provider == "custom_http" else "")
+                or (provider_name if provider_name and provider_name.lower() not in {"custom_http", "openai_compat"} else "")
+                or label
+            ),
+            title=str(
+                raw_profile.get("title")
+                or raw_profile.get("custom_title")
+                or label
+            ),
             base_url=base_url,
             endpoint=endpoint,
             api_key=api_key,
@@ -13155,6 +13778,9 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             media_endpoints=media_endpoints,
             effort=str(raw_profile.get("effort", effort_default) or effort_default),
             max_effort=str(raw_profile.get("max_effort", max_effort_default) or max_effort_default),
+            reasoning_supported=(raw_profile.get("reasoning_supported") if isinstance(raw_profile.get("reasoning_supported"), bool) else None),
+            reasoning_style=str(raw_profile.get("reasoning_style") or raw_profile.get("reasoning_dialect") or ""),
+            model_settings=model_settings,
             source=str(raw_profile.get("source", "profiles") or "profiles"),
         )
         if bool(raw_profile.get("default")) or bool(raw_profile.get("active")) or bool(raw_profile.get("selected")):
@@ -13363,17 +13989,60 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             media_endpoints=build_profile_media_endpoints("openrouter"),
         )
 
-    custom_url = str(config.get("custom_url", "")).strip()
+    custom_url = str(
+        config.get("custom_url")
+        or (config.get("provider_url") if config_provider == "custom_http" else "")
+        or (config.get("url") if config_provider == "custom_http" else "")
+        or ""
+    ).strip()
     custom_key = str(config.get("custom_key", "")).strip()
     custom_headers = parse_json_object(str(config.get("custom_headers", "{}") or "{}"), {})
     custom_payload = str(config.get("custom_payload", "") or "").strip()
     if custom_url:
+        raw_custom_models = config.get(
+            "custom_models",
+            config.get(
+                "custom_model_ids",
+                config.get("models", []) if config_provider == "custom_http" else [],
+            ),
+        )
+        if isinstance(raw_custom_models, str):
+            raw_custom_models = [x.strip() for x in re.split(r"[,\n]", raw_custom_models) if x.strip()]
+        custom_models = [str(x).strip() for x in raw_custom_models] if isinstance(raw_custom_models, list) else []
+        custom_model = str(
+            config.get("custom_model", "")
+            or (config.get("model", "") if config_provider == "custom_http" else "")
+            or config.get("openai_model", "")
+        ).strip()
+        if not custom_model and custom_models:
+            custom_model = custom_models[0]
+        if not custom_model:
+            custom_model = "custom-model"
+        if custom_model and custom_model not in custom_models:
+            custom_models.insert(0, custom_model)
         add_profile(
             profiles,
             profile_id="custom",
             provider=normalize_profile_provider("custom_http"),
-            label="Custom HTTP",
-            model=str(config.get("custom_model", "") or config.get("openai_model", "") or "custom-model"),
+            label=str(
+                config.get("custom_name")
+                or (config.get("provider_name") if config_provider == "custom_http" else "")
+                or config.get("custom_title")
+                or "Custom HTTP"
+            ),
+            model=custom_model,
+            models=custom_models,
+            display_name=str(
+                config.get("custom_name")
+                or (config.get("provider_name") if config_provider == "custom_http" else "")
+                or "Custom HTTP"
+            ),
+            title=str(
+                config.get("custom_title")
+                or (config.get("provider_title") if config_provider == "custom_http" else "")
+                or config.get("custom_name")
+                or "Custom HTTP"
+            ),
             base_url=extract_base_url(custom_url),
             endpoint=custom_url,
             api_key=custom_key,
@@ -13404,6 +14073,44 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
             source="default",
         )
 
+    # Legacy provider keys may carry a comma/newline separated model list.
+    # Keep the configured default first, then let the catalog append probed
+    # models without creating duplicate profiles.
+    provider_model_keys = {
+        "ollama": "ollama_models", "openai_compat": "openai_models",
+        "siliconflow": "siliconflow_models", "vllm": "vllm_models",
+        "lmstudio": "lmstudio_models", "anthropic": "anthropic_models",
+        "glm": "glm_models", "kimi": "kimi_models", "openrouter": "openrouter_models",
+        "custom_http": "custom_models",
+    }
+    for profile in profiles:
+        prov = str(profile.get("provider", "") or "").lower()
+        model_list_key = provider_model_keys.get(prov, "")
+        raw_list = (
+            config.get(
+                model_list_key,
+                config.get("models", []) if config_provider == prov else [],
+            )
+            if model_list_key
+            else []
+        )
+        if isinstance(raw_list, str):
+            raw_list = [x.strip() for x in re.split(r"[,\n]", raw_list) if x.strip()]
+        existing = [str(x).strip() for x in profile.get("models", []) if str(x).strip()]
+        if not existing and isinstance(raw_list, list):
+            existing = [str(x).strip() for x in raw_list if str(x).strip()]
+        default_model = str(profile.get("model", "") or "").strip()
+        # ``auto`` is a transport placeholder for local OpenAI-compatible
+        # servers.  Once a model directory is available, make its first
+        # discovered entry the active model so importing a directory is
+        # immediately runnable and stable across restarts.
+        if existing and default_model.lower() == "auto":
+            default_model = existing[0]
+            profile["model"] = default_model
+        if default_model and default_model not in existing:
+            existing.insert(0, default_model)
+        profile["models"] = existing
+
     active_map = {
         "ollama": "ollama",
         "openai": "openai",
@@ -13424,7 +14131,7 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
                 default_profile_id = candidate
                 break
     if not default_profile_id:
-        default_profile_id = active_map.get(provider, "")
+        default_profile_id = active_map.get(config_provider or provider, "")
     if not default_profile_id or default_profile_id not in profile_ids:
         # Fallback: first non-ollama profile that was explicitly configured
         for p in profiles:
@@ -13443,6 +14150,51 @@ def parse_llm_config_profiles(config: dict, default_ollama_url: str, default_oll
                 p["effort"] = effort_default
             if max_effort_default and not str(p.get("max_effort", "") or "").strip():
                 p["max_effort"] = max_effort_default
+    raw_runtime_settings = config.get(
+        "model_settings",
+        config.get("model_runtime_settings", config.get("runtime_settings", {})),
+    )
+    if isinstance(raw_runtime_settings, str):
+        raw_runtime_settings = parse_json_object(raw_runtime_settings, {})
+    if isinstance(raw_runtime_settings, dict):
+        for profile in profiles:
+            current = dict(profile.get("model_settings", {}) or {})
+            profile_model = str(profile.get("model", "") or "").strip()
+            provider_id = str(profile.get("id", "") or "").strip()
+            provider_name = str(profile.get("provider", "") or "").strip()
+            for model_id, value in raw_reasoning_map.items():
+                normalized = normalize_model_runtime_settings(value)
+                target = str(model_id or "").strip()
+                if target and normalized:
+                    current[target] = {**current.get(target, {}), **normalized}
+            for key in (profile_model, provider_id, provider_name):
+                value = raw_runtime_settings.get(key) if key else None
+                if isinstance(value, dict) and any(k in MODEL_RUNTIME_SETTING_KEYS for k in value):
+                    normalized = normalize_model_runtime_settings(value)
+                    if profile_model and normalized:
+                        current[profile_model] = {**current.get(profile_model, {}), **normalized}
+            for model_id, value in raw_runtime_settings.items():
+                if not isinstance(value, dict):
+                    continue
+                normalized = normalize_model_runtime_settings(value)
+                if normalized:
+                    current[str(model_id).strip()] = {**current.get(str(model_id).strip(), {}), **normalized}
+                elif str(model_id) in {provider_id, provider_name}:
+                    for nested_model, nested_value in value.items():
+                        nested = normalize_model_runtime_settings(nested_value)
+                        if nested:
+                            target = str(nested_model or "").strip()
+                            current[target] = {**current.get(target, {}), **nested}
+            profile["model_settings"] = current
+    elif raw_reasoning_map:
+        for profile in profiles:
+            current = dict(profile.get("model_settings", {}) or {})
+            for model_id, value in raw_reasoning_map.items():
+                target = str(model_id or "").strip()
+                normalized = normalize_model_runtime_settings(value)
+                if target and normalized:
+                    current[target] = {**current.get(target, {}), **normalized}
+            profile["model_settings"] = current
     return {"profiles": profiles, "default_profile_id": default_profile_id}
 
 def looks_like_llm_config(config: dict) -> bool:
@@ -13484,13 +14236,23 @@ def looks_like_llm_config(config: dict) -> bool:
         "openrouter_model",
         "openrouter_key",
         "custom_url",
+        "provider_url",
+        "provider_name",
+        "provider_title",
+        "name",
+        "title",
+        "custom_name",
+        "custom_title",
         "custom_model",
+        "custom_models",
         "custom_key",
         "custom_headers",
         "custom_payload",
         "capabilities",
         "multimodal_capabilities",
         "model_capabilities",
+        "model_reasoning_capabilities",
+        "reasoning_capabilities",
         "media_endpoints",
         "ollama_capabilities",
         "openai_capabilities",
@@ -13520,6 +14282,8 @@ def looks_like_llm_config(config: dict) -> bool:
         "custom_video_endpoint",
         "temperature",
         "request_timeout",
+        "model_settings",
+        "model_runtime_settings",
     }
     return bool(keys & markers)
 
@@ -25372,6 +26136,8 @@ class OllamaClient:
         self.thinking_stream = bool(thinking_stream)
         self.response_stream = bool(response_stream)
         self.capabilities = default_multimodal_capabilities()
+        self.reasoning_supported: bool | None = None
+        self.reasoning_style: str = ""
         self.media_endpoints: dict[str, str] = {}
         self.embed_model: str = ""  # embedding model name, e.g. "nomic-embed-text"
         self.telemetry_callback = None
@@ -25709,6 +26475,8 @@ class OllamaClient:
             infer_model_multimodal_capabilities(self.provider, self.model),
             declared_caps,
         )
+        self.reasoning_supported = profile.get("reasoning_supported") if isinstance(profile.get("reasoning_supported"), bool) else None
+        self.reasoning_style = str(profile.get("reasoning_style", "") or "").strip().lower()
         self.media_endpoints = parse_media_endpoints(profile.get("media_endpoints", {}))
         if "embed_model" in profile:
             self.embed_model = str(profile.get("embed_model") or "").strip()
@@ -27623,7 +28391,14 @@ class OllamaClient:
         # Resolve provider-neutral effort into native reasoning mutations once.
         # probe_mode never reasons (it is a cheap capability ping).
         reasoning = {} if probe_mode else resolve_reasoning_payload(
-            self.provider, self.model, effort, max_tokens=max_tokens,
+            self.provider,
+            self.model,
+            effort,
+            max_tokens=max_tokens,
+            capabilities={
+                "reasoning_supported": self.reasoning_supported,
+                "reasoning_style": self.reasoning_style,
+            },
         )
         if reasoning.get("max_tokens"):
             max_tokens = int(reasoning["max_tokens"])
@@ -27749,7 +28524,11 @@ class OllamaClient:
         # thinking by default when the field is omitted.  Send the explicit
         # boolean for models that advertise the native switch so a bounded
         # no-thinking compatibility turn can actually produce a tool call.
-        if model_reasoning_style(provider, self.model) == "ollama":
+        if provider == "ollama" and self.reasoning_supported is not False:
+            # Ollama accepts an explicit boolean on native chat. Unknown
+            # capability metadata stays conservative because the caller's
+            # ``think`` value defaults to false; no model-name inference is
+            # used to turn reasoning on.
             native_payload["think"] = bool(think)
         if tools:
             native_payload["tools"] = tools
@@ -30359,7 +31138,14 @@ class SessionState:
         profile = self.model_profiles.get(self.active_profile_id)
         if not profile:
             return
-        row = dict(profile)
+        stored = dict(profile)
+        row = dict(stored)
+        # Restore the selected model's persisted runtime controls before the
+        # client is configured. This keeps effort/streaming identical after a
+        # restart and when a session is loaded by the IDE.
+        active_model = str(row.get("model", "") or "").strip()
+        for key, value in model_runtime_settings_for(row, active_model).items():
+            row[key] = value
         timeout_floor = max(MIN_TIMEOUT_SECONDS, int(self.max_run_seconds or 0))
         row["request_timeout"] = normalize_timeout_seconds(
             row.get("request_timeout", DEFAULT_REQUEST_TIMEOUT),
@@ -30374,9 +31160,13 @@ class SessionState:
             if cached_caps:
                 merged = merge_multimodal_capabilities(self._capabilities_from_profile(row), cached_caps)
                 row["capabilities"] = merged
-        self.model_profiles[self.active_profile_id] = row
-        profile = row
-        self.ollama.apply_profile(profile)
+                stored["capabilities"] = merged
+        stored["request_timeout"] = row["request_timeout"]
+        self.model_profiles[self.active_profile_id] = stored
+        # Keep per-model controls in ``model_settings``. Applying them to the
+        # client must not promote them to profile-level defaults, otherwise a
+        # later model switch would inherit the previous model's settings.
+        self.ollama.apply_profile(row)
         self.thinking = False
 
     def _profile_is_runnable(self, profile: dict) -> bool:
@@ -30442,6 +31232,7 @@ class SessionState:
         if force_probe:
             self._ensure_active_profile_capabilities(force_probe=True)
         opts = []
+        profiles_changed = False
         ollama_profile_id = ""
         ollama_base = self.ollama.base_url
         for pid, profile in sorted(self.model_profiles.items(), key=lambda x: x[0]):
@@ -30465,6 +31256,29 @@ class SessionState:
                     "thinking_hint": bool(profile.get("thinking_hint", False)),
                     "thinking_stream": bool(profile.get("thinking_stream", False)),
                     "response_stream": bool(profile.get("response_stream", False)),
+                    "effort": str(profile.get("effort", "") or ""),
+                    "max_effort": str(profile.get("max_effort", "") or ""),
+                    "reasoning_supported": (
+                        profile.get("reasoning_supported")
+                        if profile.get("reasoning_supported") is not None
+                        else model_reasoning_style(
+                            str(profile.get("provider", "")),
+                            model,
+                            caps,
+                        )
+                        != "none"
+                    ),
+                    "reasoning_style": str(
+                        profile.get("reasoning_style")
+                        or model_reasoning_style(
+                            str(profile.get("provider", "")),
+                            model,
+                            caps,
+                        )
+                        or ""
+                    ),
+                    "display_name": str(profile.get("display_name", profile.get("label", pid)) or ""),
+                    "title": str(profile.get("title", profile.get("label", pid)) or ""),
                     "capabilities": caps,
                     "capabilities_probed": bool(cache_entry),
                     "capabilities_probed_at": float(cache_entry.get("updated_at", 0.0) or 0.0)
@@ -30481,7 +31295,24 @@ class SessionState:
             base = str(profile.get("base_url", self.ollama.base_url) or self.ollama.base_url).strip()
             if not base:
                 continue
-            tags = list_ollama_models_cached(base, force_refresh=bool(force_probe))
+            tags = list_ollama_models_cached(
+                base,
+                force_refresh=bool(force_probe),
+                background=not force_probe,
+            )
+            ollama_records = probe_provider_models(
+                profile,
+                force_refresh=bool(force_probe),
+                background=not force_probe,
+            )
+            profiles_changed = merge_probed_models_into_profile(
+                profile, ollama_records, model_ids=tags
+            ) or profiles_changed
+            ollama_record_map = {
+                str(record.get("id", "")): record
+                for record in ollama_records
+                if isinstance(record, dict) and str(record.get("id", "")).strip()
+            }
             if tags:
                 if pid == self.active_profile_id:
                     self.ollama_env_tags = list(tags)
@@ -30497,6 +31328,13 @@ class SessionState:
                 tag_cache_key = self._profile_cache_key(tag_profile, tag)
                 tag_cache_entry = self.multimodal_capability_cache.get(tag_cache_key, {})
                 tag_caps = self._capabilities_from_profile(tag_profile, model_override=tag)
+                tag_record = ollama_record_map.get(tag)
+                tag_record_caps = (
+                    tag_record.get("capabilities", {})
+                    if isinstance(tag_record, dict)
+                    else {}
+                )
+                tag_record_probed = isinstance(tag_record, dict)
                 opts.append(
                     {
                         "selection": selection,
@@ -30508,6 +31346,35 @@ class SessionState:
                         "thinking_hint": bool(profile.get("thinking_hint", self.thinking)),
                         "thinking_stream": bool(profile.get("thinking_stream", self.ollama.thinking_stream)),
                         "response_stream": bool(profile.get("response_stream", self.ollama.response_stream)),
+                        "effort": str(profile.get("effort", "") or ""),
+                        "max_effort": str(profile.get("max_effort", "") or ""),
+                        "reasoning_supported": (
+                            profile.get("reasoning_supported")
+                            if profile.get("reasoning_supported") is not None
+                            else tag_record_caps.get("reasoning_supported")
+                            if isinstance(tag_record_caps, dict)
+                            and tag_record_caps.get("reasoning_supported") is not None
+                            else model_reasoning_style(
+                                str(profile.get("provider", "")),
+                                tag,
+                                tag_caps,
+                                capabilities_probed=tag_record_probed,
+                            )
+                            != "none"
+                        ),
+                        "reasoning_style": str(
+                            profile.get("reasoning_style")
+                            or tag_record_caps.get("reasoning_style", "")
+                            or model_reasoning_style(
+                                str(profile.get("provider", "")),
+                                tag,
+                                tag_caps,
+                                capabilities_probed=tag_record_probed,
+                            )
+                            or ""
+                        ),
+                        "display_name": str(profile.get("display_name", profile.get("label", pid)) or ""),
+                        "title": str(profile.get("title", profile.get("label", pid)) or ""),
                         "capabilities": tag_caps,
                         "capabilities_probed": bool(tag_cache_entry),
                         "capabilities_probed_at": float(tag_cache_entry.get("updated_at", 0.0) or 0.0)
@@ -30515,6 +31382,69 @@ class SessionState:
                         else 0.0,
                     }
                 )
+        # Expand every provider from configured model lists and bounded probes.
+        # The cache prevents status polling from repeatedly hitting vendors.
+        for pid, profile in sorted(self.model_profiles.items(), key=lambda x: x[0]):
+            configured = [str(x).strip() for x in profile.get("models", []) if str(x).strip()]
+            records = probe_provider_models(
+                profile,
+                force_refresh=bool(force_probe),
+                background=not force_probe,
+            )
+            profiles_changed = merge_probed_models_into_profile(profile, records) or profiles_changed
+            for rec in records:
+                model_id = str(rec.get("id", "") or "").strip()
+                if model_id and model_id not in configured:
+                    configured.append(model_id)
+            for model_id in configured:
+                selection = f"{pid}::{model_id}"
+                if not model_id or selection in seen:
+                    continue
+                seen.add(selection)
+                rec = next((r for r in records if str(r.get("id", "")) == model_id), {})
+                rcaps = rec.get("capabilities", {}) if isinstance(rec, dict) else {}
+                opts.append({
+                    "selection": selection, "profile_id": pid,
+                    "provider": profile.get("provider", "unknown"), "model": model_id,
+                    "label": f"{profile.get('label', pid)} | {model_id}",
+                    "source": "provider-probe" if rec else profile.get("source", ""),
+                    "thinking_hint": bool(profile.get("thinking_hint", False)),
+                    "thinking_stream": bool(profile.get("thinking_stream", False)),
+                    "response_stream": bool(profile.get("response_stream", False)),
+                    "effort": str(profile.get("effort", "") or ""),
+                    "max_effort": str(profile.get("max_effort", "") or ""),
+                    "reasoning_supported": (
+                        rcaps.get("reasoning_supported")
+                        if isinstance(rcaps, dict) and rcaps.get("reasoning_supported") is not None
+                        else profile.get("reasoning_supported")
+                        if profile.get("reasoning_supported") is not None
+                        else model_reasoning_style(
+                            str(profile.get("provider", "")),
+                            model_id,
+                            rcaps if isinstance(rcaps, dict) else None,
+                            capabilities_probed=bool(rec),
+                        )
+                        != "none"
+                    ),
+                    "reasoning_style": str(
+                        (rcaps.get("reasoning_style") if isinstance(rcaps, dict) else "")
+                        or profile.get("reasoning_style", "")
+                        or model_reasoning_style(
+                            str(profile.get("provider", "")),
+                            model_id,
+                            rcaps if isinstance(rcaps, dict) else None,
+                            capabilities_probed=bool(rec),
+                        )
+                        or ""
+                    ),
+                    "display_name": str(profile.get("display_name", profile.get("label", pid)) or ""),
+                    "title": str(profile.get("title", profile.get("label", pid)) or ""),
+                    "capabilities": self._capabilities_from_profile(dict(profile, model=model_id), model_override=model_id),
+                })
+        for _option in opts:
+            _pid = str(_option.get("profile_id", "") or "")
+            _profile = self.model_profiles.get(_pid, {})
+            apply_model_option_runtime_fields(_option, _profile, str(_option.get("model", "") or ""))
         runnable_opts = [x for x in opts if self._option_is_runnable(x)]
         if runnable_opts:
             opts = runnable_opts
@@ -30536,6 +31466,27 @@ class SessionState:
                     "thinking_hint": bool(active.get("thinking_hint", False)),
                     "thinking_stream": bool(active.get("thinking_stream", False)),
                     "response_stream": bool(active.get("response_stream", False)),
+                    "effort": str(active.get("effort", "") or ""),
+                    "max_effort": str(active.get("max_effort", "") or ""),
+                    "reasoning_supported": (
+                        active.get("reasoning_supported")
+                        if active.get("reasoning_supported") is not None
+                        else model_reasoning_style(
+                            str(active.get("provider", "")),
+                            str(active.get("model", "") or ""),
+                            active.get("capabilities", {}),
+                        )
+                        != "none"
+                    ),
+                    "reasoning_style": str(
+                        active.get("reasoning_style")
+                        or model_reasoning_style(
+                            str(active.get("provider", "")),
+                            str(active.get("model", "") or ""),
+                            active.get("capabilities", {}),
+                        )
+                        or ""
+                    ),
                     "capabilities": self._capabilities_from_profile(active if isinstance(active, dict) else {}),
                     "capabilities_probed": bool(active_cache_entry),
                     "capabilities_probed_at": float(active_cache_entry.get("updated_at", 0.0) or 0.0)
@@ -30543,11 +31494,15 @@ class SessionState:
                     else 0.0,
                 },
             )
+            apply_model_option_runtime_fields(opts[0], active, str(active.get("model", "") or ""))
             option_map.add(selected)
         if opts and selected not in option_map:
             selected = str(opts[0].get("selection", ""))
         active_caps = self._capabilities_from_profile(active if isinstance(active, dict) else {})
         active_cache = self.multimodal_capability_cache.get(self._profile_cache_key(active if isinstance(active, dict) else {}), {})
+        if profiles_changed:
+            self.updated_at = now_ts()
+            self._persist()
         return {
             "provider": active.get("provider", "ollama"),
             "selected": selected,
@@ -30569,6 +31524,7 @@ class SessionState:
         model_override: str | None = None,
         *,
         reset_failures: bool = True,
+        settings: dict | None = None,
     ) -> dict:
         raw = str(selection or "").strip()
         explicit_profile = "::" in raw
@@ -30599,6 +31555,11 @@ class SessionState:
             profile["model"] = str(model_override).strip()
         elif str(selected_model).strip():
             profile["model"] = str(selected_model).strip()
+        profile = apply_model_runtime_settings(profile, str(profile.get("model", "") or ""), settings)
+        for record in probe_provider_models(profile, background=True):
+            if str(record.get("id", "")) == str(profile.get("model", "")):
+                merge_probed_models_into_profile(profile, [record])
+                break
         if not self._profile_is_runnable(profile) and not explicit_profile and str(selected_model).strip():
             fallback = self._pick_runnable_selection(preferred_provider="ollama")
             if fallback:
@@ -30679,6 +31640,9 @@ class SessionState:
         if cfg_user_memory_mode is not None:
             self.user_memory_mode = normalize_user_memory_mode(cfg_user_memory_mode)
         parsed = parse_llm_config_profiles(config, self.ollama.base_url, self.ollama.model)
+        # A config import is also a model-directory import. Probe each provider
+        # once so all advertised models are available to both UIs immediately.
+        probe_and_merge_model_profiles(parsed.get("profiles", []), force_refresh=True)
         self.multimodal_capability_cache = {}
         OllamaClient.clear_global_probe_cache()
         self.ollama.clear_probe_cache()
@@ -30814,7 +31778,6 @@ class SessionState:
         text = str(payload.get("text", "") or "")
         if not role or not text:
             return False
-        event_ts = float(event.get("ts", 0.0) or 0.0)
         for row in reversed(list(getattr(self, "messages", [])[-8:])):
             if not isinstance(row, dict):
                 continue
@@ -45601,7 +46564,9 @@ body{padding:18px}
                 "Requested range is already in long-content memory; use fresh=true for exact source verification."
             )
         body = "\n\n".join(
-            "@@ lines %d-%d @@\n%s" % (a, b, "\n".join(f"{i}: {lines[i - 1]}" for i in range(a, b + 1)))
+            f"@@ lines {a}-{b} @@\n" + "\n".join(
+                f"{i}: {lines[i - 1]}" for i in range(a, b + 1)
+            )
             for a, b in gaps
         )
         return self._clip_read_file_output(
@@ -46018,7 +46983,6 @@ body{padding:18px}
         memory["observed_segments"] = list(observed)[-LONG_CONTENT_MEMORY_MAX_SEGMENTS:]
         memory["seen_segments"] = list(seen)[-LONG_CONTENT_MEMORY_MAX_SEGMENTS:]
         read_line_count = sum(max(0, int(end) - int(start) + 1) for start, end in merged_ranges)
-        previous_coverage = float(memory.get("coverage", 0.0) or 0.0)
         memory["coverage"] = round(min(1.0, read_line_count / max(1, len(lines))), 4)
 
         evidence = [trim(str(x), 260) for x in (excerpts or []) if str(x).strip()]
@@ -46328,7 +47292,7 @@ body{padding:18px}
                     f"- {card.get('id','')} {card.get('title','')} :: "
                     f"{trim(card.get('text',''), 220)} [{','.join(card.get('evidence', [])[:2])}]"
                 )
-        out.append("\nFocused read: read_file path=\"%s\" mode=\"segment\" segment_id=\"s0001\"" % rel)
+        out.append(f"\nFocused read: read_file path=\"{rel}\" mode=\"segment\" segment_id=\"s0001\"")
         return self._clip_read_file_output("\n".join(out), self._read_file_max_chars(max_chars))
 
     def _render_long_content_segment(self, rel: str, fp: Path, lines: list[str], *, segment_id: object = "", query: object = "", max_chars: object = None) -> str:
@@ -49277,6 +50241,11 @@ body{padding:18px}
         if not goal or self._is_title_continuation_text(goal):
             return False
         goal_digest = self._auto_title_goal_digest(goal)
+        # Let the dedicated title request produce the first visible name when
+        # enabled.  A synchronous fallback before that request completes makes
+        # the UI emit two rename events for one user message.
+        if AUTO_TITLE_MODEL_REFINE:
+            return self._schedule_auto_title_model_refine(goal, goal_digest, trigger)
         quick_changed = False
         quick_old = ""
         quick_title = ""
@@ -49440,6 +50409,7 @@ body{padding:18px}
                     self.set_runtime_selection(
                         selection,
                         model_override if isinstance(model_override, str) else None,
+                        settings=normalize_model_runtime_settings(payload.get("settings", payload)),
                     )
                     applied_notes.append(f"deferred model switch applied: {trim(selection, 120)}")
                     sync_needed = True
@@ -49574,8 +50544,9 @@ body{padding:18px}
             prof = {}
         if not isinstance(prof, dict):
             prof = {}
-        default = str(prof.get("effort", "") or "").strip().lower()
-        ceiling = str(prof.get("max_effort", "") or "").strip().lower()
+        effective = model_runtime_settings_for(prof, str(prof.get("model", "") or ""))
+        default = str(effective.get("effort", "") or "").strip().lower()
+        ceiling = str(effective.get("max_effort", "") or "").strip().lower()
         if ceiling not in EFFORT_ORDER:
             ceiling = EFFORT_MAX
         if default not in EFFORT_ORDER:
@@ -63294,7 +64265,6 @@ body{padding:18px}
         changed_ids: list[str] = []
         rejected_targets: list[str] = []
         remove_ids: set[str] = set()
-        mode = str(update_mode or "status_update").strip().lower().replace("-", "_")
         for update in rows:
             target_ref = trim(str(
                 update.get("step_id", update.get("id", update.get("key", ""))) or ""
@@ -86349,12 +87319,6 @@ body{padding:18px}
                     if reason == "oversized_raw_toolcall":
                         self._inject_toolcall_overflow_hint("")
                 output_tokens = self._estimate_output_tokens(text, thinking_text, tool_calls)
-                budget_forced = self._is_thinking_budget_exhausted(
-                    text=text,
-                    thinking_text=thinking_text,
-                    tool_calls=tool_calls,
-                    output_tokens=output_tokens,
-                )
                 empty_action = self._is_empty_action_turn(text, thinking_text, tool_calls)
                 recovery_applied = False
                 # A writer-only Todo bootstrap is a protocol turn, not an
@@ -90885,7 +91849,6 @@ class SessionManager:
                         if not sid:
                             continue
                         self.session_index[sid] = {
-                            "id": sid,
                             "workspace_id": sid,
                             "title": sid,
                             "running": False,
@@ -90931,7 +91894,6 @@ class SessionManager:
                 if not isinstance(summary, dict):
                     continue
                 self.session_index[sid] = {
-                    "id": sid,
                     "workspace_id": sid,
                     "title": sid,
                     "running": False,
@@ -91413,6 +92375,7 @@ class SessionManager:
             except Exception:
                 pass
         opts = []
+        profiles_changed = False
         ollama_profile_id = ""
         ollama_base = self.ollama_base
         for pid, profile in sorted(self.user_model_profiles.items(), key=lambda x: x[0]):
@@ -91435,6 +92398,23 @@ class SessionManager:
                     "thinking_hint": bool(profile.get("thinking_hint", False)),
                     "thinking_stream": bool(profile.get("thinking_stream", False)),
                     "response_stream": bool(profile.get("response_stream", False)),
+                    "effort": str(profile.get("effort", "") or ""),
+                    "max_effort": str(profile.get("max_effort", "") or ""),
+                    "reasoning_supported": (
+                        profile.get("reasoning_supported")
+                        if profile.get("reasoning_supported") is not None
+                        else model_reasoning_style(
+                            str(profile.get("provider", "")), model, caps
+                        )
+                        != "none"
+                    ),
+                    "reasoning_style": str(
+                        profile.get("reasoning_style")
+                        or model_reasoning_style(str(profile.get("provider", "")), model, caps)
+                        or ""
+                    ),
+                    "display_name": str(profile.get("display_name", profile.get("label", pid)) or ""),
+                    "title": str(profile.get("title", profile.get("label", pid)) or ""),
                     "capabilities": caps,
                 }
             )
@@ -91447,7 +92427,24 @@ class SessionManager:
             base = str(profile.get("base_url", self.ollama_base) or self.ollama_base).strip()
             if not base:
                 continue
-            tags = list_ollama_models_cached(base, force_refresh=bool(force_probe))
+            tags = list_ollama_models_cached(
+                base,
+                force_refresh=bool(force_probe),
+                background=not force_probe,
+            )
+            ollama_records = probe_provider_models(
+                profile,
+                force_refresh=bool(force_probe),
+                background=not force_probe,
+            )
+            profiles_changed = merge_probed_models_into_profile(
+                profile, ollama_records, model_ids=tags
+            ) or profiles_changed
+            ollama_record_map = {
+                str(record.get("id", "")): record
+                for record in ollama_records
+                if isinstance(record, dict) and str(record.get("id", "")).strip()
+            }
             if tags:
                 if pid == self.user_active_profile_id:
                     self.ollama_env_tags = list(tags)
@@ -91462,6 +92459,13 @@ class SessionManager:
                     infer_model_multimodal_capabilities("ollama", tag),
                     parse_capability_overrides(profile.get("capabilities", {})),
                 )
+                tag_record = ollama_record_map.get(tag)
+                tag_record_caps = (
+                    tag_record.get("capabilities", {})
+                    if isinstance(tag_record, dict)
+                    else {}
+                )
+                tag_record_probed = isinstance(tag_record, dict)
                 opts.append(
                     {
                         "selection": selection,
@@ -91473,9 +92477,99 @@ class SessionManager:
                         "thinking_hint": bool(profile.get("thinking_hint", self.thinking)),
                         "thinking_stream": bool(profile.get("thinking_stream", False)),
                         "response_stream": bool(profile.get("response_stream", False)),
+                        "effort": str(profile.get("effort", "") or ""),
+                        "max_effort": str(profile.get("max_effort", "") or ""),
+                        "reasoning_supported": (
+                            profile.get("reasoning_supported")
+                            if profile.get("reasoning_supported") is not None
+                            else tag_record_caps.get("reasoning_supported")
+                            if isinstance(tag_record_caps, dict)
+                            and tag_record_caps.get("reasoning_supported") is not None
+                            else model_reasoning_style(
+                                "ollama",
+                                tag,
+                                tag_caps,
+                                capabilities_probed=tag_record_probed,
+                            )
+                            != "none"
+                        ),
+                        "reasoning_style": str(
+                            profile.get("reasoning_style")
+                            or tag_record_caps.get("reasoning_style", "")
+                            or model_reasoning_style(
+                                "ollama",
+                                tag,
+                                tag_caps,
+                                capabilities_probed=tag_record_probed,
+                            )
+                            or ""
+                        ),
+                        "display_name": str(profile.get("display_name", profile.get("label", pid)) or ""),
+                        "title": str(profile.get("title", profile.get("label", pid)) or ""),
                         "capabilities": tag_caps,
                     }
                 )
+        for pid, profile in sorted(self.user_model_profiles.items(), key=lambda x: x[0]):
+            configured = [str(x).strip() for x in profile.get("models", []) if str(x).strip()]
+            records = probe_provider_models(
+                profile,
+                force_refresh=bool(force_probe),
+                background=not force_probe,
+            )
+            profiles_changed = merge_probed_models_into_profile(profile, records) or profiles_changed
+            for rec in records:
+                model_id = str(rec.get("id", "") or "").strip()
+                if model_id and model_id not in configured:
+                    configured.append(model_id)
+            for model_id in configured:
+                selection = f"{pid}::{model_id}"
+                if not model_id or selection in seen:
+                    continue
+                seen.add(selection)
+                rec = next((r for r in records if str(r.get("id", "")) == model_id), {})
+                rcaps = rec.get("capabilities", {}) if isinstance(rec, dict) else {}
+                opts.append({
+                    "selection": selection, "profile_id": pid,
+                    "provider": profile.get("provider", "unknown"), "model": model_id,
+                    "label": f"{profile.get('label', pid)} | {model_id}",
+                    "source": "provider-probe" if rec else profile.get("source", ""),
+                    "thinking_hint": bool(profile.get("thinking_hint", False)),
+                    "thinking_stream": bool(profile.get("thinking_stream", False)),
+                    "response_stream": bool(profile.get("response_stream", False)),
+                    "effort": str(profile.get("effort", "") or ""),
+                    "max_effort": str(profile.get("max_effort", "") or ""),
+                    "reasoning_supported": (
+                        rcaps.get("reasoning_supported")
+                        if isinstance(rcaps, dict) and rcaps.get("reasoning_supported") is not None
+                        else profile.get("reasoning_supported")
+                        if profile.get("reasoning_supported") is not None
+                        else model_reasoning_style(
+                            str(profile.get("provider", "")),
+                            model_id,
+                            rcaps if isinstance(rcaps, dict) else None,
+                            capabilities_probed=bool(rec),
+                        )
+                        != "none"
+                    ),
+                    "reasoning_style": str(
+                        (rcaps.get("reasoning_style") if isinstance(rcaps, dict) else "")
+                        or profile.get("reasoning_style", "")
+                        or model_reasoning_style(
+                            str(profile.get("provider", "")),
+                            model_id,
+                            rcaps if isinstance(rcaps, dict) else None,
+                            capabilities_probed=bool(rec),
+                        )
+                        or ""
+                    ),
+                    "display_name": str(profile.get("display_name", profile.get("label", pid)) or ""),
+                    "title": str(profile.get("title", profile.get("label", pid)) or ""),
+                    "capabilities": merge_multimodal_capabilities(infer_model_multimodal_capabilities(str(profile.get("provider", "")), model_id), parse_capability_overrides(profile.get("capabilities", {}))),
+                })
+        for _option in opts:
+            _pid = str(_option.get("profile_id", "") or "")
+            _profile = self.user_model_profiles.get(_pid, {})
+            apply_model_option_runtime_fields(_option, _profile, str(_option.get("model", "") or ""))
         runnable_opts = [x for x in opts if self._option_is_runnable(x)]
         if runnable_opts:
             opts = runnable_opts
@@ -91499,9 +92593,31 @@ class SessionManager:
                     "thinking_hint": bool(active.get("thinking_hint", False)),
                     "thinking_stream": bool(active.get("thinking_stream", False)),
                     "response_stream": bool(active.get("response_stream", False)),
+                    "effort": str(active.get("effort", "") or ""),
+                    "max_effort": str(active.get("max_effort", "") or ""),
+                    "reasoning_supported": (
+                        active.get("reasoning_supported")
+                        if active.get("reasoning_supported") is not None
+                        else model_reasoning_style(
+                            str(active.get("provider", "")),
+                            str(active.get("model", "") or ""),
+                            active.get("capabilities", {}),
+                        )
+                        != "none"
+                    ),
+                    "reasoning_style": str(
+                        active.get("reasoning_style")
+                        or model_reasoning_style(
+                            str(active.get("provider", "")),
+                            str(active.get("model", "") or ""),
+                            active.get("capabilities", {}),
+                        )
+                        or ""
+                    ),
                     "capabilities": active_caps,
                 },
             )
+            apply_model_option_runtime_fields(opts[0], active, str(active.get("model", "") or ""))
             option_map.add(selected)
         if opts and selected not in option_map:
             selected = str(opts[0].get("selection", ""))
@@ -91509,6 +92625,8 @@ class SessionManager:
             infer_model_multimodal_capabilities(str(active.get("provider", "")), str(active.get("model", ""))),
             parse_capability_overrides(active.get("capabilities", {})),
         )
+        if profiles_changed:
+            self._persist_user_prefs()
         return {
             "provider": active.get("provider", "ollama"),
             "models": [x["selection"] for x in opts] or [self.model],
@@ -91520,7 +92638,7 @@ class SessionManager:
             "active_capabilities": active_caps,
         }
 
-    def set_runtime_model(self, model: str, thinking: bool | None = None) -> dict:
+    def set_runtime_model(self, model: str, thinking: bool | None = None, settings: dict | None = None) -> dict:
         raw = str(model or "").strip()
         if not raw:
             raise ValueError("model required")
@@ -91548,6 +92666,11 @@ class SessionManager:
                     raise ValueError(f"profile not found: {pid}")
             if selected_model.strip():
                 profile["model"] = selected_model.strip()
+            profile = apply_model_runtime_settings(profile, str(profile.get("model", "") or ""), settings)
+            for record in probe_provider_models(profile, background=True):
+                if str(record.get("id", "")) == str(profile.get("model", "")):
+                    merge_probed_models_into_profile(profile, [record])
+                    break
             if str(profile.get("provider", "")).lower() == "ollama" and selected_model.strip():
                 profile["capabilities"] = infer_model_multimodal_capabilities("ollama", selected_model.strip())
             if not self._user_profile_is_runnable(profile) and not explicit_profile and selected_model.strip():
@@ -91607,6 +92730,7 @@ class SessionManager:
         cfg = dict(config or {})
         OllamaClient.clear_global_probe_cache()
         profiles, active = self._profiles_from_config(cfg)
+        probe_and_merge_model_profiles(profiles, force_refresh=True)
         with self.lock:
             normalized: dict[str, dict] = {}
             for pid, row in profiles.items():
@@ -91940,9 +93064,10 @@ window.MathJax={
   </div>
   <div class="actions">
     <select id="langSelect"></select>
-    <select id="modelSelect"></select>
-    <button id="applyModelBtn" class="subtle">Apply Model</button>
-    <button id="llmConfigBtn" class="subtle">Fill LLM Config</button>
+    <div id="modelPicker" class="model-picker" role="group" aria-label="Model selection">
+      <select id="modelSelect"></select>
+      <button id="modelManageBtn" class="subtle" type="button" title="Manage models" aria-label="Manage models">&#9881;</button>
+    </div>
     <button id="programBtn" class="subtle" type="button">Program</button>
     <input id="configInput" type="file" accept=".json,application/json" tabindex="-1" aria-hidden="true" style="position:absolute;left:-10000px;top:auto;width:1px;height:1px;opacity:0;pointer-events:none">
     <a id="downloadBtn" href="#">Open Skills Studio</a>
@@ -92135,6 +93260,7 @@ window.MathJax={
   </aside>
 </main>
 </div>
+<div id="menuPopup" class="menu-popup is-hidden" role="dialog" aria-label="Model management"></div>
 <div id="applicationEditor" class="application-modal" hidden>
   <div class="application-dialog" role="dialog" aria-modal="true" aria-labelledby="applicationEditorTitle">
     <div class="application-dialog-head">
@@ -92772,18 +93898,48 @@ const CODE_KEYWORDS={default:new Set(['if','else','for','while','switch','case',
 S.staticMode=STATIC_UI;
 async function setTaskLevel(level){if(!S.activeId)return;const lvl=parseInt(level,10);try{await api('/api/sessions/'+S.activeId+'/config/task-level',{method:'POST',body:JSON.stringify({level:lvl})});updateLevelBtn(lvl);scheduleSnapshot({forceFull:false,delayMs:80,allowWhenFrozen:true})}catch(err){showError(err.message||String(err))}}
 function updateLevelBtn(level){const btn=E('levelBtn');if(!btn)return;if(!level||level===0){setTextIfChanged(btn,t('btn_level')+': '+t('level_auto'))}else{const labels={1:'L1',2:'L2',3:'L3',4:'L4',5:'L5'};setTextIfChanged(btn,t('btn_level')+': '+(labels[level]||t('level_auto')))}}
-const LLM_PROVIDER_FIELDS={ollama:[{key:'ollama_url',label:'Ollama URL',type:'url',placeholder:'http://127.0.0.1:11434',hint:'Ollama API endpoint'}],vllm:[{key:'vllm_url',label:'vLLM URL',type:'url',placeholder:'http://localhost:8000/v1',hint:'vLLM OpenAI-compat endpoint'},{key:'vllm_model',label:'Model',type:'text',placeholder:'(auto-detect)',hint:'Leave empty to auto-detect'},{key:'vllm_key',label:'API Key (optional)',type:'password',placeholder:'',hint:'Usually not required for local'}],lmstudio:[{key:'lmstudio_url',label:'LM Studio URL',type:'url',placeholder:'http://localhost:1234/v1',hint:'LM Studio server endpoint'},{key:'lmstudio_model',label:'Model',type:'text',placeholder:'(auto-detect)',hint:'Leave empty to auto-detect'}],openai_compat:[{key:'openai_url',label:'API Base URL',type:'url',placeholder:'https://api.openai.com/v1',hint:'OpenAI-compatible endpoint'},{key:'openai_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'Your API key'},{key:'openai_model',label:'Model',type:'text',placeholder:'gpt-4o-mini',hint:'e.g. gpt-4o, claude-sonnet-4-20250514'}],anthropic:[{key:'anthropic_url',label:'API URL',type:'url',placeholder:'https://api.anthropic.com',hint:'Anthropic API endpoint'},{key:'anthropic_key',label:'API Key',type:'password',placeholder:'sk-ant-...',hint:'Anthropic API key'},{key:'anthropic_model',label:'Model',type:'text',placeholder:'claude-sonnet-4-20250514',hint:'e.g. claude-sonnet-4-20250514, claude-opus-4-20250514'}],glm:[{key:'glm_url',label:'API URL',type:'url',placeholder:'https://open.bigmodel.cn/api/paas/v4',hint:'GLM API endpoint'},{key:'glm_key',label:'API Key',type:'password',placeholder:'',hint:'GLM API Key'},{key:'glm_model',label:'Model',type:'text',placeholder:'glm-4-flash',hint:'e.g. glm-4-flash, glm-4-plus, glm-4v'}],kimi:[{key:'kimi_url',label:'API URL',type:'url',placeholder:'https://api.moonshot.cn/v1',hint:'KIMI/Moonshot API endpoint'},{key:'kimi_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'Moonshot API Key'},{key:'kimi_model',label:'Model',type:'text',placeholder:'moonshot-v1-8k',hint:'e.g. moonshot-v1-8k, moonshot-v1-32k, moonshot-v1-128k'}],openrouter:[{key:'openrouter_url',label:'API URL',type:'url',placeholder:'https://openrouter.ai/api/v1',hint:'OpenRouter endpoint'},{key:'openrouter_key',label:'API Key',type:'password',placeholder:'sk-or-...',hint:'OpenRouter API Key'},{key:'openrouter_model',label:'Model',type:'text',placeholder:'meta-llama/llama-3.1-8b-instruct',hint:'Full model slug from openrouter.ai/models'}],siliconflow:[{key:'siliconflow_url',label:'API URL',type:'url',placeholder:'https://api.siliconflow.cn/v1',hint:'SiliconFlow API endpoint'},{key:'siliconflow_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'SiliconFlow API key'},{key:'siliconflow_model',label:'Model',type:'text',placeholder:'Qwen/Qwen3-Next-80B-A3B-Instruct',hint:'Model identifier'}],custom_http:[{key:'custom_url',label:'API Endpoint URL',type:'url',placeholder:'https://your-api.com/v1/chat/completions',hint:'Full API endpoint URL'},{key:'custom_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'API key (optional)'},{key:'custom_model',label:'Model',type:'text',placeholder:'model-name',hint:'Model identifier'},{key:'custom_headers',label:'Custom Headers (JSON)',type:'textarea',placeholder:'{"Authorization":"Bearer token","X-Custom":"value"}',hint:'JSON object of additional HTTP headers'},{key:'custom_payload',label:'Payload Template (JSON)',type:'textarea',placeholder:'{"custom_param":"value","stream":true}',hint:'Extra fields merged into the request body'},{key:'temperature',label:'Temperature',type:'number',placeholder:'0.2',hint:'0.0-2.0, lower=deterministic'},{key:'request_timeout',label:'Request Timeout (seconds)',type:'number',placeholder:'3600',hint:'Max seconds per LLM request'}]};
-function modelReasoningStyle(provider,model){const p=String(provider||'').trim().toLowerCase();const m=String(model||'').trim().toLowerCase();if(p==='anthropic'){return ['claude-3-7','claude-3.7','claude-sonnet-4','claude-opus-4','claude-haiku-4','claude-4','-thinking','claude-sonnet-5','claude-opus-5'].some(x=>m.includes(x))?'anthropic':'none'}if(p==='ollama'){return ['r1','qwen3','deepseek','thinking','reasoner','magistral'].some(x=>m.includes(x))?'ollama':'none'}const compat=new Set(['openai_compat','siliconflow','vllm','lmstudio','glm','kimi','openrouter','custom_http']);if(compat.has(p)){if(p==='glm'||m.startsWith('glm-')||m.includes('glm'))return 'glm';if(m.includes('deepseek'))return 'deepseek';if(m.startsWith('o1')||m.startsWith('o3')||m.startsWith('o4')||m.includes('gpt-5')||m.includes('/o1')||m.includes('/o3')||m.includes('/o4')||m.includes('reasoning'))return 'openai';return 'none'}return 'none'}
+const LLM_PROVIDER_FIELDS={ollama:[{key:'ollama_url',label:'Ollama URL',type:'url',placeholder:'http://127.0.0.1:11434',hint:'Ollama API endpoint'}],vllm:[{key:'vllm_url',label:'vLLM URL',type:'url',placeholder:'http://localhost:8000/v1',hint:'vLLM OpenAI-compat endpoint'},{key:'vllm_model',label:'Model',type:'text',placeholder:'(auto-detect)',hint:'Leave empty to auto-detect'},{key:'vllm_key',label:'API Key (optional)',type:'password',placeholder:'',hint:'Usually not required for local'}],lmstudio:[{key:'lmstudio_url',label:'LM Studio URL',type:'url',placeholder:'http://localhost:1234/v1',hint:'LM Studio server endpoint'},{key:'lmstudio_model',label:'Model',type:'text',placeholder:'(auto-detect)',hint:'Leave empty to auto-detect'}],openai_compat:[{key:'openai_url',label:'API Base URL',type:'url',placeholder:'https://api.openai.com/v1',hint:'OpenAI-compatible endpoint'},{key:'openai_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'Your API key'},{key:'openai_model',label:'Model',type:'text',placeholder:'gpt-4o-mini',hint:'e.g. gpt-4o, claude-sonnet-4-20250514'}],anthropic:[{key:'anthropic_url',label:'API URL',type:'url',placeholder:'https://api.anthropic.com',hint:'Anthropic API endpoint'},{key:'anthropic_key',label:'API Key',type:'password',placeholder:'sk-ant-...',hint:'Anthropic API key'},{key:'anthropic_model',label:'Model',type:'text',placeholder:'claude-sonnet-4-20250514',hint:'e.g. claude-sonnet-4-20250514, claude-opus-4-20250514'}],glm:[{key:'glm_url',label:'API URL',type:'url',placeholder:'https://open.bigmodel.cn/api/paas/v4',hint:'GLM API endpoint'},{key:'glm_key',label:'API Key',type:'password',placeholder:'',hint:'GLM API Key'},{key:'glm_model',label:'Model',type:'text',placeholder:'glm-4-flash',hint:'e.g. glm-4-flash, glm-4-plus, glm-4v'}],kimi:[{key:'kimi_url',label:'API URL',type:'url',placeholder:'https://api.moonshot.cn/v1',hint:'KIMI/Moonshot API endpoint'},{key:'kimi_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'Moonshot API Key'},{key:'kimi_model',label:'Model',type:'text',placeholder:'moonshot-v1-8k',hint:'e.g. moonshot-v1-8k, moonshot-v1-32k, moonshot-v1-128k'}],openrouter:[{key:'openrouter_url',label:'API URL',type:'url',placeholder:'https://openrouter.ai/api/v1',hint:'OpenRouter endpoint'},{key:'openrouter_key',label:'API Key',type:'password',placeholder:'sk-or-...',hint:'OpenRouter API Key'},{key:'openrouter_model',label:'Model',type:'text',placeholder:'meta-llama/llama-3.1-8b-instruct',hint:'Full model slug from openrouter.ai/models'}],siliconflow:[{key:'siliconflow_url',label:'API URL',type:'url',placeholder:'https://api.siliconflow.cn/v1',hint:'SiliconFlow API endpoint'},{key:'siliconflow_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'SiliconFlow API key'},{key:'siliconflow_model',label:'Model',type:'text',placeholder:'Qwen/Qwen3-Next-80B-A3B-Instruct',hint:'Model identifier'}],custom_http:[{key:'custom_name',label:'Provider Name',type:'text',placeholder:'My Provider',hint:'Name shown in model menus'},{key:'custom_title',label:'Provider Title',type:'text',placeholder:'Custom HTTP',hint:'Title used for display and session labels'},{key:'custom_url',label:'API Endpoint URL',type:'url',placeholder:'https://your-api.com/v1/chat/completions',hint:'Full API endpoint URL'},{key:'custom_key',label:'API Key',type:'password',placeholder:'sk-...',hint:'API key (optional)'},{key:'custom_model',label:'Model',type:'text',placeholder:'model-name',hint:'Model identifier'},{key:'custom_headers',label:'Custom Headers (JSON)',type:'textarea',placeholder:'{"Authorization":"Bearer token","X-Custom":"value"}',hint:'JSON object of additional HTTP headers'},{key:'custom_payload',label:'Payload Template (JSON)',type:'textarea',placeholder:'{"custom_param":"value","stream":true}',hint:'Extra fields merged into the request body'},{key:'temperature',label:'Temperature',type:'number',placeholder:'0.2',hint:'0.0-2.0, lower=deterministic'},{key:'request_timeout',label:'Request Timeout (seconds)',type:'number',placeholder:'3600',hint:'Max seconds per LLM request'}]};
+function modelReasoningStyle(provider,model,capabilities){const p=String(provider||'').trim().toLowerCase();const caps=capabilities&&typeof capabilities==='object'?capabilities:{};const explicit=String(caps.reasoning_style||caps.reasoning_dialect||'').trim().toLowerCase();if(['anthropic','openai','deepseek','glm','ollama','none'].includes(explicit))return explicit;if(caps.reasoning_supported===false)return 'none';if(caps.reasoning_supported===true){if(p==='anthropic')return 'anthropic';if(p==='ollama')return 'ollama';if(p==='glm')return 'glm';return 'openai'}return 'none'}
+function detectedModelCapabilities(provider,model){const key=String(provider||'').trim().toLowerCase();const target=String(model||'').trim().toLowerCase();const rows=S.llmDetectedModelRecords?.[key];if(Array.isArray(rows)){const row=rows.find(item=>String(item?.id||item?.model||'').trim().toLowerCase()===target);return row?.capabilities&&typeof row.capabilities==='object'?row.capabilities:{}}if(rows&&typeof rows==='object'){const row=rows[model]||rows[target];if(row&&typeof row==='object')return row.capabilities&&typeof row.capabilities==='object'?row.capabilities:row}return {}}
 function effortModelFieldId(provider){if(provider==='ollama')return 'llmF_ollama_model';const fields=LLM_PROVIDER_FIELDS[provider]||[];const mf=fields.find(f=>f.key&&f.key.endsWith('_model'));return mf?('llmF_'+mf.key):''}
 function effortCurrentModel(provider){const id=effortModelFieldId(provider);if(!id)return '';const el=E(id);return el?String(el.value||'').trim():''}
-function refreshEffortAvailability(){const provider=E('llmProvider')?.value||'ollama';const eff=E('llmF_effort');const mx=E('llmF_max_effort');const hint=E('llmEffortHint');if(!eff||!mx)return;const model=effortCurrentModel(provider);const style=modelReasoningStyle(provider,model);const supported=style!=='none';eff.disabled=!supported;mx.disabled=!supported;const wrap=E('llmEffortField');const wrap2=E('llmMaxEffortField');for(const w of [wrap,wrap2]){if(w)w.style.opacity=supported?'1':'0.55'}if(hint){if(!model){hint.textContent=t('llm_effort_need_model')}else if(supported){hint.textContent=t('llm_effort_supported').replace('{style}',style)}else{hint.textContent=t('llm_effort_unsupported')}}}
+function refreshEffortAvailability(){const provider=E('llmProvider')?.value||'ollama';const eff=E('llmF_effort');const mx=E('llmF_max_effort');const hint=E('llmEffortHint');if(!eff||!mx)return;const model=effortCurrentModel(provider);const style=modelReasoningStyle(provider,model,detectedModelCapabilities(provider,model));const supported=style!=='none';eff.disabled=!supported;mx.disabled=!supported;const wrap=E('llmEffortField');const wrap2=E('llmMaxEffortField');for(const w of [wrap,wrap2]){if(w)w.style.opacity=supported?'1':'0.55'}if(hint){if(!model){hint.textContent=t('llm_effort_need_model')}else if(supported){hint.textContent=t('llm_effort_supported').replace('{style}',style)}else{hint.textContent=t('llm_effort_unsupported')}}}
 function renderLlmFields(provider){const container=E('llmFieldsContainer');if(!container)return;let html='';const openaiCompatProviders=new Set(['openai_compat','siliconflow','vllm','lmstudio','glm','kimi','openrouter','custom_http']);if(provider==='ollama'){const fields=LLM_PROVIDER_FIELDS.ollama;for(const f of fields){html+='<div class=\"llm-field\"><label>'+esc(f.label)+'</label><input type=\"'+f.type+'\" id=\"llmF_'+f.key+'\" placeholder=\"'+esc(f.placeholder||'')+'\" value=\"\"><div class=\"llm-hint\">'+esc(f.hint||'')+'</div></div>'}html+='<div class=\"llm-field\"><label>'+esc(t('llm_model'))+'</label><div style=\"display:flex;gap:8px;align-items:center\"><select id=\"llmF_ollama_model\" style=\"flex:1\"><option value=\"\">-- '+esc(t('llm_scan_first'))+' --</option></select><button type=\"button\" id=\"ollamaScanBtn\" class=\"llm-modal-btn-secondary\" style=\"flex:none;padding:6px 12px\">'+esc(t('llm_scan'))+'</button></div><div class=\"llm-hint\" id=\"ollamaScanHint\">'+esc(t('llm_scan_hint'))+'</div></div>'}else{const fields=LLM_PROVIDER_FIELDS[provider]||[];for(const f of fields){if(f.type==='textarea'){html+='<div class=\"llm-field\"><label>'+esc(f.label)+'</label><textarea id=\"llmF_'+f.key+'\" placeholder=\"'+esc(f.placeholder||'')+'\" rows=\"3\" style=\"width:100%;padding:8px 10px;border:1px solid var(--line,#d9e1ec);border-radius:8px;font-size:.84rem;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;resize:vertical;box-sizing:border-box\"></textarea><div class=\"llm-hint\">'+esc(f.hint||'')+'</div></div>'}else{html+='<div class=\"llm-field\"><label>'+esc(f.label)+'</label><input type=\"'+(f.type==='number'?'text':f.type)+'\" id=\"llmF_'+f.key+'\" placeholder=\"'+esc(f.placeholder||'')+'\" value=\"\"><div class=\"llm-hint\">'+esc(f.hint||'')+'</div></div>'}}if(openaiCompatProviders.has(provider)){html+='<div class=\"llm-field\"><div style=\"display:flex;gap:8px;align-items:center\"><button type=\"button\" id=\"localScanBtn\" class=\"llm-modal-btn-secondary\" style=\"flex:none;padding:6px 12px\">'+esc(t('llm_scan'))+'</button></div><div class=\"llm-hint\" id=\"localScanHint\">'+esc(t('llm_scan_hint'))+'</div></div>'}}html+='<div class=\"llm-field\"><label>'+esc(t('llm_thinking_stream'))+'</label><select id=\"llmF_thinking_stream\"><option value=\"true\">'+esc(t('llm_enabled'))+'</option><option value=\"false\" selected>'+esc(t('llm_disabled'))+'</option></select></div>';html+='<div class=\"llm-field\"><label>'+esc(t('llm_response_stream'))+'</label><select id=\"llmF_response_stream\"><option value=\"true\">'+esc(t('llm_enabled'))+'</option><option value=\"false\" selected>'+esc(t('llm_disabled'))+'</option></select><div class=\"llm-hint\">'+esc(t('llm_response_stream_hint'))+'</div></div>';html+='<div class=\"llm-field\" id=\"llmEffortField\"><label>'+esc(t('llm_effort'))+'</label><select id=\"llmF_effort\"><option value=\"\" selected>'+esc(t('llm_effort_auto'))+'</option><option value=\"off\">'+esc(t('llm_effort_off'))+'</option><option value=\"low\">'+esc(t('llm_effort_low'))+'</option><option value=\"medium\">'+esc(t('llm_effort_medium'))+'</option><option value=\"high\">'+esc(t('llm_effort_high'))+'</option><option value=\"max\">'+esc(t('llm_effort_max'))+'</option></select></div>';html+='<div class=\"llm-field\" id=\"llmMaxEffortField\"><label>'+esc(t('llm_max_effort'))+'</label><select id=\"llmF_max_effort\"><option value=\"\">'+esc(t('llm_effort_no_ceiling'))+'</option><option value=\"low\">'+esc(t('llm_effort_low'))+'</option><option value=\"medium\">'+esc(t('llm_effort_medium'))+'</option><option value=\"high\">'+esc(t('llm_effort_high'))+'</option><option value=\"max\" selected>'+esc(t('llm_effort_max'))+'</option></select><div class=\"llm-hint\" id=\"llmEffortHint\"></div></div>';container.innerHTML=html;if(provider!=='custom_http'){const defaults=LLM_PROVIDER_FIELDS[provider]||[];for(const f of defaults){if(f.type!=='url')continue;const el=E('llmF_'+f.key);if(el&&!String(el.value||'').trim())el.value=String(f.placeholder||'')}}if(provider==='ollama'){const scanBtn=E('ollamaScanBtn');if(scanBtn)scanBtn.onclick=()=>scanOllamaModels()}if(openaiCompatProviders.has(provider)){const scanBtn=E('localScanBtn');if(scanBtn)scanBtn.onclick=()=>scanOpenAICompatModels(provider)}const _mfid=effortModelFieldId(provider);if(_mfid){const _mfe=E(_mfid);if(_mfe){_mfe.addEventListener('input',refreshEffortAvailability);_mfe.addEventListener('change',refreshEffortAvailability)}}refreshEffortAvailability()}
-async function scanOllamaModels(){const urlEl=E('llmF_ollama_url');const sel=E('llmF_ollama_model');const hint=E('ollamaScanHint');const baseUrl=(urlEl?.value||'').trim()||'http://127.0.0.1:11434';if(hint)hint.textContent=t('llm_scanning');try{const res=await fetch('/api/ollama/models?base_url='+encodeURIComponent(baseUrl));const data=await res.json();if(!data.ok||!data.models?.length){if(hint)hint.textContent=t('llm_scan_empty')+(data.error?' ('+data.error+')':'');return}if(sel){sel.innerHTML='';for(const m of data.models){const op=document.createElement('option');op.value=m;op.textContent=m;sel.appendChild(op)}}if(hint)hint.textContent=t('llm_scan_found').replace('{n}',String(data.models.length))}catch(err){if(hint)hint.textContent=t('llm_scan_error')+': '+(err.message||String(err))}}
-async function scanOpenAICompatModels(provider){const scanMap={openai_compat:{urlKey:'openai_url',modelKey:'openai_model',keyKey:'openai_key',defaultUrl:'https://api.openai.com/v1'},siliconflow:{urlKey:'siliconflow_url',modelKey:'siliconflow_model',keyKey:'siliconflow_key',defaultUrl:'https://api.siliconflow.cn/v1'},vllm:{urlKey:'vllm_url',modelKey:'vllm_model',keyKey:'vllm_key',defaultUrl:'http://localhost:8000/v1'},lmstudio:{urlKey:'lmstudio_url',modelKey:'lmstudio_model',keyKey:'lmstudio_key',defaultUrl:'http://localhost:1234/v1'},glm:{urlKey:'glm_url',modelKey:'glm_model',keyKey:'glm_key',defaultUrl:'https://open.bigmodel.cn/api/paas/v4'},kimi:{urlKey:'kimi_url',modelKey:'kimi_model',keyKey:'kimi_key',defaultUrl:'https://api.moonshot.cn/v1'},openrouter:{urlKey:'openrouter_url',modelKey:'openrouter_model',keyKey:'openrouter_key',defaultUrl:'https://openrouter.ai/api/v1'},custom_http:{urlKey:'custom_url',modelKey:'custom_model',keyKey:'custom_key',defaultUrl:''}};const normalizedProvider=String(provider||'openai_compat').trim()||'openai_compat';const meta=scanMap[normalizedProvider]||scanMap.openai_compat;const urlEl=E('llmF_'+meta.urlKey);const modelEl=E('llmF_'+meta.modelKey);const hint=E('localScanHint');const baseUrl=(urlEl?.value||'').trim()||meta.defaultUrl||'';const apiKey=(E('llmF_'+meta.keyKey)?.value||'').trim();if(hint)hint.textContent=t('llm_scanning');try{let url='/api/openai_compat/models?provider='+encodeURIComponent(normalizedProvider)+'&base_url='+encodeURIComponent(baseUrl);if(apiKey)url+='&api_key='+encodeURIComponent(apiKey);const res=await fetch(url);const data=await res.json();const models=Array.isArray(data.models)?data.models.filter(Boolean):[];if(!data.ok){if(hint)hint.textContent=t('llm_scan_error')+(data.error?' ('+data.error+')':'');return}if(models.length){if(modelEl&&!String(modelEl.value||'').trim())modelEl.value=models[0];try{refreshEffortAvailability()}catch(e){}if(hint)hint.textContent=t('llm_scan_found').replace('{n}',String(models.length))+': '+models.slice(0,3).join(', ');return}if(data.reachable){if(hint)hint.textContent=t('llm_scan_reachable_manual')+(data.error?' ('+data.error+')':'');return}if(hint)hint.textContent=t('llm_scan_empty')+(data.error?' ('+data.error+')':'')}catch(err){if(hint)hint.textContent=t('llm_scan_error')+': '+(err.message||String(err))}}
+async function scanOllamaModels(){const urlEl=E('llmF_ollama_url');const sel=E('llmF_ollama_model');const hint=E('ollamaScanHint');const baseUrl=(urlEl?.value||'').trim()||'http://127.0.0.1:11434';if(hint)hint.textContent=t('llm_scanning');try{const res=await fetch('/api/ollama/models?base_url='+encodeURIComponent(baseUrl));const data=await res.json();if(!data.ok||!data.models?.length){if(hint)hint.textContent=t('llm_scan_empty')+(data.error?' ('+data.error+')':'');return}if(sel){sel.innerHTML='';for(const m of data.models){const op=document.createElement('option');op.value=m;op.textContent=m;sel.appendChild(op)}}S.llmDetectedModels=S.llmDetectedModels||{};S.llmDetectedModelRecords=S.llmDetectedModelRecords||{};S.llmDetectedModels.ollama=data.models.slice();S.llmDetectedModelRecords.ollama=Array.isArray(data.model_records)?data.model_records.slice():data.models.map(id=>({id,capabilities:{}}));if(hint)hint.textContent=t('llm_scan_found').replace('{n}',String(data.models.length));refreshEffortAvailability()}catch(err){if(hint)hint.textContent=t('llm_scan_error')+': '+(err.message||String(err))}}
+async function scanOpenAICompatModels(provider){const scanMap={openai_compat:{urlKey:'openai_url',modelKey:'openai_model',keyKey:'openai_key',defaultUrl:'https://api.openai.com/v1'},anthropic:{urlKey:'anthropic_url',modelKey:'anthropic_model',keyKey:'anthropic_key',defaultUrl:'https://api.anthropic.com'},siliconflow:{urlKey:'siliconflow_url',modelKey:'siliconflow_model',keyKey:'siliconflow_key',defaultUrl:'https://api.siliconflow.cn/v1'},vllm:{urlKey:'vllm_url',modelKey:'vllm_model',keyKey:'vllm_key',defaultUrl:'http://localhost:8000/v1'},lmstudio:{urlKey:'lmstudio_url',modelKey:'lmstudio_model',keyKey:'lmstudio_key',defaultUrl:'http://localhost:1234/v1'},glm:{urlKey:'glm_url',modelKey:'glm_model',keyKey:'glm_key',defaultUrl:'https://open.bigmodel.cn/api/paas/v4'},kimi:{urlKey:'kimi_url',modelKey:'kimi_model',keyKey:'kimi_key',defaultUrl:'https://api.moonshot.cn/v1'},openrouter:{urlKey:'openrouter_url',modelKey:'openrouter_model',keyKey:'openrouter_key',defaultUrl:'https://openrouter.ai/api/v1'},custom_http:{urlKey:'custom_url',modelKey:'custom_model',keyKey:'custom_key',defaultUrl:''}};const normalizedProvider=String(provider||'openai_compat').trim()||'openai_compat';const meta=scanMap[normalizedProvider]||scanMap.openai_compat;const urlEl=E('llmF_'+meta.urlKey);const modelEl=E('llmF_'+meta.modelKey);const hint=E('localScanHint');const baseUrl=(urlEl?.value||'').trim()||meta.defaultUrl||'';const apiKey=(E('llmF_'+meta.keyKey)?.value||'').trim();if(hint)hint.textContent=t('llm_scanning');try{let url='/api/openai_compat/models?provider='+encodeURIComponent(normalizedProvider)+'&base_url='+encodeURIComponent(baseUrl);if(apiKey)url+='&api_key='+encodeURIComponent(apiKey);const res=await fetch(url);const data=await res.json();const models=Array.isArray(data.models)?data.models.filter(Boolean):[];const records=Array.isArray(data.model_records)?data.model_records.filter(item=>item&&String(item.id||item.model||'').trim()):models.map(id=>({id,capabilities:{}}));if(!data.ok){if(hint)hint.textContent=t('llm_scan_error')+(data.error?' ('+data.error+')':'');return}if(models.length){S.llmDetectedModels=S.llmDetectedModels||{};S.llmDetectedModelRecords=S.llmDetectedModelRecords||{};S.llmDetectedModels[normalizedProvider]=models.slice();S.llmDetectedModelRecords[normalizedProvider]=records.slice();if(modelEl&&!String(modelEl.value||'').trim())modelEl.value=models[0];try{refreshEffortAvailability()}catch(e){}if(hint)hint.textContent=t('llm_scan_found').replace('{n}',String(models.length))+': '+models.slice(0,3).join(', ');return}if(data.reachable){if(hint)hint.textContent=t('llm_scan_reachable_manual')+(data.error?' ('+data.error+')':'');return}if(hint)hint.textContent=t('llm_scan_empty')+(data.error?' ('+data.error+')':'')}catch(err){if(hint)hint.textContent=t('llm_scan_error')+': '+(err.message||String(err))}}
 function collectLlmConfig(){const provider=E('llmProvider')?.value||'ollama';const config={provider:provider};if(provider==='ollama'){config.ollama_url=(E('llmF_ollama_url')?.value||'').trim()||'http://127.0.0.1:11434';config.ollama_model=E('llmF_ollama_model')?.value||''}else if(provider==='custom_http'){const fields=LLM_PROVIDER_FIELDS.custom_http;for(const f of fields){const el=E('llmF_'+f.key);if(!el)continue;if(f.type==='textarea'){config[f.key]=el.value.trim()}else if(f.key==='temperature'){const v=parseFloat(el.value);if(!isNaN(v))config[f.key]=v}else if(f.key==='request_timeout'){const v=parseInt(el.value,10);if(!isNaN(v)&&v>0)config[f.key]=v}else{config[f.key]=el.value.trim()}}}else{const fields=LLM_PROVIDER_FIELDS[provider]||[];for(const f of fields){const el=E('llmF_'+f.key);if(el){const raw=el.value.trim();config[f.key]=(provider!=='custom_http'&&f.type==='url')?(raw||String(f.placeholder||'').trim()):raw}}}config.thinking_stream=E('llmF_thinking_stream')?.value==='true';config.response_stream=E('llmF_response_stream')?.value==='true';const _eff=E('llmF_effort');if(_eff&&!_eff.disabled){const _ev=String(_eff.value||'').trim();if(_ev)config.effort=_ev}const _mx=E('llmF_max_effort');if(_mx&&!_mx.disabled){const _mv=String(_mx.value||'').trim();if(_mv)config.max_effort=_mv}return config}
 async function submitLlmConfig(){if(!S.activeId){showError(t('select_session_first'));return}const config=collectLlmConfig();try{const payload={filename:'LLM.config.json',mime:'application/json',content_b64:btoa(unescape(encodeURIComponent(JSON.stringify(config,null,2))))};const out=await api('/api/sessions/'+S.activeId+'/uploads',{method:'POST',body:JSON.stringify(payload)});const note=String(out?.note||out?.model_catalog?.note||'').trim();if(!out?.model_catalog){showError(t('config_uploaded_no_profiles'))}else if(note){showError(note)}else{showError('')}const cat=out?.model_catalog||await loadModelCatalog();if(!applyModelCatalog(cat)){renderModelControls()}await refreshSnapshot({forceFull:true,allowWhenFrozen:true});E('llmConfigModal').style.display='none'}catch(err){showError(err.message||String(err))}}
 function openLlmConfigModal(){const modal=E('llmConfigModal');if(!modal)return;modal.style.display='flex';const prov=E('llmProvider');if(prov){renderLlmFields(prov.value)}}
+async function scanAnthropicModels(){const baseUrl=(E('llmF_anthropic_url')?.value||'').trim()||'https://api.anthropic.com';const apiKey=(E('llmF_anthropic_key')?.value||'').trim();const modelEl=E('llmF_anthropic_model');const hint=E('localScanHint');if(hint)hint.textContent=t('llm_scanning');try{let url='/api/openai_compat/models?provider=anthropic&base_url='+encodeURIComponent(baseUrl);if(apiKey)url+='&api_key='+encodeURIComponent(apiKey);const res=await fetch(url);const data=await res.json();const models=Array.isArray(data.models)?data.models.filter(Boolean):[];const records=Array.isArray(data.model_records)?data.model_records:models.map(id=>({id,capabilities:{}}));if(!data.ok){if(hint)hint.textContent=t('llm_scan_error')+(data.error?' ('+data.error+')':'');return}S.llmDetectedModels.anthropic=models.slice();S.llmDetectedModelRecords.anthropic=records.slice();if(modelEl&&models.length&&!String(modelEl.value||'').trim())modelEl.value=models[0];if(hint)hint.textContent=models.length?t('llm_scan_found').replace('{n}',String(models.length))+': '+models.slice(0,3).join(', '):t('llm_scan_reachable_manual');refreshEffortAvailability()}catch(err){if(hint)hint.textContent=t('llm_scan_error')+': '+(err.message||String(err))}}
 const COMPACT_AUTO_REFRESH_COUNT=3;
+S.llmDetectedModels=S.llmDetectedModels||{};
+S.llmDetectedModelRecords=S.llmDetectedModelRecords||{};
+setTimeout(()=>{
+  const originalScanOpenAI=scanOpenAICompatModels;
+  const originalScanOllama=scanOllamaModels;
+  const originalCollect=collectLlmConfig;
+  const originalRenderLlmFields=renderLlmFields;
+  renderLlmFields=provider=>{originalRenderLlmFields(provider);if(provider!=='anthropic')return;const container=E('llmFieldsContainer');if(!container||E('localScanBtn'))return;const field=document.createElement('div');field.className='llm-field';field.innerHTML='<div style="display:flex;gap:8px;align-items:center"><button type="button" id="localScanBtn" class="llm-modal-btn-secondary" style="flex:none;padding:6px 12px">'+esc(t('llm_scan'))+'</button></div><div class="llm-hint" id="localScanHint">'+esc(t('llm_scan_hint'))+'</div>';const effortField=E('llmEffortField');container.insertBefore(field,effortField||null);E('localScanBtn').onclick=()=>scanOpenAICompatModels('anthropic')};
+  scanOpenAICompatModels=async provider=>{
+    const key=String(provider||'openai_compat');
+    if(key==='anthropic')await scanAnthropicModels();else await originalScanOpenAI(provider);
+    const modelKey={openai_compat:'openai_model',siliconflow:'siliconflow_model',vllm:'vllm_model',lmstudio:'lmstudio_model',anthropic:'anthropic_model',glm:'glm_model',kimi:'kimi_model',openrouter:'openrouter_model',custom_http:'custom_model'}[key];
+    const current=modelKey?String(E('llmF_'+modelKey)?.value||'').trim():'';
+    if(current){const existing=Array.isArray(S.llmDetectedModels[key])?S.llmDetectedModels[key]:[];if(!existing.includes(current))existing.unshift(current);S.llmDetectedModels[key]=existing;const records=Array.isArray(S.llmDetectedModelRecords[key])?S.llmDetectedModelRecords[key]:[];if(!records.some(item=>String(item?.id||item?.model||'').trim()===current))records.unshift({id:current,capabilities:{}});S.llmDetectedModelRecords[key]=records}
+  };
+  scanOllamaModels=async()=>{await originalScanOllama();const sel=E('llmF_ollama_model');const values=[...(sel?.options||[])].map(x=>String(x.value||'').trim()).filter(Boolean);if(values.length)S.llmDetectedModels.ollama=values;if(values.length&&!Array.isArray(S.llmDetectedModelRecords.ollama))S.llmDetectedModelRecords.ollama=values.map(id=>({id,capabilities:{}}))};
+  collectLlmConfig=()=>{const config=originalCollect();const provider=String(config.provider||'');const detected=Array.isArray(S.llmDetectedModels[provider])?S.llmDetectedModels[provider].filter(Boolean):[];const records=Array.isArray(S.llmDetectedModelRecords[provider])?S.llmDetectedModelRecords[provider]:[];if(detected.length){config.models=detected;const modelListKeys={ollama:'ollama_models',openai_compat:'openai_models',siliconflow:'siliconflow_models',vllm:'vllm_models',lmstudio:'lmstudio_models',glm:'glm_models',kimi:'kimi_models',openrouter:'openrouter_models',custom_http:'custom_models',anthropic:'anthropic_models'};const listKey=modelListKeys[provider];if(listKey)config[listKey]=detected;if(provider==='custom_http')config.custom_models=detected}if(records.length){const reasoning={};const settings=(config.model_settings&&typeof config.model_settings==='object')?{...config.model_settings}:{};for(const record of records){const id=String(record?.id||record?.model||'').trim();const caps=record?.capabilities&&typeof record.capabilities==='object'?record.capabilities:{};if(!id)continue;const clean={};for(const key of ['reasoning_supported','reasoning_style','reasoning_dialect'])if(key in caps)clean[key]=caps[key];if(!Object.keys(clean).length)continue;reasoning[id]=clean;settings[id]={...(settings[id]&&typeof settings[id]==='object'?settings[id]:{}),...clean}}if(Object.keys(reasoning).length){config.model_reasoning_capabilities=reasoning;config.model_settings=settings}}return config};
+  const modelOption=()=>{const selected=String(S.config?.model||'');return (S.modelOptions||[]).find(x=>String(x.selection||'')===selected)||null};
+  let showModelSettings=anchor=>{const popup=E('menuPopup');if(!popup)return;const option=modelOption()||{};const caps=option.capabilities||{};const supports=option.reasoning_supported===true||caps.reasoning_supported===true;const effort=String(option.effort||'');const maxEffort=String(option.max_effort||'');popup.classList.remove('is-hidden','prompt-budget-menu');popup.classList.add('agent-model-menu');popup.style.display='block';popup.setAttribute('aria-hidden','false');popup.innerHTML=`<div class="agent-model-summary"><strong>${esc(option.label||option.model||S.config?.model||'Model settings')}</strong><small>Runtime settings</small></div><label class="model-setting-row">Effort<select id="webModelEffort" ${supports?'':'disabled'}><option value="">Auto</option><option value="off">Off</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="max">Max</option></select></label><label class="model-setting-row">Max effort<select id="webModelMaxEffort" ${supports?'':'disabled'}><option value="">No ceiling</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="max">Max</option></select></label><label class="model-setting-check"><input id="webModelThinking" type="checkbox" ${option.thinking_stream?'checked':''}> Thinking stream</label><label class="model-setting-check"><input id="webModelResponse" type="checkbox" ${option.response_stream?'checked':''}> Response stream</label><div class="agent-model-actions"><button id="webModelSave" class="agent-model-config">Save</button></div>`;const rect=anchor.getBoundingClientRect();popup.style.left=`${Math.max(4,Math.min(rect.left,window.innerWidth-300))}px`;popup.style.top=`${rect.bottom+6}px`;const eff=E('webModelEffort'),mx=E('webModelMaxEffort');if(eff)eff.value=effort;if(mx)mx.value=maxEffort;E('webModelSave').onclick=async ev=>{ev.stopPropagation();const settings={effort:String(eff?.value||''),max_effort:String(mx?.value||''),thinking_stream:!!E('webModelThinking')?.checked,response_stream:!!E('webModelResponse')?.checked};try{const path=S.activeId?('/api/sessions/'+S.activeId+'/config/model'):'/api/config/model';const out=await api(path,{method:'POST',body:JSON.stringify({selection:S.config?.model,model:S.config?.model,...settings})});applyModelCatalog(out);popup.classList.add('is-hidden')}catch(err){showError(err.message||String(err))}}};
+  const showModelManager=async anchor=>{const popup=E('menuPopup');if(!popup||!anchor)return;popup.classList.remove('is-hidden','prompt-budget-menu');popup.classList.add('agent-model-menu');popup.style.display='block';popup.setAttribute('aria-hidden','false');popup.style.bottom='auto';popup.style.transform='';const place=()=>{const rect=anchor.getBoundingClientRect();const width=Math.min(380,window.innerWidth-8);popup.style.width=`${width}px`;popup.style.left=`${Math.max(4,Math.min(rect.left,window.innerWidth-width-4))}px`;popup.style.top=`${Math.min(window.innerHeight-8,rect.bottom+6)}px`};place();popup.innerHTML='<div class="agent-model-summary"><strong>Loading models...</strong><small>Reading provider model catalog</small></div>';try{const cat=await loadModelCatalog(false);if(!cat||typeof cat!=='object')throw new Error('Model catalog unavailable');applyModelCatalog(cat);const options=Array.isArray(cat.options)?cat.options:[];popup.innerHTML='';const head=document.createElement('div');head.className='agent-model-summary';head.innerHTML='<strong>Model management</strong><small>Select a model or open its settings</small>';popup.appendChild(head);const actions=document.createElement('div');actions.className='agent-model-actions';const refresh=document.createElement('button');refresh.type='button';refresh.className='agent-model-config';refresh.title='Refresh provider models';refresh.setAttribute('aria-label','Refresh provider models');refresh.innerHTML='<span class="codicon codicon-refresh"></span>';refresh.onclick=async ev=>{ev.preventDefault();ev.stopPropagation();refresh.disabled=true;try{const next=await loadModelCatalog(true);applyModelCatalog(next);await showModelManager(anchor)}catch(error){showError(error.message||String(error))}finally{refresh.disabled=false}};const importBtn=document.createElement('button');importBtn.type='button';importBtn.className='agent-model-config';importBtn.title='Import LLM config';importBtn.setAttribute('aria-label','Import LLM config');importBtn.innerHTML='<span class="codicon codicon-cloud-upload"></span>';importBtn.onclick=ev=>{ev.preventDefault();ev.stopPropagation();popup.classList.add('is-hidden');openLlmConfigModal()};actions.append(refresh,importBtn);popup.appendChild(actions);const search=document.createElement('input');search.type='search';search.className='agent-model-search';search.placeholder='Search models';search.setAttribute('aria-label','Search models');popup.appendChild(search);const list=document.createElement('div');list.className='agent-model-list';popup.appendChild(list);const render=()=>{const q=String(search.value||'').trim().toLowerCase();list.innerHTML='';const shown=options.filter(o=>!q||[o.label,o.model,o.provider,o.display_name,o.title].join(' ').toLowerCase().includes(q));for(const option of shown){const row=document.createElement('div');row.className='agent-model-option';const select=document.createElement('button');select.type='button';select.classList.toggle('is-active',String(option.selection||'')===String(cat.selected||''));select.innerHTML=`<span class="codicon codicon-${String(option.selection||'')===String(cat.selected||'')?'check':'hubot'}"></span><span>${esc(option.label||option.selection)}</span>`;select.onclick=ev=>{ev.preventDefault();ev.stopPropagation();applyModelSelection(option.selection,anchor).catch(showError)};const settings=document.createElement('button');settings.type='button';settings.className='agent-model-config';settings.title='Model settings';settings.setAttribute('aria-label',`Settings for ${option.label||option.model||option.selection}`);settings.innerHTML='<span class="codicon codicon-settings-gear"></span>';settings.onclick=ev=>{ev.preventDefault();ev.stopPropagation();showModelSettings(anchor,option)};row.append(select,settings);list.appendChild(row)}if(!shown.length)list.innerHTML='<div class="agent-model-summary">No matching models.</div>'};search.oninput=render;render();place();setTimeout(()=>{try{search.focus()}catch(_){ }},0)}catch(error){popup.innerHTML=`<div class="agent-model-summary"><strong>Model management failed</strong><small>${esc(error.message||String(error))}</small></div>`;place()}};
+  const applyModelSelection=async(selection,anchor)=>{const path=S.activeId?('/api/sessions/'+S.activeId+'/config/model'):'/api/config/model';const out=await api(path,{method:'POST',body:JSON.stringify({selection,model:selection})});applyModelCatalog(out);E('menuPopup').classList.add('is-hidden');showError(out?.queued?(out.note||'Model switch queued.'):'Model switched.');scheduleSnapshot({forceFull:true,delayMs:40,allowWhenFrozen:true})};
+  const originalShowModelSettings=showModelSettings;showModelSettings=(anchor,option)=>{const selected=option||modelOption()||{};const popup=E('menuPopup');if(!popup)return;const caps=selected.capabilities||{};const supports=selected.reasoning_supported===true||caps.reasoning_supported===true;const effort=String(selected.effort||'');const maxEffort=String(selected.max_effort||'');popup.classList.remove('is-hidden','prompt-budget-menu');popup.classList.add('agent-model-menu');popup.style.display='block';popup.setAttribute('aria-hidden','false');popup.innerHTML=`<div class="agent-model-summary"><strong>${esc(selected.label||selected.model||'Model settings')}</strong><small>${esc(selected.display_name||selected.title||selected.provider||'')}</small></div><label class="model-setting-row">Effort<select id="webModelEffort" ${supports?'':'disabled'}><option value="">Auto</option><option value="off">Off</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="max">Max</option></select></label><label class="model-setting-row">Max effort<select id="webModelMaxEffort" ${supports?'':'disabled'}><option value="">No ceiling</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="max">Max</option></select></label><label class="model-setting-check"><input id="webModelThinking" type="checkbox" ${selected.thinking_stream?'checked':''}> Thinking stream</label><label class="model-setting-check"><input id="webModelResponse" type="checkbox" ${selected.response_stream?'checked':''}> Response stream</label><div class="agent-model-actions"><button id="webModelBack" class="agent-model-compact" type="button">Back</button><button id="webModelSave" class="agent-model-config" type="button" title="Save model settings" aria-label="Save model settings"><span class="codicon codicon-save"></span></button></div>`;const rect=(anchor||E('modelManageBtn')||E('modelSettingsBtn')).getBoundingClientRect();popup.style.left=`${Math.max(4,Math.min(rect.left,window.innerWidth-380))}px`;popup.style.top=`${rect.bottom+6}px`;popup.style.bottom='auto';E('webModelEffort').value=effort;E('webModelMaxEffort').value=maxEffort;E('webModelBack').onclick=ev=>{ev.stopPropagation();showModelManager(anchor||E('modelManageBtn'))};E('webModelSave').onclick=async ev=>{ev.stopPropagation();const settings={effort:String(E('webModelEffort').value||''),max_effort:String(E('webModelMaxEffort').value||''),thinking_stream:!!E('webModelThinking').checked,response_stream:!!E('webModelResponse').checked};try{const path=S.activeId?('/api/sessions/'+S.activeId+'/config/model'):'/api/config/model';const out=await api(path,{method:'POST',body:JSON.stringify({selection:selected.selection,model:selected.selection,...settings})});applyModelCatalog(out);popup.classList.add('is-hidden');showError('Model settings saved.');scheduleSnapshot({forceFull:true,delayMs:40,allowWhenFrozen:true})}catch(error){showError(error.message||String(error))}}};
+  const bindWebModelManager=()=>{const settingsBtn=E('modelSettingsBtn');if(settingsBtn)settingsBtn.onclick=ev=>{ev.preventDefault();ev.stopPropagation();showModelSettings(settingsBtn)};const manageBtn=E('modelManageBtn');if(manageBtn)manageBtn.onclick=ev=>{ev.preventDefault();ev.stopPropagation();showModelManager(manageBtn)};};
+  bindWebModelManager();
+  // Safari may restore this document from bfcache after visiting the IDE;
+  // rebind controls against the restored DOM so the gear remains functional.
+  window.addEventListener('pageshow',bindWebModelManager);
+},0);
 const COMPACT_AUTO_REFRESH_INTERVAL_MS=260;
 const E=id=>document.getElementById(id);
 const PREVIEW_TOKENS=new Map();
@@ -93206,9 +94362,11 @@ function setTextIfChanged(el,text){
 }
 function closePopups(except=''){
   const keep=String(except||'');
-  for(const menu of document.querySelectorAll('.popup-menu')){
+  for(const menu of document.querySelectorAll('.popup-menu,.menu-popup')){
     if(menu.id&&menu.id===keep)continue;
     menu.style.display='none';
+    menu.classList.add('is-hidden');
+    menu.setAttribute('aria-hidden','true');
   }
   S.openPopup=keep;
 }
@@ -93219,9 +94377,13 @@ function setPopupOpen(menuId,open){
   if(open){
     closePopups(id);
     menu.style.display='block';
+    menu.classList.remove('is-hidden');
+    menu.setAttribute('aria-hidden','false');
     S.openPopup=id;
   }else{
     menu.style.display='none';
+    menu.classList.add('is-hidden');
+    menu.setAttribute('aria-hidden','true');
     if(S.openPopup===id)S.openPopup='';
   }
 }
@@ -97425,6 +98587,7 @@ async function refreshAll(forceProbe=false){
 }
 function bindClick(id,fn){const el=E(id);if(el)el.onclick=fn}
 window.addEventListener('DOMContentLoaded',()=>bindClick('programBtn',openProgram));
+window.addEventListener('DOMContentLoaded',()=>{const select=E('modelSelect');if(select)select.onchange=()=>applyModel();const popup=E('menuPopup');if(popup)popup.addEventListener('click',event=>event.stopPropagation())});
 window.addEventListener('DOMContentLoaded',()=>{bindClick('refreshUserProcessesBtn',()=>refreshUserProcesses(true).catch(err=>showError(err.message)));USER_PROCESS_STATE.timer=setInterval(()=>{if(document.visibilityState!=='hidden')refreshUserProcesses(false).catch(()=>{})},5000)});
 window.addEventListener('DOMContentLoaded',async()=>{for(const id of ['chat','sessionList','todos','tasks','activity','commands','diffs','fileExplorer','catalog']){bindPanelScrollState(id,E(id))}const drop=E('promptComposerShell');const fileInput=E('uploadInput');const promptPick=E('promptFilePick');const promptEl=E('prompt');if(promptPick&&fileInput){promptPick.onclick=(ev)=>{ev.preventDefault();fileInput.click()}}if(drop&&fileInput){let _dragC=0;drop.setAttribute('tabindex','0');drop.addEventListener('click',e=>{if(e.target===drop&&promptEl)promptEl.focus()});fileInput.onchange=()=>uploadFiles(fileInput.files).then(()=>{fileInput.value=''}).catch(err=>showError(err.message));for(const evt of ['dragenter','dragover']){drop.addEventListener(evt,e=>{e.preventDefault();if(evt==='dragenter')_dragC++;drop.classList.add('dragover')})}for(const evt of ['dragleave','dragend']){drop.addEventListener(evt,e=>{e.preventDefault();if(evt==='dragleave')_dragC--;if(_dragC<=0){_dragC=0;drop.classList.remove('dragover')}})}drop.addEventListener('drop',e=>{e.preventDefault();_dragC=0;drop.classList.remove('dragover');const files=e.dataTransfer?.files;if(files&&files.length)uploadFiles(files).catch(err=>showError(err.message))});drop.addEventListener('paste',e=>{const files=clipboardFilesFromEvent(e);if(!files.length)return;e.preventDefault();drop.classList.add('dragover');setTimeout(()=>drop.classList.remove('dragover'),220);uploadFiles(files).catch(err=>showError(err.message||String(err)))})}const configInput=E('configInput');if(configInput){configInput.onchange=()=>uploadLlmConfigFile(configInput.files&&configInput.files[0]).then(()=>{configInput.value=''}).catch(err=>showError(err.message||String(err)))}bindClick('newSessionBtn',createSession);bindClick('renameSessionBtn',renameSession);bindClick('deleteSessionBtn',deleteSession);bindClick('applyModelBtn',applyModel);bindClick('llmConfigBtn',openLlmConfigModal);bindClick('llmModalClose',()=>{E('llmConfigModal').style.display='none'});bindClick('llmConfigConfirm',submitLlmConfig);const llmProv=E('llmProvider');if(llmProv){llmProv.addEventListener('change',()=>renderLlmFields(llmProv.value))}const llmOverlay=E('llmConfigModal');if(llmOverlay){llmOverlay.addEventListener('click',e=>{if(e.target===llmOverlay)llmOverlay.style.display='none'})}bindClick('sendBtn',sendMessage);bindClick('interruptBtn',interruptRun);bindClick('clearStaleTodosBtn',clearStaleTodos);bindClick('planModeBtn',togglePlanMode);bindClick('refreshFilesBtn',()=>refreshFileExplorer(true));bindClick('previewReloadBtn',()=>renderActivePreview(true));bindClick('previewCopyBtn',()=>copyPreviewCode());bindPopupButton('toolsMenuBtn','toolsMenu');bindClick('compactAction',(e)=>{if(e)e.preventDefault();closePopups();compactNow()});bindClick('refreshAction',(e)=>{if(e)e.preventDefault();closePopups();refreshAll(true)});bindPopupButton('levelBtn','levelMenu',(menu)=>{for(const opt of menu.querySelectorAll('.level-option')){opt.addEventListener('click',e=>{e.preventDefault();const lvl=parseInt(opt.getAttribute('data-level')||'0',10);setTaskLevel(lvl);setPopupOpen('levelMenu',false)})}});bindPopupButton('exportMenuBtn','exportMenu',(menu)=>{for(const a of menu.querySelectorAll('.export-item')){a.addEventListener('click',()=>setPopupOpen('exportMenu',false))}});document.addEventListener('click',()=>closePopups());const langSel=E('langSelect');if(langSel){langSel.onchange=()=>setLanguage(langSel.value).then(()=>applyApplicationI18n()).catch(err=>showError(err.message||String(err)))}if(promptEl){promptEl.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter'){e.preventDefault();sendMessage()}})}bindApplicationStore();applyUiStyle();applyStaticUiClass();applyMainI18n();applyApplicationI18n();_bindPreviewCopyGuard();try{await refreshAll(false);if(!S.sessions.length){const bootCreate=()=>createSession({prompt:false}).catch(err=>showError(err.message||String(err)));if(typeof requestAnimationFrame==='function'){requestAnimationFrame(()=>setTimeout(bootCreate,0))}else{setTimeout(bootCreate,0)}}}catch(err){showError(err.message||String(err))}_deltaStartWatchdog();scheduleSessionPoll(false);document.addEventListener('visibilitychange',()=>{const next=document.visibilityState||'visible';if(next===S.lastVisibilityState)return;S.lastVisibilityState=next;if(next==='hidden'){if(S.deltaWatchdogTimer){clearTimeout(S.deltaWatchdogTimer);S.deltaWatchdogTimer=null}if(S.sessionPollTimer){clearTimeout(S.sessionPollTimer);S.sessionPollTimer=null}if(S.staticMode)freezeAutoUpdates();return}if(S.staticMode&&S.frozen)resumeAutoUpdates();_deltaStartWatchdog();scheduleSessionPoll(true);scheduleSnapshot({forceFull:false,delayMs:40,allowWhenFrozen:true})})})
 function kernelNoticeDeviceId(){let value=localStorage.getItem('clouds_kernel_notice_device')||'';if(value.length<24){const bytes=new Uint8Array(18);crypto.getRandomValues(bytes);value='web_'+Array.from(bytes,x=>x.toString(16).padStart(2,'0')).join('');localStorage.setItem('clouds_kernel_notice_device',value)}return value}
@@ -97436,6 +98599,9 @@ window.addEventListener('DOMContentLoaded',()=>{const search=E('sessionSearch');
 
 APP_CSS += r"""
 :root{--web-scrollbar-size:8px;--web-scrollbar-thumb:rgba(98,116,142,.44);--web-scrollbar-thumb-hover:rgba(76,98,128,.7)}
+.model-picker{display:inline-flex;align-items:center;gap:6px;max-width:min(46vw,520px);height:44px}.model-picker select{box-sizing:border-box;min-width:180px;max-width:32vw;height:44px;min-height:44px;padding:0 34px 0 12px;line-height:1.2;appearance:none;-webkit-appearance:none;background:#fff url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath d='M3 4l3 3 3-3M3 8l3-3 3 3' fill='none' stroke='%235e6c84' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") no-repeat right 11px center}.model-picker .hidden{display:none}.model-picker button{box-sizing:border-box;flex:0 0 auto;width:44px;height:44px;min-width:44px;min-height:44px;padding:0;display:inline-flex;align-items:center;justify-content:center;line-height:1}
+.model-setting-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:6px 10px;font-size:.78rem;color:var(--fg,#0f1b2d)}.model-setting-row select{min-width:130px;padding:4px 6px;border:1px solid var(--line,#d9e1ec);border-radius:6px;background:#fff}.model-setting-check{display:flex;align-items:center;gap:8px;padding:5px 10px;font-size:.78rem}.model-setting-check input{accent-color:var(--brand,#1f6feb)}
+.menu-popup{position:fixed;z-index:10020}.menu-popup.is-hidden{display:none!important}.menu-popup:not(.is-hidden){display:block}.menu-popup.agent-model-menu{width:min(380px,calc(100vw - 8px));max-height:min(460px,72vh);overflow:auto;padding:4px;background:var(--panel,#fff);border:1px solid var(--line,#d9e1ec);border-radius:8px;box-shadow:0 10px 28px rgba(17,31,53,.22);color:var(--fg,#0f1b2d)}.agent-model-menu button{box-sizing:border-box;height:40px!important;min-height:40px!important;line-height:1.2!important;display:flex;align-items:center;color:var(--fg,#0f1b2d);border-radius:7px;padding:8px 10px!important}.agent-model-option{height:42px;padding:1px 0}.agent-model-option>button:first-child{justify-content:flex-start;text-align:left}.agent-model-option .agent-model-config{height:36px!important;min-height:36px!important;justify-content:center;padding:0!important}.agent-model-menu button:hover{background:var(--hover,#edf3fb)}.agent-model-menu button.is-active{color:var(--brand,#1f6feb);font-weight:600}.agent-model-summary{padding:8px 10px;border-bottom:1px solid var(--line,#d9e1ec);color:var(--muted,#667085);font-size:.75rem}.agent-model-summary strong,.agent-model-summary small{display:block}.agent-model-summary strong{color:var(--fg,#0f1b2d);font-size:.82rem}.agent-model-summary small{margin-top:2px}.agent-model-option{display:flex;align-items:center;gap:4px;min-width:0}.agent-model-option>button:first-child{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.agent-model-config{display:inline-grid!important;place-items:center!important;width:26px!important;min-width:26px!important;height:24px!important;min-height:24px!important;padding:0!important;border:1px solid var(--line,#d9e1ec)!important;background:transparent!important;color:var(--muted,#667085)!important}.agent-model-config:hover{background:var(--hover,#edf3fb)!important;color:var(--brand,#1f6feb)!important}.agent-model-actions{display:flex;align-items:center;justify-content:flex-end;gap:5px;padding:6px 4px}.agent-model-search{display:block;width:calc(100% - 16px);margin:7px 8px;padding:6px 8px;border:1px solid var(--line,#d9e1ec);border-radius:6px;background:var(--input,#fff);color:var(--fg,#0f1b2d);box-sizing:border-box}.agent-model-list{min-height:0}.agent-model-menu .codicon:before{display:block;font:600 14px/1 sans-serif}.agent-model-menu .codicon-refresh:before{content:"\21bb"}.agent-model-menu .codicon-cloud-upload:before{content:"\2191"}.agent-model-menu .codicon-settings-gear:before{content:"\2699"}.agent-model-menu .codicon-save:before{content:"\2713"}.agent-model-menu .codicon-check:before{content:"\2713"}.agent-model-menu .codicon-hubot:before{content:"\25c7"}
 .session-history-badge{box-sizing:border-box;position:absolute;right:-3px;bottom:-3px;display:flex;align-items:center;justify-content:center;width:15px;height:15px;padding:0;overflow:hidden;border:1px solid #252526;border-radius:50%;background:#c586c0;color:#fff;pointer-events:none}.session-history-badge>.codicon{box-sizing:border-box;position:relative;display:block;flex:0 0 9px;width:9px;height:9px;margin:0;border:1px solid currentColor;border-radius:50%;font-size:0;line-height:0;text-align:center}.session-history-badge>.codicon::before{content:"";position:absolute;left:3px;top:1px;width:1px;height:3px;background:currentColor;transform-origin:50% 100%;transform:rotate(0deg)}.session-history-badge>.codicon::after{content:"";position:absolute;left:4px;top:4px;width:3px;height:1px;background:currentColor;transform-origin:left center;transform:rotate(35deg)}
 html,body{scrollbar-gutter:stable}
 *{scrollbar-width:thin;scrollbar-color:transparent transparent!important}
@@ -103667,11 +104833,11 @@ class EvidenceRecord:
     graph_score: float = 0.0
     fusion_score: float = 0.0
     evidence_strength: str = "unverified"
-    provenance: dict = field(default_factory=dict)
-    supporting_citations: list[str] = field(default_factory=list)
-    conflicts: list[str] = field(default_factory=list)
+    provenance: dict = dataclass_field(default_factory=dict)
+    supporting_citations: list[str] = dataclass_field(default_factory=list)
+    conflicts: list[str] = dataclass_field(default_factory=list)
     duplicate_group: str = ""
-    validation: dict = field(default_factory=dict)
+    validation: dict = dataclass_field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -115209,7 +116375,7 @@ function resetAgentSessionUI(sessionId=''){if(S.agentEventRaf){cancelAnimationFr
 function namedAgentClipboardFile(file,index=0){if(!(file instanceof File))return null;if(String(file.name||'').trim())return file;const mime=String(file.type||'').toLowerCase(),ext=({'image/png':'png','image/jpeg':'jpg','image/webp':'webp','application/pdf':'pdf','text/plain':'txt','text/markdown':'md'}[mime]||mime.split('/').pop()||'bin').replace(/[^a-z0-9]+/g,'')||'bin';try{return new File([file],`clipboard_${Date.now()}_${index+1}.${ext}`,{type:file.type||'',lastModified:Date.now()})}catch{return file}}
 function agentClipboardFiles(event){const data=event?.clipboardData;if(!data)return[];const files=[],seen=new Set(),push=(raw,index)=>{const file=namedAgentClipboardFile(raw,index);if(!file)return;const key=`${file.name}:${file.type}:${file.size}`;if(seen.has(key))return;seen.add(key);files.push(file)};[...(data.files||[])].forEach(push);[...(data.items||[])].forEach((item,index)=>{if(item?.kind==='file')push(item.getAsFile?.(),index)});return files}
 async function uploadAgentAttachments(files){const list=[...(files||[])].map(namedAgentClipboardFile).filter(Boolean);if(!list.length)return;E('attachContextBtn').disabled=true;try{const items=[];for(let index=0;index<list.length;index++){const file=list[index];items.push({path:file.webkitRelativePath||file.name,content_b64:await readFileAsB64(file)});E('agentStatus').textContent=`Attaching ${index+1}/${list.length}`}const out=await api(`/api/ide/sessions/${qs(S.activeSession)}/workspace/upload`,{method:'POST',body:JSON.stringify({root_id:S.activeRoot,dest:'.clouds_coder/attachments',items})});for(const item of out.written||[])if(!S.agentAttachments.some(row=>row.path===item.path))S.agentAttachments.push({path:item.path,name:item.name,size:item.size});renderAgentAttachments();S.treeCache.clear();await loadTree('');toast(`Attached ${out.count||list.length} file(s).`,'success')}finally{E('attachContextBtn').disabled=false;E('agentStatus').textContent=S.agentState?.running?'Running':'Idle';E('agentAttachmentInput').value=''}}
-async function showAgentModelMenu(anchor){const popup=E('menuPopup');popup.classList.remove('is-hidden','prompt-budget-menu');popup.classList.add('agent-model-menu');popup.innerHTML='<div class="agent-model-summary">Loading models...</div>';const rect=anchor.getBoundingClientRect();popup.style.left=`${Math.max(4,Math.min(rect.left,window.innerWidth-364))}px`;popup.style.top='auto';popup.style.bottom=`${Math.max(4,window.innerHeight-rect.top+8)}px`;popup.style.transform='';try{const catalog=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/models`);S.agentModelCatalog=catalog;popup.innerHTML='';const pct=Number(S.agentState?.context_left_percent),left=Number(S.agentState?.context_left_tokens),limit=Number(S.agentState?.context_effective_token_limit);const summary=document.createElement('div');summary.className='agent-model-summary';const context=document.createElement('span');context.className='agent-model-context';const modelName=document.createElement('strong');modelName.className='agent-model-name';modelName.textContent=S.agentState?.model||'Current model';const usage=document.createElement('span');usage.className='agent-model-usage';usage.textContent=Number.isFinite(left)?`${left.toLocaleString()} tokens left${Number.isFinite(limit)&&limit>0?` / ${limit.toLocaleString()}`:''}${Number.isFinite(pct)?` · ${pct.toFixed(1)}%`:''}`:'Context usage unavailable';context.append(modelName,usage);const actions=document.createElement('span');actions.className='agent-model-actions';const compact=document.createElement('button');compact.type='button';compact.className='agent-model-compact';compact.textContent='Compact';compact.title='Compact the current session context';compact.setAttribute('aria-label','Compact context');compact.disabled=!!S.agentState?.running;compact.onclick=event=>{event.stopPropagation();compactAgentContext(compact).catch(showError)};const config=document.createElement('button');config.type='button';config.className='agent-model-config';config.title='Configure LLM';config.setAttribute('aria-label','Configure LLM');config.innerHTML='<span class="codicon codicon-settings-gear"></span>';config.onclick=event=>{event.stopPropagation();showLlmConfigModal().catch(showError)};actions.append(compact,config);summary.append(context,actions);popup.appendChild(summary);for(const option of catalog.options||[]){const button=document.createElement('button');button.classList.toggle('is-active',option.selection===catalog.selected);button.innerHTML=`<span class="codicon codicon-${option.selection===catalog.selected?'check':'hubot'}"></span><span>${escapeHtml(option.label||option.model||option.selection)}</span>`;button.onclick=event=>{event.stopPropagation();applyAgentModel(option.selection,option.label||option.model).catch(showError)};popup.appendChild(button)}if(!(catalog.options||[]).length)popup.insertAdjacentHTML('beforeend','<div class="agent-model-summary">No configured models.</div>')}catch(error){popup.innerHTML=`<div class="agent-model-summary">${escapeHtml(error.message)}</div>`}}
+async function showAgentModelMenu(anchor){const popup=E('menuPopup');popup.classList.remove('is-hidden','prompt-budget-menu');popup.classList.add('agent-model-menu');popup.style.display='block';popup.setAttribute('aria-hidden','false');popup.innerHTML='<div class="agent-model-summary">Loading models...</div>';const rect=anchor.getBoundingClientRect();popup.style.left=`${Math.max(4,Math.min(rect.left,window.innerWidth-364))}px`;popup.style.top='auto';popup.style.bottom=`${Math.max(4,window.innerHeight-rect.top+8)}px`;popup.style.transform='';try{const catalog=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/models`);S.agentModelCatalog=catalog;popup.innerHTML='';const pct=Number(S.agentState?.context_left_percent),left=Number(S.agentState?.context_left_tokens),limit=Number(S.agentState?.context_effective_token_limit);const summary=document.createElement('div');summary.className='agent-model-summary';const context=document.createElement('span');context.className='agent-model-context';const modelName=document.createElement('strong');modelName.className='agent-model-name';modelName.textContent=S.agentState?.model||'Current model';const usage=document.createElement('span');usage.className='agent-model-usage';usage.textContent=Number.isFinite(left)?`${left.toLocaleString()} tokens left${Number.isFinite(limit)&&limit>0?` / ${limit.toLocaleString()}`:''}${Number.isFinite(pct)?` · ${pct.toFixed(1)}%`:''}`:'Context usage unavailable';context.append(modelName,usage);const actions=document.createElement('span');actions.className='agent-model-actions';const compact=document.createElement('button');compact.type='button';compact.className='agent-model-compact';compact.textContent='Compact';compact.title='Compact the current session context';compact.setAttribute('aria-label','Compact context');compact.disabled=!!S.agentState?.running;compact.onclick=event=>{event.stopPropagation();compactAgentContext(compact).catch(showError)};const config=document.createElement('button');config.type='button';config.className='agent-model-config';config.title='Configure LLM';config.setAttribute('aria-label','Configure LLM');config.innerHTML='<span class="codicon codicon-settings-gear"></span>';config.onclick=event=>{event.stopPropagation();showLlmConfigModal().catch(showError)};actions.append(compact,config);summary.append(context,actions);popup.appendChild(summary);for(const option of catalog.options||[]){const button=document.createElement('button');button.classList.toggle('is-active',option.selection===catalog.selected);button.innerHTML=`<span class="codicon codicon-${option.selection===catalog.selected?'check':'hubot'}"></span><span>${escapeHtml(option.label||option.model||option.selection)}</span>`;button.onclick=event=>{event.stopPropagation();applyAgentModel(option.selection,option.label||option.model).catch(showError)};popup.appendChild(button)}if(!(catalog.options||[]).length)popup.insertAdjacentHTML('beforeend','<div class="agent-model-summary">No configured models.</div>')}catch(error){popup.innerHTML=`<div class="agent-model-summary">${escapeHtml(error.message)}</div>`}}
 async function compactAgentContext(button){if(S.agentState?.running)return toast('Stop the active run before compacting context.','warning');if(!confirm('Compact this session context now?'))return;button.disabled=true;button.textContent='...';try{const out=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/compact`,{method:'POST',body:'{}'});S.agentState=Object.assign({},S.agentState||{},out);E('menuPopup').classList.add('is-hidden');renderAgentContextHud(S.agentState);toast('Context compacted.','success');S.agentPollRequested=true;scheduleAgentPoll(80)}finally{button.disabled=false;button.textContent='Compact'}}
 async function applyAgentModel(selection,label){const popup=E('menuPopup');popup.classList.add('is-hidden');popup.classList.remove('agent-model-menu','prompt-budget-menu');popup.style.transform='';popup.style.bottom='auto';const out=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/model`,{method:'POST',body:JSON.stringify({selection})});toast(out.queued?out.note||'Model switch queued.':`Model switched to ${label||selection}.`,out.queued?'warning':'success');scheduleAgentPoll(80)}
 async function showLlmConfigModal(){
@@ -115447,6 +116613,34 @@ function bindUI(){
 function initIconFallback(){if(!document.fonts||typeof document.fonts.load!=='function')return;let settled=false;const timeout=setTimeout(()=>{settled=true},2500);document.fonts.load('12px codicon').then(fonts=>{if(settled||!fonts||!fonts.length)return;clearTimeout(timeout);document.body.classList.remove('icons-fallback')}).catch(()=>{})}
 function debounce(fn,delay){let timer;return(...args)=>{clearTimeout(timer);timer=setTimeout(()=>fn(...args),delay)}}
 async function startWorkbench(){E('authGate').classList.add('is-hidden');E('ideShell').classList.remove('is-hidden');if(window.innerWidth<=820){S.primaryVisible=false;S.secondaryVisible=false;E('ideShell').classList.add('primary-hidden','secondary-hidden')}configureCommands();bindUI();setStatus('Loading sessions...');const libraryTask=Promise.all([initMonaco(),initTerminalLibrary()]),workbenchTask=api('/api/ide/v2/workbench/state').catch(error=>{logOutput(`State restore failed: ${error.message}`);return{ok:false,state:{}}});await refreshConfig({lite:true});const savedWorkbench=await workbenchTask,restoredSession=workbenchSessionFromState(savedWorkbench.state||{});if(restoredSession)S.activeSession=restoredSession;renderSessions();resetAgentSessionUI(S.activeSession);const bootSession=S.activeSession,bootSessionSeq=S.sessionSwitchSeq;updateStatusBar();updateAgentContext();connectAgentEvents();scheduleAgentPoll(40);if(S.collaborationMode){renderCollaborationSnapshot();connectCollaborationEvents();startCollaborationPresenceHeartbeat()}if(!S.capabilities.processes)toast(S.capabilities.process_denial_reason||'Process features are disabled for this connection.','warning',8000);setStatus(S.collaborationMode?'Collaboration ready':'Ready');libraryTask.then(()=>restoreWorkbenchState(savedWorkbench,{restoreSession:false,expectedSession:bootSession,expectedSeq:bootSessionSeq})).then(()=>{updateStatusBar();updateAgentContext()}).catch(error=>logOutput(`Workbench restore: ${error.message}`));scheduleIdeDeferredBootstrap();setTimeout(checkIdeKernelUpdateNotice,500)}
+function showAgentModelOptionSettings(option, anchor){const popup=E('menuPopup');if(!popup)return;const caps=option?.capabilities||{};const supports=option?.reasoning_supported===true||caps.reasoning_supported===true;popup.classList.remove('is-hidden','prompt-budget-menu');popup.classList.add('agent-model-menu');popup.style.display='block';popup.setAttribute('aria-hidden','false');popup.innerHTML=`<div class="agent-model-summary"><strong>${escapeHtml(option?.label||option?.model||'Model settings')}</strong><small>Runtime settings</small></div><label class="model-setting-row">Effort<select id="ideModelEffort" ${supports?'':'disabled'}><option value="">Auto</option><option value="off">Off</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="max">Max</option></select></label><label class="model-setting-row">Max effort<select id="ideModelMaxEffort" ${supports?'':'disabled'}><option value="">No ceiling</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option><option value="max">Max</option></select></label><label class="model-setting-check"><input id="ideModelThinking" type="checkbox" ${option?.thinking_stream?'checked':''}> Thinking stream</label><label class="model-setting-check"><input id="ideModelResponse" type="checkbox" ${option?.response_stream?'checked':''}> Response stream</label><div class="agent-model-actions"><button id="ideModelSettingsBack" class="agent-model-compact" type="button">Back</button><button id="ideModelSettingsSave" class="agent-model-config" type="button" title="Save model settings" aria-label="Save model settings"><span class="codicon codicon-save"></span></button></div>`;const rect=(anchor||E('agentModelBtn')).getBoundingClientRect();popup.style.left=`${Math.max(4,Math.min(rect.left,window.innerWidth-364))}px`;popup.style.top='auto';popup.style.bottom=`${Math.max(4,window.innerHeight-rect.top+8)}px`;popup.style.transform='';const effort=E('ideModelEffort'),maxEffort=E('ideModelMaxEffort');if(effort)effort.value=String(option?.effort||'');if(maxEffort)maxEffort.value=String(option?.max_effort||'');E('ideModelSettingsBack').onclick=event=>{event.stopPropagation();showAgentModelMenu(anchor||E('agentModelBtn')).catch(showError)};E('ideModelSettingsSave').onclick=async event=>{event.stopPropagation();const payload={selection:option.selection,effort:String(effort?.value||''),max_effort:String(maxEffort?.value||''),thinking_stream:!!E('ideModelThinking')?.checked,response_stream:!!E('ideModelResponse')?.checked};try{const out=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/model`,{method:'POST',body:JSON.stringify(payload)});S.agentModelCatalog=out;popup.classList.add('is-hidden');popup.classList.remove('agent-model-menu');toast(out.queued?out.note||'Model settings queued.':'Model settings saved.','success');scheduleAgentPoll(80)}catch(error){showError(error.message||String(error))}}}
+showAgentModelMenu=(async function showAgentModelMenuWithSettings(anchor){const popup=E('menuPopup');popup.classList.remove('is-hidden','prompt-budget-menu');popup.classList.add('agent-model-menu');popup.style.display='block';popup.setAttribute('aria-hidden','false');popup.innerHTML='<div class="agent-model-summary">Loading models...</div>';const rect=anchor.getBoundingClientRect();popup.style.left=`${Math.max(4,Math.min(rect.left,window.innerWidth-364))}px`;popup.style.top='auto';popup.style.bottom=`${Math.max(4,window.innerHeight-rect.top+8)}px`;popup.style.transform='';try{const catalog=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/models`);S.agentModelCatalog=catalog;popup.innerHTML='';const summary=document.createElement('div');summary.className='agent-model-summary';summary.textContent=`${catalog.options?.length||0} models`;popup.appendChild(summary);for(const option of catalog.options||[]){const row=document.createElement('div');row.className='agent-model-option';const button=document.createElement('button');button.classList.toggle('is-active',option.selection===catalog.selected);button.innerHTML=`<span class="codicon codicon-${option.selection===catalog.selected?'check':'hubot'}"></span><span>${escapeHtml(option.label||option.model||option.selection)}</span>`;button.onclick=event=>{event.stopPropagation();applyAgentModel(option.selection,option.label||option.model).catch(showError)};const settings=document.createElement('button');settings.type='button';settings.className='agent-model-config';settings.title='Model settings';settings.setAttribute('aria-label','Model settings');settings.innerHTML='<span class="codicon codicon-settings-gear"></span>';settings.onclick=event=>{event.stopPropagation();showAgentModelOptionSettings(option,anchor)};row.append(button,settings);popup.appendChild(row)}if(!(catalog.options||[]).length)popup.insertAdjacentHTML('beforeend','<div class="agent-model-summary">No configured models.</div>')}catch(error){popup.innerHTML=`<div class="agent-model-summary">${escapeHtml(error.message)}</div>`}});
+showAgentModelMenu=async function showAgentModelMenuWithSettingsAndActions(anchor){
+  const popup=E('menuPopup');
+  if(!popup||!anchor)return;
+  popup.classList.remove('is-hidden','prompt-budget-menu');popup.classList.add('agent-model-menu');popup.style.display='block';popup.setAttribute('aria-hidden','false');
+  const rect=anchor.getBoundingClientRect();popup.style.left=`${Math.max(4,Math.min(rect.left,window.innerWidth-364))}px`;popup.style.top='auto';popup.style.bottom=`${Math.max(4,window.innerHeight-rect.top+8)}px`;popup.style.transform='';
+  popup.innerHTML='<div class="agent-model-summary">Loading models...</div>';
+  try{
+    const catalog=await api(`/api/ide/v2/sessions/${qs(S.activeSession)}/models`);S.agentModelCatalog=catalog;
+    popup.innerHTML='';
+    const summary=document.createElement('div');summary.className='agent-model-summary';
+    const context=document.createElement('span');context.className='agent-model-context';
+    const modelName=document.createElement('strong');modelName.className='agent-model-name';modelName.textContent=S.agentState?.model||'Current model';
+    const pct=Number(S.agentState?.context_left_percent),left=Number(S.agentState?.context_left_tokens),limit=Number(S.agentState?.context_effective_token_limit);
+    const usage=document.createElement('span');usage.className='agent-model-usage';usage.textContent=Number.isFinite(left)?`${left.toLocaleString()} tokens left${Number.isFinite(limit)&&limit>0?` / ${limit.toLocaleString()}`:''}${Number.isFinite(pct)?` · ${pct.toFixed(1)}%`:''}`:'Context usage unavailable';context.append(modelName,usage);
+    const actions=document.createElement('span');actions.className='agent-model-actions';
+    const compact=document.createElement('button');compact.type='button';compact.className='agent-model-compact';compact.textContent='Compact';compact.title='Compact the current session context';compact.setAttribute('aria-label','Compact context');compact.disabled=!!S.agentState?.running;compact.onclick=event=>{event.stopPropagation();compactAgentContext(compact).catch(showError)};
+    const config=document.createElement('button');config.type='button';config.className='agent-model-config';config.title='Configure LLM';config.setAttribute('aria-label','Configure LLM');config.innerHTML='<span class="codicon codicon-settings-gear"></span>';config.onclick=event=>{event.stopPropagation();showLlmConfigModal().catch(showError)};actions.append(compact,config);summary.append(context,actions);popup.appendChild(summary);
+    const options=Array.isArray(catalog.options)?catalog.options:[];let visibleLimit=80;
+    const search=document.createElement('input');search.type='search';search.className='agent-model-search';search.placeholder='Search models';search.setAttribute('aria-label','Search models');search.autocomplete='off';popup.appendChild(search);
+    const list=document.createElement('div');list.className='agent-model-list';popup.appendChild(list);
+    const renderList=()=>{const query=String(search.value||'').trim().toLowerCase();const filtered=query?options.filter(option=>[option.label,option.model,option.provider,option.selection].join(' ').toLowerCase().includes(query)):options;list.innerHTML='';const shown=filtered.slice(0,visibleLimit);for(const option of shown){const row=document.createElement('div');row.className='agent-model-option';const button=document.createElement('button');button.type='button';button.classList.toggle('is-active',option.selection===catalog.selected);button.innerHTML=`<span class="codicon codicon-${option.selection===catalog.selected?'check':'hubot'}"></span><span>${escapeHtml(option.label||option.model||option.selection)}</span>`;button.onclick=event=>{event.stopPropagation();applyAgentModel(option.selection,option.label||option.model).catch(showError)};const settings=document.createElement('button');settings.type='button';settings.className='agent-model-config';settings.title='Model settings';settings.setAttribute('aria-label',`Model settings for ${option.label||option.model||option.selection}`);settings.innerHTML='<span class="codicon codicon-settings-gear"></span>';settings.onclick=event=>{event.stopPropagation();showAgentModelOptionSettings(option,anchor)};row.append(button,settings);list.appendChild(row)}if(!shown.length)list.innerHTML='<div class="agent-model-summary">No matching models.</div>';if(filtered.length>shown.length){const more=document.createElement('button');more.type='button';more.className='agent-model-more';more.textContent=`Show ${filtered.length-shown.length} more`;more.onclick=event=>{event.stopPropagation();visibleLimit+=80;renderList()};list.appendChild(more)}};
+    search.oninput=()=>{visibleLimit=80;renderList()};renderList();
+  }catch(error){popup.innerHTML=`<div class="agent-model-summary">${escapeHtml(error.message)}</div>`}
+};
+{const style=document.createElement('style');style.textContent='.agent-model-option{display:flex;align-items:center;gap:4px;min-width:0}.agent-model-option>button:first-child{flex:1;min-width:0}.model-setting-row{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 10px;color:#ccc;font-size:11px}.model-setting-row select{min-width:140px;padding:3px 5px;border:1px solid #4f4f4f;background:#252525;color:#ddd}.model-setting-check{display:flex;align-items:center;gap:7px;padding:5px 10px;color:#ccc;font-size:11px}.model-setting-check input{accent-color:#3794ff}';document.head.appendChild(style)}
+{const style=document.createElement('style');style.textContent='.agent-model-search{display:block;width:calc(100% - 16px);margin:6px 8px;padding:5px 7px;border:1px solid #4f4f4f;border-radius:4px;background:#252525;color:#ddd;font-size:11px;box-sizing:border-box}.agent-model-search::placeholder{color:#888}.agent-model-list{min-height:0}.agent-model-more{width:100%;text-align:center;color:#9cdcfe!important}.agent-model-option .agent-model-config{flex:0 0 28px;width:28px;padding:4px!important}';document.head.appendChild(style)}
 window.addEventListener('pagehide',stopCollaborationPresenceHeartbeat);
 window.addEventListener('DOMContentLoaded',async()=>{initIconFallback();try{if(await authenticate())await startWorkbench()}catch(error){showError(error)}});
 """
@@ -123710,6 +124904,7 @@ document.addEventListener('DOMContentLoaded', function(){{
         selection: str,
         *,
         client_ip: str = "",
+        settings: dict | None = None,
     ) -> dict:
         collaboration = str(user_id or "").startswith("collab:")
         source_manager = None
@@ -123728,20 +124923,20 @@ document.addEventListener('DOMContentLoaded', function(){{
                 "Stop active Agents in the main Web UI before changing its model."
             )
         if bool(getattr(sess, "running", False)):
-            sess._queue_deferred_runtime_update("model_selection", {"selection": picked, "model_override": ""})
+            sess._queue_deferred_runtime_update("model_selection", {"selection": picked, "model_override": "", "settings": normalize_model_runtime_settings(settings)})
             if source_manager is not None:
-                source_manager.set_runtime_model(picked, None)
+                source_manager.set_runtime_model(picked, None, settings)
             queued = sess.model_catalog()
             queued["queued"] = True
             queued["note"] = "Model switch queued until the current run finishes."
             return queued
         if source_manager is not None:
-            out = source_manager.set_runtime_model(picked, None)
+            out = source_manager.set_runtime_model(picked, None, settings)
             if target_manager is not source_manager:
                 self._sync_ordinary_ide_llm_source(user_id, client_ip, force=True)
                 out = sess.model_catalog()
             return out
-        out = sess.set_runtime_selection(picked)
+        out = sess.set_runtime_selection(picked, settings=settings)
         self.manager_for_user(user_id)._sync_from_session(sess, apply_to_all=False)
         return out
 
@@ -124510,7 +125705,6 @@ document.addEventListener('DOMContentLoaded', function(){{
             prompt = "Synthesize only from these independent evidence evaluations. Do not use conversation history or outside knowledge. Cite exact citations. Return JSON with answer, answerability, uncertainties.\n\n" + json_dumps({"query": query, "evaluations": evaluations}, indent=2)
             try:
                 response = session.ollama.chat([{"role": "user", "content": prompt}], system="/no_think\nYou are a stateless grounded answer synthesizer.", max_tokens=1200, temperature=0.0, think=False, stream_thinking=False)
-                parsed = self._rag_parse_evaluation((response or {}).get("content", ""), [])
                 raw = str((response or {}).get("content", "") or "").strip()
                 try:
                     parsed_answer = json.loads(raw)
@@ -126416,7 +127610,10 @@ document.addEventListener('DOMContentLoaded', function(){{
             mgr = self.manager_for_user(user_id)
             sess = mgr.get(session_id)
             if sess and bool(getattr(sess, "_deferred_runtime_sync_requested", False)):
-                mgr._sync_from_session(sess, apply_to_all=False)
+                # Model selection and its per-model runtime controls are user
+                # preferences. Propagate them to every existing session so the
+                # WebUI and IDE observe the same state immediately.
+                mgr._sync_from_session(sess, apply_to_all=True)
                 sess._deferred_runtime_sync_requested = False
         except Exception:
             pass
@@ -127228,6 +128425,7 @@ document.addEventListener('DOMContentLoaded', function(){{
         cfg = dict(config or {})
         OllamaClient.clear_global_probe_cache()
         parsed = parse_llm_config_profiles(cfg, self.base_url, self.model)
+        probe_and_merge_model_profiles(parsed.get("profiles", []), force_refresh=True)
         self.default_llm_config = cfg
         revision = self._llm_config_revision(cfg)
         self.global_llm_config_revision = revision
@@ -127998,6 +129196,7 @@ Use this skill when tasks match this flow pattern and reusable execution is need
 
     def model_catalog(self) -> dict:
         opts = []
+        profiles_changed = False
         for pid, profile in self.global_profiles.items():
             model = str(profile.get("model", ""))
             caps = merge_multimodal_capabilities(
@@ -128015,9 +129214,80 @@ Use this skill when tasks match this flow pattern and reusable execution is need
                     "thinking_hint": bool(profile.get("thinking_hint", False)),
                     "thinking_stream": bool(profile.get("thinking_stream", False)),
                     "response_stream": bool(profile.get("response_stream", False)),
+                    "effort": str(profile.get("effort", "") or ""),
+                    "max_effort": str(profile.get("max_effort", "") or ""),
+                    "reasoning_supported": (
+                        profile.get("reasoning_supported")
+                        if profile.get("reasoning_supported") is not None
+                        else model_reasoning_style(
+                            str(profile.get("provider", "")), model, caps
+                        )
+                        != "none"
+                    ),
+                    "reasoning_style": str(
+                        profile.get("reasoning_style")
+                        or model_reasoning_style(str(profile.get("provider", "")), model, caps)
+                        or ""
+                    ),
+                    "display_name": str(profile.get("display_name", profile.get("label", pid)) or ""),
+                    "title": str(profile.get("title", profile.get("label", pid)) or ""),
                     "capabilities": caps,
                 }
             )
+        seen = {str(x.get("selection", "")) for x in opts}
+        for pid, profile in self.global_profiles.items():
+            configured = [str(x).strip() for x in profile.get("models", []) if str(x).strip()]
+            records = probe_provider_models(profile, background=True)
+            profiles_changed = merge_probed_models_into_profile(profile, records) or profiles_changed
+            for rec in records:
+                model_id = str(rec.get("id", "") or "").strip()
+                if model_id and model_id not in configured:
+                    configured.append(model_id)
+            for model_id in configured:
+                selection = f"{pid}::{model_id}"
+                if not model_id or selection in seen:
+                    continue
+                seen.add(selection)
+                rec = next((r for r in records if str(r.get("id", "")) == model_id), {})
+                rcaps = rec.get("capabilities", {}) if isinstance(rec, dict) else {}
+                opts.append({
+                    "selection": selection, "profile_id": pid,
+                    "provider": profile.get("provider", ""), "model": model_id,
+                    "label": f"{profile.get('label', pid)} | {model_id}",
+                    "source": "provider-probe" if rec else profile.get("source", ""),
+                    "thinking_hint": bool(profile.get("thinking_hint", False)),
+                    "thinking_stream": bool(profile.get("thinking_stream", False)),
+                    "response_stream": bool(profile.get("response_stream", False)),
+                    "effort": str(profile.get("effort", "") or ""),
+                    "max_effort": str(profile.get("max_effort", "") or ""),
+                    "reasoning_supported": (
+                        rcaps.get("reasoning_supported")
+                        if isinstance(rcaps, dict) and rcaps.get("reasoning_supported") is not None
+                        else profile.get("reasoning_supported")
+                        if profile.get("reasoning_supported") is not None
+                        else model_reasoning_style(
+                            str(profile.get("provider", "")), model_id,
+                            rcaps if isinstance(rcaps, dict) else None,
+                        )
+                        != "none"
+                    ),
+                    "reasoning_style": str(
+                        (rcaps.get("reasoning_style") if isinstance(rcaps, dict) else "")
+                        or profile.get("reasoning_style", "")
+                        or model_reasoning_style(
+                            str(profile.get("provider", "")), model_id,
+                            rcaps if isinstance(rcaps, dict) else None,
+                        )
+                        or ""
+                    ),
+                    "display_name": str(profile.get("display_name", profile.get("label", pid)) or ""),
+                    "title": str(profile.get("title", profile.get("label", pid)) or ""),
+                    "capabilities": merge_multimodal_capabilities(infer_model_multimodal_capabilities(str(profile.get("provider", "")), model_id), parse_capability_overrides(profile.get("capabilities", {}))),
+                })
+        for _option in opts:
+            _pid = str(_option.get("profile_id", "") or "")
+            _profile = self.global_profiles.get(_pid, {})
+            apply_model_option_runtime_fields(_option, _profile, str(_option.get("model", "") or ""))
         selected_profile = self.global_profiles.get(self.global_active_profile_id, {})
         selected = f"{self.global_active_profile_id}::{selected_profile.get('model', self.model)}"
         option_map = {str(x.get("selection", "")) for x in opts}
@@ -128034,6 +129304,25 @@ Use this skill when tasks match this flow pattern and reusable execution is need
                     "thinking_hint": bool(selected_profile.get("thinking_hint", False)),
                     "thinking_stream": bool(selected_profile.get("thinking_stream", False)),
                     "response_stream": bool(selected_profile.get("response_stream", False)),
+                    "reasoning_supported": (
+                        selected_profile.get("reasoning_supported")
+                        if selected_profile.get("reasoning_supported") is not None
+                        else model_reasoning_style(
+                            str(selected_profile.get("provider", "")),
+                            str(selected_profile.get("model", self.model)),
+                            selected_profile.get("capabilities", {}),
+                        )
+                        != "none"
+                    ),
+                    "reasoning_style": str(
+                        selected_profile.get("reasoning_style")
+                        or model_reasoning_style(
+                            str(selected_profile.get("provider", "")),
+                            str(selected_profile.get("model", self.model)),
+                            selected_profile.get("capabilities", {}),
+                        )
+                        or ""
+                    ),
                     "capabilities": merge_multimodal_capabilities(
                         infer_model_multimodal_capabilities(
                             str(selected_profile.get("provider", "")),
@@ -128043,6 +129332,13 @@ Use this skill when tasks match this flow pattern and reusable execution is need
                     ),
                 },
             )
+        selected_option = next((item for item in opts if str(item.get("selection", "")) == selected), None)
+        if selected_option is not None:
+            apply_model_option_runtime_fields(
+                selected_option,
+                selected_profile,
+                str(selected_option.get("model", "") or ""),
+            )
         active_caps = merge_multimodal_capabilities(
             infer_model_multimodal_capabilities(
                 str(selected_profile.get("provider", "")),
@@ -128050,6 +129346,21 @@ Use this skill when tasks match this flow pattern and reusable execution is need
             ),
             parse_capability_overrides(selected_profile.get("capabilities", {})),
         )
+        if profiles_changed:
+            self.global_profiles_payload = {
+                **(self.global_profiles_payload if isinstance(self.global_profiles_payload, dict) else {}),
+                "profiles": [dict(item) for item in self.global_profiles.values()],
+            }
+            # Keep the discovered directory in the system config so a restart
+            # can render the same provider/model choices before the next probe.
+            persisted = dict(self.default_llm_config or {})
+            persisted["profiles"] = [dict(item) for item in self.global_profiles.values()]
+            persisted["default_profile_id"] = self.global_active_profile_id
+            self.default_llm_config = persisted
+            try:
+                LLM_CONFIG_PATH.write_text(json_dumps(persisted, indent=2), encoding="utf-8")
+            except Exception:
+                pass
         return {
             "provider": selected_profile.get("provider", "ollama"),
             "models": [x["selection"] for x in opts] or [self.model],
@@ -128061,7 +129372,7 @@ Use this skill when tasks match this flow pattern and reusable execution is need
             "active_capabilities": active_caps,
         }
 
-    def set_runtime_model(self, model: str, thinking: bool | None = None) -> dict:
+    def set_runtime_model(self, model: str, thinking: bool | None = None, settings: dict | None = None) -> dict:
         raw = str(model or "").strip()
         if not raw:
             raise ValueError("model required")
@@ -128089,6 +129400,11 @@ Use this skill when tasks match this flow pattern and reusable execution is need
                 self.global_profiles[pid]["capabilities"] = infer_model_multimodal_capabilities(
                     "ollama", selected_model.strip()
                 )
+        self.global_profiles[pid] = apply_model_runtime_settings(
+            self.global_profiles.get(pid, {}),
+            str(self.global_profiles[pid].get("model", "") or ""),
+            settings,
+        )
         self.global_active_profile_id = pid
         selected_profile = dict(self.global_profiles.get(pid, {}))
         self._sync_global_ollama_defaults(selected_profile)
@@ -128097,7 +129413,7 @@ Use this skill when tasks match this flow pattern and reusable execution is need
         with self._lock:
             for mgr in self._session_mgrs.values():
                 try:
-                    mgr.set_runtime_model(selection, self.thinking)
+                    mgr.set_runtime_model(selection, self.thinking, settings)
                 except Exception:
                     pass
         return self.model_catalog()
@@ -129957,10 +131273,33 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/ollama/models":
             ollama_url = str((query.get("base_url", [""]) or [""])[0]).strip() or "http://127.0.0.1:11434"
             try:
-                models = list_ollama_models(ollama_url, timeout=5)
-                return self._send_json({"ok": True, "models": models, "base_url": ollama_url})
+                model_records = probe_ollama_model_records(
+                    ollama_url,
+                    timeout=1.5,
+                )
+                models = [
+                    str(record.get("id", "")).strip()
+                    for record in model_records
+                    if isinstance(record, dict) and str(record.get("id", "")).strip()
+                ]
+                return self._send_json(
+                    {
+                        "ok": True,
+                        "models": models,
+                        "model_records": model_records,
+                        "base_url": ollama_url,
+                    }
+                )
             except Exception as exc:
-                return self._send_json({"ok": False, "models": [], "error": str(exc)[:300], "base_url": ollama_url})
+                return self._send_json(
+                    {
+                        "ok": False,
+                        "models": [],
+                        "model_records": [],
+                        "error": str(exc)[:300],
+                        "base_url": ollama_url,
+                    }
+                )
         if path == "/api/openai_compat/models":
             base_url = str((query.get("base_url", [""]) or [""])[0]).strip()
             api_key = str((query.get("api_key", [""]) or [""])[0]).strip()
@@ -129977,7 +131316,60 @@ class Handler(BaseHTTPRequestHandler):
                 last_error = ""
                 notes: list[str] = []
                 probe_headers = openai_compat_probe_headers(provider, api_key)
-                for models_url in openai_compat_model_list_urls(normalized_base, provider):
+                model_urls = (
+                    [anthropic_model_list_url(normalized_base)]
+                    if provider == "anthropic"
+                    else openai_compat_model_list_urls(normalized_base, provider)
+                )
+                # Anthropic's Models API is cursor paginated. Fetch the complete
+                # catalog so importing a provider gets every available model.
+                if provider == "anthropic" and model_urls and model_urls[0]:
+                    models_url = model_urls[0]
+                    all_records: list[dict] = []
+                    seen_ids: set[str] = set()
+                    after_id = ""
+                    for _page in range(20):
+                        page_url = f"{models_url}{'&' if '?' in models_url else '?'}limit=1000"
+                        if after_id:
+                            page_url += "&after_id=" + quote(after_id, safe="")
+                        try:
+                            req = urllib.request.Request(page_url, method="GET")
+                            for hk, hv in probe_headers.items():
+                                if str(hk or "").strip() and str(hv or "").strip():
+                                    req.add_header(str(hk), str(hv))
+                            with urlopen(req, timeout=8) as resp:
+                                payload = json.loads(resp.read().decode("utf-8", errors="replace"))
+                            reachable = True
+                            page_records = extract_openai_compat_model_records(payload)
+                            for record in page_records:
+                                mid = str(record.get("id", "") or "").strip()
+                                if mid and mid not in seen_ids:
+                                    seen_ids.add(mid)
+                                    all_records.append(record)
+                            if not isinstance(payload, dict) or not payload.get("has_more"):
+                                break
+                            next_after = str(payload.get("last_id", "") or "").strip()
+                            if not next_after or next_after == after_id:
+                                break
+                            after_id = next_after
+                        except urllib.error.HTTPError as exc:
+                            reachable = int(getattr(exc, "code", 0) or 0) in {200, 401, 403, 404, 405}
+                            last_error = f"HTTP {int(getattr(exc, 'code', 0) or 0)}"
+                            break
+                        except Exception as exc:
+                            last_error = trim(str(exc), 300)
+                            break
+                    if all_records:
+                        return self._send_json({
+                            "ok": True, "reachable": True, "provider": provider,
+                            "models": [str(r.get("id", "")).strip() for r in all_records],
+                            "model_records": [
+                                {"id": str(r.get("id", "")).strip(), "capabilities": dict(r.get("capabilities", {}))}
+                                for r in all_records
+                            ],
+                            "base_url": normalized_base, "scanned_url": models_url,
+                        })
+                for models_url in model_urls:
                     try:
                         req = urllib.request.Request(models_url, method="GET")
                         for hk, hv in probe_headers.items():
@@ -129990,7 +131382,12 @@ class Handler(BaseHTTPRequestHandler):
                             payload = json.loads(body_text)
                         except Exception:
                             payload = {}
-                        model_ids = extract_openai_compat_model_ids(payload)
+                        model_records = extract_openai_compat_model_records(payload)
+                        model_ids = [
+                            str(record.get("id", "")).strip()
+                            for record in model_records
+                            if isinstance(record, dict) and str(record.get("id", "")).strip()
+                        ]
                         if model_ids:
                             return self._send_json(
                                 {
@@ -129998,6 +131395,17 @@ class Handler(BaseHTTPRequestHandler):
                                     "reachable": True,
                                     "provider": provider,
                                     "models": model_ids,
+                                    "model_records": [
+                                        {
+                                            "id": model_id,
+                                            "capabilities": dict(
+                                                model_records[index].get("capabilities", {})
+                                            )
+                                            if isinstance(model_records[index], dict)
+                                            else {},
+                                        }
+                                        for index, model_id in enumerate(model_ids)
+                                    ],
                                     "base_url": normalized_base,
                                     "scanned_url": models_url,
                                 }
@@ -130016,7 +131424,12 @@ class Handler(BaseHTTPRequestHandler):
                             payload = json.loads(body_text) if body_text else {}
                         except Exception:
                             payload = {}
-                        model_ids = extract_openai_compat_model_ids(payload)
+                        model_records = extract_openai_compat_model_records(payload)
+                        model_ids = [
+                            str(record.get("id", "")).strip()
+                            for record in model_records
+                            if isinstance(record, dict) and str(record.get("id", "")).strip()
+                        ]
                         if model_ids:
                             return self._send_json(
                                 {
@@ -130024,6 +131437,17 @@ class Handler(BaseHTTPRequestHandler):
                                     "reachable": True,
                                     "provider": provider,
                                     "models": model_ids,
+                                    "model_records": [
+                                        {
+                                            "id": model_id,
+                                            "capabilities": dict(
+                                                model_records[index].get("capabilities", {})
+                                            )
+                                            if isinstance(model_records[index], dict)
+                                            else {},
+                                        }
+                                        for index, model_id in enumerate(model_ids)
+                                    ],
                                     "base_url": normalized_base,
                                     "scanned_url": models_url,
                                 }
@@ -130056,6 +131480,7 @@ class Handler(BaseHTTPRequestHandler):
                             "reachable": True,
                             "provider": provider,
                             "models": [],
+                            "model_records": [],
                             "base_url": normalized_base,
                             "note": "endpoint reachable; no standard model list returned",
                             "error": last_error,
@@ -130068,6 +131493,7 @@ class Handler(BaseHTTPRequestHandler):
                         "reachable": False,
                         "provider": provider,
                         "models": [],
+                        "model_records": [],
                         "error": last_error or "unable to reach endpoint",
                         "base_url": normalized_base,
                         "attempts": notes[-6:],
@@ -130080,6 +131506,7 @@ class Handler(BaseHTTPRequestHandler):
                         "reachable": False,
                         "provider": provider,
                         "models": [],
+                        "model_records": [],
                         "error": str(exc)[:300],
                         "base_url": extract_base_url(base_url),
                     }
@@ -130698,7 +132125,7 @@ class Handler(BaseHTTPRequestHandler):
             if not model:
                 return self._send_json({"error": "model required"}, status=400)
             try:
-                return self._send_json(mgr.set_runtime_model(model, None))
+                return self._send_json(mgr.set_runtime_model(model, None, normalize_model_runtime_settings(payload)))
             except Exception as exc:
                 return self._send_json({"error": str(exc)}, status=400)
         if path == "/api/config/language":
@@ -130755,6 +132182,7 @@ class Handler(BaseHTTPRequestHandler):
             if not selection:
                 return self._send_json({"error": "selection required"}, status=400)
             model_override = payload.get("model_override")
+            runtime_settings = normalize_model_runtime_settings(payload)
             if bool(getattr(sess, "running", False)):
                 try:
                     sess._queue_deferred_runtime_update(
@@ -130762,6 +132190,7 @@ class Handler(BaseHTTPRequestHandler):
                         {
                             "selection": selection,
                             "model_override": model_override if isinstance(model_override, str) else "",
+                            "settings": runtime_settings,
                         },
                     )
                 except Exception as exc:
@@ -130773,8 +132202,8 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 return self._send_json(queued)
             try:
-                out = sess.set_runtime_selection(selection, model_override if isinstance(model_override, str) else None)
-                mgr._sync_from_session(sess, apply_to_all=False)
+                out = sess.set_runtime_selection(selection, model_override if isinstance(model_override, str) else None, settings=runtime_settings)
+                mgr._sync_from_session(sess, apply_to_all=True)
             except Exception as exc:
                 return self._send_json({"error": str(exc)}, status=400)
             return self._send_json(out)
@@ -130881,7 +132310,7 @@ class Handler(BaseHTTPRequestHandler):
             meta = sess.add_upload(filename, raw, mime)
             if isinstance(meta.get("model_catalog"), dict) and not bool(meta.get("model_catalog", {}).get("queued")):
                 try:
-                    mgr._sync_from_session(sess, apply_to_all=False)
+                    mgr._sync_from_session(sess, apply_to_all=True)
                 except Exception:
                     pass
             return self._send_json(meta, status=201)
@@ -131675,7 +133104,7 @@ class SkillsHandler(BaseHTTPRequestHandler):
             if not selection:
                 return self._send_json({"error": "selection required"}, status=400)
             try:
-                return self._send_json(mgr.set_runtime_model(selection, None))
+                return self._send_json(mgr.set_runtime_model(selection, None, normalize_model_runtime_settings(payload)))
             except Exception as exc:
                 return self._send_json({"error": str(exc)}, status=400)
         if path == "/api/skillslab/language":
@@ -133826,6 +135255,7 @@ class IdeHandler(BaseHTTPRequestHandler):
                         m.group(1),
                         str(payload.get("selection", payload.get("model", "")) or ""),
                         client_ip=self._client_ip(),
+                        settings=normalize_model_runtime_settings(payload),
                     )
                 )
             except Exception as exc:
