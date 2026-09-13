@@ -24,8 +24,8 @@ import math
 import mimetypes
 import multiprocessing
 import os
-import posixpath
 import platform
+import posixpath
 import queue
 import random
 import re
@@ -55,7 +55,8 @@ import zipfile
 import zlib
 from collections import Counter, defaultdict, deque
 from collections.abc import Iterable
-from dataclasses import asdict, dataclass, field as dataclass_field
+from dataclasses import asdict, dataclass
+from dataclasses import field as dataclass_field
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
@@ -377,7 +378,11 @@ def _ensure_embedded_liquid_kernel_package(package_root: Path | None = None) -> 
 
 LIQUID_KERNEL_PACKAGE_STATUS = _ensure_embedded_liquid_kernel_package()
 
-from liquid_kernel import EVOLUTION_MODES, LiquidKernelControlPlane, LiquidKernelError  # noqa: E402
+from liquid_kernel import (  # noqa: E402
+    EVOLUTION_MODES,
+    LiquidKernelControlPlane,
+    LiquidKernelError,
+)
 
 # BEGIN EMBEDDED COLLABORATION BACKEND
 COLLAB_DB_FILENAME = "collaboration.sqlite"
@@ -45601,7 +45606,9 @@ body{padding:18px}
                 "Requested range is already in long-content memory; use fresh=true for exact source verification."
             )
         body = "\n\n".join(
-            "@@ lines %d-%d @@\n%s" % (a, b, "\n".join(f"{i}: {lines[i - 1]}" for i in range(a, b + 1)))
+            f"@@ lines {a}-{b} @@\n" + "\n".join(
+                f"{i}: {lines[i - 1]}" for i in range(a, b + 1)
+            )
             for a, b in gaps
         )
         return self._clip_read_file_output(
@@ -46327,7 +46334,7 @@ body{padding:18px}
                     f"- {card.get('id','')} {card.get('title','')} :: "
                     f"{trim(card.get('text',''), 220)} [{','.join(card.get('evidence', [])[:2])}]"
                 )
-        out.append("\nFocused read: read_file path=\"%s\" mode=\"segment\" segment_id=\"s0001\"" % rel)
+        out.append(f"\nFocused read: read_file path=\"{rel}\" mode=\"segment\" segment_id=\"s0001\"")
         return self._clip_read_file_output("\n".join(out), self._read_file_max_chars(max_chars))
 
     def _render_long_content_segment(self, rel: str, fp: Path, lines: list[str], *, segment_id: object = "", query: object = "", max_chars: object = None) -> str:
