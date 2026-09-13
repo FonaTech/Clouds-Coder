@@ -1,7 +1,10 @@
 import ast
 import builtins
+import importlib.util
+import os
 import re
 import sys
+import sysconfig
 import unittest
 from io import BytesIO
 from pathlib import Path
@@ -44,6 +47,29 @@ IMPORT_TO_DISTRIBUTION = {
 DYNAMIC_RUNTIME_MODULES = {"debugpy"}
 
 
+def stdlib_module_names(imported: set[str]) -> set[str]:
+    """Return standard-library roots on Python versions with/without the 3.10 API."""
+    native = getattr(sys, "stdlib_module_names", None)
+    if native is not None:
+        return set(native)
+    stdlib_root = os.path.realpath(sysconfig.get_paths()["stdlib"])
+    names = set(sys.builtin_module_names)
+    for name in imported:
+        try:
+            spec = importlib.util.find_spec(name)
+        except (ImportError, ModuleNotFoundError, ValueError):
+            continue
+        origin = getattr(spec, "origin", None)
+        if not origin or origin in {"built-in", "frozen"}:
+            continue
+        try:
+            if os.path.commonpath((stdlib_root, os.path.realpath(origin))) == stdlib_root:
+                names.add(name)
+        except ValueError:
+            continue
+    return names
+
+
 def canonical_distribution(value: str) -> str:
     return re.sub(r"[-_.]+", "-", str(value or "").strip()).lower()
 
@@ -77,7 +103,7 @@ class RequirementsCoverageTests(unittest.TestCase):
             for path in ROOT.iterdir()
             if path.is_dir() and (path / "__init__.py").is_file()
         )
-        third_party = imported - set(sys.stdlib_module_names) - {"__future__"} - local_modules
+        third_party = imported - stdlib_module_names(imported) - {"__future__"} - local_modules
         unmapped = sorted(third_party - set(IMPORT_TO_DISTRIBUTION))
         self.assertEqual(unmapped, [], f"Map new third-party imports: {unmapped}")
 
