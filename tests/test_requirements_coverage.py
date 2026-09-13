@@ -62,8 +62,11 @@ def stdlib_module_names(imported: set[str]) -> set[str]:
         origin = getattr(spec, "origin", None)
         if not origin or origin in {"built-in", "frozen"}:
             continue
+        origin_path = os.path.realpath(origin)
+        if any(part in {"site-packages", "dist-packages"} for part in origin_path.split(os.sep)):
+            continue
         try:
-            if os.path.commonpath((stdlib_root, os.path.realpath(origin))) == stdlib_root:
+            if os.path.commonpath((stdlib_root, origin_path)) == stdlib_root:
                 names.add(name)
         except ValueError:
             continue
