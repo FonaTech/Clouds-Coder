@@ -6,6 +6,7 @@
 # HTTPS certificate bundle and YAML/frontmatter parsing
 certifi>=2024.8.30
 PyYAML>=6.0
+cryptography>=42.0  # AES-GCM host runtime support
 
 # Image conversion, safe image preview, compressed web responses, and robust
 # character-set detection. The stdlib/Pillow-free paths remain degraded
